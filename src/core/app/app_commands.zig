@@ -352,6 +352,7 @@ pub fn Handlers(comptime App: type) type {
                 .reset_session = commandResetSession,
                 .resume_session = commandResumeSession,
                 .continue_recovery = commandContinueRecovery,
+                .fork_session = commandForkSession,
                 .show_help = commandShowHelp,
                 .login = commandLogin,
                 .logout = commandLogout,
@@ -676,6 +677,21 @@ pub fn Handlers(comptime App: type) type {
                 .tone = .neutral,
                 .body = "there is no paused model response to continue",
             }, true);
+        }
+
+        fn commandForkSession(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            handleForkCommand(app, rest) catch |err| {
+                const body: []const u8 = switch (err) {
+                    error.NoActiveSession => "no active session to fork",
+                    error.SessionBusy => "wait for the current response to finish before forking",
+                    error.TitleTooLong => "title is too long",
+                    error.InvalidTitle => "title must be printable text",
+                    error.SessionPersistenceUnavailable => "session persistence is unavailable",
+                    else => return err,
+                };
+                try app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = body }, true);
+            };
         }
 
         fn commandRenameSession(ctx: *anyopaque, rest: []const u8) !void {
@@ -3466,6 +3482,11 @@ fn stripAnsiEscapes(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
     }
 
     return out.toOwnedSlice(alloc);
+}
+
+fn handleForkCommand(app: anytype, rest: []const u8) anyerror!void {
+    const App = @TypeOf(app.*);
+    try app_session_runtime.Runtime(App).forkSession(app, rest);
 }
 
 fn handleRenameCommand(app: anytype, rest: []const u8) !void {

@@ -1288,6 +1288,10 @@ const App = struct {
         try SessionAppRuntime.resetSession(self);
     }
 
+    pub fn forkSession(self: *App, title: []const u8) !void {
+        try SessionAppRuntime.forkSession(self, title);
+    }
+
     pub fn prepareLiveSessionResume(
         self: *App,
         log_options: session_log.Options,

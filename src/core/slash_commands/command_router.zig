@@ -11,6 +11,7 @@ pub const ParsedCommand = union(enum) {
     reset_session,
     resume_session,
     continue_recovery,
+    fork_session: []const u8,
     rename_session: []const u8,
     help,
     login,
@@ -55,6 +56,7 @@ pub const CommandHandlers = struct {
     reset_session: *const fn (ctx: *anyopaque) anyerror!void,
     resume_session: *const fn (ctx: *anyopaque) anyerror!void,
     continue_recovery: *const fn (ctx: *anyopaque) anyerror!void,
+    fork_session: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_help: *const fn (ctx: *anyopaque) anyerror!void,
     login: *const fn (ctx: *anyopaque) anyerror!void,
     logout: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
@@ -103,6 +105,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .reset_session => .reset_session,
         .resume_session => .resume_session,
         .continue_recovery => .continue_recovery,
+        .fork_session => .{ .fork_session = payload },
         .rename_session => .{ .rename_session = payload },
         .help => .help,
         .login => .login,
@@ -160,6 +163,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .reset_session => try handlers.reset_session(handlers.ctx),
         .resume_session => try handlers.resume_session(handlers.ctx),
         .continue_recovery => try handlers.continue_recovery(handlers.ctx),
+        .fork_session => |rest| try handlers.fork_session(handlers.ctx, rest),
         .rename_session => |rest| try handlers.rename_session(handlers.ctx, rest),
         .help => try handlers.show_help(handlers.ctx),
         .login => try handlers.login(handlers.ctx),
@@ -246,6 +250,17 @@ test "parse extracts sound command payload" {
 test "parse distinguishes new and reset lifecycle commands" {
     try std.testing.expectEqual(ParsedCommand.new_session, parse(testSlashRegistry(), "/new"));
     try std.testing.expectEqual(ParsedCommand.reset_session, parse(testSlashRegistry(), "/reset"));
+}
+
+test "parse recognizes fork with optional title" {
+    switch (parse(testSlashRegistry(), "/fork")) {
+        .fork_session => |title| try std.testing.expectEqualStrings("", title),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/fork alternative path")) {
+        .fork_session => |title| try std.testing.expectEqualStrings("alternative path", title),
+        else => return error.TestExpectedEqual,
+    }
 }
 
 test "parse recognizes interactive resume" {
@@ -499,6 +514,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .reset_session = unexpectedNoPayload,
         .resume_session = unexpectedNoPayload,
         .continue_recovery = unexpectedNoPayload,
+        .fork_session = unexpectedPayload,
         .show_help = unexpectedNoPayload,
         .login = unexpectedNoPayload,
         .logout = unexpectedPayload,

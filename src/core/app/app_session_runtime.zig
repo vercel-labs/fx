@@ -240,6 +240,10 @@ pub const ResumeHandoffIntent = enum {
 
 const ResumeNotice = union(enum) {
     session,
+    fork: struct {
+        source_id: []const u8,
+        title: []const u8,
+    },
     upgrade: []const u8,
 };
 
@@ -1484,6 +1488,187 @@ pub fn Runtime(comptime App: type) type {
             try resetSessionWithBackgroundPolicy(app, .stop_forget);
         }
 
+        pub const ForkError = error{
+            NoActiveSession,
+            SessionBusy,
+            SessionPersistenceUnavailable,
+            TitleTooLong,
+            InvalidTitle,
+        };
+
+        /// Creates the fork before closing the source, so a creation failure leaves
+        /// the current session writable and visible.
+        pub fn forkSession(app: *App, raw_title: []const u8) anyerror!void {
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) {
+                return error.SessionPersistenceUnavailable;
+            }
+            if (app.worker.isProcessing() or app.worker.queuedPromptCount() > 0) return error.SessionBusy;
+            const store = app.session_persistence.store orelse
+                return error.SessionPersistenceUnavailable;
+            const source = if (app.session_persistence.writable) |*loaded|
+                loaded
+            else
+                return error.NoActiveSession;
+
+            const title = try forkTitle(app, raw_title);
+            defer app.alloc.free(title);
+            const source_id = try app.alloc.dupe(u8, source.active_id);
+            defer app.alloc.free(source_id);
+
+            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            var fork_state = blk: {
+                defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+                try convergeDegraded(app, source, .{});
+                break :blk try snapshotCurrentState(app, source.state, io_mod.milliTimestamp());
+            };
+            defer fork_state.deinit(app.alloc);
+            try sanitizeForkState(app, &fork_state);
+            try prepareForkImagePaths(app, store.sessions_dir, &fork_state);
+
+            var forked = try store.startWritableSession(app.alloc, fork_state);
+            var forked_owned = true;
+            errdefer if (forked_owned) {
+                _ = store.deleteCommittedSession(app.alloc, &forked);
+                forked_owned = false;
+            };
+            defer if (forked_owned) forked.deinit(app.alloc);
+            try copyForkArtifacts(app, source, &forked);
+
+            try prepareLiveSessionTransition(app, .stop_forget, .{});
+            try installResumedSession(app, &forked, .{ .fork = .{
+                .source_id = source_id,
+                .title = title,
+            } });
+            forked_owned = false;
+            try renameActiveSession(app, title);
+            try finishLiveSessionResume(app);
+        }
+
+        fn forkTitle(app: *App, raw_title: []const u8) ![]u8 {
+            const trimmed = std.mem.trim(u8, raw_title, " \t\r\n");
+            if (trimmed.len > 0) {
+                const valid = validateSessionTitle(trimmed) catch |err| switch (err) {
+                    error.EmptyTitle => unreachable,
+                    else => return err,
+                };
+                return app.alloc.dupe(u8, valid);
+            }
+            const source_title = cachedSessionTitle(app) orelse "Fork";
+            const suffix = " (fork)";
+            const prefix_budget = session_display_metadata.max_title_bytes - suffix.len;
+            const prefix = text_utils.utf8PrefixByBytes(source_title, prefix_budget);
+            return std.fmt.allocPrint(app.alloc, "{s}{s}", .{ prefix, suffix });
+        }
+
+        fn sanitizeForkState(app: *App, state: *session_codec.DurableSessionState) !void {
+            app.alloc.free(state.id);
+            state.id = try session_store.generateSessionId(app.alloc);
+            const now = io_mod.milliTimestamp();
+            state.created_at_ms = now;
+            state.updated_at_ms = now;
+            state.permission_state.deinit(app.alloc);
+            state.permission_state = .{};
+            if (state.last_subagent_work_id) |work_id| app.alloc.free(work_id);
+            state.last_subagent_work_id = null;
+            if (state.recovery_checkpoint) |*checkpoint| checkpoint.deinit(app.alloc);
+            state.recovery_checkpoint = null;
+            if (state.usage) |*usage| usage.deinit(app.alloc);
+            var fresh_usage = session_usage.Usage.initFresh();
+            defer fresh_usage.deinit(app.alloc);
+            state.usage = try fresh_usage.snapshot(app.alloc);
+        }
+
+        fn prepareForkImagePaths(
+            app: *App,
+            sessions_dir: []const u8,
+            state: *session_codec.DurableSessionState,
+        ) !void {
+            const session_dir = try session_store.sessionDirPath(app.alloc, sessions_dir, state.id);
+            defer app.alloc.free(session_dir);
+            const image_dir = try std.fs.path.join(app.alloc, &.{ session_dir, "images" });
+            defer app.alloc.free(image_dir);
+            for (state.history) |*turn| {
+                const user = historyUserTurn(turn) orelse continue;
+                for (user.images) |*image| {
+                    const source_path = image.snapshot_path orelse continue;
+                    const destination = try std.fs.path.join(
+                        app.alloc,
+                        &.{ image_dir, std.fs.path.basename(source_path) },
+                    );
+                    app.alloc.free(source_path);
+                    image.snapshot_path = destination;
+                }
+            }
+        }
+
+        fn copyForkArtifacts(
+            app: *App,
+            source: *session_store.LoadedWritableSession,
+            destination: *session_store.LoadedWritableSession,
+        ) !void {
+            const source_capability = try source.childCapability();
+            const destination_capability = try destination.childCapability();
+            const kinds = [_]session_child_store.ManagedChildKind{
+                .command_artifacts,
+                .browser_artifacts,
+                .tool_results,
+            };
+            for (kinds) |kind| {
+                var entries = try source_capability.iterate(app.alloc, kind);
+                defer entries.deinit();
+                for (entries.names) |name| {
+                    var source_file = try source_capability.openFileReadOnly(app.alloc, kind, name);
+                    defer source_file.deinit();
+                    const stat = try source_file.stat();
+                    const size = std.math.cast(usize, stat.size) orelse return error.FileTooBig;
+                    const bytes = try source_file.readRange(app.alloc, 0, size);
+                    defer app.alloc.free(bytes);
+                    var copied = try destination_capability.createExclusiveFile(app.alloc, kind, name);
+                    defer copied.deinit();
+                    try copied.writeAll(bytes);
+                    try copied.sync();
+                }
+            }
+
+            const store = app.session_persistence.store orelse return error.SessionPersistenceUnavailable;
+            const destination_dir = try session_store.sessionDirPath(app.alloc, store.sessions_dir, destination.active_id);
+            defer app.alloc.free(destination_dir);
+            const image_dir = try std.fs.path.join(app.alloc, &.{ destination_dir, "images" });
+            defer app.alloc.free(image_dir);
+            var image_dir_created = false;
+            for (app.session.history.items, destination.state.history) |source_turn, *destination_turn| {
+                const source_user = historyUserTurnConst(source_turn) orelse continue;
+                const destination_user = historyUserTurn(destination_turn) orelse continue;
+                for (source_user.images, destination_user.images) |source_image, destination_image| {
+                    const source_path = source_image.snapshot_path orelse continue;
+                    const destination_path = destination_image.snapshot_path orelse continue;
+                    if (!image_dir_created) {
+                        try std.Io.Dir.cwd().createDirPath(io_mod.getIo(), image_dir);
+                        image_dir_created = true;
+                    }
+                    try io_mod.copyFileAtomic(app.alloc, source_path, destination_path);
+                }
+            }
+        }
+
+        fn historyUserTurn(turn: *types.HistoryTurn) ?*types.UserTurn {
+            return switch (turn.*) {
+                .assistant => |*entry| &entry.user,
+                .background_command => |*entry| &entry.user,
+                .interrupted => |*entry| &entry.user,
+                .compacted_summary => null,
+            };
+        }
+
+        fn historyUserTurnConst(turn: types.HistoryTurn) ?types.UserTurn {
+            return switch (turn) {
+                .assistant => |entry| entry.user,
+                .background_command => |entry| entry.user,
+                .interrupted => |entry| entry.user,
+                .compacted_summary => null,
+            };
+        }
+
         fn resetSessionWithBackgroundPolicy(
             app: *App,
             background_policy: BackgroundSessionPolicy,
@@ -1572,7 +1757,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn beginLiveSessionCancellation(app: *App) void {
             app.worker.requestCancel();
-            app.pacer.clear(app.alloc);
+            if (comptime @hasField(App, "pacer")) app.pacer.clear(app.alloc);
             if (comptime @hasField(App, "queued_prompt_review")) {
                 input_queue_runtime.Runtime(App).reset(app);
             }
@@ -1601,7 +1786,7 @@ pub fn Runtime(comptime App: type) type {
             }
 
             closeWritableSession(app, log_options);
-            app.stopStream();
+            if (comptime @hasDecl(App, "stopStream")) app.stopStream();
             app.shell.clearTranscript(app.alloc);
             app.session.reset(app.alloc);
             app.input_runtime.inputResetState().resetForSession(app.alloc);
@@ -3623,6 +3808,20 @@ pub fn Runtime(comptime App: type) type {
                     .tone = .neutral,
                     .body = display_title,
                 }),
+                .fork => |fork| {
+                    try setCachedSessionTitle(app, fork.title);
+                    const body = try std.fmt.allocPrint(
+                        app.alloc,
+                        "{s}\nTo continue the original session, run fx resume {s}",
+                        .{ fork.title, fork.source_id },
+                    );
+                    defer app.alloc.free(body);
+                    try sink.appendNotice(.{
+                        .topic = "session forked",
+                        .tone = .neutral,
+                        .body = body,
+                    });
+                },
                 .upgrade => |version| {
                     const body = try std.fmt.allocPrint(
                         app.alloc,
@@ -5101,6 +5300,30 @@ const FakeWorker = struct {
     pub fn queuedPromptCount(self: *const FakeWorker) usize {
         _ = self;
         return 0;
+    }
+
+    fn isProcessing(self: *const FakeWorker) bool {
+        _ = self;
+        return false;
+    }
+
+    fn requestCancel(self: *FakeWorker) void {
+        _ = self;
+    }
+
+    fn waitUntilIdle(self: *FakeWorker) void {
+        _ = self;
+    }
+
+    fn discardEvents(self: *FakeWorker, alloc: Allocator) void {
+        _ = self;
+        _ = alloc;
+    }
+
+    fn clearQueuedPrompts(self: *FakeWorker, alloc: Allocator, keep: []const u64) void {
+        _ = self;
+        _ = alloc;
+        _ = keep;
     }
 
     fn syncQueuedPromptModel(

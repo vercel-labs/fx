@@ -87,6 +87,8 @@ fx session resume last
 fx session resume --id <id>
 ```
 
+Inside an interactive chat, run `/fork` to branch the current conversation into a new saved session while keeping the original resumable. Add an optional title with `/fork <title>`.
+
 Each interactive session names its terminal tab. The title prefers the session name, falls back to the workspace name, and keeps the active model as secondary context. Renaming or resuming a session updates the tab, and exiting clears the fx-owned title. Noninteractive commands do not emit terminal-title controls.
 
 Run `/feedback` to open the feedback form at `fx.sh/feedback`. It does not create a diagnostic or change the clipboard.
