@@ -706,8 +706,8 @@ pub const LoadedWritableSession = struct {
             state.workspace_root,
         );
         const may_defer_cache = same_workspace and switch (reason) {
-            .compaction, .log_compaction => true,
-            .migration, .recovery => false,
+            .compaction, .log_compaction, .rewind => true,
+            .migration, .recovery, .fork => false,
         };
         const cache_deferred = if (may_defer_cache)
             try self.prepareCommitLifecycleOpportunistic(alloc, options)
