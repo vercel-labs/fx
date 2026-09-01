@@ -4459,7 +4459,8 @@ pub const Store = struct {
     /// Drops every turn after `retained_turns` from a session in place, keeping
     /// its id. The rewind is recorded as a state replacement, so the dropped
     /// turns stay in the event log until it is compacted and their artifacts
-    /// are left on disk.
+    /// are left on disk. Any paused response is cleared too, since it describes
+    /// a turn past the retained tail.
     pub fn rewindSession(
         self: Store,
         alloc: Allocator,
@@ -4488,6 +4489,10 @@ pub const Store = struct {
         var rewound = try loaded.state.dupe(alloc);
         defer rewound.deinit(alloc);
         try truncateSessionHistory(alloc, &rewound, retained_turns);
+        if (rewound.recovery_checkpoint) |*checkpoint| {
+            checkpoint.deinit(alloc);
+            rewound.recovery_checkpoint = null;
+        }
         rewound.updated_at_ms = io_mod.milliTimestamp();
         _ = try loaded.commitStateReplacement(
             alloc,
@@ -14597,4 +14602,81 @@ test "rewind refuses a session that is already open for writing" {
             .{ .session_lock_deadline_ms = 0 },
         ),
     );
+}
+
+fn testRecoveryCheckpoint() session_codec.RecoveryCheckpoint {
+    return .{
+        .turn_id = 1,
+        .user = .{ .text = @constCast("prompt") },
+        .assistant_source = @constCast(""),
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 10,
+        .consumed_provider_attempts = 1,
+    };
+}
+
+test "rewind clears a paused response because it belongs to the dropped tail" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    const session_id = "rewind-clears-checkpoint";
+    try writeForkSourceFixture(alloc, ctx.store, session_id, ctx.workspace, 3, 0);
+
+    var writable = try ctx.store.resumeForWrite(alloc, session_id);
+    _ = try writable.appendEvent(
+        alloc,
+        .{ .recovery_checkpoint_set = .{ .checkpoint = testRecoveryCheckpoint() } },
+        20,
+        .retry_expected_tail,
+        .{},
+    );
+    writable.deinit(alloc);
+
+    var result = try ctx.store.rewindSession(alloc, session_id, 1, .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), result.removed_turn_count);
+
+    var state = try ctx.store.loadReadOnly(alloc, session_id);
+    defer state.deinit(alloc);
+    try std.testing.expect(state.recovery_checkpoint == null);
+}
+
+test "rewind leaves a paused response untouched when already at target" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    const session_id = "rewind-noop-keeps-checkpoint";
+    try writeForkSourceFixture(alloc, ctx.store, session_id, ctx.workspace, 3, 0);
+
+    var writable = try ctx.store.resumeForWrite(alloc, session_id);
+    _ = try writable.appendEvent(
+        alloc,
+        .{ .recovery_checkpoint_set = .{ .checkpoint = testRecoveryCheckpoint() } },
+        20,
+        .retry_expected_tail,
+        .{},
+    );
+    writable.deinit(alloc);
+
+    var result = try ctx.store.rewindSession(alloc, session_id, 3, .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(
+        store_types.SessionRewindStatus.already_at_target,
+        result.status,
+    );
+
+    var state = try ctx.store.loadReadOnly(alloc, session_id);
+    defer state.deinit(alloc);
+    try std.testing.expect(state.recovery_checkpoint != null);
+    try std.testing.expectEqual(@as(u64, 1), state.recovery_checkpoint.?.turn_id);
 }
