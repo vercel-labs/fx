@@ -6,6 +6,7 @@ import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
   TmuxSession,
   fakeGatewayFinalText,
+  heldFakeGatewayFinalText,
   startFakeGateway,
 } from "./tmux-helpers";
 
@@ -249,6 +250,52 @@ describe("interactive session fork and rewind", () => {
         "second prompt",
         "branch prompt",
       ]);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "both commands refuse while a response is still streaming",
+    async () => {
+      const workspace = makeWorkspace("fx-tui-fork-streaming-");
+      const held = heldFakeGatewayFinalText();
+      gateway = startFakeGateway([
+        fakeGatewayFinalText("REPLY_ONE"),
+        held.response,
+      ]);
+      session = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: workspace.workspace,
+        env: gatewayEnvironment(workspace.home),
+        stderrPath: workspace.stderrPath,
+        width: 120,
+        height: 40,
+        isolated: true,
+      });
+      await session.waitForComposer(STEP_TIMEOUT);
+      await ask("first prompt", "REPLY_ONE");
+
+      await session.sendText("second prompt");
+      await session.waitForText("second prompt", STEP_TIMEOUT);
+
+      await session.sendText("/fork 1");
+      await session.waitForText(
+        "fork is unavailable until the response finishes",
+        STEP_TIMEOUT,
+      );
+      await session.sendText("/rewind 1");
+      await session.waitForText(
+        "rewind is unavailable until the response finishes",
+        STEP_TIMEOUT,
+      );
+
+      held.release("REPLY_TWO");
+      await session.waitForText("REPLY_TWO", STEP_TIMEOUT);
+
+      await quitShell(workspace.stderrPath);
+      const saved = await savedSessions(workspace.home, workspace.workspace);
+      expect(saved).toHaveLength(1);
+      expect(saved[0]!.prompts).toEqual(["first prompt", "second prompt"]);
     },
     TIMEOUT,
   );

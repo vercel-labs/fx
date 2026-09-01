@@ -2860,11 +2860,10 @@ pub fn Runtime(comptime App: type) type {
             return .committed;
         }
 
-        /// Where the shell ended up after a `/fork`. A fork has to close the
-        /// live session before it can run, so "which session am I in now" is
-        /// part of every answer, not just the failing ones.
+        /// Where the shell ended up when a fork did not finish. A fork has to
+        /// close the live session before it can run, so "which session am I in
+        /// now" is part of every failing answer.
         pub const ForkLanding = enum {
-            branch,
             source,
             fresh_session,
             no_session,
@@ -2874,24 +2873,33 @@ pub fn Runtime(comptime App: type) type {
             unavailable_during_stream,
             unavailable,
             out_of_range: usize,
-            forked: Fork,
+            branched: Branch,
+            failed: Failure,
 
-            pub const Fork = struct {
+            pub const Branch = struct {
                 source_id: []u8,
-                /// Null when no branch was created.
-                forked_id: ?[]u8,
+                forked_id: []u8,
                 retained_turns: usize,
+                unverified_artifacts: bool,
+            };
+
+            pub const Failure = struct {
+                source_id: []u8,
+                /// Set when the branch exists but this shell could not enter it.
+                forked_id: ?[]u8,
+                problem: anyerror,
                 landing: ForkLanding,
-                /// Set when the fork or the handoff into the branch failed.
-                problem: ?anyerror = null,
-                unverified_artifacts: bool = false,
             };
 
             pub fn deinit(self: *ForkOutcome, alloc: Allocator) void {
                 switch (self.*) {
-                    .forked => |*fork| {
-                        alloc.free(fork.source_id);
-                        if (fork.forked_id) |id| alloc.free(id);
+                    .branched => |branch| {
+                        alloc.free(branch.source_id);
+                        alloc.free(branch.forked_id);
+                    },
+                    .failed => |failure| {
+                        alloc.free(failure.source_id);
+                        if (failure.forked_id) |id| alloc.free(id);
                     },
                     else => {},
                 }
@@ -2902,8 +2910,8 @@ pub fn Runtime(comptime App: type) type {
         /// Branches the live session at an absolute turn and moves this shell
         /// into the branch. `forkSessionCopy` takes the source's writer lock,
         /// which this process holds for as long as the session is open, so the
-        /// session is closed first. Everything after that point has to leave
-        /// the shell with some session open again.
+        /// session is closed first. Every failure after that point runs through
+        /// `forkFailure`, which puts a session back before answering.
         pub fn forkLiveSession(app: *App, at_turn: usize) !ForkOutcome {
             if (comptime !runtime_profile.allows(App, .durable_sessions)) {
                 return .unavailable;
@@ -2925,50 +2933,56 @@ pub fn Runtime(comptime App: type) type {
             };
             try prepareLiveSessionTransition(app, .carry_forward, log_options);
 
-            const store = app.session_persistence.store.?;
+            const store = app.session_persistence.store orelse
+                return forkFailure(app, source_id, null, log_options, error.SessionStoreUnavailable);
+
             var copy = store.forkSessionCopy(
                 app.alloc,
                 source_id,
                 retained_turns,
                 .{},
-            ) catch |err| return .{ .forked = .{
-                .source_id = source_id,
-                .forked_id = null,
-                .retained_turns = retained_turns,
-                .landing = reopenSourceAfterFork(app, source_id, log_options),
-                .problem = err,
-            } };
+            ) catch |err| return forkFailure(app, source_id, null, log_options, err);
             defer copy.deinit(app.alloc);
 
-            const forked_id = try app.alloc.dupe(u8, copy.forked_session_id);
-            errdefer app.alloc.free(forked_id);
+            const forked_id = app.alloc.dupe(u8, copy.forked_session_id) catch |err|
+                return forkFailure(app, source_id, null, log_options, err);
 
             if (copy.status == .indeterminate) {
-                return .{ .forked = .{
-                    .source_id = source_id,
-                    .forked_id = forked_id,
-                    .retained_turns = retained_turns,
-                    .landing = reopenSourceAfterFork(app, source_id, log_options),
-                    .problem = error.SessionForkUnconfirmed,
-                } };
+                return forkFailure(
+                    app,
+                    source_id,
+                    forked_id,
+                    log_options,
+                    error.SessionForkUnconfirmed,
+                );
             }
 
-            enterSessionForWrite(app, forked_id, log_options) catch |err| {
-                return .{ .forked = .{
-                    .source_id = source_id,
-                    .forked_id = forked_id,
-                    .retained_turns = retained_turns,
-                    .landing = reopenSourceAfterFork(app, source_id, log_options),
-                    .problem = err,
-                } };
-            };
+            enterSessionForWrite(app, forked_id, log_options) catch |err|
+                return forkFailure(app, source_id, forked_id, log_options, err);
 
-            return .{ .forked = .{
+            return .{ .branched = .{
                 .source_id = source_id,
                 .forked_id = forked_id,
                 .retained_turns = retained_turns,
-                .landing = .branch,
                 .unverified_artifacts = copy.status == .forked_with_unverified_artifacts,
+            } };
+        }
+
+        /// The fork released the source's writer lock by closing the session, so
+        /// a failure past that point leaves the shell with no session at all.
+        /// Put one back before reporting.
+        fn forkFailure(
+            app: *App,
+            source_id: []u8,
+            forked_id: ?[]u8,
+            log_options: session_log.Options,
+            problem: anyerror,
+        ) ForkOutcome {
+            return .{ .failed = .{
+                .source_id = source_id,
+                .forked_id = forked_id,
+                .problem = problem,
+                .landing = reopenSourceAfterFork(app, source_id, log_options),
             } };
         }
 

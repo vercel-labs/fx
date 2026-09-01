@@ -3513,45 +3513,64 @@ fn handleForkCommand(app: anytype, rest: []const u8) !void {
                 true,
             );
         },
-        .forked => |fork| try writeForkNotice(app, fork),
+        .branched => |branch| {
+            var out: std.Io.Writer.Allocating = .init(app.alloc);
+            defer out.deinit();
+            try out.writer.print(
+                "Forked {s} at turn {d} into {s}. " ++
+                    "You are now in the branch; {s} is unchanged.",
+                .{
+                    branch.source_id,
+                    branch.retained_turns,
+                    branch.forked_id,
+                    branch.source_id,
+                },
+            );
+            if (branch.unverified_artifacts) {
+                try out.writer.writeAll(
+                    " Some legacy command artifacts could not be authenticated.",
+                );
+            }
+            try app.writeDomainNotice(
+                .{ .topic = "session", .tone = .neutral, .body = out.written() },
+                true,
+            );
+            app.shell.render_requests.request(.footer);
+        },
+        .failed => |failure| try writeForkFailureNotice(app, failure),
     }
 }
 
-/// Both ids are named on every path, because after a fork the reader has to
-/// know which session they left and which one they can still reach.
-fn writeForkNotice(
+/// A failed fork still names every id involved, because the reader has to know
+/// whether a branch exists and which session this shell ended up on.
+fn writeForkFailureNotice(
     app: anytype,
-    fork: app_session_runtime.Runtime(@TypeOf(app.*)).ForkOutcome.Fork,
+    failure: app_session_runtime.Runtime(@TypeOf(app.*)).ForkOutcome.Failure,
 ) !void {
     var out: std.Io.Writer.Allocating = .init(app.alloc);
     defer out.deinit();
 
-    if (fork.forked_id) |forked_id| {
+    if (failure.forked_id) |forked_id| {
         try out.writer.print(
-            "Forked {s} at turn {d} into {s}.",
-            .{ fork.source_id, fork.retained_turns, forked_id },
+            "Forked {s} into {s} but could not open it ({s}); run `fx --resume {s}`.",
+            .{
+                failure.source_id,
+                forked_id,
+                @errorName(failure.problem),
+                forked_id,
+            },
         );
-        if (fork.problem) |err| {
-            try out.writer.print(
-                " The branch could not be opened ({s}); run `fx --resume {s}`.",
-                .{ @errorName(err), forked_id },
-            );
-        }
     } else {
         try out.writer.print(
             "Could not fork {s} ({s}).",
-            .{ fork.source_id, @errorName(fork.problem orelse error.Unknown) },
+            .{ failure.source_id, @errorName(failure.problem) },
         );
     }
 
-    switch (fork.landing) {
-        .branch => try out.writer.print(
-            " You are now in the branch; {s} is unchanged.",
-            .{fork.source_id},
-        ),
+    switch (failure.landing) {
         .source => try out.writer.print(
             " This shell is still on {s}.",
-            .{fork.source_id},
+            .{failure.source_id},
         ),
         .fresh_session => try out.writer.writeAll(
             " This shell is on a new empty session.",
@@ -3560,17 +3579,11 @@ fn writeForkNotice(
             " This shell has no session; run /resume to open one.",
         ),
     }
-    if (fork.unverified_artifacts) {
-        try out.writer.writeAll(
-            " Some legacy command artifacts could not be authenticated.",
-        );
-    }
 
-    try app.writeDomainNotice(.{
-        .topic = "session",
-        .tone = if (fork.landing == .branch) .neutral else .warning,
-        .body = out.written(),
-    }, true);
+    try app.writeDomainNotice(
+        .{ .topic = "session", .tone = .warning, .body = out.written() },
+        true,
+    );
     app.shell.render_requests.request(.footer);
 }
 
