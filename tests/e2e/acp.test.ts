@@ -8425,6 +8425,60 @@ describe("acp: model catalog authentication", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "model configOptions deduplicate catalog ids across new, update, and load",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-model-options-deduplicate-");
+      const duplicateModel = "provider/duplicate-model";
+      const gateway = startFakeGateway([], {
+        models: [
+          { id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] },
+          { id: duplicateModel, type: "language", tags: ["tool-use"] },
+          { id: duplicateModel, type: "language", tags: ["tool-use"] },
+        ],
+      });
+      const expectUniqueModelOptions = (response: any) => {
+        const modelOpt = response.result.configOptions.find((option: any) => option.id === "model");
+        expect(modelOpt).toBeDefined();
+        const values = modelOpt.options.map((option: any) => option.value);
+        expect(values.filter((value: string) => value === duplicateModel)).toHaveLength(1);
+        expect(new Set(values).size).toBe(values.length);
+      };
+
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request("session/new", { mcpServers: [] }, 2) as any;
+        expectUniqueModelOptions(created);
+        await client.readLine(); // consume session/update notification
+
+        const changed = await client.request("session/set_config_option", {
+          configId: "model",
+          value: duplicateModel,
+        }, 3) as any;
+        expectUniqueModelOptions(changed);
+
+        const loaded = await client.request("session/load", {
+          sessionId: created.result.sessionId,
+          mcpServers: [],
+        }, 4) as any;
+        expectUniqueModelOptions(loaded);
+
+        client.endStdin();
+        expect(await client.waitForExit()).toBe(0);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
 });
 
 describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {

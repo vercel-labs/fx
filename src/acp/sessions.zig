@@ -1283,18 +1283,29 @@ pub fn writeModelConfigOption(
     try w.writeAll(",\"options\":[");
     const entries = catalog orelse &.{};
     var wrote_current = false;
+    var wrote_options: usize = 0;
     for (entries, 0..) |entry, i| {
         const id = entry.id;
-        if (i > 0) try w.writeAll(",");
+        var duplicate = false;
+        for (entries[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.id, id)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+
+        if (wrote_options > 0) try w.writeAll(",");
         try w.writeAll("{\"value\":");
         try writeJsonStr(id, w);
         try w.writeAll(",\"name\":");
         try writeJsonStr(id, w);
         try w.writeAll("}");
+        wrote_options += 1;
         if (std.mem.eql(u8, id, current)) wrote_current = true;
     }
     if (!wrote_current) {
-        if (entries.len > 0) try w.writeAll(",");
+        if (wrote_options > 0) try w.writeAll(",");
         try w.writeAll("{\"value\":");
         try writeJsonStr(current, w);
         try w.writeAll(",\"name\":");
@@ -1432,6 +1443,28 @@ test "writeModelConfigOption includes all cached model ids" {
     try std.testing.expect(std.mem.find(u8, items, "anthropic/claude-opus-4.6") != null);
     try std.testing.expect(std.mem.find(u8, items, "openai/gpt-4o") != null);
     try std.testing.expect(std.mem.find(u8, items, "xai/grok-3") != null);
+}
+
+test "writeModelConfigOption emits duplicate catalog ids once" {
+    const alloc = std.testing.allocator;
+    const entries = [_]model_catalog.ModelCatalogEntry{
+        .{ .id = @constCast("zai/glm-5.2"), .model_type = @constCast("language") },
+        .{ .id = @constCast("openai/gpt-5.4-mini"), .model_type = @constCast("language") },
+        .{ .id = @constCast("openai/gpt-5.4-mini"), .model_type = @constCast("language") },
+    };
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeModelConfigOption(&out.writer, "openai/gpt-5.4-mini", &entries);
+    const items = out.writer.buffered();
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, items, "\"value\":\"openai/gpt-5.4-mini\""),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, items, "\"name\":\"openai/gpt-5.4-mini\""),
+    );
 }
 
 test "writeModelConfigOption appends current model when not in cached list" {
