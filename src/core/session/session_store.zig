@@ -4561,26 +4561,25 @@ const StagingPromotionStatus = enum {
     indeterminate,
 };
 
-/// Frees the turns after `retained_turns` and clamps the model-context cursor
-/// so it can never point past the shortened history.
 fn truncateSessionHistory(
     alloc: Allocator,
     state: *session_codec.DurableSessionState,
     retained_turns: usize,
 ) !void {
-    std.debug.assert(retained_turns <= state.history.len);
-    state.context_history_start = @min(
-        state.context_history_start,
-        retained_turns,
-    );
-    if (retained_turns == state.history.len) return;
     const dropped = state.history;
-    const retained: []session.HistoryTurn = if (retained_turns == 0)
+    const retained: []session.HistoryTurn = if (retained_turns == dropped.len)
+        dropped
+    else if (retained_turns == 0)
         &.{}
     else
         try alloc.dupe(session.HistoryTurn, dropped[0..retained_turns]);
-    for (dropped[retained_turns..]) |turn| session.freeHistoryTurn(alloc, turn);
-    alloc.free(dropped);
+    session.dropHistoryTurnsAfter(
+        alloc,
+        dropped,
+        &state.context_history_start,
+        retained_turns,
+    );
+    if (retained_turns != dropped.len) alloc.free(dropped);
     state.history = retained;
 }
 
