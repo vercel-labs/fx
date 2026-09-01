@@ -2960,7 +2960,7 @@ fn appendNonLiveBackgroundHistoryContext(background: *BackgroundRuntime, session
     defer note.deinit();
     var wrote_header = false;
 
-    for (session.history.items) |turn| {
+    for (session.activeHistory()) |turn| {
         const entry = switch (turn) {
             .background_command => |value| value,
             else => continue,

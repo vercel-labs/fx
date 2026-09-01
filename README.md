@@ -148,6 +148,10 @@ zig build -Doptimize=ReleaseSafe
 
 Run the test suite with `zig build test`. See [CONTRIBUTING.md](CONTRIBUTING.md) for development and contribution guidelines.
 
+## Conversation rewind
+
+Use `/revert` or press Esc twice with an empty composer to edit an earlier message in the same session. The later conversation stays recoverable with `/unrevert` until you submit the revised prompt. Conversation rewind does not reverse files, commands, background processes, or other external actions.
+
 ## License
 
 [Apache-2.0](LICENSE)

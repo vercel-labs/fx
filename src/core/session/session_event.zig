@@ -31,6 +31,9 @@ pub const ReplacementReason = enum {
     migration,
     recovery,
     log_compaction,
+    conversation_revert,
+    conversation_unrevert,
+    conversation_revert_commit,
 };
 
 pub const SessionStarted = struct {

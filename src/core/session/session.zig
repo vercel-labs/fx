@@ -1609,6 +1609,10 @@ pub const WebFetchArtifactState = union(enum) {
     unavailable: anyerror,
 };
 
+pub const ConversationRewind = struct {
+    history_end: usize,
+};
+
 pub const SessionRuntime = struct {
     history: std.ArrayList(HistoryTurn) = .empty,
     context_notice_hashes: std.AutoHashMapUnmanaged(u64, void) = .empty,
@@ -1623,6 +1627,7 @@ pub const SessionRuntime = struct {
     /// Count limit for owned model-context snapshots; canonical history is not truncated.
     max_history_turns: usize,
     context_history_start: usize = 0,
+    conversation_rewind: ?ConversationRewind = null,
 
     pub fn init(
         max_history_turns: usize,
@@ -1857,6 +1862,7 @@ pub const SessionRuntime = struct {
         }
         self.history.clearRetainingCapacity();
         self.context_history_start = 0;
+        self.conversation_rewind = null;
     }
 
     pub fn historyLen(self: *const SessionRuntime) usize {
@@ -1865,6 +1871,66 @@ pub const SessionRuntime = struct {
 
     pub fn contextHistoryStart(self: *const SessionRuntime) usize {
         return self.context_history_start;
+    }
+
+    pub fn activeHistory(self: *const SessionRuntime) []const HistoryTurn {
+        const end = if (self.conversation_rewind) |rewind|
+            @min(rewind.history_end, self.history.items.len)
+        else
+            self.history.items.len;
+        return self.history.items[0..end];
+    }
+
+    pub fn conversationRewind(self: *const SessionRuntime) ?ConversationRewind {
+        return self.conversation_rewind;
+    }
+
+    pub fn setConversationRewind(self: *SessionRuntime, rewind: ?ConversationRewind) !void {
+        if (rewind) |value| {
+            if (value.history_end >= self.history.items.len) return error.InvalidConversationRewind;
+            if (self.history.items[value.history_end] == .compacted_summary) return error.InvalidConversationRewind;
+        }
+        self.conversation_rewind = rewind;
+    }
+
+    pub fn commitConversationRewind(self: *SessionRuntime, alloc: Allocator) void {
+        const rewind = self.conversation_rewind orelse return;
+        while (self.history.items.len > rewind.history_end) {
+            const turn = self.history.pop().?;
+            freeHistoryTurn(alloc, turn);
+        }
+        self.context_history_start = @min(self.context_history_start, self.history.items.len);
+        self.conversation_rewind = null;
+    }
+
+    pub fn userTurnAt(self: *const SessionRuntime, index: usize) ?UserTurn {
+        if (index >= self.history.items.len) return null;
+        return switch (self.history.items[index]) {
+            .assistant => |entry| entry.user,
+            .background_command => |entry| entry.user,
+            .interrupted => |entry| entry.user,
+            .compacted_summary => null,
+        };
+    }
+
+    pub fn rewindCandidateCount(self: *const SessionRuntime) usize {
+        var count: usize = 0;
+        for (self.history.items) |turn| {
+            if (turn != .compacted_summary) count += 1;
+        }
+        return count;
+    }
+
+    pub fn rewindCandidateIndex(self: *const SessionRuntime, newest_first_index: usize) ?usize {
+        var found: usize = 0;
+        var index = self.history.items.len;
+        while (index > 0) {
+            index -= 1;
+            if (self.history.items[index] == .compacted_summary) continue;
+            if (found == newest_first_index) return index;
+            found += 1;
+        }
+        return null;
     }
 
     pub fn compactedTurnCount(self: *const SessionRuntime) usize {
@@ -1900,14 +1966,14 @@ pub const SessionRuntime = struct {
         alloc: Allocator,
         current_images: []const ImageAttachment,
     ) ![]ImageAttachment {
-        return collect_image_catalog(alloc, self.history.items, current_images);
+        return collect_image_catalog(alloc, self.activeHistory(), current_images);
     }
 
     pub fn snapshotContextHistory(self: *const SessionRuntime, alloc: Allocator) ![]HistoryTurn {
         return snapshotOwnedContextHistory(
             alloc,
-            self.history.items,
-            self.context_history_start,
+            self.activeHistory(),
+            @min(self.context_history_start, self.activeHistory().len),
             self.max_history_turns,
         );
     }
@@ -5700,6 +5766,24 @@ test "SessionRuntime.appendBackgroundCommandHistoryTurn duplicates fields and pr
         messages.items[1].content.?.asText(),
     );
     try std.testing.expect(messages.items[1].owns_content);
+}
+
+test "conversation rewind limits active history and commit drops suffix" {
+    const alloc = std.testing.allocator;
+    var runtime = SessionRuntime.init(32, generation_usage_provider.unavailable_provider);
+    defer runtime.deinit(alloc);
+    try runtime.appendAssistantHistoryTurn(alloc, "one", "first");
+    try runtime.appendAssistantHistoryTurn(alloc, "two", "second");
+    try runtime.appendAssistantHistoryTurn(alloc, "three", "third");
+
+    try runtime.setConversationRewind(.{ .history_end = 1 });
+    try std.testing.expectEqual(@as(usize, 1), runtime.activeHistory().len);
+    try std.testing.expectEqualStrings("two", runtime.userTurnAt(1).?.text);
+    try std.testing.expectEqual(@as(?usize, 2), runtime.rewindCandidateIndex(0));
+
+    runtime.commitConversationRewind(alloc);
+    try std.testing.expectEqual(@as(usize, 1), runtime.historyLen());
+    try std.testing.expect(runtime.conversationRewind() == null);
 }
 
 test "SessionRuntime.snapshotHistory returns deep copy that outlives runtime history" {

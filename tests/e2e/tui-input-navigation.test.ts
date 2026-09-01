@@ -322,7 +322,7 @@ tmuxTest(
     await waitForExactComposerRow(active, "┃ /");
 
     await active.sendKeys("Enter");
-    await active.waitForText("Commands 36", READY_TIMEOUT);
+    await active.waitForText("Commands 38", READY_TIMEOUT);
     await active.sendKeys("Escape");
     await active.waitForPane(
       (pane) => hasEmptyComposer(pane) && !pane.includes("Enter Open"),
@@ -814,6 +814,41 @@ tmuxTest(
       (position) => position.col === 2 + "draft".length,
       READY_TIMEOUT,
     );
+    expect(active.isAlive()).toBe(true);
+    expectCleanStderr();
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
+  "double Escape edits an earlier message and unrevert restores the suffix",
+  async () => {
+    const active = await startFx(90, 26, true, false, 2);
+    await active.sendText("first rewind prompt");
+    await active.waitForText("history prompt complete", READY_TIMEOUT);
+    await active.waitForComposer(READY_TIMEOUT);
+    await active.sendText("second rewind prompt");
+    await active.waitForPane(
+      (pane) => gateway?.requests.length === 2 && pane.includes("history prompt complete"),
+      READY_TIMEOUT,
+    );
+    await active.waitForComposer(READY_TIMEOUT);
+
+    await active.sendKeys("Escape");
+    await active.waitForText("esc again to edit a previous message", READY_TIMEOUT);
+    await active.sendKeys("Escape");
+    await active.waitForText("Edit a previous message", READY_TIMEOUT);
+    await active.sendKeys("Down");
+    await active.sendKeys("Enter");
+    await active.waitForText(
+      "Reverted to before the selected message.",
+      READY_TIMEOUT,
+    );
+    await waitForActiveFooter(active, (footer) => footer === "┃ first rewind prompt");
+
+    await active.sendKeys("C-u");
+    await active.sendText("/unrevert");
+    await active.waitForText("Restored the reverted conversation.", READY_TIMEOUT);
     expect(active.isAlive()).toBe(true);
     expectCleanStderr();
   },
@@ -1711,7 +1746,7 @@ tmuxTest(
       READY_TIMEOUT,
     );
     await active.resizeWindow(80, 24, 300);
-    await active.waitForText("Commands 36", READY_TIMEOUT);
+    await active.waitForText("Commands 38", READY_TIMEOUT);
     expect(gateway?.requests).toHaveLength(0);
     expectCleanStderr();
   },

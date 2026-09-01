@@ -319,6 +319,12 @@ pub fn usageMenuProjection(
     };
 }
 
+pub const ConversationRewindProjection = struct {
+    active: bool = false,
+    selected_index: usize = 0,
+    history: []const types.HistoryTurn = &.{},
+};
+
 pub const WorkspaceMenuProjection = struct {
     active: bool = false,
     selected_row: usize = 0,
@@ -342,6 +348,7 @@ pub fn workspaceMenuProjection(
 }
 
 pub const CompactCommandMenuProjection = union(enum) {
+    conversation_rewind: ConversationRewindProjection,
     statusline: StatuslineMenuProjection,
     usage: UsageMenuProjection,
     workspace: WorkspaceMenuProjection,
@@ -471,6 +478,7 @@ pub const RenderContext = struct {
     settings_menu: SettingsMenuProjection = .{},
     model_menu: ModelMenuProjection = .{},
     session_menu: SessionMenuProjection = .{},
+    conversation_rewind: ConversationRewindProjection = .{},
     statusline_menu: StatuslineMenuProjection = .{},
     usage_menu: UsageMenuProjection = .{},
     workspace_menu: WorkspaceMenuProjection = .{},
@@ -478,6 +486,7 @@ pub const RenderContext = struct {
     danger_status: []const u8 = "",
     danger_status_compact: []const u8 = "",
     esc_clear_armed: bool = false,
+    esc_revert_armed: bool = false,
     question: ?question_prompt.Projection = null,
     statusline: ui_render.StatuslineItems = .{},
     activity: ActivityProjection = .none,
@@ -486,6 +495,7 @@ pub const RenderContext = struct {
 };
 
 pub fn activeCompactCommandMenu(ctx: RenderContext) ?CompactCommandMenuProjection {
+    if (ctx.conversation_rewind.active) return .{ .conversation_rewind = ctx.conversation_rewind };
     if (ctx.statusline_menu.active) return .{ .statusline = ctx.statusline_menu };
     if (ctx.usage_menu.active) return .{ .usage = ctx.usage_menu };
     if (ctx.workspace_menu.active) return .{ .workspace = ctx.workspace_menu };

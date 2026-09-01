@@ -191,7 +191,7 @@ pub fn run(
         .cancel = cancel,
         .subagent_id = trace_context.subagent_id,
     };
-    const history = turn.sessionRuntime().snapshotHistory(arena) catch return error.OutOfMemory;
+    const history = turn.sessionRuntime().snapshotContextHistory(arena) catch return error.OutOfMemory;
     const recovery_checkpoint = turn.snapshotRecoveryCheckpoint(arena) catch
         return error.OutOfMemory;
     const prompt = worker_runtime.QueuedPrompt{

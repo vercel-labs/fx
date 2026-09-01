@@ -515,6 +515,38 @@ pub fn handlePrompt(
     defer prompt_input.deinit(alloc);
     const prompt_text = prompt_input.text;
 
+    if (!prompt_input.continue_recovery and session.session_rt.conversationRewind() != null) {
+        session.session_write_mutex.lockUncancelable(io_mod.getIo());
+        defer session.session_write_mutex.unlock(io_mod.getIo());
+        const writable = if (session.writable) |*value| value else return .{
+            .rpc_error = .{
+                .code = ErrorCode.invalid_request,
+                .message = "Rewound sessions require durable persistence before continuing",
+            },
+        };
+        var current = try currentAcpState(alloc, session, writable, io_mod.milliTimestamp());
+        defer current.deinit(alloc);
+        const rewind = session.session_rt.conversationRewind().?;
+        const prefix = try alloc.dupe(types.HistoryTurn, current.history[0..rewind.history_end]);
+        var index = current.history.len;
+        while (index > rewind.history_end) {
+            index -= 1;
+            types.freeHistoryTurn(alloc, current.history[index]);
+        }
+        alloc.free(current.history);
+        current.history = prefix;
+        current.context_history_start = @min(current.context_history_start, current.history.len);
+        current.conversation_rewind = null;
+        _ = try writable.commitStateReplacement(
+            alloc,
+            current,
+            .conversation_revert_commit,
+            .retry_expected_tail,
+            .{},
+        );
+        session.session_rt.commitConversationRewind(alloc);
+    }
+
     if (prompt_input.continue_recovery and prompt_text.len != 0) {
         return .{
             .rpc_error = .{
@@ -610,7 +642,7 @@ pub fn handlePrompt(
     const root_user_intent_context = try auto_classifier_context.buildCanonicalRootUserContext(
         alloc,
         owned_prompt,
-        session.session_rt.history.items,
+        session.session_rt.activeHistory(),
     );
     defer alloc.free(root_user_intent_context);
 

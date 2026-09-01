@@ -27,6 +27,7 @@ const ChoiceView = struct {
 
 pub fn desiredRowCount(projection: CompactCommandMenuProjection, width: u16) u16 {
     const count: usize = switch (projection) {
+        .conversation_rewind => |rewind| @min(rewind.history.len, 8) + 1,
         .statusline => settings_row_offset + settings_catalog.statuslineChoiceCount(),
         .usage => |usage| usageDesiredRowCount(usage, width),
         .workspace => |workspace| workspace_pinned_rows +
@@ -45,10 +46,48 @@ pub noinline fn composeCompactCommandMenuRow(
     const empty: std.ArrayList(u8) = .empty;
     if (width == 0 or row_index >= visible_rows) return empty;
     return switch (projection) {
+        .conversation_rewind => |rewind| composeConversationRewindRow(alloc, rewind, row_index, visible_rows, width),
         .statusline => composeSettingsRow(alloc, projection, row_index, visible_rows, width),
         .usage => |usage| composeUsageRow(alloc, usage, row_index, visible_rows, width),
         .workspace => |workspace| composeWorkspaceRow(alloc, workspace, row_index, visible_rows, width),
     };
+}
+
+fn composeConversationRewindRow(
+    alloc: Allocator,
+    projection: render_input.ConversationRewindProjection,
+    row_index: u16,
+    visible_rows: u16,
+    width: u16,
+) !std.ArrayList(u8) {
+    if (row_index == 0) return composeStyledRow(alloc, "Edit a previous message", width, ui_render.selected_completion_style);
+    const visible_items: usize = visible_rows -| 1;
+    const window_start = if (visible_items == 0)
+        projection.selected_index
+    else
+        projection.selected_index -| (visible_items - 1);
+    const target_candidate = window_start + row_index - 1;
+    var candidate: usize = 0;
+    var history_index = projection.history.len;
+    while (history_index > 0) {
+        history_index -= 1;
+        const user = switch (projection.history[history_index]) {
+            .assistant => |entry| entry.user,
+            .background_command => |entry| entry.user,
+            .interrupted => |entry| entry.user,
+            .compacted_summary => continue,
+        };
+        if (candidate == target_candidate) {
+            var row: std.ArrayList(u8) = .empty;
+            errdefer row.deinit(alloc);
+            try row.appendSlice(alloc, if (candidate == projection.selected_index) "> " else "  ");
+            const line_end = std.mem.indexOfAny(u8, user.text, "\r\n") orelse user.text.len;
+            try row_text.appendClipped(alloc, &row, user.text[0..line_end], width -| 2);
+            return row;
+        }
+        candidate += 1;
+    }
+    return .empty;
 }
 
 fn composeSettingsRow(
@@ -61,7 +100,7 @@ fn composeSettingsRow(
     const empty: std.ArrayList(u8) = .empty;
     const statusline = switch (projection) {
         .statusline => |value| value,
-        .usage, .workspace => return empty,
+        .conversation_rewind, .usage, .workspace => return empty,
     };
     const choice_count = settings_catalog.statuslineChoiceCount();
     if (choice_count == 0) return empty;
@@ -101,7 +140,7 @@ fn choiceView(projection: CompactCommandMenuProjection, choice_index: usize) ?Ch
                 .selected = choice_index == statusline.selected_index % settings_catalog.statuslineChoiceCount(),
             };
         },
-        .usage, .workspace => null,
+        .conversation_rewind, .usage, .workspace => null,
     };
 }
 

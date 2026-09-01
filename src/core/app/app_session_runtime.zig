@@ -371,6 +371,26 @@ pub const PreferenceCommitResult = struct {
     }
 };
 
+pub const ConversationRewindPicker = struct {
+    active: bool = false,
+    selected: usize = 0,
+
+    pub fn open(self: *ConversationRewindPicker) void {
+        self.* = .{ .active = true };
+    }
+
+    pub fn close(self: *ConversationRewindPicker) void {
+        self.* = .{};
+    }
+
+    pub fn move(self: *ConversationRewindPicker, delta: i32, count: usize) bool {
+        if (!self.active or count == 0) return false;
+        const current: i32 = @intCast(self.selected);
+        self.selected = @intCast(std.math.clamp(current + delta, 0, @as(i32, @intCast(count - 1))));
+        return true;
+    }
+};
+
 pub const SessionPicker = struct {
     active: bool = false,
     load_state: session_catalog.LoadState = .loading,
@@ -1080,6 +1100,7 @@ pub const Persistence = struct {
     js_host_store: JsHostSessionStore = .{},
     js_host_session: ?JsHostSessionOwner = null,
     process_model_override: ?[]u8 = null,
+    conversation_rewind_picker: ConversationRewindPicker = .{},
     session_picker: SessionPicker = .{},
     session_picker_load: SessionPickerLoad = .{},
     session_picker_current_cache: SessionPickerPageCache = .{},
@@ -1937,6 +1958,19 @@ pub fn Runtime(comptime App: type) type {
                 state.context_history_start,
                 state.permission_state,
             );
+            try app.session.setConversationRewind(state.conversation_rewind);
+            if (state.conversation_rewind) |rewind| {
+                const user = app.session.userTurnAt(rewind.history_end) orelse return error.InvalidConversationRewind;
+                try app.input_runtime.edit_state.setText(app.alloc, user.text);
+                if (comptime @hasField(App, "pending_images") and @hasDecl(App, "clearPendingImages")) {
+                    app.clearPendingImages();
+                    const images = try types.dupeImageAttachmentSlice(app.alloc, user.images);
+                    errdefer types.freeImageAttachmentSlice(app.alloc, images);
+                    try app.pending_images.ensureUnusedCapacity(app.alloc, images.len);
+                    app.pending_images.appendSliceAssumeCapacity(images);
+                    app.alloc.free(images);
+                }
+            }
             if (state.usage) |usage| {
                 try app.session.usage.restore(
                     app.alloc,
@@ -2756,7 +2790,141 @@ pub fn Runtime(comptime App: type) type {
             return .committed;
         }
 
+        pub fn canOpenConversationRewind(app: *App) bool {
+            if (comptime !@hasField(App, "session_persistence") or !@hasField(App, "session")) return false;
+            return !app.stream.active and app.worker.queuedPromptCount() == 0 and
+                app.session.rewindCandidateCount() > 0 and
+                app.session_persistence.writable != null;
+        }
+
+        pub fn openConversationRewindPicker(app: *App) bool {
+            if (!canOpenConversationRewind(app)) return false;
+            if (app.input_runtime.edit_state.input.items.len > 0 or app.pending_images.items.len > 0) return false;
+            app.session_persistence.conversation_rewind_picker.open();
+            app.shell.render_requests.request(.footer);
+            return true;
+        }
+
+        pub fn moveConversationRewindPicker(app: *App, delta: i32) bool {
+            if (comptime !@hasField(App, "session_persistence") or !@hasField(App, "session")) return false;
+            const moved = app.session_persistence.conversation_rewind_picker.move(
+                delta,
+                app.session.rewindCandidateCount(),
+            );
+            if (moved) app.shell.render_requests.request(.footer);
+            return moved;
+        }
+
+        pub fn cancelConversationRewindPicker(app: *App) bool {
+            if (!app.session_persistence.conversation_rewind_picker.active) return false;
+            app.session_persistence.conversation_rewind_picker.close();
+            app.shell.render_requests.request(.footer);
+            return true;
+        }
+
+        pub fn applySelectedConversationRewind(app: *App) !bool {
+            if (comptime !@hasField(App, "session_persistence") or !@hasField(App, "session")) return false;
+            const picker = &app.session_persistence.conversation_rewind_picker;
+            if (!picker.active) return false;
+            const history_index = app.session.rewindCandidateIndex(picker.selected) orelse return false;
+            const user = app.session.userTurnAt(history_index) orelse return false;
+            const restored_text = try app.alloc.dupe(u8, user.text);
+            defer app.alloc.free(restored_text);
+            const restored_images = try types.dupeImageAttachmentSlice(app.alloc, user.images);
+            var images_owned = true;
+            defer if (images_owned) types.freeImageAttachmentSlice(app.alloc, restored_images);
+            try app.input_runtime.edit_state.input.ensureTotalCapacity(app.alloc, restored_text.len);
+            try app.pending_images.ensureTotalCapacity(app.alloc, restored_images.len);
+
+            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const loaded = if (app.session_persistence.writable) |*value|
+                value
+            else
+                return error.SessionPersistenceUnavailable;
+            try convergeDegraded(app, loaded, .{});
+            var current = try snapshotCurrentState(app, loaded.state, io_mod.milliTimestamp());
+            defer current.deinit(app.alloc);
+            current.conversation_rewind = .{ .history_end = history_index };
+            _ = try loaded.commitStateReplacement(
+                app.alloc,
+                current,
+                .conversation_revert,
+                .retry_expected_tail,
+                .{},
+            );
+            try app.session.setConversationRewind(current.conversation_rewind);
+            picker.close();
+            app.input_runtime.edit_state.input.clearRetainingCapacity();
+            app.input_runtime.edit_state.input.appendSliceAssumeCapacity(restored_text);
+            app.input_runtime.edit_state.cursor = restored_text.len;
+            app.input_runtime.edit_state.selection_anchor = null;
+            app.clearPendingImages();
+            app.pending_images.appendSliceAssumeCapacity(restored_images);
+            app.alloc.free(restored_images);
+            images_owned = false;
+            app.shell.render_requests.request(.footer);
+            return true;
+        }
+
+        pub fn unrevertConversation(app: *App) !bool {
+            if (app.session.conversationRewind() == null) return false;
+            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const loaded = if (app.session_persistence.writable) |*value|
+                value
+            else
+                return error.SessionPersistenceUnavailable;
+            try convergeDegraded(app, loaded, .{});
+            var current = try snapshotCurrentState(app, loaded.state, io_mod.milliTimestamp());
+            defer current.deinit(app.alloc);
+            current.conversation_rewind = null;
+            _ = try loaded.commitStateReplacement(
+                app.alloc,
+                current,
+                .conversation_unrevert,
+                .retry_expected_tail,
+                .{},
+            );
+            try app.session.setConversationRewind(null);
+            return true;
+        }
+
+        pub fn commitConversationRewind(app: *App) !bool {
+            if (comptime !@hasField(App, "session_persistence") or !@hasField(App, "session")) return false;
+            const rewind = app.session.conversationRewind() orelse return false;
+            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const loaded = if (app.session_persistence.writable) |*value|
+                value
+            else
+                return error.SessionPersistenceUnavailable;
+            try convergeDegraded(app, loaded, .{});
+            var current = try snapshotCurrentState(app, loaded.state, io_mod.milliTimestamp());
+            defer current.deinit(app.alloc);
+            const prefix = try app.alloc.dupe(types.HistoryTurn, current.history[0..rewind.history_end]);
+            var index = current.history.len;
+            while (index > rewind.history_end) {
+                index -= 1;
+                session_runtime.freeHistoryTurn(app.alloc, current.history[index]);
+            }
+            app.alloc.free(current.history);
+            current.history = prefix;
+            current.context_history_start = @min(current.context_history_start, current.history.len);
+            current.conversation_rewind = null;
+            _ = try loaded.commitStateReplacement(
+                app.alloc,
+                current,
+                .conversation_revert_commit,
+                .retry_expected_tail,
+                .{},
+            );
+            app.session.commitConversationRewind(app.alloc);
+            return true;
+        }
+
         pub fn compactHistory(app: *App) !void {
+            _ = try commitConversationRewind(app);
             const previous_start = app.session.contextHistoryStart();
             app.session.forceCompaction();
             if (app.session.contextHistoryStart() == previous_start) return;
@@ -4857,6 +5025,7 @@ pub fn Runtime(comptime App: type) type {
                 .preferences = owned_preferences,
                 .history = history,
                 .context_history_start = app.session.contextHistoryStart(),
+                .conversation_rewind = app.session.conversationRewind(),
                 .total_input_tokens = app.total_input_tokens,
                 .total_output_tokens = app.total_output_tokens,
                 .permission_state = permission_state,

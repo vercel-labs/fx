@@ -1450,7 +1450,7 @@ const App = struct {
         const root_user_intent_context = try auto_classifier_context.buildCanonicalRootUserContext(
             std.heap.c_allocator,
             prompt_copy,
-            self.session.history.items,
+            self.session.activeHistory(),
         );
         errdefer std.heap.c_allocator.free(root_user_intent_context);
 

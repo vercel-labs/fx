@@ -706,7 +706,7 @@ pub const LoadedWritableSession = struct {
             state.workspace_root,
         );
         const may_defer_cache = same_workspace and switch (reason) {
-            .compaction, .log_compaction => true,
+            .compaction, .log_compaction, .conversation_revert, .conversation_unrevert, .conversation_revert_commit => true,
             .migration, .recovery => false,
         };
         const cache_deferred = if (may_defer_cache)

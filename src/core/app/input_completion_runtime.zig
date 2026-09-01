@@ -363,6 +363,9 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         fn routeNonSlashPickerMove(app: *App, delta: i32) !bool {
+            if (comptime @hasField(App, "session_persistence")) {
+                if (app_session_runtime.Runtime(App).moveConversationRewindPicker(app, delta)) return true;
+            }
             if (try routeSettingsMenuMove(app, delta)) return true;
             if (try routeHelpMenuMove(app, delta)) return true;
             if (try routeModelMenuMove(app, delta)) return true;

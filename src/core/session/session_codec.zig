@@ -120,6 +120,7 @@ pub const DurableSessionState = struct {
     preferences: DurableSessionPreferences,
     history: []session.HistoryTurn,
     context_history_start: usize = 0,
+    conversation_rewind: ?session.ConversationRewind = null,
     total_input_tokens: u64,
     total_output_tokens: u64,
     permission_state: session_permission_state.State = .{},
@@ -188,6 +189,7 @@ pub const DurableSessionState = struct {
             .preferences = preferences,
             .history = history,
             .context_history_start = self.context_history_start,
+            .conversation_rewind = self.conversation_rewind,
             .total_input_tokens = self.total_input_tokens,
             .total_output_tokens = self.total_output_tokens,
             .permission_state = permission_state,
@@ -549,6 +551,9 @@ fn validateStateWithPermissionMigration(
     try validateConversationLanguage(state.conversation_language);
     try validateModel(state.preferences.model);
     if (state.context_history_start > state.history.len) return error.InvalidDurableField;
+    if (state.conversation_rewind) |rewind| {
+        if (rewind.history_end >= state.history.len or state.history[rewind.history_end] == .compacted_summary) return error.InvalidDurableField;
+    }
     if (state.last_subagent_work_id) |id| {
         session.validateWorkId(id) catch return error.InvalidDurableField;
     }
@@ -636,6 +641,9 @@ fn writeState(writer: *std.Io.Writer, state: DurableSessionState) !void {
         state.total_output_tokens,
         state.context_history_start,
     });
+    if (state.conversation_rewind) |rewind| {
+        try writer.print(",\"conversation_rewind\":{{\"history_end\":{d}}}", .{rewind.history_end});
+    }
     try writer.writeAll(",\"permission_state\":");
     try writePermissionState(writer, state.permission_state);
     if (state.usage) |usage| {
@@ -865,6 +873,7 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
     try expectKey(&json_reader, alloc, "total_output_tokens");
     const total_output_tokens = try readU64(&json_reader, alloc);
     var context_history_start: usize = 0;
+    var conversation_rewind: ?session.ConversationRewind = null;
     var context_seen = false;
     var permission_state: session_permission_state.State = .{};
     errdefer permission_state.deinit(alloc);
@@ -886,6 +895,28 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
             context_history_start = std.math.cast(usize, raw) orelse
                 return error.InvalidSessionFormat;
             context_seen = true;
+        } else if (std.mem.eql(u8, key, "conversation_rewind")) {
+            if (conversation_rewind != null or permission_state_seen or usage_seen or last_subagent_work_id != null or recovery_checkpoint != null) {
+                return error.InvalidSessionFormat;
+            }
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const value = try std.json.Value.jsonParse(arena.allocator(), &json_reader, .{
+                .max_value_len = limits.max_value_bytes,
+                .allocate = .alloc_always,
+                .parse_numbers = false,
+            });
+            const object = switch (value) {
+                .object => |object| object,
+                else => return error.InvalidSessionFormat,
+            };
+            const raw = switch (object.get("history_end") orelse return error.InvalidSessionFormat) {
+                .integer => |integer| integer,
+                .number_string => |number| std.fmt.parseInt(i64, number, 10) catch return error.InvalidSessionFormat,
+                else => return error.InvalidSessionFormat,
+            };
+            if (raw < 0) return error.InvalidSessionFormat;
+            conversation_rewind = .{ .history_end = std.math.cast(usize, raw) orelse return error.InvalidSessionFormat };
         } else if (std.mem.eql(u8, key, "permission_state")) {
             if (permission_state_seen or usage_seen or last_subagent_work_id != null or recovery_checkpoint != null) {
                 return error.InvalidSessionFormat;
@@ -951,6 +982,7 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
         },
         .history = owned_history,
         .context_history_start = context_history_start,
+        .conversation_rewind = conversation_rewind,
         .total_input_tokens = total_input_tokens,
         .total_output_tokens = total_output_tokens,
         .permission_state = permission_state,
@@ -2611,6 +2643,7 @@ test "durable state round trips live history while discarding legacy authority" 
         },
         .history = @constCast(history[0..]),
         .context_history_start = 3,
+        .conversation_rewind = .{ .history_end = 1 },
         .total_input_tokens = 1234,
         .total_output_tokens = 567,
         .last_subagent_work_id = @constCast("work-17"),
@@ -3414,6 +3447,7 @@ fn expectStateEqual(expected: DurableSessionState, actual: DurableSessionState) 
     try std.testing.expectEqual(expected.preferences.effort, actual.preferences.effort);
     try std.testing.expectEqual(expected.preferences.fast_mode, actual.preferences.fast_mode);
     try std.testing.expectEqual(expected.context_history_start, actual.context_history_start);
+    try std.testing.expectEqual(expected.conversation_rewind, actual.conversation_rewind);
     try std.testing.expectEqual(expected.total_input_tokens, actual.total_input_tokens);
     try std.testing.expectEqual(expected.total_output_tokens, actual.total_output_tokens);
     try expectPermissionStateEqual(expected.permission_state, actual.permission_state);

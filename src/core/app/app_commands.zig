@@ -369,6 +369,8 @@ pub fn Handlers(comptime App: type) type {
                 .show_stats = commandShowStats,
                 .show_usage = commandShowUsage,
                 .undo_last = commandUndoLast,
+                .revert_conversation = commandRevertConversation,
+                .unrevert_conversation = commandUnrevertConversation,
                 .handle_mcp = commandHandleMcp,
                 .handle_skills = commandHandleSkills,
                 .copy_last = commandCopyLast,
@@ -1959,6 +1961,22 @@ pub fn Handlers(comptime App: type) type {
                 .tone = .neutral,
                 .body = "Copied to clipboard.",
             }, true);
+        }
+
+        fn commandRevertConversation(ctx: *anyopaque) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (!app_session_runtime.Runtime(App).openConversationRewindPicker(app)) {
+                try app.writeDomainNotice(.{ .topic = "session", .tone = .neutral, .body = "No earlier message is available to edit." }, true);
+            }
+        }
+
+        fn commandUnrevertConversation(ctx: *anyopaque) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (try app_session_runtime.Runtime(App).unrevertConversation(app)) {
+                try app.writeDomainNotice(.{ .topic = "session", .tone = .neutral, .body = "Restored the reverted conversation." }, true);
+            } else {
+                try app.writeDomainNotice(.{ .topic = "session", .tone = .neutral, .body = "Nothing to restore." }, true);
+            }
         }
 
         fn commandSubmitFeedback(ctx: *anyopaque) !void {

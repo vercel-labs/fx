@@ -744,6 +744,11 @@ pub fn Runtime(comptime App: type) type {
                     render_input.modelMenuProjection(&app.model_cache)
                 else
                     .{},
+                .conversation_rewind = if (comptime @hasField(App, "session_persistence") and @hasField(App, "session")) .{
+                    .active = app.session_persistence.conversation_rewind_picker.active,
+                    .selected_index = app.session_persistence.conversation_rewind_picker.selected,
+                    .history = app.session.history.items,
+                } else .{},
                 .session_menu = if (comptime @hasField(App, "session_persistence")) .{
                     .active = app.session_persistence.session_picker.active,
                     .load_state = app.session_persistence.session_picker.load_state,
@@ -781,7 +786,11 @@ pub fn Runtime(comptime App: type) type {
                     app_permission_runtime.yolo_warning_compact_text
                 else
                     "",
-                .esc_clear_armed = app.input_runtime.gestures.escapeClearArmed(),
+                .esc_clear_armed = app.input_runtime.gestures.escapeClearArmed() and app.input_runtime.edit_state.input.items.len > 0,
+                .esc_revert_armed = if (comptime @hasField(App, "session"))
+                    app.input_runtime.gestures.escapeRewindArmed() and app.input_runtime.edit_state.input.items.len == 0 and app.session.rewindCandidateCount() > 0
+                else
+                    false,
                 .question = app.question_prompt.projection(),
                 .statusline = buildStatuslineItems(
                     app,

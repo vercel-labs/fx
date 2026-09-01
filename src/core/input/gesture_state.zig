@@ -3,9 +3,12 @@ const std = @import("std");
 pub const ctrl_c_exit_window_ms: i64 = 3000;
 pub const escape_clear_window_ms: i64 = 500;
 
+pub const EscapeIntent = enum { clear_draft, open_rewind };
+
 pub const State = struct {
     ctrl_c_exit_armed_ms: ?i64 = null,
     escape_clear_armed_ms: ?i64 = null,
+    escape_intent: ?EscapeIntent = null,
 
     pub fn ctrlCExitArmed(self: State) bool {
         return self.ctrl_c_exit_armed_ms != null;
@@ -16,7 +19,11 @@ pub const State = struct {
     }
 
     pub fn escapeClearArmed(self: State) bool {
-        return self.escape_clear_armed_ms != null;
+        return self.escape_clear_armed_ms != null and self.escape_intent == .clear_draft;
+    }
+
+    pub fn escapeRewindArmed(self: State) bool {
+        return self.escape_clear_armed_ms != null and self.escape_intent == .open_rewind;
     }
 
     pub fn escapeClearArmedAt(self: State) ?i64 {
@@ -61,18 +68,28 @@ pub fn pressCtrlCExit(current: State, now_ms: i64) PressTransition {
     return .{ .next = next, .result = .armed };
 }
 
-pub fn pressEscapeClear(current: State, now_ms: i64) PressTransition {
+fn pressEscape(current: State, now_ms: i64, intent: EscapeIntent) PressTransition {
     if (current.escape_clear_armed_ms) |armed_ms| {
-        if (now_ms - armed_ms <= escape_clear_window_ms) {
+        if (current.escape_intent == intent and now_ms - armed_ms <= escape_clear_window_ms) {
             var next = current;
             next.escape_clear_armed_ms = null;
+            next.escape_intent = null;
             return .{ .next = next, .result = .activated };
         }
     }
 
     var next = current;
     next.escape_clear_armed_ms = now_ms;
+    next.escape_intent = intent;
     return .{ .next = next, .result = .armed };
+}
+
+pub fn pressEscapeClear(current: State, now_ms: i64) PressTransition {
+    return pressEscape(current, now_ms, .clear_draft);
+}
+
+pub fn pressEscapeRewind(current: State, now_ms: i64) PressTransition {
+    return pressEscape(current, now_ms, .open_rewind);
 }
 
 pub fn disarmCtrlCExit(current: State) ClearTransition {
@@ -84,6 +101,7 @@ pub fn disarmCtrlCExit(current: State) ClearTransition {
 pub fn disarmEscapeClear(current: State) ClearTransition {
     var next = current;
     next.escape_clear_armed_ms = null;
+    next.escape_intent = null;
     return .{ .next = next, .cleared = current.escape_clear_armed_ms != null };
 }
 
@@ -149,6 +167,21 @@ test "Escape clear activates through its inclusive window" {
         @as(?i64, 201 + escape_clear_window_ms),
         rearmed.next.escapeClearArmedAt(),
     );
+}
+
+test "Escape intent changes rearm instead of activating" {
+    const clear = pressEscapeClear(.{}, 100);
+    try std.testing.expectEqual(PressResult.armed, clear.result);
+    try std.testing.expect(clear.next.escapeClearArmed());
+
+    const rewind = pressEscapeRewind(clear.next, 101);
+    try std.testing.expectEqual(PressResult.armed, rewind.result);
+    try std.testing.expect(!rewind.next.escapeClearArmed());
+    try std.testing.expect(rewind.next.escapeRewindArmed());
+
+    const activated = pressEscapeRewind(rewind.next, 101 + escape_clear_window_ms);
+    try std.testing.expectEqual(PressResult.activated, activated.result);
+    try std.testing.expect(!activated.next.escapeRewindArmed());
 }
 
 test "gesture expiry preserves boundary behavior" {

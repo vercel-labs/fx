@@ -9,6 +9,7 @@ const entity_spans = @import("../shared/entity_spans.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const input_queue_runtime = @import("input_queue_runtime.zig");
+const app_session_runtime = @import("app_session_runtime.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const input_limit_feedback = @import("input_limit_feedback.zig");
 
@@ -522,6 +523,9 @@ pub fn SubmitRuntime(comptime App: type) type {
             if (trimmed.len == 0) {
                 if (app.pending_images.items.len > 0) {
                     if (!try preflightPrompt(app)) return;
+                    if (comptime @hasField(App, "session_persistence")) {
+                        _ = try app_session_runtime.Runtime(App).commitConversationRewind(app);
+                    }
                     const admission = try enqueuePromptForSubmit(app, "", &.{}, null, intent);
                     if (admission == .rejected) return;
                     releasePendingImages(app);
@@ -578,6 +582,9 @@ pub fn SubmitRuntime(comptime App: type) type {
             const effective_text = if (has_inline_images) extracted.text else expanded.text;
 
             if (!try preflightPrompt(app)) return;
+            if (comptime @hasField(App, "session_persistence")) {
+                _ = try app_session_runtime.Runtime(App).commitConversationRewind(app);
+            }
 
             var staged_images = if (app.pending_images.items.len > 0 or extracted.images.len > 0)
                 try stagePendingImages(app.alloc, app.pending_images.items, extracted.images)
