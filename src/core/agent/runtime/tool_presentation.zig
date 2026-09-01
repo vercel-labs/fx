@@ -3,7 +3,6 @@ const command_admission = @import("../../permissions/command_admission.zig");
 const managed_execution = @import("../../execution/managed_execution.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const types = @import("../../shared/types.zig");
-const presentation_palette = @import("../../shared/presentation_palette.zig");
 const text_utils = @import("../../shared/text_utils.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 const tool_specs = @import("../../tooling/tool_specs.zig");
@@ -130,7 +129,12 @@ pub const ProvisionalToolStatuses = struct {
         }
 
         var buf: [512]u8 = undefined;
-        const label = try formatProvisionalProgressLabel(&buf, action_label, label_value);
+        const label = try formatProvisionalProgressLabel(
+            &buf,
+            action_label,
+            label_value,
+            hooks.presentation_styles,
+        );
         const recorded = try self.recordTracked(
             alloc,
             tool_id,
@@ -702,12 +706,13 @@ fn formatProvisionalProgressLabel(
     buf: []u8,
     action_label: []const u8,
     label_value: ?[]const u8,
+    styles: runtime_deps.PresentationStyles,
 ) ![]const u8 {
     if (label_value) |value| {
         return std.fmt.bufPrint(
             buf,
             "● {s}\x1b[0m {s}{s}\x1b[0m",
-            .{ action_label, presentation_palette.currentStyles().dim, value },
+            .{ action_label, styles.dim, value },
         );
     }
     return std.fmt.bufPrint(buf, "● {s}\x1b[0m", .{action_label});
@@ -749,6 +754,7 @@ pub noinline fn startToolVisibleLifecycle(
         arena,
         call,
         display_target,
+        hooks.presentation_styles,
         advertised_dynamic_tool_names,
     );
     try hooks.push_tool_lifecycle(hooks.ctx, .{ .authoritative_started = .{
@@ -805,6 +811,7 @@ fn finishDeferredToolStatus(
         call,
         null,
         types.context_deferred_tool_status_label,
+        hooks.presentation_styles,
         advertised_dynamic_tool_names,
     );
     try hooks.push_tool_lifecycle(hooks.ctx, .{ .terminal = .{
@@ -837,6 +844,7 @@ pub fn finishDeniedToolStatusWithResultMemory(
         status_started,
         display_target,
         label,
+        hooks.presentation_styles,
         advertised_dynamic_tool_names,
         safe_result,
         result_memory,
@@ -864,6 +872,7 @@ fn finishDeniedToolStatusInternal(
         call,
         display_target,
         label,
+        hooks.presentation_styles,
         advertised_dynamic_tool_names,
     );
     const command_artifact_handle = if (activityKindForCall(arena, hooks.tool_registry, call) == .command)
@@ -910,6 +919,7 @@ pub fn finishCancelledToolStatus(
         call,
         display_target,
         label,
+        hooks.presentation_styles,
         advertised_dynamic_tool_names,
     );
     const command_activity = activityKindForCall(
@@ -994,6 +1004,7 @@ pub fn finishExecutedToolStatus(
             call,
             display_target,
             decision.label,
+            hooks.presentation_styles,
             advertised_dynamic_tool_names,
         );
         break :blk if (decision.detail) |detail|
@@ -1009,6 +1020,7 @@ pub fn finishExecutedToolStatus(
                 arena,
                 call,
                 display_target,
+                hooks.presentation_styles,
                 advertised_dynamic_tool_names,
             ),
         .failure => blk: {
@@ -1018,6 +1030,7 @@ pub fn finishExecutedToolStatus(
                 call,
                 display_target,
                 "Failed",
+                hooks.presentation_styles,
                 advertised_dynamic_tool_names,
             );
             if (std.mem.eql(u8, call.name, "shell")) {
@@ -1048,13 +1061,20 @@ pub fn finishExecutedToolStatus(
         },
     };
     const summary_line = if (result.web_fetch_completion) |completion|
-        try formatWebFetchCompletion(arena, base_line, completion)
+        try formatWebFetchCompletion(arena, base_line, completion, hooks.presentation_styles)
     else if (result.web_search_completion) |completion|
-        try formatWebSearchCompletion(arena, base_line, completion)
+        try formatWebSearchCompletion(arena, base_line, completion, hooks.presentation_styles)
     else
         base_line;
     const line = if (diff_entry) |payload| blk: {
-        break :blk try formatToolStatusWithStats(arena, summary_line, payload.additions, payload.deletions, hooks.diff_marker_styles);
+        break :blk try formatToolStatusWithStats(
+            arena,
+            summary_line,
+            payload.additions,
+            payload.deletions,
+            hooks.presentation_styles,
+            hooks.diff_marker_styles,
+        );
     } else summary_line;
     const shell_command = activity_kind == .command and
         std.mem.eql(u8, call.name, "shell");
@@ -1349,6 +1369,7 @@ pub fn finishCommittedFileStatus(
         arena,
         call,
         display_target,
+        hooks.presentation_styles,
         advertised_dynamic_tool_names,
     );
     const line = try formatToolStatusWithStats(
@@ -1356,6 +1377,7 @@ pub fn finishCommittedFileStatus(
         base_line,
         preview.additions,
         preview.deletions,
+        hooks.presentation_styles,
         hooks.diff_marker_styles,
     );
     try hooks.push_tool_lifecycle(hooks.ctx, .{
@@ -1369,17 +1391,15 @@ pub fn finishCommittedFileStatus(
     });
 }
 
-fn formatWebSearchCompletion(arena: Allocator, base: []const u8, completion: types.WebSearchCompletion) ![]const u8 {
-    const dim = presentation_palette.currentStyles().dim;
+fn formatWebSearchCompletion(arena: Allocator, base: []const u8, completion: types.WebSearchCompletion, styles: runtime_deps.PresentationStyles) ![]const u8 {
     return std.fmt.allocPrint(
         arena,
         "{s} {s}| {d} search{s} | {d}ms\x1b[0m",
-        .{ base, dim, completion.searches, if (completion.searches == 1) "" else "es", completion.duration_ms },
+        .{ base, styles.dim, completion.searches, if (completion.searches == 1) "" else "es", completion.duration_ms },
     );
 }
 
-fn formatWebFetchCompletion(arena: Allocator, base: []const u8, completion: types.WebFetchCompletion) ![]const u8 {
-    const dim = presentation_palette.currentStyles().dim;
+fn formatWebFetchCompletion(arena: Allocator, base: []const u8, completion: types.WebFetchCompletion, styles: runtime_deps.PresentationStyles) ![]const u8 {
     const cache = if (completion.cache_hit) "cache hit" else "fetched";
     const artifact = switch (completion.artifact_state) {
         .none => "",
@@ -1389,7 +1409,7 @@ fn formatWebFetchCompletion(arena: Allocator, base: []const u8, completion: type
     return std.fmt.allocPrint(
         arena,
         "{s} {s}| {s} | {d} bytes | HTTP {d} | {d}ms | {s}{s}\x1b[0m",
-        .{ base, dim, completion.url(), completion.bytes, completion.status, completion.duration_ms, cache, artifact },
+        .{ base, styles.dim, completion.url(), completion.bytes, completion.status, completion.duration_ms, cache, artifact },
     );
 }
 
@@ -1398,10 +1418,10 @@ pub fn formatToolStatusWithStats(
     base: []const u8,
     additions: usize,
     deletions: usize,
+    styles: runtime_deps.PresentationStyles,
     markers: runtime_deps.DiffMarkerStyles,
 ) ![]const u8 {
-    const styles = presentation_palette.currentStyles();
-    const accent = styles.user_accent;
+    const accent = styles.accent;
     const dim = styles.dim;
     const reset = "\x1b[0m";
     // Fall back to the neutral accent when no marker color is supplied.
@@ -1479,10 +1499,10 @@ const ProvisionalStatusTestCapture = struct {
     fn noopRequestPermission(_: *anyopaque, _: Allocator, _: ToolCall, _: permission_auto_classifier.ReviewTurnContext, _: types.PermissionMode, _: []const types.PermissionGrant, _: ?runtime_tool_contracts.LiveToolAuthority, _: ?runtime_tool_contracts.LivePermissionRevalidation, _: []const []const u8) !command_admission.PermissionOutcome {
         return .{ .decision = .once, .execution_authority = .ordinary };
     }
-    fn describeToolAction(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, _: []const []const u8) ![]const u8 {
+    fn describeToolAction(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, _: runtime_deps.PresentationStyles, _: []const []const u8) ![]const u8 {
         return std.fmt.allocPrint(arena, "started {s}", .{call.name});
     }
-    fn describeDeniedToolAction(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, label: []const u8, _: []const []const u8) ![]const u8 {
+    fn describeDeniedToolAction(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, label: []const u8, _: runtime_deps.PresentationStyles, _: []const []const u8) ![]const u8 {
         return std.fmt.allocPrint(arena, "{s} {s}", .{ label, call.name });
     }
     fn noopPermissionTarget(_: *anyopaque, arena: Allocator, _: ToolCall, _: []const []const u8) ![]const u8 {
@@ -1491,7 +1511,7 @@ const ProvisionalStatusTestCapture = struct {
     fn noopExecuteToolCall(_: *anyopaque, _: runtime_tool_contracts.ToolExecutionRequest) !ToolExecutionResult {
         return .{ .model_output = "" };
     }
-    fn noopPublishCommittedFileHandoff(_: *anyopaque, _: @import("../../tooling/file_mutation.zig").CommittedFileHandoff) runtime_tool_contracts.SecondaryPublicationReport {
+    fn noopPublishCommittedFileHandoff(_: *anyopaque, _: @import("../../tooling/file_mutation.zig").CommittedFileHandoff, _: runtime_deps.PresentationStyles) runtime_tool_contracts.SecondaryPublicationReport {
         return .{ .diff = .skipped, .tracker = .skipped };
     }
     fn noopPropagateHistoryTurn(_: *anyopaque, _: types.HistoryTurn) !void {}
@@ -1537,15 +1557,27 @@ fn eligibleActionLabel(tool_name: []const u8) []const u8 {
 test "formatToolStatusWithStats accents the +/- counts and falls back to neutral" {
     const alloc = std.testing.allocator;
 
-    const colored = try formatToolStatusWithStats(alloc, "Edited x", 3, 1, .{ .added = "[G]", .removed = "[R]" });
+    const colored = try formatToolStatusWithStats(alloc, "Edited x", 3, 1, .{}, .{ .added = "[G]", .removed = "[R]" });
     defer alloc.free(colored);
     try std.testing.expect(std.mem.find(u8, colored, "[G]+3") != null);
     try std.testing.expect(std.mem.find(u8, colored, "[R]-1") != null);
 
-    const neutral = try formatToolStatusWithStats(alloc, "Edited x", 3, 1, .{});
+    const neutral = try formatToolStatusWithStats(alloc, "Edited x", 3, 1, .{}, .{});
     defer alloc.free(neutral);
     try std.testing.expect(std.mem.find(u8, neutral, "\x1b[38;5;252m+3") != null);
     try std.testing.expect(std.mem.find(u8, neutral, "\x1b[38;5;252m-1") != null);
+
+    const terminal = try formatToolStatusWithStats(
+        alloc,
+        "Edited x",
+        3,
+        1,
+        .{ .dim = "[DIM]", .accent = "[ACCENT]" },
+        .{},
+    );
+    defer alloc.free(terminal);
+    try std.testing.expect(std.mem.find(u8, terminal, "[ACCENT]+3") != null);
+    try std.testing.expect(std.mem.find(u8, terminal, "[DIM]/") != null);
 }
 
 test "provisional lifecycle preflight distinguishes unknown eligible and ineligible tools" {
@@ -2067,7 +2099,7 @@ test "native web_search completion status includes searches and duration" {
     const line = try formatWebSearchCompletion(std.testing.allocator, "Searched current news", .{
         .searches = 2,
         .duration_ms = 17,
-    });
+    }, .{});
     defer std.testing.allocator.free(line);
 
     try std.testing.expect(std.mem.find(u8, line, "2 searches") != null);
@@ -2245,6 +2277,7 @@ test "terminal path scope failure appends the exact status detail" {
             _: ToolCall,
             _: ?[]const u8,
             label: []const u8,
+            _: runtime_deps.PresentationStyles,
             _: []const []const u8,
         ) ![]const u8 {
             return std.fmt.allocPrint(target, "{s} start", .{label});

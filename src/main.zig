@@ -46,6 +46,7 @@ const statusline_identity = @import("core/workspace/statusline_identity.zig");
 const collections = @import("core/shared/collections.zig");
 const agent_steps = @import("core/config/agent_steps.zig");
 const config_runtime = @import("core/config/config_runtime.zig");
+const presentation_palette = @import("core/shared/presentation_palette.zig");
 const model_provider = @import("core/config/model_provider.zig");
 const js_host_prompt_history = @import("core/session/js_host_prompt_history.zig");
 const model_capabilities = @import("core/config/model_capabilities.zig");
@@ -417,16 +418,24 @@ const App = struct {
     const WorkerAppRuntime = app_worker_runtime.Runtime(Self);
     const WorkspaceAppRuntime = app_workspace_runtime.Runtime(Self);
 
-    pub fn colorPalette(_: *const Self) config_runtime.ColorPalette {
-        return ui_render.currentColorPalette();
+    pub fn colorPalette(self: *const Self) config_runtime.ColorPalette {
+        return self.color_palette;
+    }
+
+    pub fn setColorPalettePreference(self: *Self, palette: config_runtime.ColorPalette) void {
+        self.color_palette = palette;
     }
 
     pub fn applyColorPaletteUpdate(self: *Self, palette: config_runtime.ColorPalette) !void {
-        try RenderAppRuntime.applyThemeUpdateForPalette(
-            self,
-            ui_render.is_light,
-            null,
-            palette,
+        self.setColorPalettePreference(palette);
+        try RenderAppRuntime.applyColorPaletteUpdate(self, palette);
+    }
+
+    pub fn activePresentationStyles(self: *const Self) presentation_palette.Styles {
+        return presentation_palette.stylesForTerminal(
+            self.presentation_light.load(.acquire),
+            @enumFromInt(self.active_color_palette.load(.acquire)),
+            self.presentation_truecolor,
         );
     }
 
@@ -526,6 +535,10 @@ const App = struct {
     }
 
     alloc: Allocator,
+    color_palette: config_runtime.ColorPalette = .fx,
+    active_color_palette: std.atomic.Value(u8) = .init(@intFromEnum(config_runtime.ColorPalette.fx)),
+    presentation_light: std.atomic.Value(bool) = .init(false),
+    presentation_truecolor: bool = true,
     terminal: TerminalState = .{},
 
     auth: auth_runtime.Runtime = auth_runtime.Runtime.init(
@@ -1215,6 +1228,19 @@ const App = struct {
         try self.writeUserPromptCardWithSpacing(user, self.session.historyLen() > 0);
     }
 
+    pub fn writeUserPromptCardWithPresentationStyles(
+        self: *App,
+        user: types.UserTurn,
+        presentation: worker_runtime.PresentationSnapshot,
+    ) !void {
+        try self.writeUserPromptCardWithSpacingAndSkillTokensAndPresentation(
+            user,
+            self.session.historyLen() > 0,
+            &.{},
+            presentation,
+        );
+    }
+
     pub fn writeUserPromptCardWithSkillBindings(
         self: *App,
         user: types.UserTurn,
@@ -1225,6 +1251,24 @@ const App = struct {
         const skill_tokens = try promptCardSkillTokensFromDisplaySpans(self.alloc, skill_display_spans);
         defer if (skill_tokens.len > 0) self.alloc.free(skill_tokens);
         try self.writeUserPromptCardWithSpacingAndSkillTokens(user, self.session.historyLen() > 0, skill_tokens);
+    }
+
+    pub fn writeUserPromptCardWithSkillBindingsAndPresentationStyles(
+        self: *App,
+        user: types.UserTurn,
+        skill_bindings: []const worker_runtime.SkillBinding,
+        skill_display_spans: []const worker_runtime.SkillDisplaySpan,
+        presentation: worker_runtime.PresentationSnapshot,
+    ) !void {
+        _ = skill_bindings;
+        const skill_tokens = try promptCardSkillTokensFromDisplaySpans(self.alloc, skill_display_spans);
+        defer if (skill_tokens.len > 0) self.alloc.free(skill_tokens);
+        try self.writeUserPromptCardWithSpacingAndSkillTokensAndPresentation(
+            user,
+            self.session.historyLen() > 0,
+            skill_tokens,
+            presentation,
+        );
     }
 
     pub fn writeUserPromptCardWithSpacing(self: *App, user: types.UserTurn, has_prior_turns: bool) !void {
@@ -1243,6 +1287,23 @@ const App = struct {
             user,
             has_prior_turns,
             skill_tokens,
+        );
+    }
+
+    fn writeUserPromptCardWithSpacingAndSkillTokensAndPresentation(
+        self: *App,
+        user: types.UserTurn,
+        has_prior_turns: bool,
+        skill_tokens: []const registered_entities.SkillTokenSpan,
+        presentation: worker_runtime.PresentationSnapshot,
+    ) !void {
+        _ = try self.shell.writeUserPromptCardWithPresentationStyles(
+            self.alloc,
+            &self.metrics,
+            user,
+            has_prior_turns,
+            skill_tokens,
+            presentation,
         );
     }
 
@@ -2045,6 +2106,10 @@ const App = struct {
         return self.describeToolAction(arena, call, display_target, advertised_dynamic_tool_names);
     }
 
+    pub fn describeToolActionWithAdvertisedStyles(self: *App, arena: Allocator, call: ToolCall, display_target: ?[]const u8, styles: agent_runtime.PresentationStyles, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+        return AgentAppRuntime.describeToolActionWithPresentationStyles(self, arena, call, display_target, styles, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+    }
+
     pub fn describeToolActionCompleted(self: *App, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
         return AgentAppRuntime.describeToolActionCompleted(self, arena, call, display_target, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
@@ -2053,12 +2118,20 @@ const App = struct {
         return self.describeToolActionCompleted(arena, call, display_target, advertised_dynamic_tool_names);
     }
 
+    pub fn describeToolActionCompletedWithAdvertisedStyles(self: *App, arena: Allocator, call: ToolCall, display_target: ?[]const u8, styles: agent_runtime.PresentationStyles, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+        return AgentAppRuntime.describeToolActionCompletedWithPresentationStyles(self, arena, call, display_target, styles, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+    }
+
     pub fn describeToolActionDenied(self: *App, arena: Allocator, call: ToolCall, display_target: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
         return AgentAppRuntime.describeToolActionDenied(self, arena, call, display_target, label, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
     pub fn describeToolActionDeniedWithAdvertised(self: *App, arena: Allocator, call: ToolCall, display_target: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
         return self.describeToolActionDenied(arena, call, display_target, label, advertised_dynamic_tool_names);
+    }
+
+    pub fn describeToolActionDeniedWithAdvertisedStyles(self: *App, arena: Allocator, call: ToolCall, display_target: ?[]const u8, label: []const u8, styles: agent_runtime.PresentationStyles, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+        return AgentAppRuntime.describeToolActionDeniedWithPresentationStyles(self, arena, call, display_target, label, styles, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
     pub fn requestToolPermissionSync(self: *App, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, revalidation: ?agent_runtime.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
@@ -2616,12 +2689,46 @@ const App = struct {
         _ = try self.shell.appendAssistantTableOwned(self.alloc, table);
     }
 
+    pub fn appendAssistantTableWithPresentationStyles(
+        self: *App,
+        table: assistant_presentation.TablePayload,
+        presentation: worker_runtime.PresentationSnapshot,
+    ) !void {
+        _ = try self.shell.appendAssistantTableOwnedWithPresentationStyles(
+            self.alloc,
+            table,
+            presentation,
+        );
+    }
+
     pub fn appendAssistantCodeBlock(self: *App, block: assistant_presentation.CodeBlockPayload) !void {
         _ = try self.shell.appendAssistantCodeBlockOwned(self.alloc, block);
     }
 
+    pub fn appendAssistantCodeBlockWithPresentationStyles(
+        self: *App,
+        block: assistant_presentation.CodeBlockPayload,
+        presentation: worker_runtime.PresentationSnapshot,
+    ) !void {
+        _ = try self.shell.appendAssistantCodeBlockOwnedWithPresentationStyles(
+            self.alloc,
+            block,
+            presentation,
+        );
+    }
+
     pub fn appendAssistantThematicRule(self: *App) !void {
         _ = try self.shell.appendAssistantThematicRule(self.alloc);
+    }
+
+    pub fn appendAssistantThematicRuleWithPresentationStyles(
+        self: *App,
+        presentation: worker_runtime.PresentationSnapshot,
+    ) !void {
+        _ = try self.shell.appendAssistantThematicRuleWithPresentationStyles(
+            self.alloc,
+            presentation,
+        );
     }
 
     pub fn appendHistoryTurn(self: *App, turn: types.HistoryTurn) !void {
@@ -3479,7 +3586,7 @@ fn topLevelHelpStyle(raw_env: RawEnviron) command_specs.HelpStyle {
 }
 
 fn topLevelHelpStyleForValues(is_terminal: bool, no_color: bool, dumb_terminal: bool) command_specs.HelpStyle {
-    return if (is_terminal and !no_color and !dumb_terminal) .ansi else .plain;
+    return if (is_terminal and !no_color and !dumb_terminal) .ansi_terminal else .plain;
 }
 
 fn stdoutIsTerminal() bool {
@@ -3918,10 +4025,11 @@ test "raw benchmark preflight matches no-arg FX_BENCH presence" {
 }
 
 test "terminal help styling respects terminal capability and color opt-outs" {
-    try std.testing.expectEqual(command_specs.HelpStyle.ansi, topLevelHelpStyleForValues(true, false, false));
-    try std.testing.expectEqual(command_specs.HelpStyle.plain, topLevelHelpStyleForValues(false, false, false));
-    try std.testing.expectEqual(command_specs.HelpStyle.plain, topLevelHelpStyleForValues(true, true, false));
-    try std.testing.expectEqual(command_specs.HelpStyle.plain, topLevelHelpStyleForValues(true, false, true));
+    try std.testing.expect(topLevelHelpStyleForValues(true, false, false).enabled);
+    try std.testing.expectEqualStrings("\x1b[90m", topLevelHelpStyleForValues(true, false, false).muted);
+    try std.testing.expect(!topLevelHelpStyleForValues(false, false, false).enabled);
+    try std.testing.expect(!topLevelHelpStyleForValues(true, true, false).enabled);
+    try std.testing.expect(!topLevelHelpStyleForValues(true, false, true).enabled);
 }
 
 test "follow up prompt card top margin is renderer-owned" {

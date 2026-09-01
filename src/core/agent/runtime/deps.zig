@@ -14,6 +14,7 @@ const tool_admission = @import("../../tooling/tool_admission.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 const tool_contracts = @import("tool_contracts.zig");
 const context_contract = @import("../../workspace/context_contract.zig");
+const presentation_palette = @import("../../shared/presentation_palette.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
@@ -172,6 +173,24 @@ pub const DiffMarkerStyles = struct {
     removed: []const u8 = "",
 };
 
+/// Presentation colors captured when a runtime is constructed. Keeping these
+/// slices in the dependency value avoids worker threads consulting mutable UI
+/// globals and lets independent runtimes use different palettes safely.
+pub const PresentationStyles = struct {
+    dim: []const u8 = "\x1b[38;5;245m",
+    accent: []const u8 = "\x1b[38;5;252m",
+    inline_code: []const u8 = "\x1b[38;5;245m",
+    task_completed: []const u8 = "\x1b[38;5;252m",
+    diff_added: []const u8 = "\x1b[38;5;252m",
+    diff_removed: []const u8 = "\x1b[38;5;252m",
+    diff_added_marker: []const u8 = "\x1b[38;5;71m",
+    diff_removed_marker: []const u8 = "\x1b[38;5;167m",
+    /// Complete immutable turn snapshot. The role-specific fields above stay
+    /// flattened for formatter call sites; this value crosses child-admission
+    /// and queued-event boundaries without reconstructing from mutable state.
+    snapshot: presentation_palette.PresentationSnapshot = presentation_palette.snapshot(false, .fx, false),
+};
+
 pub const AgentRuntimeDeps = struct {
     ctx: *anyopaque,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
@@ -205,12 +224,12 @@ pub const AgentRuntimeDeps = struct {
     /// Admission consumes `prepared`; callers must not retry the same value through the raw callback.
     request_prepared_file_mutation_permission: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, prepared: *tool_admission.PreparedFileMutationCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?LiveToolAuthority, advertised_dynamic_tool_names: []const []const u8) anyerror!command_admission.PermissionOutcome = null,
     resolve_tool_action_display_target: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall) anyerror!?[]const u8 = null,
-    describe_tool_action: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
-    describe_tool_action_completed: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
-    describe_tool_action_denied: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
+    describe_tool_action: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, styles: PresentationStyles, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
+    describe_tool_action_completed: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, styles: PresentationStyles, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
+    describe_tool_action_denied: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, label: []const u8, styles: PresentationStyles, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
     permission_target_for_call: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
     execute_tool_call: *const fn (ctx: *anyopaque, request: ToolExecutionRequest) anyerror!ToolExecutionResult,
-    publish_committed_file_handoff: *const fn (ctx: *anyopaque, handoff: file_mutation.CommittedFileHandoff) tool_contracts.SecondaryPublicationReport,
+    publish_committed_file_handoff: *const fn (ctx: *anyopaque, handoff: file_mutation.CommittedFileHandoff, styles: PresentationStyles) tool_contracts.SecondaryPublicationReport,
     publish_deferred_tool_completion: ?*const fn (ctx: *anyopaque, completion: DeferredToolCompletion) TransportPublicationOutcome = null,
     propagate_history_turn: *const fn (ctx: *anyopaque, turn: HistoryTurn) anyerror!void,
     commit_context_compaction: ?ContextCompactionCommitEffect = null,
@@ -239,9 +258,9 @@ pub const AgentRuntimeDeps = struct {
     report_inner_tool_usage: ?*const fn (ctx: *anyopaque, tool_name: []const u8, usage: types.ToolUsage) void = null,
     usage: ?*session_usage.Usage = null,
     usage_allocator: Allocator = std.heap.c_allocator,
+    presentation_styles: PresentationStyles = .{},
     // Accent for the +N / -N counts in a committed file's status line.
-    // Captured by value at construction; that is safe only while the marker
-    // colors never change after startup (they are theme-independent).
+    // Captured by value at construction with the complete presentation value.
     diff_marker_styles: DiffMarkerStyles = .{},
 
     pub fn pushContextNotice(self: *const AgentRuntimeDeps, text: []const u8) !void {

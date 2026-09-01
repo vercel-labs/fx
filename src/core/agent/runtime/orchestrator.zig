@@ -3781,7 +3781,10 @@ fn appendPermissionFeedbackAfterToolResult(
     for (feedback) |text| {
         if (text.len == 0) continue;
         const event = worker_runtime.WorkerEvent{
-            .append_user_feedback = try std.heap.c_allocator.dupe(u8, text),
+            .append_user_feedback_styled = .{
+                .text = try std.heap.c_allocator.dupe(u8, text),
+                .styles = deps.presentation_styles.snapshot,
+            },
         };
         errdefer worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
         try deps.push_event(deps.ctx, event);

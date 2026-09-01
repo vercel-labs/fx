@@ -8,6 +8,7 @@ const assistant_presentation = @import("../agent/assistant_presentation.zig");
 const tool_admission = @import("../agent/runtime/tool_admission.zig");
 const tool_presentation = @import("../agent/runtime/tool_presentation.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const presentation_palette = @import("../shared/presentation_palette.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const host_capability = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
@@ -4155,6 +4156,13 @@ pub fn Runtime(comptime App: type) type {
                 base,
                 presentation.additions,
                 presentation.deletions,
+                blk: {
+                    const styles = presentation_palette.styles(
+                        ui_render.is_light,
+                        ui_render.currentColorPalette(),
+                    );
+                    break :blk .{ .dim = styles.dim, .accent = styles.user_accent };
+                },
                 .{
                     .added = ui_render.diff_added_marker_style,
                     .removed = ui_render.diff_removed_marker_style,

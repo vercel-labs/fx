@@ -15,6 +15,7 @@ const app_worker_runtime = @import("app_worker_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const change_tracker_mod = @import("../workspace/change_tracker.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const presentation_palette = @import("../shared/presentation_palette.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation = @import("../tooling/file_mutation.zig");
@@ -50,14 +51,16 @@ const reset_style = ui_render.reset_style;
 fn preparedDiffPayload(
     alloc: Allocator,
     handoff: file_mutation.CommittedFileHandoff,
+    styles: agent_runtime.PresentationStyles,
 ) !diff_mod.DiffEntryPayload {
-    return preparedDiffPayloadWithFullAllocator(alloc, alloc, handoff);
+    return preparedDiffPayloadWithFullAllocator(alloc, alloc, handoff, styles);
 }
 
 fn preparedDiffPayloadWithFullAllocator(
     alloc: Allocator,
     full_alloc: Allocator,
     handoff: file_mutation.CommittedFileHandoff,
+    styles: agent_runtime.PresentationStyles,
 ) !diff_mod.DiffEntryPayload {
     return diff_mod.formatFileChangePayload(
         alloc,
@@ -69,11 +72,11 @@ fn preparedDiffPayloadWithFullAllocator(
             .lifecycle_id = snapshot.lifecycle_id,
         } else null,
         .{
-            .added_fg = ui_render.diff_added_style,
-            .removed_fg = ui_render.diff_removed_style,
-            .context_fg = ui_render.dim_style,
-            .added_marker_fg = ui_render.diff_added_marker_style,
-            .removed_marker_fg = ui_render.diff_removed_marker_style,
+            .added_fg = styles.diff_added,
+            .removed_fg = styles.diff_removed,
+            .context_fg = styles.dim,
+            .added_marker_fg = styles.diff_added_marker,
+            .removed_marker_fg = styles.diff_removed_marker,
             .reset = ui_render.reset_style,
         },
     );
@@ -164,7 +167,7 @@ test "prepared diff payload keeps compact elision and retains the complete appro
         .lifecycle_id = .{ .turn_id = 39, .call_id = "full-review" },
     };
 
-    const payload = try preparedDiffPayload(alloc, enriched_handoff);
+    const payload = try preparedDiffPayload(alloc, enriched_handoff, .{});
     defer diff_mod.freeDiffEntryPayload(alloc, payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload.preview, "⋯ +118 omitted") != null);
@@ -190,6 +193,7 @@ test "prepared diff payload keeps compact output when full formatting is unavail
         std.testing.allocator,
         failing.allocator(),
         enriched_handoff,
+        .{},
     );
     defer diff_mod.freeDiffEntryPayload(std.testing.allocator, payload);
 
@@ -266,6 +270,30 @@ test "full diff formatter renders unchanged review elisions" {
 pub fn Bindings(comptime App: type) type {
     return struct {
         pub fn agentRuntimeDeps(app: *App) agent_runtime.AgentRuntimeDeps {
+            const presentation = if (comptime @hasDecl(@TypeOf(app.worker), "activePresentationStyles"))
+                app.worker.activePresentationStyles()
+            else if (comptime @hasDecl(App, "activePresentationStyles"))
+                worker_runtime.PresentationSnapshot{
+                    .styles = app.activePresentationStyles(),
+                    .theme = .dark,
+                }
+            else
+                presentation_palette.snapshot(false, .fx, false);
+            return agentRuntimeDepsWithPresentationSnapshot(app, presentation);
+        }
+
+        pub fn agentRuntimeDepsWithPresentationSnapshot(
+            app: *App,
+            presentation: worker_runtime.PresentationSnapshot,
+        ) agent_runtime.AgentRuntimeDeps {
+            return agentRuntimeDepsWithStyles(app, presentation);
+        }
+
+        fn agentRuntimeDepsWithStyles(
+            app: *App,
+            presentation: worker_runtime.PresentationSnapshot,
+        ) agent_runtime.AgentRuntimeDeps {
+            const styles = presentation.styles;
             var deps: agent_runtime.AgentRuntimeDeps = .{
                 .ctx = @ptrCast(app),
                 .agent_stream_provider = if (comptime @hasDecl(App, "agentStreamProvider"))
@@ -347,10 +375,18 @@ pub fn Bindings(comptime App: type) type {
                 .report_usage = agentReportUsage,
                 .report_inner_tool_usage = agentReportInnerToolUsage,
                 .usage_allocator = app.alloc,
-                .diff_marker_styles = .{
-                    .added = ui_render.diff_added_marker_style,
-                    .removed = ui_render.diff_removed_marker_style,
+                .presentation_styles = .{
+                    .dim = styles.dim,
+                    .accent = styles.user_accent,
+                    .inline_code = styles.inline_code,
+                    .task_completed = styles.task_completed,
+                    .diff_added = styles.diff_added,
+                    .diff_removed = styles.diff_removed,
+                    .diff_added_marker = styles.diff_added_marker,
+                    .diff_removed_marker = styles.diff_removed_marker,
+                    .snapshot = presentation,
                 },
+                .diff_marker_styles = .{ .added = styles.diff_added_marker, .removed = styles.diff_removed_marker },
             };
             if (comptime @hasField(@TypeOf(app.session), "usage")) {
                 deps.usage = &app.session.usage;
@@ -431,11 +467,16 @@ pub fn Bindings(comptime App: type) type {
                 .ctx = @ptrCast(app),
                 .tool_lifecycle = worker_tool_lifecycle_presenter(app),
                 .write_user_prompt = workerBridgeWriteUserPrompt,
+                .write_user_prompt_styled = workerBridgeWriteUserPromptStyled,
                 .write_user_prompt_with_skill_bindings = workerBridgeWriteUserPromptWithSkillBindings,
+                .write_user_prompt_with_skill_bindings_styled = workerBridgeWriteUserPromptWithSkillBindingsStyled,
                 .append_text = workerBridgeAppendText,
                 .append_table = workerBridgeAppendTable,
+                .append_table_styled = workerBridgeAppendTableStyled,
                 .append_code_block = workerBridgeAppendCodeBlock,
+                .append_code_block_styled = workerBridgeAppendCodeBlockStyled,
                 .append_thematic_rule = workerBridgeAppendThematicRule,
+                .append_thematic_rule_styled = workerBridgeAppendThematicRuleStyled,
                 .drain_assistant_text = workerBridgeDrainAssistantText,
                 .open_model_picker = workerBridgeOpenModelPicker,
                 .semantic_notice = workerBridgeSemanticNotice,
@@ -668,19 +709,19 @@ pub fn Bindings(comptime App: type) type {
             return app.resolveToolActionDisplayTarget(arena, call);
         }
 
-        fn agentDescribeToolAction(ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+        fn agentDescribeToolAction(ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, styles: agent_runtime.PresentationStyles, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
             const app: *App = @ptrCast(@alignCast(ctx));
-            return app.describeToolActionWithAdvertised(arena, call, display_target, advertised_dynamic_tool_names);
+            return app.describeToolActionWithAdvertisedStyles(arena, call, display_target, styles, advertised_dynamic_tool_names);
         }
 
-        fn agentDescribeToolActionCompleted(ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+        fn agentDescribeToolActionCompleted(ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, styles: agent_runtime.PresentationStyles, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
             const app: *App = @ptrCast(@alignCast(ctx));
-            return app.describeToolActionCompletedWithAdvertised(arena, call, display_target, advertised_dynamic_tool_names);
+            return app.describeToolActionCompletedWithAdvertisedStyles(arena, call, display_target, styles, advertised_dynamic_tool_names);
         }
 
-        fn agentDescribeToolActionDenied(ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+        fn agentDescribeToolActionDenied(ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, label: []const u8, styles: agent_runtime.PresentationStyles, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
             const app: *App = @ptrCast(@alignCast(ctx));
-            return app.describeToolActionDeniedWithAdvertised(arena, call, display_target, label, advertised_dynamic_tool_names);
+            return app.describeToolActionDeniedWithAdvertisedStyles(arena, call, display_target, label, styles, advertised_dynamic_tool_names);
         }
 
         fn agentPermissionTargetForCall(ctx: *anyopaque, arena: Allocator, call: ToolCall, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
@@ -716,10 +757,11 @@ pub fn Bindings(comptime App: type) type {
         fn agentPublishCommittedFileHandoff(
             ctx: *anyopaque,
             handoff: file_mutation.CommittedFileHandoff,
+            styles: agent_runtime.PresentationStyles,
         ) agent_runtime.SecondaryPublicationReport {
             const app: *App = @ptrCast(@alignCast(ctx));
             return .{
-                .diff = publishCommittedDiff(app, handoff),
+                .diff = publishCommittedDiff(app, handoff, styles),
                 .tracker = publishCommittedTracker(app, handoff),
             };
         }
@@ -727,10 +769,12 @@ pub fn Bindings(comptime App: type) type {
         fn publishCommittedDiff(
             app: *App,
             handoff: file_mutation.CommittedFileHandoff,
+            styles: agent_runtime.PresentationStyles,
         ) agent_runtime.SecondarySinkOutcome {
             const payload = preparedDiffPayload(
                 std.heap.c_allocator,
                 handoff,
+                styles,
             ) catch |err| {
                 debug_trace.logf(
                     "tool",
@@ -1044,6 +1088,19 @@ pub fn Bindings(comptime App: type) type {
             try app.writeUserPromptCard(prompt);
         }
 
+        fn workerBridgeWriteUserPromptStyled(
+            ctx: *anyopaque,
+            prompt: types.UserTurn,
+            styles: worker_runtime.PresentationSnapshot,
+        ) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime @hasDecl(App, "writeUserPromptCardWithPresentationStyles")) {
+                try app.writeUserPromptCardWithPresentationStyles(prompt, styles);
+            } else {
+                try app.writeUserPromptCard(prompt);
+            }
+        }
+
         fn workerBridgeWriteUserPromptWithSkillBindings(
             ctx: *anyopaque,
             prompt: types.UserTurn,
@@ -1053,6 +1110,28 @@ pub fn Bindings(comptime App: type) type {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime @hasDecl(App, "writeUserPromptCardWithSkillBindings")) {
                 try app.writeUserPromptCardWithSkillBindings(prompt, skill_bindings, skill_display_spans);
+            } else {
+                try app.writeUserPromptCard(prompt);
+            }
+        }
+
+        fn workerBridgeWriteUserPromptWithSkillBindingsStyled(
+            ctx: *anyopaque,
+            prompt: types.UserTurn,
+            skill_bindings: []const worker_runtime.SkillBinding,
+            skill_display_spans: []const worker_runtime.SkillDisplaySpan,
+            styles: worker_runtime.PresentationSnapshot,
+        ) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime @hasDecl(App, "writeUserPromptCardWithSkillBindingsAndPresentationStyles")) {
+                try app.writeUserPromptCardWithSkillBindingsAndPresentationStyles(
+                    prompt,
+                    skill_bindings,
+                    skill_display_spans,
+                    styles,
+                );
+            } else if (comptime @hasDecl(App, "writeUserPromptCardWithPresentationStyles")) {
+                try app.writeUserPromptCardWithPresentationStyles(prompt, styles);
             } else {
                 try app.writeUserPromptCard(prompt);
             }
@@ -1077,6 +1156,29 @@ pub fn Bindings(comptime App: type) type {
             handed_off = true;
         }
 
+        fn workerBridgeAppendTableStyled(
+            ctx: *anyopaque,
+            table: assistant_presentation.TablePayload,
+            styles: worker_runtime.PresentationSnapshot,
+        ) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            var owned = table;
+            var handed_off = false;
+            errdefer if (!handed_off) owned.deinit(app.alloc);
+            if (comptime @hasDecl(App, "appendAssistantTableWithPresentationStyles")) {
+                try app.appendAssistantTableWithPresentationStyles(owned, styles);
+                handed_off = true;
+                return;
+            }
+            if (comptime @hasDecl(App, "appendAssistantTable")) {
+                try app.appendAssistantTable(owned);
+                handed_off = true;
+                return;
+            }
+            owned.deinit(app.alloc);
+            handed_off = true;
+        }
+
         fn workerBridgeAppendCodeBlock(ctx: *anyopaque, block: assistant_presentation.CodeBlockPayload) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             var owned = block;
@@ -1091,9 +1193,44 @@ pub fn Bindings(comptime App: type) type {
             handed_off = true;
         }
 
+        fn workerBridgeAppendCodeBlockStyled(
+            ctx: *anyopaque,
+            block: assistant_presentation.CodeBlockPayload,
+            styles: worker_runtime.PresentationSnapshot,
+        ) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            var owned = block;
+            var handed_off = false;
+            errdefer if (!handed_off) owned.deinit(app.alloc);
+            if (comptime @hasDecl(App, "appendAssistantCodeBlockWithPresentationStyles")) {
+                try app.appendAssistantCodeBlockWithPresentationStyles(owned, styles);
+                handed_off = true;
+                return;
+            }
+            if (comptime @hasDecl(App, "appendAssistantCodeBlock")) {
+                try app.appendAssistantCodeBlock(owned);
+                handed_off = true;
+                return;
+            }
+            owned.deinit(app.alloc);
+            handed_off = true;
+        }
+
         fn workerBridgeAppendThematicRule(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime @hasDecl(App, "appendAssistantThematicRule")) {
+                try app.appendAssistantThematicRule();
+            }
+        }
+
+        fn workerBridgeAppendThematicRuleStyled(
+            ctx: *anyopaque,
+            styles: worker_runtime.PresentationSnapshot,
+        ) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime @hasDecl(App, "appendAssistantThematicRuleWithPresentationStyles")) {
+                try app.appendAssistantThematicRuleWithPresentationStyles(styles);
+            } else if (comptime @hasDecl(App, "appendAssistantThematicRule")) {
                 try app.appendAssistantThematicRule();
             }
         }
@@ -1233,6 +1370,10 @@ const FakeWorker = struct {
         if (self.fail_semantic_push) {
             switch (event) {
                 .assistant_presentation => |presentation| switch (presentation) {
+                    .table, .code_block => return error.TestSemanticPresentationPublicationFailure,
+                    .text, .thematic_rule => {},
+                },
+                .assistant_presentation_styled => |styled| switch (styled.presentation) {
                     .table, .code_block => return error.TestSemanticPresentationPublicationFailure,
                     .text, .thematic_rule => {},
                 },
@@ -1440,6 +1581,7 @@ const FakeApp = struct {
     last_notice_visibility: types.NoticeVisibility = .compact_and_full,
     last_notice_record: bool = false,
     capability_request_count: usize = 0,
+    presentation_styles: presentation_palette.Styles = presentation_palette.styles(false, .fx),
 
     fn init(alloc: std.mem.Allocator) FakeApp {
         return .{ .alloc = alloc };
@@ -1454,6 +1596,10 @@ const FakeApp = struct {
         self.pacer.deinit(self.alloc);
         self.transcript.deinit(self.alloc);
         self.last_notice_topic.deinit(self.alloc);
+    }
+
+    pub fn activePresentationStyles(self: *const FakeApp) presentation_palette.Styles {
+        return self.presentation_styles;
     }
 
     pub fn modelCompletions(self: *FakeApp, _: []const u8, out: *[32][]const u8) usize {
@@ -1531,17 +1677,17 @@ const FakeApp = struct {
         return null;
     }
 
-    fn describeToolActionWithAdvertised(self: *FakeApp, arena: Allocator, call: ToolCall, _: ?[]const u8, _: []const []const u8) ![]const u8 {
+    fn describeToolActionWithAdvertisedStyles(self: *FakeApp, arena: Allocator, call: ToolCall, _: ?[]const u8, styles: agent_runtime.PresentationStyles, _: []const []const u8) ![]const u8 {
         _ = self;
-        return std.fmt.allocPrint(arena, "run {s}", .{call.name});
+        return std.fmt.allocPrint(arena, "run {s}{s}", .{ styles.dim, call.name });
     }
 
-    fn describeToolActionCompletedWithAdvertised(self: *FakeApp, arena: Allocator, call: ToolCall, _: ?[]const u8, _: []const []const u8) ![]const u8 {
+    fn describeToolActionCompletedWithAdvertisedStyles(self: *FakeApp, arena: Allocator, call: ToolCall, _: ?[]const u8, _: agent_runtime.PresentationStyles, _: []const []const u8) ![]const u8 {
         _ = self;
         return std.fmt.allocPrint(arena, "done {s}", .{call.name});
     }
 
-    fn describeToolActionDeniedWithAdvertised(self: *FakeApp, arena: Allocator, call: ToolCall, _: ?[]const u8, label: []const u8, _: []const []const u8) ![]const u8 {
+    fn describeToolActionDeniedWithAdvertisedStyles(self: *FakeApp, arena: Allocator, call: ToolCall, _: ?[]const u8, label: []const u8, _: agent_runtime.PresentationStyles, _: []const []const u8) ![]const u8 {
         _ = self;
         return std.fmt.allocPrint(arena, "denied {s} {s}", .{ call.name, label });
     }
@@ -1866,6 +2012,34 @@ test "agent deps forward app callbacks through core types" {
     try std.testing.expectEqualStrings("tool:Boom", formatted);
 }
 
+test "agent deps retain one immutable palette snapshot per runtime" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    const fx_deps = Bindings(FakeApp).agentRuntimeDeps(&app);
+    app.presentation_styles = presentation_palette.styles(false, .terminal);
+    const terminal_deps = Bindings(FakeApp).agentRuntimeDeps(&app);
+
+    const in_flight_action = try fx_deps.describe_tool_action(
+        fx_deps.ctx,
+        std.testing.allocator,
+        .{ .id = "snapshot", .name = "read_file", .arguments_json = "{}" },
+        null,
+        fx_deps.presentation_styles,
+        &.{},
+    );
+    defer std.testing.allocator.free(in_flight_action);
+
+    try std.testing.expectEqualStrings("\x1b[38;5;245m", fx_deps.presentation_styles.dim);
+    try std.testing.expectEqualStrings("\x1b[38;5;71m", fx_deps.presentation_styles.diff_added_marker);
+    try std.testing.expectEqualStrings("\x1b[38;5;71m", fx_deps.diff_marker_styles.added);
+    try std.testing.expectEqualStrings("\x1b[90m", terminal_deps.presentation_styles.dim);
+    try std.testing.expectEqualStrings("\x1b[32m", terminal_deps.presentation_styles.diff_added_marker);
+    try std.testing.expectEqualStrings("\x1b[32m", terminal_deps.diff_marker_styles.added);
+    try std.testing.expect(std.mem.find(u8, in_flight_action, "\x1b[38;5;245m") != null);
+    try std.testing.expect(std.mem.find(u8, in_flight_action, "\x1b[90m") == null);
+}
+
 test "agent deps use request-time model capability resolution when available" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
@@ -1926,14 +2100,14 @@ test "app semantic presentation sink retains payload ownership only after succes
     });
 
     try std.testing.expectEqual(@as(usize, 2), app.worker.events.items.len);
-    try std.testing.expect(app.worker.events.items[0] == .assistant_presentation);
-    try std.testing.expect(app.worker.events.items[0].assistant_presentation == .table);
-    try std.testing.expectEqualStrings("api", app.worker.events.items[0].assistant_presentation.table.rows[1].cells[0]);
-    try std.testing.expect(app.worker.events.items[0].assistant_presentation.table.rows[1].cells[0].ptr != table_source_cell);
-    try std.testing.expect(app.worker.events.items[1] == .assistant_presentation);
-    try std.testing.expect(app.worker.events.items[1].assistant_presentation == .code_block);
-    try std.testing.expectEqualStrings("const ready = true;\n", app.worker.events.items[1].assistant_presentation.code_block.code);
-    try std.testing.expect(app.worker.events.items[1].assistant_presentation.code_block.code.ptr != code_source_ptr);
+    try std.testing.expect(app.worker.events.items[0] == .assistant_presentation_styled);
+    try std.testing.expect(app.worker.events.items[0].assistant_presentation_styled.presentation == .table);
+    try std.testing.expectEqualStrings("api", app.worker.events.items[0].assistant_presentation_styled.presentation.table.rows[1].cells[0]);
+    try std.testing.expect(app.worker.events.items[0].assistant_presentation_styled.presentation.table.rows[1].cells[0].ptr != table_source_cell);
+    try std.testing.expect(app.worker.events.items[1] == .assistant_presentation_styled);
+    try std.testing.expect(app.worker.events.items[1].assistant_presentation_styled.presentation == .code_block);
+    try std.testing.expectEqualStrings("const ready = true;\n", app.worker.events.items[1].assistant_presentation_styled.presentation.code_block.code);
+    try std.testing.expect(app.worker.events.items[1].assistant_presentation_styled.presentation.code_block.code.ptr != code_source_ptr);
 
     app.worker.fail_semantic_push = true;
     const failed_table = try assistant_presentation.parseTablePayload(
@@ -2055,7 +2229,7 @@ test "committed file handoff publishes prepared diff and cloned tracker state" {
 
     const deps = Bindings(FakeApp).agentRuntimeDeps(&app);
     const handoff = testCommittedFileHandoff();
-    const report = deps.publish_committed_file_handoff(deps.ctx, handoff);
+    const report = deps.publish_committed_file_handoff(deps.ctx, handoff, deps.presentation_styles);
 
     try std.testing.expectEqual(
         agent_runtime.SecondarySinkOutcome.published,

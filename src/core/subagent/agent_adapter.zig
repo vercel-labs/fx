@@ -70,6 +70,7 @@ const Context = struct {
 
     fn toolContext(self: *Context) tool_runtime.Context {
         var result = self.config.tool_context;
+        result.presentation_snapshot = self.admission.presentation;
         result.worker = self.turn.workerRuntime();
         result.session = self.turn.sessionRuntime();
         result.cancel_flag = self.cancel;
@@ -394,6 +395,21 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .report_usage = reportUsage,
         .usage = &context.turn.sessionRuntime().usage,
         .usage_allocator = context.turn.alloc,
+        .presentation_styles = .{
+            .dim = context.config.tool_context.presentation_dim_style,
+            .accent = context.config.tool_context.presentation_accent_style,
+            .inline_code = context.config.tool_context.presentation_inline_code_style,
+            .task_completed = context.config.tool_context.presentation_task_completed_style,
+            .diff_added = context.config.tool_context.presentation_diff_added_style,
+            .diff_removed = context.config.tool_context.presentation_diff_removed_style,
+            .diff_added_marker = context.config.tool_context.presentation_diff_added_marker_style,
+            .diff_removed_marker = context.config.tool_context.presentation_diff_removed_marker_style,
+            .snapshot = context.admission.presentation,
+        },
+        .diff_marker_styles = .{
+            .added = context.config.tool_context.presentation_diff_added_marker_style,
+            .removed = context.config.tool_context.presentation_diff_removed_marker_style,
+        },
     };
 }
 
@@ -647,7 +663,7 @@ fn requestPreparedFileMutationPermission(
     );
 }
 
-fn describeToolAction(raw: *anyopaque, arena: Allocator, call: types.ToolCall, file_path: ?[]const u8, _: []const []const u8) ![]const u8 {
+fn describeToolAction(raw: *anyopaque, arena: Allocator, call: types.ToolCall, file_path: ?[]const u8, _: agent_runtime.PresentationStyles, _: []const []const u8) ![]const u8 {
     const context: *Context = @ptrCast(@alignCast(raw));
     return tool_presentation.formatPlainAction(arena, .{
         .tool_registry = context.config.tool_context.tool_registry,
@@ -668,8 +684,8 @@ fn resolveToolActionDisplayTarget(raw: *anyopaque, arena: Allocator, call: types
     );
 }
 
-fn describeToolActionDenied(raw: *anyopaque, arena: Allocator, call: types.ToolCall, file_path: ?[]const u8, label: []const u8, dynamic_names: []const []const u8) ![]const u8 {
-    const action = try describeToolAction(raw, arena, call, file_path, dynamic_names);
+fn describeToolActionDenied(raw: *anyopaque, arena: Allocator, call: types.ToolCall, file_path: ?[]const u8, label: []const u8, styles: agent_runtime.PresentationStyles, dynamic_names: []const []const u8) ![]const u8 {
+    const action = try describeToolAction(raw, arena, call, file_path, styles, dynamic_names);
     return std.fmt.allocPrint(arena, "{s}: {s}", .{ label, action });
 }
 
@@ -717,7 +733,7 @@ fn reportUsage(raw: *anyopaque, usage: types.Usage) void {
     if (usage.output_tokens) |value| context.output_tokens = value;
 }
 
-fn publishCommittedFileHandoff(_: *anyopaque, _: file_mutation.CommittedFileHandoff) agent_runtime.SecondaryPublicationReport {
+fn publishCommittedFileHandoff(_: *anyopaque, _: file_mutation.CommittedFileHandoff, _: agent_runtime.PresentationStyles) agent_runtime.SecondaryPublicationReport {
     return .{ .diff = .skipped, .tracker = .skipped };
 }
 

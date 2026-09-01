@@ -78,7 +78,7 @@ fx uses its built-in color palette by default. To use the colors configured by y
 }
 ```
 
-The terminal palette uses the terminal's default foreground and background plus its ANSI color slots. Select `fx` again to restore the built-in palette.
+The terminal palette uses the terminal's default foreground and background plus its ANSI color slots. Changes apply immediately to fx-owned interface chrome and output from newly started turns and persist for future launches. Retained transcript entries and in-flight turns keep the styling they were created with. Select `fx` again to restore the built-in palette under the same rules.
 
 The status line hides the workspace path and Git branch by default. Enable the `Status line workspace` option in `/settings`, run `/statusline workspace`, or set it in `~/.fx/settings.json`:
 

@@ -126,6 +126,149 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
   });
 
   serialTest(
+    "color palette setting updates live chrome without retinting retained transcript bytes",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-color-palette-persistence-"));
+      try {
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        const settingsPath = join(home, ".fx", "settings.json");
+        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+        mkdirSync(workspace);
+        writeFileSync(settingsPath, "{}\n", { mode: 0o600 });
+        const env = {
+          ...NO_AUTH,
+          HOME: home,
+          NO_COLOR: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_SKIP_ONBOARDING: "1",
+        };
+
+        session = await TmuxSession.create({ cwd: workspace, env });
+        await session.waitForText("Run /help", TIMEOUT);
+        expect(await session.capturePaneEscapes()).toContain("\x1b[38;5;");
+
+        await session.sendText("/settings");
+        await session.waitForText("←→ Change", TIMEOUT);
+        await session.sendLiteral("color palette");
+        await session.waitForPane(
+          (pane) => pane.includes("Color palette") && pane.includes("live UI and new output"),
+          TIMEOUT,
+        );
+        const fxSettingsLine = (await session.capturePaneEscapes())
+          .split("\n")
+          .find((line) => line.includes("Color palette"));
+        expect(fxSettingsLine).toContain("\x1b[38;5;");
+        await session.sendKeys("Right");
+
+        const deadline = Date.now() + TIMEOUT;
+        let storedPalette: unknown;
+        while (Date.now() < deadline) {
+          storedPalette = JSON.parse(readFileSync(settingsPath, "utf8")).color_palette;
+          if (storedPalette === "terminal") break;
+          await Bun.sleep(25);
+        }
+        expect(storedPalette).toBe("terminal");
+
+        await session.waitForPane(
+          (pane) => pane.includes("Color palette") && pane.includes("terminal"),
+          TIMEOUT,
+        );
+        const livePane = await session.capturePaneEscapes();
+        const terminalSettingsLine = livePane
+          .split("\n")
+          .find((line) => line.includes("Color palette"));
+        expect(terminalSettingsLine).toBeDefined();
+        expect(terminalSettingsLine).toContain("\x1b[90m");
+        expect(terminalSettingsLine).not.toContain("\x1b[38;5;");
+        expect(terminalSettingsLine).not.toContain("\x1b[38;2;");
+        // The welcome transcript was retained byte-for-byte while the open
+        // settings chrome immediately moved to ANSI-16 terminal colors.
+        expect(livePane).toContain("\x1b[38;5;");
+
+        // With an active settings filter, the first Escape clears the filter
+        // and the second closes the menu.
+        await session.sendKeys("Escape");
+        await session.sendKeys("Escape");
+        await session.waitForPane(
+          (pane) => hasEmptyComposer(pane) && !pane.includes("←→ Change"),
+          TIMEOUT,
+        );
+        await session.sendText("/quit");
+        await session.waitForSessionEnd(TIMEOUT);
+        session = null;
+
+        secondSession = await TmuxSession.create({ cwd: workspace, env });
+        await secondSession.waitForText("Run /help", TIMEOUT);
+        const restarted = await secondSession.capturePaneEscapes();
+        expect(restarted).toContain("\x1b[36mauto\x1b[90m");
+        expect(restarted).not.toContain("\x1b[38;5;");
+        expect(restarted).not.toContain("\x1b[38;2;");
+      } finally {
+        await session?.kill();
+        await secondSession?.kill();
+        session = null;
+        secondSession = null;
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  serialTest(
+    "color palette persistence failure leaves preference and live chrome unchanged",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-color-palette-failure-"));
+      try {
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        const settingsPath = join(home, ".fx", "settings.json");
+        const externalSettings = join(root, "external-settings.json");
+        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+        mkdirSync(workspace);
+        writeFileSync(settingsPath, "{}\n", { mode: 0o600 });
+        writeFileSync(externalSettings, "{}\n", { mode: 0o600 });
+
+        session = await TmuxSession.create({
+          cwd: workspace,
+          env: {
+            ...NO_AUTH,
+            HOME: home,
+            NO_COLOR: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_SKIP_ONBOARDING: "1",
+          },
+        });
+        await session.waitForText("Run /help", TIMEOUT);
+        await session.sendText("/settings");
+        await session.waitForText("←→ Change", TIMEOUT);
+        await session.sendLiteral("color palette");
+        await session.waitForText("Color palette", TIMEOUT);
+
+        // The settings store rejects symlink primaries. Introduce one only
+        // after startup so the attempted change deterministically fails.
+        rmSync(settingsPath);
+        symlinkSync(externalSettings, settingsPath);
+        await session.sendKeys("Right");
+        await session.waitForText("not saved to user settings", TIMEOUT);
+
+        const pane = await session.capturePaneEscapes();
+        const settingsLine = pane
+          .split("\n")
+          .find((line) => line.includes("Color palette"));
+        expect(settingsLine).toContain("\x1b[1;38;5;255mfx");
+        expect(settingsLine).toContain("\x1b[38;5;");
+        expect(readFileSync(externalSettings, "utf8")).toBe("{}\n");
+      } finally {
+        await session?.kill();
+        session = null;
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  serialTest(
     "user preferences migrate globally and load in another project",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-config-persistence-"));

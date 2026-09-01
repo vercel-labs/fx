@@ -361,7 +361,7 @@ test "settings menu renders each setting on one row at wide and narrow widths" {
         .snapshot = test_snapshot,
     };
     const wide_rows = menuRowCount(projection, 100, 40);
-    try std.testing.expectEqual(@as(u16, 14), wide_rows);
+    try std.testing.expectEqual(@as(u16, 15), wide_rows);
 
     var header = try composeSettingsMenuRow(alloc, projection, 0, 100, wide_rows);
     defer header.deinit(alloc);
@@ -382,7 +382,7 @@ test "settings menu renders each setting on one row at wide and narrow widths" {
     try std.testing.expect(std.mem.find(u8, compact_item.items, "on") != null);
 
     const narrow_rows = menuRowCount(projection, 24, 40);
-    try std.testing.expectEqual(@as(u16, 14), narrow_rows);
+    try std.testing.expectEqual(@as(u16, 15), narrow_rows);
     var narrow_item = try composeSettingsMenuRow(alloc, projection, 2, 24, narrow_rows);
     defer narrow_item.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, narrow_item.items, "Status line") != null);
@@ -399,7 +399,7 @@ test "settings menu values follow the widest matching setting label" {
 
     var short = try composeSettingsMenuRow(alloc, projection, 3, 100, rows);
     defer short.deinit(alloc);
-    var long = try composeSettingsMenuRow(alloc, projection, 7, 100, rows);
+    var long = try composeSettingsMenuRow(alloc, projection, 8, 100, rows);
     defer long.deinit(alloc);
 
     const short_start = std.mem.find(u8, short.items, "off") orelse
@@ -468,7 +468,7 @@ test "settings menu renders category tabs and a flat full list through the VT" {
         .active = true,
         .snapshot = test_snapshot,
     };
-    const row_budget: u16 = 14;
+    const row_budget: u16 = 15;
     const rows = menuRowCount(projection, width, row_budget);
     try std.testing.expectEqual(row_budget, rows);
 
@@ -487,7 +487,7 @@ test "settings menu renders category tabs and a flat full list through the VT" {
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(alloc);
     try grid.rowTextTrimmed(1, &text);
-    try std.testing.expect(std.mem.find(u8, text.items, "Settings 12") != null);
+    try std.testing.expect(std.mem.find(u8, text.items, "Settings 13") != null);
     try std.testing.expect(std.mem.find(u8, text.items, "[All]") != null);
     try std.testing.expect(std.mem.find(u8, text.items, "Interface") != null);
     text.clearRetainingCapacity();
@@ -495,6 +495,6 @@ test "settings menu renders category tabs and a flat full list through the VT" {
     try std.testing.expect(std.mem.find(u8, text.items, "Status line context") != null);
     try std.testing.expect(std.mem.find(u8, text.items, "Interface") == null);
     text.clearRetainingCapacity();
-    try grid.rowTextTrimmed(14, &text);
+    try grid.rowTextTrimmed(15, &text);
     try std.testing.expect(std.mem.find(u8, text.items, "Prompt history") != null);
 }

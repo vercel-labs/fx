@@ -45,12 +45,8 @@ pub var diff_removed_style: []const u8 = "\x1b[38;5;252m";
 // monochrome diff: green for additions (#30A46C), red for deletions
 // (#E5484D). The line text stays neutral. Truecolor when the terminal
 // supports it, 256-color fallback otherwise.
-const diff_added_marker_truecolor = "\x1b[38;2;48;164;108m";
-const diff_removed_marker_truecolor = "\x1b[38;2;229;72;77m";
-const diff_added_marker_fallback = "\x1b[38;5;71m";
-const diff_removed_marker_fallback = "\x1b[38;5;167m";
-pub var diff_added_marker_style: []const u8 = diff_added_marker_fallback;
-pub var diff_removed_marker_style: []const u8 = diff_removed_marker_fallback;
+pub var diff_added_marker_style: []const u8 = "\x1b[38;5;71m";
+pub var diff_removed_marker_style: []const u8 = "\x1b[38;5;167m";
 pub var approval_button_active_style: []const u8 = "\x1b[48;5;255m\x1b[38;5;235m\x1b[1m";
 pub var approval_button_inactive_style: []const u8 = "\x1b[48;5;239m\x1b[38;5;255m";
 pub var selected_completion_style: []const u8 = "\x1b[1;38;5;255m";
@@ -63,6 +59,10 @@ var truecolor_enabled: bool = true;
 
 pub fn setTruecolorSupport(enabled: bool) void {
     truecolor_enabled = enabled;
+}
+
+pub fn truecolorEnabled() bool {
+    return truecolor_enabled;
 }
 
 /// Compatibility entry point for callers that predate configurable palettes.
@@ -79,8 +79,7 @@ pub fn initThemeForPalette(
     is_light = light;
     active_terminal_background = terminal_bg;
     active_color_palette = palette;
-    presentation_palette.setActive(light, palette);
-    const styles = presentation_palette.styles(light, palette);
+    const styles = presentation_palette.stylesForTerminal(light, palette, truecolor_enabled);
     divider_style = styles.divider;
     hint_style = styles.hint;
     statusline_style = styles.statusline;
@@ -100,18 +99,8 @@ pub fn initThemeForPalette(
     permission_auto_style = styles.permission_auto;
     assistant_presentation.setInlineCodePalette(light, palette);
 
-    // The diff marker green/red reads the same on light and dark, so it is set
-    // once here rather than per-theme.
-    if (palette == .terminal) {
-        diff_added_marker_style = styles.diff_added_marker;
-        diff_removed_marker_style = styles.diff_removed_marker;
-    } else if (truecolor_enabled) {
-        diff_added_marker_style = diff_added_marker_truecolor;
-        diff_removed_marker_style = diff_removed_marker_truecolor;
-    } else {
-        diff_added_marker_style = diff_added_marker_fallback;
-        diff_removed_marker_style = diff_removed_marker_fallback;
-    }
+    diff_added_marker_style = styles.diff_added_marker;
+    diff_removed_marker_style = styles.diff_removed_marker;
 
     user_message_card.setStyleForPalette(light, terminal_bg, palette);
 }
@@ -132,13 +121,14 @@ pub fn themeNeedsUpdateForPalette(
     return current.r != background.r or current.g != background.g or current.b != background.b;
 }
 
-pub fn setColorPalette(palette: ColorPalette) void {
-    active_color_palette = palette;
-    presentation_palette.setActive(is_light, palette);
-}
-
 pub fn currentColorPalette() ColorPalette {
     return active_color_palette;
+}
+
+/// Switch only fx-owned live presentation. Retained transcript bytes are not
+/// inspected or rewritten; the next redraw interprets those bytes unchanged.
+pub fn applyColorPalette(palette: ColorPalette) void {
+    initThemeForPalette(is_light, active_terminal_background, palette);
 }
 
 // Explicit theme overrides skip OSC 11, leaving `rgb` null for fallback shading.

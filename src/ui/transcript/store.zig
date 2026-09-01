@@ -26,12 +26,12 @@ const render_engine = @import("../render_engine.zig");
 const source_preparation = @import("source_preparation.zig");
 const user_message_card = @import("../assistant/user_message_card.zig");
 const input_visual_layout = @import("../input/visual_layout.zig");
+const presentation_palette = @import("../../core/shared/presentation_palette.zig");
 
 const Allocator = std.mem.Allocator;
 const Metrics = types.Metrics;
 const transcript_blocks = render_engine.transcript_blocks;
 const assistant_presentation = @import("../../core/agent/assistant_presentation.zig");
-const presentation_palette = @import("../../core/shared/presentation_palette.zig");
 
 const AssistantTurnSegments = transcript_blocks.AssistantTurnSegments;
 const RawEntryClass = transcript_blocks.RawEntryClass;
@@ -2016,6 +2016,7 @@ pub fn cloneEntryForSnapshot(alloc: Allocator, entry: TranscriptEntry) !Transcri
                 .created_at_ms = user.created_at_ms,
                 .turn = turn,
                 .skill_tokens = skill_tokens,
+                .presentation = user.presentation,
             } };
         },
         .assistant_turn => |assistant| blk: {
@@ -2037,6 +2038,7 @@ pub fn cloneEntryForSnapshot(alloc: Allocator, entry: TranscriptEntry) !Transcri
             .id = assistant.id,
             .created_at_ms = assistant.created_at_ms,
             .block = try assistant.block.clone(alloc),
+            .presentation = assistant.presentation,
         } },
         .assistant_thematic_rule => |assistant| .{ .assistant_thematic_rule = .{
             .id = assistant.id,
@@ -2456,6 +2458,46 @@ pub fn writeUserPromptCard(
     has_prior_turns: bool,
     skill_tokens: []const SkillTokenSpan,
 ) !u32 {
+    return writeUserPromptCardWithOptionalPresentation(
+        self,
+        alloc,
+        metrics,
+        user,
+        has_prior_turns,
+        skill_tokens,
+        null,
+    );
+}
+
+pub fn writeUserPromptCardWithPresentationStyles(
+    self: anytype,
+    alloc: Allocator,
+    metrics: *Metrics,
+    user: types.UserTurn,
+    has_prior_turns: bool,
+    skill_tokens: []const SkillTokenSpan,
+    presentation: presentation_palette.PresentationSnapshot,
+) !u32 {
+    return writeUserPromptCardWithOptionalPresentation(
+        self,
+        alloc,
+        metrics,
+        user,
+        has_prior_turns,
+        skill_tokens,
+        presentation,
+    );
+}
+
+fn writeUserPromptCardWithOptionalPresentation(
+    self: anytype,
+    alloc: Allocator,
+    metrics: *Metrics,
+    user: types.UserTurn,
+    has_prior_turns: bool,
+    skill_tokens: []const SkillTokenSpan,
+    presentation: ?presentation_palette.PresentationSnapshot,
+) !u32 {
     try self.assertCanMutateTranscript();
 
     var shadow = try cloneRecordedMutationState(self, alloc);
@@ -2470,13 +2512,23 @@ pub fn writeUserPromptCard(
         );
     }
 
-    const card = try user_message_card.buildUserPromptCardWithSkillTokensForTerminalPresentation(
-        alloc,
-        user.text,
-        user.images,
-        shadow.layout.cols,
-        skill_tokens,
-    );
+    const card = if (presentation) |snapshot|
+        try user_message_card.buildUserPromptCardWithPresentationStyles(
+            alloc,
+            user.text,
+            user.images,
+            shadow.layout.cols,
+            skill_tokens,
+            snapshot,
+        )
+    else
+        try user_message_card.buildUserPromptCardWithSkillTokensForTerminalPresentation(
+            alloc,
+            user.text,
+            user.images,
+            shadow.layout.cols,
+            skill_tokens,
+        );
     defer alloc.free(card);
     try shadow.writeTranscriptBytes(alloc, metrics, card, true);
 
@@ -2486,6 +2538,7 @@ pub fn writeUserPromptCard(
         alloc,
         user_copy,
         skill_tokens,
+        presentation,
     );
 
     try commitAuthoritativeRecordedMutationStateFromEntry(
@@ -2515,6 +2568,7 @@ pub fn appendUserTurnOwnedWithSkillTokens(
         alloc,
         turn,
         skill_tokens,
+        null,
     )).entry_id;
 }
 
@@ -2528,6 +2582,7 @@ fn appendUserTurnOwnedWithSkillTokensAndRetention(
     alloc: Allocator,
     turn: types.UserTurn,
     skill_tokens: []const SkillTokenSpan,
+    presentation: ?presentation_palette.PresentationSnapshot,
 ) !UserTurnAdmission {
     var owned_skill_tokens: []SkillTokenSpan = &.{};
     var handed_off = false;
@@ -2543,6 +2598,7 @@ fn appendUserTurnOwnedWithSkillTokensAndRetention(
         .created_at_ms = io_mod.milliTimestamp(),
         .turn = turn,
         .skill_tokens = owned_skill_tokens,
+        .presentation = if (presentation) |snapshot| snapshot.theme else null,
     } });
     handed_off = true;
     const retention_changed = try enforceStructuredRetentionAndReport(
@@ -2569,6 +2625,24 @@ pub fn appendAssistantTableOwned(
     self: anytype,
     alloc: Allocator,
     table: assistant_presentation.TablePayload,
+) !u32 {
+    return appendAssistantTableOwnedWithOptionalPresentation(self, alloc, table, null);
+}
+
+pub fn appendAssistantTableOwnedWithPresentationStyles(
+    self: anytype,
+    alloc: Allocator,
+    table: assistant_presentation.TablePayload,
+    presentation: presentation_palette.PresentationSnapshot,
+) !u32 {
+    return appendAssistantTableOwnedWithOptionalPresentation(self, alloc, table, presentation);
+}
+
+fn appendAssistantTableOwnedWithOptionalPresentation(
+    self: anytype,
+    alloc: Allocator,
+    table: assistant_presentation.TablePayload,
+    _: ?presentation_palette.PresentationSnapshot,
 ) !u32 {
     const entry_id = self.next_entry_id;
     try self.entries.append(alloc, .{ .assistant_table = .{
@@ -2601,11 +2675,30 @@ pub fn appendAssistantCodeBlockOwned(
     alloc: Allocator,
     block: assistant_presentation.CodeBlockPayload,
 ) !u32 {
+    return appendAssistantCodeBlockOwnedWithOptionalPresentation(self, alloc, block, null);
+}
+
+pub fn appendAssistantCodeBlockOwnedWithPresentationStyles(
+    self: anytype,
+    alloc: Allocator,
+    block: assistant_presentation.CodeBlockPayload,
+    presentation: presentation_palette.PresentationSnapshot,
+) !u32 {
+    return appendAssistantCodeBlockOwnedWithOptionalPresentation(self, alloc, block, presentation);
+}
+
+fn appendAssistantCodeBlockOwnedWithOptionalPresentation(
+    self: anytype,
+    alloc: Allocator,
+    block: assistant_presentation.CodeBlockPayload,
+    presentation: ?presentation_palette.PresentationSnapshot,
+) !u32 {
     const entry_id = self.next_entry_id;
     try self.entries.append(alloc, .{ .assistant_code_block = .{
         .id = entry_id,
         .created_at_ms = io_mod.milliTimestamp(),
         .block = block,
+        .presentation = if (presentation) |snapshot| snapshot.theme else null,
     } });
     errdefer {
         _ = self.entries.pop();
@@ -2627,6 +2720,22 @@ pub fn appendAssistantCodeBlockOwned(
 }
 
 pub fn appendAssistantThematicRule(self: anytype, alloc: Allocator) !u32 {
+    return appendAssistantThematicRuleWithOptionalPresentation(self, alloc, null);
+}
+
+pub fn appendAssistantThematicRuleWithPresentationStyles(
+    self: anytype,
+    alloc: Allocator,
+    presentation: presentation_palette.PresentationSnapshot,
+) !u32 {
+    return appendAssistantThematicRuleWithOptionalPresentation(self, alloc, presentation);
+}
+
+fn appendAssistantThematicRuleWithOptionalPresentation(
+    self: anytype,
+    alloc: Allocator,
+    _: ?presentation_palette.PresentationSnapshot,
+) !u32 {
     const entry_id = self.next_entry_id;
     try self.entries.append(alloc, .{ .assistant_thematic_rule = .{
         .id = entry_id,
@@ -2836,18 +2945,7 @@ pub fn retintEntriesForTheme(
     from_light: bool,
     to_light: bool,
 ) !void {
-    return retintEntriesForPalette(self, alloc, from_light, to_light, .fx, .fx);
-}
-
-pub fn retintEntriesForPalette(
-    self: anytype,
-    alloc: Allocator,
-    from_light: bool,
-    to_light: bool,
-    from_palette: presentation_palette.ColorPalette,
-    to_palette: presentation_palette.ColorPalette,
-) !void {
-    if (from_light == to_light and from_palette == to_palette) return;
+    if (from_light == to_light) return;
     try self.assertCanMutateTranscript();
 
     var shadow = try cloneMutationState(self, alloc);
@@ -2857,27 +2955,13 @@ pub fn retintEntriesForPalette(
         switch (entry.*) {
             .raw_bytes => |*raw| {
                 if (!themeOwnsRawEntry(raw.class)) continue;
-                if (try retintThemeBytes(
-                    alloc,
-                    raw.bytes,
-                    from_light,
-                    to_light,
-                    from_palette,
-                    to_palette,
-                )) |replacement| {
+                if (try retintThemeBytes(alloc, raw.bytes, from_light, to_light)) |replacement| {
                     alloc.free(raw.bytes);
                     raw.bytes = replacement;
                 }
             },
             .assistant_turn => |*assistant| {
-                if (try retintThemeBytes(
-                    alloc,
-                    assistant.segments.text.items,
-                    from_light,
-                    to_light,
-                    from_palette,
-                    to_palette,
-                )) |replacement| {
+                if (try retintThemeBytes(alloc, assistant.segments.text.items, from_light, to_light)) |replacement| {
                     assistant.segments.text.deinit(alloc);
                     assistant.segments.text = .fromOwnedSlice(replacement);
                 }
@@ -2903,6 +2987,29 @@ pub fn retintEntriesForPalette(
     );
 }
 
+const ThemeToken = struct {
+    from: []const u8,
+    to: []const u8,
+};
+
+const dark_to_light_theme_tokens = [_]ThemeToken{
+    .{ .from = "\x1b[1;38;5;255m", .to = "\x1b[1;38;5;235m" },
+    .{ .from = "\x1b[38;5;255m", .to = "\x1b[38;5;235m" },
+    .{ .from = "\x1b[1;38;5;252m", .to = "\x1b[1;38;5;238m" },
+    .{ .from = "\x1b[38;5;252m", .to = "\x1b[38;5;238m" },
+    .{ .from = "\x1b[38;5;250m", .to = "\x1b[38;5;241m" },
+    .{ .from = "\x1b[38;5;245m", .to = "\x1b[38;5;247m" },
+};
+
+const light_to_dark_theme_tokens = [_]ThemeToken{
+    .{ .from = "\x1b[1;38;5;235m", .to = "\x1b[1;38;5;255m" },
+    .{ .from = "\x1b[38;5;235m", .to = "\x1b[38;5;255m" },
+    .{ .from = "\x1b[1;38;5;238m", .to = "\x1b[1;38;5;252m" },
+    .{ .from = "\x1b[38;5;238m", .to = "\x1b[38;5;252m" },
+    .{ .from = "\x1b[38;5;241m", .to = "\x1b[38;5;250m" },
+    .{ .from = "\x1b[38;5;247m", .to = "\x1b[38;5;245m" },
+};
+
 fn themeOwnsRawEntry(class: RawEntryClass) bool {
     return switch (class) {
         .welcome,
@@ -2921,60 +3028,9 @@ fn retintThemeBytes(
     bytes: []const u8,
     from_light: bool,
     to_light: bool,
-    from_palette: presentation_palette.ColorPalette,
-    to_palette: presentation_palette.ColorPalette,
 ) !?[]u8 {
-    if (from_light == to_light and from_palette == to_palette) return null;
-
-    const from_styles = presentation_palette.styles(from_light, from_palette);
-    const to_styles = presentation_palette.styles(to_light, to_palette);
-    const ThemeToken = struct { from: []const u8, to: []const u8 };
-    var token_storage: [16]ThemeToken = undefined;
-    var token_count: usize = 0;
-
-    const appendToken = struct {
-        fn add(storage: []ThemeToken, count: *usize, from: []const u8, to: []const u8) void {
-            if (std.mem.eql(u8, from, to)) return;
-            if (count.* >= storage.len) return;
-            storage[count.*] = .{ .from = from, .to = to };
-            count.* += 1;
-        }
-    }.add;
-
-    if (from_palette == .fx and to_palette == .fx) {
-        // Keep the historical light/dark retint map byte-for-byte identical.
-        appendToken(token_storage[0..], &token_count, from_styles.tag, to_styles.tag);
-        appendToken(token_storage[0..], &token_count, from_styles.user_marker, to_styles.user_marker);
-        appendToken(token_storage[0..], &token_count, from_styles.system_notice_label, to_styles.system_notice_label);
-        appendToken(token_storage[0..], &token_count, from_styles.user_accent, to_styles.user_accent);
-        appendToken(token_storage[0..], &token_count, from_styles.system_notice_text, to_styles.system_notice_text);
-        appendToken(token_storage[0..], &token_count, from_styles.dim, to_styles.dim);
-    } else if (from_palette == .fx and to_palette == .terminal) {
-        // .fx intentionally shares a neutral foreground for several semantic
-        // roles. Retained bytes cannot recover that lost distinction, so move
-        // those roles to the terminal default foreground while preserving
-        // marker, label, and muted roles that remain unambiguous.
-        appendToken(token_storage[0..], &token_count, from_styles.tag, to_styles.tag);
-        appendToken(token_storage[0..], &token_count, from_styles.user_marker, to_styles.user_marker);
-        appendToken(token_storage[0..], &token_count, from_styles.system_notice_label, to_styles.system_notice_label);
-        appendToken(token_storage[0..], &token_count, from_styles.user_accent, to_styles.system_notice_text);
-        appendToken(token_storage[0..], &token_count, from_styles.system_notice_text, to_styles.system_notice_text);
-        appendToken(token_storage[0..], &token_count, from_styles.dim, to_styles.dim);
-    } else if (from_palette == .terminal and to_palette == .fx) {
-        appendToken(token_storage[0..], &token_count, from_styles.user_marker, to_styles.user_marker);
-        appendToken(token_storage[0..], &token_count, from_styles.user_accent, to_styles.user_accent);
-        appendToken(token_storage[0..], &token_count, from_styles.code_keyword, to_styles.code_keyword);
-        appendToken(token_storage[0..], &token_count, from_styles.green, to_styles.green);
-        appendToken(token_storage[0..], &token_count, from_styles.red, to_styles.red);
-        appendToken(token_storage[0..], &token_count, from_styles.warning, to_styles.warning);
-        appendToken(token_storage[0..], &token_count, from_styles.system_notice_text, to_styles.system_notice_text);
-        appendToken(token_storage[0..], &token_count, from_styles.dim, to_styles.dim);
-    } else {
-        // Both terminal palettes are independent of light/dark detection.
-        return null;
-    }
-
-    const tokens = token_storage[0..token_count];
+    if (from_light == to_light) return null;
+    const tokens = if (to_light) dark_to_light_theme_tokens[0..] else light_to_dark_theme_tokens[0..];
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
 
@@ -3344,23 +3400,4 @@ test "refreshFoldedCommandSummaryIndices uses final preparation indices" {
     for (runtime.folded_command_blocks.items, expected.folded_summary_indices) |block, index| {
         try std.testing.expectEqual(index, block.summary_transcript_index);
     }
-}
-
-test "retintThemeBytes maps fx-owned presentation into terminal defaults" {
-    const source = "\x1b[38;5;252mowned\x1b[0m \x1b[38;5;245mmuted\x1b[0m";
-    const converted = try retintThemeBytes(
-        std.testing.allocator,
-        source,
-        false,
-        false,
-        .fx,
-        .terminal,
-    );
-    defer if (converted) |bytes| std.testing.allocator.free(bytes);
-
-    try std.testing.expect(converted != null);
-    try std.testing.expectEqualStrings(
-        "\x1b[39mowned\x1b[0m \x1b[90mmuted\x1b[0m",
-        converted.?,
-    );
 }

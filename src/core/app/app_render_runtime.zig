@@ -56,6 +56,7 @@ const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 const ui_render = @import("../../ui/render.zig");
 const assistant_pacer = @import("../../ui/assistant/pacer.zig");
 const user_message_card = @import("../../ui/assistant/user_message_card.zig");
+const presentation_palette = @import("../shared/presentation_palette.zig");
 
 fn set_transcript_assistant_tail_writable(
     runtime: *transcript_runtime.TranscriptRuntime,
@@ -436,6 +437,20 @@ noinline fn approvalScreenNeedsClear(
 
 pub fn Runtime(comptime App: type) type {
     return struct {
+        fn syncNextTurnPresentation(app: *App, light: bool, palette: ui_render.ColorPalette) void {
+            if (comptime @hasDecl(@TypeOf(app.worker), "setPresentationStyles")) {
+                const truecolor = if (comptime @hasField(App, "presentation_truecolor"))
+                    app.presentation_truecolor
+                else
+                    false;
+                app.worker.setPresentationStyles(presentation_palette.snapshot(
+                    light,
+                    palette,
+                    truecolor,
+                ));
+            }
+        }
+
         fn appendDeferredHistoryForVisualEpoch(
             ctx: *anyopaque,
             finished: *const types.FinishedPrompt,
@@ -498,37 +513,43 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn applyThemeUpdate(app: *App, light: bool, rgb: ?ui_render.TerminalRgb) !void {
-            return applyThemeUpdateForPalette(app, light, rgb, ui_render.currentColorPalette());
-        }
-
-        pub fn applyThemeUpdateForPalette(
-            app: *App,
-            light: bool,
-            rgb: ?ui_render.TerminalRgb,
-            palette: ui_render.ColorPalette,
-        ) !void {
+            const palette = ui_render.currentColorPalette();
             if (!ui_render.themeNeedsUpdateForPalette(light, rgb, palette)) return;
 
             const prior_light = ui_render.is_light;
-            const prior_palette = ui_render.currentColorPalette();
-            app.shell.retintEntriesForPalette(
-                app.alloc,
-                prior_light,
-                light,
-                prior_palette,
-                palette,
-            ) catch |err| {
-                debug_trace.logf("theme", "theme_transcript_retint_failed err={s}", .{@errorName(err)});
-                return;
-            };
-            app.pacer.rethemeInlineCodeForPalette(app.alloc, light, palette) catch |err| {
-                debug_trace.logf("theme", "theme_pacer_retint_failed err={s}", .{@errorName(err)});
-                return;
-            };
+            if (palette == .fx) {
+                app.shell.retintEntriesForTheme(app.alloc, prior_light, light) catch |err| {
+                    debug_trace.logf("theme", "theme_transcript_retint_failed err={s}", .{@errorName(err)});
+                    return err;
+                };
+                app.pacer.rethemeInlineCode(light);
+            }
             ui_render.initThemeForPalette(light, rgb, palette);
+            if (comptime @hasField(App, "presentation_light")) {
+                app.presentation_light.store(light, .release);
+            }
+            syncNextTurnPresentation(app, light, palette);
             app.shell.setCommandOutputRenderPolicy(shellStyles());
             try app.shell.requestTerminalReset(&app.metrics);
             app.shell.render_requests.request(.transcript);
+        }
+
+        /// Activate fx-owned live chrome after the preference commit succeeds.
+        /// Existing transcript bytes and arbitrary command ANSI are retained
+        /// verbatim; new runtime snapshots observe the newly published value.
+        pub fn applyColorPaletteUpdate(app: *App, palette: ui_render.ColorPalette) !void {
+            if (ui_render.currentColorPalette() == palette) return;
+
+            ui_render.applyColorPalette(palette);
+            if (comptime @hasField(App, "active_color_palette")) {
+                app.active_color_palette.store(@intFromEnum(palette), .release);
+            }
+            syncNextTurnPresentation(app, ui_render.is_light, palette);
+            app.shell.setCommandOutputRenderPolicy(shellStyles());
+            try app.shell.requestTerminalReset(&app.metrics);
+            app.shell.render_requests.request(.first_frame);
+            app.shell.render_requests.request(.footer);
+            app.shell.render_requests.request(.modal);
         }
 
         pub fn shellStyles() transcript_runtime.Styles {

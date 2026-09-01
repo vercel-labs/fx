@@ -35,6 +35,7 @@ const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 const result_store = @import("../../core/session/result_store.zig");
 const session_child_store = @import("../../core/session/session_child_store.zig");
+const presentation_palette = @import("../../core/shared/presentation_palette.zig");
 
 const Allocator = std.mem.Allocator;
 const Layout = types.Layout;
@@ -1548,6 +1549,7 @@ test "compact transcript cache survives navigation and invalidates on content ch
         runtime.full_transcript_content_revision,
         runtime.layout.cols,
         runtime.has_committed_frame,
+        runtime.presentation_style_generation,
     ).?;
     const compact_bytes = cached_compact.bytes.ptr;
     try std.testing.expect(cached_compact.hard_line_starts.len > 0);
@@ -1570,12 +1572,14 @@ test "compact transcript cache survives navigation and invalidates on content ch
         runtime.full_transcript_content_revision,
         runtime.layout.cols,
         runtime.has_committed_frame,
+        runtime.presentation_style_generation,
     ).?.bytes.ptr);
     runtime.has_committed_frame = true;
     try std.testing.expectEqual(@as(?*TranscriptPreparationSource, null), runtime.compact_transcript_source_cache.find(
         runtime.full_transcript_content_revision,
         runtime.layout.cols,
         runtime.has_committed_frame,
+        runtime.presentation_style_generation,
     ));
     var committed_compact = try runtime.cachedTranscriptSource(alloc);
     committed_compact.deinit(alloc);
@@ -1588,6 +1592,7 @@ test "compact transcript cache survives navigation and invalidates on content ch
         runtime.full_transcript_content_revision,
         runtime.layout.cols,
         runtime.has_committed_frame,
+        runtime.presentation_style_generation,
     ).?.bytes.ptr);
 }
 
@@ -1664,6 +1669,7 @@ test "clearing a transcript releases compact source and installed page" {
         content_revision,
         runtime.layout.cols,
         runtime.has_committed_frame,
+        runtime.presentation_style_generation,
     ) != null);
     try std.testing.expect(runtime.full_transcript_installed_page != null);
 
@@ -1673,6 +1679,7 @@ test "clearing a transcript releases compact source and installed page" {
         content_revision,
         runtime.layout.cols,
         runtime.has_committed_frame,
+        runtime.presentation_style_generation,
     ) == null);
     try std.testing.expect(runtime.full_transcript_installed_page == null);
 }
@@ -4057,6 +4064,7 @@ const CachedCompactTranscriptSource = struct {
     content_revision: u64,
     cols: u16,
     has_committed_frame: bool,
+    presentation_generation: u64,
 };
 
 const CompactTranscriptSourceCache = struct {
@@ -4077,12 +4085,14 @@ const CompactTranscriptSourceCache = struct {
         content_revision: u64,
         cols: u16,
         has_committed_frame: bool,
+        presentation_generation: u64,
     ) ?*TranscriptPreparationSource {
         for (&self.entries) |*entry| {
             if (entry.*) |*cached| {
                 if (cached.content_revision == content_revision and
                     cached.cols == cols and
-                    cached.has_committed_frame == has_committed_frame)
+                    cached.has_committed_frame == has_committed_frame and
+                    cached.presentation_generation == presentation_generation)
                 {
                     return &cached.source;
                 }
@@ -4195,6 +4205,11 @@ pub const TranscriptRuntime = struct {
     full_transcript_restore_open_pending: bool = false,
     full_transcript_prepared_page_visible: bool = false,
     full_transcript_content_revision: u64 = 0,
+    /// Monotonically changes whenever the style-dependent command-output
+    /// policy changes.  It is deliberately separate from content revision:
+    /// palette switches invalidate only derived projections, never retained
+    /// transcript bytes or semantic/raw entries.
+    presentation_style_generation: u64 = 0,
     compact_transcript_source_cache: CompactTranscriptSourceCache = .{},
     /// When enabled, compact transcript tool groups render only their summary
     /// header while the full transcript retains every individual tool call.
@@ -6031,6 +6046,26 @@ pub const TranscriptRuntime = struct {
         );
     }
 
+    pub fn writeUserPromptCardWithPresentationStyles(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+        metrics: *Metrics,
+        user: types.UserTurn,
+        has_prior_turns: bool,
+        skill_tokens: []const input_visual_layout.SkillTokenSpan,
+        presentation: presentation_palette.PresentationSnapshot,
+    ) !u32 {
+        return transcript_store.writeUserPromptCardWithPresentationStyles(
+            self,
+            alloc,
+            metrics,
+            user,
+            has_prior_turns,
+            skill_tokens,
+            presentation,
+        );
+    }
+
     /// Consumes `turn` regardless of outcome. All owned slices must use `alloc`;
     /// the entry owns them on success and this method frees them on failure.
     /// Returns the stamped entry id.
@@ -6065,6 +6100,20 @@ pub const TranscriptRuntime = struct {
         return transcript_store.appendAssistantTableOwned(self, alloc, table);
     }
 
+    pub fn appendAssistantTableOwnedWithPresentationStyles(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+        table: @import("../../core/agent/assistant_presentation.zig").TablePayload,
+        presentation: presentation_palette.PresentationSnapshot,
+    ) !u32 {
+        return transcript_store.appendAssistantTableOwnedWithPresentationStyles(
+            self,
+            alloc,
+            table,
+            presentation,
+        );
+    }
+
     /// Takes ownership of `block` only when it returns successfully.
     pub fn appendAssistantCodeBlockOwned(
         self: *TranscriptRuntime,
@@ -6074,8 +6123,34 @@ pub const TranscriptRuntime = struct {
         return transcript_store.appendAssistantCodeBlockOwned(self, alloc, block);
     }
 
+    pub fn appendAssistantCodeBlockOwnedWithPresentationStyles(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+        block: @import("../../core/agent/assistant_presentation.zig").CodeBlockPayload,
+        presentation: presentation_palette.PresentationSnapshot,
+    ) !u32 {
+        return transcript_store.appendAssistantCodeBlockOwnedWithPresentationStyles(
+            self,
+            alloc,
+            block,
+            presentation,
+        );
+    }
+
     pub fn appendAssistantThematicRule(self: *TranscriptRuntime, alloc: Allocator) !u32 {
         return transcript_store.appendAssistantThematicRule(self, alloc);
+    }
+
+    pub fn appendAssistantThematicRuleWithPresentationStyles(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+        presentation: presentation_palette.PresentationSnapshot,
+    ) !u32 {
+        return transcript_store.appendAssistantThematicRuleWithPresentationStyles(
+            self,
+            alloc,
+            presentation,
+        );
     }
 
     /// Walk `entries` and return a pointer to the segments of the
@@ -6127,24 +6202,6 @@ pub const TranscriptRuntime = struct {
         to_light: bool,
     ) !void {
         return transcript_store.retintEntriesForTheme(self, alloc, from_light, to_light);
-    }
-
-    pub fn retintEntriesForPalette(
-        self: *TranscriptRuntime,
-        alloc: Allocator,
-        from_light: bool,
-        to_light: bool,
-        from_palette: ui_render.ColorPalette,
-        to_palette: ui_render.ColorPalette,
-    ) !void {
-        return transcript_store.retintEntriesForPalette(
-            self,
-            alloc,
-            from_light,
-            to_light,
-            from_palette,
-            to_palette,
-        );
     }
 
     pub fn setTranscriptPresentationDepth(
@@ -9271,6 +9328,13 @@ pub const TranscriptRuntime = struct {
         return command_output_runtime.setCommandOutputRenderPolicy(self, styles);
     }
 
+    /// Called by command_output_runtime only when the effective policy bytes
+    /// actually change.  Keeping this hook on the runtime lets all producer
+    /// paths share one generation without forcing a content mutation.
+    pub fn noteCommandOutputRenderPolicyChanged(self: *TranscriptRuntime) void {
+        self.presentation_style_generation +%= 1;
+    }
+
     pub fn retainedTranscriptStyles(self: *const TranscriptRuntime) Styles {
         return self.command_output_render.styles;
     }
@@ -9477,6 +9541,7 @@ pub const TranscriptRuntime = struct {
             self.full_transcript_content_revision,
             self.layout.cols,
             self.has_committed_frame,
+            self.presentation_style_generation,
         )) |source| {
             source.preview.cursor_row = self.cursor_row;
             source.preview.cursor_col = self.cursor_col;
@@ -9500,6 +9565,7 @@ pub const TranscriptRuntime = struct {
             .content_revision = self.full_transcript_content_revision,
             .cols = self.layout.cols,
             .has_committed_frame = self.has_committed_frame,
+            .presentation_generation = self.presentation_style_generation,
         });
         return cached.clone(alloc);
     }
@@ -9835,6 +9901,7 @@ pub const TranscriptRuntime = struct {
             .content_revision = self.full_transcript_content_revision,
             .cols = self.layout.cols,
             .anchor = self.full_transcript_page_anchor,
+            .presentation_generation = self.presentation_style_generation,
         };
     }
 

@@ -14,13 +14,13 @@ pub const underline_open = "\x1b[4m";
 pub const underline_close = "\x1b[24m";
 const task_completed_dark_open = "\x1b[38;5;252m";
 const task_completed_light_open = "\x1b[38;5;238m";
-pub var task_completed_open: []const u8 = task_completed_dark_open;
+pub threadlocal var task_completed_open: []const u8 = task_completed_dark_open;
 pub const task_completed_close = "\x1b[39m";
 pub const strike_open = "\x1b[9m";
 pub const strike_close = "\x1b[29m";
 const inline_code_dark_open = "\x1b[38;5;245m";
 const inline_code_light_open = "\x1b[38;5;247m";
-pub var inline_code_open: []const u8 = inline_code_dark_open;
+pub threadlocal var inline_code_open: []const u8 = inline_code_dark_open;
 pub const inline_code_close = "\x1b[39m";
 
 pub fn setInlineCodeTheme(light: bool) void {
@@ -33,8 +33,20 @@ pub fn setInlineCodeTheme(light: bool) void {
 /// configuration yet.
 pub fn setInlineCodePalette(light: bool, palette: ColorPalette) void {
     const styles = presentation_palette.styles(light, palette);
-    inline_code_open = styles.inline_code;
-    task_completed_open = styles.task_completed;
+    setPresentationStyles(styles.inline_code, styles.task_completed);
+}
+
+pub fn setPresentationStyles(inline_code: []const u8, task_completed: []const u8) void {
+    inline_code_open = inline_code;
+    task_completed_open = task_completed;
+}
+
+pub fn currentInlineCodeStyle() []const u8 {
+    return inline_code_open;
+}
+
+pub fn currentTaskCompletedStyle() []const u8 {
+    return task_completed_open;
 }
 
 pub fn inlineCodeStyle(light: bool, palette: ColorPalette) []const u8 {

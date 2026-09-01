@@ -26,6 +26,18 @@ var accent_style: []const u8 = accent_dark;
 
 var marker_style: []const u8 = dark_marker_style;
 
+const CardStyles = struct {
+    marker: []const u8,
+    accent: []const u8,
+};
+
+fn currentCardStyles() CardStyles {
+    return .{
+        .marker = marker_style,
+        .accent = accent_style,
+    };
+}
+
 pub fn setStyle(light: bool, terminal_bg: ?Rgb) void {
     setStyleForPalette(light, terminal_bg, .fx);
 }
@@ -38,6 +50,55 @@ pub fn setStyleForPalette(light: bool, _: ?Rgb, palette: presentation_palette.Co
 
 pub fn promptMarkerStyle() []const u8 {
     return marker_style;
+}
+
+/// Render a prompt card from an immutable worker-captured snapshot without
+/// consulting or mutating the live renderer palette.
+pub fn buildUserPromptCardWithPresentationStyles(
+    alloc: std.mem.Allocator,
+    text: []const u8,
+    images: []const types.ImageAttachment,
+    cols: u16,
+    skill_tokens: []const visual_layout.SkillTokenSpan,
+    snapshot: presentation_palette.PresentationSnapshot,
+) ![]u8 {
+    return buildUserPromptCardWithPresentationStylesInterruptible(
+        alloc,
+        text,
+        images,
+        cols,
+        skill_tokens,
+        snapshot,
+        null,
+    ) catch |err| switch (err) {
+        error.InputPending => unreachable,
+        else => |other| return other,
+    };
+}
+
+pub fn buildUserPromptCardWithPresentationStylesInterruptible(
+    alloc: std.mem.Allocator,
+    text: []const u8,
+    images: []const types.ImageAttachment,
+    cols: u16,
+    skill_tokens: []const visual_layout.SkillTokenSpan,
+    snapshot: presentation_palette.PresentationSnapshot,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) ![]u8 {
+    return buildUserPromptCardWithSkillTokensAndLinksInterruptible(
+        alloc,
+        text,
+        images,
+        cols,
+        skill_tokens,
+        true,
+        checkpoint,
+        null,
+        .{
+            .marker = snapshot.styles.user_marker,
+            .accent = snapshot.styles.user_accent,
+        },
+    );
 }
 
 fn emitRow(writer: *std.Io.Writer, content: []const u8) !void {
@@ -103,6 +164,7 @@ pub fn buildUserPromptCardWithSkillTokens(
         cols,
         skill_tokens,
         false,
+        currentCardStyles(),
     );
 }
 
@@ -143,6 +205,7 @@ pub fn buildUserPromptCardWithSkillTokensForTerminalPresentationInterruptible(
         true,
         checkpoint,
         null,
+        currentCardStyles(),
     );
 }
 
@@ -166,6 +229,7 @@ pub fn buildUserPromptCardTailForTerminalPresentationInterruptible(
         true,
         checkpoint,
         max_rows,
+        currentCardStyles(),
     );
 }
 
@@ -176,6 +240,7 @@ fn buildUserPromptCardWithSkillTokensAndLinks(
     cols: u16,
     skill_tokens: []const visual_layout.SkillTokenSpan,
     linked_images: bool,
+    styles: CardStyles,
 ) ![]u8 {
     return buildUserPromptCardWithSkillTokensAndLinksInterruptible(
         alloc,
@@ -186,6 +251,7 @@ fn buildUserPromptCardWithSkillTokensAndLinks(
         linked_images,
         null,
         null,
+        styles,
     ) catch |err| switch (err) {
         error.InputPending => unreachable,
         else => |other| return other,
@@ -201,6 +267,7 @@ fn buildUserPromptCardWithSkillTokensAndLinksInterruptible(
     linked_images: bool,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
     max_rows: ?usize,
+    styles: CardStyles,
 ) ![]u8 {
     const window: usize = if (cols > 2) @as(usize, cols) - 2 else 0;
 
@@ -216,7 +283,7 @@ fn buildUserPromptCardWithSkillTokensAndLinksInterruptible(
     }
 
     const token_text = if (skill_tokens.len > 0)
-        try renderSkillTokensForCard(alloc, text, skill_tokens)
+        try renderSkillTokensForCard(alloc, text, skill_tokens, styles.accent)
     else
         text;
     defer if (skill_tokens.len > 0) alloc.free(token_text);
@@ -262,6 +329,7 @@ fn buildUserPromptCardWithSkillTokensAndLinksInterruptible(
         window,
         checkpoint,
         max_rows,
+        styles.marker,
     );
 
     for (rows.items) |content| {
@@ -275,6 +343,7 @@ fn renderSkillTokensForCard(
     alloc: std.mem.Allocator,
     text: []const u8,
     skill_tokens: []const visual_layout.SkillTokenSpan,
+    skill_accent_style: []const u8,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
@@ -285,7 +354,7 @@ fn renderSkillTokensForCard(
         if (token.name.len == 0) continue;
 
         try out.writer.writeAll(text[pos..token.raw_start]);
-        try out.writer.writeAll(accent_style);
+        try out.writer.writeAll(skill_accent_style);
         try out.writer.writeAll(token.name);
         try out.writer.writeAll(restore_prompt_text_style);
         pos = token.raw_end;
@@ -320,8 +389,8 @@ fn appendVisibleRow(
     try appendRow(alloc, rows, content);
 }
 
-fn writeRowPrefix(writer: *std.Io.Writer) !void {
-    try writer.writeAll(marker_style);
+fn writeRowPrefix(writer: *std.Io.Writer, prompt_marker_style: []const u8) !void {
+    try writer.writeAll(prompt_marker_style);
     try writer.writeAll(user_turn_rail);
     try writer.writeAll(reset_style);
     try writer.writeByte(' ');
@@ -358,6 +427,7 @@ fn collectLogicalLinesWithFirstPrefix(
     window: usize,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
     max_rows: ?usize,
+    prompt_marker_style: []const u8,
 ) !void {
     var it = std.mem.splitScalar(u8, text, '\n');
     while (it.next()) |line| {
@@ -366,7 +436,7 @@ fn collectLogicalLinesWithFirstPrefix(
         var remaining = line;
         if (remaining.len == 0) {
             row_buf.clearRetainingCapacity();
-            try writeRowPrefix(&row_buf.writer);
+            try writeRowPrefix(&row_buf.writer, prompt_marker_style);
             try appendVisibleRow(alloc, rows, row_buf.written(), max_rows);
             continue;
         }
@@ -375,7 +445,7 @@ fn collectLogicalLinesWithFirstPrefix(
             try build_checkpoint.consume(checkpoint, @max(c.keep_bytes, c.skip_bytes));
             const fragment = remaining[0..c.keep_bytes];
             row_buf.clearRetainingCapacity();
-            try writeRowPrefix(&row_buf.writer);
+            try writeRowPrefix(&row_buf.writer, prompt_marker_style);
             if (active_hyperlink) |opener| try row_buf.writer.writeAll(opener);
             try row_buf.writer.writeAll(fragment);
             active_hyperlink = hyperlinkStateAfter(fragment, active_hyperlink);
@@ -492,6 +562,28 @@ test "terminal presentation uses ANSI-16 prompt accents" {
 
     try std.testing.expect(std.mem.startsWith(u8, card, "\x1b[96m┃\x1b[0m \x1b[1mhello"));
     try std.testing.expect(std.mem.indexOf(u8, card, "38;5;") == null);
+}
+
+test "captured prompt presentation is independent from the live palette" {
+    const alloc = std.testing.allocator;
+    defer setStyle(false, null);
+
+    setStyleForPalette(false, null, .fx);
+    const captured = try buildUserPromptCardWithPresentationStyles(
+        alloc,
+        "captured",
+        &.{},
+        80,
+        &.{},
+        presentation_palette.snapshot(false, .terminal, false),
+    );
+    defer alloc.free(captured);
+    try std.testing.expect(std.mem.startsWith(u8, captured, "\x1b[96m┃"));
+    try std.testing.expect(std.mem.indexOf(u8, captured, "38;5;") == null);
+
+    const live = try buildUserPromptCard(alloc, "live", &.{}, 80);
+    defer alloc.free(live);
+    try std.testing.expect(std.mem.startsWith(u8, live, "\x1b[38;5;255m┃"));
 }
 
 test "current presentation restores bold prompt text after skill tokens" {

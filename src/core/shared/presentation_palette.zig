@@ -38,6 +38,20 @@ pub const Styles = struct {
     code_comment: []const u8,
 };
 
+pub const PresentationTheme = enum {
+    dark,
+    light,
+    terminal,
+};
+
+/// Immutable presentation inputs captured at a worker/event boundary.  The
+/// full role set is intentional: UI-side semantic event handlers must not
+/// consult mutable renderer globals after a palette switch.
+pub const PresentationSnapshot = struct {
+    styles: Styles,
+    theme: PresentationTheme,
+};
+
 // .fx is the existing product palette. Keep these bytes in one place, but do
 // not normalize or otherwise rewrite them: retained transcript fixtures and
 // downstream integrations depend on their exact historical representation.
@@ -126,8 +140,7 @@ const terminal: Styles = .{
     .permission_auto = "\x1b[36m",
     .diff_added_marker = "\x1b[32m",
     .diff_removed_marker = "\x1b[31m",
-    // Inline code and comments share the muted ANSI slot so the same raw
-    // token can be retinted safely in retained assistant text.
+    // Inline code and comments share the terminal's muted ANSI slot.
     .inline_code = "\x1b[90m",
     .task_completed = "\x1b[32m",
     .user_marker = "\x1b[96m",
@@ -138,9 +151,6 @@ const terminal: Styles = .{
     .code_comment = "\x1b[90m",
 };
 
-var active_light: bool = false;
-var active_palette: ColorPalette = .fx;
-
 pub fn styles(light: bool, palette: ColorPalette) Styles {
     return switch (palette) {
         .fx => if (light) fx_light else fx_dark,
@@ -148,21 +158,45 @@ pub fn styles(light: bool, palette: ColorPalette) Styles {
     };
 }
 
-pub fn setActive(light: bool, palette: ColorPalette) void {
-    active_light = light;
-    active_palette = palette;
+const diff_added_marker_truecolor = "\x1b[38;2;48;164;108m";
+const diff_removed_marker_truecolor = "\x1b[38;2;229;72;77m";
+
+/// Resolve presentation styles for a concrete terminal capability snapshot.
+/// Terminal palettes always use ANSI slots; the built-in palette preserves
+/// its historical truecolor diff markers where supported.
+pub fn stylesForTerminal(light: bool, palette: ColorPalette, truecolor: bool) Styles {
+    var resolved = styles(light, palette);
+    if (palette == .fx and truecolor) {
+        resolved.diff_added_marker = diff_added_marker_truecolor;
+        resolved.diff_removed_marker = diff_removed_marker_truecolor;
+    }
+    return resolved;
 }
 
-pub fn currentStyles() Styles {
-    return styles(active_light, active_palette);
+pub fn snapshot(
+    light: bool,
+    palette: ColorPalette,
+    truecolor: bool,
+) PresentationSnapshot {
+    return .{
+        .styles = stylesForTerminal(light, palette, truecolor),
+        .theme = switch (palette) {
+            .terminal => .terminal,
+            .fx => if (light) .light else .dark,
+        },
+    };
 }
 
-pub fn currentPalette() ColorPalette {
-    return active_palette;
-}
-
-pub fn isFx(palette: ColorPalette) bool {
-    return palette == .fx;
+/// Reconstruct the canonical static snapshot for a retained presentation
+/// theme. Retained prompt and code entries need only the theme identity: the
+/// truecolor capability changes diff markers, which those entry kinds do not
+/// use.
+pub fn snapshotForTheme(theme: PresentationTheme) PresentationSnapshot {
+    return switch (theme) {
+        .dark => snapshot(false, .fx, false),
+        .light => snapshot(true, .fx, false),
+        .terminal => snapshot(false, .terminal, false),
+    };
 }
 
 test "terminal presentation palette uses defaults and ANSI-16 slots" {
@@ -171,4 +205,31 @@ test "terminal presentation palette uses defaults and ANSI-16 slots" {
     try std.testing.expect(std.mem.startsWith(u8, palette.approval_active, "\x1b[39m\x1b[49m"));
     try std.testing.expect(std.mem.indexOf(u8, palette.green, "38;5;") == null);
     try std.testing.expect(std.mem.indexOf(u8, palette.green, "38;2;") == null);
+}
+
+test "every terminal presentation role stays portable and ignores truecolor" {
+    inline for ([_]bool{ false, true }) |light| {
+        const fallback = stylesForTerminal(light, .terminal, false);
+        const capable = stylesForTerminal(light, .terminal, true);
+        inline for (@typeInfo(Styles).@"struct".fields) |field| {
+            const fallback_value = @field(fallback, field.name);
+            const capable_value = @field(capable, field.name);
+            try std.testing.expectEqualStrings(fallback_value, capable_value);
+            try std.testing.expect(std.mem.indexOf(u8, fallback_value, "38;5;") == null);
+            try std.testing.expect(std.mem.indexOf(u8, fallback_value, "38;2;") == null);
+            try std.testing.expect(std.mem.indexOf(u8, fallback_value, "48;5;") == null);
+            try std.testing.expect(std.mem.indexOf(u8, fallback_value, "48;2;") == null);
+        }
+    }
+}
+
+test "terminal capability only changes built-in diff markers" {
+    const fx = stylesForTerminal(false, .fx, true);
+    try std.testing.expectEqualStrings(diff_added_marker_truecolor, fx.diff_added_marker);
+    try std.testing.expectEqualStrings(diff_removed_marker_truecolor, fx.diff_removed_marker);
+
+    const terminal_truecolor = stylesForTerminal(false, .terminal, true);
+    const terminal_fallback = stylesForTerminal(false, .terminal, false);
+    try std.testing.expectEqualStrings(terminal_fallback.diff_added_marker, terminal_truecolor.diff_added_marker);
+    try std.testing.expectEqualStrings(terminal_fallback.diff_removed_marker, terminal_truecolor.diff_removed_marker);
 }
