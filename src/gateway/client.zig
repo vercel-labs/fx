@@ -743,6 +743,12 @@ const ResponseHeadTiming = struct {
     timeout_ms: i64 = 30_000,
 };
 
+const default_response_head_timeout_ms: i64 = 30_000;
+
+fn selectedResponseHeadTiming(timeout_ms: ?i64) ResponseHeadTiming {
+    return .{ .timeout_ms = timeout_ms orelse default_response_head_timeout_ms };
+}
+
 test "connection setup keeps the production timeout" {
     const timing = ConnectionSetupTiming{};
 
@@ -753,6 +759,17 @@ test "response head wait keeps the production timeout" {
     const timing = ResponseHeadTiming{};
 
     try std.testing.expectEqual(@as(i64, 30_000), timing.timeout_ms);
+}
+
+test "response head timing accepts one per-attempt override" {
+    try std.testing.expectEqual(
+        @as(i64, 30_000),
+        selectedResponseHeadTiming(null).timeout_ms,
+    );
+    try std.testing.expectEqual(
+        @as(i64, 120_000),
+        selectedResponseHeadTiming(120_000).timeout_ms,
+    );
 }
 
 const ConnectionSetupEpoch = struct {
@@ -1147,6 +1164,7 @@ pub const StreamRequest = struct {
     session_id: ?[]const u8 = null,
     trace_ctx: debug_trace.TraceContext = .{},
     content_capture_limit: ?usize = null,
+    response_head_timeout_ms: ?i64 = null,
     delivery: ?*DeliveryCertainty = null,
     admission: ?agent_stream_provider.Admission = null,
     on_reasoning_chunk: ?StreamCallback = null,
@@ -1320,7 +1338,9 @@ fn streamGatewayCompletionCore(
         cancel_flag,
         expected_provider_tool_name,
         watch_connected_socket,
-        .{},
+        .{ .response_head_timing = selectedResponseHeadTiming(
+            request.response_head_timeout_ms,
+        ) },
     );
 }
 
@@ -1510,7 +1530,13 @@ fn streamGatewayCompletionCoreWithOptions(
         if (active_connected_watch) |watch| {
             if (watch.arm_response_head()) |err| return @as(anyerror!StreamResult, err);
         }
-        debug_trace.eventf("gateway", "before_receive_head", trace_ctx, "attempt={d}", .{attempt + 1});
+        debug_trace.eventf(
+            "gateway",
+            "before_receive_head",
+            trace_ctx,
+            "attempt={d} timeout_ms={d}",
+            .{ attempt + 1, core_options.response_head_timing.timeout_ms },
+        );
         var response = req.receiveHead(&.{}) catch |err| {
             debug_trace.eventf("gateway", "receive_head_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
             const mapped = connectedIoFailureWithWatch(

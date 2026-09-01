@@ -2,6 +2,7 @@ const std = @import("std");
 const std_builtin = @import("builtin");
 const command_admission = @import("../permissions/command_admission.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
+const x9_provider_retry = @import("../agent/x9_provider_retry.zig");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
 const app_runtime_setup = @import("../app/app_runtime_setup.zig");
@@ -278,6 +279,7 @@ fn runAskChild(
         .advertised_tool_names = child_projection.advertised_names,
         .advertised_functions = child_projection.advertised_functions,
         .custom_tool_guidance = child_projection.custom_guidance,
+        .provider_retry_policy = ctx.x9_provider_retry_arms.providerRetryPolicy(),
         .context_registry = ctx.deps.context_registry,
         .context_enabled = ctx.context_enabled,
         .project_context = ctx.modelVisibleProjectContext(),
@@ -591,6 +593,7 @@ const AskContext = struct {
     image_snapshot_temp_dir: ?[]u8 = null,
     prompt_snapshot_committed: bool = false,
     last_recovery_status: ?types.RouteRecoveryStatus = null,
+    x9_provider_retry_arms: x9_provider_retry.Arms = .{},
 
     fn init(alloc: Allocator, cfg: Config, deps: RunDeps, workspace_root: []const u8) AskContext {
         const lifecycle_runtime = hooks.Runtime.init(alloc);
@@ -1473,6 +1476,12 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     defer if (owned_resumed_model) |model| alloc.free(model);
     var ctx = AskContext.init(alloc, cfg, options.deps, startup.workspace_root);
     defer ctx.deinit();
+    ctx.x9_provider_retry_arms = try x9_provider_retry.currentArms();
+    debug_trace.logf(
+        "quality",
+        "event=x9_provider_retry provider_retry={s}",
+        .{@tagName(ctx.x9_provider_retry_arms.provider_retry)},
+    );
     if (options.save_session) {
         _ = try ctx.session.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
         ctx.session.attachProfileUsagePublisher(alloc);
@@ -1763,6 +1772,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .skills_prompt_section = skills_section,
         .explicit_skills_prompt_section = explicit_skills.text,
         .gateway_retry_count = cfg.gateway_retry_count,
+        .provider_retry_policy = ctx.x9_provider_retry_arms.providerRetryPolicy(),
         .gateway_chat_url = cfg.gateway_chat_url,
         .advertised_tool_names = tool_projection.advertised_names,
         .advertised_functions = tool_projection.advertised_functions,

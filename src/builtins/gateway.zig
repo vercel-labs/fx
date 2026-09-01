@@ -537,6 +537,7 @@ fn streamAgentCompletion(
             .payload = payload,
             .trace_ctx = request.trace_ctx,
             .content_capture_limit = request.content_capture_limit,
+            .response_head_timeout_ms = request.response_head_timeout_ms,
             .delivery = request.delivery,
             .admission = request.admission,
             .on_reasoning_chunk = EventBridge.reasoning,

@@ -8,6 +8,7 @@ const workspace_access = @import("../../workspace/workspace_access.zig");
 const model_response_recovery = @import("model_response_recovery.zig");
 const provider_set = @import("../../gateway/provider_set.zig");
 const model_tool_schema = @import("../../tooling/model_tool_schema.zig");
+const x9_provider_retry = @import("../x9_provider_retry.zig");
 
 const ReasoningEffort = types.ReasoningEffort;
 
@@ -28,6 +29,7 @@ pub const Config = struct {
     explicit_skills_prompt_section: []const u8 = "",
     gateway_retry_count: usize,
     max_provider_attempts: usize = model_response_recovery.default_max_provider_attempts,
+    provider_retry_policy: x9_provider_retry.ProviderRetryPolicy = .{},
     /// Interactive hosts may request a durable "try later" pause separately
     /// from cancellation. Headless hosts leave this null.
     recovery_pause_flag: ?*std.atomic.Value(bool) = null,

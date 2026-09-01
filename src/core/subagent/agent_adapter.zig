@@ -5,6 +5,7 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const model_provider = @import("../config/model_provider.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const x9_provider_retry = @import("../agent/x9_provider_retry.zig");
 const provider_set = @import("../gateway/provider_set.zig");
 const auto_classifier = @import("../permissions/auto_classifier.zig");
 const command_admission = @import("../permissions/command_admission.zig");
@@ -51,6 +52,7 @@ pub const Config = struct {
     advertised_tool_names: []const []const u8 = &.{},
     advertised_functions: []const model_tool_schema.FunctionSchema = &.{},
     custom_tool_guidance: []const u8 = "",
+    provider_retry_policy: x9_provider_retry.ProviderRetryPolicy = .{},
     context_registry: context_contract.Registry,
     context_enabled: bool,
     project_context: []const u8 = "",
@@ -257,6 +259,7 @@ pub fn run(
             .skills_prompt_section = config.skills_prompt_section,
             .explicit_skills_prompt_section = config.explicit_skills_prompt_section,
             .gateway_retry_count = config.tool_context.gateway_retry_count,
+            .provider_retry_policy = config.provider_retry_policy,
             .gateway_chat_url = config.tool_context.gateway_chat_url,
             .advertised_tool_names = config.advertised_tool_names,
             .advertised_functions = config.advertised_functions,

@@ -6002,6 +6002,48 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 30_000);
 
+  test("adaptive provider retry arm caps the response budget at three attempts", async () => {
+    const root = createFixtureRoot("adaptive-provider-attempt-budget");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() => unavailableResponse("0"));
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "Exhaust the adaptive response budget."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_EXPERIMENT_X9_PROVIDER_RETRY: "adaptive_v1",
+          },
+          timeoutMs: 20_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      const trace = readFileSync(tracePath, "utf8");
+
+      expect(result.code).toBe(1);
+      expect(json.exit_code).toBe(1);
+      expect(gateway.requestCount()).toBe(3);
+      expect(json.recovery?.state).toBe("paused");
+      expect(json.recovery?.attempt).toBe(3);
+      expect(json.recovery?.attempt_limit).toBe(3);
+      expect(result.stderr).toContain("retrying request · attempt 1/3");
+      expect(result.stderr).toContain("recovery paused after 3/3 attempts");
+      expect(trace).toContain(
+        "semantic_attempt=1/3 response_head_timeout_ms=30000",
+      );
+      expect(trace).toContain(
+        "semantic_attempt=2/3 response_head_timeout_ms=60000",
+      );
+      expect(trace).toContain(
+        "semantic_attempt=3/3 response_head_timeout_ms=120000",
+      );
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("exhausted retry budget pauses once and explicit continue preserves context", async () => {
     const root = createFixtureRoot("retry-budget-pause-continue");
     const tracePath = join(root.root, "trace.log");

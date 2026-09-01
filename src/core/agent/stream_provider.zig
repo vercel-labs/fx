@@ -188,6 +188,9 @@ pub const ModelRequest = struct {
     response_format: ?StructuredResponseFormat = null,
     trace_ctx: debug_trace.TraceContext,
     content_capture_limit: ?usize,
+    /// Optional response-head deadline for this provider attempt. Null keeps
+    /// the transport's production default.
+    response_head_timeout_ms: ?i64 = null,
     /// Optional absolute provider deadline. Transports that support bounded
     /// execution must stop in-flight I/O before returning `error.Timeout`.
     deadline: ?std.Io.Clock.Timestamp = null,
