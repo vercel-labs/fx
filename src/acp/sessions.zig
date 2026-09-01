@@ -550,7 +550,7 @@ fn handleRestoreSession(
     const seed_preferences = session_codec.DurableSessionPreferences{
         .provider = state.provider,
         .model = state.configured_model,
-        .effort = state.effort,
+        .effort = state.configured_effort,
         .fast_mode = state.fast_mode,
     };
     var writable = subagent_resume_admission.resumeForExternalPrompt(
@@ -628,7 +628,11 @@ fn handleRestoreSession(
         .model = model_copy,
         .provider = effective_provider,
         .fast_mode = writable.state.preferences.fast_mode,
-        .effort = writable.state.preferences.effort,
+        .effort = effectiveLoadedEffort(
+            state.process_effort_override,
+            state.effort,
+            writable.state.preferences.effort,
+        ),
         .session_rt = session_rt,
         .mcp = session_mcp,
     }) catch
@@ -846,13 +850,21 @@ fn freshAcpState(
         .preferences = .{
             .provider = state.provider,
             .model = model,
-            .effort = state.effort,
+            .effort = state.configured_effort,
             .fast_mode = state.fast_mode,
         },
         .history = history,
         .total_input_tokens = 0,
         .total_output_tokens = 0,
     };
+}
+
+fn effectiveLoadedEffort(
+    process_override: bool,
+    process_effort: types.ReasoningEffort,
+    saved_effort: types.ReasoningEffort,
+) types.ReasoningEffort {
+    return if (process_override) process_effort else saved_effort;
 }
 
 const SessionActivation = struct {
@@ -1460,6 +1472,13 @@ test "writeModeConfigOption produces valid json with all modes" {
     try std.testing.expect(std.mem.find(u8, items, "\"review\"") != null);
     try std.testing.expect(std.mem.find(u8, items, "\"inspect\"") != null);
     try std.testing.expect(std.mem.find(u8, items, "\"permissionMode\":\"ask\"") != null);
+}
+
+test "ACP loaded session effort honors only an active process override" {
+    const saved = types.ReasoningEffort.literal("low");
+    const process = types.ReasoningEffort.literal("high");
+    try std.testing.expect(effectiveLoadedEffort(false, process, saved).eql(saved));
+    try std.testing.expect(effectiveLoadedEffort(true, process, saved).eql(process));
 }
 
 test "writeModesArray preserves supplied registry order" {

@@ -8425,6 +8425,90 @@ describe("acp: model catalog authentication", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "--effort overrides new and loaded sessions without persisting the override",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-effort-flag-");
+      const model = "provider/effort-flag";
+      const settingsPath = join(root.home, ".fx", "settings.json");
+      const settings = `${JSON.stringify({ model, effort: "low" })}\n`;
+      writeFileSync(settingsPath, settings);
+      const gateway = startFakeGateway(
+        [
+          finalText("new override complete"),
+          finalText("load override complete"),
+          finalText("saved effort complete"),
+        ],
+        {
+          models: [{
+            id: model,
+            type: "language",
+            tags: ["reasoning", "tool-use"],
+            reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+          }],
+        },
+      );
+      const env = {
+        ...fakeGatewayEnv(root, gateway),
+        FX_MODEL: undefined,
+      };
+      let sessionId: string;
+      try {
+        client = await AcpClient.create({
+          args: ["acp", "--effort", "high"],
+          cwd: root.workspace,
+          env,
+        });
+        sessionId = await startCodeSession(client);
+        expect((await runPrompt(client, "Use the process effort.")).promptResult.result.stopReason)
+          .toBe("end_turn");
+        expect(JSON.parse(gateway.requests[0]!.body)).toMatchObject({ reasoning: "high" });
+
+        await client.close();
+        client = await AcpClient.create({
+          args: ["acp", "--effort", "high"],
+          cwd: root.workspace,
+          env,
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 10);
+        client.send({
+          jsonrpc: "2.0",
+          id: 11,
+          method: "session/load",
+          params: { sessionId, mcpServers: [] },
+        });
+        expect((await readResponse(client, 11)).error).toBeUndefined();
+        expect((await runPrompt(client, "Use the process effort after load.")).promptResult.result.stopReason)
+          .toBe("end_turn");
+        expect(JSON.parse(gateway.requests[1]!.body)).toMatchObject({ reasoning: "high" });
+
+        await client.close();
+        client = await AcpClient.create({ cwd: root.workspace, env });
+        await client.request("initialize", { protocolVersion: 1 }, 20);
+        client.send({
+          jsonrpc: "2.0",
+          id: 21,
+          method: "session/load",
+          params: { sessionId, mcpServers: [] },
+        });
+        expect((await readResponse(client, 21)).error).toBeUndefined();
+        expect((await runPrompt(client, "Use the saved effort.")).promptResult.result.stopReason)
+          .toBe("end_turn");
+        expect(JSON.parse(gateway.requests[2]!.body)).toMatchObject({ reasoning: "low" });
+        expect(readFileSync(settingsPath, "utf8")).toBe(settings);
+        expect(gateway.requests).toHaveLength(3);
+        client.endStdin();
+        expect(await client.waitForExit()).toBe(0);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
 });
 
 describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {

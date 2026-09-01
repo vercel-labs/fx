@@ -1723,8 +1723,9 @@ test "ACP help documents accepted options" {
     defer std.testing.allocator.free(text);
 
     try std.testing.expect(std.mem.find(u8, text, "fx acp\n") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Usage:\n  fx acp [--model <id>] [--log-file <path>]") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Usage:\n  fx acp [--model <id>] [--effort <level>] [--log-file <path>]") != null);
     try std.testing.expect(std.mem.find(u8, text, "--model <id>") != null);
+    try std.testing.expect(std.mem.find(u8, text, "--effort <level>") != null);
     try std.testing.expect(std.mem.find(u8, text, "--log-file <path>") != null);
 }
 

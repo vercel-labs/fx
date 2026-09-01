@@ -379,9 +379,10 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
         expect(r.code).toBe(0);
         expect(r.stderr).toBe("");
         expect(r.stdout).toContain(
-          "Usage:\n  fx acp [--model <id>] [--log-file <path>]",
+          "Usage:\n  fx acp [--model <id>] [--effort <level>] [--log-file <path>]",
         );
         expect(r.stdout).toContain("--model <id>");
+        expect(r.stdout).toContain("--effort <level>");
         expect(r.stdout).toContain("--log-file <path>");
       }
     },
@@ -404,12 +405,12 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
   test(
     "fx acp rejects unknown options and missing option values",
     async () => {
-      for (const args of [["--bogus"], ["--model"], ["--log-file"]]) {
+      for (const args of [["--bogus"], ["--model"], ["--effort"], ["--log-file"]]) {
         const result = await runFx(["acp", ...args]);
         expect(result.code).toBe(1);
         expect(result.stdout).toBe("");
         expect(result.stderr).toBe(
-          "usage: fx acp [--model <id>] [--log-file <path>]\n",
+          "usage: fx acp [--model <id>] [--effort <level>] [--log-file <path>]\n",
         );
       }
     },

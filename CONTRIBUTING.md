@@ -127,6 +127,8 @@ Config precedence (highest wins):
 
 Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`, `max_tool_result_bytes`, and `context`. Profile-owned keys such as `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `update_channel`, `permission_mode`, and `permission` are ignored from project config before their values are parsed.
 
+`fx acp --model <id>` and `fx acp --effort <level>` apply process-local overrides to new and loaded ACP sessions. They do not update `~/.fx/settings.json`; omit the flags to return to the configured or saved session preferences.
+
 Runtime state lives under `~/.fx/`:
 
 * `~/.fx/sessions/<session-id>/session.json`

@@ -9,6 +9,7 @@ const host = @import("../hosts/host.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
 const context_contract = @import("../workspace/context_contract.zig");
+const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -35,6 +36,7 @@ pub const Config = struct {
     context_registry: context_contract.Registry,
     mode_registry: mode_registry.Registry,
     model_override: ?[]const u8 = null,
+    effort_override: ?types.ReasoningEffort = null,
     credential_override: ?[]const u8 = null,
     home_override: ?[]const u8 = null,
     workspace_root_override: ?[]const u8 = null,

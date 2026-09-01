@@ -58,10 +58,11 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .acp,
         .token = "acp",
-        .usage = "acp [--model <id>] [--log-file <path>]",
+        .usage = "acp [--model <id>] [--effort <level>] [--log-file <path>]",
         .summary = "Start an ACP server over stdio",
         .options = &.{
             .{ .flag = "--model <id>", .description = "Override the default model" },
+            .{ .flag = "--effort <level>", .description = "Override the configured reasoning effort" },
             .{ .flag = "--log-file <path>", .description = "Write ACP logs to a file" },
         },
     },

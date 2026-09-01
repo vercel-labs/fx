@@ -293,6 +293,7 @@ const SessionRecoveryOptions = struct {
 
 const AcpOptions = struct {
     model: ?[]const u8 = null,
+    effort: ?types.ReasoningEffort = null,
     log_file: ?[]const u8 = null,
 };
 
@@ -855,7 +856,7 @@ fn runNonInteractiveWithDeps(
         },
         .acp => |rest| {
             const acp_opts = parseAcpArgs(rest) catch {
-                try writeStderr(deps, "usage: fx acp [--model <id>] [--log-file <path>]\n");
+                try writeStderr(deps, "usage: fx acp [--model <id>] [--effort <level>] [--log-file <path>]\n");
                 return .handled_failure;
             };
             try cfg.acp_runner.run(alloc, .{
@@ -883,6 +884,7 @@ fn runNonInteractiveWithDeps(
                 .additional_directories = global_args.modifiers.additional_directories,
                 .saved_directories_suppressed = global_args.modifiers.saved_directories_suppressed,
                 .model_override = acp_opts.model,
+                .effort_override = acp_opts.effort,
                 .log_file = acp_opts.log_file,
             });
             return .handled_success;
@@ -3457,6 +3459,10 @@ fn parseAcpArgs(args: []const [:0]const u8) !AcpOptions {
             if (opts.model != null or i + 1 >= args.len) return error.InvalidAcpArgs;
             i += 1;
             opts.model = args[i];
+        } else if (std.mem.eql(u8, args[i], "--effort")) {
+            if (opts.effort != null or i + 1 >= args.len) return error.InvalidAcpArgs;
+            i += 1;
+            opts.effort = types.ReasoningEffort.parse(args[i]) orelse return error.InvalidAcpArgs;
         } else if (std.mem.eql(u8, args[i], "--log-file")) {
             if (opts.log_file != null or i + 1 >= args.len) return error.InvalidAcpArgs;
             i += 1;
@@ -4070,18 +4076,30 @@ test "parse acp args extracts known flags and rejects invalid arguments" {
     const opts = try parseAcpArgs(&.{
         @constCast("--model"),
         @constCast("openai/gpt-4o"),
+        @constCast("--effort"),
+        @constCast("high"),
         @constCast("--log-file"),
         @constCast("/tmp/fx.log"),
     });
     try std.testing.expectEqualStrings("openai/gpt-4o", opts.model.?);
+    try std.testing.expect(opts.effort.?.eql(types.ReasoningEffort.literal("high")));
     try std.testing.expectEqualStrings("/tmp/fx.log", opts.log_file.?);
 
     try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(&.{@constCast("--unknown")}));
     try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(&.{@constCast("--model")}));
+    try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(&.{@constCast("--effort")}));
+    try std.testing.expectError(
+        error.InvalidAcpArgs,
+        parseAcpArgs(&.{ @constCast("--effort"), @constCast("not valid!") }),
+    );
     try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(&.{@constCast("--log-file")}));
     try std.testing.expectError(
         error.InvalidAcpArgs,
         parseAcpArgs(&.{ @constCast("--model"), @constCast("first"), @constCast("--model"), @constCast("second") }),
+    );
+    try std.testing.expectError(
+        error.InvalidAcpArgs,
+        parseAcpArgs(&.{ @constCast("--effort"), @constCast("low"), @constCast("--effort"), @constCast("high") }),
     );
 }
 
@@ -4136,6 +4154,7 @@ test "ACP command routes parsed options and launch config through the injected r
                 std.mem.eql(u8, cfg.additional_directories[0], "/tmp/acp-extra") and
                 cfg.saved_directories_suppressed and
                 std.mem.eql(u8, cfg.model_override.?, "model-override") and
+                cfg.effort_override.?.eql(types.ReasoningEffort.literal("high")) and
                 std.mem.eql(u8, cfg.log_file.?, "/tmp/acp.log");
         }
     };
@@ -4155,6 +4174,8 @@ test "ACP command routes parsed options and launch config through the injected r
             @constCast("acp"),
             @constCast("--model"),
             @constCast("model-override"),
+            @constCast("--effort"),
+            @constCast("high"),
             @constCast("--log-file"),
             @constCast("/tmp/acp.log"),
         },

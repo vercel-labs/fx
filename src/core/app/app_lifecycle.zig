@@ -141,6 +141,8 @@ pub const StartupState = struct {
     prompt_history_store_allowed: bool = true,
     config_diagnostics: []config_runtime.ConfigDiagnostic = &.{},
     effort: types.ReasoningEffort = .auto,
+    configured_effort: types.ReasoningEffort = .auto,
+    effort_source: config_runtime.ConfigSource = .compiled_default,
     first_call_tool_choice: types.ToolChoice = .auto,
     statusline_context: bool = false,
     statusline_session: bool = false,
@@ -430,7 +432,9 @@ fn loadStartupStateFromOwnedWorkspace(
     state.auto_upgrade = settings.auto_upgrade orelse true;
     state.update_channel = settings.update_channel orelse .stable;
     state.startup_scrollback = settings.startup_scrollback orelse true;
-    state.effort = settings.effort orelse .auto;
+    state.configured_effort = settings.effort orelse .auto;
+    state.effort = state.configured_effort;
+    state.effort_source = detailed.sources.effort;
     state.first_call_tool_choice = settings.first_call_tool_choice orelse .auto;
     state.statusline_context = settings.statusline_context orelse false;
     state.statusline_session = settings.statusline_session orelse false;
@@ -2011,6 +2015,36 @@ test "loadStartupState applies core env overrides" {
     try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, state.credential.?.source);
     try std.testing.expectEqual(PermissionMode.auto, state.permission_mode);
     try std.testing.expectEqual(@as(usize, 37), state.agent_step_limit);
+}
+
+test "loadStartupState reports the configured effort source" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"effort\":\"low\"}\n");
+
+    const owned_workspace_root = try std.testing.allocator.dupe(u8, workspace_root);
+    var state = try loadStartupStateFromOwnedWorkspace(
+        std.testing.allocator,
+        oauth_transport.unavailable_provider,
+        host.unavailable_secret_store,
+        owned_workspace_root,
+        "default-model",
+        12,
+        home_root,
+        null,
+    );
+    defer state.deinit(std.testing.allocator);
+
+    try std.testing.expect(state.configured_effort.eql(types.ReasoningEffort.literal("low")));
+    try std.testing.expect(state.effort.eql(types.ReasoningEffort.literal("low")));
+    try std.testing.expectEqual(config_runtime.ConfigSource.user_global, state.effort_source);
 }
 
 test "loadStartupState defaults fast mode on only for the compiled Gateway default and preserves explicit preferences" {
