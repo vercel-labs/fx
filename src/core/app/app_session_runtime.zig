@@ -87,7 +87,7 @@ pub const RewindTarget = struct {
     }
 };
 
-pub const RewindRequest = enum {
+const RewindRequest = enum {
     confirm,
     execute,
 };
@@ -96,7 +96,7 @@ pub const RewindRequest = enum {
 /// repeated. Arming on the whole target rather than the raw count means a turn
 /// arriving between the two requests re-arms instead of silently firing a
 /// rewind the user never previewed.
-pub const RewindGate = union(enum) {
+const RewindGate = union(enum) {
     idle,
     armed: RewindTarget,
 
