@@ -382,6 +382,8 @@ pub fn Handlers(comptime App: type) type {
                 .toggle_fast = commandToggleFast,
                 .handle_statusline = commandHandleStatusline,
                 .rename_session = commandRenameSession,
+                .fork_session = commandForkSession,
+                .rewind_session = commandRewindSession,
                 .handle_notifications = commandHandleNotifications,
                 .handle_workspace = commandHandleWorkspace,
                 .show_version = commandShowVersion,
@@ -681,6 +683,26 @@ pub fn Handlers(comptime App: type) type {
         fn commandRenameSession(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try handleRenameCommand(app, rest);
+        }
+
+        fn commandForkSession(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            _ = rest;
+            try app.writeDomainNotice(.{
+                .topic = "session",
+                .tone = .neutral,
+                .body = "not implemented",
+            }, true);
+        }
+
+        fn commandRewindSession(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            _ = rest;
+            try app.writeDomainNotice(.{
+                .topic = "session",
+                .tone = .neutral,
+                .body = "not implemented",
+            }, true);
         }
 
         fn commandShowHelp(ctx: *anyopaque) !void {
