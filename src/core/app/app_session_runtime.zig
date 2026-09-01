@@ -60,6 +60,22 @@ const BackgroundSessionPolicy = enum {
     stop_forget,
 };
 
+/// `/fork <turn>` and `/rewind <count>` both accept 1 through the live history
+/// length and differ only in which end they count from. Returns null when the
+/// argument falls outside it.
+fn checkedTurnArgument(history_len: usize, requested: usize) ?usize {
+    if (requested == 0 or requested > history_len) return null;
+    return requested;
+}
+
+test "turn arguments are bounded by the live history length" {
+    try std.testing.expectEqual(@as(?usize, null), checkedTurnArgument(0, 1));
+    try std.testing.expectEqual(@as(?usize, null), checkedTurnArgument(3, 0));
+    try std.testing.expectEqual(@as(?usize, null), checkedTurnArgument(3, 4));
+    try std.testing.expectEqual(@as(?usize, 1), checkedTurnArgument(3, 1));
+    try std.testing.expectEqual(@as(?usize, 3), checkedTurnArgument(3, 3));
+}
+
 /// The exact rewind a confirmation prompt described: how long the history was
 /// when it was previewed, and how many turns would survive.
 pub const RewindTarget = struct {
@@ -2897,9 +2913,8 @@ pub fn Runtime(comptime App: type) type {
             const active = app.session_persistence.writable orelse return .unavailable;
 
             const history_len = app.session.historyLen();
-            if (at_turn == 0 or at_turn > history_len) {
+            const retained_turns = checkedTurnArgument(history_len, at_turn) orelse
                 return .{ .out_of_range = history_len };
-            }
 
             const source_id = try app.alloc.dupe(u8, active.active_id);
             errdefer app.alloc.free(source_id);
@@ -2914,12 +2929,12 @@ pub fn Runtime(comptime App: type) type {
             var copy = store.forkSessionCopy(
                 app.alloc,
                 source_id,
-                at_turn,
+                retained_turns,
                 .{},
             ) catch |err| return .{ .forked = .{
                 .source_id = source_id,
                 .forked_id = null,
-                .retained_turns = at_turn,
+                .retained_turns = retained_turns,
                 .landing = reopenSourceAfterFork(app, source_id, log_options),
                 .problem = err,
             } };
@@ -2932,7 +2947,7 @@ pub fn Runtime(comptime App: type) type {
                 return .{ .forked = .{
                     .source_id = source_id,
                     .forked_id = forked_id,
-                    .retained_turns = at_turn,
+                    .retained_turns = retained_turns,
                     .landing = reopenSourceAfterFork(app, source_id, log_options),
                     .problem = error.SessionForkUnconfirmed,
                 } };
@@ -2942,7 +2957,7 @@ pub fn Runtime(comptime App: type) type {
                 return .{ .forked = .{
                     .source_id = source_id,
                     .forked_id = forked_id,
-                    .retained_turns = at_turn,
+                    .retained_turns = retained_turns,
                     .landing = reopenSourceAfterFork(app, source_id, log_options),
                     .problem = err,
                 } };
@@ -2951,7 +2966,7 @@ pub fn Runtime(comptime App: type) type {
             return .{ .forked = .{
                 .source_id = source_id,
                 .forked_id = forked_id,
-                .retained_turns = at_turn,
+                .retained_turns = retained_turns,
                 .landing = .branch,
                 .unverified_artifacts = copy.status == .forked_with_unverified_artifacts,
             } };
@@ -3018,13 +3033,12 @@ pub fn Runtime(comptime App: type) type {
             if (app.stream.active) return .unavailable_during_stream;
 
             const history_len = app.session.historyLen();
-            if (requested_turns == 0 or requested_turns > history_len) {
+            const dropped_turns = checkedTurnArgument(history_len, requested_turns) orelse
                 return .{ .out_of_range = history_len };
-            }
 
             const target = RewindTarget{
                 .history_len = history_len,
-                .retained_turns = history_len - requested_turns,
+                .retained_turns = history_len - dropped_turns,
             };
             switch (app.session_persistence.rewind_gate.request(target)) {
                 .confirm => return .{ .confirm = target },
