@@ -98,6 +98,17 @@ fx session rewind <id> --by 2
 
 Rewound turns are not erased. The rewind is recorded as a new revision in the session's event log, and the files those turns referenced stay on disk.
 
+The interactive shell has the same two operations for the session it is already in:
+
+```
+/fork 7
+/rewind 2
+```
+
+`/fork 7` branches at turn 7, names both the source ID and the new one, and leaves you in the branch. The source session keeps every turn it had. `/rewind 2` asks first: the message says how many turns it will drop and how many remain, and a second identical `/rewind 2` carries it out. Any other command in between cancels it.
+
+Neither command reverts file edits, commands, commits, or API calls. They change the conversation only.
+
 Each interactive session names its terminal tab. The title prefers the session name, falls back to the workspace name, and keeps the active model as secondary context. Renaming or resuming a session updates the tab, and exiting clears the fx-owned title. Noninteractive commands do not emit terminal-title controls.
 
 Run `/feedback` to open the feedback form at `fx.sh/feedback`. It does not create a diagnostic or change the clipboard.
