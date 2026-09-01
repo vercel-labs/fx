@@ -1,5 +1,6 @@
 const std = @import("std");
 const config_runtime = @import("../config/config_runtime.zig");
+const settings_store = @import("../config/settings_store.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
@@ -57,6 +58,7 @@ pub fn Runtime(comptime App: type) type {
             {
                 const provider = provider_runtime.provider(app);
                 const required_source: credentials.Source = switch (provider) {
+                    .openai => .openai_api_key,
                     .codex => .chatgpt_subscription,
                     .grok => .grok_subscription,
                     .gateway => app.auth.credentialSource() orelse .fx_login,
@@ -71,7 +73,9 @@ pub fn Runtime(comptime App: type) type {
                     try app.writeDomainNotice(.{
                         .topic = "auth",
                         .tone = .warning,
-                        .body = if (provider == .grok)
+                        .body = if (provider == .openai)
+                            credentials.missing_openai_interactive_credential_message
+                        else if (provider == .grok)
                             credentials.missing_grok_interactive_credential_message
                         else if (provider == .codex)
                             credentials.missing_chatgpt_interactive_credential_message
@@ -133,7 +137,7 @@ pub fn Runtime(comptime App: type) type {
                     try writeAuthNotice(app, .{
                         .topic = "auth",
                         .tone = .warning,
-                        .body = "Usage: /logout [vercel|codex|grok]",
+                        .body = "Usage: /logout [vercel|openai|codex|grok]",
                     });
                     return;
                 };
@@ -152,6 +156,14 @@ pub fn Runtime(comptime App: type) type {
                 .active_source = app.auth.credentialSource(),
                 .available_sources = provider_inventory,
             });
+            if (logout_provider == .openai) {
+                try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .neutral,
+                    .body = "OpenAI uses the process-owned OPENAI_API_KEY. Unset it and restart fx to disconnect.",
+                });
+                return;
+            }
             if (logout_provider == .grok) {
                 const outcome = grok_oauth.logout(app.alloc, app.auth.oauthTransport()) catch {
                     try writeAuthNotice(app, .{
@@ -805,6 +817,8 @@ pub fn Runtime(comptime App: type) type {
                     .tone = .warning,
                     .body = if (intent == .post_oauth)
                         "Subscription sign-in completed, but its saved credential is unavailable. The current provider is unchanged."
+                    else if (target == .openai)
+                        credentials.missing_openai_interactive_credential_message
                     else if (target == .codex)
                         "Run fx login codex, then try switching again."
                     else if (target == .grok)
@@ -828,40 +842,91 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
 
+            var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch |err| {
+                debug_trace.logf("provider", "settings load failed err={s}", .{@errorName(err)});
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .@"error",
+                    .body = providerFailureMessage(
+                        intent,
+                        "Could not load the saved provider model. The current provider is unchanged.",
+                        "Subscription sign-in completed, but its saved provider model could not be loaded. The current provider is unchanged.",
+                    ),
+                }, true);
+                return;
+            };
+            defer settings.deinit(app.alloc);
+
             const access = credentials.catalogAccessForCredentialAndAccount(
                 credential.source,
                 credential.token,
                 credential.gatewayTeam(),
                 credential.accountId(),
             );
-            const fetched = app.fetchProviderCatalog(target, access) catch |err| {
-                debug_trace.logf("provider", "catalog preparation failed provider={t} err={s}", .{ target, @errorName(err) });
-                try app.writeDomainNotice(.{
-                    .topic = "provider",
-                    .tone = .@"error",
-                    .body = providerFailureMessage(
-                        intent,
-                        "Could not load the target provider catalog. The current provider is unchanged.",
-                        "Subscription sign-in completed, but its model catalog could not be loaded. The current provider is unchanged.",
-                    ),
-                }, true);
-                return;
-            };
-            var catalog = switch (fetched) {
-                .catalog => |catalog| catalog,
-                .failure => |failure| {
-                    debug_trace.logf("provider", "catalog rejected provider={t} category={t}", .{ target, failure.category });
+            var catalog = if (target == .openai) catalog: {
+                const model = io_mod.getenv("FX_MODEL") orelse settings.models.get(.openai) orelse {
+                    try app.writeDomainNotice(.{
+                        .topic = "provider",
+                        .tone = .warning,
+                        .body = "Configure models.openai or FX_MODEL before selecting OpenAI.",
+                    }, true);
+                    return;
+                };
+                settings_store.validateModel(model) catch {
+                    try app.writeDomainNotice(.{
+                        .topic = "provider",
+                        .tone = .warning,
+                        .body = "The configured OpenAI model is invalid. The current provider is unchanged.",
+                    }, true);
+                    return;
+                };
+                var configured: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+                errdefer model_catalog.freeModelCatalog(app.alloc, &configured);
+                const id = try app.alloc.dupe(u8, model);
+                const model_type = app.alloc.dupe(u8, "language") catch |err| {
+                    app.alloc.free(id);
+                    return err;
+                };
+                configured.append(app.alloc, .{
+                    .id = id,
+                    .model_type = model_type,
+                    .has_tool_use = true,
+                }) catch |err| {
+                    app.alloc.free(id);
+                    app.alloc.free(model_type);
+                    return err;
+                };
+                break :catalog configured;
+            } else catalog: {
+                const fetched = app.fetchProviderCatalog(target, access) catch |err| {
+                    debug_trace.logf("provider", "catalog preparation failed provider={t} err={s}", .{ target, @errorName(err) });
                     try app.writeDomainNotice(.{
                         .topic = "provider",
                         .tone = .@"error",
                         .body = providerFailureMessage(
                             intent,
-                            "The target provider catalog could not be validated. The current provider is unchanged.",
-                            "Subscription sign-in completed, but its model catalog could not be validated. The current provider is unchanged.",
+                            "Could not load the target provider catalog. The current provider is unchanged.",
+                            "Subscription sign-in completed, but its model catalog could not be loaded. The current provider is unchanged.",
                         ),
                     }, true);
                     return;
-                },
+                };
+                break :catalog switch (fetched) {
+                    .catalog => |loaded| loaded,
+                    .failure => |failure| {
+                        debug_trace.logf("provider", "catalog rejected provider={t} category={t}", .{ target, failure.category });
+                        try app.writeDomainNotice(.{
+                            .topic = "provider",
+                            .tone = .@"error",
+                            .body = providerFailureMessage(
+                                intent,
+                                "The target provider catalog could not be validated. The current provider is unchanged.",
+                                "Subscription sign-in completed, but its model catalog could not be validated. The current provider is unchanged.",
+                            ),
+                        }, true);
+                        return;
+                    },
+                };
             };
             defer model_catalog.freeModelCatalog(app.alloc, &catalog);
             if (catalog.items.len == 0) {
@@ -877,20 +942,6 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
 
-            var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch |err| {
-                debug_trace.logf("provider", "settings load failed err={s}", .{@errorName(err)});
-                try app.writeDomainNotice(.{
-                    .topic = "provider",
-                    .tone = .@"error",
-                    .body = providerFailureMessage(
-                        intent,
-                        "Could not load the saved provider model. The current provider is unchanged.",
-                        "Subscription sign-in completed, but its saved provider model could not be loaded. The current provider is unchanged.",
-                    ),
-                }, true);
-                return;
-            };
-            defer settings.deinit(app.alloc);
             const saved_model = settings.models.get(target);
             const current_model = if (intent == .post_oauth and current == target)
                 provider_runtime.model(app)
@@ -1395,6 +1446,7 @@ test "interactive subscription sign-in rejects active and queued work before OAu
             app.worker.queued_prompts = case.queued_prompts;
 
             switch (provider) {
+                .openai => unreachable,
                 .codex => try Runtime(BusySignInApp).beginChatGptSignIn(&app),
                 .grok => try Runtime(BusySignInApp).beginGrokSignIn(&app),
                 .gateway => unreachable,

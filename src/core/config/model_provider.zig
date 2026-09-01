@@ -3,6 +3,7 @@ const types = @import("../shared/types.zig");
 
 pub const ProviderId = enum {
     gateway,
+    openai,
     codex,
     grok,
 };
@@ -14,6 +15,7 @@ pub const ProviderSelection = struct {
 
 pub fn parse(value: []const u8) ?ProviderId {
     if (std.ascii.eqlIgnoreCase(value, "gateway")) return .gateway;
+    if (std.ascii.eqlIgnoreCase(value, "openai")) return .openai;
     if (std.ascii.eqlIgnoreCase(value, "codex")) return .codex;
     if (std.ascii.eqlIgnoreCase(value, "grok")) return .grok;
     return null;
@@ -22,7 +24,8 @@ pub fn parse(value: []const u8) ?ProviderId {
 pub fn authorizesCredential(provider: ProviderId, source: ?types.CredentialSource) bool {
     const selected = source orelse return false;
     return switch (provider) {
-        .gateway => selected != .chatgpt_subscription and selected != .grok_subscription,
+        .gateway => selected != .openai_api_key and selected != .chatgpt_subscription and selected != .grok_subscription,
+        .openai => selected == .openai_api_key,
         .codex => selected == .chatgpt_subscription,
         .grok => selected == .grok_subscription,
     };
@@ -31,6 +34,8 @@ pub fn authorizesCredential(provider: ProviderId, source: ?types.CredentialSourc
 test "explicit providers authorize only their own credential origins" {
     try std.testing.expect(authorizesCredential(.gateway, .ai_gateway_api_key));
     try std.testing.expect(authorizesCredential(.gateway, .fx_login));
+    try std.testing.expect(authorizesCredential(.openai, .openai_api_key));
+    try std.testing.expect(!authorizesCredential(.openai, .ai_gateway_api_key));
     try std.testing.expect(!authorizesCredential(.gateway, .chatgpt_subscription));
     try std.testing.expect(authorizesCredential(.codex, .chatgpt_subscription));
     try std.testing.expect(!authorizesCredential(.codex, .ai_gateway_api_key));
@@ -42,6 +47,7 @@ test "explicit providers authorize only their own credential origins" {
 
 test "provider parsing exposes gateway codex and grok" {
     try std.testing.expectEqual(ProviderId.gateway, parse("gateway").?);
+    try std.testing.expectEqual(ProviderId.openai, parse("OPENAI").?);
     try std.testing.expectEqual(ProviderId.codex, parse("CODEX").?);
     try std.testing.expectEqual(ProviderId.grok, parse("GROK").?);
     try std.testing.expect(parse("openai-codex") == null);

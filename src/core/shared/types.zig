@@ -90,6 +90,7 @@ test "context notice body drops legacy markers from every line" {
 pub const CredentialSource = enum {
     vercel_oidc_token,
     ai_gateway_api_key,
+    openai_api_key,
     fx_login,
     stored_key,
     chatgpt_subscription,

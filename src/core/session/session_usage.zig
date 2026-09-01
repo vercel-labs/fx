@@ -3270,6 +3270,7 @@ fn canonicalExactGenerationId(
 fn exactUsageOrigin(provider: model_provider.ProviderId) []const u8 {
     return switch (provider) {
         .gateway => "exact/gateway",
+        .openai => "exact/openai",
         .codex => "exact/codex",
         .grok => "exact/grok",
     };

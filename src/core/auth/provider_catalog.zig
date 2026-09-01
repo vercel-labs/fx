@@ -22,6 +22,14 @@ pub const entries = [_]Entry{
         .subscription = false,
     },
     .{
+        .id = .openai,
+        .slug = "openai",
+        .name = "OpenAI API",
+        .route_name = "OpenAI API",
+        .description = "OpenAI API key and Responses-compatible endpoint",
+        .subscription = false,
+    },
+    .{
         .id = .codex,
         .slug = "codex",
         .name = "Codex",
@@ -59,6 +67,7 @@ pub fn label(id: model_provider.ProviderId) []const u8 {
 test "auth provider catalog uses the model provider identity and explicit aliases" {
     try std.testing.expectEqual(model_provider.ProviderId.gateway, parse("vercel").?);
     try std.testing.expectEqual(model_provider.ProviderId.gateway, parse("gateway").?);
+    try std.testing.expectEqual(model_provider.ProviderId.openai, parse("openai").?);
     try std.testing.expectEqual(model_provider.ProviderId.codex, parse("codex").?);
     try std.testing.expectEqual(model_provider.ProviderId.grok, parse("grok").?);
     try std.testing.expect(parse("openai-codex") == null);

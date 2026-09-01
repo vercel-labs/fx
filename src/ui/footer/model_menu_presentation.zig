@@ -414,6 +414,7 @@ fn loadedCatalogStatusText(state: model_cache_runtime.ModelMenuCatalogState) ?[]
         return switch (source) {
             .fx_login => "Gateway catalog: authenticated with fx login.",
             .ai_gateway_api_key => "Note: Gateway catalog is authenticated with an API key",
+            .openai_api_key => "OpenAI catalog: authenticated with OPENAI_API_KEY.",
             .vercel_oidc_token => "Gateway catalog: authenticated with the Vercel session.",
             .stored_key => "Gateway catalog: authenticated with the stored API key.",
             .chatgpt_subscription => "Codex catalog: authenticated with a subscription.",

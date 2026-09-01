@@ -604,6 +604,12 @@ pub const StatusSnapshot = struct {
     pub fn missingHelp(self: StatusSnapshot, surface: MissingHelpSurface) ?[]const u8 {
         if (self.active_source != null) return null;
         if (self.stored_key_status == .unavailable) return credentials.unreadable_store_message;
+        if (self.required_source == .openai_api_key) {
+            return switch (surface) {
+                .cli => credentials.missing_openai_credential_message,
+                .interactive => credentials.missing_openai_interactive_credential_message,
+            };
+        }
         if (self.required_source == .chatgpt_subscription) {
             return switch (surface) {
                 .cli => credentials.missing_chatgpt_credential_message,
@@ -695,7 +701,7 @@ pub fn loadStatusSnapshotForProvider(
         },
     };
     const resolved_source = if (resolution.credential) |credential| credential.source else null;
-    var gateway_connected = resolved_source != null and resolved_source != .chatgpt_subscription and resolved_source != .grok_subscription;
+    var gateway_connected = resolved_source != null and resolved_source != .openai_api_key and resolved_source != .chatgpt_subscription and resolved_source != .grok_subscription;
     const gateway_probe_required = provider == .codex or provider == .grok or
         resolved_source == .chatgpt_subscription or resolved_source == .grok_subscription;
     if (gateway_probe_required) {
@@ -726,7 +732,9 @@ pub fn loadStatusSnapshotForProvider(
         };
     }
     return .{
-        .required_source = if (provider == .codex)
+        .required_source = if (provider == .openai)
+            .openai_api_key
+        else if (provider == .codex)
             .chatgpt_subscription
         else if (provider == .grok)
             .grok_subscription
@@ -1618,6 +1626,15 @@ pub const Runtime = struct {
         provider: model_provider.ProviderId,
     ) !?bool {
         return switch (provider) {
+            .openai => if (self.credentialSource() == .openai_api_key)
+                false
+            else
+                self.selectSourceWithLoader(
+                    alloc,
+                    .openai_api_key,
+                    self,
+                    loadRuntimeCredentialSource,
+                ),
             .codex => if (self.credentialSource() == .chatgpt_subscription)
                 false
             else
@@ -1636,7 +1653,7 @@ pub const Runtime = struct {
                     self,
                     loadRuntimeCredentialSource,
                 ),
-            .gateway => if (self.credentialSource() != .chatgpt_subscription and self.credentialSource() != .grok_subscription)
+            .gateway => if (self.credentialSource() != .openai_api_key and self.credentialSource() != .chatgpt_subscription and self.credentialSource() != .grok_subscription)
                 false
             else
                 @as(?bool, try self.reselectByPrecedenceWithDeps(

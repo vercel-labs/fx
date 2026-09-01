@@ -1110,6 +1110,7 @@ fn configuredProviderSelection(
     const provider = settings.provider orelse .gateway;
     const model = settings.models.get(provider) orelse switch (provider) {
         .gateway => default_model,
+        .openai => return error.OpenAIModelNotSelected,
         .codex => return error.CodexModelNotSelected,
         .grok => return error.GrokModelNotSelected,
     };

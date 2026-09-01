@@ -1,5 +1,6 @@
 const provider_set = @import("../core/gateway/provider_set.zig");
 const gateway = @import("gateway.zig");
+const openai = @import("../gateway/openai.zig");
 const openai_codex = @import("../gateway/openai_codex.zig");
 const openai_codex_models = @import("../gateway/openai_codex_models.zig");
 const openai_codex_permission_reviewer = @import("../gateway/openai_codex_permission_reviewer.zig");
@@ -10,6 +11,11 @@ const provider_catalog = @import("../core/auth/provider_catalog.zig");
 
 pub const native = provider_set.Set{
     .gateway = gateway.provider_bundle,
+    .openai = .{
+        .presentation = provider_catalog.find(.openai),
+        .fallback_model_capabilities_fn = openai.fallback_capabilities,
+        .agent_stream = openai.agent_stream_provider,
+    },
     .codex = .{
         .presentation = provider_catalog.find(.codex),
         .auth_strategy = .chatgpt,

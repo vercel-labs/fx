@@ -33,6 +33,17 @@ Sign in with Vercel AI Gateway:
 fx login
 ```
 
+Or use the OpenAI Responses API, including a compatible HTTPS or local loopback endpoint:
+
+```bash
+export OPENAI_API_KEY=your_key
+export OPENAI_BASE_URL=https://api.openai.com/v1
+FX_MODEL=gpt-5.4 fx provider openai
+fx
+```
+
+`OPENAI_BASE_URL` defaults to `https://api.openai.com/v1`. The OpenAI route accepts HTTPS endpoints and loopback HTTP endpoints, uses `OPENAI_API_KEY` only for that route, and does not send Vercel or subscription credentials to the configured endpoint. Configure `models.openai` in `~/.fx/settings.json` instead of `FX_MODEL` when you want to select the model persistently without the command above. OpenAI-compatible model discovery is not assumed; `fx models` reports that limitation for this provider.
+
 Or use an eligible ChatGPT subscription through OpenAI Codex OAuth:
 
 ```bash
@@ -47,7 +58,7 @@ fx login grok
 fx
 ```
 
-`fx login codex` and `fx login grok` select that provider and a model from its authenticated catalog. Inside fx, open `/setup` and choose **Model provider** to move between Gateway, Codex, and Grok. `/model` lists the active provider's fetched models. Subscription model IDs are the raw IDs returned by each authenticated catalog. Use `/logout codex` or `/logout grok` to remove that subscription session without affecting other providers; choosing it again from **Model provider** starts sign-in.
+`fx login codex` and `fx login grok` select that provider and a model from its authenticated catalog. Inside fx, open `/setup` and choose **Model provider** to move between Gateway, OpenAI, Codex, and Grok. `/model` lists the active provider's fetched models. Subscription model IDs are the raw IDs returned by each authenticated catalog. Use `/logout codex` or `/logout grok` to remove that subscription session without affecting other providers; choosing it again from **Model provider** starts sign-in.
 
 The OpenAI Codex route uses ChatGPT subscription access directly and never sends its OAuth token to Vercel AI Gateway. The session is stored privately at `~/.fx/chatgpt-auth.json` and refreshed when needed. On supported Codex models, `/fast` requests OpenAI's priority service tier and consumes ChatGPT credits at the higher Fast mode rate.
 

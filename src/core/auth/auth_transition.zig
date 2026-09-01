@@ -39,6 +39,7 @@ pub const LogoutFacts = struct {
 
 pub fn decideLogoutProvider(facts: LogoutFacts) model_provider.ProviderId {
     if (facts.requested) |provider| return provider;
+    if (facts.selected == .openai or facts.active_source == .openai_api_key) return .openai;
     if (facts.selected == .grok or facts.active_source == .grok_subscription) return .grok;
     if (facts.selected == .codex or facts.active_source == .chatgpt_subscription) return .codex;
 
@@ -65,6 +66,7 @@ pub fn signInCompletion(
 ) SignInCompletionAction {
     return switch (provider) {
         .gateway => .vercel,
+        .openai => .{ .activate_source = .openai_api_key },
         .codex => if (provider_routing_supported)
             .{ .switch_provider = .codex }
         else
@@ -106,6 +108,12 @@ test "provider switch and logout decisions are pure and provider keyed" {
         .requested = .grok,
         .selected = .codex,
         .active_source = .chatgpt_subscription,
+        .available_sources = inventory,
+    }));
+    try std.testing.expectEqual(model_provider.ProviderId.openai, decideLogoutProvider(.{
+        .requested = null,
+        .selected = .openai,
+        .active_source = .openai_api_key,
         .available_sources = inventory,
     }));
 }

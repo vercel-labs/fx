@@ -1550,6 +1550,7 @@ fn putModelPreference(
     changed = try putString(arena, models, @tagName(preference.provider), preference.model) or changed;
     const legacy_key = switch (preference.provider) {
         .gateway => "model",
+        .openai => "openai_model",
         .codex => "codex_model",
         .grok => "grok_model",
     };

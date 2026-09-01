@@ -83,6 +83,7 @@ pub const unavailable_provider = Provider{
 
 pub const Set = struct {
     gateway: ?Provider = null,
+    openai: ?Provider = null,
     codex: ?Provider = null,
     grok: ?Provider = null,
 
@@ -93,6 +94,7 @@ pub const Set = struct {
     pub fn select(self: Set, provider: model_provider.ProviderId) ?Provider {
         return switch (provider) {
             .gateway => self.gateway,
+            .openai => self.openai,
             .codex => self.codex,
             .grok => self.grok,
         };

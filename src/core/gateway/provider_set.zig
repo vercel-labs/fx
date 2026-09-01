@@ -49,12 +49,14 @@ fn emptyModelCapabilities(_: []const u8) model_capabilities.Capabilities {
 
 pub const Set = struct {
     gateway: Bundle,
+    openai: Bundle = .{},
     codex: Bundle,
     grok: Bundle,
 
     pub fn select(self: Set, provider: model_provider.ProviderId) Bundle {
         return switch (provider) {
             .gateway => self.gateway,
+            .openai => self.openai,
             .codex => self.codex,
             .grok => self.grok,
         };
@@ -63,6 +65,7 @@ pub const Set = struct {
     pub fn deferredUsageProviders(self: Set) generation_usage_provider.Set {
         return .{
             .gateway = self.gateway.deferred_usage,
+            .openai = self.openai.deferred_usage,
             .codex = self.codex.deferred_usage,
             .grok = self.grok.deferred_usage,
         };
@@ -72,6 +75,7 @@ pub const Set = struct {
 pub fn gateway_only(gateway: Bundle) Set {
     return .{
         .gateway = gateway,
+        .openai = .{},
         .codex = .{},
         .grok = .{},
     };

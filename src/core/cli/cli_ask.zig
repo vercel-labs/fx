@@ -1404,7 +1404,9 @@ fn missingCredentialResult(
     options: RunOptions,
     provider: model_provider.ProviderId,
 ) !PromptRunResult {
-    const message = if (provider == .codex)
+    const message = if (provider == .openai)
+        credentials.missing_openai_credential_message
+    else if (provider == .codex)
         credentials.missing_chatgpt_credential_message
     else if (provider == .grok)
         credentials.missing_grok_credential_message

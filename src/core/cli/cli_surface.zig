@@ -664,6 +664,7 @@ fn activateProviderSelection(
     if (caller == .provider_command and already_selected and resolution.credential != null) {
         try writeStdout(deps, switch (target) {
             .gateway => "Gateway is already selected.\n",
+            .openai => "OpenAI is already selected.\n",
             .codex => "Codex is already selected.\n",
             .grok => "Grok is already selected.\n",
         });
@@ -710,6 +711,7 @@ fn activateProviderSelection(
             deps,
             caller,
             switch (target) {
+                .openai => "OPENAI_API_KEY is unavailable",
                 .codex => "Codex credential is unavailable",
                 .grok => "Grok credential is unavailable",
                 .gateway => "configure a Gateway credential first",
@@ -717,8 +719,30 @@ fn activateProviderSelection(
         );
         return false;
     };
+    if (target == .openai) {
+        const selected_model = settings.models.get(.openai) orelse io_mod.getenv("FX_MODEL") orelse {
+            try writeProviderActivationError(alloc, deps, caller, "configure models.openai or FX_MODEL first");
+            return false;
+        };
+        var attempt = config_runtime.attemptUserPreferences(alloc, .{
+            .provider = .openai,
+            .model_preference = .{ .provider = .openai, .model = selected_model },
+        });
+        defer attempt.deinit(alloc);
+        switch (attempt) {
+            .failure => |failure| {
+                debug_trace.logf("config", "OpenAI provider selection persistence failed err={s}", .{@errorName(failure.err)});
+                try writeProviderActivationError(alloc, deps, caller, "failed to save OpenAI provider selection");
+                return false;
+            },
+            .outcome => {},
+        }
+        if (caller == .provider_command) try writeStdout(deps, "Provider set to OpenAI.\n");
+        return true;
+    }
     const catalog_provider = cfg.provider_set.select(target).model_catalog orelse {
         try writeProviderActivationError(alloc, deps, caller, switch (target) {
+            .openai => unreachable,
             .codex => "Codex model catalog is unavailable",
             .grok => "Grok model catalog is unavailable",
             .gateway => "Gateway model catalog is unavailable",
@@ -764,6 +788,7 @@ fn activateProviderSelection(
         .outcome => {},
     }
     if (performed_login) |provider| switch (provider) {
+        .openai => unreachable,
         .codex => try writeStdout(deps, "Signed in with Codex.\n"),
         .grok => try writeStdout(deps, "Signed in with Grok.\n"),
         .gateway => unreachable,
@@ -771,6 +796,7 @@ fn activateProviderSelection(
     if (caller == .provider_command) {
         try writeStdout(deps, switch (target) {
             .gateway => "Provider set to Gateway.\n",
+            .openai => unreachable,
             .codex => "Provider set to Codex.\n",
             .grok => "Provider set to Grok.\n",
         });
@@ -891,12 +917,16 @@ fn runNonInteractiveWithDeps(
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx login [vercel|codex|grok]\n");
+                try writeStderr(deps, "usage: fx login [vercel|openai|codex|grok]\n");
                 return .handled_failure;
             };
             // Preserve the original `fx login` behavior for scripts and users.
             const login_provider = maybe_login_provider orelse .gateway;
             switch (login_provider) {
+                .openai => {
+                    try writeStderr(deps, "fx login: OpenAI uses OPENAI_API_KEY; set it and select the OpenAI provider\n");
+                    return .handled_failure;
+                },
                 .gateway => login_flow.runLogin(
                     alloc,
                     cfg.gateway_provider.oauth_transport,
@@ -950,11 +980,15 @@ fn runNonInteractiveWithDeps(
         },
         .logout => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx logout [vercel|codex|grok]\n");
+                try writeStderr(deps, "usage: fx logout [vercel|openai|codex|grok]\n");
                 return .handled_failure;
             };
             // Preserve the original `fx logout` behavior for scripts and users.
             const login_provider = maybe_login_provider orelse .gateway;
+            if (login_provider == .openai) {
+                try writeStdout(deps, "OpenAI uses the process-owned OPENAI_API_KEY; unset it to disconnect.\n");
+                return .handled_success;
+            }
             if (login_provider == .codex) {
                 const outcome = chatgpt_oauth.logout() catch {
                     try writeStderr(deps, "fx logout: failed to durably remove saved Codex login\n");
@@ -1039,11 +1073,11 @@ fn runNonInteractiveWithDeps(
         },
         .provider => |rest| {
             if (rest.len != 1) {
-                try writeStderr(deps, "usage: fx provider <gateway|codex|grok>\n");
+                try writeStderr(deps, "usage: fx provider <gateway|openai|codex|grok>\n");
                 return .handled_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {
-                try writeStderr(deps, "fx provider: expected gateway, codex, or grok\n");
+                try writeStderr(deps, "fx provider: expected gateway, openai, codex, or grok\n");
                 return .handled_failure;
             };
             return if (try activateProviderSelection(alloc, cfg, deps, target, .provider_command))
@@ -1137,6 +1171,7 @@ fn runNonInteractiveWithDeps(
             const catalog_provider = cfg.provider_set.select(startup.provider).cli_model_catalog orelse {
                 try writeStderr(deps, switch (startup.provider) {
                     .gateway => "fx models: Gateway model catalog is unavailable\n",
+                    .openai => "fx models: OpenAI model discovery is unavailable; configure models.openai or FX_MODEL\n",
                     .codex => "fx models: Codex model catalog is unavailable\n",
                     .grok => "fx models: Grok model catalog is unavailable\n",
                 });

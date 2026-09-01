@@ -1,12 +1,13 @@
 const std = @import("std");
 const chatgpt_oauth = @import("../core/auth/chatgpt_oauth.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
-const secret = @import("../core/auth/secret.zig");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
 const responses_protocol = @import("responses_protocol.zig");
+const responses_sse = @import("responses_sse.zig");
+const responses_transport = @import("responses_transport.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 
 const Allocator = std.mem.Allocator;
@@ -20,10 +21,10 @@ const max_tool_calls: usize = 128;
 const max_tool_identity_bytes: usize = 1024;
 const max_tool_arguments_bytes: usize = 4 * 1024 * 1024;
 const max_provider_state_bytes: usize = 4 * 1024 * 1024;
-const transfer_buffer_bytes: usize = 256 * 1024;
 const connect_timeout_ms: i64 = 30_000;
 
 const CodexLimits = struct {
+    line_bytes: usize = max_sse_line_bytes,
     aggregate_bytes: usize = max_sse_aggregate_bytes,
     events: usize = max_sse_events,
     tool_calls: usize = max_tool_calls,
@@ -140,280 +141,73 @@ fn streamCompletion(
     try validateModel(request.model);
     const payload = try buildRequest(alloc, request.data());
     defer alloc.free(payload);
-    return streamPrepared(alloc, request, payload) catch |err| {
-        if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
-        request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(err, request.delivery.load());
-        return err;
-    };
+    return streamPrepared(alloc, request, payload);
 }
-
-const OpenedRequest = struct {
-    request: ?std.http.Client.Request,
-
-    pub fn deinit(self: *OpenedRequest, _: Allocator) void {
-        if (self.request) |*request| request.deinit();
-        self.request = null;
-    }
-
-    pub fn take(self: *OpenedRequest) std.http.Client.Request {
-        const request = self.request.?;
-        self.request = null;
-        return request;
-    }
-};
-
-const OpenRequestOperation = struct {
-    client: *std.http.Client,
-    uri: std.Uri,
-    auth_header: []const u8,
-    extra_headers: []const std.http.Header,
-
-    pub fn run(self: *@This()) !OpenedRequest {
-        return .{ .request = try self.client.request(.POST, self.uri, .{
-            .headers = .{
-                .content_type = .{ .override = "application/json" },
-                .authorization = .{ .override = self.auth_header },
-                .accept_encoding = .omit,
-                .user_agent = .{ .override = gateway_client.user_agent },
-            },
-            .extra_headers = self.extra_headers,
-            .keep_alive = false,
-            .redirect_behavior = .unhandled,
-        }) };
-    }
-};
 
 pub fn streamPrepared(
     alloc: Allocator,
     request: stream_provider.ModelRequest,
     payload: []const u8,
 ) !stream_provider.Result {
-    if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
     const account_id = try chatgpt_oauth.extractAccountId(alloc, request.credential.secret);
     defer alloc.free(account_id);
-    const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.credential.secret});
-    defer secret.zeroAndFree(alloc, auth_header);
     const request_endpoint = if (io_mod.getenv(e2e_endpoint_env)) |override| endpoint: {
         if (!gateway_client.isLoopbackHttpUrl(override)) {
             return stream_provider.failResult(error.InvalidE2EOpenAICodexEndpoint);
         }
         break :endpoint override;
     } else endpoint;
-    const uri = try std.Uri.parse(request_endpoint);
 
-    var extra_headers_buf: [7]std.http.Header = undefined;
-    var extra_count: usize = 0;
-    extra_headers_buf[extra_count] = .{ .name = "chatgpt-account-id", .value = account_id };
-    extra_count += 1;
-    extra_headers_buf[extra_count] = .{ .name = "originator", .value = "fx" };
-    extra_count += 1;
-    extra_headers_buf[extra_count] = .{ .name = "OpenAI-Beta", .value = "responses=experimental" };
-    extra_count += 1;
-    extra_headers_buf[extra_count] = .{ .name = "accept", .value = "text/event-stream" };
-    extra_count += 1;
+    var headers: [7]std.http.Header = undefined;
+    var count: usize = 0;
+    headers[count] = .{ .name = "chatgpt-account-id", .value = account_id };
+    count += 1;
+    headers[count] = .{ .name = "originator", .value = "fx" };
+    count += 1;
+    headers[count] = .{ .name = "OpenAI-Beta", .value = "responses=experimental" };
+    count += 1;
+    headers[count] = .{ .name = "accept", .value = "text/event-stream" };
+    count += 1;
     if (request.session_id) |session_id| if (session_id.len > 0) {
-        extra_headers_buf[extra_count] = .{ .name = "session-id", .value = session_id };
-        extra_count += 1;
-        extra_headers_buf[extra_count] = .{ .name = "x-client-request-id", .value = session_id };
-        extra_count += 1;
+        headers[count] = .{ .name = "session-id", .value = session_id };
+        count += 1;
+        headers[count] = .{ .name = "x-client-request-id", .value = session_id };
+        count += 1;
     };
 
-    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
-    defer client.deinit();
-    var open_operation = OpenRequestOperation{
-        .client = &client,
-        .uri = uri,
-        .auth_header = auth_header,
-        .extra_headers = extra_headers_buf[0..extra_count],
-    };
-    const connect_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
-        .clock = .awake,
-        .raw = .fromMilliseconds(connect_timeout_ms),
+    var result = try responses_transport.stream(alloc, request, payload, .{
+        .endpoint = request_endpoint,
+        .extra_headers = headers[0..count],
+        .max_error_body_bytes = max_error_body_bytes,
+        .error_limit_message = "OpenAI Codex error response exceeded the local limit",
+        .connect_timeout_ms = connect_timeout_ms,
+        .stream_limits = .{
+            .line_bytes = max_sse_line_bytes,
+            .aggregate_bytes = max_sse_aggregate_bytes,
+            .events = max_sse_events,
+            .tool_calls = max_tool_calls,
+            .tool_identity_bytes = max_tool_identity_bytes,
+            .tool_arguments_bytes = max_tool_arguments_bytes,
+            .provider_state_bytes = max_provider_state_bytes,
+        },
     });
-    try request.admission.admit();
-    var opened = try gateway_client.runBoundedHttpOperation(
-        OpenedRequest,
+    errdefer result.deinit(alloc);
+    switch (result) {
+        .failed => return result,
+        .completed => {},
+    }
+    const completion = &result.completed.completion;
+    if (completion.generation_id == null) return result;
+    completion.billing = try responses_protocol.buildSubscriptionBilling(
         alloc,
-        request.cancel_flag,
-        connect_deadline,
-        &open_operation,
-    );
-    var http_request = opened.take();
-    defer http_request.deinit();
-    var cancel_watch_done = std.atomic.Value(bool).init(false);
-    const cancel_watcher = if (http_request.connection) |connection|
-        try gateway_client.spawnHttpCancelWatcher(
-            &cancel_watch_done,
-            request.cancel_flag,
-            connection.stream_writer.stream,
-        )
-    else
-        null;
-    defer {
-        cancel_watch_done.store(true, .seq_cst);
-        if (cancel_watcher) |thread| thread.join();
-    }
-    if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-
-    http_request.transfer_encoding = .{ .content_length = payload.len };
-    var send_buffer: [8192]u8 = undefined;
-    request.delivery.markPossiblySent();
-    var body_writer = try http_request.sendBodyUnflushed(&send_buffer);
-    try body_writer.writer.writeAll(payload);
-    try body_writer.end();
-    if (http_request.connection) |connection| try connection.flush();
-    if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-
-    var response = try http_request.receiveHead(&.{});
-    if (response.head.status != .ok) {
-        var transfer: [16 * 1024]u8 = undefined;
-        const reader = response.reader(&transfer);
-        const body = reader.allocRemaining(alloc, .limited(max_error_body_bytes)) catch |err| switch (err) {
-            error.StreamTooLong => try alloc.dupe(u8, "OpenAI Codex error response exceeded the local limit"),
-            else => return err,
-        };
-        return .{ .failed = .{
-            .kind = failureKind(response.head.status),
-            .detail = body,
-            .ownership = .owned,
-        } };
-    }
-
-    var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
-    const reader = response.reader(&transfer_buffer);
-    var events = request.events;
-    var completion = try consumeSse(
-        alloc,
-        reader,
-        &events,
-        EventBridge.content,
-        EventBridge.toolStart,
-        EventBridge.reasoning,
-        EventBridge.toolInput,
-        request.cancel_flag,
-        request.content_capture_limit,
-        .{},
-    );
-    errdefer {
-        var owned = stream_provider.Result{ .completed = .{
-            .completion = completion,
-            .ownership = .owned,
-        } };
-        owned.deinit(alloc);
-    }
-    const usage_outcome: stream_provider.UsageOutcome = usage: {
-        if (completion.generation_id == null) {
-            break :usage .{ .unavailable = .possibly_billed };
-        }
-        completion.billing = try responses_protocol.buildSubscriptionBilling(
-            alloc,
-            .codex,
-            request.model,
-            @max(io_mod.milliTimestamp(), 0),
-            completion.usage,
-        ) orelse break :usage .{ .unavailable = .possibly_billed };
-        break :usage .{ .exact = .codex };
-    };
-    return .{ .completed = .{
-        .completion = completion,
-        .usage = usage_outcome,
-        .ownership = .owned,
-    } };
+        .codex,
+        request.model,
+        @max(io_mod.milliTimestamp(), 0),
+        completion.usage,
+    ) orelse return result;
+    result.completed.usage = .{ .exact = .codex };
+    return result;
 }
-
-const EventBridge = struct {
-    fn sink(raw: *anyopaque) *stream_provider.EventSink {
-        return @ptrCast(@alignCast(raw));
-    }
-
-    fn content(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .content_delta = chunk });
-    }
-
-    fn reasoning(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .reasoning_delta = chunk });
-    }
-
-    fn toolInput(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .tool_input_delta = chunk });
-    }
-
-    fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8) void {
-        sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label } });
-    }
-};
-
-fn failureKind(status: std.http.Status) stream_provider.FailureKind {
-    return switch (status) {
-        .bad_request => .invalid_request,
-        .unauthorized => .unauthorized,
-        .forbidden => .forbidden,
-        .payload_too_large => .request_too_large,
-        .too_many_requests => .rate_limited,
-        .internal_server_error => .server_error,
-        .bad_gateway => .bad_gateway,
-        .service_unavailable => .unavailable,
-        .gateway_timeout => .gateway_timeout,
-        else => .provider_error,
-    };
-}
-
-const SseReader = struct {
-    pending_line: std.ArrayList(u8) = .empty,
-
-    fn deinit(self: *SseReader, alloc: Allocator) void {
-        self.pending_line.deinit(alloc);
-    }
-
-    fn release(self: *SseReader) void {
-        self.pending_line.clearRetainingCapacity();
-    }
-
-    fn next(self: *SseReader, alloc: Allocator, reader: anytype) !?[]const u8 {
-        while (true) {
-            const line = try self.readLine(alloc, reader) orelse return null;
-            const trimmed = std.mem.trim(u8, line, " \t\r");
-            if (trimmed.len == 0 or trimmed[0] == ':') {
-                self.release();
-                continue;
-            }
-            if (!std.mem.startsWith(u8, trimmed, "data:")) {
-                self.release();
-                continue;
-            }
-            const data = std.mem.trim(u8, trimmed["data:".len..], " \t");
-            if (std.mem.eql(u8, data, "[DONE]")) return null;
-            return data;
-        }
-    }
-
-    fn readLine(self: *SseReader, alloc: Allocator, reader: anytype) !?[]const u8 {
-        while (true) {
-            const fragment = reader.takeDelimiter('\n') catch |err| switch (err) {
-                error.StreamTooLong => {
-                    const buffered = reader.buffered();
-                    if (buffered.len == 0) return error.OpenAICodexSseReadStalled;
-                    if (buffered.len > max_sse_line_bytes - self.pending_line.items.len) {
-                        return error.OpenAICodexSseEventTooLarge;
-                    }
-                    try self.pending_line.appendSlice(alloc, buffered);
-                    reader.tossBuffered();
-                    continue;
-                },
-                error.ReadFailed => return error.ReadFailed,
-            } orelse {
-                if (self.pending_line.items.len > 0) return self.pending_line.items;
-                return null;
-            };
-            if (fragment.len > max_sse_line_bytes - self.pending_line.items.len) {
-                return error.OpenAICodexSseEventTooLarge;
-            }
-            if (self.pending_line.items.len == 0) return fragment;
-            try self.pending_line.appendSlice(alloc, fragment);
-            return self.pending_line.items;
-        }
-    }
-};
 
 fn consumeSse(
     alloc: Allocator,
@@ -427,42 +221,23 @@ fn consumeSse(
     content_capture_limit: ?usize,
     limits: CodexLimits,
 ) !types.ModelCompletion {
-    var reducer = responses_protocol.Reducer.init(alloc);
-    defer reducer.deinit(alloc);
-    var sse: SseReader = .{};
-    defer sse.deinit(alloc);
-    const callbacks = responses_protocol.StreamCallbacks{
+    return responses_sse.consume(alloc, reader, .{
         .context = callback_ctx,
         .on_content = on_content_chunk,
         .on_tool_start = on_tool_start,
         .on_reasoning = on_reasoning_chunk,
         .on_tool_input = on_tool_input_chunk,
-    };
-    const stream_limits = responses_protocol.StreamLimits{
+    }, cancel_flag, content_capture_limit, .{
+        .line_bytes = limits.line_bytes,
         .aggregate_bytes = limits.aggregate_bytes,
         .events = limits.events,
         .tool_calls = limits.tool_calls,
         .tool_identity_bytes = limits.tool_identity_bytes,
         .tool_arguments_bytes = limits.tool_arguments_bytes,
         .provider_state_bytes = limits.provider_state_bytes,
-    };
-    while (try sse.next(alloc, reader)) |json_text| {
-        defer sse.release();
-        if (reducer.applyJson(
-            alloc,
-            json_text,
-            callbacks,
-            cancel_flag,
-            content_capture_limit,
-            stream_limits,
-        ) catch |err| return mapReducerError(err)) break;
-    }
-    return reducer.finish(alloc, cancel_flag, stream_limits) catch |err|
-        return mapReducerError(err);
-}
-
-fn mapReducerError(err: anyerror) anyerror {
-    return switch (err) {
+    }) catch |err| return switch (err) {
+        error.ResponsesSseReadStalled => error.OpenAICodexSseReadStalled,
+        error.ResponsesSseEventTooLarge => error.OpenAICodexSseEventTooLarge,
         error.InvalidEvent => error.InvalidOpenAICodexSseEvent,
         error.ResponseFailed => error.OpenAICodexResponseFailed,
         error.StreamIncomplete => error.OpenAICodexStreamIncomplete,
