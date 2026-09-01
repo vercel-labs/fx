@@ -23,6 +23,7 @@ const credential_authority = @import("../core/auth/credential_authority.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
 const vercel_model_policy = @import("../gateway/vercel_model_policy.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
+const catalog_disk_cache = @import("../core/gateway/catalog_disk_cache.zig");
 const output_contracts = @import("../core/output/output_contracts.zig");
 const shared_types = @import("../core/shared/types.zig");
 const session_usage = @import("../core/session/session_usage.zig");
@@ -2372,6 +2373,112 @@ fn fetchModelCatalogForView(
     return parseModelCatalogForView(alloc, json_text, view);
 }
 
+const e2e_models_url_env = "FX_E2E_GATEWAY_MODELS_URL";
+
+const model_catalog_cache_config = catalog_disk_cache.Config{
+    .file_prefix = "gateway-models",
+    // The catalog schema this binary parses can change between releases, so
+    // gate cache entries on the fx build that wrote them.
+    .version = gateway_client.user_agent,
+    .max_body_bytes = 8 * 1024 * 1024,
+};
+
+/// The cache is bypassed whenever a loopback endpoint override is active:
+/// e2e runs must observe every catalog request, and must not perform durable
+/// writes outside the fixture sandbox.
+fn modelCatalogCacheEnabled() bool {
+    return io_mod.getenv(e2e_models_url_env) == null and
+        io_mod.getenv(base_url_env) == null;
+}
+
+/// One cache slot per catalog identity: credential source, team, account (or
+/// the credential itself when no stable account id exists), and the resolved
+/// URL. The material is hashed before it reaches the file system.
+fn modelCatalogCachePartition(
+    alloc: Allocator,
+    access: credentials.CatalogAccess,
+    url: []const u8,
+) ![]u8 {
+    const source_label = if (access.credentialSource()) |source| @tagName(source) else "public";
+    const team = access.teamContext() orelse "";
+    const account = access.accountId() orelse (access.authorizationCredential() orelse "");
+    return std.fmt.allocPrint(
+        alloc,
+        "{s}\x00{s}\x00{s}\x00{s}",
+        .{ source_label, team, account, url },
+    );
+}
+
+fn modelCatalogCachePath(
+    alloc: Allocator,
+    access: credentials.CatalogAccess,
+    url: []const u8,
+) ?[]u8 {
+    if (!modelCatalogCacheEnabled()) return null;
+    const partition = modelCatalogCachePartition(alloc, access, url) catch return null;
+    defer alloc.free(partition);
+    return catalog_disk_cache.cachePath(alloc, model_catalog_cache_config, partition) catch null;
+}
+
+/// Stores a fetched catalog body only after it parses with the same rules as
+/// every consumer, so a cached body can never be weaker than a fetched one.
+/// The response is already in hand, so all failures here are advisory.
+fn storeValidatedModelCatalogBody(alloc: Allocator, path: []const u8, body: []const u8) void {
+    var catalog = parseModelCatalogForView(alloc, body, .full) catch |err| {
+        debug_trace.logf(
+            "catalog",
+            "Gateway model catalog cache outcome=store_skipped error={s}",
+            .{@errorName(err)},
+        );
+        return;
+    };
+    freeModelCatalog(alloc, &catalog);
+    catalog_disk_cache.store(
+        alloc,
+        model_catalog_cache_config,
+        path,
+        body,
+        io_mod.milliTimestamp(),
+    ) catch |err| {
+        debug_trace.logf(
+            "catalog",
+            "Gateway model catalog cache outcome=store_failed error={s}",
+            .{@errorName(err)},
+        );
+        return;
+    };
+    debug_trace.logf("catalog", "Gateway model catalog cache outcome=stored", .{});
+}
+
+test "gateway model catalog cache partitions separate identity, team, and URL" {
+    const alloc = std.testing.allocator;
+    const key_access: credentials.CatalogAccess = .{ .authenticated = .{
+        .source = .gateway_api_key,
+        .credential = "vck_test",
+        .team_context = null,
+    } };
+    const base = try modelCatalogCachePartition(alloc, key_access, "https://gateway/v1/models");
+    defer alloc.free(base);
+    const other_url = try modelCatalogCachePartition(alloc, key_access, "https://gateway/v2/models");
+    defer alloc.free(other_url);
+    try std.testing.expect(!std.mem.eql(u8, base, other_url));
+
+    const other_key: credentials.CatalogAccess = .{ .authenticated = .{
+        .source = .gateway_api_key,
+        .credential = "vck_other",
+        .team_context = null,
+    } };
+    const other_credential = try modelCatalogCachePartition(alloc, other_key, "https://gateway/v1/models");
+    defer alloc.free(other_credential);
+    try std.testing.expect(!std.mem.eql(u8, base, other_credential));
+
+    const public_access: credentials.CatalogAccess = .{ .public_only = .no_credential };
+    const public_partition = try modelCatalogCachePartition(alloc, public_access, "https://gateway/v1/models");
+    defer alloc.free(public_partition);
+    try std.testing.expect(std.mem.startsWith(u8, public_partition, "public"));
+    try std.testing.expect(!std.mem.eql(u8, base, public_partition));
+}
+
 fn fetchModelCatalogResponse(
     alloc: std.mem.Allocator,
     access: credentials.CatalogAccess,
@@ -2392,12 +2499,34 @@ fn fetchModelCatalogResponse(
     );
     defer alloc.free(model_catalog_url);
 
+    const cache_path = modelCatalogCachePath(alloc, access, model_catalog_url);
+    defer if (cache_path) |cache_file| alloc.free(cache_file);
+    if (cache_path) |cache_file| {
+        if (catalog_disk_cache.loadFresh(
+            alloc,
+            model_catalog_cache_config,
+            cache_file,
+            io_mod.milliTimestamp(),
+        )) |body| {
+            debug_trace.logf("catalog", "Gateway model catalog cache outcome=hit", .{});
+            return .{ .success = body };
+        }
+        debug_trace.logf("catalog", "Gateway model catalog cache outcome=miss", .{});
+    }
+
     const api_key = access.authorizationCredential();
     const gateway_team = modelCatalogHeaderTeam(access);
-    return if (cancel_flag) |flag|
-        gateway_client.fetchGatewayJsonCancellable(alloc, api_key, gateway_team, model_catalog_url, flag)
+    const result = if (cancel_flag) |flag|
+        try gateway_client.fetchGatewayJsonCancellable(alloc, api_key, gateway_team, model_catalog_url, flag)
     else
-        gateway_client.fetchGatewayJson(alloc, api_key, gateway_team, model_catalog_url);
+        try gateway_client.fetchGatewayJson(alloc, api_key, gateway_team, model_catalog_url);
+    if (cache_path) |cache_file| {
+        switch (result) {
+            .success => |body| storeValidatedModelCatalogBody(alloc, cache_file, body),
+            .http_status => {},
+        }
+    }
+    return result;
 }
 
 fn modelCatalogTeamPath(

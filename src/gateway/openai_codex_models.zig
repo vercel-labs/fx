@@ -1,8 +1,11 @@
 const std = @import("std");
 const chatgpt_oauth = @import("../core/auth/chatgpt_oauth.zig");
+const catalog_disk_cache = @import("../core/gateway/catalog_disk_cache.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
+const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
+const profile_paths = @import("../core/shared/profile_paths.zig");
 const secret = @import("../core/auth/secret.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
@@ -11,6 +14,7 @@ const max_catalog_models: usize = 128;
 const max_model_id_bytes: usize = 1024;
 const max_catalog_bytes: usize = 4 * 1024 * 1024;
 const fetch_timeout_ms: i64 = 30_000;
+const catalog_cache_prefix = "codex-models";
 const default_models_endpoint = "https://chatgpt.com/backend-api/codex/models";
 const e2e_models_endpoint_env = "FX_E2E_OPENAI_CODEX_MODELS_URL";
 
@@ -68,6 +72,28 @@ fn fetchCatalogForProvider(
         return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
     };
     defer alloc.free(account_id);
+
+    const cache_path = catalogCachePath(alloc, account_id) catch null;
+    defer if (cache_path) |path| alloc.free(path);
+    if (cache_path) |path| {
+        if (loadFreshCatalogCache(alloc, path, io_mod.milliTimestamp())) |body| {
+            defer secret.zeroAndFree(alloc, body);
+            if (parseValidatedCatalog(alloc, body)) |catalog| {
+                debug_trace.logf("catalog", "Codex model catalog cache outcome=hit", .{});
+                return .{ .catalog = catalog };
+            } else |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                debug_trace.logf(
+                    "catalog",
+                    "Codex model catalog cache outcome=invalid error={s}",
+                    .{@errorName(err)},
+                );
+            }
+        } else {
+            debug_trace.logf("catalog", "Codex model catalog cache outcome=miss", .{});
+        }
+    }
+
     const request_url = modelsUrl(alloc) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{ .category = .runtime } };
@@ -102,20 +128,24 @@ fn fetchCatalogForProvider(
     if (response.status != .ok) {
         return .{ .failure = model_catalog.failureForHttpStatus(response.status) };
     }
-    var catalog = parseCatalog(alloc, response.body) catch |err| {
+    var catalog = parseValidatedCatalog(alloc, response.body) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{ .category = .malformed_response, .http_status = .ok } };
     };
-    var reviewer_available = false;
-    for (catalog.items) |entry| {
-        if (std.mem.eql(u8, entry.id, reviewer_model)) {
-            reviewer_available = true;
-            break;
+    if (cache_path) |path| {
+        if (storeCatalogCache(alloc, path, response.body, io_mod.milliTimestamp())) {
+            debug_trace.logf("catalog", "Codex model catalog cache outcome=stored", .{});
+        } else |err| {
+            if (err == error.OutOfMemory) {
+                model_catalog.freeModelCatalog(alloc, &catalog);
+                return error.OutOfMemory;
+            }
+            debug_trace.logf(
+                "catalog",
+                "Codex model catalog cache outcome=store_failed error={s}",
+                .{@errorName(err)},
+            );
         }
-    }
-    if (!reviewer_available) {
-        model_catalog.freeModelCatalog(alloc, &catalog);
-        return .{ .failure = .{ .category = .malformed_response, .http_status = .ok } };
     }
     return .{ .catalog = catalog };
 }
@@ -183,6 +213,55 @@ fn modelsUrl(alloc: std.mem.Allocator) ![]u8 {
         "{s}{c}client_version={s}",
         .{ base, separator, protocol_client_version },
     );
+}
+
+const catalog_cache_config = catalog_disk_cache.Config{
+    .file_prefix = catalog_cache_prefix,
+    .version = protocol_client_version,
+    .max_body_bytes = max_catalog_bytes,
+};
+
+/// The cache is bypassed entirely when the loopback e2e endpoint override is
+/// active: e2e runs must observe every catalog request, and must not perform
+/// durable writes outside the fixture sandbox.
+fn catalogCacheEnabled() bool {
+    return io_mod.getenv(e2e_models_endpoint_env) == null;
+}
+
+fn catalogCachePath(alloc: std.mem.Allocator, account_id: []const u8) ![]u8 {
+    if (!catalogCacheEnabled()) return error.CodexCatalogCacheDisabled;
+    // The account id partitions the cache so switching accounts can never
+    // serve another tenant's catalog.
+    return catalog_disk_cache.cachePath(alloc, catalog_cache_config, account_id);
+}
+
+fn loadFreshCatalogCache(alloc: std.mem.Allocator, path: []const u8, now_ms: i64) ?[]u8 {
+    return catalog_disk_cache.loadFresh(alloc, catalog_cache_config, path, now_ms);
+}
+
+fn storeCatalogCache(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    body: []const u8,
+    fetched_at_ms: i64,
+) !void {
+    if (!catalogCacheEnabled()) return error.CodexCatalogCacheDisabled;
+    return catalog_disk_cache.store(alloc, catalog_cache_config, path, body, fetched_at_ms);
+}
+
+/// Parses a catalog body and applies the same acceptance rule as the network
+/// path: a catalog that does not include the reviewer model is rejected, so a
+/// cached body can never be weaker than a fetched one.
+fn parseValidatedCatalog(
+    alloc: std.mem.Allocator,
+    json_text: []const u8,
+) !std.ArrayList(model_catalog.ModelCatalogEntry) {
+    var catalog = try parseCatalog(alloc, json_text);
+    errdefer model_catalog.freeModelCatalog(alloc, &catalog);
+    for (catalog.items) |entry| {
+        if (std.mem.eql(u8, entry.id, reviewer_model)) return catalog;
+    }
+    return error.InvalidCodexModelCatalog;
 }
 
 fn parseCatalog(
@@ -316,6 +395,52 @@ test "Codex catalog parser keeps visible API models and live capabilities" {
     try std.testing.expect(model.has_vision);
     try std.testing.expect(model.has_file_input);
     try std.testing.expectEqual(@as(u32, 272_000), model.context_window);
+}
+
+const test_catalog_body =
+    \\{"models":[
+    \\  {"slug":"gpt-5.4-mini","visibility":"list","supported_in_api":true,"priority":7,"supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}],"additional_speed_tiers":[],"input_modalities":["text","image"],"context_window":272000}
+    \\]}
+;
+
+fn testCachePath(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    return std.fs.path.join(alloc, &.{ root, "cache", "codex-models-test.json" });
+}
+
+test "Codex catalog cache round-trips a fresh body" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testCachePath(alloc, &tmp);
+    defer alloc.free(path);
+
+    const stored_at_ms: i64 = 1_000_000;
+    try storeCatalogCache(alloc, path, test_catalog_body, stored_at_ms);
+
+    const loaded = loadFreshCatalogCache(alloc, path, stored_at_ms + 1) orelse
+        return error.TestExpectedCacheHit;
+    defer alloc.free(loaded);
+    try std.testing.expectEqualStrings(test_catalog_body, loaded);
+
+    var catalog = try parseValidatedCatalog(alloc, loaded);
+    defer model_catalog.freeModelCatalog(alloc, &catalog);
+    try std.testing.expectEqual(@as(usize, 1), catalog.items.len);
+    try std.testing.expectEqualStrings(reviewer_model, catalog.items[0].id);
+}
+
+test "Codex validated catalog parse rejects a catalog without the reviewer model" {
+    const alloc = std.testing.allocator;
+    const missing_reviewer =
+        \\{"models":[
+        \\  {"slug":"other-model","visibility":"list","supported_in_api":true,"priority":7,"supported_reasoning_levels":[],"additional_speed_tiers":[],"input_modalities":["text"],"context_window":1000}
+        \\]}
+    ;
+    try std.testing.expectError(
+        error.InvalidCodexModelCatalog,
+        parseValidatedCatalog(alloc, missing_reviewer),
+    );
 }
 
 test "Codex catalog URL uses the live-validated protocol compatibility version" {
