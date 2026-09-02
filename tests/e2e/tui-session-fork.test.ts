@@ -129,16 +129,28 @@ describe("interactive session fork and rewind", () => {
       );
       await ask("first prompt", "REPLY_ONE");
 
+      const before = await savedSessions(home, workspace);
+      expect(before).toHaveLength(1);
+      const sourceId = before[0]!.id;
+
       await session!.sendText("/fork");
-      await session!.waitForText("Use: /fork <turn>", STEP_TIMEOUT);
-      await session!.sendText("/rewind");
-      await session!.waitForText("Use: /rewind <count>", STEP_TIMEOUT);
-      expect(await flatPane()).toContain("Run`fxsession");
+      await session!.waitForText("You are now in the branch", STEP_TIMEOUT);
+
+      const after = await savedSessions(home, workspace);
+      expect(after).toHaveLength(2);
+      const branch = after.find((entry) => entry.id !== sourceId)!;
+      expect(branch.prompts).toEqual(["first prompt"]);
+      expect(after.find((entry) => entry.id === sourceId)!.prompts).toEqual([
+        "first prompt",
+      ]);
+      const pane = await flatPane();
+      expect(pane).toContain(sourceId);
+      expect(pane).toContain(branch.id);
 
       await quitShell(stderrPath);
       const saved = await savedSessions(home, workspace);
-      expect(saved).toHaveLength(1);
-      expect(saved[0]!.prompts).toEqual(["first prompt"]);
+      expect(saved).toHaveLength(2);
+      for (const entry of saved) expect(entry.prompts).toEqual(["first prompt"]);
     },
     TIMEOUT,
   );
@@ -179,6 +191,67 @@ describe("interactive session fork and rewind", () => {
       const saved = await savedSessions(home, workspace);
       expect(saved).toHaveLength(1);
       expect(saved[0]!.prompts).toEqual(["first prompt", "second prompt"]);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "bare /rewind selects a turn and restores its prompt to the composer",
+    async () => {
+      const { home, workspace, stderrPath } = await startShell(
+        ["REPLY_ONE", "REPLY_TWO", "REPLY_THREE"],
+        "fx-tui-rewind-picker-",
+      );
+      await ask("first picker prompt", "REPLY_ONE");
+      await ask("second picker prompt", "REPLY_TWO");
+      await ask("third picker prompt", "REPLY_THREE");
+
+      await session!.sendText("/rewind");
+      await session!.waitForText("(current)", STEP_TIMEOUT);
+      const opened = (await session!.capturePaneGrid()).join("\n");
+      expect(opened).toContain("third picker prompt");
+      expect(opened.indexOf("third picker prompt")).toBeLessThan(
+        opened.indexOf("(current)"),
+      );
+
+      await session!.sendKeys("Up");
+      await session!.sendKeys("Up");
+      await session!.waitForText("Drops 2 turns, keeps 1", STEP_TIMEOUT);
+      await session!.sendKeys("Enter");
+      await session!.waitForPane(
+        (pane) => pane.includes("second picker prompt") && !pane.includes("No change."),
+        STEP_TIMEOUT,
+      );
+
+      const saved = await savedSessions(home, workspace);
+      expect(saved).toHaveLength(1);
+      expect(saved[0]!.prompts).toEqual(["first picker prompt"]);
+      await session!.sendKeys("C-u");
+      await quitShell(stderrPath);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "Escape closes the rewind picker without changing history",
+    async () => {
+      const { home, workspace, stderrPath } = await startShell(
+        ["REPLY_ONE"],
+        "fx-tui-rewind-picker-cancel-",
+      );
+      await ask("cancel picker prompt", "REPLY_ONE");
+      await session!.sendText("/rewind");
+      await session!.waitForText("(current)", STEP_TIMEOUT);
+      await session!.sendKeys("Escape");
+      await session!.waitForPane(
+        (pane) => !pane.includes("Enter to continue") && !pane.includes("(current)"),
+        STEP_TIMEOUT,
+      );
+      await session!.waitForComposer(STEP_TIMEOUT);
+
+      const saved = await savedSessions(home, workspace);
+      expect(saved[0]!.prompts).toEqual(["cancel picker prompt"]);
+      await quitShell(stderrPath);
     },
     TIMEOUT,
   );

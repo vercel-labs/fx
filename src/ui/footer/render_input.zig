@@ -213,6 +213,15 @@ pub const SessionMenuProjection = struct {
     }
 };
 
+pub const TurnPickerProjection = struct {
+    active: bool = false,
+    history: []const types.HistoryTurn = &.{},
+    history_len: usize = 0,
+    cursor: usize = 0,
+    window_start: usize = 0,
+    visible_rows: usize = 8,
+};
+
 pub const HelpMenuProjection = struct {
     active: bool = false,
     category: ?command_specs.SlashPresentationCategory = null,
@@ -312,6 +321,7 @@ pub fn workspaceMenuProjection(
 }
 
 pub const CompactCommandMenuProjection = union(enum) {
+    turn_picker: TurnPickerProjection,
     statusline: StatuslineMenuProjection,
     usage: UsageMenuProjection,
     workspace: WorkspaceMenuProjection,
@@ -439,6 +449,7 @@ pub const RenderContext = struct {
     settings_menu: SettingsMenuProjection = .{},
     model_menu: ModelMenuProjection = .{},
     session_menu: SessionMenuProjection = .{},
+    turn_picker: TurnPickerProjection = .{},
     statusline_menu: StatuslineMenuProjection = .{},
     usage_menu: UsageMenuProjection = .{},
     workspace_menu: WorkspaceMenuProjection = .{},
@@ -454,6 +465,7 @@ pub const RenderContext = struct {
 };
 
 pub fn activeCompactCommandMenu(ctx: RenderContext) ?CompactCommandMenuProjection {
+    if (ctx.turn_picker.active) return .{ .turn_picker = ctx.turn_picker };
     if (ctx.statusline_menu.active) return .{ .statusline = ctx.statusline_menu };
     if (ctx.usage_menu.active) return .{ .usage = ctx.usage_menu };
     if (ctx.workspace_menu.active) return .{ .workspace = ctx.workspace_menu };

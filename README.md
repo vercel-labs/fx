@@ -105,7 +105,7 @@ The interactive shell has the same two operations for the session it is already 
 /rewind 2
 ```
 
-`/fork 7` branches at turn 7, names both the source ID and the new one, and leaves you in the branch. The source session keeps every turn it had. `/rewind 2` asks first: the message says how many turns it will drop and how many remain, and a second identical `/rewind 2` carries it out. Any other command in between cancels it.
+`/fork` branches the whole session at its current point; `/fork 7` branches at turn 7. Both forms name the source ID and the new one and leave you in the branch, while the source session keeps every turn it had. Bare `/rewind` opens a turn picker that restores to before the selected prompt and puts that prompt back in the composer. `/rewind 2` asks first: the message says how many turns it will drop and how many remain, and a second identical `/rewind 2` carries it out. Any other command in between cancels it.
 
 Neither command reverts file edits, commands, commits, or API calls. They change the conversation only.
 

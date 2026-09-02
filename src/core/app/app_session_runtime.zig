@@ -162,6 +162,93 @@ test "rewind target reports the turns it drops" {
     try std.testing.expectEqual(@as(usize, 3), target.removedTurnCount());
 }
 
+pub const TurnPicker = struct {
+    history_len: usize,
+    cursor: usize,
+    window_start: usize,
+
+    pub const window_rows: usize = 8;
+
+    pub const Effect = union(enum) {
+        no_change,
+        rewind: struct {
+            dropped_turns: usize,
+            retained_turns: usize,
+        },
+    };
+
+    pub fn init(history_len: usize) TurnPicker {
+        return .{
+            .history_len = history_len,
+            .cursor = history_len,
+            .window_start = (history_len + 1) -| window_rows,
+        };
+    }
+
+    pub fn move(self: *TurnPicker, delta: i32, visible_rows: usize) void {
+        const next = std.math.clamp(
+            @as(i64, @intCast(self.cursor)) + delta,
+            0,
+            @as(i64, @intCast(self.history_len)),
+        );
+        self.cursor = @intCast(next);
+        const rows = @max(visible_rows, 1);
+        if (self.cursor < self.window_start) self.window_start = self.cursor;
+        if (self.cursor >= self.window_start + rows) {
+            self.window_start = self.cursor + 1 - rows;
+        }
+        self.window_start = @min(self.window_start, (self.history_len + 1) -| rows);
+    }
+
+    pub fn retainedTurns(self: TurnPicker) usize {
+        return self.cursor;
+    }
+
+    pub fn effectLine(self: TurnPicker) Effect {
+        if (self.cursor == self.history_len) return .no_change;
+        return .{ .rewind = .{
+            .dropped_turns = self.history_len - self.cursor,
+            .retained_turns = self.cursor,
+        } };
+    }
+
+    pub fn isCurrent(self: TurnPicker, history_len: usize) bool {
+        return self.history_len == history_len;
+    }
+};
+
+test "turn picker starts at current and moves with a clamped window" {
+    var picker = TurnPicker.init(6);
+    try std.testing.expectEqual(@as(usize, 6), picker.cursor);
+    try std.testing.expectEqual(@as(usize, 0), picker.window_start);
+    try std.testing.expectEqual(TurnPicker.Effect.no_change, picker.effectLine());
+
+    picker.move(-2, 3);
+    try std.testing.expectEqual(@as(usize, 4), picker.cursor);
+    try std.testing.expectEqual(@as(usize, 2), picker.window_start);
+    picker.move(-20, 3);
+    try std.testing.expectEqual(@as(usize, 0), picker.cursor);
+    try std.testing.expectEqual(@as(usize, 0), picker.window_start);
+    picker.move(20, 3);
+    try std.testing.expectEqual(@as(usize, 6), picker.cursor);
+    try std.testing.expectEqual(@as(usize, 4), picker.window_start);
+}
+
+test "turn picker selection restores before the selected prompt" {
+    var picker = TurnPicker.init(5);
+    picker.move(-3, 5);
+    try std.testing.expectEqual(@as(usize, 2), picker.retainedTurns());
+    try std.testing.expectEqual(TurnPicker.Effect{
+        .rewind = .{ .dropped_turns = 3, .retained_turns = 2 },
+    }, picker.effectLine());
+}
+
+test "turn picker detects history changes before selection" {
+    const picker = TurnPicker.init(4);
+    try std.testing.expect(picker.isCurrent(4));
+    try std.testing.expect(!picker.isCurrent(5));
+}
+
 const LiveSessionTransitionEvent = union(enum) {
     request: BackgroundSessionPolicy,
     settle,
@@ -1193,12 +1280,13 @@ pub const Persistence = struct {
     resume_handoff_intent: ResumeHandoffIntent = .none,
     pending_live_session_policy: ?BackgroundSessionPolicy = null,
     rewind_gate: RewindGate = .idle,
+    turn_picker: ?TurnPicker = null,
 
     /// Fieldwise initialization avoids retaining undefined optional payloads
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (std.meta.fields(Persistence).len != 20) {
+            if (std.meta.fields(Persistence).len != 21) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -1223,6 +1311,7 @@ pub const Persistence = struct {
         storage.resume_handoff_intent = .none;
         storage.pending_live_session_policy = null;
         storage.rewind_gate = .idle;
+        storage.turn_picker = null;
     }
 
     pub fn deinit(self: *Persistence, alloc: Allocator) void {
@@ -2513,7 +2602,16 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn appendHistoryTurn(app: *App, turn: types.HistoryTurn) !void {
+            closeStaleTurnPicker(app);
             _ = try appendHistoryTurnWithPendingPresentation(app, turn, .strict, null);
+        }
+
+        fn closeStaleTurnPicker(app: *App) void {
+            if (app.session_persistence.turn_picker) |picker| {
+                if (!picker.isCurrent(app.session.historyLen())) {
+                    app.session_persistence.turn_picker = null;
+                }
+            }
         }
 
         pub fn appendFinishedPrompt(
@@ -3059,7 +3157,14 @@ pub fn Runtime(comptime App: type) type {
                 .execute => {},
             }
 
-            app.session.truncateHistory(app.alloc, target.retained_turns);
+            try rewindToRetainedTurns(app, target.retained_turns);
+            return .{ .rewound = target };
+        }
+
+        fn rewindToRetainedTurns(app: *App, retained_turns: usize) !void {
+            app.session_persistence.rewind_gate.disarm();
+
+            app.session.truncateHistory(app.alloc, retained_turns);
             commitJsHostSnapshot(app, "rewind");
 
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
@@ -3070,7 +3175,56 @@ pub fn Runtime(comptime App: type) type {
                 // dropped, so its checkpoint cannot outlive the turns.
                 try commitCurrentStateReplacement(app, loaded, .rewind, .{}, true);
             }
-            return .{ .rewound = target };
+        }
+
+        pub fn openTurnPicker(app: *App) !bool {
+            if (app.stream.active or app.session.historyLen() == 0) return false;
+            // The picker is an inline compact menu like /statusline, so it never
+            // takes the alternate screen and has no terminal modes to restore.
+            app.session_persistence.turn_picker = TurnPicker.init(app.session.historyLen());
+            app.shell.render_requests.request(.footer);
+            return true;
+        }
+
+        pub fn moveTurnPicker(app: *App, delta: i32, visible_rows: usize) bool {
+            if (app.session_persistence.turn_picker) |*picker| {
+                picker.move(delta, visible_rows);
+                return true;
+            }
+            return false;
+        }
+
+        pub fn cancelTurnPicker(app: *App) !bool {
+            if (app.session_persistence.turn_picker == null) return false;
+            app.session_persistence.turn_picker = null;
+            app.shell.render_requests.request(.footer);
+            return true;
+        }
+
+        pub fn applyTurnPicker(app: *App) !bool {
+            const picker = app.session_persistence.turn_picker orelse return false;
+            if (!picker.isCurrent(app.session.historyLen())) {
+                _ = try cancelTurnPicker(app);
+                return true;
+            }
+            if (picker.retainedTurns() == picker.history_len) {
+                _ = try cancelTurnPicker(app);
+                return true;
+            }
+            const prompt = switch (app.session.history.items[picker.retainedTurns()]) {
+                .assistant => |turn| turn.user.text,
+                .background_command => |turn| turn.user.text,
+                .interrupted => |turn| turn.user.text,
+                .compacted_summary => "",
+            };
+            const prompt_copy = try app.alloc.dupe(u8, prompt);
+            defer app.alloc.free(prompt_copy);
+            _ = try cancelTurnPicker(app);
+            try rewindToRetainedTurns(app, picker.retainedTurns());
+            if (prompt_copy.len > 0) {
+                try app.input_runtime.textReplacementState().replace(app.alloc, prompt_copy);
+            }
+            return true;
         }
 
         pub fn disarmRewind(app: *App) void {

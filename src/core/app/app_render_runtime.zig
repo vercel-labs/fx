@@ -757,6 +757,17 @@ pub fn Runtime(comptime App: type) type {
                     .now_ms = now_ms,
                     .selection_failure = app.session_persistence.session_picker.selection_failure,
                 } else .{},
+                .turn_picker = if (comptime @hasField(App, "session_persistence") and @hasField(App, "session")) blk: {
+                    const picker = app.session_persistence.turn_picker orelse break :blk .{};
+                    break :blk .{
+                        .active = true,
+                        .history = app.session.history.items,
+                        .history_len = picker.history_len,
+                        .cursor = picker.cursor,
+                        .window_start = picker.window_start,
+                        .visible_rows = app_session_runtime.TurnPicker.window_rows,
+                    };
+                } else .{},
                 .statusline_menu = render_input.statuslineMenuProjection(
                     &app.input_runtime.statusline_menu,
                     settings_snapshot,

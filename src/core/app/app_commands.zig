@@ -3612,7 +3612,26 @@ fn handleRewindCommand(app: anytype, rest: []const u8) !void {
     const App = @TypeOf(app.*);
     const SessionRuntime = app_session_runtime.Runtime(App);
 
-    const requested = parsedTurnCount(rest) orelse {
+    const trimmed = std.mem.trim(u8, rest, " \t\r\n");
+    if (trimmed.len == 0) {
+        if (app.stream.active) {
+            try app.writeDomainNotice(.{
+                .topic = "session",
+                .tone = .neutral,
+                .body = "rewind is unavailable until the response finishes",
+            }, true);
+        } else if (app.session.historyLen() == 0) {
+            try app.writeDomainNotice(.{
+                .topic = "session",
+                .tone = .neutral,
+                .body = "there are no turns to rewind",
+            }, true);
+        } else {
+            _ = try SessionRuntime.openTurnPicker(app);
+        }
+        return;
+    }
+    const requested = parsedTurnCount(trimmed) orelse {
         try writeTurnArgumentUsage(app, "/rewind <count>");
         return;
     };

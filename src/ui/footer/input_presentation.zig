@@ -708,6 +708,11 @@ pub fn composeCompactCommandMenuHintRow(
     menu: render_input.CompactCommandMenuProjection,
 ) !std.ArrayList(u8) {
     const variants = switch (menu) {
+        .turn_picker => [_][]const u8{
+            "Enter to continue · Esc to cancel",
+            "Enter · Esc",
+            "Enter Esc",
+        },
         .statusline => [_][]const u8{
             "↑↓ Navigate     ←→ Change     Esc Close",
             "↑↓ Move  ←→ Change  Esc",
