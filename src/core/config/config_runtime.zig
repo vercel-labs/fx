@@ -6,6 +6,7 @@ const profile_paths = @import("../shared/profile_paths.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const types = @import("../shared/types.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const settings_store = @import("settings_store.zig");
 const project_config = @import("../mcp/project_config.zig");
 const model_provider = @import("model_provider.zig");
@@ -15,6 +16,7 @@ pub const context_limits = @import("context_limits.zig");
 
 const Allocator = std.mem.Allocator;
 const max_settings_bytes: usize = 64 * 1024;
+const max_system_prompt_bytes: usize = 64 * 1024;
 pub const default_permission_mode: types.PermissionMode = .auto;
 
 pub const Paths = struct {
@@ -1138,6 +1140,104 @@ fn readOptionalFile(alloc: Allocator, path: []const u8) !?[]u8 {
     return try io_mod.readFileToEnd(alloc, &file, max_settings_bytes + 1);
 }
 
+pub const SystemPromptRefusal = enum {
+    blank,
+    oversized,
+    unsafe_path,
+    unsafe_text,
+    unreadable,
+
+    pub fn label(self: SystemPromptRefusal) []const u8 {
+        return switch (self) {
+            .blank => "the file holds no text",
+            .oversized => "the file is too large",
+            .unsafe_path => "the path is a symlink or not a regular file",
+            .unsafe_text => "the file is not valid UTF-8 text",
+            .unreadable => "the file could not be read",
+        };
+    }
+};
+
+/// Where the effective system prompt comes from. A `profile` value owns its bytes.
+pub const SystemPromptSource = union(enum) {
+    compiled,
+    profile: []u8,
+    refused: SystemPromptRefusal,
+
+    pub fn text(self: SystemPromptSource) ?[]const u8 {
+        return switch (self) {
+            .profile => |value| value,
+            .compiled, .refused => null,
+        };
+    }
+
+    pub fn deinit(self: *SystemPromptSource, alloc: Allocator) void {
+        if (self.* == .profile) alloc.free(self.profile);
+        self.* = .compiled;
+    }
+};
+
+/// Resolves the system prompt from `~/.fx/SYSTEM.md`, which replaces the compiled prompt.
+/// Caller owns the returned bytes.
+pub fn loadSystemPromptSource(alloc: Allocator) Allocator.Error!SystemPromptSource {
+    const home = io_mod.getenv("HOME") orelse return .compiled;
+    return loadSystemPromptSourceFromHome(alloc, home);
+}
+
+fn loadSystemPromptSourceFromHome(alloc: Allocator, home: []const u8) Allocator.Error!SystemPromptSource {
+    const text = readSystemPromptFile(alloc, home) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.FileNotFound => return .compiled,
+        else => {
+            const refusal: SystemPromptRefusal = switch (err) {
+                error.SystemPromptBlank => .blank,
+                error.StreamTooLong => .oversized,
+                error.SystemPromptNotModelSafe => .unsafe_text,
+                error.NotDir, error.SymLinkLoop, error.DurablePathUnsafe, error.IsDir => .unsafe_path,
+                else => .unreadable,
+            };
+            debug_trace.logf(
+                "core",
+                "system prompt not applied file={s}/{s} refusal={s} err={s}",
+                .{
+                    profile_paths.root_dir_name,
+                    profile_paths.system_prompt_file_name,
+                    @tagName(refusal),
+                    @errorName(err),
+                },
+            );
+            return .{ .refused = refusal };
+        },
+    };
+    return .{ .profile = text };
+}
+
+/// Opens the profile directory without following it, the way `settings_store` does, so a
+/// symlinked `~/.fx` is refused. `O_NOFOLLOW` on the file guards only the last path component.
+fn readSystemPromptFile(alloc: Allocator, home: []const u8) ![]u8 {
+    const zio = io_mod.getIo();
+    var home_dir = try std.Io.Dir.openDirAbsolute(zio, home, .{});
+    defer home_dir.close(zio);
+    var profile_dir = try home_dir.openDir(zio, profile_paths.root_dir_name, .{ .follow_symlinks = false });
+    defer profile_dir.close(zio);
+
+    var file = try io_mod.openExistingRegularFile(
+        profile_dir,
+        profile_paths.system_prompt_file_name,
+        .read_only,
+    );
+    defer file.close(zio);
+
+    const stat = try file.stat(zio);
+    if (stat.size > max_system_prompt_bytes) return error.StreamTooLong;
+
+    const text = try io_mod.readFileToEnd(alloc, &file, max_system_prompt_bytes + 1);
+    errdefer alloc.free(text);
+    if (std.mem.trim(u8, text, " \t\r\n").len == 0) return error.SystemPromptBlank;
+    if (!text_utils.isModelSafeText(text)) return error.SystemPromptNotModelSafe;
+    return text;
+}
+
 fn parseSettingsJson(alloc: Allocator, json_text: []const u8) !Settings {
     return parseSettingsJsonForLayer(alloc, json_text, .profile);
 }
@@ -1808,6 +1908,75 @@ test "discoverPathsFromHome returns home-backed and workspace paths" {
     try std.testing.expectEqualStrings("/Users/tester/.fx", paths.home_fx_dir.?);
     try std.testing.expectEqualStrings("/Users/tester/.fx/sessions", paths.sessions_dir.?);
     try std.testing.expectEqualStrings("/tmp/workspace", paths.workspace_root);
+}
+
+test "system prompt source names why a file is refused" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "missing/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "blank/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "custom/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "oversized/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "invalid/.fx");
+    try writeFixtureFile(tmp.dir, "blank/.fx/SYSTEM.md", "\n  \t\n");
+    try writeFixtureFile(tmp.dir, "custom/.fx/SYSTEM.md", "You are a pirate.\n");
+    try writeFixtureFile(tmp.dir, "invalid/.fx/SYSTEM.md", "You are a pirate.\xff\n");
+
+    const alloc = std.testing.allocator;
+    const expected = [_]struct { home: []const u8, source: SystemPromptSource }{
+        .{ .home = "missing", .source = .compiled },
+        .{ .home = "blank", .source = .{ .refused = .blank } },
+        .{ .home = "invalid", .source = .{ .refused = .unsafe_text } },
+    };
+    for (expected) |case| {
+        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, case.home);
+        defer alloc.free(home);
+        var source = try loadSystemPromptSourceFromHome(alloc, home);
+        defer source.deinit(alloc);
+        try std.testing.expectEqual(case.source, source);
+        try std.testing.expectEqual(@as(?[]const u8, null), source.text());
+    }
+
+    const custom_home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "custom");
+    defer alloc.free(custom_home);
+    var custom = try loadSystemPromptSourceFromHome(alloc, custom_home);
+    defer custom.deinit(alloc);
+    try std.testing.expectEqualStrings("You are a pirate.\n", custom.text().?);
+
+    const oversized_home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "oversized");
+    defer alloc.free(oversized_home);
+    const oversized_path = try profile_paths.systemPromptPath(alloc, oversized_home);
+    defer alloc.free(oversized_path);
+    try writeRepeatedByteAbsolute(oversized_path, 'a', max_system_prompt_bytes + 1);
+    var oversized = try loadSystemPromptSourceFromHome(alloc, oversized_home);
+    defer oversized.deinit(alloc);
+    try std.testing.expectEqual(SystemPromptSource{ .refused = .oversized }, oversized);
+}
+
+test "system prompt source refuses a symlinked profile directory and a symlinked file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "elsewhere");
+    try tmp.dir.createDirPath(io_mod.getIo(), "linked_dir");
+    try tmp.dir.createDirPath(io_mod.getIo(), "linked_file/.fx");
+    try writeFixtureFile(tmp.dir, "elsewhere/SYSTEM.md", "You are a pirate.\n");
+    tmp.dir.symLink(io_mod.getIo(), "../elsewhere", "linked_dir/.fx", .{ .is_directory = true }) catch |err| switch (err) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    tmp.dir.symLink(io_mod.getIo(), "../../elsewhere/SYSTEM.md", "linked_file/.fx/SYSTEM.md", .{}) catch |err| switch (err) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return err,
+    };
+
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "linked_dir", "linked_file" }) |name| {
+        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, name);
+        defer alloc.free(home);
+        var source = try loadSystemPromptSourceFromHome(alloc, home);
+        defer source.deinit(alloc);
+        try std.testing.expectEqual(SystemPromptSource{ .refused = .unsafe_path }, source);
+    }
 }
 
 test "merged settings rejects symlinked durable root reload path" {

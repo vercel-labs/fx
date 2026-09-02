@@ -98,6 +98,7 @@ pub fn collect(
         // Settings are unreadable, so no remembered choice is available to honour.
         snapshot.auth = try auth_runtime.loadStatusSnapshot(alloc, secret_store, null);
         try appendConfigLoadFailureCheck(&checks, alloc, "config", "failed to load config", err);
+        try appendSystemPromptCheck(&checks, alloc);
         try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
         try appendAuthCheck(&checks, alloc, snapshot.auth);
         try appendConfigLoadFailureCheck(&checks, alloc, "startup", "failed to resolve startup settings", err);
@@ -120,6 +121,7 @@ pub fn collect(
 
     try appendConfigCheck(&checks, alloc, paths, detailed.diagnostics);
     try appendConfigDiagnosticChecks(&checks, alloc, detailed.diagnostics);
+    try appendSystemPromptCheck(&checks, alloc);
     try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
     try appendAuthCheck(&checks, alloc, snapshot.auth);
     try appendResolvedStartupCheck(&snapshot, &checks, alloc, .{
@@ -543,6 +545,46 @@ fn appendCheckOwned(checks: *std.ArrayList(Check), alloc: Allocator, name: []con
         .detail = detail,
         .owned_detail = detail,
     });
+}
+
+fn appendSystemPromptCheck(checks: *std.ArrayList(Check), alloc: Allocator) !void {
+    var source = try config_runtime.loadSystemPromptSource(alloc);
+    defer source.deinit(alloc);
+
+    switch (source) {
+        .compiled => try appendCheck(checks, alloc, "system_prompt", .ok, "using the compiled prompt"),
+        .profile => |text| try appendCheckOwned(
+            checks,
+            alloc,
+            "system_prompt",
+            .ok,
+            try std.fmt.allocPrint(alloc, "using ~/.fx/SYSTEM.md ({d} bytes)", .{text.len}),
+        ),
+        .refused => |refusal| try appendCheckOwned(
+            checks,
+            alloc,
+            "system_prompt",
+            .warn,
+            try std.fmt.allocPrint(
+                alloc,
+                "ignoring ~/.fx/SYSTEM.md because {s}; using the compiled prompt",
+                .{refusal.label()},
+            ),
+        ),
+    }
+}
+
+test "system prompt check reports the profile file and its refusals" {
+    const alloc = std.testing.allocator;
+    var checks: std.ArrayList(Check) = .empty;
+    defer {
+        for (checks.items) |*entry| entry.deinit(alloc);
+        checks.deinit(alloc);
+    }
+
+    try appendSystemPromptCheck(&checks, alloc);
+    try std.testing.expectEqual(@as(usize, 1), checks.items.len);
+    try std.testing.expectEqualStrings("system_prompt", checks.items[0].name);
 }
 
 fn appendMcpConfigCheck(

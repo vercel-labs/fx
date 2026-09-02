@@ -12,6 +12,7 @@ pub const prompt_history_file_name = "history.jsonl";
 pub const usage_file_name = "usage.jsonl";
 pub const usage_recovery_dir_name = "usage-recovery";
 pub const backups_dir_name = "backups";
+pub const system_prompt_file_name = "SYSTEM.md";
 pub const mcp_credentials_dir_name = "mcp-credentials";
 pub const mcp_credentials_file_name = "credentials.json";
 
@@ -28,6 +29,10 @@ pub fn rootDir(alloc: Allocator, home: []const u8) ![]u8 {
 
 pub fn settingsPath(alloc: Allocator, home: []const u8) ![]u8 {
     return std.fs.path.join(alloc, &.{ home, root_dir_name, settings_file_name });
+}
+
+pub fn systemPromptPath(alloc: Allocator, home: []const u8) ![]u8 {
+    return std.fs.path.join(alloc, &.{ home, root_dir_name, system_prompt_file_name });
 }
 
 pub fn mcpConfigPath(alloc: Allocator, home: []const u8) ![]u8 {

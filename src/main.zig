@@ -431,8 +431,10 @@ const App = struct {
         return null;
     }
 
-    pub fn promptPolicy(_: *const Self) prompt_policy.Policy {
-        return builtin_context.prompt_policy;
+    pub fn promptPolicy(self: *const Self) prompt_policy.Policy {
+        var policy = builtin_context.prompt_policy;
+        if (self.system_prompt.text()) |text| policy.system_prompt = text;
+        return policy;
     }
 
     pub fn slashRegistry(_: *const Self) command_specs.SlashRegistry {
@@ -577,6 +579,7 @@ const App = struct {
     file_index: file_index_mod.FileIndex = .{},
     context_enabled: bool = true,
     context_limits: config_runtime.context_limits.Values = .{},
+    system_prompt: config_runtime.SystemPromptSource = .compiled,
     fast_mode: bool = false,
     auto_upgrade_enabled: bool = true,
     effort: ReasoningEffort = .auto,
@@ -668,6 +671,9 @@ const App = struct {
             launch.modifiers.saved_directories_suppressed,
         );
         app.context_limits.applyCommandLine(launch.modifiers.context_limit_overrides);
+        if (comptime !host_target.is_wasm) {
+            app.system_prompt = try config_runtime.loadSystemPromptSource(alloc);
+        }
         if (comptime host_profile.durable_sessions or host_profile.js_host_sessions) {
             if (app.requested_resume != null) {
                 if (launch.upgrade_relaunch) {
@@ -886,6 +892,7 @@ const App = struct {
         self.mcp.deinit(self.alloc);
         self.skills.deinit(std.heap.c_allocator);
         self.context_snapshot.deinit(self.alloc);
+        self.system_prompt.deinit(self.alloc);
         self.file_index.deinit(std.heap.c_allocator);
         self.lifecycle_runtime.deinit();
 
@@ -3355,7 +3362,7 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
     io_mod.setRawEnviron(raw_env);
 
     const alloc = processAllocator();
-    const cfg = if (cli_args.len == 0)
+    var cfg = if (cli_args.len == 0)
         emptyEntryConfig()
     else if (needsFullEntryConfig(cli_args))
         fullEntryConfig()
@@ -3373,6 +3380,14 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
         });
         if (early_threaded) |*threaded| io_mod.setIo(threaded.io());
     }
+
+    var system_prompt: config_runtime.SystemPromptSource = .compiled;
+    defer system_prompt.deinit(alloc);
+    if (needsFullEntryConfig(cli_args)) {
+        debug_trace.configureFromEnv(alloc, ".");
+        system_prompt = try config_runtime.loadSystemPromptSource(alloc);
+    }
+    cfg = entryConfigWithSystemPrompt(cfg, system_prompt.text());
 
     const before = try app_entry_runtime.runBeforeInteractive(alloc, cli_args, cfg);
     switch (before) {
@@ -3740,6 +3755,38 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .remove_mcp_profile_server = builtin_mcp.removeProfileServer,
         .acp_runner = .{ .run_fn = runAcpServer },
     };
+}
+
+fn entryConfigWithSystemPrompt(
+    cfg: app_entry_runtime.Config,
+    override: ?[]const u8,
+) app_entry_runtime.Config {
+    var resolved = cfg;
+    if (override) |text| resolved.prompt_policy.system_prompt = text;
+    return resolved;
+}
+
+test "entry config takes the profile system prompt over the compiled one" {
+    const compiled = entryConfigWithSystemPrompt(fullEntryConfig(), null);
+    try std.testing.expectEqualStrings(
+        builtin_context.gateway_system_prompt,
+        compiled.prompt_policy.system_prompt,
+    );
+
+    const overridden = entryConfigWithSystemPrompt(fullEntryConfig(), "You are a pirate.");
+    try std.testing.expectEqualStrings("You are a pirate.", overridden.prompt_policy.system_prompt);
+}
+
+test "interactive app takes the profile system prompt over the compiled one" {
+    var app = App{ .alloc = std.testing.allocator };
+    try std.testing.expectEqualStrings(
+        builtin_context.gateway_system_prompt,
+        app.promptPolicy().system_prompt,
+    );
+
+    var custom = "You are a pirate.".*;
+    app.system_prompt = .{ .profile = &custom };
+    try std.testing.expectEqualStrings("You are a pirate.", app.promptPolicy().system_prompt);
 }
 
 fn localEntryConfig() app_entry_runtime.Config {
