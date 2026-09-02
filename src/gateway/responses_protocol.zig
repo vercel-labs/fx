@@ -378,6 +378,21 @@ pub const Reducer = struct {
         } else if (std.mem.eql(u8, event_type, "response.failed") or
             std.mem.eql(u8, event_type, "error"))
         {
+            const error_value = parsed.value.object.get("error");
+            const response_value = parsed.value.object.get("response");
+            const response_error = if (response_value != null and response_value.? == .object)
+                response_value.?.object.get("error")
+            else
+                null;
+            const code = if (error_value != null and error_value.? == .object)
+                stringField(error_value.?.object, "code")
+            else if (response_error != null and response_error.? == .object)
+                stringField(response_error.?.object, "code")
+            else
+                stringField(parsed.value.object, "code");
+            if (code) |value| if (std.mem.eql(u8, value, "previous_response_not_found")) {
+                return error.PreviousResponseNotFound;
+            };
             return error.ResponseFailed;
         }
         return false;
@@ -736,6 +751,39 @@ test "Responses usage projection retains optional cached and reasoning detail" {
     try std.testing.expectEqual(@as(?u64, 5), usage.cache_read_tokens);
     try std.testing.expectEqual(@as(?u64, 2), usage.cache_write_tokens);
     try std.testing.expectEqual(@as(?u64, 3), usage.reasoning_tokens);
+}
+
+test "Responses protocol distinguishes missing WebSocket continuation state" {
+    const Capture = struct {
+        fn content(_: *anyopaque, _: []const u8) void {}
+        fn toolStart(_: *anyopaque, _: []const u8, _: []const u8, _: ?[]const u8) void {}
+    };
+    var reducer = Reducer.init(std.testing.allocator);
+    defer reducer.deinit(std.testing.allocator);
+    var cancelled = std.atomic.Value(bool).init(false);
+    var context: u8 = 0;
+    try std.testing.expectError(
+        error.PreviousResponseNotFound,
+        reducer.applyJson(
+            std.testing.allocator,
+            "{\"type\":\"error\",\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"expired\"}}",
+            .{
+                .context = &context,
+                .on_content = Capture.content,
+                .on_tool_start = Capture.toolStart,
+            },
+            &cancelled,
+            null,
+            .{
+                .aggregate_bytes = 4096,
+                .events = 8,
+                .tool_calls = 8,
+                .tool_identity_bytes = 1024,
+                .tool_arguments_bytes = 4096,
+                .provider_state_bytes = 4096,
+            },
+        ),
+    );
 }
 
 test "Responses protocol owns one subscription billing projection" {
