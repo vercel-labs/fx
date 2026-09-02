@@ -1749,6 +1749,10 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn finishLiveSessionResume(app: *App) !void {
+            try resetTerminalForTranscriptReplacement(app);
+        }
+
+        fn resetTerminalForTranscriptReplacement(app: *App) !void {
             try app.shell.requestTerminalReset(&app.metrics);
             app.shell.render_requests.request(.footer);
         }
@@ -2150,6 +2154,32 @@ pub fn Runtime(comptime App: type) type {
             app.total_output_tokens = state.total_output_tokens;
             app.total_web_search_requests = 0;
 
+            const ResumeTranscriptExtras = struct {
+                display_title: []const u8,
+                notice: ResumeNotice,
+                recovery_state: session_codec.DurableSessionState,
+
+                fn writeBefore(self: @This(), target: *App, sink: anytype) !void {
+                    try writeResumeNotice(target, sink, self.display_title, self.notice);
+                }
+
+                fn writeAfter(self: @This(), target: *App, sink: anytype) !void {
+                    try writeRecoveryCheckpointToSink(target, sink, self.recovery_state);
+                }
+            };
+            try rebuildTranscriptFromHistory(app, state.history, ResumeTranscriptExtras{
+                .display_title = display_title,
+                .notice = notice,
+                .recovery_state = state,
+            });
+        }
+
+        fn rebuildTranscriptFromHistory(
+            app: *App,
+            history: []const types.HistoryTurn,
+            extras: anytype,
+        ) !void {
+            // Inline rendering only appends, so dropping turns requires the same retained-history redraw used by resume.
             if (comptime @hasDecl(App, "beginResumeProjection")) {
                 const projection_started_ns = io_mod.nanoTimestamp();
                 var projection = try app.beginResumeProjection();
@@ -2158,9 +2188,13 @@ pub fn Runtime(comptime App: type) type {
                     .app = app,
                     .projection = &projection,
                 };
-                try writeResumeNotice(app, &sink, display_title, notice);
-                try replayHistoryToSink(app, &sink, state.history);
-                try writeRecoveryCheckpointToSink(app, &sink, state);
+                if (comptime @TypeOf(extras) != @TypeOf(null)) {
+                    try extras.writeBefore(app, &sink);
+                }
+                try replayHistoryToSink(app, &sink, history);
+                if (comptime @TypeOf(extras) != @TypeOf(null)) {
+                    try extras.writeAfter(app, &sink);
+                }
                 const projection_finished_ns = io_mod.nanoTimestamp();
                 try projection.finalize();
                 const finalization_finished_ns = io_mod.nanoTimestamp();
@@ -2170,7 +2204,7 @@ pub fn Runtime(comptime App: type) type {
                     "session",
                     "event=resume_projection turns={d} project_us={d} finalize_us={d} install_us={d}",
                     .{
-                        state.history.len,
+                        history.len,
                         @divTrunc(projection_finished_ns - projection_started_ns, std.time.ns_per_us),
                         @divTrunc(finalization_finished_ns - projection_finished_ns, std.time.ns_per_us),
                         @divTrunc(install_finished_ns - finalization_finished_ns, std.time.ns_per_us),
@@ -2178,9 +2212,13 @@ pub fn Runtime(comptime App: type) type {
                 );
             } else {
                 var sink = LiveHistorySink(App){ .app = app };
-                try writeResumeNotice(app, &sink, display_title, notice);
-                try replayHistoryToSink(app, &sink, state.history);
-                try writeRecoveryCheckpointToSink(app, &sink, state);
+                if (comptime @TypeOf(extras) != @TypeOf(null)) {
+                    try extras.writeBefore(app, &sink);
+                }
+                try replayHistoryToSink(app, &sink, history);
+                if (comptime @TypeOf(extras) != @TypeOf(null)) {
+                    try extras.writeAfter(app, &sink);
+                }
             }
         }
 
@@ -3175,6 +3213,11 @@ pub fn Runtime(comptime App: type) type {
                 // dropped, so its checkpoint cannot outlive the turns.
                 try commitCurrentStateReplacement(app, loaded, .rewind, .{}, true);
             }
+            // The projection installs on top of whatever the shell already holds,
+            // so the old turns must go before the retained ones are redrawn.
+            app.shell.clearTranscript(app.alloc);
+            try rebuildTranscriptFromHistory(app, app.session.history.items, null);
+            try resetTerminalForTranscriptReplacement(app);
         }
 
         pub fn openTurnPicker(app: *App) !bool {

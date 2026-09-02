@@ -186,6 +186,10 @@ describe("interactive session fork and rewind", () => {
         STEP_TIMEOUT,
       );
       expect(done).toContain("File changes were not reverted");
+      await session!.waitForPane(
+        (pane) => !pane.includes("third prompt"),
+        STEP_TIMEOUT,
+      );
 
       await quitShell(stderrPath);
       const saved = await savedSessions(home, workspace);
@@ -222,6 +226,10 @@ describe("interactive session fork and rewind", () => {
         (pane) => pane.includes("second picker prompt") && !pane.includes("No change."),
         STEP_TIMEOUT,
       );
+      const rewound = (await session!.capturePaneGrid()).join("\n");
+      expect(rewound).toContain("first picker prompt");
+      expect(rewound.match(/second picker prompt/g)).toHaveLength(1);
+      expect(rewound).not.toContain("third picker prompt");
 
       const saved = await savedSessions(home, workspace);
       expect(saved).toHaveLength(1);
