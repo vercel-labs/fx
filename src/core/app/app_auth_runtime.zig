@@ -72,6 +72,7 @@ pub fn Runtime(comptime App: type) type {
                 const required_source: credentials.Source = switch (provider) {
                     .codex => .chatgpt_subscription,
                     .grok => .grok_subscription,
+                    .orcarouter => .orcarouter_api_key,
                     .gateway => app.auth.credentialSource() orelse .fx_login,
                 };
                 const route_change = app.auth.selectForProvider(app.alloc, provider) catch |err| switch (err) {
@@ -88,6 +89,8 @@ pub fn Runtime(comptime App: type) type {
                             credentials.missing_grok_interactive_credential_message
                         else if (provider == .codex)
                             credentials.missing_chatgpt_interactive_credential_message
+                        else if (provider == .orcarouter)
+                            credentials.missing_orcarouter_interactive_credential_message
                         else
                             credentials.missing_interactive_credential_message,
                     }, true);
@@ -1532,6 +1535,7 @@ test "interactive subscription sign-in rejects active and queued work before OAu
                 .codex => try Runtime(BusySignInApp).beginChatGptSignIn(&app),
                 .grok => try Runtime(BusySignInApp).beginGrokSignIn(&app),
                 .gateway => unreachable,
+                .orcarouter => unreachable,
             }
 
             try std.testing.expectEqual(@as(usize, 0), app.auth.start_count);

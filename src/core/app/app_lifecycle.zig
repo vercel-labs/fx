@@ -1085,6 +1085,7 @@ fn configuredProviderSelection(
         .gateway => default_model,
         .codex => return error.CodexModelNotSelected,
         .grok => return error.GrokModelNotSelected,
+        .orcarouter => return error.OrcaRouterModelNotSelected,
     };
     return .{ .provider = provider, .model = model };
 }

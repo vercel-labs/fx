@@ -94,6 +94,7 @@ pub const CredentialSource = enum {
     stored_key,
     chatgpt_subscription,
     grok_subscription,
+    orcarouter_api_key,
 };
 
 pub const CredentialLease = struct {

@@ -37,6 +37,15 @@ pub const entries = [_]Entry{
         .description = "SuperGrok or X Premium subscription",
         .subscription = true,
     },
+    .{
+        .id = .orcarouter,
+        .slug = "orcarouter",
+        .aliases = &.{"orca"},
+        .name = "OrcaRouter",
+        .route_name = "OrcaRouter",
+        .description = "OrcaRouter API key",
+        .subscription = false,
+    },
 };
 
 pub fn parse(value: []const u8) ?model_provider.ProviderId {
@@ -61,9 +70,12 @@ test "auth provider catalog uses the model provider identity and explicit aliase
     try std.testing.expectEqual(model_provider.ProviderId.gateway, parse("gateway").?);
     try std.testing.expectEqual(model_provider.ProviderId.codex, parse("codex").?);
     try std.testing.expectEqual(model_provider.ProviderId.grok, parse("grok").?);
+    try std.testing.expectEqual(model_provider.ProviderId.orcarouter, parse("orcarouter").?);
+    try std.testing.expectEqual(model_provider.ProviderId.orcarouter, parse("orca").?);
     try std.testing.expect(parse("openai-codex") == null);
     try std.testing.expect(parse("chatgpt") == null);
     try std.testing.expect(parse("unknown") == null);
     try std.testing.expect(find(.codex).subscription);
     try std.testing.expect(find(.grok).subscription);
+    try std.testing.expect(!find(.orcarouter).subscription);
 }

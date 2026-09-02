@@ -676,6 +676,7 @@ fn activateProviderSelection(
             .gateway => "Gateway is already selected.\n",
             .codex => "Codex is already selected.\n",
             .grok => "Grok is already selected.\n",
+            .orcarouter => "OrcaRouter is already selected.\n",
         });
         return true;
     }
@@ -724,6 +725,7 @@ fn activateProviderSelection(
             switch (target) {
                 .codex => "Codex credential is unavailable",
                 .grok => "Grok credential is unavailable",
+                .orcarouter => "OrcaRouter credential is unavailable",
                 .gateway => "configure a Gateway credential first",
             },
         );
@@ -733,6 +735,7 @@ fn activateProviderSelection(
         try writeProviderActivationError(alloc, deps, caller, switch (target) {
             .codex => "Codex model catalog is unavailable",
             .grok => "Grok model catalog is unavailable",
+            .orcarouter => "OrcaRouter model catalog is unavailable",
             .gateway => "Gateway model catalog is unavailable",
         });
         return false;
@@ -796,12 +799,14 @@ fn activateProviderSelection(
         .codex => try writeStdout(deps, "Signed in with Codex.\n"),
         .grok => try writeStdout(deps, "Signed in with Grok.\n"),
         .gateway => unreachable,
+        .orcarouter => unreachable,
     };
     if (caller == .provider_command) {
         try writeStdout(deps, switch (target) {
             .gateway => "Provider set to Gateway.\n",
             .codex => "Provider set to Codex.\n",
             .grok => "Provider set to Grok.\n",
+            .orcarouter => "Provider set to OrcaRouter.\n",
         });
     }
     return true;
@@ -920,7 +925,7 @@ fn runNonInteractiveWithDeps(
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx login [vercel|codex|grok]\n");
+                try writeStderr(deps, "usage: fx login [vercel|codex|grok|orcarouter]\n");
                 return .handled_failure;
             };
             // Preserve the original `fx login` behavior for scripts and users.
@@ -986,16 +991,34 @@ fn runNonInteractiveWithDeps(
                     }
                     try writeStdout(deps, "Signed in with Grok.\n");
                 },
+                .orcarouter => {
+                    // OrcaRouter authenticates with an API key from the
+                    // environment; there is no OAuth session to create.
+                    if (io_mod.getenv("ORCAROUTER_API_KEY") == null) {
+                        try writeStderr(deps, "fx login: ORCAROUTER_API_KEY is not set\n");
+                        return .handled_failure;
+                    }
+                    if (!try activateProviderSelection(alloc, cfg, deps, .orcarouter, .provider_login)) {
+                        return .handled_failure;
+                    }
+                    try writeStdout(deps, "Using OrcaRouter with ORCAROUTER_API_KEY.\n");
+                },
             }
             return .handled_success;
         },
         .logout => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx logout [vercel|codex|grok]\n");
+                try writeStderr(deps, "usage: fx logout [vercel|codex|grok|orcarouter]\n");
                 return .handled_failure;
             };
             // Preserve the original `fx logout` behavior for scripts and users.
             const login_provider = maybe_login_provider orelse .gateway;
+            if (login_provider == .orcarouter) {
+                // OrcaRouter has no stored session; the key lives in the
+                // environment until the user unsets it.
+                try writeStdout(deps, "OrcaRouter uses ORCAROUTER_API_KEY; there is no session to sign out of.\n");
+                return .handled_success;
+            }
             if (login_provider == .codex) {
                 const outcome = chatgpt_oauth.logout() catch {
                     try writeStderr(deps, "fx logout: failed to durably remove saved Codex login\n");
@@ -1217,6 +1240,7 @@ fn runNonInteractiveWithDeps(
                     .gateway => "fx models: Gateway model catalog is unavailable\n",
                     .codex => "fx models: Codex model catalog is unavailable\n",
                     .grok => "fx models: Grok model catalog is unavailable\n",
+                    .orcarouter => "fx models: OrcaRouter model catalog is unavailable\n",
                 });
                 return .handled_failure;
             };
