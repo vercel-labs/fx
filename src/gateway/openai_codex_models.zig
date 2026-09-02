@@ -1,5 +1,6 @@
 const std = @import("std");
 const chatgpt_oauth = @import("../core/auth/chatgpt_oauth.zig");
+const credentials = @import("../core/auth/credentials.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -58,16 +59,17 @@ fn fetchCatalogForProvider(
     alloc: std.mem.Allocator,
     input: model_catalog.FetchInput,
 ) std.mem.Allocator.Error!model_catalog.ProviderResult {
-    if (input.access.credentialSource() != .chatgpt_subscription) {
+    const request_auth = catalogRequestAuth(input.access) orelse
         return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
-    }
-    const credential = input.access.authorizationCredential() orelse
-        return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
-    const account_id = chatgpt_oauth.extractAccountId(alloc, credential) catch |err| {
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
-    };
-    defer alloc.free(account_id);
+    var owned_account_id: ?[]u8 = null;
+    defer if (owned_account_id) |account| alloc.free(account);
+    const account_id = request_auth.account_id orelse if (request_auth.credential) |credential| account: {
+        owned_account_id = chatgpt_oauth.extractAccountId(alloc, credential) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
+        };
+        break :account owned_account_id.?;
+    } else null;
     const request_url = modelsUrl(alloc) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{ .category = .runtime } };
@@ -79,7 +81,7 @@ fn fetchCatalogForProvider(
     var operation = FetchOperation{
         .alloc = alloc,
         .url = request_url,
-        .credential = credential,
+        .credential = request_auth.credential,
         .account_id = account_id,
     };
     var response = gateway_client.runBoundedHttpOperation(
@@ -120,6 +122,25 @@ fn fetchCatalogForProvider(
     return .{ .catalog = catalog };
 }
 
+const CatalogRequestAuth = struct {
+    credential: ?[]const u8 = null,
+    account_id: ?[]const u8 = null,
+};
+
+fn catalogRequestAuth(access: credentials.CatalogAccess) ?CatalogRequestAuth {
+    return switch (access) {
+        .host_managed => .{},
+        .public_only => null,
+        .authenticated => |authenticated| if (authenticated.source == .chatgpt_subscription)
+            .{
+                .credential = authenticated.credential,
+                .account_id = authenticated.account_id,
+            }
+        else
+            null,
+    };
+}
+
 const FetchResponse = struct {
     status: std.http.Status,
     body: []u8,
@@ -133,30 +154,40 @@ const FetchResponse = struct {
 const FetchOperation = struct {
     alloc: std.mem.Allocator,
     url: []const u8,
-    credential: []const u8,
-    account_id: []const u8,
+    credential: ?[]const u8,
+    account_id: ?[]const u8,
 
     pub fn run(self: *@This()) !FetchResponse {
         var client: std.http.Client = .{ .allocator = self.alloc, .io = io_mod.getIo() };
         defer client.deinit();
-        const auth_header = try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{self.credential});
-        defer secret.zeroAndFree(self.alloc, auth_header);
+        var auth_header: ?[]u8 = null;
+        defer if (auth_header) |value| secret.zeroAndFree(self.alloc, value);
+        var headers: std.http.Client.Request.Headers = .{
+            .user_agent = .{ .override = gateway_client.user_agent },
+            .accept_encoding = .omit,
+        };
+        if (self.credential) |credential| {
+            auth_header = try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{credential});
+            headers.authorization = .{ .override = auth_header.? };
+        }
         const body_buffer = try self.alloc.alloc(u8, max_catalog_bytes + 1);
         defer secret.zeroAndFree(self.alloc, body_buffer);
         var response_writer = std.Io.Writer.fixed(body_buffer);
+        var extra_headers: [3]std.http.Header = undefined;
+        var extra_len: usize = 0;
+        if (self.account_id) |account_id| {
+            extra_headers[extra_len] = .{ .name = "chatgpt-account-id", .value = account_id };
+            extra_len += 1;
+        }
+        extra_headers[extra_len] = .{ .name = "originator", .value = "fx" };
+        extra_len += 1;
+        extra_headers[extra_len] = .{ .name = "accept", .value = "application/json" };
+        extra_len += 1;
         const result = client.fetch(.{
             .location = .{ .url = self.url },
             .method = .GET,
-            .headers = .{
-                .authorization = .{ .override = auth_header },
-                .user_agent = .{ .override = gateway_client.user_agent },
-                .accept_encoding = .omit,
-            },
-            .extra_headers = &.{
-                .{ .name = "chatgpt-account-id", .value = self.account_id },
-                .{ .name = "originator", .value = "fx" },
-                .{ .name = "accept", .value = "application/json" },
-            },
+            .headers = headers,
+            .extra_headers = extra_headers[0..extra_len],
             .response_writer = &response_writer,
             .redirect_behavior = .unhandled,
         }) catch |err| switch (err) {
@@ -323,4 +354,10 @@ test "Codex catalog URL uses the live-validated protocol compatibility version" 
     defer std.testing.allocator.free(url);
     try std.testing.expect(std.mem.find(u8, url, "client_version=0.148.0") != null);
     try std.testing.expect(std.mem.find(u8, url, "client_version=0.0.4") == null);
+}
+
+test "host-managed Codex catalog auth carries no local headers" {
+    const auth = catalogRequestAuth(.host_managed) orelse return error.TestExpectedHostManagedCatalogAuth;
+    try std.testing.expect(auth.credential == null);
+    try std.testing.expect(auth.account_id == null);
 }

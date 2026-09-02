@@ -4218,12 +4218,13 @@ fn activeCredentialLease(
     secret_value: []const u8,
     job: QueuedPrompt,
 ) types.CredentialLease {
-    return .{
-        .secret = secret_value,
+    if (job.credential_source == .host_managed) return .host_managed;
+    return .{ .direct = .{
+        .secret_bytes = secret_value,
         .source = job.credential_source,
         .account_id = job.account_id,
-        .tenant = job.gateway_team,
-    };
+        .tenant_context = job.gateway_team,
+    } };
 }
 
 fn appendTrustedPermissionFeedback(
@@ -5448,12 +5449,15 @@ fn processQueuedPromptLoop(
                 .pending_status = &pending_auto_retry_status,
             };
             var model_request = agent_stream_provider.ModelRequest{
-                .credential = .{
-                    .secret = active_api_key,
-                    .source = job.credential_source,
-                    .account_id = job.account_id,
-                    .tenant = job.gateway_team,
-                },
+                .credential = if (job.credential_source == .host_managed)
+                    .host_managed
+                else
+                    .{ .direct = .{
+                        .secret_bytes = active_api_key,
+                        .source = job.credential_source orelse .ai_gateway_api_key,
+                        .account_id = job.account_id,
+                        .tenant_context = job.gateway_team,
+                    } },
                 .session_id = lifecycle.scope.session_id,
                 .model = gateway_model,
                 .retry_count = config.gateway_retry_count,
@@ -5861,7 +5865,7 @@ fn processQueuedPromptLoop(
                     auth_retry_used = true;
                     var replay_delivery = runtime_gateway_step.DeliveryCertainty.init();
                     var replay_evidence: runtime_gateway_step.AttemptEvidence = .{};
-                    model_request.credential.secret = active_api_key;
+                    model_request.credential.direct.secret_bytes = active_api_key;
                     model_request.delivery = &replay_delivery;
                     model_request.attempt_evidence = &replay_evidence;
                     stream_result = try runtime_gateway_step.streamModelCompletion(

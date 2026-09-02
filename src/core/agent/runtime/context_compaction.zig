@@ -299,16 +299,20 @@ fn runSummaryCall(
         .clock = .awake,
         .raw = .fromMilliseconds(provider_timeout_ms),
     });
+    const credential: agent_stream_provider.CredentialLease = if (request.credential_source == .host_managed)
+        .host_managed
+    else
+        .{ .direct = .{
+            .secret_bytes = request.api_key,
+            .source = request.credential_source,
+            .account_id = request.account_id,
+            .tenant_context = request.gateway_team,
+        } };
     var streamed = try runtime_gateway_step.streamModelCompletion(
         request.stream_provider,
         alloc,
         .{
-            .credential = .{
-                .secret = request.api_key,
-                .source = request.credential_source,
-                .account_id = request.account_id,
-                .tenant = request.gateway_team,
-            },
+            .credential = credential,
             .session_id = request.session_id,
             .model = request.model,
             .retry_count = request.retry_count,
@@ -416,6 +420,8 @@ const FakeProvider = struct {
     saw_only_summary_prompt: bool = true,
     max_output_tokens: ?u32 = null,
     observed_model: ?[]const u8 = null,
+    observed_credential_source: ?types.CredentialSource = null,
+    observed_secret: ?[]const u8 = null,
 
     fn provider(self: *FakeProvider) agent_stream_provider.Provider {
         return .{ .context = self, .stream_fn = stream };
@@ -449,6 +455,8 @@ const FakeProvider = struct {
             std.mem.startsWith(u8, system, "Summarize only conversation goals");
         self.max_output_tokens = request.max_output_tokens;
         self.observed_model = request.model;
+        self.observed_credential_source = request.credential.credentialSource();
+        self.observed_secret = request.credential.secret();
         try request.admission.admit();
         request.delivery.markPossiblySent();
         request.events.emit(.{ .content_delta = self.response });
@@ -466,6 +474,35 @@ const FakeProvider = struct {
 
 test "compaction result exposes only caller-consumed state" {
     try std.testing.expect(!@hasField(Result, "usage"));
+}
+
+test "host-managed compaction carries authority without secret bytes" {
+    const alloc = std.testing.allocator;
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "Preserve this decision." },
+        .{ .role = .assistant, .content = "Decision preserved." },
+        .{ .role = .user, .content = "Continue." },
+    };
+    var provider = FakeProvider{ .response = "Preserve the decision." };
+    var cancel = std.atomic.Value(bool).init(false);
+    var result = try compact(alloc, &messages, .{
+        .stream_provider = provider.provider(),
+        .model = "provider/compactor",
+        .api_key = "",
+        .credential_source = .host_managed,
+        .retry_count = 0,
+        .cancel_flag = &cancel,
+        .accepted_tokens = 256,
+        .generation_tokens = 128,
+        .trace_ctx = .{},
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(
+        types.CredentialSource.host_managed,
+        provider.observed_credential_source.?,
+    );
+    try std.testing.expect(provider.observed_secret == null);
 }
 
 test "semantic compaction summarizes once while runtime truth remains authoritative" {

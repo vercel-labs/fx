@@ -201,6 +201,10 @@ pub fn Runtime(comptime App: type) type {
                     app.secretStore()
                 else
                     host.unavailable_secret_store,
+                .auth_mode = if (comptime @hasDecl(@TypeOf(app.auth), "authMode"))
+                    app.auth.authMode()
+                else
+                    .local,
                 .resize_handler = resize_handler,
                 .fx_version = App.app_version,
             });

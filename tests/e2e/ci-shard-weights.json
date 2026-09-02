@@ -22,7 +22,7 @@
   { "file": "terminal-host.test.ts", "weight": 273 },
   { "file": "tmux-helpers.test.ts", "weight": 2 },
   { "file": "tui-agent.test.ts", "weight": 1 },
-  { "file": "tui-auth-source-selection.test.ts", "weight": 49 },
+  { "file": "tui-auth-source-selection.test.ts", "weight": 51 },
   { "file": "tui-command-permissions.test.ts", "weight": 153 },
   { "file": "tui-composer-edit-contracts.test.ts", "weight": 168 },
   { "file": "tui-cost.test.ts", "weight": 16 },

@@ -826,7 +826,12 @@ pub fn handlePrompt(
     );
     if (comptime @import("builtin").os.tag != .wasi) {
         if (state.cfg.provider_set.select(session.provider).deferred_usage != null) {
-            if (session.credential_source) |source| {
+            if (session.credential_source == .host_managed) {
+                session.session_rt.usage.replaceHostManagedReconciliationAuthority(
+                    alloc,
+                    session.provider,
+                );
+            } else if (session.credential_source) |source| {
                 session.session_rt.usage.replaceProviderReconciliationCredential(
                     alloc,
                     session.provider,

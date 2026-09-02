@@ -143,7 +143,9 @@ fn streamCompletion(
     request: stream_provider.ModelRequest,
 ) !stream_provider.Result {
     if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
-    if (request.credential.source != .chatgpt_subscription) {
+    if (request.credential.credentialSource() != .chatgpt_subscription and
+        request.credential.credentialSource() != .host_managed)
+    {
         return stream_provider.failResult(error.CodexSubscriptionCredentialRequired);
     }
     try validateModel(request.model);
@@ -199,17 +201,20 @@ const OpenedRequest = struct {
 const OpenRequestOperation = struct {
     client: *std.http.Client,
     uri: std.Uri,
-    auth_header: []const u8,
+    auth_header: ?[]const u8,
     extra_headers: []const std.http.Header,
 
     pub fn run(self: *@This()) !OpenedRequest {
+        var headers: std.http.Client.Request.Headers = .{
+            .content_type = .{ .override = "application/json" },
+            .accept_encoding = .omit,
+            .user_agent = .{ .override = gateway_client.user_agent },
+        };
+        if (self.auth_header) |authorization| {
+            headers.authorization = .{ .override = authorization };
+        }
         return .{ .request = try self.client.request(.POST, self.uri, .{
-            .headers = .{
-                .content_type = .{ .override = "application/json" },
-                .authorization = .{ .override = self.auth_header },
-                .accept_encoding = .omit,
-                .user_agent = .{ .override = gateway_client.user_agent },
-            },
+            .headers = headers,
             .extra_headers = self.extra_headers,
             .keep_alive = false,
             .redirect_behavior = .unhandled,
@@ -217,19 +222,47 @@ const OpenRequestOperation = struct {
     }
 };
 
+const RequestAuthHeaders = struct {
+    authorization: ?[]u8 = null,
+    account_id: ?[]u8 = null,
+
+    fn deinit(self: *RequestAuthHeaders, alloc: Allocator) void {
+        if (self.authorization) |value| secret.zeroAndFree(alloc, value);
+        if (self.account_id) |value| alloc.free(value);
+        self.* = .{};
+    }
+};
+
+fn requestAuthHeaders(alloc: Allocator, auth: stream_provider.CredentialLease) !RequestAuthHeaders {
+    return switch (auth) {
+        .host_managed => .{},
+        .direct => |direct| blk: {
+            const authorization = try std.fmt.allocPrint(alloc, "Bearer {s}", .{direct.secret_bytes});
+            errdefer secret.zeroAndFree(alloc, authorization);
+            const account_id = if (direct.account_id) |account|
+                try alloc.dupe(u8, account)
+            else
+                try chatgpt_oauth.extractAccountId(alloc, direct.secret_bytes);
+            errdefer alloc.free(account_id);
+            if (!types.validCredentialAccountId(account_id)) {
+                return error.InvalidChatGptSubscriptionAccount;
+            }
+            break :blk .{
+                .authorization = authorization,
+                .account_id = account_id,
+            };
+        },
+    };
+}
+
 pub fn streamPrepared(
     alloc: Allocator,
     request: stream_provider.ModelRequest,
     payload: []const u8,
 ) !stream_provider.Result {
     if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
-    const account_id = try chatgpt_oauth.extractAccountId(alloc, request.credential.secret);
-    defer alloc.free(account_id);
-    if (!types.validCredentialAccountId(account_id)) {
-        return stream_provider.failResult(error.InvalidChatGptSubscriptionAccount);
-    }
-    const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.credential.secret});
-    defer secret.zeroAndFree(alloc, auth_header);
+    var auth_headers = try requestAuthHeaders(alloc, request.credential);
+    defer auth_headers.deinit(alloc);
     const request_endpoint = if (io_mod.getenv(e2e_endpoint_env)) |override| endpoint: {
         if (!gateway_client.isLoopbackHttpUrl(override)) {
             return stream_provider.failResult(error.InvalidE2EOpenAICodexEndpoint);
@@ -240,8 +273,10 @@ pub fn streamPrepared(
 
     var extra_headers_buf: [7]std.http.Header = undefined;
     var extra_count: usize = 0;
-    extra_headers_buf[extra_count] = .{ .name = "chatgpt-account-id", .value = account_id };
-    extra_count += 1;
+    if (auth_headers.account_id) |account_id| {
+        extra_headers_buf[extra_count] = .{ .name = "chatgpt-account-id", .value = account_id };
+        extra_count += 1;
+    }
     extra_headers_buf[extra_count] = .{ .name = "originator", .value = "fx" };
     extra_count += 1;
     extra_headers_buf[extra_count] = .{ .name = "OpenAI-Beta", .value = "responses=experimental" };
@@ -260,7 +295,7 @@ pub fn streamPrepared(
     var open_operation = OpenRequestOperation{
         .client = &client,
         .uri = uri,
-        .auth_header = auth_header,
+        .auth_header = auth_headers.authorization,
         .extra_headers = extra_headers_buf[0..extra_count],
     };
     const connect_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
@@ -699,7 +734,7 @@ test "OpenAI Codex rejects a wrong-origin credential before network I/O" {
     try std.testing.expectError(
         error.CodexSubscriptionCredentialRequired,
         agent_stream_provider.stream(std.testing.allocator, .{
-            .credential = .{ .secret = "gateway-key", .source = .ai_gateway_api_key },
+            .credential = .{ .direct = .{ .secret_bytes = "gateway-key", .source = .ai_gateway_api_key } },
             .model = "gpt-5.6-sol",
             .retry_count = 1,
             .messages = &.{},
@@ -716,6 +751,14 @@ test "OpenAI Codex rejects a wrong-origin credential before network I/O" {
         }),
     );
     try std.testing.expectEqual(stream_provider.DeliveryCertainty.State.definitely_unsent, delivery.load());
+}
+
+test "host-managed Codex request auth omits bearer and account headers" {
+    var headers = try requestAuthHeaders(std.testing.allocator, .host_managed);
+    defer headers.deinit(std.testing.allocator);
+
+    try std.testing.expect(headers.authorization == null);
+    try std.testing.expect(headers.account_id == null);
 }
 
 test "OpenAI Codex SSE maps text reasoning tools and usage" {

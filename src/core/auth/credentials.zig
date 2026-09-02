@@ -17,6 +17,20 @@ const types = @import("../shared/types.zig");
 
 pub const Source = types.CredentialSource;
 
+pub const AuthMode = enum {
+    local,
+    host_managed,
+};
+
+pub const AuthModeError = error{InvalidAuthMode};
+
+pub fn parseAuthMode(value: ?[]const u8) AuthModeError!AuthMode {
+    const raw = value orelse return .local;
+    if (std.mem.eql(u8, raw, "local")) return .local;
+    if (std.mem.eql(u8, raw, "host-managed")) return .host_managed;
+    return error.InvalidAuthMode;
+}
+
 pub const CatalogPublicOnly = union(enum) {
     no_credential,
     fx_login_team_required,
@@ -79,11 +93,13 @@ pub const CatalogAccess = union(enum) {
         account_id: ?[]const u8 = null,
         authority: CatalogAuthority = .automatic,
     },
+    host_managed,
 
     pub fn credentialSource(self: CatalogAccess) ?Source {
         return switch (self) {
             .public_only => |access| access.credentialSource(),
             .authenticated => |access| access.source.credentialSource(),
+            .host_managed => .host_managed,
         };
     }
 
@@ -95,7 +111,7 @@ pub const CatalogAccess = union(enum) {
     pub fn publicOnly(self: CatalogAccess) ?CatalogPublicOnly {
         return switch (self) {
             .public_only => |access| access,
-            .authenticated => null,
+            .authenticated, .host_managed => null,
         };
     }
 
@@ -112,6 +128,7 @@ pub const CatalogAccess = union(enum) {
                         .authenticated_credential_rejected = access.source.credentialSource(),
                     },
                 },
+            .host_managed => null,
         };
     }
 
@@ -125,6 +142,7 @@ pub const CatalogAccess = union(enum) {
                 .account_id = access.account_id,
                 .authority = .explicit,
             } },
+            .host_managed => .host_managed,
         };
     }
 
@@ -132,6 +150,7 @@ pub const CatalogAccess = union(enum) {
         return switch (self) {
             .public_only => null,
             .authenticated => |access| access.credential,
+            .host_managed => null,
         };
     }
 
@@ -139,6 +158,7 @@ pub const CatalogAccess = union(enum) {
         const team = switch (self) {
             .public_only => return null,
             .authenticated => |access| access.team_context orelse return null,
+            .host_managed => return null,
         };
         return if (team.len > 0) team else null;
     }
@@ -147,6 +167,7 @@ pub const CatalogAccess = union(enum) {
         const account_id = switch (self) {
             .public_only => return null,
             .authenticated => |access| access.account_id orelse return null,
+            .host_managed => return null,
         };
         return if (account_id.len > 0) account_id else null;
     }
@@ -191,12 +212,14 @@ pub fn catalogAccessForCredentialAndAccount(
     account_id: ?[]const u8,
 ) CatalogAccess {
     const selected_source = source orelse return .{ .public_only = .no_credential };
+    if (selected_source == .host_managed) return .host_managed;
     const authenticated_source: CatalogAuthenticatedSource = switch (selected_source) {
         .vercel_oidc_token => .vercel_oidc_token,
         .ai_gateway_api_key => .ai_gateway_api_key,
         .stored_key => .stored_key,
         .chatgpt_subscription => .chatgpt_subscription,
         .grok_subscription => .grok_subscription,
+        .host_managed => unreachable,
         .fx_login => blk: {
             const team = team_context orelse
                 return .{ .public_only = .fx_login_team_required };
@@ -232,11 +255,30 @@ pub const missing_chatgpt_interactive_credential_message = "Codex needs a subscr
 pub const missing_grok_credential_message = "fx needs a Grok subscription login for this model. Run fx login grok.";
 pub const missing_grok_interactive_credential_message = "Grok needs a subscription login. Run /login, open Connections, then choose Grok subscription.";
 pub const unreadable_store_message = "fx could not read the stored API key from " ++ stored_key_backend_label ++ ". A key may be saved but unreadable. Set FX_TRACE_LOG for the failing step, or set AI_GATEWAY_API_KEY.";
+pub const host_managed_auth_message = "Authentication is managed by the host.";
 
 test "public credential guidance spells fx lowercase" {
     try std.testing.expect(std.mem.startsWith(u8, missing_credential_message, "fx needs"));
     try std.testing.expect(std.mem.startsWith(u8, missing_interactive_credential_message, "fx needs"));
     try std.testing.expect(std.mem.startsWith(u8, unreadable_store_message, "fx could"));
+}
+
+test "auth mode accepts only local and host-managed process values" {
+    try std.testing.expectEqual(AuthMode.local, try parseAuthMode(null));
+    try std.testing.expectEqual(AuthMode.local, try parseAuthMode("local"));
+    try std.testing.expectEqual(AuthMode.host_managed, try parseAuthMode("host-managed"));
+    try std.testing.expectError(error.InvalidAuthMode, parseAuthMode("host_managed"));
+    try std.testing.expectError(error.InvalidAuthMode, parseAuthMode(""));
+}
+
+test "host-managed catalog access is authenticated without local headers" {
+    const access: CatalogAccess = .host_managed;
+    try std.testing.expect(access.authorizationCredential() == null);
+    try std.testing.expect(access.accountId() == null);
+    try std.testing.expect(access.teamContext() == null);
+    try std.testing.expectEqual(Source.host_managed, access.credentialSource().?);
+    try std.testing.expect(access.publicOnlyReason() == null);
+    try std.testing.expect(access.publicFallbackAfterRejection() == null);
 }
 
 pub const Credential = struct {
@@ -479,6 +521,7 @@ pub fn loadSource(
         .stored_key => loadStoredKeyCredential(alloc, secret_store),
         .chatgpt_subscription => loadChatGptCredential(alloc, transport, .if_needed),
         .grok_subscription => loadGrokCredential(alloc, transport, .if_needed),
+        .host_managed => null,
     };
 }
 
@@ -519,6 +562,7 @@ pub fn sourceExists(
                 },
             };
         },
+        .host_managed => false,
     };
 }
 
@@ -542,6 +586,7 @@ pub fn sourcePresence(
             secret_store.presence(),
         .chatgpt_subscription => chatgpt_session.presence(),
         .grok_subscription => grok_session.presence(),
+        .host_managed => .missing,
     };
 }
 
@@ -755,6 +800,7 @@ pub fn sourceLabel(source: Source) []const u8 {
         .stored_key => "stored API key (" ++ stored_key_backend_label ++ ")",
         .chatgpt_subscription => "Codex subscription",
         .grok_subscription => "Grok subscription",
+        .host_managed => "host managed",
     };
 }
 

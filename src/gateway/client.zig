@@ -264,7 +264,7 @@ pub fn fetchGatewayGetResult(alloc: std.mem.Allocator, api_key: ?[]const u8, pat
 
 pub fn fetchGatewayGenerationResult(
     alloc: std.mem.Allocator,
-    api_key: []const u8,
+    api_key: ?[]const u8,
     gateway_team: ?[]const u8,
     gateway_origin: []const u8,
     generation_id: []const u8,
@@ -292,7 +292,7 @@ pub fn fetchGatewayGenerationResult(
 
 const GenerationLookupOperation = struct {
     alloc: std.mem.Allocator,
-    api_key: []const u8,
+    api_key: ?[]const u8,
     gateway_team: ?[]const u8,
     gateway_origin: []const u8,
     generation_id: []const u8,
@@ -317,23 +317,23 @@ const GenerationLookupOperation = struct {
             .io = io_mod.getIo(),
         };
         defer client.deinit();
-        const auth_header = try std.fmt.allocPrint(
-            self.alloc,
-            "Bearer {s}",
-            .{self.api_key},
-        );
-        defer secret.zeroAndFree(self.alloc, auth_header);
+        var auth_header: ?[]u8 = null;
+        defer if (auth_header) |value| secret.zeroAndFree(self.alloc, value);
+        var headers: std.http.Client.Request.Headers = .{
+            .accept_encoding = .omit,
+            .user_agent = .{ .override = user_agent },
+        };
+        if (self.api_key) |api_key| {
+            auth_header = try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{api_key});
+            headers.authorization = .{ .override = auth_header.? };
+        }
         var extra_headers_buf: [1]std.http.Header = undefined;
         const extra_headers = gatewayModelCatalogExtraHeaders(
             &extra_headers_buf,
             self.gateway_team,
         );
         var req = try client.request(.GET, uri, .{
-            .headers = .{
-                .authorization = .{ .override = auth_header },
-                .accept_encoding = .omit,
-                .user_agent = .{ .override = user_agent },
-            },
+            .headers = headers,
             .extra_headers = extra_headers,
             .redirect_behavior = .unhandled,
         });
@@ -1140,7 +1140,7 @@ test "connection setup policy bounds retry by deadline attempts and delivery" {
 }
 
 pub const StreamRequest = struct {
-    api_key: []const u8,
+    api_key: ?[]const u8,
     model: []const u8,
     retry_count: usize,
     chat_url: []const u8,
@@ -1394,8 +1394,17 @@ fn streamGatewayCompletionCoreWithOptions(
     const request_url = try resolveE2eGatewayUrl(e2e_gateway_chat_url_env, request.chat_url);
     const uri = try std.Uri.parse(request_url);
 
-    const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.api_key});
-    defer alloc.free(auth_header);
+    var auth_header: ?[]u8 = null;
+    defer if (auth_header) |value| secret.zeroAndFree(alloc, value);
+    var request_headers: std.http.Client.Request.Headers = .{
+        .content_type = .{ .override = "application/json" },
+        .accept_encoding = .omit,
+        .user_agent = .{ .override = user_agent },
+    };
+    if (request.api_key) |api_key| {
+        auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{api_key});
+        request_headers.authorization = .{ .override = auth_header.? };
+    }
 
     var extra_headers_buf: [10]std.http.Header = undefined;
     const extra_headers = gatewayExtraHeaders(
@@ -1429,12 +1438,7 @@ fn streamGatewayCompletionCoreWithOptions(
         debug_trace.eventf("gateway", "before_http_open_connect", trace_ctx, "attempt={d} attempt_limit={d} retries_used={d}", .{ attempt + 1, retry_count, attempt });
         debug_trace.eventf("gateway", "before_request_open", trace_ctx, "attempt={d} attempt_limit={d} retries_used={d} payload_bytes={d}", .{ attempt + 1, retry_count, attempt, payload.len });
         var req = openGatewayRequestBounded(&client, uri, .{
-            .headers = .{
-                .content_type = .{ .override = "application/json" },
-                .authorization = .{ .override = auth_header },
-                .accept_encoding = .omit,
-                .user_agent = .{ .override = user_agent },
-            },
+            .headers = request_headers,
             .extra_headers = extra_headers,
             .keep_alive = false,
             .redirect_behavior = .unhandled,
@@ -7914,4 +7918,44 @@ test "gateway chat request sends extended time and attribution headers" {
     try std.testing.expectEqualStrings("session_wire_123", fixture.capturedHeaderValue("x-session-id").?);
     try std.testing.expectEqualStrings("session_wire_123", fixture.capturedHeaderValue("x-session-affinity").?);
     try std.testing.expect(std.mem.find(u8, fixture.capturedHeaderValue("user-agent").?, "zig") == null);
+}
+
+test "host-managed Gateway chat omits authentication-owned headers" {
+    var fixture = try LoopbackGatewayFixture.init(.success_capture, 0);
+    defer fixture.deinit();
+    try fixture.start();
+    try std.testing.expect(fixture.waitForAcceptStart(5000));
+
+    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/chat", .{fixture.port()});
+    defer std.testing.allocator.free(url);
+
+    const Noop = struct {
+        fn onChunk(_: *anyopaque, _: []const u8) void {}
+    };
+    var callback_ctx: u8 = 0;
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var result = try streamGatewayCompletionCore(
+        std.testing.allocator,
+        .{
+            .api_key = null,
+            .model = "test/model",
+            .retry_count = 1,
+            .chat_url = url,
+            .payload = "{}",
+            .team = null,
+        },
+        @ptrCast(&callback_ctx),
+        Noop.onChunk,
+        null,
+        &cancel_flag,
+        null,
+        false,
+    );
+    defer result.deinit(std.testing.allocator);
+    fixture.deinit();
+
+    if (fixture.failure) |err| return err;
+    try std.testing.expect(fixture.capturedHeaderValue("authorization") == null);
+    try std.testing.expect(fixture.capturedHeaderValue(vercel_ai_gateway_team_header) == null);
+    try std.testing.expectEqualStrings(user_agent, fixture.capturedHeaderValue("user-agent").?);
 }

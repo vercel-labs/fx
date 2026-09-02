@@ -952,6 +952,7 @@ pub fn Bindings(comptime App: type) type {
                             .chatgpt_subscription => "Reconnect Codex through /login to repair this source.",
                             .grok_subscription => "Reconnect Grok through /login to repair this source.",
                             .vercel_oidc_token, .ai_gateway_api_key, .stored_key => "Run /setup to repair this source.",
+                            .host_managed => credentials.host_managed_auth_message,
                         },
                     },
                 )

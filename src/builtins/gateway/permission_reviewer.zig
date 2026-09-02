@@ -29,7 +29,7 @@ const StreamFn = *const fn (
 var default_stream_ctx: u8 = 0;
 
 const GatewayConfig = struct {
-    api_key: []const u8,
+    api_key: ?[]const u8,
     credential_source: ?types.CredentialSource = null,
     team: ?[]const u8 = null,
     chat_url: []const u8,
@@ -49,7 +49,7 @@ fn reviewGateway(
     request: permission_auto_classifier.ReviewRequest,
 ) anyerror!permission_auto_classifier.ParseOutcome {
     return reviewGatewayConfig(.{
-        .api_key = input.credential,
+        .api_key = if (input.credential_source == .host_managed) null else input.credential,
         .credential_source = input.credential_source,
         .team = input.tenant,
         .chat_url = input.endpoint,
@@ -123,7 +123,7 @@ fn sendGatewayReview(
         .{ model, single_transport_attempt },
     );
     if (cancel_flag.load(.seq_cst)) return .cancelled;
-    if (config.api_key.len == 0 or config.chat_url.len == 0) {
+    if ((config.api_key == null and config.credential_source != .host_managed) or config.chat_url.len == 0) {
         debug_trace.logf("permission", "event=auto_review_transport result=permanent_failure reason=missing_gateway_config", .{});
         return .permanent_failure;
     }
@@ -140,7 +140,7 @@ fn sendGatewayReview(
     var stream = config.stream_fn(
         config.stream_ctx,
         alloc,
-        config.api_key,
+        config.api_key orelse "",
         config.team,
         model,
         single_transport_attempt,
@@ -182,11 +182,18 @@ fn sendGatewayReview(
         return .permanent_failure;
     };
     if (stream.status == .ok and std.meta.activeTag(usage_outcome) == .deferred) if (config.usage) |ledger| {
-        ledger.startDeferredReconciliation(
-            config.usage_allocator,
-            usage_outcome.deferred,
-            config.api_key,
-        );
+        if (config.api_key) |api_key| {
+            ledger.startDeferredReconciliation(
+                config.usage_allocator,
+                usage_outcome.deferred,
+                api_key,
+            );
+        } else if (config.credential_source == .host_managed) {
+            ledger.startHostManagedDeferredReconciliation(
+                config.usage_allocator,
+                usage_outcome.deferred,
+            );
+        }
     };
 
     if (cancel_flag.load(.seq_cst)) {
@@ -310,7 +317,7 @@ fn streamGatewayReviewer(
     return gateway_client.streamGatewayRequiredToolCompletionBounded(
         alloc,
         .{
-            .api_key = api_key,
+            .api_key = if (api_key.len > 0) api_key else null,
             .team = team,
             .model = model,
             .retry_count = retry_count,

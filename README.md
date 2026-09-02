@@ -59,6 +59,8 @@ To use an AI Gateway API key instead:
 fx setup
 ```
 
+Embedding hosts that inject provider authentication at the network boundary can set `FX_AUTH_MODE=host-managed`. In this mode, fx does not read, refresh, or write local model-provider credentials and does not add authentication-owned headers to Gateway, Codex, or Grok requests. The host must authenticate those forwarded requests.
+
 Run fx from a project:
 
 ```bash

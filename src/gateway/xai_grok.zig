@@ -133,13 +133,17 @@ fn streamCompletion(
     request: stream_provider.ModelRequest,
 ) !stream_provider.Result {
     if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
-    if (request.credential.source != .grok_subscription) {
+    if (request.credential.credentialSource() != .grok_subscription and
+        request.credential.credentialSource() != .host_managed)
+    {
         return stream_provider.failResult(error.GrokSubscriptionCredentialRequired);
     }
-    const account_id = request.credential.account_id orelse
-        return stream_provider.failResult(error.GrokSubscriptionAccountRequired);
-    if (!grok_session.validAccountId(account_id)) {
-        return stream_provider.failResult(error.InvalidGrokSubscriptionAccount);
+    if (request.credential.credentialSource() != .host_managed) {
+        const account_id = request.credential.accountId() orelse
+            return stream_provider.failResult(error.GrokSubscriptionAccountRequired);
+        if (!grok_session.validAccountId(account_id)) {
+            return stream_provider.failResult(error.InvalidGrokSubscriptionAccount);
+        }
     }
     try validateModel(request.model);
     const payload = request.prepared_request_body orelse
@@ -182,17 +186,20 @@ const OpenedRequest = struct {
 const OpenRequestOperation = struct {
     client: *std.http.Client,
     uri: std.Uri,
-    auth_header: []const u8,
+    auth_header: ?[]const u8,
     extra_headers: []const std.http.Header,
 
     pub fn run(self: *@This()) !OpenedRequest {
+        var headers: std.http.Client.Request.Headers = .{
+            .content_type = .{ .override = "application/json" },
+            .accept_encoding = .omit,
+            .user_agent = .{ .override = gateway_client.user_agent },
+        };
+        if (self.auth_header) |authorization| {
+            headers.authorization = .{ .override = authorization };
+        }
         return .{ .request = try self.client.request(.POST, self.uri, .{
-            .headers = .{
-                .content_type = .{ .override = "application/json" },
-                .authorization = .{ .override = self.auth_header },
-                .accept_encoding = .omit,
-                .user_agent = .{ .override = gateway_client.user_agent },
-            },
+            .headers = headers,
             .extra_headers = self.extra_headers,
             .keep_alive = false,
             .redirect_behavior = .unhandled,
@@ -200,15 +207,36 @@ const OpenRequestOperation = struct {
     }
 };
 
+const RequestAuthHeaders = struct {
+    authorization: ?[]u8 = null,
+    account_id: ?[]const u8 = null,
+    include_subscription_headers: bool = false,
+
+    fn deinit(self: *RequestAuthHeaders, alloc: Allocator) void {
+        if (self.authorization) |value| secret.zeroAndFree(alloc, value);
+        self.* = .{};
+    }
+};
+
+fn requestAuthHeaders(alloc: Allocator, auth: stream_provider.CredentialLease) !RequestAuthHeaders {
+    return switch (auth) {
+        .host_managed => .{},
+        .direct => |direct| .{
+            .authorization = try std.fmt.allocPrint(alloc, "Bearer {s}", .{direct.secret_bytes}),
+            .account_id = direct.account_id,
+            .include_subscription_headers = true,
+        },
+    };
+}
+
 pub fn streamPrepared(
     alloc: Allocator,
     request: stream_provider.ModelRequest,
     payload: []const u8,
 ) !stream_provider.Result {
     if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
-    const account_id = request.credential.account_id.?;
-    const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.credential.secret});
-    defer secret.zeroAndFree(alloc, auth_header);
+    var auth_headers = try requestAuthHeaders(alloc, request.credential);
+    defer auth_headers.deinit(alloc);
     const request_endpoint = if (io_mod.getenv(e2e_endpoint_env)) |override| endpoint: {
         if (!gateway_client.isLoopbackHttpUrl(override)) {
             return stream_provider.failResult(error.InvalidE2EXaiGrokEndpoint);
@@ -221,18 +249,22 @@ pub fn streamPrepared(
     var extra_count: usize = 0;
     extra_headers_buf[extra_count] = .{ .name = "accept", .value = "text/event-stream" };
     extra_count += 1;
-    extra_headers_buf[extra_count] = .{ .name = "X-XAI-Token-Auth", .value = "xai-grok-cli" };
-    extra_count += 1;
-    extra_headers_buf[extra_count] = .{ .name = "x-authenticateresponse", .value = "authenticate-response" };
-    extra_count += 1;
+    if (auth_headers.include_subscription_headers) {
+        extra_headers_buf[extra_count] = .{ .name = "X-XAI-Token-Auth", .value = "xai-grok-cli" };
+        extra_count += 1;
+        extra_headers_buf[extra_count] = .{ .name = "x-authenticateresponse", .value = "authenticate-response" };
+        extra_count += 1;
+    }
     extra_headers_buf[extra_count] = .{ .name = "x-grok-client-version", .value = proxy_compatibility_version };
     extra_count += 1;
     extra_headers_buf[extra_count] = .{ .name = "x-grok-client-identifier", .value = "fx" };
     extra_count += 1;
     extra_headers_buf[extra_count] = .{ .name = "x-grok-model-override", .value = request.model };
     extra_count += 1;
-    extra_headers_buf[extra_count] = .{ .name = "x-grok-user-id", .value = account_id };
-    extra_count += 1;
+    if (auth_headers.account_id) |account_id| {
+        extra_headers_buf[extra_count] = .{ .name = "x-grok-user-id", .value = account_id };
+        extra_count += 1;
+    }
     if (request.session_id) |session_id| if (session_id.len > 0) {
         extra_headers_buf[extra_count] = .{ .name = "x-grok-conv-id", .value = session_id };
         extra_count += 1;
@@ -243,7 +275,7 @@ pub fn streamPrepared(
     var open_operation = OpenRequestOperation{
         .client = &client,
         .uri = uri,
-        .auth_header = auth_header,
+        .auth_header = auth_headers.authorization,
         .extra_headers = extra_headers_buf[0..extra_count],
     };
     var connect_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
@@ -660,11 +692,11 @@ fn testModelRequest(
     callback_context: *u8,
 ) stream_provider.ModelRequest {
     return .{
-        .credential = .{
-            .secret = secret_value,
+        .credential = .{ .direct = .{
+            .secret_bytes = secret_value,
             .source = source,
             .account_id = account_id,
-        },
+        } },
         .model = "grok-4.20",
         .retry_count = 1,
         .messages = &.{},
@@ -970,6 +1002,15 @@ test "xAI Grok request deadline closes slow headers and stalled SSE" {
 fn ignoreTestChunk(_: *anyopaque, _: []const u8) void {}
 fn ignoreTestEvent(_: *anyopaque, _: stream_provider.Event) void {}
 fn admitTestRequest(_: *anyopaque) !void {}
+
+test "host-managed Grok request auth omits bearer and subscription headers" {
+    var headers = try requestAuthHeaders(std.testing.allocator, .host_managed);
+    defer headers.deinit(std.testing.allocator);
+
+    try std.testing.expect(headers.authorization == null);
+    try std.testing.expect(headers.account_id == null);
+    try std.testing.expect(!headers.include_subscription_headers);
+}
 
 test "xAI Grok error-body reader accepts the exact bound and replaces one beyond" {
     inline for (.{ TestResponseMode.error_body_exact, TestResponseMode.error_body_excess }) |mode| {

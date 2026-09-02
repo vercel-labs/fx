@@ -268,7 +268,7 @@ pub const ReviewTurnContext = struct {
     pending_assistant: types.ChatMessage,
     target_call_id: []const u8,
     origin: ReviewOrigin,
-    credential: types.CredentialLease = .{},
+    credential: types.CredentialLease = .{ .direct = .{} },
     /// Canonical root-user context for contextual security review. Assistant,
     /// tool, repository, attachment, and permission-feedback text never become
     /// authority.

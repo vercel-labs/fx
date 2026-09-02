@@ -49,6 +49,27 @@ fn selectCatalogModel(
     return if (entries.len > 0) entries[0].id else null;
 }
 
+fn optionalGatewayApiKey(credential: anytype) ?[]const u8 {
+    if (comptime @typeInfo(@TypeOf(credential.api_key)) == .optional) {
+        return credential.api_key;
+    }
+    return credential.api_key;
+}
+
+fn gatewayCredentialSource(credential: anytype) ?credentials.Source {
+    if (comptime @hasField(@TypeOf(credential), "source")) {
+        return credential.source;
+    }
+    return null;
+}
+
+fn hostManagesAuth(app: anytype) bool {
+    if (comptime @hasDecl(@TypeOf(app.auth), "isHostManaged")) {
+        return app.auth.isHostManaged();
+    }
+    return false;
+}
+
 const TeamCatalogValidation = union(enum) {
     rejected,
     accepted: ?[]u8,
@@ -113,6 +134,10 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn runLoginCommand(app: *App) !void {
+            if (hostManagesAuth(app)) {
+                try writeAuthNotice(app, .{ .topic = "auth", .tone = .neutral, .body = credentials.host_managed_auth_message });
+                return;
+            }
             if (comptime !oauthAuthEnabled(App)) {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
@@ -143,6 +168,10 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn runLogoutCommand(app: *App, target: []const u8) !void {
+            if (hostManagesAuth(app)) {
+                try writeAuthNotice(app, .{ .topic = "auth", .tone = .neutral, .body = credentials.host_managed_auth_message });
+                return;
+            }
             if (comptime !oauthAuthEnabled(App)) {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
@@ -240,6 +269,10 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn openSetupHub(app: *App) !void {
+            if (hostManagesAuth(app)) {
+                try writeAuthNotice(app, .{ .topic = "auth", .tone = .neutral, .body = credentials.host_managed_auth_message });
+                return;
+            }
             if (comptime !runtime_profile.allows(App, .native_auth)) {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
@@ -835,55 +868,61 @@ pub fn Runtime(comptime App: type) type {
             };
             defer settings.deinit(app.alloc);
 
-            var credential = (auth_runtime.prepareCredential(
-                app.alloc,
-                app.auth.oauthTransport(),
-                app.auth.secretStore(),
-                target,
-                if (target == .gateway) settings.credential_source else null,
-            ) catch |err| {
-                debug_trace.logf("provider", "credential preparation failed provider={t} err={s}", .{ target, @errorName(err) });
-                try app.writeDomainNotice(.{
-                    .topic = "provider",
-                    .tone = .@"error",
-                    .body = providerFailureMessage(
-                        intent,
-                        "Could not prepare the target provider credential. The current provider is unchanged.",
-                        "Subscription sign-in completed, but its credential could not be prepared. The current provider is unchanged.",
-                    ),
-                }, true);
-                return;
-            }) orelse {
-                if (target == .codex and allow_login) {
-                    try beginCodexSignInForProviderSwitch(app);
+            var credential: ?credentials.Credential = null;
+            defer if (credential) |*value| value.deinit(app.alloc);
+            if (!hostManagesAuth(app)) {
+                credential = (auth_runtime.prepareCredential(
+                    app.alloc,
+                    app.auth.oauthTransport(),
+                    app.auth.secretStore(),
+                    target,
+                    if (target == .gateway) settings.credential_source else null,
+                ) catch |err| {
+                    debug_trace.logf("provider", "credential preparation failed provider={t} err={s}", .{ target, @errorName(err) });
+                    try app.writeDomainNotice(.{
+                        .topic = "provider",
+                        .tone = .@"error",
+                        .body = providerFailureMessage(
+                            intent,
+                            "Could not prepare the target provider credential. The current provider is unchanged.",
+                            "Subscription sign-in completed, but its credential could not be prepared. The current provider is unchanged.",
+                        ),
+                    }, true);
                     return;
-                }
-                if (target == .grok and allow_login) {
-                    try beginGrokSignInForProviderSwitch(app);
+                }) orelse {
+                    if (target == .codex and allow_login) {
+                        try beginCodexSignInForProviderSwitch(app);
+                        return;
+                    }
+                    if (target == .grok and allow_login) {
+                        try beginGrokSignInForProviderSwitch(app);
+                        return;
+                    }
+                    try app.writeDomainNotice(.{
+                        .topic = "provider",
+                        .tone = .warning,
+                        .body = if (intent == .post_oauth)
+                            "Subscription sign-in completed, but its saved credential is unavailable. The current provider is unchanged."
+                        else if (target == .codex)
+                            "Run fx login codex, then try switching again."
+                        else if (target == .grok)
+                            "Run fx login grok, then try switching again."
+                        else
+                            credentials.missing_interactive_credential_message,
+                    }, true);
                     return;
-                }
-                try app.writeDomainNotice(.{
-                    .topic = "provider",
-                    .tone = .warning,
-                    .body = if (intent == .post_oauth)
-                        "Subscription sign-in completed, but its saved credential is unavailable. The current provider is unchanged."
-                    else if (target == .codex)
-                        "Run fx login codex, then try switching again."
-                    else if (target == .grok)
-                        "Run fx login grok, then try switching again."
-                    else
-                        credentials.missing_interactive_credential_message,
-                }, true);
-                return;
-            };
-            defer credential.deinit(app.alloc);
+                };
+            }
 
-            const access = credentials.catalogAccessForCredentialAndAccount(
-                credential.source,
-                credential.token,
-                credential.gatewayTeam(),
-                credential.accountId(),
-            );
+            const access: credentials.CatalogAccess = if (hostManagesAuth(app))
+                .host_managed
+            else
+                credentials.catalogAccessForCredentialAndAccount(
+                    credential.?.source,
+                    credential.?.token,
+                    credential.?.gatewayTeam(),
+                    credential.?.accountId(),
+                );
             const fetched = app.fetchProviderCatalog(target, access) catch |err| {
                 debug_trace.logf("provider", "catalog preparation failed provider={t} err={s}", .{ target, @errorName(err) });
                 try app.writeDomainNotice(.{
@@ -955,7 +994,7 @@ pub fn Runtime(comptime App: type) type {
 
             app.model_cache.adoptOwnedCatalog(access, &catalog);
             app.provider_selection.adoptOwned(target, &owned_model);
-            _ = app.auth.adoptCredential(app.alloc, &credential);
+            if (credential) |*value| _ = app.auth.adoptCredential(app.alloc, value);
             reconcileGatewayCredential(app);
 
             const body = try std.fmt.allocPrint(
@@ -1266,6 +1305,7 @@ pub fn Runtime(comptime App: type) type {
                         .chatgpt_subscription => "Run /login and reconnect Codex to repair this source.",
                         .grok_subscription => "Run /login and reconnect Grok to repair this source.",
                         .vercel_oidc_token, .ai_gateway_api_key, .stored_key => "Run /setup to repair this source.",
+                        .host_managed => credentials.host_managed_auth_message,
                     },
                 },
             );
@@ -1294,6 +1334,15 @@ pub fn Runtime(comptime App: type) type {
                 @hasField(@TypeOf(app.session), "usage"))
             {
                 if (app.auth.gatewayCredential()) |credential| {
+                    if (gatewayCredentialSource(credential) == .host_managed) {
+                        if (comptime @hasDecl(@TypeOf(app.session.usage), "replaceHostManagedReconciliationAuthority")) {
+                            app.session.usage.replaceHostManagedReconciliationAuthority(
+                                app.alloc,
+                                provider_runtime.provider(app),
+                            );
+                        }
+                        return;
+                    }
                     const subscription = if (comptime @hasField(@TypeOf(credential), "source"))
                         credential.source == .chatgpt_subscription or credential.source == .grok_subscription
                     else
@@ -1305,18 +1354,22 @@ pub fn Runtime(comptime App: type) type {
                             @TypeOf(app.session.usage),
                             "replaceProviderReconciliationCredential",
                         )) {
-                            app.session.usage.replaceProviderReconciliationCredential(
-                                app.alloc,
-                                .gateway,
-                                credential.source,
-                                null,
-                                credential.api_key,
-                            );
+                            if (optionalGatewayApiKey(credential)) |api_key| {
+                                app.session.usage.replaceProviderReconciliationCredential(
+                                    app.alloc,
+                                    .gateway,
+                                    credential.source,
+                                    null,
+                                    api_key,
+                                );
+                            }
                         } else {
-                            app.session.usage.replaceReconciliationCredential(
-                                app.alloc,
-                                credential.api_key,
-                            );
+                            if (optionalGatewayApiKey(credential)) |api_key| {
+                                app.session.usage.replaceReconciliationCredential(
+                                    app.alloc,
+                                    api_key,
+                                );
+                            }
                         }
                     }
                 } else {

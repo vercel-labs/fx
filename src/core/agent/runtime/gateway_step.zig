@@ -85,11 +85,18 @@ pub fn streamModelCompletion(
             );
             if (comptime @import("builtin").os.tag != .wasi) {
                 if (std.meta.activeTag(completed.usage) == .deferred) if (usage) |ledger| {
-                    ledger.startDeferredReconciliation(
-                        usage_allocator,
-                        completed.usage.deferred,
-                        request.credential.secret,
-                    );
+                    if (request.credential.secret()) |credential| {
+                        ledger.startDeferredReconciliation(
+                            usage_allocator,
+                            completed.usage.deferred,
+                            credential,
+                        );
+                    } else if (request.credential.credentialSource() == .host_managed) {
+                        ledger.startHostManagedDeferredReconciliation(
+                            usage_allocator,
+                            completed.usage.deferred,
+                        );
+                    }
                 };
             }
         },
@@ -269,7 +276,7 @@ test "provider preflight failure does not reserve usage" {
         agent_stream_provider.unavailable_provider,
         alloc,
         .{
-            .credential = .{ .secret = "test-key" },
+            .credential = .{ .direct = .{ .secret_bytes = "test-key" } },
             .model = "test/model",
             .retry_count = 1,
             .messages = &.{},
@@ -337,7 +344,7 @@ test "caller admission publishes before provider attempt is admitted" {
         .{ .context = &provider, .stream_fn = Provider.stream },
         alloc,
         .{
-            .credential = .{ .secret = "test-key" },
+            .credential = .{ .direct = .{ .secret_bytes = "test-key" } },
             .model = "test/model",
             .retry_count = 1,
             .messages = &.{},
@@ -405,7 +412,7 @@ test "caller admission failure settles usage and prevents request open" {
             .{ .context = &provider, .stream_fn = Provider.stream },
             alloc,
             .{
-                .credential = .{ .secret = "test-key" },
+                .credential = .{ .direct = .{ .secret_bytes = "test-key" } },
                 .model = "test/model",
                 .retry_count = 1,
                 .messages = &.{},
@@ -462,7 +469,7 @@ test "possibly sent gateway failure marks billing incomplete" {
         .{ .stream_fn = Gateway.stream },
         alloc,
         .{
-            .credential = .{ .secret = "test-key" },
+            .credential = .{ .direct = .{ .secret_bytes = "test-key" } },
             .model = "test/model",
             .retry_count = 1,
             .messages = &.{},
@@ -542,11 +549,11 @@ test "provider-local exact usage reaches session accounting" {
         provider,
         alloc,
         .{
-            .credential = .{
-                .secret = "subscription-token",
+            .credential = .{ .direct = .{
+                .secret_bytes = "subscription-token",
                 .source = .chatgpt_subscription,
                 .account_id = "acct_test",
-            },
+            } },
             .session_id = "session-test",
             .model = "gpt-test",
             .retry_count = 1,

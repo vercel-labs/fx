@@ -5,6 +5,7 @@ const app_session_runtime = @import("app_session_runtime.zig");
 const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
 const acp_runner = @import("../cli/acp_runner.zig");
 const cli_surface = @import("../cli/cli_surface.zig");
+const credentials = @import("../auth/credentials.zig");
 const process_provider = @import("../execution/process_provider.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const provider_set = @import("../gateway/provider_set.zig");
@@ -66,6 +67,7 @@ pub const Config = struct {
     version: []const u8 = "",
     revision: []const u8 = "",
     build_channel: update_target.Channel = .stable,
+    auth_mode: credentials.AuthMode = .local,
     command_catalog: command_specs.TopLevelRegistry,
     default_model: []const u8,
     default_agent_step_limit: usize,
@@ -160,7 +162,7 @@ fn runWithDeps(comptime App: type, alloc: Allocator, args: []const [:0]const u8,
         .exit => |code| return .{ .exit = code },
     }
 
-    return runInteractiveWithDeps(App, false, alloc, &launch, deps);
+    return runInteractiveWithDeps(App, false, alloc, &launch, cfg.auth_mode, deps);
 }
 
 pub fn runBeforeInteractive(alloc: Allocator, args: []const [:0]const u8, cfg: Config) !BeforeInteractiveResult {
@@ -219,23 +221,23 @@ fn benchEnabled() bool {
     return io_mod.getenv("FX_BENCH") != null;
 }
 
-pub fn runInteractive(comptime App: type, alloc: Allocator, launch: *cli_surface.InteractiveLaunch) !RunOutcome {
-    return runInteractiveWithDeps(App, false, alloc, launch, .{});
+pub fn runInteractive(comptime App: type, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, auth_mode: credentials.AuthMode) !RunOutcome {
+    return runInteractiveWithDeps(App, false, alloc, launch, auth_mode, .{});
 }
 
 /// Runs the interactive product without native CLI dispatch, process replacement,
 /// or a worker thread. Single-threaded hosts must arrange cooperative prompt work.
-pub fn runInteractiveCooperative(comptime App: type, alloc: Allocator, launch: *cli_surface.InteractiveLaunch) !RunOutcome {
-    return runInteractiveWithDeps(App, true, alloc, launch, .{});
+pub fn runInteractiveCooperative(comptime App: type, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, auth_mode: credentials.AuthMode) !RunOutcome {
+    return runInteractiveWithDeps(App, true, alloc, launch, auth_mode, .{});
 }
 
 fn unavailableCliDispatch(_: ?*anyopaque, _: Allocator, _: []const [:0]const u8, _: cli_surface.Config) anyerror!cli_surface.RunResult {
     return error.UnknownCliCommand;
 }
 
-fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, deps: RunDeps) !RunOutcome {
+fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, auth_mode: credentials.AuthMode, deps: RunDeps) !RunOutcome {
     const resume_requested = launch.requested_resume != null;
-    var app = App.init(alloc, launch) catch |err| {
+    var app = App.init(alloc, launch, auth_mode) catch |err| {
         switch (err) {
             error.NotATerminal => {
                 writeStderr(deps, "fx requires an interactive terminal (TTY).\n");
@@ -411,6 +413,7 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
         .version = cfg.version,
         .revision = cfg.revision,
         .build_channel = cfg.build_channel,
+        .auth_mode = cfg.auth_mode,
         .command_catalog = cfg.command_catalog,
         .default_model = cfg.default_model,
         .default_agent_step_limit = cfg.default_agent_step_limit,
@@ -734,7 +737,7 @@ const TestApp = struct {
     requested_resume: ?cli_surface.ResumeTarget = null,
     terminal_released: bool = false,
 
-    fn init(_: Allocator, launch: *cli_surface.InteractiveLaunch) !TestApp {
+    fn init(_: Allocator, launch: *cli_surface.InteractiveLaunch, _: credentials.AuthMode) !TestApp {
         appendInitEvent(launch);
         if (active_capture.?.init_error) |err| return err;
 

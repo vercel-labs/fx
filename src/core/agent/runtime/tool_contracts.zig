@@ -131,7 +131,7 @@ pub const ToolExecutionRequest = struct {
     result_allocator: Allocator,
     call: ToolCall,
     authority: command_admission.ToolExecutionAuthority,
-    credential: types.CredentialLease = .{},
+    credential: types.CredentialLease = .{ .direct = .{} },
     /// Action-scoped root mode sampled before permission admission. Direct
     /// callers without a sampled mode retain their execution context value.
     permission_mode: ?types.PermissionMode = null,

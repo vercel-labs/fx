@@ -73,15 +73,17 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
     const payload = request.prepared_request_body orelse
         try context.build_fn(alloc, request.data());
     defer if (request.prepared_request_body == null) alloc.free(payload);
-    const auth = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.credential.secret});
-    defer alloc.free(auth);
+    const auth = if (request.credential.secret()) |credential|
+        try std.fmt.allocPrint(alloc, "Bearer {s}", .{credential})
+    else
+        null;
+    defer if (auth) |value| alloc.free(value);
 
     const Header = struct { name: []const u8, value: []const u8 };
     var headers: std.ArrayList(Header) = .empty;
     defer headers.deinit(alloc);
     try headers.appendSlice(alloc, &.{
         .{ .name = "content-type", .value = "application/json" },
-        .{ .name = "authorization", .value = auth },
         .{ .name = "HTTP-Referer", .value = "https://github.com/vercel-labs/fx" },
         .{ .name = "X-Title", .value = "fx" },
         .{ .name = gateway_client.vercel_gateway_extended_time_header, .value = gateway_client.vercel_gateway_extended_time_value },
@@ -90,7 +92,8 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
         .{ .name = "ai-language-model-id", .value = request.model },
         .{ .name = "ai-language-model-streaming", .value = "true" },
     });
-    if (request.credential.tenant) |team| if (team.len > 0) try headers.append(alloc, .{ .name = "x-vercel-ai-gateway-team", .value = team });
+    if (auth) |value| try headers.append(alloc, .{ .name = "authorization", .value = value });
+    if (request.credential.tenant()) |team| if (team.len > 0) try headers.append(alloc, .{ .name = "x-vercel-ai-gateway-team", .value = team });
     if (request.session_id) |session_id| if (session_id.len > 0) try headers.appendSlice(alloc, &.{
         .{ .name = "x-session-id", .value = session_id },
         .{ .name = "x-session-affinity", .value = session_id },
@@ -192,17 +195,17 @@ fn gatewayUsageReference(
     completion: @import("../core/shared/types.zig").ModelCompletion,
 ) ?stream_provider.DeferredUsageReference {
     const generation_id = completion.generation_id orelse return null;
-    const source = request.credential.source orelse return null;
+    const source = request.credential.credentialSource() orelse return null;
     return .{
         .provider = .gateway,
         .generation_id = generation_id,
         .scope = gateway_client.generationBaseUrl(),
-        .tenant = request.credential.tenant,
-        .account_id = request.credential.account_id,
+        .tenant = request.credential.tenant(),
+        .account_id = request.credential.accountId(),
         .credential_source = source,
         .credential_identity = credential_authority.derive(
             source,
-            request.credential.account_id,
+            request.credential.accountId(),
         ),
     };
 }

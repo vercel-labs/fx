@@ -262,7 +262,7 @@ pub const FakeGateway = struct {
         defer if (request.prepared_request_body == null) alloc.free(payload);
         try self.request_bodies.append(self.alloc, try self.alloc.dupe(u8, payload));
         try self.request_models.append(self.alloc, try self.alloc.dupe(u8, request.model));
-        try self.request_api_keys.append(self.alloc, try self.alloc.dupe(u8, request.credential.secret));
+        try self.request_api_keys.append(self.alloc, try self.alloc.dupe(u8, request.credential.secret() orelse ""));
         const session_id = if (request.session_id) |id| try self.alloc.dupe(u8, id) else null;
         errdefer if (session_id) |id| self.alloc.free(id);
         try self.request_session_ids.append(self.alloc, session_id);
@@ -1122,7 +1122,7 @@ pub const FakeAgentRuntimeDeps = struct {
         if (self.last_permission_credential) |value| self.alloc.free(value);
         self.last_permission_credential = try self.alloc.dupe(
             u8,
-            review_turn.credential.secret,
+            review_turn.credential.secret() orelse "",
         );
         if (self.last_permission_arguments) |value| self.alloc.free(value);
         self.last_permission_arguments = try self.alloc.dupe(u8, call.arguments_json);
@@ -1411,7 +1411,7 @@ pub const FakeAgentRuntimeDeps = struct {
             if (self.last_executed_arguments) |value| self.alloc.free(value);
             self.last_executed_arguments = try self.alloc.dupe(u8, call.arguments_json);
             if (self.last_execute_credential) |value| self.alloc.free(value);
-            self.last_execute_credential = try self.alloc.dupe(u8, request.credential.secret);
+            self.last_execute_credential = try self.alloc.dupe(u8, request.credential.secret() orelse "");
             if (self.last_execute_root_user_intent_context) |value| self.alloc.free(value);
             self.last_execute_root_user_intent_context = try self.alloc.dupe(
                 u8,

@@ -1061,7 +1061,7 @@ fn parseTurnAuthority(alloc: Allocator, value: std.json.Value) !TurnAuthority {
     errdefer alloc.free(model);
     const credential_source = if (object.get("credential_source")) |source| switch (source) {
         .null => null,
-        .string => |text| types.parseCredentialSource(text) orelse return error.InvalidDurableField,
+        .string => |text| types.parseRuntimeCredentialSource(text) orelse return error.InvalidDurableField,
         else => return error.InvalidDurableField,
     } else return error.InvalidSessionFormat;
     const credential_identity = if (object.get("credential_identity")) |identity| switch (identity) {

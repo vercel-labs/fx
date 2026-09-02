@@ -275,6 +275,7 @@ pub const Context = struct {
             return permission_auto_classifier.Classifier.disabled();
         return permission_auto_classifier.Classifier.withProvider(provider, .{
             .credential = self.api_key,
+            .credential_source = self.credential_source,
             .account_id = self.account_id,
             .tenant = self.gateway_team,
             .endpoint = self.gateway_chat_url,
@@ -6715,8 +6716,8 @@ const VisionGatewayFixture = struct {
         const payload = try test_builtin_gateway.buildAgentRequest(self.alloc, request.data());
         defer self.alloc.free(payload);
         try self.payloads.append(self.alloc, try self.alloc.dupe(u8, payload));
-        self.last_api_key = request.credential.secret;
-        self.last_team = request.credential.tenant;
+        self.last_api_key = request.credential.secret() orelse "";
+        self.last_team = request.credential.tenant();
         self.last_model = request.model;
         self.last_retry_count = request.retry_count;
         if (self.cancel_after_call == self.call_count) request.cancel_flag.store(true, .seq_cst);
@@ -6725,6 +6726,8 @@ const VisionGatewayFixture = struct {
         try request.admission.admit();
         request.delivery.markPossiblySent();
         if (response.status != .ok) return .{ .failed = .{ .kind = .provider_error } };
+        const credential_source = request.credential.credentialSource() orelse
+            return error.MissingCredentialSource;
         return .{ .completed = .{
             .completion = .{
                 .content = response.content,
@@ -6736,11 +6739,11 @@ const VisionGatewayFixture = struct {
                 .provider = .gateway,
                 .generation_id = response.generation_id orelse "gen_test",
                 .scope = "https://ai-gateway.vercel.sh",
-                .tenant = request.credential.tenant,
-                .credential_source = request.credential.source orelse .ai_gateway_api_key,
+                .tenant = request.credential.tenant(),
+                .credential_source = credential_source,
                 .credential_identity = credential_authority.derive(
-                    request.credential.source orelse .ai_gateway_api_key,
-                    request.credential.account_id,
+                    credential_source,
+                    request.credential.accountId(),
                 ),
             } },
         } };

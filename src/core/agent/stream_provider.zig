@@ -148,6 +148,16 @@ pub const ToolSelection = struct {
     }
 };
 
+pub const CredentialLease = types.CredentialLease;
+
+test "host-managed credential lease exposes no secret or account metadata" {
+    const lease: CredentialLease = .host_managed;
+    try std.testing.expect(lease.secret() == null);
+    try std.testing.expect(lease.accountId() == null);
+    try std.testing.expect(lease.tenant() == null);
+    try std.testing.expectEqual(types.CredentialSource.host_managed, lease.credentialSource().?);
+}
+
 /// Pure provider input used by request serializers and permission reviewers.
 /// Every slice and JSON value is borrowed for the call.
 pub const RequestData = struct {
@@ -406,7 +416,7 @@ test "stream provider accepts one typed request and emits ordered neutral events
         .context = &fake,
         .stream_fn = Fake.stream,
     }).stream(std.testing.allocator, .{
-        .credential = .{ .secret = "key" },
+        .credential = .{ .direct = .{ .secret_bytes = "key" } },
         .model = "model",
         .retry_count = 1,
         .messages = &.{},

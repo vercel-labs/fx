@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { spawn as nodeSpawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
@@ -2332,7 +2332,9 @@ test(
     expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
     expect(result.stdout).toContain("Selected Vercel team: Vercel Labs (vercel-labs).");
     expect(savedCredentialSource(home)).toBe("fx_login");
-    const persisted = JSON.parse(readFileSync(join(home, ".fx", "auth.json"), "utf8")) as {
+    const persisted = JSON.parse(
+      readFileSync(join(home, ".fx", "auth.json"), "utf8"),
+    ) as {
       team_id?: string;
       team_slug?: string;
     };
@@ -2382,7 +2384,9 @@ test(
     expect(result.stdout).not.toContain("Selected Vercel team");
     expect(result.stderr).toContain("selected team could not access AI Gateway");
     expect(savedCredentialSource(home)).toBeUndefined();
-    const persisted = JSON.parse(readFileSync(join(home, ".fx", "auth.json"), "utf8")) as {
+    const persisted = JSON.parse(
+      readFileSync(join(home, ".fx", "auth.json"), "utf8"),
+    ) as {
       team_id?: string;
     };
     expect(persisted.team_id).toBe("team_old");
@@ -4758,3 +4762,251 @@ for (const scenario of [
     60_000,
   );
 }
+
+type HostManagedCapturedRequest = {
+  path: string;
+  headers: Headers;
+};
+
+describe("host-managed authentication", () => {
+  let hostRoot = "";
+  let hostHome = "";
+  let hostWorkspace = "";
+  let hostRequests: HostManagedCapturedRequest[] = [];
+  let hostServer: ReturnType<typeof Bun.serve>;
+  let hostBaseUrl = "";
+  let codexUnauthorizedResponses = 0;
+
+  beforeAll(() => {
+    hostRoot = mkdtempSync(join(tmpdir(), "fx-host-managed-auth-"));
+    hostHome = join(hostRoot, "home");
+    hostWorkspace = join(hostRoot, "workspace");
+    mkdirSync(hostHome, { recursive: true });
+    mkdirSync(hostWorkspace, { recursive: true });
+    hostServer = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(request) {
+        const path = new URL(request.url).pathname;
+        hostRequests.push({ path, headers: new Headers(request.headers) });
+        if (path === "/gateway/models") {
+          return Response.json({
+            data: [{ id: "test/gateway-model", type: "language", tags: ["tool-use"] }],
+          });
+        }
+        if (path === "/gateway/responses") {
+          return fakeGatewayFinalText("GATEWAY_HOST_MANAGED_OK");
+        }
+        if (path === "/codex/models") {
+          return Response.json({ models: [{
+            slug: "gpt-5.4-mini",
+            visibility: "list",
+            supported_in_api: true,
+            priority: 1,
+            supported_reasoning_levels: [{ effort: "low" }],
+            additional_speed_tiers: [],
+            input_modalities: ["text"],
+            context_window: 272000,
+          }] });
+        }
+        if (path === "/codex/responses") {
+          if (codexUnauthorizedResponses > 0) {
+            codexUnauthorizedResponses -= 1;
+            return Response.json({ error: { message: "host rejected request" } }, { status: 401 });
+          }
+          return new Response(
+            'data: {"type":"response.output_text.delta","delta":"CODEX_HOST_MANAGED_OK"}\n\n' +
+              'data: {"type":"response.completed","response":{"id":"resp_codex_host","status":"completed","usage":{"input_tokens":4,"output_tokens":2}}}\n\n',
+            { headers: { "content-type": "text/event-stream" } },
+          );
+        }
+        if (path === "/grok/models") {
+          return Response.json({ data: [{
+            id: "grok-4.20",
+            model: "grok-4.20",
+            api_backend: "responses",
+            context_window: 1000000,
+            supports_reasoning_effort: false,
+            reasoning_efforts: [],
+          }] });
+        }
+        if (path === "/grok/modalities") {
+          return Response.json({ models: [{
+            id: "grok-4.20",
+            input_modalities: ["text"],
+            output_modalities: ["text"],
+          }] });
+        }
+        if (path === "/grok/responses") {
+          return new Response(
+            'data: {"type":"response.output_text.delta","delta":"GROK_HOST_MANAGED_OK"}\n\n' +
+              'data: {"type":"response.completed","response":{"id":"resp_grok_host","status":"completed","usage":{"input_tokens":4,"output_tokens":2}}}\n\n',
+            { headers: { "content-type": "text/event-stream" } },
+          );
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    hostBaseUrl = `http://127.0.0.1:${hostServer.port}`;
+  });
+
+  afterAll(() => {
+    hostServer.stop(true);
+    rmSync(hostRoot, { recursive: true, force: true });
+  });
+
+  function hostManagedEnv(): Record<string, string | undefined> {
+    return {
+      HOME: hostHome,
+      AI_GATEWAY_API_KEY: undefined,
+      VERCEL_OIDC_TOKEN: undefined,
+      FX_AUTH_MODE: "host-managed",
+      FX_AUTO_UPGRADE: "0",
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_SKIP_ONBOARDING: "1",
+      FX_SOUND: "0",
+      FX_E2E_GATEWAY_MODELS_URL: `${hostBaseUrl}/gateway/models`,
+      FX_E2E_GATEWAY_CHAT_URL: `${hostBaseUrl}/gateway/responses`,
+      FX_E2E_OPENAI_CODEX_MODELS_URL: `${hostBaseUrl}/codex/models`,
+      FX_E2E_OPENAI_CODEX_RESPONSES_URL: `${hostBaseUrl}/codex/responses`,
+      FX_E2E_XAI_GROK_MODELS_URL: `${hostBaseUrl}/grok/models`,
+      FX_E2E_XAI_GROK_MODALITIES_URL: `${hostBaseUrl}/grok/modalities`,
+      FX_E2E_XAI_GROK_RESPONSES_URL: `${hostBaseUrl}/grok/responses`,
+    };
+  }
+
+  test("runs Gateway Codex and Grok without local authentication headers", async () => {
+    const childEnv = hostManagedEnv();
+    const status = await runFx(["status", "--json"], { cwd: hostWorkspace, env: childEnv });
+    expect(status.code).toBe(0);
+    expect(status.stderr).toBe("");
+    expect(JSON.parse(status.stdout).auth).toBe("host managed");
+
+    for (const command of [["login"], ["logout"], ["setup"], ["teams"]]) {
+      const result = await runFx(command, { cwd: hostWorkspace, env: childEnv });
+      expect(result.code).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(result.stdout).toBe("Authentication is managed by the host.\n");
+    }
+    expect(existsSync(join(hostHome, ".fx", "auth.json"))).toBe(false);
+
+    for (const [provider, marker] of [
+      ["gateway", "GATEWAY_HOST_MANAGED_OK"],
+      ["codex", "CODEX_HOST_MANAGED_OK"],
+      ["grok", "GROK_HOST_MANAGED_OK"],
+    ] as const) {
+      const selected = await runFx(["provider", provider], {
+        cwd: hostWorkspace,
+        env: childEnv,
+        timeoutMs: TIMEOUT,
+      });
+      expect(selected.code).toBe(0);
+      expect(selected.stderr).toBe("");
+
+      const models = await runFx(["models", "--json"], {
+        cwd: hostWorkspace,
+        env: childEnv,
+        timeoutMs: TIMEOUT,
+      });
+      expect(models.code).toBe(0);
+      expect(models.stderr).toBe("");
+
+      const asked = await runFx(["ask", "--json", "--no-save", "Reply once."], {
+        cwd: hostWorkspace,
+        env: childEnv,
+        timeoutMs: TIMEOUT,
+      });
+      expect(asked.code).toBe(0);
+      expect(asked.stderr).toBe("");
+      expect(asked.stdout).toContain(marker);
+    }
+
+    expect(hostRequests.length).toBeGreaterThan(0);
+    for (const request of hostRequests) {
+      expect(request.headers.get("authorization"), request.path).toBeNull();
+      expect(request.headers.get("x-vercel-ai-gateway-team"), request.path).toBeNull();
+      expect(request.headers.get("chatgpt-account-id"), request.path).toBeNull();
+      expect(request.headers.get("x-xai-token-auth"), request.path).toBeNull();
+      expect(request.headers.get("x-authenticateresponse"), request.path).toBeNull();
+      expect(request.headers.get("x-grok-user-id"), request.path).toBeNull();
+      expect(request.headers.get("x-userid"), request.path).toBeNull();
+    }
+    expect(existsSync(join(hostHome, ".fx", "auth.json"))).toBe(false);
+  }, TIMEOUT);
+
+  test("rejects malformed auth mode before provider I/O", async () => {
+    const before = hostRequests.length;
+    const result = await runFx(["ask", "--json", "--no-save", "Do nothing."], {
+      cwd: hostWorkspace,
+      env: { ...hostManagedEnv(), FX_AUTH_MODE: "host_managed" },
+      timeoutMs: TIMEOUT,
+    });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("FX_AUTH_MODE must be local or host-managed");
+    expect(hostRequests.length).toBe(before);
+  }, TIMEOUT);
+
+  test("final provider 401 does not enter local refresh or replay", async () => {
+    const childEnv = hostManagedEnv();
+    const selected = await runFx(["provider", "codex"], {
+      cwd: hostWorkspace,
+      env: childEnv,
+      timeoutMs: TIMEOUT,
+    });
+    expect(selected.code).toBe(0);
+
+    const before = hostRequests.filter((request) => request.path === "/codex/responses").length;
+    codexUnauthorizedResponses = 1;
+    const asked = await runFx(["ask", "--json", "--no-save", "Reply once."], {
+      cwd: hostWorkspace,
+      env: childEnv,
+      timeoutMs: TIMEOUT,
+    });
+    expect(asked.code).toBe(1);
+    const after = hostRequests.filter((request) => request.path === "/codex/responses").length;
+    expect(after - before).toBe(1);
+    expect(existsSync(join(hostHome, ".fx", "auth.json"))).toBe(false);
+  }, TIMEOUT);
+
+  test("interactive host-managed session streams through the same authority", async () => {
+    const childEnv = hostManagedEnv();
+    const selected = await runFx(["provider", "gateway"], {
+      cwd: hostWorkspace,
+      env: childEnv,
+      timeoutMs: TIMEOUT,
+    });
+    expect(selected.code).toBe(0);
+
+    const hostStderrPath = join(hostRoot, "tui.stderr");
+    const tracePath = join(hostRoot, "tui.trace");
+    const before = hostRequests.length;
+    const hostSession = await TmuxSession.create({
+      cwd: hostWorkspace,
+      env: {
+        ...childEnv,
+        FX_TRACE_LOG: tracePath,
+        FX_TRACE_SCOPES: "auth,session,worker,gateway",
+      },
+      stderrPath: hostStderrPath,
+      isolated: true,
+    });
+    try {
+      await hostSession.waitForComposer(TIMEOUT);
+      await hostSession.sendText("Reply once.");
+      const pane = await hostSession.waitForText("GATEWAY_HOST_MANAGED_OK", TIMEOUT);
+      expect(pane).toContain("GATEWAY_HOST_MANAGED_OK");
+    } catch (error) {
+      const trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "<no trace>";
+      throw new Error(`${String(error)}\ntrace:\n${trace}`);
+    } finally {
+      await hostSession.kill();
+    }
+
+    expect(readFileSync(hostStderrPath, "utf8")).toBe("");
+    expect(hostRequests.length).toBeGreaterThan(before);
+    for (const request of hostRequests.slice(before)) {
+      expect(request.headers.get("authorization"), request.path).toBeNull();
+      expect(request.headers.get("x-vercel-ai-gateway-team"), request.path).toBeNull();
+    }
+  }, TIMEOUT * 2);
+});

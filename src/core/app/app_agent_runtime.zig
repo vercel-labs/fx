@@ -764,17 +764,18 @@ pub fn Runtime(comptime App: type) type {
             gateway_retry_count: usize,
             gateway_chat_url: []const u8,
         ) void {
-            if (credential.secret.len == 0) return;
-            ctx.api_key = credential.secret;
-            ctx.credential_source = credential.source;
-            ctx.account_id = credential.account_id;
-            ctx.gateway_team = credential.tenant;
+            const credential_secret = credential.secret() orelse return;
+            const credential_source = credential.credentialSource();
+            ctx.api_key = credential_secret;
+            ctx.credential_source = credential_source;
+            ctx.account_id = credential.accountId();
+            ctx.gateway_team = credential.tenant();
             if (comptime @hasField(App, "web_search_runtime") and @hasField(App, "session")) {
                 if (ctx.provider_capabilities.fx_search) {
                     app.web_search_runtime.configure(.{
-                        .api_key = credential.secret,
-                        .credential_source = credential.source,
-                        .gateway_team = credential.tenant,
+                        .api_key = credential_secret,
+                        .credential_source = credential_source,
+                        .gateway_team = credential.tenant(),
                         .worker_model = provider_runtime.model(app),
                         .gateway_retry_count = gateway_retry_count,
                         .gateway_chat_url = gateway_chat_url,

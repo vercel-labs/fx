@@ -39,7 +39,7 @@ const OwnedCatalogAccess = struct {
 
     fn init(alloc: Allocator, access: credentials.CatalogAccess) !OwnedCatalogAccess {
         return switch (access) {
-            .public_only => .{ .access = access },
+            .public_only, .host_managed => .{ .access = access },
             .authenticated => |authenticated| blk: {
                 const credential = try alloc.dupe(u8, authenticated.credential);
                 errdefer secret.zeroAndFree(alloc, credential);
@@ -72,7 +72,7 @@ const OwnedCatalogAccess = struct {
 
     fn deinit(self: *OwnedCatalogAccess, alloc: Allocator) void {
         switch (self.access) {
-            .public_only => {},
+            .public_only, .host_managed => {},
             .authenticated => |access| {
                 secret.zeroAndFree(alloc, @constCast(access.credential));
                 if (access.team_context) |team| alloc.free(@constCast(team));

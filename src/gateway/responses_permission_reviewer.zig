@@ -40,16 +40,15 @@ pub fn review(
     request: permission_auto_classifier.ReviewRequest,
     adapter: Adapter,
 ) !permission_auto_classifier.ParseOutcome {
-    if (input.credential.len == 0) {
-        return .{ .invalid = .provider_context_missing };
+    if (reviewInputFailure(input, adapter.require_account)) |reason| {
+        return .{ .invalid = reason };
     }
-    if (adapter.require_account and input.account_id == null) {
-        return .{ .invalid = .provider_context_missing };
+    if (input.credential_source != .host_managed) {
+        adapter.validate_fn(alloc, input) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return .{ .invalid = .provider_failed };
+        };
     }
-    adapter.validate_fn(alloc, input) catch |err| {
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        return .{ .invalid = .provider_failed };
-    };
     var runtime = Runtime{ .input = input, .adapter = adapter };
     return permission_auto_classifier.Reviewer.withTransportModel(
         .{
@@ -61,6 +60,16 @@ pub fn review(
         permission_auto_classifier.Reviewer.default_timeout_ms,
         adapter.model,
     ).review(alloc, request);
+}
+
+fn reviewInputFailure(
+    input: permission_auto_classifier.ProviderInput,
+    require_account: bool,
+) ?permission_auto_classifier.InvalidReason {
+    if (input.credential_source == .host_managed) return null;
+    if (input.credential.len == 0) return .provider_context_missing;
+    if (require_account and input.account_id == null) return .provider_context_missing;
+    return null;
 }
 
 fn buildReviewPayload(
@@ -126,6 +135,12 @@ pub fn buildPayloadForTest(
 
 fn validateUnavailable(_: Allocator, _: permission_auto_classifier.ProviderInput) !void {}
 
+test "host-managed permission review accepts absent local credential metadata" {
+    try std.testing.expect(reviewInputFailure(.{
+        .credential_source = .host_managed,
+    }, true) == null);
+}
+
 const OwnedResult = struct {
     result: stream_provider.Result,
 };
@@ -175,12 +190,15 @@ fn sendReview(
     };
     var callback_context: u8 = 0;
     var result = runtime.adapter.send_fn(alloc, .{
-        .credential = .{
-            .secret = runtime.input.credential,
-            .source = runtime.adapter.source,
-            .account_id = runtime.input.account_id,
-            .tenant = runtime.input.tenant,
-        },
+        .credential = if (runtime.input.credential_source == .host_managed)
+            .host_managed
+        else
+            .{ .direct = .{
+                .secret_bytes = runtime.input.credential,
+                .source = runtime.adapter.source,
+                .account_id = runtime.input.account_id,
+                .tenant_context = runtime.input.tenant,
+            } },
         .model = model,
         .retry_count = 1,
         .messages = &.{},

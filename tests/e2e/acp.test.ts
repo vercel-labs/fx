@@ -1048,6 +1048,42 @@ describe("acp: model-independent", () => {
   });
 
   test(
+    "host-managed ACP sessions stream without local credentials",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-host-managed-");
+      const gateway = startFakeGateway([finalText("ACP_HOST_MANAGED_OK")]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            AI_GATEWAY_API_KEY: undefined,
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_AUTH_MODE: "host-managed",
+          },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine();
+        const result = await runPrompt(client, "Reply once.", TIMEOUT);
+
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(result.messages)).toContain("ACP_HOST_MANAGED_OK");
+        expect(gateway.requests.length).toBe(1);
+        expect(gateway.requests[0]!.headers.get("authorization")).toBeNull();
+        expect(gateway.requests[0]!.headers.get("x-vercel-ai-gateway-team")).toBeNull();
+        expect(existsSync(join(root.home, ".fx", "auth.json"))).toBe(false);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "active ACP session uses typed MCP Resources Prompts and Completion state",
     async () => {
       const root = createIsolatedRoot("fx-acp-mcp-features-");
