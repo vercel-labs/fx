@@ -3482,10 +3482,23 @@ fn handleForkCommand(app: anytype, rest: []const u8) !void {
     const App = @TypeOf(app.*);
     const SessionRuntime = app_session_runtime.Runtime(App);
 
-    const at_turn = parsedTurnCount(rest) orelse {
-        try writeTurnArgumentUsage(app, "/fork <turn>");
+    const trimmed = std.mem.trim(u8, rest, " \t\r\n");
+    const bare = trimmed.len == 0;
+    const at_turn = if (bare)
+        app.session.historyLen()
+    else
+        parsedTurnCount(trimmed) orelse {
+            try writeTurnArgumentUsage(app, "/fork <turn>");
+            return;
+        };
+    if (bare and at_turn == 0) {
+        try app.writeDomainNotice(.{
+            .topic = "session",
+            .tone = .neutral,
+            .body = "there are no turns to fork",
+        }, true);
         return;
-    };
+    }
 
     var outcome = try SessionRuntime.forkLiveSession(app, at_turn);
     defer outcome.deinit(app.alloc);
@@ -3516,16 +3529,24 @@ fn handleForkCommand(app: anytype, rest: []const u8) !void {
         .branched => |branch| {
             var out: std.Io.Writer.Allocating = .init(app.alloc);
             defer out.deinit();
-            try out.writer.print(
-                "Forked {s} at turn {d} into {s}. " ++
-                    "You are now in the branch; {s} is unchanged.",
-                .{
-                    branch.source_id,
-                    branch.retained_turns,
-                    branch.forked_id,
-                    branch.source_id,
-                },
-            );
+            if (bare) {
+                try out.writer.print(
+                    "Forked {s} into {s}. You are now in the branch; " ++
+                        "resume the original with /resume or fx --resume {s}.",
+                    .{ branch.source_id, branch.forked_id, branch.source_id },
+                );
+            } else {
+                try out.writer.print(
+                    "Forked {s} at turn {d} into {s}. " ++
+                        "You are now in the branch; {s} is unchanged.",
+                    .{
+                        branch.source_id,
+                        branch.retained_turns,
+                        branch.forked_id,
+                        branch.source_id,
+                    },
+                );
+            }
             if (branch.unverified_artifacts) {
                 try out.writer.writeAll(
                     " Some legacy command artifacts could not be authenticated.",

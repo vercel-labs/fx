@@ -121,7 +121,7 @@ async function quitShell(stderrPath: string) {
 
 describe("interactive session fork and rewind", () => {
   test(
-    "a bare /fork or /rewind names its argument instead of acting",
+    "bare /fork branches the full session and leaves the source unchanged",
     async () => {
       const { home, workspace, stderrPath } = await startShell(
         ["REPLY_ONE"],
