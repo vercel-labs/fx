@@ -124,7 +124,7 @@ describe("interactive session fork and rewind", () => {
     "bare /fork branches the full session and leaves the source unchanged",
     async () => {
       const { home, workspace, stderrPath } = await startShell(
-        ["REPLY_ONE"],
+        ["REPLY_ONE", "SOURCE_REPLY"],
         "fx-tui-fork-usage-",
       );
       await ask("first prompt", "REPLY_ONE");
@@ -147,10 +147,29 @@ describe("interactive session fork and rewind", () => {
       expect(pane).toContain(sourceId);
       expect(pane).toContain(branch.id);
 
+      await session!.sendText(`/resume ${sourceId}`);
+      await session!.waitForText("Session resumed", STEP_TIMEOUT);
+      await ask("source-only prompt", "SOURCE_REPLY");
+
+      const resumed = await savedSessions(home, workspace);
+      expect(resumed.find((entry) => entry.id === sourceId)!.prompts).toEqual([
+        "first prompt",
+        "source-only prompt",
+      ]);
+      expect(resumed.find((entry) => entry.id === branch.id)!.prompts).toEqual([
+        "first prompt",
+      ]);
+
       await quitShell(stderrPath);
       const saved = await savedSessions(home, workspace);
       expect(saved).toHaveLength(2);
-      for (const entry of saved) expect(entry.prompts).toEqual(["first prompt"]);
+      expect(saved.find((entry) => entry.id === sourceId)!.prompts).toEqual([
+        "first prompt",
+        "source-only prompt",
+      ]);
+      expect(saved.find((entry) => entry.id === branch.id)!.prompts).toEqual([
+        "first prompt",
+      ]);
     },
     TIMEOUT,
   );

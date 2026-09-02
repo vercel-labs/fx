@@ -439,7 +439,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .clear_screen, .command = "/clear", .help_entry = "/clear", .completion_description = "start a fresh session and keep background processes", .presentation_category = .general, .show_in_welcome = true },
     .{ .kind = .new_session, .command = "/new", .help_entry = "/new", .completion_description = "start a fresh session", .presentation_category = .session, .show_in_welcome = true },
     .{ .kind = .reset_session, .command = "/reset", .help_entry = "/reset", .completion_description = "reset the current session context", .presentation_category = .session },
-    .{ .kind = .resume_session, .command = "/resume", .help_entry = "/resume", .completion_description = "resume a saved session", .presentation_category = .session },
+    .{ .kind = .resume_session, .command = "/resume", .help_entry = "/resume [last|<id>]", .completion_description = "resume a saved session", .presentation_category = .session, .has_args = true, .accepts_payload = true },
     .{ .kind = .continue_recovery, .command = "/continue", .help_entry = "/continue", .completion_description = "continue a paused model response", .presentation_category = .session, .requires_prompt_credential = true },
     .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename the current session", .presentation_category = .session, .has_args = true, .accepts_payload = true },
     .{ .kind = .fork_session, .command = "/fork", .help_entry = "/fork [turn]", .completion_description = "branch this session at a turn into a new one", .presentation_category = .session, .has_args = true, .accepts_payload = true },

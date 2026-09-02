@@ -87,6 +87,8 @@ fx session resume last
 fx session resume --id <id>
 ```
 
+Inside the interactive shell, use `/resume` to open the session picker, `/resume last` for the latest workspace session, or `/resume <id>` for an exact session.
+
 `fx session <id>` prints the saved conversation with a `[turn N]` label above every turn. Those labels are the boundaries the branch and undo commands take:
 
 ```bash

@@ -34,6 +34,7 @@ const skill_runtime = @import("../skills/skill_runtime.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_presentation = @import("../tooling/tool_presentation.zig");
 const session_commands = @import("../session/session_commands.zig");
+const session_store_paths = @import("../session/session_store_paths.zig");
 const usage_recovery = @import("../session/usage_recovery.zig");
 const usage_dashboard_runtime = @import("usage_dashboard_runtime.zig");
 const usage_report = @import("../session/usage_report.zig");
@@ -653,7 +654,7 @@ pub fn Handlers(comptime App: type) type {
             try app.newSession();
         }
 
-        fn commandResumeSession(ctx: *anyopaque) !void {
+        fn commandResumeSession(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime !runtime_profile.allows(App, .durable_sessions)) {
                 try app.writeDomainNotice(.{
@@ -663,7 +664,50 @@ pub fn Handlers(comptime App: type) type {
                 }, true);
                 return;
             }
-            try app_session_runtime.Runtime(App).openSessionPicker(app);
+            const target = std.mem.trim(u8, rest, " \t\r\n");
+            if (target.len == 0) {
+                try app_session_runtime.Runtime(App).openSessionPicker(app);
+                return;
+            }
+            if (app.stream.active) {
+                try app.writeDomainNotice(.{
+                    .topic = "session",
+                    .tone = .neutral,
+                    .body = "resume is unavailable until the response finishes",
+                }, true);
+                return;
+            }
+            if (!std.mem.eql(u8, target, "last")) {
+                session_store_paths.validateSessionId(target) catch {
+                    try app.writeDomainNotice(.{
+                        .topic = "session",
+                        .tone = .@"error",
+                        .body = "invalid session ID",
+                    }, true);
+                    return;
+                };
+            }
+            const resume_target: @import("../session/session_store.zig").ResumeTarget =
+                if (std.mem.eql(u8, target, "last")) .last else .{ .id = target };
+            const resumed = app_session_runtime.Runtime(App).resumeLiveSession(app, resume_target) catch |err| {
+                const body: []const u8 = switch (err) {
+                    error.SessionNotFound => "no saved session with that ID",
+                    error.SessionBusy => "This session is open in another fx. Close it there, then try again.",
+                    error.SessionAuthorityBoundaryUnavailable,
+                    error.SessionCommitBoundaryUnavailable,
+                    => "This session is being updated. Wait a moment, then try again.",
+                    else => "Unable to resume this session.",
+                };
+                try app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = body }, true);
+                return;
+            };
+            if (!resumed) {
+                try app.writeDomainNotice(.{
+                    .topic = "session",
+                    .tone = .neutral,
+                    .body = "this session is already active",
+                }, true);
+            }
         }
 
         fn commandContinueRecovery(ctx: *anyopaque) !void {
@@ -3532,8 +3576,8 @@ fn handleForkCommand(app: anytype, rest: []const u8) !void {
             if (bare) {
                 try out.writer.print(
                     "Forked {s} into {s}. You are now in the branch; " ++
-                        "resume the original with /resume or fx --resume {s}.",
-                    .{ branch.source_id, branch.forked_id, branch.source_id },
+                        "resume the original with /resume {s} or fx --resume {s}.",
+                    .{ branch.source_id, branch.forked_id, branch.source_id, branch.source_id },
                 );
             } else {
                 try out.writer.print(

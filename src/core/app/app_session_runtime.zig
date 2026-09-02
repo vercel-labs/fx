@@ -2049,13 +2049,39 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn resumeSelectedSession(app: *App) !bool {
             const selected_id = app.session_persistence.session_picker.selectedId() orelse return false;
+            return resumeLiveSession(app, .{ .id = selected_id });
+        }
+
+        pub fn resumeLiveSession(app: *App, target: session_store.ResumeTarget) !bool {
+            if (target == .id and app.session_persistence.writable != null and
+                std.mem.eql(u8, target.id, app.session_persistence.writable.?.active_id))
+            {
+                return false;
+            }
+            if (target == .last) {
+                // Resolve "last" once, through the same summary the CLI uses, so
+                // the id compared here is the id that gets opened below.
+                const store = app.session_persistence.store orelse
+                    return error.SessionStoreUnavailable;
+                var latest = store.latestReadOnlyWorkspaceSummary(app.alloc) catch |err| switch (err) {
+                    error.NoSavedSessions => return false,
+                    else => return err,
+                };
+                defer latest.deinit(app.alloc);
+                if (app.session_persistence.writable) |writable| {
+                    if (std.mem.eql(u8, latest.id, writable.active_id)) return false;
+                }
+                const latest_id = try app.alloc.dupe(u8, latest.id);
+                defer app.alloc.free(latest_id);
+                return resumeLiveSession(app, .{ .id = latest_id });
+            }
             const log_options = session_log.Options{
                 .session_lock_deadline_ms = 0,
                 .commit_lock_deadline_ms = 0,
             };
             var loaded = try loadResumeTargetForWrite(
                 app,
-                .{ .id = selected_id },
+                target,
                 log_options,
             );
             var loaded_owned = true;

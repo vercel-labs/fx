@@ -1452,10 +1452,12 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       );
       await session.sendLiteralText("/resume ");
       pane = await session.waitForPane(
-        (current) =>
-          composerContains(current, "/resume") &&
-          !current.includes("resume-helper") &&
-          !current.includes("Enter Use"),
+        (current) => composerContains(current, "/resume") && current.includes("resume-helper"),
+        5_000,
+      );
+      await session.sendKeys("Escape");
+      pane = await session.waitForPane(
+        (current) => composerContains(current, "/resume") && !current.includes("Enter Use"),
         5_000,
       );
       expect(pane).not.toContain("no matching slash commands");
