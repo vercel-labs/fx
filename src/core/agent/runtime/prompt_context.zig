@@ -34,20 +34,40 @@ pub fn buildGatewayMessages(
     var messages: std.ArrayList(ChatMessage) = .empty;
     errdefer messages.deinit(alloc);
 
-    try messages.appendSlice(alloc, stable_prefix);
-    try appendEphemeralOverlayMessages(alloc, &messages, ephemeral_overlay);
-    try messages.appendSlice(alloc, durable_history);
+    // 1. All system messages must be strictly leading for provider compatibility.
+    for (stable_prefix) |msg| {
+        if (msg.role == .system) try messages.append(alloc, msg);
+    }
+    for (ephemeral_overlay) |msg| {
+        if (msg.role == .system) {
+            var copy = msg;
+            copy.cache_policy = .no_cache;
+            try messages.append(alloc, copy);
+        }
+    }
+    for (durable_history) |msg| {
+        if (msg.role == .system) try messages.append(alloc, msg);
+    }
+
+    // 2. Non-system messages follow in logical execution order.
+    for (stable_prefix) |msg| {
+        if (msg.role != .system) try messages.append(alloc, msg);
+    }
+    for (ephemeral_overlay) |msg| {
+        if (msg.role != .system) {
+            var copy = msg;
+            copy.cache_policy = .no_cache;
+            try messages.append(alloc, copy);
+        }
+    }
+    for (durable_history) |msg| {
+        if (msg.role != .system) try messages.append(alloc, msg);
+    }
+
+    // 3. Current turn user message and within-turn suffix.
     try messages.append(alloc, current_user_message);
     try messages.appendSlice(alloc, within_turn_suffix);
     return messages;
-}
-
-fn appendEphemeralOverlayMessages(alloc: Allocator, messages: *std.ArrayList(ChatMessage), ephemeral_overlay: []const ChatMessage) !void {
-    for (ephemeral_overlay) |overlay_message| {
-        var copy = overlay_message;
-        copy.cache_policy = .no_cache;
-        try messages.append(alloc, copy);
-    }
 }
 
 test "history context budget reserves known output capacity from one capability snapshot" {
@@ -275,4 +295,67 @@ test "buildGatewayMessages preserves one system prefix for projected session his
     try std.testing.expectEqual(@as(usize, 1), interruption_count);
     try std.testing.expectEqualStrings("current portable prompt", messages.items[messages.items.len - 2].content.?);
     try std.testing.expectEqualStrings("within-turn suffix", messages.items[messages.items.len - 1].content.?);
+}
+
+test "buildGatewayMessages guarantees all system messages are contiguous and strictly leading even with mixed overlays and history" {
+    const alloc = std.testing.allocator;
+    const stable_prefix = [_]ChatMessage{
+        .{ .role = .system, .content = "stable system prompt" },
+    };
+    const overlay = [_]ChatMessage{
+        .{ .role = .user, .content = "ephemeral user context notice" },
+        .{ .role = .system, .content = "ephemeral system skill warning" },
+    };
+    const history = [_]ChatMessage{
+        .{ .role = .system, .content = "earlier history was summarized" },
+        .{ .role = .user, .content = "turn 1 user" },
+        .{ .role = .assistant, .content = "turn 1 assistant" },
+    };
+    const current = ChatMessage{ .role = .user, .content = "turn 2 user" };
+    const suffix = [_]ChatMessage{
+        .{ .role = .assistant, .content = "turn 2 assistant prefill" },
+    };
+
+    var messages = try buildGatewayMessages(alloc, &stable_prefix, &overlay, &history, current, &suffix);
+    defer messages.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 8), messages.items.len);
+
+    // Assert strictly leading system messages:
+    var saw_non_system = false;
+    for (messages.items) |msg| {
+        if (msg.role == .system) {
+            try std.testing.expect(!saw_non_system);
+        } else {
+            saw_non_system = true;
+        }
+    }
+
+    // First 3 are system messages:
+    try std.testing.expectEqual(types.ChatRole.system, messages.items[0].role);
+    try std.testing.expectEqualStrings("stable system prompt", messages.items[0].content.?);
+
+    try std.testing.expectEqual(types.ChatRole.system, messages.items[1].role);
+    try std.testing.expectEqualStrings("ephemeral system skill warning", messages.items[1].content.?);
+    try std.testing.expectEqual(types.ChatCachePolicy.no_cache, messages.items[1].cache_policy);
+
+    try std.testing.expectEqual(types.ChatRole.system, messages.items[2].role);
+    try std.testing.expectEqualStrings("earlier history was summarized", messages.items[2].content.?);
+
+    // Remaining 5 are non-system messages:
+    try std.testing.expectEqual(types.ChatRole.user, messages.items[3].role);
+    try std.testing.expectEqualStrings("ephemeral user context notice", messages.items[3].content.?);
+    try std.testing.expectEqual(types.ChatCachePolicy.no_cache, messages.items[3].cache_policy);
+
+    try std.testing.expectEqual(types.ChatRole.user, messages.items[4].role);
+    try std.testing.expectEqualStrings("turn 1 user", messages.items[4].content.?);
+
+    try std.testing.expectEqual(types.ChatRole.assistant, messages.items[5].role);
+    try std.testing.expectEqualStrings("turn 1 assistant", messages.items[5].content.?);
+
+    try std.testing.expectEqual(types.ChatRole.user, messages.items[6].role);
+    try std.testing.expectEqualStrings("turn 2 user", messages.items[6].content.?);
+
+    try std.testing.expectEqual(types.ChatRole.assistant, messages.items[7].role);
+    try std.testing.expectEqualStrings("turn 2 assistant prefill", messages.items[7].content.?);
 }
