@@ -201,6 +201,22 @@ const LocalSurfaceOptions = struct {
     format: output_contracts.OutputFormat = .text,
 };
 
+const ModelsSurfaceOptions = struct {
+    format: output_contracts.OutputFormat = .text,
+    /// Restrict the listing to models that cost nothing to run.
+    free_only: bool = false,
+};
+
+/// `fx setup` with no argument keeps its original meaning, so existing scripts
+/// still reach the Gateway key.
+fn parseSetupTarget(rest: []const [:0]const u8) ?auth_runtime.ApiKeyTarget {
+    if (rest.len == 0) return .gateway;
+    if (rest.len != 1) return null;
+    if (std.mem.eql(u8, rest[0], "gateway")) return .gateway;
+    if (std.mem.eql(u8, rest[0], "openrouter")) return .openrouter;
+    return null;
+}
+
 fn parseLoginProvider(rest: []const [:0]const u8) !?model_provider.ProviderId {
     if (rest.len == 0) return null;
     if (rest.len != 1) return error.InvalidLoginProviderArgs;
@@ -693,6 +709,7 @@ fn activateProviderSelection(
             .gateway => "Gateway is already selected.\n",
             .codex => "Codex is already selected.\n",
             .grok => "Grok is already selected.\n",
+            .openrouter => "OpenRouter is already selected.\n",
         });
         return true;
     }
@@ -738,6 +755,7 @@ fn activateProviderSelection(
                 .codex => "Codex credential is unavailable",
                 .grok => "Grok credential is unavailable",
                 .gateway => "configure a Gateway credential first",
+                .openrouter => "set " ++ credentials.openrouter_api_key_env ++ " first",
             },
         );
         return false;
@@ -747,6 +765,7 @@ fn activateProviderSelection(
             .codex => "Codex model catalog is unavailable",
             .grok => "Grok model catalog is unavailable",
             .gateway => "Gateway model catalog is unavailable",
+            .openrouter => "OpenRouter model catalog is unavailable",
         });
         return false;
     };
@@ -810,13 +829,16 @@ fn activateProviderSelection(
     if (performed_login) |provider| switch (provider) {
         .codex => try writeStdout(deps, "Signed in with Codex.\n"),
         .grok => try writeStdout(deps, "Signed in with Grok.\n"),
-        .gateway => unreachable,
+        // Only the OAuth providers run a login here; the rest never set
+        // `performed_login`.
+        .gateway, .openrouter => unreachable,
     };
     if (caller == .provider_command) {
         try writeStdout(deps, switch (target) {
             .gateway => "Provider set to Gateway.\n",
             .codex => "Provider set to Codex.\n",
             .grok => "Provider set to Grok.\n",
+            .openrouter => "Provider set to OpenRouter.\n",
         });
     }
     return true;
@@ -935,7 +957,7 @@ fn runNonInteractiveWithDeps(
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx login [vercel|codex|grok]\n");
+                try writeStderr(deps, "usage: fx login [vercel|codex|grok|openrouter]\n");
                 return .handled_failure;
             };
             // Preserve the original `fx login` behavior for scripts and users.
@@ -1001,12 +1023,31 @@ fn runNonInteractiveWithDeps(
                     }
                     try writeStdout(deps, "Signed in with Grok.\n");
                 },
+                // OpenRouter authenticates with a plain API key, so there is no
+                // sign-in flow to run. Point at the environment variable and
+                // switch the active provider if the key is already present.
+                .openrouter => {
+                    const key_present = credentials.sourceExists(alloc, cfg.secret_store, .openrouter_api_key) catch false;
+                    if (!key_present) {
+                        try writeStderr(
+                            deps,
+                            "fx login: OpenRouter uses an API key; run fx setup openrouter, or set " ++
+                                credentials.openrouter_api_key_env ++
+                                ", then run fx provider openrouter\n",
+                        );
+                        return .handled_failure;
+                    }
+                    if (!try activateProviderSelection(alloc, cfg, deps, .openrouter, .provider_login, null)) {
+                        return .handled_failure;
+                    }
+                    try writeStdout(deps, "Using OpenRouter.\n");
+                },
             }
             return .handled_success;
         },
         .logout => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx logout [vercel|codex|grok]\n");
+                try writeStderr(deps, "usage: fx logout [vercel|codex|grok|openrouter]\n");
                 return .handled_failure;
             };
             // Preserve the original `fx logout` behavior for scripts and users.
@@ -1030,6 +1071,19 @@ fn runNonInteractiveWithDeps(
                         break :result .handled_failure;
                     },
                 };
+            }
+            // OpenRouter keeps no session of its own, only a key. `fx logout`
+            // does not delete saved keys for any provider, so say where the key
+            // lives rather than falling through to the Vercel logout.
+            if (login_provider == .openrouter) {
+                const message = try std.fmt.allocPrint(
+                    alloc,
+                    "OpenRouter has no login session. Its key stays in {s}; unset {s} to stop using an environment key.\n",
+                    .{ cfg.secret_store.backend_label, credentials.openrouter_api_key_env },
+                );
+                defer alloc.free(message);
+                try writeStdout(deps, message);
+                return .handled_success;
             }
             if (login_provider == .grok) {
                 const outcome = grok_oauth.logout(alloc, cfg.gateway_provider.oauth_transport) catch {
@@ -1131,11 +1185,11 @@ fn runNonInteractiveWithDeps(
         },
         .provider => |rest| {
             if (rest.len != 1) {
-                try writeStderr(deps, "usage: fx provider <gateway|codex|grok>\n");
+                try writeStderr(deps, "usage: fx provider <gateway|codex|grok|openrouter>\n");
                 return .handled_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {
-                try writeStderr(deps, "fx provider: expected gateway, codex, or grok\n");
+                try writeStderr(deps, "fx provider: expected gateway, codex, grok, or openrouter\n");
                 return .handled_failure;
             };
             return if (try activateProviderSelection(alloc, cfg, deps, target, .provider_command, null))
@@ -1144,11 +1198,22 @@ fn runNonInteractiveWithDeps(
                 .handled_failure;
         },
         .setup => |rest| {
-            if (rest.len != 0) {
+            const target = parseSetupTarget(rest) orelse {
                 try writeTopLevelUsage(cfg.command_catalog, deps, .setup);
                 return .handled_failure;
-            }
-            return if (try runPasteSetup(alloc, cfg.secret_store, deps)) .handled_success else .handled_failure;
+            };
+            const secret_store = switch (target) {
+                .gateway => cfg.secret_store,
+                .openrouter => cfg.secret_store.forOpenRouter() orelse {
+                    try writeStderr(deps, "fx setup: this host cannot store an OpenRouter key; set " ++
+                        credentials.openrouter_api_key_env ++ " instead\n");
+                    return .handled_failure;
+                },
+            };
+            return if (try runPasteSetup(alloc, secret_store, target, deps))
+                .handled_success
+            else
+                .handled_failure;
         },
         .status => |rest| {
             const opts = parseLocalSurfaceArgs(rest) catch |err| {
@@ -1211,7 +1276,7 @@ fn runNonInteractiveWithDeps(
             return runTopLevelMcp(alloc, rest, cfg, deps);
         },
         .models => |rest| {
-            const opts = parseLocalSurfaceArgs(rest) catch |err| {
+            const opts = parseModelsSurfaceArgs(rest) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .models, "models", err, rest);
                 return .handled_failure;
             };
@@ -1232,6 +1297,7 @@ fn runNonInteractiveWithDeps(
                     .gateway => "fx models: Gateway model catalog is unavailable\n",
                     .codex => "fx models: Codex model catalog is unavailable\n",
                     .grok => "fx models: Grok model catalog is unavailable\n",
+                    .openrouter => "fx models: OpenRouter model catalog is unavailable\n",
                 });
                 return .handled_failure;
             };
@@ -1267,9 +1333,21 @@ fn runNonInteractiveWithDeps(
             var ids = loaded.ids;
             defer collections.freeStringList(alloc, &ids);
 
+            var shown = ids.items;
+            if (opts.free_only) {
+                // The catalog already sorts free models first, so keeping the
+                // leading free run preserves order without reallocating.
+                var free_count: usize = 0;
+                while (free_count < shown.len and
+                    model_catalog.isFreeModelId(shown[free_count])) : (free_count += 1)
+                {}
+                shown = shown[0..free_count];
+            }
+
             const text = try (output_contracts.ModelListSnapshot{
-                .ids = ids.items,
+                .ids = shown,
                 .provider = startup.provider,
+                .free_only = opts.free_only,
                 .private_models_hidden = loaded.provenance.access.private_models_may_be_hidden,
                 .public_only_reason = loaded.provenance.access.public_only_reason,
             }).render(alloc, opts.format);
@@ -1800,6 +1878,7 @@ fn writeStderr(deps: RunDeps, text: []const u8) !void {
 fn runPasteSetup(
     alloc: Allocator,
     secret_store: host.SecretStore,
+    target: auth_runtime.ApiKeyTarget,
     deps: RunDeps,
 ) !bool {
     if (secret_store.isDisabled()) {
@@ -1811,7 +1890,10 @@ fn runPasteSetup(
         return false;
     }
 
-    try writeStderr(deps, "Paste AI Gateway API key (input hidden): ");
+    try writeStderr(deps, switch (target) {
+        .gateway => "Paste AI Gateway API key (input hidden): ",
+        .openrouter => "Paste OpenRouter API key (input hidden): ",
+    });
     const stored_interactively = secret_store.storeInteractive() catch {
         try writeStderr(deps, "\nfx setup: API key was not saved\n");
         return false;
@@ -3160,6 +3242,23 @@ fn parseAcpArgs(args: []const [:0]const u8) !AcpOptions {
         }
     }
     return opts;
+}
+
+/// `fx models` accepts `--free` in addition to the shared local-surface flags.
+fn parseModelsSurfaceArgs(args: []const [:0]const u8) !ModelsSurfaceOptions {
+    var options = ModelsSurfaceOptions{};
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--json")) {
+            options.format = .json;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--free")) {
+            options.free_only = true;
+            continue;
+        }
+        return error.InvalidLocalSurfaceArgs;
+    }
+    return options;
 }
 
 fn parseLocalSurfaceArgs(args: []const [:0]const u8) !LocalSurfaceOptions {

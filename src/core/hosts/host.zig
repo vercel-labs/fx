@@ -96,6 +96,9 @@ pub const SecretStorePresence = enum {
 pub const SecretStore = struct {
     context: ?*anyopaque = null,
     backend_label: []const u8,
+    /// The sibling slot holding the OpenRouter key. Null on hosts that keep a
+    /// single slot, which leaves OpenRouter on its environment variable alone.
+    openrouter: ?*const SecretStore = null,
     is_disabled_fn: *const fn (?*anyopaque) bool,
     presence_fn: *const fn (?*anyopaque) SecretStorePresence = unavailableSecretStorePresence,
     load_fn: *const fn (
@@ -145,6 +148,13 @@ pub const SecretStore = struct {
         self: SecretStore,
     ) SecretStoreWriteError!bool {
         return self.store_interactive_fn(self.context);
+    }
+
+    /// The slot that holds `provider`'s pasted key. Providers without a slot of
+    /// their own share the default slot.
+    pub fn forOpenRouter(self: SecretStore) ?SecretStore {
+        const sibling = self.openrouter orelse return null;
+        return sibling.*;
     }
 };
 

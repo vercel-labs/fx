@@ -37,6 +37,15 @@ pub const entries = [_]Entry{
         .description = "SuperGrok or X Premium subscription",
         .subscription = true,
     },
+    .{
+        .id = .openrouter,
+        .slug = "openrouter",
+        .aliases = &.{"or"},
+        .name = "OpenRouter",
+        .route_name = "OpenRouter API key",
+        .description = "OpenRouter API key; free models available",
+        .subscription = false,
+    },
 };
 
 pub fn parse(value: []const u8) ?model_provider.ProviderId {

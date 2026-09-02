@@ -5788,7 +5788,10 @@ test "app_input_runtime model catalog owns search navigation and provider tabs" 
     try std.testing.expectEqual(@as(usize, 1), app.model_cache.menu.selected_index);
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 102);
-    try std.testing.expectEqual(@as(usize, 1), app.model_cache.menu.provider_index);
+    try std.testing.expectEqual(
+        @intFromEnum(model_cache_runtime.ModelProviderFilter.anthropic),
+        app.model_cache.menu.provider_index,
+    );
     try std.testing.expectEqual(@as(usize, 0), app.model_cache.menu.selected_index);
     try std.testing.expectEqual(model_cache_runtime.ModelProviderFilter.anthropic, app.model_cache.menu.providerFilter());
     try std.testing.expectEqual(@as(usize, 1), app.model_cache.menu.filteredItemCount());
@@ -14621,4 +14624,31 @@ test "app input bridge loads the most recent durable history in chronological or
     try std.testing.expectEqual(@as(usize, 100), app.input_runtime.composer_history.count());
     try std.testing.expectEqualStrings("prompt-1", app.input_runtime.composer_history.entryText(0).?);
     try std.testing.expectEqualStrings("prompt-100", app.input_runtime.composer_history.entryText(99).?);
+}
+
+test "model menu search filters an OpenRouter catalog while typing" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try openRoutingModelMenu(&app, &.{
+        "google/gemma-4-26b-a4b-it:free",
+        "qwen/qwen3.8-flash",
+        "nvidia/nemotron-3.5-lightning:free",
+    });
+    app.model_cache.menu.catalog_state = .{
+        .access_level = .authenticated,
+        .source = .openrouter_api_key,
+    };
+
+    try std.testing.expectEqual(@as(usize, 3), app.model_cache.menu.filteredItemCount());
+
+    for ("gemma") |byte| {
+        try Runtime(RoutingFakeApp).handleByte(&app, byte, 4096, 100);
+    }
+    try std.testing.expectEqualStrings("gemma", app.model_cache.menu.query());
+    try std.testing.expectEqual(@as(usize, 1), app.model_cache.menu.filteredItemCount());
+    try std.testing.expectEqualStrings(
+        "google/gemma-4-26b-a4b-it:free",
+        app.model_cache.menu.itemAt(0).?.id,
+    );
 }

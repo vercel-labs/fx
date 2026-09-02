@@ -18,13 +18,40 @@ const max_key_file_bytes: usize = 8 * 1024;
 const LoadError = host.SecretStoreLoadError;
 const StoreError = host.SecretStoreWriteError;
 
+/// Each provider that can hold its own pasted key gets a slot. A slot names the
+/// keychain service and the profile file, so the two backends stay in step.
+const Slot = struct {
+    service: []const u8,
+    file_name: []const u8,
+};
+
+const gateway_slot: Slot = .{
+    .service = keychain.service_name,
+    .file_name = profile_paths.api_key_file_name,
+};
+
+const openrouter_slot: Slot = .{
+    .service = keychain.openrouter_service_name,
+    .file_name = profile_paths.openrouter_api_key_file_name,
+};
+
 pub const provider: host.SecretStore = .{
     .backend_label = backend_label,
+    .openrouter = &openrouter_provider,
     .is_disabled_fn = isDisabledCallback,
     .presence_fn = presenceCallback,
     .load_fn = loadCallback,
     .store_fn = storeCallback,
     .store_interactive_fn = storeInteractiveCallback,
+};
+
+pub const openrouter_provider: host.SecretStore = .{
+    .backend_label = backend_label,
+    .is_disabled_fn = isDisabledCallback,
+    .presence_fn = presenceOpenRouterCallback,
+    .load_fn = loadOpenRouterCallback,
+    .store_fn = storeOpenRouterCallback,
+    .store_interactive_fn = storeOpenRouterInteractiveCallback,
 };
 
 /// The disable switch is named for the macOS backend, so its reader stays there.
@@ -34,25 +61,25 @@ fn isDisabled() bool {
 
 /// Returns the stored key, or null when no key is stored. An error means the store
 /// could not be read, which callers must keep distinct from absence.
-fn load(alloc: Allocator) LoadError!?[]u8 {
-    if (comptime builtin.os.tag == .macos) return loadFromKeychain(alloc);
-    return loadFromProfile(alloc);
+fn load(alloc: Allocator, slot: Slot) LoadError!?[]u8 {
+    if (comptime builtin.os.tag == .macos) return loadFromKeychain(alloc, slot);
+    return loadFromProfile(alloc, slot);
 }
 
-fn store(alloc: Allocator, value: []const u8) StoreError!void {
+fn store(alloc: Allocator, slot: Slot, value: []const u8) StoreError!void {
     if (value.len == 0) return error.StoredKeyWriteFailed;
     if (comptime builtin.os.tag == .macos) {
-        keychain.storeValue(value) catch |err| return writeFailed("keychain", err);
+        keychain.storeServiceValue(slot.service, value) catch |err| return writeFailed("keychain", err);
         return;
     }
-    return storeInProfile(alloc, value);
+    return storeInProfile(alloc, slot, value);
 }
 
 /// Let the platform credential store own terminal input when it supports a
 /// secure prompt, keeping plaintext out of the fx process.
-fn storeInteractive() StoreError!bool {
+fn storeInteractive(slot: Slot) StoreError!bool {
     if (comptime builtin.os.tag == .macos) {
-        keychain.storeInteractive() catch |err| return writeFailed("keychain_interactive", err);
+        keychain.storeInteractiveService(slot.service) catch |err| return writeFailed("keychain_interactive", err);
         return true;
     }
     return false;
@@ -63,14 +90,22 @@ fn isDisabledCallback(_: ?*anyopaque) bool {
 }
 
 fn presenceCallback(_: ?*anyopaque) host.SecretStorePresence {
-    if (isDisabled()) return .missing;
-    if (comptime builtin.os.tag == .macos) {
-        return keychain.contains() catch .unavailable;
-    }
-    return presenceInProfile();
+    return presence(gateway_slot);
 }
 
-fn presenceInProfile() host.SecretStorePresence {
+fn presenceOpenRouterCallback(_: ?*anyopaque) host.SecretStorePresence {
+    return presence(openrouter_slot);
+}
+
+fn presence(slot: Slot) host.SecretStorePresence {
+    if (isDisabled()) return .missing;
+    if (comptime builtin.os.tag == .macos) {
+        return keychain.servicePresence(slot.service) catch .unavailable;
+    }
+    return presenceInProfile(slot);
+}
+
+fn presenceInProfile(slot: Slot) host.SecretStorePresence {
     const home = io_mod.getenv("HOME") orelse return .unavailable;
     var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{}) catch
         return .unavailable;
@@ -79,7 +114,7 @@ fn presenceInProfile() host.SecretStorePresence {
         .follow_symlinks = false,
     }) catch |err| return if (err == error.FileNotFound) .missing else .unavailable;
     defer fx_dir.close(io_mod.getIo());
-    const stat = fx_dir.statFile(io_mod.getIo(), profile_paths.api_key_file_name, .{
+    const stat = fx_dir.statFile(io_mod.getIo(), slot.file_name, .{
         .follow_symlinks = false,
     }) catch |err| return if (err == error.FileNotFound) .missing else .unavailable;
     if (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0) return .unavailable;
@@ -87,7 +122,7 @@ fn presenceInProfile() host.SecretStorePresence {
 }
 
 fn loadCallback(_: ?*anyopaque, alloc: Allocator) LoadError!?[]u8 {
-    return load(alloc);
+    return load(alloc, gateway_slot);
 }
 
 fn storeCallback(
@@ -95,22 +130,38 @@ fn storeCallback(
     alloc: Allocator,
     value: []const u8,
 ) StoreError!void {
-    return store(alloc, value);
+    return store(alloc, gateway_slot, value);
 }
 
 fn storeInteractiveCallback(_: ?*anyopaque) StoreError!bool {
-    return storeInteractive();
+    return storeInteractive(gateway_slot);
 }
 
-fn loadFromKeychain(alloc: Allocator) LoadError!?[]u8 {
-    return keychain.load(alloc) catch |err| switch (err) {
+fn loadOpenRouterCallback(_: ?*anyopaque, alloc: Allocator) LoadError!?[]u8 {
+    return load(alloc, openrouter_slot);
+}
+
+fn storeOpenRouterCallback(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    value: []const u8,
+) StoreError!void {
+    return store(alloc, openrouter_slot, value);
+}
+
+fn storeOpenRouterInteractiveCallback(_: ?*anyopaque) StoreError!bool {
+    return storeInteractive(openrouter_slot);
+}
+
+fn loadFromKeychain(alloc: Allocator, slot: Slot) LoadError!?[]u8 {
+    return keychain.loadService(alloc, slot.service) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.KeychainItemNotFound => null,
         else => error.StoredKeyUnreadable,
     };
 }
 
-fn loadFromProfile(alloc: Allocator) LoadError!?[]u8 {
+fn loadFromProfile(alloc: Allocator, slot: Slot) LoadError!?[]u8 {
     const home = io_mod.getenv("HOME") orelse {
         debug_trace.logf("stored_key", "load failed step=home err=HomeNotSet", .{});
         return error.StoredKeyUnreadable;
@@ -133,11 +184,11 @@ fn loadFromProfile(alloc: Allocator) LoadError!?[]u8 {
     };
     defer fx_dir.close(io_mod.getIo());
 
-    return loadFromDir(alloc, &fx_dir);
+    return loadFromDir(alloc, &fx_dir, slot);
 }
 
-fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) LoadError!?[]u8 {
-    var file = fx_dir.openFile(io_mod.getIo(), profile_paths.api_key_file_name, .{
+fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir, slot: Slot) LoadError!?[]u8 {
+    var file = fx_dir.openFile(io_mod.getIo(), slot.file_name, .{
         .mode = .read_only,
         .allow_directory = false,
         .follow_symlinks = false,
@@ -179,7 +230,7 @@ fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) LoadError!?[]u8 {
     return try alloc.dupe(u8, trimmed);
 }
 
-fn storeInProfile(alloc: Allocator, value: []const u8) StoreError!void {
+fn storeInProfile(alloc: Allocator, slot: Slot, value: []const u8) StoreError!void {
     const home = io_mod.getenv("HOME") orelse return writeFailed("home", error.HomeNotSet);
     var home_dir = io_mod.VerifiedDir{
         .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| {
@@ -193,13 +244,13 @@ fn storeInProfile(alloc: Allocator, value: []const u8) StoreError!void {
     };
     defer fx_dir.close();
 
-    return storeInDir(alloc, &fx_dir, value);
+    return storeInDir(alloc, &fx_dir, slot, value);
 }
 
 /// `durableReplaceVerified` creates the file at 0600 and re-stats it after the rename,
 /// so the mode this store depends on is enforced rather than assumed.
-fn storeInDir(alloc: Allocator, fx_dir: *io_mod.VerifiedDir, value: []const u8) StoreError!void {
-    io_mod.durableReplaceVerified(alloc, fx_dir, profile_paths.api_key_file_name, value) catch |err| switch (err) {
+fn storeInDir(alloc: Allocator, fx_dir: *io_mod.VerifiedDir, slot: Slot, value: []const u8) StoreError!void {
+    io_mod.durableReplaceVerified(alloc, fx_dir, slot.file_name, value) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return writeFailed("replace", err),
     };
@@ -228,12 +279,12 @@ test "stored key file round-trips byte-identically at mode 0600" {
     defer fx_dir.close();
 
     const written = "vt1-file-round-trip-value";
-    try storeInDir(std.testing.allocator, &fx_dir, written);
+    try storeInDir(std.testing.allocator, &fx_dir, gateway_slot, written);
 
-    const stat = try tmp.dir.statFile(std.testing.io, profile_paths.api_key_file_name, .{});
+    const stat = try tmp.dir.statFile(std.testing.io, gateway_slot.file_name, .{});
     try std.testing.expect(stat.permissions.toMode() & 0o777 == 0o600);
 
-    const read_back = (try loadFromDir(std.testing.allocator, &fx_dir.dir)) orelse
+    const read_back = (try loadFromDir(std.testing.allocator, &fx_dir.dir, gateway_slot)) orelse
         return error.TestUnexpectedMissingStoredKey;
     defer secret.zeroAndFree(std.testing.allocator, read_back);
     try std.testing.expectEqualStrings(written, read_back);
@@ -247,22 +298,22 @@ test "stored key file refusal stays distinguishable from absence" {
     };
     defer fx_dir.close();
 
-    try std.testing.expect((try loadFromDir(std.testing.allocator, &fx_dir.dir)) == null);
+    try std.testing.expect((try loadFromDir(std.testing.allocator, &fx_dir.dir, gateway_slot)) == null);
 
-    try storeInDir(std.testing.allocator, &fx_dir, "vt2-secret-value");
+    try storeInDir(std.testing.allocator, &fx_dir, gateway_slot, "vt2-secret-value");
     for ([_]std.posix.mode_t{ 0o640, 0o604, 0o644 }) |mode| {
-        var file = try tmp.dir.openFile(std.testing.io, profile_paths.api_key_file_name, .{ .mode = .read_write });
+        var file = try tmp.dir.openFile(std.testing.io, gateway_slot.file_name, .{ .mode = .read_write });
         try file.setPermissions(std.testing.io, std.Io.File.Permissions.fromMode(mode));
         file.close(std.testing.io);
 
         try std.testing.expectError(
             error.StoredKeyInsecure,
-            loadFromDir(std.testing.allocator, &fx_dir.dir),
+            loadFromDir(std.testing.allocator, &fx_dir.dir, gateway_slot),
         );
     }
 
-    try tmp.dir.deleteFile(std.testing.io, profile_paths.api_key_file_name);
-    try std.testing.expect((try loadFromDir(std.testing.allocator, &fx_dir.dir)) == null);
+    try tmp.dir.deleteFile(std.testing.io, gateway_slot.file_name);
+    try std.testing.expect((try loadFromDir(std.testing.allocator, &fx_dir.dir, gateway_slot)) == null);
 }
 
 test "stored key file tolerates a trailing newline and rejects an empty value" {
@@ -273,14 +324,46 @@ test "stored key file tolerates a trailing newline and rejects an empty value" {
     };
     defer fx_dir.close();
 
-    try storeInDir(std.testing.allocator, &fx_dir, "hand-edited-value\n");
-    const read_back = (try loadFromDir(std.testing.allocator, &fx_dir.dir)) orelse
+    try storeInDir(std.testing.allocator, &fx_dir, gateway_slot, "hand-edited-value\n");
+    const read_back = (try loadFromDir(std.testing.allocator, &fx_dir.dir, gateway_slot)) orelse
         return error.TestUnexpectedMissingStoredKey;
     defer secret.zeroAndFree(std.testing.allocator, read_back);
     try std.testing.expectEqualStrings("hand-edited-value", read_back);
 
-    try storeInDir(std.testing.allocator, &fx_dir, "\n\n");
-    try std.testing.expect((try loadFromDir(std.testing.allocator, &fx_dir.dir)) == null);
+    try storeInDir(std.testing.allocator, &fx_dir, gateway_slot, "\n\n");
+    try std.testing.expect((try loadFromDir(std.testing.allocator, &fx_dir.dir, gateway_slot)) == null);
 
-    try std.testing.expectError(error.StoredKeyWriteFailed, store(std.testing.allocator, ""));
+    try std.testing.expectError(error.StoredKeyWriteFailed, store(std.testing.allocator, gateway_slot, ""));
+}
+
+test "provider slots keep their keys apart" {
+    try std.testing.expect(!std.mem.eql(u8, gateway_slot.service, openrouter_slot.service));
+    try std.testing.expect(!std.mem.eql(u8, gateway_slot.file_name, openrouter_slot.file_name));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fx_dir = io_mod.VerifiedDir{
+        .dir = try tmp.dir.openDir(io_mod.getIo(), ".", .{ .iterate = true, .follow_symlinks = false }),
+    };
+    defer fx_dir.close();
+
+    try storeInDir(std.testing.allocator, &fx_dir, gateway_slot, "gateway-value");
+    try storeInDir(std.testing.allocator, &fx_dir, openrouter_slot, "openrouter-value");
+
+    // The profile file is the whole store on every non-macOS target, so the
+    // new slot must be created as privately as the one it sits beside.
+    for ([_]Slot{ gateway_slot, openrouter_slot }) |slot| {
+        const stat = try tmp.dir.statFile(std.testing.io, slot.file_name, .{});
+        try std.testing.expect(stat.permissions.toMode() & 0o777 == 0o600);
+    }
+
+    const gateway_key = (try loadFromDir(std.testing.allocator, &fx_dir.dir, gateway_slot)) orelse
+        return error.TestUnexpectedMissingStoredKey;
+    defer secret.zeroAndFree(std.testing.allocator, gateway_key);
+    try std.testing.expectEqualStrings("gateway-value", gateway_key);
+
+    const openrouter_key = (try loadFromDir(std.testing.allocator, &fx_dir.dir, openrouter_slot)) orelse
+        return error.TestUnexpectedMissingStoredKey;
+    defer secret.zeroAndFree(std.testing.allocator, openrouter_key);
+    try std.testing.expectEqualStrings("openrouter-value", openrouter_key);
 }

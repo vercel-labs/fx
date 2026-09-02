@@ -290,7 +290,20 @@ pub const ModelCatalogEntry = struct {
     context_window: u32 = 0,
     max_tokens: u32 = 0,
     web_search_price: ?[]u8 = null,
+    /// The model costs nothing to run. Only providers that publish per-model
+    /// pricing set this; the rest leave it false.
+    is_free: bool = false,
 };
+
+/// Suffix marking a zero-cost model variant. `ModelCatalogEntry.is_free` is the
+/// authoritative signal, parsed from published pricing; this predicate exists
+/// for surfaces that carry only an id string and cannot reach the entry.
+/// Providers that set `is_free` must keep the two in agreement.
+pub const free_variant_suffix = ":free";
+
+pub fn isFreeModelId(id: []const u8) bool {
+    return std.mem.endsWith(u8, id, free_variant_suffix);
+}
 
 pub fn freeModelCatalog(alloc: std.mem.Allocator, entries: *std.ArrayList(ModelCatalogEntry)) void {
     for (entries.items) |entry| freeModelCatalogEntry(alloc, entry);
@@ -349,6 +362,7 @@ fn cloneModelCatalogEntry(alloc: std.mem.Allocator, entry: ModelCatalogEntry) !M
         .context_window = entry.context_window,
         .max_tokens = entry.max_tokens,
         .web_search_price = null,
+        .is_free = entry.is_free,
     };
     if (entry.web_search_price) |price| {
         cloned.web_search_price = try alloc.dupe(u8, price);
@@ -885,4 +899,28 @@ test "featured deepseek slot prefers the pro variant at equal recency" {
     try std.testing.expectEqualStrings("deepseek/deepseek-v4-pro", curated.items[0].id);
     try std.testing.expectEqualStrings("deepseek/deepseek-v4", curated.items[1].id);
     try std.testing.expectEqualStrings("deepseek/deepseek-v4-flash", curated.items[2].id);
+}
+
+test "cloning a catalog entry preserves the free-pricing flag" {
+    var source = ModelCatalogEntry{
+        .id = try std.testing.allocator.dupe(u8, "z-ai/glm-5.2:free"),
+        .model_type = try std.testing.allocator.dupe(u8, "language"),
+        .context_window = 1_048_576,
+        .max_tokens = 131_072,
+        .has_tool_use = true,
+        .is_free = true,
+    };
+    defer freeModelCatalogEntry(std.testing.allocator, source);
+
+    const cloned = try cloneModelCatalogEntry(std.testing.allocator, source);
+    defer freeModelCatalogEntry(std.testing.allocator, cloned);
+
+    try std.testing.expect(cloned.is_free);
+    try std.testing.expectEqualStrings(source.id, cloned.id);
+    try std.testing.expectEqual(source.context_window, cloned.context_window);
+
+    source.is_free = false;
+    const paid = try cloneModelCatalogEntry(std.testing.allocator, source);
+    defer freeModelCatalogEntry(std.testing.allocator, paid);
+    try std.testing.expect(!paid.is_free);
 }

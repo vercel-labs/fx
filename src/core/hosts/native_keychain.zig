@@ -21,6 +21,7 @@ const FindGenericPasswordFn = *const fn (
 ) callconv(.c) i32;
 
 pub const service_name = "FX_AI_GATEWAY_API_KEY";
+pub const openrouter_service_name = "FX_OPENROUTER_API_KEY";
 const mcp_credentials_service_name = "FX_MCP_OAUTH_CREDENTIALS_V1";
 pub const oauth_session_service_name = "FX_OAUTH_SESSION_V1";
 
@@ -156,6 +157,10 @@ pub fn contains() Error!host.SecretStorePresence {
     return containsService(service_name);
 }
 
+pub fn servicePresence(service: []const u8) Error!host.SecretStorePresence {
+    return containsService(service);
+}
+
 pub fn oauthSessionPresence() Error!host.SecretStorePresence {
     return containsService(oauth_session_service_name);
 }
@@ -194,6 +199,10 @@ fn containsService(service: []const u8) Error!host.SecretStorePresence {
     if (status == err_sec_item_not_found) return .missing;
     debug_trace.logf("keychain", "presence failed status={d}", .{status});
     return error.KeychainReadFailed;
+}
+
+pub fn loadService(alloc: std.mem.Allocator, service: []const u8) !?[]u8 {
+    return loadFromService(alloc, service);
 }
 
 pub fn loadMcpCredentials(alloc: std.mem.Allocator) !?[]u8 {
@@ -249,8 +258,8 @@ fn loadFromService(alloc: std.mem.Allocator, service: []const u8) !?[]u8 {
     return key;
 }
 
-fn storeArgv(account: []const u8) [8][]const u8 {
-    return .{ "/usr/bin/security", "add-generic-password", "-a", account, "-s", service_name, "-U", "-w" };
+fn storeArgv(account: []const u8, service: []const u8) [8][]const u8 {
+    return .{ "/usr/bin/security", "add-generic-password", "-a", account, "-s", service, "-U", "-w" };
 }
 
 const store_value_script =
@@ -347,16 +356,27 @@ fn storeValueArgv() [3][]const u8 {
 
 /// The returned argv borrows `account_buf`, which must outlive it.
 pub fn storeInteractiveArgv(account_buf: *AccountBuffer) Error![8][]const u8 {
+    return storeInteractiveArgvForService(account_buf, service_name);
+}
+
+pub fn storeInteractiveArgvForService(
+    account_buf: *AccountBuffer,
+    service: []const u8,
+) Error![8][]const u8 {
     if (!isAvailable()) return error.UnsupportedPlatform;
-    return storeArgv(try accountName(account_buf));
+    return storeArgv(try accountName(account_buf), service);
 }
 
 pub fn storeInteractive() Error!void {
+    return storeInteractiveService(service_name);
+}
+
+pub fn storeInteractiveService(service: []const u8) Error!void {
     if (!isAvailable()) return error.UnsupportedPlatform;
 
     // Let macOS prompt for the secret; do not put it in argv.
     var account_buf: AccountBuffer = undefined;
-    const argv = try storeInteractiveArgv(&account_buf);
+    const argv = try storeInteractiveArgvForService(&account_buf, service);
     var child = std.process.spawn(io_mod.getIo(), .{
         .argv = &argv,
         .stdin = .inherit,
@@ -368,10 +388,14 @@ pub fn storeInteractive() Error!void {
 }
 
 pub fn storeValue(value: []const u8) Error!void {
+    return storeServiceValue(service_name, value);
+}
+
+pub fn storeServiceValue(service: []const u8, value: []const u8) Error!void {
     if (!isAvailable()) return error.UnsupportedPlatform;
     if (value.len == 0) return error.KeychainWriteFailed;
 
-    if (comptime builtin.os.tag == .macos) return storeValueMac(service_name, value);
+    if (comptime builtin.os.tag == .macos) return storeValueMac(service, value);
     return error.UnsupportedPlatform;
 }
 
@@ -826,11 +850,15 @@ test "MCP Keychain storage round-trips values beyond the security prompt limit" 
 }
 
 test "Keychain store command has no secret argument" {
-    const argv = storeArgv("user");
-    try std.testing.expectEqualStrings("-w", argv[argv.len - 1]);
-    for (argv) |arg| {
-        try std.testing.expect(!std.mem.eql(u8, arg, "vca_secret_value"));
+    for ([_][]const u8{ service_name, openrouter_service_name }) |service| {
+        const argv = storeArgv("user", service);
+        try std.testing.expectEqualStrings("-w", argv[argv.len - 1]);
+        try std.testing.expectEqualStrings(service, argv[5]);
+        for (argv) |arg| {
+            try std.testing.expect(!std.mem.eql(u8, arg, "vca_secret_value"));
+        }
     }
+    try std.testing.expect(!std.mem.eql(u8, service_name, openrouter_service_name));
 }
 
 test "cancellable MCP Keychain runner interrupts and reaps a stalled child" {

@@ -83,7 +83,7 @@ If you cannot manage labels, a maintainer or repository agent will apply the lab
 
 * `src/ui/`: terminal rendering, event loop, input, transcript
 
-* `src/gateway/`: AI Gateway client transport
+* `src/gateway/`: provider transports (Vercel AI Gateway, Codex, Grok, OpenRouter) and their wire protocols
 
 * `.fx/skills/`: optional fx-native workspace-level skill root
 

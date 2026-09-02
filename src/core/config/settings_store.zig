@@ -1589,6 +1589,9 @@ fn putModelPreference(
         .gateway => "model",
         .codex => "codex_model",
         .grok => "grok_model",
+        // OpenRouter postdates the per-provider `models` object, so it never
+        // had a top-level alias to clean up.
+        .openrouter => "openrouter_model",
     };
     if (root.contains(legacy_key)) {
         _ = root.orderedRemove(legacy_key);

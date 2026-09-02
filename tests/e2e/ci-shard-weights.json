@@ -2,6 +2,7 @@
   { "file": "auto-mode-reliability.test.ts", "weight": 4 },
   { "file": "acp.test.ts", "weight": 29 },
   { "file": "ask-presentation.test.ts", "weight": 5 },
+  { "file": "openrouter-stream.test.ts", "weight": 8 },
   { "file": "auth-refresh.test.ts", "weight": 2 },
   { "file": "ci-shards.test.ts", "weight": 15 },
   { "file": "cli.test.ts", "weight": 19 },

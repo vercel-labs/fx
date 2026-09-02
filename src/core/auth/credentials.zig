@@ -49,6 +49,7 @@ pub const CatalogAuthenticatedSource = enum {
     stored_key,
     chatgpt_subscription,
     grok_subscription,
+    openrouter_api_key,
 
     fn credentialSource(self: CatalogAuthenticatedSource) Source {
         return switch (self) {
@@ -58,6 +59,7 @@ pub const CatalogAuthenticatedSource = enum {
             .stored_key => .stored_key,
             .chatgpt_subscription => .chatgpt_subscription,
             .grok_subscription => .grok_subscription,
+            .openrouter_api_key => .openrouter_api_key,
         };
     }
 };
@@ -197,6 +199,7 @@ pub fn catalogAccessForCredentialAndAccount(
         .stored_key => .stored_key,
         .chatgpt_subscription => .chatgpt_subscription,
         .grok_subscription => .grok_subscription,
+        .openrouter_api_key => .openrouter_api_key,
         .fx_login => blk: {
             const team = team_context orelse
                 return .{ .public_only = .fx_login_team_required };
@@ -209,7 +212,9 @@ pub fn catalogAccessForCredentialAndAccount(
         .authenticated = .{
             .source = authenticated_source,
             .credential = credential,
-            .team_context = if (authenticated_source == .chatgpt_subscription or authenticated_source == .grok_subscription) null else team_context,
+            .team_context = if (authenticated_source == .chatgpt_subscription or
+                authenticated_source == .grok_subscription or
+                authenticated_source == .openrouter_api_key) null else team_context,
             .account_id = if (authenticated_source == .grok_subscription) account_id else null,
         },
     };
@@ -225,12 +230,39 @@ pub const LoadMode = enum { stored, refresh_if_needed };
 
 const FxLoginRefreshMode = enum { if_needed, force };
 
+/// OpenRouter authenticates with a plain API key. The environment wins when it
+/// is set, so a shell override still beats a key saved from `/setup`.
+pub const openrouter_api_key_env = "OPENROUTER_API_KEY";
+
 pub const missing_credential_message = "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.";
 pub const missing_interactive_credential_message = "fx needs access to Vercel AI Gateway. Run /login to sign in, /setup to use an API key, or set AI_GATEWAY_API_KEY.";
 pub const missing_chatgpt_credential_message = "fx needs a Codex subscription login for this model. Run fx login codex.";
 pub const missing_chatgpt_interactive_credential_message = "Codex needs a subscription login. Run /login, open Connections, then choose Codex subscription.";
 pub const missing_grok_credential_message = "fx needs a Grok subscription login for this model. Run fx login grok.";
 pub const missing_grok_interactive_credential_message = "Grok needs a subscription login. Run /login, open Connections, then choose Grok subscription.";
+pub const missing_openrouter_credential_message = "fx needs an OpenRouter API key for this model. Run fx setup openrouter, or set " ++ openrouter_api_key_env ++ ".";
+pub const missing_openrouter_interactive_credential_message = "OpenRouter needs an API key. Run /setup, open Connections, then choose OpenRouter API key.";
+
+/// Guidance for a provider whose credential is missing. A switch rather than a
+/// fall-through chain, so a new provider cannot silently inherit the Gateway
+/// message and tell the user to run `fx login`.
+pub fn missingCredentialMessage(provider: model_provider.ProviderId) []const u8 {
+    return switch (provider) {
+        .gateway => missing_credential_message,
+        .codex => missing_chatgpt_credential_message,
+        .grok => missing_grok_credential_message,
+        .openrouter => missing_openrouter_credential_message,
+    };
+}
+
+pub fn missingInteractiveCredentialMessage(provider: model_provider.ProviderId) []const u8 {
+    return switch (provider) {
+        .gateway => missing_interactive_credential_message,
+        .codex => missing_chatgpt_interactive_credential_message,
+        .grok => missing_grok_interactive_credential_message,
+        .openrouter => missing_openrouter_interactive_credential_message,
+    };
+}
 pub const unreadable_store_message = "fx could not read the stored API key from " ++ stored_key_backend_label ++ ". A key may be saved but unreadable. Set FX_TRACE_LOG for the failing step, or set AI_GATEWAY_API_KEY.";
 
 test "public credential guidance spells fx lowercase" {
@@ -345,6 +377,10 @@ pub fn resolveForProvider(
             };
             return .{ .credential = credential };
         },
+        .openrouter => {
+            const credential = try loadOpenRouterCredential(alloc, secret_store);
+            return .{ .credential = credential };
+        },
         .gateway => {},
     }
     return resolvePreferring(
@@ -352,7 +388,9 @@ pub fn resolveForProvider(
         transport,
         secret_store,
         mode,
-        if (preferred == .chatgpt_subscription or preferred == .grok_subscription) null else preferred,
+        if (preferred == .chatgpt_subscription or
+            preferred == .grok_subscription or
+            preferred == .openrouter_api_key) null else preferred,
     );
 }
 
@@ -479,6 +517,7 @@ pub fn loadSource(
         .stored_key => loadStoredKeyCredential(alloc, secret_store),
         .chatgpt_subscription => loadChatGptCredential(alloc, transport, .if_needed),
         .grok_subscription => loadGrokCredential(alloc, transport, .if_needed),
+        .openrouter_api_key => loadOpenRouterCredential(alloc, secret_store),
     };
 }
 
@@ -490,6 +529,9 @@ pub fn sourceExists(
     return switch (source) {
         .vercel_oidc_token => nonEmptyEnvValue("VERCEL_OIDC_TOKEN") != null,
         .ai_gateway_api_key => nonEmptyEnvValue("AI_GATEWAY_API_KEY") != null,
+        // Probing must not read the key: on macOS that spawns a Keychain read
+        // on every inventory refresh. Presence answers from metadata alone.
+        .openrouter_api_key => sourcePresence(secret_store, source) == .present,
         .fx_login => blk: {
             const loaded = oauth_session.load(alloc) catch |err| switch (err) {
                 error.OutOfMemory => return err,
@@ -535,6 +577,12 @@ pub fn sourcePresence(
             .present
         else
             .missing,
+        .openrouter_api_key => if (nonEmptyEnvValue(openrouter_api_key_env) != null)
+            .present
+        else if (secret_store.forOpenRouter()) |openrouter_store|
+            if (openrouter_store.isDisabled()) .missing else openrouter_store.presence()
+        else
+            .missing,
         .fx_login => oauth_session.presence(),
         .stored_key => if (secret_store.isDisabled())
             .missing
@@ -555,6 +603,28 @@ fn loadEnvCredential(
         .token = try alloc.dupe(u8, value),
         .source = source,
     };
+}
+
+/// The environment wins over the saved key so a shell override still works, and
+/// a store that cannot be read falls through to "absent" rather than failing the
+/// whole resolution.
+fn loadOpenRouterCredential(
+    alloc: std.mem.Allocator,
+    secret_store: host.SecretStore,
+) !?Credential {
+    if (try loadEnvCredential(alloc, openrouter_api_key_env, .openrouter_api_key)) |credential| {
+        return credential;
+    }
+    const openrouter_store = secret_store.forOpenRouter() orelse return null;
+    if (openrouter_store.isDisabled()) return null;
+    const value = openrouter_store.load(alloc) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            debug_trace.logf("auth", "openrouter stored key unreadable err={s}", .{@errorName(err)});
+            return null;
+        },
+    };
+    return .{ .token = value orelse return null, .source = .openrouter_api_key };
 }
 
 fn loadStoredKeyCredential(
@@ -755,6 +825,7 @@ pub fn sourceLabel(source: Source) []const u8 {
         .stored_key => "stored API key (" ++ stored_key_backend_label ++ ")",
         .chatgpt_subscription => "Codex subscription",
         .grok_subscription => "Grok subscription",
+        .openrouter_api_key => openrouter_api_key_env,
     };
 }
 

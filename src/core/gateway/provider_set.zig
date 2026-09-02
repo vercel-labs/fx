@@ -17,6 +17,7 @@ pub const Bundle = struct {
         vercel,
         chatgpt,
         grok,
+        openrouter,
     };
     pub const Capabilities = struct {
         fx_search: bool = false,
@@ -63,12 +64,14 @@ pub const Set = struct {
     gateway: Bundle,
     codex: Bundle,
     grok: Bundle,
+    openrouter: Bundle,
 
     pub fn select(self: Set, provider: model_provider.ProviderId) Bundle {
         return switch (provider) {
             .gateway => self.gateway,
             .codex => self.codex,
             .grok => self.grok,
+            .openrouter => self.openrouter,
         };
     }
 
@@ -90,6 +93,7 @@ pub const Set = struct {
             .gateway = self.gateway.deferred_usage,
             .codex = self.codex.deferred_usage,
             .grok = self.grok.deferred_usage,
+            .openrouter = self.openrouter.deferred_usage,
         };
     }
 };
@@ -99,6 +103,7 @@ pub fn gateway_only(gateway: Bundle) Set {
         .gateway = gateway,
         .codex = .{},
         .grok = .{},
+        .openrouter = .{},
     };
 }
 
@@ -169,7 +174,7 @@ test "provider set selects each provider's complete route" {
         .model_catalog = .{ .context = &grok_tag, .fetch_fn = Fake.model_catalog_fetch },
         .permission_reviewer = .{ .context = &grok_tag, .review_fn = Fake.review },
     };
-    var providers = Set{ .gateway = gateway, .codex = codex, .grok = grok };
+    var providers = Set{ .gateway = gateway, .codex = codex, .grok = grok, .openrouter = .{} };
 
     try std.testing.expect(providers.select(.gateway).agent_stream.?.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
     try std.testing.expect(providers.select(.gateway).capabilities.fx_search);

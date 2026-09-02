@@ -33,6 +33,7 @@ const credential_source_order = [_]credentials.Source{
     .stored_key,
     .chatgpt_subscription,
     .grok_subscription,
+    .openrouter_api_key,
 };
 
 const SourceProbeFn = *const fn (?*anyopaque, Allocator, credentials.Source) anyerror!bool;
@@ -42,6 +43,21 @@ const StoredKeyStoreFn = *const fn (?*anyopaque, Allocator, []const u8) anyerror
 const UnavailableSourcePolicy = enum {
     fail,
     omit,
+};
+
+/// Which provider's slot a pasted key lands in. The entry stage looks the same
+/// either way, so the target decides the prompt, the store and the source the
+/// saved key reloads as.
+pub const ApiKeyTarget = enum {
+    gateway,
+    openrouter,
+
+    pub fn source(self: ApiKeyTarget) credentials.Source {
+        return switch (self) {
+            .gateway => .stored_key,
+            .openrouter => .openrouter_api_key,
+        };
+    }
 };
 
 const max_api_key_entry_bytes: usize = 8 * 1024;
@@ -239,6 +255,7 @@ fn requestedSource(
         .gateway => preferred,
         .codex => .chatgpt_subscription,
         .grok => .grok_subscription,
+        .openrouter => .openrouter_api_key,
     };
 }
 
@@ -315,6 +332,9 @@ pub const AcquisitionAction = enum {
     chatgpt_login,
     grok_login,
     setup,
+    /// OpenRouter authenticates from the environment, so this row reports
+    /// whether the key is present rather than starting a sign-in flow.
+    openrouter_key,
     change_team,
     switch_credential,
     switch_provider,
@@ -344,7 +364,9 @@ pub const ApiKeySaveStart = enum {
 
 pub const ApiKeySaveResult = union(enum) {
     empty,
-    saved: bool,
+    /// Carries the source the key reloaded as, so the caller can finish the
+    /// flow for the provider whose key was actually saved.
+    saved: struct { changed: bool, source: credentials.Source },
     gateway_refused,
     gateway_unavailable,
     store_failed,
@@ -376,26 +398,32 @@ const ApiKeySaveDeps = struct {
     validator: api_key_validator.Provider = api_key_validator.unavailable_provider,
     store: StoredKeyStoreFn = storeUnavailableSecret,
     loader: CredentialLoaderFn = loadCredentialSource,
+    target: ApiKeyTarget = .gateway,
 };
 
 /// The whole save sequence with no runtime state, so outcome behaviour can be
 /// tested synchronously while the worker owns only threading.
 fn performApiKeySave(alloc: Allocator, key: []const u8, deps: ApiKeySaveDeps) ApiKeySaveOutcome {
-    switch (deps.validator.validate(alloc, key)) {
-        .accepted => {},
-        .refused => return .gateway_refused,
-        .unavailable => return .gateway_unavailable,
+    // Only the Gateway key can be checked before it is saved; OpenRouter has no
+    // equivalent probe, so its key is stored on the user's word.
+    if (deps.target == .gateway) {
+        switch (deps.validator.validate(alloc, key)) {
+            .accepted => {},
+            .refused => return .gateway_refused,
+            .unavailable => return .gateway_unavailable,
+        }
     }
+    const target_source = deps.target.source();
     deps.store(deps.ctx, alloc, key) catch |err| {
         debug_trace.logf("auth", "api key save failed step=store err={s}", .{@errorName(err)});
         return .store_failed;
     };
-    const loaded = deps.loader(deps.ctx, alloc, .stored_key) catch |err| {
+    const loaded = deps.loader(deps.ctx, alloc, target_source) catch |err| {
         debug_trace.logf("auth", "api key save failed step=reload err={s}", .{@errorName(err)});
         return .reload_failed;
     };
     const credential = loaded orelse return .reload_failed;
-    if (credential.source != .stored_key) {
+    if (credential.source != target_source) {
         var wrong = credential;
         wrong.deinit(alloc);
         return .reload_failed;
@@ -630,6 +658,7 @@ pub const PickerView = struct {
     sign_in_code_visible: bool = false,
     sign_in_code_mask_count: usize = 0,
     api_key_mask_count: usize = 0,
+    api_key_target: ApiKeyTarget = .gateway,
 
     pub fn activeSourceLabel(self: PickerView) []const u8 {
         return sourceLabelOrMissing(self.active_source);
@@ -644,7 +673,7 @@ pub const PickerView = struct {
             else
                 4,
             .connections => connectionChoiceCount(),
-            .provider => if (comptime host_target.is_wasm) 2 else 3,
+            .provider => if (comptime host_target.is_wasm) 2 else 4,
             .sign_in, .api_key => 0,
             .change_team => blk: {
                 var count: usize = 0;
@@ -678,6 +707,9 @@ pub const PickerView = struct {
                 0 => .{ .provider = .gateway },
                 1 => .{ .provider = .codex },
                 2 => if (comptime host_target.is_wasm) null else .{ .provider = .grok },
+                // OpenRouter needs no browser flow, but its transport is native
+                // only, so the WASM host does not offer it.
+                3 => if (comptime host_target.is_wasm) null else .{ .provider = .openrouter },
                 else => null,
             },
             .sign_in, .api_key => null,
@@ -722,7 +754,13 @@ pub const PickerView = struct {
                 .login => "Sign in with Vercel",
                 .chatgpt_login => "Sign in with Codex",
                 .grok_login => "Sign in with Grok",
-                .setup => if (self.include_skip) "Add an API key" else "API key",
+                // Onboarding is the one screen with no heading naming the
+                // provider, so each key row says which key it takes.
+                .openrouter_key => if (self.include_skip)
+                    "Add an OpenRouter API key"
+                else
+                    "OpenRouter API key",
+                .setup => if (self.include_skip) "Add an AI Gateway API key" else "API key",
                 .change_team => "Change team",
                 .switch_credential => "Switch credential",
                 .switch_provider => "Switch provider",
@@ -741,6 +779,7 @@ pub const PickerView = struct {
                 .login => if (self.fx_login_session_available) "connected" else "",
                 .chatgpt_login => if (self.available_sources.contains(.chatgpt_subscription)) "connected" else "",
                 .grok_login => if (self.available_sources.contains(.grok_subscription)) "connected" else "",
+                .openrouter_key => if (self.available_sources.contains(.openrouter_api_key)) "connected" else "",
                 .setup, .switch_credential, .switch_provider => "",
                 .automatic => "use the first available source",
                 .change_team => if (self.fx_login_session_available) "choose a team" else "sign in first",
@@ -753,7 +792,8 @@ pub const PickerView = struct {
         return switch (choice) {
             .action => |action| (action != .change_team or self.fx_login_session_available) and
                 (action != .chatgpt_login or !host_target.is_wasm) and
-                (action != .grok_login or !host_target.is_wasm),
+                (action != .grok_login or !host_target.is_wasm) and
+                (action != .openrouter_key or !host_target.is_wasm),
             .provider, .source, .team => true,
         };
     }
@@ -767,7 +807,7 @@ pub const PickerView = struct {
 };
 
 fn connectionChoiceCount() usize {
-    return if (comptime host_target.is_wasm) 2 else 4;
+    return if (comptime host_target.is_wasm) 2 else 5;
 }
 
 fn connectionChoiceAt(index: usize) ?Choice {
@@ -783,6 +823,7 @@ fn connectionChoiceAt(index: usize) ?Choice {
         1 => .{ .action = .chatgpt_login },
         2 => .{ .action = .grok_login },
         3 => .{ .action = .setup },
+        4 => .{ .action = .openrouter_key },
         else => null,
     };
 }
@@ -821,6 +862,7 @@ pub const StatusSnapshot = struct {
     gateway_connected: bool = false,
     chatgpt_connected: bool = false,
     grok_connected: bool = false,
+    openrouter_connected: bool = false,
     /// The active credential is past its refresh deadline. Distinct from `refreshable`,
     /// which answers whether this source type can refresh at all.
     expired: bool = false,
@@ -911,6 +953,14 @@ pub fn loadStatusSnapshotForProvider(
         error.OutOfMemory => return err,
         else => false,
     };
+    const openrouter_connected = credentials.sourceExists(
+        alloc,
+        secret_store,
+        .openrouter_api_key,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => false,
+    };
     // Resolves in `.stored` mode: a diagnostic must not refresh, because refreshing
     // rewrites the session file and performs network I/O. It reports the expired state
     // instead of repairing it.
@@ -967,6 +1017,7 @@ pub fn loadStatusSnapshotForProvider(
             .gateway_connected = gateway_connected,
             .chatgpt_connected = chatgpt_connected,
             .grok_connected = grok_connected,
+            .openrouter_connected = openrouter_connected,
             .expired = expired,
         };
     }
@@ -982,6 +1033,7 @@ pub fn loadStatusSnapshotForProvider(
         .gateway_connected = gateway_connected,
         .chatgpt_connected = chatgpt_connected,
         .grok_connected = grok_connected,
+        .openrouter_connected = openrouter_connected,
     };
 }
 
@@ -1037,6 +1089,7 @@ pub const Runtime = struct {
     sign_in_code_input: std.ArrayList(u8) = .empty,
     api_key_input: std.ArrayList(u8) = .empty,
     api_key_returns_to_root: bool = false,
+    api_key_target: ApiKeyTarget = .gateway,
     api_key_save: ApiKeySaveRuntime = .{},
     inventory_refresh_task: ?*InventoryRefreshTask = null,
 
@@ -1061,7 +1114,7 @@ pub const Runtime = struct {
         secret_store: host.SecretStore,
     ) void {
         comptime {
-            if (std.meta.fields(Self).len != 26) {
+            if (std.meta.fields(Self).len != 27) {
                 @compileError("update Runtime.initInto for the changed field set");
             }
         }
@@ -1090,6 +1143,7 @@ pub const Runtime = struct {
         storage.sign_in_code_input = .empty;
         storage.api_key_input = .empty;
         storage.api_key_returns_to_root = false;
+        storage.api_key_target = .gateway;
         storage.api_key_save = .{};
         storage.inventory_refresh_task = null;
     }
@@ -1186,10 +1240,12 @@ pub const Runtime = struct {
             self.source_inventory.contains(.stored_key);
         const chatgpt_connected = self.source_inventory.contains(.chatgpt_subscription);
         const grok_connected = self.source_inventory.contains(.grok_subscription);
+        const openrouter_connected = self.source_inventory.contains(.openrouter_api_key);
         const credential = self.selected_credential orelse return .{
             .gateway_connected = gateway_connected,
             .chatgpt_connected = chatgpt_connected,
             .grok_connected = grok_connected,
+            .openrouter_connected = openrouter_connected,
         };
         return .{
             .active_source = credential.source,
@@ -1197,6 +1253,7 @@ pub const Runtime = struct {
             .gateway_connected = gateway_connected,
             .chatgpt_connected = chatgpt_connected,
             .grok_connected = grok_connected,
+            .openrouter_connected = openrouter_connected,
             .expired = credential.needsRefreshAt(now_ms),
         };
     }
@@ -1372,6 +1429,7 @@ pub const Runtime = struct {
             .sign_in_code_visible = self.sign_in_code_visible,
             .sign_in_code_mask_count = @min(self.sign_in_code_input.items.len, max_manual_code_mask_glyphs),
             .api_key_mask_count = @min(self.api_key_input.items.len, max_api_key_mask_glyphs),
+            .api_key_target = self.api_key_target,
         };
     }
 
@@ -1472,14 +1530,27 @@ pub const Runtime = struct {
     }
 
     pub fn openApiKeyPicker(self: *Self, alloc: Allocator) void {
-        self.openApiKeyPickerWithParent(alloc, false);
+        self.openApiKeyPickerWithParent(alloc, false, .gateway);
     }
 
     pub fn openApiKeyPickerFromRoot(self: *Self, alloc: Allocator) void {
-        self.openApiKeyPickerWithParent(alloc, true);
+        self.openApiKeyPickerWithParent(alloc, true, .gateway);
     }
 
-    fn openApiKeyPickerWithParent(self: *Self, alloc: Allocator, returns_to_root: bool) void {
+    pub fn openOpenRouterApiKeyPicker(self: *Self, alloc: Allocator) void {
+        self.openApiKeyPickerWithParent(alloc, false, .openrouter);
+    }
+
+    pub fn openOpenRouterApiKeyPickerFromRoot(self: *Self, alloc: Allocator) void {
+        self.openApiKeyPickerWithParent(alloc, true, .openrouter);
+    }
+
+    fn openApiKeyPickerWithParent(
+        self: *Self,
+        alloc: Allocator,
+        returns_to_root: bool,
+        target: ApiKeyTarget,
+    ) void {
         self.exitSignInStage(alloc);
         self.exitApiKeyStage(alloc, .screen_replacement);
         self.clearTeamSelection(alloc);
@@ -1487,6 +1558,7 @@ pub const Runtime = struct {
         self.picker_stage = .api_key;
         self.picker_selection = null;
         self.api_key_returns_to_root = returns_to_root;
+        self.api_key_target = target;
     }
 
     pub fn openSignInPicker(self: *Self, alloc: Allocator) !bool {
@@ -1646,8 +1718,12 @@ pub const Runtime = struct {
         return self.beginApiKeySaveWithDeps(alloc, .{
             .ctx = self,
             .validator = self.api_key_validator,
-            .store = storeRuntimeSecret,
+            .store = switch (self.api_key_target) {
+                .gateway => storeRuntimeSecret,
+                .openrouter => storeRuntimeOpenRouterSecret,
+            },
             .loader = loadRuntimeCredentialSource,
+            .target = self.api_key_target,
         });
     }
 
@@ -1659,14 +1735,18 @@ pub const Runtime = struct {
         self.api_key_input = .empty;
 
         const returns_to_root = self.api_key_returns_to_root;
+        const parent_selection: Choice = switch (self.api_key_target) {
+            .gateway => .{ .action = .setup },
+            .openrouter => .{ .action = .openrouter_key },
+        };
         self.exitApiKeyStage(alloc, .saved);
         self.picker_active = returns_to_root;
         if (!returns_to_root or self.picker_include_skip) {
             self.picker_stage = .root;
-            self.picker_selection = if (returns_to_root) .{ .action = .setup } else null;
+            self.picker_selection = if (returns_to_root) parent_selection else null;
         } else {
             self.picker_stage = .connections;
-            self.picker_selection = .{ .action = .setup };
+            self.picker_selection = parent_selection;
         }
 
         return if (self.api_key_save.start(alloc, key, deps)) .started else .busy;
@@ -1688,8 +1768,12 @@ pub const Runtime = struct {
             .loaded => |*credential| blk: {
                 var owned = credential.*;
                 outcome = .reload_failed;
+                const source = owned.source;
                 defer owned.deinit(alloc);
-                break :blk .{ .saved = self.adoptCredential(alloc, &owned) };
+                break :blk .{ .saved = .{
+                    .changed = self.adoptCredential(alloc, &owned),
+                    .source = source,
+                } };
             },
         };
     }
@@ -1791,7 +1875,7 @@ pub const Runtime = struct {
             .connections => switch (selected) {
                 .action => |action| switch (action) {
                     .login, .chatgpt_login, .grok_login => self.closePicker(alloc),
-                    .setup => {},
+                    .setup, .openrouter_key => {},
                     .connections,
                     .change_team,
                     .switch_credential,
@@ -1819,7 +1903,9 @@ pub const Runtime = struct {
                         self.openSwitchCredentialPicker(alloc);
                         return null;
                     },
-                    .setup => {},
+                    // Onboarding shows the connection rows on the root stage, so
+                    // OpenRouter key entry arrives here as well as from Connections.
+                    .setup, .openrouter_key => {},
                     // Only reachable from the switch screen, never the root.
                     .automatic => unreachable,
                     .login, .chatgpt_login, .grok_login => self.closePicker(alloc),
@@ -1971,7 +2057,18 @@ pub const Runtime = struct {
                     self,
                     loadRuntimeCredentialSource,
                 ),
-            .gateway => if (self.credentialSource() != .chatgpt_subscription and self.credentialSource() != .grok_subscription)
+            .openrouter => if (self.credentialSource() == .openrouter_api_key)
+                false
+            else
+                self.selectSourceWithLoader(
+                    alloc,
+                    .openrouter_api_key,
+                    self,
+                    loadRuntimeCredentialSource,
+                ),
+            .gateway => if (self.credentialSource() != .chatgpt_subscription and
+                self.credentialSource() != .grok_subscription and
+                self.credentialSource() != .openrouter_api_key)
                 false
             else
                 @as(?bool, try self.reselectByPrecedenceWithDeps(
@@ -2201,6 +2298,12 @@ fn storeRuntimeSecret(raw: ?*anyopaque, alloc: Allocator, value: []const u8) !vo
     return self.secret_store.store(alloc, value);
 }
 
+fn storeRuntimeOpenRouterSecret(raw: ?*anyopaque, alloc: Allocator, value: []const u8) !void {
+    const self: *Runtime = @ptrCast(@alignCast(raw.?));
+    const store = self.secret_store.forOpenRouter() orelse return error.StoredKeyWriteFailed;
+    return store.store(alloc, value);
+}
+
 fn storeUnavailableSecret(_: ?*anyopaque, _: Allocator, _: []const u8) !void {
     return error.StoredKeyWriteFailed;
 }
@@ -2221,10 +2324,19 @@ fn takeDisplayTeam(alloc: Allocator, credential: *credentials.Credential) ?[]u8 
     return team;
 }
 
+/// Credentials the Gateway route can actually use. Subscription and
+/// provider-scoped keys authenticate only their own provider.
+fn isGatewaySource(source: credentials.Source) bool {
+    return switch (source) {
+        .chatgpt_subscription, .grok_subscription, .openrouter_api_key => false,
+        .vercel_oidc_token, .ai_gateway_api_key, .fx_login, .stored_key => true,
+    };
+}
+
 fn gatewaySourceCount(sources: SourceSet) usize {
     var count: usize = 0;
     for (credential_source_order) |source| {
-        if (source == .chatgpt_subscription or source == .grok_subscription or !sources.contains(source)) continue;
+        if (!isGatewaySource(source) or !sources.contains(source)) continue;
         count += 1;
     }
     return count;
@@ -2233,7 +2345,7 @@ fn gatewaySourceCount(sources: SourceSet) usize {
 fn gatewaySourceAtIndex(sources: SourceSet, wanted_index: usize) ?credentials.Source {
     var index: usize = 0;
     for (credential_source_order) |source| {
-        if (source == .chatgpt_subscription or source == .grok_subscription or !sources.contains(source)) continue;
+        if (!isGatewaySource(source) or !sources.contains(source)) continue;
         if (index == wanted_index) return source;
         index += 1;
     }
@@ -3174,13 +3286,18 @@ test "auth onboarding picker exposes the setup paths" {
 
     const picker = runtime.pickerView();
     try std.testing.expect(picker.include_skip);
-    try std.testing.expectEqual(@as(usize, 4), picker.choiceCount());
+    try std.testing.expectEqual(@as(usize, 5), picker.choiceCount());
     try std.testing.expect((Choice{ .action = .login }).eql(picker.choiceAt(0).?));
     try std.testing.expect((Choice{ .action = .chatgpt_login }).eql(picker.choiceAt(1).?));
     try std.testing.expect((Choice{ .action = .grok_login }).eql(picker.choiceAt(2).?));
     try std.testing.expect((Choice{ .action = .setup }).eql(picker.choiceAt(3).?));
-    try std.testing.expectEqualStrings("Add an API key", picker.choiceLabel(picker.choiceAt(3).?));
-    try std.testing.expect(picker.choiceAt(4) == null);
+    try std.testing.expectEqualStrings("Add an AI Gateway API key", picker.choiceLabel(picker.choiceAt(3).?));
+    try std.testing.expect((Choice{ .action = .openrouter_key }).eql(picker.choiceAt(4).?));
+    try std.testing.expectEqualStrings(
+        "Add an OpenRouter API key",
+        picker.choiceLabel(picker.choiceAt(4).?),
+    );
+    try std.testing.expect(picker.choiceAt(5) == null);
 }
 
 test "clearing a remembered choice re-resolves even when no login was active" {
@@ -3562,7 +3679,7 @@ test "api key stage zeroes its allocation on every exit path" {
         defer outcome.deinit(alloc);
         runtime.exitApiKeyStage(alloc, .saved);
         const result: ApiKeySaveResult = switch (outcome) {
-            .loaded => .{ .saved = true },
+            .loaded => .{ .saved = .{ .changed = true, .source = .stored_key } },
             .gateway_refused => .gateway_refused,
             .gateway_unavailable => .gateway_unavailable,
             .store_failed => .store_failed,
@@ -3591,7 +3708,7 @@ test "api key stage zeroes its allocation on every exit path" {
         defer outcome.deinit(alloc);
         runtime.exitApiKeyStage(alloc, .saved);
         const result: ApiKeySaveResult = switch (outcome) {
-            .loaded => .{ .saved = true },
+            .loaded => .{ .saved = .{ .changed = true, .source = .stored_key } },
             .gateway_refused => .gateway_refused,
             .gateway_unavailable => .gateway_unavailable,
             .store_failed => .store_failed,
@@ -3620,7 +3737,7 @@ test "api key stage zeroes its allocation on every exit path" {
         defer outcome.deinit(alloc);
         runtime.exitApiKeyStage(alloc, .saved);
         const result: ApiKeySaveResult = switch (outcome) {
-            .loaded => .{ .saved = true },
+            .loaded => .{ .saved = .{ .changed = true, .source = .stored_key } },
             .gateway_refused => .gateway_refused,
             .gateway_unavailable => .gateway_unavailable,
             .store_failed => .store_failed,
@@ -3649,7 +3766,7 @@ test "api key stage zeroes its allocation on every exit path" {
         defer outcome.deinit(alloc);
         runtime.exitApiKeyStage(alloc, .saved);
         const result: ApiKeySaveResult = switch (outcome) {
-            .loaded => .{ .saved = true },
+            .loaded => .{ .saved = .{ .changed = true, .source = .stored_key } },
             .gateway_refused => .gateway_refused,
             .gateway_unavailable => .gateway_unavailable,
             .store_failed => .store_failed,
@@ -3678,7 +3795,7 @@ test "api key stage zeroes its allocation on every exit path" {
         defer outcome.deinit(alloc);
         runtime.exitApiKeyStage(alloc, .saved);
         const result: ApiKeySaveResult = switch (outcome) {
-            .loaded => .{ .saved = true },
+            .loaded => .{ .saved = .{ .changed = true, .source = .stored_key } },
             .gateway_refused => .gateway_refused,
             .gateway_unavailable => .gateway_unavailable,
             .store_failed => .store_failed,
@@ -3813,4 +3930,155 @@ test "manual code visibility cannot toggle without provider capability" {
     try std.testing.expect(!runtime.toggleSignInCodeEntry());
     try std.testing.expect(!runtime.pickerView().sign_in_code_visible);
     try std.testing.expect(!runtime.signInCodeEntryActive());
+}
+
+test "setup picker offers every provider and reports the OpenRouter key" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    runtime.openProviderPicker(alloc, .gateway);
+
+    // Every ProviderId must be reachable from the Model provider screen, or the
+    // provider cannot be selected interactively at all.
+    const provider_view = runtime.pickerView();
+    try std.testing.expectEqual(@as(usize, 4), provider_view.choiceCount());
+    var seen = std.EnumSet(model_provider.ProviderId).initEmpty();
+    var index: usize = 0;
+    while (provider_view.choiceAt(index)) |choice| : (index += 1) {
+        seen.insert(choice.provider);
+    }
+    for (std.meta.tags(model_provider.ProviderId)) |provider| {
+        try std.testing.expect(seen.contains(provider));
+    }
+    try std.testing.expectEqualStrings(
+        "OpenRouter API key",
+        provider_view.choiceLabel(.{ .provider = .openrouter }),
+    );
+
+    // The Connections screen reports whether the key is present; selecting it
+    // opens key entry rather than a browser sign-in.
+    runtime.openConnectionPicker(alloc);
+    const connections = runtime.pickerView();
+    try std.testing.expect((Choice{ .action = .openrouter_key }).eql(connections.choiceAt(4).?));
+    try std.testing.expectEqualStrings("", connections.choiceDescription(.{ .action = .openrouter_key }));
+
+    var connected: Runtime = .{ .source_inventory = SourceSet.initMany(&.{.openrouter_api_key}) };
+    connected.openConnectionPicker(alloc);
+    try std.testing.expectEqualStrings(
+        "connected",
+        connected.pickerView().choiceDescription(.{ .action = .openrouter_key }),
+    );
+    connected.closePicker(alloc);
+    runtime.closePicker(alloc);
+}
+
+test "OpenRouter key entry is reachable from onboarding and Connections" {
+    const alloc = std.testing.allocator;
+
+    // Onboarding lists the connection rows on the root stage, so the OpenRouter
+    // row must be both selectable and confirmable there.
+    var onboarding: Runtime = .{ .picker_active = true, .picker_include_skip = true };
+    defer onboarding.deinit(alloc);
+    const onboarding_view = onboarding.pickerView();
+    try std.testing.expectEqual(connectionChoiceCount(), onboarding_view.choiceCount());
+    const last_index = onboarding_view.choiceCount() - 1;
+    try std.testing.expect((Choice{ .action = .openrouter_key })
+        .eql(onboarding_view.choiceAt(last_index).?));
+
+    onboarding.picker_selection = .{ .action = .openrouter_key };
+    const taken = onboarding.takePickerChoice(alloc).?;
+    try std.testing.expect((Choice{ .action = .openrouter_key }).eql(taken));
+    // The stage stays open so the host can push key entry onto it.
+    try std.testing.expect(onboarding.picker_active);
+
+    // Key entry records which slot the pasted key belongs to.
+    onboarding.openOpenRouterApiKeyPickerFromRoot(alloc);
+    try std.testing.expect(onboarding.apiKeyEntryActive());
+    try std.testing.expectEqual(ApiKeyTarget.openrouter, onboarding.pickerView().api_key_target);
+
+    var gateway: Runtime = .{};
+    defer gateway.deinit(alloc);
+    gateway.openApiKeyPickerFromRoot(alloc);
+    try std.testing.expectEqual(ApiKeyTarget.gateway, gateway.pickerView().api_key_target);
+}
+
+test "api key save reloads the slot it wrote" {
+    const Probe = struct {
+        stored: []const u8 = &.{},
+        requested: ?credentials.Source = null,
+
+        fn store(raw: ?*anyopaque, _: Allocator, value: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.stored = value;
+        }
+
+        fn load(raw: ?*anyopaque, alloc: Allocator, source: credentials.Source) !?credentials.Credential {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.requested = source;
+            return .{ .token = try alloc.dupe(u8, "reloaded"), .source = source };
+        }
+    };
+
+    // The OpenRouter key has no pre-save probe, so a validator that refuses must
+    // not block it; the Gateway key still runs the check.
+    var probe: Probe = .{};
+    const refusing: api_key_validator.Provider = .{
+        .context = null,
+        .validate_fn = struct {
+            fn validate(_: ?*anyopaque, _: Allocator, _: []const u8) api_key_validator.Result {
+                return .refused;
+            }
+        }.validate,
+    };
+
+    var outcome = performApiKeySave(std.testing.allocator, "or-key", .{
+        .ctx = &probe,
+        .validator = refusing,
+        .store = Probe.store,
+        .loader = Probe.load,
+        .target = .openrouter,
+    });
+    switch (outcome) {
+        .loaded => |*credential| {
+            defer credential.deinit(std.testing.allocator);
+            try std.testing.expectEqual(credentials.Source.openrouter_api_key, credential.source);
+        },
+        else => return error.TestExpectedOpenRouterSave,
+    }
+    try std.testing.expectEqual(credentials.Source.openrouter_api_key, probe.requested.?);
+    try std.testing.expectEqualStrings("or-key", probe.stored);
+
+    var gateway_probe: Probe = .{};
+    const gateway_outcome = performApiKeySave(std.testing.allocator, "gw-key", .{
+        .ctx = &gateway_probe,
+        .validator = refusing,
+        .store = Probe.store,
+        .loader = Probe.load,
+        .target = .gateway,
+    });
+    try std.testing.expectEqual(ApiKeySaveOutcome.gateway_refused, gateway_outcome);
+    try std.testing.expect(gateway_probe.requested == null);
+}
+
+test "provider-scoped credentials never appear as gateway credential choices" {
+    // The Credential source screen picks a credential for the Gateway route, so
+    // subscription and provider-scoped keys must stay out of it even when present.
+    const sources = SourceSet.initMany(&.{
+        .ai_gateway_api_key,
+        .chatgpt_subscription,
+        .grok_subscription,
+        .openrouter_api_key,
+    });
+    try std.testing.expectEqual(@as(usize, 1), gatewaySourceCount(sources));
+    try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, gatewaySourceAtIndex(sources, 0).?);
+    try std.testing.expect(gatewaySourceAtIndex(sources, 1) == null);
+
+    try std.testing.expect(isGatewaySource(.ai_gateway_api_key));
+    try std.testing.expect(!isGatewaySource(.openrouter_api_key));
+
+    // Probing must still know about the key, or Connections could never report it.
+    var found = false;
+    for (credential_source_order) |source| {
+        if (source == .openrouter_api_key) found = true;
+    }
+    try std.testing.expect(found);
 }

@@ -18,6 +18,7 @@ pub fn fromCatalogEntry(entry: model_catalog.ModelCatalogEntry) model_capabiliti
         .supports_web_search = entry.has_web_search,
         .supports_explicit_caching = entry.has_explicit_caching,
         .supports_implicit_caching = entry.has_implicit_caching,
+        .is_free = entry.is_free,
         .context_window = optionalPositiveU32(entry.context_window),
         .max_output_tokens = optionalPositiveU32(entry.max_tokens),
     };

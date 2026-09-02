@@ -2016,6 +2016,7 @@ const App = struct {
             providers.gateway.permission_reviewer = null;
             providers.codex.permission_reviewer = null;
             providers.grok.permission_reviewer = null;
+            providers.openrouter.permission_reviewer = null;
         }
         return providers;
     }
@@ -4223,6 +4224,10 @@ test {
     _ = @import("gateway/openai_codex_permission_reviewer.zig");
     _ = @import("core/auth/grok_session.zig");
     _ = @import("core/auth/grok_oauth.zig");
+    _ = @import("gateway/chat_completions_protocol.zig");
+    _ = @import("gateway/openrouter.zig");
+    _ = @import("gateway/openrouter_models.zig");
+    _ = @import("gateway/openrouter_permission_reviewer.zig");
     _ = @import("gateway/xai_grok_models.zig");
     _ = @import("gateway/xai_grok.zig");
     _ = @import("gateway/xai_grok_permission_reviewer.zig");

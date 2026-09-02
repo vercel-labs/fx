@@ -5,6 +5,7 @@ pub const ProviderId = enum {
     gateway,
     codex,
     grok,
+    openrouter,
 };
 
 pub const ProviderSelection = struct {
@@ -16,15 +17,19 @@ pub fn parse(value: []const u8) ?ProviderId {
     if (std.ascii.eqlIgnoreCase(value, "gateway")) return .gateway;
     if (std.ascii.eqlIgnoreCase(value, "codex")) return .codex;
     if (std.ascii.eqlIgnoreCase(value, "grok")) return .grok;
+    if (std.ascii.eqlIgnoreCase(value, "openrouter")) return .openrouter;
     return null;
 }
 
 pub fn authorizesCredential(provider: ProviderId, source: ?types.CredentialSource) bool {
     const selected = source orelse return false;
     return switch (provider) {
-        .gateway => selected != .chatgpt_subscription and selected != .grok_subscription,
+        .gateway => selected != .chatgpt_subscription and
+            selected != .grok_subscription and
+            selected != .openrouter_api_key,
         .codex => selected == .chatgpt_subscription,
         .grok => selected == .grok_subscription,
+        .openrouter => selected == .openrouter_api_key,
     };
 }
 

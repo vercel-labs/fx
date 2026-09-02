@@ -951,6 +951,7 @@ pub fn Bindings(comptime App: type) type {
                             .fx_login => "Run /login to repair this source.",
                             .chatgpt_subscription => "Reconnect Codex through /login to repair this source.",
                             .grok_subscription => "Reconnect Grok through /login to repair this source.",
+                            .openrouter_api_key => "Repair the OpenRouter key through /setup.",
                             .vercel_oidc_token, .ai_gateway_api_key, .stored_key => "Run /setup to repair this source.",
                         },
                     },

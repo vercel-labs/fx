@@ -1089,6 +1089,7 @@ fn configuredProviderSelection(
         .gateway => default_model,
         .codex => return error.CodexModelNotSelected,
         .grok => return error.GrokModelNotSelected,
+        .openrouter => return error.OpenRouterModelNotSelected,
     };
     return .{ .provider = provider, .model = model };
 }

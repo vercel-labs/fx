@@ -340,6 +340,7 @@ fn appendCompactFacts(
     if (capabilities.context_window) |tokens| try appendTokenFact(alloc, facts, tokens, "context");
     if (capabilities.max_output_tokens) |tokens| try appendTokenFact(alloc, facts, tokens, "output");
     if (capabilities.supports_fast_mode) try appendMetadataFact(alloc, facts, "Fast");
+    if (capabilities.is_free) try appendMetadataFact(alloc, facts, "Free");
 }
 
 fn compactFactsWidth(capabilities: model_capabilities.Capabilities) usize {
@@ -355,6 +356,10 @@ fn compactFactsWidth(capabilities: model_capabilities.Capabilities) usize {
     if (capabilities.supports_fast_mode) {
         if (width > 0) width += display_width.visibleWidth(" · ");
         width += display_width.visibleWidth("Fast");
+    }
+    if (capabilities.is_free) {
+        if (width > 0) width += display_width.visibleWidth(" · ");
+        width += display_width.visibleWidth("Free");
     }
     return width;
 }
@@ -377,6 +382,15 @@ fn formatTokenFact(buf: *[48]u8, tokens: u32, suffix: []const u8) ![]const u8 {
     }
     if (tokens >= 1_000 and tokens % 1_000 == 0) {
         return try std.fmt.bufPrint(buf, "{d}K {s}", .{ tokens / 1_000, suffix });
+    }
+    // Context windows are not always round decimals: a power-of-two window such
+    // as 1048576 would otherwise print in full and crowd out the rest of the
+    // column, so it rounds to the nearest unit instead.
+    if (tokens >= 1_000_000) {
+        return try std.fmt.bufPrint(buf, "{d}M {s}", .{ (tokens + 500_000) / 1_000_000, suffix });
+    }
+    if (tokens >= 1_000) {
+        return try std.fmt.bufPrint(buf, "{d}K {s}", .{ (tokens + 500) / 1_000, suffix });
     }
     return try std.fmt.bufPrint(buf, "{d} {s}", .{ tokens, suffix });
 }
@@ -419,6 +433,7 @@ fn loadedCatalogStatusText(state: model_cache_runtime.ModelMenuCatalogState) ?[]
             .stored_key => "Gateway catalog: authenticated with the stored API key.",
             .chatgpt_subscription => "Codex catalog: authenticated with a subscription.",
             .grok_subscription => "Grok catalog: authenticated with a subscription.",
+            .openrouter_api_key => "OpenRouter catalog: authenticated with an API key.",
         };
     }
     return null;
@@ -823,4 +838,53 @@ test "model menu keeps only compact facts beside the model" {
     try std.testing.expect(std.mem.find(u8, title.items, "Reasoning") == null);
     try std.testing.expect(std.mem.find(u8, title.items, "Vision") == null);
     try std.testing.expect(std.mem.find(u8, title.items, "Tools") == null);
+}
+
+test "model menu shows a Free fact for zero-cost models" {
+    const alloc = std.testing.allocator;
+
+    var free_row = try composeTitleRow(alloc, .{
+        .id = @constCast("z-ai/glm-5.2:free"),
+        .provider = "z-ai",
+        .capabilities = .{ .context_window = 1_000_000, .is_free = true },
+    }, false, 40, 120);
+    defer free_row.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, free_row.items, "1M context · Free") != null);
+    try std.testing.expect(std.mem.find(u8, free_row.items, "z-ai/glm-5.2:free") != null);
+
+    var paid_row = try composeTitleRow(alloc, .{
+        .id = @constCast("qwen/qwen3.8-flash"),
+        .provider = "qwen",
+        .capabilities = .{ .context_window = 1_000_000 },
+    }, false, 40, 120);
+    defer paid_row.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, paid_row.items, "Free") == null);
+}
+
+test "the Free fact is measured so the facts column stays aligned" {
+    const paid = compactFactsWidth(.{ .context_window = 1_000_000 });
+    const free = compactFactsWidth(.{ .context_window = 1_000_000, .is_free = true });
+    // " · Free" is seven display columns wider.
+    try std.testing.expectEqual(paid + 7, free);
+
+    // A terminal too narrow for the facts column drops it entirely rather than
+    // overflowing the row.
+    try std.testing.expect(modelFactsColumn(.{
+        .items = &.{},
+        .load_state = .ready,
+        .catalog_state = .{},
+    }, 10) == null);
+}
+
+test "token facts abbreviate windows that are not round decimals" {
+    var buf: [48]u8 = undefined;
+    // Exact multiples keep their existing rendering.
+    try std.testing.expectEqualStrings("1M context", try formatTokenFact(&buf, 1_000_000, "context"));
+    try std.testing.expectEqualStrings("128K output", try formatTokenFact(&buf, 128_000, "output"));
+    // Real OpenRouter windows are powers of two and must not print in full.
+    try std.testing.expectEqualStrings("1M context", try formatTokenFact(&buf, 1_048_576, "context"));
+    try std.testing.expectEqualStrings("230K output", try formatTokenFact(&buf, 230_400, "output"));
+    try std.testing.expectEqualStrings("262K context", try formatTokenFact(&buf, 262_144, "context"));
+    // Small values stay exact.
+    try std.testing.expectEqualStrings("512 output", try formatTokenFact(&buf, 512, "output"));
 }
