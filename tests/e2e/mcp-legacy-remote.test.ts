@@ -411,6 +411,253 @@ describe("version-scoped legacy MCP remote transports", () => {
     expect(legacySse.streamCancelled).toBe(1);
   }, 30_000);
 
+  test("Streamable HTTP listener reconnects with delay when the server closes its stream", async () => {
+    streamable = startLegacyStreamableHttpFixture("2025-06-18", {
+      listChanged: true,
+      mode: "closed_listener",
+    });
+    const root = createRoot("closed-listener", "http", streamable.url);
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("activate_listener", "mcp_search_tools", {
+        query: "echo",
+      }),
+      async () => {
+        await Bun.sleep(3_000);
+        // A second search after the reconnect window: the tool list is
+        // refetched lazily, so this is what makes a delivered
+        // tools/list_changed observable.
+        return fakeGatewayToolCall("search_fresh", "mcp_search_tools", {
+          query: "fresh",
+        });
+      },
+      fakeGatewayFinalText("closed listener complete."),
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+
+    const result = await runAsk(root, gateway, "Use the legacy tool.");
+
+    expect(result.code).toBe(0);
+    // A server that closes the notification stream must not be reconnected to
+    // without a delay: roughly three seconds of listener lifetime here. The
+    // lower bound is what keeps the upper bound honest: without it the test
+    // passes just as well when the listener never runs at all. Before the
+    // default this fixture drew 13946 reconnects.
+    // Spacing first: it is the property the default actually guarantees, and a
+    // count in a window is satisfied by any delay at all. 800ms rather than
+    // 1000ms leaves room for scheduler jitter without admitting a storm.
+    // The first reconnect is deliberately immediate, so that gap is excluded:
+    // one stream closing after it has done its work is the ordinary case. The
+    // storm is what happens next, and every later gap has to carry the delay.
+    const listenerGets = streamable.requests.filter((entry) =>
+      entry.httpMethod === "GET" && entry.at !== undefined
+    );
+    const gaps = listenerGets.slice(1).map((entry, index) =>
+      entry.at! - listenerGets[index]!.at!
+    );
+    const spacedGaps = gaps.slice(1);
+    expect(spacedGaps.length).toBeGreaterThanOrEqual(1);
+    expect(Math.min(...spacedGaps)).toBeGreaterThanOrEqual(800);
+
+    expect(streamable.resumeCalls).toBeGreaterThanOrEqual(2);
+    expect(streamable.resumeCalls).toBeLessThanOrEqual(10);
+
+    // And the listener must still be a listener: from its second attempt the
+    // fixture delivers a tools/list_changed before closing, so a refreshed
+    // tools/list proves notifications survive the reconnect delay.
+    expect(streamable.toolsListCalls).toBeGreaterThanOrEqual(2);
+  }, 30_000);
+
+  test("Streamable HTTP call resume honors the operation deadline between attempts", async () => {
+    streamable = startLegacyStreamableHttpFixture("2025-06-18", {
+      mode: "resume_storm",
+    });
+    // A two second operation deadline against a server that never sends a
+    // final response: the resume loop has to notice the deadline between
+    // waits, not only while it is waiting.
+    const root = createRoot("resume-deadline", "http", streamable.url, 2_000);
+    gateway = startToolGateway("resume deadline complete.");
+
+    const result = await runAsk(root, gateway, "Call the fixture.");
+
+    expect(result.code).toBe(0);
+    expect(streamable.resumeCalls).toBeGreaterThanOrEqual(1);
+    expect(streamable.resumeCalls).toBeLessThanOrEqual(4);
+    expect(streamable.cancellationNotifications).toBeGreaterThanOrEqual(1);
+  }, 30_000);
+
+  test("Streamable HTTP listener reconnects on the server's own retry hint", async () => {
+    streamable = startLegacyStreamableHttpFixture("2025-06-18", {
+      listChanged: true,
+      mode: "retry_hint_listener",
+    });
+    const root = createRoot("retry-hint-listener", "http", streamable.url);
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("activate_listener", "mcp_search_tools", {
+        query: "echo",
+      }),
+      async () => {
+        await Bun.sleep(3_000);
+        return fakeGatewayFinalText("retry hint complete.");
+      },
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+
+    const result = await runAsk(root, gateway, "Use the legacy tool.");
+
+    expect(result.code).toBe(0);
+    // SEP-1699 makes the retry field a MUST, so a server that asked for 500ms
+    // gets 500ms and not the client's own default. Both bounds matter: the
+    // lower one is the conformance suite's "reconnected too early", the upper
+    // one is its "very late" threshold at twice the hint, which is exactly
+    // what a 1000ms default applied on top of the hint would trip.
+    const listenerGets = streamable.requests.filter((entry) =>
+      entry.httpMethod === "GET" && entry.at !== undefined
+    );
+    const gaps = listenerGets.slice(1).map((entry, index) =>
+      entry.at! - listenerGets[index]!.at!
+    );
+    expect(gaps.length).toBeGreaterThanOrEqual(1);
+    expect(Math.min(...gaps)).toBeGreaterThanOrEqual(450);
+    expect(Math.max(...gaps)).toBeLessThan(1_000);
+
+    expect(streamable.resumeCalls).toBeGreaterThanOrEqual(2);
+    expect(streamable.resumeCalls).toBeLessThanOrEqual(12);
+  }, 30_000);
+
+  test("Streamable HTTP listener treats an explicit retry:0 as no interval", async () => {
+    streamable = startLegacyStreamableHttpFixture("2025-06-18", {
+      listChanged: true,
+      mode: "retry_zero_listener",
+    });
+    const root = createRoot("retry-zero-listener", "http", streamable.url);
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("activate_listener", "mcp_search_tools", {
+        query: "echo",
+      }),
+      async () => {
+        await Bun.sleep(3_000);
+        return fakeGatewayFinalText("retry zero complete.");
+      },
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+
+    const result = await runAsk(root, gateway, "Use the legacy tool.");
+
+    expect(result.code).toBe(0);
+    // Honoring this one literally would reopen the defect: zero wait is the
+    // storm. It falls back to the default instead, so the spacing after the
+    // first reconnect matches the no-hint case rather than collapsing.
+    const listenerGets = streamable.requests.filter((entry) =>
+      entry.httpMethod === "GET" && entry.at !== undefined
+    );
+    const gaps = listenerGets.slice(1).map((entry, index) =>
+      entry.at! - listenerGets[index]!.at!
+    );
+    const spacedGaps = gaps.slice(1);
+    expect(spacedGaps.length).toBeGreaterThanOrEqual(1);
+    expect(Math.min(...spacedGaps)).toBeGreaterThanOrEqual(800);
+    expect(streamable.resumeCalls).toBeLessThanOrEqual(10);
+  }, 30_000);
+
+  test("Streamable HTTP listener keeps using a retry hint the server sent once", async () => {
+    streamable = startLegacyStreamableHttpFixture("2025-06-18", {
+      listChanged: true,
+      mode: "retry_hint_once",
+    });
+    const root = createRoot("retry-hint-once", "http", streamable.url);
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("activate_listener", "mcp_search_tools", {
+        query: "echo",
+      }),
+      async () => {
+        await Bun.sleep(3_000);
+        return fakeGatewayFinalText("retry hint once complete.");
+      },
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+
+    const result = await runAsk(root, gateway, "Use the legacy tool.");
+
+    expect(result.code).toBe(0);
+    // The retry field sets the reconnection time until the server changes it,
+    // so a hint sent on the first stream still governs the tenth. Holding it
+    // only for the stream that carried it is the shape that reads as fixed and
+    // is not: every later reconnect silently reverts to our own default, which
+    // is the exact substitution SEP-1699 forbids. The upper bound is what
+    // catches that, since the default is twice the hint.
+    const listenerGets = streamable.requests.filter((entry) =>
+      entry.httpMethod === "GET" && entry.at !== undefined
+    );
+    const gaps = listenerGets.slice(1).map((entry, index) =>
+      entry.at! - listenerGets[index]!.at!
+    );
+    expect(gaps.length).toBeGreaterThanOrEqual(2);
+    expect(Math.min(...gaps)).toBeGreaterThanOrEqual(450);
+    expect(Math.max(...gaps)).toBeLessThan(1_000);
+  }, 30_000);
+
+  test("Streamable HTTP call resume honors the server's own retry hint", async () => {
+    streamable = startLegacyStreamableHttpFixture("2025-06-18", {
+      mode: "retry_hint_resume",
+    });
+    const root = createRoot("retry-hint-resume", "http", streamable.url);
+    gateway = startToolGateway("retry hint resume complete.");
+
+    const result = await runAsk(root, gateway, "Call the fixture.");
+
+    expect(result.code).toBe(0);
+    // The listener has had this coverage since the hint was first honored; the
+    // resume loop carries the same logic and had none, so a floor or an
+    // override here passed every other test in this file. 500ms is the value
+    // the conformance suite uses, bounded on both sides for the same reason as
+    // the listener test: too early is a spec violation, and twice the hint is
+    // what our own default would look like if it were applied on top.
+    const resumeGets = streamable.requests.filter((entry) =>
+      entry.httpMethod === "GET" && entry.at !== undefined
+    );
+    const gaps = resumeGets.slice(1).map((entry, index) =>
+      entry.at! - resumeGets[index]!.at!
+    );
+    expect(gaps.length).toBeGreaterThanOrEqual(1);
+    expect(Math.min(...gaps)).toBeGreaterThanOrEqual(450);
+    expect(Math.max(...gaps)).toBeLessThan(1_000);
+  }, 30_000);
+
+  test("Streamable HTTP call resume waits between attempts when the server keeps closing", async () => {
+    streamable = startLegacyStreamableHttpFixture("2025-06-18", {
+      mode: "resume_storm",
+    });
+    const root = createRoot("resume-storm", "http", streamable.url);
+    gateway = startToolGateway("resume storm complete.");
+
+    const result = await runAsk(root, gateway, "Call the fixture.");
+
+    expect(result.code).toBe(0);
+    // The tool call never receives a final response, so it resumes until the
+    // operation deadline. Each resume must wait. Before the default this fixture
+    // drew 16953 resume requests in five seconds.
+    expect(streamable.resumeCalls).toBeGreaterThanOrEqual(2);
+    expect(streamable.resumeCalls).toBeLessThanOrEqual(10);
+    // Spacing as well as the count, matching the listener test: a count inside a
+    // window is satisfied by any delay at all, including one too small to
+    // matter, so the gap is what actually pins the default here. The first
+    // resume is deliberately immediate and excluded for the same reason.
+    const resumeGets = streamable.requests.filter((entry) =>
+      entry.httpMethod === "GET" && entry.at !== undefined
+    );
+    const gaps = resumeGets.slice(1).map((entry, index) =>
+      entry.at! - resumeGets[index]!.at!
+    );
+    const spacedGaps = gaps.slice(1);
+    expect(spacedGaps.length).toBeGreaterThanOrEqual(1);
+    expect(Math.min(...spacedGaps)).toBeGreaterThanOrEqual(800);
+  }, 30_000);
+
+
   for (const version of VERSIONS) {
     test(`fresh fx ask calls Streamable HTTP ${version} with its lifecycle headers`, async () => {
       streamable = startLegacyStreamableHttpFixture(version);

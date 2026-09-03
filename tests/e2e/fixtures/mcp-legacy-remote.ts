@@ -10,6 +10,7 @@ export type LegacyRequest = {
   httpMethod: string;
   path: string;
   headers: Record<string, string>;
+  at?: number;
   message?: {
     id?: number;
     method?: string;
@@ -32,7 +33,13 @@ type StreamableMode =
   | "expire_session"
   | "elicitation_form"
   | "elicitation_url"
-  | "url_required_error";
+  | "url_required_error"
+  | "closed_listener"
+  | "retry_hint_listener"
+  | "resume_storm"
+  | "retry_hint_resume"
+  | "retry_hint_once"
+  | "retry_zero_listener";
 
 export function startLegacyStreamableHttpFixture(
   version: LegacyStreamableVersion,
@@ -114,8 +121,83 @@ export function startLegacyStreamableHttpFixture(
           httpMethod: request.method,
           path: url.pathname,
           headers,
+          at: Date.now(),
         });
         resumeCalls += 1;
+        if (mode === "retry_hint_listener") {
+          // A server that closes the listener stream immediately but says how
+          // long to wait first. The client is expected to honor the hint
+          // rather than substitute its own delay. 500ms is the value the MCP
+          // conformance suite uses for the same check.
+          return new Response("retry: 500\n\n", {
+            headers: { "content-type": "text/event-stream" },
+          });
+        }
+        if (mode === "retry_zero_listener") {
+          // An explicit `retry: 0`. Zero is not an interval a client can wait,
+          // and reconnecting with no wait is the storm this file exists to
+          // prevent, so it has to fall back to the default rather than be
+          // honored literally.
+          return new Response("retry: 0\n\n", {
+            headers: { "content-type": "text/event-stream" },
+          });
+        }
+        if (mode === "retry_hint_once") {
+          // The hint arrives exactly once. Per the SSE spec the retry field
+          // sets the reconnection time until the server changes it, so every
+          // later reconnect must still use 500ms even though the field is
+          // absent from these responses.
+          return new Response(resumeCalls === 1 ? "retry: 500\n\n" : "", {
+            headers: { "content-type": "text/event-stream" },
+          });
+        }
+        if (mode === "retry_hint_resume") {
+          // The resume path's mirror of retry_hint_listener: every resumption
+          // response carries the server's own interval and still closes
+          // without a final response, so readSseWithResumption keeps resuming
+          // and the observed spacing is the hint rather than our default.
+          return new Response(
+            `retry: 500\nid: resume-${resumeCalls}\ndata: ${JSON.stringify({
+              jsonrpc: "2.0",
+              method: "notifications/progress",
+              params: { progressToken: 4, progress: 1, total: 2 },
+            })}\n\n`,
+            { headers: { "content-type": "text/event-stream" } },
+          );
+        }
+        if (mode === "resume_storm") {
+          // A resumable close with no final response: the client resumes,
+          // and the server closes again the same way.
+          return sseResponse([{
+            id: `resume-${resumeCalls}`,
+            data: {
+              jsonrpc: "2.0",
+              method: "notifications/progress",
+              params: { progressToken: 4, progress: 1, total: 2 },
+            },
+          }]);
+        }
+        if (mode === "closed_listener") {
+          // A server that answers the notification GET with a well-formed but
+          // already-finished SSE body. The client must not treat that as a cue
+          // to reconnect without delay. From the second attempt on it closes
+          // the same way but delivers one notification first, so a test can
+          // tell "stopped storming" apart from "stopped listening".
+          if (resumeCalls === 1) {
+            return new Response("", {
+              headers: { "content-type": "text/event-stream" },
+            });
+          }
+          currentToolName = "fresh";
+          return new Response(
+            `id: closed-${resumeCalls}\ndata: ${JSON.stringify({
+              jsonrpc: "2.0",
+              method: "notifications/tools/list_changed",
+              params: {},
+            })}\n\n`,
+            { headers: { "content-type": "text/event-stream" } },
+          );
+        }
         if (mode === "url_required_error") {
           let active = true;
           return new Response(
@@ -526,7 +608,7 @@ export function startLegacyStreamableHttpFixture(
             },
           }]);
         }
-        if (mode === "resume") {
+        if (mode === "resume" || mode === "resume_storm" || mode === "retry_hint_resume") {
           return sseResponse([
             {
               id: "call-event-1",
