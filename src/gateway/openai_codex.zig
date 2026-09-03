@@ -6,6 +6,7 @@ const stream_provider = @import("../core/agent/stream_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
+const curl_proxy_transport = @import("curl_proxy_transport.zig");
 const responses_protocol = @import("responses_protocol.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 
@@ -290,6 +291,17 @@ pub fn streamPrepared(
         extra_count += 1;
     };
 
+    if (curl_proxy_transport.shouldUse(request_endpoint)) {
+        return streamPreparedWithCurl(
+            alloc,
+            request,
+            request_endpoint,
+            auth_headers.authorization,
+            extra_headers_buf[0..extra_count],
+            payload,
+        );
+    }
+
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();
     var open_operation = OpenRequestOperation{
@@ -353,6 +365,14 @@ pub fn streamPrepared(
 
     var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
+    return consumeSuccessfulResponse(alloc, request, reader);
+}
+
+fn consumeSuccessfulResponse(
+    alloc: Allocator,
+    request: stream_provider.ModelRequest,
+    reader: anytype,
+) !stream_provider.Result {
     var events = request.events;
     var completion = try consumeSse(
         alloc,
@@ -391,6 +411,52 @@ pub fn streamPrepared(
         .usage = usage_outcome,
         .ownership = .owned,
     } };
+}
+
+fn streamPreparedWithCurl(
+    alloc: Allocator,
+    request: stream_provider.ModelRequest,
+    request_endpoint: []const u8,
+    authorization: ?[]const u8,
+    extra_headers: []const std.http.Header,
+    payload: []const u8,
+) !stream_provider.Result {
+    var headers: [10]curl_proxy_transport.Header = undefined;
+    var header_count: usize = 0;
+    headers[header_count] = .{ .name = "Content-Type", .value = "application/json" };
+    header_count += 1;
+    headers[header_count] = .{ .name = "User-Agent", .value = gateway_client.user_agent };
+    header_count += 1;
+    if (authorization) |value| {
+        headers[header_count] = .{ .name = "Authorization", .value = value };
+        header_count += 1;
+    }
+    for (extra_headers) |header| {
+        headers[header_count] = .{ .name = header.name, .value = header.value };
+        header_count += 1;
+    }
+
+    try request.admission.admit();
+    request.delivery.markPossiblySent();
+    var response = try curl_proxy_transport.execute(alloc, .{
+        .url = request_endpoint,
+        .method = .post,
+        .headers = headers[0..header_count],
+        .payload = payload,
+        .max_response_bytes = max_sse_aggregate_bytes,
+        .timeout_seconds = 300,
+        .cancel_flag = request.cancel_flag,
+    });
+    defer response.deinit(alloc);
+    if (response.status != .ok) {
+        return .{ .failed = .{
+            .kind = failureKind(response.status),
+            .detail = try alloc.dupe(u8, response.body[0..@min(response.body.len, max_error_body_bytes)]),
+            .ownership = .owned,
+        } };
+    }
+    var response_reader = std.Io.Reader.fixed(response.body);
+    return consumeSuccessfulResponse(alloc, request, &response_reader);
 }
 
 const EventBridge = struct {

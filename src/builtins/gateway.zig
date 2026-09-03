@@ -12,6 +12,7 @@ const collections = @import("../core/shared/collections.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_error_format = @import("../core/shared/gateway_error_format.zig");
 const gateway_client = @import("../gateway/client.zig");
+const curl_proxy_transport = @import("../gateway/curl_proxy_transport.zig");
 const vercel_failure_diagnostics = @import("../gateway/vercel_failure_diagnostics.zig");
 const vercel_protocol = @import("../gateway/vercel_protocol.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -799,6 +800,8 @@ const OAuthHttpOperation = struct {
     request: oauth_transport.Request,
 
     pub fn run(self: *@This()) !oauth_transport.Response {
+        if (curl_proxy_transport.shouldUse(self.request.url)) return self.runWithCurl();
+
         var client: std.http.Client = .{
             .allocator = self.alloc,
             .io = io_mod.getIo(),
@@ -841,6 +844,41 @@ const OAuthHttpOperation = struct {
         return .{
             .disposition = if (result.status == .ok) .accepted else .rejected,
             .body = try self.alloc.dupe(u8, body),
+        };
+    }
+
+    fn runWithCurl(self: *@This()) !oauth_transport.Response {
+        var headers: [3]curl_proxy_transport.Header = undefined;
+        var header_count: usize = 0;
+        headers[header_count] = .{ .name = "User-Agent", .value = gateway_client.user_agent };
+        header_count += 1;
+        if (self.request.method != .get) {
+            headers[header_count] = .{
+                .name = "Content-Type",
+                .value = switch (self.request.method) {
+                    .get => unreachable,
+                    .post_form => "application/x-www-form-urlencoded",
+                    .post_json => "application/json",
+                },
+            };
+            header_count += 1;
+        }
+        if (self.request.authorization) |authorization| {
+            headers[header_count] = .{ .name = "Authorization", .value = authorization };
+            header_count += 1;
+        }
+        const response = try curl_proxy_transport.execute(self.alloc, .{
+            .url = self.request.url,
+            .method = if (self.request.method == .get) .get else .post,
+            .headers = headers[0..header_count],
+            .payload = self.request.payload,
+            .max_response_bytes = oauth_response_max_bytes,
+            .timeout_seconds = 15,
+            .cancel_flag = self.request.cancel_flag,
+        });
+        return .{
+            .disposition = if (response.status == .ok) .accepted else .rejected,
+            .body = response.body,
         };
     }
 };
