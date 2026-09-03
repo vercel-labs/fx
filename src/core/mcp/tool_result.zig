@@ -364,9 +364,18 @@ fn serialize_capped(
     return try alloc.dupe(u8, best);
 }
 
-/// Prefer the machine-readable MCP result when the server supplies one. The
-/// human-readable content is the compatibility fallback, so sending both to
-/// the model would duplicate context for conforming servers.
+/// Modern MCP servers can return the required `content` and the newer but optional
+/// `structuredContent`.
+///
+/// Its biggest advantage is that if the tool declares an `outputSchema`,
+/// `structuredContent` has to conform to it.
+///
+/// This function prefers keeping `structuredContent` if present, falling back to `content`.
+/// This avoids sending equivalent structured and unstructured results to the model and
+/// needlessly using additional input tokens.
+///
+/// Reference:
+/// https://modelcontextprotocol.io/specification/2026-07-28/server/tools#structured-content
 fn select_model_result(result: std.json.Value) std.json.Value {
     if (result != .object) return result;
     if (result.object.get("structuredContent")) |structured_content| {
