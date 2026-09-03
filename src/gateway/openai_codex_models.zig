@@ -7,6 +7,7 @@ const io_mod = @import("../core/shared/io.zig");
 const secret = @import("../core/auth/secret.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
+const curl_proxy_transport = @import("curl_proxy_transport.zig");
 
 const max_catalog_models: usize = 128;
 const max_model_id_bytes: usize = 1024;
@@ -158,6 +159,8 @@ const FetchOperation = struct {
     account_id: ?[]const u8,
 
     pub fn run(self: *@This()) !FetchResponse {
+        if (curl_proxy_transport.shouldUse(self.url)) return self.runWithCurl();
+
         var client: std.http.Client = .{ .allocator = self.alloc, .io = io_mod.getIo() };
         defer client.deinit();
         var auth_header: ?[]u8 = null;
@@ -200,6 +203,35 @@ const FetchOperation = struct {
             .status = result.status,
             .body = try self.alloc.dupe(u8, body),
         };
+    }
+
+    fn runWithCurl(self: *@This()) !FetchResponse {
+        var auth_header: ?[]u8 = null;
+        defer if (auth_header) |value| secret.zeroAndFree(self.alloc, value);
+        var headers: [5]curl_proxy_transport.Header = undefined;
+        var header_count: usize = 0;
+        headers[header_count] = .{ .name = "User-Agent", .value = gateway_client.user_agent };
+        header_count += 1;
+        headers[header_count] = .{ .name = "originator", .value = "fx" };
+        header_count += 1;
+        headers[header_count] = .{ .name = "accept", .value = "application/json" };
+        header_count += 1;
+        if (self.credential) |credential| {
+            auth_header = try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{credential});
+            headers[header_count] = .{ .name = "Authorization", .value = auth_header.? };
+            header_count += 1;
+        }
+        if (self.account_id) |account_id| {
+            headers[header_count] = .{ .name = "chatgpt-account-id", .value = account_id };
+            header_count += 1;
+        }
+        const response = try curl_proxy_transport.execute(self.alloc, .{
+            .url = self.url,
+            .headers = headers[0..header_count],
+            .max_response_bytes = max_catalog_bytes,
+            .timeout_seconds = 30,
+        });
+        return .{ .status = response.status, .body = response.body };
     }
 };
 
