@@ -149,8 +149,13 @@ pub fn pollDeviceTokenBounded(
     deadline: std.Io.Clock.Timestamp,
 ) !PollResult {
     var form: FormBody = .{};
-    var writer: std.Io.Writer.Allocating = .init(alloc);
+    var writer: std.Io.Writer.Allocating = try .initCapacity(alloc, formCapacity(&.{
+        "client_id",   client_id,
+        "grant_type",  "urn:ietf:params:oauth:grant-type:device_code",
+        "device_code", device_code,
+    }));
     defer writer.deinit();
+    defer secret.zero(writer.written());
     try form.append(&writer.writer, "client_id", client_id);
     try form.append(&writer.writer, "grant_type", "urn:ietf:params:oauth:grant-type:device_code");
     try form.append(&writer.writer, "device_code", device_code);
@@ -182,8 +187,13 @@ pub fn refreshToken(
     refresh_token: []const u8,
 ) !TokenSet {
     var form: FormBody = .{};
-    var writer: std.Io.Writer.Allocating = .init(alloc);
+    var writer: std.Io.Writer.Allocating = try .initCapacity(alloc, formCapacity(&.{
+        "client_id",     client_id,
+        "grant_type",    "refresh_token",
+        "refresh_token", refresh_token,
+    }));
     defer writer.deinit();
+    defer secret.zero(writer.written());
     try form.append(&writer.writer, "client_id", client_id);
     try form.append(&writer.writer, "grant_type", "refresh_token");
     try form.append(&writer.writer, "refresh_token", refresh_token);
@@ -208,8 +218,13 @@ pub fn revokeToken(
     token_type_hint: TokenTypeHint,
 ) !void {
     var form: FormBody = .{};
-    var writer: std.Io.Writer.Allocating = .init(alloc);
+    var writer: std.Io.Writer.Allocating = try .initCapacity(alloc, formCapacity(&.{
+        "client_id",       client_id,
+        "token",           token,
+        "token_type_hint", @tagName(token_type_hint),
+    }));
     defer writer.deinit();
+    defer secret.zero(writer.written());
     try form.append(&writer.writer, "client_id", client_id);
     try form.append(&writer.writer, "token", token);
     try form.append(&writer.writer, "token_type_hint", @tagName(token_type_hint));
@@ -336,6 +351,16 @@ fn mapOAuthHttpError(alloc: Allocator, body: []const u8) !void {
     return OAuthError.OAuthRequestFailed;
 }
 
+/// Upper bound on an encoded form body. `percentEncode` expands each byte to at
+/// most three characters, and each field adds one `=` or `&`. Reserving this up
+/// front keeps the writer from reallocating while it holds a credential, which
+/// would leave the secret behind in the abandoned buffer.
+fn formCapacity(parts: []const []const u8) usize {
+    var total: usize = 0;
+    for (parts) |part| total += part.len * 3;
+    return total + parts.len;
+}
+
 const FormBody = struct {
     first: bool = true,
 
@@ -403,6 +428,80 @@ fn check_token_set_allocation_failures(alloc: Allocator) !void {
         "{\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"expires_in\":3600,\"scope\":\"openid offline_access\",\"token_type\":\"Bearer\"}",
     );
     defer token.deinit(alloc);
+}
+
+fn credentialProbeMetadata() Metadata {
+    return .{
+        .issuer = @constCast("https://vercel.test"),
+        .device_authorization_endpoint = @constCast("https://vercel.test/device"),
+        .token_endpoint = @constCast("https://vercel.test/token"),
+    };
+}
+
+test "oauth request bodies carrying a credential are wiped before release" {
+    // The response in each of these calls is already wiped with
+    // `secret.zeroAndFree`. The request form carries the credential itself, so
+    // it must not outlive the call in plaintext either.
+    var scan = secret.ScanAllocator{
+        .backing = std.testing.allocator,
+        .marker = secret.scan_needle,
+    };
+    const alloc = scan.allocator();
+    const metadata = credentialProbeMetadata();
+
+    {
+        var probe = TransportProbe{
+            .expected_method = .post_form,
+            .expected_url = "https://vercel.test/token",
+            .response_body = "{\"access_token\":\"a\",\"token_type\":\"bearer\",\"expires_in\":3600}",
+        };
+        var tokens = try refreshToken(alloc, probe.provider(), metadata, "client", secret.scan_marker);
+        tokens.deinit(alloc);
+    }
+
+    {
+        var cancel_flag = std.atomic.Value(bool).init(false);
+        const deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+            .clock = .awake,
+            .raw = .fromMilliseconds(1),
+        });
+        var probe = TransportProbe{
+            .expected_method = .post_form,
+            .expected_url = "https://vercel.test/token",
+            .response_disposition = .rejected,
+            .response_body = "{\"error\":\"authorization_pending\"}",
+            .expected_cancel_flag = &cancel_flag,
+            .expect_deadline = true,
+        };
+        const result = try pollDeviceTokenBounded(
+            alloc,
+            probe.provider(),
+            metadata,
+            "client",
+            secret.scan_marker,
+            &cancel_flag,
+            deadline,
+        );
+        try std.testing.expectEqual(PollResult.pending, result);
+    }
+
+    {
+        var probe = TransportProbe{
+            .expected_method = .post_form,
+            .expected_url = "https://vercel.test/revoke",
+            .response_body = "{}",
+        };
+        try revokeToken(
+            alloc,
+            probe.provider(),
+            "https://vercel.test/revoke",
+            "client",
+            secret.scan_marker,
+            .refresh_token,
+        );
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), scan.released_with_plaintext);
 }
 
 const TransportProbe = struct {

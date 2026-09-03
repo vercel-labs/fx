@@ -529,8 +529,13 @@ fn refreshSession(
     mutation: *grok_session.Mutation,
     session: *grok_session.Session,
 ) !void {
-    var body: std.Io.Writer.Allocating = .init(alloc);
+    var body: std.Io.Writer.Allocating = try .initCapacity(alloc, formCapacity(&.{
+        "grant_type",    "refresh_token",
+        "client_id",     client_id,
+        "refresh_token", session.refresh_token,
+    }));
     defer body.deinit();
+    defer secret.zero(body.written());
     var form: FormBody = .{};
     try form.append(&body.writer, "grant_type", "refresh_token");
     try form.append(&body.writer, "client_id", client_id);
@@ -674,8 +679,15 @@ fn exchangeAuthorizationCodeForRedirectWithBounds(
     deadline: ?std.Io.Clock.Timestamp,
 ) !TokenSet {
     var form: FormBody = .{};
-    var body: std.Io.Writer.Allocating = .init(alloc);
+    var body: std.Io.Writer.Allocating = try .initCapacity(alloc, formCapacity(&.{
+        "grant_type",    "authorization_code",
+        "client_id",     client_id,
+        "code",          authorization_code,
+        "code_verifier", code_verifier,
+        "redirect_uri",  redirect_uri,
+    }));
     defer body.deinit();
+    defer secret.zero(body.written());
     try form.append(&body.writer, "grant_type", "authorization_code");
     try form.append(&body.writer, "client_id", client_id);
     try form.append(&body.writer, "code", authorization_code);
@@ -759,7 +771,7 @@ fn fetchAccountId(
 ) ![]u8 {
     const endpoint_url = try configuredEndpoint(alloc, e2e_userinfo_url_env, userinfo_url);
     defer alloc.free(endpoint_url);
-    const authorization = try std.fmt.allocPrint(alloc, "Bearer {s}", .{access_token});
+    const authorization = try secret.bearerHeaderAlloc(alloc, access_token);
     defer secret.zeroAndFree(alloc, authorization);
     var response = try transport.execute(alloc, .{
         .method = .get,
@@ -786,8 +798,12 @@ fn revokeToken(
 ) !void {
     const endpoint_url = try configuredEndpoint(alloc, e2e_revoke_url_env, revoke_url);
     defer alloc.free(endpoint_url);
-    var body: std.Io.Writer.Allocating = .init(alloc);
+    var body: std.Io.Writer.Allocating = try .initCapacity(alloc, formCapacity(&.{
+        "token",     token,
+        "client_id", client_id,
+    }));
     defer body.deinit();
+    defer secret.zero(body.written());
     var form: FormBody = .{};
     try form.append(&body.writer, "token", token);
     try form.append(&body.writer, "client_id", client_id);
@@ -921,6 +937,16 @@ fn percentDecodeAlloc(alloc: Allocator, value: []const u8) ![]u8 {
     }
     if (write_index == 0) return error.InvalidGrokOAuthCallback;
     return alloc.realloc(out, write_index);
+}
+
+/// Upper bound on an encoded form body. `percentEncode` expands each byte to at
+/// most three characters, and each field adds one `=` or `&`. Reserving this up
+/// front keeps the writer from reallocating while it holds a credential, which
+/// would leave the secret behind in the abandoned buffer.
+fn formCapacity(parts: []const []const u8) usize {
+    var total: usize = 0;
+    for (parts) |part| total += part.len * 3;
+    return total + parts.len;
 }
 
 const FormBody = struct {
@@ -1123,4 +1149,147 @@ test "Grok browser callback requires the exact path and state" {
             "expected",
         ),
     );
+}
+
+/// Restoring the environment means pointing it at a map that outlives every
+/// test, since there is no way to hand the process environment back.
+var stable_test_environ: ?*std.process.Environ.Map = null;
+
+fn stableTestEnviron() !*std.process.Environ.Map {
+    if (stable_test_environ) |existing| return existing;
+    const alloc = std.heap.page_allocator;
+    const map = try alloc.create(std.process.Environ.Map);
+    map.* = std.process.Environ.Map.init(alloc);
+    stable_test_environ = map;
+    return map;
+}
+
+/// A temporary HOME holding a Grok auth file whose refresh token is `token`,
+/// so the mutation-backed request paths can be driven end to end.
+const MarkedSessionHome = struct {
+    alloc: Allocator,
+    tmp: std.testing.TmpDir,
+    home: []u8,
+    map: *std.process.Environ.Map,
+
+    fn install(alloc: Allocator, token: []const u8) !MarkedSessionHome {
+        const profile_paths = @import("../shared/profile_paths.zig");
+        _ = try stableTestEnviron();
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "");
+        errdefer alloc.free(home);
+
+        try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+        const fx_path = try std.fs.path.join(alloc, &.{ home, ".fx" });
+        defer alloc.free(fx_path);
+        var fx_dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), fx_path, .{ .iterate = true });
+        defer fx_dir.close(io_mod.getIo());
+        try fx_dir.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o700));
+
+        const text = try std.fmt.allocPrint(
+            alloc,
+            "{{\"version\":1,\"access_token\":\"access\",\"refresh_token\":\"{s}\"," ++
+                "\"expires_at_ms\":1,\"account_id\":\"acct\"}}",
+            .{token},
+        );
+        defer alloc.free(text);
+        var file = try fx_dir.createFile(io_mod.getIo(), profile_paths.grok_auth_file_name, .{
+            .truncate = true,
+            .permissions = std.Io.File.Permissions.fromMode(0o600),
+        });
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(io_mod.getIo(), text);
+
+        const map = try alloc.create(std.process.Environ.Map);
+        errdefer alloc.destroy(map);
+        map.* = std.process.Environ.Map.init(alloc);
+        try map.put("HOME", home);
+        io_mod.setEnvironMap(map);
+        return .{ .alloc = alloc, .tmp = tmp, .home = home, .map = map };
+    }
+
+    fn deinit(self: *MarkedSessionHome) void {
+        if (stable_test_environ) |map| io_mod.setEnvironMap(map);
+        self.map.deinit();
+        self.alloc.destroy(self.map);
+        self.alloc.free(self.home);
+        self.tmp.cleanup();
+    }
+};
+
+const MarkedTransport = struct {
+    fn execute(_: ?*anyopaque, alloc: Allocator, request: oauth_transport.Request) !oauth_transport.Response {
+        const payload = request.payload orelse "";
+        if (std.mem.indexOf(u8, payload, "grant_type=refresh_token") != null or
+            std.mem.indexOf(u8, payload, "grant_type=authorization_code") != null)
+        {
+            return .{
+                .disposition = .accepted,
+                .body = try alloc.dupe(
+                    u8,
+                    "{\"access_token\":\"new-access\",\"refresh_token\":\"new-refresh\",\"expires_in\":3600}",
+                ),
+            };
+        }
+        if (std.mem.indexOf(u8, payload, "token=") != null) {
+            return .{ .disposition = .accepted, .body = try alloc.dupe(u8, "{}") };
+        }
+        return .{ .disposition = .accepted, .body = try alloc.dupe(u8, "{\"sub\":\"acct\"}") };
+    }
+
+    fn provider() oauth_transport.Provider {
+        return .{ .execute_fn = execute };
+    }
+};
+
+// The refresh and revoke bodies are built from the token stored on disk, which
+// the file read and the JSON parse also copy. Percent-encoding separates them:
+// the form escapes the spaces in this needle and the stored JSON leaves them
+// literal, so a hit on the encoded spelling can only be the request body.
+const spaced_needle = "GROK TEST CREDENTIAL MARKER";
+const spaced_marker = spaced_needle ++ ("x" ** 1024);
+const encoded_needle = "GROK%20TEST%20CREDENTIAL%20MARKER";
+
+test "Grok request bodies carrying a credential are wiped before release" {
+    // The responses are already wiped with `secret.zeroAndFree`. The request
+    // form carries the credential itself, so it must not outlive the call in
+    // plaintext either.
+    var scan = secret.ScanAllocator{
+        .backing = std.testing.allocator,
+        .marker = secret.scan_needle,
+    };
+    const alloc = scan.allocator();
+
+    // Nothing is stored for this one, so every hit is the form body.
+    var tokens = try exchangeAuthorizationCodeForRedirectWithBounds(
+        alloc,
+        MarkedTransport.provider(),
+        "https://auth.x.ai/token",
+        "authorization-code",
+        secret.scan_marker,
+        "http://127.0.0.1:1455/callback",
+        null,
+        null,
+    );
+    tokens.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), scan.released_with_plaintext);
+
+    scan.marker = encoded_needle;
+
+    {
+        var home = try MarkedSessionHome.install(alloc, spaced_marker);
+        defer home.deinit();
+        var access = (try loadAccess(alloc, MarkedTransport.provider(), .force)).?;
+        access.deinit(alloc);
+    }
+
+    {
+        var home = try MarkedSessionHome.install(alloc, spaced_marker);
+        defer home.deinit();
+        const result = try logout(alloc, MarkedTransport.provider());
+        try std.testing.expect(!result.revocation_failed);
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), scan.released_with_plaintext);
 }

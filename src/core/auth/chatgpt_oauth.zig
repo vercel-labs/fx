@@ -428,8 +428,9 @@ fn refreshSession(
     mutation: *chatgpt_session.Mutation,
     session: *chatgpt_session.Session,
 ) !void {
-    var body: std.Io.Writer.Allocating = .init(alloc);
+    var body: std.Io.Writer.Allocating = try .initCapacity(alloc, refreshBodyCapacity(session.refresh_token));
     defer body.deinit();
+    defer secret.zero(body.written());
     try body.writer.writeAll("{\"client_id\":");
     try std.json.Stringify.value(client_id, .{}, &body.writer);
     try body.writer.writeAll(",\"grant_type\":\"refresh_token\",\"refresh_token\":");
@@ -609,8 +610,15 @@ fn exchangeAuthorizationCodeForRedirectWithBounds(
     deadline: ?std.Io.Clock.Timestamp,
 ) !TokenSet {
     var form: FormBody = .{};
-    var body: std.Io.Writer.Allocating = .init(alloc);
+    var body: std.Io.Writer.Allocating = try .initCapacity(alloc, formCapacity(&.{
+        "grant_type",    "authorization_code",
+        "client_id",     client_id,
+        "code",          authorization_code,
+        "code_verifier", code_verifier,
+        "redirect_uri",  redirect_uri,
+    }));
     defer body.deinit();
+    defer secret.zero(body.written());
     try form.append(&body.writer, "grant_type", "authorization_code");
     try form.append(&body.writer, "client_id", client_id);
     try form.append(&body.writer, "code", authorization_code);
@@ -871,6 +879,25 @@ fn percentDecodeAlloc(alloc: Allocator, value: []const u8) ![]u8 {
     return alloc.realloc(out, write_index);
 }
 
+/// Upper bound on an encoded form body. `percentEncode` expands each byte to at
+/// most three characters, and each field adds one `=` or `&`. Reserving this up
+/// front keeps the writer from reallocating while it holds a credential, which
+/// would leave the secret behind in the abandoned buffer.
+fn formCapacity(parts: []const []const u8) usize {
+    var total: usize = 0;
+    for (parts) |part| total += part.len * 3;
+    return total + parts.len;
+}
+
+/// Upper bound on the JSON refresh body. JSON string escaping expands a byte to
+/// at most six characters (`\uXXXX`), and the keys and punctuation around the
+/// two values are fixed. Same reason as `formCapacity`: growth would abandon a
+/// buffer holding the refresh token.
+fn refreshBodyCapacity(refresh_token: []const u8) usize {
+    const fixed = "{\"client_id\":\"\",\"grant_type\":\"refresh_token\",\"refresh_token\":\"\"}".len;
+    return fixed + (client_id.len + refresh_token.len) * 6;
+}
+
 const FormBody = struct {
     first: bool = true,
 
@@ -1042,4 +1069,68 @@ test "ChatGPT browser callback requires the exact path and state" {
             "expected",
         ),
     );
+}
+
+test "ChatGPT request bodies carrying a credential are wiped before release" {
+    // The response is already wiped with `secret.zeroAndFree`. The request form
+    // carries the credential itself, so it must not outlive the call in
+    // plaintext either.
+    var scan = secret.ScanAllocator{
+        .backing = std.testing.allocator,
+        .marker = secret.scan_needle,
+    };
+    const alloc = scan.allocator();
+
+    const Transport = struct {
+        fn execute(_: ?*anyopaque, a: Allocator, _: oauth_transport.Request) !oauth_transport.Response {
+            return .{
+                .disposition = .accepted,
+                .body = try a.dupe(
+                    u8,
+                    "{\"access_token\":\"header.payload.signature\"," ++
+                        "\"refresh_token\":\"new-refresh\",\"expires_in\":3600}",
+                ),
+            };
+        }
+    };
+
+    var tokens = try exchangeAuthorizationCodeForRedirectWithBounds(
+        alloc,
+        .{ .execute_fn = Transport.execute },
+        "https://auth.openai.com/oauth/token",
+        "authorization-code",
+        secret.scan_marker,
+        "http://127.0.0.1:1455/auth/callback",
+        null,
+        null,
+    );
+    tokens.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), scan.released_with_plaintext);
+}
+
+test "ChatGPT refresh body capacity covers the encoded bound so the writer never grows" {
+    // The refresh body is assembled from the stored token, which the file read
+    // and the JSON parse also copy, so a scan cannot attribute a hit to the
+    // body alone. What the reservation has to be is large enough, and that is
+    // measurable directly.
+    const alloc = std.testing.allocator;
+    const cases: []const []const u8 = &.{
+        "",
+        "plain-refresh-token",
+        // Control bytes take the six character `\uXXXX` form, the worst case.
+        "\x00\x01\x02\x03\x04\x05\x06\x07",
+        "\"\\\n\t" ** 64,
+        "x" ** 4096,
+    };
+    for (cases) |refresh_token| {
+        var body: std.Io.Writer.Allocating = .init(alloc);
+        defer body.deinit();
+        try body.writer.writeAll("{\"client_id\":");
+        try std.json.Stringify.value(client_id, .{}, &body.writer);
+        try body.writer.writeAll(",\"grant_type\":\"refresh_token\",\"refresh_token\":");
+        try std.json.Stringify.value(refresh_token, .{}, &body.writer);
+        try body.writer.writeByte('}');
+        try std.testing.expect(refreshBodyCapacity(refresh_token) >= body.written().len);
+    }
 }
