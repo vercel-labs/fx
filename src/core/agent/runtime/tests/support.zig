@@ -22,6 +22,7 @@ const file_mutation = @import("../../../tooling/file_mutation.zig");
 const file_mutation_contract = @import("../../../tooling/file_mutation_contract.zig");
 const context_contract = @import("../../../workspace/context_contract.zig");
 const io_mod = @import("../../../shared/io.zig");
+const presentation_palette = @import("../../../shared/presentation_palette.zig");
 const pathing = @import("../../../workspace/pathing.zig");
 const tool_dispatch = @import("../../../tooling/tool_dispatch.zig");
 const tool_runtime = @import("../../../tooling/tool_runtime.zig");
@@ -592,6 +593,8 @@ pub const FakeAgentRuntimeDeps = struct {
     history_turns: std.ArrayList(HistoryTurn) = .empty,
     interrupted_history_count: usize = 0,
     interrupted_event_count: usize = 0,
+    presentation_snapshot: presentation_palette.PresentationSnapshot = presentation_palette.snapshot(false, .fx, false),
+    feedback_presentations: std.ArrayList(presentation_palette.PresentationSnapshot) = .empty,
     interrupted_tool_name: ?[]u8 = null,
     http_status: ?std.http.Status = null,
     http_detail: ?[]u8 = null,
@@ -731,6 +734,7 @@ pub const FakeAgentRuntimeDeps = struct {
             worker_runtime.freeToolLifecycleEvent(self.alloc, event);
         }
         self.lifecycle_events.deinit(self.alloc);
+        self.feedback_presentations.deinit(self.alloc);
         freeStringList(self.alloc, &self.capability_queries);
         self.credential_refresh_sources.deinit(self.alloc);
         self.credential_refresh_modes.deinit(self.alloc);
@@ -798,6 +802,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .report_inner_tool_usage = reportCapturedInnerToolUsage,
             .usage = self.usage,
             .usage_allocator = self.alloc,
+            .presentation_styles = .{ .snapshot = self.presentation_snapshot },
         };
     }
 
@@ -1344,21 +1349,21 @@ pub const FakeAgentRuntimeDeps = struct {
         return try arena.dupe(u8, value);
     }
 
-    fn describeAction(_: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, _: []const []const u8) ![]const u8 {
+    fn describeAction(_: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, _: runtime_deps.PresentationStyles, _: []const []const u8) ![]const u8 {
         return if (display_target) |target|
             std.fmt.allocPrint(arena, "start {s} {s}", .{ call.name, target })
         else
             std.fmt.allocPrint(arena, "start {s}", .{call.name});
     }
 
-    fn describeCompleted(_: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, _: []const []const u8) ![]const u8 {
+    fn describeCompleted(_: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, _: runtime_deps.PresentationStyles, _: []const []const u8) ![]const u8 {
         return if (display_target) |target|
             std.fmt.allocPrint(arena, "done {s} {s}", .{ call.name, target })
         else
             std.fmt.allocPrint(arena, "done {s}", .{call.name});
     }
 
-    fn describeDenied(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, label: []const u8, _: []const []const u8) ![]const u8 {
+    fn describeDenied(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, label: []const u8, _: runtime_deps.PresentationStyles, _: []const []const u8) ![]const u8 {
         return std.fmt.allocPrint(arena, "{s} {s}", .{ label, call.name });
     }
 
@@ -1554,6 +1559,7 @@ pub const FakeAgentRuntimeDeps = struct {
     fn publishCommittedFileHandoff(
         raw: *anyopaque,
         _: file_mutation.CommittedFileHandoff,
+        _: runtime_deps.PresentationStyles,
     ) SecondaryPublicationReport {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         self.record("publish:committed_file", .{}) catch
@@ -1650,6 +1656,9 @@ pub const FakeAgentRuntimeDeps = struct {
                         if (update.output_exact) "exact" else "approx",
                     },
                 );
+            },
+            .append_user_feedback_styled => |feedback| {
+                try self.feedback_presentations.append(self.alloc, feedback.styles);
             },
             else => {},
         }

@@ -21,6 +21,7 @@ const host = @import("../hosts/host.zig");
 const pathing = @import("../workspace/pathing.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const presentation_palette = @import("../shared/presentation_palette.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation = @import("../tooling/file_mutation.zig");
 const gateway_error_format = @import("../shared/gateway_error_format.zig");
@@ -576,6 +577,7 @@ const AskContext = struct {
     auth_failure: ?auth_runtime.FailureSnapshot = null,
     output_mode: OutputMode = .raw,
     prompt_permissions: bool = false,
+    presentation_styles: agent_runtime.PresentationStyles = .{},
     presenter: ?*ask_presentation.Runtime = null,
     pending_tool_progress: std.ArrayList(PendingToolProgress) = .empty,
     deferred_tool_progress: std.ArrayList([]u8) = .empty,
@@ -974,6 +976,15 @@ const AskContext = struct {
         }
         var tc: tool_runtime.Context = .{
             .workspace_root = self.workspace_root,
+            .presentation_snapshot = self.presentation_styles.snapshot,
+            .presentation_dim_style = self.presentation_styles.dim,
+            .presentation_accent_style = self.presentation_styles.accent,
+            .presentation_inline_code_style = self.presentation_styles.inline_code,
+            .presentation_task_completed_style = self.presentation_styles.task_completed,
+            .presentation_diff_added_style = self.presentation_styles.diff_added,
+            .presentation_diff_removed_style = self.presentation_styles.diff_removed,
+            .presentation_diff_added_marker_style = self.presentation_styles.diff_added_marker,
+            .presentation_diff_removed_marker_style = self.presentation_styles.diff_removed_marker,
             .access_scope = self.workspace_access.scope(self.workspace_root),
             .ignored_list_entries = self.cfg.ignored_list_entries,
             .max_list_entries = self.cfg.max_list_entries,
@@ -1459,7 +1470,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     if (permission_override) |explicit| permission_mode = explicit;
 
     if (permission_mode == .yolo and !startup.yolo_acknowledged) {
-        try emitHeadlessYoloWarning(alloc, options);
+        try emitHeadlessYoloWarning(alloc, options, startup.color_palette);
     }
 
     for (startup.config_diagnostics) |diagnostic| {
@@ -1528,12 +1539,17 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.permission_rules = try takeCorePermissionRules(alloc, &startup);
     ctx.context_enabled = startup.context_enabled;
     if (options.output_mode.isTerminal()) {
-        presenter = try ask_presentation.Runtime.init(alloc, .{
+        presenter = try ask_presentation.Runtime.initForPalette(alloc, .{
             .text = owned_prompt,
             .images = @constCast(options.images),
-        }, options.output_mode == .terminal_no_color);
+        }, options.output_mode == .terminal_no_color, startup.color_palette);
         ctx.presenter = &presenter.?;
     }
+    ctx.presentation_styles = askPresentationStyles(
+        if (presenter) |*value| value.presentationLight() else false,
+        startup.color_palette,
+        if (presenter) |*value| value.presentationTruecolor() else false,
+    );
     try ctx.configureNotifications(
         startup.notification_turn_end,
         startup.notification_attention_required,
@@ -1871,6 +1887,49 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     return result;
 }
 
+fn askPresentationStyles(
+    light: bool,
+    color_palette: presentation_palette.ColorPalette,
+    truecolor: bool,
+) agent_runtime.PresentationStyles {
+    const selected = presentation_palette.stylesForTerminal(light, color_palette, truecolor);
+    return .{
+        .dim = selected.dim,
+        .accent = selected.user_accent,
+        .inline_code = selected.inline_code,
+        .task_completed = selected.task_completed,
+        .diff_added = selected.diff_added,
+        .diff_removed = selected.diff_removed,
+        .diff_added_marker = selected.diff_added_marker,
+        .diff_removed_marker = selected.diff_removed_marker,
+        .snapshot = presentation_palette.snapshot(light, color_palette, truecolor),
+    };
+}
+
+test "fx ask presentation styles follow the detected terminal theme" {
+    const light = askPresentationStyles(true, .fx, true);
+    try std.testing.expectEqualStrings("\x1b[38;5;247m", light.dim);
+    try std.testing.expectEqualStrings("\x1b[38;5;238m", light.accent);
+    try std.testing.expectEqualStrings("\x1b[38;5;247m", light.inline_code);
+    try std.testing.expectEqualStrings("\x1b[38;5;238m", light.task_completed);
+
+    const dark = askPresentationStyles(false, .fx, true);
+    try std.testing.expect(!std.mem.eql(u8, light.inline_code, dark.inline_code));
+    try std.testing.expect(!std.mem.eql(u8, light.task_completed, dark.task_completed));
+
+    const terminal_light = askPresentationStyles(true, .terminal, true);
+    const terminal_dark = askPresentationStyles(false, .terminal, false);
+    try std.testing.expectEqualStrings("\x1b[90m", terminal_light.inline_code);
+    try std.testing.expectEqualStrings("\x1b[32m", terminal_light.task_completed);
+    try std.testing.expectEqualStrings(terminal_light.inline_code, terminal_dark.inline_code);
+    try std.testing.expectEqualStrings(terminal_light.task_completed, terminal_dark.task_completed);
+
+    const truecolor = askPresentationStyles(false, .fx, true);
+    const fallback = askPresentationStyles(false, .fx, false);
+    try std.testing.expectEqualStrings("\x1b[38;2;48;164;108m", truecolor.diff_added_marker);
+    try std.testing.expectEqualStrings("\x1b[38;5;71m", fallback.diff_added_marker);
+}
+
 fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
     const assistant_output = try alloc.dupe(u8, ctx.assistant_output.items);
     errdefer alloc.free(assistant_output);
@@ -2023,6 +2082,11 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .report_usage = reportUsage,
         .usage = &ctx.session.usage,
         .usage_allocator = ctx.alloc,
+        .presentation_styles = ctx.presentation_styles,
+        .diff_marker_styles = .{
+            .added = ctx.presentation_styles.diff_added_marker,
+            .removed = ctx.presentation_styles.diff_removed_marker,
+        },
     };
 }
 
@@ -2471,7 +2535,7 @@ fn cliContextPermissionPromptAllowed(ctx: *const AskContext) bool {
     );
 }
 
-fn describeToolAction(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+fn describeToolAction(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, _: agent_runtime.PresentationStyles, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     return tool_presentation.formatPlainAction(arena, .{
         .tool_registry = ctx.toolRegistry(),
@@ -2493,7 +2557,7 @@ fn resolveToolActionDisplayTarget(raw_ctx: *anyopaque, arena: Allocator, call: T
     );
 }
 
-fn describeToolActionCompleted(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+fn describeToolActionCompleted(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, _: agent_runtime.PresentationStyles, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     return tool_presentation.formatPlainAction(arena, .{
         .tool_registry = ctx.toolRegistry(),
@@ -2504,7 +2568,7 @@ fn describeToolActionCompleted(raw_ctx: *anyopaque, arena: Allocator, call: Tool
     });
 }
 
-fn describeToolActionDenied(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+fn describeToolActionDenied(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, label: []const u8, _: agent_runtime.PresentationStyles, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     const action = try tool_presentation.formatPlainAction(arena, .{
         .tool_registry = ctx.toolRegistry(),
@@ -2609,6 +2673,7 @@ fn captureToolExecutionResult(
 fn publishCommittedFileHandoff(
     _: *anyopaque,
     _: file_mutation.CommittedFileHandoff,
+    _: agent_runtime.PresentationStyles,
 ) agent_runtime.SecondaryPublicationReport {
     return .{ .diff = .skipped, .tracker = .skipped };
 }
@@ -3685,11 +3750,22 @@ fn parseOptionsWithStdin(alloc: Allocator, args: []const [:0]const u8, stdin: St
     return opts;
 }
 
-fn emitHeadlessYoloWarning(alloc: Allocator, options: RunOptions) !void {
+fn emitHeadlessYoloWarning(
+    alloc: Allocator,
+    options: RunOptions,
+    color_palette: config_runtime.ColorPalette,
+) !void {
     if (options.color_enabled and options.deps.stderr_is_tty(options.deps.stderr_ctx)) {
+        const warning_style = presentation_palette.styles(false, color_palette).warning;
+        const warning = try std.fmt.allocPrint(
+            alloc,
+            "{s}{s}\x1b[0m\n",
+            .{ warning_style, permissions.yolo_warning_text },
+        );
+        defer alloc.free(warning);
         try options.deps.write_stderr(
             options.deps.stderr_ctx,
-            "\x1b[38;5;252m" ++ permissions.yolo_warning_text ++ "\x1b[0m\n",
+            warning,
         );
     } else {
         try options.deps.write_stderr(options.deps.stderr_ctx, permissions.yolo_warning_text ++ "\n");
@@ -4170,6 +4246,12 @@ fn testPresentKeyStartup(alloc: Allocator, _: oauth_transport.Provider, _: host.
 fn testMissingKeyAcknowledgedStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
     var state = try testMissingKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit);
     state.yolo_acknowledged = true;
+    return state;
+}
+
+fn testMissingKeyTerminalPaletteStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
+    var state = try testMissingKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit);
+    state.color_palette = .terminal;
     return state;
 }
 
@@ -5084,6 +5166,30 @@ test "fx ask ChatGPT route disables Gateway-backed auxiliary providers" {
     try std.testing.expect(tool_ctx.permission_reviewer_provider == null);
 }
 
+test "fx ask tool context carries the complete terminal presentation snapshot" {
+    const alloc = std.testing.allocator;
+    var stdout_capture = TestCapture{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture = TestCapture{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        testConfig(),
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        "/tmp/workspace",
+    );
+    defer ctx.deinit();
+    ctx.presentation_styles = askPresentationStyles(false, .terminal, false);
+
+    const tool_ctx = ctx.toolContext();
+    try std.testing.expectEqual(
+        presentation_palette.PresentationTheme.terminal,
+        tool_ctx.presentation_snapshot.theme,
+    );
+    try std.testing.expectEqualStrings("\x1b[96m", tool_ctx.presentation_snapshot.styles.user_marker);
+    try std.testing.expectEqualStrings(ctx.presentation_styles.dim, tool_ctx.presentation_dim_style);
+}
+
 test "fx ask finalization fails every failed turn" {
     const cases = [_]struct {
         outcome: types.TurnPresentationOutcome,
@@ -5269,7 +5375,7 @@ test "headless yolo persistence is skipped when warning emission fails" {
         emitHeadlessYoloWarning(std.testing.allocator, .{
             .output_mode = .raw,
             .deps = deps,
-        }),
+        }, .fx),
     );
     try std.testing.expectEqual(@as(usize, 0), TestYoloPersistence.calls);
 }
@@ -5316,6 +5422,26 @@ test "headless yolo warning respects acknowledgment and no-color" {
         u8,
         stderr_capture.bytes.items,
         "\x1b[38;5;252m" ++ permissions.yolo_warning_text ++ "\x1b[0m\n",
+    ));
+
+    stderr_capture.bytes.clearRetainingCapacity();
+    var terminal_palette_deps = testPromptRunDeps(
+        &stdout_capture,
+        &stderr_capture,
+        testMissingKeyTerminalPaletteStartup,
+    );
+    terminal_palette_deps.stderr_is_tty = TestTty.yes;
+    terminal_palette_deps.persist_yolo_acknowledgment = TestYoloPersistence.persist;
+    _ = try runWithDeps(
+        alloc,
+        &.{ "--yolo", "hello" },
+        testConfig(),
+        terminal_palette_deps,
+    );
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        stderr_capture.bytes.items,
+        "\x1b[33m" ++ permissions.yolo_warning_text ++ "\x1b[0m\n",
     ));
 
     stderr_capture.bytes.clearRetainingCapacity();

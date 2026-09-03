@@ -28,6 +28,21 @@ const transcript_blocks = render_engine.transcript_blocks;
 
 const Styles = transcript_blocks.Styles;
 
+fn stylesEqual(lhs: Styles, rhs: Styles) bool {
+    return std.mem.eql(u8, lhs.system_notice_label_style, rhs.system_notice_label_style) and
+        std.mem.eql(u8, lhs.system_notice_text_style, rhs.system_notice_text_style) and
+        std.mem.eql(u8, lhs.reset_style, rhs.reset_style) and
+        std.mem.eql(u8, lhs.dim_style, rhs.dim_style) and
+        std.mem.eql(u8, lhs.red_style, rhs.red_style) and
+        std.mem.eql(u8, lhs.cancelled_text_style, rhs.cancelled_text_style) and
+        std.mem.eql(u8, lhs.notice_information_style, rhs.notice_information_style) and
+        std.mem.eql(u8, lhs.notice_success_style, rhs.notice_success_style) and
+        std.mem.eql(u8, lhs.notice_warning_style, rhs.notice_warning_style) and
+        std.mem.eql(u8, lhs.notice_error_style, rhs.notice_error_style) and
+        std.mem.eql(u8, lhs.notice_cancelled_style, rhs.notice_cancelled_style) and
+        lhs.code_highlight_theme == rhs.code_highlight_theme;
+}
+
 fn requestTranscriptPaint(shell: anytype, entry_id: ?u32) void {
     const Runtime = @TypeOf(shell.*);
     if (entry_id) |dirty_entry_id| {
@@ -319,9 +334,16 @@ pub fn resetCommandOutputDisplay(shell: anytype, alloc: Allocator, reason: []con
 }
 
 pub fn setCommandOutputRenderPolicy(shell: anytype, styles: Styles) void {
+    const changed = !stylesEqual(shell.command_output_render.styles, styles);
     shell.command_output_render = .{
         .styles = styles,
     };
+    if (changed) {
+        const Runtime = @TypeOf(shell.*);
+        if (comptime @hasDecl(Runtime, "noteCommandOutputRenderPolicyChanged")) {
+            shell.noteCommandOutputRenderPolicyChanged();
+        }
+    }
 }
 
 const PreparedCanonicalRecord = struct {

@@ -28,6 +28,7 @@ const ui_render = @import("../../ui/render.zig");
 const ui_input = @import("../../ui/input/runtime.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
+const presentation_palette = @import("../shared/presentation_palette.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -209,6 +210,33 @@ pub fn Runtime(comptime App: type) type {
                 .fx_version = App.app_version,
             });
             defer startup.deinit(app.alloc);
+
+            if (comptime @hasField(App, "color_palette")) {
+                app.color_palette = startup.color_palette;
+            }
+            if (comptime @hasField(App, "active_color_palette")) {
+                app.active_color_palette.store(@intFromEnum(startup.color_palette), .release);
+            }
+            if (comptime @hasField(App, "presentation_light")) {
+                app.presentation_light.store(ui_render.is_light, .release);
+            }
+            if (comptime @hasField(App, "presentation_truecolor")) {
+                app.presentation_truecolor = ui_render.truecolorEnabled();
+            }
+            if (comptime @hasDecl(@TypeOf(app.worker), "setPresentationStyles")) {
+                const presentation = presentation_palette.snapshot(
+                    ui_render.is_light,
+                    startup.color_palette,
+                    if (comptime @hasField(App, "presentation_truecolor"))
+                        app.presentation_truecolor
+                    else
+                        false,
+                );
+                app.worker.setPresentationStyles(presentation);
+                if (comptime @hasDecl(@TypeOf(app.worker), "setActivePresentationStyles")) {
+                    app.worker.setActivePresentationStyles(presentation);
+                }
+            }
 
             app.workspace_root = startup.takeWorkspaceRoot();
             if (comptime @hasDecl(App, "adoptWorkspaceAccess")) {

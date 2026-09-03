@@ -251,9 +251,14 @@ pub const HelpMenu = struct {
 
 pub const top_level_help_default_width: usize = 80;
 
-pub const HelpStyle = enum {
-    plain,
-    ansi,
+pub const HelpStyle = struct {
+    enabled: bool = false,
+    muted: []const u8 = "",
+
+    pub const plain: HelpStyle = .{};
+    pub const ansi: HelpStyle = ansi_fx;
+    pub const ansi_fx: HelpStyle = .{ .enabled = true, .muted = "\x1b[38;5;243m" };
+    pub const ansi_terminal: HelpStyle = .{ .enabled = true, .muted = "\x1b[90m" };
 };
 
 const HelpRole = enum {
@@ -1399,18 +1404,18 @@ fn writeStyleEnd(writer: *std.Io.Writer, style: HelpStyle) !void {
 }
 
 fn styleStart(style: HelpStyle, role: HelpRole) []const u8 {
-    if (style == .plain) return "";
+    if (!style.enabled) return "";
     return switch (role) {
         .brand => "\x1b[1m",
         .heading, .label => "\x1b[1m",
         .syntax => "\x1b[39m",
-        .muted => "\x1b[38;5;243m",
+        .muted => style.muted,
         .link => "\x1b[4m",
     };
 }
 
 fn styleEnd(style: HelpStyle) []const u8 {
-    return if (style == .ansi) "\x1b[0m" else "";
+    return if (style.enabled) "\x1b[0m" else "";
 }
 
 fn writeWrappedStyledLine(writer: *std.Io.Writer, prefix: []const u8, continuation_prefix: []const u8, text: []const u8, columns: usize, style: HelpStyle, role: HelpRole) !void {
@@ -1646,6 +1651,12 @@ test "terminal top-level help adds styling without changing visible content" {
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[1mUsage:\x1b[0m") != null);
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[39mask <prompt>\x1b[0m") != null);
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[38;5;243mFast, native coding agent") != null);
+
+    const terminal_palette = try renderTopLevelHelpWithStyle(std.testing.allocator, testTopLevelRegistry(), top_level_help_default_width, "9.8.7", .ansi_terminal);
+    defer std.testing.allocator.free(terminal_palette);
+    try std.testing.expect(std.mem.find(u8, terminal_palette, "\x1b[90mFast, native coding agent") != null);
+    try std.testing.expect(std.mem.find(u8, terminal_palette, "38;5;") == null);
+    try std.testing.expect(std.mem.find(u8, terminal_palette, "38;2;") == null);
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[4mhttps://fx.sh/docs\x1b[0m") != null);
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[39mrun `/feedback` inside fx\x1b[0m") != null);
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[38;5;252m") == null);

@@ -4,6 +4,8 @@ const Allocator = std.mem.Allocator;
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const types = @import("../../core/shared/types.zig");
+const assistant_ansi = @import("../../core/agent/presentation/ansi.zig");
+const presentation_palette = @import("../../core/shared/presentation_palette.zig");
 const HistoryTurn = types.HistoryTurn;
 const FinishedPrompt = types.FinishedPrompt;
 
@@ -37,6 +39,7 @@ pub const SgrState = struct {
         none,
         dark,
         light,
+        terminal,
     };
 
     bold: bool = false,
@@ -72,7 +75,14 @@ pub const SgrState = struct {
             self.dim = false;
         } else if (std.mem.eql(u8, body, "23")) self.italic = false else if (std.mem.eql(u8, body, "24")) self.underline = false else if (std.mem.eql(u8, body, "29")) self.strike = false else if (std.mem.eql(u8, body, "39")) {
             self.code_fg = .none;
-        } else if (std.mem.eql(u8, body, "38;5;245")) self.code_fg = .dark else if (std.mem.eql(u8, body, "38;5;247")) self.code_fg = .light;
+        } else if (assistant_ansi.isInlineCodeOpen(seq)) {
+            self.code_fg = if (std.mem.eql(u8, seq, presentation_palette.styles(false, .terminal).inline_code))
+                .terminal
+            else if (std.mem.eql(u8, seq, "\x1b[38;5;247m"))
+                .light
+            else
+                .dark;
+        }
     }
 
     /// Serialize open codes for the currently-active attributes into `buf`.
@@ -97,6 +107,7 @@ pub const SgrState = struct {
             .none => {},
             .dark => append(buf, &n, "\x1b[38;5;245m"),
             .light => append(buf, &n, "\x1b[38;5;247m"),
+            .terminal => append(buf, &n, presentation_palette.styles(false, .terminal).inline_code),
         }
         return n;
     }

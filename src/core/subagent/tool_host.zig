@@ -8,6 +8,7 @@ const managed_owner = @import("managed_owner.zig");
 const model_contract = @import("model_contract.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const presentation_palette = @import("../shared/presentation_palette.zig");
 const mcp_access = @import("../mcp/access_policy.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -63,6 +64,7 @@ pub const ExecuteOptions = struct {
     timestamp_ms: i64,
     identity_epoch: u64 = 0,
     cancel_flag: ?*std.atomic.Value(bool) = null,
+    presentation: presentation_palette.PresentationSnapshot = presentation_palette.snapshot(false, .fx, false),
 };
 
 pub const ManagedExecutionResult = struct {
@@ -90,6 +92,8 @@ pub const Runtime = struct {
     authority_resolver: authority.Resolver,
     managed: managed_owner.Owner,
     recovery_state: std.atomic.Value(RecoveryState) = .init(.pending),
+    presentation_mutex: std.Io.Mutex = .init,
+    child_presentations: std.StringHashMapUnmanaged(presentation_palette.PresentationSnapshot) = .empty,
 
     pub fn create(
         alloc: Allocator,
@@ -134,6 +138,9 @@ pub const Runtime = struct {
     pub fn deinit(self: *Runtime) void {
         self.managed.deinit();
         self.approvals.deinit();
+        var presentation_it = self.child_presentations.iterator();
+        while (presentation_it.next()) |entry| self.alloc.free(entry.key_ptr.*);
+        self.child_presentations.deinit(self.alloc);
         self.alloc.free(self.root_id);
         const alloc = self.alloc;
         self.* = undefined;
@@ -333,6 +340,7 @@ pub const Runtime = struct {
                 operation_id,
                 options.defaults,
             );
+            try self.rememberChildPresentation(existing.id, options.presentation);
             return managedAdmissionReady(alloc, existing.id);
         }
 
@@ -356,6 +364,7 @@ pub const Runtime = struct {
                     active.id,
                     options.defaults,
                 );
+                try self.rememberChildPresentation(child_id, options.presentation);
                 return managedAdmissionReady(
                     alloc,
                     registry.children[registry.children.len - 1].id,
@@ -401,6 +410,7 @@ pub const Runtime = struct {
                     active.id,
                     options.defaults,
                 );
+                try self.rememberChildPresentation(child_id, options.presentation);
                 return managedAdmissionReady(
                     alloc,
                     registry.children[registry.children.len - 1].id,
@@ -433,6 +443,29 @@ pub const Runtime = struct {
             else => return err,
         }
         try self.childStateStore().markChildSession(alloc, child_id);
+    }
+
+    fn rememberChildPresentation(
+        self: *Runtime,
+        child_id: []const u8,
+        presentation: presentation_palette.PresentationSnapshot,
+    ) !void {
+        self.presentation_mutex.lockUncancelable(io_mod.getIo());
+        defer self.presentation_mutex.unlock(io_mod.getIo());
+        if (self.child_presentations.contains(child_id)) return;
+        const owned_id = try self.alloc.dupe(u8, child_id);
+        errdefer self.alloc.free(owned_id);
+        try self.child_presentations.put(self.alloc, owned_id, presentation);
+    }
+
+    fn childPresentation(
+        self: *Runtime,
+        child_id: []const u8,
+    ) presentation_palette.PresentationSnapshot {
+        self.presentation_mutex.lockUncancelable(io_mod.getIo());
+        defer self.presentation_mutex.unlock(io_mod.getIo());
+        return self.child_presentations.get(child_id) orelse
+            presentation_palette.snapshot(false, .fx, false);
     }
 
     fn observeManagedState(
@@ -731,6 +764,7 @@ fn captureAdmission(
         else
             0,
         .mcp_view = snapshot.mcp_view,
+        .presentation = self.childPresentation(request.child_id),
     }) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.AdmissionFailed,
@@ -842,4 +876,29 @@ pub fn captureHostAuthorityWithMcpView(
         permission_state,
         mcp_view,
     );
+}
+
+test "managed child retains its creation presentation" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = undefined;
+    runtime.alloc = alloc;
+    runtime.presentation_mutex = .init;
+    runtime.child_presentations = .empty;
+    defer {
+        var it = runtime.child_presentations.iterator();
+        while (it.next()) |entry| alloc.free(entry.key_ptr.*);
+        runtime.child_presentations.deinit(alloc);
+    }
+
+    const initial = presentation_palette.snapshot(false, .terminal, false);
+    const changed = presentation_palette.snapshot(true, .fx, true);
+    try runtime.rememberChildPresentation("child", initial);
+    try runtime.rememberChildPresentation("child", changed);
+
+    const retained = runtime.childPresentation("child");
+    try std.testing.expectEqual(
+        presentation_palette.PresentationTheme.terminal,
+        retained.theme,
+    );
+    try std.testing.expectEqualStrings("\x1b[96m", retained.styles.user_marker);
 }

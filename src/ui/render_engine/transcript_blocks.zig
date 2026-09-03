@@ -10,6 +10,7 @@ const user_message_card = @import("../assistant/user_message_card.zig");
 const input_visual_layout = @import("../input/visual_layout.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 const assistant_presentation = @import("../../core/agent/assistant_presentation.zig");
+const presentation_palette = @import("../../core/shared/presentation_palette.zig");
 const code_highlight = @import("code_highlight.zig");
 const code_highlight_languages = @import("code_highlight_languages.zig");
 
@@ -339,6 +340,7 @@ pub const TranscriptEntry = union(enum) {
         created_at_ms: i64 = 0,
         turn: types.UserTurn,
         skill_tokens: []input_visual_layout.SkillTokenSpan = &.{},
+        presentation: ?presentation_palette.PresentationTheme = null,
     };
 
     pub const AssistantTurnEntry = struct {
@@ -357,6 +359,7 @@ pub const TranscriptEntry = union(enum) {
         id: u32,
         created_at_ms: i64 = 0,
         block: assistant_presentation.CodeBlockPayload,
+        presentation: ?presentation_palette.PresentationTheme = null,
     };
 
     pub const AssistantThematicRuleEntry = struct {
@@ -1576,14 +1579,25 @@ fn renderEntryToBlockForPresentationInterruptible(
             break :blk try normalizeOwnedRenderedBlock(alloc, kind, rendered);
         },
         .user_turn => |e| blk: {
-            const card = try user_message_card.buildUserPromptCardWithSkillTokensForTerminalPresentationInterruptible(
-                alloc,
-                e.turn.text,
-                e.turn.images,
-                cols,
-                e.skill_tokens,
-                checkpoint,
-            );
+            const card = if (e.presentation) |theme|
+                try user_message_card.buildUserPromptCardWithPresentationStylesInterruptible(
+                    alloc,
+                    e.turn.text,
+                    e.turn.images,
+                    cols,
+                    e.skill_tokens,
+                    presentation_palette.snapshotForTheme(theme),
+                    checkpoint,
+                )
+            else
+                try user_message_card.buildUserPromptCardWithSkillTokensForTerminalPresentationInterruptible(
+                    alloc,
+                    e.turn.text,
+                    e.turn.images,
+                    cols,
+                    e.skill_tokens,
+                    checkpoint,
+                );
             break :blk try normalizeOwnedRenderedBlock(alloc, kind, card);
         },
         .assistant_turn => |e| blk: {
@@ -1618,7 +1632,11 @@ fn renderEntryToBlockForPresentationInterruptible(
                 alloc,
                 e.block,
                 cols -| gutter,
-                styles.code_highlight_theme,
+                if (e.presentation) |theme| switch (theme) {
+                    .dark => .dark,
+                    .light => .light,
+                    .terminal => .terminal,
+                } else styles.code_highlight_theme,
             );
             defer alloc.free(rendered);
             const prefixed = try assistant_wrap.prefixStructuralRows(alloc, rendered, gutter);

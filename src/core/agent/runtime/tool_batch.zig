@@ -377,6 +377,7 @@ pub fn processCommittedFileResult(
     const publication = hooks.publish_committed_file_handoff(
         hooks.ctx,
         handoff,
+        hooks.presentation_styles,
     );
     debug_trace.eventf(
         "tool",

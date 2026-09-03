@@ -31,6 +31,7 @@ const subagent_agent_adapter = @import("../subagent/agent_adapter.zig");
 const subagent_domain = @import("../subagent/domain.zig");
 const subagent_execution = @import("../subagent/execution.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const presentation_palette = @import("../shared/presentation_palette.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_args = @import("../tooling/tool_args.zig");
 const tool_admission = @import("../tooling/tool_admission.zig");
@@ -124,6 +125,7 @@ pub fn Runtime(comptime App: type) type {
                 gateway_retry_count,
                 gateway_chat_url,
                 null,
+                null,
             );
         }
 
@@ -139,6 +141,7 @@ pub fn Runtime(comptime App: type) type {
             gateway_chat_url: []const u8,
             admission: subagent_domain.AdmissionSnapshot,
         ) tool_runtime.Context {
+            const presentation = admission.presentation.styles;
             return toolContextWithAuthority(
                 app,
                 ignored_list_entries,
@@ -154,6 +157,44 @@ pub fn Runtime(comptime App: type) type {
                     .grants = admission.grants,
                     .rules = admission.rules,
                 },
+                .{
+                    .dim = presentation.dim,
+                    .accent = presentation.user_accent,
+                    .inline_code = presentation.inline_code,
+                    .task_completed = presentation.task_completed,
+                    .diff_added = presentation.diff_added,
+                    .diff_removed = presentation.diff_removed,
+                    .diff_added_marker = presentation.diff_added_marker,
+                    .diff_removed_marker = presentation.diff_removed_marker,
+                    .snapshot = admission.presentation,
+                },
+            );
+        }
+
+        fn toolContextWithPresentationStyles(
+            app: *App,
+            ignored_list_entries: []const []const u8,
+            max_list_entries: usize,
+            max_read_file_bytes: usize,
+            max_read_file_lines: usize,
+            max_read_file_line_len: usize,
+            max_command_output_bytes: usize,
+            gateway_retry_count: usize,
+            gateway_chat_url: []const u8,
+            presentation_styles: agent_runtime.PresentationStyles,
+        ) tool_runtime.Context {
+            return toolContextWithAuthority(
+                app,
+                ignored_list_entries,
+                max_list_entries,
+                max_read_file_bytes,
+                max_read_file_lines,
+                max_read_file_line_len,
+                max_command_output_bytes,
+                gateway_retry_count,
+                gateway_chat_url,
+                null,
+                presentation_styles,
             );
         }
 
@@ -168,6 +209,7 @@ pub fn Runtime(comptime App: type) type {
             gateway_retry_count: usize,
             gateway_chat_url: []const u8,
             authority: ?ToolAuthorityView,
+            captured_presentation: ?agent_runtime.PresentationStyles,
         ) tool_runtime.Context {
             const host_workspace = appHostWorkspaceInfo(app);
             const workspace_root = if (host_workspace) |info|
@@ -201,8 +243,34 @@ pub fn Runtime(comptime App: type) type {
                 provider_set.Bundle.Capabilities{ .fx_search = true, .vision_fallback = true }
             else
                 provider_set.Bundle.Capabilities{};
+            const live_presentation = if (captured_presentation == null)
+                if (comptime @hasDecl(App, "activePresentationStyles"))
+                    app.activePresentationStyles()
+                else
+                    presentation_palette.styles(false, .fx)
+            else
+                null;
+            const live_presentation_snapshot = if (captured_presentation == null)
+                if (comptime @hasDecl(@TypeOf(app.worker), "activePresentationStyles"))
+                    app.worker.activePresentationStyles()
+                else
+                    presentation_palette.PresentationSnapshot{
+                        .styles = live_presentation.?,
+                        .theme = .dark,
+                    }
+            else
+                null;
             var ctx: tool_runtime.Context = .{
                 .workspace_root = workspace_root,
+                .presentation_snapshot = if (captured_presentation) |styles| styles.snapshot else live_presentation_snapshot.?,
+                .presentation_dim_style = if (captured_presentation) |styles| styles.dim else live_presentation.?.dim,
+                .presentation_accent_style = if (captured_presentation) |styles| styles.accent else live_presentation.?.user_accent,
+                .presentation_inline_code_style = if (captured_presentation) |styles| styles.inline_code else live_presentation.?.inline_code,
+                .presentation_task_completed_style = if (captured_presentation) |styles| styles.task_completed else live_presentation.?.task_completed,
+                .presentation_diff_added_style = if (captured_presentation) |styles| styles.diff_added else live_presentation.?.diff_added,
+                .presentation_diff_removed_style = if (captured_presentation) |styles| styles.diff_removed else live_presentation.?.diff_removed,
+                .presentation_diff_added_marker_style = if (captured_presentation) |styles| styles.diff_added_marker else live_presentation.?.diff_added_marker,
+                .presentation_diff_removed_marker_style = if (captured_presentation) |styles| styles.diff_removed_marker else live_presentation.?.diff_removed_marker,
                 .access_scope = if (host_workspace != null)
                     workspace_access.AccessScope.primaryOnly(workspace_root)
                 else
@@ -557,6 +625,26 @@ pub fn Runtime(comptime App: type) type {
             return formatToolAction(ctx, arena, call, display_target, .active, null);
         }
 
+        pub fn describeToolActionWithPresentationStyles(
+            app: *App,
+            arena: Allocator,
+            call: ToolCall,
+            display_target: ?[]const u8,
+            presentation_styles: agent_runtime.PresentationStyles,
+            advertised_dynamic_tool_names: []const []const u8,
+            ignored_list_entries: []const []const u8,
+            max_list_entries: usize,
+            max_read_file_bytes: usize,
+            max_read_file_lines: usize,
+            max_read_file_line_len: usize,
+            max_command_output_bytes: usize,
+            gateway_retry_count: usize,
+            gateway_chat_url: []const u8,
+        ) ![]const u8 {
+            const ctx = tool_runtime.withAdvertisedDynamicToolNames(toolContextWithPresentationStyles(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url, presentation_styles), advertised_dynamic_tool_names);
+            return formatToolAction(ctx, arena, call, display_target, .active, null);
+        }
+
         pub fn describeToolActionCompleted(
             app: *App,
             arena: Allocator,
@@ -573,6 +661,26 @@ pub fn Runtime(comptime App: type) type {
             gateway_chat_url: []const u8,
         ) ![]const u8 {
             const ctx = tool_runtime.withAdvertisedDynamicToolNames(toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), advertised_dynamic_tool_names);
+            return formatToolAction(ctx, arena, call, display_target, .completed, null);
+        }
+
+        pub fn describeToolActionCompletedWithPresentationStyles(
+            app: *App,
+            arena: Allocator,
+            call: ToolCall,
+            display_target: ?[]const u8,
+            presentation_styles: agent_runtime.PresentationStyles,
+            advertised_dynamic_tool_names: []const []const u8,
+            ignored_list_entries: []const []const u8,
+            max_list_entries: usize,
+            max_read_file_bytes: usize,
+            max_read_file_lines: usize,
+            max_read_file_line_len: usize,
+            max_command_output_bytes: usize,
+            gateway_retry_count: usize,
+            gateway_chat_url: []const u8,
+        ) ![]const u8 {
+            const ctx = tool_runtime.withAdvertisedDynamicToolNames(toolContextWithPresentationStyles(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url, presentation_styles), advertised_dynamic_tool_names);
             return formatToolAction(ctx, arena, call, display_target, .completed, null);
         }
 
@@ -593,6 +701,27 @@ pub fn Runtime(comptime App: type) type {
             gateway_chat_url: []const u8,
         ) ![]const u8 {
             const ctx = tool_runtime.withAdvertisedDynamicToolNames(toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), advertised_dynamic_tool_names);
+            return formatToolAction(ctx, arena, call, display_target, .denied, label);
+        }
+
+        pub fn describeToolActionDeniedWithPresentationStyles(
+            app: *App,
+            arena: Allocator,
+            call: ToolCall,
+            display_target: ?[]const u8,
+            label: []const u8,
+            presentation_styles: agent_runtime.PresentationStyles,
+            advertised_dynamic_tool_names: []const []const u8,
+            ignored_list_entries: []const []const u8,
+            max_list_entries: usize,
+            max_read_file_bytes: usize,
+            max_read_file_lines: usize,
+            max_read_file_line_len: usize,
+            max_command_output_bytes: usize,
+            gateway_retry_count: usize,
+            gateway_chat_url: []const u8,
+        ) ![]const u8 {
+            const ctx = tool_runtime.withAdvertisedDynamicToolNames(toolContextWithPresentationStyles(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url, presentation_styles), advertised_dynamic_tool_names);
             return formatToolAction(ctx, arena, call, display_target, .denied, label);
         }
 
@@ -1033,7 +1162,14 @@ pub fn Runtime(comptime App: type) type {
                 else
                     null;
 
-            const deps = app_callbacks.Bindings(App).agentRuntimeDeps(app);
+            const active_presentation = if (comptime @hasDecl(@TypeOf(app.worker), "activePresentationStyles"))
+                app.worker.activePresentationStyles()
+            else
+                presentation_palette.snapshot(false, .fx, false);
+            const deps = app_callbacks.Bindings(App).agentRuntimeDepsWithPresentationSnapshot(
+                app,
+                active_presentation,
+            );
             const semantic_presentation = app_callbacks.Bindings(App).semanticPresentationSink(app);
             const config = buildQueuedPromptConfig(
                 app,
@@ -1339,15 +1475,15 @@ fn formatToolAction(
     denied_label: ?[]const u8,
 ) ![]const u8 {
     if (std.mem.eql(u8, call.name, "web_search") or tool_presentation.isProviderSearchAlias(call.name)) {
-        return formatWebSearchAction(arena, call, state, denied_label);
+        return formatWebSearchAction(arena, call, state, denied_label, ctx.presentation_dim_style);
     }
     const spec = ctx.tool_registry.lookup(call.name) orelse {
         if (dynamicMcpActionLabel(state)) |label| {
             if (mcpToolAvailable(ctx, call.name)) {
-                return formatToolActionValue(arena, label, call.name);
+                return formatToolActionValue(arena, label, call.name, ctx.presentation_dim_style);
             }
         }
-        return formatMissingSpecToolAction(arena, state, denied_label, call.name);
+        return formatMissingSpecToolAction(arena, state, denied_label, call.name, ctx.presentation_dim_style);
     };
     if (try tool_presentation.formatRunCommandActivity(arena, ctx.tool_registry, ctx.workspace_root, call)) |activity| {
         defer arena.free(activity.detail);
@@ -1362,6 +1498,7 @@ fn formatToolAction(
             arena,
             label,
             activity.detail,
+            ctx.presentation_dim_style,
         );
     }
     if (std.mem.eql(u8, call.name, "write_file") or
@@ -1371,49 +1508,54 @@ fn formatToolAction(
             arena,
             specLabel(spec, state, denied_label),
             display_target orelse spec.label_arg_default,
+            ctx.presentation_dim_style,
         );
     }
     const args = tool_args.parseToolArgsObject(arena, call.arguments_json) catch {
-        return formatInvalidArgsToolAction(arena, state, denied_label);
+        return formatInvalidArgsToolAction(arena, state, denied_label, ctx.presentation_dim_style);
     };
 
     const presentation = tool_dispatch.presentationForArgs(spec.*, args);
     const value = display_target orelse
         tool_dispatch.presentationLabelValue(presentation, args) orelse
         presentation.label_arg_default;
-    return formatToolActionValue(arena, presentationLabel(presentation, state, denied_label), value);
+    return formatToolActionValue(arena, presentationLabel(presentation, state, denied_label), value, ctx.presentation_dim_style);
 }
 
-fn formatWebSearchAction(arena: Allocator, call: ToolCall, state: ToolActionState, denied_label: ?[]const u8) ![]const u8 {
+fn formatWebSearchAction(arena: Allocator, call: ToolCall, state: ToolActionState, denied_label: ?[]const u8, dim_style: []const u8) ![]const u8 {
     const args = tool_args.parseToolArgsObject(arena, call.arguments_json) catch {
-        return formatInvalidArgsToolAction(arena, state, denied_label);
+        return formatInvalidArgsToolAction(arena, state, denied_label, dim_style);
     };
     const label = switch (state) {
         .active => "Searching",
         .completed => "Searched",
         .denied => denied_label.?,
     };
-    return formatToolActionValue(arena, label, try tool_presentation.formatWebSearchActionDetail(arena, args));
+    return formatToolActionValue(arena, label, try tool_presentation.formatWebSearchActionDetail(arena, args), dim_style);
 }
 
-fn formatMissingSpecToolAction(arena: Allocator, state: ToolActionState, denied_label: ?[]const u8, name: []const u8) ![]const u8 {
+fn formatMissingSpecToolAction(arena: Allocator, state: ToolActionState, denied_label: ?[]const u8, name: []const u8, dim_style: []const u8) ![]const u8 {
     return switch (state) {
-        .active => formatToolActionValue(arena, "Working", name),
-        .completed => formatToolActionValue(arena, "Completed", name),
-        .denied => formatToolActionValue(arena, denied_label.?, name),
+        .active => formatToolActionValue(arena, "Working", name, dim_style),
+        .completed => formatToolActionValue(arena, "Completed", name, dim_style),
+        .denied => formatToolActionValue(arena, denied_label.?, name, dim_style),
     };
 }
 
-fn formatInvalidArgsToolAction(arena: Allocator, state: ToolActionState, denied_label: ?[]const u8) ![]const u8 {
+fn formatInvalidArgsToolAction(arena: Allocator, state: ToolActionState, denied_label: ?[]const u8, dim_style: []const u8) ![]const u8 {
     return switch (state) {
         .active => std.fmt.allocPrint(arena, "● Working…\x1b[0m", .{}),
-        .completed => formatToolActionValue(arena, "Completed", "tool call"),
-        .denied => formatToolActionValue(arena, denied_label.?, "tool call"),
+        .completed => formatToolActionValue(arena, "Completed", "tool call", dim_style),
+        .denied => formatToolActionValue(arena, denied_label.?, "tool call", dim_style),
     };
 }
 
-fn formatToolActionValue(arena: Allocator, label: []const u8, value: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(arena, "● {s}\x1b[0m \x1b[38;5;245m{s}\x1b[0m", .{ label, value });
+fn formatToolActionValue(arena: Allocator, label: []const u8, value: []const u8, dim_style: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(
+        arena,
+        "● {s}\x1b[0m {s}{s}\x1b[0m",
+        .{ label, dim_style, value },
+    );
 }
 
 fn specLabel(spec: *const tool_dispatch.Tool, state: ToolActionState, denied_label: ?[]const u8) []const u8 {
@@ -1828,6 +1970,10 @@ const FakeApp = struct {
         return Runtime(FakeApp).describeToolAction(self, arena, call, display_target, advertised_dynamic_tool_names, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     }
 
+    pub fn describeToolActionWithAdvertisedStyles(self: *FakeApp, arena: Allocator, call: ToolCall, display_target: ?[]const u8, styles: agent_runtime.PresentationStyles, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+        return Runtime(FakeApp).describeToolActionWithPresentationStyles(self, arena, call, display_target, styles, advertised_dynamic_tool_names, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    }
+
     pub fn describeToolActionCompleted(self: *FakeApp, arena: Allocator, call: ToolCall) ![]const u8 {
         return Runtime(FakeApp).describeToolActionCompleted(self, arena, call, null, &.{}, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     }
@@ -1836,12 +1982,20 @@ const FakeApp = struct {
         return Runtime(FakeApp).describeToolActionCompleted(self, arena, call, display_target, advertised_dynamic_tool_names, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     }
 
+    pub fn describeToolActionCompletedWithAdvertisedStyles(self: *FakeApp, arena: Allocator, call: ToolCall, display_target: ?[]const u8, styles: agent_runtime.PresentationStyles, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+        return Runtime(FakeApp).describeToolActionCompletedWithPresentationStyles(self, arena, call, display_target, styles, advertised_dynamic_tool_names, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    }
+
     pub fn describeToolActionDenied(self: *FakeApp, arena: Allocator, call: ToolCall, label: []const u8) ![]const u8 {
         return Runtime(FakeApp).describeToolActionDenied(self, arena, call, null, label, &.{}, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     }
 
     pub fn describeToolActionDeniedWithAdvertised(self: *FakeApp, arena: Allocator, call: ToolCall, display_target: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
         return Runtime(FakeApp).describeToolActionDenied(self, arena, call, display_target, label, advertised_dynamic_tool_names, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    }
+
+    pub fn describeToolActionDeniedWithAdvertisedStyles(self: *FakeApp, arena: Allocator, call: ToolCall, display_target: ?[]const u8, label: []const u8, styles: agent_runtime.PresentationStyles, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+        return Runtime(FakeApp).describeToolActionDeniedWithPresentationStyles(self, arena, call, display_target, label, styles, advertised_dynamic_tool_names, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     }
 
     pub fn permissionTargetForCall(self: *FakeApp, arena: Allocator, call: ToolCall) ![]const u8 {
@@ -2742,7 +2896,7 @@ test "app direct ask delivers semantic presentation through the runtime sink" {
     var semantic_events: [3]SemanticEvent = undefined;
     var semantic_event_count: usize = 0;
     for (events.items) |event| switch (event) {
-        .assistant_presentation => |presentation| switch (presentation) {
+        .assistant_presentation_styled => |styled| switch (styled.presentation) {
             .table => |table| {
                 table_count += 1;
                 semantic_events[semantic_event_count] = .table;
@@ -2945,8 +3099,12 @@ test "subagent tool context uses immutable admission authority" {
         .permission_mode = .auto,
         .rules = .{ .rules = &admission_rules },
         .grants = &admission_grants,
+        .presentation = presentation_palette.snapshot(false, .terminal, false),
     });
     defer admission.deinit(alloc);
+
+    // A newer root turn must not recolor an already-admitted child.
+    app.worker.setActivePresentationStyles(presentation_palette.snapshot(true, .fx, true));
 
     const ctx = app.subagentToolContextForAdmission(admission);
     try std.testing.expectEqual(PermissionMode.auto, ctx.permission_mode);
@@ -2960,6 +3118,11 @@ test "subagent tool context uses immutable admission authority" {
         "run_command",
         ctx.permission_grants[0].tool_name,
     );
+    try std.testing.expectEqual(
+        presentation_palette.PresentationTheme.terminal,
+        ctx.presentation_snapshot.theme,
+    );
+    try std.testing.expectEqualStrings("\x1b[96m", ctx.presentation_snapshot.styles.user_marker);
 }
 
 test "app agent runtime discards queued snapshots when tool projection preflight fails" {

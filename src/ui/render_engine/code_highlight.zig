@@ -1,5 +1,6 @@
 const std = @import("std");
 const languages = @import("code_highlight_languages.zig");
+const presentation_palette = @import("../../core/shared/presentation_palette.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -8,6 +9,7 @@ const reset_style = "\x1b[39m";
 pub const Theme = enum {
     dark,
     light,
+    terminal,
 };
 
 const Palette = struct {
@@ -17,24 +19,25 @@ const Palette = struct {
     comment_style: []const u8,
 };
 
-const dark_palette: Palette = .{
-    .keyword_style = "\x1b[38;5;252m",
-    .string_style = "\x1b[38;5;250m",
-    .number_style = "\x1b[38;5;250m",
-    .comment_style = "\x1b[38;5;245m",
-};
-
-const light_palette: Palette = .{
-    .keyword_style = "\x1b[38;5;238m",
-    .string_style = "\x1b[38;5;241m",
-    .number_style = "\x1b[38;5;241m",
-    .comment_style = "\x1b[38;5;243m",
-};
-
 fn paletteForTheme(theme: Theme) Palette {
+    const configured = switch (theme) {
+        .dark => presentation_palette.styles(false, .fx),
+        .light => presentation_palette.styles(true, .fx),
+        .terminal => presentation_palette.styles(false, .terminal),
+    };
     return switch (theme) {
-        .dark => dark_palette,
-        .light => light_palette,
+        .dark, .light => .{
+            .keyword_style = configured.code_keyword,
+            .string_style = configured.code_string,
+            .number_style = configured.code_number,
+            .comment_style = configured.code_comment,
+        },
+        .terminal => .{
+            .keyword_style = configured.code_keyword,
+            .string_style = configured.code_string,
+            .number_style = configured.code_number,
+            .comment_style = configured.code_comment,
+        },
     };
 }
 
@@ -242,6 +245,22 @@ test "light theme uses a readable syntax palette without changing code bytes" {
     try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;241m\"ready\"\x1b[39m") != null);
     try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;243m// comment\x1b[39m") != null);
     try std.testing.expectEqual(count(styled, "\x1b[38;5;"), count(styled, "\x1b[39m"));
+}
+
+test "terminal theme uses default-safe ANSI-16 syntax colors" {
+    const alloc = std.testing.allocator;
+    const source = "const value = \"ready\"; // comment\n";
+    const styled = try highlight(alloc, source, languages.resolve("zig").?, .terminal);
+    defer alloc.free(styled);
+
+    const plain = try stripAnsi(alloc, styled);
+    defer alloc.free(plain);
+    try std.testing.expectEqualStrings(source, plain);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[34mconst\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[32m\"ready\"\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[90m// comment\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "38;5;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "38;2;") == null);
 }
 
 test "every registered profile highlights representative source" {

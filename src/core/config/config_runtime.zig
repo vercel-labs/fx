@@ -11,6 +11,7 @@ const project_config = @import("../mcp/project_config.zig");
 const model_provider = @import("model_provider.zig");
 const model_preferences = @import("model_preferences.zig");
 const update_target = @import("../upgrade/update_target.zig");
+const color_palette = @import("color_palette.zig");
 pub const context_limits = @import("context_limits.zig");
 
 const Allocator = std.mem.Allocator;
@@ -39,6 +40,7 @@ pub const Paths = struct {
 pub const Settings = struct {
     models: model_preferences.Preferences = .{},
     provider: ?model_provider.ProviderId = null,
+    color_palette: ?color_palette.ColorPalette = null,
     permission_mode: ?types.PermissionMode = null,
     credential_source: ?types.CredentialSource = null,
     yolo_acknowledged: ?bool = null,
@@ -113,6 +115,7 @@ pub const ModelSource = ConfigSource;
 pub const ConfigSources = struct {
     models: ProviderModelSources = .{},
     provider: ConfigSource = .compiled_default,
+    color_palette: ConfigSource = .compiled_default,
     permission_mode: ConfigSource = .compiled_default,
     effort: ConfigSource = .compiled_default,
     fast_mode: ConfigSource = .compiled_default,
@@ -580,6 +583,7 @@ fn hasLegacyWorkspacePreferences(root: std.json.Value) bool {
             "slash_menu_categories",
             "collapse_tool_calls",
             "startup_scrollback",
+            "color_palette",
         }) |key| {
             if (workspace.contains(key)) return true;
         }
@@ -622,6 +626,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "permission_mode",
         "credential_source",
         "yolo_acknowledged",
+        "color_palette",
         "permission",
         "additional_directories",
     }) |profile_key| {
@@ -652,6 +657,7 @@ fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: Conf
         if (settings.models.get(provider) != null) sources.models.set(provider, source);
     }
     if (settings.provider != null) sources.provider = source;
+    if (settings.color_palette != null) sources.color_palette = source;
     if (settings.permission_mode != null) sources.permission_mode = source;
     if (settings.effort != null) sources.effort = source;
     if (settings.fast_mode != null) sources.fast_mode = source;
@@ -816,6 +822,7 @@ pub const AllowlistResetScope = settings_store.AllowlistResetScope;
 pub const PermissionMutation = settings_store.PermissionMutation;
 pub const PermissionScope = settings_store.PermissionScope;
 pub const StatuslineItem = settings_store.StatuslineItem;
+pub const ColorPalette = color_palette.ColorPalette;
 pub const UserSettingsPatch = settings_store.UserSettingsPatch;
 pub const WorkspaceDirectoryMutation = settings_store.WorkspaceDirectoryMutation;
 pub const CommitOutcome = settings_store.CommitOutcome;
@@ -1362,6 +1369,12 @@ fn parseProfileOnlyFields(
             return error.InvalidProviderValue;
     }
 
+    if (root.object.get("color_palette")) |color_palette_value| {
+        if (color_palette_value != .string) return error.InvalidColorPaletteType;
+        settings.color_palette = color_palette.ColorPalette.parse(color_palette_value.string) orelse
+            return error.InvalidColorPaletteValue;
+    }
+
     if (root.object.get("codex_model")) |model_value| {
         if (model_value != .string) return error.InvalidCodexModelType;
         settings_store.validateModel(model_value.string) catch return error.InvalidCodexModelValue;
@@ -1547,6 +1560,7 @@ fn parseProjectSafeFields(settings: *Settings, root: std.json.Value) !void {
 fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void {
     target.models.mergeOwnedFrom(alloc, &incoming.models);
     if (incoming.provider) |value| target.provider = value;
+    if (incoming.color_palette) |value| target.color_palette = value;
     if (incoming.permission_mode) |value| target.permission_mode = value;
     if (incoming.credential_source) |value| target.credential_source = value;
     if (incoming.yolo_acknowledged) |value| target.yolo_acknowledged = value;
@@ -3558,6 +3572,73 @@ test "all currently parsed read-only settings survive detailed loading" {
     try std.testing.expectEqual(false, parsed.context.?);
     try std.testing.expectEqual(false, parsed.auto_upgrade.?);
     try std.testing.expectEqual(update_target.Channel.dev, parsed.update_channel.?);
+}
+
+test "color palette settings parse, merge, and reject invalid values" {
+    var global = try parseSettingsJson(std.testing.allocator, "{\"color_palette\":\"fx\"}");
+    defer global.deinit(std.testing.allocator);
+    var workspace = try parseSettingsJson(std.testing.allocator, "{\"color_palette\":\"TERMINAL\"}");
+    defer workspace.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(color_palette.ColorPalette.fx, global.color_palette.?);
+    mergeSettings(&global, &workspace, std.testing.allocator);
+    try std.testing.expectEqual(color_palette.ColorPalette.terminal, global.color_palette.?);
+
+    try std.testing.expectError(
+        error.InvalidColorPaletteType,
+        parseSettingsJson(std.testing.allocator, "{\"color_palette\":true}"),
+    );
+    try std.testing.expectError(
+        error.InvalidColorPaletteValue,
+        parseSettingsJson(std.testing.allocator, "{\"color_palette\":\"unknown\"}"),
+    );
+}
+
+test "color palette settings track profile sources and ignore project values" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDir(std.testing.io, "workspace", .default_dir);
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"color_palette\":\"fx\"}\n");
+    try writeFixtureFile(tmp.dir, "workspace/.fx.json", "{\"color_palette\":123,\"max_agent_steps\":17}\n");
+
+    {
+        var detailed = try loadMergedSettingsDetailedFromHome(
+            std.testing.allocator,
+            home_root,
+            workspace_root,
+        );
+        defer detailed.deinit(std.testing.allocator);
+        try std.testing.expectEqual(color_palette.ColorPalette.fx, detailed.settings.color_palette.?);
+        try std.testing.expectEqual(ConfigSource.user_global, detailed.sources.color_palette);
+        try std.testing.expectEqual(@as(usize, 1), detailed.diagnostics.len);
+        try expectIgnoredProjectKey(detailed.diagnostics, "color_palette");
+        try std.testing.expectEqual(@as(usize, 17), detailed.settings.max_agent_steps.?);
+    }
+
+    const workspace_fixture = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"color_palette\":\"fx\",\"workspaces\":{{\"{s}\":{{\"color_palette\":\"terminal\"}}}}}}\n",
+        .{workspace_root},
+    );
+    defer std.testing.allocator.free(workspace_fixture);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", workspace_fixture);
+    try writeFixtureFile(tmp.dir, "workspace/.fx.json", "{}\n");
+
+    var detailed = try loadMergedSettingsDetailedFromHome(
+        std.testing.allocator,
+        home_root,
+        workspace_root,
+    );
+    defer detailed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(color_palette.ColorPalette.terminal, detailed.settings.color_palette.?);
+    try std.testing.expectEqual(ConfigSource.user_workspace, detailed.sources.color_palette);
 }
 
 test "additional directories load only from the current profile workspace" {

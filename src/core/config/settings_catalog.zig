@@ -28,6 +28,7 @@ pub const SettingId = enum {
     statusline_workspace,
     slash_menu_categories,
     collapse_tool_calls,
+    color_palette,
     model,
     effort,
     fast_mode,
@@ -56,6 +57,7 @@ pub const Snapshot = struct {
     statusline_workspace: bool = false,
     slash_menu_categories: bool = true,
     collapse_tool_calls: bool = false,
+    color_palette: []const u8 = "fx",
     startup_scrollback: bool = true,
     prompt_history: bool = true,
     sound_level: []const u8 = "on",
@@ -71,6 +73,7 @@ pub const Snapshot = struct {
             .statusline_workspace => onOff(self.statusline_workspace),
             .slash_menu_categories => onOff(self.slash_menu_categories),
             .collapse_tool_calls => onOff(self.collapse_tool_calls),
+            .color_palette => self.color_palette,
             .startup_scrollback => onOff(self.startup_scrollback),
             .prompt_history => onOff(self.prompt_history),
             .sound_level => self.sound_level,
@@ -257,6 +260,7 @@ const specs = [_]Spec{
     .{ .id = .statusline_workspace, .category = .interface, .label = "Status line workspace", .description = "Show the workspace path and Git branch in the status line" },
     .{ .id = .slash_menu_categories, .category = .interface, .label = "Slash menu categories", .description = "Show categories and skill sources in slash-command results" },
     .{ .id = .collapse_tool_calls, .category = .interface, .label = "Collapse tool calls", .description = "Show only a summary for each group of tool calls" },
+    .{ .id = .color_palette, .category = .interface, .label = "Color palette", .description = "Apply fx or terminal colors to live UI and new output" },
     .{ .id = .model, .category = .agent, .label = "Model", .description = "Choose the model used for new turns" },
     .{ .id = .effort, .category = .agent, .label = "Reasoning effort", .description = "Control how much reasoning the model applies" },
     .{ .id = .fast_mode, .category = .agent, .label = "Fast mode", .description = "Use faster inference when the model supports it" },
@@ -269,6 +273,7 @@ const specs = [_]Spec{
 const on_off_options = [_][]const u8{ "off", "on" };
 const permission_options = [_][]const u8{ "ask", "auto", "yolo" };
 const sound_level_options = [_][]const u8{ "off", "on", "max" };
+const color_palette_options = [_][]const u8{ "fx", "terminal" };
 
 pub fn filteredCount(snapshot: Snapshot, category: Category, query: []const u8) usize {
     var count: usize = 0;
@@ -375,6 +380,7 @@ fn staticOptionsFor(id: SettingId) []const []const u8 {
         .startup_scrollback,
         .prompt_history,
         => &on_off_options,
+        .color_palette => &color_palette_options,
         .sound_level => &sound_level_options,
         .permission_mode => &permission_options,
     };
@@ -430,8 +436,8 @@ test "settings catalog projects grouped searchable preferences" {
         .sound_level = "on",
     };
 
-    try std.testing.expectEqual(@as(usize, 12), filteredCount(snapshot, .all, ""));
-    try std.testing.expectEqual(@as(usize, 5), filteredCount(snapshot, .interface, ""));
+    try std.testing.expectEqual(@as(usize, 13), filteredCount(snapshot, .all, ""));
+    try std.testing.expectEqual(@as(usize, 6), filteredCount(snapshot, .interface, ""));
     try std.testing.expectEqual(@as(usize, 4), filteredCount(snapshot, .agent, ""));
     try std.testing.expectEqual(@as(usize, 1), filteredCount(snapshot, .notifications, ""));
     try std.testing.expectEqual(@as(usize, 2), filteredCount(snapshot, .advanced, ""));
@@ -484,6 +490,23 @@ test "settings catalog exposes collapse tool calls as an interface toggle" {
     const collapse = changeAt(&expanded, .collapse_tool_calls, 1).?;
     try std.testing.expectEqual(SettingId.collapse_tool_calls, collapse.setting);
     try std.testing.expectEqualStrings("on", collapse.value);
+}
+
+test "settings catalog exposes color palette choices" {
+    const snapshot: Snapshot = .{};
+    const item = itemAt(snapshot, .interface, "color palette", 0).?;
+
+    try std.testing.expectEqual(SettingId.color_palette, item.id);
+    try std.testing.expectEqualStrings("Color palette", item.label);
+    try std.testing.expectEqualStrings("Apply fx or terminal colors to live UI and new output", item.description);
+    try std.testing.expectEqualStrings("fx", item.value);
+    try std.testing.expectEqual(@as(usize, 2), optionCount(&snapshot, .color_palette));
+    try std.testing.expectEqualStrings("fx", optionAt(&snapshot, .color_palette, 0).?);
+    try std.testing.expectEqualStrings("terminal", optionAt(&snapshot, .color_palette, 1).?);
+
+    const terminal = changeAt(&snapshot, .color_palette, 1).?;
+    try std.testing.expectEqual(SettingId.color_palette, terminal.setting);
+    try std.testing.expectEqualStrings("terminal", terminal.value);
 }
 
 test "settings catalog exposes slash menu categories as an interface toggle" {

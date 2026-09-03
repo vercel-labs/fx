@@ -17,6 +17,7 @@ const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
 const paste_blocks = @import("../input/pasted_blocks.zig");
 const entity_spans = @import("../shared/entity_spans.zig");
+const presentation_palette = @import("../shared/presentation_palette.zig");
 const types = @import("../shared/types.zig");
 const model_provider = @import("../config/model_provider.zig");
 const assistant_presentation = @import("assistant_presentation.zig");
@@ -46,6 +47,30 @@ pub const BeginPromptWithSkillBindings = struct {
     prompt: types.UserTurn,
     skill_bindings: []SkillBinding = &.{},
     skill_display_spans: []SkillDisplaySpan = &.{},
+};
+
+pub const PresentationSnapshot = presentation_palette.PresentationSnapshot;
+
+pub const StyledBeginPrompt = struct {
+    prompt: types.UserTurn,
+    styles: PresentationSnapshot,
+};
+
+pub const StyledBeginPromptWithSkillBindings = struct {
+    prompt: types.UserTurn,
+    skill_bindings: []SkillBinding = &.{},
+    skill_display_spans: []SkillDisplaySpan = &.{},
+    styles: PresentationSnapshot,
+};
+
+pub const StyledUserFeedback = struct {
+    text: []u8,
+    styles: PresentationSnapshot,
+};
+
+pub const StyledAssistantPresentation = struct {
+    presentation: assistant_presentation.Event,
+    styles: PresentationSnapshot,
 };
 
 pub const QueueReviewDraft = struct {
@@ -596,9 +621,13 @@ pub const PendingQuestionBatchSnapshot = struct {
 pub const WorkerEvent = union(enum) {
     begin_prompt: types.UserTurn,
     begin_prompt_with_skill_bindings: BeginPromptWithSkillBindings,
+    begin_prompt_styled: StyledBeginPrompt,
+    begin_prompt_with_skill_bindings_styled: StyledBeginPromptWithSkillBindings,
     begin_presented_prompt: u64,
     append_user_feedback: []u8,
+    append_user_feedback_styled: StyledUserFeedback,
     assistant_presentation: assistant_presentation.Event,
+    assistant_presentation_styled: StyledAssistantPresentation,
     notification: notification_contract.Notification,
     question_requested,
     open_model_picker,
@@ -668,6 +697,14 @@ pub const WorkerRuntime = struct {
     pending_question_response: QuestionResponse = .pending,
     agent_turn_settings: AgentTurnSettings = .{},
     active_agent_turn_settings: ?AgentTurnSettings = null,
+    active_presentation_dim_style: []const u8 = "\x1b[38;5;245m",
+    /// Snapshot used for events that begin a new root turn.  It is updated on
+    /// the UI thread when preferences change and is read under worker_mutex
+    /// while admitting the turn.
+    presentation_styles: PresentationSnapshot = presentation_palette.snapshot(false, .fx, false),
+    /// Snapshot captured when the active turn starts.  It remains stable while
+    /// a palette switch updates `presentation_styles` for the next root turn.
+    active_presentation_styles: PresentationSnapshot = presentation_palette.snapshot(false, .fx, false),
     active_context_snapshot: ?*const context_contract.GatheredContextSnapshot = null,
     active_prompt_is_root_authority: bool = false,
     active_prompt_snapshot_ownership: ?*ActivePromptSnapshotOwnership = null,
@@ -1135,7 +1172,10 @@ pub const WorkerRuntime = struct {
             messages[copied] = try alloc.dupe(u8, prompt.prompt);
             copied += 1;
             events[event_count] = .{
-                .append_user_feedback = try alloc.dupe(u8, prompt.prompt),
+                .append_user_feedback_styled = .{
+                    .text = try alloc.dupe(u8, prompt.prompt),
+                    .styles = self.active_presentation_styles,
+                },
             };
             event_count += 1;
         }
@@ -1471,6 +1511,9 @@ pub const WorkerRuntime = struct {
         if (self.worker_stop_requested or self.queued_prompts.items.len == 0) return null;
 
         const queued = self.queued_prompts.items[0];
+        const active_presentation = self.presentation_styles;
+        self.active_presentation_styles = active_presentation;
+        self.active_presentation_dim_style = active_presentation.styles.dim;
         if (queued.recovery_checkpoint == null and queued.user_prompt_already_presented) {
             try self.worker_events.append(alloc, .{
                 .begin_presented_prompt = queued.turn_id,
@@ -1484,14 +1527,18 @@ pub const WorkerRuntime = struct {
                 const skill_display_spans = try dupeSkillDisplaySpans(alloc, queued.skill_display_spans);
                 errdefer freeSkillDisplaySpans(alloc, skill_display_spans);
                 try self.worker_events.append(alloc, .{
-                    .begin_prompt_with_skill_bindings = .{
+                    .begin_prompt_with_skill_bindings_styled = .{
                         .prompt = begin_prompt,
                         .skill_bindings = skill_bindings,
                         .skill_display_spans = skill_display_spans,
+                        .styles = active_presentation,
                     },
                 });
             } else {
-                try self.worker_events.append(alloc, .{ .begin_prompt = begin_prompt });
+                try self.worker_events.append(alloc, .{ .begin_prompt_styled = .{
+                    .prompt = begin_prompt,
+                    .styles = active_presentation,
+                } });
             }
         }
 
@@ -1869,6 +1916,37 @@ pub const WorkerRuntime = struct {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         self.active_agent_turn_settings = null;
+    }
+
+    pub fn setActivePresentationDimStyle(self: *WorkerRuntime, style: []const u8) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.active_presentation_dim_style = style;
+    }
+
+    pub fn setPresentationStyles(self: *WorkerRuntime, styles: PresentationSnapshot) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.presentation_styles = styles;
+    }
+
+    pub fn setActivePresentationStyles(self: *WorkerRuntime, styles: PresentationSnapshot) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.active_presentation_styles = styles;
+        self.active_presentation_dim_style = styles.styles.dim;
+    }
+
+    pub fn activePresentationStyles(self: *WorkerRuntime) PresentationSnapshot {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        return self.active_presentation_styles;
+    }
+
+    pub fn activePresentationDimStyle(self: *WorkerRuntime) []const u8 {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        return self.active_presentation_dim_style;
     }
 
     pub fn effectiveAgentTurnSettings(self: *WorkerRuntime) AgentTurnSettings {
@@ -3470,10 +3548,37 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
                 .skill_display_spans = skill_display_spans,
             } };
         },
+        .begin_prompt_styled => |begin| .{ .begin_prompt_styled = .{
+            .prompt = try types.dupeUserTurn(alloc, begin.prompt),
+            .styles = begin.styles,
+        } },
+        .begin_prompt_with_skill_bindings_styled => |begin| blk: {
+            const prompt = try types.dupeUserTurn(alloc, begin.prompt);
+            errdefer types.freeUserTurn(alloc, prompt);
+            const skill_bindings = try dupeSkillBindings(alloc, begin.skill_bindings);
+            errdefer freeSkillBindings(alloc, skill_bindings);
+            const skill_display_spans = try dupeSkillDisplaySpans(alloc, begin.skill_display_spans);
+            break :blk .{ .begin_prompt_with_skill_bindings_styled = .{
+                .prompt = prompt,
+                .skill_bindings = skill_bindings,
+                .skill_display_spans = skill_display_spans,
+                .styles = begin.styles,
+            } };
+        },
         .begin_presented_prompt => |turn_id| .{ .begin_presented_prompt = turn_id },
         .append_user_feedback => |text| .{ .append_user_feedback = try alloc.dupe(u8, text) },
+        .append_user_feedback_styled => |feedback| .{ .append_user_feedback_styled = .{
+            .text = try alloc.dupe(u8, feedback.text),
+            .styles = feedback.styles,
+        } },
         .assistant_presentation => |presentation| .{
             .assistant_presentation = try presentation.clone(alloc),
+        },
+        .assistant_presentation_styled => |presentation| .{
+            .assistant_presentation_styled = .{
+                .presentation = try presentation.presentation.clone(alloc),
+                .styles = presentation.styles,
+            },
         },
         .notification => |notification| .{ .notification = notification },
         .question_requested => .question_requested,
@@ -3550,10 +3655,21 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
             freeSkillBindings(alloc, begin.skill_bindings);
             freeSkillDisplaySpans(alloc, begin.skill_display_spans);
         },
+        .begin_prompt_styled => |begin| types.freeUserTurn(alloc, begin.prompt),
+        .begin_prompt_with_skill_bindings_styled => |begin| {
+            types.freeUserTurn(alloc, begin.prompt);
+            freeSkillBindings(alloc, begin.skill_bindings);
+            freeSkillDisplaySpans(alloc, begin.skill_display_spans);
+        },
         .begin_presented_prompt => {},
         .append_user_feedback => |text| alloc.free(text),
+        .append_user_feedback_styled => |feedback| alloc.free(feedback.text),
         .assistant_presentation => |presentation| {
             var owned = presentation;
+            owned.deinit(alloc);
+        },
+        .assistant_presentation_styled => |presentation| {
+            var owned = presentation.presentation;
             owned.deinit(alloc);
         },
         .notification => {},
@@ -3826,8 +3942,8 @@ test "active prompt admission drains steering in FIFO order" {
     try std.testing.expectEqualStrings("second", guidance[1]);
     try std.testing.expectEqual(@as(usize, 0), runtime.queued_prompts.items.len);
     try std.testing.expectEqual(@as(usize, 2), runtime.worker_events.items.len);
-    try std.testing.expectEqualStrings("first", runtime.worker_events.items[0].append_user_feedback);
-    try std.testing.expectEqualStrings("second", runtime.worker_events.items[1].append_user_feedback);
+    try std.testing.expectEqualStrings("first", runtime.worker_events.items[0].append_user_feedback_styled.text);
+    try std.testing.expectEqualStrings("second", runtime.worker_events.items[1].append_user_feedback_styled.text);
 }
 
 test "immediate steering owns and clears only its cancellation" {
@@ -4393,9 +4509,9 @@ test "queue, event, snapshot, sync, history, and grant behavior" {
     var events = runtime.takeEvents();
     defer freeEventList(alloc, &events);
     try std.testing.expectEqual(@as(usize, 1), events.items.len);
-    try std.testing.expect(events.items[0] == .begin_prompt);
-    try std.testing.expectEqualStrings("first", events.items[0].begin_prompt.text);
-    try std.testing.expect(events.items[0].begin_prompt.text.ptr != job.prompt.ptr);
+    try std.testing.expect(events.items[0] == .begin_prompt_styled);
+    try std.testing.expectEqualStrings("first", events.items[0].begin_prompt_styled.prompt.text);
+    try std.testing.expect(events.items[0].begin_prompt_styled.prompt.text.ptr != job.prompt.ptr);
 
     try runtime.syncQueuedPromptModel(alloc, "next");
     try std.testing.expectEqualStrings("next", runtime.queued_prompts.items[0].model);
@@ -4589,20 +4705,20 @@ test "waitAndTakeNextPrompt emits bound skill prompt event when queued prompt ha
     var events = runtime.takeEvents();
     defer freeEventList(alloc, &events);
     try std.testing.expectEqual(@as(usize, 1), events.items.len);
-    try std.testing.expect(events.items[0] == .begin_prompt_with_skill_bindings);
-    try std.testing.expectEqualStrings("raw $review then $review and $review", events.items[0].begin_prompt_with_skill_bindings.prompt.text);
-    try std.testing.expectEqual(@as(usize, 1), events.items[0].begin_prompt_with_skill_bindings.skill_bindings.len);
-    try std.testing.expectEqualStrings("review", events.items[0].begin_prompt_with_skill_bindings.skill_bindings[0].name);
-    try std.testing.expectEqualStrings("/tmp/.codex/skills/review", events.items[0].begin_prompt_with_skill_bindings.skill_bindings[0].path);
-    try std.testing.expectEqual(@as(usize, 2), events.items[0].begin_prompt_with_skill_bindings.skill_display_spans.len);
-    try std.testing.expectEqual(@as(usize, "raw $review then ".len), events.items[0].begin_prompt_with_skill_bindings.skill_display_spans[0].raw_start);
-    try std.testing.expectEqual(@as(usize, "raw $review then $review".len), events.items[0].begin_prompt_with_skill_bindings.skill_display_spans[0].raw_end);
-    try std.testing.expectEqualStrings("review", events.items[0].begin_prompt_with_skill_bindings.skill_display_spans[0].name);
+    try std.testing.expect(events.items[0] == .begin_prompt_with_skill_bindings_styled);
+    try std.testing.expectEqualStrings("raw $review then $review and $review", events.items[0].begin_prompt_with_skill_bindings_styled.prompt.text);
+    try std.testing.expectEqual(@as(usize, 1), events.items[0].begin_prompt_with_skill_bindings_styled.skill_bindings.len);
+    try std.testing.expectEqualStrings("review", events.items[0].begin_prompt_with_skill_bindings_styled.skill_bindings[0].name);
+    try std.testing.expectEqualStrings("/tmp/.codex/skills/review", events.items[0].begin_prompt_with_skill_bindings_styled.skill_bindings[0].path);
+    try std.testing.expectEqual(@as(usize, 2), events.items[0].begin_prompt_with_skill_bindings_styled.skill_display_spans.len);
+    try std.testing.expectEqual(@as(usize, "raw $review then ".len), events.items[0].begin_prompt_with_skill_bindings_styled.skill_display_spans[0].raw_start);
+    try std.testing.expectEqual(@as(usize, "raw $review then $review".len), events.items[0].begin_prompt_with_skill_bindings_styled.skill_display_spans[0].raw_end);
+    try std.testing.expectEqualStrings("review", events.items[0].begin_prompt_with_skill_bindings_styled.skill_display_spans[0].name);
     try std.testing.expectEqual(
         skill_contract.SkillSource.workspace_codex,
-        events.items[0].begin_prompt_with_skill_bindings.skill_display_spans[0].display_source.?,
+        events.items[0].begin_prompt_with_skill_bindings_styled.skill_display_spans[0].display_source.?,
     );
-    try std.testing.expect(events.items[0].begin_prompt_with_skill_bindings.skill_display_spans[0].owns_trailing_separator);
+    try std.testing.expect(events.items[0].begin_prompt_with_skill_bindings_styled.skill_display_spans[0].owns_trailing_separator);
 }
 
 test "permission snapshot keeps the full file review borrowed and request-bound" {
@@ -5342,7 +5458,37 @@ test "waitAndTakeNextPrompt assigns turn id and resets cancellation for next pro
     var events = runtime.takeEvents();
     defer freeEventList(alloc, &events);
     try std.testing.expectEqual(@as(usize, 1), events.items.len);
-    try std.testing.expect(events.items[0] == .begin_prompt);
+    try std.testing.expect(events.items[0] == .begin_prompt_styled);
+}
+
+test "palette updates affect the next turn without restyling the active turn" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+
+    const first_styles = presentation_palette.snapshot(false, .fx, false);
+    const next_styles = presentation_palette.snapshot(false, .terminal, false);
+    runtime.setPresentationStyles(first_styles);
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "first", "model"));
+
+    const first = (try runtime.tryTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, first);
+    var first_events = runtime.takeEvents();
+    defer freeEventList(alloc, &first_events);
+    try std.testing.expect(first_events.items[0] == .begin_prompt_styled);
+    try std.testing.expectEqual(presentation_palette.PresentationTheme.dark, first_events.items[0].begin_prompt_styled.styles.theme);
+
+    runtime.setPresentationStyles(next_styles);
+    try std.testing.expectEqual(presentation_palette.PresentationTheme.dark, runtime.activePresentationStyles().theme);
+
+    runtime.finishProcessing();
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "second", "model"));
+    const second = (try runtime.tryTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, second);
+    var second_events = runtime.takeEvents();
+    defer freeEventList(alloc, &second_events);
+    try std.testing.expect(second_events.items[0] == .begin_prompt_styled);
+    try std.testing.expectEqual(presentation_palette.PresentationTheme.terminal, second_events.items[0].begin_prompt_styled.styles.theme);
 }
 
 test "already-presented queued prompt emits identity without duplicating user payload" {

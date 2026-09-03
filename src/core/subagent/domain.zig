@@ -3,6 +3,7 @@ const mcp_access = @import("../mcp/access_policy.zig");
 const model_provider = @import("../config/model_provider.zig");
 const session_layout = @import("../session/session_layout.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
+const presentation_palette = @import("../shared/presentation_palette.zig");
 const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -56,6 +57,7 @@ pub const AdmissionSnapshot = struct {
     integration_names: [][]u8,
     authority_generation: u64 = 0,
     mcp_view: ?mcp_access.View = null,
+    presentation: presentation_palette.PresentationSnapshot = presentation_palette.snapshot(false, .fx, false),
 
     pub fn deinit(self: *AdmissionSnapshot, alloc: Allocator) void {
         alloc.free(self.parent_id);
@@ -85,6 +87,7 @@ pub const AdmissionInput = struct {
     integration_names: []const []const u8 = &.{},
     authority_generation: u64 = 0,
     mcp_view: ?mcp_access.View = null,
+    presentation: presentation_palette.PresentationSnapshot = presentation_palette.snapshot(false, .fx, false),
 };
 
 pub const AdmissionError = error{
@@ -161,6 +164,7 @@ pub fn captureAdmission(
         .integration_names = integration_names,
         .authority_generation = input.authority_generation,
         .mcp_view = mcp_view,
+        .presentation = input.presentation,
     };
 }
 

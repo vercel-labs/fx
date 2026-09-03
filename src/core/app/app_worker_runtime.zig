@@ -10,6 +10,7 @@ const io_mod = @import("../shared/io.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
+const presentation_palette = @import("../shared/presentation_palette.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
 const assistant_pacer = @import("../../ui/assistant/pacer.zig");
@@ -63,11 +64,16 @@ pub const WorkerEventHandlers = struct {
     ctx: *anyopaque,
     tool_lifecycle: activity_runtime.LifecyclePresenter,
     write_user_prompt: *const fn (*anyopaque, types.UserTurn) anyerror!void,
+    write_user_prompt_styled: ?*const fn (*anyopaque, types.UserTurn, worker_runtime.PresentationSnapshot) anyerror!void = null,
     write_user_prompt_with_skill_bindings: ?*const fn (*anyopaque, types.UserTurn, []const worker_runtime.SkillBinding, []const worker_runtime.SkillDisplaySpan) anyerror!void = null,
+    write_user_prompt_with_skill_bindings_styled: ?*const fn (*anyopaque, types.UserTurn, []const worker_runtime.SkillBinding, []const worker_runtime.SkillDisplaySpan, worker_runtime.PresentationSnapshot) anyerror!void = null,
     append_text: *const fn (*anyopaque, []const u8) anyerror!void,
     append_table: *const fn (*anyopaque, assistant_presentation.TablePayload) anyerror!void = discardTable,
+    append_table_styled: ?*const fn (*anyopaque, assistant_presentation.TablePayload, worker_runtime.PresentationSnapshot) anyerror!void = null,
     append_code_block: *const fn (*anyopaque, assistant_presentation.CodeBlockPayload) anyerror!void = discardCodeBlock,
+    append_code_block_styled: ?*const fn (*anyopaque, assistant_presentation.CodeBlockPayload, worker_runtime.PresentationSnapshot) anyerror!void = null,
     append_thematic_rule: *const fn (*anyopaque) anyerror!void = discardThematicRule,
+    append_thematic_rule_styled: ?*const fn (*anyopaque, worker_runtime.PresentationSnapshot) anyerror!void = null,
     drain_assistant_text: *const fn (*anyopaque) anyerror!AssistantTextDrainResult,
     open_model_picker: *const fn (*anyopaque) anyerror!void,
     semantic_notice: *const fn (*anyopaque, types.SemanticNotice) anyerror!void,
@@ -153,7 +159,12 @@ fn batchContainsInterruptedClosure(
 fn batchSegmentEndsInterrupted(events: []const WorkerEvent) bool {
     for (events, 0..) |event, index| {
         if (index > 0) switch (event) {
-            .begin_prompt, .begin_prompt_with_skill_bindings, .begin_presented_prompt => return false,
+            .begin_prompt,
+            .begin_prompt_with_skill_bindings,
+            .begin_prompt_styled,
+            .begin_prompt_with_skill_bindings_styled,
+            .begin_presented_prompt,
+            => return false,
             else => {},
         };
         const lifecycle = switch (event) {
@@ -187,6 +198,7 @@ pub fn Runtime(comptime App: type) type {
         ) CancelledEventAdmission {
             return switch (event) {
                 .assistant_presentation,
+                .assistant_presentation_styled,
                 .open_model_picker,
                 .semantic_notice,
                 .command_output,
@@ -214,8 +226,11 @@ pub fn Runtime(comptime App: type) type {
                 },
                 .begin_prompt,
                 .begin_prompt_with_skill_bindings,
+                .begin_prompt_styled,
+                .begin_prompt_with_skill_bindings_styled,
                 .begin_presented_prompt,
                 .append_user_feedback,
+                .append_user_feedback_styled,
                 .notification,
                 .question_requested,
                 .clear_route_recovery_status,
@@ -346,15 +361,36 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn pushTable(app: *App, table: assistant_presentation.TablePayload) !void {
-            try pushEvent(app, .{ .assistant_presentation = .{ .table = table } });
+            const styles = if (comptime @hasDecl(@TypeOf(app.worker), "activePresentationStyles"))
+                app.worker.activePresentationStyles()
+            else
+                presentation_palette.snapshot(false, .fx, false);
+            try pushEvent(app, .{ .assistant_presentation_styled = .{
+                .presentation = .{ .table = table },
+                .styles = styles,
+            } });
         }
 
         pub fn pushCodeBlock(app: *App, block: assistant_presentation.CodeBlockPayload) !void {
-            try pushEvent(app, .{ .assistant_presentation = .{ .code_block = block } });
+            const styles = if (comptime @hasDecl(@TypeOf(app.worker), "activePresentationStyles"))
+                app.worker.activePresentationStyles()
+            else
+                presentation_palette.snapshot(false, .fx, false);
+            try pushEvent(app, .{ .assistant_presentation_styled = .{
+                .presentation = .{ .code_block = block },
+                .styles = styles,
+            } });
         }
 
         pub fn pushThematicRule(app: *App) !void {
-            try pushEvent(app, .{ .assistant_presentation = .thematic_rule });
+            const styles = if (comptime @hasDecl(@TypeOf(app.worker), "activePresentationStyles"))
+                app.worker.activePresentationStyles()
+            else
+                presentation_palette.snapshot(false, .fx, false);
+            try pushEvent(app, .{ .assistant_presentation_styled = .{
+                .presentation = .thematic_rule,
+                .styles = styles,
+            } });
         }
 
         pub fn pushCommandOutput(
@@ -400,7 +436,11 @@ pub fn Runtime(comptime App: type) type {
                 );
                 return;
             }
-            const label = try formatWebSearchProgress(std.heap.c_allocator, progress);
+            const dim_style = if (comptime @hasDecl(@TypeOf(app.worker), "activePresentationDimStyle"))
+                app.worker.activePresentationDimStyle()
+            else
+                "";
+            const label = try formatWebSearchProgress(std.heap.c_allocator, progress, dim_style);
             defer std.heap.c_allocator.free(label);
             try pushToolLifecycle(app, .{ .progress = .{
                 .id = .{ .turn_id = turn_id, .call_id = call_id },
@@ -418,7 +458,11 @@ pub fn Runtime(comptime App: type) type {
                 );
                 return;
             }
-            const label = try formatWebFetchProgress(std.heap.c_allocator, progress);
+            const dim_style = if (comptime @hasDecl(@TypeOf(app.worker), "activePresentationDimStyle"))
+                app.worker.activePresentationDimStyle()
+            else
+                "";
+            const label = try formatWebFetchProgress(std.heap.c_allocator, progress, dim_style);
             defer std.heap.c_allocator.free(label);
             try pushToolLifecycle(app, .{ .progress = .{
                 .id = .{ .turn_id = turn_id, .call_id = call_id },
@@ -649,7 +693,12 @@ pub fn Runtime(comptime App: type) type {
 
             events: while (batch.claim()) |event| {
                 if (!first_event) switch (event) {
-                    .begin_prompt, .begin_prompt_with_skill_bindings, .begin_presented_prompt => {
+                    .begin_prompt,
+                    .begin_prompt_with_skill_bindings,
+                    .begin_prompt_styled,
+                    .begin_prompt_with_skill_bindings_styled,
+                    .begin_presented_prompt,
+                    => {
                         interrupted_segment = cancel_requested or
                             batchSegmentEndsInterrupted(batch.claimedAndRemaining());
                     },
@@ -716,6 +765,48 @@ pub fn Runtime(comptime App: type) type {
                             try handlers.write_user_prompt(handlers.ctx, begin.prompt);
                         }
                     },
+                    .begin_prompt_styled => |begin| {
+                        if (!try requireAssistantTextDrain(handlers)) {
+                            try retainClaimedEventAndSuffix(app, &batch, "assistant_text_drain_blocked");
+                            drain_owns_current = false;
+                            break :events;
+                        }
+                        resetStream(app, true);
+                        app.stream.active = true;
+                        app.stream.turn_started_ms = io_mod.milliTimestamp();
+                        app.shell.render_requests.request(.footer);
+                        if (handlers.write_user_prompt_styled) |write_styled_prompt| {
+                            try write_styled_prompt(handlers.ctx, begin.prompt, begin.styles);
+                        } else {
+                            try handlers.write_user_prompt(handlers.ctx, begin.prompt);
+                        }
+                    },
+                    .begin_prompt_with_skill_bindings_styled => |begin| {
+                        if (!try requireAssistantTextDrain(handlers)) {
+                            try retainClaimedEventAndSuffix(app, &batch, "assistant_text_drain_blocked");
+                            drain_owns_current = false;
+                            break :events;
+                        }
+                        resetStream(app, true);
+                        app.stream.active = true;
+                        app.stream.turn_started_ms = io_mod.milliTimestamp();
+                        app.shell.render_requests.request(.footer);
+                        if (handlers.write_user_prompt_with_skill_bindings_styled) |write_styled_bound_prompt| {
+                            try write_styled_bound_prompt(
+                                handlers.ctx,
+                                begin.prompt,
+                                begin.skill_bindings,
+                                begin.skill_display_spans,
+                                begin.styles,
+                            );
+                        } else if (handlers.write_user_prompt_styled) |write_styled_prompt| {
+                            try write_styled_prompt(handlers.ctx, begin.prompt, begin.styles);
+                        } else if (handlers.write_user_prompt_with_skill_bindings) |write_bound_prompt| {
+                            try write_bound_prompt(handlers.ctx, begin.prompt, begin.skill_bindings, begin.skill_display_spans);
+                        } else {
+                            try handlers.write_user_prompt(handlers.ctx, begin.prompt);
+                        }
+                    },
                     .begin_presented_prompt => |turn_id| {
                         if (!try requireAssistantTextDrain(handlers)) {
                             try retainClaimedEventAndSuffix(app, &batch, "assistant_text_drain_blocked");
@@ -742,6 +833,13 @@ pub fn Runtime(comptime App: type) type {
                         if (app.stream.active and app.stream.phase != .thinking) {
                             app.stream.phase = .thinking;
                             app.shell.render_requests.request(.footer);
+                        }
+                    },
+                    .append_user_feedback_styled => |feedback| {
+                        if (handlers.write_user_prompt_styled) |write_styled_prompt| {
+                            try write_styled_prompt(handlers.ctx, .{ .text = feedback.text }, feedback.styles);
+                        } else {
+                            try handlers.write_user_prompt(handlers.ctx, .{ .text = feedback.text });
                         }
                     },
                     .assistant_presentation => |presentation| {
@@ -772,6 +870,50 @@ pub fn Runtime(comptime App: type) type {
                             .thematic_rule => {
                                 drain_owns_current = false;
                                 try handlers.append_thematic_rule(handlers.ctx);
+                            },
+                        }
+                    },
+                    .assistant_presentation_styled => |styled| {
+                        const presentation = styled.presentation;
+                        if (presentation.requiresTextDrain() and !try requireAssistantTextDrain(handlers)) {
+                            try retainClaimedEventAndSuffix(app, &batch, "assistant_text_drain_blocked");
+                            drain_owns_current = false;
+                            break :events;
+                        }
+                        switch (presentation) {
+                            .text => |text| {
+                                try handlers.append_text(handlers.ctx, text);
+                                debug_trace.eventf(
+                                    "worker",
+                                    "assistant_chunk_applied",
+                                    .{},
+                                    "chunk_bytes={d}",
+                                    .{text.len},
+                                );
+                            },
+                            .table => |table| {
+                                drain_owns_current = false;
+                                if (handlers.append_table_styled) |append_styled_table| {
+                                    try append_styled_table(handlers.ctx, table, styled.styles);
+                                } else {
+                                    try handlers.append_table(handlers.ctx, table);
+                                }
+                            },
+                            .code_block => |block| {
+                                drain_owns_current = false;
+                                if (handlers.append_code_block_styled) |append_styled_code| {
+                                    try append_styled_code(handlers.ctx, block, styled.styles);
+                                } else {
+                                    try handlers.append_code_block(handlers.ctx, block);
+                                }
+                            },
+                            .thematic_rule => {
+                                drain_owns_current = false;
+                                if (handlers.append_thematic_rule_styled) |append_styled_rule| {
+                                    try append_styled_rule(handlers.ctx, styled.styles);
+                                } else {
+                                    try handlers.append_thematic_rule(handlers.ctx);
+                                }
                             },
                         }
                     },
@@ -1034,50 +1176,50 @@ pub fn Runtime(comptime App: type) type {
     };
 }
 
-fn formatWebSearchProgress(alloc: std.mem.Allocator, progress: types.WebSearchProgress) ![]u8 {
+fn formatWebSearchProgress(alloc: std.mem.Allocator, progress: types.WebSearchProgress, dim_style: []const u8) ![]u8 {
     var query_buf: [160]u8 = undefined;
     return switch (progress) {
         .query_started => |query| std.fmt.allocPrint(
             alloc,
-            "● Searching\x1b[0m \x1b[38;5;245m{s}\x1b[0m",
-            .{text_utils.clippedLabel(&query_buf, query, 120)},
+            "● Searching\x1b[0m {s}{s}\x1b[0m",
+            .{ dim_style, text_utils.clippedLabel(&query_buf, query, 120) },
         ),
         .results_received => |entry| std.fmt.allocPrint(
             alloc,
-            "● Found {d} result{s}\x1b[0m \x1b[38;5;245m{s}\x1b[0m",
-            .{ entry.result_count, if (entry.result_count == 1) "" else "s", text_utils.clippedLabel(&query_buf, entry.query, 120) },
+            "● Found {d} result{s}\x1b[0m {s}{s}\x1b[0m",
+            .{ entry.result_count, if (entry.result_count == 1) "" else "s", dim_style, text_utils.clippedLabel(&query_buf, entry.query, 120) },
         ),
     };
 }
 
-fn formatWebFetchProgress(alloc: std.mem.Allocator, progress: types.WebFetchProgress) ![]u8 {
+fn formatWebFetchProgress(alloc: std.mem.Allocator, progress: types.WebFetchProgress, dim_style: []const u8) ![]u8 {
     var url_buf: [types.WebFetchCompletion.max_url_len]u8 = undefined;
     return switch (progress) {
         .fetching => |url| std.fmt.allocPrint(
             alloc,
-            "● Fetching\x1b[0m \x1b[38;5;245m{s}\x1b[0m",
-            .{text_utils.clippedLabel(&url_buf, url, 120)},
+            "● Fetching\x1b[0m {s}{s}\x1b[0m",
+            .{ dim_style, text_utils.clippedLabel(&url_buf, url, 120) },
         ),
         .converting => |url| std.fmt.allocPrint(
             alloc,
-            "● Converting\x1b[0m \x1b[38;5;245m{s}\x1b[0m",
-            .{text_utils.clippedLabel(&url_buf, url, 120)},
+            "● Converting\x1b[0m {s}{s}\x1b[0m",
+            .{ dim_style, text_utils.clippedLabel(&url_buf, url, 120) },
         ),
     };
 }
 
 test "core.app_worker_runtime web progress labels keep the non-bold status style" {
     const alloc = std.testing.allocator;
-    const searching = try formatWebSearchProgress(alloc, .{ .query_started = @constCast("zig terminal") });
+    const searching = try formatWebSearchProgress(alloc, .{ .query_started = @constCast("zig terminal") }, "[DIM]");
     defer alloc.free(searching);
     const results = try formatWebSearchProgress(alloc, .{ .results_received = .{
         .query = @constCast("zig terminal"),
         .result_count = 2,
-    } });
+    } }, "[DIM]");
     defer alloc.free(results);
-    const fetching = try formatWebFetchProgress(alloc, .{ .fetching = @constCast("https://example.com") });
+    const fetching = try formatWebFetchProgress(alloc, .{ .fetching = @constCast("https://example.com") }, "[DIM]");
     defer alloc.free(fetching);
-    const converting = try formatWebFetchProgress(alloc, .{ .converting = @constCast("https://example.com") });
+    const converting = try formatWebFetchProgress(alloc, .{ .converting = @constCast("https://example.com") }, "[DIM]");
     defer alloc.free(converting);
     const cases = [_][]u8{
         searching,
@@ -1090,19 +1232,19 @@ test "core.app_worker_runtime web progress labels keep the non-bold status style
         try std.testing.expect(std.mem.find(u8, label, "\x1b[1m") == null);
     }
     try std.testing.expectEqualStrings(
-        "● Searching\x1b[0m \x1b[38;5;245mzig terminal\x1b[0m",
+        "● Searching\x1b[0m [DIM]zig terminal\x1b[0m",
         cases[0],
     );
     try std.testing.expectEqualStrings(
-        "● Found 2 results\x1b[0m \x1b[38;5;245mzig terminal\x1b[0m",
+        "● Found 2 results\x1b[0m [DIM]zig terminal\x1b[0m",
         cases[1],
     );
     try std.testing.expectEqualStrings(
-        "● Fetching\x1b[0m \x1b[38;5;245mhttps://example.com\x1b[0m",
+        "● Fetching\x1b[0m [DIM]https://example.com\x1b[0m",
         cases[2],
     );
     try std.testing.expectEqualStrings(
-        "● Converting\x1b[0m \x1b[38;5;245mhttps://example.com\x1b[0m",
+        "● Converting\x1b[0m [DIM]https://example.com\x1b[0m",
         cases[3],
     );
 }
@@ -1150,10 +1292,22 @@ const FakeWorker = struct {
     propagated_grants: usize = 0,
     reset_cancel_after_take_events: bool = false,
     admission_snapshot: worker_runtime.InteractiveAdmissionSnapshot = .open,
+    active_presentation: worker_runtime.PresentationSnapshot = presentation_palette.snapshot(false, .fx, false),
 
     fn deinit(self: *FakeWorker) void {
         for (self.events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
         self.events.deinit(std.heap.c_allocator);
+    }
+
+    fn setActivePresentationStyles(
+        self: *FakeWorker,
+        presentation: worker_runtime.PresentationSnapshot,
+    ) void {
+        self.active_presentation = presentation;
+    }
+
+    fn activePresentationStyles(self: *FakeWorker) worker_runtime.PresentationSnapshot {
+        return self.active_presentation;
     }
 
     fn queuePreview(self: *FakeWorker) QueuePreview {
@@ -4075,6 +4229,48 @@ test "core.app_worker_runtime writes queued approval feedback after a tool termi
     try std.testing.expectEqual(@as(usize, 1), capture.user_count);
     try std.testing.expect(capture.saw_feedback);
     try std.testing.expect(capture.stream_remained_active);
+}
+
+test "queued styled feedback keeps its turn palette when live palette changes before drain" {
+    const Capture = struct {
+        theme: ?presentation_palette.PresentationTheme = null,
+        marker: ?[]const u8 = null,
+
+        fn fallback(_: *anyopaque, _: types.UserTurn) !void {
+            return error.TestUnexpectedFallback;
+        }
+
+        fn styled(
+            raw: *anyopaque,
+            _: types.UserTurn,
+            snapshot: worker_runtime.PresentationSnapshot,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.theme = snapshot.theme;
+            self.marker = snapshot.styles.user_marker;
+        }
+    };
+
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    const old_turn = presentation_palette.snapshot(false, .terminal, false);
+    try app.worker.pushEvent(std.heap.c_allocator, .{
+        .append_user_feedback_styled = .{
+            .text = try std.heap.c_allocator.dupe(u8, "old turn feedback"),
+            .styles = old_turn,
+        },
+    });
+    app.worker.setActivePresentationStyles(presentation_palette.snapshot(true, .fx, true));
+
+    var capture = Capture{};
+    var handlers = NoopBridge.handlers(&app);
+    handlers.ctx = @ptrCast(&capture);
+    handlers.write_user_prompt = Capture.fallback;
+    handlers.write_user_prompt_styled = Capture.styled;
+    try Runtime(FakeApp).tick(&app, handlers);
+
+    try std.testing.expectEqual(presentation_palette.PresentationTheme.terminal, capture.theme.?);
+    try std.testing.expectEqualStrings("\x1b[96m", capture.marker.?);
 }
 
 test "core.app_worker_runtime drains diff block through bridge handler" {

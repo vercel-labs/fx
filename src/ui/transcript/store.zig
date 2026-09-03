@@ -26,6 +26,7 @@ const render_engine = @import("../render_engine.zig");
 const source_preparation = @import("source_preparation.zig");
 const user_message_card = @import("../assistant/user_message_card.zig");
 const input_visual_layout = @import("../input/visual_layout.zig");
+const presentation_palette = @import("../../core/shared/presentation_palette.zig");
 
 const Allocator = std.mem.Allocator;
 const Metrics = types.Metrics;
@@ -2064,6 +2065,7 @@ pub fn cloneEntryForSnapshot(alloc: Allocator, entry: TranscriptEntry) !Transcri
                 .created_at_ms = user.created_at_ms,
                 .turn = turn,
                 .skill_tokens = skill_tokens,
+                .presentation = user.presentation,
             } };
         },
         .assistant_turn => |assistant| blk: {
@@ -2085,6 +2087,7 @@ pub fn cloneEntryForSnapshot(alloc: Allocator, entry: TranscriptEntry) !Transcri
             .id = assistant.id,
             .created_at_ms = assistant.created_at_ms,
             .block = try assistant.block.clone(alloc),
+            .presentation = assistant.presentation,
         } },
         .assistant_thematic_rule => |assistant| .{ .assistant_thematic_rule = .{
             .id = assistant.id,
@@ -2516,6 +2519,46 @@ pub fn writeUserPromptCard(
     has_prior_turns: bool,
     skill_tokens: []const SkillTokenSpan,
 ) !u32 {
+    return writeUserPromptCardWithOptionalPresentation(
+        self,
+        alloc,
+        metrics,
+        user,
+        has_prior_turns,
+        skill_tokens,
+        null,
+    );
+}
+
+pub fn writeUserPromptCardWithPresentationStyles(
+    self: anytype,
+    alloc: Allocator,
+    metrics: *Metrics,
+    user: types.UserTurn,
+    has_prior_turns: bool,
+    skill_tokens: []const SkillTokenSpan,
+    presentation: presentation_palette.PresentationSnapshot,
+) !u32 {
+    return writeUserPromptCardWithOptionalPresentation(
+        self,
+        alloc,
+        metrics,
+        user,
+        has_prior_turns,
+        skill_tokens,
+        presentation,
+    );
+}
+
+fn writeUserPromptCardWithOptionalPresentation(
+    self: anytype,
+    alloc: Allocator,
+    metrics: *Metrics,
+    user: types.UserTurn,
+    has_prior_turns: bool,
+    skill_tokens: []const SkillTokenSpan,
+    presentation: ?presentation_palette.PresentationSnapshot,
+) !u32 {
     try self.assertCanMutateTranscript();
 
     var shadow = try cloneRecordedMutationState(self, alloc);
@@ -2530,13 +2573,23 @@ pub fn writeUserPromptCard(
         );
     }
 
-    const card = try user_message_card.buildUserPromptCardWithSkillTokensForTerminalPresentation(
-        alloc,
-        user.text,
-        user.images,
-        shadow.layout.cols,
-        skill_tokens,
-    );
+    const card = if (presentation) |snapshot|
+        try user_message_card.buildUserPromptCardWithPresentationStyles(
+            alloc,
+            user.text,
+            user.images,
+            shadow.layout.cols,
+            skill_tokens,
+            snapshot,
+        )
+    else
+        try user_message_card.buildUserPromptCardWithSkillTokensForTerminalPresentation(
+            alloc,
+            user.text,
+            user.images,
+            shadow.layout.cols,
+            skill_tokens,
+        );
     defer alloc.free(card);
     try shadow.writeTranscriptBytes(alloc, metrics, card, true);
 
@@ -2546,6 +2599,7 @@ pub fn writeUserPromptCard(
         alloc,
         user_copy,
         skill_tokens,
+        presentation,
     );
 
     try commitAuthoritativeRecordedMutationStateFromEntry(
@@ -2575,6 +2629,7 @@ pub fn appendUserTurnOwnedWithSkillTokens(
         alloc,
         turn,
         skill_tokens,
+        null,
     )).entry_id;
 }
 
@@ -2588,6 +2643,7 @@ fn appendUserTurnOwnedWithSkillTokensAndRetention(
     alloc: Allocator,
     turn: types.UserTurn,
     skill_tokens: []const SkillTokenSpan,
+    presentation: ?presentation_palette.PresentationSnapshot,
 ) !UserTurnAdmission {
     var owned_skill_tokens: []SkillTokenSpan = &.{};
     var handed_off = false;
@@ -2603,6 +2659,7 @@ fn appendUserTurnOwnedWithSkillTokensAndRetention(
         .created_at_ms = io_mod.milliTimestamp(),
         .turn = turn,
         .skill_tokens = owned_skill_tokens,
+        .presentation = if (presentation) |snapshot| snapshot.theme else null,
     } });
     handed_off = true;
     const retention_changed = try enforceStructuredRetentionAndReport(
@@ -2629,6 +2686,24 @@ pub fn appendAssistantTableOwned(
     self: anytype,
     alloc: Allocator,
     table: assistant_presentation.TablePayload,
+) !u32 {
+    return appendAssistantTableOwnedWithOptionalPresentation(self, alloc, table, null);
+}
+
+pub fn appendAssistantTableOwnedWithPresentationStyles(
+    self: anytype,
+    alloc: Allocator,
+    table: assistant_presentation.TablePayload,
+    presentation: presentation_palette.PresentationSnapshot,
+) !u32 {
+    return appendAssistantTableOwnedWithOptionalPresentation(self, alloc, table, presentation);
+}
+
+fn appendAssistantTableOwnedWithOptionalPresentation(
+    self: anytype,
+    alloc: Allocator,
+    table: assistant_presentation.TablePayload,
+    _: ?presentation_palette.PresentationSnapshot,
 ) !u32 {
     const entry_id = self.next_entry_id;
     try self.entries.append(alloc, .{ .assistant_table = .{
@@ -2661,11 +2736,30 @@ pub fn appendAssistantCodeBlockOwned(
     alloc: Allocator,
     block: assistant_presentation.CodeBlockPayload,
 ) !u32 {
+    return appendAssistantCodeBlockOwnedWithOptionalPresentation(self, alloc, block, null);
+}
+
+pub fn appendAssistantCodeBlockOwnedWithPresentationStyles(
+    self: anytype,
+    alloc: Allocator,
+    block: assistant_presentation.CodeBlockPayload,
+    presentation: presentation_palette.PresentationSnapshot,
+) !u32 {
+    return appendAssistantCodeBlockOwnedWithOptionalPresentation(self, alloc, block, presentation);
+}
+
+fn appendAssistantCodeBlockOwnedWithOptionalPresentation(
+    self: anytype,
+    alloc: Allocator,
+    block: assistant_presentation.CodeBlockPayload,
+    presentation: ?presentation_palette.PresentationSnapshot,
+) !u32 {
     const entry_id = self.next_entry_id;
     try self.entries.append(alloc, .{ .assistant_code_block = .{
         .id = entry_id,
         .created_at_ms = io_mod.milliTimestamp(),
         .block = block,
+        .presentation = if (presentation) |snapshot| snapshot.theme else null,
     } });
     errdefer {
         _ = self.entries.pop();
@@ -2687,6 +2781,22 @@ pub fn appendAssistantCodeBlockOwned(
 }
 
 pub fn appendAssistantThematicRule(self: anytype, alloc: Allocator) !u32 {
+    return appendAssistantThematicRuleWithOptionalPresentation(self, alloc, null);
+}
+
+pub fn appendAssistantThematicRuleWithPresentationStyles(
+    self: anytype,
+    alloc: Allocator,
+    presentation: presentation_palette.PresentationSnapshot,
+) !u32 {
+    return appendAssistantThematicRuleWithOptionalPresentation(self, alloc, presentation);
+}
+
+fn appendAssistantThematicRuleWithOptionalPresentation(
+    self: anytype,
+    alloc: Allocator,
+    _: ?presentation_palette.PresentationSnapshot,
+) !u32 {
     const entry_id = self.next_entry_id;
     try self.entries.append(alloc, .{ .assistant_thematic_rule = .{
         .id = entry_id,

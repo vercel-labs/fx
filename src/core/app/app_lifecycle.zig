@@ -151,6 +151,7 @@ pub const StartupState = struct {
     notification_turn_end: bool = false,
     notification_attention_required: bool = false,
     notification_max: bool = false,
+    color_palette: config_runtime.ColorPalette = .fx,
     theme_monitor_enabled: bool = false,
 
     pub fn deinit(self: *StartupState, alloc: Allocator) void {
@@ -549,6 +550,7 @@ fn loadStartupStateFromOwnedWorkspace(
     state.notification_turn_end = sound_on_override orelse settings.notification_turn_end orelse notification_sound.default_enabled;
     state.notification_attention_required = sound_on_override orelse settings.notification_attention_required orelse notification_sound.default_enabled;
     state.notification_max = max_override orelse settings.notification_max orelse false;
+    state.color_palette = settings.color_palette orelse .fx;
 
     return state;
 }
@@ -630,7 +632,7 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
         io_mod.getenv("TERM_PROGRAM"),
     ));
     const theme = ui_render.detectTheme(cfg.alloc, cfg.terminal);
-    ui_render.initTheme(theme.light, theme.rgb);
+    ui_render.initThemeForPalette(theme.light, theme.rgb, state.color_palette);
     state.theme_monitor_enabled = ui_render.explicitThemeOverride() == null;
 
     const cursor = cfg.terminal.queryCursorPosition() catch blk: {

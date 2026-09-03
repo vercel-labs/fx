@@ -11,6 +11,10 @@ pub const Request = struct {
     content_revision: u64,
     cols: u16,
     anchor: Anchor,
+    /// Presentation generation is part of the page identity.  A page built
+    /// before a palette/presentation-policy switch must never become visible
+    /// after that switch, even when its content, width, and anchor match.
+    presentation_generation: u64 = 0,
 };
 
 pub const SourceRange = struct {
@@ -41,11 +45,14 @@ pub fn sourceRange(request: Request, total_entries: usize) SourceRange {
 pub fn sameRequest(lhs: Request, rhs: Request) bool {
     return lhs.content_revision == rhs.content_revision and
         lhs.cols == rhs.cols and
+        lhs.presentation_generation == rhs.presentation_generation and
         std.meta.eql(lhs.anchor, rhs.anchor);
 }
 
 pub fn sameSurface(lhs: Request, rhs: Request) bool {
-    return lhs.cols == rhs.cols and std.meta.eql(lhs.anchor, rhs.anchor);
+    return lhs.cols == rhs.cols and
+        lhs.presentation_generation == rhs.presentation_generation and
+        std.meta.eql(lhs.anchor, rhs.anchor);
 }
 
 pub fn previousAnchor(range: SourceRange) ?Anchor {
@@ -88,16 +95,18 @@ test "full transcript page range centers an entry without crossing bounds" {
     try std.testing.expectEqual(SourceRange{ .start = 0, .end = 3 }, head);
 }
 
-test "full transcript page request identity includes revision width and anchor" {
+test "full transcript page request identity includes revision width anchor and presentation generation" {
     const request = Request{
         .content_revision = 73,
         .cols = 96,
         .anchor = .tail,
+        .presentation_generation = 5,
     };
     try std.testing.expect(sameRequest(request, .{
         .content_revision = 73,
         .cols = 96,
         .anchor = .tail,
+        .presentation_generation = 5,
     }));
     try std.testing.expect(!sameRequest(request, .{
         .content_revision = 72,
@@ -114,13 +123,20 @@ test "full transcript page request identity includes revision width and anchor" 
         .cols = 96,
         .anchor = .{ .entry_index = 42 },
     }));
+    try std.testing.expect(!sameRequest(request, .{
+        .content_revision = 73,
+        .cols = 96,
+        .anchor = .tail,
+        .presentation_generation = 4,
+    }));
 }
 
-test "full transcript page surface ignores revisions but not width or anchor" {
+test "full transcript page surface ignores revisions but not width anchor or presentation generation" {
     const original = Request{
         .content_revision = 73,
         .cols = 96,
         .anchor = .tail,
+        .presentation_generation = 5,
     };
     var changed = original;
     changed.content_revision = 74;
@@ -130,6 +146,9 @@ test "full transcript page surface ignores revisions but not width or anchor" {
     try std.testing.expect(!sameSurface(original, changed));
     changed.cols = original.cols;
     changed.anchor = .{ .entry_index = 42 };
+    try std.testing.expect(!sameSurface(original, changed));
+    changed.anchor = original.anchor;
+    changed.presentation_generation = original.presentation_generation - 1;
     try std.testing.expect(!sameSurface(original, changed));
 }
 

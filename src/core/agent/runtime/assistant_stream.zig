@@ -750,11 +750,11 @@ const NoticeCapture = struct {
         };
     }
 
-    fn describeAction(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, _: []const []const u8) ![]const u8 {
+    fn describeAction(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, _: runtime_deps.PresentationStyles, _: []const []const u8) ![]const u8 {
         return arena.dupe(u8, call.name);
     }
 
-    fn describeDenied(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, label: []const u8, _: []const []const u8) ![]const u8 {
+    fn describeDenied(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, label: []const u8, _: runtime_deps.PresentationStyles, _: []const []const u8) ![]const u8 {
         return std.fmt.allocPrint(arena, "{s} {s}", .{ label, call.name });
     }
 
@@ -772,6 +772,7 @@ const NoticeCapture = struct {
     fn publishCommittedFileHandoff(
         _: *anyopaque,
         _: file_mutation.CommittedFileHandoff,
+        _: runtime_deps.PresentationStyles,
     ) SecondaryPublicationReport {
         return .{ .diff = .skipped, .tracker = .skipped };
     }
@@ -870,10 +871,10 @@ const StreamCapture = struct {
     fn noopRequestPermission(_: *anyopaque, _: Allocator, _: ToolCall, _: permission_auto_classifier.ReviewTurnContext, _: PermissionMode, _: []const PermissionGrant, _: ?runtime_tool_contracts.LiveToolAuthority, _: ?runtime_tool_contracts.LivePermissionRevalidation, _: []const []const u8) !command_admission.PermissionOutcome {
         return .{ .decision = .once, .execution_authority = .ordinary };
     }
-    fn noopDescribeAction(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, _: []const []const u8) ![]const u8 {
+    fn noopDescribeAction(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, _: runtime_deps.PresentationStyles, _: []const []const u8) ![]const u8 {
         return arena.dupe(u8, call.name);
     }
-    fn noopDescribeDenied(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, label: []const u8, _: []const []const u8) ![]const u8 {
+    fn noopDescribeDenied(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, label: []const u8, _: runtime_deps.PresentationStyles, _: []const []const u8) ![]const u8 {
         return std.fmt.allocPrint(arena, "{s} {s}", .{ label, call.name });
     }
     fn noopPermissionTarget(_: *anyopaque, arena: Allocator, _: ToolCall, _: []const []const u8) ![]const u8 {
@@ -882,7 +883,7 @@ const StreamCapture = struct {
     fn noopExecute(_: *anyopaque, _: runtime_tool_contracts.ToolExecutionRequest) !ToolExecutionResult {
         return .{ .model_output = "" };
     }
-    fn noopPublishCommittedFileHandoff(_: *anyopaque, _: file_mutation.CommittedFileHandoff) SecondaryPublicationReport {
+    fn noopPublishCommittedFileHandoff(_: *anyopaque, _: file_mutation.CommittedFileHandoff, _: runtime_deps.PresentationStyles) SecondaryPublicationReport {
         return .{ .diff = .skipped, .tracker = .skipped };
     }
     fn noopPropagateHistory(_: *anyopaque, _: HistoryTurn) !void {}

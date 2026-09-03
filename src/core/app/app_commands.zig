@@ -3651,6 +3651,7 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
     if (comptime @hasField(App, "shell") and @hasField(@TypeOf(app.shell), "collapse_tool_calls")) {
         snapshot.collapse_tool_calls = app.shell.collapse_tool_calls;
     }
+    if (comptime @hasDecl(App, "colorPalette")) snapshot.color_palette = app.colorPalette().label();
     if (comptime @hasField(App, "statusline_context")) snapshot.statusline_context = app.statusline_context;
     if (comptime @hasField(App, "statusline_session")) snapshot.statusline_session = app.statusline_session;
     if (comptime @hasField(App, "workspace_identity")) snapshot.statusline_workspace = app.workspace_identity.enabled;
@@ -3726,6 +3727,47 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
                 .{ .collapse_tool_calls = enabled },
                 runtime_changed,
             );
+        },
+        .color_palette => {
+            const palette = config_runtime.ColorPalette.parse(change.value) orelse
+                return error.InvalidSettingsCatalogValue;
+            const App = @TypeOf(app.*);
+            const preference_changed = if (comptime @hasDecl(App, "colorPalette"))
+                palette != app.colorPalette()
+            else
+                false;
+            const patch: config_runtime.UserSettingsPatch = .{ .color_palette = palette };
+            var attempt = config_runtime.attemptUserPreferences(app.alloc, patch);
+            defer attempt.deinit(app.alloc);
+            switch (attempt) {
+                .failure => |failure| try session_commands.reportUserSettingsFailure(
+                    app,
+                    "color palette",
+                    failure.err,
+                    failure.cleanup,
+                    false,
+                ),
+                .outcome => |outcome| {
+                    var session_error: ?anyerror = null;
+                    if (preference_changed) {
+                        if (comptime @hasDecl(App, "applyColorPaletteUpdate")) {
+                            app.applyColorPaletteUpdate(palette) catch |err| {
+                                session_error = err;
+                            };
+                        } else if (comptime @hasDecl(App, "setColorPalettePreference")) {
+                            app.setColorPalettePreference(palette);
+                        }
+                    }
+                    _ = try session_commands.reportUserSettingsCommit(
+                        app,
+                        "color palette",
+                        patch,
+                        outcome,
+                        session_error,
+                        true,
+                    );
+                },
+            }
         },
         .slash_menu_categories => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;

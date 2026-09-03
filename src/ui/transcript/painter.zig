@@ -289,7 +289,12 @@ fn renderTranscriptRows(
                 rendered.last_visible_row_blank = blank;
             },
             .folded_line => |folded| {
-                var folded_bytes = try foldedLineBytes(alloc, folded.text, folded.stream);
+                var folded_bytes = try foldedLineBytes(
+                    alloc,
+                    folded.text,
+                    folded.stream,
+                    commandOutputStyles(self),
+                );
                 var folded_bytes_needs_free = true;
                 errdefer if (folded_bytes_needs_free) alloc.free(folded_bytes);
                 const rows_touched = visualRowsForLine(folded_bytes, self.layout.cols);
@@ -376,8 +381,31 @@ fn foldedPartialTailBytes(self: anytype, bytes: []const u8, partial_skip_rows: u
     return if (offset < bytes.len) bytes[offset..] else "";
 }
 
-fn foldedLineBytes(alloc: Allocator, text: []const u8, stream: command_output_content.Stream) ![]u8 {
-    const style = if (stream == .stderr) "\x1b[38;5;252m" else "\x1b[38;5;245m";
+fn commandOutputStyles(self: anytype) transcript_blocks.Styles {
+    const Runtime = @TypeOf(self.*);
+    if (comptime @hasField(Runtime, "command_output_render")) {
+        return self.command_output_render.styles;
+    }
+    return .{};
+}
+
+fn foldedLineBytes(
+    alloc: Allocator,
+    text: []const u8,
+    stream: command_output_content.Stream,
+    styles: transcript_blocks.Styles,
+) ![]u8 {
+    // These are only a last-resort path for detached/test shells whose
+    // command-output policy has not been initialized yet.  Keep them in the
+    // portable ANSI range so an uninitialized terminal render can never leak
+    // the Fx 256-color palette.  Normal initialized shells always provide the
+    // policy styles above and therefore keep their exact existing output.
+    const style = if (stream == .stderr)
+        if (styles.red_style.len > 0) styles.red_style else "\x1b[31m"
+    else if (styles.dim_style.len > 0)
+        styles.dim_style
+    else
+        "\x1b[90m";
     const trimmed = stripTrailingNewline(text);
     const reset = "\x1b[0m";
     const bytes = try alloc.alloc(u8, style.len + "│ ".len + trimmed.len + reset.len);
@@ -4103,6 +4131,23 @@ test "transcript surface painter renders folded stdout and stderr" {
     defer target.deinit();
     try expectGridContains(&target, alloc, "stdout");
     try expectGridContains(&target, alloc, "stderr");
+}
+
+test "empty command-output policy uses portable ANSI fallback" {
+    const alloc = std.testing.allocator;
+    const styles: transcript_blocks.Styles = .{};
+
+    const stdout = try foldedLineBytes(alloc, "stdout\n", .stdout, styles);
+    defer alloc.free(stdout);
+    try std.testing.expectEqualStrings("\x1b[90m│ stdout\x1b[0m", stdout);
+
+    const stderr = try foldedLineBytes(alloc, "stderr\n", .stderr, styles);
+    defer alloc.free(stderr);
+    try std.testing.expectEqualStrings("\x1b[31m│ stderr\x1b[0m", stderr);
+    try std.testing.expect(std.mem.indexOf(u8, stdout, "38;5;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout, "38;2;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr, "38;5;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr, "38;2;") == null);
 }
 
 test "transcript surface painter renders block gap rows" {

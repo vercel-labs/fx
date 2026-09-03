@@ -62,6 +62,7 @@ const model_provider = @import("../config/model_provider.zig");
 const provider_set = @import("../gateway/provider_set.zig");
 const credential_authority = @import("../auth/credential_authority.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
+const presentation_palette = @import("../shared/presentation_palette.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const test_builtin_tools = if (builtin.is_test)
     @import("../../builtins/tools.zig")
@@ -117,6 +118,15 @@ test {
 
 pub const Context = struct {
     workspace_root: []const u8,
+    presentation_snapshot: presentation_palette.PresentationSnapshot = presentation_palette.snapshot(false, .fx, false),
+    presentation_dim_style: []const u8 = "\x1b[38;5;245m",
+    presentation_accent_style: []const u8 = "\x1b[38;5;252m",
+    presentation_inline_code_style: []const u8 = "\x1b[38;5;245m",
+    presentation_task_completed_style: []const u8 = "\x1b[38;5;252m",
+    presentation_diff_added_style: []const u8 = "\x1b[38;5;252m",
+    presentation_diff_removed_style: []const u8 = "\x1b[38;5;252m",
+    presentation_diff_added_marker_style: []const u8 = "\x1b[38;5;71m",
+    presentation_diff_removed_marker_style: []const u8 = "\x1b[38;5;167m",
     access_scope: ?workspace_access.AccessScope = null,
     ignored_list_entries: []const []const u8,
     max_list_entries: usize,
@@ -1910,6 +1920,7 @@ fn executeSubagentProvider(
         .timestamp_ms = io_mod.milliTimestamp(),
         .identity_epoch = identity_epoch,
         .cancel_flag = runtimeCancelFlag(ctx),
+        .presentation = ctx.presentation_snapshot,
     }) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         if (err == error.Cancelled) return error.Cancelled;

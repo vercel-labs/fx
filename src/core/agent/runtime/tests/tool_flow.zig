@@ -11,6 +11,7 @@ const result_store = @import("../../../session/result_store.zig");
 const debug_trace = @import("../../../shared/debug_trace.zig");
 const image_attachments = @import("../../../images/image_attachments.zig");
 const io_mod = @import("../../../shared/io.zig");
+const presentation_palette = @import("../../../shared/presentation_palette.zig");
 const diff = @import("../../../output/diff.zig");
 const file_mutation = @import("../../../tooling/file_mutation.zig");
 const command_result_mapping = @import("../../../tooling/command_result_mapping.zig");
@@ -4274,11 +4275,25 @@ test "permission feedback follows the matching tool result" {
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
+    hooks.presentation_snapshot = presentation_palette.snapshot(false, .terminal, false);
     hooks.permission_feedback = &.{"Summarize the file after reading it."};
     hooks.exec_plans = &.{.{ .result = .{ .model_output = "read output" } }};
     var fixture = PromptFixture{};
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    // Simulate a palette switch after the old turn queued its UI event but
+    // before a renderer drains it. The queued event keeps the turn snapshot.
+    hooks.presentation_snapshot = presentation_palette.snapshot(false, .fx, false);
+    try std.testing.expectEqual(@as(usize, 1), hooks.feedback_presentations.items.len);
+    try std.testing.expectEqual(
+        presentation_palette.PresentationTheme.terminal,
+        hooks.feedback_presentations.items[0].theme,
+    );
+    try std.testing.expectEqualStrings(
+        "\x1b[96m",
+        hooks.feedback_presentations.items[0].styles.user_marker,
+    );
 
     try std.testing.expectEqual(@as(usize, 1), hooks.permission_user_intent_contexts.items.len);
     const review_context = hooks.permission_user_intent_contexts.items[0];
