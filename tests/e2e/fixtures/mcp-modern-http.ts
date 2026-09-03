@@ -641,6 +641,8 @@ export function startModernMcpHttpFixture(
             type: "text",
             text: mode === "mrtr_form"
               ? "HTTP continued after elicitation"
+              : mode === "server_authoritative_schema"
+              ? `compatibility:${message.params?.arguments?.text ?? ""}`
               : `${MODERN_HTTP_TOOL_RESULT}:${message.params?.arguments?.text ?? ""}`,
           }],
           ...(mode === "server_authoritative_schema"

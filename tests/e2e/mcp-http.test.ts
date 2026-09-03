@@ -1352,6 +1352,10 @@ describe("modern MCP Streamable HTTP", () => {
     expect(gateway.requests[2]?.body).toContain(
       `${MODERN_HTTP_TOOL_RESULT}:hello`,
     );
+    expect(toolResultText(gateway.requests[2]!.body, "call_mcp")).toBe(
+      `{"server":"fixture","tool":"${TOOL_NAME}","result":{"echo":"${MODERN_HTTP_TOOL_RESULT}:hello"}}`,
+    );
+    expect(gateway.requests[2]?.body).not.toContain("compatibility:hello");
     expect(gateway.requests.some((request) =>
       request.body.includes('"pattern":"^(?!blocked$).+$"')
     )).toBe(true);
