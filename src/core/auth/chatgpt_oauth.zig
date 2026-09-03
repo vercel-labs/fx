@@ -459,7 +459,7 @@ fn refreshSession(
         .account_id = account_id,
     };
     token.access_token = &.{};
-    errdefer replacement.deinit(alloc);
+    errdefer secret.zeroAndFree(alloc, replacement.access_token);
     try mutation.save(alloc, replacement);
 
     session.deinit(alloc);
@@ -984,4 +984,132 @@ test "ChatGPT browser callback requires the exact path and state" {
             "expected",
         ),
     );
+}
+
+/// JWTs whose payload carries the namespaced `chatgpt_account_id` claim.
+const account_test_jwt = "header.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF90ZXN0In19.signature";
+const account_other_jwt = "header.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF9vdGhlciJ9fQ.signature";
+
+fn refreshResponseBody(alloc: Allocator, access_token: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        alloc,
+        "{{\"access_token\":\"{s}\",\"refresh_token\":\"new-refresh\",\"expires_in\":3600}}",
+        .{access_token},
+    );
+}
+
+test "ChatGPT refresh releases every credential exactly once when the save fails" {
+    const alloc = std.testing.allocator;
+    const State = struct {
+        fn execute(
+            _: ?*anyopaque,
+            a: Allocator,
+            request: oauth_transport.Request,
+        ) !oauth_transport.Response {
+            if (request.method != .post_json) return error.UnexpectedRequest;
+            return .{ .disposition = .accepted, .body = try refreshResponseBody(a, account_test_jwt) };
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var lock_file = try tmp.dir.createFile(io_mod.getIo(), "lock", .{ .truncate = true });
+    defer lock_file.close(io_mod.getIo());
+
+    // An unwritable profile directory is the ordinary disk condition that makes
+    // the save fail after the replacement session already owns the credentials.
+    tmp.dir.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o500)) catch
+        return error.SkipZigTest;
+    defer tmp.dir.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o700)) catch {};
+
+    var mutation = chatgpt_session.Mutation{
+        .fx_dir = .{ .dir = tmp.dir },
+        .lock = .{ .file = lock_file },
+    };
+    var session = chatgpt_session.Session{
+        .access_token = try alloc.dupe(u8, "old-access"),
+        .refresh_token = try alloc.dupe(u8, "old-refresh"),
+        .expires_at_ms = 0,
+        .account_id = try alloc.dupe(u8, "acct_test"),
+    };
+    defer session.deinit(alloc);
+
+    try std.testing.expectError(
+        error.DurableReplacePreRenameFailed,
+        refreshSession(alloc, .{ .execute_fn = State.execute }, &mutation, &session),
+    );
+    try std.testing.expectEqualStrings("old-refresh", session.refresh_token);
+}
+
+test "ChatGPT refresh replaces the stored session when the save succeeds" {
+    const alloc = std.testing.allocator;
+    const State = struct {
+        fn execute(
+            _: ?*anyopaque,
+            a: Allocator,
+            request: oauth_transport.Request,
+        ) !oauth_transport.Response {
+            if (request.method != .post_json) return error.UnexpectedRequest;
+            return .{ .disposition = .accepted, .body = try refreshResponseBody(a, account_test_jwt) };
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var lock_file = try tmp.dir.createFile(io_mod.getIo(), "lock", .{ .truncate = true });
+    defer lock_file.close(io_mod.getIo());
+
+    var mutation = chatgpt_session.Mutation{
+        .fx_dir = .{ .dir = tmp.dir },
+        .lock = .{ .file = lock_file },
+    };
+    var session = chatgpt_session.Session{
+        .access_token = try alloc.dupe(u8, "old-access"),
+        .refresh_token = try alloc.dupe(u8, "old-refresh"),
+        .expires_at_ms = 0,
+        .account_id = try alloc.dupe(u8, "acct_test"),
+    };
+    defer session.deinit(alloc);
+
+    try refreshSession(alloc, .{ .execute_fn = State.execute }, &mutation, &session);
+    try std.testing.expectEqualStrings(account_test_jwt, session.access_token);
+    try std.testing.expectEqualStrings("new-refresh", session.refresh_token);
+    try std.testing.expectEqualStrings("acct_test", session.account_id);
+}
+
+test "ChatGPT refresh rejects a changed account without leaking the extracted id" {
+    const alloc = std.testing.allocator;
+    const State = struct {
+        fn execute(
+            _: ?*anyopaque,
+            a: Allocator,
+            request: oauth_transport.Request,
+        ) !oauth_transport.Response {
+            if (request.method != .post_json) return error.UnexpectedRequest;
+            return .{ .disposition = .accepted, .body = try refreshResponseBody(a, account_other_jwt) };
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var lock_file = try tmp.dir.createFile(io_mod.getIo(), "lock", .{ .truncate = true });
+    defer lock_file.close(io_mod.getIo());
+
+    var mutation = chatgpt_session.Mutation{
+        .fx_dir = .{ .dir = tmp.dir },
+        .lock = .{ .file = lock_file },
+    };
+    var session = chatgpt_session.Session{
+        .access_token = try alloc.dupe(u8, "old-access"),
+        .refresh_token = try alloc.dupe(u8, "old-refresh"),
+        .expires_at_ms = 0,
+        .account_id = try alloc.dupe(u8, "acct_test"),
+    };
+    defer session.deinit(alloc);
+
+    try std.testing.expectError(
+        error.ChatGptAccountChanged,
+        refreshSession(alloc, .{ .execute_fn = State.execute }, &mutation, &session),
+    );
+    try std.testing.expectEqualStrings("old-access", session.access_token);
 }
