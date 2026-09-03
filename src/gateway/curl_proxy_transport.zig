@@ -30,6 +30,13 @@ pub const Response = struct {
     }
 };
 
+pub fn StreamingResponse(comptime Result: type) type {
+    return union(enum) {
+        completed: Result,
+        failed: Response,
+    };
+}
+
 /// Zig 0.16 sends plaintext HTTP after an HTTPS proxy CONNECT. macOS ships
 /// curl, so use it only for affected HTTPS requests when a proxy is configured.
 pub fn shouldUse(url: []const u8) bool {
@@ -44,19 +51,7 @@ pub fn shouldUse(url: []const u8) bool {
 }
 
 pub fn execute(alloc: Allocator, request: Request) !Response {
-    var config_writer: std.Io.Writer.Allocating = .init(alloc);
-    defer config_writer.deinit();
-    const writer = &config_writer.writer;
-    try writeOption(writer, "url", request.url);
-    try writer.print("request = \"{s}\"\n", .{switch (request.method) {
-        .get => "GET",
-        .post => "POST",
-    }});
-    try writer.print("max-time = {d}\n", .{request.timeout_seconds});
-    for (request.headers) |header| try writeHeader(writer, header);
-    if (request.payload) |payload| try writeOption(writer, "data-binary", payload);
-    try writer.writeAll("write-out = \"\\n%{http_code}\"\n");
-    const config = try config_writer.toOwnedSlice();
+    const config = try buildConfig(alloc, request, false, true);
     defer secret.zeroAndFree(alloc, config);
 
     const io = io_mod.getIo();
@@ -104,6 +99,108 @@ pub fn execute(alloc: Allocator, request: Request) !Response {
     const stdout = try multi_reader.toOwnedSlice(0);
     defer secret.zeroAndFree(alloc, stdout);
     return parseResponse(alloc, stdout, request.max_response_bytes);
+}
+
+pub fn executeStreaming(
+    comptime Result: type,
+    alloc: Allocator,
+    request: Request,
+    operation: anytype,
+) !StreamingResponse(Result) {
+    const config = try buildConfig(alloc, request, true, false);
+    defer secret.zeroAndFree(alloc, config);
+
+    const io = io_mod.getIo();
+    var child = try spawnCurl(io);
+    defer if (child.id != null) child.kill(io);
+    try sendConfig(io, &child, config);
+
+    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
+    multi_reader.init(alloc, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer multi_reader.deinit();
+    const stdout_reader = multi_reader.reader(0);
+    const status = try readFinalStatus(stdout_reader);
+    if (status != .ok) {
+        const body = stdout_reader.allocRemaining(alloc, .limited(request.max_response_bytes)) catch |err| switch (err) {
+            error.StreamTooLong => return error.CurlProxyResponseTooLarge,
+            else => return err,
+        };
+        errdefer secret.zeroAndFree(alloc, body);
+        const term = try child.wait(io);
+        if (term != .exited or term.exited != 0) return error.CurlProxyRequestFailed;
+        return .{ .failed = .{ .status = status, .body = body } };
+    }
+
+    const result = try operation.run(stdout_reader);
+    if (multi_reader.reader(1).buffered().len > 16 * 1024) return error.CurlProxyResponseTooLarge;
+    if (request.cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
+    return .{ .completed = result };
+}
+
+fn buildConfig(alloc: Allocator, request: Request, include_headers: bool, write_status: bool) ![]u8 {
+    var config_writer: std.Io.Writer.Allocating = .init(alloc);
+    defer config_writer.deinit();
+    const writer = &config_writer.writer;
+    try writeOption(writer, "url", request.url);
+    try writer.print("request = \"{s}\"\n", .{switch (request.method) {
+        .get => "GET",
+        .post => "POST",
+    }});
+    try writer.print("max-time = {d}\n", .{request.timeout_seconds});
+    if (include_headers) try writer.writeAll("include\n");
+    for (request.headers) |header| try writeHeader(writer, header);
+    if (request.payload) |payload| try writeOption(writer, "data-binary", payload);
+    if (write_status) try writer.writeAll("write-out = \"\\n%{http_code}\"\n");
+    return config_writer.toOwnedSlice();
+}
+
+fn spawnCurl(io: std.Io) !std.process.Child {
+    return std.process.spawn(io, .{
+        .argv = &.{
+            "/usr/bin/curl",
+            "--silent",
+            "--show-error",
+            "--no-buffer",
+            "--config",
+            "-",
+        },
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+}
+
+fn sendConfig(io: std.Io, child: *std.process.Child, config: []const u8) !void {
+    var stdin = child.stdin orelse return error.CurlProxyStdinUnavailable;
+    child.stdin = null;
+    try stdin.writeStreamingAll(io, config);
+    stdin.close(io);
+}
+
+fn readFinalStatus(reader: *std.Io.Reader) !std.http.Status {
+    while (true) {
+        const status_line = try readHeaderLine(reader) orelse return error.InvalidCurlProxyResponse;
+        if (!std.mem.startsWith(u8, status_line, "HTTP/")) return error.InvalidCurlProxyResponse;
+        var parts = std.mem.tokenizeScalar(u8, status_line, ' ');
+        _ = parts.next() orelse return error.InvalidCurlProxyResponse;
+        const status_bytes = parts.next() orelse return error.InvalidCurlProxyResponse;
+        const status_code = std.fmt.parseUnsigned(u10, status_bytes, 10) catch
+            return error.InvalidCurlProxyResponse;
+        if (status_code < 100 or status_code > 599) return error.InvalidCurlProxyResponse;
+        const connection_established = std.mem.endsWith(u8, status_line, "Connection established");
+        while (try readHeaderLine(reader)) |line| {
+            if (line.len == 0) break;
+        }
+        if (!connection_established) {
+            return @enumFromInt(status_code);
+        }
+    }
+}
+
+fn readHeaderLine(reader: *std.Io.Reader) !?[]const u8 {
+    const line = try reader.takeDelimiter('\n') orelse return null;
+    return std.mem.trimEnd(u8, line, "\r");
 }
 
 fn parseResponse(alloc: Allocator, stdout: []const u8, max_response_bytes: usize) !Response {
@@ -164,4 +261,14 @@ test "curl proxy response separates body from status trailer" {
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqual(std.http.Status.ok, response.status);
     try std.testing.expectEqualStrings("data: value\n", response.body);
+}
+
+test "curl proxy streaming status skips CONNECT response" {
+    var reader = std.Io.Reader.fixed(
+        "HTTP/1.1 200 Connection established\r\n\r\n" ++
+            "HTTP/2 200\r\ncontent-type: text/event-stream\r\n\r\n" ++
+            "data: value\n",
+    );
+    try std.testing.expectEqual(std.http.Status.ok, try readFinalStatus(&reader));
+    try std.testing.expectEqualStrings("data: value", (try readHeaderLine(&reader)).?);
 }

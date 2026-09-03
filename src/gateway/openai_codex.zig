@@ -438,26 +438,34 @@ fn streamPreparedWithCurl(
 
     try request.admission.admit();
     request.delivery.markPossiblySent();
-    var response = try curl_proxy_transport.execute(alloc, .{
+    var operation = CurlSseOperation{ .alloc = alloc, .request = request };
+    const outcome = try curl_proxy_transport.executeStreaming(stream_provider.Result, alloc, .{
         .url = request_endpoint,
         .method = .post,
         .headers = headers[0..header_count],
         .payload = payload,
-        .max_response_bytes = max_sse_aggregate_bytes,
+        .max_response_bytes = max_error_body_bytes,
         .timeout_seconds = 300,
         .cancel_flag = request.cancel_flag,
-    });
-    defer response.deinit(alloc);
-    if (response.status != .ok) {
-        return .{ .failed = .{
+    }, &operation);
+    return switch (outcome) {
+        .completed => |result| result,
+        .failed => |response| .{ .failed = .{
             .kind = failureKind(response.status),
-            .detail = try alloc.dupe(u8, response.body[0..@min(response.body.len, max_error_body_bytes)]),
+            .detail = response.body,
             .ownership = .owned,
-        } };
-    }
-    var response_reader = std.Io.Reader.fixed(response.body);
-    return consumeSuccessfulResponse(alloc, request, &response_reader);
+        } },
+    };
 }
+
+const CurlSseOperation = struct {
+    alloc: Allocator,
+    request: stream_provider.ModelRequest,
+
+    pub fn run(self: *@This(), reader: *std.Io.Reader) !stream_provider.Result {
+        return consumeSuccessfulResponse(self.alloc, self.request, reader);
+    }
+};
 
 const EventBridge = struct {
     fn sink(raw: *anyopaque) *stream_provider.EventSink {
