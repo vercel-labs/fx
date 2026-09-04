@@ -823,13 +823,14 @@ fn buildCompactTranscriptProjectionInterruptible(
     focused_entry_id: ?u32,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
 ) !tool_group_projection.Projection {
-    var projection = try tool_group_projection.buildStyledFocusedInterruptible(
+    var projection = try tool_group_projection.buildStyledFocusedWithFinalityInterruptible(
         alloc,
         self.entries.items,
         self.tool_details.items,
         self.layout.cols,
         focused_entry_id,
         collapseToolCalls(self),
+        toolTurnPresentationWatermark(self),
         .{
             .marker_style = user_message_card.promptMarkerStyle(),
             .text_style = ui_render.statusline_style,
@@ -949,6 +950,14 @@ fn collapseToolCalls(self: anytype) bool {
         self.collapse_tool_calls
     else
         false;
+}
+
+fn toolTurnPresentationWatermark(self: anytype) u64 {
+    const Shell = @TypeOf(self.*);
+    return if (comptime @hasDecl(Shell, "toolTurnPresentationWatermark"))
+        self.toolTurnPresentationWatermark()
+    else
+        std.math.maxInt(u64);
 }
 
 fn observationEnabled(self: anytype, alloc: Allocator) bool {

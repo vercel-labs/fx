@@ -4630,6 +4630,13 @@ pub const TranscriptRuntime = struct {
         return self.lifecycle_state.finalized_turn_watermark;
     }
 
+    pub fn toolTurnPresentationWatermark(self: *const TranscriptRuntime) u64 {
+        return @max(
+            self.lifecycle_state.finalized_turn_watermark,
+            self.lifecycle_state.batch_finalized_turn_watermark orelse 0,
+        );
+    }
+
     pub fn clearTranscript(self: *TranscriptRuntime, alloc: Allocator) void {
         const pending_resume_bytes = self.releasePendingResumeSource(alloc);
         if (pending_resume_bytes > 0) {

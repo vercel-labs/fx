@@ -118,6 +118,8 @@ const BuildStats = struct {
 };
 
 const ProjectionMode = enum { compact, expanded };
+const CollapsedGroupMode = enum { summary, live_tail };
+const live_tool_call_limit = 5;
 
 const category_labels = [_][]const u8{
     "read",
@@ -442,13 +444,13 @@ fn formatGroupBlock(
     detail_indices: *const std.AutoHashMapUnmanaged(u32, usize),
     summary: Summary,
     focused_entry_id: ?u32,
-    collapse_tool_calls: bool,
+    collapsed_group_mode: ?CollapsedGroupMode,
     cols: u16,
     style: SummaryStyle,
     styles: transcript_blocks.Styles,
 ) ![]u8 {
     const header = try formatGroupHeader(alloc, summary, cols, style);
-    if (collapse_tool_calls) return header;
+    if (collapsed_group_mode == .summary) return header;
     defer alloc.free(header);
 
     var focused_in_group = false;
@@ -473,6 +475,10 @@ fn formatGroupBlock(
     errdefer out.deinit();
     try out.writer.writeAll(header);
 
+    const static_start = if (collapsed_group_mode == .live_tail)
+        static_count -| live_tool_call_limit
+    else
+        0;
     var static_index: usize = 0;
     for (status_indices) |status_index| {
         const entry = entries[status_index];
@@ -490,6 +496,7 @@ fn formatGroupBlock(
             detail,
         ) orelse raw_phrase;
         static_index += 1;
+        if (static_index <= static_start) continue;
         const connector = if (!focused_in_group and static_index == static_count) "└" else "├";
         const child = try std.fmt.allocPrint(scratch, "{s} {s}", .{ connector, phrase });
         const clipped = try clipSummary(scratch, child, cols);
@@ -575,6 +582,33 @@ fn installExpandedGroup(
             try alloc.dupe(u8, child);
         try projection.setOwnedOverride(alloc, status_index, .tool_status, bytes);
     }
+}
+
+fn collapsedGroupMode(
+    collapse_tool_calls: bool,
+    finalized_turn_watermark: u64,
+    status_indices: []const usize,
+    entries: []const TranscriptEntry,
+    details: []const ToolDetailRecord,
+    detail_indices: *const std.AutoHashMapUnmanaged(u32, usize),
+) ?CollapsedGroupMode {
+    if (!collapse_tool_calls) return null;
+
+    var concrete_group_id: ?types.ToolPresentationGroupId = null;
+    var concrete_group_terminal = true;
+    for (status_indices) |status_index| {
+        const entry_id = toolStatusEntryId(entries[status_index]) orelse continue;
+        const detail = detailForEntry(details, detail_indices, entry_id, null) orelse continue;
+        if (detail.presentation_group_id) |group_id| {
+            concrete_group_id = group_id;
+            concrete_group_terminal = concrete_group_terminal and detail.outcome != null;
+            continue;
+        }
+        const lifecycle = detail.lifecycle_id orelse continue;
+        if (lifecycle.turn_id > finalized_turn_watermark) return .live_tail;
+    }
+    if (concrete_group_id != null and !concrete_group_terminal) return .live_tail;
+    return .summary;
 }
 
 fn presentationGroupId(
@@ -669,7 +703,7 @@ fn build(
     details: []const ToolDetailRecord,
     cols: u16,
 ) !Projection {
-    return buildWithStyleAndStats(alloc, entries, details, cols, null, false, .{}, .{}, .compact, null, null) catch |err| switch (err) {
+    return buildWithStyleAndStats(alloc, entries, details, cols, null, false, std.math.maxInt(u64), .{}, .{}, .compact, null, null) catch |err| switch (err) {
         error.InputPending => unreachable,
         else => |other| return other,
     };
@@ -683,7 +717,7 @@ pub fn buildStyled(
     style: SummaryStyle,
     styles: transcript_blocks.Styles,
 ) !Projection {
-    return buildWithStyleAndStats(alloc, entries, details, cols, null, false, style, styles, .compact, null, null) catch |err| switch (err) {
+    return buildWithStyleAndStats(alloc, entries, details, cols, null, false, std.math.maxInt(u64), style, styles, .compact, null, null) catch |err| switch (err) {
         error.InputPending => unreachable,
         else => |other| return other,
     };
@@ -698,7 +732,7 @@ pub fn buildExpandedStyledInterruptible(
     styles: transcript_blocks.Styles,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
 ) !Projection {
-    return buildWithStyleAndStats(alloc, entries, details, cols, null, false, style, styles, .expanded, null, checkpoint);
+    return buildWithStyleAndStats(alloc, entries, details, cols, null, false, std.math.maxInt(u64), style, styles, .expanded, null, checkpoint);
 }
 
 pub fn buildExpandedRelationshipsInterruptible(
@@ -714,6 +748,7 @@ pub fn buildExpandedRelationshipsInterruptible(
         std.math.maxInt(u16),
         null,
         false,
+        std.math.maxInt(u64),
         .{},
         .{},
         .expanded,
@@ -819,6 +854,32 @@ pub fn buildStyledFocusedInterruptible(
     styles: transcript_blocks.Styles,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
 ) !Projection {
+    return buildStyledFocusedWithFinalityInterruptible(
+        alloc,
+        entries,
+        details,
+        cols,
+        focused_entry_id,
+        collapse_tool_calls,
+        std.math.maxInt(u64),
+        style,
+        styles,
+        checkpoint,
+    );
+}
+
+pub fn buildStyledFocusedWithFinalityInterruptible(
+    alloc: std.mem.Allocator,
+    entries: []const TranscriptEntry,
+    details: []const ToolDetailRecord,
+    cols: u16,
+    focused_entry_id: ?u32,
+    collapse_tool_calls: bool,
+    finalized_turn_watermark: u64,
+    style: SummaryStyle,
+    styles: transcript_blocks.Styles,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !Projection {
     return buildWithStyleAndStats(
         alloc,
         entries,
@@ -826,6 +887,7 @@ pub fn buildStyledFocusedInterruptible(
         cols,
         focused_entry_id,
         collapse_tool_calls,
+        finalized_turn_watermark,
         style,
         styles,
         .compact,
@@ -841,7 +903,7 @@ fn buildWithStats(
     cols: u16,
     stats: ?*BuildStats,
 ) !Projection {
-    return buildWithStyleAndStats(alloc, entries, details, cols, null, false, .{}, .{}, .compact, stats, null);
+    return buildWithStyleAndStats(alloc, entries, details, cols, null, false, std.math.maxInt(u64), .{}, .{}, .compact, stats, null);
 }
 
 fn buildWithStyleAndStats(
@@ -851,6 +913,7 @@ fn buildWithStyleAndStats(
     cols: u16,
     focused_entry_id: ?u32,
     collapse_tool_calls: bool,
+    finalized_turn_watermark: u64,
     style: SummaryStyle,
     styles: transcript_blocks.Styles,
     mode: ProjectionMode,
@@ -1024,7 +1087,14 @@ fn buildWithStyleAndStats(
                 &detail_indices,
                 group.summary,
                 focused_entry_id,
-                collapse_tool_calls,
+                collapsedGroupMode(
+                    collapse_tool_calls,
+                    finalized_turn_watermark,
+                    group.status_indices.items,
+                    entries,
+                    details,
+                    &detail_indices,
+                ),
                 cols,
                 style,
                 styles,
@@ -1071,7 +1141,14 @@ fn buildWithStyleAndStats(
             &detail_indices,
             summary,
             focused_entry_id,
-            collapse_tool_calls,
+            collapsedGroupMode(
+                collapse_tool_calls,
+                finalized_turn_watermark,
+                status_indices.items,
+                entries,
+                details,
+                &detail_indices,
+            ),
             cols,
             style,
             styles,
@@ -1099,6 +1176,69 @@ test "collapsed tool groups render only the summary header" {
     try std.testing.expect(std.mem.find(u8, block, "2 tool calls") != null);
     try std.testing.expect(std.mem.find(u8, block, "Read file") == null);
     try std.testing.expect(projection.entry_actions.items[1] == .hide);
+}
+
+test "collapsed live tool groups show the latest five calls until batch finalization" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = @constCast("● Read one\n"), .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = @constCast("● Read two\n"), .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = @constCast("● Read three\n"), .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = @constCast("● Read four\n"), .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 5, .bytes = @constCast("● Read five\n"), .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 6, .bytes = @constCast("● Read six\n"), .class = .tool_status } },
+    };
+    const group_id: types.ToolPresentationGroupId = .{ .turn_id = 1, .anchor_step_id = 1 };
+    var details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed, .lifecycle_id = .{ .turn_id = 1, .call_id = "one" }, .presentation_group_id = group_id },
+        .{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed, .lifecycle_id = .{ .turn_id = 1, .call_id = "two" }, .presentation_group_id = group_id },
+        .{ .entry_id = 3, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed, .lifecycle_id = .{ .turn_id = 1, .call_id = "three" }, .presentation_group_id = group_id },
+        .{ .entry_id = 4, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed, .lifecycle_id = .{ .turn_id = 1, .call_id = "four" }, .presentation_group_id = group_id },
+        .{ .entry_id = 5, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed, .lifecycle_id = .{ .turn_id = 1, .call_id = "five" }, .presentation_group_id = group_id },
+        .{ .entry_id = 6, .tool_name = @constCast("read_file"), .activity_kind = .read, .lifecycle_id = .{ .turn_id = 1, .call_id = "six" }, .presentation_group_id = group_id },
+    };
+
+    var live = try buildStyledFocusedWithFinalityInterruptible(
+        alloc,
+        &entries,
+        &details,
+        120,
+        null,
+        true,
+        std.math.maxInt(u64),
+        .{},
+        .{},
+        null,
+    );
+    defer live.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "● 6 tool calls · 6 read\n" ++
+            "├ Read two\n" ++
+            "├ Read three\n" ++
+            "├ Read four\n" ++
+            "├ Read five\n" ++
+            "└ Read six",
+        live.entry_actions.items[0].override.bytes,
+    );
+
+    details[5].outcome = .completed;
+    var finalized = try buildStyledFocusedWithFinalityInterruptible(
+        alloc,
+        &entries,
+        &details,
+        120,
+        null,
+        true,
+        0,
+        .{},
+        .{},
+        null,
+    );
+    defer finalized.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "● 6 tool calls · 6 read",
+        finalized.entry_actions.items[0].override.bytes,
+    );
 }
 
 test "tool relationship grouping retries cleanly after cancellation" {
