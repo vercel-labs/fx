@@ -877,6 +877,10 @@ pub const LoadedWritableSession = struct {
         options: Options,
     ) !void {
         try confirmWritableNamespace(self, alloc, options);
+        if (self.projection_status == .current) {
+            try validateCurrentProjection(self, alloc);
+            return;
+        }
         _ = try validateLivePosition(
             alloc,
             &self.log.dir,
@@ -2723,6 +2727,36 @@ fn loadCurrentManifestForOpen(
         .manifest = manifest,
         .event_file_matches = !session_projection.isManifestStale(manifest, stat),
     };
+}
+
+fn validateCurrentProjection(
+    loaded: *LoadedWritableSession,
+    alloc: Allocator,
+) !void {
+    var event_log = try openManagedFile(&loaded.log.dir, events_file, .read_only);
+    defer event_log.close(io_mod.getIo());
+    var current = try loadCurrentManifestForOpen(
+        alloc,
+        &loaded.log.dir,
+        loaded.active_id,
+        loaded.authority_id,
+        event_log,
+        loaded.position,
+    );
+    defer current.manifest.deinit(alloc);
+    if (!current.event_file_matches or
+        !session_projection.stateMatchesManifest(loaded.state, current.manifest))
+    {
+        return error.InvalidSessionFormat;
+    }
+    const position = try loadCurrentPositionReference(
+        alloc,
+        &loaded.log.dir,
+        loaded.active_id,
+    );
+    if (!positionsEqual(position, loaded.position)) {
+        return error.InvalidSessionFormat;
+    }
 }
 
 fn replayCurrentCheckpoint(
@@ -6555,6 +6589,34 @@ test "checkpoint clean shutdown preserves a valid bounded tail" {
         opened.tail_bytes,
     );
     try std.testing.expect(opened.state.preferences.fast_mode);
+}
+
+test "resume boundary validation uses the current projection without replaying history" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-resume-boundary-projection", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+
+    const response = try alloc.alloc(u8, 1024 * 1024);
+    defer alloc.free(response);
+    @memset(response, 'r');
+    var next = try stateWithPrompt(alloc, loaded.state, 20, "hello", response);
+    defer next.deinit(alloc);
+    _ = try loaded.appendEvent(
+        alloc,
+        historyEvent(next),
+        20,
+        .retry_expected_tail,
+        .{},
+    );
+    try std.testing.expectEqual(ProjectionStatus.current, loaded.projection_status);
+
+    var validation_buffer: [64 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&validation_buffer);
+    try loaded.validateResumeBoundary(fixed.allocator(), .{});
 }
 
 test "final replacement policy tracks mutations after the last replacement" {
