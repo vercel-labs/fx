@@ -12,6 +12,7 @@ const session_store = @import("../core/session/session_store.zig");
 const legacy_background_migration = @import("../core/session/legacy_background_migration.zig");
 const js_host_session_store = @import("../core/session/js_host_session_store.zig");
 const session_runtime = @import("../core/session/session.zig");
+const session_display_metadata = @import("../core/session/session_display_metadata.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
 const mcp_contract = @import("../core/mcp/mcp_contract.zig");
 const project_config = @import("../core/mcp/project_config.zig");
@@ -429,17 +430,25 @@ pub fn handleListWasmSessions(state: *server.ServerState, alloc: Allocator, msg:
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"sessions\":[");
-    for (entries, 0..) |entry, index| {
-        if (index > 0) try out.writer.writeByte(',');
-        try out.writer.writeAll("{\"sessionId\":");
-        try writeJsonStr(entry.id, &out.writer);
-        try out.writer.writeAll(",\"cwd\":");
-        try writeJsonStr(state.workspace_root, &out.writer);
-        try out.writer.writeAll(",\"updatedAt\":");
-        const iso = try formatIso8601(alloc, entry.updated_at_ms);
-        defer alloc.free(iso);
-        try writeJsonStr(iso, &out.writer);
-        try out.writer.writeByte('}');
+    var written: usize = 0;
+    for (entries) |entry| {
+        const maybe_loaded = js_host_session_store.load(alloc, entry.id) catch continue;
+        var loaded = maybe_loaded orelse continue;
+        defer loaded.deinit(alloc);
+        var display = try session_display_metadata.deriveFromHistory(alloc, loaded.state.history);
+        defer display.deinit(alloc);
+        if (written > 0) try out.writer.writeByte(',');
+        try writeSessionListEntry(
+            &out.writer,
+            alloc,
+            entry.id,
+            state.workspace_root,
+            entry.updated_at_ms,
+            display.title,
+            loaded.state.preferences,
+            loaded.state.history.len,
+        );
+        written += 1;
     }
     try out.writer.writeAll("]}");
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
@@ -1100,21 +1109,20 @@ pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *js
             );
             continue;
         }
+        var metadata = store.loadSubagentBootstrapMetadata(alloc, summary.id) catch continue;
+        defer metadata.deinit(alloc);
         if (wrote_session) try out.writer.writeAll(",");
         wrote_session = true;
-        try out.writer.writeAll("{\"sessionId\":");
-        try writeJsonStr(summary.id, &out.writer);
-        try out.writer.writeAll(",\"cwd\":");
-        try writeJsonStr(workspace_root, &out.writer);
-        if (summary.title) |title| {
-            try out.writer.writeAll(",\"title\":");
-            try writeJsonStr(title, &out.writer);
-        }
-        try out.writer.writeAll(",\"updatedAt\":");
-        const iso = try formatIso8601(alloc, summary.updated_at_ms);
-        defer alloc.free(iso);
-        try writeJsonStr(iso, &out.writer);
-        try out.writer.writeAll("}");
+        try writeSessionListEntry(
+            &out.writer,
+            alloc,
+            summary.id,
+            workspace_root,
+            summary.updated_at_ms,
+            summary.title,
+            metadata.preferences,
+            summary.history_len,
+        );
     }
     try out.writer.writeAll("]");
     if (next_cursor) |cursor| {
@@ -1173,6 +1181,42 @@ fn parseListCursor(raw: []const u8) !session_store.ResumableSessionContinuation 
     if (updated_at_ms < 0 or fields.next() != null) return error.InvalidParams;
     session_store.validateSessionId(id) catch return error.InvalidParams;
     return .{ .updated_at_ms = updated_at_ms, .id = id };
+}
+
+fn writeSessionListEntry(
+    writer: *std.Io.Writer,
+    alloc: Allocator,
+    session_id: []const u8,
+    cwd: []const u8,
+    updated_at_ms: i64,
+    title: ?[]const u8,
+    preferences: session_codec.DurableSessionPreferences,
+    history_len: usize,
+) !void {
+    try writer.writeAll("{\"sessionId\":");
+    try writeJsonStr(session_id, writer);
+    try writer.writeAll(",\"cwd\":");
+    try writeJsonStr(cwd, writer);
+    try writer.writeAll(",\"updatedAt\":");
+    const iso = try formatIso8601(alloc, updated_at_ms);
+    defer alloc.free(iso);
+    try writeJsonStr(iso, writer);
+    try writer.writeAll(",\"title\":");
+    if (title) |value| {
+        try writeJsonStr(value, writer);
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll(",\"preferences\":{\"provider\":");
+    try writeJsonStr(@tagName(preferences.provider), writer);
+    try writer.writeAll(",\"model\":");
+    try writeJsonStr(preferences.model, writer);
+    try writer.writeAll(",\"effort\":");
+    try writeJsonStr(preferences.effort.label(), writer);
+    try writer.print(",\"fast_mode\":{s}}},\"history_len\":{d}}}", .{
+        if (preferences.fast_mode) "true" else "false",
+        history_len,
+    });
 }
 
 fn sendHistoryTurnAsUpdates(state: *server.ServerState, alloc: Allocator, session_id: []const u8, turn: types.HistoryTurn) !void {
@@ -1482,6 +1526,30 @@ test "formatIso8601 produces known timestamp" {
     const result = try formatIso8601(alloc, 0);
     defer alloc.free(result);
     try std.testing.expectEqualStrings("1970-01-01T00:00:00Z", result);
+}
+
+test "ACP session list entry includes display preferences and history metadata" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeSessionListEntry(
+        &out.writer,
+        std.testing.allocator,
+        "session-1",
+        "/tmp/workspace",
+        0,
+        "Inspect metadata",
+        .{
+            .provider = .codex,
+            .model = @constCast("gpt-5.4"),
+            .effort = types.ReasoningEffort.literal("high"),
+            .fast_mode = true,
+        },
+        3,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"sessionId\":\"session-1\",\"cwd\":\"/tmp/workspace\",\"updatedAt\":\"1970-01-01T00:00:00Z\",\"title\":\"Inspect metadata\",\"preferences\":{\"provider\":\"codex\",\"model\":\"gpt-5.4\",\"effort\":\"high\",\"fast_mode\":true},\"history_len\":3}",
+        out.writer.buffered(),
+    );
 }
 
 test "writeModelConfigOption produces valid json with single model fallback" {

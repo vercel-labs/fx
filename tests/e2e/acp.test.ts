@@ -6577,6 +6577,58 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "session/list returns title preferences and history length",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-session-list-metadata-");
+      const model = "provider/list-metadata";
+      const gateway = startFakeGateway([finalText("metadata complete")], {
+        models: [{
+          id: model,
+          type: "language",
+          tags: ["reasoning", "tool-use"],
+          reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+        }],
+      });
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        `${JSON.stringify({ model, effort: "high", fast_mode: false })}\n`,
+      );
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        const sessionId = await startCodeSession(client);
+        const prompt = "Expose rich ACP session metadata.";
+        expect((await runPrompt(client, prompt)).promptResult.result.stopReason).toBe("end_turn");
+
+        const listed = await client.request("session/list", {}, 20) as any;
+        expect(listed.error).toBeUndefined();
+        expect(listed.result.sessions).toContainEqual(expect.objectContaining({
+          sessionId,
+          cwd: root.workspace,
+          title: prompt,
+          preferences: {
+            provider: "gateway",
+            model,
+            effort: "high",
+            fast_mode: false,
+          },
+          history_len: 1,
+        }));
+        client.endStdin();
+        expect(await client.waitForExit()).toBe(0);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "session/list treats null cwd as omitted",
     async () => {
       const root = createIsolatedRoot("fx-acp-null-session-list-");
