@@ -317,6 +317,13 @@ fn writeNewSessionResponse(
         state.active_session.?.model,
         state.capability_resolver.catalogEntries(),
     );
+    if (modelSupportsFastMode(
+        state.active_session.?.model,
+        state.capability_resolver.catalogEntries(),
+    )) {
+        try out.writer.writeAll(",");
+        try writeFastConfigOption(&out.writer, state.active_session.?.fast_mode);
+    }
     try out.writer.writeAll(",");
     try writeModeConfigOption(
         &out.writer,
@@ -859,6 +866,10 @@ fn writeLoadSessionResponse(
         model,
         state.capability_resolver.catalogEntries(),
     );
+    if (modelSupportsFastMode(model, state.capability_resolver.catalogEntries())) {
+        try out.writer.writeAll(",");
+        try writeFastConfigOption(&out.writer, state.active_session.?.fast_mode);
+    }
     try out.writer.writeAll(",");
     try writeModeConfigOption(
         &out.writer,
@@ -1426,6 +1437,24 @@ pub fn writeModelConfigOption(
     try w.writeAll("]}");
 }
 
+pub fn modelSupportsFastMode(
+    model: []const u8,
+    catalog: ?[]const model_catalog.ModelCatalogEntry,
+) bool {
+    const entries = catalog orelse return false;
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.id, model)) return entry.supports_fast_mode;
+    }
+    return false;
+}
+
+/// Callers omit this option when the active catalog entry has no Fast support.
+pub fn writeFastConfigOption(w: *std.Io.Writer, enabled: bool) !void {
+    try w.writeAll("{\"id\":\"fast\",\"name\":\"Fast mode\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":");
+    try writeJsonStr(if (enabled) "fast" else "normal", w);
+    try w.writeAll(",\"options\":[{\"value\":\"normal\",\"name\":\"Normal\"},{\"value\":\"fast\",\"name\":\"Fast\"}]}");
+}
+
 pub fn writeProviderConfigOption(
     w: *std.Io.Writer,
     current: model_provider.ProviderId,
@@ -1535,6 +1564,29 @@ test "writeModelConfigOption appends current model when not in cached list" {
     try std.testing.expect(std.mem.find(u8, items, "\"currentValue\":\"custom/my-model\"") != null);
     try std.testing.expect(std.mem.find(u8, items, "anthropic/claude-opus-4.6") != null);
     try std.testing.expect(std.mem.find(u8, items, "custom/my-model") != null);
+}
+
+test "Fast config option is catalog gated and uses ACP select values" {
+    const alloc = std.testing.allocator;
+    const entries = [_]model_catalog.ModelCatalogEntry{
+        .{
+            .id = @constCast("provider/fast"),
+            .model_type = @constCast("language"),
+            .supports_fast_mode = true,
+        },
+        .{ .id = @constCast("provider/plain"), .model_type = @constCast("language") },
+    };
+    try std.testing.expect(modelSupportsFastMode("provider/fast", &entries));
+    try std.testing.expect(!modelSupportsFastMode("provider/plain", &entries));
+    try std.testing.expect(!modelSupportsFastMode("provider/missing", &entries));
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeFastConfigOption(&out.writer, true);
+    try std.testing.expectEqualStrings(
+        "{\"id\":\"fast\",\"name\":\"Fast mode\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":\"fast\",\"options\":[{\"value\":\"normal\",\"name\":\"Normal\"},{\"value\":\"fast\",\"name\":\"Fast\"}]}",
+        out.writer.buffered(),
+    );
 }
 
 test "writeModeConfigOption produces valid json with all modes" {

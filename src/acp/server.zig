@@ -2042,6 +2042,10 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 .code = ErrorCode.invalid_params,
                 .message = "Invalid session model",
             });
+        const next_fast_mode = session.fast_mode and sessions.modelSupportsFastMode(
+            value,
+            state.capability_resolver.catalogEntries(),
+        );
         if (comptime !host_target.is_wasm) {
             if (session.provider != .gateway) {
                 try refreshModelCatalogForOptions(state);
@@ -2078,9 +2082,12 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     .message = "Failed to update session model",
                 });
             const previous_model = session.model;
+            const previous_fast_mode = session.fast_mode;
             session.model = next_model;
+            session.fast_mode = next_fast_mode;
             sessions.commitWasmSession(alloc, session) catch {
                 session.model = previous_model;
+                session.fast_mode = previous_fast_mode;
                 alloc.free(next_model);
                 return state.writer.writeError(alloc, msg.id, .{
                     .code = ErrorCode.internal_error,
@@ -2092,6 +2099,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             alloc,
             session,
             value,
+            next_fast_mode,
             session_test_controls.logOptions(),
         ) catch |err| {
             if (modelCommitFailureTerminatesConnection(err)) {
@@ -2111,6 +2119,53 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     "Invalid session model"
                 else
                     "Failed to persist session model",
+            });
+        };
+    } else if (std.mem.eql(u8, config_id, "fast")) {
+        const session = if (state.active_session) |*active| active else return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = "No active session",
+        });
+        const enabled = if (std.mem.eql(u8, value, "normal"))
+            false
+        else if (std.mem.eql(u8, value, "fast"))
+            true
+        else
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_params,
+                .message = "Invalid Fast mode",
+            });
+        if (!sessions.modelSupportsFastMode(
+            session.model,
+            state.capability_resolver.catalogEntries(),
+        )) {
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_params,
+                .message = "Fast mode is not supported by the active model",
+            });
+        }
+        if (host_target.is_wasm and session.writable == null) {
+            const previous_fast_mode = session.fast_mode;
+            session.fast_mode = enabled;
+            sessions.commitWasmSession(alloc, session) catch {
+                session.fast_mode = previous_fast_mode;
+                return state.writer.writeError(alloc, msg.id, .{
+                    .code = ErrorCode.internal_error,
+                    .message = "Failed to persist session Fast mode",
+                });
+            };
+        } else commitActiveSessionFastMode(
+            alloc,
+            session,
+            enabled,
+            session_test_controls.logOptions(),
+        ) catch |err| {
+            if (modelCommitFailureTerminatesConnection(err)) {
+                state.terminate_connection = true;
+            }
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.internal_error,
+                .message = "Failed to persist session Fast mode",
             });
         };
     } else if (std.mem.eql(u8, config_id, "provider")) {
@@ -2213,11 +2268,14 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     }
                 }
             }
+            const next_fast_mode = session.fast_mode and
+                sessions.modelSupportsFastMode(selected_model, catalog.items);
             commitActiveSessionProvider(
                 alloc,
                 session,
                 target,
                 selected_model,
+                next_fast_mode,
                 session_test_controls.logOptions(),
             ) catch |err| {
                 if (modelCommitFailureTerminatesConnection(err)) {
@@ -2265,6 +2323,16 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
         current_model,
         state.capability_resolver.catalogEntries(),
     );
+    if (sessions.modelSupportsFastMode(
+        current_model,
+        state.capability_resolver.catalogEntries(),
+    )) {
+        try out.writer.writeAll(",");
+        try sessions.writeFastConfigOption(
+            &out.writer,
+            if (state.active_session) |session| session.fast_mode else state.fast_mode,
+        );
+    }
     try out.writer.writeAll(",");
     try sessions.writeModeConfigOption(&out.writer, state.cfg.mode_registry, current_mode);
     try out.writer.writeAll("]}");
@@ -2299,6 +2367,7 @@ fn commitActiveSessionProvider(
     session: *ActiveSessionState,
     provider: model_provider.ProviderId,
     model: []const u8,
+    fast_mode: bool,
     options: session_log.Options,
 ) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
@@ -2314,6 +2383,7 @@ fn commitActiveSessionProvider(
         .{ .preferences_changed = .{
             .provider = provider,
             .model = @constCast(model),
+            .fast_mode = fast_mode,
         } },
         io_mod.milliTimestamp(),
         .rollback_before_adapter_continue,
@@ -2322,12 +2392,14 @@ fn commitActiveSessionProvider(
     alloc.free(session.model);
     session.model = staged_model;
     session.provider = provider;
+    session.fast_mode = fast_mode;
 }
 
 fn commitActiveSessionModel(
     alloc: Allocator,
     session: *ActiveSessionState,
     value: []const u8,
+    fast_mode: bool,
     options: session_log.Options,
 ) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
@@ -2341,8 +2413,10 @@ fn commitActiveSessionModel(
         writable,
         &session.model,
         value,
+        fast_mode,
         options,
     );
+    session.fast_mode = fast_mode;
 }
 
 fn commitSessionModel(
@@ -2350,19 +2424,45 @@ fn commitSessionModel(
     writable: *session_store.LoadedWritableSession,
     active_model: *[]u8,
     value: []const u8,
+    fast_mode: bool,
     options: session_log.Options,
 ) !void {
     const staged_model = try alloc.dupe(u8, value);
     errdefer alloc.free(staged_model);
     _ = try writable.appendEvent(
         alloc,
-        .{ .preferences_changed = .{ .model = @constCast(value) } },
+        .{ .preferences_changed = .{
+            .model = @constCast(value),
+            .fast_mode = fast_mode,
+        } },
         io_mod.milliTimestamp(),
         .rollback_before_adapter_continue,
         options,
     );
     alloc.free(active_model.*);
     active_model.* = staged_model;
+}
+
+fn commitActiveSessionFastMode(
+    alloc: Allocator,
+    session: *ActiveSessionState,
+    enabled: bool,
+    options: session_log.Options,
+) !void {
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const writable = if (session.writable) |*active|
+        active
+    else
+        return error.SessionPersistenceUnavailable;
+    _ = try writable.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .fast_mode = enabled } },
+        io_mod.milliTimestamp(),
+        .rollback_before_adapter_continue,
+        options,
+    );
+    session.fast_mode = enabled;
 }
 
 fn modelCommitFailureTerminatesConnection(err: anyerror) bool {
@@ -2860,7 +2960,7 @@ fn acpModelTestState(
         .preferences = .{
             .model = model,
             .effort = .auto,
-            .fast_mode = false,
+            .fast_mode = true,
         },
         .history = history,
         .total_input_tokens = 0,
@@ -2900,6 +3000,7 @@ test "ACP model commit rolls back before later request can succeed" {
             &writable,
             &active_model,
             "rejected-model",
+            false,
             failure.options(),
         ),
     );
@@ -2908,6 +3009,7 @@ test "ACP model commit rolls back before later request can succeed" {
         "old-model",
         writable.state.preferences.model,
     );
+    try std.testing.expect(writable.state.preferences.fast_mode);
     try std.testing.expect(writable.degradedTail() == null);
 
     try commitSessionModel(
@@ -2915,6 +3017,7 @@ test "ACP model commit rolls back before later request can succeed" {
         &writable,
         &active_model,
         "accepted-model",
+        false,
         .{},
     );
     try std.testing.expectEqualStrings("accepted-model", active_model);
@@ -2922,6 +3025,7 @@ test "ACP model commit rolls back before later request can succeed" {
         "accepted-model",
         writable.state.preferences.model,
     );
+    try std.testing.expect(!writable.state.preferences.fast_mode);
 }
 
 test "ACP indeterminate model commit leaves staged runtime value unapplied" {
@@ -2960,6 +3064,7 @@ test "ACP indeterminate model commit leaves staged runtime value unapplied" {
         &writable,
         &active_model,
         "uncertain-model",
+        false,
         failure.options(),
     );
     try std.testing.expectError(error.SessionCommitIndeterminate, result);
@@ -2997,6 +3102,7 @@ test "ACP model commits honor the active session write boundary" {
                 self.alloc,
                 self.active,
                 "new-model",
+                false,
                 .{},
             ) catch |err| {
                 self.failure = err;

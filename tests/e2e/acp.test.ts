@@ -8093,6 +8093,81 @@ describe("acp: model-independent", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "Fast config follows model support and reaches the Gateway request",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-fast-config-");
+      const plainModel = "provider/plain-model";
+      const gateway = startFakeGateway([finalText("fast complete")], {
+        models: [
+          {
+            id: FAKE_GATEWAY_MODEL,
+            type: "language",
+            tags: ["tool-use"],
+            fast_options: [{ type: "toggle" }],
+          },
+          { id: plainModel, type: "language", tags: ["tool-use"] },
+        ],
+      });
+      const fastOption = (response: any) =>
+        response.result.configOptions.find((option: any) => option.id === "fast");
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request("session/new", { mcpServers: [] }, 2) as any;
+        expect(fastOption(created).currentValue).toBe("normal");
+        expect(fastOption(created).options.map((option: any) => option.value))
+          .toEqual(["normal", "fast"]);
+        await client.readLine(); // consume session/update notification
+
+        const selected = await client.request("session/set_config_option", {
+          configId: "fast",
+          value: "fast",
+        }, 3) as any;
+        expect(fastOption(selected).currentValue).toBe("fast");
+
+        await client.request("session/new", { mcpServers: [] }, 4);
+        await client.readLine(); // consume session/update notification
+        const loaded = await client.request("session/load", {
+          sessionId: created.result.sessionId,
+          mcpServers: [],
+        }, 5) as any;
+        expect(fastOption(loaded).currentValue).toBe("fast");
+
+        const prompt = await runPrompt(client, "Confirm Fast mode.", TIMEOUT);
+        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.parse(gateway.requests[0]!.body).providerOptions.gateway.speed)
+          .toBe("fast");
+
+        const invalid = await client.request("session/set_config_option", {
+          configId: "fast",
+          value: "turbo",
+        }, 6) as any;
+        expect(invalid.result).toBeUndefined();
+        expect(invalid.error.code).toBe(-32602);
+        expect(invalid.error.message).toContain("Invalid Fast mode");
+
+        const changedModel = await client.request("session/set_config_option", {
+          configId: "model",
+          value: plainModel,
+        }, 7) as any;
+        expect(fastOption(changedModel)).toBeUndefined();
+
+        client.endStdin();
+        expect(await client.waitForExit()).toBe(0);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
 });
 
 describe("acp: model catalog authentication", () => {
