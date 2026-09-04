@@ -4075,7 +4075,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     await expectFixtureProcessesExited(timeoutWire);
   }, 45_000);
 
-  test("fx ask bounds startup timeouts and reaps every attempted child", async () => {
+  test("fx ask bounds startup timeouts without relaunching a live child", async () => {
     const root = createRoot("ask-startup-timeout", MODERN_FIXTURE, {
       mode: "stall_startup",
       startupTimeoutMs: 50,
@@ -4105,8 +4105,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     expect(JSON.parse(result.stdout).output).toContain("Startup timeout bounded.");
     expect(activeGateway.requests).toHaveLength(2);
     const launch = readStartupLaunchEvidence(root);
-    expect(launch.startedPids.length).toBeGreaterThanOrEqual(2);
-    expect(launch.startedPids.length).toBeLessThanOrEqual(4);
+    expect(launch.startedPids).toHaveLength(1);
     expect(launch.childRecordedPids.length).toBeLessThanOrEqual(
       launch.startedPids.length,
     );
