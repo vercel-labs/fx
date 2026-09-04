@@ -1,4 +1,6 @@
 const std = @import("std");
+const auth_runtime = @import("../../auth/auth_runtime.zig");
+const agent_stream_provider = @import("../stream_provider.zig");
 const image_attachments = @import("../../images/image_attachments.zig");
 const types = @import("../../shared/types.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
@@ -80,6 +82,7 @@ pub const VisionFailure = union(enum) {
     provider_response_invalid,
     output_limit_exceeded: OutputLimit,
     vision_unavailable,
+    provider_failure: agent_stream_provider.FailureMetadata,
     missing_provider_record,
 
     pub fn code(self: VisionFailure) FailureCode {
@@ -94,6 +97,7 @@ pub const VisionFailure = union(enum) {
             .vision_unavailable,
             .missing_provider_record,
             => true,
+            .provider_failure => false,
         };
     }
 
@@ -103,6 +107,13 @@ pub const VisionFailure = union(enum) {
             .provider_response_invalid => "Try a later explicit Vision call if useful, or continue without visual claims.",
             .output_limit_exceeded => "Call Vision again with a narrower focus or fewer images.",
             .vision_unavailable => "Retry later, change model or strategy, or continue without visual claims.",
+            .provider_failure => |failure| if (auth_runtime.FailureSnapshot.from_provider(.{
+                .kind = failure.kind,
+                .http_status = failure.http_status,
+            }, failure.credential_source)) |snapshot|
+                snapshot.recovery_message()
+            else
+                "Report the provider failure and continue without visual claims.",
             .missing_provider_record => "Call Vision again for only this image if its evidence is still needed.",
         };
     }
@@ -382,7 +393,7 @@ pub fn stringify_vision_result(
             },
             .failed => |failure| {
                 try out.writer.writeAll("\"status\":\"failed\",\"error\":");
-                try write_failure_diagnostic(&out.writer, failure);
+                try write_failure_diagnostic(alloc, &out.writer, failure);
             },
         }
         try out.writer.writeByte('}');
@@ -392,9 +403,10 @@ pub fn stringify_vision_result(
 }
 
 fn write_failure_diagnostic(
+    alloc: Allocator,
     writer: *std.Io.Writer,
     failure: VisionFailure,
-) std.Io.Writer.Error!void {
+) !void {
     try writer.writeAll("{\"code\":");
     try std.json.Stringify.value(@tagName(failure.code()), .{}, writer);
     try writer.writeAll(",\"message\":");
@@ -418,6 +430,11 @@ fn write_failure_diagnostic(
             .{},
             writer,
         ),
+        .provider_failure => |provider_failure| {
+            const message = try auth_runtime.provider_failure_text(alloc, provider_failure);
+            defer alloc.free(message);
+            try std.json.Stringify.value(message, .{}, writer);
+        },
         .missing_provider_record => try std.json.Stringify.value(
             "Vision returned no record for this image.",
             .{},

@@ -1,4 +1,5 @@
 const std = @import("std");
+const auth_runtime = @import("../../core/auth/auth_runtime.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const list_window = @import("../../core/shared/list_window.zig");
 const model_cache_runtime = @import("../../core/app/model_cache_runtime.zig");
@@ -114,15 +115,13 @@ pub inline fn composeModelMenuRow(
     if (projection.load_state != .ready or layout.match_count == 0) {
         if (layout.state_row == row_index) return composeStateRow(alloc, projection, width);
         if (layout.status_row == row_index) {
-            const text = loadedCatalogStatusText(projection.catalog_state) orelse return row;
-            return composeDimmedRow(alloc, text, width);
+            return composeCatalogStatusRow(alloc, projection.catalog_state, width);
         }
         return row;
     }
     if (layout.status_row) |status_row| {
         if (row_index == status_row) {
-            const text = loadedCatalogStatusText(projection.catalog_state) orelse return row;
-            return composeDimmedRow(alloc, text, width);
+            return composeCatalogStatusRow(alloc, projection.catalog_state, width);
         }
     }
     if (row_index < layout.first_item_row) return row;
@@ -387,7 +386,12 @@ fn appendMetadataFact(alloc: Allocator, text: *std.ArrayList(u8), fact: []const 
 }
 
 fn composeStateRow(alloc: Allocator, projection: ModelMenuProjection, width: u16) !std.ArrayList(u8) {
-    const text = switch (projection.load_state) {
+    const host_message = if (projection.load_state == .failed and projection.catalog_state.failure != null)
+        try auth_runtime.host_catalog_failure_text(alloc, projection.catalog_state.failure.?, projection.catalog_state.source)
+    else
+        null;
+    defer if (host_message) |message| alloc.free(message);
+    const text = host_message orelse switch (projection.load_state) {
         .loading => "Loading models…",
         .failed => retryableFailureText(projection.catalog_state.failure) orelse "Unable to load models.",
         .ready => if (projection.items.len == 0) "No models available." else "No models found.",
@@ -395,7 +399,23 @@ fn composeStateRow(alloc: Allocator, projection: ModelMenuProjection, width: u16
     return composeDimmedRow(alloc, text, width);
 }
 
+fn composeCatalogStatusRow(alloc: Allocator, state: model_cache_runtime.ModelMenuCatalogState, width: u16) !std.ArrayList(u8) {
+    const host_message = if (state.failure) |failure| try auth_runtime.host_catalog_failure_text(alloc, failure, state.source) else null;
+    defer if (host_message) |message| alloc.free(message);
+    const text = host_message orelse loadedCatalogStatusText(state) orelse return .empty;
+    return composeDimmedRow(alloc, text, width);
+}
+
 fn loadedCatalogStatusText(state: model_cache_runtime.ModelMenuCatalogState) ?[]const u8 {
+    if (state.source == .host_managed) {
+        if (state.failure) |failure| {
+            if (failure.upstream_cancel_unconfirmed) return auth_runtime.upstream_cancellation_unconfirmed_message;
+            if (failure.http_status) |status| {
+                if (auth_runtime.FailureSnapshot.fromHttp(status, state.source)) |snapshot| return snapshot.recovery_message();
+                return "Host model catalog request failed.";
+            }
+        }
+    }
     if (retryableFailureText(state.failure)) |text| return text;
     if (state.private_models_hidden) {
         const reason = state.public_only_reason orelse return "Using the public model catalog.";

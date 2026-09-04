@@ -756,8 +756,13 @@ pub fn requestToolPermissionTraced(
     const target_class = classifyPermissionTarget(hooks, arena, call, advertised_dynamic_tool_names, workspace_root);
     tracePermissionRequest(call, mode, local_grants.len, target_class, ctx);
     const outcome = hooks.request_tool_permission(hooks.ctx, arena, call, review_turn, mode, local_grants, live_authority, revalidation, advertised_dynamic_tool_names) catch |err| {
+        if (err == error.UpstreamCancellationUnconfirmed) {
+            try hooks.push_unconfirmed_cancellation();
+            return error.Cancelled;
+        }
         return permissionErrorOutcome(arena, call, mode, err, target_class, ctx);
     };
+    try publishReviewFailure(hooks, outcome);
     tracePermissionOutcome(call, mode, local_grants.len, target_class, ctx, outcome);
     return outcome;
 }
@@ -788,10 +793,27 @@ pub fn requestPreparedFileMutationPermissionTraced(
         );
     };
     const outcome = request(hooks.ctx, arena, call, prepared, review_turn, mode, local_grants, live_authority, advertised_dynamic_tool_names) catch |err| {
+        if (err == error.UpstreamCancellationUnconfirmed) {
+            try hooks.push_unconfirmed_cancellation();
+            return error.Cancelled;
+        }
         return permissionErrorOutcome(arena, call, mode, err, target_class, ctx);
     };
+    try publishReviewFailure(hooks, outcome);
     tracePermissionOutcome(call, mode, local_grants.len, target_class, ctx, outcome);
     return outcome;
+}
+
+fn publishReviewFailure(hooks: *const AgentRuntimeDeps, outcome: command_admission.PermissionOutcome) !void {
+    if (outcome.provider_failure) |failure| {
+        try hooks.push_provider_failure(hooks.ctx, .{
+            .kind = failure.kind,
+            .http_status = failure.http_status,
+        }, failure.credential_source);
+    }
+    if (outcome.upstream_cancel_unconfirmed) {
+        try hooks.push_unconfirmed_cancellation();
+    }
 }
 
 fn tracePermissionRequest(

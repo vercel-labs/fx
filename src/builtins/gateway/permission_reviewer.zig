@@ -1,5 +1,6 @@
 const std = @import("std");
 const gateway_client = @import("../../gateway/client.zig");
+const host_broker = @import("../../gateway/host_broker.zig");
 const permission_auto_classifier = @import("../../core/permissions/auto_classifier.zig");
 const session_usage = @import("../../core/session/session_usage.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
@@ -165,7 +166,15 @@ fn sendGatewayReview(
             );
             return .permanent_failure;
         };
-        return mapTransportError(err, cancel_flag);
+        const outcome = try mapTransportError(err, cancel_flag);
+        if (delivery.upstream_cancel_unconfirmed.load(.seq_cst)) {
+            return .{ .upstream_cancellation_unconfirmed = switch (outcome) {
+                .cancelled => .cancelled,
+                .timed_out => .timed_out,
+                else => .transport_failure,
+            } };
+        }
+        return outcome;
     };
     var stream_owned = true;
     defer if (stream_owned) stream.deinit(alloc);
@@ -201,9 +210,19 @@ fn sendGatewayReview(
     };
 
     if (cancel_flag.load(.seq_cst)) {
-        return .cancelled;
+        return if (delivery.upstream_cancel_unconfirmed.load(.seq_cst))
+            .{ .upstream_cancellation_unconfirmed = .cancelled }
+        else
+            .cancelled;
     }
     if (stream.status != .ok) {
+        if (config.credential_source == .host_managed) {
+            return .{ .provider_failure = .{
+                .kind = providerFailureKind(stream.status),
+                .http_status = stream.status,
+                .credential_source = .host_managed,
+            } };
+        }
         const outcome = mapHttpStatus(stream.status);
         debug_trace.logf(
             "permission",
@@ -305,6 +324,21 @@ fn mapHttpStatus(status: std.http.Status) permission_auto_classifier.TransportOu
     return .permanent_failure;
 }
 
+fn providerFailureKind(status: std.http.Status) stream_provider.FailureKind {
+    return switch (status) {
+        .bad_request => .invalid_request,
+        .unauthorized => .unauthorized,
+        .forbidden => .forbidden,
+        .payload_too_large => .request_too_large,
+        .too_many_requests => .rate_limited,
+        .internal_server_error => .server_error,
+        .bad_gateway => .bad_gateway,
+        .service_unavailable => .unavailable,
+        .gateway_timeout => .gateway_timeout,
+        else => .provider_error,
+    };
+}
+
 fn streamGatewayReviewer(
     _: *anyopaque,
     alloc: Allocator,
@@ -318,14 +352,22 @@ fn streamGatewayReviewer(
     delivery: *gateway_client.DeliveryCertainty,
     cancel_flag: *std.atomic.Value(bool),
 ) !gateway_client.StreamResult {
+    var broker_request = try host_broker.prepare(alloc, .gateway_chat, null);
+    defer if (broker_request) |*prepared| prepared.deinit(alloc);
+    errdefer if (broker_request) |*prepared| {
+        if (delivery.load() == .possibly_sent and !prepared.cancel(alloc)) {
+            delivery.upstream_cancel_unconfirmed.store(true, .seq_cst);
+        }
+    };
     return gateway_client.streamGatewayRequiredToolCompletionBounded(
         alloc,
         .{
-            .api_key = if (api_key.len > 0) api_key else null,
-            .team = team,
+            .broker_request = if (broker_request) |*prepared| prepared else null,
+            .api_key = if (broker_request) |prepared| prepared.token else if (api_key.len > 0) api_key else null,
+            .team = if (broker_request == null) team else null,
             .model = model,
             .retry_count = retry_count,
-            .chat_url = chat_url,
+            .chat_url = if (broker_request) |prepared| prepared.url else chat_url,
             .payload = payload,
             .delivery = delivery,
         },
@@ -344,6 +386,11 @@ const FakeOutcome = enum {
     cancelled,
     transient_http,
     permanent_http,
+    host_unauthorized,
+    host_forbidden,
+    host_unavailable,
+    unconfirmed_cancel,
+    unconfirmed_timeout,
 };
 
 const FakeStream = struct {
@@ -388,6 +435,19 @@ const FakeStream = struct {
             .cancelled => error.Cancelled,
             .transient_http => .{ .status = @enumFromInt(429) },
             .permanent_http => .{ .status = @enumFromInt(400) },
+            .host_unauthorized => failedStream(alloc, .unauthorized),
+            .host_forbidden => failedStream(alloc, .forbidden),
+            .host_unavailable => failedStream(alloc, .service_unavailable),
+            .unconfirmed_cancel => {
+                delivery.markPossiblySent();
+                delivery.upstream_cancel_unconfirmed.store(true, .seq_cst);
+                return error.Cancelled;
+            },
+            .unconfirmed_timeout => {
+                delivery.markPossiblySent();
+                delivery.upstream_cancel_unconfirmed.store(true, .seq_cst);
+                return error.Timeout;
+            },
         };
     }
 };
@@ -428,6 +488,13 @@ fn malformedStream(alloc: Allocator) !gateway_client.StreamResult {
             .content = try alloc.dupe(u8, "not a structured decision"),
             .finish_reason = .stop,
         },
+    };
+}
+
+fn failedStream(alloc: Allocator, status: std.http.Status) !gateway_client.StreamResult {
+    return .{
+        .status = status,
+        .err_body = try alloc.dupe(u8, "owned provider body"),
     };
 }
 
@@ -474,7 +541,11 @@ test "gateway automatic reviewer transport is single-attempt" {
 
     switch (outcome) {
         .valid => |result| try std.testing.expectEqual(permission_auto_classifier.Decision.clear, result.decision),
-        .evidence_incomplete, .invalid => return error.TestExpectedEqual,
+        .evidence_incomplete,
+        .invalid,
+        .provider_failure,
+        .upstream_cancellation_unconfirmed,
+        => return error.TestExpectedEqual,
     }
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expect(fake.saw_single_attempt_only);
@@ -639,6 +710,40 @@ test "gateway automatic reviewer distinguishes transient and permanent HTTP fail
     try std.testing.expectEqual(@as(usize, 1), permanent_fake.calls);
 }
 
+test "host gateway review preserves provider failure metadata after owned body cleanup" {
+    const cases = [_]struct {
+        outcome: FakeOutcome,
+        status: std.http.Status,
+        kind: stream_provider.FailureKind,
+    }{
+        .{ .outcome = .host_unauthorized, .status = .unauthorized, .kind = .unauthorized },
+        .{ .outcome = .host_forbidden, .status = .forbidden, .kind = .forbidden },
+        .{ .outcome = .host_unavailable, .status = .service_unavailable, .kind = .unavailable },
+    };
+    for (cases) |case| {
+        var fake = FakeStream{ .outcomes = &.{case.outcome} };
+        const config = GatewayConfig{
+            .api_key = null,
+            .credential_source = .host_managed,
+            .chat_url = "https://example.test/chat",
+            .stream_ctx = @ptrCast(&fake),
+            .stream_fn = FakeStream.execute,
+        };
+        var outcome = try reviewGatewayConfig(config, std.testing.allocator, testRequest());
+        defer outcome.deinit(std.testing.allocator);
+        const failure = switch (outcome) {
+            .provider_failure => |value| value,
+            else => return error.TestExpectedProviderFailure,
+        };
+        try std.testing.expectEqual(case.kind, failure.kind);
+        try std.testing.expectEqual(case.status, failure.http_status.?);
+        try std.testing.expectEqual(
+            types.CredentialSource.host_managed,
+            failure.credential_source.?,
+        );
+    }
+}
+
 test "gateway transport preserves cancellation timeout transient and permanent outcomes" {
     var fake = FakeStream{ .outcomes = &.{
         .cancelled,
@@ -675,6 +780,36 @@ test "gateway transport preserves cancellation timeout transient and permanent o
         try std.testing.expectEqual(expected_tag, std.meta.activeTag(outcome));
     }
     try std.testing.expectEqual(expected.len, fake.calls);
+}
+
+test "gateway transport preserves unconfirmed upstream cancellation cause" {
+    var fake = FakeStream{ .outcomes = &.{ .unconfirmed_cancel, .unconfirmed_timeout } };
+    var config = GatewayConfig{
+        .api_key = "test-key",
+        .chat_url = "https://example.test/chat",
+        .stream_ctx = @ptrCast(&fake),
+        .stream_fn = FakeStream.execute,
+    };
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(100),
+    });
+    const expected = [_]stream_provider.UpstreamCancellationCause{ .cancelled, .timed_out };
+    for (expected) |expected_cause| {
+        const outcome = try sendGatewayReview(
+            @ptrCast(&config),
+            std.testing.allocator,
+            "openai/gpt-5",
+            "{}",
+            deadline,
+            &cancel_flag,
+        );
+        try std.testing.expectEqual(
+            expected_cause,
+            outcome.upstream_cancellation_unconfirmed,
+        );
+    }
 }
 
 test "gateway automatic reviewer distinguishes timeout permanent failure and cancellation" {

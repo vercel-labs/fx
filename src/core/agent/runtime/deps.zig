@@ -231,7 +231,7 @@ pub const AgentRuntimeDeps = struct {
     push_context_notice: ?*const fn (ctx: *anyopaque, text: []const u8) anyerror!void = null,
     push_route_recovery_status: *const fn (ctx: *anyopaque, status: types.RouteRecoveryStatus) anyerror!void = discardRouteRecoveryStatus,
     push_command_output_complete: *const fn (ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId) anyerror!void,
-    push_http_error: *const fn (ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) anyerror!void,
+    push_provider_failure: *const fn (ctx: *anyopaque, failure: agent_stream_provider.Failure, credential_source: ?types.CredentialSource) anyerror!void,
     refresh_gateway_credential: ?*const fn (ctx: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: CredentialRefreshMode, expected_account_id: ?[]const u8) anyerror!?[]u8 = null,
     request_route_recovery: ?*const fn (ctx: *anyopaque, arena: Allocator, request: RouteRecoveryRequest) anyerror!RouteRecoveryDecision = null,
     available_model_capabilities: *const fn (ctx: *anyopaque, model: []const u8) model_capabilities.Capabilities = localAvailableModelCapabilities,
@@ -250,6 +250,13 @@ pub const AgentRuntimeDeps = struct {
     pub fn pushContextNotice(self: *const AgentRuntimeDeps, text: []const u8) !void {
         if (self.push_context_notice) |push| return push(self.ctx, text);
         return self.push_system_notice(self.ctx, text);
+    }
+
+    pub fn push_unconfirmed_cancellation(self: *const AgentRuntimeDeps) !void {
+        try self.push_provider_failure(self.ctx, .{
+            .kind = .provider_error,
+            .detail = auth_runtime.upstream_cancellation_unconfirmed_message,
+        }, .host_managed);
     }
 };
 

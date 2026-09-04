@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const agent_stream_provider = @import("../stream_provider.zig");
+const auth_runtime = @import("../../auth/auth_runtime.zig");
 const context_limits = @import("../../config/context_limits.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const image_attachments = @import("../../images/image_attachments.zig");
@@ -80,6 +81,8 @@ pub fn executeRequest(
         records.deinit(alloc);
     }
     var total_usage: types.ToolUsage = .{};
+    var provider_failure: ?agent_stream_provider.FailureMetadata = null;
+    var recovery_snapshot: ?auth_runtime.FailureSnapshot = null;
 
     var batcher = vision_contracts.VisionBatchIterator.init(image_ids);
     var batch_start: usize = 0;
@@ -206,6 +209,23 @@ pub fn executeRequest(
                 healthy_ids.items,
                 .{ .output_limit_exceeded = limit },
             ),
+            .provider_failure => |failure| {
+                if (provider_failure == null) provider_failure = failure;
+                const snapshot = auth_runtime.FailureSnapshot.from_provider(.{
+                    .kind = failure.kind,
+                    .http_status = failure.http_status,
+                }, failure.credential_source);
+                if (snapshot) |resolved| {
+                    if (recovery_snapshot == null) recovery_snapshot = resolved;
+                }
+                try appendBatchFailures(alloc, &records, healthy_ids.items, .{ .provider_failure = failure });
+            },
+            .upstream_cancellation_unconfirmed => |cause| return .{
+                .status = .failure,
+                .cancelled = cause == .cancelled,
+                .upstream_cancel_unconfirmed = true,
+                .model_output = try alloc.dupe(u8, auth_runtime.upstream_cancellation_unconfirmed_message),
+            },
             .unavailable => try appendBatchFailures(
                 alloc,
                 &records,
@@ -224,16 +244,25 @@ pub fn executeRequest(
     const output = try vision_contracts.stringify_vision_result(alloc, merged);
     const any_success = hasSuccess(merged.images);
     const unavailable = !any_success and allUnavailable(merged.images);
+    const recovery_message = if (recovery_snapshot) |snapshot|
+        snapshot.recovery_message()
+    else
+        null;
     return .{
         .model_output = output,
         .status = if (any_success) .success else .failure,
         .status_detail = totalFailureStatusDetail(merged.images),
-        .system_notice = if (unavailable) outage_system_notice else null,
-        .interactive_notice = if (unavailable) .{
+        .system_notice = recovery_message orelse if (unavailable) outage_system_notice else null,
+        .interactive_notice = if (recovery_message) |message| .{
+            .topic = "authentication",
+            .tone = .@"error",
+            .body = message,
+        } else if (unavailable) .{
             .topic = "vision",
             .tone = .@"error",
             .body = outage_tip,
         } else null,
+        .provider_failure = provider_failure,
         .inner_usage = if (total_usage.input_tokens > 0 or total_usage.output_tokens > 0)
             total_usage
         else
@@ -245,6 +274,8 @@ pub fn executeRequest(
 const BatchAttempt = union(enum) {
     parsed: vision_contracts.VisionResult,
     invalid_response,
+    provider_failure: agent_stream_provider.FailureMetadata,
+    upstream_cancellation_unconfirmed: agent_stream_provider.UpstreamCancellationCause,
     unavailable,
     output_limit_exceeded: vision_contracts.OutputLimit,
 
@@ -254,7 +285,7 @@ const BatchAttempt = union(enum) {
     fn retryable(self: BatchAttempt) bool {
         return switch (self) {
             .invalid_response => true,
-            .parsed, .unavailable, .output_limit_exceeded => false,
+            .parsed, .provider_failure, .upstream_cancellation_unconfirmed, .unavailable, .output_limit_exceeded => false,
         };
     }
 };
@@ -283,7 +314,7 @@ fn runBatchAttempt(
     };
     defer parsed_schema.deinit();
     if (parsed_schema.value != .object) return error.InvalidStructuredResponseSchema;
-    var provider_result = image_provider.inspect(
+    var inspection = image_provider.inspect(
         alloc,
         system_prompt,
         user_prompt,
@@ -333,7 +364,15 @@ fn runBatchAttempt(
             return .unavailable;
         },
     };
-    defer provider_result.deinit(alloc);
+    defer inspection.deinit(alloc);
+    const provider_result = switch (inspection) {
+        .completed => |*result| result,
+        .upstream_cancellation_unconfirmed => |cause| return .{ .upstream_cancellation_unconfirmed = cause },
+        .failed => |failure| return if (failure.credential_source == .host_managed)
+            .{ .provider_failure = failure }
+        else
+            .unavailable,
+    };
     total_usage.input_tokens +|= provider_result.usage.input_tokens;
     total_usage.output_tokens +|= provider_result.usage.output_tokens;
 
@@ -483,6 +522,7 @@ fn totalFailureStatusDetail(records: []const vision_contracts.VisionImageResult)
         .provider_response_invalid => "provider response stayed invalid after one retry",
         .output_limit_exceeded => "response exceeded the configured output budget",
         .vision_unavailable => "Vision is unavailable right now",
+        .provider_failure => "provider authentication or availability failed",
         .missing_provider_record => "provider omitted every requested image",
     };
 }

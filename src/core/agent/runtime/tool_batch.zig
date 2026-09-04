@@ -164,6 +164,15 @@ pub fn assembleParallelToolResults(
                 },
             }
         };
+        if (execution.provider_failure) |failure| {
+            try hooks.push_provider_failure(hooks.ctx, .{
+                .kind = failure.kind,
+                .http_status = failure.http_status,
+            }, failure.credential_source);
+        }
+        if (execution.upstream_cancel_unconfirmed) {
+            try hooks.push_unconfirmed_cancellation();
+        }
         var prepared = try runtime_execution_memory.prepareToolModelOutput(arena, config, original_call, execution.model_output);
         runtime_execution_memory.applyToolResultMemory(
             &prepared.memory,

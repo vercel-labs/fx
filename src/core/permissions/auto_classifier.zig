@@ -1,4 +1,5 @@
 const std = @import("std");
+const agent_stream_provider = @import("../agent/stream_provider.zig");
 const auto_classifier_context = @import("auto_classifier_context.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diff_mod = @import("../output/diff.zig");
@@ -78,11 +79,17 @@ pub const ParseOutcome = union(enum) {
     valid: Result,
     evidence_incomplete,
     invalid: InvalidReason,
+    provider_failure: agent_stream_provider.FailureMetadata,
+    upstream_cancellation_unconfirmed: agent_stream_provider.UpstreamCancellationCause,
 
     pub fn deinit(self: *ParseOutcome, alloc: std.mem.Allocator) void {
         switch (self.*) {
             .valid => |*result| result.deinit(alloc),
-            .evidence_incomplete, .invalid => {},
+            .evidence_incomplete,
+            .invalid,
+            .provider_failure,
+            .upstream_cancellation_unconfirmed,
+            => {},
         }
         self.* = undefined;
     }
@@ -94,7 +101,11 @@ pub fn hostDisposition(outcome: ParseOutcome) HostDisposition {
             .clear => .clear,
             .caution => .caution,
         },
-        .evidence_incomplete, .invalid => .unavailable,
+        .evidence_incomplete,
+        .invalid,
+        .provider_failure,
+        .upstream_cancellation_unconfirmed,
+        => .unavailable,
     };
 }
 
@@ -305,6 +316,8 @@ pub const OwnedCompletion = struct {
 
 pub const TransportOutcome = union(enum) {
     completion: OwnedCompletion,
+    provider_failure: agent_stream_provider.FailureMetadata,
+    upstream_cancellation_unconfirmed: agent_stream_provider.UpstreamCancellationCause,
     transient_failure,
     permanent_failure,
     timed_out,
@@ -570,6 +583,13 @@ pub const Reviewer = struct {
         };
         switch (transport_outcome) {
             .cancelled => return error.Cancelled,
+            .provider_failure => |failure| return .{ .provider_failure = failure },
+            .upstream_cancellation_unconfirmed => |cause| switch (cause) {
+                .cancelled => return error.UpstreamCancellationUnconfirmed,
+                .timed_out, .transport_failure => return .{
+                    .upstream_cancellation_unconfirmed = cause,
+                },
+            },
             .timed_out => return .{ .invalid = .transport_timed_out },
             .permanent_failure => return .{ .invalid = .transport_permanent },
             .transient_failure => return .{ .invalid = .transport_transient },
@@ -615,7 +635,7 @@ pub const Classifier = struct {
         self: Classifier,
         alloc: std.mem.Allocator,
         request: ReviewRequest,
-    ) error{ OutOfMemory, Cancelled }!ParseOutcome {
+    ) error{ OutOfMemory, Cancelled, UpstreamCancellationUnconfirmed }!ParseOutcome {
         if (self.override_fn) |review_fn| {
             return Reviewer.withOverride(
                 self.override_ctx orelse return .{ .invalid = .override_context_missing },
@@ -635,6 +655,7 @@ pub const Classifier = struct {
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Cancelled => return error.Cancelled,
+            error.UpstreamCancellationUnconfirmed => return error.UpstreamCancellationUnconfirmed,
             else => return .{ .invalid = .provider_failed },
         };
     }
@@ -1516,7 +1537,11 @@ test "automatic review parses clear and caution assessments" {
         defer outcome.deinit(std.testing.allocator);
         switch (outcome) {
             .valid => |result| try std.testing.expectEqual(case.expected, result.decision),
-            .evidence_incomplete, .invalid => return error.TestExpectedEqual,
+            .evidence_incomplete,
+            .invalid,
+            .provider_failure,
+            .upstream_cancellation_unconfirmed,
+            => return error.TestExpectedEqual,
         }
     }
 }
@@ -1537,6 +1562,85 @@ test "review outcome reduces to clear caution or unavailable without effects" {
     try std.testing.expectEqual(
         HostDisposition.unavailable,
         hostDisposition(.{ .invalid = .transport_timed_out }),
+    );
+}
+
+test "host provider failure preserves copy-safe recovery facts and fails closed" {
+    const FakeTransport = struct {
+        unconfirmed_cause: ?agent_stream_provider.UpstreamCancellationCause = null,
+        calls: usize = 0,
+
+        fn send(
+            raw: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: std.Io.Clock.Timestamp,
+            _: *std.atomic.Value(bool),
+        ) anyerror!TransportOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.unconfirmed_cause) |cause| {
+                return .{ .upstream_cancellation_unconfirmed = cause };
+            }
+            return .{ .provider_failure = .{
+                .kind = .forbidden,
+                .http_status = .forbidden,
+                .credential_source = .host_managed,
+            } };
+        }
+    };
+
+    var transport_context: FakeTransport = .{};
+    const reviewer = Reviewer.withTransport(.{
+        .context = &transport_context,
+        .send_fn = FakeTransport.send,
+        .build_fn = buildTestReviewPayload,
+    }, null, Reviewer.default_timeout_ms);
+    const request = ReviewRequest{
+        .review_turn = .{
+            .model = "openai/gpt-5",
+            .pending_assistant = .{ .role = .assistant, .tool_calls = &.{.{
+                .id = "host-failure",
+                .name = "run_command",
+                .arguments_json = "{\"command\":\"touch file\"}",
+            }} },
+            .target_call_id = "host-failure",
+            .origin = .root,
+            .trusted_root_context = "current_request: Create the file.\n",
+        },
+        .targets = &.{},
+        .action = .{ .command = .{
+            .command = "touch file",
+            .resolved_cwd = "/tmp/workspace",
+            .background = false,
+            .target_os = .linux,
+        } },
+    };
+    const outcome = try reviewer.review(std.testing.allocator, request);
+    try std.testing.expectEqual(@as(usize, 1), transport_context.calls);
+
+    const failure = switch (outcome) {
+        .provider_failure => |value| value,
+        else => return error.TestExpectedProviderFailure,
+    };
+    try std.testing.expectEqual(agent_stream_provider.FailureKind.forbidden, failure.kind);
+    try std.testing.expectEqual(std.http.Status.forbidden, failure.http_status.?);
+    try std.testing.expectEqual(types.CredentialSource.host_managed, failure.credential_source.?);
+    try std.testing.expectEqual(HostDisposition.unavailable, hostDisposition(outcome));
+
+    transport_context.unconfirmed_cause = .timed_out;
+    const timed_out = try reviewer.review(std.testing.allocator, request);
+    try std.testing.expectEqual(
+        agent_stream_provider.UpstreamCancellationCause.timed_out,
+        timed_out.upstream_cancellation_unconfirmed,
+    );
+    try std.testing.expectEqual(HostDisposition.unavailable, hostDisposition(timed_out));
+
+    transport_context.unconfirmed_cause = .cancelled;
+    try std.testing.expectError(
+        error.UpstreamCancellationUnconfirmed,
+        reviewer.review(std.testing.allocator, request),
     );
 }
 

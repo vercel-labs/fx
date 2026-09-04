@@ -6,6 +6,7 @@ const stream_provider = @import("../core/agent/stream_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
+const host_broker = @import("host_broker.zig");
 const responses_protocol = @import("responses_protocol.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 
@@ -237,7 +238,21 @@ pub fn streamPrepared(
     if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
     var auth_headers = try requestAuthHeaders(alloc, request.credential);
     defer auth_headers.deinit(alloc);
-    const request_endpoint = if (io_mod.getenv(e2e_endpoint_env)) |override| endpoint: {
+    var broker_request = try host_broker.prepare(alloc, .grok_responses, null);
+    defer if (broker_request) |*prepared| prepared.deinit(alloc);
+    errdefer if (broker_request) |*prepared| {
+        if (request.delivery.load() == .possibly_sent and !prepared.cancel(alloc)) {
+            request.delivery.upstream_cancel_unconfirmed.store(true, .seq_cst);
+        }
+    };
+    var broker_authorization: ?[]u8 = null;
+    defer if (broker_authorization) |value| secret.zeroAndFree(alloc, value);
+    if (broker_request) |prepared| {
+        broker_authorization = try std.fmt.allocPrint(alloc, "Bearer {s}", .{prepared.token});
+    }
+    const request_endpoint = if (broker_request) |prepared|
+        prepared.url
+    else if (io_mod.getenv(e2e_endpoint_env)) |override| endpoint: {
         if (!gateway_client.isLoopbackHttpUrl(override)) {
             return stream_provider.failResult(error.InvalidE2EXaiGrokEndpoint);
         }
@@ -249,7 +264,7 @@ pub fn streamPrepared(
     else
         null;
 
-    var extra_headers_buf: [8]std.http.Header = undefined;
+    var extra_headers_buf: [10]std.http.Header = undefined;
     var extra_count: usize = 0;
     extra_headers_buf[extra_count] = .{ .name = "accept", .value = "text/event-stream" };
     extra_count += 1;
@@ -275,13 +290,22 @@ pub fn streamPrepared(
         extra_headers_buf[extra_count] = .{ .name = "x-grok-conv-id", .value = session_id };
         extra_count += 1;
     };
+    if (broker_request) |*prepared| {
+        extra_headers_buf[extra_count] = .{
+            .name = host_broker.protocol_header_name,
+            .value = host_broker.protocol_header_value,
+        };
+        extra_count += 1;
+        extra_headers_buf[extra_count] = .{ .name = host_broker.request_id_header_name, .value = &prepared.request_id };
+        extra_count += 1;
+    }
 
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();
     var open_operation = OpenRequestOperation{
         .client = &client,
         .uri = uri,
-        .auth_header = auth_headers.authorization,
+        .auth_header = broker_authorization orelse auth_headers.authorization,
         .extra_headers = extra_headers_buf[0..extra_count],
     };
     var connect_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
@@ -349,6 +373,7 @@ pub fn streamPrepared(
         } else bounded_body;
         return .{ .failed = .{
             .kind = failureKind(response.head.status),
+            .http_status = response.head.status,
             .detail = body,
             .ownership = .owned,
         } };

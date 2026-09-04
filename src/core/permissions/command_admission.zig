@@ -1,4 +1,5 @@
 const std = @import("std");
+const stream_provider = @import("../agent/stream_provider.zig");
 const auto_classifier = @import("auto_classifier.zig");
 const command_effect = @import("../shell_command/command_effect.zig");
 const command_environment = @import("../execution/command_environment.zig");
@@ -108,6 +109,8 @@ pub const PermissionOutcome = struct {
     /// Owned by the allocator passed to the permission request.
     auto_review_result: ?auto_classifier.Result = null,
     auto_review_failure: ?auto_classifier.InvalidReason = null,
+    provider_failure: ?stream_provider.FailureMetadata = null,
+    upstream_cancel_unconfirmed: bool = false,
 };
 
 pub const PermissionRequirement = enum {

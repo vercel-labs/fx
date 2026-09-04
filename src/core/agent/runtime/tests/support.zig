@@ -325,6 +325,7 @@ pub const FakeGateway = struct {
             const failure_request_shape = if (completion.failure_request_shape) |value| try alloc.dupe(u8, value) else null;
             return .{ .failed = .{
                 .kind = failureKind(completion.status),
+                .http_status = completion.status,
                 .detail = err_body,
                 .retry_after_seconds = completion.retry_after_seconds,
                 .diagnostics = .{
@@ -787,7 +788,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .push_context_notice = contextNotice,
             .push_route_recovery_status = routeRecoveryStatus,
             .push_command_output_complete = commandOutputComplete,
-            .push_http_error = httpError,
+            .push_provider_failure = httpError,
             .refresh_gateway_credential = refreshGatewayCredential,
             .request_route_recovery = if (self.enable_route_recovery) requestRouteRecovery else null,
             .available_model_capabilities = availableModelCapabilities,
@@ -1779,12 +1780,12 @@ pub const FakeAgentRuntimeDeps = struct {
         }
     }
 
-    fn httpError(raw: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) !void {
+    fn httpError(raw: *anyopaque, failure: agent_stream_provider.Failure, credential_source: ?types.CredentialSource) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        self.http_status = status;
+        self.http_status = failure.http_status;
         self.http_credential_source = credential_source;
         if (self.http_detail) |value| self.alloc.free(value);
-        self.http_detail = try self.alloc.dupe(u8, detail);
+        self.http_detail = try self.alloc.dupe(u8, failure.detail orelse "");
         try self.record("http_error", .{});
     }
 

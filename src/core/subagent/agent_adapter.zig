@@ -1,4 +1,5 @@
 const std = @import("std");
+const agent_stream_provider = @import("../agent/stream_provider.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
@@ -390,7 +391,7 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .push_system_notice = pushLiveNotice,
         .push_route_recovery_status = pushLiveRouteRecoveryStatus,
         .push_command_output_complete = pushLiveCommandOutputComplete,
-        .push_http_error = captureHttpError,
+        .push_provider_failure = captureHttpError,
         .refresh_gateway_credential = refreshGatewayCredential,
         .format_tool_execution_error = formatToolExecutionError,
         .report_usage = reportUsage,
@@ -790,16 +791,14 @@ fn pushLiveRouteRecoveryStatus(
 
 fn captureHttpError(
     raw: *anyopaque,
-    status: std.http.Status,
-    detail: []const u8,
-    _: ?types.CredentialSource,
+    failure: agent_stream_provider.Failure,
+    source: ?types.CredentialSource,
 ) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
-    const formatted = try gateway_error_format.formatHttpErrorMessage(
-        context.turn.alloc,
-        status,
-        detail,
-    );
+    const formatted = if (auth_runtime.FailureSnapshot.from_provider(failure, source)) |snapshot|
+        try snapshot.render_with_recovery(context.turn.alloc)
+    else
+        try gateway_error_format.format_provider_failure(context.turn.alloc, failure);
     defer context.turn.alloc.free(formatted);
     const redacted = try execution_memory.redactText(context.turn.alloc, formatted);
     defer context.turn.alloc.free(redacted);

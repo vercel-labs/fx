@@ -834,7 +834,7 @@ fn activateProviderSelectionFallible(
         },
         .failed => |failure| {
             debug_trace.logf("catalog", "provider selection catalog failed provider={s} category={s}", .{ @tagName(target), @tagName(failure.failure.category) });
-            const detail = try std.fmt.allocPrint(
+            const detail = (try auth_runtime.host_catalog_failure_text(alloc, failure.failure, failure.access.source)) orelse try std.fmt.allocPrint(
                 alloc,
                 "could not load the target model catalog ({s})",
                 .{@tagName(failure.failure.category)},
@@ -1289,7 +1289,7 @@ fn runNonInteractiveWithDeps(
                 .loaded => |loaded| loaded,
                 .failure => |failure| {
                     const error_name = @errorName(failure.failure.asError());
-                    const message = try std.fmt.allocPrint(
+                    const message = (try auth_runtime.host_catalog_failure_text(alloc, failure.failure, failure.access.source)) orelse try std.fmt.allocPrint(
                         alloc,
                         "could not list models: {s}",
                         .{catalogFailureDetail(failure.failure)},

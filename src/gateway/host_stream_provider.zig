@@ -123,6 +123,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
     const status: std.http.Status = @enumFromInt(status_code);
     if (status != .ok) return .{ .failed = .{
         .kind = failureKind(status),
+        .http_status = status,
         .detail = try readBody(
             alloc,
             transport,

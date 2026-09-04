@@ -553,13 +553,14 @@ const VisionProviderScript = struct {
 
     const Response = union(enum) {
         content: []const u8,
+        incomplete_content: []const u8,
         http_status: std.http.Status,
         cancel,
     };
 
     fn stream(
         context: ?*anyopaque,
-        _: Allocator,
+        alloc: Allocator,
         request: agent_stream_provider.ModelRequest,
     ) anyerror!agent_stream_provider.Result {
         const self: *VisionProviderScript = @ptrCast(@alignCast(context.?));
@@ -568,13 +569,26 @@ const VisionProviderScript = struct {
         self.calls += 1;
         try request.admission.admit();
         return switch (response) {
-            .content => |text| .{ .completed = .{ .completion = .{ .content = text } } },
-            .http_status => |status| .{ .failed = .{ .kind = switch (status) {
-                .unauthorized => .unauthorized,
-                .too_many_requests => .rate_limited,
-                .service_unavailable => .unavailable,
-                else => .provider_error,
+            .content => |text| .{ .completed = .{ .completion = .{
+                .content = text,
+                .finish_reason = .stop,
             } } },
+            .incomplete_content => |text| .{ .completed = .{ .completion = .{
+                .content = text,
+                .finish_reason = .length,
+            } } },
+            .http_status => |status| .{ .failed = .{
+                .kind = switch (status) {
+                    .unauthorized => .unauthorized,
+                    .forbidden => .forbidden,
+                    .too_many_requests => .rate_limited,
+                    .service_unavailable => .unavailable,
+                    else => .provider_error,
+                },
+                .http_status = status,
+                .detail = try alloc.dupe(u8, "owned provider response body"),
+                .ownership = .owned,
+            } },
             .cancel => blk: {
                 request.cancel_flag.store(true, .seq_cst);
                 break :blk .{ .completed = .{} };
@@ -590,12 +604,31 @@ fn runScriptedVision(
     args_json: []const u8,
     output_limit_bytes: usize,
 ) !runtime_tool_contracts.ToolExecutionResult {
+    return runScriptedVisionWithSource(
+        alloc,
+        script,
+        catalog,
+        args_json,
+        output_limit_bytes,
+        null,
+    );
+}
+
+fn runScriptedVisionWithSource(
+    alloc: Allocator,
+    script: *VisionProviderScript,
+    catalog: []const types.ImageAttachment,
+    args_json: []const u8,
+    output_limit_bytes: usize,
+    credential_source: ?types.CredentialSource,
+) !runtime_tool_contracts.ToolExecutionResult {
     var provider = @import("../../../../builtins/gateway.zig").agent_stream_provider;
     provider.context = script;
     provider.stream_fn = VisionProviderScript.stream;
     return vision_executor.execute(alloc, args_json, catalog, .{
         .stream_provider = provider,
         .api_key = "key",
+        .credential_source = credential_source,
         .gateway_team = null,
         .retry_count = 1,
         .cancel_flag = null,
@@ -2132,6 +2165,96 @@ test "vision does not retry a provider outage" {
     try std.testing.expectEqualStrings(vision_executor.outage_system_notice, result.system_notice.?);
 }
 
+test "vision preserves host provider failures for recovery and parent publication" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const image_path = try writeTestImagePath(alloc, &tmp);
+    defer alloc.free(image_path);
+    const image = try scriptedVisionCatalog(alloc, &tmp, image_path);
+    defer types.freeImageAttachment(alloc, image);
+    const catalog = [_]types.ImageAttachment{image};
+
+    const Case = struct {
+        status: std.http.Status,
+        kind: agent_stream_provider.FailureKind,
+        model_message: []const u8,
+        recovery: []const u8,
+    };
+    const cases = [_]Case{
+        .{
+            .status = .unauthorized,
+            .kind = .unauthorized,
+            .model_message = "Host authentication failed",
+            .recovery = "Reconnect this provider in the host application.",
+        },
+        .{
+            .status = .forbidden,
+            .kind = .forbidden,
+            .model_message = "Host authorization denied",
+            .recovery = "Request access in the host application.",
+        },
+        .{
+            .status = .service_unavailable,
+            .kind = .unavailable,
+            .model_message = "Host authentication service unavailable",
+            .recovery = "Try again shortly or check the host application.",
+        },
+    };
+    for (cases) |case| {
+        const responses = [_]VisionProviderScript.Response{
+            .{ .http_status = case.status },
+            .{ .content = scripted_vision_ok },
+        };
+        var script = VisionProviderScript{ .responses = &responses };
+        const result = try runScriptedVisionWithSource(
+            alloc,
+            &script,
+            &catalog,
+            scripted_vision_args,
+            64 * 1024,
+            .host_managed,
+        );
+        defer alloc.free(result.model_output);
+
+        try std.testing.expectEqual(@as(usize, 1), script.calls);
+        try std.testing.expectEqual(runtime_tool_contracts.ToolExecutionStatus.failure, result.status);
+        try std.testing.expect(std.mem.find(u8, result.model_output, case.model_message) != null);
+        try std.testing.expect(std.mem.find(u8, result.model_output, case.recovery) != null);
+        try std.testing.expect(std.mem.find(u8, result.model_output, "owned provider response body") == null);
+        const publication = result.provider_failure.?;
+        try std.testing.expectEqual(case.kind, publication.kind);
+        try std.testing.expectEqual(case.status, publication.http_status.?);
+        try std.testing.expectEqual(types.CredentialSource.host_managed, publication.credential_source.?);
+        try std.testing.expectEqualStrings(case.recovery, result.interactive_notice.?.body);
+        try std.testing.expect(std.mem.find(u8, result.interactive_notice.?.body, "switching") == null);
+    }
+}
+
+test "vision never retries an incomplete provider response as malformed success" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const image_path = try writeTestImagePath(alloc, &tmp);
+    defer alloc.free(image_path);
+    const image = try scriptedVisionCatalog(alloc, &tmp, image_path);
+    defer types.freeImageAttachment(alloc, image);
+    const catalog = [_]types.ImageAttachment{image};
+
+    const responses = [_]VisionProviderScript.Response{
+        .{ .incomplete_content = "not json at all" },
+        .{ .content = scripted_vision_ok },
+    };
+    var script = VisionProviderScript{ .responses = &responses };
+    const result = try runScriptedVision(alloc, &script, &catalog, scripted_vision_args, 64 * 1024);
+    defer alloc.free(result.model_output);
+
+    try std.testing.expectEqual(@as(usize, 1), script.calls);
+    try std.testing.expectEqual(runtime_tool_contracts.ToolExecutionStatus.failure, result.status);
+    try std.testing.expect(std.mem.find(u8, result.model_output, "retried evidence") == null);
+    try std.testing.expect(result.provider_failure == null);
+}
+
 test "vision does not retry a provider response over the output limit" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3165,6 +3288,44 @@ test "processQueuedPrompt compacts and retries one context overflow" {
         hooks.finish_assistant_text.?,
     );
     try std.testing.expect(hooks.http_status == null);
+}
+
+test "host-managed context overflow does not compact or replay the rejected request" {
+    const alloc = std.testing.allocator;
+    const model = "provider/host-context-overflow";
+    for ([_]std.http.Status{ .bad_request, .payload_too_large }) |status| {
+        const completions = [_]FakeCompletion{
+            .{ .status = status, .err_body = "maximum context length exceeded" },
+            .{ .content = "MUST_NOT_COMPACT" },
+            .{ .content = "MUST_NOT_REPLAY" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        hooks.available_capability_overrides = &.{.{
+            .model = model,
+            .capabilities = .{ .context_window = 128_000, .max_output_tokens = 16_384 },
+        }};
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+        var job = fixture.job();
+        job.model = @constCast(model);
+        job.api_key = @constCast("");
+        job.credential_source = .host_managed;
+        var history = [_]HistoryTurn{.{ .assistant = .{
+            .user = .{ .text = @constCast("prior user") },
+            .assistant = @constCast("prior assistant"),
+        } }};
+        job.history = &history;
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+        try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+        try std.testing.expectEqual(status, hooks.http_status.?);
+        try std.testing.expectEqual(types.CredentialSource.host_managed, hooks.http_credential_source.?);
+        try std.testing.expectEqual(@as(usize, 0), hooks.history_turns.items.len);
+        try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+    }
 }
 
 test "processQueuedPrompt stops after one context overflow recovery" {

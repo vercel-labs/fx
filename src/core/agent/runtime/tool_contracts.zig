@@ -1,4 +1,5 @@
 const std = @import("std");
+const agent_stream_provider = @import("../stream_provider.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const types = @import("../../shared/types.zig");
 const diff = @import("../../output/diff.zig");
@@ -81,6 +82,8 @@ pub const ToolExecutionResult = struct {
     finish_turn: bool = false,
     system_notice: ?[]const u8 = null,
     interactive_notice: ?types.SemanticNotice = null,
+    provider_failure: ?agent_stream_provider.FailureMetadata = null,
+    upstream_cancel_unconfirmed: bool = false,
     context_notices: []const []const u8 = &.{},
     command_result_json: ?[]const u8 = null,
     turn_control: ?tool_dispatch.TurnControl = null,

@@ -96,10 +96,7 @@ pub const ModelMenuCatalogState = struct {
     private_models_hidden: bool = false,
     failure: ?Failure = null,
 
-    pub const Failure = struct {
-        category: model_catalog.FailureCategory,
-        retryable: bool,
-    };
+    pub const Failure = model_catalog.Failure;
 };
 
 pub const ModelProviderFilter = enum {
@@ -757,10 +754,7 @@ fn modelMenuCatalogState(outcome: CatalogOutcome) ModelMenuCatalogState {
         .source = access.source,
         .public_only_reason = access.public_only_reason,
         .private_models_hidden = access.private_models_may_be_hidden,
-        .failure = if (failure) |failed| .{
-            .category = failed.category,
-            .retryable = failed.retryable,
-        } else null,
+        .failure = failure,
     };
 }
 

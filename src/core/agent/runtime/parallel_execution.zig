@@ -327,6 +327,8 @@ fn duplicateParallelToolResult(alloc: Allocator, call: ToolCall, execution: Tool
         .web_search_completion = execution.web_search_completion,
         .web_fetch_completion = execution.web_fetch_completion,
         .inner_usage = execution.inner_usage,
+        .provider_failure = execution.provider_failure,
+        .upstream_cancel_unconfirmed = execution.upstream_cancel_unconfirmed,
     };
     errdefer freeOwnedToolExecutionResult(alloc, duplicated_execution);
     if (execution.status_detail) |detail| {
@@ -752,6 +754,7 @@ fn checkParallelResultDuplicationAllocationFailures(alloc: Allocator) !void {
         .model_output = "contents",
         .status_detail = "detail",
         .system_notice = "notice",
+        .provider_failure = .{ .kind = .unauthorized, .http_status = .unauthorized, .credential_source = .host_managed },
         .interactive_notice = .{
             .topic = "background",
             .tone = .information,
@@ -774,6 +777,7 @@ fn checkParallelResultDuplicationAllocationFailures(alloc: Allocator) !void {
     );
     defer freeParallelToolResult(alloc, duplicated);
     try std.testing.expectEqualStrings("notice", duplicated.execution.system_notice.?);
+    try std.testing.expectEqual(execution.provider_failure, duplicated.execution.provider_failure);
     const interactive_notice = duplicated.execution.interactive_notice.?;
     try std.testing.expectEqualStrings("background", interactive_notice.topic);
     try std.testing.expectEqual(types.NoticeTone.information, interactive_notice.tone);

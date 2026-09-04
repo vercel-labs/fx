@@ -67,6 +67,25 @@ fx setup
 
 Embedding hosts that inject provider authentication at the network boundary can set `FX_AUTH_MODE=host-managed`. In this mode, fx does not read, refresh, or write local model-provider credentials and does not add authentication-owned headers to Gateway, Codex, or Grok requests. The host must authenticate those forwarded requests.
 
+Hosts that cannot transparently forward provider traffic can route every authenticated provider operation through one broker:
+
+```bash
+FX_AUTH_MODE=host-managed \
+FX_HOST_BROKER_URL=https://broker.example/fx \
+FX_HOST_BROKER_TOKEN=sandbox-broker-reference \
+./fx
+```
+
+The token value visible inside the sandbox must be a non-secret placeholder. The sandbox network boundary replaces it with a sandbox-scoped broker capability only for the broker host. Vercel Sandbox supports header replacement through [network-policy credential brokering](https://vercel.com/docs/sandbox/concepts/firewall#credentials-brokering); Microsandbox supports host-held [secret placeholder substitution](https://github.com/superradcompany/microsandbox/blob/main/docs/cli/sandbox-commands.mdx). The broker owns provider credentials, refresh, and provider client-version selection, rejects unknown routes, strips incoming authentication headers, and streams provider responses unchanged. Broker deployments should deny direct sandbox egress to provider domains.
+
+fx sends the original method, query, provider body, and non-authentication headers with `X-Fx-Host-Protocol: 1` and a fresh `X-Fx-Request-Id` containing 32 lowercase hexadecimal characters. The closed routes are `/v1/gateway/chat`, `/v1/gateway/models`, `/v1/gateway/credits`, `/v1/gateway/generation`, `/v1/codex/responses`, `/v1/codex/models`, `/v1/grok/responses`, `/v1/grok/models`, and `/v1/grok/modalities`, appended to the configured base URL. The broker returns the upstream status, headers, and body or stream unchanged. If its HTTP runtime decodes an upstream response, it must remove the stale `content-encoding` and framing headers before returning those decoded bytes.
+
+When fx cancels an active request, it sends an authenticated `POST /v1/cancel` with `{"request_id":"…"}` and the same protocol header and sandbox capability. The broker must scope the ID to that authenticated binding, abort only its matching upstream, and return HTTP 204 only after settlement. Repeated cancellation is idempotent. Cancellation before admission must reserve the ID so a delayed original request cannot start; an ID never authorizes an inference retry. fx bounds cancellation acknowledgement independently of the original request and reports an unconfirmed upstream outcome if acknowledgement fails.
+
+Some network proxies retain upstream work after a guest disconnects, so connection closure alone is insufficient. The host must also terminate active work on binding revocation, expiry, and sandbox teardown, and enforce a finite per-operation deadline. Retain bounded request-ID records until the binding expires or is revoked; reject new work when that capacity is exhausted rather than evicting records that prevent late admission. Provider credentials, binding lifetime, and these limits remain host-owned.
+
+`FX_HOST_BROKER_URL` and `FX_HOST_BROKER_TOKEN` must be set together and are valid only with host-managed authentication. Broker URLs require HTTPS; loopback HTTP is accepted only for local integration testing.
+
 Run fx from a project:
 
 ```bash

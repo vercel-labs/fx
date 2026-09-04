@@ -56,6 +56,7 @@ pub const Admission = struct {
 /// Core uses it to distinguish safe retries from potentially billed delivery.
 pub const DeliveryCertainty = struct {
     state: std.atomic.Value(State) = .init(.definitely_unsent),
+    upstream_cancel_unconfirmed: std.atomic.Value(bool) = .init(false),
 
     pub const State = enum(u8) {
         definitely_unsent,
@@ -97,6 +98,12 @@ pub const NetworkFailureEvidence = struct {
 pub const AttemptEvidence = struct {
     provider_admitted: bool = false,
     network_failure: ?NetworkFailureEvidence = null,
+};
+
+pub const UpstreamCancellationCause = enum {
+    cancelled,
+    timed_out,
+    transport_failure,
 };
 
 /// Gives a cooperative single-threaded host a chance to publish UI and runtime
@@ -304,10 +311,19 @@ pub const Completed = struct {
 
 pub const Failure = struct {
     kind: FailureKind,
-    detail: ?[]u8 = null,
+    http_status: ?std.http.Status = null,
+    detail: ?[]const u8 = null,
     diagnostics: FailureDiagnostics = .{},
     retry_after_seconds: ?u64 = null,
     ownership: ResultOwnership = .borrowed,
+};
+
+/// Copy-safe failure facts for a secondary request whose owned result has
+/// already been released before its parent publishes the failure.
+pub const FailureMetadata = struct {
+    kind: FailureKind,
+    http_status: ?std.http.Status = null,
+    credential_source: ?types.CredentialSource = null,
 };
 
 pub const Result = union(enum) {

@@ -1156,10 +1156,12 @@ pub fn Runtime(comptime App: type) type {
                 .catalog => |catalog| catalog,
                 .failure => |failure| {
                     debug_trace.logf("provider", "catalog rejected provider={t} category={t}", .{ target, failure.category });
+                    const host_message = try auth_runtime.host_catalog_failure_text(app.alloc, failure, access.credentialSource());
+                    defer if (host_message) |message| app.alloc.free(message);
                     try app.writeDomainNotice(.{
                         .topic = "provider",
                         .tone = .@"error",
-                        .body = if (failure.category == .cancellation) providerFailureMessage(
+                        .body = host_message orelse if (failure.category == .cancellation) providerFailureMessage(
                             intent,
                             "Provider switching was cancelled. The current provider is unchanged.",
                             "Subscription sign-in completed, but provider activation was cancelled. The current provider is unchanged.",

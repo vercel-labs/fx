@@ -1,4 +1,6 @@
 const std = @import("std");
+const agent_stream_provider = @import("../core/agent/stream_provider.zig");
+const gateway_error_format = @import("../core/shared/gateway_error_format.zig");
 const std_builtin = @import("builtin");
 const command_admission = @import("../core/permissions/command_admission.zig");
 const auth_runtime = @import("../core/auth/auth_runtime.zig");
@@ -1363,7 +1365,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .push_system_notice = pushSystemNotice,
         .push_context_notice = pushContextNotice,
         .push_command_output_complete = pushCommandOutputComplete,
-        .push_http_error = pushHttpError,
+        .push_provider_failure = pushHttpError,
         .refresh_gateway_credential = refreshGatewayCredential,
         .available_model_capabilities = availableModelCapabilities,
         .resolve_model_capabilities = resolveModelCapabilities,
@@ -2173,20 +2175,29 @@ fn pushDiffBlock(raw_ctx: *anyopaque, payload: agent_runtime.DiffEntryPayload) !
 
 fn pushCommandOutputComplete(_: *anyopaque, _: ?types.ToolLifecycleId) !void {}
 
-fn pushHttpError(raw_ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) !void {
+fn pushHttpError(raw_ctx: *anyopaque, provider_failure: agent_stream_provider.Failure, credential_source: ?types.CredentialSource) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    var buf: [1024]u8 = undefined;
-    const auth_failure = auth_runtime.FailureSnapshot.fromHttp(status, credential_source);
+    const auth_failure = auth_runtime.FailureSnapshot.from_provider(provider_failure, credential_source);
     const owned_message = if (auth_failure) |failure|
         try failure.renderText(ctx.alloc)
     else
         null;
     defer if (owned_message) |message| ctx.alloc.free(message);
-    const msg = owned_message orelse if (detail.len > 0)
-        std.fmt.bufPrint(&buf, "HTTP {d}: {s}", .{ @intFromEnum(status), detail }) catch "HTTP error"
+    const fallback_message = if (owned_message == null)
+        try gateway_error_format.format_provider_failure(ctx.alloc, provider_failure)
     else
-        std.fmt.bufPrint(&buf, "HTTP {d}", .{@intFromEnum(status)}) catch "HTTP error";
-    ctx.sendAgentText(ctx.operationalMessageId(), msg) catch {};
+        null;
+    defer if (fallback_message) |message| ctx.alloc.free(message);
+    const base_message = owned_message orelse fallback_message.?;
+    const host_message: ?[]u8 = if (auth_failure) |failure|
+        if (failure.source == .host_managed)
+            try std.fmt.allocPrint(ctx.alloc, "{s}. {s}", .{ base_message, failure.recovery_message() })
+        else
+            null
+    else
+        null;
+    defer if (host_message) |message| ctx.alloc.free(message);
+    ctx.sendAgentText(ctx.operationalMessageId(), host_message orelse base_message) catch {};
 }
 
 fn formatToolExecutionError(_: *anyopaque, arena: Allocator, tool_name: []const u8, err: anyerror) ![]const u8 {
@@ -3509,10 +3520,9 @@ test "ACP auth failure emits a valid detail-free JSON-RPC notification" {
     );
 
     const deps = agentRuntimeDeps(&ctx);
-    try deps.push_http_error(
+    try deps.push_provider_failure(
         deps.ctx,
-        .unauthorized,
-        "provider rejected access-token-secret",
+        .{ .kind = .unauthorized, .http_status = .unauthorized, .detail = "provider rejected access-token-secret" },
         state.active_session.?.credential_source,
     );
     try capture.sync(io_mod.getIo());

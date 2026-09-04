@@ -127,6 +127,7 @@ const web_search_runtime = @import("core/tooling/web_search_runtime.zig");
 const worker_runtime = @import("core/agent/worker_runtime.zig");
 const question_prompt = @import("core/agent/question_prompt.zig");
 const gateway_client = @import("gateway/client.zig");
+const host_broker = @import("gateway/host_broker.zig");
 const js_host_stream_provider = @import("gateway/js_host_stream_provider.zig");
 const js_host_model_catalog = @import("gateway/js_host_model_catalog.zig");
 const url_opener = @import("core/hosts/url_opener.zig");
@@ -3329,6 +3330,20 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
     const alloc = processAllocator();
     const auth_mode = credentials.parseAuthMode(rawEnvValue(raw_env, "FX_AUTH_MODE")) catch {
         try writeStderrFast("fx: FX_AUTH_MODE must be local or host-managed\n");
+        exitFast(1);
+    };
+    _ = host_broker.Config.parse(
+        auth_mode,
+        rawEnvValue(raw_env, "FX_HOST_BROKER_URL"),
+        rawEnvValue(raw_env, "FX_HOST_BROKER_TOKEN"),
+    ) catch |err| {
+        const message = switch (err) {
+            error.IncompleteHostBrokerConfiguration => "fx: FX_HOST_BROKER_URL and FX_HOST_BROKER_TOKEN must be set together\n",
+            error.HostBrokerRequiresHostManagedAuth => "fx: FX_HOST_BROKER_URL requires FX_AUTH_MODE=host-managed\n",
+            error.InvalidHostBrokerUrl => "fx: FX_HOST_BROKER_URL must be an HTTPS URL without credentials, query, or fragment\n",
+            error.InvalidHostBrokerToken => "fx: FX_HOST_BROKER_TOKEN must be a non-empty single-line value\n",
+        };
+        try writeStderrFast(message);
         exitFast(1);
     };
     const cfg = if (cli_args.len == 0)

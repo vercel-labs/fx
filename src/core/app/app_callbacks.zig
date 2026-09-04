@@ -323,7 +323,7 @@ pub fn Bindings(comptime App: type) type {
                 .push_context_notice = agentPushContextNotice,
                 .push_route_recovery_status = agentPushRouteRecoveryStatus,
                 .push_command_output_complete = agentPushCommandOutputComplete,
-                .push_http_error = agentPushHttpError,
+                .push_provider_failure = agentPushHttpError,
                 .refresh_gateway_credential = if (comptime @hasField(App, "auth"))
                     refreshGatewayCredential
                 else
@@ -1021,28 +1021,19 @@ pub fn Bindings(comptime App: type) type {
             try app_worker_runtime.Runtime(App).pushCommandOutputComplete(app, lifecycle_id);
         }
 
-        fn agentPushHttpError(ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) !void {
+        fn agentPushHttpError(ctx: *anyopaque, provider_failure: agent_stream_provider.Failure, credential_source: ?types.CredentialSource) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            const auth_failure = auth_runtime.FailureSnapshot.fromHttp(status, credential_source);
+            const auth_failure = auth_runtime.FailureSnapshot.from_provider(provider_failure, credential_source);
             const message = if (auth_failure) |failure|
                 try failure.renderText(std.heap.c_allocator)
             else
-                try gateway_error_format.formatHttpErrorMessage(std.heap.c_allocator, status, detail);
+                try gateway_error_format.format_provider_failure(std.heap.c_allocator, provider_failure);
             defer std.heap.c_allocator.free(message);
             const label = if (auth_failure) |failure|
                 try std.fmt.allocPrint(
                     std.heap.c_allocator,
                     "⚠ {s} · {s}",
-                    .{
-                        message,
-                        switch (failure.source) {
-                            .fx_login => "Run /login to repair this source.",
-                            .chatgpt_subscription => "Reconnect Codex through /login to repair this source.",
-                            .grok_subscription => "Reconnect Grok through /login to repair this source.",
-                            .vercel_oidc_token, .ai_gateway_api_key, .stored_key => "Run /provider to repair this source.",
-                            .host_managed => credentials.host_managed_auth_message,
-                        },
-                    },
+                    .{ message, failure.recovery_message() },
                 )
             else
                 try std.fmt.allocPrint(std.heap.c_allocator, "⚠ {s}", .{message});

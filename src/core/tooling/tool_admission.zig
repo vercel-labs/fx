@@ -963,6 +963,18 @@ fn nonAllowAutoReviewOutcome(
     )) {
         .clear => null,
         .unavailable => switch (review) {
+            .provider_failure => |failure| .{
+                .decision = .deny,
+                .denial_reason = .review_unavailable,
+                .auto_review_failure = .provider_failed,
+                .provider_failure = failure,
+            },
+            .upstream_cancellation_unconfirmed => |cause| .{
+                .decision = .deny,
+                .denial_reason = .review_unavailable,
+                .auto_review_failure = if (cause == .timed_out) .transport_timed_out else .transport_call_failed,
+                .upstream_cancel_unconfirmed = true,
+            },
             .invalid => |failure| .{
                 .decision = .deny,
                 .denial_reason = .review_unavailable,
@@ -993,7 +1005,7 @@ fn nonAllowAutoReviewOutcome(
                     },
                 };
             },
-            .evidence_incomplete, .invalid => unreachable,
+            .evidence_incomplete, .invalid, .provider_failure, .upstream_cancellation_unconfirmed => unreachable,
         },
     };
 }
@@ -1080,6 +1092,16 @@ fn runAutomaticReview(
         return err;
     };
     switch (review) {
+        .provider_failure => |failure| debug_trace.logf(
+            "permission",
+            "event=auto_review_result tool_name={s} decision=unavailable provider_failure={t} http_status={any} execution_started=false call_id={s}",
+            .{ call.name, failure.kind, failure.http_status, call.id },
+        ),
+        .upstream_cancellation_unconfirmed => |cause| debug_trace.logf(
+            "permission",
+            "event=auto_review_result tool_name={s} decision=unavailable upstream_cancel_unconfirmed={t} execution_started=false call_id={s}",
+            .{ call.name, cause, call.id },
+        ),
         .valid => |result| debug_trace.logf(
             "permission",
             "event=auto_review_result tool_name={s} decision={s} fallback_reason=none elapsed_ms={d} execution_started=false call_id={s}",

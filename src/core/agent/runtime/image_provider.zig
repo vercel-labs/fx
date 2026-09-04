@@ -37,13 +37,27 @@ pub const Result = struct {
     }
 };
 
+pub const Inspection = union(enum) {
+    completed: Result,
+    failed: agent_stream_provider.FailureMetadata,
+    upstream_cancellation_unconfirmed: agent_stream_provider.UpstreamCancellationCause,
+
+    pub fn deinit(self: *Inspection, alloc: Allocator) void {
+        switch (self.*) {
+            .completed => |*result| result.deinit(alloc),
+            .failed, .upstream_cancellation_unconfirmed => {},
+        }
+        self.* = undefined;
+    }
+};
+
 pub fn inspect(
     alloc: Allocator,
     system_prompt: []const u8,
     user_prompt: []const u8,
     images: []const image_attachments.VerifiedSnapshot,
     request: Request,
-) !Result {
+) !Inspection {
     const instructions = [_]ChatMessage{.{ .role = .system, .content = system_prompt }};
     const messages = [_]ChatMessage{.{ .role = .user, .content = user_prompt }};
     var capture = StreamCapture{
@@ -53,7 +67,7 @@ pub fn inspect(
     defer capture.deinit();
     var delivery = runtime_gateway_step.DeliveryCertainty.init();
     var attempt_evidence: agent_stream_provider.AttemptEvidence = .{};
-    var streamed = try runtime_gateway_step.streamModelCompletion(
+    var streamed = runtime_gateway_step.streamModelCompletion(
         request.stream_provider,
         alloc,
         .{
@@ -84,32 +98,47 @@ pub fn inspect(
         },
         request.usage,
         request.usage_allocator,
-    );
+    ) catch |err| {
+        if (delivery.upstream_cancel_unconfirmed.load(.seq_cst)) {
+            return .{ .upstream_cancellation_unconfirmed = if (request.cancel_flag.load(.seq_cst))
+                .cancelled
+            else if (err == error.Timeout)
+                .timed_out
+            else
+                .transport_failure };
+        }
+        return err;
+    };
     defer streamed.deinit(alloc);
 
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-    if (std.meta.activeTag(streamed) == .failed) return error.ImageProviderUnavailable;
+    if (std.meta.activeTag(streamed) == .failed) return .{ .failed = .{
+        .kind = streamed.failed.kind,
+        .http_status = streamed.failed.http_status,
+        .credential_source = request.credential_source,
+    } };
     if (capture.failed) return error.OutOfMemory;
     const completion = streamed.completed.completion;
+    if (completion.finish_reason != .stop) return error.IncompleteImageProviderResponse;
 
     const tool_usage = types.ToolUsage{
         .input_tokens = completion.usage.input_tokens orelse 0,
         .output_tokens = completion.usage.output_tokens orelse 0,
     };
     if (capture.saw_content) {
-        return .{
+        return .{ .completed = .{
             .text = try capture.takeText(),
             .observed_bytes = capture.observed_bytes,
             .usage = tool_usage,
-        };
+        } };
     }
     if (completion.content) |content| {
         const retained_len = @min(content.len, request.capture_limit_bytes);
-        return .{
+        return .{ .completed = .{
             .text = try alloc.dupe(u8, content[0..retained_len]),
             .observed_bytes = content.len,
             .usage = tool_usage,
-        };
+        } };
     }
     return error.InvalidProviderResponse;
 }

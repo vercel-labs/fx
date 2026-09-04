@@ -49,6 +49,20 @@ pub const Result = struct {
     }
 };
 
+pub const Outcome = union(enum) {
+    completed: Result,
+    provider_failure: agent_stream_provider.FailureMetadata,
+    upstream_cancellation_unconfirmed: agent_stream_provider.UpstreamCancellationCause,
+
+    pub fn deinit(self: *Outcome, alloc: Allocator) void {
+        switch (self.*) {
+            .completed => |*result| result.deinit(alloc),
+            .provider_failure, .upstream_cancellation_unconfirmed => {},
+        }
+        self.* = undefined;
+    }
+};
+
 pub const ResultStorage = union(enum) {
     unavailable,
     legacy_dir: []const u8,
@@ -122,7 +136,7 @@ pub fn compact(
     alloc: Allocator,
     source_messages: []const types.ChatMessage,
     request: Request,
-) !Result {
+) !Outcome {
     if (source_messages.len == 0) return error.NoContextToCompact;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -202,15 +216,23 @@ pub fn compact(
             scratch,
             bounded_messages[range.start..range.end],
         );
-        const call = try runSummaryCall(
+        var call_outcome = try runSummaryCall(
             scratch,
             request,
             source_text,
             per_chunk_generation,
             per_chunk_budget *| 8 +| 1,
         );
-        summaries[index] = call.text;
-        addUsage(&total_usage, call.usage);
+        switch (call_outcome) {
+            .completed => |*call| {
+                summaries[index] = call.text;
+                addUsage(&total_usage, call.usage);
+            },
+            .provider_failure => |failure| return .{ .provider_failure = failure },
+            .upstream_cancellation_unconfirmed => |cause| return .{
+                .upstream_cancellation_unconfirmed = cause,
+            },
+        }
     }
 
     const handoff = try compaction_state.renderHandoff(alloc, summaries);
@@ -234,7 +256,7 @@ pub fn compact(
             },
         );
     }
-    return .{ .handoff = handoff };
+    return .{ .completed = .{ .handoff = handoff } };
 }
 
 fn planSummaryRanges(
@@ -346,13 +368,19 @@ const SummaryCall = struct {
     usage: types.ToolUsage,
 };
 
+const SummaryCallOutcome = union(enum) {
+    completed: SummaryCall,
+    provider_failure: agent_stream_provider.FailureMetadata,
+    upstream_cancellation_unconfirmed: agent_stream_provider.UpstreamCancellationCause,
+};
+
 fn runSummaryCall(
     alloc: Allocator,
     request: Request,
     source_text: []const u8,
     generation_tokens: usize,
     max_bytes: usize,
-) !SummaryCall {
+) !SummaryCallOutcome {
     const instructions = [_]types.ChatMessage{.{
         .role = .system,
         .content = summarySystemPrompt(),
@@ -375,7 +403,7 @@ fn runSummaryCall(
             .account_id = request.account_id,
             .tenant_context = request.gateway_team,
         } };
-    var streamed = try runtime_gateway_step.streamModelCompletion(
+    var streamed = runtime_gateway_step.streamModelCompletion(
         request.stream_provider,
         alloc,
         .{
@@ -401,11 +429,35 @@ fn runSummaryCall(
         },
         request.usage,
         request.usage_allocator,
-    );
+    ) catch |err| {
+        if (delivery.upstream_cancel_unconfirmed.load(.seq_cst)) {
+            return .{ .upstream_cancellation_unconfirmed = if (err == error.Cancelled or request.cancel_flag.load(.seq_cst))
+                .cancelled
+            else if (err == error.Timeout)
+                .timed_out
+            else
+                .transport_failure };
+        }
+        return err;
+    };
     defer streamed.deinit(alloc);
-    if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+    if (request.cancel_flag.load(.seq_cst)) {
+        if (delivery.upstream_cancel_unconfirmed.load(.seq_cst)) {
+            return .{ .upstream_cancellation_unconfirmed = .cancelled };
+        }
+        return error.Cancelled;
+    }
     const completion = switch (streamed) {
-        .failed => return error.ContextCompactionUnavailable,
+        .failed => |failure| {
+            if (request.credential_source == .host_managed) {
+                return .{ .provider_failure = .{
+                    .kind = failure.kind,
+                    .http_status = failure.http_status,
+                    .credential_source = .host_managed,
+                } };
+            }
+            return error.ContextCompactionUnavailable;
+        },
         .completed => |completed| completed.completion,
     };
     if (completion.finish_reason != .stop) return error.IncompleteCompactionHandoff;
@@ -423,13 +475,13 @@ fn runSummaryCall(
     if (trimmed.len == 0 or !std.unicode.utf8ValidateSlice(trimmed)) {
         return error.InvalidCompactionHandoff;
     }
-    return .{
+    return .{ .completed = .{
         .text = try alloc.dupe(u8, trimmed),
         .usage = .{
             .input_tokens = completion.usage.input_tokens orelse 0,
             .output_tokens = completion.usage.output_tokens orelse 0,
         },
-    };
+    } };
 }
 
 fn addUsage(total: *types.ToolUsage, item: types.ToolUsage) void {
@@ -492,6 +544,9 @@ const FakeProvider = struct {
     observed_model: ?[]const u8 = null,
     observed_credential_source: ?types.CredentialSource = null,
     observed_secret: ?[]const u8 = null,
+    failure_status: ?std.http.Status = null,
+    transport_error: ?anyerror = null,
+    upstream_cancel_unconfirmed: bool = false,
 
     fn provider(self: *FakeProvider) agent_stream_provider.Provider {
         return .{ .context = self, .stream_fn = stream };
@@ -499,7 +554,7 @@ const FakeProvider = struct {
 
     fn stream(
         raw: ?*anyopaque,
-        _: Allocator,
+        alloc: Allocator,
         request: agent_stream_provider.ModelRequest,
     ) !agent_stream_provider.Result {
         const self: *FakeProvider = @ptrCast(@alignCast(raw.?));
@@ -529,6 +584,25 @@ const FakeProvider = struct {
         self.observed_secret = request.credential.secret();
         try request.admission.admit();
         request.delivery.markPossiblySent();
+        if (self.transport_error) |err| {
+            if (self.upstream_cancel_unconfirmed) {
+                request.delivery.upstream_cancel_unconfirmed.store(true, .seq_cst);
+            }
+            return err;
+        }
+        if (self.failure_status) |status| {
+            return .{ .failed = .{
+                .kind = switch (status) {
+                    .unauthorized => .unauthorized,
+                    .forbidden => .forbidden,
+                    .service_unavailable => .unavailable,
+                    else => .provider_error,
+                },
+                .http_status = status,
+                .detail = try alloc.dupe(u8, "owned provider body"),
+                .ownership = .owned,
+            } };
+        }
         request.events.emit(.{ .content_delta = self.response });
         if (self.emit_tool_call) {
             request.events.emit(.{ .tool_started = .{ .id = "call-1", .name = "read_file" } });
@@ -575,6 +649,94 @@ test "host-managed compaction carries authority without secret bytes" {
     try std.testing.expect(provider.observed_secret == null);
 }
 
+test "host-managed compaction preserves provider failure metadata after owned body cleanup" {
+    const alloc = std.testing.allocator;
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "Preserve this decision." },
+        .{ .role = .assistant, .content = "Decision preserved." },
+        .{ .role = .user, .content = "Continue." },
+    };
+    const cases = [_]struct {
+        status: std.http.Status,
+        kind: agent_stream_provider.FailureKind,
+    }{
+        .{ .status = .unauthorized, .kind = .unauthorized },
+        .{ .status = .forbidden, .kind = .forbidden },
+        .{ .status = .service_unavailable, .kind = .unavailable },
+    };
+    for (cases) |case| {
+        var provider = FakeProvider{
+            .response = "",
+            .failure_status = case.status,
+        };
+        var cancel = std.atomic.Value(bool).init(false);
+        var outcome = try compact(alloc, &messages, .{
+            .stream_provider = provider.provider(),
+            .model = "provider/compactor",
+            .api_key = "",
+            .credential_source = .host_managed,
+            .retry_count = 0,
+            .cancel_flag = &cancel,
+            .accepted_tokens = 256,
+            .generation_tokens = 128,
+            .trace_ctx = .{},
+        });
+        defer outcome.deinit(alloc);
+        const failure = switch (outcome) {
+            .provider_failure => |value| value,
+            else => return error.TestExpectedProviderFailure,
+        };
+        try std.testing.expectEqual(case.kind, failure.kind);
+        try std.testing.expectEqual(case.status, failure.http_status.?);
+        try std.testing.expectEqual(
+            types.CredentialSource.host_managed,
+            failure.credential_source.?,
+        );
+    }
+}
+
+test "compaction preserves the cause of unconfirmed upstream cancellation" {
+    const alloc = std.testing.allocator;
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "Preserve this decision." },
+        .{ .role = .assistant, .content = "Decision preserved." },
+        .{ .role = .user, .content = "Continue." },
+    };
+    const cases = [_]struct {
+        err: anyerror,
+        cause: agent_stream_provider.UpstreamCancellationCause,
+    }{
+        .{ .err = error.Cancelled, .cause = .cancelled },
+        .{ .err = error.Timeout, .cause = .timed_out },
+        .{ .err = error.ConnectionResetByPeer, .cause = .transport_failure },
+    };
+    for (cases) |case| {
+        var provider = FakeProvider{
+            .response = "",
+            .transport_error = case.err,
+            .upstream_cancel_unconfirmed = true,
+        };
+        var cancel = std.atomic.Value(bool).init(false);
+        var outcome = try compact(alloc, &messages, .{
+            .stream_provider = provider.provider(),
+            .model = "provider/compactor",
+            .api_key = "",
+            .credential_source = .host_managed,
+            .retry_count = 0,
+            .cancel_flag = &cancel,
+            .accepted_tokens = 256,
+            .generation_tokens = 128,
+            .trace_ctx = .{},
+        });
+        defer outcome.deinit(alloc);
+        const cause = switch (outcome) {
+            .upstream_cancellation_unconfirmed => |value| value,
+            else => return error.TestExpectedUnconfirmedCancellation,
+        };
+        try std.testing.expectEqual(case.cause, cause);
+    }
+}
+
 test "semantic compaction includes tool outcomes in one bounded summary" {
     const alloc = std.testing.allocator;
     const calls = [_]types.ToolCall{.{
@@ -602,7 +764,7 @@ test "semantic compaction includes tool outcomes in one bounded summary" {
         .response = "The terminal call completed successfully; exact output is at result-secret.txt.",
     };
     var cancel = std.atomic.Value(bool).init(false);
-    var result = try compact(alloc, &messages, .{
+    var outcome = try compact(alloc, &messages, .{
         .stream_provider = provider.provider(),
         .model = "provider/compactor",
         .api_key = "key",
@@ -613,7 +775,11 @@ test "semantic compaction includes tool outcomes in one bounded summary" {
         .compactor_input_tokens = 100_000,
         .trace_ctx = .{},
     });
-    defer result.deinit(alloc);
+    defer outcome.deinit(alloc);
+    const result = switch (outcome) {
+        .completed => |*value| value,
+        else => return error.TestExpectedCompactionResult,
+    };
 
     try std.testing.expectEqual(@as(usize, 1), provider.request_count);
     try std.testing.expect(provider.saw_no_tools);
@@ -640,7 +806,7 @@ test "capacity-required summaries use identical prompts without a merge call" {
     };
     var provider = FakeProvider{ .response = "Preserve the user goal." };
     var cancel = std.atomic.Value(bool).init(false);
-    var result = try compact(alloc, &messages, .{
+    var outcome = try compact(alloc, &messages, .{
         .stream_provider = provider.provider(),
         .model = "provider/compactor",
         .api_key = "key",
@@ -651,7 +817,11 @@ test "capacity-required summaries use identical prompts without a merge call" {
         .compactor_input_tokens = 700,
         .trace_ctx = .{},
     });
-    defer result.deinit(alloc);
+    defer outcome.deinit(alloc);
+    const result = switch (outcome) {
+        .completed => |*value| value,
+        else => return error.TestExpectedCompactionResult,
+    };
     try std.testing.expect(provider.request_count > 1);
     try std.testing.expect(provider.saw_only_summary_prompt);
     try std.testing.expectEqual(

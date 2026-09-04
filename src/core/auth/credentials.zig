@@ -257,6 +257,9 @@ pub const missing_grok_credential_message = "fx needs a Grok subscription login 
 pub const missing_grok_interactive_credential_message = "Grok needs a subscription login. Run /login, open Connections, then choose Grok subscription.";
 pub const unreadable_store_message = "fx could not read the stored API key from " ++ stored_key_backend_label ++ ". A key may be saved but unreadable. Set FX_TRACE_LOG for the failing step, or set AI_GATEWAY_API_KEY.";
 pub const host_managed_auth_message = "Authentication is managed by the host.";
+pub const host_managed_repair_message = "Reconnect this provider in the host application.";
+pub const host_managed_access_message = "Request access in the host application.";
+pub const host_managed_unavailable_message = "Try again shortly or check the host application.";
 
 test "public credential guidance spells fx lowercase" {
     try std.testing.expect(std.mem.startsWith(u8, missing_credential_message, "fx needs"));

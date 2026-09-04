@@ -2017,7 +2017,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .push_context_notice = pushContextNotice,
         .push_route_recovery_status = pushRouteRecoveryStatus,
         .push_command_output_complete = pushCommandOutputComplete,
-        .push_http_error = pushHttpError,
+        .push_provider_failure = pushHttpError,
         .refresh_gateway_credential = refreshGatewayCredential,
         .available_model_capabilities = availableModelCapabilities,
         .resolve_model_capabilities = resolveModelCapabilities,
@@ -3245,21 +3245,33 @@ fn pushCommandOutputComplete(raw_ctx: *anyopaque, _: ?types.ToolLifecycleId) !vo
     ctx.command_output_line_open = false;
 }
 
-fn pushHttpError(raw_ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) !void {
+fn pushHttpError(raw_ctx: *anyopaque, provider_failure: agent_stream_provider.Failure, credential_source: ?types.CredentialSource) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     ctx.failed = true;
-    const auth_failure = auth_runtime.FailureSnapshot.fromHttp(status, credential_source);
+    const auth_failure = auth_runtime.FailureSnapshot.from_provider(provider_failure, credential_source);
     ctx.auth_failure = auth_failure;
     const message = if (auth_failure) |failure|
         try failure.renderText(ctx.alloc)
     else
-        try gateway_error_format.formatHttpErrorMessage(ctx.alloc, status, detail);
+        try gateway_error_format.format_provider_failure(ctx.alloc, provider_failure);
     defer ctx.alloc.free(message);
+    const host_recovery = if (auth_failure) |failure|
+        if (failure.source == .host_managed) failure.recovery_message() else null
+    else
+        null;
     try ctx.writeStderr("fx ask: ");
     try ctx.writeStderr(message);
+    if (host_recovery) |recovery| {
+        try ctx.writeStderr(". ");
+        try ctx.writeStderr(recovery);
+    }
     try ctx.writeStderr("\n");
     if (ctx.output_mode.capturesJson()) {
         try ctx.assistant_output.appendSlice(ctx.alloc, message);
+        if (host_recovery) |recovery| {
+            try ctx.assistant_output.appendSlice(ctx.alloc, ". ");
+            try ctx.assistant_output.appendSlice(ctx.alloc, recovery);
+        }
         try ctx.assistant_output.append(ctx.alloc, '\n');
     }
 }
@@ -4303,30 +4315,27 @@ fn testProcessQueuedPromptChecksInjectedToolSet(_: *agent_runtime.Agent, deps: *
 
 fn testProcessQueuedPromptHttp413(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
     try std.testing.expect(semantic_presentation == null);
-    try deps.push_http_error(
+    try deps.push_provider_failure(
         deps.ctx,
-        .payload_too_large,
-        "provider payload rejected\n\nprompt_too_long=true\nProvider rejected the prompt as too large. Latest local tool evidence remains in session history/result handles; no local tool actions were replayed.",
+        .{ .kind = .request_too_large, .http_status = .payload_too_large, .detail = "provider payload rejected\n\nprompt_too_long=true\nProvider rejected the prompt as too large. Latest local tool evidence remains in session history/result handles; no local tool actions were replayed." },
         null,
     );
 }
 
 fn testProcessQueuedPromptRestrictedProvider(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
     try std.testing.expect(semantic_presentation == null);
-    try deps.push_http_error(
+    try deps.push_provider_failure(
         deps.ctx,
-        .forbidden,
-        "{\"error\":{\"message\":\"Your team has restricted access to this provider. Contact the owner of the account for more details. Providers considered: wafer\",\"type\":\"no_providers_available\",\"param\":{\"name\":\"RestrictedProvidersError\",\"message\":\"Your team has restricted access to this provider. Contact the owner of the account for more details. Providers considered: wafer\"}},\"providerMetadata\":{\"gateway\":{\"routing\":{}}}}",
+        .{ .kind = .forbidden, .http_status = .forbidden, .detail = "{\"error\":{\"message\":\"Your team has restricted access to this provider. Contact the owner of the account for more details. Providers considered: wafer\",\"type\":\"no_providers_available\",\"param\":{\"name\":\"RestrictedProvidersError\",\"message\":\"Your team has restricted access to this provider. Contact the owner of the account for more details. Providers considered: wafer\"}},\"providerMetadata\":{\"gateway\":{\"routing\":{}}}}" },
         null,
     );
 }
 
 fn testProcessQueuedPromptUnauthorized(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
     try std.testing.expect(semantic_presentation == null);
-    try deps.push_http_error(
+    try deps.push_provider_failure(
         deps.ctx,
-        .unauthorized,
-        "provider rejected secret-key body",
+        .{ .kind = .unauthorized, .http_status = .unauthorized, .detail = "provider rejected secret-key body" },
         job.credential_source,
     );
 }

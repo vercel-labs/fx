@@ -272,6 +272,13 @@ fn sendReview(
                 .timed_out
             else
                 .transient_failure;
+        if (delivery.upstream_cancel_unconfirmed.load(.seq_cst)) {
+            return .{ .upstream_cancellation_unconfirmed = switch (outcome) {
+                .cancelled => .cancelled,
+                .timed_out => .timed_out,
+                else => .transport_failure,
+            } };
+        }
         debug_trace.logf(
             "permission",
             "event=auto_review_transport result={s} reason=transport_error error={s}",
@@ -296,8 +303,20 @@ fn sendReview(
         debugUsageFailure("completion", err);
         return .permanent_failure;
     };
-    if (cancel_flag.load(.seq_cst)) return .cancelled;
+    if (cancel_flag.load(.seq_cst)) {
+        return if (delivery.upstream_cancel_unconfirmed.load(.seq_cst))
+            .{ .upstream_cancellation_unconfirmed = .cancelled }
+        else
+            .cancelled;
+    }
     if (std.meta.activeTag(result) == .failed) {
+        if (runtime.input.credential_source == .host_managed) {
+            return .{ .provider_failure = .{
+                .kind = result.failed.kind,
+                .http_status = result.failed.http_status,
+                .credential_source = .host_managed,
+            } };
+        }
         const outcome: permission_auto_classifier.TransportOutcome = switch (result.failed.kind) {
             .rate_limited, .server_error, .bad_gateway, .unavailable, .gateway_timeout => .transient_failure,
             else => .permanent_failure,
@@ -469,6 +488,11 @@ test "direct review settles every post-admission outcome before projection" {
                 request.delivery.markPossiblySent();
                 return error.Timeout;
             }
+            if (std.mem.eql(u8, payload, "unconfirmed_timeout")) {
+                request.delivery.markPossiblySent();
+                request.delivery.upstream_cancel_unconfirmed.store(true, .seq_cst);
+                return error.Timeout;
+            }
             if (std.mem.eql(u8, payload, "provider_failure")) {
                 return .{ .failed = .{ .kind = .unauthorized } };
             }
@@ -499,6 +523,7 @@ test "direct review settles every post-admission outcome before projection" {
     }{
         .{ .payload = "cancelled", .outcome = .cancelled, .billing = .incomplete, .request_count = 0 },
         .{ .payload = "timed_out", .outcome = .timed_out, .billing = .incomplete, .request_count = 0 },
+        .{ .payload = "unconfirmed_timeout", .outcome = .upstream_cancellation_unconfirmed, .billing = .incomplete, .request_count = 0 },
         .{ .payload = "provider_failure", .outcome = .permanent_failure, .billing = .complete, .request_count = 0 },
         .{ .payload = "malformed", .outcome = .completion, .billing = .incomplete, .request_count = 0 },
         .{ .payload = "cancel_after_completion", .outcome = .cancelled, .billing = .complete, .request_count = 1 },
@@ -532,6 +557,12 @@ test "direct review settles every post-admission outcome before projection" {
         );
         defer if (outcome == .completion) outcome.completion.deinit(std.testing.allocator);
         try std.testing.expectEqual(case.outcome, std.meta.activeTag(outcome));
+        if (std.mem.eql(u8, case.payload, "unconfirmed_timeout")) {
+            try std.testing.expectEqual(
+                stream_provider.UpstreamCancellationCause.timed_out,
+                outcome.upstream_cancellation_unconfirmed,
+            );
+        }
 
         var snapshot = try usage.snapshot(std.testing.allocator);
         defer snapshot.deinit(std.testing.allocator);
@@ -540,5 +571,85 @@ test "direct review settles every post-admission outcome before projection" {
         try std.testing.expectEqual(@as(u64, 2), snapshot.next_sequence);
         try std.testing.expectEqual(@as(u64, 1), snapshot.settled_through_sequence);
         try std.testing.expectEqual(@as(usize, 0), snapshot.pending.len);
+    }
+}
+
+test "host review preserves provider failure metadata after owned result cleanup" {
+    const Fake = struct {
+        fn validate(_: Allocator, _: permission_auto_classifier.ProviderInput) !void {}
+
+        fn build(_: Allocator, _: stream_provider.RequestData) ![]u8 {
+            return error.TestUnexpectedBuild;
+        }
+
+        fn send(
+            alloc: Allocator,
+            request: stream_provider.ModelRequest,
+            payload: []const u8,
+        ) !stream_provider.Result {
+            try request.admission.admit();
+            const status: std.http.Status = if (std.mem.eql(u8, payload, "401"))
+                .unauthorized
+            else if (std.mem.eql(u8, payload, "403"))
+                .forbidden
+            else
+                .service_unavailable;
+            const kind: stream_provider.FailureKind = switch (status) {
+                .unauthorized => .unauthorized,
+                .forbidden => .forbidden,
+                .service_unavailable => .unavailable,
+                else => unreachable,
+            };
+            return .{ .failed = .{
+                .kind = kind,
+                .http_status = status,
+                .detail = try alloc.dupe(u8, "owned provider body"),
+                .ownership = .owned,
+            } };
+        }
+    };
+
+    const cases = [_]struct {
+        payload: []const u8,
+        status: std.http.Status,
+        kind: stream_provider.FailureKind,
+    }{
+        .{ .payload = "401", .status = .unauthorized, .kind = .unauthorized },
+        .{ .payload = "403", .status = .forbidden, .kind = .forbidden },
+        .{ .payload = "503", .status = .service_unavailable, .kind = .unavailable },
+    };
+    for (cases) |case| {
+        var runtime = Runtime{
+            .input = .{ .credential_source = .host_managed },
+            .adapter = .{
+                .source = .chatgpt_subscription,
+                .model = "gpt-review",
+                .validate_fn = Fake.validate,
+                .build_fn = Fake.build,
+                .send_fn = Fake.send,
+            },
+        };
+        var cancelled = std.atomic.Value(bool).init(false);
+        const outcome = try sendReview(
+            &runtime,
+            std.testing.allocator,
+            "gpt-review",
+            case.payload,
+            std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+                .clock = .awake,
+                .raw = .fromSeconds(5),
+            }),
+            &cancelled,
+        );
+        const failure = switch (outcome) {
+            .provider_failure => |value| value,
+            else => return error.TestExpectedProviderFailure,
+        };
+        try std.testing.expectEqual(case.kind, failure.kind);
+        try std.testing.expectEqual(case.status, failure.http_status.?);
+        try std.testing.expectEqual(
+            types.CredentialSource.host_managed,
+            failure.credential_source.?,
+        );
     }
 }

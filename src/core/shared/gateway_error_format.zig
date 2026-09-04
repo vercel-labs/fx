@@ -1,4 +1,5 @@
 const std = @import("std");
+const agent_stream_provider = @import("../agent/stream_provider.zig");
 const display_width = @import("display_width.zig");
 const text_utils = @import("text_utils.zig");
 
@@ -68,6 +69,32 @@ pub fn formatHttpErrorMessage(alloc: Allocator, status: std.http.Status, detail:
     else
         "API request failed";
     return formatHttpDiagnostic(alloc, status, detail, title, max_published_error_bytes);
+}
+
+pub fn format_provider_failure(alloc: Allocator, failure: agent_stream_provider.Failure) ![]u8 {
+    if (failure.http_status) |status| return formatHttpErrorMessage(alloc, status, failure.detail orelse "");
+    const raw = try std.fmt.allocPrint(alloc, "Provider request failed · {s}{s}{s}", .{
+        @tagName(failure.kind),
+        if (failure.detail != null) ": " else "",
+        failure.detail orelse "",
+    });
+    defer alloc.free(raw);
+    return sanitizeExternalText(alloc, raw, max_published_error_bytes);
+}
+
+test "provider failure formatting preserves observed status and never invents one" {
+    const alloc = std.testing.allocator;
+    for ([_]std.http.Status{ .payment_required, .not_found, .unprocessable_entity }) |status| {
+        const text = try format_provider_failure(alloc, .{ .kind = .provider_error, .http_status = status });
+        defer alloc.free(text);
+        const expected = try std.fmt.allocPrint(alloc, "HTTP {d}", .{@intFromEnum(status)});
+        defer alloc.free(expected);
+        try std.testing.expectEqualStrings(expected, text);
+    }
+    const text = try format_provider_failure(alloc, .{ .kind = .provider_error });
+    defer alloc.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "HTTP") == null);
+    try std.testing.expect(std.mem.find(u8, text, "provider_error") != null);
 }
 
 pub fn formatHttpRecoveryDiagnostic(alloc: Allocator, status: std.http.Status, detail: []const u8) ![]u8 {

@@ -35,6 +35,7 @@ pub const FailureCategory = enum {
 };
 
 pub const Failure = struct {
+    upstream_cancel_unconfirmed: bool = false,
     category: FailureCategory,
     http_status: ?std.http.Status = null,
     retryable: bool = false,
