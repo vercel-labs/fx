@@ -352,7 +352,7 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
   );
 
   test(
-    "fx session help documents inspect resume migrate and recover",
+    "fx session help documents inspect resume migrate recover fork and rewind",
     async () => {
       for (const args of [
         ["session", "--help"],
@@ -361,11 +361,13 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
         const r = await runFx(args);
         expect(r.code).toBe(0);
         expect(r.stderr).toBe("");
-        expect(r.stdout).toContain("Inspect, resume, migrate, or recover saved sessions");
+        expect(r.stdout).toContain("Inspect, resume, migrate, recover, fork, or rewind saved sessions");
         expect(r.stdout).toContain("session <last|id>|--id <id>");
         expect(r.stdout).toContain("session resume [last|<id>]");
         expect(r.stdout).toContain("session migrate <id>|--id <id>");
         expect(r.stdout).toContain("session recover <id>|--id <id>");
+        expect(r.stdout).toContain("session fork <id>|--id <id> --at <turn>");
+        expect(r.stdout).toContain("session rewind <id>|--id <id> --by <count>");
       }
     },
     TIMEOUT,

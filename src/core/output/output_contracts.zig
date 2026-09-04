@@ -1304,6 +1304,136 @@ pub const SessionRecoverySnapshot = struct {
     }
 };
 
+pub const SessionForkSnapshot = struct {
+    result: session_store.SessionForkResult,
+
+    pub fn render(
+        self: SessionForkSnapshot,
+        alloc: Allocator,
+        format: OutputFormat,
+    ) ![]u8 {
+        return switch (format) {
+            .text => self.renderText(alloc),
+            .json => self.renderJson(alloc),
+        };
+    }
+
+    pub fn renderText(self: SessionForkSnapshot, alloc: Allocator) ![]u8 {
+        if (self.result.status == .indeterminate) {
+            return std.fmt.allocPrint(
+                alloc,
+                "[session fork] could not confirm branch {s}\nsource: {s} (unchanged)\nresolve: fx --resume {s}\ninspect: fx doctor\n",
+                .{
+                    self.result.forked_session_id,
+                    self.result.source_session_id,
+                    self.result.forked_session_id,
+                },
+            );
+        }
+        if (self.result.status == .forked_with_unverified_artifacts) {
+            return std.fmt.allocPrint(
+                alloc,
+                "[session fork] forked {s} to {s}\nhistory_turns: {d} of {d}\nwarning: legacy command artifacts could not be authenticated\nresume: fx --resume {s}\n",
+                .{
+                    self.result.source_session_id,
+                    self.result.forked_session_id,
+                    self.result.history_len,
+                    self.result.source_history_len,
+                    self.result.forked_session_id,
+                },
+            );
+        }
+        return std.fmt.allocPrint(
+            alloc,
+            "[session fork] forked {s} to {s}\nhistory_turns: {d} of {d}\nresume: fx --resume {s}\n",
+            .{
+                self.result.source_session_id,
+                self.result.forked_session_id,
+                self.result.history_len,
+                self.result.source_history_len,
+                self.result.forked_session_id,
+            },
+        );
+    }
+
+    pub fn renderJson(self: SessionForkSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.writeAll("{\"kind\":\"session_fork\",\"source_id\":");
+        try std.json.Stringify.value(
+            self.result.source_session_id,
+            .{},
+            &out.writer,
+        );
+        try out.writer.writeAll(",\"forked_id\":");
+        try std.json.Stringify.value(
+            self.result.forked_session_id,
+            .{},
+            &out.writer,
+        );
+        try out.writer.writeAll(",\"status\":");
+        try std.json.Stringify.value(
+            @tagName(self.result.status),
+            .{},
+            &out.writer,
+        );
+        try out.writer.print(
+            ",\"history_turns\":{d},\"source_history_turns\":{d}}}",
+            .{ self.result.history_len, self.result.source_history_len },
+        );
+        return try out.toOwnedSlice();
+    }
+};
+
+pub const SessionRewindSnapshot = struct {
+    result: session_store.SessionRewindResult,
+
+    pub fn render(
+        self: SessionRewindSnapshot,
+        alloc: Allocator,
+        format: OutputFormat,
+    ) ![]u8 {
+        return switch (format) {
+            .text => self.renderText(alloc),
+            .json => self.renderJson(alloc),
+        };
+    }
+
+    pub fn renderText(self: SessionRewindSnapshot, alloc: Allocator) ![]u8 {
+        return std.fmt.allocPrint(
+            alloc,
+            "[session rewind] {s}\nhistory_turns: {d}\nremoved_turns: {d}\n",
+            .{
+                self.result.session_id,
+                self.result.history_len,
+                self.result.removed_turn_count,
+            },
+        );
+    }
+
+    pub fn renderJson(self: SessionRewindSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.writeAll("{\"kind\":\"session_rewind\",\"id\":");
+        try std.json.Stringify.value(
+            self.result.session_id,
+            .{},
+            &out.writer,
+        );
+        try out.writer.writeAll(",\"status\":");
+        try std.json.Stringify.value(
+            @tagName(self.result.status),
+            .{},
+            &out.writer,
+        );
+        try out.writer.print(
+            ",\"history_turns\":{d},\"removed_turns\":{d}}}",
+            .{ self.result.history_len, self.result.removed_turn_count },
+        );
+        return try out.toOwnedSlice();
+    }
+};
+
 pub const DoctorSnapshot = struct {
     workspace_root: []const u8,
     model: []const u8,
@@ -2712,6 +2842,114 @@ test "core session recovery snapshot text and json stay stable" {
     try std.testing.expectEqualStrings(
         "[session recovery] could not confirm target target-session\nsource: source-session (unchanged)\nresolve: fx --resume target-session\ninspect: fx doctor\n",
         warning,
+    );
+}
+
+test "core session fork snapshot text and json stay stable" {
+    const result = session_store.SessionForkResult{
+        .source_session_id = @constCast("source-session"),
+        .forked_session_id = @constCast("forked-session"),
+        .history_len = 3,
+        .source_history_len = 7,
+    };
+
+    const text = try (SessionForkSnapshot{ .result = result }).renderText(
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings(
+        "[session fork] forked source-session to forked-session\nhistory_turns: 3 of 7\nresume: fx --resume forked-session\n",
+        text,
+    );
+
+    const json = try (SessionForkSnapshot{ .result = result }).renderJson(
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"session_fork\",\"source_id\":\"source-session\",\"forked_id\":\"forked-session\",\"status\":\"forked\",\"history_turns\":3,\"source_history_turns\":7}",
+        json,
+    );
+
+    const partial = session_store.SessionForkResult{
+        .source_session_id = @constCast("source-session"),
+        .forked_session_id = @constCast("partial-session"),
+        .history_len = 3,
+        .source_history_len = 7,
+        .status = .forked_with_unverified_artifacts,
+    };
+    const partial_text = try (SessionForkSnapshot{
+        .result = partial,
+    }).renderText(std.testing.allocator);
+    defer std.testing.allocator.free(partial_text);
+    try std.testing.expectEqualStrings(
+        "[session fork] forked source-session to partial-session\nhistory_turns: 3 of 7\nwarning: legacy command artifacts could not be authenticated\nresume: fx --resume partial-session\n",
+        partial_text,
+    );
+
+    const indeterminate = session_store.SessionForkResult{
+        .source_session_id = @constCast("source-session"),
+        .forked_session_id = @constCast("target-session"),
+        .history_len = 3,
+        .source_history_len = 7,
+        .status = .indeterminate,
+    };
+    const warning = try (SessionForkSnapshot{
+        .result = indeterminate,
+    }).renderText(std.testing.allocator);
+    defer std.testing.allocator.free(warning);
+    try std.testing.expectEqualStrings(
+        "[session fork] could not confirm branch target-session\nsource: source-session (unchanged)\nresolve: fx --resume target-session\ninspect: fx doctor\n",
+        warning,
+    );
+    const indeterminate_json = try (SessionForkSnapshot{
+        .result = indeterminate,
+    }).renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(indeterminate_json);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"session_fork\",\"source_id\":\"source-session\",\"forked_id\":\"target-session\",\"status\":\"indeterminate\",\"history_turns\":3,\"source_history_turns\":7}",
+        indeterminate_json,
+    );
+}
+
+test "core session rewind snapshot text and json stay stable" {
+    const result = session_store.SessionRewindResult{
+        .session_id = @constCast("rewound-session"),
+        .history_len = 4,
+        .removed_turn_count = 2,
+    };
+
+    const text = try (SessionRewindSnapshot{ .result = result }).renderText(
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings(
+        "[session rewind] rewound-session\nhistory_turns: 4\nremoved_turns: 2\n",
+        text,
+    );
+
+    const json = try (SessionRewindSnapshot{ .result = result }).renderJson(
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"session_rewind\",\"id\":\"rewound-session\",\"status\":\"rewound\",\"history_turns\":4,\"removed_turns\":2}",
+        json,
+    );
+
+    const unchanged = session_store.SessionRewindResult{
+        .session_id = @constCast("rewound-session"),
+        .history_len = 6,
+        .removed_turn_count = 0,
+        .status = .already_at_target,
+    };
+    const unchanged_json = try (SessionRewindSnapshot{
+        .result = unchanged,
+    }).renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(unchanged_json);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"session_rewind\",\"id\":\"rewound-session\",\"status\":\"already_at_target\",\"history_turns\":6,\"removed_turns\":0}",
+        unchanged_json,
     );
 }
 

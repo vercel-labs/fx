@@ -286,6 +286,28 @@ const SessionRecoveryOptions = struct {
     }
 };
 
+const SessionForkOptions = struct {
+    format: output_contracts.OutputFormat = .text,
+    session_id: []u8,
+    at_turn: usize,
+
+    fn deinit(self: *SessionForkOptions, alloc: Allocator) void {
+        alloc.free(self.session_id);
+        self.* = undefined;
+    }
+};
+
+const SessionRewindOptions = struct {
+    format: output_contracts.OutputFormat = .text,
+    session_id: []u8,
+    by_turns: usize,
+
+    fn deinit(self: *SessionRewindOptions, alloc: Allocator) void {
+        alloc.free(self.session_id);
+        self.* = undefined;
+    }
+};
+
 const AcpOptions = struct {
     model: ?[]const u8 = null,
     log_file: ?[]const u8 = null,
@@ -1418,6 +1440,143 @@ fn runNonInteractiveWithDeps(
                     .handled_success
                 else
                     .handled_failure;
+            }
+
+            if (rest.len > 0 and std.mem.eql(u8, rest[0], "fork")) {
+                var fork = parseSessionForkArgs(
+                    alloc,
+                    rest[1..],
+                ) catch |err| {
+                    try writeUsageOrJsonError(
+                        alloc,
+                        cfg.command_catalog,
+                        deps,
+                        .session,
+                        "session",
+                        err,
+                        rest[1..],
+                    );
+                    return .handled_failure;
+                };
+                defer fork.deinit(alloc);
+
+                const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+                defer alloc.free(workspace_root);
+                var store = session_store.Store.init(
+                    alloc,
+                    workspace_root,
+                ) catch |err| {
+                    try writeLookupFailure(alloc, deps, "session", err, fork.format);
+                    return .handled_failure;
+                };
+                defer store.deinit(alloc);
+
+                const history_len = readSessionHistoryLen(
+                    alloc,
+                    store,
+                    fork.session_id,
+                ) catch |err| {
+                    try writeLookupFailure(alloc, deps, "session", err, fork.format);
+                    return .handled_failure;
+                };
+                if (fork.at_turn == 0 or fork.at_turn > history_len) {
+                    try writeSessionForkRangeFailure(
+                        alloc,
+                        deps,
+                        fork.at_turn,
+                        history_len,
+                        fork.format,
+                    );
+                    return .handled_failure;
+                }
+
+                var result = store.forkSessionCopy(
+                    alloc,
+                    fork.session_id,
+                    fork.at_turn,
+                    .{},
+                ) catch |err| {
+                    try writeLookupFailure(alloc, deps, "session", err, fork.format);
+                    return .handled_failure;
+                };
+                defer result.deinit(alloc);
+
+                const text = try (output_contracts.SessionForkSnapshot{
+                    .result = result,
+                }).render(alloc, fork.format);
+                defer alloc.free(text);
+                try writeFormattedOutput(deps, text, fork.format);
+                return if (result.status == .indeterminate)
+                    .handled_failure
+                else
+                    .handled_success;
+            }
+
+            if (rest.len > 0 and std.mem.eql(u8, rest[0], "rewind")) {
+                var rewind = parseSessionRewindArgs(
+                    alloc,
+                    rest[1..],
+                ) catch |err| {
+                    try writeUsageOrJsonError(
+                        alloc,
+                        cfg.command_catalog,
+                        deps,
+                        .session,
+                        "session",
+                        err,
+                        rest[1..],
+                    );
+                    return .handled_failure;
+                };
+                defer rewind.deinit(alloc);
+
+                const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+                defer alloc.free(workspace_root);
+                var store = session_store.Store.init(
+                    alloc,
+                    workspace_root,
+                ) catch |err| {
+                    try writeLookupFailure(alloc, deps, "session", err, rewind.format);
+                    return .handled_failure;
+                };
+                defer store.deinit(alloc);
+
+                const history_len = readSessionHistoryLen(
+                    alloc,
+                    store,
+                    rewind.session_id,
+                ) catch |err| {
+                    try writeLookupFailure(alloc, deps, "session", err, rewind.format);
+                    return .handled_failure;
+                };
+                if (rewind.by_turns > history_len) {
+                    try writeSessionRewindRangeFailure(
+                        alloc,
+                        deps,
+                        rewind.by_turns,
+                        history_len,
+                        rewind.format,
+                    );
+                    return .handled_failure;
+                }
+
+                var result = store.rewindSession(
+                    alloc,
+                    rewind.session_id,
+                    history_len - rewind.by_turns,
+                    .{},
+                ) catch |err| {
+                    try writeLookupFailure(alloc, deps, "session", err, rewind.format);
+                    return .handled_failure;
+                };
+                defer result.deinit(alloc);
+
+                const text = try (output_contracts.SessionRewindSnapshot{
+                    .result = result,
+                }).render(alloc, rewind.format);
+                defer alloc.free(text);
+                try writeFormattedOutput(deps, text, rewind.format);
+                return .handled_success;
             }
 
             if (rest.len > 0 and std.mem.eql(u8, rest[0], "migrate")) {
@@ -2917,6 +3076,36 @@ fn writeLookupFailure(
                 "fx session: the recovery copy could not be confirmed; the source was left unchanged\n",
             );
         },
+        error.SessionTurnOutOfRange => {
+            try writeStderr(
+                deps,
+                "fx session: the requested turn is out of range for this session\n",
+            );
+        },
+        error.SessionForkRequiresCurrentSchema => {
+            try writeStderr(
+                deps,
+                "fx session: fork only applies to current schema-v3 sessions; migrate legacy sessions first\n",
+            );
+        },
+        error.SessionRewindRequiresCurrentSchema => {
+            try writeStderr(
+                deps,
+                "fx session: rewind only applies to current schema-v3 sessions; migrate legacy sessions first\n",
+            );
+        },
+        error.SessionForkArtifactsUnavailable => {
+            try writeStderr(
+                deps,
+                "fx session: the retained turn artifacts could not be copied; the source was left unchanged\n",
+            );
+        },
+        error.SessionForkIndeterminate => {
+            try writeStderr(
+                deps,
+                "fx session: the forked session could not be confirmed; the source was left unchanged\n",
+            );
+        },
         error.SessionAuthorityBoundaryUnavailable,
         error.SessionCommitBoundaryUnavailable,
         => {
@@ -2958,6 +3147,84 @@ fn writeLookupFailure(
     }
 }
 
+fn writeSessionMessageFailure(
+    alloc: Allocator,
+    deps: RunDeps,
+    err: anyerror,
+    message: []const u8,
+    format: output_contracts.OutputFormat,
+) !void {
+    if (format == .json) {
+        return writeJsonCommandFailure(alloc, deps, "session", err, message);
+    }
+    try writeStderr(deps, "fx session: ");
+    try writeStderr(deps, message);
+    try writeStderr(deps, "\n");
+}
+
+fn turnPlural(count: usize) []const u8 {
+    return if (count == 1) "" else "s";
+}
+
+fn writeSessionForkRangeFailure(
+    alloc: Allocator,
+    deps: RunDeps,
+    at_turn: usize,
+    history_len: usize,
+    format: output_contracts.OutputFormat,
+) !void {
+    const message = try std.fmt.allocPrint(
+        alloc,
+        "turn {d} is out of range; session has {d} turn{s}",
+        .{ at_turn, history_len, turnPlural(history_len) },
+    );
+    defer alloc.free(message);
+    return writeSessionMessageFailure(
+        alloc,
+        deps,
+        error.SessionTurnOutOfRange,
+        message,
+        format,
+    );
+}
+
+fn writeSessionRewindRangeFailure(
+    alloc: Allocator,
+    deps: RunDeps,
+    by_turns: usize,
+    history_len: usize,
+    format: output_contracts.OutputFormat,
+) !void {
+    const message = try std.fmt.allocPrint(
+        alloc,
+        "cannot rewind {d} turn{s}; session has {d} turn{s}",
+        .{
+            by_turns,
+            turnPlural(by_turns),
+            history_len,
+            turnPlural(history_len),
+        },
+    );
+    defer alloc.free(message);
+    return writeSessionMessageFailure(
+        alloc,
+        deps,
+        error.SessionTurnOutOfRange,
+        message,
+        format,
+    );
+}
+
+fn readSessionHistoryLen(
+    alloc: Allocator,
+    store: session_store.Store,
+    session_id: []const u8,
+) !usize {
+    var state = try store.loadReadOnly(alloc, session_id);
+    defer state.deinit(alloc);
+    return state.history.len;
+}
+
 fn writeSessionDetailFailure(
     alloc: Allocator,
     deps: RunDeps,
@@ -2985,18 +3252,7 @@ fn writeSessionDetailFailure(
         ),
     };
     defer alloc.free(message);
-    if (format == .json) {
-        return writeJsonCommandFailure(
-            alloc,
-            deps,
-            "session",
-            err,
-            message,
-        );
-    }
-    try writeStderr(deps, "fx session: ");
-    try writeStderr(deps, message);
-    try writeStderr(deps, "\n");
+    return writeSessionMessageFailure(alloc, deps, err, message, format);
 }
 
 fn commandFailureMessage(err: anyerror) ?[]const u8 {
@@ -3007,6 +3263,8 @@ fn commandFailureMessage(err: anyerror) ?[]const u8 {
         error.InvalidSessionDetailArgs,
         error.InvalidSessionMigrationArgs,
         error.InvalidSessionRecoveryArgs,
+        error.InvalidSessionForkArgs,
+        error.InvalidSessionRewindArgs,
         error.InvalidResumeArgs,
         => "invalid arguments",
         else => null,
@@ -3031,6 +3289,11 @@ fn lookupFailureMessage(err: anyerror) ?[]const u8 {
         error.SessionRecoveryUnsupportedSchema => "recovery is unavailable for this unsupported session version",
         error.SessionRecoveryBoundaryInvalid => "no exact trustworthy recovery boundary was found; the source was left unchanged",
         error.SessionRecoveryIndeterminate => "the recovery copy could not be confirmed; the source was left unchanged",
+        error.SessionTurnOutOfRange => "the requested turn is out of range for this session",
+        error.SessionForkRequiresCurrentSchema => "fork only applies to current schema-v3 sessions; migrate legacy sessions first",
+        error.SessionRewindRequiresCurrentSchema => "rewind only applies to current schema-v3 sessions; migrate legacy sessions first",
+        error.SessionForkArtifactsUnavailable => "the retained turn artifacts could not be copied; the source was left unchanged",
+        error.SessionForkIndeterminate => "the forked session could not be confirmed; the source was left unchanged",
         error.SessionAuthorityBoundaryUnavailable,
         error.SessionCommitBoundaryUnavailable,
         => "session authority is temporarily unavailable while an incomplete commit is resolved",
@@ -3514,6 +3777,94 @@ fn parseSessionRecoveryArgs(
         .format = format,
         .session_id = session_id orelse return error.InvalidSessionRecoveryArgs,
     };
+}
+
+fn parseSessionForkArgs(
+    alloc: Allocator,
+    args: []const [:0]const u8,
+) !SessionForkOptions {
+    var format: output_contracts.OutputFormat = .text;
+    var session_id: ?[]u8 = null;
+    var at_turn: ?usize = null;
+    errdefer if (session_id) |id| alloc.free(id);
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--json")) {
+            format = .json;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--at")) {
+            if (at_turn != null) return error.InvalidSessionForkArgs;
+            i += 1;
+            if (i >= args.len) return error.InvalidSessionForkArgs;
+            at_turn = parseTurnCount(args[i]) catch
+                return error.InvalidSessionForkArgs;
+            continue;
+        }
+        if (session_id != null) return error.InvalidSessionForkArgs;
+        const exact_id = std.mem.eql(u8, arg, "--id");
+        if (exact_id) {
+            i += 1;
+            if (i >= args.len) return error.InvalidSessionForkArgs;
+        }
+        const trimmed = std.mem.trim(u8, args[i], " \t\r\n");
+        if (trimmed.len == 0) return error.InvalidSessionForkArgs;
+        session_id = try alloc.dupe(u8, trimmed);
+    }
+    return .{
+        .format = format,
+        .session_id = session_id orelse return error.InvalidSessionForkArgs,
+        .at_turn = at_turn orelse return error.InvalidSessionForkArgs,
+    };
+}
+
+fn parseSessionRewindArgs(
+    alloc: Allocator,
+    args: []const [:0]const u8,
+) !SessionRewindOptions {
+    var format: output_contracts.OutputFormat = .text;
+    var session_id: ?[]u8 = null;
+    var by_turns: ?usize = null;
+    errdefer if (session_id) |id| alloc.free(id);
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--json")) {
+            format = .json;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--by")) {
+            if (by_turns != null) return error.InvalidSessionRewindArgs;
+            i += 1;
+            if (i >= args.len) return error.InvalidSessionRewindArgs;
+            by_turns = parseTurnCount(args[i]) catch
+                return error.InvalidSessionRewindArgs;
+            continue;
+        }
+        if (session_id != null) return error.InvalidSessionRewindArgs;
+        const exact_id = std.mem.eql(u8, arg, "--id");
+        if (exact_id) {
+            i += 1;
+            if (i >= args.len) return error.InvalidSessionRewindArgs;
+        }
+        const trimmed = std.mem.trim(u8, args[i], " \t\r\n");
+        if (trimmed.len == 0) return error.InvalidSessionRewindArgs;
+        session_id = try alloc.dupe(u8, trimmed);
+    }
+    return .{
+        .format = format,
+        .session_id = session_id orelse return error.InvalidSessionRewindArgs,
+        .by_turns = by_turns orelse return error.InvalidSessionRewindArgs,
+    };
+}
+
+fn parseTurnCount(raw: []const u8) !usize {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidTurnCount;
+    return std.fmt.parseInt(usize, trimmed, 10) catch error.InvalidTurnCount;
 }
 
 fn parseResumeArgs(

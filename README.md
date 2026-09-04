@@ -95,6 +95,17 @@ fx session resume last
 fx session resume --id <id>
 ```
 
+`fx session <id>` prints the saved conversation with a `[turn N]` label above every turn. Those labels are the boundaries the branch and undo commands take:
+
+```bash
+fx session fork <id> --at 7
+fx session rewind <id> --by 2
+```
+
+`fork` copies the first 7 turns into a brand-new session and prints the new ID to resume. The source session is left exactly as it was. `rewind` drops the last 2 turns from the session in place, keeping its ID. Both accept `--id <id>` and `--json`.
+
+Rewound turns are not erased. The rewind is recorded as a new revision in the session's event log, and the files those turns referenced stay on disk.
+
 Each interactive session names its terminal tab. The title prefers the session name, falls back to the workspace name, and keeps the active model as secondary context. Renaming or resuming a session updates the tab, and exiting clears the fx-owned title. Noninteractive commands do not emit terminal-title controls.
 
 Run `/feedback` to open the feedback form at `fx.sh/feedback`. It does not create a diagnostic or change the clipboard.
