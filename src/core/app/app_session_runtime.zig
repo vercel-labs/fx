@@ -1259,7 +1259,7 @@ pub fn Runtime(comptime App: type) type {
                         "session",
                         "event=resume_view_cache outcome={s} freshness={s} complete={} cached={d}x{d} terminal={d}x{d} bytes={d}",
                         .{
-                            if (paint_safe) "painted" else "skipped",
+                            if (paint_safe) "staged" else "skipped",
                             @tagName(freshness),
                             view.capture.complete,
                             view.capture.terminal_cols,
@@ -1274,14 +1274,17 @@ pub fn Runtime(comptime App: type) type {
             return stage;
         }
 
-        pub fn publishStagedResumeView(app: *App, entry_id: u32) !void {
-            app.commitStartupResumeReplayAnchor() catch |err| {
-                traceResumeViewUnavailable(err);
-            };
+        pub fn releaseStagedResumeView(app: *App, entry_id: u32) !void {
+            // A cached tail is provisional. Committing it in the inline
+            // terminal would turn it into physical scrollback before the
+            // authoritative resume projection publishes the same history.
             _ = try app.shell.releaseStartupResumeViewEntry(
                 app.alloc,
                 entry_id,
             );
+            app.commitStartupResumeReplayAnchor() catch |err| {
+                traceResumeViewUnavailable(err);
+            };
         }
 
         fn traceResumeViewUnavailable(err: anyerror) void {
@@ -5304,6 +5307,7 @@ const TestApp = struct {
     writable_seen_during_notice_failure: bool = false,
     fail_startup_resume_anchor: bool = false,
     startup_resume_anchor_count: usize = 0,
+    startup_resume_anchor_shell_transcript_len: usize = 0,
     startup_resume_anchor_saw_writable: bool = false,
     startup_resume_anchor_history_len: usize = 0,
     startup_resume_anchor_notice_count: usize = 0,
@@ -5428,6 +5432,7 @@ const TestApp = struct {
 
     fn commitStartupResumeReplayAnchor(self: *TestApp) !void {
         self.startup_resume_anchor_count += 1;
+        self.startup_resume_anchor_shell_transcript_len = self.shell.transcript.items.len;
         self.startup_resume_anchor_saw_writable = self.session_persistence.writable != null;
         self.startup_resume_anchor_history_len = self.session.historyLen();
         self.startup_resume_anchor_notice_count = self.notices.items.len;
@@ -7508,7 +7513,7 @@ test "execution replay keeps failed and unpaired persisted results visible witho
     );
 }
 
-test "safe last resume view paints and pins authoritative resume to its session id" {
+test "safe last resume view pins its session without committing the cached tail" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7565,10 +7570,15 @@ test "safe last resume view paints and pins authoritative resume to its session 
             .{ .log = .{ .session_lock_deadline_ms = 0 } },
         ),
     );
-    try Runtime(TestApp).publishStagedResumeView(&app, stage.ready);
+    try Runtime(TestApp).releaseStagedResumeView(&app, stage.ready);
     try std.testing.expectEqual(@as(usize, 0), app.shell.transcript.items.len);
     try std.testing.expectEqual(@as(usize, 1), app.startup_resume_anchor_count);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        app.startup_resume_anchor_shell_transcript_len,
+    );
     try Runtime(TestApp).resumeRequestedSession(&app);
+    try std.testing.expectEqual(@as(usize, 2), app.startup_resume_anchor_count);
     try std.testing.expect(app.session_persistence.resume_view_admission == null);
     try std.testing.expectEqualStrings(
         "cached-session",

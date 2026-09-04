@@ -4803,7 +4803,7 @@ test.skipIf(!tmuxAvailable())(
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         const resumeTrace = readFileSync(tracePath, "utf8");
         expect(resumeTrace).toMatch(
-          /event=resume_view_cache (?:outcome=painted freshness=exact|outcome=skipped freshness=(?:exact|older))/,
+          /event=resume_view_cache (?:outcome=staged freshness=exact|outcome=skipped freshness=(?:exact|older))/,
         );
         const replay = await runFx(["replay", tapePath, "--frames"], {
           cwd: workspaceRoot,
@@ -6260,9 +6260,12 @@ test.skipIf(!tmuxAvailable())(
     const workspaceRoot = realpathSync(workspace);
     const earlyMarker = "SESSION_PICKER_SCROLLBACK_EARLY";
     const lateMarker = "SESSION_PICKER_SCROLLBACK_LATE";
-    const lines = Array.from(
+    const numberedMarkers = Array.from(
       { length: 80 },
-      (_, index) => `SESSION_PICKER_SCROLLBACK_LINE_${String(index).padStart(3, "0")} has enough text to wrap in the terminal viewport.`,
+      (_, index) => `SESSION_PICKER_SCROLLBACK_LINE_${String(index).padStart(3, "0")}`,
+    );
+    const lines = numberedMarkers.map(
+      (marker) => `${marker} has enough text to wrap in the terminal viewport.`,
     );
     lines.unshift(earlyMarker);
     lines.push(lateMarker);
@@ -6314,8 +6317,15 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
 
-      const resumed = await waitForScrollback(active, earlyMarker);
+      const resumed = stripAnsi(await waitForScrollback(active, lateMarker));
       expect(resumed).toContain(earlyMarker);
+      expect(countOccurrences(resumed, "● Session resumed:")).toBe(1);
+      for (const marker of [earlyMarker, ...numberedMarkers, lateMarker]) {
+        expect(countOccurrences(resumed, marker)).toBe(1);
+      }
+      expect(resumed.indexOf("● Session resumed:")).toBeLessThan(
+        resumed.indexOf(earlyMarker),
+      );
       const tape = readFileSync(tapePath);
       expect(tape.includes(Buffer.from("\x1b[?1002h"))).toBe(false);
       expect(tape.includes(Buffer.from("\x1b[?1006h"))).toBe(false);
