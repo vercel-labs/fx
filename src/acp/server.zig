@@ -2042,6 +2042,14 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 .code = ErrorCode.invalid_params,
                 .message = "Invalid session model",
             });
+        const next_effort = if (sessions.reasoningEffortSupported(
+            value,
+            session.effort,
+            state.capability_resolver.catalogEntries(),
+        ))
+            session.effort
+        else
+            types.ReasoningEffort.auto;
         if (comptime !host_target.is_wasm) {
             if (session.provider != .gateway) {
                 try refreshModelCatalogForOptions(state);
@@ -2078,9 +2086,12 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     .message = "Failed to update session model",
                 });
             const previous_model = session.model;
+            const previous_effort = session.effort;
             session.model = next_model;
+            session.effort = next_effort;
             sessions.commitWasmSession(alloc, session) catch {
                 session.model = previous_model;
+                session.effort = previous_effort;
                 alloc.free(next_model);
                 return state.writer.writeError(alloc, msg.id, .{
                     .code = ErrorCode.internal_error,
@@ -2092,6 +2103,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             alloc,
             session,
             value,
+            next_effort,
             session_test_controls.logOptions(),
         ) catch |err| {
             if (modelCommitFailureTerminatesConnection(err)) {
@@ -2111,6 +2123,50 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     "Invalid session model"
                 else
                     "Failed to persist session model",
+            });
+        };
+    } else if (std.mem.eql(u8, config_id, "effort")) {
+        const session = if (state.active_session) |*active| active else return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = "No active session",
+        });
+        const effort = types.ReasoningEffort.parse(value) orelse
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_params,
+                .message = "Invalid reasoning effort",
+            });
+        if (!sessions.reasoningEffortSupported(
+            session.model,
+            effort,
+            state.capability_resolver.catalogEntries(),
+        )) {
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_params,
+                .message = "Reasoning effort is not supported by the active model",
+            });
+        }
+        if (host_target.is_wasm and session.writable == null) {
+            const previous_effort = session.effort;
+            session.effort = effort;
+            sessions.commitWasmSession(alloc, session) catch {
+                session.effort = previous_effort;
+                return state.writer.writeError(alloc, msg.id, .{
+                    .code = ErrorCode.internal_error,
+                    .message = "Failed to persist session effort",
+                });
+            };
+        } else commitActiveSessionEffort(
+            alloc,
+            session,
+            effort,
+            session_test_controls.logOptions(),
+        ) catch |err| {
+            if (modelCommitFailureTerminatesConnection(err)) {
+                state.terminate_connection = true;
+            }
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.internal_error,
+                .message = "Failed to persist session effort",
             });
         };
     } else if (std.mem.eql(u8, config_id, "provider")) {
@@ -2213,11 +2269,17 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     }
                 }
             }
+            const next_effort = if (sessions.reasoningEffortSupported(
+                selected_model,
+                session.effort,
+                catalog.items,
+            )) session.effort else types.ReasoningEffort.auto;
             commitActiveSessionProvider(
                 alloc,
                 session,
                 target,
                 selected_model,
+                next_effort,
                 session_test_controls.logOptions(),
             ) catch |err| {
                 if (modelCommitFailureTerminatesConnection(err)) {
@@ -2266,6 +2328,13 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
         state.capability_resolver.catalogEntries(),
     );
     try out.writer.writeAll(",");
+    try sessions.writeEffortConfigOption(
+        &out.writer,
+        current_model,
+        if (state.active_session) |session| session.effort else state.effort,
+        state.capability_resolver.catalogEntries(),
+    );
+    try out.writer.writeAll(",");
     try sessions.writeModeConfigOption(&out.writer, state.cfg.mode_registry, current_mode);
     try out.writer.writeAll("]}");
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
@@ -2299,6 +2368,7 @@ fn commitActiveSessionProvider(
     session: *ActiveSessionState,
     provider: model_provider.ProviderId,
     model: []const u8,
+    effort: types.ReasoningEffort,
     options: session_log.Options,
 ) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
@@ -2314,6 +2384,7 @@ fn commitActiveSessionProvider(
         .{ .preferences_changed = .{
             .provider = provider,
             .model = @constCast(model),
+            .effort = effort,
         } },
         io_mod.milliTimestamp(),
         .rollback_before_adapter_continue,
@@ -2322,12 +2393,14 @@ fn commitActiveSessionProvider(
     alloc.free(session.model);
     session.model = staged_model;
     session.provider = provider;
+    session.effort = effort;
 }
 
 fn commitActiveSessionModel(
     alloc: Allocator,
     session: *ActiveSessionState,
     value: []const u8,
+    effort: types.ReasoningEffort,
     options: session_log.Options,
 ) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
@@ -2341,8 +2414,10 @@ fn commitActiveSessionModel(
         writable,
         &session.model,
         value,
+        effort,
         options,
     );
+    session.effort = effort;
 }
 
 fn commitSessionModel(
@@ -2350,19 +2425,45 @@ fn commitSessionModel(
     writable: *session_store.LoadedWritableSession,
     active_model: *[]u8,
     value: []const u8,
+    effort: types.ReasoningEffort,
     options: session_log.Options,
 ) !void {
     const staged_model = try alloc.dupe(u8, value);
     errdefer alloc.free(staged_model);
     _ = try writable.appendEvent(
         alloc,
-        .{ .preferences_changed = .{ .model = @constCast(value) } },
+        .{ .preferences_changed = .{
+            .model = @constCast(value),
+            .effort = effort,
+        } },
         io_mod.milliTimestamp(),
         .rollback_before_adapter_continue,
         options,
     );
     alloc.free(active_model.*);
     active_model.* = staged_model;
+}
+
+fn commitActiveSessionEffort(
+    alloc: Allocator,
+    session: *ActiveSessionState,
+    effort: types.ReasoningEffort,
+    options: session_log.Options,
+) !void {
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const writable = if (session.writable) |*active|
+        active
+    else
+        return error.SessionPersistenceUnavailable;
+    _ = try writable.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .effort = effort } },
+        io_mod.milliTimestamp(),
+        .rollback_before_adapter_continue,
+        options,
+    );
+    session.effort = effort;
 }
 
 fn modelCommitFailureTerminatesConnection(err: anyerror) bool {
@@ -2859,7 +2960,7 @@ fn acpModelTestState(
         .conversation_language = session_runtime.ConversationLanguage.literal("en"),
         .preferences = .{
             .model = model,
-            .effort = .auto,
+            .effort = types.ReasoningEffort.literal("high"),
             .fast_mode = false,
         },
         .history = history,
@@ -2900,6 +3001,7 @@ test "ACP model commit rolls back before later request can succeed" {
             &writable,
             &active_model,
             "rejected-model",
+            .auto,
             failure.options(),
         ),
     );
@@ -2908,6 +3010,10 @@ test "ACP model commit rolls back before later request can succeed" {
         "old-model",
         writable.state.preferences.model,
     );
+    try std.testing.expectEqual(
+        types.ReasoningEffort.literal("high"),
+        writable.state.preferences.effort,
+    );
     try std.testing.expect(writable.degradedTail() == null);
 
     try commitSessionModel(
@@ -2915,12 +3021,17 @@ test "ACP model commit rolls back before later request can succeed" {
         &writable,
         &active_model,
         "accepted-model",
+        .auto,
         .{},
     );
     try std.testing.expectEqualStrings("accepted-model", active_model);
     try std.testing.expectEqualStrings(
         "accepted-model",
         writable.state.preferences.model,
+    );
+    try std.testing.expectEqual(
+        types.ReasoningEffort.auto,
+        writable.state.preferences.effort,
     );
 }
 
@@ -2960,6 +3071,7 @@ test "ACP indeterminate model commit leaves staged runtime value unapplied" {
         &writable,
         &active_model,
         "uncertain-model",
+        .auto,
         failure.options(),
     );
     try std.testing.expectError(error.SessionCommitIndeterminate, result);
@@ -2997,6 +3109,7 @@ test "ACP model commits honor the active session write boundary" {
                 self.alloc,
                 self.active,
                 "new-model",
+                .auto,
                 .{},
             ) catch |err| {
                 self.failure = err;

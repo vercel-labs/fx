@@ -8093,6 +8093,84 @@ describe("acp: model-independent", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "reasoning effort config follows model tiers and reaches the Gateway request",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-effort-config-");
+      const plainModel = "provider/plain-model";
+      const gateway = startFakeGateway([finalText("effort complete")], {
+        models: [
+          {
+            id: FAKE_GATEWAY_MODEL,
+            type: "language",
+            tags: ["reasoning", "tool-use"],
+            reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+          },
+          { id: plainModel, type: "language", tags: ["tool-use"] },
+        ],
+      });
+      const effortOption = (response: any) =>
+        response.result.configOptions.find((option: any) => option.id === "effort");
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request("session/new", { mcpServers: [] }, 2) as any;
+        expect(effortOption(created).currentValue).toBe("auto");
+        expect(effortOption(created).options.map((option: any) => option.value))
+          .toEqual(["auto", "low", "high"]);
+        await client.readLine(); // consume session/update notification
+
+        const selected = await client.request("session/set_config_option", {
+          configId: "effort",
+          value: "high",
+        }, 3) as any;
+        expect(effortOption(selected).currentValue).toBe("high");
+
+        await client.request("session/new", { mcpServers: [] }, 4);
+        await client.readLine(); // consume session/update notification
+        const loaded = await client.request("session/load", {
+          sessionId: created.result.sessionId,
+          mcpServers: [],
+        }, 5) as any;
+        expect(effortOption(loaded).currentValue).toBe("high");
+        expect(effortOption(loaded).options.map((option: any) => option.value))
+          .toEqual(["auto", "low", "high"]);
+
+        const prompt = await runPrompt(client, "Confirm the selected effort.", TIMEOUT);
+        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.parse(gateway.requests[0]!.body).reasoning).toBe("high");
+
+        const invalid = await client.request("session/set_config_option", {
+          configId: "effort",
+          value: "max",
+        }, 6) as any;
+        expect(invalid.result).toBeUndefined();
+        expect(invalid.error.code).toBe(-32602);
+        expect(invalid.error.message).toContain("not supported");
+
+        const changedModel = await client.request("session/set_config_option", {
+          configId: "model",
+          value: plainModel,
+        }, 7) as any;
+        expect(effortOption(changedModel).currentValue).toBe("auto");
+        expect(effortOption(changedModel).options.map((option: any) => option.value))
+          .toEqual(["auto"]);
+
+        client.endStdin();
+        expect(await client.waitForExit()).toBe(0);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
 });
 
 describe("acp: model catalog authentication", () => {

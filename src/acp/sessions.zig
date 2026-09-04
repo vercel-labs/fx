@@ -318,6 +318,13 @@ fn writeNewSessionResponse(
         state.capability_resolver.catalogEntries(),
     );
     try out.writer.writeAll(",");
+    try writeEffortConfigOption(
+        &out.writer,
+        state.active_session.?.model,
+        state.active_session.?.effort,
+        state.capability_resolver.catalogEntries(),
+    );
+    try out.writer.writeAll(",");
     try writeModeConfigOption(
         &out.writer,
         state.cfg.mode_registry,
@@ -857,6 +864,13 @@ fn writeLoadSessionResponse(
     try writeModelConfigOption(
         &out.writer,
         model,
+        state.capability_resolver.catalogEntries(),
+    );
+    try out.writer.writeAll(",");
+    try writeEffortConfigOption(
+        &out.writer,
+        model,
+        state.active_session.?.effort,
         state.capability_resolver.catalogEntries(),
     );
     try out.writer.writeAll(",");
@@ -1426,6 +1440,49 @@ pub fn writeModelConfigOption(
     try w.writeAll("]}");
 }
 
+pub fn reasoningEffortSupported(
+    model: []const u8,
+    effort: types.ReasoningEffort,
+    catalog: ?[]const model_catalog.ModelCatalogEntry,
+) bool {
+    if (effort.isDefault()) return true;
+    const entries = catalog orelse return false;
+    for (entries) |entry| {
+        if (!std.mem.eql(u8, entry.id, model)) continue;
+        for (entry.reasoning_efforts.items) |option| {
+            if (option.eql(effort)) return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+/// The option remains present with only `auto` when the active model declares
+/// no reasoning tiers, so clients always have a representable fail-closed value.
+pub fn writeEffortConfigOption(
+    w: *std.Io.Writer,
+    model: []const u8,
+    current: types.ReasoningEffort,
+    catalog: ?[]const model_catalog.ModelCatalogEntry,
+) !void {
+    try w.writeAll("{\"id\":\"effort\",\"name\":\"Reasoning effort\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":");
+    try writeJsonStr(current.label(), w);
+    try w.writeAll(",\"options\":[{\"value\":\"auto\",\"name\":\"Auto\"}");
+    const entries = catalog orelse &.{};
+    for (entries) |entry| {
+        if (!std.mem.eql(u8, entry.id, model)) continue;
+        for (entry.reasoning_efforts.items) |effort| {
+            try w.writeAll(",{\"value\":");
+            try writeJsonStr(effort.label(), w);
+            try w.writeAll(",\"name\":");
+            try writeJsonStr(effort.displayLabel(), w);
+            try w.writeAll("}");
+        }
+        break;
+    }
+    try w.writeAll("]}");
+}
+
 pub fn writeProviderConfigOption(
     w: *std.Io.Writer,
     current: model_provider.ProviderId,
@@ -1535,6 +1592,52 @@ test "writeModelConfigOption appends current model when not in cached list" {
     try std.testing.expect(std.mem.find(u8, items, "\"currentValue\":\"custom/my-model\"") != null);
     try std.testing.expect(std.mem.find(u8, items, "anthropic/claude-opus-4.6") != null);
     try std.testing.expect(std.mem.find(u8, items, "custom/my-model") != null);
+}
+
+test "writeEffortConfigOption uses only catalog-declared tiers" {
+    const alloc = std.testing.allocator;
+    const efforts = [_]types.ReasoningEffort{
+        types.ReasoningEffort.literal("low"),
+        types.ReasoningEffort.literal("high"),
+    };
+    const entries = [_]model_catalog.ModelCatalogEntry{
+        .{
+            .id = @constCast("provider/reasoning"),
+            .model_type = @constCast("language"),
+            .reasoning_efforts = .{
+                .items = @constCast(efforts[0..]),
+                .capacity = efforts.len,
+            },
+        },
+    };
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeEffortConfigOption(
+        &out.writer,
+        "provider/reasoning",
+        types.ReasoningEffort.literal("high"),
+        &entries,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"id\":\"effort\",\"name\":\"Reasoning effort\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":\"high\",\"options\":[{\"value\":\"auto\",\"name\":\"Auto\"},{\"value\":\"low\",\"name\":\"low\"},{\"value\":\"high\",\"name\":\"high\"}]}",
+        out.writer.buffered(),
+    );
+}
+
+test "writeEffortConfigOption emits only auto without declared tiers" {
+    const alloc = std.testing.allocator;
+    const entries = [_]model_catalog.ModelCatalogEntry{
+        .{ .id = @constCast("provider/plain"), .model_type = @constCast("language") },
+    };
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeEffortConfigOption(&out.writer, "provider/plain", .auto, &entries);
+    try std.testing.expectEqualStrings(
+        "{\"id\":\"effort\",\"name\":\"Reasoning effort\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":\"auto\",\"options\":[{\"value\":\"auto\",\"name\":\"Auto\"}]}",
+        out.writer.buffered(),
+    );
 }
 
 test "writeModeConfigOption produces valid json with all modes" {
