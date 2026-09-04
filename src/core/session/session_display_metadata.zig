@@ -251,7 +251,8 @@ pub fn readSidecarOrFallback(
 ) !DisplayMetadata {
     var file = session_dir.dir.openFile(io_mod.getIo(), sidecar_file, .{
         .mode = .read_only,
-        .allow_directory = false,
+        // The stat below rejects directories and other non-files.
+        .allow_directory = true,
         .follow_symlinks = false,
         .resolve_beneath = true,
     }) catch |err| switch (err) {
@@ -260,7 +261,12 @@ pub fn readSidecarOrFallback(
         else => return err,
     };
     defer file.close(io_mod.getIo());
-    const bytes = io_mod.readFileToEnd(alloc, &file, max_sidecar_bytes) catch |err| switch (err) {
+    const stat = file.stat(io_mod.getIo()) catch |err| {
+        debug_trace.logf("session", "event=display_sidecar_unreadable err={s}", .{@errorName(err)});
+        return missingFallback(alloc);
+    };
+    if (stat.kind != .file) return missingFallback(alloc);
+    const bytes = io_mod.readFileToEndSized(alloc, &file, stat.size, max_sidecar_bytes) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             debug_trace.logf("session", "event=display_sidecar_unreadable err={s}", .{@errorName(err)});
