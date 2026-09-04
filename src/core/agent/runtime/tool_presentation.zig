@@ -689,12 +689,11 @@ pub fn activityKind(registry: tool_dispatch.Registry, tool_name: []const u8) typ
 }
 
 pub fn activityKindForCall(
-    alloc: Allocator,
     registry: tool_dispatch.Registry,
     call: ToolCall,
 ) types.ToolActivityKind {
     if (tooling_presentation.isProviderSearchAlias(call.name)) return .read;
-    return tool_dispatch.toolActivityKindForCall(alloc, registry, call);
+    return tool_dispatch.toolActivityKindForCall(registry, call);
 }
 
 fn formatProvisionalProgressLabel(
@@ -736,7 +735,7 @@ pub noinline fn startToolVisibleLifecycle(
     display_target: ?[]const u8,
     advertised_dynamic_tool_names: []const []const u8,
 ) !bool {
-    const activity_kind = activityKindForCall(arena, hooks.tool_registry, call);
+    const activity_kind = activityKindForCall(hooks.tool_registry, call);
     if (activity_kind == .ask) return false;
     const redacted_arguments = try text_utils.maskSecrets(arena, call.arguments_json);
     const activity_line = try hooks.describe_tool_action(
@@ -861,7 +860,7 @@ fn finishDeniedToolStatusInternal(
         label,
         advertised_dynamic_tool_names,
     );
-    const command_artifact_handle = if (activityKindForCall(arena, hooks.tool_registry, call) == .command)
+    const command_artifact_handle = if (activityKindForCall(hooks.tool_registry, call) == .command)
         try commandArtifactHandle(arena, command_result_json)
     else
         null;
@@ -908,7 +907,6 @@ pub fn finishCancelledToolStatus(
         advertised_dynamic_tool_names,
     );
     const command_activity = activityKindForCall(
-        arena,
         hooks.tool_registry,
         call,
     ) == .command;
@@ -972,7 +970,7 @@ pub fn finishExecutedToolStatus(
     advertised_dynamic_tool_names: []const []const u8,
 ) !void {
     if (!status_started) return;
-    const activity_kind = activityKindForCall(arena, hooks.tool_registry, call);
+    const activity_kind = activityKindForCall(hooks.tool_registry, call);
     const command_decision = if (activity_kind == .command)
         try commandOutcomeDecision(arena, result_memory.command_process_presentation)
     else

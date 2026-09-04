@@ -276,8 +276,12 @@ fn cancelRequested(cancel_flag: ?*std.atomic.Value(bool)) bool {
 
 pub fn parallelHookExecute(ctx: *anyopaque, alloc: Allocator, call: ToolCall, index: usize) !ToolExecutionResult {
     const exec_ctx: *ParallelHookExecContext = @ptrCast(@alignCast(ctx));
+    // Same per-call scratch ownership as the sequential path: call scratch is
+    // reclaimed when the call returns, survivors are copied to alloc.
+    var call_arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer call_arena_state.deinit();
     return exec_ctx.hooks.execute_tool_call(exec_ctx.hooks.ctx, .{
-        .call_allocator = alloc,
+        .call_allocator = call_arena_state.allocator(),
         .result_allocator = alloc,
         .call = call,
         .authority = .ordinary,

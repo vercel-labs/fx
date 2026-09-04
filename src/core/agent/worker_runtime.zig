@@ -3309,32 +3309,7 @@ fn dupeToolResultMemory(
     source: ?types.ToolResultMemory,
 ) !?types.ToolResultMemory {
     const memory = source orelse return null;
-    const output_handle = if (memory.output_handle) |handle|
-        try alloc.dupe(u8, handle)
-    else
-        null;
-    errdefer if (output_handle) |handle| alloc.free(handle);
-    const preview = if (memory.preview) |value|
-        try alloc.dupe(u8, value)
-    else
-        null;
-    errdefer if (preview) |value| alloc.free(value);
-    const command_output_replay = if (memory.command_output_replay) |replay|
-        try types.dupeCommandOutputReplay(alloc, replay)
-    else
-        null;
-    errdefer if (command_output_replay) |replay| types.freeCommandOutputReplay(alloc, replay);
-    return .{
-        .output_handle = output_handle,
-        .preview = preview,
-        .output_bytes = memory.output_bytes,
-        .stored_output_bytes = memory.stored_output_bytes,
-        .truncated = memory.truncated,
-        .model_view_covers_full_file = memory.model_view_covers_full_file,
-        .command_output_replay = command_output_replay,
-        .command_process_presentation = memory.command_process_presentation,
-        .terminal_action_presentation = memory.terminal_action_presentation,
-    };
+    return try types.dupeToolResultMemory(alloc, memory);
 }
 
 fn freeToolResultMemory(

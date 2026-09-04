@@ -2391,6 +2391,176 @@ pub fn freeCommandOutputReplay(
     }
 }
 
+/// Deep-copies every slice-bearing field so the result is owned by `alloc`.
+/// The caller owns the returned memory.
+pub fn dupeToolResultMemory(
+    alloc: std.mem.Allocator,
+    memory: ToolResultMemory,
+) !ToolResultMemory {
+    const output_handle = if (memory.output_handle) |handle|
+        try alloc.dupe(u8, handle)
+    else
+        null;
+    errdefer if (output_handle) |handle| alloc.free(@constCast(handle));
+    const preview = if (memory.preview) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (preview) |value| alloc.free(@constCast(value));
+    const command_output_replay = if (memory.command_output_replay) |replay|
+        try dupeCommandOutputReplay(alloc, replay)
+    else
+        null;
+    errdefer if (command_output_replay) |replay| freeCommandOutputReplay(alloc, replay);
+    const committed_file_presentation = if (memory.committed_file_presentation) |presentation|
+        try dupeCommittedFilePresentation(alloc, presentation)
+    else
+        null;
+    return .{
+        .output_handle = output_handle,
+        .preview = preview,
+        .output_bytes = memory.output_bytes,
+        .stored_output_bytes = memory.stored_output_bytes,
+        .truncated = memory.truncated,
+        .model_view_covers_full_file = memory.model_view_covers_full_file,
+        .committed_file_presentation = committed_file_presentation,
+        .command_output_replay = command_output_replay,
+        .command_process_presentation = memory.command_process_presentation,
+        .terminal_action_presentation = memory.terminal_action_presentation,
+    };
+}
+
+/// Deep-copies every slice-bearing field of a provider completion so the
+/// result is owned by `alloc`. Arena callers rely on this to move a completion
+/// out of a shorter-lived attempt allocator.
+pub fn dupeModelCompletion(alloc: std.mem.Allocator, completion: ModelCompletion) !ModelCompletion {
+    var copy = completion;
+    copy.content = if (completion.content) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (copy.content) |value| alloc.free(@constCast(value));
+    copy.tool_calls = try dupeToolCallSlice(alloc, completion.tool_calls);
+    errdefer freeToolCallSlice(alloc, @constCast(copy.tool_calls));
+    copy.generation_id = if (completion.generation_id) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (copy.generation_id) |value| alloc.free(@constCast(value));
+    if (completion.billing) |billing| copy.billing.?.model = try alloc.dupe(u8, billing.model);
+    errdefer if (copy.billing) |billing| alloc.free(@constCast(billing.model));
+    copy.provider_failure_detail = if (completion.provider_failure_detail) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (copy.provider_failure_detail) |value| alloc.free(@constCast(value));
+    copy.provider_state_json = if (completion.provider_state_json) |value| try alloc.dupe(u8, value) else null;
+    return copy;
+}
+
+test "model completion dupe covers every slice-bearing field" {
+    // Tripwire: adding a field to ModelCompletion requires extending
+    // dupeModelCompletion (and the attempt-boundary copy-out that relies on
+    // it) before bumping this count.
+    comptime std.debug.assert(@typeInfo(ModelCompletion).@"struct".fields.len == 12);
+    comptime std.debug.assert(@typeInfo(ProviderBilling).@"struct".fields.len == 9);
+
+    var source_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    const source_alloc = source_state.allocator();
+    const source = ModelCompletion{
+        .content = try source_alloc.dupe(u8, "answer"),
+        .tool_calls = try dupeToolCallSlice(source_alloc, &.{.{
+            .id = "call_1",
+            .name = "read_file",
+            .arguments_json = "{}",
+            .provisional_id = "tmp_1",
+            .provider_result = "{\"ok\":true}",
+        }}),
+        .generation_id = try source_alloc.dupe(u8, "gen_1"),
+        .billing = .{
+            .created_at_ms = 7,
+            .model = try source_alloc.dupe(u8, "model-x"),
+            .total_cost = 0.5,
+            .input_tokens = 1,
+            .output_tokens = 2,
+            .cache_read_tokens = 3,
+            .cache_write_tokens = 4,
+            .reasoning_tokens = 5,
+            .billable_web_search_calls = 6,
+        },
+        .generation_metadata_invalid = true,
+        .delivery_ambiguous = true,
+        .provider_result_identity_failure = .absent,
+        .provider_failure_cause = .gateway_stream_timeout,
+        .provider_failure_detail = try source_alloc.dupe(u8, "detail"),
+        .provider_state_json = try source_alloc.dupe(u8, "[{\"id\":\"rs_1\"}]"),
+        .finish_reason = .tool_calls,
+        .usage = .{ .input_tokens = 9 },
+    };
+
+    var owned_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer owned_state.deinit();
+    const owned = try dupeModelCompletion(owned_state.allocator(), source);
+    source_state.deinit();
+
+    try std.testing.expectEqualStrings("answer", owned.content.?);
+    try std.testing.expectEqual(@as(usize, 1), owned.tool_calls.len);
+    try std.testing.expectEqualStrings("call_1", owned.tool_calls[0].id);
+    try std.testing.expectEqualStrings("read_file", owned.tool_calls[0].name);
+    try std.testing.expectEqualStrings("{}", owned.tool_calls[0].arguments_json);
+    try std.testing.expectEqualStrings("tmp_1", owned.tool_calls[0].provisional_id.?);
+    try std.testing.expectEqualStrings("{\"ok\":true}", owned.tool_calls[0].provider_result.?);
+    try std.testing.expectEqualStrings("gen_1", owned.generation_id.?);
+    try std.testing.expectEqualStrings("model-x", owned.billing.?.model);
+    try std.testing.expectEqual(@as(u64, 4), owned.billing.?.cache_write_tokens);
+    try std.testing.expect(owned.generation_metadata_invalid);
+    try std.testing.expect(owned.delivery_ambiguous);
+    try std.testing.expectEqual(ProviderResultIdentityFailure.absent, owned.provider_result_identity_failure.?);
+    try std.testing.expectEqual(ProviderFailureCause.gateway_stream_timeout, owned.provider_failure_cause.?);
+    try std.testing.expectEqualStrings("detail", owned.provider_failure_detail.?);
+    try std.testing.expectEqualStrings("[{\"id\":\"rs_1\"}]", owned.provider_state_json.?);
+    try std.testing.expectEqual(ProviderFinishReason.tool_calls, owned.finish_reason.?);
+    try std.testing.expectEqual(@as(?u64, 9), owned.usage.input_tokens);
+}
+
+test "tool result memory dupe covers every slice-bearing field" {
+    // Tripwire: adding a field to ToolResultMemory requires extending
+    // dupeToolResultMemory (and the dispatch-boundary copy-out that relies on
+    // it) before bumping this count.
+    comptime std.debug.assert(@typeInfo(ToolResultMemory).@"struct".fields.len == 10);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const source = ToolResultMemory{
+        .output_handle = "handle.txt",
+        .preview = "preview text",
+        .output_bytes = 42,
+        .stored_output_bytes = 21,
+        .truncated = true,
+        .model_view_covers_full_file = false,
+        .committed_file_presentation = .{
+            .path = "src/file.zig",
+            .kind = .edited,
+            .lines = &.{},
+            .additions = 1,
+            .deletions = 2,
+            .truncated = false,
+        },
+        .command_output_replay = .{ .available = .{
+            .handle = "replay-handle",
+            .framed_bytes = 7,
+        } },
+        .command_process_presentation = .{ .signal = 9 },
+        .terminal_action_presentation = .{ .returned = .safety_ceiling },
+    };
+
+    const owned = try dupeToolResultMemory(arena, source);
+    try std.testing.expectEqualStrings("handle.txt", owned.output_handle.?);
+    try std.testing.expect(owned.output_handle.?.ptr != source.output_handle.?.ptr);
+    try std.testing.expectEqualStrings("preview text", owned.preview.?);
+    try std.testing.expect(owned.preview.?.ptr != source.preview.?.ptr);
+    try std.testing.expectEqualStrings("src/file.zig", owned.committed_file_presentation.?.path);
+    try std.testing.expect(owned.committed_file_presentation.?.path.ptr !=
+        source.committed_file_presentation.?.path.ptr);
+    try std.testing.expectEqualStrings("replay-handle", owned.command_output_replay.?.available.handle);
+    try std.testing.expect(owned.command_output_replay.?.available.handle.ptr !=
+        source.command_output_replay.?.available.handle.ptr);
+    try std.testing.expectEqual(@as(usize, 42), owned.output_bytes);
+    try std.testing.expectEqual(source.command_process_presentation, owned.command_process_presentation);
+}
+
 pub fn dupePermissionFeedback(
     alloc: std.mem.Allocator,
     feedback: []const []const u8,

@@ -32,6 +32,10 @@ const TransportPublicationOutcome = tool_contracts.TransportPublicationOutcome;
 pub const LiveToolAuthority = tool_contracts.LiveToolAuthority;
 
 pub const RecoveryCheckpointEffect = struct {
+    /// The checkpoint borrows caller-owned scratch memory that is freed as
+    /// soon as this call returns. A sink must serialize the checkpoint or
+    /// dupe it with its own allocator before returning; it must not retain
+    /// the passed pointers.
     set: *const fn (ctx: *anyopaque, checkpoint: session_codec.RecoveryCheckpoint) anyerror!void,
 };
 

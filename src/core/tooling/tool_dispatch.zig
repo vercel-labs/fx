@@ -578,12 +578,13 @@ pub fn presentationForArgs(tool: Tool, args: std.json.ObjectMap) CallPresentatio
 }
 
 pub fn toolCallPresentation(
-    alloc: Allocator,
     registry: Registry,
     call: core_types.ToolCall,
 ) ?CallPresentation {
     const tool = registry.lookup(call.name) orelse return null;
-    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    // Scratch is backed by c_allocator so deinit reclaims it even when the
+    // caller's allocator is the per-turn arena.
+    var scratch_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer scratch_state.deinit();
     const args = tool_args.parseToolArgsObject(
         scratch_state.allocator(),
@@ -593,11 +594,10 @@ pub fn toolCallPresentation(
 }
 
 pub fn toolActivityKindForCall(
-    alloc: Allocator,
     registry: Registry,
     call: core_types.ToolCall,
 ) core_types.ToolActivityKind {
-    const presentation = toolCallPresentation(alloc, registry, call) orelse
+    const presentation = toolCallPresentation(registry, call) orelse
         return .command;
     return presentation.activity_kind;
 }

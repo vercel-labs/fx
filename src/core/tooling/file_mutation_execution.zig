@@ -207,7 +207,7 @@ fn fileMutationFailure(
     };
 }
 
-fn allocatorsEqual(a: Allocator, b: Allocator) bool {
+pub fn allocatorsEqual(a: Allocator, b: Allocator) bool {
     return a.ptr == b.ptr and a.vtable == b.vtable;
 }
 
