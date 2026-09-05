@@ -379,6 +379,11 @@ pub fn Handlers(comptime App: type) type {
             };
         }
 
+        pub fn collectClipboardImageFacts(app: *App) !void {
+            if (comptime !@hasField(App, "clipboard_images")) return;
+            try image_commands.Commands(App).collectClipboardImage(app);
+        }
+
         pub fn collectMcpReloadFacts(app: *App) !void {
             if (comptime !@hasDecl(App, "takeMcpReloadCompletion")) return;
             var completion = (try app.takeMcpReloadCompletion()) orelse return;
@@ -2021,6 +2026,7 @@ pub fn Handlers(comptime App: type) type {
         }
 
         fn commandPasteClipboard(ctx: *anyopaque) !void {
+            if (comptime !@hasField(App, "clipboard_images")) return;
             const app: *App = @ptrCast(@alignCast(ctx));
             try image_commands.Commands(App).attachClipboard(app);
         }

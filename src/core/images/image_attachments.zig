@@ -20,6 +20,10 @@ const image_normalization_timeout = std.Io.Clock.Duration{
     .clock = .awake,
     .raw = .fromSeconds(5),
 };
+const clipboard_image_timeout = std.Io.Clock.Duration{
+    .clock = .awake,
+    .raw = .fromSeconds(10),
+};
 
 pub fn findById(
     attachments: []const types.ImageAttachment,
@@ -741,21 +745,21 @@ fn fitsEncodedLimit(raw_bytes: usize) bool {
     return encoded_bytes <= max_encoded_image_bytes;
 }
 
-const ImageNormalizerEvent = union(enum) {
+const ImageProcessEvent = union(enum) {
     wait: anyerror!std.process.Child.Term,
     timeout: anyerror!void,
     cancelled: anyerror!void,
 };
 
-fn waitForImageNormalizerChild(child: *std.process.Child) anyerror!std.process.Child.Term {
+fn waitForImageProcessChild(child: *std.process.Child) anyerror!std.process.Child.Term {
     return child.wait(io_mod.getIo());
 }
 
-fn waitForImageNormalizerTimeout(deadline: std.Io.Clock.Timestamp) anyerror!void {
+fn waitForImageProcessTimeout(deadline: std.Io.Clock.Timestamp) anyerror!void {
     return std.Io.Timeout.sleep(.{ .deadline = deadline }, io_mod.getIo());
 }
 
-fn waitForImageNormalizerCancellation(
+fn waitForImageProcessCancellation(
     cancel_flag: *const std.atomic.Value(bool),
 ) anyerror!void {
     while (!cancel_flag.load(.acquire)) {
@@ -763,21 +767,21 @@ fn waitForImageNormalizerCancellation(
     }
 }
 
-fn waitForImageNormalizer(
+fn waitForImageProcess(
     child: *std.process.Child,
     deadline: std.Io.Clock.Timestamp,
     cancel_flag: ?*const std.atomic.Value(bool),
 ) !std.process.Child.Term {
-    var select_buffer: [3]ImageNormalizerEvent = undefined;
-    var select: std.Io.Select(ImageNormalizerEvent) = .init(
+    var select_buffer: [3]ImageProcessEvent = undefined;
+    var select: std.Io.Select(ImageProcessEvent) = .init(
         io_mod.getIo(),
         &select_buffer,
     );
-    select.concurrent(.wait, waitForImageNormalizerChild, .{child}) catch |err|
+    select.concurrent(.wait, waitForImageProcessChild, .{child}) catch |err|
         return err;
     select.concurrent(
         .timeout,
-        waitForImageNormalizerTimeout,
+        waitForImageProcessTimeout,
         .{deadline},
     ) catch |err| {
         select.cancelDiscard();
@@ -786,7 +790,7 @@ fn waitForImageNormalizer(
     if (cancel_flag) |flag| {
         select.concurrent(
             .cancelled,
-            waitForImageNormalizerCancellation,
+            waitForImageProcessCancellation,
             .{flag},
         ) catch |err| {
             select.cancelDiscard();
@@ -822,10 +826,11 @@ fn waitForImageNormalizer(
     };
 }
 
-fn runImageNormalizerProcess(
+fn runBoundedImageProcess(
     argv: []const []const u8,
     budget: CaptureBudget,
-) !void {
+    default_timeout: std.Io.Clock.Duration,
+) !std.process.Child.Term {
     try budget.check();
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = argv,
@@ -836,8 +841,19 @@ fn runImageNormalizerProcess(
     defer child.kill(io_mod.getIo());
 
     const deadline = budget.deadline orelse
-        std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), image_normalization_timeout);
-    const term = try waitForImageNormalizer(&child, deadline, budget.cancel_flag);
+        std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), default_timeout);
+    return waitForImageProcess(&child, deadline, budget.cancel_flag);
+}
+
+fn runImageNormalizerProcess(
+    argv: []const []const u8,
+    budget: CaptureBudget,
+) !void {
+    const term = try runBoundedImageProcess(
+        argv,
+        budget,
+        image_normalization_timeout,
+    );
     switch (term) {
         .exited => |code| if (code != 0) return error.ImagePreparationFailed,
         .signal, .stopped, .unknown => return error.ImagePreparationFailed,
@@ -1780,7 +1796,15 @@ pub const ClipboardImageAttachment = struct {
 };
 
 pub fn loadClipboardImageAttachment(alloc: std.mem.Allocator) !ClipboardImageAttachment {
+    return loadClipboardImageAttachmentWithBudget(alloc, .{});
+}
+
+pub fn loadClipboardImageAttachmentWithBudget(
+    alloc: std.mem.Allocator,
+    budget: CaptureBudget,
+) !ClipboardImageAttachment {
     if (builtin.os.tag != .macos) return error.Unsupported;
+    try budget.check();
 
     const source_dir = try createTempSnapshotDir(alloc);
     errdefer {
@@ -1803,15 +1827,12 @@ pub fn loadClipboardImageAttachment(alloc: std.mem.Allocator) !ClipboardImageAtt
     defer alloc.free(write_script);
 
     const argv = [_][]const u8{ "osascript", "-e", write_script };
-    const result = try std.process.run(alloc, io_mod.getIo(), .{
-        .argv = &argv,
-        .stdout_limit = .limited(1024),
-        .stderr_limit = .limited(4096),
-    });
-    defer alloc.free(result.stdout);
-    defer alloc.free(result.stderr);
-
-    switch (result.term) {
+    const term = try runBoundedImageProcess(
+        &argv,
+        budget,
+        clipboard_image_timeout,
+    );
+    switch (term) {
         .exited => |code| if (code == 0) {
             const attachment = try loadImageAttachment(alloc, temp_path);
             return .{
