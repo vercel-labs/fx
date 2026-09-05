@@ -830,10 +830,16 @@ pub fn SubmitRuntime(comptime App: type) type {
         }
 
         fn knownSlashCommand(app: *const App, text: []const u8) ?*const command_specs.SlashSpec {
-            if (text.len == 0 or text[0] != '/') return null;
+            if (text.len == 0) return null;
+            if (text[0] != '/') return bareAliasCommand(app, text);
             var command_end: usize = 1;
             while (command_end < text.len and !std.ascii.isWhitespace(text[command_end])) : (command_end += 1) {}
             return app.slashRegistry().lookup(text[0..command_end]);
+        }
+
+        fn bareAliasCommand(app: *const App, text: []const u8) ?*const command_specs.SlashSpec {
+            const token = bareAliasCandidate(text) orelse return null;
+            return command_specs.lookupBareAlias(app.slashRegistry(), token);
         }
 
         fn shouldRouteUnknownSlashCommand(app: *App, text: []const u8) bool {
@@ -2054,6 +2060,85 @@ pub fn SubmitRuntime(comptime App: type) type {
 pub fn directCommand(expanded: []const u8) ?[]const u8 {
     if (expanded.len == 0 or expanded[0] != '!') return null;
     return expanded[1..];
+}
+
+/// A submission without a leading slash can only name a command when the whole
+/// submission is that command token, so ordinary prose never routes locally.
+pub fn bareCommandSubmission(text: []const u8) []const u8 {
+    return std.mem.trimEnd(u8, text, " \t\r\n");
+}
+
+/// Ordinary prose must stay on the cheapest possible path, so reject it on length
+/// and interior whitespace before any registry comparison happens. Returns the
+/// candidate token only when a slash-less alias could plausibly match.
+pub fn bareAliasCandidate(text: []const u8) ?[]const u8 {
+    if (text.len == 0 or text.len > command_specs.max_bare_alias_len + trailing_whitespace_slack) return null;
+    const token = bareCommandSubmission(text);
+    if (token.len == 0 or token.len > command_specs.max_bare_alias_len) return null;
+    if (std.mem.indexOfAny(u8, token, " \t\r\n") != null) return null;
+    return token;
+}
+
+/// Trailing whitespace tolerated before a submission is treated as prose.
+const trailing_whitespace_slack: usize = 8;
+
+test "bare command submission tolerates trailing whitespace only" {
+    try std.testing.expectEqualStrings("exit", bareCommandSubmission("exit"));
+    try std.testing.expectEqualStrings("exit", bareCommandSubmission("exit \t\r\n"));
+    try std.testing.expectEqualStrings("exit now", bareCommandSubmission("exit now"));
+}
+
+test "bare exit resolves to quit through the default registry" {
+    const registry = @import("../../builtins/commands.zig").slash_registry;
+
+    const bare = command_specs.lookupBareAlias(registry, bareCommandSubmission("exit  ")) orelse
+        return error.TestExpectedEqual;
+    try std.testing.expectEqual(command_specs.SlashKind.quit, bare.kind);
+
+    const slashed = registry.lookup("/exit") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(command_specs.SlashKind.quit, slashed.kind);
+
+    try std.testing.expect(command_specs.lookupBareAlias(registry, "exit now") == null);
+    try std.testing.expect(command_specs.lookupBareAlias(registry, "Exit") == null);
+}
+
+test "bare alias lookup never resolves a primary slash token" {
+    const registry = @import("../../builtins/commands.zig").slash_registry;
+
+    try std.testing.expect(command_specs.lookupBareAlias(registry, "/quit") == null);
+    try std.testing.expect(command_specs.lookupBareAlias(registry, "/exit") == null);
+    try std.testing.expect(command_specs.lookupBareAlias(registry, "quit") == null);
+    try std.testing.expect(command_specs.lookupBareAlias(registry, "") == null);
+}
+
+test "bare alias length bound is derived from registry data" {
+    try std.testing.expectEqual(@as(usize, "exit".len), command_specs.max_bare_alias_len);
+}
+
+test "bare exit routes to quit and stays out of slash completions" {
+    const registry = @import("../../builtins/commands.zig").slash_registry;
+    const command_router = @import("../slash_commands/command_router.zig");
+
+    try std.testing.expectEqual(command_router.ParsedCommand.quit, command_router.parse(registry, "exit"));
+    try std.testing.expectEqual(command_router.ParsedCommand.quit, command_router.parse(registry, "exit "));
+    try std.testing.expectEqual(command_router.ParsedCommand.unknown, command_router.parse(registry, "exit now"));
+
+    try std.testing.expectEqual(@as(usize, 0), command_specs.slashCompletionCount(registry, "exit"));
+}
+
+test "prose submissions reject before the registry is consulted" {
+    // Anything with interior whitespace or beyond the longest alias is rejected
+    // without a single token comparison.
+    try std.testing.expect(bareAliasCandidate("") == null);
+    try std.testing.expect(bareAliasCandidate("exit now") == null);
+    try std.testing.expect(bareAliasCandidate("please exit the app") == null);
+    try std.testing.expect(bareAliasCandidate("explain the exit code") == null);
+    try std.testing.expect(bareAliasCandidate("exiting") == null);
+
+    // Only a short single token survives the pre-filter and pays for a scan.
+    try std.testing.expectEqualStrings("exit", bareAliasCandidate("exit").?);
+    try std.testing.expectEqualStrings("exit", bareAliasCandidate("exit  ").?);
+    try std.testing.expectEqualStrings("Exit", bareAliasCandidate("Exit").?);
 }
 
 test "direct terminal route requires the literal first character" {
