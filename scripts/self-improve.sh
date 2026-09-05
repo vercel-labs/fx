@@ -79,7 +79,7 @@ revert() { git checkout -q -- . && git clean -fdq; }
 # the baseline captured from the clean tree, so pre-existing environment
 # failures do not block progress. DI_SELF_IMPROVE_SKIP_TESTS=1 disables it.
 failing_tests() {
-  "$ZIG" build test $ZIG_BUILD_ARGS 2>&1 | sed -nE "s/^error: '([^']+)' (failed|crashed|terminated).*/\1/p" | sort -u
+  ("$ZIG" build test $ZIG_BUILD_ARGS 2>&1 || true) | sed -nE "s/^error: '([^']+)' (failed|crashed|terminated).*/\1/p" | sort -u
 }
 baseline_file=$(mktemp)
 if [ "${DI_SELF_IMPROVE_SKIP_TESTS:-0}" != 1 ]; then
