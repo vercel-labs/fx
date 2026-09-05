@@ -32,6 +32,7 @@ const web_search_policy = @import("../core/tooling/web_search_policy.zig");
 const web_search_provider = @import("../core/tooling/web_search_provider.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
+const text_utils = @import("../core/shared/text_utils.zig");
 const sort_utils = @import("../core/shared/sort_utils.zig");
 
 const Allocator = std.mem.Allocator;
@@ -2851,6 +2852,12 @@ fn parseModelCatalogEntry(alloc: std.mem.Allocator, entry: std.json.Value) !?Mod
     var reasoning_efforts = try parseReasoningEfforts(alloc, entry.object.get("reasoning_options"));
     errdefer reasoning_efforts.deinit(alloc);
     const has_reasoning = optionalTagListContains(tags_value, "reasoning") or reasoning_efforts.items.len > 0;
+    if (reasoning_efforts.items.len == 0) {
+        const fallbacks = fallbackReasoningEffortsForModel(id_value.string, has_reasoning);
+        for (fallbacks) |effort| {
+            try reasoning_efforts.append(alloc, effort);
+        }
+    }
     const supports_fast_mode = supportsFastMode(entry.object);
     const has_vision = optionalTagListContains(tags_value, "vision");
     const has_file_input = optionalTagListContains(tags_value, "file-input");
@@ -2909,6 +2916,22 @@ fn parseReasoningEfforts(alloc: std.mem.Allocator, options: ?std.json.Value) !st
         break;
     }
     return efforts;
+}
+
+const default_anthropic_reasoning_efforts = [_]shared_types.ReasoningEffort{
+    shared_types.ReasoningEffort.literal("minimal"),
+    shared_types.ReasoningEffort.literal("low"),
+    shared_types.ReasoningEffort.literal("medium"),
+    shared_types.ReasoningEffort.literal("high"),
+    shared_types.ReasoningEffort.literal("xhigh"),
+};
+
+fn fallbackReasoningEffortsForModel(id: []const u8, has_reasoning: bool) []const shared_types.ReasoningEffort {
+    if (!has_reasoning) return &.{};
+    if (std.mem.startsWith(u8, id, "anthropic/") or text_utils.containsIgnoreCase(id, "claude")) {
+        return &default_anthropic_reasoning_efforts;
+    }
+    return &.{};
 }
 
 fn hasToggleOption(options: ?std.json.Value) bool {
@@ -3245,4 +3268,48 @@ test "gateway catalog controls are explicit ordered and bounded" {
     try std.testing.expectEqualStrings("provider/malformed", catalog.items[2].id);
     try std.testing.expectEqual(@as(usize, 0), catalog.items[2].reasoning_efforts.items.len);
     try std.testing.expect(!catalog.items[2].supports_fast_mode);
+}
+
+test "gateway catalog falls back to standard reasoning tiers for Anthropic models when reasoning_options is omitted" {
+    const json_text =
+        \\{"object":"list","data":[
+        \\  {"id":"anthropic/claude-opus-5","type":"language","tags":["reasoning","tool-use"]},
+        \\  {"id":"anthropic/claude-opus-5-fast","type":"language","tags":["reasoning","tool-use"]},
+        \\  {"id":"anthropic/claude-explicit","type":"language","tags":["reasoning","tool-use"],"reasoning_options":[{"type":"effort","values":["low","high"]}]}
+        \\]}
+    ;
+
+    var catalog = try parseSortedModelCatalog(std.testing.allocator, json_text);
+    defer freeModelCatalog(std.testing.allocator, &catalog);
+
+    try std.testing.expectEqual(@as(usize, 3), catalog.items.len);
+
+    var opus5: ?ModelCatalogEntry = null;
+    var opus5_fast: ?ModelCatalogEntry = null;
+    var explicit: ?ModelCatalogEntry = null;
+
+    for (catalog.items) |entry| {
+        if (std.mem.eql(u8, entry.id, "anthropic/claude-opus-5")) opus5 = entry;
+        if (std.mem.eql(u8, entry.id, "anthropic/claude-opus-5-fast")) opus5_fast = entry;
+        if (std.mem.eql(u8, entry.id, "anthropic/claude-explicit")) explicit = entry;
+    }
+
+    try std.testing.expect(opus5 != null);
+    try std.testing.expect(opus5.?.has_reasoning);
+    try std.testing.expectEqual(@as(usize, 5), opus5.?.reasoning_efforts.items.len);
+    try std.testing.expectEqualStrings("minimal", opus5.?.reasoning_efforts.items[0].label());
+    try std.testing.expectEqualStrings("low", opus5.?.reasoning_efforts.items[1].label());
+    try std.testing.expectEqualStrings("medium", opus5.?.reasoning_efforts.items[2].label());
+    try std.testing.expectEqualStrings("high", opus5.?.reasoning_efforts.items[3].label());
+    try std.testing.expectEqualStrings("xhigh", opus5.?.reasoning_efforts.items[4].label());
+
+    try std.testing.expect(opus5_fast != null);
+    try std.testing.expect(opus5_fast.?.has_reasoning);
+    try std.testing.expectEqual(@as(usize, 5), opus5_fast.?.reasoning_efforts.items.len);
+
+    try std.testing.expect(explicit != null);
+    try std.testing.expect(explicit.?.has_reasoning);
+    try std.testing.expectEqual(@as(usize, 2), explicit.?.reasoning_efforts.items.len);
+    try std.testing.expectEqualStrings("low", explicit.?.reasoning_efforts.items[0].label());
+    try std.testing.expectEqualStrings("high", explicit.?.reasoning_efforts.items[1].label());
 }
