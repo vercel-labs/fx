@@ -502,7 +502,7 @@ test "authority capture permits registry access and rejects changed work" {
                 .none => {},
                 .host_failure => return error.HostAuthorityUnavailable,
                 .finish, .replace => {
-                    registry.finish(alloc, "authority-child", "work-one", .completed) catch
+                    registry.finish(alloc, "authority-child", "work-one", .completed, null) catch
                         return error.HostAuthorityUnavailable;
                     if (self.change != .finish) {
                         var work = child_state.ActiveWork{

@@ -5,9 +5,10 @@ const session_child_store = @import("../session/session_child_store.zig");
 const session_store = @import("../session/session_store.zig");
 const session_discovery = @import("../session/session_discovery.zig");
 const types = @import("../shared/types.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
-const schema_version: u64 = 1;
+const schema_version: u64 = 2;
 const state_file = "children.json";
 const lock_file = "children.lock";
 const owner_marker_file = "owner.json";
@@ -126,6 +127,7 @@ pub const Child = struct {
     last_work_id: ?[]u8 = null,
     last_request_fingerprint: ?[32]u8 = null,
     last_outcome: ?Outcome = null,
+    last_failure: ?types.ModelFailureDiagnostic = null,
 
     pub fn deinit(self: *Child, alloc: Allocator) void {
         alloc.free(self.id);
@@ -160,6 +162,7 @@ pub const Child = struct {
             .last_work_id = if (self.last_work_id) |value| try alloc.dupe(u8, value) else null,
             .last_request_fingerprint = self.last_request_fingerprint,
             .last_outcome = self.last_outcome,
+            .last_failure = self.last_failure,
         };
     }
 
@@ -365,14 +368,18 @@ pub const Registry = struct {
         child_id: []const u8,
         work_id: []const u8,
         outcome: Outcome,
+        failure: ?types.ModelFailureDiagnostic,
     ) !void {
         const child = self.findById(child_id) orelse return error.ChildNotFound;
         const active = child.active orelse return error.StaleWork;
         if (!std.mem.eql(u8, active.id, work_id)) return error.StaleWork;
+        if (failure != null and outcome != .failed) return error.InvalidState;
+        const next_work_id = try alloc.dupe(u8, work_id);
         if (child.last_work_id) |old| alloc.free(old);
-        child.last_work_id = try alloc.dupe(u8, work_id);
+        child.last_work_id = next_work_id;
         child.last_request_fingerprint = active.request_fingerprint;
         child.last_outcome = outcome;
+        child.last_failure = failure;
         child.active.?.deinit(alloc);
         child.active = null;
         child.phase = switch (child.kind) {
@@ -391,6 +398,7 @@ pub const Registry = struct {
                 child.last_work_id = alloc.dupe(u8, active.id) catch null;
                 child.last_request_fingerprint = active.request_fingerprint;
                 child.last_outcome = .interrupted;
+                child.last_failure = null;
                 child.active.?.deinit(alloc);
                 child.active = null;
             }
@@ -628,6 +636,8 @@ fn renderChild(writer: *std.Io.Writer, child: Child) !void {
     } else try writer.writeAll("null");
     try writer.writeAll(",\"last_outcome\":");
     try writeOptionalString(writer, if (child.last_outcome) |outcome| @tagName(outcome) else null);
+    try writer.writeAll(",\"last_failure\":");
+    try writeOptionalString(writer, if (child.last_failure) |*failure| failure.view() else null);
     try writer.writeByte('}');
 }
 
@@ -658,7 +668,8 @@ fn parseRegistry(alloc: Allocator, bytes: []const u8, parent_id: []const u8) !Re
     defer parsed.deinit();
     const root = try object(parsed.value);
     try exactFields(root, &.{ "schema_version", "parent_id", "generation", "children" });
-    if (try unsigned(root, "schema_version") != schema_version) return error.UnsupportedSchema;
+    const version = try unsigned(root, "schema_version");
+    if (version != 1 and version != schema_version) return error.UnsupportedSchema;
     const stored_parent = try string(root, "parent_id");
     if (!std.mem.eql(u8, stored_parent, parent_id)) return error.InvalidParentId;
     const values = root.get("children") orelse return error.InvalidState;
@@ -674,7 +685,7 @@ fn parseRegistry(alloc: Allocator, bytes: []const u8, parent_id: []const u8) !Re
         alloc.free(children);
     };
     for (values.array.items) |value| {
-        children[built] = try parseChild(alloc, value);
+        children[built] = try parseChild(alloc, value, version);
         built += 1;
     }
     registry.children = children;
@@ -683,9 +694,16 @@ fn parseRegistry(alloc: Allocator, bytes: []const u8, parent_id: []const u8) !Re
     return registry;
 }
 
-fn parseChild(alloc: Allocator, value: std.json.Value) !Child {
+fn parseChild(alloc: Allocator, value: std.json.Value, version: u64) !Child {
     const source = try object(value);
-    try exactFields(source, &.{ "id", "kind", "persistent", "phase", "work_generation", "active", "last_work_id", "last_request_fingerprint", "last_outcome" });
+    const fields = [_][]const u8{ "id", "kind", "persistent", "phase", "work_generation", "active", "last_work_id", "last_request_fingerprint", "last_outcome", "last_failure" };
+    try exactFields(source, fields[0..if (version == 1) fields.len - 1 else fields.len]);
+    const failure: ?types.ModelFailureDiagnostic = if (version == schema_version) blk: {
+        const raw = (try optionalString(source, "last_failure")) orelse break :blk null;
+        if (raw.len == 0 or raw.len > types.ModelFailureDiagnostic.max_bytes or
+            !text_utils.isTerminalSafe(raw)) return error.InvalidState;
+        break :blk types.ModelFailureDiagnostic.init(raw);
+    } else null;
     const id_value = try string(source, "id");
     domain.validateId(id_value) catch return error.InvalidState;
     const kind_name = try string(source, "kind");
@@ -722,6 +740,7 @@ fn parseChild(alloc: Allocator, value: std.json.Value) !Child {
             std.meta.stringToEnum(Outcome, raw) orelse return error.InvalidState
         else
             null,
+        .last_failure = failure,
     };
 }
 
@@ -792,6 +811,10 @@ fn validateRegistry(registry: Registry) !void {
             },
         }
         if ((child.phase == .running or child.phase == .awaiting_approval) != (child.active != null)) return error.InvalidState;
+        if (child.last_failure) |*failure| {
+            if (child.last_outcome != .failed or child.last_work_id == null or
+                failure.view().len == 0 or !text_utils.isTerminalSafe(failure.view())) return error.InvalidState;
+        }
         for (registry.children[0..index]) |prior| {
             if (std.mem.eql(u8, prior.id, child.id)) return error.InvalidState;
             if (child.agentName()) |agent| {
@@ -869,6 +892,69 @@ fn cloneStrings(alloc: Allocator, source: []const []u8) ![][]u8 {
 fn freeStrings(alloc: Allocator, values: [][]u8) void {
     for (values) |value| alloc.free(value);
     if (values.len > 0) alloc.free(values);
+}
+
+test "subagent failure state survives reload and is replaced only by matching work" {
+    const alloc = std.testing.allocator;
+    const parent_id = "01J00000000000000000000000";
+    const child_id = "01J00000000000000000000001";
+    var registry = try Registry.init(alloc, parent_id);
+    defer registry.deinit(alloc);
+    var active = ActiveWork{
+        .id = try alloc.dupe(u8, "work-1"),
+        .message = try alloc.dupe(u8, "review"),
+        .created_at_ms = 1,
+    };
+    defer active.deinit(alloc);
+    try registry.appendPersistent(alloc, child_id, "reviewer", "", active);
+    const failure = types.ModelFailureDiagnostic.init("agent_turn_failed: SessionCommitFailed");
+    try std.testing.expectError(error.StaleWork, registry.finish(alloc, child_id, "other", .failed, failure));
+    try registry.finish(alloc, child_id, "work-1", .failed, failure);
+    const encoded = try renderRegistry(alloc, registry);
+    defer alloc.free(encoded);
+    var restored = try parseRegistry(alloc, encoded, parent_id);
+    defer restored.deinit(alloc);
+    try std.testing.expectEqualStrings(failure.view(), restored.children[0].last_failure.?.view());
+
+    alloc.free(active.id);
+    active.id = try alloc.dupe(u8, "work-2");
+    _ = try restored.startPersistentWork(alloc, "reviewer", null, active);
+    try std.testing.expectError(error.StaleWork, restored.finish(alloc, child_id, "work-1", .failed, failure));
+    try restored.finish(alloc, child_id, "work-2", .completed, null);
+    try std.testing.expect(restored.children[0].last_failure == null);
+    restored.children[0].last_failure = failure;
+    try std.testing.expectError(error.InvalidState, validateRegistry(restored));
+}
+
+test "subagent failure codec reads historical absence and rejects invalid detail" {
+    const alloc = std.testing.allocator;
+    const parent_id = "01J00000000000000000000000";
+    const legacy =
+        \\{"schema_version":1,"parent_id":"01J00000000000000000000000","generation":1,"children":[{"id":"01J00000000000000000000001","kind":"one_off","persistent":null,"phase":"finished","work_generation":1,"active":null,"last_work_id":"work-1","last_request_fingerprint":"0000000000000000000000000000000000000000000000000000000000000000","last_outcome":"failed"}]}
+    ;
+    var restored = try parseRegistry(alloc, legacy, parent_id);
+    defer restored.deinit(alloc);
+    try std.testing.expect(restored.children[0].last_failure == null);
+    const encoded = try renderRegistry(alloc, restored);
+    defer alloc.free(encoded);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+    defer parsed.deinit();
+    const record = &parsed.value.object.getPtr("children").?.array.items[0];
+    const bad_values = [_]std.json.Value{
+        .{ .string = "x" ** (types.ModelFailureDiagnostic.max_bytes + 1) },
+        .{ .string = "unsafe\x1b[31m" },
+        .{ .integer = 7 },
+    };
+    for (bad_values) |bad| {
+        record.object.getPtr("last_failure").?.* = bad;
+        const invalid = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+        defer alloc.free(invalid);
+        try std.testing.expectError(error.InvalidState, parseRegistry(alloc, invalid, parent_id));
+    }
+    parsed.value.object.getPtr("schema_version").?.* = .{ .integer = 99 };
+    const future = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+    defer alloc.free(future);
+    try std.testing.expectError(error.UnsupportedSchema, parseRegistry(alloc, future, parent_id));
 }
 
 test "parent child state round trips only required delegation state" {
@@ -977,7 +1063,7 @@ test "persistent state derives create continue busy and terminal transitions" {
         "Review carefully.",
         registry.children[0].instructions(),
     );
-    try registry.finish(alloc, registry.children[0].id, "work-1", .completed);
+    try registry.finish(alloc, registry.children[0].id, "work-1", .completed, null);
     var second = ActiveWork{
         .id = try alloc.dupe(u8, "work-2"),
         .message = try alloc.dupe(u8, "second"),
@@ -988,7 +1074,7 @@ test "persistent state derives create continue busy and terminal transitions" {
     try std.testing.expectEqual(Phase.running, child.phase);
     try std.testing.expectEqual(@as(u64, 2), child.work_generation);
     try std.testing.expectEqualStrings("Review carefully.", child.instructions());
-    try registry.finish(alloc, child.id, "work-2", .completed);
+    try registry.finish(alloc, child.id, "work-2", .completed, null);
     var third = ActiveWork{
         .id = try alloc.dupe(u8, "work-3"),
         .message = try alloc.dupe(u8, "third"),

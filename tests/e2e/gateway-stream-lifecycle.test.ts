@@ -9,6 +9,7 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   truncateSync,
@@ -6537,6 +6538,143 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 45_000);
+
+  test("subagent failure retains its cause after effects and worker cleanup", async () => {
+    const root = createFixtureRoot("subagent-failure-detail");
+    const marker = join(root.workspace, "effect.txt");
+    const childTask = "Write the effect once, then read it.";
+    const nextTask = "Reply CHILD_RECOVERED without tools.";
+    let childRequests = 0;
+    let childId = "";
+    let registryPath = "";
+    let recoveryPath = "";
+    let failureObserved = false;
+    const scripted = startDynamicFakeGateway((body) => {
+      if (hasCurrentToolResult(body, "followup")) {
+        const result = JSON.parse(toolResultOutput(body, "followup"));
+        expect(result).toEqual({ ok: true, result: "CHILD_RECOVERED", error_code: null });
+        const registry = JSON.parse(readFileSync(registryPath, "utf8"));
+        const child = registry.children.find((entry: { id: string }) => entry.id === childId);
+        expect(child.last_outcome).toBe("completed");
+        expect(child.last_failure).toBeNull();
+        expect(readFileSync(marker, "utf8")).toBe("EFFECT_ONCE\n");
+        return fakeGatewayFinalText("SUBAGENT_FAILURE_REPORTED");
+      }
+      if (hasCurrentToolResult(body, "delegate")) {
+        const result = JSON.parse(toolResultOutput(body, "delegate"));
+        expect(result.ok).toBe(false);
+        expect(result.error_code).toBe("child_failed");
+        expect(result.result).toContain("SessionCommitFailed");
+        expect(result.result).toContain("agent_turn_failed");
+        expect(result.result).toContain("Earlier tool calls may have completed");
+        expect(childRequests).toBe(2);
+        expect(readFileSync(marker, "utf8")).toBe("EFFECT_ONCE\n");
+        const registry = JSON.parse(readFileSync(registryPath, "utf8"));
+        expect(registry.schema_version).toBe(2);
+        const child = registry.children.find((entry: { id: string }) => entry.id === childId);
+        expect(child.phase).toBe("idle");
+        expect(child.active).toBeNull();
+        expect(child.last_failure).toContain("SessionCommitFailed");
+        failureObserved = true;
+        rmSync(recoveryPath, { recursive: true });
+        return fakeGatewayToolCall("followup", "subagent", {
+          request: { action: "message", agent: "reporter", message: nextTask },
+        });
+      }
+      if (body.includes(nextTask)) return fakeGatewayFinalText("CHILD_RECOVERED");
+      if (body.includes(childTask)) {
+        childRequests++;
+        if (hasCurrentToolResult(body, "child_effect")) {
+          expect(readFileSync(marker, "utf8")).toBe("EFFECT_ONCE\n");
+          const sessions = join(root.home, ".fx", "sessions");
+          childId = readdirSync(sessions).find((id) => existsSync(join(sessions, id, "subagent", "owner.json")))!;
+          expect(childId).toBeTruthy();
+          const owner = JSON.parse(readFileSync(join(sessions, childId, "subagent", "owner.json"), "utf8"));
+          registryPath = join(sessions, owner.parent_id, "subagent", "children.json");
+          recoveryPath = join(sessions, childId, "recovery.json");
+          if (existsSync(recoveryPath)) renameSync(recoveryPath, `${recoveryPath}.saved`);
+          mkdirSync(recoveryPath);
+          return fakeGatewayToolCall("read_effect", "read_file", { path: marker });
+        }
+        return fakeShellRun("child_effect", "printf 'EFFECT_ONCE\\n' >> effect.txt");
+      }
+      return fakeGatewayToolCall("delegate", "subagent", {
+        request: { action: "message", agent: "reporter", message: childTask },
+      });
+    }, { classifierDecision: "clear", models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    try {
+      const result = await runFx(["ask", "--json", "--auto", "Exercise a failed child and its next message."], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, scripted, ""), FX_TRACE_LOG: undefined, FX_TRACE: undefined, FX_TRACE_SCOPES: undefined },
+        timeoutMs: 15_000,
+      });
+      expect(result.code).toBe(0);
+      expect(failureObserved).toBe(true);
+      expect(parseAskJson(result.stdout).output).toContain("SUBAGENT_FAILURE_REPORTED");
+      const events = readFileSync(join(root.home, ".fx", "sessions", parseAskJson(result.stdout).session_id, "events.jsonl"), "utf8")
+        .trim().split("\n").map((line) => JSON.parse(line));
+      const persisted = events.find((entry) => entry.event.tool_result?.call_id === "delegate")?.event.tool_result;
+      expect(persisted?.status).toBe("failure");
+      expect(persisted?.preview).toContain("agent_turn_failed: SessionCommitFailed");
+      expect(scripted.requestCount()).toBe(6);
+      expect(result.stderr).not.toContain("panic");
+    } finally {
+      scripted.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test("subagent replay returns saved success and failure without another worker", async () => {
+    const root = createFixtureRoot("subagent-completed-replay");
+    const task = "Reply REPLAY_CHILD_DONE without tools.";
+    const seen: Array<{ ok: boolean; result: string; error_code: string | null }> = [];
+    let childRequests = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      const prompt = gatewayRequest(body).prompt;
+      const lastUser = prompt.findLastIndex((message) => message.role === "user");
+      const parts = prompt.slice(lastUser + 1).flatMap((message) => Array.isArray(message.content) ? message.content : []) as Array<Record<string, unknown>>;
+      const result = parts.find((part) => part.type === "tool-result" && part.toolCallId === "replayed_delegation");
+      if (result) {
+        seen.push(JSON.parse(contentText(result.output)));
+        return fakeGatewayFinalText("REPLAY_PARENT_DONE");
+      }
+      if (contentText(prompt[lastUser]?.content).includes(task)) {
+        childRequests++;
+        return fakeGatewayFinalText("REPLAY_CHILD_DONE");
+      }
+      return fakeGatewayToolCall("replayed_delegation", "subagent", { request: { action: "run", task } });
+    }, { classifierDecision: "clear", models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    const env = fixtureEnv(root, gateway, join(root.root, "trace.log"));
+    try {
+      const first = await runFx(["ask", "--json", "--auto", "Run the delegation."], { cwd: root.workspace, env, timeoutMs: 10_000 });
+      expect(first.code).toBe(0);
+      const sessionId = parseAskJson(first.stdout).session_id;
+      const repeat = ["ask", "--json", "--auto", "--resume-id", sessionId, "Observe that same delegation again."];
+      const second = await runFx(repeat, { cwd: root.workspace, env, timeoutMs: 10_000 });
+      expect(second.code).toBe(0);
+      expect(seen).toHaveLength(2);
+      expect(seen[0]).toEqual({ ok: true, result: "REPLAY_CHILD_DONE", error_code: null });
+      expect(seen[1]).toEqual(seen[0]);
+      const registryPath = join(root.home, ".fx", "sessions", sessionId, "subagent", "children.json");
+      const registry = JSON.parse(readFileSync(registryPath, "utf8"));
+      expect(registry.children).toHaveLength(1);
+      registry.children[0].last_outcome = "failed";
+      registry.children[0].last_failure = "agent_turn_failed: RetainedFailure";
+      writeFileSync(registryPath, JSON.stringify(registry));
+      const third = await runFx(repeat, { cwd: root.workspace, env, timeoutMs: 10_000 });
+      expect(third.code).toBe(0);
+      expect(seen).toHaveLength(3);
+      expect(seen[2]?.ok).toBe(false);
+      expect(seen[2]?.error_code).toBe("child_failed");
+      expect(seen[2]?.result).toContain("agent_turn_failed: RetainedFailure");
+      expect(seen[2]?.result).toContain("Partial result:\nREPLAY_CHILD_DONE");
+      expect(childRequests).toBe(1);
+      expect(gateway.requestCount()).toBe(7);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 35_000);
 
   test("subagent call waits for one terminal child result", async () => {
     const root = createFixtureRoot("subagent-terminal-result");

@@ -8,6 +8,7 @@ const io_mod = @import("../shared/io.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const session_store = @import("../session/session_store.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
+const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -19,6 +20,7 @@ pub const CancelError = error{ChildUnavailable};
 pub const Observation = struct {
     phase: child_state.Phase,
     outcome: ?child_state.Outcome = null,
+    failure: ?types.ModelFailureDiagnostic = null,
 };
 
 const Slot = struct {
@@ -30,7 +32,7 @@ const Slot = struct {
     route_refs: usize = 0,
     route_changed: std.Io.Condition = .init,
     thread: ?std.Thread = null,
-    finished: bool = false,
+    completion: enum { running, published, unpublished } = .running,
     done: std.Io.Event = .unset,
 };
 
@@ -54,7 +56,7 @@ pub const Owner = struct {
                 if (self.closed) return error.OwnerClosed;
                 for (self.slots.items, 0..) |slot, index| {
                     if (!std.mem.eql(u8, slot.child_id, child_id)) continue;
-                    if (!slot.finished) return .already_running;
+                    if (slot.completion == .running) return .already_running;
                     break :blk self.slots.swapRemove(index);
                 }
                 const slot = try self.alloc.create(Slot);
@@ -85,7 +87,7 @@ pub const Owner = struct {
                 error.Timeout => return self.observe(child_id),
                 error.Canceled => return self.observe(child_id),
             };
-            self.reapSlot(active);
+            try self.reapSlot(active);
         }
         return self.observe(child_id);
     }
@@ -95,7 +97,7 @@ pub const Owner = struct {
         defer self.mutex.unlock(io_mod.getIo());
         for (self.slots.items) |slot| {
             if (!std.mem.eql(u8, slot.child_id, child_id)) continue;
-            if (slot.finished) return;
+            if (slot.completion != .running) return;
             slot.cancel.store(true, .seq_cst);
             if (slot.worker) |worker| worker.requestCancel();
             return;
@@ -145,11 +147,11 @@ pub const Owner = struct {
         return null;
     }
 
-    fn reapSlot(self: *Owner, slot: *Slot) void {
+    fn reapSlot(self: *Owner, slot: *Slot) error{StateUnavailable}!void {
         self.mutex.lockUncancelable(io_mod.getIo());
         var index: ?usize = null;
         for (self.slots.items, 0..) |candidate, candidate_index| {
-            if (candidate == slot and candidate.finished) {
+            if (candidate == slot and candidate.completion != .running) {
                 index = candidate_index;
                 break;
             }
@@ -159,8 +161,10 @@ pub const Owner = struct {
             return;
         }
         _ = self.slots.swapRemove(index.?);
+        const unpublished = slot.completion == .unpublished;
         self.mutex.unlock(io_mod.getIo());
         destroySlot(self, slot);
+        if (unpublished) return error.StateUnavailable;
     }
 
     fn observe(self: *Owner, child_id: []const u8) WaitError!Observation {
@@ -173,7 +177,7 @@ pub const Owner = struct {
         };
         defer registry.deinit(self.alloc);
         const child = registry.findById(child_id) orelse return error.ChildUnavailable;
-        return .{ .phase = child.phase, .outcome = child.last_outcome };
+        return .{ .phase = child.phase, .outcome = child.last_outcome, .failure = child.last_failure };
     }
 
     fn phaseTransition(
@@ -200,24 +204,27 @@ pub const Owner = struct {
         child_id: []const u8,
         work_id: []const u8,
         outcome: child_state.Outcome,
-    ) void {
+        failure: ?types.ModelFailureDiagnostic,
+    ) bool {
         var lock = self.state_store.acquireLock(self.alloc) catch |err| {
             debugFailure(child_id, "state_lock", err);
-            return;
+            return false;
         };
         defer lock.release();
         var registry = self.state_store.load(self.alloc) catch |err| {
             debugFailure(child_id, "state_load", err);
-            return;
+            return false;
         };
         defer registry.deinit(self.alloc);
-        registry.finish(self.alloc, child_id, work_id, outcome) catch |err| {
+        registry.finish(self.alloc, child_id, work_id, outcome, failure) catch |err| {
             debugFailure(child_id, "state_finish", err);
-            return;
+            return false;
         };
         self.state_store.save(self.alloc, registry) catch |err| {
             debugFailure(child_id, "state_save", err);
+            return false;
         };
+        return true;
     }
 };
 
@@ -231,9 +238,9 @@ fn destroySlot(owner: *Owner, slot: *Slot) void {
 fn slotMain(slot: *Slot) void {
     const owner = slot.owner;
     const outcome = runOne(slot);
-    owner.finish(slot.child_id, outcome.work_id, outcome.outcome);
+    const published = owner.finish(slot.child_id, outcome.work_id, outcome.outcome, outcome.failure);
     owner.mutex.lockUncancelable(io_mod.getIo());
-    slot.finished = true;
+    slot.completion = if (published) .published else .unpublished;
     slot.done.set(io_mod.getIo());
     owner.mutex.unlock(io_mod.getIo());
     outcome.deinit(owner.alloc);
@@ -242,6 +249,7 @@ fn slotMain(slot: *Slot) void {
 const OneOutcome = struct {
     work_id: []u8,
     outcome: child_state.Outcome,
+    failure: ?types.ModelFailureDiagnostic = null,
 
     fn deinit(self: OneOutcome, alloc: Allocator) void {
         alloc.free(self.work_id);
@@ -250,7 +258,8 @@ const OneOutcome = struct {
 
 fn runOne(slot: *Slot) OneOutcome {
     const owner = slot.owner;
-    var snapshot = loadRunSnapshot(owner, slot.child_id) catch {
+    var snapshot = loadRunSnapshot(owner, slot.child_id) catch |err| {
+        debugFailure(slot.child_id, "run_snapshot", err);
         return fallbackOutcome(owner.alloc, "unknown", .failed);
     };
     defer snapshot.deinit(owner.alloc);
@@ -262,7 +271,7 @@ fn runOne(slot: *Slot) OneOutcome {
         .{ .id = slot.child_id },
         owner.sessions.workspace_root,
         .{},
-    ) catch return .{ .work_id = work_id, .outcome = .failed };
+    ) catch |err| return failedOutcome(work_id, "session_resume", err);
     defer {
         loaded.log.park();
         loaded.deinit(owner.alloc);
@@ -271,7 +280,7 @@ fn runOne(slot: *Slot) OneOutcome {
         owner.alloc,
         &loaded,
         owner.max_history_turns,
-    ) catch return .{ .work_id = work_id, .outcome = .failed };
+    ) catch |err| return failedOutcome(work_id, "turn_initialization", err);
     defer turn.deinit();
     turn.live_authority = owner.authority_resolver;
     turn.approval_registry = owner.approvals;
@@ -289,8 +298,7 @@ fn runOne(slot: *Slot) OneOutcome {
         owner.alloc,
         owner.state_store.parent_id,
         snapshot.instructions,
-    ) catch
-        return .{ .work_id = work_id, .outcome = .failed };
+    ) catch |err| return failedOutcome(work_id, "message_preparation", err);
     defer message.deinit(owner.alloc);
     const admission = owner.services.capture(owner.alloc, .{
         .child_id = slot.child_id,
@@ -301,10 +309,10 @@ fn runOne(slot: *Slot) OneOutcome {
             .model = loaded.state.preferences.model,
             .effort = loaded.state.preferences.effort,
         },
-    }) catch |err| return .{
+    }) catch |err| return if (err == error.Cancelled) .{
         .work_id = work_id,
-        .outcome = if (err == error.Cancelled) .cancelled else .failed,
-    };
+        .outcome = .cancelled,
+    } else failedOutcome(work_id, "admission", err);
     var owned_admission = admission;
     defer owned_admission.deinit(owner.alloc);
     const result = owner.services.run(
@@ -312,14 +320,21 @@ fn runOne(slot: *Slot) OneOutcome {
         message,
         admission,
         &slot.cancel,
-    ) catch |err| return .{
-        .work_id = work_id,
-        .outcome = if (slot.shutdown.load(.seq_cst))
+    ) catch |err| {
+        const outcome: child_state.Outcome = if (slot.shutdown.load(.seq_cst))
             .interrupted
         else if (slot.cancel.load(.seq_cst) or err == error.Cancelled)
             .cancelled
         else
-            .failed,
+            .failed;
+        return .{
+            .work_id = work_id,
+            .outcome = outcome,
+            .failure = if (outcome == .failed)
+                turn.failureDiagnostic() orelse execution.failureDiagnosticValue("agent_execution", @errorName(err))
+            else
+                null,
+        };
     };
     if (slot.shutdown.load(.seq_cst)) return .{
         .work_id = work_id,
@@ -450,12 +465,48 @@ fn fallbackOutcome(alloc: Allocator, work_id: []const u8, outcome: child_state.O
     };
 }
 
+fn failedOutcome(work_id: []u8, stage: []const u8, err: anyerror) OneOutcome {
+    return .{
+        .work_id = work_id,
+        .outcome = .failed,
+        .failure = execution.failureDiagnosticValue(stage, @errorName(err)),
+    };
+}
+
 fn debugFailure(child_id: []const u8, stage: []const u8, err: anyerror) void {
     @import("../shared/debug_trace.zig").logf(
         "subagent",
         "managed child state update failed child_id={s} stage={s} err={s}",
         .{ child_id, stage, @errorName(err) },
     );
+}
+
+test "subagent failure to publish completion returns state unavailable instead of waiting" {
+    const alloc = std.testing.allocator;
+    var approvals = approval_registry.Registry{ .alloc = alloc };
+    defer approvals.deinit();
+    var owner = Owner{
+        .alloc = alloc,
+        .sessions = undefined,
+        .state_store = undefined,
+        .services = undefined,
+        .authority_resolver = undefined,
+        .approvals = &approvals,
+    };
+    defer owner.deinit();
+    const slot = try alloc.create(Slot);
+    slot.* = .{
+        .owner = &owner,
+        .child_id = try alloc.dupe(u8, "child"),
+        .completion = .unpublished,
+    };
+    try owner.slots.append(alloc, slot);
+    slot.done.set(io_mod.getIo());
+    try std.testing.expectError(error.StateUnavailable, owner.wait("child", .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(1),
+    }));
+    try std.testing.expectEqual(@as(usize, 0), owner.slots.items.len);
 }
 
 test "worker detach invalidates approval routes before worker deinit" {
