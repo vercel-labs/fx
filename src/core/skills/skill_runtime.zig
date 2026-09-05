@@ -332,6 +332,19 @@ const CanonicalSkillPaths = struct {
     }
 };
 
+fn isCompatSkillSource(source: SkillSource) bool {
+    return switch (source) {
+        .workspace_fx, .workspace_shared, .global_fx => false,
+        else => true,
+    };
+}
+
+fn shouldIncludeSkillSource(source: SkillSource) bool {
+    if (!isCompatSkillSource(source)) return true;
+    if (io_mod.getenv("FX_DISABLE_SKILL_COMPAT") != null) return false;
+    return true;
+}
+
 pub fn loadVisibleSkills(
     alloc: Allocator,
     workspace_root: ?[]const u8,
@@ -402,6 +415,7 @@ fn appendConfiguredSkillRoots(
     }
     if (home) |home_root| {
         for (root_policy.global_roots) |spec| {
+            if (!shouldIncludeSkillSource(spec.source)) continue;
             try appendSpecRoot(alloc, roots, home_root, spec);
         }
     }
@@ -521,6 +535,7 @@ fn appendWorkspaceRoots(
         }
 
         for (root_specs) |spec| {
+            if (!shouldIncludeSkillSource(spec.source)) continue;
             try appendSpecRoot(alloc, roots, dir, spec);
         }
     }
@@ -5829,4 +5844,51 @@ test "loadVisibleSkills still rejects external symlinks without an authority" {
     try std.testing.expectEqualStrings(logical_path, discovery.diagnostics[0].path);
     try std.testing.expectEqual(SkillDiagnosticScope.candidate, discovery.diagnostics[0].scope);
     try std.testing.expectEqual(SkillDiagnosticCause.linked_candidate_unavailable, discovery.diagnostics[0].cause);
+}
+
+test "loadVisibleSkills respects FX_DISABLE_SKILL_COMPAT for compat roots" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTempFile(&tmp, "home/workspace/app/.codex/skills/local-codex/SKILL.md", "---\nname: local-codex\ndescription: workspace codex\n---\n\nbody\n");
+    try writeTempFile(&tmp, "home/.codex/skills/global-codex/SKILL.md", "---\nname: global-codex\ndescription: global codex\n---\n\nbody\n");
+    try writeTempFile(&tmp, "home/.fx/skills/managed/SKILL.md", "---\nname: managed\ndescription: managed\n---\n\nbody\n");
+    try writeTempFile(&tmp, "home/workspace/app/skills/workspace-fx/SKILL.md", "---\nname: workspace-fx\ndescription: workspace fx\n---\n\nbody\n");
+    try writeTempFile(&tmp, "home/workspace/app/skills/workspace-shared/SKILL.md", "---\nname: workspace-shared\ndescription: workspace shared\n---\n\nbody\n");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
+
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace/app");
+    defer alloc.free(workspace_root);
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    defer alloc.free(managed_root);
+
+    // Without the gate, compat roots are retained.
+    {
+        var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
+        defer discovery.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 5), discovery.skills.len);
+        try std.testing.expect(findSkillByName(discovery.skills, "local-codex") != null);
+        try std.testing.expect(findSkillByName(discovery.skills, "global-codex") != null);
+        try std.testing.expect(findSkillByName(discovery.skills, "managed") != null);
+        try std.testing.expect(findSkillByName(discovery.skills, "workspace-fx") != null);
+        try std.testing.expect(findSkillByName(discovery.skills, "workspace-shared") != null);
+    }
+
+    // With FX_DISABLE_SKILL_COMPAT, compat roots are dropped and fx roots remain.
+    {
+        const env = try TestEnviron.install(alloc);
+        defer env.deinit();
+        try env.put("FX_DISABLE_SKILL_COMPAT", "1");
+        var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
+        defer discovery.deinit(alloc);
+        try std.testing.expect(findSkillByName(discovery.skills, "local-codex") == null);
+        try std.testing.expect(findSkillByName(discovery.skills, "global-codex") == null);
+        try std.testing.expect(findSkillByName(discovery.skills, "managed") != null);
+        try std.testing.expect(findSkillByName(discovery.skills, "workspace-fx") != null);
+        try std.testing.expect(findSkillByName(discovery.skills, "workspace-shared") != null);
+        try std.testing.expectEqual(@as(usize, 3), discovery.skills.len);
+    }
 }
