@@ -99,6 +99,49 @@ pub const AttemptEvidence = struct {
     network_failure: ?NetworkFailureEvidence = null,
 };
 
+/// Opaque provider state whose lifetime is exactly one user turn. The owner
+/// allocates on first capture, keeps that value immutable, and releases it at
+/// turn end. It is never part of a request body or durable message state.
+pub const ProviderTurnState = struct {
+    pub const maximum_bytes: usize = 8 * 1024;
+
+    allocator: Allocator,
+    value: ?[]u8 = null,
+
+    pub fn init(allocator: Allocator) ProviderTurnState {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *ProviderTurnState) void {
+        if (self.value) |value| {
+            @memset(value, 0);
+            self.allocator.free(value);
+            self.value = null;
+        }
+    }
+
+    pub fn get(self: *const ProviderTurnState) ?[]const u8 {
+        return self.value;
+    }
+
+    /// Captures the first usable header value. Later response attempts cannot
+    /// replace it, while malformed provider metadata is ignored.
+    pub fn capture(self: *ProviderTurnState, candidate: []const u8) Allocator.Error!void {
+        if (self.value != null or !is_valid_candidate(candidate)) return;
+        self.value = try self.allocator.dupe(u8, candidate);
+    }
+
+    fn is_valid_candidate(candidate: []const u8) bool {
+        if (candidate.len == 0 or candidate.len > maximum_bytes) return false;
+        var has_non_whitespace = false;
+        for (candidate) |byte| {
+            if ((byte < 0x20 and byte != '\t') or byte == 0x7f) return false;
+            if (byte != ' ' and byte != '\t') has_non_whitespace = true;
+        }
+        return has_non_whitespace;
+    }
+};
+
 /// Gives a cooperative single-threaded host a chance to publish UI and runtime
 /// state while provider transport remains pending.
 pub const CooperativePulse = struct {
@@ -235,6 +278,8 @@ pub const ModelRequest = struct {
     admission: Admission = .{},
     cancel_flag: *std.atomic.Value(bool),
     provider_attempt_owner: ProviderAttemptOwner = .transport,
+    /// Optional mutable turn-scoped owner, borrowed only for this call.
+    provider_turn_state: ?*ProviderTurnState = null,
 
     pub fn data(self: ModelRequest) RequestData {
         return .{
@@ -661,4 +706,40 @@ test "stream provider rejects non-system instructions before serialization" {
         try std.testing.expectEqual(error.InvalidProviderPrompt, err);
     }
     try std.testing.expectEqual(@as(usize, 0), builder.calls);
+}
+
+test "provider turn state accepts only the first response value" {
+    var state = ProviderTurnState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.capture("accepted-state");
+    try state.capture("later-attempt-state");
+
+    try std.testing.expectEqualStrings("accepted-state", state.get().?);
+}
+
+test "provider turn state ignores unusable values and accepts its exact byte bound" {
+    const candidate = try std.testing.allocator.alloc(u8, ProviderTurnState.maximum_bytes + 1);
+    defer std.testing.allocator.free(candidate);
+    @memset(candidate, 's');
+
+    var state = ProviderTurnState.init(std.testing.allocator);
+    defer state.deinit();
+    for ([_][]const u8{
+        "",
+        candidate,
+        "contains\rreturn",
+        "contains\nnewline",
+        " ",
+        "\t",
+        " \t ",
+        "contains\x01control",
+        "contains\x7fdelete",
+    }) |unusable| {
+        try state.capture(unusable);
+        try std.testing.expect(state.get() == null);
+    }
+
+    try state.capture(candidate[0..ProviderTurnState.maximum_bytes]);
+    try std.testing.expectEqual(ProviderTurnState.maximum_bytes, state.get().?.len);
 }

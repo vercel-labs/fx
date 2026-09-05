@@ -5233,6 +5233,12 @@ fn processQueuedPromptLoop(
     else
         .none;
     var restore_recovery_source = job.recovery_checkpoint != null;
+    var provider_turn_state = runtime_gateway_step.ProviderTurnState.init(std.heap.c_allocator);
+    defer provider_turn_state.deinit();
+    const provider_turn_state_ptr: ?*runtime_gateway_step.ProviderTurnState = if (job.provider == .codex)
+        &provider_turn_state
+    else
+        null;
     var step: usize = 0;
     agent_steps_loop: while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
         current_step_index = step + 1;
@@ -5925,6 +5931,7 @@ fn processQueuedPromptLoop(
                 .admission = .{ .context = &provider_admission, .admit_fn = ProviderAdmission.admit },
                 .cancel_flag = config.cancel_flag,
                 .provider_attempt_owner = .agent,
+                .provider_turn_state = provider_turn_state_ptr,
             };
             stream_result = runtime_gateway_step.streamModelCompletion(
                 deps.agent_stream_provider,

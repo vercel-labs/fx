@@ -14,6 +14,7 @@ const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
 
 pub const DeliveryCertainty = agent_stream_provider.DeliveryCertainty;
 pub const AttemptEvidence = agent_stream_provider.AttemptEvidence;
+pub const ProviderTurnState = agent_stream_provider.ProviderTurnState;
 
 pub const StreamResult = agent_stream_provider.Result;
 
