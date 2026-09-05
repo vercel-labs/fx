@@ -213,6 +213,9 @@ processes maintain their own module caches.
 
 Node.js 20+ is supported. Browser WebAssembly requires a JSPI-capable browser.
 Some Node versions require `--experimental-wasm-jspi`.
+Bun 1.4.2 is the tested recommendation for Bun's WebAssembly backend.
+Bun 1.3.14 can crash when a hot WebAssembly loop resumes through JSPI during
+JIT tier-up.
 
 ## Interactive terminal
 
