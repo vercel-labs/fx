@@ -165,6 +165,9 @@ fn persistUserPreferences(
     patch: config_runtime.UserSettingsPatch,
     runtime_changed: bool,
 ) !void {
+    // js-host surfaces have no user settings file; the host config store
+    // owns preferences there, so a HOME-based write has nothing to report.
+    if (comptime runtime_profile.allows(@TypeOf(app.*), .js_host_config)) return;
     var attempt = config_runtime.attemptUserPreferences(app.alloc, patch);
     defer attempt.deinit(app.alloc);
     switch (attempt) {
@@ -3577,26 +3580,28 @@ fn handleNotificationsCommand(app: anytype, rest: []const u8) !void {
         .notification_attention_required = sound_on,
         .notification_max = max,
     };
-    var attempt = config_runtime.attemptUserPreferences(app.alloc, patch);
-    defer attempt.deinit(app.alloc);
-    switch (attempt) {
-        .failure => |failure| try session_commands.reportUserSettingsFailure(
-            app,
-            "sound",
-            failure.err,
-            failure.cleanup,
-            runtime_changed,
-        ),
-        // announce_commit=false drops the routine "saved" line (the state
-        // notice below covers it, matching /fast) but keeps warnings.
-        .outcome => |outcome| _ = try session_commands.reportUserSettingsCommit(
-            app,
-            "sound",
-            patch,
-            outcome,
-            null,
-            false,
-        ),
+    if (comptime !runtime_profile.allows(@TypeOf(app.*), .js_host_config)) {
+        var attempt = config_runtime.attemptUserPreferences(app.alloc, patch);
+        defer attempt.deinit(app.alloc);
+        switch (attempt) {
+            .failure => |failure| try session_commands.reportUserSettingsFailure(
+                app,
+                "sound",
+                failure.err,
+                failure.cleanup,
+                runtime_changed,
+            ),
+            // announce_commit=false drops the routine "saved" line (the state
+            // notice below covers it, matching /fast) but keeps warnings.
+            .outcome => |outcome| _ = try session_commands.reportUserSettingsCommit(
+                app,
+                "sound",
+                patch,
+                outcome,
+                null,
+                false,
+            ),
+        }
     }
 
     try app.writeDomainNotice(.{
@@ -3664,6 +3669,9 @@ fn persistUserPreferencesSilently(
     patch: config_runtime.UserSettingsPatch,
     runtime_changed: bool,
 ) !void {
+    // js-host surfaces have no user settings file; the host config store
+    // owns preferences there, so a HOME-based write has nothing to report.
+    if (comptime runtime_profile.allows(@TypeOf(app.*), .js_host_config)) return;
     var attempt = config_runtime.attemptUserPreferences(app.alloc, patch);
     defer attempt.deinit(app.alloc);
     switch (attempt) {
