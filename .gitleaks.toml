@@ -1,0 +1,14 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Build output and unit-test fixture tokens"
+paths = [
+  '''^\.zig-cache/''',
+  '''^zig-out/''',
+]
+regexTarget = "line"
+regexes = [
+  '''abcdefghijklmnop''',
+  '''invalid-utf8-proof-key''',
+]
