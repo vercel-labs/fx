@@ -610,6 +610,7 @@ pub const QuestionPrompt = struct {
         const idx: usize = @min(entry.choice_index, entry.options.items.len - 1);
         const opt = entry.options.items[idx];
         if (opt.is_freeform_slot) {
+            if (entry.freeform_buffer.items.len == 0) return .redraw;
             try entry.confirmed_freeform_buffer.ensureTotalCapacity(alloc, entry.freeform_buffer.items.len);
             entry.confirmed_freeform_buffer.clearRetainingCapacity();
             entry.confirmed_freeform_buffer.appendSliceAssumeCapacity(entry.freeform_buffer.items);
@@ -1248,14 +1249,18 @@ test "submit on freeform slot stores the draft as its answer" {
     try std.testing.expectEqualStrings("xy", prompt.entries.items[0].answer.?);
 }
 
-test "submit on empty freeform slot stores an empty answer" {
+test "submit on empty freeform slot keeps the question active" {
     var prompt = QuestionPrompt{};
     defer prompt.deinit(std.testing.allocator);
     try syncTestQuestion(&prompt);
 
     prompt.moveChoice(-1);
-    try std.testing.expectEqual(QuestionInputEvent.all_decided, try prompt.apply(std.testing.allocator, .submit));
-    try std.testing.expectEqualStrings("", prompt.entries.items[0].answer.?);
+    try std.testing.expectEqual(QuestionInputEvent.redraw, try prompt.apply(std.testing.allocator, .submit));
+    try std.testing.expect(prompt.isActive());
+    try std.testing.expect(prompt.isFreeformSelected());
+    try std.testing.expectEqual(@as(u8, 0), prompt.current_index);
+    try std.testing.expect(prompt.entries.items[0].answer == null);
+    try std.testing.expect(prompt.entries.items[0].confirmed_choice_index == null);
 }
 
 test "moveChoice off freeform preserves buffer for re-entry" {
