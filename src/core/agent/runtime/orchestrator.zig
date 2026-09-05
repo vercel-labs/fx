@@ -6310,6 +6310,7 @@ fn processQueuedPromptLoop(
                 }
             }
             if (streamCompletionPtr(&stream_result)) |completion| {
+                agent.observeUsage(completion.usage);
                 completion.tool_calls = try normalize_terminal_request_tool_calls(
                     arena,
                     deps.tool_registry,
@@ -6761,7 +6762,6 @@ fn processQueuedPromptLoop(
                                     report_fn(deps.ctx, attempt_completion.usage);
                                 }
                             }
-                            agent.observeUsage(attempt_completion.usage);
                             stream_ctx.drop_staged_response_language_candidate();
                             stream_result.deinit(arena);
                             stream_result_set = false;
@@ -7274,7 +7274,6 @@ fn processQueuedPromptLoop(
                 report_fn(deps.ctx, completion.usage);
             }
         }
-        agent.observeUsage(completion.usage);
 
         if (disposition == .completed and completion.tool_calls.len > 0) {
             switch (tool_admission) {

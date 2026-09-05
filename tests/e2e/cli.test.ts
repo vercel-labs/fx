@@ -29,6 +29,7 @@ import {
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
+  fakeGatewaySse,
   startFakeGateway,
 } from "./tmux-helpers";
 
@@ -402,6 +403,7 @@ Options:
 The prompt may be passed as arguments or piped on stdin when no prompt args are given.
 TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw assistant Markdown.
 Operational progress and diagnostics are written to stderr. JSON \`output\` keeps accumulated assistant Markdown; \`final_output\` contains only the completed final response, or an empty string when absent.
+JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. Nested usage and dollar spend are excluded.
 --system replaces only the built-in base prompt for this request; tool, skill, project, and runtime context still apply.
 With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.
 `;
@@ -4026,7 +4028,7 @@ describe("cli: ask success", () => {
       expect(jsonResult.code).toBe(1);
       expect(jsonResult.stderr).toBe("");
       expect(jsonResult.stdout).toBe(
-        '{"output":"","final_output":"","exit_code":1,"model":"","session_id":"","steps":0,"tool_calls":[],"error":"PromptResourceLimitExceeded"}\n',
+        '{"output":"","final_output":"","exit_code":1,"model":"","session_id":"","steps":0,"tool_calls":[],"usage":{"input_tokens":null,"output_tokens":null},"error":"PromptResourceLimitExceeded"}\n',
       );
     },
     120_000,
@@ -4166,6 +4168,124 @@ describe("cli: ask success", () => {
     120_000,
   );
 
+  test.each([
+    {
+      name: "reports exact provider totals",
+      reportedUsage: { inputTokens: { total: 17 }, outputTokens: { total: 23 } },
+      expectedUsage: { input_tokens: 17, output_tokens: 23 },
+      toolLoop: false,
+      json: true,
+    },
+    {
+      name: "reports null when provider totals are missing",
+      reportedUsage: undefined,
+      expectedUsage: { input_tokens: null, output_tokens: null },
+      toolLoop: false,
+      json: true,
+    },
+    {
+      name: "sums main-agent completions across a read_file tool loop",
+      reportedUsage: { inputTokens: { total: 17 }, outputTokens: { total: 23 } },
+      expectedUsage: { input_tokens: 20, output_tokens: 28 },
+      toolLoop: true,
+      json: true,
+    },
+    {
+      name: "leaves plain output unchanged",
+      reportedUsage: { inputTokens: { total: 17 }, outputTokens: { total: 23 } },
+      expectedUsage: undefined,
+      toolLoop: false,
+      json: false,
+    },
+  ])(
+    "fx ask usage $name",
+    async ({ reportedUsage, expectedUsage, toolLoop, json }) => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-usage-"));
+      const answer = "Usage fixture complete.\n";
+      const gateway = startFakeGateway([
+        fakeGatewaySse([
+          toolLoop
+            ? {
+                type: "tool-call",
+                toolCallId: "read_usage_fixture",
+                toolName: "read_file",
+                input: JSON.stringify({ path: "fixture.txt" }),
+              }
+            : { type: "text-delta", id: "answer_1", delta: answer },
+          {
+            type: "finish",
+            finishReason: toolLoop
+              ? { unified: "tool-calls", raw: "tool-calls" }
+              : { unified: "stop", raw: "stop" },
+            usage: reportedUsage,
+          },
+        ]),
+        ...(toolLoop ? [fakeGatewayFinalText(answer)] : []),
+      ]);
+      try {
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        mkdirSync(home);
+        mkdirSync(workspace);
+        writeFileSync(join(workspace, "fixture.txt"), "usage fixture contents\n");
+
+        const result = await runFx(
+          [
+            "ask",
+            ...(json ? ["--json"] : []),
+            "--auto",
+            "--no-save",
+            toolLoop ? "Read fixture.txt and reply." : "Reply with the fixture answer.",
+          ],
+          {
+            cwd: realpathSync(workspace),
+            env: {
+              HOME: realpathSync(home),
+              AI_GATEWAY_API_KEY: "fake-ask-usage-key",
+              VERCEL_OIDC_TOKEN: undefined,
+              FX_DISABLE_KEYCHAIN: "1",
+              FX_GATEWAY_BASE_URL: gateway.baseUrl,
+              FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+              FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+              FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+              FX_MODEL: FAKE_GATEWAY_MODEL,
+              FX_AUTO_UPGRADE: "0",
+            },
+            timeoutMs: 60_000,
+          },
+        );
+
+        expect(result.code).toBe(0);
+        if (json) {
+          const output = JSON.parse(result.stdout);
+          expect(output.output).toBe(answer);
+          expect(output.final_output).toBe(answer.trimEnd());
+          expect(output.exit_code).toBe(0);
+          expect(output.session_id).toBe("");
+          expect(output.usage).toEqual(expectedUsage);
+          expect(output.tool_calls).toEqual(
+            toolLoop ? [{ name: "read_file", status: "success" }] : [],
+          );
+        } else {
+          expect(result.stdout).toBe(answer);
+        }
+        if (toolLoop) {
+          expect(result.stderr).toContain("Reading fixture.txt");
+          expect(gateway.requests[1]!.body).toContain("usage fixture contents");
+        } else {
+          expect(result.stderr).toBe("");
+        }
+        expect(gateway.requests).toHaveLength(toolLoop ? 2 : 1);
+        expect(gateway.classifierRequests).toHaveLength(0);
+        expect(existsSync(join(home, ".fx"))).toBe(false);
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
   test(
     "saved ask resumes the exact session while no-save creates no durable state",
     async () => {
@@ -4204,6 +4324,7 @@ describe("cli: ask success", () => {
         expect(first.code).toBe(0);
         expect(first.stderr).toBe("");
         const firstJson = JSON.parse(first.stdout.trim());
+        expect(firstJson.usage).toEqual({ input_tokens: 3, output_tokens: 5 });
         expect(typeof firstJson.session_id).toBe("string");
         expect(firstJson.session_id.length).toBeGreaterThan(0);
         expect(gateway.requests[0]?.headers.get("x-session-id")).toBe(
@@ -4247,9 +4368,9 @@ describe("cli: ask success", () => {
         );
         expect(resumed.code).toBe(0);
         expect(resumed.stderr).toBe("");
-        expect(JSON.parse(resumed.stdout.trim()).session_id).toBe(
-          firstJson.session_id,
-        );
+        const resumedJson = JSON.parse(resumed.stdout.trim());
+        expect(resumedJson.session_id).toBe(firstJson.session_id);
+        expect(resumedJson.usage).toEqual({ input_tokens: 3, output_tokens: 5 });
         expect(gateway.requests[1]?.headers.get("x-session-id")).toBe(
           firstJson.session_id,
         );
@@ -4286,7 +4407,9 @@ describe("cli: ask success", () => {
         );
         expect(noSave.code).toBe(0);
         expect(noSave.stderr).toBe("");
-        expect(JSON.parse(noSave.stdout.trim()).session_id).toBe("");
+        const noSaveJson = JSON.parse(noSave.stdout.trim());
+        expect(noSaveJson.session_id).toBe("");
+        expect(noSaveJson.usage).toEqual({ input_tokens: 3, output_tokens: 5 });
         expect(gateway.requests[2]?.headers.get("x-session-id")).toBeNull();
         expect(gateway.requests[2]?.headers.get("x-session-affinity")).toBeNull();
         expect(existsSync(join(noSaveHome, ".fx"))).toBe(false);

@@ -249,7 +249,7 @@ function finishOnlyGatewayStreamTimeoutResponse(): Response {
 
 function contentFilterResponse(): Response {
   return sse(
-    'data: {"type":"finish","finishReason":{"unified":"content-filter","raw":"content_filter"}}\n\n' +
+    'data: {"type":"finish","finishReason":{"unified":"content-filter","raw":"content_filter"},"usage":{"inputTokens":{"total":7},"outputTokens":{"total":11}}}\n\n' +
       "data: [DONE]\n\n",
   );
 }
@@ -325,6 +325,7 @@ function parseAskJson(stdout: string): {
   error?: string;
   session_id: string;
   tool_calls: Array<{ name: string; status: string }>;
+  usage: { input_tokens: number | null; output_tokens: number | null };
   recovery?: {
     state: string;
     kind: string;
@@ -3267,6 +3268,7 @@ describe("gateway stream lifecycle", () => {
       expect(first.code).toBe(0);
       expect(first.stderr).toBe("");
       expect(firstJson.output).toContain(accepted);
+      expect(firstJson.usage).toEqual({ input_tokens: 6, output_tokens: 10 });
       expect(firstJson.output).not.toContain(rejected);
       expect(gateway.requestCount()).toBe(2);
       expect(gateway.requests[0]!.body).toContain(
@@ -3297,6 +3299,7 @@ describe("gateway stream lifecycle", () => {
       expect(resumed.code).toBe(0);
       expect(resumed.stderr).toBe("");
       expect(parseAskJson(resumed.stdout).output).toContain(resumedText);
+      expect(parseAskJson(resumed.stdout).usage).toEqual({ input_tokens: 3, output_tokens: 5 });
       expect(gateway.requestCount()).toBe(3);
       expect(gateway.requests[2]!.body).toContain(accepted);
       expect(gateway.requests[2]!.body).not.toContain(rejected);
@@ -7268,6 +7271,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(result.code).toBe(0);
       expect(json.exit_code).toBe(0);
       expect(json.output).toContain("Recovered after route retry.");
+      expect(json.usage).toEqual({ input_tokens: 5, output_tokens: 7 });
+      expect(result.signal).toBeNull();
+      expect(result.timedOut).toBe(false);
       expect(json.output).not.toContain("⚠ API error");
       expect(json.recovery?.state).toBe("recovered");
       expect(json.recovery?.attempt).toBe(3);
@@ -7953,6 +7959,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(result.code).toBe(1);
       expect(json.exit_code).toBe(1);
       expect(json.error).toBe("ModelError");
+      expect(json.usage).toEqual({ input_tokens: 7, output_tokens: 11 });
+      expect(result.signal).toBeNull();
+      expect(result.timedOut).toBe(false);
       expect(json.recovery?.message).toContain(
         "⚠ blocked · content_filter · content filter",
       );
