@@ -12,6 +12,7 @@ const vt_emulator = @import("../../core/terminal/engine.zig");
 const assistant_presentation = @import("../../core/agent/assistant_presentation.zig");
 const code_highlight = @import("code_highlight.zig");
 const code_highlight_languages = @import("code_highlight_languages.zig");
+const mermaid_renderer = @import("mermaid.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -982,6 +983,26 @@ fn renderCodeBlockForTranscriptWithTheme(
     return rendered.toOwnedSlice(alloc);
 }
 
+fn renderAssistantCodeBlock(
+    alloc: Allocator,
+    block: assistant_presentation.CodeBlockPayload,
+    cols: u16,
+    styles: Styles,
+) ![]u8 {
+    if (std.ascii.eqlIgnoreCase(block.language, "mermaid")) {
+        // Transcript reflow calls this path again with the current width.
+        // A null diagram deliberately falls through to the source renderer,
+        // making wide diagram -> narrow source -> wide diagram reversible.
+        if (try mermaid_renderer.render(alloc, block.code, cols, .{
+            .dim = styles.dim_style,
+            .reset = styles.reset_style,
+        })) |rendered| {
+            return rendered;
+        }
+    }
+    return renderCodeBlockForTranscriptWithTheme(alloc, block, cols, styles.code_highlight_theme);
+}
+
 const CodeStyle = struct {
     foreground: ?[]const u8 = null,
 
@@ -1628,11 +1649,11 @@ fn renderEntryToBlockForPresentationInterruptible(
         },
         .assistant_code_block => |e| blk: {
             const gutter = assistant_wrap.gutterWidth(cols);
-            const rendered = try renderCodeBlockForTranscriptWithTheme(
+            const rendered = try renderAssistantCodeBlock(
                 alloc,
                 e.block,
                 cols -| gutter,
-                styles.code_highlight_theme,
+                styles,
             );
             defer alloc.free(rendered);
             const prefixed = try assistant_wrap.prefixStructuralRows(alloc, rendered, gutter);
@@ -3134,6 +3155,36 @@ test "semantic code blocks use the light syntax palette when requested" {
     try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "\x1b[38;5;238mconst\x1b[39m") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "\x1b[38;5;241m\"ready\"\x1b[39m") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "\x1b[38;5;243m// comment\x1b[39m") != null);
+}
+
+test "mermaid semantic code blocks render diagrams and preserve bounded fallback" {
+    const alloc = std.testing.allocator;
+    const language = try alloc.dupe(u8, "Mermaid");
+    defer alloc.free(language);
+    const code = try alloc.dupe(u8, "flowchart LR\n  A[Request] -->|validate| B[Response]");
+    defer alloc.free(code);
+    const entry = TranscriptEntry{ .assistant_code_block = .{
+        .id = 1,
+        .block = .{ .language = language, .code = code },
+    } };
+
+    const rendered = try renderEntryToBlock(alloc, entry, 80, .{
+        .dim_style = "\x1b[2m",
+        .reset_style = "\x1b[0m",
+    });
+    defer rendered.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "Request") != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "Response") != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "▶") != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "flowchart LR") == null);
+    var rows = std.mem.splitScalar(u8, rendered.bytes, '\n');
+    while (rows.next()) |row| {
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row) <= 80);
+    }
+
+    const narrow = try renderEntryToBlock(alloc, entry, 12, .{});
+    defer narrow.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, narrow.bytes, "flowchart") != null);
 }
 
 test "renderCodeBlockForTranscript infers registered high-confidence code blocks" {

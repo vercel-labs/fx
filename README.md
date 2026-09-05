@@ -84,6 +84,8 @@ When a tool targets a directory with additional project instructions, fx shows `
 
 Ctrl+L clears the inline display while keeping the conversation available in Ctrl+O. It preserves your draft and conversation context; `/clear` starts a fresh conversation instead.
 
+Closed `mermaid` code fences render as bounded Unicode diagrams directly in the TUI. Flowcharts, state diagrams, class diagrams, entity-relationship diagrams, and sequence diagrams are supported. Unsupported syntax and diagrams that do not fit the terminal remain visible as ordinary source code blocks.
+
 The status line hides the workspace path and Git branch by default. Enable the `Status line workspace` option in `/settings`, run `/statusline workspace`, or set it in `~/.fx/settings.json`:
 
 ```json
