@@ -4449,6 +4449,101 @@ for (const scenario of ["replace", "conflict", "invalid-index"] as const) {
   }, 60_000);
 }
 
+test("native terminal outcomes preserve recovery and incomplete warnings", async () => {
+  for (const provider of ["gateway", "codex", "grok"] as const) for (const mode of ["transient", "partial", "tool", "rejected", "rejected-partial", "length", "length-with-status"]) {
+    const native = provider !== "gateway";
+    if (!native && mode !== "transient") continue;
+    const profile = mkdtempSync(join(tmpdir(), "fx-native-outcomes-"));
+    const model = native ? "fixture-model" : FAKE_GATEWAY_MODEL;
+    const limited = mode.startsWith("length");
+    const rejected = mode.startsWith("rejected");
+    const event = (text: string) => native
+      ? { type: "response.output_text.delta", output_index: 0, content_index: 0, delta: text }
+      : { type: "text-delta", id: "answer", delta: text };
+    const terminal = native
+      ? { type: "response.completed", response: { id: "resp_ok", status: "completed", output: [], usage: { input_tokens: 1, output_tokens: 1 } } }
+      : { type: "finish", finishReason: { unified: "stop" } };
+    const events: object[] = [];
+    if (mode === "partial") events.push(event("DISCARDED_PREVIEW"));
+    if (mode === "rejected-partial") events.push(event("REJECTED_PARTIAL"));
+    if (limited) events.push(event("LIMITED_ANSWER"));
+    if (mode === "tool" || rejected) {
+      writeFileSync(join(profile, "read-me.txt"), "must not be read by the failed attempt");
+      events.push({ type: "response.output_item.added", output_index: 1, item: { type: "function_call", id: "fc_failed", call_id: "failed", name: "read_file", arguments: JSON.stringify({ path: "read-me.txt" }) } });
+    }
+    const failure = { code: rejected ? "invalid_prompt" : "server_error", message: rejected ? "OUTCOME_REJECTED" : "OUTCOME_RETRY" };
+    if (limited) events.push({ type: "response.incomplete", response: { id: "resp_limited", ...(mode === "length-with-status" ? { status: "incomplete" } : {}), output: [], incomplete_details: { reason: "max_output_tokens" } } });
+    else if (native) events.push({ type: "response.failed", response: { id: "resp_failed", status: "failed", error: failure, output: [], usage: null } });
+    else events.push({ type: "error", error: failure }, { type: "finish", finishReason: { unified: "error" } });
+    const replies = [fakeGatewaySse(events), fakeGatewaySse([event("RECOVERED_OK"), terminal])];
+    const gateway = startFakeGateway(native ? [] : replies);
+    const direct = provider === "codex" ? startFakeCodexToolLoop({ model, responses: replies })
+      : provider === "grok" ? startFakeGrokToolLoop({ model, responses: replies }) : null;
+    try {
+      if (provider === "codex") writeSeededChatGptLogin(profile, direct!.accessToken);
+      else if (provider === "grok") writeSeededGrokLogin(profile, direct!.accessToken);
+      mkdirSync(join(profile, ".fx"), { recursive: true });
+      writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [native ? provider + "_model" : "model"]: model }));
+      const env = {
+        HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: native ? undefined : model,
+        FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_E2E_GATEWAY_MODELS_URL: gateway.baseUrl + "/coding-agent/v1/models",
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct?.responsesUrl, FX_E2E_OPENAI_CODEX_MODELS_URL: direct?.modelsUrl,
+        FX_E2E_XAI_GROK_RESPONSES_URL: direct?.responsesUrl, FX_E2E_XAI_GROK_MODELS_URL: direct?.modelsUrl,
+        FX_E2E_XAI_GROK_MODALITIES_URL: direct && "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+      };
+      const result = await runFx(["ask", "--json", "--auto", "Report the supplied answer without using tools."], { cwd: profile, env, timeoutMs: TIMEOUT });
+      expect(result.signal).toBeNull();
+      expect(result.code, result.stdout + result.stderr).toBe(rejected ? 1 : 0);
+      expect(direct ? direct.bodies.length : gateway.requests.length).toBe(rejected || limited ? 1 : 2);
+      const output = JSON.parse(result.stdout);
+      expect(output.tool_calls).toEqual([]);
+      if (native && !limited) {
+        const usage = JSON.parse(readFileSync(join(profile, ".fx", "sessions", output.session_id, "usage-v2.json"), "utf8"));
+        expect(usage.snapshot.billing).toBe("incomplete");
+      }
+      if (rejected) {
+        expect(result.stderr).toContain("invalid_prompt: OUTCOME_REJECTED");
+        expect(result.stderr).not.toContain("retrying");
+        if (mode === "rejected-partial") {
+          const detail = await runFx(["session", "--json", "--id", output.session_id], { cwd: profile, env });
+          expect(detail.code).toBe(0);
+          const history = JSON.parse(detail.stdout).history;
+          expect(history).toHaveLength(1);
+          expect(history[0].kind).toBe("interrupted");
+          expect(history[0].assistant).toBe("REJECTED_PARTIAL");
+          expect(history[0].execution?.tool_steps ?? []).toEqual([]);
+          expect(history[0].tool_call).toBeNull();
+          expect(history[0].completed_tool_names).toEqual([]);
+          const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", output.session_id, "Continue from the saved partial answer without using tools."], { cwd: profile, env, timeoutMs: TIMEOUT });
+          expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
+          expect(JSON.parse(resumed.stdout).output).toBe("RECOVERED_OK");
+          expect(direct!.bodies).toHaveLength(2);
+          const input = JSON.parse(direct!.bodies[1]).input;
+          expect(JSON.stringify(input)).toContain("REJECTED_PARTIAL");
+          expect(input.filter((item: { type?: string }) => item.type === "function_call")).toEqual([]);
+        }
+      } else {
+        expect(output.output).toBe(limited ? "LIMITED_ANSWER" : "RECOVERED_OK");
+        expect(result.stderr).toContain(limited ? "response hit provider length limit" : "OUTCOME_RETRY");
+        const detail = await runFx(["session", "--json", "--id", output.session_id], { cwd: profile, env });
+        expect(detail.code).toBe(0);
+        const history = JSON.parse(detail.stdout).history;
+        expect(history).toHaveLength(1);
+        expect(history[0].assistant).toBe(limited ? "LIMITED_ANSWER" : "RECOVERED_OK");
+        expect(history[0].execution.tool_steps).toEqual([]);
+        if (mode === "partial") expect(direct!.bodies[1]).not.toContain("DISCARDED_PREVIEW");
+      }
+      if (native) expect(gateway.requests).toHaveLength(0);
+    } finally {
+      direct?.stop();
+      gateway.stop();
+      rmSync(profile, { recursive: true, force: true });
+    }
+  }
+}, 60_000);
+
 test("provider SSE framing preserves saved and resumed answers", async () => {
   const prefix = "CONTROL_PREFIX\n", answer = "EXPECTED_FINAL";
   for (const provider of ["gateway", "codex", "grok"] as const) for (const mode of ["no-space", "multiline", "invalid"]) {

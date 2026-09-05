@@ -488,7 +488,6 @@ fn mapReducerError(err: anyerror) anyerror {
     return switch (err) {
         error.EventTooLarge => error.OpenAICodexSseEventTooLarge,
         error.InvalidEvent => error.InvalidOpenAICodexSseEvent,
-        error.ResponseFailed => error.OpenAICodexResponseFailed,
         error.StreamIncomplete => error.OpenAICodexStreamIncomplete,
         error.ToolCallLimitExceeded => error.OpenAICodexToolCallLimitExceeded,
         error.ToolArgumentsTooLarge => error.OpenAICodexToolArgumentsTooLarge,

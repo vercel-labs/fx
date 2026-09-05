@@ -823,6 +823,8 @@ pub const Reducer = struct {
     finish_reason: ?types.ProviderFinishReason = null,
     usage: types.Usage = .{},
     generation_id: ?[]u8 = null,
+    provider_failure_detail: ?[]u8 = null,
+    provider_failure_cause: ?types.ProviderFailureCause = null,
     terminal_seen: bool = false,
     text_parts: std.AutoHashMapUnmanaged(TextKey, TextPart) = .empty,
     last_text_key: ?TextKey = null,
@@ -842,6 +844,7 @@ pub const Reducer = struct {
         for (self.tools.items) |*tool| tool.deinit(alloc);
         self.tools.deinit(alloc);
         if (self.generation_id) |id| alloc.free(id);
+        if (self.provider_failure_detail) |detail| alloc.free(detail);
         self.* = undefined;
     }
 
@@ -966,11 +969,16 @@ pub const Reducer = struct {
             }
         } else if (std.mem.eql(u8, event_type, "response.completed") or
             std.mem.eql(u8, event_type, "response.done") or
-            std.mem.eql(u8, event_type, "response.incomplete"))
+            std.mem.eql(u8, event_type, "response.incomplete") or
+            std.mem.eql(u8, event_type, "response.failed"))
         {
-            const response_value = parsed.value.object.get("response") orelse return false;
-            if (response_value != .object) return false;
-            if (response_value.object.get("output")) |output| {
+            const response_value = parsed.value.object.get("response") orelse return error.InvalidEvent;
+            if (response_value != .object) return error.InvalidEvent;
+            const status = try terminal_status(event_type, response_value.object);
+            if (status == .failed) {
+                const failure = response_value.object.get("error");
+                try self.accept_failure(alloc, if (failure != null and failure.? == .object) failure.?.object else .{});
+            } else if (response_value.object.get("output")) |output| {
                 if (output != .array) return error.InvalidEvent;
                 for (output.array.items, 0..) |item, output_index| {
                     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
@@ -988,7 +996,7 @@ pub const Reducer = struct {
             if (cancel_flag.load(.seq_cst)) return error.Cancelled;
             self.terminal_seen = true;
             self.finish_reason = finishReason(
-                stringField(response_value.object, "status"),
+                status,
                 response_value.object,
                 self.tools.items.len > 0,
             );
@@ -998,12 +1006,30 @@ pub const Reducer = struct {
                 self.generation_id = try alloc.dupe(u8, id);
             }
             return true;
-        } else if (std.mem.eql(u8, event_type, "response.failed") or
-            std.mem.eql(u8, event_type, "error"))
-        {
-            return error.ResponseFailed;
+        } else if (std.mem.eql(u8, event_type, "error")) {
+            try self.accept_failure(alloc, parsed.value.object);
+            self.terminal_seen = true;
+            self.finish_reason = .provider_error;
+            return true;
         }
         return false;
+    }
+
+    fn accept_failure(self: *Reducer, alloc: std.mem.Allocator, fields: std.json.ObjectMap) !void {
+        const code = stringField(fields, "code") orelse "provider_error";
+        const message = stringField(fields, "message") orelse "Provider response failed";
+        const bounded_code = types.ModelFailureDiagnostic.init(code);
+        const bounded_message = types.ModelFailureDiagnostic.init(message);
+        var buffer: [2 * types.ModelFailureDiagnostic.max_bytes + 2]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buffer, "{s}: {s}", .{ bounded_code.view(), bounded_message.view() });
+        const detail = types.ModelFailureDiagnostic.init(text);
+        self.provider_failure_detail = try alloc.dupe(u8, detail.view());
+        self.provider_failure_cause = if (std.mem.eql(u8, code, "server_error"))
+            null
+        else if (std.mem.eql(u8, code, "rate_limit_exceeded"))
+            .rate_limited
+        else
+            .non_retryable;
     }
 
     fn appendReplayPart(self: *Reducer, bytes: []const u8, limit: usize) !void {
@@ -1172,11 +1198,15 @@ pub const Reducer = struct {
         }
         const generation_id = self.generation_id;
         self.generation_id = null;
+        const provider_failure_detail = self.provider_failure_detail;
+        self.provider_failure_detail = null;
         return .{
             .content = owned_content,
             .tool_calls = owned_tools,
             .assistant_phase = self.assistant_phase.resolved(),
             .generation_id = generation_id,
+            .provider_failure_detail = provider_failure_detail,
+            .provider_failure_cause = self.provider_failure_cause,
             .provider_state_json = owned_provider_state,
             .finish_reason = self.finish_reason orelse if (owned_tools.len > 0) .tool_calls else .stop,
             .usage = self.usage,
@@ -1215,6 +1245,7 @@ const ToolRecordTest = struct {
         if (completion.content) |value| self.alloc.free(value);
         if (completion.provider_state_json) |value| self.alloc.free(value);
         if (completion.generation_id) |value| self.alloc.free(value);
+        if (completion.provider_failure_detail) |value| self.alloc.free(value);
     }
 
     fn ignore(_: *anyopaque, _: []const u8) void {}
@@ -1229,6 +1260,117 @@ test "Responses text finalization preserves mixed streamed and final-only items"
     const completion = try stream.finish();
     defer stream.freeCompletion(completion);
     try std.testing.expectEqualStrings("COMMENTARY_ITEM\nFINAL_ANSWER_ITEM", completion.content.?);
+}
+
+test "Responses terminal failures retain provider diagnostics as outcomes" {
+    for ([_][]const u8{
+        "{\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failed\",\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"temporarily unavailable\"}}}",
+        "{\"type\":\"error\",\"code\":\"server_error\",\"message\":\"temporarily unavailable\"}",
+    }) |event| {
+        var stream = ToolRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        try stream.apply(event);
+        const completion = try stream.finish();
+        defer stream.freeCompletion(completion);
+        try std.testing.expectEqual(types.ProviderFinishReason.provider_error, completion.finish_reason.?);
+        try std.testing.expectEqualStrings("server_error: temporarily unavailable", completion.provider_failure_detail.?);
+    }
+}
+
+test "Responses terminal incomplete event does not require nested status" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply("{\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}");
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqual(types.ProviderFinishReason.length, completion.finish_reason.?);
+}
+
+test "Responses terminal failure classification is conservative and diagnostics are bounded" {
+    const cases = .{
+        .{ "server_error", false },
+        .{ "rate_limit_exceeded", false },
+        .{ "invalid_prompt", true },
+        .{ "unknown_code", true },
+    };
+    inline for (cases) |case| {
+        var stream = ToolRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        const event = try std.json.Stringify.valueAlloc(std.testing.allocator, .{
+            .type = "response.failed",
+            .response = .{ .id = "resp_failure", .@"error" = .{ .code = case[0], .message = "é" ** 512 }, .usage = .{ .input_tokens = 7, .output_tokens = 3 } },
+        }, .{});
+        defer std.testing.allocator.free(event);
+        try stream.apply(event);
+        const completion = try stream.finish();
+        defer stream.freeCompletion(completion);
+        try std.testing.expectEqual(case[1], completion.provider_failure_cause == .non_retryable);
+        if (std.mem.eql(u8, case[0], "rate_limit_exceeded")) {
+            try std.testing.expectEqual(@as(?types.ProviderFailureCause, .rate_limited), completion.provider_failure_cause);
+        }
+        try std.testing.expect(completion.provider_failure_detail.?.len <= types.ModelFailureDiagnostic.max_bytes);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(completion.provider_failure_detail.?));
+        try std.testing.expect(std.mem.startsWith(u8, completion.provider_failure_detail.?, case[0]));
+        try std.testing.expectEqualStrings("resp_failure", completion.generation_id.?);
+        try std.testing.expectEqual(@as(?u64, 7), completion.usage.input_tokens);
+        try std.testing.expectEqual(@as(?u64, 3), completion.usage.output_tokens);
+    }
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply("{\"type\":\"response.failed\",\"response\":{\"error\":null}}");
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqual(types.ProviderFinishReason.provider_error, completion.finish_reason.?);
+    try std.testing.expectEqual(types.ProviderFailureCause.non_retryable, completion.provider_failure_cause.?);
+    try std.testing.expect(completion.provider_failure_detail.?.len > 0);
+}
+
+test "Responses terminal metadata rejects contradictions before publishing final text" {
+    for ([_][]const u8{
+        "{\"type\":\"response.completed\",\"response\":{\"status\":\"incomplete\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"must not publish\"}]}]}}",
+        "{\"type\":\"response.incomplete\",\"response\":{\"status\":\"completed\"}}",
+        "{\"type\":\"response.failed\",\"response\":{\"status\":42}}",
+        "{\"type\":\"response.done\",\"response\":{\"status\":\"in_progress\"}}",
+    }) |event| {
+        var stream = TextRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        try std.testing.expectError(error.InvalidEvent, stream.apply(event));
+        try stream.expect_emitted("");
+    }
+}
+
+test "Responses terminal failure retains progress without final-only output" {
+    var stream = TextRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.delta(0, 0, "partial");
+    try stream.apply(ToolRecordTest.start);
+    try stream.apply("{\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\",\"message\":\"retry\"},\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"must not publish\"}]}]}}");
+    try stream.expect_emitted("partial");
+    const completion = try stream.reducer.finish(stream.alloc, &stream.cancelled, stream.limits);
+    var owned: stream_provider.Result = .{ .completed = .{ .completion = completion, .ownership = .owned } };
+    defer owned.deinit(stream.alloc);
+    try std.testing.expectEqualStrings("partial", completion.content.?);
+    try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
+    try std.testing.expectEqual(types.ProviderCompletionDisposition.provider_failure, types.classifyProviderCompletion(completion));
+}
+
+test "Responses terminal failure releases allocations and obeys cancellation" {
+    const Scenario = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var stream = ToolRecordTest.init(alloc);
+            defer stream.deinit();
+            try stream.apply(ToolRecordTest.start);
+            try stream.apply("{\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failure\",\"error\":{\"code\":\"server_error\",\"message\":\"retry\"}}}");
+            const completion = try stream.finish();
+            defer stream.freeCompletion(completion);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    stream.cancelled.store(true, .seq_cst);
+    try std.testing.expectError(error.Cancelled, stream.apply("{\"type\":\"error\",\"code\":\"server_error\"}"));
+    try std.testing.expectError(error.Cancelled, stream.finish());
 }
 
 const TextRecordTest = struct {
@@ -1777,14 +1919,36 @@ fn findTool(tools: []const ToolAccumulator, output_index: i64) ?usize {
     return null;
 }
 
+const TerminalStatus = enum { completed, incomplete, failed, cancelled };
+
+fn terminal_status(event_type: []const u8, response: std.json.ObjectMap) error{InvalidEvent}!TerminalStatus {
+    const expected: ?TerminalStatus = if (std.mem.eql(u8, event_type, "response.completed"))
+        .completed
+    else if (std.mem.eql(u8, event_type, "response.incomplete"))
+        .incomplete
+    else if (std.mem.eql(u8, event_type, "response.failed"))
+        .failed
+    else
+        null;
+    if (response.get("status")) |value| {
+        if (value != .string) return error.InvalidEvent;
+        const status = std.meta.stringToEnum(TerminalStatus, value.string) orelse return error.InvalidEvent;
+        if (expected) |kind| if (status != kind) return error.InvalidEvent;
+        return status;
+    }
+    if (expected) |kind| return kind;
+    if (response.get("error")) |value| if (value != .null) return .failed;
+    if (response.get("incomplete_details")) |value| if (value != .null) return .incomplete;
+    return .completed;
+}
+
 fn finishReason(
-    status: ?[]const u8,
+    status: TerminalStatus,
     response: std.json.ObjectMap,
     has_tools: bool,
 ) types.ProviderFinishReason {
-    const value = status orelse return if (has_tools) .tool_calls else .stop;
-    if (std.mem.eql(u8, value, "completed")) return if (has_tools) .tool_calls else .stop;
-    if (std.mem.eql(u8, value, "incomplete")) {
+    if (status == .completed) return if (has_tools) .tool_calls else .stop;
+    if (status == .incomplete) {
         if (response.get("incomplete_details")) |details| if (details == .object) {
             if (stringField(details.object, "reason")) |reason| {
                 if (std.mem.eql(u8, reason, "max_output_tokens")) return .length;
@@ -1793,10 +1957,7 @@ fn finishReason(
         };
         return .provider_error;
     }
-    if (std.mem.eql(u8, value, "failed") or std.mem.eql(u8, value, "cancelled")) {
-        return .provider_error;
-    }
-    return if (has_tools) .tool_calls else .other;
+    return .provider_error;
 }
 
 fn parseUsage(response: std.json.ObjectMap) types.Usage {

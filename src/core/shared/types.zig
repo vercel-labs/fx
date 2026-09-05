@@ -1286,6 +1286,8 @@ pub const ProviderFinishReason = enum {
 
 pub const ProviderFailureCause = enum {
     gateway_stream_timeout,
+    non_retryable,
+    rate_limited,
 };
 
 pub const ModelCompletion = struct {

@@ -5573,6 +5573,35 @@ test "processQueuedPrompt disables provider option fast after a replay safe SSE 
     try expectBodyContains(&gateway, 1, "\"providerOptions\":{\"gateway\":{\"caching\":\"auto\"}}");
 }
 
+test "processQueuedPrompt preserves fast mode after a streamed rate limit" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .finish_reason = .provider_error, .provider_failure_cause = .rate_limited, .provider_failure_detail = "rate_limit_exceeded: retry later" },
+        .{ .content = "Recovered" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    const overrides = [_]ModelCapabilityOverride{.{
+        .model = "fixture/model",
+        .capabilities = model_capabilities.resolveCapabilities("fixture/model", .{ .supports_fast_mode = true }),
+    }};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.capability_overrides = &overrides;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.model = @constCast("fixture/model");
+    var config = fixture.config();
+    config.fast_mode = true;
+    config.max_provider_attempts = 2;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
+    for (0..2) |index| try expectBodyContains(&gateway, index, "\"speed\":\"fast\"");
+    try std.testing.expectEqual(@as(?types.ModelRecoveryCause, .rate_limited), hooks.route_recovery_statuses.items[0].cause);
+}
+
 test "processQueuedPrompt disables provider option fast after a replay safe HTTP failure" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{
@@ -7029,6 +7058,35 @@ test "processQueuedPrompt exhaustion pauses without invoking route recovery" {
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
     try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_statuses.items.len);
     try expectRouteStatus(&hooks, 0, .terminal_provider_error, "⚠ Provider unavailable · provider_error: route failed · recovery paused after 1/1 attempts");
+}
+
+test "processQueuedPrompt stops nonretryable provider outcomes without releasing tools" {
+    const alloc = std.testing.allocator;
+    const chunks = [_][]const u8{"accepted partial response"};
+    const calls = [_]ToolCall{toolCall("rejected_call", "read_file", "{\"path\":\"a.txt\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .chunks = &chunks, .content = "accepted partial response", .finish_reason = .provider_error, .provider_failure_cause = .non_retryable, .provider_failure_detail = "invalid_prompt: request rejected", .tool_calls = &calls },
+        .{ .content = "must not be requested" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.max_provider_attempts = 2;
+
+    try std.testing.expectError(error.ModelError, runFakePrompt(&gateway, &hooks, config, fixture.job()));
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_statuses.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.system_notices.items.len);
+    try std.testing.expect(std.mem.find(u8, hooks.system_notices.items[0], "invalid_prompt: request rejected") != null);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    const interrupted = hooks.history_turns.items[0].interrupted;
+    try std.testing.expectEqualStrings("accepted partial response", interrupted.assistant.?);
+    try std.testing.expectEqual(@as(?types.InterruptedTerminalReason, .failed), interrupted.terminal_reason);
+    try std.testing.expectEqual(@as(usize, 0), interrupted.execution.tool_steps.len);
 }
 
 test "processQueuedPrompt spacer newline is skipped for ask first tool" {

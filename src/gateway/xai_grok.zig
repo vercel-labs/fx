@@ -491,7 +491,6 @@ fn mapReducerError(err: anyerror) anyerror {
         error.EventTooLarge => error.XaiGrokSseEventTooLarge,
         error.StreamTooLarge => error.XaiGrokResourceLimitExceeded,
         error.InvalidEvent => error.InvalidXaiGrokSseEvent,
-        error.ResponseFailed => error.XaiGrokResponseFailed,
         error.StreamIncomplete => error.XaiGrokStreamIncomplete,
         error.ToolCallLimitExceeded => error.XaiGrokToolCallLimitExceeded,
         error.ToolArgumentsTooLarge => error.XaiGrokToolArgumentsTooLarge,

@@ -6796,6 +6796,8 @@ fn processQueuedPromptLoop(
                 const finish_reason = attempt_completion.finish_reason;
                 const cause: model_response_recovery.FailureCause = if (attempt_completion.provider_failure_cause == .gateway_stream_timeout)
                     .provider_stream_timeout
+                else if (attempt_completion.provider_failure_cause == .rate_limited)
+                    .rate_limited
                 else if (attempt_disposition == .interrupted)
                     .response_interrupted
                 else if (finish_reason.? == .content_filter)
@@ -6809,19 +6811,23 @@ fn processQueuedPromptLoop(
                 );
                 attempt_failure_diagnostic = diagnostic;
                 latest_recovery_diagnostic = diagnostic;
-                const decision = model_response_recovery.decide(.{
-                    .cause = cause,
-                    .delivery = .possibly_sent,
-                    .attempts = .{ .consumed = semantic_attempt + 1, .limit = semantic_limit },
-                    .pacing = retry_pacing,
-                    .output = if (partial_assistant.len > 0) .partial else .none,
-                    .tool = effectiveRecoveryToolEvidence(
-                        preserved_tool_evidence,
-                        attempt_completion,
-                        &stream_ctx,
-                    ),
-                    .cancelled = config.cancel_flag.load(.seq_cst),
-                });
+                const non_retryable = attempt_completion.provider_failure_cause == .non_retryable;
+                const decision = if (non_retryable)
+                    model_response_recovery.Decision{ .strategy = .stop, .required_action = .change_request }
+                else
+                    model_response_recovery.decide(.{
+                        .cause = cause,
+                        .delivery = .possibly_sent,
+                        .attempts = .{ .consumed = semantic_attempt + 1, .limit = semantic_limit },
+                        .pacing = retry_pacing,
+                        .output = if (partial_assistant.len > 0) .partial else .none,
+                        .tool = effectiveRecoveryToolEvidence(
+                            preserved_tool_evidence,
+                            attempt_completion,
+                            &stream_ctx,
+                        ),
+                        .cancelled = config.cancel_flag.load(.seq_cst),
+                    });
                 if (attempt_disposition == .provider_failure or
                     attempt_completion.provider_failure_cause == .gateway_stream_timeout)
                 {
@@ -6837,7 +6843,7 @@ fn processQueuedPromptLoop(
                         decision.reserve_provider_attempt,
                     );
                 }
-                const route_changed = disableFastRouteAfterFailure(
+                const route_changed = !non_retryable and disableFastRouteAfterFailure(
                     &route_fast_mode,
                     &gateway_model,
                     job.model,
@@ -6987,7 +6993,24 @@ fn processQueuedPromptLoop(
                     completionContentBytes(attempt_completion),
                     attempt_completion.tool_calls.len,
                 });
-                if (finish_reason == .provider_error) {
+                if (attempt_completion.provider_failure_cause == .non_retryable) {
+                    try deps.push_system_notice(deps.ctx, diagnostic.view());
+                    const failed_assistant_source = stream_ctx.interruption_source_or("");
+                    if (stop_state.retained_candidate == null and
+                        std.mem.trim(u8, failed_assistant_source, " \t\r\n").len > 0)
+                    {
+                        try runtime_interruption.persistFailedPartialTurnOnce(
+                            deps,
+                            finalization,
+                            job,
+                            failed_assistant_source,
+                            &interrupted_persisted,
+                            step_ctx,
+                            within_turn_suffix.items,
+                            &stop_state.terminal_materializing,
+                        );
+                    }
+                } else if (finish_reason == .provider_error) {
                     if (replay_safe) {
                         try pushTerminalProviderFailureStatus(
                             deps,
