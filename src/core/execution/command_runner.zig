@@ -622,6 +622,20 @@ pub fn executeCommandInEnvironment(
     cwd: []const u8,
     environment: command_environment.Environment,
 ) !command_contract.RunCommandResult {
+    return executeCommandInEnvironmentResolving(cfg, arena, command, cwd, environment, .shell_defined);
+}
+
+/// `words` states whether the operator's shell may redefine the command before
+/// it runs. A command approved by parsing its text runs `as_parsed`, so the
+/// approval and the execution are about the same command.
+pub fn executeCommandInEnvironmentResolving(
+    cfg: Config,
+    arena: Allocator,
+    command: []const u8,
+    cwd: []const u8,
+    environment: command_environment.Environment,
+    words: shell_resolver.WordResolution,
+) !command_contract.RunCommandResult {
     switch (environment) {
         .legacy => return executeCommand(cfg, arena, command, cwd),
         .workspace_clean => return error.InvalidCommandEnvironment,
@@ -635,11 +649,15 @@ pub fn executeCommandInEnvironment(
     var effective_cfg = cfg;
     if (effective_cfg.timeout_started_ms == null) effective_cfg.timeout_started_ms = io_mod.milliTimestamp();
     try ExecutionControl.init(effective_cfg).check();
-    const invocation = try shell_resolver.capturedInvocation(scratch, environment, command);
+    const invocation = try shell_resolver.capturedInvocationResolving(scratch, environment, command, words);
     debug_trace.logf(
         "core",
-        "command runner explicit environment={s} shell={s}",
-        .{ @tagName(std.meta.activeTag(environment)), invocation.path },
+        "command runner explicit environment={s} shell={s} word_resolution={s}",
+        .{
+            @tagName(std.meta.activeTag(environment)),
+            invocation.path,
+            @tagName(words),
+        },
     );
     return executeRawInvocation(
         arena,
