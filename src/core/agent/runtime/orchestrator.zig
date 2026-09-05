@@ -3264,7 +3264,6 @@ noinline fn recoveryCheckpointAssistantSource(
 fn persistRecoveryCheckpoint(
     deps: *const AgentRuntimeDeps,
     finalization: *const TurnFinalizationGuard,
-    arena: Allocator,
     job: QueuedPrompt,
     current_turn_messages: []const ChatMessage,
     assistant_source: []const u8,
@@ -3280,6 +3279,11 @@ fn persistRecoveryCheckpoint(
     trace_ctx: TraceContext,
 ) !void {
     const effect = deps.recovery_checkpoint orelse return;
+    // Every sink copies or serializes the borrowed checkpoint synchronously.
+    // Retaining these full-history reconstructions in the turn arena is quadratic.
+    var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
     const execution = try runtime_execution_memory.buildExecutionMemory(
         arena,
         current_turn_messages,
@@ -3330,6 +3334,59 @@ fn persistRecoveryCheckpoint(
 
 fn streamSucceeded(result: runtime_gateway_step.StreamResult) bool {
     return std.meta.activeTag(result) == .completed;
+}
+
+test "recovery checkpoints do not accumulate temporary history copies in the turn arena" {
+    const support = @import("tests/support.zig");
+    const Sink = struct {
+        checkpoint: ?session_codec.RecoveryCheckpoint = null,
+        fail: bool = false,
+
+        fn set(raw: *anyopaque, checkpoint: session_codec.RecoveryCheckpoint) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail) return error.CheckpointWriteFailed;
+            const next = try checkpoint.dupe(std.testing.allocator);
+            if (self.checkpoint) |*old| old.deinit(std.testing.allocator);
+            self.checkpoint = next;
+        }
+    };
+    var sink: Sink = .{};
+    defer if (sink.checkpoint) |*checkpoint| checkpoint.deinit(std.testing.allocator);
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    var deps = fake.deps();
+    deps.ctx = &sink;
+    deps.recovery_checkpoint = .{ .set = Sink.set };
+    var fixture: support.PromptFixture = .{};
+    var finalization = TurnFinalizationGuard.init(&deps, 1, support.testLifecycleContext(
+        hooks.RuntimeView.empty(),
+        std.testing.allocator,
+        fixture.workspace_root,
+    ));
+    defer finalization.deinit();
+    var turn = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer turn.deinit();
+    const alloc = turn.allocator();
+    var messages: std.ArrayList(ChatMessage) = .empty;
+    for (0..1000) |step_index| {
+        const id = try std.fmt.allocPrint(alloc, "read_{d}", .{step_index});
+        const calls = try alloc.alloc(ToolCall, 1);
+        calls[0] = .{ .id = id, .name = "read_file", .arguments_json = "{\"path\":\"evidence.txt\"}" };
+        try messages.appendSlice(alloc, &.{
+            .{ .role = .assistant, .tool_calls = calls },
+            .{ .role = .tool, .tool_call_id = id, .tool_name = "read_file", .tool_result_status = .success, .content = "current evidence" ** 16 },
+        });
+        const retained_bytes = turn.queryCapacity();
+        try persistRecoveryCheckpoint(&deps, &finalization, fixture.job(), messages.items, "partial", "model", false, false, 10, 1, false, .transport_interrupted, .retry_request, .confirmed, .{});
+        try std.testing.expectEqual(retained_bytes, turn.queryCapacity());
+        try std.testing.expectEqual(step_index + 1, sink.checkpoint.?.execution.tool_steps.len);
+        try std.testing.expectEqualStrings(id, sink.checkpoint.?.execution.tool_steps[step_index].tool_calls[0].id);
+    }
+    sink.fail = true;
+    const retained_bytes = turn.queryCapacity();
+    try std.testing.expectError(error.CheckpointWriteFailed, persistRecoveryCheckpoint(&deps, &finalization, fixture.job(), messages.items, "cancelled", "model", false, false, 10, 1, false, .transport_interrupted, .pause, .confirmed, .{}));
+    try std.testing.expectEqual(retained_bytes, turn.queryCapacity());
+    try std.testing.expectEqual(@as(usize, 1000), sink.checkpoint.?.execution.tool_steps.len);
 }
 
 fn streamFailure(result: runtime_gateway_step.StreamResult) ?agent_stream_provider.Failure {
@@ -5409,7 +5466,6 @@ fn processQueuedPromptLoop(
                 try persistRecoveryCheckpoint(
                     deps,
                     finalization,
-                    arena,
                     job,
                     within_turn_suffix.items,
                     try recoveryCheckpointAssistantSource(
@@ -5447,7 +5503,6 @@ fn processQueuedPromptLoop(
                 try persistRecoveryCheckpoint(
                     deps,
                     finalization,
-                    arena,
                     job,
                     within_turn_suffix.items,
                     try recoveryCheckpointAssistantSource(
@@ -5861,7 +5916,6 @@ fn processQueuedPromptLoop(
                 try persistRecoveryCheckpoint(
                     deps,
                     finalization,
-                    arena,
                     job,
                     within_turn_suffix.items,
                     stream_ctx.interruption_source_or(""),
@@ -5958,7 +6012,6 @@ fn processQueuedPromptLoop(
                     try persistRecoveryCheckpoint(
                         deps,
                         finalization,
-                        arena,
                         job,
                         within_turn_suffix.items,
                         try recoveryCheckpointAssistantSource(
@@ -6056,7 +6109,6 @@ fn processQueuedPromptLoop(
                 try persistRecoveryCheckpoint(
                     deps,
                     finalization,
-                    arena,
                     job,
                     within_turn_suffix.items,
                     try recoveryCheckpointAssistantSource(
@@ -6099,7 +6151,6 @@ fn processQueuedPromptLoop(
                     try persistRecoveryCheckpoint(
                         deps,
                         finalization,
-                        arena,
                         job,
                         within_turn_suffix.items,
                         try recoveryCheckpointAssistantSource(
@@ -6367,7 +6418,6 @@ fn processQueuedPromptLoop(
                 try persistRecoveryCheckpoint(
                     deps,
                     finalization,
-                    arena,
                     job,
                     within_turn_suffix.items,
                     try recoveryCheckpointAssistantSource(
@@ -6461,7 +6511,6 @@ fn processQueuedPromptLoop(
                 try persistRecoveryCheckpoint(
                     deps,
                     finalization,
-                    arena,
                     job,
                     within_turn_suffix.items,
                     try recoveryCheckpointAssistantSource(
@@ -6557,7 +6606,6 @@ fn processQueuedPromptLoop(
                     try persistRecoveryCheckpoint(
                         deps,
                         finalization,
-                        arena,
                         job,
                         within_turn_suffix.items,
                         try recoveryCheckpointAssistantSource(
@@ -6598,7 +6646,6 @@ fn processQueuedPromptLoop(
                         try persistRecoveryCheckpoint(
                             deps,
                             finalization,
-                            arena,
                             job,
                             within_turn_suffix.items,
                             try recoveryCheckpointAssistantSource(
@@ -6893,7 +6940,6 @@ fn processQueuedPromptLoop(
                     try persistRecoveryCheckpoint(
                         deps,
                         finalization,
-                        arena,
                         job,
                         within_turn_suffix.items,
                         try recoveryCheckpointAssistantSource(
@@ -6933,7 +6979,6 @@ fn processQueuedPromptLoop(
                         try persistRecoveryCheckpoint(
                             deps,
                             finalization,
-                            arena,
                             job,
                             within_turn_suffix.items,
                             try recoveryCheckpointAssistantSource(

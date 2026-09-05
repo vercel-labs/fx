@@ -189,6 +189,8 @@ zig build -Doptimize=ReleaseSafe
 
 Run the test suite with `zig build test`. See [CONTRIBUTING.md](CONTRIBUTING.md) for development and contribution guidelines.
 
+A [bounded long-turn memory benchmark](docs/long-turn-memory.md) exercises saved turns against a local model fixture.
+
 ## License
 
 [Apache-2.0](LICENSE)
