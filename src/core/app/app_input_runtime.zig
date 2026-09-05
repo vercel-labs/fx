@@ -1278,6 +1278,10 @@ pub fn Runtime(comptime App: type) type {
                         _ = moveCompactCommandMenu(app, menu, -1);
                         app.shell.render_requests.request(.footer);
                     },
+                    27 => {
+                        _ = cancelCompactCommandMenu(app);
+                        app.shell.render_requests.request(.footer);
+                    },
                     else => {},
                 }
                 return true;
