@@ -2832,6 +2832,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(rowContaining(thinkingGrid, submittedPrompt)).toBe(
         rowContaining(preEnterGrid, submittedPrompt),
       );
+      expect(composerContains(thinkingGrid.join("\n"), newerDraft)).toBe(true);
+      await session.sendKeys("C-c");
+      expect(composerContains((await session.capturePaneGrid()).join("\n"), newerDraft)).toBe(false);
+      expect(hold.cancelled).toBe(false);
       await session.sendKeys("C-c");
       const cancelledPane = await session.waitForText(
         "What can fx do differently?",
@@ -2855,7 +2859,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(frameCommitted).toBeGreaterThanOrEqual(0);
       expect(promptQueued).toBeGreaterThan(frameCommitted);
       expect(workerBegin).toBeGreaterThan(promptQueued);
-      expect(composerContains(cancelledPane, newerDraft)).toBe(true);
+      expect(composerContains(cancelledPane, newerDraft)).toBe(false);
 
       expect(hold.cancelled).toBe(true);
       expect(readFileSync(stderrPath, "utf8")).toBe("");

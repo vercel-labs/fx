@@ -63,6 +63,79 @@ afterEach(async () => {
 
 describe.skipIf(SKIP)("tui: interrupt recovery", () => {
   test(
+    "Ctrl-C clears the composer before cancelling an active response",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-composer-interrupt-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const tracePath = join(root, "trace.log");
+      const tapePath = join(root, "render.fxtape");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+
+      const held: HoldState = { started: false, cancelled: false, cancelCount: 0, released: false };
+      gateway = startFakeGateway([
+        () => heldUntilReleasedResponse(held),
+        fakeGatewayFinalText("COMPOSER_INTERRUPT_RECOVERED"),
+      ]);
+      session = await TmuxSession.create({
+        cwd: workspace,
+        stderrPath,
+        isolated: true,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-composer-interrupt-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_TRACE_SCOPES: `${TRACE_SCOPES},input`,
+          FX_TRACE_LOG: tracePath,
+          FX_RECORD: tapePath,
+        },
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Hold this response.");
+      await waitForCondition(() => held.started, "response start");
+      await session.sendLiteral("DISCARD_THIS_DRAFT");
+      await session.waitForText("DISCARD_THIS_DRAFT", TIMEOUT);
+
+      await session.sendKeys("C-c");
+      const cleared = (await session.capturePaneGrid()).join("\n");
+      expect(cleared).not.toContain("DISCARD_THIS_DRAFT");
+      expect(cleared).not.toContain("What can fx do differently?");
+      expect(held.cancelCount).toBe(0);
+      expect(readTrace(tracePath)).toContain("draft cleared reason=ctrl_c");
+      expect(readTrace(tracePath)).not.toContain("event=cancel_requested");
+      expect(session.isPaneAlive()).toBe(true);
+
+      await session.sendKeys("C-c");
+      await waitForCondition(() => held.cancelled, "second Control-C cancellation");
+      await session.waitForText("What can fx do differently?", TIMEOUT);
+      expect(held.cancelCount).toBe(1);
+      expect(session.isPaneAlive()).toBe(true);
+
+      await session.sendText("Continue after cancellation.");
+      await session.waitForText("COMPOSER_INTERRUPT_RECOVERED", TIMEOUT);
+      const scrollback = await session.captureFullScrollback();
+      expect(countOccurrences(scrollback, "What can fx do differently?")).toBe(1);
+      expect(scrollback).not.toContain("DISCARD_THIS_DRAFT");
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.requests[1]!.body).not.toContain("DISCARD_THIS_DRAFT");
+      expect(gateway.requests[1]!.body).toContain("<turn_aborted>");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      const replay = Bun.spawnSync([join(import.meta.dir, "../../zig-out/bin/fx"), "replay", tapePath]);
+      expect(replay.exitCode).toBe(0);
+      expect(replay.stdout.toString()).toContain("COMPOSER_INTERRUPT_RECOVERED");
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "immediate prompt after cancellation keeps thinking visible and remains cancellable",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cancel-next-prompt-")));

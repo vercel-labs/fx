@@ -82,6 +82,8 @@ Tool calls are expanded by default. Enable `Collapse tool calls` in `/settings`,
 
 When a tool targets a directory with additional project instructions, fx shows `Reading project instructions before continuing:` before the agent decides whether to retry. This refresh does not add a failure or “command not run” count to the tool summary.
 
+While fx is working, Ctrl+C clears a nonempty composer without interrupting the turn. Press Ctrl+C again with an empty composer to cancel the active work.
+
 Ctrl+L clears the inline display while keeping the conversation available in Ctrl+O. It preserves your draft and conversation context; `/clear` starts a fresh conversation instead.
 
 The status line hides the workspace path and Git branch by default. Enable the `Status line workspace` option in `/settings`, run `/statusline workspace`, or set it in `~/.fx/settings.json`:

@@ -1533,6 +1533,12 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn handleSemanticCtrlC(app: *App) !void {
+            if (app.stream.active and draftHasState(app)) {
+                clearDraftState(app, "ctrl_c");
+                app.shell.render_requests.request(.footer);
+                return;
+            }
+
             const now = io_mod.milliTimestamp();
             const transition = gesture_state.pressCtrlCExit(
                 app.input_runtime.gestures,
@@ -10262,6 +10268,46 @@ test "app_input_runtime raw and Kitty Ctrl-C preserve double-press exit" {
 
         try feedRoutingBytes(&app, sequence);
         try std.testing.expect(app.should_exit);
+    }
+}
+
+test "app_input_runtime active Ctrl-C clears drafts before cancelling work" {
+    const sequences = [_][]const u8{ "\x03", "\x1b[99;5u" };
+    const drafts = [_]RoutingDraftKind{ .text, .paste, .image };
+    for (sequences) |sequence| {
+        for (drafts) |draft| {
+            for ([_]bool{ false, true }) |tool_active| {
+                const alloc = std.testing.allocator;
+                var app = try RoutingFakeApp.init(alloc);
+                defer app.deinit();
+                app.stream.active = true;
+                if (tool_active) {
+                    _ = try app.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+                        .id = .{ .turn_id = 1, .call_id = "command" },
+                        .reconciles_provisional_call_id = null,
+                        .tool_name = "shell",
+                        .activity_kind = .command,
+                    } });
+                }
+                try seedRoutingDraftForGuard(&app, draft);
+                app.shell.render_requests.clearReason(.footer);
+
+                try feedRoutingBytes(&app, sequence);
+
+                try std.testing.expect(!Runtime(RoutingFakeApp).draftHasState(&app));
+                try std.testing.expect(app.stream.active);
+                try std.testing.expect(!app.worker.cancel_requested);
+                try std.testing.expect(!app.input_runtime.gestures.ctrlCExitArmed());
+                try std.testing.expect(!app.should_exit);
+                try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+
+                try feedRoutingBytes(&app, sequence);
+
+                try std.testing.expect(app.worker.cancel_requested);
+                try std.testing.expect(app.input_runtime.gestures.ctrlCExitArmed());
+                try std.testing.expect(!app.should_exit);
+            }
+        }
     }
 }
 
