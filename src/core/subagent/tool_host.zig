@@ -250,10 +250,17 @@ pub const Runtime = struct {
                         const result = try self.observeManagedState(
                             alloc,
                             ready.child_id,
+                            operation_id,
                             options.cancel_flag,
                         );
                         break :blk result;
                     },
+                    .completed => |completed| break :blk self.completeManagedResult(
+                        alloc,
+                        completed.child_id,
+                        operation_id,
+                        completed.observation,
+                    ),
                 }
             },
         };
@@ -283,6 +290,10 @@ pub const Runtime = struct {
 
     const ManagedAdmission = union(enum) {
         ready: struct { child_id: []u8 },
+        completed: struct {
+            child_id: []u8,
+            observation: managed_owner.Observation,
+        },
         rejected: struct {
             child_id: ?[]u8 = null,
             code: []const u8,
@@ -291,6 +302,7 @@ pub const Runtime = struct {
         fn deinit(self: *ManagedAdmission, alloc: Allocator) void {
             switch (self.*) {
                 .ready => |ready| alloc.free(ready.child_id),
+                .completed => |completed| alloc.free(completed.child_id),
                 .rejected => |failure| if (failure.child_id) |child_id| {
                     alloc.free(child_id);
                 },
@@ -333,6 +345,16 @@ pub const Runtime = struct {
                 operation_id,
                 options.defaults,
             );
+            if (existing.last_work_id) |work_id| {
+                if (std.mem.eql(u8, work_id, operation_id)) return .{ .completed = .{
+                    .child_id = try alloc.dupe(u8, existing.id),
+                    .observation = .{
+                        .phase = existing.phase,
+                        .outcome = existing.last_outcome,
+                        .failure = existing.last_failure,
+                    },
+                } };
+            }
             return managedAdmissionReady(alloc, existing.id);
         }
 
@@ -439,6 +461,7 @@ pub const Runtime = struct {
         self: *Runtime,
         alloc: Allocator,
         child_id: []const u8,
+        work_id: []const u8,
         cancel_flag: ?*std.atomic.Value(bool),
     ) !ManagedExecutionResult {
         while (true) {
@@ -465,31 +488,33 @@ pub const Runtime = struct {
                 .running, .awaiting_approval => continue,
                 .idle, .finished, .interrupted => {},
             }
-            const result = try self.managedResultText(alloc, child_id);
-            defer if (result) |text| alloc.free(text);
-            const failure_text = if (observation.outcome == .failed)
-                try formatFailedResult(alloc, if (observation.failure) |*failure| failure.view() else null, result)
-            else
-                null;
-            defer if (failure_text) |text| alloc.free(text);
-            return self.encodeManaged(
-                alloc,
-                terminalResult(observation, failure_text orelse result),
-            );
+            return self.completeManagedResult(alloc, child_id, work_id, observation);
         }
+    }
+
+    fn completeManagedResult(
+        self: *Runtime,
+        alloc: Allocator,
+        child_id: []const u8,
+        work_id: []const u8,
+        observation: managed_owner.Observation,
+    ) !ManagedExecutionResult {
+        const result = try self.managedResultText(alloc, child_id, work_id);
+        defer if (result) |text| alloc.free(text);
+        const failure_text = if (observation.outcome == .failed)
+            try formatFailedResult(alloc, if (observation.failure) |*failure| failure.view() else null, result)
+        else
+            null;
+        defer if (failure_text) |text| alloc.free(text);
+        return self.encodeManaged(alloc, terminalResult(observation, failure_text orelse result));
     }
 
     fn managedResultText(
         self: *Runtime,
         alloc: Allocator,
         child_id: []const u8,
+        work_id: []const u8,
     ) !?[]u8 {
-        var lock = try self.managed.state_store.acquireLock(alloc);
-        defer lock.release();
-        var registry = try self.managed.state_store.load(alloc);
-        defer registry.deinit(alloc);
-        const child = registry.findById(child_id) orelse return null;
-        const work_id = child.last_work_id orelse return null;
         var state = self.sessions.loadReadOnly(alloc, child_id) catch return null;
         defer state.deinit(alloc);
         const text = assistantTextForWork(state.history, work_id) orelse return null;

@@ -6559,6 +6559,58 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 20_000);
 
+  test("subagent replay returns saved success and failure without another worker", async () => {
+    const root = createFixtureRoot("subagent-completed-replay");
+    const task = "Reply REPLAY_CHILD_DONE without tools.";
+    const seen: Array<{ ok: boolean; result: string; error_code: string | null }> = [];
+    let childRequests = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      const prompt = gatewayRequest(body).prompt;
+      const lastUser = prompt.findLastIndex((message) => message.role === "user");
+      const parts = prompt.slice(lastUser + 1).flatMap((message) => Array.isArray(message.content) ? message.content : []) as Array<Record<string, unknown>>;
+      const result = parts.find((part) => part.type === "tool-result" && part.toolCallId === "replayed_delegation");
+      if (result) {
+        seen.push(JSON.parse(contentText(result.output)));
+        return fakeGatewayFinalText("REPLAY_PARENT_DONE");
+      }
+      if (contentText(prompt[lastUser]?.content).includes(task)) {
+        childRequests++;
+        return fakeGatewayFinalText("REPLAY_CHILD_DONE");
+      }
+      return fakeGatewayToolCall("replayed_delegation", "subagent", { request: { action: "run", task } });
+    }, { classifierDecision: "clear", models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    const env = fixtureEnv(root, gateway, join(root.root, "trace.log"));
+    try {
+      const first = await runFx(["ask", "--json", "--auto", "Run the delegation."], { cwd: root.workspace, env, timeoutMs: 10_000 });
+      expect(first.code).toBe(0);
+      const sessionId = parseAskJson(first.stdout).session_id;
+      const repeat = ["ask", "--json", "--auto", "--resume-id", sessionId, "Observe that same delegation again."];
+      const second = await runFx(repeat, { cwd: root.workspace, env, timeoutMs: 10_000 });
+      expect(second.code).toBe(0);
+      expect(seen).toHaveLength(2);
+      expect(seen[0]).toEqual({ ok: true, result: "REPLAY_CHILD_DONE", error_code: null });
+      expect(seen[1]).toEqual(seen[0]);
+      const registryPath = join(root.home, ".fx", "sessions", sessionId, "subagent", "children.json");
+      const registry = JSON.parse(readFileSync(registryPath, "utf8"));
+      expect(registry.children).toHaveLength(1);
+      registry.children[0].last_outcome = "failed";
+      registry.children[0].last_failure = "agent_turn_failed: RetainedFailure";
+      writeFileSync(registryPath, JSON.stringify(registry));
+      const third = await runFx(repeat, { cwd: root.workspace, env, timeoutMs: 10_000 });
+      expect(third.code).toBe(0);
+      expect(seen).toHaveLength(3);
+      expect(seen[2]?.ok).toBe(false);
+      expect(seen[2]?.error_code).toBe("child_failed");
+      expect(seen[2]?.result).toContain("agent_turn_failed: RetainedFailure");
+      expect(seen[2]?.result).toContain("Partial result:\nREPLAY_CHILD_DONE");
+      expect(childRequests).toBe(1);
+      expect(gateway.requestCount()).toBe(7);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 35_000);
+
   test("subagent call waits for one terminal child result", async () => {
     const root = createFixtureRoot("subagent-terminal-result");
     const tracePath = join(root.root, "trace.log");
