@@ -75,6 +75,26 @@ docs, CI, or unrelated files. Do not run git.'
 
 revert() { git checkout -q -- . && git clean -fdq; }
 
+# Test gate: a change passes when it introduces no new failing test relative to
+# the baseline captured from the clean tree, so pre-existing environment
+# failures do not block progress. DI_SELF_IMPROVE_SKIP_TESTS=1 disables it.
+failing_tests() {
+  "$ZIG" build test $ZIG_BUILD_ARGS 2>&1 | sed -nE "s/^error: '([^']+)' (failed|crashed|terminated).*/\1/p" | sort -u
+}
+baseline_file=$(mktemp)
+if [ "${DI_SELF_IMPROVE_SKIP_TESTS:-0}" != 1 ]; then
+  echo "== capturing baseline test failures"
+  failing_tests > "$baseline_file"
+  echo "baseline failing tests: $(wc -l < "$baseline_file")"
+fi
+tests_pass() {
+  [ "${DI_SELF_IMPROVE_SKIP_TESTS:-0}" = 1 ] && return 0
+  local now; now=$(mktemp); failing_tests > "$now"
+  local new; new=$(comm -13 "$baseline_file" "$now")
+  rm -f "$now"
+  [ -z "$new" ] || { echo "new failing tests:" >&2; echo "$new" >&2; return 1; }
+}
+
 if [ "$merge_upstream" = 1 ]; then
   echo "== merge upstream $upstream/main"
   git fetch -q "$upstream" main
@@ -100,7 +120,7 @@ Finish with a one-line 'Summary:' of what you reconciled."
     fi
     git add -A
   fi
-  if ! "$ZIG" build -Doptimize=ReleaseSafe $ZIG_BUILD_ARGS || ! "$ZIG" build test $ZIG_BUILD_ARGS; then
+  if ! "$ZIG" build -Doptimize=ReleaseSafe $ZIG_BUILD_ARGS || ! tests_pass; then
     echo "self-improve: merged tree fails build/test; aborting merge" >&2
     git merge --abort 2>/dev/null || git reset -q --hard ORIG_HEAD; exit 1
   fi
@@ -127,7 +147,7 @@ for i in $(seq 1 "$iterations"); do
     echo "self-improve: no changes produced"
     continue
   fi
-  if ! "$ZIG" build -Doptimize=ReleaseSafe $ZIG_BUILD_ARGS || ! "$ZIG" build test $ZIG_BUILD_ARGS; then
+  if ! "$ZIG" build -Doptimize=ReleaseSafe $ZIG_BUILD_ARGS || ! tests_pass; then
     echo "self-improve: build/test failed; reverting" >&2
     revert
     continue

@@ -188,8 +188,10 @@ scripts/self-improve.sh -m deepseek/deepseek-v4-flash-vision-exp -- "make /model
 scripts/self-improve.sh --merge-upstream         # merge vercel-labs/fx main; di resolves conflicts
 ```
 
-Iterations that fail to build or test are reverted, so the branch only ever
-gains passing commits. `--no-push` keeps commits local; `--remote` and
+Iterations that fail to build or introduce a new failing test are reverted, so
+the branch only ever gains passing commits. The test gate compares against a
+baseline captured from the clean tree, so pre-existing failures on a machine do
+not block progress. `--no-push` keeps commits local; `--remote` and
 `--upstream` select the git remotes.
 
 ## Valgrind
