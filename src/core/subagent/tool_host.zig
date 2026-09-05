@@ -467,9 +467,14 @@ pub const Runtime = struct {
             }
             const result = try self.managedResultText(alloc, child_id);
             defer if (result) |text| alloc.free(text);
+            const failure_text = if (observation.outcome == .failed)
+                try formatFailedResult(alloc, if (observation.failure) |*failure| failure.view() else null, result)
+            else
+                null;
+            defer if (failure_text) |text| alloc.free(text);
             return self.encodeManaged(
                 alloc,
-                terminalResult(observation, result),
+                terminalResult(observation, failure_text orelse result),
             );
         }
     }
@@ -526,6 +531,28 @@ test "internal operation identity is deterministic and invocation-bound" {
     try std.testing.expectEqualStrings(first, replay);
     try std.testing.expect(!std.mem.eql(u8, first, changed));
     try std.testing.expect(std.mem.startsWith(u8, first, "fxop:2:m:41:"));
+}
+
+fn formatFailedResult(alloc: Allocator, failure: ?[]const u8, partial: ?[]const u8) ![]u8 {
+    const reason = failure orelse "failure reason unavailable";
+    const text = partial orelse "";
+    return std.fmt.allocPrint(alloc, "Subagent failed: {s}. Earlier tool calls may have completed; their effects are not rolled back.{s}{s}", .{
+        reason,
+        if (text.len > 0) "\n\nPartial result:\n" else "",
+        text,
+    });
+}
+
+test "subagent failure result distinguishes runtime cause from retained partial text" {
+    const alloc = std.testing.allocator;
+    const text = try formatFailedResult(alloc, "agent_turn_failed: SessionCommitFailed", "one edit completed");
+    defer alloc.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "SessionCommitFailed") != null);
+    try std.testing.expect(std.mem.endsWith(u8, text, "Partial result:\none edit completed"));
+    const legacy = try formatFailedResult(alloc, null, "");
+    defer alloc.free(legacy);
+    try std.testing.expect(std.mem.find(u8, legacy, "failure reason unavailable") != null);
+    try std.testing.expect(std.mem.find(u8, legacy, "Partial result:") == null);
 }
 
 fn terminalResult(

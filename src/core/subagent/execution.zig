@@ -1,12 +1,8 @@
 const std = @import("std");
-const agent_runtime = @import("../agent/agent_runtime.zig");
 const managed_execution = @import("../execution/managed_execution.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const permission_prompter = @import("../permissions/permission_prompter.zig");
-const runtime_assistant_stream = @import("../agent/runtime/assistant_stream.zig");
-const runtime_config = @import("../agent/runtime/config.zig");
 const runtime_deps = @import("../agent/runtime/deps.zig");
-const runtime_lifecycle = @import("../agent/runtime/lifecycle.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const authority_mod = @import("authority.zig");
 const approval_registry_mod = @import("approval_registry.zig");
@@ -234,7 +230,7 @@ pub const TurnContext = struct {
         []const u8,
         child_state.Phase,
     ) anyerror!void = null,
-    failure_diagnostic: ?[]u8 = null,
+    failure_diagnostic: ?types.ModelFailureDiagnostic = null,
     committed: bool = false,
 
     pub fn init(
@@ -260,7 +256,6 @@ pub const TurnContext = struct {
     }
 
     pub fn deinit(self: *TurnContext) void {
-        if (self.failure_diagnostic) |diagnostic| self.alloc.free(diagnostic);
         self.managed_executions.deinit();
         self.worker.deinit(self.alloc);
         self.runtime.deinit(self.alloc);
@@ -271,25 +266,12 @@ pub const TurnContext = struct {
         self: *TurnContext,
         code: []const u8,
         detail: []const u8,
-    ) Allocator.Error!void {
+    ) void {
         if (self.failure_diagnostic != null) return;
-        const safe_detail = if (text_utils.isModelSafeText(detail))
-            text_utils.utf8PrefixByBytes(
-                detail,
-                domain.max_cancellation_reason_bytes -| code.len -| 2,
-            )
-        else
-            "";
-        self.failure_diagnostic = if (safe_detail.len == 0)
-            try self.alloc.dupe(u8, text_utils.utf8PrefixByBytes(
-                code,
-                domain.max_cancellation_reason_bytes,
-            ))
-        else
-            try std.fmt.allocPrint(self.alloc, "{s}: {s}", .{ code, safe_detail });
+        self.failure_diagnostic = failureDiagnosticValue(code, detail);
     }
 
-    pub fn failureDiagnostic(self: *const TurnContext) ?[]const u8 {
+    pub fn failureDiagnostic(self: *const TurnContext) ?types.ModelFailureDiagnostic {
         return self.failure_diagnostic;
     }
 
@@ -630,30 +612,30 @@ pub const TurnContext = struct {
     }
 };
 
-pub const NormalAgentError = error{
-    OutOfMemory,
-    Cancelled,
-    AgentExecutionFailed,
-};
+pub fn failureDiagnosticValue(code: []const u8, detail: []const u8) types.ModelFailureDiagnostic {
+    const max_bytes = types.ModelFailureDiagnostic.max_bytes;
+    const prefix = text_utils.utf8PrefixByBytes(code, max_bytes);
+    const safe_detail = if (text_utils.isTerminalSafe(detail))
+        text_utils.utf8PrefixByBytes(detail, max_bytes -| prefix.len -| 2)
+    else
+        "";
+    if (safe_detail.len == 0) return types.ModelFailureDiagnostic.init(prefix);
+    var buffer: [max_bytes]u8 = undefined;
+    const text = std.fmt.bufPrint(&buffer, "{s}: {s}", .{ prefix, safe_detail }) catch unreachable;
+    return types.ModelFailureDiagnostic.init(text);
+}
 
-pub fn runNormalAgentTurn(
-    agent: *agent_runtime.Agent,
-    deps: *const runtime_deps.AgentRuntimeDeps,
-    semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
-    lifecycle: runtime_lifecycle.LifecycleContext,
-    config: runtime_config.Config,
-    prompt: worker_runtime.QueuedPrompt,
-) NormalAgentError!void {
-    agent_runtime.processAgentPrompt(
-        agent,
-        deps,
-        semantic_presentation,
-        lifecycle,
-        config,
-        prompt,
-    ) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.Cancelled => error.Cancelled,
-        else => error.AgentExecutionFailed,
-    };
+test "subagent failure capture is bounded and keeps the first cause without allocation" {
+    var turn: TurnContext = undefined;
+    turn.failure_diagnostic = null;
+    turn.setFailureDiagnostic("agent_turn_failed", "SessionCommitFailed");
+    turn.setFailureDiagnostic("cleanup", "OutOfMemory");
+    const retained = turn.failureDiagnostic().?;
+    turn.failure_diagnostic = null;
+    try std.testing.expectEqualStrings("agent_turn_failed: SessionCommitFailed", retained.view());
+    const long = failureDiagnosticValue("stage", "界" ** 200);
+    try std.testing.expect(long.view().len <= types.ModelFailureDiagnostic.max_bytes);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(long.view()));
+    const unsafe = failureDiagnosticValue("provider_http_error", "unsafe\x1b[31m");
+    try std.testing.expectEqualStrings("provider_http_error", unsafe.view());
 }

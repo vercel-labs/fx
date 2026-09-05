@@ -157,13 +157,11 @@ pub fn run(
             config.tool_context.credential_source,
         ) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
-            turn.setFailureDiagnostic("model_credential_resolution_failed", @errorName(err)) catch
-                return error.OutOfMemory;
+            turn.setFailureDiagnostic("model_credential_resolution_failed", @errorName(err));
             return error.ProviderFailed;
         };
         const credential = if (routed_credential) |*value| value else {
-            turn.setFailureDiagnostic("model_credential_missing", admission.model) catch
-                return error.OutOfMemory;
+            turn.setFailureDiagnostic("model_credential_missing", admission.model);
             return error.ProviderFailed;
         };
         routed_config.tool_context.api_key = credential.token;
@@ -196,7 +194,7 @@ pub fn run(
     defer if (context.refreshed_credential) |*credential| credential.deinit(turn.alloc);
     const recovery_checkpoint = turn.prepareRecoveryForActiveWork(arena) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        turn.setFailureDiagnostic("recovery_admission_failed", @errorName(err)) catch return error.OutOfMemory;
+        turn.setFailureDiagnostic("recovery_admission_failed", @errorName(err));
         return error.ProviderFailed;
     };
     const history = turn.sessionRuntime().snapshotHistory(arena) catch return error.OutOfMemory;
@@ -261,7 +259,7 @@ pub fn run(
         },
     );
     const deps = runtimeDeps(&context);
-    execution.runNormalAgentTurn(
+    agent_runtime.processAgentPrompt(
         &turn.sessionRuntime().agent,
         &deps,
         null,
@@ -308,10 +306,8 @@ pub fn run(
             error.Cancelled => error.Cancelled,
             else => error.ProviderFailed,
         };
-        if (mapped != error.OutOfMemory) {
-            turn.setFailureDiagnostic("agent_turn_failed", @errorName(err)) catch
-                return error.OutOfMemory;
-        }
+        turn.setFailureDiagnostic("agent_turn_failed", @errorName(err));
+        debug_trace.eventf("subagent", "child_execution_failed", trace_context, "child_id={s} err={s}", .{ turn.child_id orelse "unknown", @errorName(err) });
         return mapped;
     };
     return if (context.turn_outcome == .paused) .paused else .completed;
@@ -817,7 +813,7 @@ fn captureHttpError(
     defer context.turn.alloc.free(formatted);
     const redacted = try execution_memory.redactText(context.turn.alloc, formatted);
     defer context.turn.alloc.free(redacted);
-    try context.turn.setFailureDiagnostic("provider_http_error", redacted);
+    context.turn.setFailureDiagnostic("provider_http_error", redacted);
 }
 
 fn pushLiveEvent(raw: *anyopaque, event: worker_runtime.WorkerEvent) !void {
