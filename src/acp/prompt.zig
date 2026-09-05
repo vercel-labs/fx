@@ -301,6 +301,26 @@ const AcpContext = struct {
         try self.sendUpdate(out.writer.buffered());
     }
 
+    fn sendToolCallDiff(
+        self: *AcpContext,
+        tool_call_id: []const u8,
+        path: []const u8,
+        old_text: ?[]const u8,
+        new_text: []const u8,
+    ) !void {
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        defer out.deinit();
+        try acp_types.writeToolCallDiffUpdate(
+            &out.writer,
+            tool_call_id,
+            .in_progress,
+            path,
+            old_text,
+            new_text,
+        );
+        try self.sendUpdate(out.writer.buffered());
+    }
+
     fn sendToolCallError(self: *AcpContext, tool_call_id: []const u8, err_text: []const u8) !void {
         try self.sendToolCallErrorWithCommandResult(tool_call_id, err_text, null);
     }
@@ -1833,10 +1853,27 @@ fn completeToolCallTransport(
 }
 
 fn publishCommittedFileHandoff(
-    _: *anyopaque,
-    _: file_mutation.CommittedFileHandoff,
+    raw_ctx: *anyopaque,
+    handoff: file_mutation.CommittedFileHandoff,
 ) agent_runtime.SecondaryPublicationReport {
-    return .{ .diff = .skipped, .tracker = .skipped };
+    const full_view = handoff.full_view orelse {
+        return .{ .diff = .failed, .tracker = .skipped };
+    };
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.sendToolCallDiff(
+        full_view.lifecycle_id.call_id,
+        handoff.tracker.raw_path,
+        handoff.tracker.previous_content,
+        full_view.after_content,
+    ) catch |err| {
+        debug_trace.logf(
+            "acp",
+            "committed file diff publication failed call_id={s} err={s}",
+            .{ full_view.lifecycle_id.call_id, @errorName(err) },
+        );
+        return .{ .diff = .failed, .tracker = .skipped };
+    };
+    return .{ .diff = .published, .tracker = .skipped };
 }
 
 fn publishDeferredToolCompletion(
@@ -1846,7 +1883,9 @@ fn publishDeferredToolCompletion(
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     ctx.sendToolCallCompletedWithCommandResult(
         completion.transport_id,
-        completion.content_text,
+        // ACP content updates replace the collection. Omitting content keeps
+        // the authoritative diff published by the committed-file handoff.
+        null,
         completion.command_result_json,
     ) catch |err| {
         debug_trace.logf(
