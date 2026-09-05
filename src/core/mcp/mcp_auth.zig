@@ -1312,7 +1312,7 @@ fn requestInteractiveAuthorization(
             "Content-Type: text/plain; charset=utf-8\r\n" ++
             "Content-Length: 49\r\n" ++
             "Connection: close\r\n\r\n" ++
-            "Authorization received. You can return to fx now.",
+            "Authorization received. You can return to di now.",
     );
     try writer.interface.flush();
     return parseAuthorizationRedirect(alloc, target);

@@ -185,7 +185,7 @@ pub fn writeInitializeResponse(w: *std.Io.Writer) !void {
     try w.writeAll("\"promptCapabilities\":{\"image\":false,\"audio\":false,\"embeddedContext\":true},");
     try w.writeAll("\"mcpCapabilities\":{\"http\":true,\"sse\":true},");
     try w.writeAll("\"sessionCapabilities\":{\"list\":{},\"resume\":{},\"close\":{}}");
-    try w.writeAll("},\"agentInfo\":{\"name\":\"fx\",\"title\":\"fx\",\"version\":");
+    try w.writeAll("},\"agentInfo\":{\"name\":\"di\",\"title\":\"di\",\"version\":");
     try writeJsonStr(build_options.app_version, w);
     try w.writeAll("},");
     try w.writeAll("\"authMethods\":[]}");
@@ -303,7 +303,7 @@ test "writeInitializeResponse contains required fields" {
     const mcp_capabilities = agent_capabilities.get("mcpCapabilities").?.object;
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"protocolVersion\":1") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"loadSession\":true") != null);
-    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"name\":\"fx\"") != null);
+    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"name\":\"di\"") != null);
     try std.testing.expectEqualStrings(
         build_options.app_version,
         parsed.value.object.get("agentInfo").?.object.get("version").?.string,

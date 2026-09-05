@@ -109,7 +109,7 @@ pub const Background = struct {
                 "background_persistence_available=false\n" ++
                 "mode=headless\n" ++
                 "reason=session_store_unavailable\n" ++
-                "message=headless background commands require session persistence so they can be inspected after fx ask exits. Remove --no-save or restore access to the session store, then retry.\n",
+                "message=headless background commands require session persistence so they can be inspected after di ask exits. Remove --no-save or restore access to the session store, then retry.\n",
         );
         return .{ .status = .failure, .model_output = output, .finish_turn = true, .system_notice = output };
     }

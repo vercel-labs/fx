@@ -1118,7 +1118,23 @@ fn configuredProviderSelection(
         .codex => settings.codex_model orelse return error.CodexModelNotSelected,
         .grok => settings.grok_model orelse return error.GrokModelNotSelected,
     };
-    return .{ .provider = provider, .model = model };
+    // Route on the model that will actually run (FX_MODEL wins), but keep the
+    // persisted per-provider model as the configured value.
+    const effective = initialModelId(model, model);
+    const rerouted = model_provider.rerouteUnservableSelection(.{ .provider = provider, .model = effective });
+    return .{ .provider = rerouted.provider, .model = model };
+}
+
+test "startup reroutes a third-party model persisted under codex to openpaths" {
+    const settings = config_runtime.Settings{
+        .provider = .codex,
+        .codex_model = @constCast("deepseek-v4-flash-vision-exp"),
+    };
+    const selection = try configuredProviderSelection("default/model", &settings);
+    try std.testing.expectEqualStrings("deepseek-v4-flash-vision-exp", selection.model);
+    const has_key = io_mod.getenv("OPENPATHS_API_KEY") != null or io_mod.getenv("OPENROUTER_API_KEY") != null;
+    const expected: model_provider.ProviderId = if (has_key) .openpaths else .codex;
+    try std.testing.expectEqual(expected, selection.provider);
 }
 
 fn initialModelId(default_model: []const u8, configured: ?[]const u8) []const u8 {

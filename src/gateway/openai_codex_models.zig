@@ -154,7 +154,7 @@ const FetchOperation = struct {
             },
             .extra_headers = &.{
                 .{ .name = "chatgpt-account-id", .value = self.account_id },
-                .{ .name = "originator", .value = "fx" },
+                .{ .name = "originator", .value = "di" },
                 .{ .name = "accept", .value = "application/json" },
             },
             .response_writer = &response_writer,

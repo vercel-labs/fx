@@ -1478,6 +1478,7 @@ fn disableFastRouteAfterFailure(
 /// of the turn. Only fires when nothing user-visible was emitted, so the swap
 /// can never splice output across two different models.
 noinline fn applyCircuitBreakerFallback(
+    provider: model_provider.ProviderId,
     fallback_slot: *?[]const u8,
     route_model: *[]const u8,
     cause: model_response_recovery.FailureCause,
@@ -1485,6 +1486,7 @@ noinline fn applyCircuitBreakerFallback(
     latest_diagnostic: *?types.ModelFailureDiagnostic,
     trace_ctx: TraceContext,
 ) bool {
+    if (provider != .gateway and provider != .openpaths) return false;
     if (!replay_safe) return false;
     if (cause != .provider_unavailable and cause != .transport_interrupted) return false;
     if (fallback_slot.* != null) return false;
@@ -1500,6 +1502,44 @@ noinline fn applyCircuitBreakerFallback(
     route_model.* = fallback_model;
     latest_diagnostic.* = types.ModelFailureDiagnostic.init("circuit-broke to fallback model");
     return true;
+}
+
+test "model circuit breaker is limited to compatible gateway transports" {
+    const original = model_provider.openpaths_default_model;
+
+    inline for (.{ model_provider.ProviderId.codex, model_provider.ProviderId.grok }) |provider| {
+        var fallback: ?[]const u8 = null;
+        var route: []const u8 = original;
+        var diagnostic: ?types.ModelFailureDiagnostic = null;
+        try std.testing.expect(!applyCircuitBreakerFallback(
+            provider,
+            &fallback,
+            &route,
+            .provider_unavailable,
+            true,
+            &diagnostic,
+            .{},
+        ));
+        try std.testing.expect(fallback == null);
+        try std.testing.expectEqualStrings(original, route);
+        try std.testing.expect(diagnostic == null);
+    }
+
+    var fallback: ?[]const u8 = null;
+    var route: []const u8 = original;
+    var diagnostic: ?types.ModelFailureDiagnostic = null;
+    try std.testing.expect(applyCircuitBreakerFallback(
+        .openpaths,
+        &fallback,
+        &route,
+        .provider_unavailable,
+        true,
+        &diagnostic,
+        .{},
+    ));
+    try std.testing.expectEqualStrings("deepseek-v4-flash-vision-exp", fallback.?);
+    try std.testing.expectEqualStrings(fallback.?, route);
+    try std.testing.expect(diagnostic != null);
 }
 
 fn routeFailureDetail(completion: types.GatewayCompletion) []const u8 {
@@ -3243,6 +3283,7 @@ fn processQueuedPromptLoop(
                 const failure_diagnostic = types.ModelFailureDiagnostic.init(@errorName(err));
                 latest_recovery_diagnostic = failure_diagnostic;
                 _ = applyCircuitBreakerFallback(
+                    job.provider,
                     &circuit_fallback_model,
                     &gateway_model,
                     failure_cause,
@@ -3800,6 +3841,7 @@ fn processQueuedPromptLoop(
                     step_ctx,
                 );
                 _ = applyCircuitBreakerFallback(
+                    job.provider,
                     &circuit_fallback_model,
                     &gateway_model,
                     cause,
@@ -4019,6 +4061,7 @@ fn processQueuedPromptLoop(
                     step_ctx,
                 );
                 _ = applyCircuitBreakerFallback(
+                    job.provider,
                     &circuit_fallback_model,
                     &gateway_model,
                     cause,

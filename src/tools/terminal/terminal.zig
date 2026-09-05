@@ -131,7 +131,7 @@ pub const MonitorOperationInput = struct {
 };
 
 /// Public semantic terminal input. Authority and persistence fields are
-/// intentionally absent; Core derives them from the current fx session.
+/// intentionally absent; Core derives them from the current di session.
 pub const Input = struct {
     action: Action,
     session_id: ?[]const u8 = null,
@@ -1231,7 +1231,7 @@ pub fn mapAuthorizedResult(
         .path_outside_workspace => try alloc.dupe(u8, "path is outside the workspace"),
         .authority_retired => try alloc.dupe(
             u8,
-            "saved terminal authority is from an older fx version; start a new terminal",
+            "saved terminal authority is from an older di version; start a new terminal",
         ),
         else => return result,
     };
@@ -2158,7 +2158,7 @@ test "terminal result mapper adds detail for actionable failures" {
         .{
             .status = .failure,
             .body = "{\"failure\":{\"action\":\"read\",\"code\":\"authority_retired\",\"session_id\":\"terminal-old\",\"retryable\":false}}",
-            .expected_detail = "saved terminal authority is from an older fx version; start a new terminal",
+            .expected_detail = "saved terminal authority is from an older di version; start a new terminal",
         },
         .{ .status = .failure, .body = "not json", .expected_detail = null },
         .{

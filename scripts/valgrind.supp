@@ -1,0 +1,12 @@
+{
+   glibc-dl-init
+   Memcheck:Leak
+   ...
+   fun:_dl_init
+}
+{
+   glibc-getaddrinfo
+   Memcheck:Leak
+   ...
+   fun:getaddrinfo
+}

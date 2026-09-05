@@ -1,4 +1,4 @@
-//! `fx replay <tape>` implementation.
+//! `di replay <tape>` implementation.
 //!
 //! This module keeps tape parsing and virtual-terminal replay isolated from
 //! the top-level CLI dispatch.
@@ -83,18 +83,18 @@ fn runWithOutput(alloc: Allocator, args: []const [:0]const u8, output: anytype) 
     });
 
     const file = std.Io.Dir.cwd().openFile(io_mod.getIo(), opts.path, .{}) catch |err| {
-        return replyFormattedError(alloc, output, opts.json, @errorName(err), 512, "fx replay: cannot open {s}: {s}\n", .{ opts.path, @errorName(err) }, "fx replay: open failed\n");
+        return replyFormattedError(alloc, output, opts.json, @errorName(err), 512, "di replay: cannot open {s}: {s}\n", .{ opts.path, @errorName(err) }, "di replay: open failed\n");
     };
     var file_mut = file;
     defer file_mut.close(io_mod.getIo());
 
     const bytes = io_mod.readFileToEnd(alloc, &file_mut, 64 * 1024 * 1024) catch |err| {
-        return replyFormattedError(alloc, output, opts.json, @errorName(err), 256, "fx replay: read failed: {s}\n", .{@errorName(err)}, "fx replay: read failed\n");
+        return replyFormattedError(alloc, output, opts.json, @errorName(err), 256, "di replay: read failed: {s}\n", .{@errorName(err)}, "di replay: read failed\n");
     };
     defer alloc.free(bytes);
 
     var parser = record_tape.Parser.init(bytes) catch |err| {
-        return replyFormattedError(alloc, output, opts.json, @errorName(err), 256, "fx replay: bad tape: {s}\n", .{@errorName(err)}, "fx replay: bad tape\n");
+        return replyFormattedError(alloc, output, opts.json, @errorName(err), 256, "di replay: bad tape: {s}\n", .{@errorName(err)}, "di replay: bad tape\n");
     };
     debug_trace.logf("render", "replay_header cols={d} rows={d} version_bytes={d}", .{
         parser.header.cols,
@@ -128,7 +128,7 @@ fn runWithOutput(alloc: Allocator, args: []const [:0]const u8, output: anytype) 
 
     if (opts.frames_dir) |dir| {
         prepareFramesDir(alloc, dir) catch |err| {
-            return replyFormattedError(alloc, output, opts.json, @errorName(err), 512, "fx replay: cannot prepare frames dir {s}: {s}\n", .{ dir, @errorName(err) }, "fx replay: cannot prepare frames dir\n");
+            return replyFormattedError(alloc, output, opts.json, @errorName(err), 512, "di replay: cannot prepare frames dir {s}: {s}\n", .{ dir, @errorName(err) }, "di replay: cannot prepare frames dir\n");
         };
     }
 
@@ -181,7 +181,7 @@ fn runWithOutput(alloc: Allocator, args: []const [:0]const u8, output: anytype) 
 
         if (opts.frames_dir) |dir| {
             writeFrameArtifacts(alloc, dir, frame_count, frame, elapsed_ms, grid, markers.items) catch |err| {
-                return replyFormattedError(alloc, output, opts.json, @errorName(err), 512, "fx replay: cannot write frame artifacts to {s}: {s}\n", .{ dir, @errorName(err) }, "fx replay: cannot write frame artifacts\n");
+                return replyFormattedError(alloc, output, opts.json, @errorName(err), 512, "di replay: cannot write frame artifacts to {s}: {s}\n", .{ dir, @errorName(err) }, "di replay: cannot write frame artifacts\n");
             };
         }
     }
@@ -199,12 +199,12 @@ fn runWithOutput(alloc: Allocator, args: []const [:0]const u8, output: anytype) 
         try output.writeStdout(summary.written());
     }
     if (ignored_incomplete_tail) {
-        try output.writeStderr("fx replay: ignored incomplete final tape frame\n");
+        try output.writeStderr("di replay: ignored incomplete final tape frame\n");
     }
 
     if (opts.frames_dir) |dir| {
         writeFramesManifest(alloc, dir, parser.header, frame_count, resize_count, stdout_bytes) catch |err| {
-            return replyFormattedError(alloc, output, opts.json, @errorName(err), 512, "fx replay: cannot write frames manifest to {s}: {s}\n", .{ dir, @errorName(err) }, "fx replay: cannot write frames manifest\n");
+            return replyFormattedError(alloc, output, opts.json, @errorName(err), 512, "di replay: cannot write frames manifest to {s}: {s}\n", .{ dir, @errorName(err) }, "di replay: cannot write frames manifest\n");
         };
     }
 
@@ -214,7 +214,7 @@ fn runWithOutput(alloc: Allocator, args: []const [:0]const u8, output: anytype) 
 
     if (opts.golden_path) |out_path| {
         var out_file = std.Io.Dir.cwd().createFile(io_mod.getIo(), out_path, .{ .truncate = true }) catch |err| {
-            return replyFormattedError(alloc, output, opts.json, @errorName(err), 256, "fx replay: cannot write {s}: {s}\n", .{ out_path, @errorName(err) }, "fx replay: write failed\n");
+            return replyFormattedError(alloc, output, opts.json, @errorName(err), 256, "di replay: cannot write {s}: {s}\n", .{ out_path, @errorName(err) }, "di replay: write failed\n");
         };
         defer out_file.close(io_mod.getIo());
         try out_file.writeStreamingAll(io_mod.getIo(), final.items);
@@ -433,12 +433,12 @@ fn replyParseError(
     json: bool,
 ) !u8 {
     const msg = switch (err) {
-        Error.MissingTapePath => "fx replay: missing tape path\nusage: fx replay <tape> [--frames] [--json] [--golden <path>] [--frames-dir <path>]\n",
-        Error.TooManyArgs => "fx replay: too many positional arguments\n",
-        Error.UnknownFlag => "fx replay: unknown flag\n",
-        Error.MissingGoldenPath => "fx replay: --golden requires a path\n",
-        Error.MissingFramesDirPath => "fx replay: --frames-dir requires a path\n",
-        else => "fx replay: argument error\n",
+        Error.MissingTapePath => "di replay: missing tape path\nusage: di replay <tape> [--frames] [--json] [--golden <path>] [--frames-dir <path>]\n",
+        Error.TooManyArgs => "di replay: too many positional arguments\n",
+        Error.UnknownFlag => "di replay: unknown flag\n",
+        Error.MissingGoldenPath => "di replay: --golden requires a path\n",
+        Error.MissingFramesDirPath => "di replay: --frames-dir requires a path\n",
+        else => "di replay: argument error\n",
     };
     return replyError(alloc, output, json, @errorName(err), msg);
 }
@@ -740,7 +740,7 @@ test "json replay recovers an incomplete final frame through stderr" {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, std.mem.trim(u8, capture.stdout.written(), " \t\r\n"), .{});
     defer parsed.deinit();
     try testing.expectEqual(@as(i64, 1), parsed.value.object.get("frame_count").?.integer);
-    try testing.expectEqualStrings("fx replay: ignored incomplete final tape frame\n", capture.stderr.written());
+    try testing.expectEqualStrings("di replay: ignored incomplete final tape frame\n", capture.stderr.written());
 }
 
 test "frames mode prints unknown frame snapshots without trapping" {
@@ -861,7 +861,7 @@ test "run missing tape path returns current stderr" {
 
     const exit_code = try runCaptured(alloc, &.{}, &capture);
     try testing.expectEqual(@as(u8, 1), exit_code);
-    try testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "fx replay: missing tape path\n"));
+    try testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "di replay: missing tape path\n"));
 }
 
 test "json failures use stdout for missing arguments files and malformed tapes" {
@@ -933,5 +933,5 @@ test "run malformed tape returns bad tape stderr" {
 
     const exit_code = try runCaptured(alloc, &.{tape_arg}, &capture);
     try testing.expectEqual(@as(u8, 1), exit_code);
-    try testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "fx replay: bad tape"));
+    try testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "di replay: bad tape"));
 }

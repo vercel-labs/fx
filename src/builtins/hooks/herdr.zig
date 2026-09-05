@@ -1,7 +1,7 @@
 //! Best-effort lifecycle reporter for the herdr agent multiplexer.
 //!
 //! Each report uses a short-lived Unix socket. Failures and reply timeouts are
-//! ignored so the integration cannot block or terminate an fx session.
+//! ignored so the integration cannot block or terminate an di session.
 
 const std = @import("std");
 const io_mod = @import("../../core/shared/io.zig");
@@ -17,8 +17,8 @@ const custom_status_max = 32;
 const response_timeout = std.posix.timeval{ .sec = 0, .usec = 250_000 };
 
 // Third-party reporters use the `custom:` source prefix.
-const source = "custom:fx";
-const agent_name = "fx";
+const source = "custom:di";
+const agent_name = "di";
 
 const Request = union(enum) {
     report: struct { state: State, custom_status: ?[]const u8 },
@@ -78,7 +78,7 @@ pub const Client = struct {
 
     pub fn deinit(self: *Client) void {
         // Clear herdr's pane before freeing paths so exit does not leave a
-        // stale idle "fx" label behind.
+        // stale idle "di" label behind.
         self.release();
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
@@ -99,14 +99,14 @@ pub const Client = struct {
         self.send(.{ .report = .{ .state = state, .custom_status = clampStatus(custom_status) } });
     }
 
-    /// Report fx's session id so herdr can associate the pane with a resumable
+    /// Report di's session id so herdr can associate the pane with a resumable
     /// session. Does not affect herdr's semantic state.
     pub fn reportSession(self: *Client, session_id: []const u8) void {
         if (session_id.len == 0) return;
         self.send(.{ .session = session_id });
     }
 
-    /// Name the pane/agent so herdr lists fx even while idle. Best-effort;
+    /// Name the pane/agent so herdr lists di even while idle. Best-effort;
     /// called once at startup after the first state report.
     pub fn announce(self: *Client) void {
         self.sendAll(&.{
@@ -115,8 +115,8 @@ pub const Client = struct {
         });
     }
 
-    /// Remove fx from the pane on exit: drop the reported agent and clear the
-    /// label/name. Without this the pane keeps showing "fx" after fx is gone.
+    /// Remove di from the pane on exit: drop the reported agent and clear the
+    /// label/name. Without this the pane keeps showing "di" after di is gone.
     pub fn release(self: *Client) void {
         self.sendAll(&.{
             .{ .agent_rename = null },
@@ -306,7 +306,7 @@ test "report_agent serializes a single newline-delimited json line" {
     try writeReportAgent(&out.writer, 7, "w1:p1", .working, "editing");
     try std.testing.expectEqualStrings(
         "{\"id\":\"7\",\"method\":\"pane.report_agent\",\"params\":{\"pane_id\":\"w1:p1\"," ++
-            "\"source\":\"custom:fx\",\"agent\":\"fx\",\"state\":\"working\"," ++
+            "\"source\":\"custom:di\",\"agent\":\"di\",\"state\":\"working\"," ++
             "\"custom_status\":\"editing\"}}\n",
         out.written(),
     );
@@ -318,7 +318,7 @@ test "report_agent omits custom_status when null" {
     try writeReportAgent(&out.writer, 1, "w1:p1", .idle, null);
     try std.testing.expectEqualStrings(
         "{\"id\":\"1\",\"method\":\"pane.report_agent\",\"params\":{\"pane_id\":\"w1:p1\"," ++
-            "\"source\":\"custom:fx\",\"agent\":\"fx\",\"state\":\"idle\"}}\n",
+            "\"source\":\"custom:di\",\"agent\":\"di\",\"state\":\"idle\"}}\n",
         out.written(),
     );
 }
@@ -329,7 +329,7 @@ test "report_agent escapes pane id" {
     try writeReportAgent(&out.writer, 2, "pane\"x", .blocked, null);
     try std.testing.expectEqualStrings(
         "{\"id\":\"2\",\"method\":\"pane.report_agent\",\"params\":{\"pane_id\":\"pane\\\"x\"," ++
-            "\"source\":\"custom:fx\",\"agent\":\"fx\",\"state\":\"blocked\"}}\n",
+            "\"source\":\"custom:di\",\"agent\":\"di\",\"state\":\"blocked\"}}\n",
         out.written(),
     );
 }
@@ -337,9 +337,9 @@ test "report_agent escapes pane id" {
 test "pane.rename labels the pane" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try writeRename(&out.writer, 4, "pane.rename", "pane_id", "w1:p1", "label", "fx");
+    try writeRename(&out.writer, 4, "pane.rename", "pane_id", "w1:p1", "label", "di");
     try std.testing.expectEqualStrings(
-        "{\"id\":\"4\",\"method\":\"pane.rename\",\"params\":{\"pane_id\":\"w1:p1\",\"label\":\"fx\"}}\n",
+        "{\"id\":\"4\",\"method\":\"pane.rename\",\"params\":{\"pane_id\":\"w1:p1\",\"label\":\"di\"}}\n",
         out.written(),
     );
 }
@@ -347,9 +347,9 @@ test "pane.rename labels the pane" {
 test "agent.rename names the agent" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try writeRename(&out.writer, 5, "agent.rename", "target", "w1:p1", "name", "fx");
+    try writeRename(&out.writer, 5, "agent.rename", "target", "w1:p1", "name", "di");
     try std.testing.expectEqualStrings(
-        "{\"id\":\"5\",\"method\":\"agent.rename\",\"params\":{\"target\":\"w1:p1\",\"name\":\"fx\"}}\n",
+        "{\"id\":\"5\",\"method\":\"agent.rename\",\"params\":{\"target\":\"w1:p1\",\"name\":\"di\"}}\n",
         out.written(),
     );
 }
@@ -364,12 +364,12 @@ test "rename with null value clears the label" {
     );
 }
 
-test "clear_agent_authority removes fx from the pane" {
+test "clear_agent_authority removes di from the pane" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     try writeClearAuthority(&out.writer, 7, "w1:p1");
     try std.testing.expectEqualStrings(
-        "{\"id\":\"7\",\"method\":\"pane.clear_agent_authority\",\"params\":{\"pane_id\":\"w1:p1\",\"source\":\"custom:fx\"}}\n",
+        "{\"id\":\"7\",\"method\":\"pane.clear_agent_authority\",\"params\":{\"pane_id\":\"w1:p1\",\"source\":\"custom:di\"}}\n",
         out.written(),
     );
 }
@@ -380,7 +380,7 @@ test "report_agent_session serializes session identity" {
     try writeReportAgentSession(&out.writer, 3, "w1:p1", "session-42");
     try std.testing.expectEqualStrings(
         "{\"id\":\"3\",\"method\":\"pane.report_agent_session\",\"params\":{\"pane_id\":\"w1:p1\"," ++
-            "\"source\":\"custom:fx\",\"agent\":\"fx\",\"agent_session_id\":\"session-42\"}}\n",
+            "\"source\":\"custom:di\",\"agent\":\"di\",\"agent_session_id\":\"session-42\"}}\n",
         out.written(),
     );
 }

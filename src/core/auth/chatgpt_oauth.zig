@@ -316,7 +316,7 @@ fn readBrowserCallbackTarget(alloc: Allocator, stream: std.Io.net.Stream) ![]u8 
 
 fn writeBrowserCallbackResponse(stream: std.Io.net.Stream, success: bool) !void {
     const body = if (success)
-        "Authorization complete. You can return to fx."
+        "Authorization complete. You can return to di."
     else
         "Authorization failed. Return to fx for details.";
     var buffer: [1024]u8 = undefined;

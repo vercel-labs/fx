@@ -757,7 +757,7 @@ pub const SessionChildCapability = struct {
     }
 
     /// Opens a capability restricted to holder proofs in the owning durable
-    /// fx session. It does not imply access to host-owned terminal state.
+    /// di session. It does not imply access to host-owned terminal state.
     pub fn initTerminalProofs(
         alloc: Allocator,
         session_dir: std.Io.Dir,

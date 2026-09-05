@@ -3917,7 +3917,7 @@ test "welcome logo stays pinned while middle transcript rows overflow" {
     try h.flush();
 
     try expectGridContains(&h, "Run /help for commands");
-    try expectGridContains(&h, "𝒇x v");
+    try expectGridContains(&h, "di v");
     try expectGridNotContains(&h, "content line 0");
     try expectGridContains(&h, "content line 44");
 }
@@ -3946,7 +3946,7 @@ test "welcome logo stays pinned during footer-reserved overflow" {
 
     try std.testing.expect(h.shell.last_visible_transcript_split_active);
     try std.testing.expect(h.shell.last_visible_transcript_split_suffix_start_line > h.shell.last_visible_transcript_split_prefix_lines);
-    try expectGridContains(&h, "𝒇x v");
+    try expectGridContains(&h, "di v");
     try expectGridContains(&h, "Run /help for commands");
     try expectGridNotContains(&h, "content line 0");
     try expectGridContains(&h, "content line 44");
@@ -4598,7 +4598,7 @@ test "entry-bound shimmer resolves inside pinned welcome tail selection" {
     try h.flush();
 
     const status_row = try findRowContaining(&h, "tail status line");
-    try expectGridContains(&h, "𝒇x v");
+    try expectGridContains(&h, "di v");
 
     var ctx = defaultFooterContext(&input);
     setToolActivity(&ctx, status_id, "Reading pinned tail");
@@ -4860,7 +4860,7 @@ test "clean footer frame does not spam trace on idle ticks" {
     try std.testing.expect(std.mem.find(u8, trace, "footer.clean") == null);
 }
 
-test "startup reservation scrolls to fit first paint without wiping pre-fx rows" {
+test "startup reservation scrolls to fit first paint without wiping pre-di rows" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 80, 24, 4);
     defer h.deinit();
@@ -6728,7 +6728,7 @@ test "rapid settled resizes retain the four-skill transcript" {
     );
 }
 
-test "settled resize clears pre-fx shell history and reanchors at row one" {
+test "settled resize clears pre-di shell history and reanchors at row one" {
     var h = try Harness.init(std.testing.allocator, 40, 20, 4);
     defer h.deinit();
 
@@ -6738,7 +6738,7 @@ test "settled resize clears pre-fx shell history and reanchors at row one" {
     try h.vt.feed("$ fx\n");
 
     try h.shell.initViewport(&h.metrics, 4);
-    try h.shell.writeTranscript(h.alloc, &h.metrics, "first fx line\nsecond fx line\n", true);
+    try h.shell.writeTranscript(h.alloc, &h.metrics, "first di line\nsecond di line\n", true);
     try h.flush();
 
     try h.driveResize(40, 24, 4, true);
@@ -6749,11 +6749,11 @@ test "settled resize clears pre-fx shell history and reanchors at row one" {
     try expectGridNotContains(&h, "$ fx");
     try std.testing.expectEqual(@as(u16, 1), h.shell.owned_top_row);
     try std.testing.expectEqual(@as(u16, 1), h.shell.viewport_top_row);
-    try expectRowPrefix(&h, 1, "first fx line");
-    try expectRowPrefix(&h, 2, "second fx line");
+    try expectRowPrefix(&h, 1, "first di line");
+    try expectRowPrefix(&h, 2, "second di line");
 }
 
-test "settled width resize clears pre-fx shell rows and reanchors at row one" {
+test "settled width resize clears pre-di shell rows and reanchors at row one" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 80, 24, 4);
     defer h.deinit();
@@ -6764,7 +6764,7 @@ test "settled width resize clears pre-fx shell rows and reanchors at row one" {
     try h.vt.feed("$ fx\n");
 
     try h.shell.initViewport(&h.metrics, 4);
-    try h.shell.writeTranscript(alloc, &h.metrics, "first fx line\nsecond fx line\n", true);
+    try h.shell.writeTranscript(alloc, &h.metrics, "first di line\nsecond di line\n", true);
     try h.flush();
 
     const before = try h.file.length(io_mod.getIo());
@@ -6943,7 +6943,7 @@ test "large tabbed user turn keeps frame scroll plan aligned" {
     try std.testing.expectEqual(@as(usize, 21), std.mem.count(u8, raw_prompt, "\t"));
 
     try h.shell.initViewport(&h.metrics, 12);
-    try h.shell.writeTranscript(alloc, &h.metrics, "What would you like fx to do?\n", true);
+    try h.shell.writeTranscript(alloc, &h.metrics, "What would you like di to do?\n", true);
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();

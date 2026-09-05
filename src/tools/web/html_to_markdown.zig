@@ -535,7 +535,7 @@ test "web_fetch converts representative html to bounded markdown" {
         \\<head><title>Ignored</title><style>.x{}</style><script>alert(1)</script></head>
         \\<body>
         \\<h1>Release &amp; Notes</h1>
-        \\<p>Hello <a href="/docs">docs</a> and <code>fx ask</code>.</p>
+        \\<p>Hello <a href="/docs">docs</a> and <code>di ask</code>.</p>
         \\<ul><li>One</li><li>Two&nbsp;items</li></ul>
         \\<pre><code>const x = 1 &lt; 2;</code></pre>
         \\<table><tr><th>Name</th><th>Value</th></tr><tr><td>A</td><td>42</td></tr></table>
@@ -550,7 +550,7 @@ test "web_fetch converts representative html to bounded markdown" {
     try std.testing.expect(std.mem.find(u8, markdown, "# Release & Notes") != null);
     try std.testing.expect(std.mem.find(u8, markdown, "# Ignored") != null);
     try std.testing.expect(std.mem.find(u8, markdown, "[docs](/docs)") != null);
-    try std.testing.expect(std.mem.find(u8, markdown, "`fx ask`") != null);
+    try std.testing.expect(std.mem.find(u8, markdown, "`di ask`") != null);
     try std.testing.expect(std.mem.find(u8, markdown, "- One") != null);
     try std.testing.expect(std.mem.find(u8, markdown, "Two items") != null);
     try std.testing.expect(std.mem.find(u8, markdown, "const x = 1 < 2;") != null);

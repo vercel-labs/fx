@@ -61,7 +61,7 @@ pub fn Runtime(comptime App: type) type {
             app.prepareResumeHandoffForUpgrade() catch |err| {
                 const notice = try std.fmt.allocPrint(
                     app.alloc,
-                    "upgrade paused because this conversation is not safely resumable: {s}; run `fx doctor` for recovery guidance",
+                    "upgrade paused because this conversation is not safely resumable: {s}; run `di doctor` for recovery guidance",
                     .{@errorName(err)},
                 );
                 defer app.alloc.free(notice);

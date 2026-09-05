@@ -52,7 +52,7 @@ pub const web_fetch_unavailable_message = "web_fetch is unavailable: no local We
 pub const terminal_unavailable_message =
     "{\"error\":{\"tool\":\"terminal\",\"code\":\"unsupported_host\",\"retryable\":false}}";
 const terminal_saved_session_required_message =
-    "Durable terminal actions require a saved fx session.";
+    "Durable terminal actions require a saved di session.";
 const terminal_saved_session_required_suggestion =
     "Use terminal.exec, or rerun without --no-save.";
 

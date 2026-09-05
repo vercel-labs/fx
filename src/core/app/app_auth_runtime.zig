@@ -243,7 +243,7 @@ pub fn Runtime(comptime App: type) type {
                     try writeAuthNotice(app, .{
                         .topic = "auth",
                         .tone = .@"error",
-                        .body = "Could not complete fx logout. The current source is unchanged.",
+                        .body = "Could not complete di logout. The current source is unchanged.",
                     });
                     return;
                 },
@@ -268,7 +268,7 @@ pub fn Runtime(comptime App: type) type {
         fn applyLogoutResult(app: *App, result: login_flow.LogoutResult) !void {
             // Logging out is an explicit rejection of that credential, so a
             // remembered pointer to it would silently reactivate on next login.
-            // A remembered source always wins resolution, so an active fx login
+            // A remembered source always wins resolution, so an active di login
             // is the only way one can be remembered; clearing otherwise is a
             // no-op against a store that holds nothing.
             if (app.auth.credentialSource() == .fx_login) forgetCredentialSource(app);
@@ -277,7 +277,7 @@ pub fn Runtime(comptime App: type) type {
                 .{
                     .topic = "auth",
                     .tone = .warning,
-                    .body = "Could not confirm durable fx logout. The active source was recalculated.",
+                    .body = "Could not confirm durable di logout. The active source was recalculated.",
                 }
             else if (result.session_deleted)
                 .{
@@ -289,7 +289,7 @@ pub fn Runtime(comptime App: type) type {
                 .{
                     .topic = "auth",
                     .tone = .neutral,
-                    .body = "No fx login session found.",
+                    .body = "No di login session found.",
                 });
             if (result.remote_revocation_failed) {
                 try writeAuthNotice(app, .{
@@ -401,7 +401,7 @@ pub fn Runtime(comptime App: type) type {
                                 try writeAuthNotice(app, .{
                                     .topic = "auth",
                                     .tone = .@"error",
-                                    .body = "Signed in, but the fx login credential could not be loaded.",
+                                    .body = "Signed in, but the di login credential could not be loaded.",
                                 });
                                 return;
                             }
@@ -832,9 +832,9 @@ pub fn Runtime(comptime App: type) type {
                     .body = if (intent == .post_oauth)
                         "Subscription sign-in completed, but its saved credential is unavailable. The current provider is unchanged."
                     else if (target == .codex)
-                        "Run fx login codex, then try switching again."
+                        "Run di login codex, then try switching again."
                     else if (target == .grok)
-                        "Run fx login grok, then try switching again."
+                        "Run di login grok, then try switching again."
                     else
                         credentials.missing_interactive_credential_message,
                 }, true);
@@ -1152,7 +1152,7 @@ pub fn Runtime(comptime App: type) type {
                     .topic = "auth",
                     .tone = .@"error",
                     .body = switch (err) {
-                        error.NoSession => "The fx login session is no longer available. Sign in to change teams.",
+                        error.NoSession => "The di login session is no longer available. Sign in to change teams.",
                         error.NoTeams => "No Vercel teams are available for this account.",
                         else => "Could not load Vercel teams. The current team is unchanged.",
                     },
@@ -1182,7 +1182,7 @@ pub fn Runtime(comptime App: type) type {
                     .topic = "auth",
                     .tone = .@"error",
                     .body = switch (err) {
-                        error.SessionChanged, error.NoSession => "The fx login session changed before the team could be saved.",
+                        error.SessionChanged, error.NoSession => "The di login session changed before the team could be saved.",
                         else => "Could not change the Vercel team. The current team is unchanged.",
                     },
                 }, true);
@@ -1197,7 +1197,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .@"error",
-                    .body = "Changed the Vercel team, but the fx login credential could not be loaded.",
+                    .body = "Changed the Vercel team, but the di login credential could not be loaded.",
                 }, true);
                 return;
             }
@@ -1361,7 +1361,7 @@ pub fn Runtime(comptime App: type) type {
                     else => .{ .topic = "auth", .tone = .@"error", .body = "Grok sign-in failed. The current credential is unchanged." },
                 }
             else switch (err) {
-                error.ClientIdMissing => .{ .topic = "auth", .tone = .@"error", .body = "fx login is not configured yet. The current credential is unchanged." },
+                error.ClientIdMissing => .{ .topic = "auth", .tone = .@"error", .body = "di login is not configured yet. The current credential is unchanged." },
                 error.AccessDenied => .{ .topic = "auth", .tone = .@"error", .body = "Vercel sign-in was denied. The current credential is unchanged." },
                 error.ExpiredToken, error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "The Vercel sign-in code expired. The current credential is unchanged; run /login to try again." },
                 else => .{ .topic = "auth", .tone = .@"error", .body = "Vercel sign-in failed. The current credential is unchanged." },
@@ -1928,7 +1928,7 @@ test "completed credential switch emits exactly one transcript line" {
     try std.testing.expectEqualStrings(expected, app.transcript.items);
 }
 
-test "team change from an environment source activates and remembers fx login" {
+test "team change from an environment source activates and remembers di login" {
     var app: TestApp = .{};
     defer app.deinit();
     app.auth.select_result = true;
@@ -1951,7 +1951,7 @@ test "team change from an environment source activates and remembers fx login" {
     );
 }
 
-test "team change on an active fx login updates and remembers the selected team" {
+test "team change on an active di login updates and remembers the selected team" {
     var app: TestApp = .{};
     defer app.deinit();
     app.auth.active_source = .fx_login;
@@ -1963,7 +1963,7 @@ test "team change on an active fx login updates and remembers the selected team"
     try std.testing.expectEqual(credentials.Source.fx_login, app.last_preference_source.?);
 }
 
-test "successful direct login remembers fx login after activation" {
+test "successful direct login remembers di login after activation" {
     var app: TestApp = .{};
     defer app.deinit();
     app.auth.select_result = true;
@@ -2116,7 +2116,7 @@ test "logout durability failure still reconciles live auth" {
 
     try std.testing.expectEqual(@as(usize, 1), app.auth.logout_reconcile_count);
     try std.testing.expectEqual(@as(usize, 1), app.model_cache.reset_count);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Could not confirm durable fx logout.") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Could not confirm durable di logout.") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, login_flow.remote_revocation_warning) != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "current source is unchanged") == null);
 }
@@ -2127,7 +2127,7 @@ test "prompt credential refresh failure is recoverable and detail-free" {
     app.auth.refresh_error = error.OAuthRequestFailed;
 
     try std.testing.expect(!try Runtime(TestApp).preparePromptCredential(&app));
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "fx login credential refresh failed.") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "di login credential refresh failed.") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Choose another source below.") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "OAuthRequestFailed") == null);
     try std.testing.expect(app.shell.render_requests.footer_requested);
@@ -2156,7 +2156,7 @@ test "prompt credential admission rejects a credential that remains unavailable"
 
     try std.testing.expect(!try Runtime(TestApp).preparePromptCredential(&app));
     try std.testing.expectEqual(@as(usize, 2), app.auth.refresh_count);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "fx login credential refresh failed.") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "di login credential refresh failed.") != null);
     try std.testing.expect(app.auth.picker_opened);
 }
 

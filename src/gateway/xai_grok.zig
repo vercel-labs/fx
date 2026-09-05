@@ -334,7 +334,7 @@ fn streamCompletionCore(alloc: Allocator, request: stream_provider.Request) !str
     extra_count += 1;
     extra_headers_buf[extra_count] = .{ .name = "x-grok-client-version", .value = proxy_compatibility_version };
     extra_count += 1;
-    extra_headers_buf[extra_count] = .{ .name = "x-grok-client-identifier", .value = "fx" };
+    extra_headers_buf[extra_count] = .{ .name = "x-grok-client-identifier", .value = "di" };
     extra_count += 1;
     extra_headers_buf[extra_count] = .{ .name = "x-grok-model-override", .value = request.model };
     extra_count += 1;

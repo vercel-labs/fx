@@ -193,7 +193,7 @@ const default_gateway_base_url = "https://ai-gateway.vercel.sh";
 pub const vercel_ai_gateway_team_header = "x-vercel-ai-gateway-team";
 /// Identifies fx on every AI Gateway request; the zig std.http default
 /// (`zig/<version> (std.http)`) is never sent to the gateway.
-pub const user_agent = "fx/" ++ build_options.app_version;
+pub const user_agent = "di/" ++ build_options.app_version;
 var resolved_model_trace_emitted = std.atomic.Value(bool).init(false);
 var test_cancel_watcher_spawn_error: ?anyerror = null;
 
@@ -626,8 +626,8 @@ pub fn postGatewayCompletion(
         defer secret.zeroAndFree(alloc, auth_header);
 
         const extra_headers = [_]std.http.Header{
-            .{ .name = "HTTP-Referer", .value = "https://github.com/vercel-labs/fx" },
-            .{ .name = "X-Title", .value = "fx" },
+            .{ .name = "HTTP-Referer", .value = "https://github.com/lee101/di" },
+            .{ .name = "X-Title", .value = "di" },
             .{ .name = "Accept", .value = "application/json" },
             .{ .name = "ai-gateway-protocol-version", .value = "0.0.1" },
             .{ .name = "ai-language-model-specification-version", .value = "4" },
@@ -1464,9 +1464,9 @@ fn gatewayExtraHeaders(
 ) []const std.http.Header {
     std.debug.assert(buf.len >= 9);
     var len: usize = 0;
-    buf[len] = .{ .name = "HTTP-Referer", .value = "https://github.com/vercel-labs/fx" };
+    buf[len] = .{ .name = "HTTP-Referer", .value = "https://github.com/lee101/di" };
     len += 1;
-    buf[len] = .{ .name = "X-Title", .value = "fx" };
+    buf[len] = .{ .name = "X-Title", .value = "di" };
     len += 1;
     buf[len] = .{ .name = "ai-gateway-protocol-version", .value = "0.0.1" };
     len += 1;
@@ -7286,7 +7286,7 @@ test "direct gateway core callbacks stay on the invoking thread" {
     try std.testing.expectEqual(capture.expected_thread, capture.observed_thread.?);
 }
 
-test "gateway chat request sends fx user agent and attribution headers" {
+test "gateway chat request sends di user agent and attribution headers" {
     var fixture = try LoopbackGatewayFixture.init(.success_capture, 0);
     defer fixture.deinit();
     try fixture.start();
@@ -7322,8 +7322,8 @@ test "gateway chat request sends fx user agent and attribution headers" {
 
     if (fixture.failure) |err| return err;
     try std.testing.expectEqualStrings(user_agent, fixture.capturedHeaderValue("user-agent").?);
-    try std.testing.expectEqualStrings("https://github.com/vercel-labs/fx", fixture.capturedHeaderValue("http-referer").?);
-    try std.testing.expectEqualStrings("fx", fixture.capturedHeaderValue("x-title").?);
+    try std.testing.expectEqualStrings("https://github.com/lee101/di", fixture.capturedHeaderValue("http-referer").?);
+    try std.testing.expectEqualStrings("di", fixture.capturedHeaderValue("x-title").?);
     try std.testing.expectEqualStrings("session_wire_123", fixture.capturedHeaderValue("x-session-id").?);
     try std.testing.expectEqualStrings("session_wire_123", fixture.capturedHeaderValue("x-session-affinity").?);
     try std.testing.expect(std.mem.find(u8, fixture.capturedHeaderValue("user-agent").?, "zig") == null);

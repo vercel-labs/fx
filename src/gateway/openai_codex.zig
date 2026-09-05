@@ -340,7 +340,7 @@ fn streamCompletionCore(alloc: Allocator, request: stream_provider.Request) !str
     var extra_count: usize = 0;
     extra_headers_buf[extra_count] = .{ .name = "chatgpt-account-id", .value = account_id };
     extra_count += 1;
-    extra_headers_buf[extra_count] = .{ .name = "originator", .value = "fx" };
+    extra_headers_buf[extra_count] = .{ .name = "originator", .value = "di" };
     extra_count += 1;
     extra_headers_buf[extra_count] = .{ .name = "OpenAI-Beta", .value = "responses=experimental" };
     extra_count += 1;

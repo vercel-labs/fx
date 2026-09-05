@@ -4009,7 +4009,7 @@ test "trace auth summary preserves missing and loaded status text" {
     defer loaded.deinit();
     try writeAuthStateSummary(&loaded.writer, &app);
     try std.testing.expectEqualStrings(
-        "auth: source=fx login refreshable=true gateway_team=unset\n",
+        "auth: source=di login refreshable=true gateway_team=unset\n",
         loaded.written(),
     );
 }

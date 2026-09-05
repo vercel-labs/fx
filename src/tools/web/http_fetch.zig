@@ -571,7 +571,7 @@ fn writeRequest(writer: *std.Io.Writer, target: PinnedTarget, options: FetchOpti
     try writer.print(
         "GET {s} HTTP/1.1\r\n" ++
             "Host: {s}\r\n" ++
-            "User-Agent: fx (web_fetch; +https://github.com/vercel-labs/fx)\r\n" ++
+            "User-Agent: di (web_fetch; +https://github.com/lee101/di)\r\n" ++
             "Accept: text/markdown, text/html, */*\r\n" ++
             "Accept-Encoding: gzip, deflate, zstd\r\n" ++
             "Connection: close\r\n" ++
@@ -2812,7 +2812,7 @@ test "web_fetch advertises supported content codings" {
     try std.testing.expectEqualStrings(
         "GET /docs?q=1 HTTP/1.1\r\n" ++
             "Host: example.com\r\n" ++
-            "User-Agent: fx (web_fetch; +https://github.com/vercel-labs/fx)\r\n" ++
+            "User-Agent: di (web_fetch; +https://github.com/lee101/di)\r\n" ++
             "Accept: text/markdown, text/html, */*\r\n" ++
             "Accept-Encoding: gzip, deflate, zstd\r\n" ++
             "Connection: close\r\n" ++

@@ -495,7 +495,7 @@ fn fetchCredits(
     );
 }
 
-/// An fx login can reach several teams, so `/v1/credits` rejects it outright
+/// An di login can reach several teams, so `/v1/credits` rejects it outright
 /// unless the request names one. The endpoint reads the team from a `teamId`
 /// query value and ignores `x-vercel-ai-gateway-team`, which is the reverse of
 /// the inference endpoint. An API key carries its own team and resolves to no
@@ -651,8 +651,8 @@ const OAuthHttpOperation = struct {
 };
 
 test "oauth transport user agent uses the product version" {
-    try std.testing.expect(std.mem.startsWith(u8, gateway_client.user_agent, "fx/"));
-    try std.testing.expect(gateway_client.user_agent.len > "fx/".len);
+    try std.testing.expect(std.mem.startsWith(u8, gateway_client.user_agent, "di/"));
+    try std.testing.expect(gateway_client.user_agent.len > "di/".len);
     try std.testing.expect(std.mem.find(u8, gateway_client.user_agent, "zig") == null);
     try std.testing.expect(std.mem.find(u8, gateway_client.user_agent, "std.http") == null);
 }
@@ -2300,7 +2300,7 @@ test "model catalog GET omits team header for null and empty team" {
     try expectModelCatalogTeamHeaderOmitted("");
 }
 
-test "model catalog GET sends fx user agent without attribution headers" {
+test "model catalog GET sends di user agent without attribution headers" {
     var fixture = try gateway_client.TestModelCatalogFixture.init();
     defer fixture.deinit();
     try fixture.start();

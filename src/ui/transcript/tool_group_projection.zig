@@ -7,7 +7,7 @@ const sort_utils = @import("../../core/shared/sort_utils.zig");
 
 const TranscriptEntry = transcript_blocks.TranscriptEntry;
 const ToolDetailRecord = transcript_blocks.ToolDetailRecord;
-const cancellation_follow_up = " · What can fx do differently?";
+const cancellation_follow_up = " · What can di do differently?";
 
 pub const Projection = struct {
     entry_actions: std.ArrayList(transcript_blocks.EntryRenderAction) = .empty,
@@ -1231,7 +1231,7 @@ test "tool-heavy groups render every canonical action" {
 test "minimal tool group keeps cancellation in the header and child row" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "■ Cancelled sleep 30 · What can fx do differently?", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "■ Cancelled sleep 30 · What can di do differently?", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = .cancelled },
@@ -1243,7 +1243,7 @@ test "minimal tool group keeps cancellation in the header and child row" {
     try std.testing.expectEqualStrings(
         "● 1 tool call · 1 command · 1 cancelled\n" ++
             "└ Cancelled sleep 30\n\n" ++
-            "■ Cancelled sleep 30 · What can fx do differently?",
+            "■ Cancelled sleep 30 · What can di do differently?",
         projection.entry_actions.items[0].override.bytes,
     );
 }

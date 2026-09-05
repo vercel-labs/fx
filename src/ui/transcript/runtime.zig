@@ -498,7 +498,7 @@ fn lifecycleTerminalLine(
     const cancelled = kind == .cancelled;
     const text_style = if (cancelled) ui_render.hint_style else "";
     const text_reset = if (cancelled) ui_render.reset_style else "";
-    const follow_up = if (cancelled) " · What can fx do differently?" else "";
+    const follow_up = if (cancelled) " · What can di do differently?" else "";
     const normalized = if (has_marker)
         try std.fmt.allocPrint(
             alloc,
