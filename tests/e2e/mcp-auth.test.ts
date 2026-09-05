@@ -3427,7 +3427,7 @@ describe("MCP remote authentication lifecycle", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "legacy Streamable HTTP logout closes its session and deletes stored credentials",
+    "legacy Streamable HTTP logout closes its session and permits sign-in from the inspector",
     async () => {
       legacyStreamable = startLegacyStreamableHttpFixture("2025-06-18");
       auth = startAuthFixture(legacyStreamable.url);
@@ -3466,6 +3466,17 @@ describe("MCP remote authentication lifecycle", () => {
       expect(existsSync(credentialPath)).toBe(false);
       await tui.sendText("/mcp");
       await tui.waitForPane((pane) => /fixture\s+Disconnected/.test(pane), 5_000);
+      expect(auth.authorizationRequests).toBe(0);
+      await tui.sendKeys("Enter");
+      await tui.waitForText("Enter Sign in", 5_000);
+      expect(await tui.capturePane()).toMatch(/State\s+Disconnected/);
+
+      await tui.sendKeys("Enter");
+      await tui.waitForPane((pane) => /State\s+Ready/.test(pane), 15_000);
+      expect(auth.authorizationRequests).toBe(1);
+      expect(auth.tokenExchanges).toBe(1);
+      expect(existsSync(credentialPath)).toBe(true);
+      expect(gateway.requests).toHaveLength(0);
     },
     30_000,
   );

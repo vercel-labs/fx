@@ -47,13 +47,65 @@ pub const Action = enum {
 
 pub fn serverActionAvailable(action: Action, server: *const health.ServerSnapshot) bool {
     return switch (action) {
-        .authenticate => server.transport == .http and server.authentication == .required and server.connection != .connecting,
+        .authenticate => server.transport == .http and server.connection != .connecting and
+            (server.authentication == .required or
+                (server.connection == .disconnected and server.authentication != .authenticated)),
         .logout => server.transport == .http and server.authentication == .authenticated,
         .remove => server.source == .profile,
         .trust_approve => server.workspace_admission == .pending,
         .trust_reject => server.source == .workspace and server.workspace_admission != .rejected,
         else => true,
     };
+}
+
+test "MCP sign-in action is available for disconnected remote servers" {
+    const alloc = std.testing.allocator;
+    var server = health.ServerSnapshot{
+        .configured_name = try alloc.dupe(u8, "fixture"),
+        .negotiated_name = null,
+        .negotiated_version = null,
+        .source = .profile,
+        .scope = .profile,
+        .required = false,
+        .transport = .http,
+        .protocol_version = null,
+        .connection = .disconnected,
+        .authentication = .none,
+        .counts = .{},
+        .cache_freshness = .unavailable,
+        .subscription = .unavailable,
+        .runtime_generation = 0,
+        .catalog_generation = 0,
+        .retry_attempt = 0,
+        .retry_in_ms = null,
+        .last_successful_discovery_ms = null,
+        .failure = null,
+    };
+    defer server.deinit(alloc);
+    const cases = [_]struct {
+        connection: health.ConnectionState,
+        authentication: health.AuthenticationState,
+        expected: bool,
+    }{
+        .{ .connection = .disconnected, .authentication = .none, .expected = true },
+        .{ .connection = .disconnected, .authentication = .configured, .expected = true },
+        .{ .connection = .disconnected, .authentication = .required, .expected = true },
+        .{ .connection = .disconnected, .authentication = .authenticated, .expected = false },
+        .{ .connection = .ready, .authentication = .none, .expected = false },
+        .{ .connection = .failed, .authentication = .none, .expected = false },
+        .{ .connection = .failed, .authentication = .required, .expected = true },
+        .{ .connection = .connecting, .authentication = .required, .expected = false },
+        .{ .connection = .disabled, .authentication = .none, .expected = false },
+    };
+    for (cases) |case| {
+        server.connection = case.connection;
+        server.authentication = case.authentication;
+        try std.testing.expectEqual(case.expected, serverActionAvailable(.authenticate, &server));
+    }
+    server.transport = .stdio;
+    server.connection = .disconnected;
+    server.authentication = .required;
+    try std.testing.expect(!serverActionAvailable(.authenticate, &server));
 }
 
 pub const Request = struct {
