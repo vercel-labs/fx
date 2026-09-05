@@ -2216,6 +2216,11 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             defer state.subagent_authority_mutex.unlock(io_mod.getIo());
             applySessionMode(state.cfg.mode_registry, session, value);
         }
+    } else {
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Unknown configId",
+        });
     }
 
     try refreshModelCatalogForOptions(state);

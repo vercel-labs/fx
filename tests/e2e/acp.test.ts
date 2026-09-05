@@ -8154,6 +8154,37 @@ describe("acp: model-independent", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "session/set_config_option rejects an unknown configId",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-set-unknown-config-");
+      const gateway = startFakeGateway([]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine(); // consume session/update notification
+
+        const resp = await client.request("session/set_config_option", {
+          configId: "definitely-unknown-config",
+          value: "ignored-value",
+        }, 3) as any;
+        expect(resp.result).toBeUndefined();
+        expect(resp.error.code).toBe(-32602);
+        expect(resp.error.message).toBe("Unknown configId");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
 });
 
 describe("acp: model catalog authentication", () => {
