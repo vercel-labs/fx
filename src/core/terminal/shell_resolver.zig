@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const contracts = @import("contracts.zig");
 const command_environment = @import("../execution/command_environment.zig");
+const io_mod = @import("../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -23,8 +24,21 @@ fn shellKind(path: []const u8) ?ShellKind {
     return null;
 }
 
+fn existingExecutable(path: []const u8) bool {
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), path, .{}) catch return false;
+    return true;
+}
+
 fn fallbackLoginShell() []const u8 {
-    return if (builtin.os.tag == .macos) "/bin/zsh" else "/bin/bash";
+    const default_path = if (builtin.os.tag == .macos) "/bin/zsh" else "/bin/bash";
+    if (existingExecutable(default_path)) return default_path;
+    for ([_][]const u8{
+        "/usr/bin/bash",
+        "/run/current-system/sw/bin/bash",
+    }) |path| {
+        if (existingExecutable(path)) return path;
+    }
+    return default_path;
 }
 
 fn supportedLoginShell(configured_login_shell: ?[]const u8) ResolveError![]const u8 {
@@ -410,13 +424,13 @@ test "login shell resolution falls back without accepting explicit unsupported s
     if (builtin.os.tag == .macos) {
         try std.testing.expectEqualSlices(
             []const u8,
-            &.{ "/bin/zsh", "-l", "-i" },
+            &.{ fallbackLoginShell(), "-l", "-i" },
             fallback.argv(),
         );
     } else {
         try std.testing.expectEqualSlices(
             []const u8,
-            &.{ "/bin/bash", "--login", "-i" },
+            &.{ fallbackLoginShell(), "--login", "-i" },
             fallback.argv(),
         );
     }
