@@ -4031,6 +4031,23 @@ test "renderEntriesToBytes reflows parser-rendered lists at paint-time cols" {
     }
 }
 
+test "renderEntriesToBytes preserves parser-rendered list paragraph indentation" {
+    const alloc = std.testing.allocator;
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(alloc);
+    try processor.push(alloc, "1. Heading\n   alpha beta gamma delta\n\n- Heading\n  alpha beta gamma delta\n", &source);
+    try processor.flush(alloc, &source);
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+    try appendAssistantTestEntry(&entries, alloc, 1, source.items);
+    const narrow = try renderEntriesToBytes(alloc, entries.items, 18, .{});
+    defer alloc.free(narrow);
+    try std.testing.expect(std.mem.find(u8, narrow, "     alpha beta\n     gamma delta") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "    alpha beta\n    gamma delta") != null);
+}
+
 test "renderEntriesToBytes reflows parser-rendered task lists at paint-time cols" {
     const alloc = std.testing.allocator;
     var processor = assistant_presentation.MarkdownProcessor{};
