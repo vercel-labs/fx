@@ -566,11 +566,11 @@ pub fn consumeInputEscapeByteWithMouse(
                 return null;
             }
 
-            // Ghostty can report a Kitty key event type as a colon-qualified
-            // modifier, e.g. `ESC[27;1:1u` for an Escape key press.
-            if (byte == ':' and param2.* == 27) {
-                param2.* = if (param.* > 0) param.* - 1 else 0;
-                param.* = 0;
+            // Kitty keyboard protocol reports key event types as a colon-qualified
+            // modifier, e.g. `ESC[<keycode>;<modifier>:<event_type>u`.
+            if (byte == ':') {
+                const raw_modifiers = if (param.* > 0) param.* - 1 else 0;
+                param.* = raw_modifiers << 4;
                 setBaseEscapeStage(stage, kitty_escape_event_type_stage);
                 return null;
             }
@@ -656,19 +656,21 @@ pub fn consumeInputEscapeByteWithMouse(
 
             return beginControlSequenceDiscard(stage, param, param2, mouse, byte);
         },
-        // Kitty key reports with an event type: `ESC[27;modifier:event-type u`.
-        // Only press and repeat are actionable; release must not close a panel.
+        // Kitty key reports with an event type: `ESC[<keycode>;modifier:event-type u`.
+        // Only press (1) and repeat (2) are actionable; release (3) must not trigger actions.
         kitty_escape_event_type_stage => {
             if (byte >= '0' and byte <= '9') {
-                appendCsiDigitSaturating(param, byte);
+                param.* = (param.* & 0xFFF0) | (byte - '0');
                 return null;
             }
             if (byte == 'u') {
-                const modifiers = param2.*;
-                const event_type = param.*;
+                const meta_prefixed = hasMetaPrefix(stage.*);
+                const keycode = param2.*;
+                const modifiers = param.* >> 4;
+                const event_type = param.* & 0x0F;
                 resetMouseEscapeDecode(stage, param, param2, mouse);
-                if (event_type == 1 or event_type == 2) {
-                    return kittyUnicodeKeyAction(27, modifiers, false);
+                if (event_type == 1 or event_type == 2 or event_type == 0) {
+                    return kittyUnicodeKeyAction(keycode, modifiers, meta_prefixed);
                 }
                 return .ignore;
             }
