@@ -5445,6 +5445,123 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     60_000,
   );
 
+  for (const trigger of ["manual", "automatic"] as const) {
+    test.skipIf(!tmuxAvailable())(
+      `cancelled tool history survives ${trigger} compaction and restart`,
+      async () => {
+        const root = createFixtureRoot(`cancelled-tool-compaction-${trigger}`);
+        const tracePath = join(root.root, "trace.log");
+        const stderrPath = join(root.root, "stderr.log");
+        const held = heldFakeGatewayFinalText();
+        writeFileSync(join(root.workspace, "follow-up.txt"), "FOLLOW_UP_FACT\n");
+        let step = 0;
+        let compactions = 0;
+        let diagnosticHandle = "";
+        const gateway = startDynamicFakeGateway((body) => {
+          const request = JSON.parse(body);
+          if (request.tools.length === 0) {
+            compactions++;
+            expect(body).toContain("Tool subagent (failure)");
+            expect(body).toContain("aborted by user");
+            diagnosticHandle = body.match(/result-subagent-[a-f0-9-]+\.txt/)?.[0] ?? "";
+            expect(diagnosticHandle).not.toBe("");
+            return fakeGatewayFinalText(`The subagent was cancelled, not completed. Its diagnostic is ${diagnosticHandle}. Continue without repeating it.`);
+          }
+          switch (step++) {
+            case 0:
+              return fakeGatewayToolCall("cancelled-history-child", "subagent", {
+                request: { action: "run", task: "Wait for further input without tools." },
+              });
+            case 1:
+              return held.response;
+            case 2:
+              expect(toolResultOutput(body, "cancelled-history-child")).toBe("aborted by user");
+              return fakeGatewaySse([
+                { type: "tool-call", toolCallId: "cancel-follow-up-read", toolName: "read_file", input: { path: "follow-up.txt" } },
+                { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" }, ...(trigger === "automatic" ? { usage: { inputTokens: { total: 120000 }, outputTokens: { total: 10 } } } : {}) },
+              ]);
+            case 3:
+              expect(toolResultOutput(body, "cancel-follow-up-read")).toContain("FOLLOW_UP_FACT");
+              expect(compactions).toBe(trigger === "automatic" ? 1 : 0);
+              return fakeGatewayFinalText("CANCEL_FOLLOWUP_COMPLETE");
+            case 4:
+              expect(body).toContain("context_handoff");
+              expect(body).toContain(diagnosticHandle);
+              return fakeGatewayFinalText("CANCEL_RESTART_COMPLETE");
+            default:
+              return new Response("unexpected request", { status: 500 });
+          }
+        }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"], context_window: 128000 }] });
+        const env = {
+          ...fixtureEnv(root, gateway, tracePath),
+          FX_PERMISSION_MODE: "full-access",
+          FX_AUTO_UPGRADE: "0",
+          FX_TRACE_SCOPES: "agent,tool,session,context_compaction,worker,interrupt",
+        };
+        let tui: TmuxSession | null = null;
+        try {
+          tui = await TmuxSession.create({ cwd: root.workspace, env, stderrPath, remainOnExit: true });
+          await tui.waitForComposer(15000);
+          await tui.sendText("Run the requested subagent.");
+          const deadline = Date.now() + 15000;
+          while (gateway.requests.length < 2 && Date.now() < deadline) await Bun.sleep(10);
+          expect(gateway.requests).toHaveLength(2);
+          await tui.sendKeys("C-c");
+          await tui.waitForPane((pane) => pane.includes("cancelled") && hasEmptyComposer(pane), 15000);
+          const sessionsRoot = join(root.home, ".fx", "sessions");
+          const sessionId = readdirSync(sessionsRoot).find((id) => {
+            const path = join(sessionsRoot, id, "session.json");
+            return existsSync(path) && !JSON.parse(readFileSync(path, "utf8")).subagent_child;
+          });
+          expect(sessionId).toBeString();
+          const sessionDir = join(sessionsRoot, sessionId!);
+          const eventsPath = join(sessionDir, "events.jsonl");
+          const before = readFileSync(eventsPath, "utf8");
+          expect(before).toContain('"reason":"cancelled"');
+          await tui.sendText("Read the follow-up file and briefly acknowledge it. Do not rerun the child.");
+          const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("CANCEL_FOLLOWUP_COMPLETE") || text.includes("request failed:")), 20000);
+          expect(pane).not.toContain("request failed:");
+          expect(pane).toContain("CANCEL_FOLLOWUP_COMPLETE");
+          if (trigger === "manual") {
+            await tui.sendText("/compact");
+            const compacted = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("Context compacted.") || text.includes("request failed:")), 20000);
+            expect(compacted).not.toContain("request failed:");
+            expect(compacted).toContain("Context compacted.");
+          }
+          expect(compactions).toBe(1);
+          expect(gateway.requests).toHaveLength(5);
+          const saved = readFileSync(eventsPath, "utf8");
+          expect(saved.startsWith(before)).toBe(true);
+          expect(saved.match(/"context_checkpoint":/g)).toHaveLength(1);
+          expect(readFileSync(join(sessionDir, "tool-results", diagnosticHandle), "utf8")).toBe("aborted by user");
+          expect(await tui.captureFullScrollback()).not.toContain("IncompleteCompactionResult");
+          await tui.sendText("/quit");
+          await tui.waitForPane(() => paneExitMatches(tui!.paneStatus(), 0), 15000);
+          expect(readFileSync(stderrPath, "utf8")).toBe("");
+          await tui.kill();
+          tui = await TmuxSession.create({ cmd: `${FX_BIN} --resume ${sessionId}`, cwd: root.workspace, env, stderrPath, remainOnExit: true });
+          await tui.waitForComposer(15000);
+          await tui.sendText("Continue without repeating cancelled work.");
+          await tui.waitForPane((text) => hasEmptyComposer(text) && text.includes("CANCEL_RESTART_COMPLETE"), 15000);
+          expect(gateway.requests).toHaveLength(6);
+          const events = readFileSync(eventsPath, "utf8").trim().split("\n").map((line) => JSON.parse(line).event);
+          expect(events.filter((event) => event.tool_call?.call_id === "cancelled-history-child")).toHaveLength(1);
+          expect(events.filter((event) => event.tool_call?.call_id === "cancel-follow-up-read")).toHaveLength(1);
+          expect(events.some((event) => event.assistant?.text === "CANCEL_RESTART_COMPLETE")).toBe(true);
+          await tui.sendText("/quit");
+          await tui.waitForPane(() => paneExitMatches(tui!.paneStatus(), 0), 15000);
+          expect(readFileSync(stderrPath, "utf8")).toBe("");
+        } finally {
+          held.dispose();
+          await tui?.kill();
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      },
+      90000,
+    );
+  }
+
   test.skipIf(!tmuxAvailable())(
     "manual context compaction cancellation leaves no checkpoint and accepts a follow-up",
     async () => {
