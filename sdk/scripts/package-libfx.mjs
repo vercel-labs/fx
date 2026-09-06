@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { spawnSync } from "node:child_process";
 import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,6 +16,12 @@ const requiredNativeNames = new Set([
   "libfx.darwin-x64.node",
   "libfx.darwin-arm64.node",
 ]);
+const localNativeName = {
+  "linux-x64": "libfx.linux-x64.node",
+  "linux-arm64": "libfx.linux-arm64.node",
+  "darwin-x64": "libfx.darwin-x64.node",
+  "darwin-arm64": "libfx.darwin-arm64.node",
+}[`${process.platform}-${process.arch}`];
 const files = [
   ["sdk/package.json", "package.json"],
   ["sdk/README.md", "README.md"],
@@ -22,6 +29,7 @@ const files = [
   ["sdk/browser.js", "browser.js"],
   ["sdk/node.js", "node.js"],
   ["sdk/fx-sdk.js", "fx-sdk.js"],
+  ["sdk/wasm-module.js", "wasm-module.js"],
   ["sdk/core-output.js", "core-output.js"],
   ["sdk/mcp.js", "mcp.js"],
   ["sdk/skills.js", "skills.js"],
@@ -44,15 +52,25 @@ if (requestedNativeAddons.length) {
     ].filter(Boolean).join("; "));
   }
 }
+if (!requestedNativeAddons.length && !localNativeName) {
+  throw new Error(`local native packaging is unsupported on ${process.platform}-${process.arch}`);
+}
 
 await rm(outputDir, { recursive: true, force: true });
 await mkdir(outputDir, { recursive: true });
+const cjsBuild = spawnSync(process.execPath, [
+  resolve(repoRoot, "sdk/scripts/build-node-cjs.mjs"),
+  resolve(outputDir, "node.cjs"),
+], { cwd: repoRoot, stdio: "inherit" });
+if (cjsBuild.error) throw cjsBuild.error;
+if (cjsBuild.status !== 0) process.exit(cjsBuild.status ?? 1);
 for (const [source, destination] of files) {
   await cp(resolve(repoRoot, source), resolve(outputDir, destination));
 }
 for (const addon of nativeAddons) {
   if (!addon.endsWith(".node")) throw new Error(`native addon must end in .node: ${addon}`);
-  await cp(addon, resolve(outputDir, basename(addon)));
+  const destination = requestedNativeAddons.length ? basename(addon) : localNativeName;
+  await cp(addon, resolve(outputDir, destination));
 }
 
 const manifest = JSON.parse(await readFile(resolve(outputDir, "package.json"), "utf8"));
@@ -60,5 +78,8 @@ manifest.files = undefined;
 await writeFile(resolve(outputDir, "package.json"), `${JSON.stringify(manifest, null, 2)}\n`);
 
 console.log(`packaged ${manifest.name} in ${outputDir}`);
+console.log("  node.cjs");
 for (const [, destination] of files) console.log(`  ${destination}`);
-for (const addon of nativeAddons) console.log(`  ${basename(addon)}`);
+for (const addon of nativeAddons) {
+  console.log(`  ${requestedNativeAddons.length ? basename(addon) : localNativeName}`);
+}

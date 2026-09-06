@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { CoreOutput } from "./core-output.js";
+import { loadModule, withModuleFailure } from "./wasm-module.js";
 import {
   createFxAgent as createWasmAgent,
   createFxTerminal as createWasmTerminal,
@@ -24,15 +25,22 @@ const fetchOperationStale = 0;
 const fetchOperationApplied = 1;
 const fetchOperationBackpressure = 2;
 
-const require = createRequire(import.meta.url);
+const nodeRequire = createRequire(import.meta.url);
 const defaultCoreWasm = new URL("./fx-core.wasm", import.meta.url);
 const defaultTermWasm = new URL("./fx-term.wasm", import.meta.url);
-const defaultNativeCandidates = [
-  "./libfx.node",
-  `./libfx.${process.platform}-${process.arch}.node`,
-];
 let nativeBackendPromise;
 const wasmFilePromises = new Map();
+
+const backendReasonCodes = {
+  unsupportedPlatform: "LIBFX_UNSUPPORTED_PLATFORM",
+  missingArtifact: "LIBFX_NATIVE_ARTIFACT_MISSING",
+  nativeLoad: "LIBFX_NATIVE_LOAD_FAILED",
+  nativeApi: "LIBFX_NATIVE_API_MISMATCH",
+  missingSurface: "LIBFX_NATIVE_SURFACE_MISSING",
+  disabledNative: "LIBFX_NATIVE_DISABLED",
+  jspiUnavailable: "LIBFX_JSPI_UNAVAILABLE",
+  wasmLoad: "LIBFX_WASM_LOAD_FAILED",
+};
 
 function jspiFallbackError(surface, nativeError) {
   const nativeDetail = nativeError ? ` Native loading failed: ${nativeError.message}.` : " No compatible native addon was found.";
@@ -50,7 +58,8 @@ async function loadNativeCandidate(candidate) {
   if (candidate == null) return null;
   if (candidate instanceof URL) {
     if (candidate.protocol === "file:" && candidate.pathname.endsWith(".node")) {
-      return require(fileURLToPath(candidate));
+      // Bundlers trace the asset URL; Node must load the native file at runtime.
+      return Reflect.apply(nodeRequire, undefined, [fileURLToPath(candidate)]);
     }
     const imported = await import(candidate.href);
     return imported.default ?? imported;
@@ -59,9 +68,27 @@ async function loadNativeCandidate(candidate) {
   if (typeof candidate !== "string") {
     throw new TypeError("nativeAddon must be a module, path, URL, false, or undefined");
   }
-  if (candidate.endsWith(".node")) return require(isAbsolute(candidate) ? candidate : resolve(candidate));
+  if (candidate.endsWith(".node")) {
+    return Reflect.apply(nodeRequire, undefined, [isAbsolute(candidate) ? candidate : resolve(candidate)]);
+  }
   const imported = await import(candidate.startsWith("file:") ? candidate : pathToFileURL(candidate).href);
   return imported.default ?? imported;
+}
+
+function defaultNativeCandidate() {
+  if (process.platform === "linux" && process.arch === "x64") {
+    return new URL("./libfx.linux-x64.node", import.meta.url);
+  }
+  if (process.platform === "linux" && process.arch === "arm64") {
+    return new URL("./libfx.linux-arm64.node", import.meta.url);
+  }
+  if (process.platform === "darwin" && process.arch === "x64") {
+    return new URL("./libfx.darwin-x64.node", import.meta.url);
+  }
+  if (process.platform === "darwin" && process.arch === "arm64") {
+    return new URL("./libfx.darwin-arm64.node", import.meta.url);
+  }
+  return null;
 }
 
 function validateNativeBackend(backend) {
@@ -78,50 +105,215 @@ function validateNativeBackend(backend) {
   return backend;
 }
 
-async function discoverNativeBackend() {
-  for (const relativePath of defaultNativeCandidates) {
-    const url = new URL(relativePath, import.meta.url);
-    try {
-      await access(fileURLToPath(url));
-    } catch (error) {
-      if (error?.code === "ENOENT") continue;
-      return { backend: null, error };
-    }
-    try {
-      return { backend: validateNativeBackend(await loadNativeCandidate(url)), error: null };
-    } catch (error) {
-      return { backend: null, error };
-    }
+function missingArtifact(error) {
+  return error?.code === "ENOENT" || error?.code === "MODULE_NOT_FOUND" || error?.code === "ERR_MODULE_NOT_FOUND";
+}
+
+function nativeCandidateFilePath(candidate) {
+  if (candidate instanceof URL) return candidate.protocol === "file:" ? fileURLToPath(candidate) : null;
+  if (typeof candidate !== "string") return null;
+  if (candidate.startsWith("file:")) return fileURLToPath(new URL(candidate));
+  return URL.canParse(candidate) ? null : resolve(candidate);
+}
+
+async function nativeArtifactMissing(candidate) {
+  try {
+    const path = nativeCandidateFilePath(candidate);
+    if (path === null) return false;
+    await access(path);
+    return false;
+  } catch (error) {
+    return missingArtifact(error);
   }
-  return { backend: null, error: null };
+}
+
+function validationFailure(error) {
+  return error?.message?.startsWith("native addon API version ") ? "api" : "surface";
+}
+
+async function loadAndValidateNativeCandidate(candidate, artifactMissing = false) {
+  let backend;
+  try {
+    backend = await loadNativeCandidate(candidate);
+  } catch (error) {
+    return { backend: null, error, failure: artifactMissing ? "missing" : "load" };
+  }
+  try {
+    return { backend: validateNativeBackend(backend), error: null, failure: null };
+  } catch (error) {
+    return { backend: null, error, failure: validationFailure(error) };
+  }
+}
+
+async function discoverNativeBackend() {
+  const candidate = defaultNativeCandidate();
+  if (!candidate) {
+    return { backend: null, error: null, failure: "unsupported" };
+  }
+  try {
+    await access(fileURLToPath(candidate));
+  } catch (error) {
+    if (missingArtifact(error)) {
+      return { backend: null, error: null, probeError: error, failure: "missing" };
+    }
+    return { backend: null, error, failure: "load" };
+  }
+  return loadAndValidateNativeCandidate(candidate);
 }
 
 async function resolveNativeBackend(nativeAddon) {
-  if (nativeAddon === false) return { backend: null, error: null };
+  if (nativeAddon === false) return { backend: null, error: null, failure: "disabled" };
   if (nativeAddon !== undefined) {
-    try {
-      return { backend: validateNativeBackend(await loadNativeCandidate(nativeAddon)), error: null };
-    } catch (error) {
-      return { backend: null, error };
-    }
+    return loadAndValidateNativeCandidate(nativeAddon, await nativeArtifactMissing(nativeAddon));
   }
   nativeBackendPromise ??= discoverNativeBackend();
   return nativeBackendPromise;
 }
 
-function wasmBytes(input) {
-  let path;
-  if (input instanceof URL && input.protocol === "file:") path = fileURLToPath(input);
-  else if (typeof input === "string" && !URL.canParse(input)) path = resolve(input);
-  else return input;
+function wasmInput(input) {
+  const path = wasmFilePath(input);
+  if (path === null) {
+    if (input instanceof URL) return input.href;
+    return input;
+  }
   const cached = wasmFilePromises.get(path);
   if (cached) return cached;
-  const pending = readFile(path);
+  const pendingRead = readFile(path);
+  let pending;
+  pending = withModuleFailure(pendingRead, () => {
+    if (wasmFilePromises.get(path) === pending) wasmFilePromises.delete(path);
+  });
   wasmFilePromises.set(path, pending);
-  pending.catch(() => {
+  pendingRead.catch(() => {
     if (wasmFilePromises.get(path) === pending) wasmFilePromises.delete(path);
   });
   return pending;
+}
+
+function wasmFilePath(input) {
+  if (input instanceof URL && input.protocol === "file:") return fileURLToPath(input);
+  if (typeof input === "string" && !URL.canParse(input)) return resolve(input);
+  return null;
+}
+
+function reason(code, message, error) {
+  const causeCode = error?.code;
+  return {
+    code,
+    message,
+    ...(typeof causeCode === "string" || typeof causeCode === "number" ? { causeCode } : {}),
+  };
+}
+
+function nativeFailureReason(result) {
+  const detailError = result.probeError ?? result.error;
+  switch (result.failure) {
+    case "unsupported":
+      return reason(
+        backendReasonCodes.unsupportedPlatform,
+        `native addon is not available for ${process.platform}-${process.arch}`,
+      );
+    case "missing":
+      return reason(
+        backendReasonCodes.missingArtifact,
+        `native addon artifact was not found${detailError?.message ? `: ${detailError.message}` : ""}`,
+        detailError,
+      );
+    case "load":
+      return reason(
+        backendReasonCodes.nativeLoad,
+        `native addon failed to load${result.error?.message ? `: ${result.error.message}` : ""}`,
+        result.error,
+      );
+    case "api":
+      return reason(backendReasonCodes.nativeApi, result.error.message, result.error);
+    case "surface":
+      return reason(backendReasonCodes.missingSurface, result.error.message, result.error);
+    case "disabled":
+      return reason(backendReasonCodes.disabledNative, "native addon loading is disabled");
+    default:
+      return reason(backendReasonCodes.nativeLoad, "native addon is unavailable", result.error);
+  }
+}
+
+function validateBackendInfoOptions(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("getBackendInfo() options must be an object");
+  }
+  const options = { ...value };
+  for (const key of Object.keys(options)) {
+    if (!new Set(["surface", "backend", "nativeAddon", "wasm"]).has(key)) {
+      throw new TypeError(`getBackendInfo() does not accept ${key}`);
+    }
+  }
+  const surface = options.surface ?? "agent";
+  if (!new Set(["agent", "terminal"]).has(surface)) {
+    throw new TypeError('surface must be "agent" or "terminal"');
+  }
+  const backend = options.backend ?? "auto";
+  if (!new Set(["auto", "native", "wasm"]).has(backend)) {
+    throw new TypeError('backend must be "auto", "native", or "wasm"');
+  }
+  if (Object.hasOwn(options, "nativeAddon") && options.nativeAddon !== undefined && options.nativeAddon !== false &&
+    typeof options.nativeAddon !== "string" && !(options.nativeAddon instanceof URL) &&
+    (typeof options.nativeAddon !== "object" || options.nativeAddon === null)) {
+    throw new TypeError("nativeAddon must be a module, path, URL, false, or undefined");
+  }
+  const validWasm = options.wasm === undefined || typeof options.wasm === "string" || options.wasm instanceof URL ||
+    options.wasm instanceof Promise || options.wasm instanceof WebAssembly.Module || options.wasm instanceof Response ||
+    options.wasm instanceof ArrayBuffer || ArrayBuffer.isView(options.wasm);
+  if (Object.hasOwn(options, "wasm") && !validWasm) {
+    throw new TypeError("wasm must be a URL, Response, ArrayBuffer, typed array, or WebAssembly.Module");
+  }
+  return { ...options, surface, backend };
+}
+
+export async function getBackendInfo(value = {}) {
+  const { surface, backend, nativeAddon, wasm } = validateBackendInfoOptions(value);
+  const attempts = [];
+  if (backend !== "wasm") {
+    const native = await resolveNativeBackend(nativeAddon);
+    const nativeMethod = surface === "agent" ? "createCore" : "createFxTerminal";
+    if (typeof native.backend?.[nativeMethod] === "function") {
+      attempts.push({ backend: "native", available: true, reason: null });
+      return { surface, backend: "native", attempts };
+    }
+    const failureReason = native.backend
+      ? reason(backendReasonCodes.missingSurface, `native addon does not provide ${nativeMethod}()`)
+      : nativeFailureReason(native);
+    attempts.push({ backend: "native", available: false, reason: failureReason });
+    if (backend === "native") return { surface, backend: "unavailable", attempts };
+  }
+
+  if (!supportsJspi()) {
+    attempts.push({
+      backend: "wasm-jspi",
+      available: false,
+      reason: reason(
+        backendReasonCodes.jspiUnavailable,
+        "WebAssembly backend requires JavaScript Promise Integration (JSPI)",
+      ),
+    });
+    return { surface, backend: "unavailable", attempts };
+  }
+  const defaultWasm = surface === "agent" ? defaultCoreWasm : defaultTermWasm;
+  const wasmSource = wasm ?? defaultWasm;
+  try {
+    await loadModule(wasmInput(wasmSource));
+    attempts.push({ backend: "wasm-jspi", available: true, reason: null });
+    return { surface, backend: "wasm-jspi", attempts };
+  } catch (error) {
+    attempts.push({
+      backend: "wasm-jspi",
+      available: false,
+      reason: reason(
+        backendReasonCodes.wasmLoad,
+        `WebAssembly asset failed to load or compile: ${error?.message ?? String(error)}`,
+        error,
+      ),
+    });
+    return { surface, backend: "unavailable", attempts };
+  }
 }
 
 function createNativeCoreRuntime(addon, options) {
@@ -321,10 +513,8 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
     if (nativeAttempted) throw nativeError;
     throw jspiFallbackError(surface, nativeError);
   }
-  return wasmFactory({
-    ...runtimeOptions,
-    wasm: await wasmBytes(runtimeOptions.wasm ?? defaultWasm),
-  });
+  const wasmSource = runtimeOptions.wasm ?? defaultWasm;
+  return wasmFactory({ ...runtimeOptions, wasm: wasmInput(wasmSource) });
 }
 
 export async function createFxAgent(options = {}) {

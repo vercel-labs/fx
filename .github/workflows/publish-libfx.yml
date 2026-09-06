@@ -116,8 +116,12 @@ jobs:
         include:
           - runner: ubuntu-24.04
             package_platform: linux-x64
+            target_flags: -Dtarget=x86_64-linux-gnu.2.34 -Dcpu=baseline
+            runtime_image: public.ecr.aws/lambda/nodejs@sha256:2472f0273d8848d8b2aa6528f5526b8a514b70703596199efe5a4b84d3d59b0b
           - runner: ubuntu-24.04-arm
             package_platform: linux-arm64
+            target_flags: -Dtarget=aarch64-linux-gnu.2.34 -Dcpu=baseline
+            runtime_image: public.ecr.aws/lambda/nodejs@sha256:104527dd19c1907b4aaf328b5b3af1ac0c5db6bb9c76be8cb73fb295ec58b0fe
           - runner: macos-15-intel
             package_platform: darwin-x64
           - runner: macos-15
@@ -138,7 +142,25 @@ jobs:
           node-version: "24"
 
       - name: Build ReleaseSafe addon
-        run: zig build -Dnapi-surface=core -Doptimize=ReleaseSafe -Dupdate-channel=${{ needs.metadata.outputs.channel }}
+        run: zig build libfx-napi -Dnapi-surface=core -Doptimize=ReleaseSafe -Dupdate-channel=${{ needs.metadata.outputs.channel }} ${{ matrix.target_flags }}
+
+      - name: Check Linux ABI baseline
+        if: startsWith(matrix.package_platform, 'linux-')
+        run: |
+          python3 sdk/tests/test-linux-abi.py
+          python3 sdk/scripts/check-linux-abi.py zig-out/lib/libfx.node
+
+      - name: Test Linux addon on Amazon Linux 2023
+        if: startsWith(matrix.package_platform, 'linux-')
+        run: |
+          docker run --rm --network none --entrypoint /bin/bash \
+            --volume "$PWD:/workspace:ro" --workdir /workspace \
+            '${{ matrix.runtime_image }}' -euc '
+              node -e '\''const assert = require("node:assert/strict"); assert.equal(process.report.getReport().header.glibcVersionRuntime, "2.34");'\''
+              node sdk/tests/test-native-core-ready.mjs
+              node sdk/tests/test-host-tools.mjs native
+              node sdk/tests/test-host-tool-cancel.mjs native
+            '
 
       - name: Test native addon
         run: npm run --prefix sdk test:node-napi
@@ -196,57 +218,44 @@ jobs:
             zig-out/bin/fx-term.wasm
           if-no-files-found: error
 
-  publish:
+  package:
     needs: [metadata, native, wasm]
     runs-on: ubuntu-24.04
-    environment: npm
-    permissions:
-      contents: read
-      id-token: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          fetch-depth: 0
           ref: ${{ needs.metadata.outputs.sha }}
 
-      - name: Setup Node for npm trusted publishing
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: "24"
-          registry-url: https://registry.npmjs.org
+          node-version: "24.18.0"
 
-      - name: Install OIDC-capable npm
-        run: npm install --global npm@11.15.0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
 
-      - name: Download native addons
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - name: Install package test runner
+        run: npm install --global pnpm@11.1.1
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: libfx-native-*
           path: native-addons
           merge-multiple: true
 
-      - name: Download WebAssembly artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: libfx-wasm
           path: wasm-artifacts
 
-      - name: Restore package artifact layout
-        run: |
-          mkdir -p zig-out/bin
-          cp wasm-artifacts/fx-core.wasm zig-out/bin/fx-core.wasm
-          cp wasm-artifacts/fx-term.wasm zig-out/bin/fx-term.wasm
-
-      - name: Stage package without executing repository code
+      - name: Assemble package
         env:
           LIBFX_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           set -euo pipefail
-          test "$(find native-addons -type f -name '*.node' | wc -l | tr -d ' ')" = 4
-          for name in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
-            test -f "native-addons/libfx.${name}.node"
-          done
-
+          mkdir -p zig-out/bin zig-out/lib
+          cp wasm-artifacts/*.wasm zig-out/bin/
+          cp native-addons/libfx.linux-x64.node zig-out/lib/libfx.node
           jq -e '
             .name == "libfx" and
             .type == "module" and
@@ -259,29 +268,21 @@ jobs:
             (.bin == null)
           ' sdk/package.json >/dev/null
 
-          rm -rf sdk/dist/libfx
-          mkdir -p sdk/dist/libfx
-          cp sdk/package.json sdk/README.md sdk/browser.js sdk/node.js sdk/fx-sdk.js sdk/core-output.js sdk/mcp.js sdk/skills.js sdk/skills-node.js LICENSE sdk/dist/libfx/
-          cp wasm-artifacts/fx-core.wasm wasm-artifacts/fx-term.wasm sdk/dist/libfx/
-          cp native-addons/*.node sdk/dist/libfx/
-          jq --arg version "$LIBFX_VERSION" '.version = $version | del(.files)' \
+          node sdk/scripts/package-libfx.mjs sdk/dist/libfx native-addons/*.node
+          jq --arg version "$LIBFX_VERSION" '.version = $version' \
             sdk/dist/libfx/package.json > sdk/dist/libfx/package.json.tmp
           mv sdk/dist/libfx/package.json.tmp sdk/dist/libfx/package.json
-
-      - name: Run packed public API example
-        run: |
-          node sdk/tests/test-packed-example.mjs sdk/dist/libfx native
-          node --experimental-wasm-jspi sdk/tests/test-packed-example.mjs sdk/dist/libfx wasm
+          npm pack ./sdk/dist/libfx --ignore-scripts --json > /tmp/libfx-pack.json
+          mv "$(jq -r '.[0].filename' /tmp/libfx-pack.json)" libfx-package.tgz
+          sha256sum libfx-package.tgz > libfx-package.tgz.sha256
 
       - name: Validate package archive
         run: |
-          set -euo pipefail
-          npm pack --ignore-scripts --dry-run --json sdk/dist/libfx > /tmp/libfx-pack.json
           node -e '
             const report = require("/tmp/libfx-pack.json")[0];
             const names = new Set(report.files.map(({ path }) => path));
             const required = [
-              "package.json", "README.md", "LICENSE", "browser.js", "node.js", "fx-sdk.js",
+              "package.json", "README.md", "LICENSE", "browser.js", "node.js", "node.cjs", "fx-sdk.js", "wasm-module.js",
               "core-output.js", "mcp.js", "skills.js", "skills-node.js",
               "fx-core.wasm", "fx-term.wasm",
               "libfx.linux-x64.node", "libfx.linux-arm64.node",
@@ -294,6 +295,61 @@ jobs:
             console.log(`validated ${report.name}@${report.version}: ${report.files.length} files, ${report.size} bytes packed`);
           '
 
+      - name: Test installed package and diagnostics
+        run: |
+          node sdk/tests/test-packed-example.mjs libfx-package.tgz native esm
+          node --no-experimental-require-module sdk/tests/test-packed-example.mjs libfx-package.tgz native cjs
+          node --experimental-wasm-jspi sdk/tests/test-packed-example.mjs libfx-package.tgz wasm esm
+          node --experimental-wasm-jspi --no-experimental-require-module sdk/tests/test-packed-example.mjs libfx-package.tgz wasm cjs
+          node --experimental-wasm-jspi sdk/tests/test-backend-info.mjs
+          node sdk/tests/test-term-demo-package.mjs
+
+      - name: Test Next development, production and isolated output
+        env:
+          LIBFX_TEST_ARTIFACT_ROOT: ${{ runner.temp }}/libfx-package-evidence
+        run: node sdk/tests/test-next-package.mjs libfx-package.tgz
+
+      - name: Retain package qualification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: libfx-package-evidence
+          path: |
+            ${{ runner.temp }}/libfx-package-evidence/libfx-next-*/*.log
+            ${{ runner.temp }}/libfx-package-evidence/libfx-next-*/results.json
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: libfx-package
+          path: |
+            libfx-package.tgz
+            libfx-package.tgz.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: [metadata, package]
+    runs-on: ubuntu-24.04
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.metadata.outputs.sha }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+      - name: Install OIDC-capable npm
+        run: npm install --global npm@11.15.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: libfx-package
+      - run: sha256sum --check libfx-package.tgz.sha256
+
       - name: Confirm dev publish still targets main
         if: needs.metadata.outputs.channel == 'dev'
         env:
@@ -305,7 +361,7 @@ jobs:
             exit 1
           fi
 
-      - name: Publish with npm trusted publishing
+      - name: Publish the verified archive with npm trusted publishing
         env:
           LIBFX_VERSION: ${{ needs.metadata.outputs.version }}
           NPM_TAG: ${{ needs.metadata.outputs.npm_tag }}
@@ -315,4 +371,46 @@ jobs:
             echo "libfx@${LIBFX_VERSION} is already published; leaving ${NPM_TAG} unchanged"
             exit 0
           fi
-          npm publish sdk/dist/libfx --ignore-scripts --access public --tag "$NPM_TAG" --provenance
+          npm publish ./libfx-package.tgz --ignore-scripts --access public --tag "$NPM_TAG" --provenance
+
+  verify-published:
+    needs: [metadata, publish]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.metadata.outputs.sha }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24.18.0"
+      - run: npm install --global pnpm@11.1.1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: libfx-package
+      - name: Download and compare the immutable registry version
+        env:
+          LIBFX_VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          sha256sum --check libfx-package.tgz.sha256
+          npm pack "libfx@${LIBFX_VERSION}" --ignore-scripts --registry=https://registry.npmjs.org/ --json > /tmp/libfx-registry-pack.json
+          mv "$(jq -r '.[0].filename' /tmp/libfx-registry-pack.json)" libfx-registry.tgz
+          cmp libfx-package.tgz libfx-registry.tgz
+      - name: Test the registry package in Node and Next
+        env:
+          LIBFX_TEST_ARTIFACT_ROOT: ${{ runner.temp }}/libfx-registry-evidence
+        run: |
+          node sdk/tests/test-packed-example.mjs libfx-registry.tgz native esm
+          node --no-experimental-require-module sdk/tests/test-packed-example.mjs libfx-registry.tgz native cjs
+          node --experimental-wasm-jspi sdk/tests/test-packed-example.mjs libfx-registry.tgz wasm esm
+          node --experimental-wasm-jspi --no-experimental-require-module sdk/tests/test-packed-example.mjs libfx-registry.tgz wasm cjs
+          node sdk/tests/test-next-package.mjs libfx-registry.tgz
+      - name: Retain registry qualification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: libfx-registry-evidence
+          path: |
+            ${{ runner.temp }}/libfx-registry-evidence/libfx-next-*/*.log
+            ${{ runner.temp }}/libfx-registry-evidence/libfx-next-*/results.json
+          if-no-files-found: ignore

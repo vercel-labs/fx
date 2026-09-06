@@ -1,4 +1,5 @@
 import { CoreOutput, maxCoreMessageBytes } from "./core-output.js";
+import { loadModule } from "./wasm-module.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -287,43 +288,6 @@ class ByteQueue {
   wake() {
     this.waiters.splice(0).forEach((resolve) => resolve());
   }
-}
-
-const modulePromisesBySource = new Map();
-const modulePromisesByObject = new WeakMap();
-
-async function compileModule(input) {
-  if (input instanceof WebAssembly.Module) return input;
-  if (typeof input === "string") input = fetch(input);
-  if (input instanceof Promise) input = await input;
-  if (input instanceof WebAssembly.Module) return input;
-  if (input instanceof Response) {
-    const contentType = input.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
-    if (contentType === "application/wasm" && typeof WebAssembly.compileStreaming === "function") {
-      return WebAssembly.compileStreaming(input);
-    }
-    const bytes = await input.arrayBuffer();
-    return WebAssembly.compile(bytes);
-  }
-  if (input instanceof ArrayBuffer || ArrayBuffer.isView(input)) {
-    return WebAssembly.compile(input);
-  }
-  throw new TypeError("wasm must be a URL, Response, ArrayBuffer, typed array, or WebAssembly.Module");
-}
-
-function loadModule(input) {
-  if (input instanceof WebAssembly.Module) return Promise.resolve(input);
-  const isString = typeof input === "string";
-  if (!isString && (typeof input !== "object" || input === null)) return compileModule(input);
-  const cache = isString ? modulePromisesBySource : modulePromisesByObject;
-  const cached = cache.get(input);
-  if (cached) return cached;
-  const pending = compileModule(input);
-  cache.set(input, pending);
-  pending.catch(() => {
-    if (cache.get(input) === pending) cache.delete(input);
-  });
-  return pending;
 }
 
 function raceWithTimeout(promise, timeoutMs, timeoutValue) {

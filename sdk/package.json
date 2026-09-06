@@ -17,11 +17,17 @@
   },
   "exports": {
     ".": {
-      "node": "./node.js",
+      "node": {
+        "import": "./node.js",
+        "require": "./node.cjs"
+      },
       "browser": "./browser.js",
       "default": "./browser.js"
     },
-    "./node": "./node.js",
+    "./node": {
+      "import": "./node.js",
+      "require": "./node.cjs"
+    },
     "./browser": "./browser.js",
     "./wasm": "./fx-sdk.js",
     "./mcp": "./mcp.js",
@@ -31,7 +37,9 @@
   "files": [
     "browser.js",
     "node.js",
+    "node.cjs",
     "fx-sdk.js",
+    "wasm-module.js",
     "core-output.js",
     "mcp.js",
     "skills.js",

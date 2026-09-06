@@ -206,16 +206,97 @@ await createFxAgent({ apiKey, backend: "native" }); // require N-API
 await createFxAgent({ apiKey, backend: "wasm" });   // require Wasm + JSPI
 ```
 
-Within one JavaScript realm, libfx compiles each stable Wasm source once and
+CommonJS applications can load the same Node API with `require("libfx")`. The
+package chooses its generated CommonJS entry automatically and keeps asset
+paths relative to the installed package.
+
+Use `getBackendInfo()` to inspect backend availability without creating an
+Agent or terminal:
+
+```js
+import { getBackendInfo } from "libfx";
+
+const info = await getBackendInfo({ surface: "agent", backend: "auto" });
+// {
+//   surface: "agent",
+//   backend: "native" | "wasm-jspi" | "unavailable",
+//   attempts: [{ backend, available, reason }]
+// }
+```
+
+`surface` is `agent` by default and may also be `terminal`. `backend` has the
+same `auto`, `native`, and `wasm` selection as the factories. `nativeAddon` and
+`wasm` select explicit assets with the same meanings as their factory options.
+The probe loads and validates the native module or compiles the selected Wasm
+asset, then stops. It does not create a core, open a runtime socket, read
+credentials, start a model request, or write session state. A remote Wasm
+source can perform its normal asset fetch.
+
+Expected environmental failures resolve as structured attempts. Invalid
+options reject with `TypeError`. The stable reason codes are:
+
+| Code | Meaning |
+| --- | --- |
+| `LIBFX_UNSUPPORTED_PLATFORM` | No packaged native addon supports the current platform and architecture. |
+| `LIBFX_NATIVE_ARTIFACT_MISSING` | The selected native addon file is absent. |
+| `LIBFX_NATIVE_LOAD_FAILED` | Node could not load the selected native addon. |
+| `LIBFX_NATIVE_API_MISMATCH` | The addon API version is incompatible. |
+| `LIBFX_NATIVE_SURFACE_MISSING` | The addon does not implement the selected Agent or terminal surface. |
+| `LIBFX_NATIVE_DISABLED` | `nativeAddon: false` disabled native loading. |
+| `LIBFX_JSPI_UNAVAILABLE` | The current JavaScript runtime does not provide JSPI. |
+| `LIBFX_WASM_LOAD_FAILED` | The selected Wasm asset could not be loaded or compiled. |
+
+The optional `causeCode` field retains a Node error code such as `ENOENT` or
+`ERR_DLOPEN_FAILED` when one exists. Probe success establishes backend loading
+only; it does not validate credentials, a future Agent initialization, or a
+model request.
+
+Within one loaded SDK module, libfx compiles each stable Wasm source once and
 creates a separate WebAssembly instance for every Agent. Agent memory, history,
 tools, cancellation, and shutdown remain isolated. Workers and separate
-processes maintain their own module caches.
+processes maintain their own module caches, as do the ESM and CommonJS entries.
 
 Node.js 20+ is supported. Browser WebAssembly requires a JSPI-capable browser.
+The Linux x64 and arm64 native addons require glibc 2.34 or newer. Native
+agents do not require JSPI or experimental Node flags.
 Some Node versions require `--experimental-wasm-jspi`.
 Bun 1.4.2 is the tested recommendation for Bun's WebAssembly backend.
 Bun 1.3.14 can crash when a hot WebAssembly loop resumes through JSPI during
 JIT tier-up.
+
+### Next.js and Vercel
+
+Create agents in a server route using the Node.js runtime. Import `libfx`
+normally; the package includes its native assets and exposes both ESM and
+CommonJS Node entrypoints. No `serverExternalPackages` setting or manual native
+file inclusion is required.
+
+```js
+import { createFxAgent } from "libfx";
+
+export const runtime = "nodejs";
+
+export async function POST(request) {
+  const { prompt } = await request.json();
+  const agent = await createFxAgent({ apiKey: process.env.AI_GATEWAY_API_KEY });
+  try {
+    let text = "";
+    const turn = agent.prompt(prompt, { signal: request.signal });
+    for await (const event of turn) {
+      if (event.type === "text_delta") text += event.delta;
+    }
+    await turn.result;
+    return Response.json({ text });
+  } finally {
+    await agent.close();
+  }
+}
+```
+
+Use the application's normal authentication and request limits around the
+route. JavaScript tools and MCP clients remain host-owned and must be supplied
+when creating an agent, including after checkpoint restoration. The native
+backend does not enable the CLI's built-in shell or filesystem tools.
 
 ## Interactive terminal
 
