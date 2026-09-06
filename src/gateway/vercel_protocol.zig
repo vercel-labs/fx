@@ -382,10 +382,9 @@ fn buildGatewayRequestBodyValidated(
         try out.writer.print(",\"maxOutputTokens\":{d}", .{value});
     }
 
-    if (options.reasoning) |*reasoning| {
-        try out.writer.writeAll(",\"reasoning\":");
-        try std.json.Stringify.value(reasoning.label(), .{}, &out.writer);
-    }
+    // The v3 call-options schema has no top-level reasoning effort field; the
+    // user's effort preferences stay available through supported provider
+    // options rather than a root field the route discards.
     try writeProviderOptions(&out.writer, options);
 
     try out.writer.writeByte('}');
@@ -643,6 +642,13 @@ fn write_tool_result_group(
     try writer.writeAll("]}");
 }
 
+fn findToolCallByFinalId(tool_calls: []const ToolCall, id: []const u8) ?*const ToolCall {
+    for (tool_calls) |*tool_call| {
+        if (std.mem.eql(u8, tool_call.id, id)) return tool_call;
+    }
+    return null;
+}
+
 fn write_tool_result_part(scratch_alloc: std.mem.Allocator, writer: *std.Io.Writer, message: ChatMessage, ids: *const tool_call_ids.Projection) !void {
     try writer.writeAll("{\"type\":\"tool-result\",\"toolCallId\":");
     try std.json.Stringify.value(ids.resolve(message.tool_call_id orelse ""), .{}, writer);
@@ -672,7 +678,9 @@ fn write_tool_result_part(scratch_alloc: std.mem.Allocator, writer: *std.Io.Writ
             try std.json.Stringify.value(image.mime_type, .{}, writer);
             try writer.writeByte('}');
         }
-        try writer.writeAll("]}}");
+        try writer.writeAll("]}");
+        try write_tool_result_provider_options(scratch_alloc, writer, message);
+        try writer.writeByte('}');
         return;
     }
     if (denied) {
@@ -683,7 +691,19 @@ fn write_tool_result_part(scratch_alloc: std.mem.Allocator, writer: *std.Io.Writ
         try writer.writeAll(",\"output\":{\"type\":\"text\",\"value\":");
     }
     try std.json.Stringify.value(content, .{}, writer);
-    try writer.writeAll("}}");
+    try writer.writeByte('}');
+    try write_tool_result_provider_options(scratch_alloc, writer, message);
+    try writer.writeByte('}');
+}
+
+fn write_tool_result_provider_options(scratch_alloc: std.mem.Allocator, writer: *std.Io.Writer, message: ChatMessage) !void {
+    const memory = message.tool_result_memory orelse return;
+    const options = memory.provider_options_json orelse return;
+    types.validateProviderOptionsJson(scratch_alloc, options) catch {
+        return error.InvalidGatewayHistory;
+    };
+    try writer.writeAll(",\"providerOptions\":");
+    try writer.writeAll(options);
 }
 
 fn writeChatMessageJsonInner(
@@ -753,25 +773,88 @@ fn writeChatMessageJsonInner(
         },
         .assistant => {
             try writer.writeAll(",\"content\":[");
-            var wrote_part = false;
-            if (message.content) |content| {
-                if (content.len > 0) {
-                    try writer.writeAll("{\"type\":\"text\",\"text\":");
-                    try std.json.Stringify.value(content, .{}, writer);
+            if (message.assistant_parts) |parts| {
+                // A present part sequence is authoritative and emitted exactly
+                // once. References must resolve to the surviving canonical
+                // calls; invalid replay state fails the build explicitly.
+                types.validateAssistantParts(parts, message.tool_calls) catch {
+                    return error.InvalidGatewayHistory;
+                };
+                for (parts, 0..) |part, index| {
+                    if (index > 0) try writer.writeByte(',');
+                    switch (part) {
+                        .text => |text_part| {
+                            try writer.writeAll("{\"type\":\"text\",\"text\":");
+                            try std.json.Stringify.value(text_part.text, .{}, writer);
+                            if (text_part.provider_options) |options| {
+                                types.validateProviderOptionsJson(scratch_alloc, options) catch {
+                                    return error.InvalidGatewayHistory;
+                                };
+                                try writer.writeAll(",\"providerOptions\":");
+                                try writer.writeAll(options);
+                            }
+                            try writer.writeByte('}');
+                        },
+                        .reasoning => |reasoning_part| {
+                            try writer.writeAll("{\"type\":\"reasoning\",\"text\":");
+                            try std.json.Stringify.value(reasoning_part.text, .{}, writer);
+                            if (reasoning_part.provider_options) |options| {
+                                types.validateProviderOptionsJson(scratch_alloc, options) catch {
+                                    return error.InvalidGatewayHistory;
+                                };
+                                try writer.writeAll(",\"providerOptions\":");
+                                try writer.writeAll(options);
+                            }
+                            try writer.writeByte('}');
+                        },
+                        .tool_call_ref => |ref| {
+                            const tool_call = findToolCallByFinalId(message.tool_calls, ref.id) orelse
+                                return error.InvalidGatewayHistory;
+                            try writer.writeAll("{\"type\":\"tool-call\",\"toolCallId\":");
+                            try std.json.Stringify.value(ids.resolve(tool_call.id), .{}, writer);
+                            try writer.writeAll(",\"toolName\":");
+                            try std.json.Stringify.value(tool_call.name, .{}, writer);
+                            try writer.writeAll(",\"input\":");
+                            try writer.writeAll(tool_call.arguments_json);
+                            if (tool_call.provider_options_json) |options| {
+                                types.validateProviderOptionsJson(scratch_alloc, options) catch {
+                                    return error.InvalidGatewayHistory;
+                                };
+                                try writer.writeAll(",\"providerOptions\":");
+                                try writer.writeAll(options);
+                            }
+                            try writer.writeByte('}');
+                        },
+                    }
+                }
+            } else {
+                var wrote_part = false;
+                if (message.content) |content| {
+                    if (content.len > 0) {
+                        try writer.writeAll("{\"type\":\"text\",\"text\":");
+                        try std.json.Stringify.value(content, .{}, writer);
+                        try writer.writeByte('}');
+                        wrote_part = true;
+                    }
+                }
+                for (message.tool_calls) |tool_call| {
+                    if (wrote_part) try writer.writeByte(',');
+                    try writer.writeAll("{\"type\":\"tool-call\",\"toolCallId\":");
+                    try std.json.Stringify.value(ids.resolve(tool_call.id), .{}, writer);
+                    try writer.writeAll(",\"toolName\":");
+                    try std.json.Stringify.value(tool_call.name, .{}, writer);
+                    try writer.writeAll(",\"input\":");
+                    try writer.writeAll(tool_call.arguments_json);
+                    if (tool_call.provider_options_json) |options| {
+                        types.validateProviderOptionsJson(scratch_alloc, options) catch {
+                            return error.InvalidGatewayHistory;
+                        };
+                        try writer.writeAll(",\"providerOptions\":");
+                        try writer.writeAll(options);
+                    }
                     try writer.writeByte('}');
                     wrote_part = true;
                 }
-            }
-            for (message.tool_calls) |tool_call| {
-                if (wrote_part) try writer.writeByte(',');
-                try writer.writeAll("{\"type\":\"tool-call\",\"toolCallId\":");
-                try std.json.Stringify.value(ids.resolve(tool_call.id), .{}, writer);
-                try writer.writeAll(",\"toolName\":");
-                try std.json.Stringify.value(tool_call.name, .{}, writer);
-                try writer.writeAll(",\"input\":");
-                try writer.writeAll(tool_call.arguments_json);
-                try writer.writeByte('}');
-                wrote_part = true;
             }
             try writer.writeByte(']');
         },
@@ -1209,6 +1292,130 @@ test "writeChatMessageJson maps tool result status to the Vercel output variant"
     }
 }
 
+test "writeChatMessageJson replays ordered assistant parts with per-part providerOptions" {
+    const calls = [_]ToolCall{.{
+        .id = "call_1",
+        .name = "lookup",
+        .arguments_json = "{\"query\":\"example\"}",
+        .provider_options_json = "{\"google\":{\"thoughtSignature\":\"ts_1\"}}",
+    }};
+    const parts = [_]types.AssistantPart{
+        .{ .text = .{ .text = "Checking.", .provider_options = "{\"testprovider\":{\"note\":\"n1\"}}" } },
+        .{ .reasoning = .{ .text = "Let me check.", .provider_options = "{\"anthropic\":{\"signature\":\"sig_1\"}}" } },
+        .{ .tool_call_ref = .{ .id = "call_1" } },
+        .{ .reasoning = .{ .text = "", .provider_options = "{\"anthropic\":{\"redactedData\":\"red_1\"}}" } },
+    };
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    // The display string derives from text and must not merge into or replace
+    // the authoritative part sequence.
+    try writeChatMessageJson(std.testing.allocator, &out.writer, .{
+        .role = .assistant,
+        .content = "Checking.",
+        .tool_calls = &calls,
+        .assistant_parts = &parts,
+    });
+
+    try std.testing.expectEqualStrings(
+        "{\"role\":\"assistant\",\"content\":[" ++
+            "{\"type\":\"text\",\"text\":\"Checking.\",\"providerOptions\":{\"testprovider\":{\"note\":\"n1\"}}}," ++
+            "{\"type\":\"reasoning\",\"text\":\"Let me check.\",\"providerOptions\":{\"anthropic\":{\"signature\":\"sig_1\"}}}," ++
+            "{\"type\":\"tool-call\",\"toolCallId\":\"call_1\",\"toolName\":\"lookup\",\"input\":{\"query\":\"example\"},\"providerOptions\":{\"google\":{\"thoughtSignature\":\"ts_1\"}}}," ++
+            "{\"type\":\"reasoning\",\"text\":\"\",\"providerOptions\":{\"anthropic\":{\"redactedData\":\"red_1\"}}}" ++
+            "]}",
+        out.written(),
+    );
+}
+
+test "writeChatMessageJson rejects stale and duplicate tool-call references" {
+    const calls = [_]ToolCall{.{ .id = "call_1", .name = "lookup", .arguments_json = "{}" }};
+    const stale = [_]types.AssistantPart{.{ .tool_call_ref = .{ .id = "gone" } }};
+    const duplicate = [_]types.AssistantPart{
+        .{ .tool_call_ref = .{ .id = "call_1" } },
+        .{ .tool_call_ref = .{ .id = "call_1" } },
+    };
+    const provisional_only = [_]types.AssistantPart{.{ .tool_call_ref = .{ .id = "call_1" } }};
+    const provisional_calls = [_]ToolCall{.{
+        .id = "call_1",
+        .name = "lookup",
+        .arguments_json = "{}",
+        .final_identity = .wrong_type,
+    }};
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try std.testing.expectError(error.InvalidGatewayHistory, writeChatMessageJson(std.testing.allocator, &out.writer, .{
+        .role = .assistant,
+        .tool_calls = &calls,
+        .assistant_parts = &stale,
+    }));
+    try std.testing.expectError(error.InvalidGatewayHistory, writeChatMessageJson(std.testing.allocator, &out.writer, .{
+        .role = .assistant,
+        .tool_calls = &calls,
+        .assistant_parts = &duplicate,
+    }));
+    // A reference never resolves to a call without a valid final identity.
+    try std.testing.expectError(error.InvalidGatewayHistory, writeChatMessageJson(std.testing.allocator, &out.writer, .{
+        .role = .assistant,
+        .tool_calls = &provisional_calls,
+        .assistant_parts = &provisional_only,
+    }));
+}
+
+test "writeChatMessageJson emits a present empty part sequence without display fallback" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeChatMessageJson(std.testing.allocator, &out.writer, .{
+        .role = .assistant,
+        .content = "Done.",
+        .assistant_parts = &.{},
+    });
+    try std.testing.expectEqualStrings("{\"role\":\"assistant\",\"content\":[]}", out.written());
+}
+
+test "writeChatMessageJson writes tool-result providerOptions for text, error, and denial outputs" {
+    const denial = "{\"error\":{\"type\":\"tool_permission_denied\",\"reason\":\"policy_denied\"}}";
+    const cases = [_]struct {
+        status: types.PersistedToolStatus,
+        content: []const u8,
+        output_type: []const u8,
+    }{
+        .{ .status = .success, .content = "ordinary result", .output_type = "text" },
+        .{ .status = .failure, .content = "ordinary failure", .output_type = "error-text" },
+        .{ .status = .failure, .content = denial, .output_type = "execution-denied" },
+    };
+    for (cases) |case| {
+        var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        try writeChatMessageJson(std.testing.allocator, &out.writer, .{
+            .role = .tool,
+            .content = case.content,
+            .tool_call_id = "call_1",
+            .tool_name = "terminal",
+            .tool_result_status = case.status,
+            .tool_result_memory = .{ .provider_options_json = "{\"gateway\":{\"resultNote\":\"rn_1\"}}" },
+        });
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
+        defer parsed.deinit();
+        const result = parsed.value.object.get("content").?.array.items[0].object;
+        try std.testing.expectEqualStrings(case.output_type, result.get("output").?.object.get("type").?.string);
+        const options = result.get("providerOptions").?.object;
+        try std.testing.expectEqualStrings("rn_1", options.get("gateway").?.object.get("resultNote").?.string);
+    }
+
+    // Malformed replay metadata fails the build explicitly.
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try std.testing.expectError(error.InvalidGatewayHistory, writeChatMessageJson(std.testing.allocator, &out.writer, .{
+        .role = .tool,
+        .content = "ordinary result",
+        .tool_call_id = "call_1",
+        .tool_name = "terminal",
+        .tool_result_memory = .{ .provider_options_json = "[1,2]" },
+    }));
+}
+
 test "Gateway automatic caching preserves transient context and grouped tool results" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{
@@ -1274,7 +1481,9 @@ test "buildGatewayRequestBodyWithOptions keeps Anthropic default silent and name
     defer alloc.free(named_body);
     var named_parsed = try std.json.parseFromSlice(std.json.Value, alloc, named_body, .{});
     defer named_parsed.deinit();
-    try std.testing.expectEqualStrings("future-tier", named_parsed.value.object.get("reasoning").?.string);
+    // v3 has no top-level reasoning field: named effort is never emitted at
+    // the root of the request.
+    try std.testing.expect(named_parsed.value.object.get("reasoning") == null);
     try std.testing.expect(named_parsed.value.object.get("providerOptions") == null);
 }
 
@@ -1358,7 +1567,11 @@ test "pending tool review closes the exact assistant step with synthetic pending
     const user_index = std.mem.find(u8, body, "\"role\":\"user\"").?;
     try std.testing.expect(system_index < user_index);
     try std.testing.expect(std.mem.find(u8, body, "\"maxOutputTokens\":2048") != null);
-    try std.testing.expect(std.mem.find(u8, body, "\"reasoning\":\"minimal\"") != null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    // v3 has no top-level reasoning field; part-level providerOptions are the
+    // only reasoning carrier, so a whole-body search would be incorrect.
+    try std.testing.expect(parsed.value.object.get("reasoning") == null);
     try std.testing.expectError(
         error.InvalidGatewayHistory,
         buildGatewayRequestBody(std.testing.allocator, "[]", &messages),
@@ -1468,7 +1681,7 @@ test "buildGatewayRequestBodyWithOptions serializes Gateway Fast provider option
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("future-tier", parsed.value.object.get("reasoning").?.string);
+    try std.testing.expect(parsed.value.object.get("reasoning") == null);
     try std.testing.expect(parsed.value.object.get("fast") == null);
     const provider_options = parsed.value.object.get("providerOptions").?;
     const gateway = provider_options.object.get("gateway").?;

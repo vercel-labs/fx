@@ -1116,8 +1116,8 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         expect(gateway.requests[1]!.headers.get("authorization")).toBe(
           "Bearer fake-capability-key",
         );
+        expect(JSON.parse(gateway.requests[1]!.body)).not.toHaveProperty("reasoning");
         expect(JSON.parse(gateway.requests[1]!.body)).toMatchObject({
-          reasoning: "max",
           providerOptions: { gateway: { speed: "fast" } },
         });
         expect(JSON.parse(gateway.requests[1]!.body)).not.toHaveProperty("fast");
@@ -1343,7 +1343,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           gateway.requests[0]!.headers.get(
             "ai-language-model-specification-version",
           ),
-        ).toBe("4");
+        ).toBe("3");
         expect(JSON.parse(gateway.requests[0]!.body)).not.toHaveProperty("reasoning");
 
         await session.sendLiteral("/model new-reasoning");
@@ -1373,10 +1373,8 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           gateway.requests[1]!.headers.get(
             "ai-language-model-specification-version",
           ),
-        ).toBe("4");
-        expect(JSON.parse(gateway.requests[1]!.body)).toMatchObject({
-          reasoning: "future-tier",
-        });
+        ).toBe("3");
+        expect(JSON.parse(gateway.requests[1]!.body)).not.toHaveProperty("reasoning");
         expect(JSON.parse(gateway.requests[1]!.body).providerOptions).toEqual({
           gateway: { caching: "auto" },
         });

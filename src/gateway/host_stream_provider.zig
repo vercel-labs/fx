@@ -87,7 +87,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
         .{ .name = "HTTP-Referer", .value = "https://github.com/vercel-labs/fx" },
         .{ .name = "X-Title", .value = "fx" },
         .{ .name = "ai-gateway-protocol-version", .value = "0.0.1" },
-        .{ .name = "ai-language-model-specification-version", .value = "4" },
+        .{ .name = "ai-language-model-specification-version", .value = "3" },
         .{ .name = "ai-language-model-id", .value = request.model },
         .{ .name = "ai-language-model-streaming", .value = "true" },
     });

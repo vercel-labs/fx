@@ -793,8 +793,8 @@ describe("web_search Gateway fixture", () => {
         expect(gateway.requests[0].body).toContain('"name":"exa_search"');
         expect(gateway.requests[0].body).not.toContain('"name":"perplexity_search"');
         expect(gateway.requests[0].body).not.toContain('"name":"parallel_search"');
-        expect(JSON.parse(gateway.requests[0].body)).toMatchObject({ reasoning: "high" });
-        expect(JSON.parse(gateway.requests[1].body)).toMatchObject({ reasoning: "high" });
+        expect(JSON.parse(gateway.requests[0].body)).not.toHaveProperty("reasoning");
+        expect(JSON.parse(gateway.requests[1].body)).not.toHaveProperty("reasoning");
         expect(gateway.requests[0].body).not.toContain('"thinking"');
         expect(gateway.requests[1].body).not.toContain('"thinking"');
       } finally {

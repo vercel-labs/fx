@@ -229,6 +229,7 @@ pub const StreamResult = struct {
             if (call.provisional_id) |provisional_id| alloc.free(provisional_id);
             if (call.provider_result) |provider_result| alloc.free(provider_result);
             if (call.provider_options_json) |options| alloc.free(options);
+            if (call.provider_result_options_json) |options| alloc.free(options);
         }
         if (self.completion.tool_calls.len > 0) alloc.free(self.completion.tool_calls);
         if (self.completion.provider_failure_detail) |detail| alloc.free(@constCast(detail));
@@ -646,7 +647,7 @@ pub fn postGatewayCompletion(
             .{ .name = "Accept", .value = "application/json" },
             .{ .name = vercel_gateway_extended_time_header, .value = vercel_gateway_extended_time_value },
             .{ .name = "ai-gateway-protocol-version", .value = "0.0.1" },
-            .{ .name = "ai-language-model-specification-version", .value = "4" },
+            .{ .name = "ai-language-model-specification-version", .value = "3" },
             .{ .name = "ai-language-model-id", .value = model },
             .{ .name = "ai-language-model-streaming", .value = "false" },
         };
@@ -1723,7 +1724,7 @@ fn gatewayExtraHeaders(
     len += 1;
     buf[len] = .{ .name = "ai-gateway-protocol-version", .value = "0.0.1" };
     len += 1;
-    buf[len] = .{ .name = "ai-language-model-specification-version", .value = "4" };
+    buf[len] = .{ .name = "ai-language-model-specification-version", .value = "3" };
     len += 1;
     buf[len] = .{ .name = "ai-language-model-id", .value = model };
     len += 1;
@@ -2260,14 +2261,141 @@ const SseStreamedToolInput = struct {
     arguments: std.ArrayList(u8),
     state: StreamedToolInputState = .open,
     label_sent: bool = false,
+    provider_options: ?[]u8 = null,
 
     fn deinit(self: *SseStreamedToolInput, alloc: std.mem.Allocator) void {
         self.id.deinit(alloc);
         self.name.deinit(alloc);
         self.arguments.deinit(alloc);
+        if (self.provider_options) |options| alloc.free(options);
         self.* = undefined;
     }
 };
+
+/// Bounds for retained replay state. Exceeding any of them discards the whole
+/// ordered part sequence explicitly; truncated signed content is never kept.
+const max_replay_part_count: usize = 1024;
+const max_part_metadata_bytes: usize = 256 * 1024;
+const max_replay_capture_bytes: usize = 16 * 1024 * 1024;
+
+const SseTextBlock = struct {
+    id: std.ArrayList(u8),
+    text: std.ArrayList(u8),
+    provider_options: ?[]u8 = null,
+    ended: bool = false,
+
+    fn deinit(self: *SseTextBlock, alloc: std.mem.Allocator) void {
+        self.id.deinit(alloc);
+        self.text.deinit(alloc);
+        if (self.provider_options) |options| alloc.free(options);
+        self.* = undefined;
+    }
+};
+
+const SseReasoningBlock = struct {
+    id: std.ArrayList(u8),
+    text: std.ArrayList(u8),
+    provider_options: ?[]u8 = null,
+    ended: bool = false,
+
+    fn deinit(self: *SseReasoningBlock, alloc: std.mem.Allocator) void {
+        self.id.deinit(alloc);
+        self.text.deinit(alloc);
+        if (self.provider_options) |options| alloc.free(options);
+        self.* = undefined;
+    }
+};
+
+const SsePartOrderEntry = union(enum) {
+    text: usize,
+    reasoning: usize,
+    tool_call: usize,
+};
+
+/// Ordered capture state for replayable assistant content. Parsed event values
+/// die with the per-event arena; retained text and metadata are copied into
+/// `alloc` here and moved into the completion on success.
+const SseReplayCapture = struct {
+    text_blocks: std.ArrayList(SseTextBlock) = .empty,
+    reasoning_blocks: std.ArrayList(SseReasoningBlock) = .empty,
+    order: std.ArrayList(SsePartOrderEntry) = .empty,
+    bytes: usize = 0,
+    overflowed: bool = false,
+    /// Content arrived that cannot be attributed to a tracked block; emitting
+    /// the partial sequence would silently drop it from the replay.
+    inconsistent: bool = false,
+
+    fn deinit(self: *SseReplayCapture, alloc: std.mem.Allocator) void {
+        for (self.text_blocks.items) |*block| block.deinit(alloc);
+        self.text_blocks.deinit(alloc);
+        for (self.reasoning_blocks.items) |*block| block.deinit(alloc);
+        self.reasoning_blocks.deinit(alloc);
+        self.order.deinit(alloc);
+        self.* = undefined;
+    }
+
+    fn active(self: *const SseReplayCapture) bool {
+        return !self.overflowed and !self.inconsistent;
+    }
+
+    fn noteBytes(self: *SseReplayCapture, n: usize) void {
+        self.bytes +|= n;
+        if (self.bytes > max_replay_capture_bytes) self.overflowed = true;
+    }
+
+    fn notePart(self: *SseReplayCapture) void {
+        if (self.order.items.len >= max_replay_part_count) {
+            self.overflowed = true;
+        }
+    }
+};
+
+fn findTextBlock(blocks: []SseTextBlock, id: []const u8) ?usize {
+    for (blocks, 0..) |*block, index| {
+        if (std.mem.eql(u8, block.id.items, id)) return index;
+    }
+    return null;
+}
+
+fn findReasoningBlock(blocks: []SseReasoningBlock, id: []const u8) ?usize {
+    for (blocks, 0..) |*block, index| {
+        if (std.mem.eql(u8, block.id.items, id)) return index;
+    }
+    return null;
+}
+
+/// Applies the SDK's latest-snapshot metadata rule: a present object snapshot
+/// replaces prior state, while a missing or nullish update keeps it. The
+/// retained bytes are owned by `alloc` and validated as the two-level
+/// provider-metadata envelope; unknown namespaces are preserved.
+fn capturePartMetadata(
+    alloc: std.mem.Allocator,
+    root: std.json.Value,
+    current: *?[]u8,
+    capture: *SseReplayCapture,
+) !void {
+    const metadata_value = root.object.get("providerMetadata") orelse return;
+    if (metadata_value == .null) return;
+    if (metadata_value != .object) {
+        traceStreamStateAnomaly(.invalid_part_metadata);
+        return;
+    }
+    const bytes = try stringifyJsonValueOwned(alloc, metadata_value);
+    errdefer alloc.free(bytes);
+    if (bytes.len > max_part_metadata_bytes) {
+        alloc.free(bytes);
+        capture.overflowed = true;
+        return;
+    }
+    types.validateProviderOptionsJson(alloc, bytes) catch {
+        alloc.free(bytes);
+        traceStreamStateAnomaly(.invalid_part_metadata);
+        return;
+    };
+    capture.noteBytes(bytes.len);
+    if (current.*) |old| alloc.free(old);
+    current.* = bytes;
+}
 
 const ProviderResultState = enum {
     none,
@@ -2283,6 +2411,8 @@ const SseToolCallAccumulator = struct {
     argument_integrity: types.ToolArgumentIntegrity = .valid,
     provider_result: ?[]u8 = null,
     provider_result_state: ProviderResultState = .none,
+    provider_options: ?[]u8 = null,
+    provider_result_options: ?[]u8 = null,
     final_identity: types.FinalToolIdentity = .valid,
     provenance: types.ToolExecutionProvenance = .fx_local,
 
@@ -2292,6 +2422,8 @@ const SseToolCallAccumulator = struct {
         self.arguments.deinit(alloc);
         self.provisional_id.deinit(alloc);
         if (self.provider_result) |result| alloc.free(result);
+        if (self.provider_options) |options| alloc.free(options);
+        if (self.provider_result_options) |options| alloc.free(options);
         self.* = undefined;
     }
 };
@@ -2307,6 +2439,7 @@ const StreamStateAnomaly = enum {
     late_start,
     unmatched_or_late_delta,
     unmatched_or_duplicate_end,
+    invalid_part_metadata,
 };
 
 var test_force_sse_preview_failure = false;
@@ -2534,6 +2667,7 @@ fn deinitGatewayCompletion(alloc: std.mem.Allocator, completion: *types.ModelCom
         if (call.provisional_id) |provisional_id| alloc.free(provisional_id);
         if (call.provider_result) |provider_result| alloc.free(provider_result);
         if (call.provider_options_json) |options| alloc.free(options);
+        if (call.provider_result_options_json) |options| alloc.free(options);
     }
     if (completion.tool_calls.len > 0) alloc.free(completion.tool_calls);
     if (completion.provider_failure_detail) |detail| alloc.free(@constCast(detail));
@@ -2692,6 +2826,8 @@ fn materializeToolCalls(
             alloc.free(call.arguments_json);
             if (call.provisional_id) |provisional_id| alloc.free(provisional_id);
             if (call.provider_result) |provider_result| alloc.free(provider_result);
+            if (call.provider_options_json) |options| alloc.free(options);
+            if (call.provider_result_options_json) |options| alloc.free(options);
         }
         alloc.free(calls);
     }
@@ -2713,6 +2849,13 @@ fn materializeToolCalls(
         else
             null;
         errdefer if (provider_result) |result| alloc.free(result);
+        const provider_options = if (acc.provider_options) |options| try alloc.dupe(u8, options) else null;
+        errdefer if (provider_options) |options| alloc.free(options);
+        const provider_result_options = if (acc.provider_result_state == .final)
+            if (acc.provider_result_options) |options| try alloc.dupe(u8, options) else null
+        else
+            null;
+        errdefer if (provider_result_options) |options| alloc.free(options);
 
         calls[i] = .{
             .id = id,
@@ -2721,13 +2864,87 @@ fn materializeToolCalls(
             .argument_integrity = acc.argument_integrity,
             .provisional_id = provisional_id,
             .provider_result = provider_result,
+            .provider_result_options_json = provider_result_options,
             .final_identity = acc.final_identity,
             .provenance = acc.provenance,
+            .provider_options_json = provider_options,
         };
         initialized += 1;
     }
 
     return calls;
+}
+
+/// Builds the ordered replay sequence from captured blocks and final tool
+/// calls. Returns null when nothing replayable was captured (legacy or
+/// non-lifecycle streams keep the existing text/tool projection) or when
+/// capture bounds were exceeded; signed content is never truncated to fit.
+fn buildAssistantReplayParts(
+    alloc: std.mem.Allocator,
+    capture: *const SseReplayCapture,
+    accumulators: []const SseToolCallAccumulator,
+) !?[]types.AssistantPart {
+    if (capture.overflowed) {
+        debug_trace.logf("sse", "event=replay_capture_discarded reason=overflow", .{});
+        return null;
+    }
+    if (capture.inconsistent) {
+        debug_trace.logf("sse", "event=replay_capture_discarded reason=inconsistent_lifecycle", .{});
+        return null;
+    }
+    if (capture.order.items.len == 0) return null;
+    for (accumulators) |acc| {
+        if (acc.final_identity != .valid) {
+            // A call without a valid final identity cannot be referenced; the
+            // existing identity-failure handling owns this completion instead.
+            debug_trace.logf("sse", "event=replay_capture_discarded reason=invalid_tool_identity", .{});
+            return null;
+        }
+    }
+
+    const parts = try alloc.alloc(types.AssistantPart, capture.order.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (parts[0..initialized]) |part| {
+            switch (part) {
+                .text => |text_part| {
+                    alloc.free(text_part.text);
+                    if (text_part.provider_options) |options| alloc.free(options);
+                },
+                .reasoning => |reasoning_part| {
+                    alloc.free(reasoning_part.text);
+                    if (reasoning_part.provider_options) |options| alloc.free(options);
+                },
+                .tool_call_ref => |ref| alloc.free(ref.id),
+            }
+        }
+        alloc.free(parts);
+    }
+
+    for (capture.order.items, 0..) |entry, i| {
+        parts[i] = switch (entry) {
+            .text => |index| blk: {
+                const block = capture.text_blocks.items[index];
+                const text = try alloc.dupe(u8, block.text.items);
+                errdefer alloc.free(text);
+                const options = if (block.provider_options) |current| try alloc.dupe(u8, current) else null;
+                break :blk types.AssistantPart{ .text = .{ .text = text, .provider_options = options } };
+            },
+            .reasoning => |index| blk: {
+                const block = capture.reasoning_blocks.items[index];
+                const text = try alloc.dupe(u8, block.text.items);
+                errdefer alloc.free(text);
+                const options = if (block.provider_options) |current| try alloc.dupe(u8, current) else null;
+                break :blk types.AssistantPart{ .reasoning = .{ .text = text, .provider_options = options } };
+            },
+            .tool_call => |index| blk: {
+                const id = try alloc.dupe(u8, accumulators[index].id.items);
+                break :blk types.AssistantPart{ .tool_call_ref = .{ .id = id } };
+            },
+        };
+        initialized += 1;
+    }
+    return parts;
 }
 
 fn extractFirstJsonStringValue(args: []const u8) ?[]const u8 {
@@ -3120,6 +3337,9 @@ fn consumeSseStreamTraced(
         tool_accumulators.deinit(alloc);
     }
 
+    var replay_capture: SseReplayCapture = .{};
+    defer replay_capture.deinit(alloc);
+
     var finish_reason_holder: ?types.ProviderFinishReason = null;
     var finish_usage: types.Usage = .{};
     var finish_billing: ?types.ProviderBilling = null;
@@ -3237,6 +3457,34 @@ fn consumeSseStreamTraced(
         } else if (std.mem.eql(u8, event_type, "error")) {
             provider_failure_cause = provider_failure_cause orelse providerFailureCause(root);
             try captureProviderFailureDetail(alloc, &provider_failure_detail, root);
+        } else if (std.mem.eql(u8, event_type, "text-start")) {
+            if (!replay_capture.active()) continue;
+            const id = streamedToolInputId(root, .invalid_start) orelse {
+                replay_capture.inconsistent = true;
+                continue;
+            };
+            if (findTextBlock(replay_capture.text_blocks.items, id)) |_| {
+                traceStreamStateAnomaly(.conflicting_start);
+                replay_capture.inconsistent = true;
+                continue;
+            }
+            var block: SseTextBlock = .{ .id = .empty, .text = .empty };
+            block.id.appendSlice(alloc, id) catch |err| {
+                block.deinit(alloc);
+                return err;
+            };
+            replay_capture.notePart();
+            if (!replay_capture.active()) {
+                block.deinit(alloc);
+                continue;
+            }
+            replay_capture.text_blocks.append(alloc, block) catch |err| {
+                block.deinit(alloc);
+                return err;
+            };
+            // The block list owns the block from here on.
+            try replay_capture.order.append(alloc, .{ .text = replay_capture.text_blocks.items.len - 1 });
+            try capturePartMetadata(alloc, root, &replay_capture.text_blocks.items[replay_capture.text_blocks.items.len - 1].provider_options, &replay_capture);
         } else if (std.mem.eql(u8, event_type, "text-delta")) {
             if (root.object.get("delta")) |delta_val| {
                 if (delta_val == .string and delta_val.string.len > 0) {
@@ -3246,8 +3494,85 @@ fn consumeSseStreamTraced(
                         delta_val.string;
                     try content_buf.appendSlice(alloc, retained);
                     on_content_chunk(callback_ctx, delta_val.string);
+                    if (replay_capture.active()) {
+                        const id_value = root.object.get("id");
+                        const block_index = if (id_value != null and id_value.? == .string)
+                            findTextBlock(replay_capture.text_blocks.items, id_value.?.string)
+                        else
+                            null;
+                        if (block_index) |index| {
+                            const block = &replay_capture.text_blocks.items[index];
+                            if (block.ended) {
+                                traceStreamStateAnomaly(.unmatched_or_late_delta);
+                                replay_capture.inconsistent = true;
+                            } else {
+                                try block.text.appendSlice(alloc, delta_val.string);
+                                replay_capture.noteBytes(delta_val.string.len);
+                            }
+                        } else {
+                            // Text that cannot be attributed to a tracked block
+                            // would vanish from the replay sequence.
+                            replay_capture.inconsistent = true;
+                        }
+                    }
                 }
             }
+            if (replay_capture.active()) {
+                if (root.object.get("id")) |id_value| {
+                    if (id_value == .string) {
+                        if (findTextBlock(replay_capture.text_blocks.items, id_value.string)) |index| {
+                            try capturePartMetadata(alloc, root, &replay_capture.text_blocks.items[index].provider_options, &replay_capture);
+                        }
+                    }
+                }
+            }
+        } else if (std.mem.eql(u8, event_type, "text-end")) {
+            if (!replay_capture.active()) continue;
+            const id = streamedToolInputId(root, .unmatched_or_duplicate_end) orelse {
+                replay_capture.inconsistent = true;
+                continue;
+            };
+            const index = findTextBlock(replay_capture.text_blocks.items, id) orelse {
+                traceStreamStateAnomaly(.unmatched_or_duplicate_end);
+                replay_capture.inconsistent = true;
+                continue;
+            };
+            const block = &replay_capture.text_blocks.items[index];
+            if (block.ended) {
+                traceStreamStateAnomaly(.unmatched_or_duplicate_end);
+                replay_capture.inconsistent = true;
+                continue;
+            }
+            block.ended = true;
+            try capturePartMetadata(alloc, root, &block.provider_options, &replay_capture);
+        } else if (std.mem.eql(u8, event_type, "reasoning-start")) {
+            if (!replay_capture.active()) continue;
+            const id = streamedToolInputId(root, .invalid_start) orelse {
+                replay_capture.inconsistent = true;
+                continue;
+            };
+            if (findReasoningBlock(replay_capture.reasoning_blocks.items, id)) |_| {
+                traceStreamStateAnomaly(.conflicting_start);
+                replay_capture.inconsistent = true;
+                continue;
+            }
+            var block: SseReasoningBlock = .{ .id = .empty, .text = .empty };
+            block.id.appendSlice(alloc, id) catch |err| {
+                block.deinit(alloc);
+                return err;
+            };
+            replay_capture.notePart();
+            if (!replay_capture.active()) {
+                block.deinit(alloc);
+                continue;
+            }
+            replay_capture.reasoning_blocks.append(alloc, block) catch |err| {
+                block.deinit(alloc);
+                return err;
+            };
+            // The block list owns the block from here on.
+            try replay_capture.order.append(alloc, .{ .reasoning = replay_capture.reasoning_blocks.items.len - 1 });
+            try capturePartMetadata(alloc, root, &replay_capture.reasoning_blocks.items[replay_capture.reasoning_blocks.items.len - 1].provider_options, &replay_capture);
         } else if (std.mem.eql(u8, event_type, "reasoning-delta")) {
             if (on_reasoning_chunk) |callback| {
                 if (root.object.get("delta")) |delta_val| {
@@ -3256,6 +3581,52 @@ fn consumeSseStreamTraced(
                     }
                 }
             }
+            // Metadata arrives independently of text: an empty delta may carry
+            // the block's signature, and metadata-only blocks carry replay state
+            // with no text at all.
+            if (!replay_capture.active()) continue;
+            const id_value = root.object.get("id") orelse {
+                replay_capture.inconsistent = true;
+                continue;
+            };
+            if (id_value != .string) {
+                replay_capture.inconsistent = true;
+                continue;
+            }
+            const index = findReasoningBlock(replay_capture.reasoning_blocks.items, id_value.string) orelse {
+                replay_capture.inconsistent = true;
+                continue;
+            };
+            const block = &replay_capture.reasoning_blocks.items[index];
+            if (block.ended) {
+                traceStreamStateAnomaly(.unmatched_or_late_delta);
+                replay_capture.inconsistent = true;
+            } else if (root.object.get("delta")) |delta_val| {
+                if (delta_val == .string and delta_val.string.len > 0) {
+                    try block.text.appendSlice(alloc, delta_val.string);
+                    replay_capture.noteBytes(delta_val.string.len);
+                }
+            }
+            try capturePartMetadata(alloc, root, &block.provider_options, &replay_capture);
+        } else if (std.mem.eql(u8, event_type, "reasoning-end")) {
+            if (!replay_capture.active()) continue;
+            const id = streamedToolInputId(root, .unmatched_or_duplicate_end) orelse {
+                replay_capture.inconsistent = true;
+                continue;
+            };
+            const index = findReasoningBlock(replay_capture.reasoning_blocks.items, id) orelse {
+                traceStreamStateAnomaly(.unmatched_or_duplicate_end);
+                replay_capture.inconsistent = true;
+                continue;
+            };
+            const block = &replay_capture.reasoning_blocks.items[index];
+            if (block.ended) {
+                traceStreamStateAnomaly(.unmatched_or_duplicate_end);
+                replay_capture.inconsistent = true;
+                continue;
+            }
+            block.ended = true;
+            try capturePartMetadata(alloc, root, &block.provider_options, &replay_capture);
         } else if (std.mem.eql(u8, event_type, "tool-input-start")) {
             const id = streamedToolInputId(root, .invalid_start) orelse continue;
             const name = if (root.object.get("toolName")) |name_value|
@@ -3278,6 +3649,9 @@ fn consumeSseStreamTraced(
                 record.deinit(alloc);
                 return err;
             };
+            if (replay_capture.active()) {
+                try capturePartMetadata(alloc, root, &streamed_tool_inputs.items[streamed_tool_inputs.items.len - 1].provider_options, &replay_capture);
+            }
             if (name.len > 0) {
                 if (on_tool_start) |cb| cb(callback_ctx, id, name, null);
             }
@@ -3306,6 +3680,9 @@ fn consumeSseStreamTraced(
                 if (on_tool_input_chunk) |callback| callback(callback_ctx, delta_value.string);
             } else {
                 record.state = .ended;
+            }
+            if (replay_capture.active()) {
+                try capturePartMetadata(alloc, root, &record.provider_options, &replay_capture);
             }
         } else if (std.mem.eql(u8, event_type, "tool-call")) {
             var acc: SseToolCallAccumulator = .{
@@ -3459,10 +3836,29 @@ fn consumeSseStreamTraced(
                 }
             }
 
+            // The final tool-call event's metadata takes precedence over any
+            // metadata captured from the preliminary streamed-input events.
+            if (replay_capture.active()) {
+                try capturePartMetadata(alloc, root, &acc.provider_options, &replay_capture);
+                if (acc.provider_options == null) {
+                    if (stream_index) |index| {
+                        if (streamed_tool_inputs.items[index].provider_options) |inherited| {
+                            acc.provider_options = try alloc.dupe(u8, inherited);
+                        }
+                    }
+                }
+            }
+
             try tool_accumulators.append(alloc, acc);
             acc_owned = false;
             if (stream_index) |index| {
                 streamed_tool_inputs.items[index].state = .finalized;
+            }
+            if (replay_capture.active()) {
+                replay_capture.notePart();
+                if (replay_capture.active()) {
+                    try replay_capture.order.append(alloc, .{ .tool_call = tool_accumulators.items.len - 1 });
+                }
             }
         } else if (std.mem.eql(u8, event_type, "tool-result")) {
             const result_identity = finalToolIdentity(root.object.get("toolCallId"));
@@ -3542,6 +3938,11 @@ fn consumeSseStreamTraced(
             if (acc.provider_result) |old_result| alloc.free(old_result);
             acc.provider_result = owned_result;
             acc.provider_result_state = if (preliminary) .preliminary else .final;
+            // Only a final result's metadata is replay state; a preliminary
+            // result's metadata must not masquerade as final-result data.
+            if (!preliminary and replay_capture.active()) {
+                try capturePartMetadata(alloc, root, &acc.provider_result_options, &replay_capture);
+            }
         } else if (std.mem.eql(u8, event_type, "finish")) {
             provider_failure_cause = provider_failure_cause orelse providerFailureCause(root);
             const finish_event = parseSseFinishEvent(alloc, root, &provider_failure_detail) catch |err| {
@@ -3584,6 +3985,7 @@ fn consumeSseStreamTraced(
     }
 
     completion.tool_calls = try materializeToolCalls(alloc, tool_accumulators.items);
+    completion.assistant_parts = try buildAssistantReplayParts(alloc, &replay_capture, tool_accumulators.items);
 
     completion.provider_result_identity_failure = provider_result_identity_failure;
     completion.provider_failure_cause = provider_failure_cause;
@@ -3667,6 +4069,274 @@ test "consumeSseStream preserves provider finish_reason" {
 
     try std.testing.expectEqualStrings("Hola", completion.content.?);
     try std.testing.expectEqual(types.ProviderFinishReason.length, completion.finish_reason.?);
+}
+
+test "decode to replay preserves ordered reasoning parts and per-part metadata" {
+    const vercel_protocol = @import("vercel_protocol.zig");
+    const alloc = std.testing.allocator;
+
+    // Synthetic provider stream: text, a signed reasoning block (signature on an
+    // empty delta, replacing the start snapshot), one authoritative tool call,
+    // a metadata-only reasoning block, and trailing text with its own metadata.
+    const payload =
+        "data: {\"type\":\"text-start\",\"id\":\"t1\"}\n\n" ++
+        "data: {\"type\":\"text-delta\",\"id\":\"t1\",\"delta\":\"Checking the file.\"}\n\n" ++
+        "data: {\"type\":\"text-end\",\"id\":\"t1\"}\n\n" ++
+        "data: {\"type\":\"reasoning-start\",\"id\":\"r1\",\"providerMetadata\":{\"anthropic\":{\"signature\":\"sig_superseded\",\"note\":1}}}\n\n" ++
+        "data: {\"type\":\"reasoning-delta\",\"id\":\"r1\",\"delta\":\"Let me check.\"}\n\n" ++
+        "data: {\"type\":\"reasoning-delta\",\"id\":\"r1\",\"delta\":\"\",\"providerMetadata\":{\"anthropic\":{\"signature\":\"sig_1\"}}}\n\n" ++
+        "data: {\"type\":\"reasoning-end\",\"id\":\"r1\"}\n\n" ++
+        "data: {\"type\":\"tool-input-start\",\"id\":\"call_1\",\"toolName\":\"lookup\"}\n\n" ++
+        "data: {\"type\":\"tool-input-delta\",\"id\":\"call_1\",\"delta\":\"{\\\"query\\\":\"}\n\n" ++
+        "data: {\"type\":\"tool-input-delta\",\"id\":\"call_1\",\"delta\":\"\\\"example\\\"}\"}\n\n" ++
+        "data: {\"type\":\"tool-input-end\",\"id\":\"call_1\"}\n\n" ++
+        "data: {\"type\":\"tool-call\",\"toolCallId\":\"call_1\",\"toolName\":\"lookup\",\"input\":\"{\\\"query\\\":\\\"example\\\"}\",\"providerMetadata\":{\"google\":{\"thoughtSignature\":\"ts_1\"}}}\n\n" ++
+        "data: {\"type\":\"reasoning-start\",\"id\":\"r2\",\"providerMetadata\":{\"anthropic\":{\"redactedData\":\"red_1\"}}}\n\n" ++
+        "data: {\"type\":\"reasoning-end\",\"id\":\"r2\"}\n\n" ++
+        "data: {\"type\":\"text-start\",\"id\":\"t2\",\"providerMetadata\":{\"testprovider\":{\"note\":\"n1\"}}}\n\n" ++
+        "data: {\"type\":\"text-delta\",\"id\":\"t2\",\"delta\":\"Done checking.\"}\n\n" ++
+        "data: {\"type\":\"text-end\",\"id\":\"t2\"}\n\n" ++
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"tool-calls\",\"raw\":\"tool_use\"},\"usage\":{\"inputTokens\":{\"total\":10},\"outputTokens\":{\"total\":5}}}\n\n" ++
+        "data: [DONE]\n\n";
+
+    // Decode with no reasoning callback installed, into a releasable arena.
+    var source_arena = std.heap.ArenaAllocator.init(alloc);
+    var completion = blk: {
+        var reader = std.Io.Reader.fixed(payload);
+        var cancel_flag = std.atomic.Value(bool).init(false);
+        const Noop = struct {
+            fn chunk(_: *anyopaque, _: []const u8) void {}
+        };
+        break :blk try consumeSseStream(source_arena.allocator(), &reader, undefined, Noop.chunk, null, &cancel_flag);
+    };
+
+    // The accepted content is deep-cloned, then every decode-side buffer dies.
+    const parts = try types.dupeAssistantParts(alloc, completion.assistant_parts orelse &.{
+        .{ .text = .{ .text = "decode dropped the reasoning blocks" } },
+    });
+    defer types.freeAssistantParts(alloc, parts);
+    const calls = try types.dupeToolCallSlice(alloc, completion.tool_calls);
+    defer types.freeToolCallSlice(alloc, calls);
+    const content = if (completion.content) |text| try alloc.dupe(u8, text) else null;
+    defer if (content) |text| alloc.free(text);
+    completion = undefined;
+    source_arena.deinit();
+
+    try std.testing.expectEqual(@as(usize, 5), parts.len);
+    try std.testing.expectEqualStrings("Checking the file.", parts[0].text.text);
+    try std.testing.expect(parts[0].text.provider_options == null);
+    try std.testing.expectEqualStrings("Let me check.", parts[1].reasoning.text);
+    try std.testing.expectEqualStrings(
+        "{\"anthropic\":{\"signature\":\"sig_1\"}}",
+        parts[1].reasoning.provider_options.?,
+    );
+    try std.testing.expectEqualStrings("call_1", parts[2].tool_call_ref.id);
+    try std.testing.expectEqualStrings("", parts[3].reasoning.text);
+    try std.testing.expectEqualStrings(
+        "{\"anthropic\":{\"redactedData\":\"red_1\"}}",
+        parts[3].reasoning.provider_options.?,
+    );
+    try std.testing.expectEqualStrings("Done checking.", parts[4].text.text);
+    try std.testing.expectEqualStrings(
+        "{\"testprovider\":{\"note\":\"n1\"}}",
+        parts[4].text.provider_options.?,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    try std.testing.expectEqualStrings("{\"query\":\"example\"}", calls[0].arguments_json);
+    try std.testing.expectEqualStrings(
+        "{\"google\":{\"thoughtSignature\":\"ts_1\"}}",
+        calls[0].provider_options_json.?,
+    );
+    // The display/legacy projection derives from text, never from reasoning.
+    try std.testing.expectEqualStrings("Checking the file.Done checking.", content.?);
+
+    // Serialize the cloned state as history in the next request after the tool
+    // result, as the tool loop would.
+    const messages: []const types.ChatMessage = &.{
+        .{ .role = .user, .content = "Look up an example." },
+        .{
+            .role = .assistant,
+            .content = content,
+            .tool_calls = calls,
+            .assistant_parts = parts,
+        },
+        .{
+            .role = .tool,
+            .content = "found it",
+            .tool_call_id = "call_1",
+            .tool_name = "lookup",
+        },
+    };
+    const body = try vercel_protocol.buildGatewayRequestBody(alloc, "[]", messages);
+    defer alloc.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    // The unsupported top-level reasoning effort field is never emitted on v3.
+    try std.testing.expect(parsed.value.object.get("reasoning") == null);
+
+    const prompt = parsed.value.object.get("prompt").?;
+    try std.testing.expectEqual(@as(usize, 3), prompt.array.items.len);
+    const assistant = prompt.array.items[1];
+    try std.testing.expectEqualStrings("assistant", assistant.object.get("role").?.string);
+    const expected_content =
+        "[{\"type\":\"text\",\"text\":\"Checking the file.\"}," ++
+        "{\"type\":\"reasoning\",\"text\":\"Let me check.\",\"providerOptions\":{\"anthropic\":{\"signature\":\"sig_1\"}}}," ++
+        "{\"type\":\"tool-call\",\"toolCallId\":\"call_1\",\"toolName\":\"lookup\",\"input\":{\"query\":\"example\"},\"providerOptions\":{\"google\":{\"thoughtSignature\":\"ts_1\"}}}," ++
+        "{\"type\":\"reasoning\",\"text\":\"\",\"providerOptions\":{\"anthropic\":{\"redactedData\":\"red_1\"}}}," ++
+        "{\"type\":\"text\",\"text\":\"Done checking.\",\"providerOptions\":{\"testprovider\":{\"note\":\"n1\"}}}]";
+    var content_out: std.Io.Writer.Allocating = .init(alloc);
+    defer content_out.deinit();
+    try std.json.Stringify.value(assistant.object.get("content").?, .{}, &content_out.writer);
+    try std.testing.expectEqualStrings(expected_content, content_out.written());
+
+    const tool_message = prompt.array.items[2];
+    try std.testing.expectEqualStrings("tool", tool_message.object.get("role").?.string);
+    const tool_parts = tool_message.object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), tool_parts.len);
+    try std.testing.expectEqualStrings("tool-result", tool_parts[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("call_1", tool_parts[0].object.get("toolCallId").?.string);
+    try std.testing.expectEqualStrings("lookup", tool_parts[0].object.get("toolName").?.string);
+}
+
+test "reasoning metadata arrives on end with latest snapshot semantics" {
+    const payload =
+        "data: {\"type\":\"reasoning-start\",\"id\":\"rs_1\",\"providerMetadata\":{\"openai\":{\"itemId\":\"rs_1\"}}}\n\n" ++
+        "data: {\"type\":\"reasoning-delta\",\"id\":\"rs_1\",\"delta\":\"thinking\"}\n\n" ++
+        "data: {\"type\":\"reasoning-delta\",\"id\":\"rs_1\",\"delta\":\" more\"}\n\n" ++
+        "data: {\"type\":\"reasoning-end\",\"id\":\"rs_1\",\"providerMetadata\":{\"openai\":{\"reasoningEncryptedContent\":\"enc_1\",\"itemId\":\"rs_1\"}}}\n\n" ++
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"}}\n\n" ++
+        "data: [DONE]\n\n";
+
+    var reader = std.Io.Reader.fixed(payload);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+
+    var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
+    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+
+    const parts = completion.assistant_parts orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), parts.len);
+    try std.testing.expectEqualStrings("thinking more", parts[0].reasoning.text);
+    // The end-event snapshot replaced the start snapshot, and the metadata-less
+    // deltas did not erase earlier state.
+    try std.testing.expectEqualStrings(
+        "{\"openai\":{\"reasoningEncryptedContent\":\"enc_1\",\"itemId\":\"rs_1\"}}",
+        parts[0].reasoning.provider_options.?,
+    );
+}
+
+test "incomplete reasoning block at EOF retains accumulated replay state" {
+    const payload =
+        "data: {\"type\":\"reasoning-start\",\"id\":\"r1\",\"providerMetadata\":{\"anthropic\":{\"signature\":\"sig_partial\"}}}\n\n" ++
+        "data: {\"type\":\"reasoning-delta\",\"id\":\"r1\",\"delta\":\"partial thought\"}\n\n";
+
+    var reader = std.Io.Reader.fixed(payload);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+
+    var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
+    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+
+    const parts = completion.assistant_parts orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), parts.len);
+    try std.testing.expectEqualStrings("partial thought", parts[0].reasoning.text);
+    try std.testing.expectEqualStrings(
+        "{\"anthropic\":{\"signature\":\"sig_partial\"}}",
+        parts[0].reasoning.provider_options.?,
+    );
+}
+
+test "malformed and unattributable lifecycle events discard replay capture explicitly" {
+    // A metadata snapshot with a scalar namespace value is dropped, not replayed.
+    const malformed_metadata =
+        "data: {\"type\":\"reasoning-start\",\"id\":\"r1\",\"providerMetadata\":{\"anthropic\":\"scalar\"}}\n\n" ++
+        "data: {\"type\":\"reasoning-delta\",\"id\":\"r1\",\"delta\":\"kept\"}\n\n" ++
+        "data: {\"type\":\"reasoning-end\",\"id\":\"r1\"}\n\n" ++
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"}}\n\n";
+    var reader = std.Io.Reader.fixed(malformed_metadata);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+    var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
+    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    const kept_parts = completion.assistant_parts orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), kept_parts.len);
+    try std.testing.expect(kept_parts[0].reasoning.provider_options == null);
+    try std.testing.expectEqualStrings("kept", kept_parts[0].reasoning.text);
+
+    // A text delta that cannot be attributed to any tracked block discards the
+    // whole sequence rather than replaying an incomplete response.
+    const unattributable =
+        "data: {\"type\":\"reasoning-start\",\"id\":\"r1\"}\n\n" ++
+        "data: {\"type\":\"reasoning-delta\",\"id\":\"r1\",\"delta\":\"fine\"}\n\n" ++
+        "data: {\"type\":\"reasoning-end\",\"id\":\"r1\"}\n\n" ++
+        "data: {\"type\":\"text-delta\",\"id\":\"orphan\",\"delta\":\"lost text\"}\n\n" ++
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"}}\n\n";
+    var second_reader = std.Io.Reader.fixed(unattributable);
+    var second_completion = try consumeSseStream(std.testing.allocator, &second_reader, undefined, Noop.chunk, null, &cancel_flag);
+    defer deinitGatewayCompletion(std.testing.allocator, &second_completion);
+    try std.testing.expect(second_completion.assistant_parts == null);
+    try std.testing.expectEqualStrings("lost text", second_completion.content.?);
+}
+
+test "oversized part metadata discards replay capture without truncation" {
+    const alloc = std.testing.allocator;
+    const oversized_signature = "s" ** (max_part_metadata_bytes);
+    const payload = try std.fmt.allocPrint(alloc, "data: {{\"type\":\"reasoning-start\",\"id\":\"r1\",\"providerMetadata\":{{\"anthropic\":{{\"signature\":\"{s}\"}}}}}}\n\n" ++
+        "data: {{\"type\":\"reasoning-delta\",\"id\":\"r1\",\"delta\":\"thought\"}}\n\n" ++
+        "data: {{\"type\":\"finish\",\"finishReason\":{{\"unified\":\"stop\"}}}}\n\n", .{oversized_signature});
+    defer alloc.free(payload);
+
+    var reader = std.Io.Reader.fixed(payload);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+    var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
+    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    // Explicit unavailability: no truncated signature is labeled replay-safe.
+    try std.testing.expect(completion.assistant_parts == null);
+}
+
+test "replay capture survives allocation failure without leaks" {
+    const payload =
+        "data: {\"type\":\"text-start\",\"id\":\"t1\"}\n\n" ++
+        "data: {\"type\":\"text-delta\",\"id\":\"t1\",\"delta\":\"alpha\"}\n\n" ++
+        "data: {\"type\":\"text-end\",\"id\":\"t1\"}\n\n" ++
+        "data: {\"type\":\"reasoning-start\",\"id\":\"r1\",\"providerMetadata\":{\"anthropic\":{\"signature\":\"sig_1\"}}}\n\n" ++
+        "data: {\"type\":\"reasoning-delta\",\"id\":\"r1\",\"delta\":\"beta\"}\n\n" ++
+        "data: {\"type\":\"reasoning-end\",\"id\":\"r1\"}\n\n" ++
+        "data: {\"type\":\"tool-call\",\"toolCallId\":\"call_1\",\"toolName\":\"lookup\",\"input\":\"{}\",\"providerMetadata\":{\"google\":{\"thoughtSignature\":\"ts_1\"}}}\n\n" ++
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"tool-calls\"}}\n\n";
+
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+
+    var fail_index: usize = 0;
+    while (fail_index < 400) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var reader = std.Io.Reader.fixed(payload);
+        var cancel_flag = std.atomic.Value(bool).init(false);
+        var completion = consumeSseStream(failing.allocator(), &reader, undefined, Noop.chunk, null, &cancel_flag) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            fail_index += 1;
+            continue;
+        };
+        deinitGatewayCompletion(std.testing.allocator, &completion);
+        break;
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(fail_index > 0);
 }
 
 test "consumeSseStream captures generation identity metadata" {
@@ -4358,18 +5028,8 @@ test "consumeSseStream serializes tool-call input that arrives as an object" {
         fn chunk(_: *anyopaque, _: []const u8) void {}
     };
 
-    const completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
-    defer {
-        if (completion.content) |c| std.testing.allocator.free(c);
-        for (completion.tool_calls) |tc| {
-            std.testing.allocator.free(tc.id);
-            std.testing.allocator.free(tc.name);
-            std.testing.allocator.free(tc.arguments_json);
-            if (tc.provisional_id) |id| std.testing.allocator.free(id);
-            if (tc.provider_result) |pr| std.testing.allocator.free(pr);
-        }
-        std.testing.allocator.free(completion.tool_calls);
-    }
+    var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
+    defer deinitGatewayCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
     try std.testing.expect(completion.tool_calls[0].arguments_json.len > 0);

@@ -742,6 +742,10 @@ pub const ToolCall = struct {
     argument_integrity: ToolArgumentIntegrity = .valid,
     provisional_id: ?[]const u8 = null,
     provider_result: ?[]const u8 = null,
+    /// Owned validated JSON object captured from the final provider-executed
+    /// result event, carried beside `provider_result` until the result scope
+    /// takes ownership. Replayed as the tool-result part's `providerOptions`.
+    provider_result_options_json: ?[]const u8 = null,
     final_identity: FinalToolIdentity = .valid,
     provenance: ToolExecutionProvenance = .fx_local,
     /// Owned validated JSON object replayed verbatim as this call part's
@@ -1025,6 +1029,9 @@ pub const ToolResultMemory = struct {
     command_output_replay: ?CommandOutputReplay = null,
     command_process_presentation: ?CommandProcessPresentation = null,
     terminal_action_presentation: ?TerminalActionPresentation = null,
+    /// Borrowed validated JSON object replayed verbatim as this result part's
+    /// `providerOptions`, projected from the persisted result.
+    provider_options_json: ?[]const u8 = null,
 };
 
 pub const ToolExecutionStep = struct {
@@ -2860,6 +2867,8 @@ pub fn dupeToolCall(alloc: std.mem.Allocator, call: ToolCall) !ToolCall {
     errdefer if (provider_result) |result| alloc.free(result);
     const provider_options_json = if (call.provider_options_json) |options| try alloc.dupe(u8, options) else null;
     errdefer if (provider_options_json) |options| alloc.free(options);
+    const provider_result_options_json = if (call.provider_result_options_json) |options| try alloc.dupe(u8, options) else null;
+    errdefer if (provider_result_options_json) |options| alloc.free(options);
     return .{
         .id = id,
         .name = name,
@@ -2867,6 +2876,7 @@ pub fn dupeToolCall(alloc: std.mem.Allocator, call: ToolCall) !ToolCall {
         .argument_integrity = call.argument_integrity,
         .provisional_id = provisional_id,
         .provider_result = provider_result,
+        .provider_result_options_json = provider_result_options_json,
         .final_identity = call.final_identity,
         .provenance = call.provenance,
         .provider_options_json = provider_options_json,
@@ -2879,6 +2889,7 @@ pub fn freeToolCall(alloc: std.mem.Allocator, call: ToolCall) void {
     alloc.free(call.arguments_json);
     if (call.provisional_id) |provisional_id| alloc.free(provisional_id);
     if (call.provider_result) |provider_result| alloc.free(provider_result);
+    if (call.provider_result_options_json) |options| alloc.free(options);
     if (call.provider_options_json) |options| alloc.free(options);
 }
 

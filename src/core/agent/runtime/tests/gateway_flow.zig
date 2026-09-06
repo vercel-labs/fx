@@ -2743,7 +2743,7 @@ test "processQueuedPrompt omits Fast without catalog support" {
 
     try std.testing.expectEqual(@as(usize, 1), hooks.capability_queries.items.len);
     try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
-    try expectBodyContains(&gateway, 0, "\"reasoning\":\"high\"");
+    try expectRootFieldAbsent(&gateway, 0, "reasoning");
     try expectRootFieldAbsent(&gateway, 0, "fast");
     try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"caching\":\"auto\"}}");
     try expectBodyNotContains(&gateway, 0, "\"maxOutputTokens\"");
@@ -3656,7 +3656,7 @@ test "processQueuedPrompt resolves catalog capabilities for opaque effort" {
 
     try std.testing.expectEqual(@as(usize, 1), hooks.capability_queries.items.len);
     try std.testing.expectEqualStrings("provider/new-reasoning-model", hooks.capability_queries.items[0]);
-    try expectBodyContains(&gateway, 0, "\"reasoning\":\"future-tier\"");
+    try expectRootFieldAbsent(&gateway, 0, "reasoning");
     try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"caching\":\"auto\"}}");
 
     const trace = try readTraceFile(alloc, trace_path, 65536);
@@ -3837,7 +3837,7 @@ test "processQueuedPrompt filters stale controls against each queued model" {
 
         try runFakePrompt(&gateway, &hooks, config, job);
 
-        try expectBodyContains(&gateway, 0, "\"reasoning\":\"xhigh\"");
+        try expectRootFieldAbsent(&gateway, 0, "reasoning");
         try expectRootFieldAbsent(&gateway, 0, "fast");
         try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\",\"caching\":\"auto\"}}");
     }
@@ -3967,7 +3967,7 @@ test "processQueuedPrompt provider payload follows queued model sync boundaries"
         try runFakePrompt(&gateway, &hooks, config, supported_job);
 
         try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
-        try expectBodyContains(&gateway, 0, "\"reasoning\":\"high\"");
+        try expectRootFieldAbsent(&gateway, 0, "reasoning");
         try expectRootFieldAbsent(&gateway, 0, "fast");
         try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\",\"caching\":\"auto\"}}");
     }

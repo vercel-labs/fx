@@ -4027,8 +4027,8 @@ describe("cli: ask success", () => {
         expect(JSON.parse(result.stdout).output.trim()).toBe("portable ask complete");
         expect(gateway.requests).toHaveLength(1);
         const request = JSON.parse(gateway.requests[0]!.body);
+        expect(request).not.toHaveProperty("reasoning");
         expect(request).toMatchObject({
-          reasoning: "high",
           maxOutputTokens: 64_000,
         });
         expect(gateway.modelRequests).toHaveLength(1);
@@ -4037,7 +4037,7 @@ describe("cli: ask success", () => {
           gateway.requests[0]!.headers.get(
             "ai-language-model-specification-version",
           ),
-        ).toBe("4");
+        ).toBe("3");
       } finally {
         gateway.stop();
         rmSync(root, { recursive: true, force: true });
