@@ -2755,6 +2755,16 @@ fn previewTestWorkspaceAuthority(alloc: Allocator, _: []const u8) ![][]u8 {
     return alloc.alloc([]u8, 0);
 }
 
+/// Reports the currently installed workspace server as still authorized, so a
+/// superseded reload cannot independently self-detect an authority reduction
+/// and race an explicit beginAuthorityReduction call for the same runtime.
+fn previewUnchangedWorkspaceAuthority(alloc: Allocator, _: []const u8) ![][]u8 {
+    const names = try alloc.alloc([]u8, 1);
+    errdefer alloc.free(names);
+    names[0] = try alloc.dupe(u8, "workspace");
+    return names;
+}
+
 fn failPendingReloadSpawn(_: *PendingReload) !std.Thread {
     return error.TestSpawnFailed;
 }
@@ -3003,20 +3013,27 @@ test "authority reduction quiesces superseded tasks before detached runtime reti
         "/workspace",
         .{},
         loadTestReloadRuntime,
-        previewTestWorkspaceAuthority,
+        previewUnchangedWorkspaceAuthority,
         .{},
         50,
     );
 
     const authentication = try alloc.create(PendingAuthentication);
+    var authentication_owned = true;
+    errdefer if (authentication_owned) alloc.destroy(authentication);
+    const authentication_server_name = try alloc.dupe(u8, "workspace");
+    var authentication_server_name_owned = true;
+    errdefer if (authentication_server_name_owned) alloc.free(authentication_server_name);
     authentication.* = .{
         .alloc = alloc,
-        .server_name = try alloc.dupe(u8, "workspace"),
+        .server_name = authentication_server_name,
         .lease = state.acquire() orelse return error.TestUnexpectedResult,
         .opener = host.unavailable_url_opener,
         .done = .init(true),
         .result = error.Cancelled,
     };
+    authentication_owned = false;
+    authentication_server_name_owned = false;
     state.lock.lockUncancelable(io_mod.getIo());
     state.pending_authentication = authentication;
     state.lock.unlock(io_mod.getIo());

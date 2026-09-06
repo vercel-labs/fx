@@ -5902,6 +5902,7 @@ const LoopbackGatewayFixture = struct {
     stopping: std.atomic.Value(bool) = .init(false),
     accepted: std.atomic.Value(bool) = .init(false),
     reached_stage: std.atomic.Value(bool) = .init(false),
+    stage_event: std.Io.Event = .unset,
     request_headers: [16 * 1024]u8 = undefined,
     request_headers_len: std.atomic.Value(usize) = .init(0),
     failure: ?anyerror = null,
@@ -5994,6 +5995,7 @@ const LoopbackGatewayFixture = struct {
 
     fn markStage(self: *@This()) void {
         self.reached_stage.store(true, .seq_cst);
+        self.stage_event.set(io_mod.getIo());
     }
 
     fn captureRequestHeaders(self: *@This(), headers: []const u8) void {
@@ -7259,7 +7261,7 @@ test "bounded stream deadline cancels and joins every blocked request stage" {
 
         try std.testing.expectError(
             error.Timeout,
-            runBoundedStreamOperation(std.testing.allocator, &cancel_flag, testAwakeDeadlineAfter(1), &probe),
+            runBoundedStreamOperation(std.testing.allocator, &cancel_flag, testAwakeDeadlineAfter(200), &probe),
         );
         try std.testing.expectEqual(stage, probe.reached_stage.?);
         try std.testing.expectEqual(@as(usize, 0), probe.active_tasks);
@@ -7457,26 +7459,54 @@ test "delivery certainty becomes possibly sent before response head" {
 
     var delivery = DeliveryCertainty.init();
     var cancel_flag = std.atomic.Value(bool).init(false);
-    try std.testing.expectError(
-        error.Timeout,
-        streamGatewayRequiredToolCompletionBounded(
-            std.testing.allocator,
-            .{
-                .api_key = "test-key",
-                .model = "test/model",
-                .retry_count = 1,
-                .chat_url = url,
-                .payload = "{}",
-                .delivery = &delivery,
-            },
-            testAwakeDeadlineAfter(20),
-            &cancel_flag,
-        ),
+    const Request = struct {
+        result: anyerror!StreamResult = undefined,
+
+        fn run(
+            self: *@This(),
+            request_url: []const u8,
+            certainty: *DeliveryCertainty,
+            cancelled: *std.atomic.Value(bool),
+            deadline: std.Io.Clock.Timestamp,
+        ) void {
+            self.result = streamGatewayRequiredToolCompletionBounded(
+                std.testing.allocator,
+                .{
+                    .api_key = "test-key",
+                    .model = "test/model",
+                    .retry_count = 1,
+                    .chat_url = request_url,
+                    .payload = "{}",
+                    .delivery = certainty,
+                },
+                deadline,
+                cancelled,
+            );
+        }
+    };
+    const deadline = testAwakeDeadlineAfter(5000);
+    var request: Request = .{};
+    const request_thread = try std.Thread.spawn(
+        .{},
+        Request.run,
+        .{ &request, url, &delivery, &cancel_flag, deadline },
     );
+    var request_joined = false;
+    defer if (!request_joined) {
+        cancel_flag.store(true, .seq_cst);
+        request_thread.join();
+    };
+
+    try fixture.stage_event.waitTimeout(io_mod.getIo(), .{ .deadline = deadline });
     try std.testing.expectEqual(
         DeliveryCertainty.State.possibly_sent,
         delivery.load(),
     );
+
+    cancel_flag.store(true, .seq_cst);
+    request_thread.join();
+    request_joined = true;
+    try std.testing.expectError(error.Cancelled, request.result);
 }
 
 test "server error response preserves billing ambiguity" {

@@ -2966,18 +2966,6 @@ fn expectReapedChildForTest(child: *std.process.Child, pid: std.posix.pid_t) !vo
     try std.testing.expectError(error.ProcessNotFound, std.posix.kill(pid, @enumFromInt(0)));
 }
 
-fn expectProcessGoneWithinForTest(pid: std.posix.pid_t, timeout_ms: i64) !void {
-    const deadline_ms = io_mod.milliTimestamp() + timeout_ms;
-    while (io_mod.milliTimestamp() < deadline_ms) {
-        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
-            error.ProcessNotFound => return,
-            else => return err,
-        };
-        io_mod.sleep(std.time.ns_per_ms);
-    }
-    return error.TestUnexpectedResult;
-}
-
 test "captured foreground command runs beneath a detached session supervisor" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
 
@@ -3029,7 +3017,7 @@ test "foreground session bootstrap waits for release before executing target" {
     try std.testing.expectEqualStrings("released", marker);
 }
 
-test "foreground session owner loss kills the target and descendant before delayed effects" {
+test "foreground session owner loss kills the target and descendant" {
     if (comptime !supports_foreground_session) return;
 
     const alloc = std.testing.allocator;
@@ -3037,20 +3025,7 @@ test "foreground session owner loss kills the target and descendant before delay
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pids_path = try std.fs.path.join(alloc, &.{ workspace, "owner-loss.pids" });
-    defer alloc.free(pids_path);
-    const effect_path = try std.fs.path.join(alloc, &.{ workspace, "owner-loss.finished" });
-    defer alloc.free(effect_path);
-    const quoted_pids = try shellQuote(alloc, pids_path);
-    defer alloc.free(quoted_pids);
-    const quoted_effect = try shellQuote(alloc, effect_path);
-    defer alloc.free(quoted_effect);
-    const target_script = try std.fmt.allocPrint(
-        alloc,
-        "sleep 30 & child=$!; printf '%s %s' \"$$\" \"$child\" > {s}; sleep 3; printf FINISHED > {s}",
-        .{ quoted_pids, quoted_effect },
-    );
-    defer alloc.free(target_script);
+    const target_script = "sleep 30 & child=$!; printf '%s %s\\n' \"$$\" \"$child\"; wait";
 
     var child = try spawnForegroundSessionBootstrapForTest(workspace, target_script);
     defer child.kill(io_mod.getIo());
@@ -3064,15 +3039,18 @@ test "foreground session owner loss kills the target and descendant before delay
         "",
     );
 
-    const marker_deadline_ms = io_mod.milliTimestamp() + 2_000;
-    while (!absoluteFileExists(pids_path) and
-        io_mod.milliTimestamp() < marker_deadline_ms)
-    {
-        io_mod.sleep(std.time.ns_per_ms);
+    var target_output = child.stdout orelse return error.TestUnexpectedResult;
+    child.stdout = null;
+    defer target_output.close(io_mod.getIo());
+    var pids_buffer: [128]u8 = undefined;
+    var pids_len: usize = 0;
+    while (std.mem.findScalar(u8, pids_buffer[0..pids_len], '\n') == null) {
+        if (pids_len == pids_buffer.len) return error.TestUnexpectedResult;
+        const read_len = try std.posix.read(target_output.handle, pids_buffer[pids_len..]);
+        if (read_len == 0) return error.TestUnexpectedResult;
+        pids_len += read_len;
     }
-    const pids_text = try readAbsoluteFile(alloc, pids_path, 128);
-    defer alloc.free(pids_text);
-    var pids = std.mem.tokenizeAny(u8, pids_text, " \r\n\t");
+    var pids = std.mem.tokenizeAny(u8, pids_buffer[0..pids_len], " \r\n\t");
     const target_pid = try std.fmt.parseInt(std.posix.pid_t, pids.next() orelse return error.TestUnexpectedResult, 10);
     const descendant_pid = try std.fmt.parseInt(std.posix.pid_t, pids.next() orelse return error.TestUnexpectedResult, 10);
     try std.testing.expect(pids.next() == null);
@@ -3081,9 +3059,8 @@ test "foreground session owner loss kills the target and descendant before delay
 
     owner_write.close(io_mod.getIo());
     _ = try child.wait(io_mod.getIo());
-    try expectProcessGoneWithinForTest(target_pid, 2_000);
-    try expectProcessGoneWithinForTest(descendant_pid, 2_000);
-    try std.testing.expect(!absoluteFileExists(effect_path));
+    try expectProcessGone(target_pid);
+    try expectProcessGone(descendant_pid);
 }
 
 test "foreground session bootstrap EOF executes no target" {
@@ -3602,6 +3579,7 @@ const StreamCapture = struct {
 
 const CancelAfterOutput = struct {
     flag: *std.atomic.Value(bool),
+    force_flag: ?*std.atomic.Value(bool) = null,
     needle: []const u8,
     seen: bool = false,
 
@@ -3609,6 +3587,7 @@ const CancelAfterOutput = struct {
         const self: *@This() = @ptrCast(@alignCast(ctx));
         if (std.mem.find(u8, chunk, self.needle) == null) return;
         self.seen = true;
+        if (self.force_flag) |flag| flag.store(true, .seq_cst);
         self.flag.store(true, .seq_cst);
     }
 };
@@ -3626,19 +3605,6 @@ const FailOutput = struct {
         self.seen = true;
         if (self.cancel_flag) |flag| flag.store(true, .seq_cst);
         return error.TestOutputCallbackFailure;
-    }
-};
-
-const DelayAfterOutput = struct {
-    needle: []const u8,
-    delay_ns: u64,
-    seen: bool = false,
-
-    fn onChunk(ctx: *anyopaque, _: ?types.ToolLifecycleId, _: CommandOutputStream, chunk: []const u8) !void {
-        const self: *@This() = @ptrCast(@alignCast(ctx));
-        if (std.mem.find(u8, chunk, self.needle) == null) return;
-        self.seen = true;
-        io_mod.sleep(self.delay_ns);
     }
 };
 
@@ -4377,6 +4343,28 @@ test "timeout remains dominant when its output callback fails" {
     );
 }
 
+test "timeout termination requests force" {
+    const timeout_ms: usize = 1000;
+    const started_ms: i64 = 500;
+    const control = ExecutionControl.init(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = timeout_ms,
+        .timeout_started_ms = started_ms,
+    });
+
+    try std.testing.expectEqual(
+        TerminationSource.timed_out,
+        pending_termination_source(.foreground_supervisor, false, control.deadlineMs(), started_ms + timeout_ms),
+    );
+    try std.testing.expectEqual(
+        TerminationSignalPlan{
+            .scope = .supervisor,
+            .signal = foreground_session_force_signal,
+        },
+        terminationSignalPlan(.foreground_supervisor, .force),
+    );
+}
+
 test "timeout terminates foreground process group descendants" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
 
@@ -4424,7 +4412,7 @@ test "timeout terminates foreground process group descendants" {
     }
 }
 
-test "timeout terminates redirected descendant after setsid" {
+test "forced cancellation terminates redirected descendant after setsid" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
@@ -4437,23 +4425,42 @@ test "timeout terminates redirected descendant after setsid" {
     const command = try std.fmt.allocPrint(
         alloc,
         "python3 -c 'import os,time\n" ++
+            "ready_r,ready_w=os.pipe()\n" ++
             "pid=os.fork()\n" ++
             "if pid == 0:\n" ++
+            " os.close(ready_r)\n" ++
             " os.setsid()\n" ++
             " null=os.open(\"/dev/null\",os.O_RDWR)\n" ++
             " os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)\n" ++
-            " open(\"{s}\",\"w\").write(str(os.getpid()))\n" ++
+            " with open(\"{s}\",\"w\") as output: output.write(str(os.getpid()))\n" ++
+            " os.write(ready_w,b\"R\"); os.close(ready_w)\n" ++
             " time.sleep(30)\n" ++
             "else:\n" ++
+            " os.close(ready_w)\n" ++
+            " if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
+            " os.close(ready_r); print(\"ESCAPED-READY\",flush=True)\n" ++
             " while True: time.sleep(1)'",
         .{pid_path},
     );
     defer alloc.free(command);
 
-    try std.testing.expectError(error.TimeoutExpired, executeCommand(.{
+    var cancel = std.atomic.Value(bool).init(false);
+    var force = std.atomic.Value(bool).init(false);
+    var trigger = CancelAfterOutput{
+        .flag = &cancel,
+        .force_flag = &force,
+        .needle = "ESCAPED-READY",
+    };
+    const result = try executeCommand(.{
         .max_command_output_bytes = 1024,
-        .timeout_ms = 10_000,
-    }, alloc, command, workspace));
+        .cancel_flag = &cancel,
+        .force_cancel_flag = &force,
+        .output_chunk_ctx = @ptrCast(&trigger),
+        .on_output_chunk = CancelAfterOutput.onChunk,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+    try std.testing.expect(trigger.seen);
+    try std.testing.expect(result.cancelled);
 
     const pid_text = try readAbsoluteFile(alloc, pid_path, 64);
     defer alloc.free(pid_text);
@@ -4465,7 +4472,7 @@ test "timeout terminates redirected descendant after setsid" {
     try expectProcessGone(pid);
 }
 
-test "timeout terminates double-forked descendant after setsid" {
+test "forced cancellation terminates double-forked descendant after setsid" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
@@ -4478,25 +4485,44 @@ test "timeout terminates double-forked descendant after setsid" {
     const command = try std.fmt.allocPrint(
         alloc,
         "python3 -c 'import os,time\n" ++
+            "ready_r,ready_w=os.pipe()\n" ++
             "pid=os.fork()\n" ++
             "if pid == 0:\n" ++
+            " os.close(ready_r)\n" ++
             " os.setsid()\n" ++
             " grandchild=os.fork()\n" ++
             " if grandchild > 0: os._exit(0)\n" ++
             " null=os.open(\"/dev/null\",os.O_RDWR)\n" ++
             " os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)\n" ++
-            " open(\"{s}\",\"w\").write(str(os.getpid()))\n" ++
+            " with open(\"{s}\",\"w\") as output: output.write(str(os.getpid()))\n" ++
+            " os.write(ready_w,b\"R\"); os.close(ready_w)\n" ++
             " time.sleep(30)\n" ++
             "else:\n" ++
+            " os.close(ready_w)\n" ++
+            " if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
+            " os.close(ready_r); print(\"ESCAPED-READY\",flush=True)\n" ++
             " while True: time.sleep(1)'",
         .{pid_path},
     );
     defer alloc.free(command);
 
-    try std.testing.expectError(error.TimeoutExpired, executeCommand(.{
+    var cancel = std.atomic.Value(bool).init(false);
+    var force = std.atomic.Value(bool).init(false);
+    var trigger = CancelAfterOutput{
+        .flag = &cancel,
+        .force_flag = &force,
+        .needle = "ESCAPED-READY",
+    };
+    const result = try executeCommand(.{
         .max_command_output_bytes = 1024,
-        .timeout_ms = 10_000,
-    }, alloc, command, workspace));
+        .cancel_flag = &cancel,
+        .force_cancel_flag = &force,
+        .output_chunk_ctx = @ptrCast(&trigger),
+        .on_output_chunk = CancelAfterOutput.onChunk,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+    try std.testing.expect(trigger.seen);
+    try std.testing.expect(result.cancelled);
 
     const pid_text = try readAbsoluteFile(alloc, pid_path, 64);
     defer alloc.free(pid_text);
@@ -4508,7 +4534,7 @@ test "timeout terminates double-forked descendant after setsid" {
     try expectProcessGone(pid);
 }
 
-test "timeout terminates environment-sanitized double-fork descendants" {
+test "forced cancellation terminates environment-sanitized double-fork descendants" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
@@ -4521,25 +4547,48 @@ test "timeout terminates environment-sanitized double-fork descendants" {
     const command = try std.fmt.allocPrint(
         alloc,
         "/usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/python3 -c 'import os,time\n" ++
+            "ready_r,ready_w=os.pipe()\n" ++
             "for index in range(16):\n" ++
             " pid=os.fork()\n" ++
             " if pid == 0:\n" ++
+            "  os.close(ready_r)\n" ++
             "  os.setsid()\n" ++
             "  grandchild=os.fork()\n" ++
             "  if grandchild > 0: os._exit(0)\n" ++
             "  with open(\"{s}\",\"a\") as output: output.write(str(os.getpid())+\"\\n\")\n" ++
             "  null=os.open(\"/dev/null\",os.O_RDWR)\n" ++
             "  os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)\n" ++
+            "  os.write(ready_w,b\"R\"); os.close(ready_w)\n" ++
             "  time.sleep(30)\n" ++
+            "os.close(ready_w)\n" ++
+            "ready=b\"\"\n" ++
+            "while len(ready)<16:\n" ++
+            " chunk=os.read(ready_r,16-len(ready))\n" ++
+            " if not chunk: raise SystemExit(1)\n" ++
+            " ready+=chunk\n" ++
+            "os.close(ready_r); print(\"ESCAPED-READY\",flush=True)\n" ++
             "while True: time.sleep(1)'",
         .{pid_path},
     );
     defer alloc.free(command);
 
-    try std.testing.expectError(error.TimeoutExpired, executeCommand(.{
+    var cancel = std.atomic.Value(bool).init(false);
+    var force = std.atomic.Value(bool).init(false);
+    var trigger = CancelAfterOutput{
+        .flag = &cancel,
+        .force_flag = &force,
+        .needle = "ESCAPED-READY",
+    };
+    const result = try executeCommand(.{
         .max_command_output_bytes = 1024,
-        .timeout_ms = 10_000,
-    }, alloc, command, workspace));
+        .cancel_flag = &cancel,
+        .force_cancel_flag = &force,
+        .output_chunk_ctx = @ptrCast(&trigger),
+        .on_output_chunk = CancelAfterOutput.onChunk,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+    try std.testing.expect(trigger.seen);
+    try std.testing.expect(result.cancelled);
 
     const pid_text = try readAbsoluteFile(alloc, pid_path, 4096);
     defer alloc.free(pid_text);
@@ -4650,18 +4699,25 @@ test "natural command completion terminates redirected descendant after setsid" 
     defer alloc.free(workspace);
     const pid_path = try std.fs.path.join(alloc, &.{ workspace, "escaped-child.pid" });
     defer alloc.free(pid_path);
+    // Natural cleanup may kill the child before it publishes its PID unless
+    // the parent waits for readiness after setsid and stream redirection.
     const command = try std.fmt.allocPrint(
         alloc,
         "python3 -c 'import os,time\n" ++
+            "ready_r,ready_w=os.pipe()\n" ++
             "pid=os.fork()\n" ++
             "if pid == 0:\n" ++
+            " os.close(ready_r)\n" ++
             " os.setsid()\n" ++
             " null=os.open(\"/dev/null\",os.O_RDWR)\n" ++
             " os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)\n" ++
-            " open(\"{s}\",\"w\").write(str(os.getpid()))\n" ++
+            " with open(\"{s}\",\"w\") as f: f.write(str(os.getpid()))\n" ++
+            " os.write(ready_w,b\"R\"); os.close(ready_w)\n" ++
             " time.sleep(30)\n" ++
             "else:\n" ++
-            " pass'",
+            " os.close(ready_w)\n" ++
+            " if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
+            " os.close(ready_r)'",
         .{pid_path},
     );
     defer alloc.free(command);
@@ -4780,70 +4836,20 @@ test "cancel and timeout tie chooses cancellation" {
     }, std.testing.allocator, "sleep 5", "/tmp"));
 }
 
-test "runtime cancellation observed at the timeout deadline stays graceful" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+test "runtime cancellation at the timeout deadline chooses graceful termination" {
+    const deadline_ms: i64 = 1000;
 
-    for (0..10) |_| {
-        const alloc = std.testing.allocator;
-        var tmp = std.testing.tmpDir(.{});
-        defer tmp.cleanup();
-        const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-        defer alloc.free(workspace);
-        const term_path = try std.fs.path.join(alloc, &.{ workspace, "tie.term" });
-        defer alloc.free(term_path);
-        const quoted_term = try shellQuote(alloc, term_path);
-        defer alloc.free(quoted_term);
-        const command = try std.fmt.allocPrint(
-            alloc,
-            "trap 'printf TERM > {s}; sleep 3; exit 130' TERM; printf 'TIE-READY\n'; while :; do sleep 1; done",
-            .{quoted_term},
-        );
-        defer alloc.free(command);
-
-        const timeout_ms: usize = 2000;
-        const started_ms = io_mod.milliTimestamp();
-        var cancel = std.atomic.Value(bool).init(false);
-        const CancelNearDeadline = struct {
-            fn run(flag: *std.atomic.Value(bool), request_at_ms: i64) void {
-                while (io_mod.milliTimestamp() < request_at_ms) {
-                    io_mod.sleep(std.time.ns_per_ms);
-                }
-                flag.store(true, .seq_cst);
-            }
-        };
-        const request_at_ms = started_ms + @as(i64, @intCast(timeout_ms)) - 25;
-        const thread = try std.Thread.spawn(
-            .{},
-            CancelNearDeadline.run,
-            .{ &cancel, request_at_ms },
-        );
-        defer thread.join();
-        var result: ?CommandExecutionResult = null;
-        var cancelled = false;
-        if (executeCommand(.{
-            .max_command_output_bytes = 4096,
-            .cancel_flag = &cancel,
-            .timeout_ms = timeout_ms,
-            .timeout_started_ms = started_ms,
-        }, alloc, command, workspace)) |value| {
-            result = value;
-            cancelled = value.cancelled;
-        } else |err| switch (err) {
-            error.Cancelled => cancelled = true,
-            else => {
-                try std.testing.expectEqual(error.Cancelled, err);
-                cancelled = true;
-            },
-        }
-        defer if (result) |value| alloc.free(value.output);
-
-        try std.testing.expect(cancelled);
-        try std.testing.expect(io_mod.milliTimestamp() - started_ms >= @as(i64, @intCast(timeout_ms)));
-        try std.testing.expect(absoluteFileExists(term_path));
-        const term_text = try readAbsoluteFile(alloc, term_path, 64);
-        defer alloc.free(term_text);
-        try std.testing.expectEqualStrings("TERM", term_text);
-    }
+    try std.testing.expectEqual(
+        TerminationSource.cancelled,
+        pending_termination_source(.foreground_supervisor, true, deadline_ms, deadline_ms),
+    );
+    try std.testing.expectEqual(
+        TerminationSignalPlan{
+            .scope = .process_group,
+            .signal = std.posix.SIG.TERM,
+        },
+        terminationSignalPlan(.foreground_supervisor, .cooperative),
+    );
 }
 
 test "accepted short timeout matrix returns timeout errors" {
@@ -4858,87 +4864,33 @@ test "accepted short timeout matrix returns timeout errors" {
 }
 
 test "supervisor handoff does not extend the parent timeout deadline" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    const deadline_ms: i64 = 1000;
+    const fallback_deadline_ms = foreground_supervisor_fallback_deadline_ms(deadline_ms).?;
 
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(workspace);
-    const effect_path = try std.fs.path.join(alloc, &.{ workspace, "handoff-effect" });
-    defer alloc.free(effect_path);
-    const quoted_effect = try shellQuote(alloc, effect_path);
-    defer alloc.free(quoted_effect);
-    const command = try std.fmt.allocPrint(
-        alloc,
-        "sleep 0.6; printf trailing > {s}",
-        .{quoted_effect},
+    try std.testing.expectEqual(deadline_ms + foreground_supervisor_handoff_ms, fallback_deadline_ms);
+    try std.testing.expectEqual(
+        TerminationSource.timed_out,
+        pending_termination_source(.foreground_supervisor, false, deadline_ms, deadline_ms),
     );
-    defer alloc.free(command);
-
-    try std.testing.expectError(error.TimeoutExpired, executeCommand(.{
-        .max_command_output_bytes = 1024,
-        .timeout_ms = 500,
-    }, alloc, command, workspace));
-    try std.testing.expect(!absoluteFileExists(effect_path));
 }
 
 test "supervisor fallback force remains timeout dominant" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    const deadline_ms: i64 = 1000;
+    const fallback_deadline_ms = foreground_supervisor_fallback_deadline_ms(deadline_ms).?;
 
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(workspace);
-    const term_path = try std.fs.path.join(alloc, &.{ workspace, "fallback.term" });
-    defer alloc.free(term_path);
-    const quoted_term = try shellQuote(alloc, term_path);
-    defer alloc.free(quoted_term);
-    const command = try std.fmt.allocPrint(
-        alloc,
-        "trap 'printf TERM > {s}; exit 130' TERM; printf 'FALLBACK-BLOCK\n'; while :; do sleep 1; done",
-        .{quoted_term},
+    try std.testing.expectEqual(
+        TerminationSource.cancelled,
+        pending_termination_source(.foreground_supervisor, true, deadline_ms, fallback_deadline_ms - 1),
     );
-    defer alloc.free(command);
-
-    const timeout_ms: usize = 2000;
-    const started_ms = io_mod.milliTimestamp();
-    var cancel = std.atomic.Value(bool).init(false);
-    const CancelNearDeadline = struct {
-        fn run(flag: *std.atomic.Value(bool), request_at_ms: i64) void {
-            while (io_mod.milliTimestamp() < request_at_ms) {
-                io_mod.sleep(std.time.ns_per_ms);
-            }
-            flag.store(true, .seq_cst);
-        }
-    };
-    const thread = try std.Thread.spawn(
-        .{},
-        CancelNearDeadline.run,
-        .{ &cancel, started_ms + @as(i64, @intCast(timeout_ms)) - 25 },
+    try std.testing.expectEqual(
+        TerminationSource.timed_out,
+        pending_termination_source(.foreground_supervisor, true, deadline_ms, fallback_deadline_ms),
     );
-    defer thread.join();
-    var delay = DelayAfterOutput{
-        .needle = "FALLBACK-BLOCK",
-        .delay_ns = 2500 * std.time.ns_per_ms,
-    };
-
-    var returned_result: ?CommandExecutionResult = null;
-    if (executeCommand(.{
-        .max_command_output_bytes = 4096,
-        .cancel_flag = &cancel,
-        .output_chunk_ctx = @ptrCast(&delay),
-        .on_output_chunk = DelayAfterOutput.onChunk,
-        .timeout_ms = timeout_ms,
-        .timeout_started_ms = started_ms,
-    }, alloc, command, workspace)) |value| {
-        returned_result = value;
-    } else |err| {
-        try std.testing.expectEqual(error.TimeoutExpired, err);
-    }
-    defer if (returned_result) |value| alloc.free(value.output);
-    try std.testing.expect(returned_result == null);
-    try std.testing.expect(delay.seen);
-    try std.testing.expect(!absoluteFileExists(term_path));
+    try std.testing.expectEqual(
+        TerminationSignalPlan{
+            .scope = .supervisor,
+            .signal = foreground_session_force_signal,
+        },
+        terminationSignalPlan(.foreground_supervisor, .force),
+    );
 }

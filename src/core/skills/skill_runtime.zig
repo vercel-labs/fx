@@ -3471,6 +3471,14 @@ test "skill catalog lease keeps one retired generation alive until release" {
     try std.testing.expect(runtime.retired_catalog == null);
 }
 
+fn awaitRefreshTaskForTest(runtime: *Runtime) void {
+    const task = runtime.refresh_task orelse return;
+    if (task.thread) |thread| {
+        thread.join();
+        task.thread = null;
+    }
+}
+
 test "skill refresh publishes one generation and coalesces one latest request" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3498,13 +3506,12 @@ test "skill refresh publishes one generation and coalesces one latest request" {
     );
 
     var adopted = false;
-    for (0..100_000) |_| {
+    while (runtime.refresh_task != null) {
+        awaitRefreshTaskForTest(&runtime);
         switch (try runtime.pollRefresh(alloc, home, policy)) {
             .adopted => adopted = true,
             .none, .unchanged, .failed => {},
         }
-        if (adopted and runtime.refresh_task == null) break;
-        std.Thread.yield() catch std.atomic.spinLoopHint();
     }
     try std.testing.expect(adopted);
     try std.testing.expectEqual(@as(usize, 1), runtime.items.len);
@@ -3512,11 +3519,8 @@ test "skill refresh publishes one generation and coalesces one latest request" {
 
     var terminal: RefreshCompletion = .none;
     _ = try runtime.requestRefresh(alloc, home, home, policy);
-    for (0..100_000) |_| {
-        terminal = try runtime.pollRefresh(alloc, home, policy);
-        if (terminal != .none) break;
-        std.Thread.yield() catch std.atomic.spinLoopHint();
-    }
+    awaitRefreshTaskForTest(&runtime);
+    terminal = try runtime.pollRefresh(alloc, home, policy);
     try std.testing.expectEqual(RefreshCompletion.unchanged, terminal);
 
     try writeTempFile(
@@ -3525,11 +3529,8 @@ test "skill refresh publishes one generation and coalesces one latest request" {
         "---\nname: refreshable-v2\ndescription: one-file delta refresh with a new size\n---\nbody changed\n",
     );
     _ = try runtime.requestRefresh(alloc, home, home, policy);
-    for (0..100_000) |_| {
-        terminal = try runtime.pollRefresh(alloc, home, policy);
-        if (terminal != .none) break;
-        std.Thread.yield() catch std.atomic.spinLoopHint();
-    }
+    awaitRefreshTaskForTest(&runtime);
+    terminal = try runtime.pollRefresh(alloc, home, policy);
     try std.testing.expectEqual(RefreshCompletion.adopted, terminal);
     try std.testing.expectEqualStrings("refreshable-v2", runtime.items[0].name);
 
@@ -3539,11 +3540,8 @@ test "skill refresh publishes one generation and coalesces one latest request" {
         "---\nname: added\ndescription: root manifest changed\n---\nbody\n",
     );
     _ = try runtime.requestRefresh(alloc, home, home, policy);
-    for (0..100_000) |_| {
-        terminal = try runtime.pollRefresh(alloc, home, policy);
-        if (terminal != .none) break;
-        std.Thread.yield() catch std.atomic.spinLoopHint();
-    }
+    awaitRefreshTaskForTest(&runtime);
+    terminal = try runtime.pollRefresh(alloc, home, policy);
     try std.testing.expectEqual(RefreshCompletion.adopted, terminal);
     try std.testing.expectEqual(@as(usize, 2), runtime.items.len);
 }

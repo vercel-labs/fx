@@ -66,7 +66,8 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addImport("build_options", build_options.createModule());
 
-    b.installArtifact(exe);
+    const install_exe = b.addInstallArtifact(exe, .{});
+    b.getInstallStep().dependOn(&install_exe.step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -77,18 +78,42 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run fx");
     run_step.dependOn(&run_cmd.step);
 
-    const exe_tests = b.addTest(.{
-        .root_module = exe.root_module,
-    });
-    const run_exe_tests = b.addRunArtifact(exe_tests);
-    run_exe_tests.step.dependOn(b.getInstallStep());
-    run_exe_tests.setEnvironmentVariable(
-        "FX_TEST_PRODUCT_EXE",
-        b.getInstallPath(.bin, "fx"),
-    );
-
+    // Compile the suite once, then run disjoint modulo slices in concurrent
+    // processes. This avoids maintaining test-name filters or timing data.
     const test_step = b.step("test", "Run tests");
-    test_step.dependOn(&run_exe_tests.step);
+    const max_test_shards: u32 = 40;
+    const cpu_count: u32 = @intCast(std.Thread.getCpuCount() catch 1);
+    const test_shard_count = b.option(
+        u32,
+        "test-shards",
+        b.fmt("Number of concurrent unit-test processes (default: up to 2 per CPU, capped at {d})", .{max_test_shards}),
+    ) orelse @min(cpu_count *| 2, max_test_shards);
+    if (test_shard_count == 0) @panic("-Dtest-shards must be at least 1");
+    const suite_tests = b.addTest(.{
+        .root_module = exe.root_module,
+        .test_runner = .{
+            .path = b.path("src/test_shard_runner.zig"),
+            .mode = .server,
+        },
+    });
+
+    for (0..test_shard_count) |test_shard| {
+        const run_shard_tests = b.addRunArtifact(suite_tests);
+        run_shard_tests.step.dependOn(&install_exe.step);
+        run_shard_tests.setEnvironmentVariable(
+            "FX_TEST_PRODUCT_EXE",
+            b.getInstallPath(.bin, "fx"),
+        );
+        run_shard_tests.setEnvironmentVariable(
+            "FX_TEST_SHARD",
+            b.fmt("{d}", .{test_shard}),
+        );
+        run_shard_tests.setEnvironmentVariable(
+            "FX_TEST_SHARD_COUNT",
+            b.fmt("{d}", .{test_shard_count}),
+        );
+        test_step.dependOn(&run_shard_tests.step);
+    }
 
     if (wasm_surface != .none) {
         addWasmArtifact(b, wasm_surface, git_commit, app_version, update_channel);
