@@ -740,6 +740,144 @@ describe("gateway stream lifecycle", () => {
     }
   }, 45_000);
 
+  test("gateway reasoning parts survive tool continuation and saved-session resume", async () => {
+    const root = createFixtureRoot("reasoning-replay");
+    writeFileSync(join(root.workspace, "note.txt"), "NOTE_CONTENT_SENTINEL\n");
+    const tracePath = join(root.root, "trace.log");
+
+    const SIGNATURE = "sig_step_1";
+    const REDACTED = "redacted_blob_1";
+    const THOUGHT_SIGNATURE = "thought_sig_1";
+    const ENCRYPTED = "enc_final_1";
+    const ITEM_ID = "rs_final_1";
+
+    // The tool continuation must carry the first response's ordered parts, and
+    // the resumed request must carry them again from durable history.
+    const expectStepParts = (body: string) => {
+      const request = gatewayRequest(body);
+      expect(request).not.toHaveProperty("reasoning");
+      const assistant = request.prompt.find((message) => message.role === "assistant");
+      expect(assistant).toBeDefined();
+      const content = assistant!.content as Array<Record<string, unknown>>;
+      expect(Array.isArray(content)).toBe(true);
+      expect(content.map((part) => part.type)).toEqual([
+        "text",
+        "reasoning",
+        "tool-call",
+        "reasoning",
+      ]);
+      expect(content[0]).toEqual({ type: "text", text: "Reading the note." });
+      expect(content[1]).toEqual({
+        type: "reasoning",
+        text: "The note has the answer.",
+        providerOptions: { anthropic: { signature: SIGNATURE } },
+      });
+      expect(content[2]).toMatchObject({
+        type: "tool-call",
+        toolCallId: "call_read_1",
+        toolName: "read_file",
+        input: { path: "note.txt" },
+        providerOptions: { google: { thoughtSignature: THOUGHT_SIGNATURE } },
+      });
+      expect(content[3]).toEqual({
+        type: "reasoning",
+        text: "",
+        providerOptions: { anthropic: { redactedData: REDACTED } },
+      });
+      expect(toolResultOutput(body, "call_read_1")).toContain("NOTE_CONTENT_SENTINEL");
+    };
+    // The final answer's parts, retained on the completed turn.
+    const expectFinalParts = (body: string) => {
+      const request = gatewayRequest(body);
+      const assistants = request.prompt.filter((message) => message.role === "assistant");
+      const last = assistants[assistants.length - 1]!;
+      const content = last.content as Array<Record<string, unknown>>;
+      expect(content.map((part) => part.type)).toEqual(["reasoning", "text"]);
+      expect(content[0]).toEqual({
+        type: "reasoning",
+        text: "The answer is known.",
+        providerOptions: { openai: { reasoningEncryptedContent: ENCRYPTED, itemId: ITEM_ID } },
+      });
+      expect(content[1]).toEqual({ type: "text", text: "The note says hello." });
+    };
+
+    let index = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      switch (index++) {
+        case 0:
+          return fakeGatewaySse([
+            { type: "text-start", id: "t1" },
+            { type: "text-delta", id: "t1", delta: "Reading the note." },
+            { type: "text-end", id: "t1" },
+            { type: "reasoning-start", id: "r1" },
+            { type: "reasoning-delta", id: "r1", delta: "The note has the answer." },
+            { type: "reasoning-delta", id: "r1", delta: "", providerMetadata: { anthropic: { signature: SIGNATURE } } },
+            { type: "reasoning-end", id: "r1" },
+            {
+              type: "tool-call",
+              toolCallId: "call_read_1",
+              toolName: "read_file",
+              input: { path: "note.txt" },
+              providerMetadata: { google: { thoughtSignature: THOUGHT_SIGNATURE } },
+            },
+            { type: "reasoning-start", id: "r2", providerMetadata: { anthropic: { redactedData: REDACTED } } },
+            { type: "reasoning-end", id: "r2" },
+            { type: "finish", finishReason: { unified: "tool-calls", raw: "tool_use" } },
+          ]);
+        case 1:
+          expectStepParts(body);
+          return fakeGatewaySse([
+            { type: "reasoning-start", id: "r3" },
+            { type: "reasoning-delta", id: "r3", delta: "The answer is known." },
+            { type: "reasoning-end", id: "r3", providerMetadata: { openai: { reasoningEncryptedContent: ENCRYPTED, itemId: ITEM_ID } } },
+            { type: "text-start", id: "t2" },
+            { type: "text-delta", id: "t2", delta: "The note says hello." },
+            { type: "text-end", id: "t2" },
+            { type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage: { inputTokens: { total: 8 }, outputTokens: { total: 6 } } },
+          ]);
+        case 2:
+          expectStepParts(body);
+          expectFinalParts(body);
+          return fakeGatewayFinalText("Resumed answer.");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"], context_window: 100_000 }] });
+
+    try {
+      const result = await runFx(["ask", "--auto", "--json", "Read note.txt and tell me what it says."], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 30_000,
+      });
+      if (result.code !== 0) throw new Error(`Reasoning replay flow failed: ${result.stderr}\n${result.stdout}`);
+      const output = parseAskJson(result.stdout);
+      expect(output.exit_code).toBe(0);
+      expect(output.session_id).not.toBe("");
+      expect(output.tool_calls).toEqual([{ name: "read_file", status: "success" }]);
+      expect(gateway.requestCount()).toBe(2);
+      expect(result.stderr).not.toContain("panic");
+
+      const resumed = await runFx(["ask", "--auto", "--json", "--resume-id", output.session_id, "Tell me again."], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 30_000,
+      });
+      if (resumed.code !== 0) throw new Error(`Reasoning replay resume failed: ${resumed.stderr}\n${resumed.stdout}`);
+      expect(resumed.code).toBe(0);
+      expect(parseAskJson(resumed.stdout).exit_code).toBe(0);
+      expect(gateway.requestCount()).toBe(3);
+
+      // The durable conversation log holds the parts for the next process.
+      const eventsLog = readFileSync(
+        join(root.home, ".fx", "sessions", output.session_id, "events.jsonl"),
+        "utf8",
+      );
+      expect(eventsLog).toContain(SIGNATURE);
+      expect(eventsLog).toContain(REDACTED);
+      expect(eventsLog).toContain(ENCRYPTED);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45_000);
+
   test.skipIf(!tmuxAvailable())("explicit skill context survives cancellation and a fresh turn", async () => {
     const root = createFixtureRoot("skill-cancel-recover");
     const directory = join(root.workspace, ".agents", "skills", "cancel-workflow");

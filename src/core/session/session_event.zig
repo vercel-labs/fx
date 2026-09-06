@@ -321,11 +321,13 @@ fn validateConversationEventShape(event: ConversationEvent) ConversationTransiti
                 for (parts) |part| {
                     const options: ?[]const u8 = switch (part) {
                         .text => |text_part| blk: {
-                            try validateConversationText(text_part.text);
+                            // Part texts may be empty: metadata-only reasoning
+                            // blocks carry replay state with no text.
+                            try validateOptionalConversationText(text_part.text);
                             break :blk text_part.provider_options;
                         },
                         .reasoning => |reasoning_part| blk: {
-                            try validateConversationText(reasoning_part.text);
+                            try validateOptionalConversationText(reasoning_part.text);
                             break :blk reasoning_part.provider_options;
                         },
                         .tool_call_ref => |ref| blk: {
