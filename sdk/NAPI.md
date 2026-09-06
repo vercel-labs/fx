@@ -266,6 +266,20 @@ URLs. The publish workflow builds and tests each addon on its native runner
 before combining the artifacts with both WebAssembly surfaces, the README, and
 the Apache-2.0 license.
 
+The release workflow also requires a dedicated Next.js verification project.
+Configure its project-scoped token as the `LIBFX_VERCEL_TOKEN` repository
+secret, and its IDs as the `LIBFX_VERCEL_PROJECT_ID` and
+`LIBFX_VERCEL_ORG_ID` repository variables. Live turns use the existing
+`AI_GATEWAY_API_KEY` secret. The project uses Node.js 24 and the fixture's
+per-deployment request token; platform deployment protection must allow those
+requests, including the fixture's HTTP MCP calls.
+
+Package assembly and Next tests run without npm publishing credentials. The
+exact tarball is verified on Vercel before the OIDC publish, and the immutable
+registry version is checked afterward. Missing credentials or failed
+pre-publish qualification block publication. Redacted logs and structured
+results are retained as workflow artifacts, including on failure.
+
 ## Error model
 
 Native errors use stable codes where JavaScript needs to distinguish failure classes:

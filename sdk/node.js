@@ -298,9 +298,8 @@ export async function getBackendInfo(value = {}) {
   }
   const defaultWasm = surface === "agent" ? defaultCoreWasm : defaultTermWasm;
   const wasmSource = wasm ?? defaultWasm;
-  const pendingWasm = wasmInput(wasmSource);
   try {
-    await loadModule(pendingWasm);
+    await loadModule(wasmInput(wasmSource));
     attempts.push({ backend: "wasm-jspi", available: true, reason: null });
     return { surface, backend: "wasm-jspi", attempts };
   } catch (error) {

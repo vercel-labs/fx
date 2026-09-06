@@ -19,6 +19,7 @@ const replacedWasm = join(temp, "replaced.wasm");
 const stableWasm = join(temp, "stable.wasm");
 const dependencyAddon = join(temp, "dependency-addon.mjs");
 const nonlocalAddon = new URL("file://other-host/tmp/addon.node");
+const nonlocalWasm = new URL("file://other-host/tmp/core.wasm");
 await writeFile(corruptAddon, "not a native addon");
 await writeFile(corruptWasm, "not WebAssembly");
 await writeFile(replacedWasm, "not WebAssembly");
@@ -162,6 +163,22 @@ try {
   const nonlocalCheckpoint = await nonlocalFallback.checkpoint();
   await nonlocalFallback.close();
   assert.ok(nonlocalCheckpoint.length > 0, "auto mode must fall back after a nonlocal addon URL fails");
+
+  const nonlocalWasmInfo = await getBackendInfo({ backend: "wasm", wasm: nonlocalWasm });
+  assert.equal(nonlocalWasmInfo.backend, "unavailable");
+  assert.equal(nonlocalWasmInfo.attempts[0].reason.code, "LIBFX_WASM_LOAD_FAILED");
+  assert.equal(nonlocalWasmInfo.attempts[0].reason.causeCode, "ERR_INVALID_FILE_URL_HOST");
+  const nonlocalWasmAuto = await getBackendInfo({ backend: "auto", nativeAddon: false, wasm: nonlocalWasm });
+  assert.equal(nonlocalWasmAuto.backend, "unavailable");
+  assert.deepEqual(nonlocalWasmAuto.attempts.map(({ backend, reason }) => [backend, reason?.code]), [
+    ["native", "LIBFX_NATIVE_DISABLED"],
+    ["wasm-jspi", "LIBFX_WASM_LOAD_FAILED"],
+  ]);
+  await assert.rejects(
+    createFxAgent({ backend: "wasm", wasm: nonlocalWasm, apiKey: "nonlocal-wasm-key" }),
+    (error) => error?.code === "ERR_INVALID_FILE_URL_HOST",
+  );
+  assert.equal((await getBackendInfo({ backend: "auto", nativeAddon: false, wasm: coreWasm })).backend, "wasm-jspi");
 
   const missingWasmInfo = await getBackendInfo({ backend: "wasm", wasm: missingWasm });
   assert.equal(missingWasmInfo.backend, "unavailable");
