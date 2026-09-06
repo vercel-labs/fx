@@ -224,9 +224,22 @@ Consequently:
 - publishing must preserve provenance and use the exact tested artifacts;
 - addon load failures must not be mistaken for a safe sandbox boundary.
 
-The JavaScript loader searches for `libfx.node` first for local development, then `libfx.<platform>-<arch>.node` for packaged builds. It validates `libfxApiVersion` and the expected export shape before use. `backend: "native"` fails closed if a compatible addon is unavailable. `backend: "auto"` may fall back to WebAssembly when JSPI is available.
+The JavaScript loader uses literal references to the four packaged
+`libfx.<platform>-<arch>.node` names and selects the matching supported tuple.
+Local package assembly renames `zig-out/lib/libfx.node` to that tuple's package
+name. The loader validates `libfxApiVersion` and the expected export shape
+before use. `backend: "native"` fails closed if a compatible addon is
+unavailable. `backend: "auto"` may fall back to WebAssembly when JSPI is
+available. Explicit `nativeAddon` objects, paths, and URLs remain separate from
+packaged discovery.
 
 ## Build and packaging
+
+Linux package builds pin `x86_64-linux-gnu.2.34` or
+`aarch64-linux-gnu.2.34` with baseline CPUs. The release checks reject newer
+glibc requirements and exercise the addon on Amazon Linux 2023 before package
+assembly. Building against the CI host's glibc can introduce imports such as
+`arc4random_buf@GLIBC_2.36` that cannot load on the deployment runtime.
 
 The build is enabled with:
 
@@ -245,7 +258,13 @@ Published packages contain one addon for each supported tuple:
 - `darwin-x64`;
 - `darwin-arm64`.
 
-`package-libfx.mjs` requires exactly those four names when assembling a publishable multi-platform package. It rejects missing, duplicate, or unexpected addon names. The publish workflow builds and tests each addon on its native runner before combining the artifacts with both WebAssembly surfaces, the README, and the Apache-2.0 license.
+`package-libfx.mjs` requires exactly those four names when assembling a
+publishable multi-platform package. It rejects missing, duplicate, or
+unexpected addon names. Package assembly also generates a self-contained
+`node.cjs` from the dependency-free ESM source with package-relative module
+URLs. The publish workflow builds and tests each addon on its native runner
+before combining the artifacts with both WebAssembly surfaces, the README, and
+the Apache-2.0 license.
 
 ## Error model
 

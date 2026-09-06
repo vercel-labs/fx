@@ -147,7 +147,7 @@ jobs:
 
       - name: Build SDK artifacts
         run: |
-          zig build -Dnapi-surface=core -Doptimize=ReleaseSafe
+          zig build libfx-napi -Dnapi-surface=core -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-gnu.2.34 -Dcpu=baseline
           zig build -Dwasm-surface=core -Doptimize=ReleaseSmall
           zig build -Dwasm-surface=term -Doptimize=ReleaseSmall
 
@@ -176,6 +176,49 @@ jobs:
           bun sdk/tests/test-mcp-adapter.mjs http wasm
           bun sdk/tests/test-skills-adapter.mjs disk native
           bun sdk/tests/test-skills-adapter.mjs host wasm
+
+      - name: Check Linux addon compatibility
+        run: |
+          python3 sdk/tests/test-linux-abi.py
+          python3 sdk/scripts/check-linux-abi.py zig-out/lib/libfx.node
+          docker run --rm --network none --entrypoint /bin/bash \
+            --volume "$PWD:/workspace:ro" --workdir /workspace \
+            public.ecr.aws/lambda/nodejs@sha256:2472f0273d8848d8b2aa6528f5526b8a514b70703596199efe5a4b84d3d59b0b -euc '
+              node sdk/tests/test-native-core-ready.mjs
+              node sdk/tests/test-host-tools.mjs native
+              node sdk/tests/test-host-tool-cancel.mjs native
+            '
+
+      - name: Test Node package and backend diagnostics
+        run: |
+          node --experimental-wasm-jspi sdk/tests/test-backend-info.mjs
+          node sdk/tests/test-node-package.mjs
+          node sdk/tests/test-term-demo-package.mjs
+          node sdk/scripts/package-libfx.mjs sdk/dist/libfx
+          npm pack ./sdk/dist/libfx --ignore-scripts --json > /tmp/libfx-pack.json
+          mv "$(node -p 'require("/tmp/libfx-pack.json")[0].filename')" /tmp/libfx-package.tgz
+          node sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz native esm
+          node --no-experimental-require-module sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz native cjs
+          node --experimental-wasm-jspi sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz wasm esm
+          node --experimental-wasm-jspi --no-experimental-require-module sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz wasm cjs
+
+      - name: Install Next fixture package manager
+        run: npm install --global pnpm@11.1.1
+
+      - name: Test installed package through Next
+        env:
+          LIBFX_TEST_ARTIFACT_ROOT: ${{ runner.temp }}/libfx-package-evidence
+        run: node sdk/tests/test-next-package.mjs /tmp/libfx-package.tgz
+
+      - name: Retain Next package evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: libfx-next-package-evidence
+          path: |
+            ${{ runner.temp }}/libfx-package-evidence/libfx-next-*/*.log
+            ${{ runner.temp }}/libfx-package-evidence/libfx-next-*/results.json
+          if-no-files-found: ignore
 
   sdk-browser-wasm:
     name: SDK (Browser + WASM)
