@@ -32,11 +32,21 @@ if (process.argv[2] !== "--installed") {
     await rm(temp, { recursive: true, force: true });
   }
 } else {
-  const { createFxAgent } = format === "cjs" ? createRequire(import.meta.url)("libfx") : await import("libfx");
+  const { createFxAgent, createFxTerminal, getBackendInfo } = format === "cjs" ? createRequire(import.meta.url)("libfx") : await import("libfx");
   const { createMcpAdapter } = await import("libfx/mcp");
   const { createSkillsAdapter } = await import("libfx/skills");
   assert.equal(typeof createMcpAdapter, "function");
   assert.equal(typeof createSkillsAdapter, "function");
+
+  for (const invalid of [null, false, 0, "", "other"]) {
+    await assert.rejects(getBackendInfo({ backend: invalid }), TypeError);
+    await assert.rejects(getBackendInfo({ surface: invalid }), TypeError);
+    const backendError = { name: "TypeError", message: 'backend must be "auto", "native", or "wasm"' };
+    await assert.rejects(createFxAgent({ backend: invalid }), backendError);
+    await assert.rejects(createFxTerminal({ backend: invalid }), backendError);
+  }
+  assert.deepEqual(await getBackendInfo({ backend: undefined, surface: undefined }), await getBackendInfo());
+  assert.deepEqual(await getBackendInfo({ backend: "auto", surface: "agent" }), await getBackendInfo());
 
   let requestedAuthorization;
   let requestedModel;

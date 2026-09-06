@@ -246,11 +246,10 @@ function validateBackendInfoOptions(value) {
       throw new TypeError(`getBackendInfo() does not accept ${key}`);
     }
   }
-  const surface = options.surface ?? "agent";
+  const { surface = "agent", backend = "auto" } = options;
   if (!new Set(["agent", "terminal"]).has(surface)) {
     throw new TypeError('surface must be "agent" or "terminal"');
   }
-  const backend = options.backend ?? "auto";
   if (!new Set(["auto", "native", "wasm"]).has(backend)) {
     throw new TypeError('backend must be "auto", "native", or "wasm"');
   }

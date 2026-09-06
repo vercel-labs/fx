@@ -40,9 +40,16 @@ const matchingTerminal = {
 };
 
 try {
-  for (const options of [null, [], 1, { surface: "browser" }, { backend: "other" }, { nativeAddon: true }]) {
+  for (const options of [null, [], 1, { surface: "browser" }, { surface: null }, { backend: "other" }, { backend: null }, { nativeAddon: true }]) {
     await assert.rejects(getBackendInfo(options), TypeError);
   }
+
+  const defaults = await getBackendInfo({ nativeAddon: matchingCore });
+  assert.deepEqual(await getBackendInfo({ surface: undefined, backend: undefined, nativeAddon: matchingCore }), defaults);
+  assert.deepEqual(await getBackendInfo({ surface: "agent", backend: "auto", nativeAddon: matchingCore }), defaults);
+  const backendError = { name: "TypeError", message: 'backend must be "auto", "native", or "wasm"' };
+  await assert.rejects(createFxAgent({ backend: null }), backendError);
+  await assert.rejects(createFxTerminal({ backend: null }), backendError);
 
   assert.deepEqual(await getBackendInfo({ backend: "native", nativeAddon: matchingCore }), {
     surface: "agent",
