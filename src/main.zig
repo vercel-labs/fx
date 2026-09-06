@@ -88,6 +88,7 @@ const github_publish = @import("core/github/github_publish.zig");
 const subagent_domain = @import("core/subagent/domain.zig");
 const subagent_execution = @import("core/subagent/execution.zig");
 const types = @import("core/shared/types.zig");
+const clipboard_image_runtime = @import("core/images/clipboard_image_runtime.zig");
 const image_attachments = @import("core/images/image_attachments.zig");
 const permissions = @import("core/permissions/permissions.zig");
 const command_runner = @import("core/execution/command_runner.zig");
@@ -544,6 +545,7 @@ const App = struct {
     input_runtime: InputRuntime = .{},
     terminal_input_runtime: TerminalInputRuntime = .{},
     submission: input_submit_runtime.State = .{},
+    clipboard_images: clipboard_image_runtime.Runtime = .{},
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
     next_image_id: usize = 1,
     shell: TranscriptRuntime = .{},
@@ -849,6 +851,7 @@ const App = struct {
         self.terminal_client.deinit();
         self.managed_executions.deinit();
         self.model_cache.deinit();
+        self.clipboard_images.deinit(self.alloc);
         self.usage_dashboard.deinit();
         InputSubmitRuntime.clearPendingSubmission(self, "shutdown");
         const resume_handoff = if (capture_resume_handoff)
@@ -2878,6 +2881,7 @@ const App = struct {
         if (try self.model_cache.pollLoadTransition()) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
+        try app_commands.Handlers(App).collectClipboardImageFacts(self);
         if (try app_commands.Handlers(App).collectUsageDashboardFacts(self)) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
