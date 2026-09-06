@@ -200,6 +200,9 @@ pub const FakeCompletion = struct {
     reasoning_chunks: []const []const u8 = &.{},
     content: ?[]const u8 = null,
     provider_state_json: ?[]const u8 = null,
+    /// Retained ordered replay parts for the completion, as the real gateway
+    /// decoder would capture them.
+    assistant_parts: ?[]const types.AssistantPart = null,
     tool_calls: []const ToolCall = &.{},
     streamed_tool_starts: []const ToolCall = &.{},
     provider_result_identity_failure: ?types.ProviderResultIdentityFailure = null,
@@ -339,6 +342,7 @@ pub const FakeGateway = struct {
             .completion = .{
                 .content = completion.content,
                 .provider_state_json = completion.provider_state_json,
+                .assistant_parts = completion.assistant_parts,
                 .tool_calls = completion.tool_calls,
                 .provider_result_identity_failure = completion.provider_result_identity_failure,
                 .provider_failure_cause = completion.provider_failure_cause,

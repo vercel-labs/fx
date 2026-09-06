@@ -2526,6 +2526,54 @@ pub fn validateProviderOptionsJson(
     }
 }
 
+/// Concatenates the replay sequences of two joined assistant segments, in
+/// chronological order. Borrows both inputs' payloads; the caller owns only
+/// the returned slice. Returns null when both are absent.
+pub fn concatAssistantParts(
+    alloc: std.mem.Allocator,
+    first: ?[]const AssistantPart,
+    second: ?[]const AssistantPart,
+) !?[]const AssistantPart {
+    if (first == null) return second;
+    if (second == null) return first;
+    const joined = try alloc.alloc(AssistantPart, first.?.len + second.?.len);
+    @memcpy(joined[0..first.?.len], first.?);
+    @memcpy(joined[first.?.len..], second.?);
+    return joined;
+}
+
+/// Keeps a replay sequence in sync when calls are filtered after admission:
+/// text and reasoning parts always survive, and references to removed calls
+/// are dropped in the same pass. Returns null when nothing remains, so the
+/// caller falls back to the legacy projection instead of emitting an
+/// authoritative empty sequence for a step that still has filtered calls.
+/// The returned slice aliases the source parts' payloads; it owns only the
+/// array itself, which the caller frees.
+pub fn filterAssistantPartsToCalls(
+    alloc: std.mem.Allocator,
+    parts: ?[]const AssistantPart,
+    tool_calls: []const ToolCall,
+) !?[]AssistantPart {
+    const source = parts orelse return null;
+    var kept: std.ArrayList(AssistantPart) = .empty;
+    errdefer kept.deinit(alloc);
+    for (source) |part| {
+        const keep = switch (part) {
+            .text, .reasoning => true,
+            .tool_call_ref => |ref| for (tool_calls) |call| {
+                if (std.mem.eql(u8, call.id, ref.id)) break true;
+            } else false,
+        };
+        if (keep) {
+            kept.append(alloc, part) catch |err| {
+                return err;
+            };
+        }
+    }
+    if (kept.items.len == 0) return null;
+    return try kept.toOwnedSlice(alloc);
+}
+
 pub fn dupeToolExecutionSteps(alloc: std.mem.Allocator, steps: []const ToolExecutionStep) ![]ToolExecutionStep {
     if (steps.len == 0) return &.{};
 

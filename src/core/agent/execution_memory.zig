@@ -121,6 +121,44 @@ pub fn redactText(alloc: Allocator, text: []const u8) ![]u8 {
     return @constCast(masked);
 }
 
+fn textUnalteredByRedaction(alloc: Allocator, text: []const u8) !bool {
+    const masked = text_utils.maskSecrets(alloc, text) catch |err| switch (err) {
+        error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
+    };
+    if (masked.ptr == text.ptr) return true;
+    alloc.free(@constCast(masked));
+    return false;
+}
+
+/// Retains ordered replay parts across the durable boundary only when the
+/// segment survives redaction byte-for-byte: every text and reasoning payload
+/// must be unmasked, and every tool-call reference must resolve to a surviving
+/// call whose final identity was not rewritten. Anything redaction would alter
+/// marks the whole replay unit unavailable; the legacy projection then carries
+/// the step and no signature is attached to altered content.
+pub fn durableRetainedAssistantParts(
+    alloc: Allocator,
+    parts: ?[]const types.AssistantPart,
+    persisted_calls: []const types.ToolCall,
+) !?[]types.AssistantPart {
+    const source = parts orelse return null;
+    for (source) |part| {
+        switch (part) {
+            .text => |text_part| {
+                if (!try textUnalteredByRedaction(alloc, text_part.text)) return null;
+            },
+            .reasoning => |reasoning_part| {
+                if (!try textUnalteredByRedaction(alloc, reasoning_part.text)) return null;
+            },
+            .tool_call_ref => |ref| {
+                const call = findToolCallById(persisted_calls, ref.id) orelse return null;
+                if (call.final_identity != .valid) return null;
+            },
+        }
+    }
+    return try types.dupeAssistantParts(alloc, source);
+}
+
 fn dupeRedactedCommittedFilePresentation(
     alloc: Allocator,
     presentation: types.CommittedFilePresentation,
@@ -263,6 +301,10 @@ const ChatMessageAdapter = struct {
         return value.tool_result_memory;
     }
 
+    fn assistantParts(value: Message) ?[]const types.AssistantPart {
+        return value.assistant_parts;
+    }
+
     fn content(value: Message) ?[]const u8 {
         return value.content;
     }
@@ -305,6 +347,10 @@ const MessageAdapter = struct {
 
     fn toolResultMemory(value: Message) ?types.ToolResultMemory {
         return value.tool_result_memory;
+    }
+
+    fn assistantParts(value: Message) ?[]const types.AssistantPart {
+        return value.assistant_parts;
     }
 
     fn content(value: Message) ?[]const u8 {
@@ -417,10 +463,17 @@ fn buildNormalExecutionMemory(
         errdefer types.freeToolCallSlice(alloc, persisted_calls);
         const owned_results = try results.toOwnedSlice(alloc);
         errdefer types.freePersistedToolResults(alloc, owned_results);
+        const assistant_parts = try durableRetainedAssistantParts(
+            alloc,
+            Adapter.assistantParts(msg),
+            persisted_calls,
+        );
+        errdefer if (assistant_parts) |parts| types.freeAssistantParts(alloc, parts);
         const step = types.ToolExecutionStep{
             .assistant = assistant,
             .tool_calls = persisted_calls,
             .tool_results = owned_results,
+            .assistant_parts = assistant_parts,
         };
         try tool_steps.append(alloc, step);
         i = j;
@@ -526,14 +579,33 @@ pub fn dupeRedactedToolCall(alloc: Allocator, call: ToolCall) !ToolCall {
     errdefer if (provisional_id) |value| alloc.free(value);
     const provider_result = if (call.provider_result) |result| try redactText(alloc, result) else null;
     errdefer if (provider_result) |result| alloc.free(result);
+    // Signed replay metadata stays attached only when the call's identity and
+    // payloads survive redaction byte-for-byte; a masked call is replayed by
+    // the legacy projection without its signatures.
+    const call_unaltered = std.mem.eql(u8, id, call.id) and
+        std.mem.eql(u8, arguments_json, call.arguments_json) and
+        (call.provider_result == null or
+            (provider_result != null and std.mem.eql(u8, provider_result.?, call.provider_result.?)));
+    const provider_options_json = if (call_unaltered and call.provider_options_json != null)
+        try alloc.dupe(u8, call.provider_options_json.?)
+    else
+        null;
+    errdefer if (provider_options_json) |options| alloc.free(options);
+    const provider_result_options_json = if (call_unaltered and call.provider_result_options_json != null)
+        try alloc.dupe(u8, call.provider_result_options_json.?)
+    else
+        null;
+    errdefer if (provider_result_options_json) |options| alloc.free(options);
     return .{
         .id = id,
         .name = name,
         .arguments_json = arguments_json,
         .provisional_id = provisional_id,
         .provider_result = provider_result,
+        .provider_result_options_json = provider_result_options_json,
         .final_identity = call.final_identity,
         .provenance = call.provenance,
+        .provider_options_json = provider_options_json,
     };
 }
 

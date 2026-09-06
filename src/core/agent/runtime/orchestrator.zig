@@ -124,6 +124,7 @@ fn append_pending_steering_after_assistant(
     within_turn_suffix: *std.ArrayList(ChatMessage),
     turn_id: u64,
     assistant_text: []const u8,
+    assistant_parts: ?[]const types.AssistantPart,
 ) !bool {
     const boundary = try take_steering_boundary(deps, arena, turn_id, .model);
     const guidance = switch (boundary) {
@@ -134,6 +135,7 @@ fn append_pending_steering_after_assistant(
     try within_turn_suffix.append(arena, .{
         .role = .assistant,
         .content = assistant_text,
+        .assistant_parts = assistant_parts,
     });
     try append_steering_guidance(arena, within_turn_suffix, guidance);
     return true;
@@ -571,6 +573,9 @@ fn project_terminal_request_messages(
         target.* = message;
         target.content = null;
         target.tool_calls = &.{};
+        // This projection rewrites calls and text; replay parts stay with the
+        // canonical request, not this legacy view.
+        target.assistant_parts = null;
         initialized += 1;
         target.content = if (message.content) |content|
             try alloc.dupe(u8, content)
@@ -826,6 +831,9 @@ fn project_subagent_request_messages(
         target.* = message;
         target.content = if (message.content) |content| try alloc.dupe(u8, content) else null;
         target.tool_calls = &.{};
+        // This projection rewrites subagent calls and text; replay parts stay
+        // with the canonical request, not this derived view.
+        target.assistant_parts = null;
         initialized += 1;
 
         if (message.role == .tool and message.tool_call_id != null) {
@@ -869,6 +877,9 @@ fn project_subagent_request_messages(
                     )) orelse try alloc.dupe(u8, call.arguments_json);
                     var copied = call;
                     copied.arguments_json = arguments;
+                    // Rewritten arguments detach signed replay metadata.
+                    copied.provider_options_json = null;
+                    copied.provider_result_options_json = null;
                     projected_calls.append(alloc, copied) catch |err| {
                         alloc.free(arguments);
                         return err;
@@ -1085,6 +1096,9 @@ fn project_read_tool_result_request_messages(
             }
             @constCast(projected.?[message_index].tool_calls)[call_index].arguments_json =
                 arguments_json;
+            // Rewritten arguments detach signed replay metadata.
+            @constCast(projected.?[message_index].tool_calls)[call_index].provider_options_json = null;
+            @constCast(projected.?[message_index].tool_calls)[call_index].provider_result_options_json = null;
         }
     }
     return projected orelse source;
@@ -1251,6 +1265,9 @@ fn normalize_terminal_request_tool_calls(
             };
         }
         normalized.?[index].arguments_json = arguments_json;
+        // Rewritten arguments detach signed replay metadata for this call.
+        normalized.?[index].provider_options_json = null;
+        normalized.?[index].provider_result_options_json = null;
     }
     return normalized orelse source;
 }
@@ -1288,6 +1305,8 @@ fn normalize_subagent_request_tool_calls(
             };
         }
         normalized.?[index].arguments_json = arguments_json;
+        normalized.?[index].provider_options_json = null;
+        normalized.?[index].provider_result_options_json = null;
     }
     return normalized orelse source;
 }
@@ -2578,6 +2597,7 @@ fn materializeConfirmedProviderTools(
         novel_calls,
         completion.assistant_phase,
         completion.provider_state_json,
+        try types.filterAssistantPartsToCalls(arena, completion.assistant_parts, novel_calls),
     );
     var batch: runtime_tool_batch.StepBatchState = .{};
     reportProviderExecutedUsage(deps, novel_calls);
@@ -2802,6 +2822,9 @@ fn finishPendingCancelledCalls(
 
 pub const CommonStopState = struct {
     retained_candidate: ?[]const u8 = null,
+    /// Replay parts of the retained candidate segment, joined chronologically
+    /// with the next segment's parts when the candidate text is joined.
+    retained_candidate_parts: ?[]const types.AssistantPart = null,
     latest_partial: ?[]const u8 = null,
     dispatched: bool = false,
     terminal_materializing: bool = false,
@@ -6777,6 +6800,9 @@ fn processQueuedPromptLoop(
                         stream_ctx.drop_staged_response_language_candidate();
                         if (streamCompletionPtr(&stream_result)) |candidate| {
                             candidate.content = null;
+                            // The rejected prose must not stay available for
+                            // replay through the canonical part sequence.
+                            candidate.assistant_parts = null;
                         }
                     },
                     .retry_once, .fail_without_commit => {
@@ -7124,6 +7150,13 @@ fn processQueuedPromptLoop(
         ) else .{ .calls = completion.tool_calls, .removed = 0 };
         completion.tool_calls = filtered_provider_calls.calls;
         if (filtered_provider_calls.removed > 0) {
+            completion.assistant_parts = try types.filterAssistantPartsToCalls(
+                arena,
+                completion.assistant_parts,
+                completion.tool_calls,
+            );
+        }
+        if (filtered_provider_calls.removed > 0) {
             debug_trace.eventf(
                 "agent",
                 "provider_tool_recovery_duplicate_suppressed",
@@ -7187,6 +7220,7 @@ fn processQueuedPromptLoop(
                     within_turn_suffix.items,
                     &summary_accumulator,
                     assistant_text,
+                    null,
                     .failed,
                     null,
                     &finish_trace,
@@ -7204,6 +7238,7 @@ fn processQueuedPromptLoop(
                     within_turn_suffix.items,
                     &summary_accumulator,
                     partial_assistant,
+                    null,
                     .failed,
                     null,
                     &finish_trace,
@@ -7455,6 +7490,7 @@ fn processQueuedPromptLoop(
                     within_turn_suffix.items,
                     &summary_accumulator,
                     persisted_text,
+                    null,
                     .failed,
                     .length_limited,
                     &finish_trace,
@@ -7496,10 +7532,11 @@ fn processQueuedPromptLoop(
                     if (completion.content) |content| content.len else 0,
                     if (completion.provider_state_json != null) "true" else "false",
                 });
-                if (completion.provider_state_json) |state| {
+                if (completion.provider_state_json != null or completion.assistant_parts != null) {
                     try within_turn_suffix.append(arena, .{
                         .role = .assistant,
-                        .provider_state_json = state,
+                        .provider_state_json = completion.provider_state_json,
+                        .assistant_parts = completion.assistant_parts,
                     });
                 }
                 try within_turn_suffix.append(arena, .{ .role = .user, .content = continuation_prompt });
@@ -7521,6 +7558,7 @@ fn processQueuedPromptLoop(
                     &within_turn_suffix,
                     turn_id,
                     history_text,
+                    completion.assistant_parts,
                 ))
             {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
@@ -7538,6 +7576,11 @@ fn processQueuedPromptLoop(
                     stop_state.retained_candidate,
                     history_text,
                 );
+                const persisted_parts = try types.concatAssistantParts(
+                    arena,
+                    stop_state.retained_candidate_parts,
+                    completion.assistant_parts,
+                );
                 stop_state.terminal_materializing =
                     stop_state.retained_candidate != null;
                 try finishCommonAssistantTerminal(
@@ -7548,6 +7591,7 @@ fn processQueuedPromptLoop(
                     within_turn_suffix.items,
                     &summary_accumulator,
                     persisted_text,
+                    persisted_parts,
                     .completed,
                     if (disposition == .length_limited)
                         .length_limited
@@ -7560,6 +7604,7 @@ fn processQueuedPromptLoop(
             }
 
             stop_state.retained_candidate = history_text;
+            stop_state.retained_candidate_parts = completion.assistant_parts;
             stop_state.latest_partial = null;
             if (!has_content) {
                 try deps.push_text(deps.ctx, .{ .operational = rendered });
@@ -7586,6 +7631,7 @@ fn processQueuedPromptLoop(
                         history_text,
                     )) {
                         stop_state.retained_candidate = null;
+                        stop_state.retained_candidate_parts = null;
                         stop_state.latest_partial = null;
                         continue :agent_steps_loop;
                     }
@@ -7621,6 +7667,7 @@ fn processQueuedPromptLoop(
                         within_turn_suffix.items,
                         &summary_accumulator,
                         history_text,
+                        completion.assistant_parts,
                         .completed,
                         if (disposition == .length_limited)
                             .length_limited
@@ -7635,6 +7682,7 @@ fn processQueuedPromptLoop(
                     try within_turn_suffix.append(arena, .{
                         .role = .assistant,
                         .content = history_text,
+                        .assistant_parts = completion.assistant_parts,
                     });
                     const synthetic = try hooks.prompt.buildContinuationMessage(
                         arena,
@@ -7761,6 +7809,7 @@ fn processQueuedPromptLoop(
                 partial_assistant,
             .tool_calls = effective_tool_calls,
             .provider_state_json = completion.provider_state_json,
+            .assistant_parts = if (terminal_provider_completion) null else completion.assistant_parts,
         };
 
         var preparation_batch = tool_preparation.ReadyCallBatch.init(
@@ -7993,6 +8042,7 @@ fn processQueuedPromptLoop(
             effective_tool_calls,
             completion.assistant_phase,
             completion.provider_state_json,
+            if (terminal_provider_completion) null else completion.assistant_parts,
         );
 
         const step_has_content = !terminal_provider_completion and completion.content != null and completion.content.?.len > 0;
@@ -10046,6 +10096,7 @@ fn processQueuedPromptLoop(
                     within_turn_suffix.items,
                     &summary_accumulator,
                     assistant_text,
+                    null,
                     .completed,
                     null,
                     &finish_trace,
@@ -10171,6 +10222,7 @@ fn processQueuedPromptLoop(
                 within_turn_suffix.items,
                 &summary_accumulator,
                 assistant_text,
+                null,
                 .completed,
                 null,
                 &finish_trace,
@@ -10212,6 +10264,7 @@ fn processQueuedPromptLoop(
                     &within_turn_suffix,
                     turn_id,
                     rendered,
+                    completion.assistant_parts,
                 ))
             {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
@@ -10230,6 +10283,11 @@ fn processQueuedPromptLoop(
                     stop_state.retained_candidate,
                     history_text,
                 );
+                const persisted_parts = try types.concatAssistantParts(
+                    arena,
+                    stop_state.retained_candidate_parts,
+                    completion.assistant_parts,
+                );
                 stop_state.terminal_materializing =
                     stop_state.retained_candidate != null;
                 try finishCommonAssistantTerminal(
@@ -10240,6 +10298,7 @@ fn processQueuedPromptLoop(
                     within_turn_suffix.items,
                     &summary_accumulator,
                     persisted_text,
+                    persisted_parts,
                     .completed,
                     null,
                     &finish_trace,
@@ -10249,6 +10308,7 @@ fn processQueuedPromptLoop(
             }
 
             stop_state.retained_candidate = rendered;
+            stop_state.retained_candidate_parts = completion.assistant_parts;
             stop_state.latest_partial = null;
             try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
 
@@ -10296,6 +10356,7 @@ fn processQueuedPromptLoop(
                         within_turn_suffix.items,
                         &summary_accumulator,
                         rendered,
+                        completion.assistant_parts,
                         .completed,
                         null,
                         &finish_trace,
@@ -10307,6 +10368,7 @@ fn processQueuedPromptLoop(
                     try within_turn_suffix.append(arena, .{
                         .role = .assistant,
                         .content = rendered,
+                        .assistant_parts = completion.assistant_parts,
                     });
                     const synthetic = try hooks.prompt.buildContinuationMessage(
                         arena,
@@ -10374,6 +10436,7 @@ fn finishFailedTurnWithNotice(
             current_turn_messages,
             summary_accumulator,
             assistant_text,
+            null,
             .failed,
             null,
             finish_trace,
@@ -10408,6 +10471,7 @@ pub fn finishCommonAssistantTerminal(
     current_turn_messages: []const ChatMessage,
     summary_accumulator: *runtime_telemetry.TurnSummaryAccumulator,
     assistant_text: []const u8,
+    assistant_parts: ?[]const types.AssistantPart,
     outcome: types.TurnPresentationOutcome,
     disposition: ?types.ProviderCompletionDisposition,
     finish_trace: *PromptFinishTrace,
@@ -10424,6 +10488,7 @@ pub fn finishCommonAssistantTerminal(
         execution_memory,
         summary_accumulator,
         assistant_text,
+        assistant_parts,
         outcome,
         disposition,
         finish_trace,
@@ -10438,6 +10503,7 @@ fn finishCommonAssistantTerminalWithExecution(
     execution_memory: types.ExecutionMemory,
     summary_accumulator: *runtime_telemetry.TurnSummaryAccumulator,
     assistant_text: []const u8,
+    assistant_parts: ?[]const types.AssistantPart,
     outcome: types.TurnPresentationOutcome,
     disposition: ?types.ProviderCompletionDisposition,
     finish_trace: *PromptFinishTrace,
@@ -10450,6 +10516,7 @@ fn finishCommonAssistantTerminalWithExecution(
         execution_memory,
         summary_accumulator,
         assistant_text,
+        assistant_parts,
         outcome,
         disposition,
         finish_trace,

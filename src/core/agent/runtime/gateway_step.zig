@@ -189,6 +189,8 @@ pub fn projectToolImageMessages(alloc: Allocator, messages: []const types.ChatMe
             const content = message.content orelse "";
             const keep = @import("../../config/context_limits.zig").utf8PrefixLength(content, text_limit -| notice.len);
             memory.truncated = memory.truncated or keep < content.len;
+            // The rewritten result text detaches signed result metadata.
+            memory.provider_options_json = null;
             message.content = try std.mem.concat(alloc, u8, &.{ notice[0..@min(notice.len, text_limit)], content[0..keep] });
         }
     }

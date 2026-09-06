@@ -155,6 +155,7 @@ pub fn finishAssistantTerminalWithExecution(
     execution: types.ExecutionMemory,
     summary: *TurnSummaryAccumulator,
     assistant_text: []const u8,
+    assistant_parts: ?[]const types.AssistantPart,
     outcome: types.TurnPresentationOutcome,
     disposition: ?types.ProviderCompletionDisposition,
     finish_trace: *PromptFinishTrace,
@@ -164,11 +165,16 @@ pub fn finishAssistantTerminalWithExecution(
     defer projection_arena.deinit();
     const context_execution = try finalization.compacted_execution.project(projection_arena.allocator(), execution);
     const completed_summary = summary.finish();
-    var turn: HistoryTurn = .{ .assistant = .{
-        .user = .{ .text = job.prompt, .images = job.images },
-        .assistant = @constCast(assistant_text),
-        .execution = context_execution,
-    } };
+    var turn: HistoryTurn = .{
+        .assistant = .{
+            .user = .{ .text = job.prompt, .images = job.images },
+            .assistant = @constCast(assistant_text),
+            .execution = context_execution,
+            // Borrowed like `assistant` text; the turn is deep-copied before it
+            // outlives this scope.
+            .assistant_parts = @constCast(assistant_parts),
+        },
+    };
     types.setHistoryTurnSummary(&turn, completed_summary);
     const finished = try types.dupeFinishedPrompt(
         std.heap.c_allocator,
@@ -212,6 +218,7 @@ pub fn finishExecutionOnlyFailureIfNeeded(
         execution,
         summary,
         "",
+        null,
         .failed,
         null,
         finish_trace,
@@ -249,6 +256,7 @@ pub fn finalizeRetainedCandidateFailure(
         execution,
         summary,
         assistant_text,
+        null,
         .failed,
         null,
         finish_trace,

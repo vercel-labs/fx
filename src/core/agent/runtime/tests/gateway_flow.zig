@@ -3430,6 +3430,89 @@ test "processQueuedPrompt does not compact away its only recent exchange" {
     try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items[0].assistant.execution.tool_steps.len);
 }
 
+test "processQueuedPrompt replays retained reasoning parts in the tool continuation request" {
+    const alloc = std.testing.allocator;
+    const step_parts = [_]types.AssistantPart{
+        .{ .reasoning = .{ .text = "The file holds the answer.", .provider_options = "{\"anthropic\":{\"signature\":\"sig_step\"}}" } },
+        .{ .text = .{ .text = "Reading the file." } },
+        .{ .tool_call_ref = .{ .id = "call_reasoning" } },
+    };
+    const final_parts = [_]types.AssistantPart{
+        .{ .reasoning = .{ .text = "The result answers the question.", .provider_options = "{\"anthropic\":{\"signature\":\"sig_final\"}}" } },
+        .{ .text = .{ .text = "The file says hello." } },
+    };
+    var call = toolCall("call_reasoning", "read_file", "{\"path\":\"note.txt\"}");
+    call.provider_options_json = "{\"google\":{\"thoughtSignature\":\"ts_1\"}}";
+    const calls = [_]ToolCall{call};
+
+    var gateway = FakeGateway.init(alloc, &.{
+        .{
+            .content = "Reading the file.",
+            .tool_calls = &calls,
+            .assistant_parts = &step_parts,
+        },
+        .{
+            .content = "The file says hello.",
+            .assistant_parts = &final_parts,
+        },
+    });
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.permission_decisions = &.{.once};
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = "file contents: hello" } }};
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.model = @constCast("provider/reasoning-model");
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        gateway.request_bodies.items[1],
+        .{},
+    );
+    defer parsed.deinit();
+    const prompt = parsed.value.object.get("prompt").?.array.items;
+    var assistant_entry: ?std.json.Value = null;
+    for (prompt) |entry| {
+        if (entry != .object) continue;
+        const role = entry.object.get("role") orelse continue;
+        if (role == .string and std.mem.eql(u8, role.string, "assistant")) assistant_entry = entry;
+    }
+    const assistant = assistant_entry orelse return error.TestExpectedPromptMessageMissing;
+    var content_out: std.Io.Writer.Allocating = .init(alloc);
+    defer content_out.deinit();
+    try std.json.Stringify.value(assistant.object.get("content").?, .{}, &content_out.writer);
+    try std.testing.expectEqualStrings(
+        "[{\"type\":\"reasoning\",\"text\":\"The file holds the answer.\",\"providerOptions\":{\"anthropic\":{\"signature\":\"sig_step\"}}}," ++
+            "{\"type\":\"text\",\"text\":\"Reading the file.\"}," ++
+            "{\"type\":\"tool-call\",\"toolCallId\":\"call_reasoning\",\"toolName\":\"read_file\",\"input\":{\"path\":\"note.txt\"},\"providerOptions\":{\"google\":{\"thoughtSignature\":\"ts_1\"}}}]",
+        content_out.written(),
+    );
+
+    // The durable turn retains the step's parts and the final answer's parts.
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    const completed = hooks.history_turns.items[0].assistant;
+    const persisted_step_parts = completed.execution.tool_steps[0].assistant_parts orelse
+        return error.TestExpectedAssistantParts;
+    try std.testing.expectEqual(@as(usize, 3), persisted_step_parts.len);
+    try std.testing.expectEqualStrings(
+        "{\"anthropic\":{\"signature\":\"sig_step\"}}",
+        persisted_step_parts[0].reasoning.provider_options.?,
+    );
+    try std.testing.expectEqualStrings("call_reasoning", persisted_step_parts[2].tool_call_ref.id);
+    const persisted_final_parts = completed.assistant_parts orelse return error.TestExpectedAssistantParts;
+    try std.testing.expectEqual(@as(usize, 2), persisted_final_parts.len);
+    try std.testing.expectEqualStrings(
+        "{\"anthropic\":{\"signature\":\"sig_final\"}}",
+        persisted_final_parts[0].reasoning.provider_options.?,
+    );
+    try std.testing.expectEqualStrings("The file says hello.", persisted_final_parts[1].text.text);
+}
+
 test "automatic compaction summarizes a newest exchange larger than the input window" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

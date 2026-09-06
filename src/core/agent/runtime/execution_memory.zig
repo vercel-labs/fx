@@ -89,22 +89,27 @@ pub fn buildExecutionMemory(alloc: Allocator, within_turn_suffix: []const ChatMe
         for (steering.items) |item| {
             alloc.free(item.text);
             if (item.assistant_prefix) |prefix| alloc.free(prefix);
+            if (item.assistant_prefix_parts) |parts| types.freeAssistantParts(alloc, parts);
         }
         steering.deinit(alloc);
     }
     var tool_step_count: usize = 0;
     var assistant_prefix: ?[]const u8 = null;
+    var assistant_prefix_parts: ?[]const types.AssistantPart = null;
     for (within_turn_suffix, 0..) |message, index| {
         if (startsPersistedToolStep(within_turn_suffix, index)) {
             tool_step_count += 1;
             assistant_prefix = null;
+            assistant_prefix_parts = null;
         } else if (message.role == .assistant) {
             assistant_prefix = message.content;
+            assistant_prefix_parts = message.assistant_parts;
         }
         if (message.role != .user) continue;
         const content = message.content orelse continue;
         const text = steeringText(content) orelse {
             assistant_prefix = null;
+            assistant_prefix_parts = null;
             continue;
         };
         const copy = try alloc.dupe(u8, text);
@@ -115,16 +120,32 @@ pub fn buildExecutionMemory(alloc: Allocator, within_turn_suffix: []const ChatMe
             }
         else
             null;
+        // The prefix replay unit survives only when the prefix text crosses the
+        // redaction boundary byte-for-byte.
+        const prefix_parts = if (assistant_prefix_parts != null and
+            prefix_copy != null and
+            assistant_prefix != null and
+            std.mem.eql(u8, prefix_copy.?, assistant_prefix.?))
+            execution_memory_helpers.durableRetainedAssistantParts(alloc, assistant_prefix_parts, &.{}) catch |err| {
+                alloc.free(copy);
+                if (prefix_copy) |prefix| alloc.free(prefix);
+                return err;
+            }
+        else
+            null;
         steering.append(alloc, .{
             .text = copy,
             .assistant_prefix = prefix_copy,
+            .assistant_prefix_parts = prefix_parts,
             .after_tool_step_count = tool_step_count,
         }) catch |err| {
             alloc.free(copy);
             if (prefix_copy) |prefix| alloc.free(prefix);
+            if (prefix_parts) |parts| types.freeAssistantParts(alloc, parts);
             return err;
         };
         assistant_prefix = null;
+        assistant_prefix_parts = null;
     }
     std.debug.assert(tool_step_count == execution.tool_steps.len);
     execution.steering = try steering.toOwnedSlice(alloc);
@@ -189,6 +210,11 @@ pub fn buildInterruptedExecutionMemory(
         for (allocated_call_slices.items) |calls| alloc.free(calls);
         allocated_call_slices.deinit(alloc);
     }
+    var allocated_part_slices: std.ArrayList([]types.AssistantPart) = .empty;
+    defer {
+        for (allocated_part_slices.items) |parts| alloc.free(parts);
+        allocated_part_slices.deinit(alloc);
+    }
 
     var active_group_index: ?usize = null;
     if (active_tool_call) |active| {
@@ -245,6 +271,14 @@ pub fn buildInterruptedExecutionMemory(
 
             var projected = item;
             projected.tool_calls = calls;
+            // Keep the replay sequence in sync with the filtered call set:
+            // references to the removed active or incomplete calls are dropped
+            // with the calls, in the same pass.
+            if (item.assistant_parts) |parts| {
+                const projected_parts = try types.filterAssistantPartsToCalls(alloc, parts, calls);
+                if (projected_parts) |kept| try allocated_part_slices.append(alloc, kept);
+                projected.assistant_parts = projected_parts;
+            }
             filtered.appendAssumeCapacity(projected);
             for (result_messages) |result| {
                 const result_call_id = result.tool_call_id orelse continue;

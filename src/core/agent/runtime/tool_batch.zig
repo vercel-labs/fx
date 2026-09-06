@@ -48,6 +48,7 @@ pub fn appendAssistantToolCallStep(
     tool_calls: []const ToolCall,
     assistant_phase: ?types.AssistantMessagePhase,
     provider_state_json: ?[]const u8,
+    assistant_parts: ?[]const types.AssistantPart,
 ) !void {
     try within_turn_suffix.append(arena, .{
         .role = .assistant,
@@ -55,6 +56,7 @@ pub fn appendAssistantToolCallStep(
         .tool_calls = tool_calls,
         .assistant_phase = assistant_phase,
         .provider_state_json = provider_state_json,
+        .assistant_parts = assistant_parts,
     });
 }
 
@@ -556,7 +558,7 @@ test "drained batch feedback follows all tool results and keeps its source call"
         .{ .id = "call_second", .name = "run_command", .arguments_json = "{}" },
     };
 
-    try appendAssistantToolCallStep(alloc, &suffix, null, &calls, .commentary, null);
+    try appendAssistantToolCallStep(alloc, &suffix, null, &calls, .commentary, null, null);
     try appendToolResultContent(
         alloc,
         &suffix,

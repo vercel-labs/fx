@@ -470,6 +470,7 @@ pub const Reviewer = struct {
         // attachments are untrusted and do not identify the action.
         target_pending_assistant.images = &.{};
         target_pending_assistant.content = null;
+        target_pending_assistant.assistant_parts = null;
         const instructions = [_]types.ChatMessage{.{ .role = .system, .content = instruction }};
         const messages = [_]types.ChatMessage{ user_message, target_pending_assistant };
 

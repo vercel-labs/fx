@@ -2036,12 +2036,17 @@ pub fn contextHistoryRange(
             execution.files = &.{};
             execution.turn_summary = null;
             switch (turn) {
-                .assistant => |*entry| entry.assistant = @constCast(""),
+                // Clearing the final answer also clears its replay parts.
+                .assistant => |*entry| {
+                    entry.assistant = @constCast("");
+                    entry.assistant_parts = null;
+                },
                 .interrupted => |*entry| {
                     entry.assistant = null;
                     entry.tool_call = null;
                     entry.completed_tool_names = &.{};
                     entry.cancelled_command = null;
+                    entry.assistant_parts = null;
                 },
                 .compacted_summary => unreachable,
             }
@@ -3166,7 +3171,11 @@ pub fn appendExecutionMemoryChatMessages(
             const steering = execution.steering[steering_index];
             if (steering.assistant_prefix) |prefix| {
                 if (prefix.len > 0) {
-                    try messages.append(alloc, .{ .role = .assistant, .content = prefix });
+                    try messages.append(alloc, .{
+                        .role = .assistant,
+                        .content = prefix,
+                        .assistant_parts = steering.assistant_prefix_parts,
+                    });
                 }
             }
             if (steering.text.len > 0) {
@@ -3179,6 +3188,7 @@ pub fn appendExecutionMemoryChatMessages(
             .role = .assistant,
             .content = step.assistant,
             .tool_calls = step.tool_calls,
+            .assistant_parts = step.assistant_parts,
         });
         for (step.tool_results) |result| {
             try messages.append(alloc, .{
@@ -3209,7 +3219,11 @@ pub fn appendExecutionMemoryChatMessages(
         const steering = execution.steering[steering_index];
         if (steering.assistant_prefix) |prefix| {
             if (prefix.len > 0) {
-                try messages.append(alloc, .{ .role = .assistant, .content = prefix });
+                try messages.append(alloc, .{
+                    .role = .assistant,
+                    .content = prefix,
+                    .assistant_parts = steering.assistant_prefix_parts,
+                });
             }
         }
         if (steering.text.len == 0) continue;
@@ -3230,6 +3244,7 @@ fn toolResultMemory(result: core_types.PersistedToolResult) core_types.ToolResul
         .command_output_replay = result.command_output_replay,
         .command_process_presentation = result.command_process_presentation,
         .terminal_action_presentation = result.terminal_action_presentation,
+        .provider_options_json = result.provider_options_json,
     };
 }
 
@@ -3252,8 +3267,15 @@ fn appendHistoryChatMessagesImpl(
             .assistant => |entry| {
                 try messages.append(alloc, .{ .role = .user, .content = entry.user.text, .images = entry.user.images });
                 try appendExecutionMemoryChatMessages(alloc, messages, entry.execution);
-                if (entry.assistant.len > 0) {
-                    try messages.append(alloc, .{ .role = .assistant, .content = entry.assistant });
+                // A reasoning-only final answer still carries replay parts.
+                if (entry.assistant.len > 0 or
+                    (entry.assistant_parts != null and entry.assistant_parts.?.len > 0))
+                {
+                    try messages.append(alloc, .{
+                        .role = .assistant,
+                        .content = entry.assistant,
+                        .assistant_parts = entry.assistant_parts,
+                    });
                 }
             },
             .interrupted => |entry| {
