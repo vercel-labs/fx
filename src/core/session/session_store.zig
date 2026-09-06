@@ -126,8 +126,12 @@ pub const ResumeOptions = store_types.ResumeOptions;
 pub const ResumeTarget = store_types.ResumeTarget;
 pub const SessionMigrationResult = store_types.SessionMigrationResult;
 pub const SessionMigrationStatus = store_types.SessionMigrationStatus;
+pub const SessionForkResult = store_types.SessionForkResult;
+pub const SessionForkStatus = store_types.SessionForkStatus;
 pub const SessionRecoveryResult = store_types.SessionRecoveryResult;
 pub const SessionRecoveryStatus = store_types.SessionRecoveryStatus;
+pub const SessionRewindResult = store_types.SessionRewindResult;
+pub const SessionRewindStatus = store_types.SessionRewindStatus;
 pub const SessionSummary = store_types.SessionSummary;
 pub const HistoryPage = store_types.HistoryPage;
 
@@ -3444,6 +3448,52 @@ pub const Store = struct {
 
         const source_id = try alloc.dupe(u8, recovered.id);
         errdefer alloc.free(source_id);
+        const outcome = try self.publishSessionCopy(
+            alloc,
+            &source,
+            &source_children,
+            &recovered,
+            current_boundary,
+            if (metadata) |current| current.value.title else null,
+            options,
+            "session_recovery",
+        );
+        return .{
+            .source_session_id = source_id,
+            .recovered_session_id = outcome.target_id,
+            .history_len = recovered.history.len,
+            .status = switch (outcome.status) {
+                .published => .recovered,
+                .published_with_unverified_artifacts => .recovered_with_unverified_artifacts,
+                .indeterminate => .indeterminate,
+            },
+        };
+    }
+
+    const SessionCopyOutcome = struct {
+        target_id: []u8,
+        status: enum {
+            published,
+            published_with_unverified_artifacts,
+            indeterminate,
+        },
+    };
+
+    /// Publishes a copy of `recovered` as a new session and returns its id,
+    /// which also replaces `recovered.id`. With `prefix`, the copy's log is
+    /// that exact byte prefix of `source`; without it the log is serialized
+    /// from `recovered.history`. `label` names the copy in trace events.
+    fn publishSessionCopy(
+        self: Store,
+        alloc: Allocator,
+        source: *session_log.WritableSessionDir,
+        source_children: *session_child_store.SessionChildCapability,
+        recovered: *session_codec.DurableSessionState,
+        prefix: ?session_log.ConversationRecoveryBoundary,
+        title: ?[]const u8,
+        options: session_log.Options,
+        comptime label: []const u8,
+    ) !SessionCopyOutcome {
         const recovered_id = try generateSessionId(alloc);
         errdefer alloc.free(recovered_id);
         const replacement_id = try alloc.dupe(u8, recovered_id);
@@ -3479,7 +3529,7 @@ pub const Store = struct {
                 if (disposition != .discarded) {
                     debug_trace.logf(
                         "session",
-                        "event=session_recovery_unpublished_target_cleanup disposition={s}",
+                        "event=" ++ label ++ "_unpublished_target_cleanup disposition={s}",
                         .{@tagName(disposition)},
                     );
                 }
@@ -3530,15 +3580,15 @@ pub const Store = struct {
         const contains_unverified_artifacts = try copyRecoveredManagedChildren(
             alloc,
             recovered.history,
-            &source_children,
+            source_children,
             target.child_capability orelse
                 return error.SessionChildStoreFailed,
         );
-        if (current_boundary) |boundary| {
+        if (prefix) |boundary| {
             try session_log.copy_conversation_recovery_prefix(alloc, &source.dir, &target.log.dir, boundary);
-            if (metadata.?.value.title) |title| _ = try target.renameConversation(alloc, title);
+            if (title) |value| _ = try target.renameConversation(alloc, value);
         }
-        if (!try session_log.durableStatesEqual(target.state, recovered)) {
+        if (!try session_log.durableStatesEqual(target.state, recovered.*)) {
             const disposition = discardRecoveryStagedSession(
                 &staging_root,
                 alloc,
@@ -3548,7 +3598,7 @@ pub const Store = struct {
             if (disposition != .discarded) {
                 debug_trace.logf(
                     "session",
-                    "event=session_recovery_staged_target_cleanup disposition={s}",
+                    "event=" ++ label ++ "_staged_target_cleanup disposition={s}",
                     .{@tagName(disposition)},
                 );
             }
@@ -3560,7 +3610,7 @@ pub const Store = struct {
         ) catch |err| {
             debug_trace.logf(
                 "session",
-                "event=session_recovery_target_promotion_failed target={s} err={s}",
+                "event=" ++ label ++ "_target_promotion_failed target={s} err={s}",
                 .{ recovered_id, @errorName(err) },
             );
             return error.SessionRecoveryIndeterminate;
@@ -3569,12 +3619,7 @@ pub const Store = struct {
         if (promotion == .indeterminate) {
             target.deinit(alloc);
             target_owned = false;
-            return .{
-                .source_session_id = source_id,
-                .recovered_session_id = recovered_id,
-                .history_len = recovered.history.len,
-                .status = .indeterminate,
-            };
+            return .{ .target_id = recovered_id, .status = .indeterminate };
         }
         target.deinit(alloc);
         target_owned = false;
@@ -3582,34 +3627,154 @@ pub const Store = struct {
         var verified = self.loadReadOnly(alloc, recovered_id) catch |err| {
             debug_trace.logf(
                 "session",
-                "event=session_recovery_target_indeterminate target={s} verify_err={s}",
+                "event=" ++ label ++ "_target_indeterminate target={s} verify_err={s}",
                 .{ recovered_id, @errorName(err) },
             );
-            return .{
-                .source_session_id = source_id,
-                .recovered_session_id = recovered_id,
-                .history_len = recovered.history.len,
-                .status = .indeterminate,
-            };
+            return .{ .target_id = recovered_id, .status = .indeterminate };
         };
         defer verified.deinit(alloc);
-        if (!try session_log.durableStatesEqual(verified, recovered)) {
-            return .{
-                .source_session_id = source_id,
-                .recovered_session_id = recovered_id,
-                .history_len = recovered.history.len,
-                .status = .indeterminate,
-            };
+        if (!try session_log.durableStatesEqual(verified, recovered.*)) {
+            return .{ .target_id = recovered_id, .status = .indeterminate };
         }
 
         return .{
-            .source_session_id = source_id,
-            .recovered_session_id = recovered_id,
-            .history_len = recovered.history.len,
+            .target_id = recovered_id,
             .status = if (contains_unverified_artifacts)
-                .recovered_with_unverified_artifacts
+                .published_with_unverified_artifacts
             else
-                .recovered,
+                .published,
+        };
+    }
+
+    /// Creates a new session holding the turns of a healthy source before
+    /// `cut`. The source is locked for the read and never modified. Its
+    /// referenced result files and image snapshots are copied like recovery
+    /// copies them.
+    pub fn forkSessionCopy(
+        self: Store,
+        alloc: Allocator,
+        session_id: []const u8,
+        cut: session_log.ConversationCut,
+        options: session_log.Options,
+    ) !SessionForkResult {
+        try validateSessionId(session_id);
+        var source = try self.openWritableSessionDir(
+            alloc,
+            session_id,
+            options.session_lock_deadline_ms,
+        );
+        defer source.deinit(alloc);
+        var metadata = (session_log.readConversationMetadata(alloc, &source.dir) catch |err| switch (err) {
+            error.InvalidSessionMetadata, error.InvalidSessionFormat => return error.SessionForkRequiresCurrentSchema,
+            else => return err,
+        }) orelse return error.SessionForkRequiresCurrentSchema;
+        defer metadata.deinit();
+        if (!std.mem.eql(u8, metadata.value.id, session_id)) return error.InvalidSessionMetadata;
+        if (metadata.value.subagent_child) return error.SessionNotFound;
+
+        const plan = try session_log.planConversationCut(alloc, &source.dir, cut);
+        if (plan.retained_turns == 0) return error.SessionTurnOutOfRange;
+        var forked = session_log.load_conversation_recovery_state(
+            alloc,
+            &source.dir,
+            session_id,
+            plan.boundary,
+        ) catch |err| return mapForkError(err);
+        defer forked.deinit(alloc);
+        try resolveSessionSnapshotLocators(
+            alloc,
+            forked.history,
+            self.sessions_dir,
+            session_id,
+        );
+        const forked_at_ms = io_mod.milliTimestamp();
+        forked.created_at_ms = forked_at_ms;
+        forked.updated_at_ms = forked_at_ms;
+
+        const source_dir_path = try sessionDirPath(
+            alloc,
+            self.sessions_dir,
+            session_id,
+        );
+        defer alloc.free(source_dir_path);
+        var source_children = try session_child_store.SessionChildCapability.init(
+            alloc,
+            source.dir.dir,
+            source_dir_path,
+            .read_only,
+        );
+        defer source_children.deinit();
+        if (try subagent_child_state.capabilityHasManagedChildMarker(alloc, &source_children)) {
+            return error.SessionNotFound;
+        }
+
+        const source_id = try alloc.dupe(u8, session_id);
+        errdefer alloc.free(source_id);
+        const outcome = self.publishSessionCopy(
+            alloc,
+            &source,
+            &source_children,
+            &forked,
+            plan.boundary,
+            metadata.value.title,
+            options,
+            "session_fork",
+        ) catch |err| return mapForkError(err);
+        return .{
+            .source_session_id = source_id,
+            .forked_session_id = outcome.target_id,
+            .history_len = forked.history.len,
+            .source_history_len = plan.total_turns,
+            .status = switch (outcome.status) {
+                .published => .forked,
+                .published_with_unverified_artifacts => .forked_with_unverified_artifacts,
+                .indeterminate => .indeterminate,
+            },
+        };
+    }
+
+    /// Drops the turns after `cut` from a session in place, keeping its id.
+    /// The conversation log is truncated, so the dropped turns leave the
+    /// transcript; a paused response goes with them. Fails with
+    /// `error.SessionBusy` while another process holds the session open.
+    pub fn rewindSession(
+        self: Store,
+        alloc: Allocator,
+        session_id: []const u8,
+        cut: session_log.ConversationCut,
+        options: session_log.Options,
+    ) !SessionRewindResult {
+        try validateSessionId(session_id);
+        var root = self.canonical_root;
+        var loaded = root.resumeForWrite(alloc, session_id, options) catch |err| switch (err) {
+            error.SessionMigrationRequired => return error.SessionRewindRequiresCurrentSchema,
+            else => return err,
+        };
+        defer loaded.deinit(alloc);
+        if (loaded.state.subagent_child) return error.SessionNotFound;
+
+        const plan = try session_log.planConversationTruncation(
+            alloc,
+            loaded.conversation_writer.file,
+            loaded.conversation_writer.committed_bytes,
+            cut,
+        );
+        const owned_id = try alloc.dupe(u8, loaded.active_id);
+        errdefer alloc.free(owned_id);
+        if (plan.dropped_turns == 0) {
+            return .{
+                .session_id = owned_id,
+                .history_len = plan.total_turns,
+                .removed_turn_count = 0,
+                .status = .already_at_target,
+            };
+        }
+        try loaded.truncateConversation(alloc, plan, io_mod.milliTimestamp());
+        return .{
+            .session_id = owned_id,
+            .history_len = plan.retained_turns,
+            .removed_turn_count = plan.dropped_turns,
+            .status = .rewound,
         };
     }
 };
@@ -3624,6 +3789,14 @@ const RecoveryPromotionStatus = enum {
     promoted,
     indeterminate,
 };
+
+fn mapForkError(err: anyerror) anyerror {
+    return switch (err) {
+        error.SessionRecoveryBoundaryInvalid => error.SessionForkArtifactsUnavailable,
+        error.SessionRecoveryIndeterminate => error.SessionForkIndeterminate,
+        else => err,
+    };
+}
 
 fn copyRecoveredImageSnapshots(
     alloc: Allocator,
@@ -8395,4 +8568,434 @@ test "history page allocation failure sweep frees replay and page ownership" {
         try std.testing.expect(failing.has_induced_failure);
         try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
     }
+}
+
+fn writeForkSourceFixture(
+    alloc: Allocator,
+    store: Store,
+    id: []const u8,
+    workspace_root: []const u8,
+    count: usize,
+) !void {
+    var state = try testDurableState(alloc, id, workspace_root);
+    defer state.deinit(alloc);
+    var created = try store.startWritableSession(alloc, state);
+    created.deinit(alloc);
+    if (count == 0) return;
+    try replaceHistoryPageFixture(alloc, store, id, 20, count, "turn");
+}
+
+fn compactFixture(alloc: Allocator, store: Store, id: []const u8, removed_turn_count: usize) !void {
+    var writable = try store.resumeForWrite(alloc, id);
+    defer writable.deinit(alloc);
+    _ = try writable.commitContextCompaction(alloc, .{
+        .summary = @constCast("summary of the earlier turns"),
+        .removed_turn_count = removed_turn_count,
+        .compaction_count = 1,
+    }, null, null, 30);
+}
+
+/// Labels the archive the way `fx session <id>` shows it: prompts for turns,
+/// the summary text for a compaction.
+fn expectArchiveTurns(
+    alloc: Allocator,
+    store: Store,
+    id: []const u8,
+    expected: []const []const u8,
+) !void {
+    var detail = try store.loadReadOnlyDetail(alloc, id, .{});
+    defer detail.deinit(alloc);
+    try std.testing.expectEqual(expected.len, detail.state.history.len);
+    for (detail.state.history, expected) |turn, label| {
+        const actual = switch (turn) {
+            .assistant => |entry| entry.user.text,
+            .interrupted => |entry| entry.user.text,
+            .compacted_summary => |entry| entry.summary,
+        };
+        try std.testing.expectEqualStrings(label, actual);
+    }
+}
+
+fn readSessionDurableBytes(
+    alloc: Allocator,
+    store: Store,
+    id: []const u8,
+) ![2][]u8 {
+    const events = try readFixtureFile(
+        alloc,
+        store,
+        id,
+        "events.jsonl",
+        1024 * 1024,
+    );
+    errdefer alloc.free(events);
+    const manifest = try readFixtureFile(
+        alloc,
+        store,
+        id,
+        "session.json",
+        session_projection.manifest_max_bytes,
+    );
+    return .{ events, manifest };
+}
+
+test "fork copies a turn prefix into a new session and leaves the source unchanged" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    const source_id = "fork-prefix-source";
+    try writeForkSourceFixture(alloc, ctx.store, source_id, ctx.workspace, 5);
+
+    const before = try readSessionDurableBytes(alloc, ctx.store, source_id);
+    defer alloc.free(before[0]);
+    defer alloc.free(before[1]);
+
+    var result = try ctx.store.forkSessionCopy(alloc, source_id, .{ .archive_turns = 3 }, .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings(source_id, result.source_session_id);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        source_id,
+        result.forked_session_id,
+    ));
+    try std.testing.expectEqual(@as(usize, 3), result.history_len);
+    try std.testing.expectEqual(@as(usize, 5), result.source_history_len);
+    try std.testing.expectEqual(
+        store_types.SessionForkStatus.forked,
+        result.status,
+    );
+
+    const after = try readSessionDurableBytes(alloc, ctx.store, source_id);
+    defer alloc.free(after[0]);
+    defer alloc.free(after[1]);
+    try std.testing.expectEqualSlices(u8, before[0], after[0]);
+    try std.testing.expectEqualSlices(u8, before[1], after[1]);
+
+    try expectArchiveTurns(alloc, ctx.store, result.forked_session_id, &.{ "turn-0", "turn-1", "turn-2" });
+    try expectArchiveTurns(alloc, ctx.store, source_id, &.{ "turn-0", "turn-1", "turn-2", "turn-3", "turn-4" });
+
+    // The branch's log is the source's byte prefix, so it resumes as the
+    // source did at that point.
+    const forked_events = try readFixtureFile(alloc, ctx.store, result.forked_session_id, "events.jsonl", 1024 * 1024);
+    defer alloc.free(forked_events);
+    try std.testing.expect(forked_events.len < before[0].len);
+    try std.testing.expectEqualSlices(u8, before[0][0..forked_events.len], forked_events);
+
+    var forked = try ctx.store.loadReadOnly(alloc, result.forked_session_id);
+    defer forked.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), forked.history.len);
+    try std.testing.expect(forked.recovery_checkpoint == null);
+    try std.testing.expectEqualStrings(ctx.workspace, forked.workspace_root);
+}
+
+test "fork keeps a compaction summary that the retained turns depend on" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    const source_id = "fork-across-compaction";
+    try writeForkSourceFixture(alloc, ctx.store, source_id, ctx.workspace, 2);
+    try compactFixture(alloc, ctx.store, source_id, 2);
+    try replaceHistoryPageFixture(alloc, ctx.store, source_id, 40, 2, "later");
+    try expectArchiveTurns(alloc, ctx.store, source_id, &.{ "turn-0", "turn-1", "summary of the earlier turns", "later-0", "later-1" });
+
+    // Archive turn 4 is the first turn after the summary.
+    var by_archive = try ctx.store.forkSessionCopy(alloc, source_id, .{ .archive_turns = 4 }, .{});
+    defer by_archive.deinit(alloc);
+    try std.testing.expectEqual(store_types.SessionForkStatus.forked, by_archive.status);
+    try std.testing.expectEqual(@as(usize, 4), by_archive.history_len);
+    try expectArchiveTurns(alloc, ctx.store, by_archive.forked_session_id, &.{ "turn-0", "turn-1", "summary of the earlier turns", "later-0" });
+    var resumed = try ctx.store.resumeForWrite(alloc, by_archive.forked_session_id);
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), resumed.state.history.len);
+    try std.testing.expect(resumed.state.history[0] == .compacted_summary);
+    try std.testing.expectEqualStrings("later-0", resumed.state.history[1].assistant.user.text);
+
+    // A resumed session numbers the same point as window turn 2.
+    var by_window = try ctx.store.forkSessionCopy(alloc, source_id, .{ .window_turns = 2 }, .{});
+    defer by_window.deinit(alloc);
+    try std.testing.expectEqual(store_types.SessionForkStatus.forked, by_window.status);
+    try expectArchiveTurns(alloc, ctx.store, by_window.forked_session_id, &.{ "turn-0", "turn-1", "summary of the earlier turns", "later-0" });
+
+    var everything = try ctx.store.forkSessionCopy(alloc, source_id, .everything, .{});
+    defer everything.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 5), everything.history_len);
+    try expectArchiveTurns(alloc, ctx.store, everything.forked_session_id, &.{ "turn-0", "turn-1", "summary of the earlier turns", "later-0", "later-1" });
+}
+
+test "fork rejects turn counts outside the source history" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    const source_id = "fork-range-source";
+    try writeForkSourceFixture(alloc, ctx.store, source_id, ctx.workspace, 3);
+    try std.testing.expectError(
+        error.SessionTurnOutOfRange,
+        ctx.store.forkSessionCopy(alloc, source_id, .{ .archive_turns = 0 }, .{}),
+    );
+    try std.testing.expectError(
+        error.SessionTurnOutOfRange,
+        ctx.store.forkSessionCopy(alloc, source_id, .{ .archive_turns = 4 }, .{}),
+    );
+
+    const empty_id = "fork-empty-source";
+    try writeForkSourceFixture(alloc, ctx.store, empty_id, ctx.workspace, 0);
+    try std.testing.expectError(
+        error.SessionTurnOutOfRange,
+        ctx.store.forkSessionCopy(alloc, empty_id, .{ .archive_turns = 1 }, .{}),
+    );
+    try std.testing.expectError(
+        error.SessionTurnOutOfRange,
+        ctx.store.forkSessionCopy(alloc, empty_id, .everything, .{}),
+    );
+}
+
+test "fork refuses a session that is open for writing" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    const source_id = "fork-busy";
+    try writeForkSourceFixture(alloc, ctx.store, source_id, ctx.workspace, 2);
+    var holder = try ctx.store.resumeForWrite(alloc, source_id);
+    defer holder.deinit(alloc);
+    try std.testing.expectError(
+        error.SessionBusy,
+        ctx.store.forkSessionCopy(alloc, source_id, .{ .archive_turns = 1 }, .{ .session_lock_deadline_ms = 0 }),
+    );
+}
+
+test "rewind drops trailing turns in place and keeps the session id" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    const session_id = "rewind-in-place";
+    try writeForkSourceFixture(alloc, ctx.store, session_id, ctx.workspace, 5);
+
+    const before = try readFixtureFile(alloc, ctx.store, session_id, "events.jsonl", 1024 * 1024);
+    defer alloc.free(before);
+
+    var result = try ctx.store.rewindSession(alloc, session_id, .{ .archive_turns = 2 }, .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings(session_id, result.session_id);
+    try std.testing.expectEqual(@as(usize, 2), result.history_len);
+    try std.testing.expectEqual(@as(usize, 3), result.removed_turn_count);
+    try std.testing.expectEqual(
+        store_types.SessionRewindStatus.rewound,
+        result.status,
+    );
+
+    try expectArchiveTurns(alloc, ctx.store, session_id, &.{ "turn-0", "turn-1" });
+
+    // The log is cut, not rewritten: what remains is the old byte prefix.
+    const after = try readFixtureFile(alloc, ctx.store, session_id, "events.jsonl", 1024 * 1024);
+    defer alloc.free(after);
+    try std.testing.expect(after.len < before.len);
+    try std.testing.expectEqualSlices(u8, before[0..after.len], after);
+
+    // The session keeps working afterwards.
+    try replaceHistoryPageFixture(alloc, ctx.store, session_id, 50, 1, "again");
+    try expectArchiveTurns(alloc, ctx.store, session_id, &.{ "turn-0", "turn-1", "again-0" });
+}
+
+test "rewind to an empty conversation is allowed" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    const session_id = "rewind-to-empty";
+    try writeForkSourceFixture(alloc, ctx.store, session_id, ctx.workspace, 3);
+
+    var result = try ctx.store.rewindSession(alloc, session_id, .{ .archive_turns = 0 }, .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), result.history_len);
+    try std.testing.expectEqual(@as(usize, 3), result.removed_turn_count);
+
+    try expectArchiveTurns(alloc, ctx.store, session_id, &.{});
+    var state = try ctx.store.loadReadOnly(alloc, session_id);
+    defer state.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), state.history.len);
+}
+
+test "rewind reports already_at_target without writing the log" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    const session_id = "rewind-noop";
+    try writeForkSourceFixture(alloc, ctx.store, session_id, ctx.workspace, 3);
+
+    const before = try readFixtureFile(alloc, ctx.store, session_id, "events.jsonl", 1024 * 1024);
+    defer alloc.free(before);
+
+    var result = try ctx.store.rewindSession(alloc, session_id, .{ .archive_turns = 3 }, .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(
+        store_types.SessionRewindStatus.already_at_target,
+        result.status,
+    );
+    try std.testing.expectEqual(@as(usize, 3), result.history_len);
+    try std.testing.expectEqual(@as(usize, 0), result.removed_turn_count);
+
+    const after = try readFixtureFile(alloc, ctx.store, session_id, "events.jsonl", 1024 * 1024);
+    defer alloc.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+}
+
+test "rewind rejects retaining more turns than the session holds" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    const session_id = "rewind-range";
+    try writeForkSourceFixture(alloc, ctx.store, session_id, ctx.workspace, 2);
+    try std.testing.expectError(
+        error.SessionTurnOutOfRange,
+        ctx.store.rewindSession(alloc, session_id, .{ .archive_turns = 3 }, .{}),
+    );
+    try expectArchiveTurns(alloc, ctx.store, session_id, &.{ "turn-0", "turn-1" });
+}
+
+test "rewind counts window turns the way a resumed session does" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    const session_id = "rewind-window";
+    try writeForkSourceFixture(alloc, ctx.store, session_id, ctx.workspace, 2);
+    try compactFixture(alloc, ctx.store, session_id, 2);
+    try replaceHistoryPageFixture(alloc, ctx.store, session_id, 40, 2, "later");
+    {
+        var window = try ctx.store.resumeForWrite(alloc, session_id);
+        defer window.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 3), window.state.history.len);
+    }
+
+    var result = try ctx.store.rewindSession(alloc, session_id, .{ .window_turns = 2 }, .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), result.history_len);
+    try std.testing.expectEqual(@as(usize, 1), result.removed_turn_count);
+    try expectArchiveTurns(alloc, ctx.store, session_id, &.{ "turn-0", "turn-1", "summary of the earlier turns", "later-0" });
+    var window = try ctx.store.resumeForWrite(alloc, session_id);
+    defer window.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), window.state.history.len);
+    try std.testing.expect(window.state.history[0] == .compacted_summary);
+}
+
+test "rewind refuses a session that is already open for writing" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    const session_id = "rewind-busy";
+    try writeForkSourceFixture(alloc, ctx.store, session_id, ctx.workspace, 3);
+
+    var holder = try ctx.store.resumeForWrite(alloc, session_id);
+    defer holder.deinit(alloc);
+    try std.testing.expectError(
+        error.SessionBusy,
+        ctx.store.rewindSession(
+            alloc,
+            session_id,
+            .{ .archive_turns = 1 },
+            .{ .session_lock_deadline_ms = 0 },
+        ),
+    );
+}
+
+fn testRecoveryCheckpoint() session_codec.RecoveryCheckpoint {
+    return .{
+        .turn_id = 1,
+        .user = .{ .text = @constCast("prompt") },
+        .assistant_source = @constCast(""),
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 10,
+        .consumed_provider_attempts = 1,
+    };
+}
+
+test "rewind clears a paused response because it belongs to the dropped tail" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    const session_id = "rewind-clears-checkpoint";
+    try writeForkSourceFixture(alloc, ctx.store, session_id, ctx.workspace, 3);
+
+    var writable = try ctx.store.resumeForWrite(alloc, session_id);
+    _ = try writable.appendEvent(
+        alloc,
+        .{ .recovery_checkpoint_set = .{ .checkpoint = testRecoveryCheckpoint() } },
+        20,
+    );
+    writable.deinit(alloc);
+
+    var result = try ctx.store.rewindSession(alloc, session_id, .{ .archive_turns = 1 }, .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), result.removed_turn_count);
+
+    var state = try ctx.store.loadReadOnly(alloc, session_id);
+    defer state.deinit(alloc);
+    try std.testing.expect(state.recovery_checkpoint == null);
+    try std.testing.expectEqual(@as(usize, 1), state.history.len);
+}
+
+test "rewind leaves a paused response untouched when already at target" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    const session_id = "rewind-noop-keeps-checkpoint";
+    try writeForkSourceFixture(alloc, ctx.store, session_id, ctx.workspace, 3);
+
+    var writable = try ctx.store.resumeForWrite(alloc, session_id);
+    _ = try writable.appendEvent(
+        alloc,
+        .{ .recovery_checkpoint_set = .{ .checkpoint = testRecoveryCheckpoint() } },
+        20,
+    );
+    writable.deinit(alloc);
+
+    var result = try ctx.store.rewindSession(alloc, session_id, .{ .archive_turns = 3 }, .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(
+        store_types.SessionRewindStatus.already_at_target,
+        result.status,
+    );
+
+    var state = try ctx.store.loadReadOnly(alloc, session_id);
+    defer state.deinit(alloc);
+    try std.testing.expect(state.recovery_checkpoint != null);
+    try std.testing.expectEqual(@as(u64, 1), state.recovery_checkpoint.?.turn_id);
 }

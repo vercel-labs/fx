@@ -103,6 +103,17 @@ fx session resume last
 fx session resume --id <id>
 ```
 
+`fx session <id>` prints the saved conversation with a `[turn N]` label above every turn. Those labels are the boundaries the branch and undo commands take:
+
+```bash
+fx session fork <id> --at 7
+fx session rewind <id> --by 2
+```
+
+`fork` copies the first 7 turns into a brand-new session and prints the new ID to resume. The source session is left exactly as it was. `rewind` drops the last 2 turns from the session in place, keeping its ID. Both accept `--id <id>` and `--json`.
+
+A rewind truncates the session's conversation log to the retained turns, so the dropped turns no longer appear in its transcript. Fork first if the tail should stay reachable.
+
 `fx -c` also resumes the latest session for the current workspace. It skips unrelated current-format conversation histories during selection and attempts safe recovery of the selected session after an interrupted migration. A busy or unrecoverable selected session produces an error rather than opening an older conversation.
 
 Repeated continuation reuses validated summaries of unchanged older sessions instead of replaying their histories during selection. The first scan, or a scan after those session files change, can take longer. Opening the resume picker preserves these cached summaries.

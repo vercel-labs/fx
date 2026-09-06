@@ -181,14 +181,16 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .session,
         .token = "session",
-        .usage = "session <last|id>|--id <id> [--json] | session resume [last|<id>] | session resume --id <id> | session migrate <id>|--id <id> [--allow-large] [--json] | session recover <id>|--id <id> [--json]",
-        .summary = "Inspect, resume, migrate, or recover saved sessions",
+        .usage = "session <last|id>|--id <id> [--json] | session resume [last|<id>] | session resume --id <id> | session migrate <id>|--id <id> [--allow-large] [--json] | session recover <id>|--id <id> [--json] | session fork <id>|--id <id> --at <turn> [--json] | session rewind <id>|--id <id> --by <count> [--json]",
+        .summary = "Inspect, resume, migrate, recover, fork, or rewind saved sessions",
         .options = &.{
             .{ .flag = "last", .description = "Inspect the current workspace session" },
             .{ .flag = "--id <id>", .description = "Inspect a saved session by exact id" },
             .{ .flag = "resume [last|<id>]", .description = "Resume the latest workspace session or a session by id" },
             .{ .flag = "migrate <id>", .description = "Migrate a saved session to the current format" },
             .{ .flag = "recover <id>", .description = "Copy a recoverable corrupt session into a new session" },
+            .{ .flag = "fork <id> --at <turn>", .description = "Branch a session into a new session holding its first <turn> turns" },
+            .{ .flag = "rewind <id> --by <count>", .description = "Drop the last <count> turns from a session in place" },
             .{ .flag = "--allow-large", .description = "Permit migrating an oversized session" },
             json_option,
         },
@@ -299,6 +301,8 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .usage = "session resume [last|id]", .summary = "Resume the latest workspace session or a session by id" },
         .{ .usage = "session migrate <id>", .summary = "Migrate a saved session to the current format" },
         .{ .usage = "session recover <id>", .summary = "Copy a recoverable corrupt session" },
+        .{ .usage = "session fork <id> --at <turn>", .summary = "Branch a session at a turn into a new session" },
+        .{ .usage = "session rewind <id> --by <count>", .summary = "Drop the last turns from a session in place" },
     } },
     .{ .entries = &.{
         .{ .kind = .login, .usage = "login [vercel|codex|grok]", .summary = "Sign in to a model provider" },
