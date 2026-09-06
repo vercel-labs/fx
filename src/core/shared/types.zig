@@ -744,6 +744,9 @@ pub const ToolCall = struct {
     provider_result: ?[]const u8 = null,
     final_identity: FinalToolIdentity = .valid,
     provenance: ToolExecutionProvenance = .fx_local,
+    /// Owned validated JSON object replayed verbatim as this call part's
+    /// `providerOptions` (for example per-call thought signatures).
+    provider_options_json: ?[]const u8 = null,
     /// Borrowed only for this action. Copies and durable/provider encodings omit it.
     resolved_skill: ?*const skill_contract.PreparedSkill = null,
 };
@@ -856,6 +859,9 @@ pub const PersistedToolResult = struct {
     stored_output_bytes: usize,
     truncated: bool = false,
     provider_native: bool = false,
+    /// Owned validated JSON object replayed verbatim as this result part's
+    /// `providerOptions`, captured from the provider-executed result event.
+    provider_options_json: ?[]u8 = null,
     created_at_ms: i64 = 0,
     permission_feedback: [][]u8 = &.{},
     committed_file_presentation: ?CommittedFilePresentation = null,
@@ -1025,11 +1031,15 @@ pub const ToolExecutionStep = struct {
     assistant: ?[]u8 = null,
     tool_calls: []ToolCall = &.{},
     tool_results: []PersistedToolResult = &.{},
+    /// Ordered replay parts for this step's assistant segment, owned with the step.
+    assistant_parts: ?[]AssistantPart = null,
 };
 
 pub const PersistedSteering = struct {
     text: []u8,
     assistant_prefix: ?[]u8 = null,
+    /// Ordered replay parts for the assistant prefix before this steering point.
+    assistant_prefix_parts: ?[]AssistantPart = null,
     after_tool_step_count: usize,
 };
 
@@ -1118,6 +1128,43 @@ pub const AssistantMessagePhase = enum {
     final_answer,
 };
 
+/// One text part of an ordered assistant response retained for replay.
+pub const AssistantTextPart = struct {
+    /// Exact text as returned by the provider; never a display projection.
+    text: []const u8,
+    /// Owned validated JSON object replayed verbatim as this part's
+    /// `providerOptions`. Opaque protocol state, not display prose.
+    provider_options: ?[]const u8 = null,
+};
+
+/// One reasoning part of an ordered assistant response retained for replay.
+/// Empty text is meaningful: metadata-only blocks still carry replay state.
+pub const AssistantReasoningPart = struct {
+    text: []const u8,
+    /// Owned validated JSON object replayed verbatim as this part's
+    /// `providerOptions` (for example provider signatures or encrypted state).
+    provider_options: ?[]const u8 = null,
+};
+
+/// Ordered reference to the canonical `ToolCall` with this final ID. The
+/// referenced call remains the single owner of execution identity and
+/// arguments; this sequence only fixes the call's position among text and
+/// reasoning parts. Never references a provisional ID.
+pub const AssistantToolCallRef = struct {
+    id: []const u8,
+};
+
+/// Ordered content of one assistant response segment. A present slice is
+/// authoritative for replay and is emitted exactly once; a null field means
+/// old, direct-provider, or synthetic content and keeps the existing
+/// text/tool projection. A present empty slice is explicit: it must not fall
+/// back to a display string.
+pub const AssistantPart = union(enum) {
+    text: AssistantTextPart,
+    reasoning: AssistantReasoningPart,
+    tool_call_ref: AssistantToolCallRef,
+};
+
 pub const ChatMessage = struct {
     role: ChatRole,
     content: ?[]const u8 = null,
@@ -1133,6 +1180,9 @@ pub const ChatMessage = struct {
     tool_result_status: ?PersistedToolStatus = null,
     tool_result_memory: ?ToolResultMemory = null,
     permission_feedback: bool = false,
+    /// Ordered assistant replay parts, borrowed like `tool_calls`. Present means
+    /// authoritative; null keeps the legacy text/tool projection.
+    assistant_parts: ?[]const AssistantPart = null,
 };
 
 pub const Usage = struct {
@@ -1237,6 +1287,9 @@ pub const ModelCompletion = struct {
     provider_state_json: ?[]const u8 = null,
     finish_reason: ?ProviderFinishReason = null,
     usage: Usage = .{},
+    /// Ordered assistant replay parts owned by this completion's allocator.
+    /// Null for direct-provider or synthetic completions.
+    assistant_parts: ?[]const AssistantPart = null,
 };
 
 pub fn parseGatewayTimestamp(text: []const u8) error{InvalidGatewayTimestamp}!i64 {
@@ -1796,6 +1849,8 @@ pub const AssistantHistoryTurn = struct {
     user: UserTurn,
     assistant: []u8,
     execution: ExecutionMemory = .{},
+    /// Ordered replay parts for the final assistant answer, owned with the turn.
+    assistant_parts: ?[]AssistantPart = null,
 };
 
 pub const InterruptedTerminalReason = enum {
@@ -1811,6 +1866,8 @@ pub const InterruptedHistoryTurn = struct {
     execution: ExecutionMemory = .{},
     cancelled_command: ?CancelledCommandPresentation = null,
     terminal_reason: InterruptedTerminalReason = .cancelled,
+    /// Ordered replay parts for the interrupted assistant segment, owned with the turn.
+    assistant_parts: ?[]AssistantPart = null,
 };
 
 pub const context_handoff_open = "<context_handoff>";
@@ -2110,6 +2167,7 @@ pub fn freeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) void {
             freeUserTurn(alloc, entry.user);
             alloc.free(entry.assistant);
             freeExecutionMemory(alloc, entry.execution);
+            if (entry.assistant_parts) |parts| freeAssistantParts(alloc, parts);
         },
         .interrupted => |entry| {
             freeUserTurn(alloc, entry.user);
@@ -2120,6 +2178,7 @@ pub fn freeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) void {
             if (entry.cancelled_command) |presentation| {
                 freeCancelledCommandPresentation(alloc, presentation);
             }
+            if (entry.assistant_parts) |parts| freeAssistantParts(alloc, parts);
         },
     }
 }
@@ -2168,10 +2227,18 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
             errdefer alloc.free(assistant);
 
             const execution = try dupeExecutionMemory(alloc, entry.execution);
+            errdefer freeExecutionMemory(alloc, execution);
+
+            const assistant_parts = if (entry.assistant_parts) |parts|
+                try dupeAssistantParts(alloc, parts)
+            else
+                null;
+
             break :blk .{ .assistant = .{
                 .user = user,
                 .assistant = assistant,
                 .execution = execution,
+                .assistant_parts = assistant_parts,
             } };
         },
         .interrupted => |entry| blk: {
@@ -2196,6 +2263,12 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
             };
 
             const execution = try dupeExecutionMemory(alloc, entry.execution);
+            errdefer freeExecutionMemory(alloc, execution);
+
+            const assistant_parts = if (entry.assistant_parts) |parts|
+                try dupeAssistantParts(alloc, parts)
+            else
+                null;
 
             break :blk .{ .interrupted = .{
                 .user = user,
@@ -2205,6 +2278,7 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
                 .execution = execution,
                 .cancelled_command = cancelled_command,
                 .terminal_reason = entry.terminal_reason,
+                .assistant_parts = assistant_parts,
             } };
         },
     };
@@ -2305,6 +2379,7 @@ pub fn dupePersistedSteering(
     errdefer for (copy[0..copied]) |item| {
         alloc.free(item.text);
         if (item.assistant_prefix) |prefix| alloc.free(prefix);
+        if (item.assistant_prefix_parts) |parts| freeAssistantParts(alloc, parts);
     };
     for (steering, copy) |item, *dest| {
         const text = try alloc.dupe(u8, item.text);
@@ -2314,9 +2389,15 @@ pub fn dupePersistedSteering(
         else
             null;
         errdefer if (assistant_prefix) |prefix| alloc.free(prefix);
+        const assistant_prefix_parts = if (item.assistant_prefix_parts) |parts|
+            try dupeAssistantParts(alloc, parts)
+        else
+            null;
+        errdefer if (assistant_prefix_parts) |parts| freeAssistantParts(alloc, parts);
         dest.* = .{
             .text = text,
             .assistant_prefix = assistant_prefix,
+            .assistant_prefix_parts = assistant_prefix_parts,
             .after_tool_step_count = item.after_tool_step_count,
         };
         copied += 1;
@@ -2328,8 +2409,114 @@ pub fn freePersistedSteering(alloc: std.mem.Allocator, steering: []PersistedStee
     for (steering) |item| {
         alloc.free(item.text);
         if (item.assistant_prefix) |prefix| alloc.free(prefix);
+        if (item.assistant_prefix_parts) |parts| freeAssistantParts(alloc, parts);
     }
     if (steering.len > 0) alloc.free(steering);
+}
+
+pub fn dupeAssistantParts(alloc: std.mem.Allocator, parts: []const AssistantPart) ![]AssistantPart {
+    if (parts.len == 0) return &.{};
+
+    const copy = try alloc.alloc(AssistantPart, parts.len);
+    errdefer alloc.free(copy);
+
+    var copied: usize = 0;
+    errdefer {
+        for (copy[0..copied]) |part| freeAssistantPart(alloc, part);
+    }
+
+    for (parts, 0..) |part, i| {
+        copy[i] = try dupeAssistantPart(alloc, part);
+        copied += 1;
+    }
+    return copy;
+}
+
+pub fn freeAssistantParts(alloc: std.mem.Allocator, parts: []const AssistantPart) void {
+    for (parts) |part| freeAssistantPart(alloc, part);
+    if (parts.len > 0) alloc.free(parts);
+}
+
+fn dupeAssistantPart(alloc: std.mem.Allocator, part: AssistantPart) !AssistantPart {
+    switch (part) {
+        .text => |text_part| {
+            const text = try alloc.dupe(u8, text_part.text);
+            errdefer alloc.free(text);
+            const provider_options = if (text_part.provider_options) |options|
+                try alloc.dupe(u8, options)
+            else
+                null;
+            return .{ .text = .{ .text = text, .provider_options = provider_options } };
+        },
+        .reasoning => |reasoning_part| {
+            const text = try alloc.dupe(u8, reasoning_part.text);
+            errdefer alloc.free(text);
+            const provider_options = if (reasoning_part.provider_options) |options|
+                try alloc.dupe(u8, options)
+            else
+                null;
+            return .{ .reasoning = .{ .text = text, .provider_options = provider_options } };
+        },
+        .tool_call_ref => |ref| {
+            return .{ .tool_call_ref = .{ .id = try alloc.dupe(u8, ref.id) } };
+        },
+    }
+}
+
+fn freeAssistantPart(alloc: std.mem.Allocator, part: AssistantPart) void {
+    switch (part) {
+        .text => |text_part| {
+            alloc.free(text_part.text);
+            if (text_part.provider_options) |options| alloc.free(options);
+        },
+        .reasoning => |reasoning_part| {
+            alloc.free(reasoning_part.text);
+            if (reasoning_part.provider_options) |options| alloc.free(options);
+        },
+        .tool_call_ref => |ref| alloc.free(ref.id),
+    }
+}
+
+/// Validates replay integrity: every tool-call reference resolves to exactly
+/// one surviving canonical call with a valid final identity, and no call is
+/// referenced twice. Text and reasoning parts carry their own payloads.
+pub fn validateAssistantParts(
+    parts: []const AssistantPart,
+    tool_calls: []const ToolCall,
+) error{InvalidAssistantParts}!void {
+    for (parts, 0..) |part, i| {
+        if (part != .tool_call_ref) continue;
+        const ref = part.tool_call_ref;
+        var matches: usize = 0;
+        for (tool_calls) |call| {
+            if (!std.mem.eql(u8, call.id, ref.id)) continue;
+            matches += 1;
+            if (call.final_identity != .valid) return error.InvalidAssistantParts;
+        }
+        if (matches != 1) return error.InvalidAssistantParts;
+        for (parts[i + 1 ..]) |other| {
+            if (other == .tool_call_ref and std.mem.eql(u8, other.tool_call_ref.id, ref.id)) {
+                return error.InvalidAssistantParts;
+            }
+        }
+    }
+}
+
+/// Validates the provider-metadata envelope: a JSON object mapping provider
+/// namespaces to objects. Unknown namespaces and nested values are retained
+/// as-is; the validated raw bytes, not a reserialization, are replayed.
+pub fn validateProviderOptionsJson(
+    alloc: std.mem.Allocator,
+    bytes: []const u8,
+) error{InvalidProviderOptions}!void {
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch {
+        return error.InvalidProviderOptions;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidProviderOptions;
+    for (parsed.value.object.values()) |value| {
+        if (value != .object) return error.InvalidProviderOptions;
+    }
 }
 
 pub fn dupeToolExecutionSteps(alloc: std.mem.Allocator, steps: []const ToolExecutionStep) ![]ToolExecutionStep {
@@ -2363,11 +2550,17 @@ fn dupeToolExecutionStep(alloc: std.mem.Allocator, step: ToolExecutionStep) !Too
     errdefer freeToolCallSlice(alloc, tool_calls);
     const tool_results = try dupePersistedToolResults(alloc, step.tool_results);
     errdefer freePersistedToolResults(alloc, tool_results);
+    const assistant_parts = if (step.assistant_parts) |parts|
+        try dupeAssistantParts(alloc, parts)
+    else
+        null;
+    errdefer if (assistant_parts) |parts| freeAssistantParts(alloc, parts);
 
     return .{
         .assistant = assistant,
         .tool_calls = tool_calls,
         .tool_results = tool_results,
+        .assistant_parts = assistant_parts,
     };
 }
 
@@ -2375,6 +2568,7 @@ fn freeToolExecutionStep(alloc: std.mem.Allocator, step: ToolExecutionStep) void
     if (step.assistant) |assistant| alloc.free(assistant);
     freeToolCallSlice(alloc, step.tool_calls);
     freePersistedToolResults(alloc, step.tool_results);
+    if (step.assistant_parts) |parts| freeAssistantParts(alloc, parts);
 }
 
 pub fn dupeToolCallSlice(alloc: std.mem.Allocator, calls: []const ToolCall) ![]ToolCall {
@@ -2511,6 +2705,8 @@ fn dupePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult
     errdefer if (command_output_replay) |replay| freeCommandOutputReplay(alloc, replay);
     const tool_image_handle = if (result.tool_image_handle) |handle| try alloc.dupe(u8, handle) else null;
     errdefer if (tool_image_handle) |handle| alloc.free(handle);
+    const provider_options_json = if (result.provider_options_json) |options| try alloc.dupe(u8, options) else null;
+    errdefer if (provider_options_json) |options| alloc.free(options);
     const tool_images = try dupeToolImages(alloc, result.tool_images);
     return .{
         .tool_images = tool_images,
@@ -2525,6 +2721,7 @@ fn dupePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult
         .stored_output_bytes = result.stored_output_bytes,
         .truncated = result.truncated,
         .provider_native = result.provider_native,
+        .provider_options_json = provider_options_json,
         .created_at_ms = result.created_at_ms,
         .permission_feedback = permission_feedback,
         .committed_file_presentation = committed_file_presentation,
@@ -2547,6 +2744,7 @@ fn freePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult
         freeCommittedFilePresentation(alloc, presentation);
     }
     if (result.command_output_replay) |replay| freeCommandOutputReplay(alloc, replay);
+    if (result.provider_options_json) |options| alloc.free(options);
 }
 
 pub fn dupeCommandOutputReplay(
@@ -2660,6 +2858,8 @@ pub fn dupeToolCall(alloc: std.mem.Allocator, call: ToolCall) !ToolCall {
     errdefer if (provisional_id) |value| alloc.free(value);
     const provider_result = if (call.provider_result) |result| try alloc.dupe(u8, result) else null;
     errdefer if (provider_result) |result| alloc.free(result);
+    const provider_options_json = if (call.provider_options_json) |options| try alloc.dupe(u8, options) else null;
+    errdefer if (provider_options_json) |options| alloc.free(options);
     return .{
         .id = id,
         .name = name,
@@ -2669,6 +2869,7 @@ pub fn dupeToolCall(alloc: std.mem.Allocator, call: ToolCall) !ToolCall {
         .provider_result = provider_result,
         .final_identity = call.final_identity,
         .provenance = call.provenance,
+        .provider_options_json = provider_options_json,
     };
 }
 
@@ -2678,6 +2879,7 @@ pub fn freeToolCall(alloc: std.mem.Allocator, call: ToolCall) void {
     alloc.free(call.arguments_json);
     if (call.provisional_id) |provisional_id| alloc.free(provisional_id);
     if (call.provider_result) |provider_result| alloc.free(provider_result);
+    if (call.provider_options_json) |options| alloc.free(options);
 }
 
 test "dupeToolCall preserves argument integrity" {
@@ -3208,4 +3410,91 @@ test "public types remain constructible" {
     _ = decision;
     _ = action;
     _ = resolve_mode;
+}
+
+test "dupeAssistantParts deep-copies text, reasoning, metadata, and references" {
+    const alloc = std.testing.allocator;
+    const parts: []const AssistantPart = &.{
+        .{ .text = .{ .text = "Checking.", .provider_options = "{\"meta\":{\"k\":\"v\"}}" } },
+        .{ .reasoning = .{ .text = "Let me check.", .provider_options = "{\"anthropic\":{\"signature\":\"sig_1\"}}" } },
+        .{ .tool_call_ref = .{ .id = "call_1" } },
+        .{ .reasoning = .{ .text = "", .provider_options = "{\"anthropic\":{\"redactedData\":\"red_1\"}}" } },
+    };
+
+    const copy = try dupeAssistantParts(alloc, parts);
+    defer freeAssistantParts(alloc, copy);
+
+    try std.testing.expectEqual(@as(usize, 4), copy.len);
+    try std.testing.expectEqualStrings("Checking.", copy[0].text.text);
+    try std.testing.expect(copy[0].text.text.ptr != parts[0].text.text.ptr);
+    try std.testing.expectEqualStrings("{\"anthropic\":{\"signature\":\"sig_1\"}}", copy[1].reasoning.provider_options.?);
+    try std.testing.expect(copy[1].reasoning.provider_options.?.ptr != parts[1].reasoning.provider_options.?.ptr);
+    try std.testing.expectEqualStrings("call_1", copy[2].tool_call_ref.id);
+    try std.testing.expect(copy[2].tool_call_ref.id.ptr != parts[2].tool_call_ref.id.ptr);
+    try std.testing.expectEqualStrings("", copy[3].reasoning.text);
+    try std.testing.expectEqualStrings("{\"anthropic\":{\"redactedData\":\"red_1\"}}", copy[3].reasoning.provider_options.?);
+}
+
+test "dupeAssistantParts cleans up on allocation failure" {
+    const parts: []const AssistantPart = &.{
+        .{ .text = .{ .text = "alpha" } },
+        .{ .reasoning = .{ .text = "beta", .provider_options = "{\"a\":{\"b\":1}}" } },
+        .{ .tool_call_ref = .{ .id = "call_1" } },
+    };
+
+    var fail_index: usize = 0;
+    while (true) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        const copy = dupeAssistantParts(failing.allocator(), parts) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            fail_index += 1;
+            continue;
+        };
+        freeAssistantParts(std.testing.allocator, copy);
+        break;
+    }
+    try std.testing.expect(fail_index > 0);
+}
+
+test "validateAssistantParts accepts resolving references and rejects drift" {
+    const calls: []const ToolCall = &.{
+        .{ .id = "call_1", .name = "lookup", .arguments_json = "{}" },
+        .{ .id = "call_2", .name = "read", .arguments_json = "{}" },
+    };
+
+    const valid: []const AssistantPart = &.{
+        .{ .reasoning = .{ .text = "thinking" } },
+        .{ .tool_call_ref = .{ .id = "call_1" } },
+        .{ .tool_call_ref = .{ .id = "call_2" } },
+    };
+    try validateAssistantParts(valid, calls);
+
+    const missing: []const AssistantPart = &.{.{ .tool_call_ref = .{ .id = "gone" } }};
+    try std.testing.expectError(error.InvalidAssistantParts, validateAssistantParts(missing, calls));
+
+    const duplicate: []const AssistantPart = &.{
+        .{ .tool_call_ref = .{ .id = "call_1" } },
+        .{ .tool_call_ref = .{ .id = "call_1" } },
+    };
+    try std.testing.expectError(error.InvalidAssistantParts, validateAssistantParts(duplicate, calls));
+
+    const provisional: []const AssistantPart = &.{.{ .tool_call_ref = .{ .id = "stream_1" } }};
+    const provisional_calls: []const ToolCall = &.{.{
+        .id = "call_9",
+        .name = "lookup",
+        .arguments_json = "{}",
+        .provisional_id = "stream_1",
+    }};
+    try std.testing.expectError(error.InvalidAssistantParts, validateAssistantParts(provisional, provisional_calls));
+}
+
+test "validateProviderOptionsJson enforces the two-level metadata envelope" {
+    const alloc = std.testing.allocator;
+    try validateProviderOptionsJson(alloc, "{\"anthropic\":{\"signature\":\"s\"}}");
+    try validateProviderOptionsJson(alloc, "{\"google\":{\"thoughtSignature\":\"t\",\"nested\":{\"x\":[1,null]}}}");
+    try validateProviderOptionsJson(alloc, "{}");
+
+    try std.testing.expectError(error.InvalidProviderOptions, validateProviderOptionsJson(alloc, "[]"));
+    try std.testing.expectError(error.InvalidProviderOptions, validateProviderOptionsJson(alloc, "{\"anthropic\":\"scalar\"}"));
+    try std.testing.expectError(error.InvalidProviderOptions, validateProviderOptionsJson(alloc, "{]"));
 }

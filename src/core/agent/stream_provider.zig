@@ -326,6 +326,7 @@ pub const Result = union(enum) {
                 types.freeToolCallSlice(alloc, @constCast(completed.completion.tool_calls));
                 if (completed.completion.provider_failure_detail) |detail| alloc.free(@constCast(detail));
                 if (completed.completion.provider_state_json) |state| alloc.free(@constCast(state));
+                if (completed.completion.assistant_parts) |parts| types.freeAssistantParts(alloc, parts);
             },
             .failed => |failure| if (failure.ownership == .owned) {
                 if (failure.detail) |detail| alloc.free(detail);

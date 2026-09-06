@@ -228,9 +228,11 @@ pub const StreamResult = struct {
             alloc.free(call.arguments_json);
             if (call.provisional_id) |provisional_id| alloc.free(provisional_id);
             if (call.provider_result) |provider_result| alloc.free(provider_result);
+            if (call.provider_options_json) |options| alloc.free(options);
         }
         if (self.completion.tool_calls.len > 0) alloc.free(self.completion.tool_calls);
         if (self.completion.provider_failure_detail) |detail| alloc.free(@constCast(detail));
+        if (self.completion.assistant_parts) |parts| types.freeAssistantParts(alloc, parts);
         const status = self.status;
         self.* = .{ .status = status };
     }
@@ -2531,9 +2533,11 @@ fn deinitGatewayCompletion(alloc: std.mem.Allocator, completion: *types.ModelCom
         alloc.free(call.arguments_json);
         if (call.provisional_id) |provisional_id| alloc.free(provisional_id);
         if (call.provider_result) |provider_result| alloc.free(provider_result);
+        if (call.provider_options_json) |options| alloc.free(options);
     }
     if (completion.tool_calls.len > 0) alloc.free(completion.tool_calls);
     if (completion.provider_failure_detail) |detail| alloc.free(@constCast(detail));
+    if (completion.assistant_parts) |parts| types.freeAssistantParts(alloc, parts);
     completion.* = .{};
 }
 

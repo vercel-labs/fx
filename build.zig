@@ -38,6 +38,11 @@ pub fn build(b: *std.Build) void {
         "napi-surface",
         "Build a Node-API addon surface (core)",
     ) orelse .none;
+    const test_filter = b.option(
+        []const u8,
+        "test-filter",
+        "Run only unit tests whose name contains this substring",
+    );
 
     const git_commit = readGitCommit(b);
     const app_version = readAppVersion(b);
@@ -79,6 +84,7 @@ pub fn build(b: *std.Build) void {
 
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
+        .filters = if (test_filter) |filter| &.{filter} else &.{},
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
     run_exe_tests.step.dependOn(b.getInstallStep());

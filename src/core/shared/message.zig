@@ -36,8 +36,11 @@ pub const Message = struct {
     tool_result_status: ?types.PersistedToolStatus = null,
     tool_result_memory: ?types.ToolResultMemory = null,
     permission_feedback: bool = false,
+    /// Ordered assistant replay parts; present is authoritative for replay.
+    assistant_parts: ?[]const types.AssistantPart = null,
     owns_content: bool = false,
     owns_tool_calls: bool = false,
+    owns_assistant_parts: bool = false,
 
     /// Builds a borrowed system message.
     pub fn systemText(text: []const u8) Message {
@@ -116,6 +119,9 @@ pub const Message = struct {
             if (self.content) |content| alloc.free(content.asText());
         }
         if (self.owns_tool_calls) freeToolCalls(alloc, self.tool_calls);
+        if (self.owns_assistant_parts) {
+            if (self.assistant_parts) |parts| types.freeAssistantParts(alloc, parts);
+        }
         self.* = .{ .role = .user };
     }
 };
@@ -143,6 +149,7 @@ pub fn freeToolCalls(alloc: std.mem.Allocator, tool_calls: []const ToolCall) voi
         alloc.free(call.arguments_json);
         if (call.provisional_id) |provisional_id| alloc.free(provisional_id);
         if (call.provider_result) |provider_result| alloc.free(provider_result);
+        if (call.provider_options_json) |options| alloc.free(options);
     }
     if (tool_calls.len > 0) alloc.free(tool_calls);
 }

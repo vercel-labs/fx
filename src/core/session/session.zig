@@ -2175,10 +2175,16 @@ pub fn dupeHistoryTurn(alloc: Allocator, turn: HistoryTurn) !HistoryTurn {
             const assistant_copy = try alloc.dupe(u8, entry.assistant);
             errdefer alloc.free(assistant_copy);
             const execution = try core_types.dupeExecutionMemory(alloc, entry.execution);
+            errdefer core_types.freeExecutionMemory(alloc, execution);
+            const assistant_parts = if (entry.assistant_parts) |parts|
+                try core_types.dupeAssistantParts(alloc, parts)
+            else
+                null;
             return .{ .assistant = .{
                 .user = user,
                 .assistant = assistant_copy,
                 .execution = execution,
+                .assistant_parts = assistant_parts,
             } };
         },
         .interrupted => |entry| {
@@ -2198,6 +2204,11 @@ pub fn dupeHistoryTurn(alloc: Allocator, turn: HistoryTurn) !HistoryTurn {
                 core_types.freeCancelledCommandPresentation(alloc, presentation);
             };
             const execution = try core_types.dupeExecutionMemory(alloc, entry.execution);
+            errdefer core_types.freeExecutionMemory(alloc, execution);
+            const assistant_parts = if (entry.assistant_parts) |parts|
+                try core_types.dupeAssistantParts(alloc, parts)
+            else
+                null;
             return .{ .interrupted = .{
                 .user = user,
                 .assistant = assistant,
@@ -2206,6 +2217,7 @@ pub fn dupeHistoryTurn(alloc: Allocator, turn: HistoryTurn) !HistoryTurn {
                 .execution = execution,
                 .cancelled_command = cancelled_command,
                 .terminal_reason = entry.terminal_reason,
+                .assistant_parts = assistant_parts,
             } };
         },
     }
