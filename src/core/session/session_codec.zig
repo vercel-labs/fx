@@ -475,6 +475,10 @@ pub fn writeHistoryTurn(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
             try writeUserTurn(writer, entry.user);
             try writer.writeAll(",\"assistant\":");
             try writeDurableBytes(writer, entry.assistant);
+            if (entry.assistant_parts) |parts| {
+                try writer.writeAll(",\"assistant_parts\":");
+                try writeAssistantParts(writer, parts);
+            }
             try writer.writeAll(",\"execution\":");
             try writeExecutionMemory(writer, entry.execution);
             try writer.writeByte('}');
@@ -496,6 +500,10 @@ pub fn writeHistoryTurn(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
                 try writeDurableBytes(writer, name);
             }
             try writer.writeByte(']');
+            if (entry.assistant_parts) |parts| {
+                try writer.writeAll(",\"assistant_parts\":");
+                try writeAssistantParts(writer, parts);
+            }
             try writer.writeAll(",\"terminal_reason\":");
             try writeJsonString(writer, @tagName(entry.terminal_reason));
             if (hasDurableExecutionMemory(entry.execution)) {
@@ -589,17 +597,33 @@ pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Histor
         } };
     }
     if (std.mem.eql(u8, kind, "assistant")) {
-        const object = try exactObject(value, &.{ "kind", "user", "assistant", "execution" });
+        const source = try requireObject(value);
+        const has_parts = source.get("assistant_parts") != null;
+        const object = if (has_parts)
+            try exactObject(value, &.{ "kind", "user", "assistant", "assistant_parts", "execution" })
+        else
+            try exactObject(value, &.{ "kind", "user", "assistant", "execution" });
         const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat);
         errdefer session.freeUserTurn(alloc, user);
         const assistant = try parseRequiredDurableBytes(alloc, object, "assistant");
         errdefer alloc.free(assistant);
+        const assistant_parts = if (has_parts)
+            try parseAssistantParts(alloc, object.get("assistant_parts") orelse return error.InvalidSessionFormat)
+        else
+            null;
+        errdefer if (assistant_parts) |parts| types.freeAssistantParts(alloc, parts);
+        // A completed final answer has no pending calls to reference.
+        if (assistant_parts) |parts| {
+            types.validateAssistantParts(parts, &.{}) catch
+                return error.InvalidSessionFormat;
+        }
         const execution = try parseExecutionMemory(alloc, object.get("execution") orelse return error.InvalidSessionFormat);
         errdefer session.freeExecutionMemory(alloc, execution);
         return .{ .assistant = .{
             .user = user,
             .assistant = assistant,
             .execution = execution,
+            .assistant_parts = assistant_parts,
         } };
     }
     if (std.mem.eql(u8, kind, "background_command")) {
@@ -644,18 +668,34 @@ pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Histor
         const has_execution = source.get("execution") != null;
         const has_presentation = source.get("cancelled_command") != null;
         const has_terminal_reason = source.get("terminal_reason") != null;
+        const has_parts = source.get("assistant_parts") != null;
         const object = try exactInterruptedHistoryObject(
             value,
             has_execution,
             has_presentation,
             has_terminal_reason,
+            has_parts,
         );
         const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat);
         errdefer session.freeUserTurn(alloc, user);
         const assistant = try parseOptionalDurableBytes(alloc, object.get("assistant") orelse return error.InvalidSessionFormat);
         errdefer if (assistant) |owned| alloc.free(owned);
+        const assistant_parts = if (has_parts)
+            try parseAssistantParts(alloc, object.get("assistant_parts") orelse return error.InvalidSessionFormat)
+        else
+            null;
+        errdefer if (assistant_parts) |parts| types.freeAssistantParts(alloc, parts);
         const tool_call = try parseOptionalToolCall(alloc, object.get("tool_call") orelse return error.InvalidSessionFormat);
         errdefer if (tool_call) |call| session.freeToolCall(alloc, call);
+        // Interrupted parts may reference only the turn's own active call.
+        if (assistant_parts) |parts| {
+            const reference_calls: []const types.ToolCall = if (tool_call) |*call|
+                @as([*]const types.ToolCall, @ptrCast(call))[0..1]
+            else
+                &.{};
+            types.validateAssistantParts(parts, reference_calls) catch
+                return error.InvalidSessionFormat;
+        }
         const completed_tool_names = try parseDurableBytesArray(
             alloc,
             object.get("completed_tool_names") orelse return error.InvalidSessionFormat,
@@ -695,6 +735,7 @@ pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Histor
             .execution = execution,
             .cancelled_command = cancelled_command,
             .terminal_reason = terminal_reason,
+            .assistant_parts = assistant_parts,
         } };
     }
     return error.InvalidSessionFormat;
@@ -1295,6 +1336,10 @@ fn writeExecutionMemory(writer: *std.Io.Writer, execution: session.ExecutionMemo
         if (i > 0) try writer.writeByte(',');
         try writer.writeAll("{\"assistant\":");
         try writeOptionalDurableBytes(writer, step.assistant);
+        if (step.assistant_parts) |parts| {
+            try writer.writeAll(",\"assistant_parts\":");
+            try writeAssistantParts(writer, parts);
+        }
         try writer.writeAll(",\"tool_calls\":[");
         for (step.tool_calls, 0..) |tool_call, call_index| {
             if (call_index > 0) try writer.writeByte(',');
@@ -1319,6 +1364,10 @@ fn writeExecutionMemory(writer: *std.Io.Writer, execution: session.ExecutionMemo
         try writeDurableBytes(writer, steering.text);
         try writer.writeAll(",\"assistant_prefix\":");
         try writeOptionalDurableBytes(writer, steering.assistant_prefix);
+        if (steering.assistant_prefix_parts) |parts| {
+            try writer.writeAll(",\"assistant_prefix_parts\":");
+            try writeAssistantParts(writer, parts);
+        }
         try writer.print(",\"after_tool_step_count\":{d}}}", .{steering.after_tool_step_count});
     }
     try writer.writeAll("],\"turn_summary\":");
@@ -1359,7 +1408,110 @@ fn writeToolCall(writer: *std.Io.Writer, tool_call: session.ToolCall) !void {
     try writeDurableBytes(writer, tool_call.arguments_json);
     try writer.writeAll(",\"provider_result\":");
     try writeOptionalDurableBytes(writer, tool_call.provider_result);
+    if (tool_call.provider_options_json) |options| {
+        try writer.writeAll(",\"provider_options_json\":");
+        try writeDurableBytes(writer, options);
+    }
+    if (tool_call.provider_result_options_json) |options| {
+        try writer.writeAll(",\"provider_result_options_json\":");
+        try writeDurableBytes(writer, options);
+    }
     try writer.writeByte('}');
+}
+
+/// Writes the ordered replay part sequence as a JSON array. Part metadata
+/// travels as validated JSON object bytes, matching `arguments_json`.
+fn writeAssistantParts(writer: *std.Io.Writer, parts: []const types.AssistantPart) !void {
+    try writer.writeByte('[');
+    for (parts, 0..) |part, index| {
+        if (index > 0) try writer.writeByte(',');
+        switch (part) {
+            .text => |text_part| {
+                try writer.writeAll("{\"type\":\"text\",\"text\":");
+                try writeDurableBytes(writer, text_part.text);
+                if (text_part.provider_options) |options| {
+                    try writer.writeAll(",\"provider_options_json\":");
+                    try writeDurableBytes(writer, options);
+                }
+                try writer.writeByte('}');
+            },
+            .reasoning => |reasoning_part| {
+                try writer.writeAll("{\"type\":\"reasoning\",\"text\":");
+                try writeDurableBytes(writer, reasoning_part.text);
+                if (reasoning_part.provider_options) |options| {
+                    try writer.writeAll(",\"provider_options_json\":");
+                    try writeDurableBytes(writer, options);
+                }
+                try writer.writeByte('}');
+            },
+            .tool_call_ref => |ref| {
+                try writer.writeAll("{\"type\":\"tool_call_ref\",\"call_id\":");
+                try writeDurableBytes(writer, ref.id);
+                try writer.writeByte('}');
+            },
+        }
+    }
+    try writer.writeByte(']');
+}
+
+fn parseAssistantParts(alloc: Allocator, value: std.json.Value) ![]types.AssistantPart {
+    if (value != .array) return error.InvalidSessionFormat;
+    if (value.array.items.len == 0) return &.{};
+    if (value.array.items.len > 1024) return error.InvalidSessionFormat;
+    const parts = try alloc.alloc(types.AssistantPart, value.array.items.len);
+    errdefer alloc.free(parts);
+    var parsed_count: usize = 0;
+    errdefer for (parts[0..parsed_count]) |part| {
+        switch (part) {
+            .text => |text_part| {
+                alloc.free(text_part.text);
+                if (text_part.provider_options) |options| alloc.free(options);
+            },
+            .reasoning => |reasoning_part| {
+                alloc.free(reasoning_part.text);
+                if (reasoning_part.provider_options) |options| alloc.free(options);
+            },
+            .tool_call_ref => |ref| alloc.free(ref.id),
+        }
+    };
+    for (value.array.items, 0..) |item, i| {
+        const source = try requireObject(item);
+        const has_text = source.get("text") != null;
+        const has_options = source.get("provider_options_json") != null;
+        const has_call_id = source.get("call_id") != null;
+        const type_value = try requireString(source, "type");
+        if (std.mem.eql(u8, type_value, "text") or std.mem.eql(u8, type_value, "reasoning")) {
+            if (!has_text or has_call_id) return error.InvalidSessionFormat;
+            const object = if (has_options)
+                try exactObject(item, &.{ "type", "text", "provider_options_json" })
+            else
+                try exactObject(item, &.{ "type", "text" });
+            const text = try parseRequiredDurableBytes(alloc, object, "text");
+            errdefer alloc.free(text);
+            const options = if (has_options)
+                try parseRequiredDurableBytes(alloc, object, "provider_options_json")
+            else
+                null;
+            errdefer if (options) |owned| alloc.free(owned);
+            if (options) |owned| {
+                types.validateProviderOptionsJson(alloc, owned) catch
+                    return error.InvalidSessionFormat;
+            }
+            parts[i] = if (std.mem.eql(u8, type_value, "text"))
+                .{ .text = .{ .text = text, .provider_options = options } }
+            else
+                .{ .reasoning = .{ .text = text, .provider_options = options } };
+        } else if (std.mem.eql(u8, type_value, "tool_call_ref")) {
+            if (!has_call_id or has_text or has_options) return error.InvalidSessionFormat;
+            const object = try exactObject(item, &.{ "type", "call_id" });
+            const id = try parseRequiredDurableBytes(alloc, object, "call_id");
+            parts[i] = .{ .tool_call_ref = .{ .id = id } };
+        } else {
+            return error.InvalidSessionFormat;
+        }
+        parsed_count += 1;
+    }
+    return parts;
 }
 
 fn writePersistedToolResult(writer: *std.Io.Writer, result: session.PersistedToolResult) !void {
@@ -1408,6 +1560,10 @@ fn writePersistedToolResult(writer: *std.Io.Writer, result: session.PersistedToo
         writer,
         result.terminal_action_presentation,
     );
+    if (result.provider_options_json) |options| {
+        try writer.writeAll(",\"provider_options_json\":");
+        try writeDurableBytes(writer, options);
+    }
     if (result.tool_image_handle) |handle| {
         try writer.writeAll(",\"tool_image_handle\":");
         try writeDurableBytes(writer, handle);
@@ -1739,6 +1895,7 @@ fn parsePersistedSteering(
     errdefer for (steering[0..parsed_count]) |item| {
         alloc.free(item.text);
         if (item.assistant_prefix) |prefix| alloc.free(prefix);
+        if (item.assistant_prefix_parts) |parts| types.freeAssistantParts(alloc, parts);
     };
     var prior_tool_step_count: usize = 0;
     for (value.array.items, 0..) |item, index| {
@@ -1748,7 +1905,12 @@ fn parsePersistedSteering(
                 .after_tool_step_count = tool_step_count,
             }
         else blk: {
-            const object = try exactObject(item, &.{ "text", "assistant_prefix", "after_tool_step_count" });
+            const item_source = try requireObject(item);
+            const has_parts = item_source.get("assistant_prefix_parts") != null;
+            const object = if (has_parts)
+                try exactObject(item, &.{ "text", "assistant_prefix", "assistant_prefix_parts", "after_tool_step_count" })
+            else
+                try exactObject(item, &.{ "text", "assistant_prefix", "after_tool_step_count" });
             const after_tool_step_count = try requireUsize(object, "after_tool_step_count");
             if (after_tool_step_count > tool_step_count or
                 (index > 0 and after_tool_step_count < prior_tool_step_count))
@@ -1759,16 +1921,20 @@ fn parsePersistedSteering(
                 alloc,
                 object.get("text") orelse return error.InvalidSessionFormat,
             );
-            const assistant_prefix = parseOptionalDurableBytes(
+            errdefer alloc.free(text);
+            const assistant_prefix = try parseOptionalDurableBytes(
                 alloc,
                 object.get("assistant_prefix") orelse return error.InvalidSessionFormat,
-            ) catch |err| {
-                alloc.free(text);
-                return err;
-            };
+            );
+            errdefer if (assistant_prefix) |prefix| alloc.free(prefix);
+            const assistant_prefix_parts = if (has_parts)
+                try parseAssistantParts(alloc, object.get("assistant_prefix_parts") orelse return error.InvalidSessionFormat)
+            else
+                null;
             break :blk types.PersistedSteering{
                 .text = text,
                 .assistant_prefix = assistant_prefix,
+                .assistant_prefix_parts = assistant_prefix_parts,
                 .after_tool_step_count = after_tool_step_count,
             };
         };
@@ -1828,7 +1994,12 @@ fn parseToolSteps(
         session.freePersistedToolResults(alloc, step.tool_results);
     };
     for (value.array.items, 0..) |step_value, i| {
-        const object = try exactObject(step_value, &.{ "assistant", "tool_calls", "tool_results" });
+        const step_source = try requireObject(step_value);
+        const has_parts = step_source.get("assistant_parts") != null;
+        const object = if (has_parts)
+            try exactObject(step_value, &.{ "assistant", "assistant_parts", "tool_calls", "tool_results" })
+        else
+            try exactObject(step_value, &.{ "assistant", "tool_calls", "tool_results" });
         const assistant = try parseOptionalDurableBytes(alloc, object.get("assistant") orelse return error.InvalidSessionFormat);
         errdefer if (assistant) |owned| alloc.free(owned);
         const tool_calls = try parseToolCalls(alloc, object.get("tool_calls") orelse return error.InvalidSessionFormat);
@@ -1839,11 +2010,21 @@ fn parseToolSteps(
             schema_version,
         );
         errdefer session.freePersistedToolResults(alloc, tool_results);
+        const assistant_parts = if (has_parts)
+            try parseAssistantParts(alloc, object.get("assistant_parts") orelse return error.InvalidSessionFormat)
+        else
+            null;
+        errdefer if (assistant_parts) |parts| types.freeAssistantParts(alloc, parts);
+        if (assistant_parts) |parts| {
+            types.validateAssistantParts(parts, tool_calls) catch
+                return error.InvalidSessionFormat;
+        }
         try session.repairPersistedToolArguments(alloc, tool_calls, tool_results, .schema_v3);
         steps[i] = .{
             .assistant = assistant,
             .tool_calls = tool_calls,
             .tool_results = tool_results,
+            .assistant_parts = assistant_parts,
         };
         parsed_count += 1;
     }
@@ -1865,12 +2046,17 @@ fn parseToolCalls(alloc: Allocator, value: std.json.Value) ![]session.ToolCall {
 }
 
 fn parseToolCall(alloc: Allocator, value: std.json.Value) !session.ToolCall {
-    const object = try exactObject(value, &.{
-        "id",
-        "name",
-        "arguments_json",
-        "provider_result",
-    });
+    const source = try requireObject(value);
+    const has_options = source.get("provider_options_json") != null;
+    const has_result_options = source.get("provider_result_options_json") != null;
+    const object = if (has_options and has_result_options)
+        try exactObject(value, &.{ "id", "name", "arguments_json", "provider_result", "provider_options_json", "provider_result_options_json" })
+    else if (has_options)
+        try exactObject(value, &.{ "id", "name", "arguments_json", "provider_result", "provider_options_json" })
+    else if (has_result_options)
+        try exactObject(value, &.{ "id", "name", "arguments_json", "provider_result", "provider_result_options_json" })
+    else
+        try exactObject(value, &.{ "id", "name", "arguments_json", "provider_result" });
     const id = try parseRequiredDurableBytes(alloc, object, "id");
     errdefer alloc.free(id);
     const name = try parseRequiredDurableBytes(alloc, object, "name");
@@ -1887,12 +2073,33 @@ fn parseToolCall(alloc: Allocator, value: std.json.Value) !session.ToolCall {
         alloc,
         object.get("provider_result") orelse return error.InvalidSessionFormat,
     );
+    errdefer if (provider_result) |result| alloc.free(result);
+    const provider_options_json = if (has_options)
+        try parseRequiredDurableBytes(alloc, object, "provider_options_json")
+    else
+        null;
+    errdefer if (provider_options_json) |options| alloc.free(options);
+    if (provider_options_json) |options| {
+        types.validateProviderOptionsJson(alloc, options) catch
+            return error.InvalidSessionFormat;
+    }
+    const provider_result_options_json = if (has_result_options)
+        try parseRequiredDurableBytes(alloc, object, "provider_result_options_json")
+    else
+        null;
+    errdefer if (provider_result_options_json) |options| alloc.free(options);
+    if (provider_result_options_json) |options| {
+        types.validateProviderOptionsJson(alloc, options) catch
+            return error.InvalidSessionFormat;
+    }
     return .{
         .id = id,
         .name = name,
         .arguments_json = arguments_json,
         .argument_integrity = argument_integrity,
         .provider_result = provider_result,
+        .provider_result_options_json = provider_result_options_json,
+        .provider_options_json = provider_options_json,
     };
 }
 
@@ -1934,6 +2141,7 @@ fn parseToolResults(
         if (result.command_output_replay) |replay| {
             types.freeCommandOutputReplay(alloc, replay);
         }
+        if (result.provider_options_json) |options| alloc.free(options);
     };
     for (value.array.items, 0..) |result_value, i| {
         results[i] = try parseToolResult(alloc, result_value, schema_version);
@@ -2024,17 +2232,23 @@ fn parseToolResult(
         "command_process_presentation",
         "terminal_action_presentation",
     };
+    const has_provider_options = value == .object and value.object.contains("provider_options_json");
+    const v4_with_options_keys = v4_keys.* ++ [_][]const u8{"provider_options_json"};
+    const v4_with_images_keys = v4_keys.* ++ [_][]const u8{"tool_images"};
+    const v4_with_handle_keys = v4_keys.* ++ [_][]const u8{"tool_image_handle"};
+    const v4_with_options_images_keys = v4_with_options_keys ++ [_][]const u8{"tool_images"};
+    const v4_with_options_handle_keys = v4_with_options_keys ++ [_][]const u8{"tool_image_handle"};
     const result_shape: ExactVariantObject = switch (schema_version) {
         1 => .{ .object = try exactObject(value, v1_keys), .extended = false },
         2 => try exactVariantObject(value, v2_keys, v2_extended_keys),
         3 => .{ .object = try exactObject(value, v3_keys), .extended = true },
-        4, 5, 6, 7 => .{ .object = try exactObject(value, v4_keys), .extended = true },
+        4, 5, 6, 7 => .{ .object = try exactObject(value, if (has_provider_options) &v4_with_options_keys else v4_keys), .extended = true },
         8 => .{ .object = if (value == .object and value.object.contains("tool_images"))
-            try exactObject(value, &(v4_keys.* ++ [_][]const u8{"tool_images"}))
+            try exactObject(value, if (has_provider_options) &v4_with_options_images_keys else &v4_with_images_keys)
         else if (value == .object and value.object.contains("tool_image_handle"))
-            try exactObject(value, &(v4_keys.* ++ [_][]const u8{"tool_image_handle"}))
+            try exactObject(value, if (has_provider_options) &v4_with_options_handle_keys else &v4_with_handle_keys)
         else
-            try exactObject(value, v4_keys), .extended = true },
+            try exactObject(value, if (has_provider_options) &v4_with_options_keys else v4_keys), .extended = true },
         else => return error.InvalidSessionFormat,
     };
     const object = result_shape.object;
@@ -2094,6 +2308,15 @@ fn parseToolResult(
         )
     else
         null;
+    const provider_options_json = if (has_provider_options)
+        try parseRequiredDurableBytes(alloc, object, "provider_options_json")
+    else
+        null;
+    errdefer if (provider_options_json) |options| alloc.free(options);
+    if (provider_options_json) |options| {
+        types.validateProviderOptionsJson(alloc, options) catch
+            return error.InvalidSessionFormat;
+    }
     const tool_image_handle = if (object.get("tool_image_handle")) |value_handle| try parseOptionalDurableBytes(alloc, value_handle) else null;
     errdefer if (tool_image_handle) |handle| alloc.free(handle);
     const tool_images = if (object.get("tool_images")) |images| images: {
@@ -2137,6 +2360,7 @@ fn parseToolResult(
         .command_output_replay = command_output_replay,
         .command_process_presentation = command_process_presentation,
         .terminal_action_presentation = terminal_action_presentation,
+        .provider_options_json = provider_options_json,
     };
 }
 
@@ -2645,14 +2869,19 @@ fn exactInterruptedHistoryObject(
     has_execution: bool,
     has_presentation: bool,
     has_terminal_reason: bool,
+    has_parts: bool,
 ) !std.json.ObjectMap {
-    var keys: [8][]const u8 = undefined;
+    var keys: [9][]const u8 = undefined;
     keys[0] = "kind";
     keys[1] = "user";
     keys[2] = "assistant";
     keys[3] = "tool_call";
     keys[4] = "completed_tool_names";
     var len: usize = 5;
+    if (has_parts) {
+        keys[len] = "assistant_parts";
+        len += 1;
+    }
     if (has_execution) {
         keys[len] = "execution";
         len += 1;
@@ -3428,6 +3657,154 @@ test "execution memory codec preserves feedback and reads v1 results without it"
     try std.testing.expectError(
         error.InvalidSessionFormat,
         parseHistoryTurn(alloc, invalid_v7_parsed.value),
+    );
+}
+
+test "history codec round-trips replay parts, metadata scopes, and interrupted turns" {
+    const alloc = std.testing.allocator;
+    var step_calls = [_]session.ToolCall{.{
+        .id = "call_codec",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"note.txt\"}",
+        .provider_options_json = "{\"google\":{\"thoughtSignature\":\"ts_1\"}}",
+    }};
+    var step_results = [_]session.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_codec"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("note contents"),
+        .output_bytes = 13,
+        .stored_output_bytes = 13,
+        .provider_options_json = @constCast("{\"gateway\":{\"resultNote\":\"rn_1\"}}"),
+    }};
+    var step_parts = [_]types.AssistantPart{
+        .{ .reasoning = .{ .text = "Read it first.", .provider_options = "{\"anthropic\":{\"signature\":\"sig_step\"}}" } },
+        .{ .text = .{ .text = "Reading." } },
+        .{ .tool_call_ref = .{ .id = "call_codec" } },
+    };
+    var steps = [_]session.ToolExecutionStep{.{
+        .assistant = @constCast("Reading."),
+        .tool_calls = &step_calls,
+        .tool_results = &step_results,
+        .assistant_parts = &step_parts,
+    }};
+    var prefix_parts = [_]types.AssistantPart{
+        .{ .reasoning = .{ .text = "Prefix thought.", .provider_options = "{\"anthropic\":{\"signature\":\"sig_prefix\"}}" } },
+    };
+    var steering = [_]types.PersistedSteering{.{
+        .text = @constCast("steer now"),
+        .assistant_prefix = @constCast("partial prefix"),
+        .assistant_prefix_parts = &prefix_parts,
+        .after_tool_step_count = 1,
+    }};
+    var final_parts = [_]types.AssistantPart{
+        .{ .reasoning = .{ .text = "", .provider_options = "{\"anthropic\":{\"redactedData\":\"red_1\"}}" } },
+        .{ .text = .{ .text = "Final answer." } },
+    };
+    const turn: session.HistoryTurn = .{ .assistant = .{
+        .user = .{ .text = @constCast("read the note") },
+        .assistant = @constCast("Final answer."),
+        .execution = .{ .tool_steps = steps[0..], .steering = steering[0..] },
+        .assistant_parts = &final_parts,
+    } };
+
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    try writeHistoryTurn(&encoded.writer, turn);
+    // Absent fields are omitted, never written as null keys.
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"assistant_parts\":null") == null);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "sig_step") != null);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+    defer parsed.deinit();
+    const decoded = try parseHistoryTurn(alloc, parsed.value);
+    defer session.freeHistoryTurn(alloc, decoded);
+    const decoded_step = decoded.assistant.execution.tool_steps[0];
+    const decoded_step_parts = decoded_step.assistant_parts orelse return error.TestExpectedAssistantParts;
+    try std.testing.expectEqual(@as(usize, 3), decoded_step_parts.len);
+    try std.testing.expectEqualStrings("Read it first.", decoded_step_parts[0].reasoning.text);
+    try std.testing.expectEqualStrings(
+        "{\"anthropic\":{\"signature\":\"sig_step\"}}",
+        decoded_step_parts[0].reasoning.provider_options.?,
+    );
+    try std.testing.expectEqualStrings("call_codec", decoded_step_parts[2].tool_call_ref.id);
+    try std.testing.expectEqualStrings(
+        "{\"google\":{\"thoughtSignature\":\"ts_1\"}}",
+        decoded_step.tool_calls[0].provider_options_json.?,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"gateway\":{\"resultNote\":\"rn_1\"}}",
+        decoded_step.tool_results[0].provider_options_json.?,
+    );
+    const decoded_prefix_parts = decoded.assistant.execution.steering[0].assistant_prefix_parts orelse
+        return error.TestExpectedAssistantParts;
+    try std.testing.expectEqual(@as(usize, 1), decoded_prefix_parts.len);
+    try std.testing.expectEqualStrings(
+        "{\"anthropic\":{\"signature\":\"sig_prefix\"}}",
+        decoded_prefix_parts[0].reasoning.provider_options.?,
+    );
+    const decoded_final = decoded.assistant.assistant_parts orelse return error.TestExpectedAssistantParts;
+    try std.testing.expectEqual(@as(usize, 2), decoded_final.len);
+    try std.testing.expectEqualStrings("", decoded_final[0].reasoning.text);
+    try std.testing.expectEqualStrings(
+        "{\"anthropic\":{\"redactedData\":\"red_1\"}}",
+        decoded_final[0].reasoning.provider_options.?,
+    );
+
+    // A parts reference to a call that did not survive fails strictly.
+    const stale =
+        "{\"kind\":\"assistant\",\"user\":{\"text\":\"prompt\",\"images\":[]},\"assistant\":\"done\",\"execution\":{\"schema_version\":7,\"tool_steps\":[{\"assistant\":null,\"assistant_parts\":[{\"type\":\"tool_call_ref\",\"call_id\":\"ghost\"}],\"tool_calls\":[],\"tool_results\":[]}],\"files\":[],\"steering\":[],\"turn_summary\":null}}";
+    var stale_parsed = try std.json.parseFromSlice(std.json.Value, alloc, stale, .{});
+    defer stale_parsed.deinit();
+    try std.testing.expectError(
+        error.InvalidSessionFormat,
+        parseHistoryTurn(alloc, stale_parsed.value),
+    );
+
+    // Interrupted turns carry parts explicitly when present.
+    const interrupted: session.HistoryTurn = .{ .interrupted = .{
+        .user = .{ .text = @constCast("stop soon") },
+        .assistant = @constCast("partial"),
+        .completed_tool_names = &.{},
+        .assistant_parts = &final_parts,
+    } };
+    var interrupted_encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer interrupted_encoded.deinit();
+    try writeHistoryTurn(&interrupted_encoded.writer, interrupted);
+    var interrupted_parsed = try std.json.parseFromSlice(std.json.Value, alloc, interrupted_encoded.written(), .{});
+    defer interrupted_parsed.deinit();
+    const decoded_interrupted = try parseHistoryTurn(alloc, interrupted_parsed.value);
+    defer session.freeHistoryTurn(alloc, decoded_interrupted);
+    const decoded_interrupted_parts = decoded_interrupted.interrupted.assistant_parts orelse
+        return error.TestExpectedAssistantParts;
+    try std.testing.expectEqual(@as(usize, 2), decoded_interrupted_parts.len);
+    try std.testing.expectEqualStrings(
+        "{\"anthropic\":{\"redactedData\":\"red_1\"}}",
+        decoded_interrupted_parts[0].reasoning.provider_options.?,
+    );
+}
+
+test "history codec keeps old records free of replay state" {
+    const alloc = std.testing.allocator;
+    const v7 =
+        "{\"kind\":\"assistant\",\"user\":{\"text\":\"write a note\",\"images\":[]},\"assistant\":\"done\",\"execution\":{\"schema_version\":7,\"tool_steps\":[{\"assistant\":null,\"tool_calls\":[{\"id\":\"call_feedback\",\"name\":\"write_file\",\"arguments_json\":\"{\\\"path\\\":\\\"note.txt\\\"}\",\"provider_result\":null}],\"tool_results\":[{\"tool_call_id\":\"call_feedback\",\"tool_name\":\"write_file\",\"status\":\"success\",\"output\":\"wrote note.txt\",\"output_handle\":null,\"preview\":null,\"output_bytes\":15,\"stored_output_bytes\":15,\"truncated\":false,\"provider_native\":false,\"created_at_ms\":1,\"permission_feedback\":[],\"committed_file_presentation\":null,\"command_output_replay\":null,\"command_process_presentation\":null,\"terminal_action_presentation\":null}]}],\"files\":[],\"steering\":[],\"turn_summary\":null}}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, v7, .{});
+    defer parsed.deinit();
+    const decoded = try parseHistoryTurn(alloc, parsed.value);
+    defer session.freeHistoryTurn(alloc, decoded);
+    try std.testing.expect(decoded.assistant.assistant_parts == null);
+    try std.testing.expect(decoded.assistant.execution.tool_steps[0].assistant_parts == null);
+    try std.testing.expect(decoded.assistant.execution.tool_steps[0].tool_calls[0].provider_options_json == null);
+    try std.testing.expect(decoded.assistant.execution.tool_steps[0].tool_results[0].provider_options_json == null);
+
+    // Unknown envelope keys stay rejected.
+    const unknown =
+        "{\"kind\":\"assistant\",\"user\":{\"text\":\"prompt\",\"images\":[]},\"assistant\":\"done\",\"unknown_new\":1,\"execution\":{\"schema_version\":7,\"tool_steps\":[],\"files\":[],\"steering\":[],\"turn_summary\":null}}";
+    var unknown_parsed = try std.json.parseFromSlice(std.json.Value, alloc, unknown, .{});
+    defer unknown_parsed.deinit();
+    try std.testing.expectError(
+        error.InvalidSessionFormat,
+        parseHistoryTurn(alloc, unknown_parsed.value),
     );
 }
 

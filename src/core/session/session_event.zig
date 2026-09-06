@@ -20,6 +20,7 @@ pub const max_conversation_text_bytes: usize = event_frame_max_bytes;
 pub const max_conversation_identity_bytes: usize = types.ConversationIdentity.max_bytes;
 pub const max_conversation_arguments_bytes: usize = event_frame_max_bytes;
 pub const max_conversation_preview_bytes: usize = 4 * 1024;
+pub const max_conversation_part_count: usize = 1024;
 
 pub const ArtifactCompleteness = enum {
     complete,
@@ -29,6 +30,25 @@ pub const ArtifactCompleteness = enum {
 
 pub const ConversationText = struct {
     text: []const u8,
+};
+
+/// Assistant event payload carrying the ordered replay parts when present.
+/// Parts borrow the turn's state for the append's lifetime. Old frames without
+/// `parts` decode with parts absent.
+pub const ConversationAssistant = struct {
+    text: []const u8,
+    parts: ?[]const types.AssistantPart = null,
+
+    pub fn jsonStringify(self: ConversationAssistant, jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("text");
+        try jw.write(self.text);
+        if (self.parts) |parts| {
+            try jw.objectField("parts");
+            try jw.write(parts);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ConversationUser = struct {
@@ -46,6 +66,39 @@ pub const ConversationToolCall = struct {
     provider_result: ?[]const u8 = null,
     final_identity: types.FinalToolIdentity = .valid,
     provenance: types.ToolExecutionProvenance = .fx_local,
+    /// Validated JSON object bytes for this call part's providerOptions.
+    provider_options_json: ?[]const u8 = null,
+    /// Validated JSON object bytes captured from the final provider result event.
+    provider_result_options_json: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: ConversationToolCall, jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("call_id");
+        try jw.write(self.call_id);
+        try jw.objectField("tool_name");
+        try jw.write(self.tool_name);
+        try jw.objectField("arguments_json");
+        try jw.write(self.arguments_json);
+        try jw.objectField("argument_integrity");
+        try jw.write(self.argument_integrity);
+        try jw.objectField("provisional_id");
+        try jw.write(self.provisional_id);
+        try jw.objectField("provider_result");
+        try jw.write(self.provider_result);
+        try jw.objectField("final_identity");
+        try jw.write(self.final_identity);
+        try jw.objectField("provenance");
+        try jw.write(self.provenance);
+        if (self.provider_options_json) |options| {
+            try jw.objectField("provider_options_json");
+            try jw.write(options);
+        }
+        if (self.provider_result_options_json) |options| {
+            try jw.objectField("provider_result_options_json");
+            try jw.write(options);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ConversationToolResult = struct {
@@ -66,6 +119,51 @@ pub const ConversationToolResult = struct {
     command_replay_bytes: ?u64 = null,
     command_process_presentation: ?types.CommandProcessPresentation = null,
     terminal_action_presentation: ?types.TerminalActionPresentation = null,
+    /// Validated JSON object bytes for this result part's providerOptions.
+    provider_options_json: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: ConversationToolResult, jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("call_id");
+        try jw.write(self.call_id);
+        try jw.objectField("tool_name");
+        try jw.write(self.tool_name);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        try jw.objectField("artifact_ref");
+        try jw.write(self.artifact_ref);
+        try jw.objectField("tool_image_handle");
+        try jw.write(self.tool_image_handle);
+        try jw.objectField("output_bytes");
+        try jw.write(self.output_bytes);
+        try jw.objectField("stored_bytes");
+        try jw.write(self.stored_bytes);
+        try jw.objectField("completeness");
+        try jw.write(self.completeness);
+        try jw.objectField("preview");
+        try jw.write(self.preview);
+        try jw.objectField("provider_native");
+        try jw.write(self.provider_native);
+        try jw.objectField("created_at_ms");
+        try jw.write(self.created_at_ms);
+        try jw.objectField("permission_feedback");
+        try jw.write(self.permission_feedback);
+        try jw.objectField("committed_file_presentation");
+        try jw.write(self.committed_file_presentation);
+        try jw.objectField("command_replay_ref");
+        try jw.write(self.command_replay_ref);
+        try jw.objectField("command_replay_bytes");
+        try jw.write(self.command_replay_bytes);
+        try jw.objectField("command_process_presentation");
+        try jw.write(self.command_process_presentation);
+        try jw.objectField("terminal_action_presentation");
+        try jw.write(self.terminal_action_presentation);
+        if (self.provider_options_json) |options| {
+            try jw.objectField("provider_options_json");
+            try jw.write(options);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ConversationInterruption = struct {
@@ -90,7 +188,7 @@ pub const ConversationCheckpoint = struct {
 
 pub const ConversationEvent = union(enum) {
     user: ConversationUser,
-    assistant: ConversationText,
+    assistant: ConversationAssistant,
     tool_call: ConversationToolCall,
     tool_result: ConversationToolResult,
     steering: ConversationText,
@@ -113,6 +211,26 @@ pub const PendingToolCall = struct {
     tool_name: []const u8,
     seq: u64,
 };
+
+/// Validates and deep-copies decoded frame parts into owned replay parts.
+/// Invalid provider-metadata envelopes fail with `error.InvalidConversationFrame`.
+pub fn dupeAssistantPartsFromConversation(
+    alloc: Allocator,
+    parts: []const types.AssistantPart,
+) ![]types.AssistantPart {
+    for (parts) |part| {
+        const options: ?[]const u8 = switch (part) {
+            .text => |text_part| text_part.provider_options,
+            .reasoning => |reasoning_part| reasoning_part.provider_options,
+            .tool_call_ref => null,
+        };
+        if (options) |value| {
+            types.validateProviderOptionsJson(alloc, value) catch
+                return error.InvalidConversationFrame;
+        }
+    }
+    return types.dupeAssistantParts(alloc, parts);
+}
 
 pub const ConversationStateView = struct {
     last_seq: u64 = 0,
@@ -196,7 +314,37 @@ fn validateConversationEventShape(event: ConversationEvent) ConversationTransiti
             }
             if (value.work_id) |work_id| try validateConversationIdentity(work_id);
         },
-        .assistant, .steering => |value| try validateConversationText(value.text),
+        .assistant => |value| {
+            try validateConversationText(value.text);
+            if (value.parts) |parts| {
+                if (parts.len > max_conversation_part_count) return error.InvalidConversationEvent;
+                for (parts) |part| {
+                    const options: ?[]const u8 = switch (part) {
+                        .text => |text_part| blk: {
+                            try validateConversationText(text_part.text);
+                            break :blk text_part.provider_options;
+                        },
+                        .reasoning => |reasoning_part| blk: {
+                            try validateConversationText(reasoning_part.text);
+                            break :blk reasoning_part.provider_options;
+                        },
+                        .tool_call_ref => |ref| blk: {
+                            try validateConversationIdentity(ref.id);
+                            break :blk null;
+                        },
+                    };
+                    if (options) |value_bytes| {
+                        if (value_bytes.len == 0 or
+                            value_bytes.len > max_conversation_arguments_bytes or
+                            !std.unicode.utf8ValidateSlice(value_bytes))
+                        {
+                            return error.InvalidConversationEvent;
+                        }
+                    }
+                }
+            }
+        },
+        .steering => |value| try validateConversationText(value.text),
         .tool_call => |call| {
             try validateConversationIdentity(call.call_id);
             try validateConversationIdentity(call.tool_name);
@@ -209,6 +357,22 @@ fn validateConversationEventShape(event: ConversationEvent) ConversationTransiti
             if (call.provisional_id) |value| try validateConversationIdentity(value);
             if (call.provider_result) |value| {
                 if (value.len > max_conversation_arguments_bytes or
+                    !std.unicode.utf8ValidateSlice(value))
+                {
+                    return error.InvalidConversationEvent;
+                }
+            }
+            if (call.provider_options_json) |value| {
+                if (value.len == 0 or
+                    value.len > max_conversation_arguments_bytes or
+                    !std.unicode.utf8ValidateSlice(value))
+                {
+                    return error.InvalidConversationEvent;
+                }
+            }
+            if (call.provider_result_options_json) |value| {
+                if (value.len == 0 or
+                    value.len > max_conversation_arguments_bytes or
                     !std.unicode.utf8ValidateSlice(value))
                 {
                     return error.InvalidConversationEvent;
@@ -260,6 +424,14 @@ fn validateConversationEventShape(event: ConversationEvent) ConversationTransiti
             }
             if (result.command_replay_ref) |handle| {
                 try validateConversationIdentity(handle);
+            }
+            if (result.provider_options_json) |value| {
+                if (value.len == 0 or
+                    value.len > max_conversation_arguments_bytes or
+                    !std.unicode.utf8ValidateSlice(value))
+                {
+                    return error.InvalidConversationEvent;
+                }
             }
         },
         .interrupted => |interrupted| {
@@ -390,8 +562,13 @@ pub fn appendHistoryTurnConversationEvents(
                 .work_id = entry.user.work_id,
             } });
             try appendExecutionConversationEvents(alloc, events, entry.execution);
-            if (entry.assistant.len > 0) {
-                try events.append(alloc, .{ .assistant = .{ .text = entry.assistant } });
+            if (entry.assistant.len > 0 or
+                (entry.assistant_parts != null and entry.assistant_parts.?.len > 0))
+            {
+                try events.append(alloc, .{ .assistant = .{
+                    .text = entry.assistant,
+                    .parts = entry.assistant_parts,
+                } });
             }
             try events.append(alloc, .{ .turn_completed = .{
                 .files = entry.execution.files,
@@ -415,6 +592,8 @@ pub fn appendHistoryTurnConversationEvents(
                     .provider_result = call.provider_result,
                     .final_identity = call.final_identity,
                     .provenance = call.provenance,
+                    .provider_options_json = call.provider_options_json,
+                    .provider_result_options_json = call.provider_result_options_json,
                 } });
             }
             try events.append(alloc, .{ .interrupted = .{
@@ -470,7 +649,13 @@ fn appendExecutionConversationEvents(
     }
     for (execution.tool_steps, 0..) |step, step_index| {
         if (step.assistant) |assistant| {
-            if (assistant.len > 0) try events.append(alloc, .{ .assistant = .{ .text = assistant } });
+            const has_parts = step.assistant_parts != null and step.assistant_parts.?.len > 0;
+            if (assistant.len > 0 or has_parts) {
+                try events.append(alloc, .{ .assistant = .{
+                    .text = assistant,
+                    .parts = step.assistant_parts,
+                } });
+            }
         }
         for (step.tool_calls) |call| {
             try events.append(alloc, .{ .tool_call = .{
@@ -482,6 +667,8 @@ fn appendExecutionConversationEvents(
                 .provider_result = call.provider_result,
                 .final_identity = call.final_identity,
                 .provenance = call.provenance,
+                .provider_options_json = call.provider_options_json,
+                .provider_result_options_json = call.provider_result_options_json,
             } });
         }
         for (step.tool_results) |result| {
@@ -513,6 +700,7 @@ fn appendExecutionConversationEvents(
                 .command_replay_bytes = resultCommandReplayBytes(result),
                 .command_process_presentation = result.command_process_presentation,
                 .terminal_action_presentation = result.terminal_action_presentation,
+                .provider_options_json = result.provider_options_json,
             } });
         }
         const completed_steps = step_index + 1;
@@ -534,7 +722,13 @@ fn appendSteeringConversationEvents(
     steering: types.PersistedSteering,
 ) !void {
     if (steering.assistant_prefix) |assistant| {
-        if (assistant.len > 0) try events.append(alloc, .{ .assistant = .{ .text = assistant } });
+        const has_parts = steering.assistant_prefix_parts != null and steering.assistant_prefix_parts.?.len > 0;
+        if (assistant.len > 0 or has_parts) {
+            try events.append(alloc, .{ .assistant = .{
+                .text = assistant,
+                .parts = steering.assistant_prefix_parts,
+            } });
+        }
     }
     if (steering.text.len > 0) {
         try events.append(alloc, .{ .steering = .{ .text = steering.text } });

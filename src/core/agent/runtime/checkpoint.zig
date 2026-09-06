@@ -116,9 +116,14 @@ pub fn decode(alloc: Allocator, bytes: []const u8) Error!Decoded {
 
 test "kernel checkpoint round trips history and usage" {
     const alloc = std.testing.allocator;
+    const final_parts = [_]types.AssistantPart{
+        .{ .reasoning = .{ .text = "thinking", .provider_options = "{\"anthropic\":{\"signature\":\"sig_kernel\"}}" } },
+        .{ .text = .{ .text = "world" } },
+    };
     const history = [_]types.HistoryTurn{.{ .assistant = .{
         .user = .{ .text = @constCast("hello") },
         .assistant = @constCast("world"),
+        .assistant_parts = @constCast(&final_parts),
     } }};
     const bytes = try encode(alloc, &history, .{ .input_tokens = 3, .output_tokens = 2 });
     defer alloc.free(bytes);
@@ -127,6 +132,13 @@ test "kernel checkpoint round trips history and usage" {
     try std.testing.expectEqual(@as(usize, 1), decoded.history.len);
     try std.testing.expectEqualStrings("hello", decoded.history[0].assistant.user.text);
     try std.testing.expectEqualStrings("world", decoded.history[0].assistant.assistant);
+    const decoded_parts = decoded.history[0].assistant.assistant_parts orelse
+        return error.TestExpectedAssistantParts;
+    try std.testing.expectEqual(@as(usize, 2), decoded_parts.len);
+    try std.testing.expectEqualStrings(
+        "{\"anthropic\":{\"signature\":\"sig_kernel\"}}",
+        decoded_parts[0].reasoning.provider_options.?,
+    );
     try std.testing.expectEqual(@as(?u64, 3), decoded.usage.input_tokens);
 }
 

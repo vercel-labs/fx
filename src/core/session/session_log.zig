@@ -930,7 +930,7 @@ fn replayConversationHistory(
         defer decoded.deinit();
         switch (decoded.value.event) {
             .user => |value| try turn.begin(value),
-            .assistant => |value| try turn.appendAssistant(value.text),
+            .assistant => |value| try turn.appendAssistant(value),
             .tool_call => |value| try turn.appendToolCall(value),
             .tool_result => |value| try turn.appendToolResult(value),
             .steering => |value| try turn.appendSteering(value.text),
@@ -1004,7 +1004,7 @@ pub const ConversationHistoryReader = struct {
                     break :blk null;
                 },
                 .assistant => |value| blk: {
-                    try self.builder.appendAssistant(value.text);
+                    try self.builder.appendAssistant(value);
                     break :blk null;
                 },
                 .tool_call => |value| blk: {
@@ -1093,7 +1093,7 @@ pub fn loadConversationArchive(
                 break :blk null;
             },
             .assistant => |value| blk: {
-                try builder.appendAssistant(value.text);
+                try builder.appendAssistant(value);
                 break :blk null;
             },
             .tool_call => |value| blk: {
@@ -1233,6 +1233,7 @@ const ConversationTurnBuilder = struct {
     alloc: Allocator,
     user: ?types.UserTurn = null,
     pending_assistant: ?[]u8 = null,
+    pending_assistant_parts: ?[]types.AssistantPart = null,
     calls: std.ArrayList(types.ToolCall) = .empty,
     results: std.ArrayList(types.PersistedToolResult) = .empty,
     steps: std.ArrayList(types.ToolExecutionStep) = .empty,
@@ -1245,6 +1246,7 @@ const ConversationTurnBuilder = struct {
     fn deinit(self: *ConversationTurnBuilder) void {
         if (self.user) |user| types.freeUserTurn(self.alloc, user);
         if (self.pending_assistant) |text| self.alloc.free(text);
+        if (self.pending_assistant_parts) |parts| types.freeAssistantParts(self.alloc, parts);
         for (self.calls.items) |call| types.freeToolCall(self.alloc, call);
         self.calls.deinit(self.alloc);
         for (self.results.items) |result| freeConversationToolResult(self.alloc, result);
@@ -1253,10 +1255,12 @@ const ConversationTurnBuilder = struct {
             if (step.assistant) |text| self.alloc.free(text);
             types.freeToolCallSlice(self.alloc, step.tool_calls);
             types.freePersistedToolResults(self.alloc, step.tool_results);
+            if (step.assistant_parts) |parts| types.freeAssistantParts(self.alloc, parts);
         }
         for (self.steering.items) |item| {
             self.alloc.free(item.text);
             if (item.assistant_prefix) |text| self.alloc.free(text);
+            if (item.assistant_prefix_parts) |parts| types.freeAssistantParts(self.alloc, parts);
         }
         self.steps.deinit(self.alloc);
         self.steering.deinit(self.alloc);
@@ -1266,6 +1270,7 @@ const ConversationTurnBuilder = struct {
     fn isIdle(self: *const ConversationTurnBuilder) bool {
         return self.user == null and
             self.pending_assistant == null and
+            self.pending_assistant_parts == null and
             self.calls.items.len == 0 and
             self.results.items.len == 0 and
             self.steps.items.len == 0 and
@@ -1284,11 +1289,23 @@ const ConversationTurnBuilder = struct {
         });
     }
 
-    fn appendAssistant(self: *ConversationTurnBuilder, text: []const u8) !void {
+    fn appendAssistant(
+        self: *ConversationTurnBuilder,
+        value: session_event.ConversationAssistant,
+    ) !void {
         if (self.user == null or self.pending_assistant != null or self.calls.items.len != 0) {
             return error.InvalidConversationFrame;
         }
-        self.pending_assistant = try self.alloc.dupe(u8, text);
+        self.pending_assistant = try self.alloc.dupe(u8, value.text);
+        if (value.parts) |parts| {
+            self.pending_assistant_parts = session_event.dupeAssistantPartsFromConversation(
+                self.alloc,
+                parts,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvalidConversationFrame => return error.InvalidConversationFrame,
+            };
+        }
     }
 
     fn appendToolCall(
@@ -1301,6 +1318,14 @@ const ConversationTurnBuilder = struct {
         for (self.calls.items) |call| {
             if (std.mem.eql(u8, call.id, value.call_id)) return error.InvalidConversationFrame;
         }
+        if (value.provider_options_json) |options| {
+            types.validateProviderOptionsJson(self.alloc, options) catch
+                return error.InvalidConversationFrame;
+        }
+        if (value.provider_result_options_json) |options| {
+            types.validateProviderOptionsJson(self.alloc, options) catch
+                return error.InvalidConversationFrame;
+        }
         const call = try types.dupeToolCall(self.alloc, .{
             .id = value.call_id,
             .name = value.tool_name,
@@ -1310,6 +1335,8 @@ const ConversationTurnBuilder = struct {
             .provider_result = value.provider_result,
             .final_identity = value.final_identity,
             .provenance = value.provenance,
+            .provider_options_json = value.provider_options_json,
+            .provider_result_options_json = value.provider_result_options_json,
         });
         errdefer types.freeToolCall(self.alloc, call);
         try self.calls.append(self.alloc, call);
@@ -1350,12 +1377,18 @@ const ConversationTurnBuilder = struct {
         errdefer types.freeToolCallSlice(self.alloc, calls);
         const results = try self.results.toOwnedSlice(self.alloc);
         errdefer types.freePersistedToolResults(self.alloc, results);
+        if (self.pending_assistant_parts) |parts| {
+            types.validateAssistantParts(parts, calls) catch
+                return error.InvalidConversationFrame;
+        }
         self.steps.appendAssumeCapacity(.{
             .assistant = self.pending_assistant,
             .tool_calls = calls,
             .tool_results = results,
+            .assistant_parts = self.pending_assistant_parts,
         });
         self.pending_assistant = null;
+        self.pending_assistant_parts = null;
     }
 
     fn appendSteering(self: *ConversationTurnBuilder, text: []const u8) !void {
@@ -1367,9 +1400,11 @@ const ConversationTurnBuilder = struct {
         try self.steering.append(self.alloc, .{
             .text = owned,
             .assistant_prefix = self.pending_assistant,
+            .assistant_prefix_parts = self.pending_assistant_parts,
             .after_tool_step_count = self.steps.items.len,
         });
         self.pending_assistant = null;
+        self.pending_assistant_parts = null;
     }
 
     fn finishAssistant(
@@ -1383,17 +1418,26 @@ const ConversationTurnBuilder = struct {
             text
         else
             try self.alloc.dupe(u8, "");
+        // A completed final answer carries no pending tool calls, so its parts
+        // must not reference any.
+        if (self.pending_assistant_parts) |parts| {
+            types.validateAssistantParts(parts, &.{}) catch
+                return error.InvalidConversationFrame;
+        }
         const execution = try self.takeExecution(
             completed.files,
             completed.turn_summary,
         );
         const user = self.user.?;
         self.user = null;
+        const assistant_parts = self.pending_assistant_parts;
         self.pending_assistant = null;
+        self.pending_assistant_parts = null;
         return .{ .assistant = .{
             .user = user,
             .assistant = assistant,
             .execution = execution,
+            .assistant_parts = assistant_parts,
         } };
     }
 
@@ -1412,6 +1456,10 @@ const ConversationTurnBuilder = struct {
         if (self.pending_assistant) |text| {
             self.alloc.free(text);
             self.pending_assistant = null;
+        }
+        if (self.pending_assistant_parts) |parts| {
+            types.freeAssistantParts(self.alloc, parts);
+            self.pending_assistant_parts = null;
         }
         const assistant = if (value.partial_text) |text|
             try self.alloc.dupe(u8, text)
@@ -1538,6 +1586,12 @@ fn dupeConversationToolResult(
     errdefer if (committed_file_presentation) |presentation| {
         types.freeCommittedFilePresentation(alloc, presentation);
     };
+    const provider_options_json = if (value.provider_options_json) |options| blk: {
+        types.validateProviderOptionsJson(alloc, options) catch
+            return error.InvalidConversationFrame;
+        break :blk try alloc.dupe(u8, options);
+    } else null;
+    errdefer if (provider_options_json) |options| alloc.free(options);
     const stored_bytes = std.math.cast(usize, value.stored_bytes) orelse
         return error.ConversationSizeOverflow;
     const output_bytes = std.math.cast(
@@ -1562,6 +1616,7 @@ fn dupeConversationToolResult(
         .command_output_replay = command_output_replay,
         .command_process_presentation = value.command_process_presentation,
         .terminal_action_presentation = value.terminal_action_presentation,
+        .provider_options_json = provider_options_json,
     };
 }
 
@@ -1584,6 +1639,7 @@ fn freeConversationToolResult(
     if (result.command_output_replay) |replay| {
         types.freeCommandOutputReplay(alloc, replay);
     }
+    if (result.provider_options_json) |options| alloc.free(options);
 }
 
 fn latestConversationCheckpointIndex(history: []const session.HistoryTurn) usize {
@@ -3508,6 +3564,170 @@ test "conversation writer flattens a canonical history turn" {
         bytes,
         "\"snapshot_path\":\"/tmp/session/images",
     ) == null);
+}
+
+test "conversation log round-trips assistant replay parts and part metadata" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "events.jsonl", .{
+        .read = true,
+        .truncate = true,
+    });
+    var writer = try ConversationWriter.init(alloc, file);
+    defer writer.deinit();
+
+    var step_calls = [_]types.ToolCall{.{
+        .id = "call-reasoning",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"note.txt\"}",
+        .provider_options_json = "{\"google\":{\"thoughtSignature\":\"ts_1\"}}",
+    }};
+    var step_results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call-reasoning"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("hello"),
+        .output_handle = @constCast("result-call-reasoning.txt"),
+        .output_bytes = 5,
+        .stored_output_bytes = 5,
+        .provider_options_json = @constCast("{\"gateway\":{\"resultNote\":\"rn_1\"}}"),
+    }};
+    var step_parts = [_]types.AssistantPart{
+        .{ .reasoning = .{ .text = "Read the note first.", .provider_options = "{\"anthropic\":{\"signature\":\"sig_step\"}}" } },
+        .{ .text = .{ .text = "Reading the note." } },
+        .{ .tool_call_ref = .{ .id = "call-reasoning" } },
+    };
+    var steps = [_]types.ToolExecutionStep{.{
+        .assistant = @constCast("Reading the note."),
+        .tool_calls = &step_calls,
+        .tool_results = &step_results,
+        .assistant_parts = &step_parts,
+    }};
+    var prefix_parts = [_]types.AssistantPart{
+        .{ .reasoning = .{ .text = "Thinking before steering.", .provider_options = "{\"anthropic\":{\"signature\":\"sig_prefix\"}}" } },
+        .{ .text = .{ .text = "Prefix answer." } },
+    };
+    var steering = [_]types.PersistedSteering{.{
+        .text = @constCast("Also check the other file."),
+        .assistant_prefix = @constCast("Prefix answer."),
+        .assistant_prefix_parts = &prefix_parts,
+        .after_tool_step_count = 1,
+    }};
+    var final_parts = [_]types.AssistantPart{
+        .{ .reasoning = .{ .text = "Both files read.", .provider_options = "{\"anthropic\":{\"signature\":\"sig_final\"}}" } },
+        .{ .text = .{ .text = "Done reading." } },
+    };
+    try writer.appendHistoryTurn(alloc, 10, .{ .assistant = .{
+        .user = .{ .text = @constCast("Read the note.") },
+        .assistant = @constCast("Done reading."),
+        .execution = .{ .tool_steps = &steps, .steering = &steering },
+        .assistant_parts = &final_parts,
+    } });
+
+    const bytes = try writer.readAllForTest(alloc);
+    defer alloc.free(bytes);
+    // Metadata rides as validated bytes, never as a nested object or a second
+    // transcript of the calls.
+    try std.testing.expect(std.mem.find(u8, bytes, "\"providerOptions\"") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"provider_options_json\":") != null);
+
+    var conversation_seq: u64 = 0;
+    var open_work_id: ?[]u8 = null;
+    defer if (open_work_id) |work_id| alloc.free(work_id);
+    const history = try replayConversationHistory(alloc, file, &conversation_seq, &open_work_id);
+    defer session.freeHistoryTurnSlice(alloc, history);
+
+    try std.testing.expectEqual(@as(usize, 1), history.len);
+    const turn = history[0].assistant;
+    try std.testing.expectEqualStrings("Done reading.", turn.assistant);
+    const restored_step_parts = turn.execution.tool_steps[0].assistant_parts orelse
+        return error.TestExpectedAssistantParts;
+    try std.testing.expectEqual(@as(usize, 3), restored_step_parts.len);
+    try std.testing.expectEqualStrings("Read the note first.", restored_step_parts[0].reasoning.text);
+    try std.testing.expectEqualStrings(
+        "{\"anthropic\":{\"signature\":\"sig_step\"}}",
+        restored_step_parts[0].reasoning.provider_options.?,
+    );
+    try std.testing.expectEqualStrings("Reading the note.", restored_step_parts[1].text.text);
+    try std.testing.expectEqualStrings("call-reasoning", restored_step_parts[2].tool_call_ref.id);
+    const restored_call = turn.execution.tool_steps[0].tool_calls[0];
+    try std.testing.expectEqualStrings(
+        "{\"google\":{\"thoughtSignature\":\"ts_1\"}}",
+        restored_call.provider_options_json.?,
+    );
+    const restored_result = turn.execution.tool_steps[0].tool_results[0];
+    try std.testing.expectEqualStrings(
+        "{\"gateway\":{\"resultNote\":\"rn_1\"}}",
+        restored_result.provider_options_json.?,
+    );
+    const restored_prefix_parts = turn.execution.steering[0].assistant_prefix_parts orelse
+        return error.TestExpectedAssistantParts;
+    try std.testing.expectEqual(@as(usize, 2), restored_prefix_parts.len);
+    try std.testing.expectEqualStrings(
+        "{\"anthropic\":{\"signature\":\"sig_prefix\"}}",
+        restored_prefix_parts[0].reasoning.provider_options.?,
+    );
+    const restored_final_parts = turn.assistant_parts orelse return error.TestExpectedAssistantParts;
+    try std.testing.expectEqual(@as(usize, 2), restored_final_parts.len);
+    try std.testing.expectEqualStrings(
+        "{\"anthropic\":{\"signature\":\"sig_final\"}}",
+        restored_final_parts[0].reasoning.provider_options.?,
+    );
+    try std.testing.expectEqualStrings("Done reading.", restored_final_parts[1].text.text);
+}
+
+test "conversation log keeps old frames without replay parts absent" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "events.jsonl", .{
+        .read = true,
+        .truncate = true,
+    });
+    var writer = try ConversationWriter.init(alloc, file);
+    defer writer.deinit();
+
+    var step_calls = [_]types.ToolCall{.{
+        .id = "call-plain",
+        .name = "read_file",
+        .arguments_json = "{}",
+    }};
+    var step_results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call-plain"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("hello"),
+        .output_handle = @constCast("result-call-plain.txt"),
+        .output_bytes = 5,
+        .stored_output_bytes = 5,
+    }};
+    var steps = [_]types.ToolExecutionStep{.{
+        .assistant = @constCast("Reading."),
+        .tool_calls = &step_calls,
+        .tool_results = &step_results,
+    }};
+    try writer.appendHistoryTurn(alloc, 10, .{ .assistant = .{
+        .user = .{ .text = @constCast("Read it.") },
+        .assistant = @constCast("Done."),
+        .execution = .{ .tool_steps = &steps },
+    } });
+
+    const bytes = try writer.readAllForTest(alloc);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"parts\":") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "provider_options_json") == null);
+
+    var conversation_seq: u64 = 0;
+    var open_work_id: ?[]u8 = null;
+    defer if (open_work_id) |work_id| alloc.free(work_id);
+    const history = try replayConversationHistory(alloc, file, &conversation_seq, &open_work_id);
+    defer session.freeHistoryTurnSlice(alloc, history);
+    try std.testing.expectEqual(@as(usize, 1), history.len);
+    const turn = history[0].assistant;
+    try std.testing.expect(turn.assistant_parts == null);
+    try std.testing.expect(turn.execution.tool_steps[0].assistant_parts == null);
+    try std.testing.expect(turn.execution.tool_steps[0].tool_calls[0].provider_options_json == null);
 }
 
 test "legacy import recovery restores old authority or keeps published current data" {
