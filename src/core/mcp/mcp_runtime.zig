@@ -5643,7 +5643,8 @@ test "modern MCP calls delegate unsupported schema assertions to the server" {
         tool_result_limits.default_max_tool_result_bytes,
     )).?;
     defer alloc.free(result.model_output);
-    try std.testing.expect(std.mem.find(u8, result.model_output, "accepted") != null);
+    try std.testing.expect(std.mem.find(u8, result.model_output, "person@example.com") != null);
+    try std.testing.expect(std.mem.find(u8, result.model_output, "accepted") == null);
 
     server.disconnect();
 }
