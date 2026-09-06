@@ -138,7 +138,7 @@ pub const State = struct {
         self.vertical_navigation.reset();
         self.picker.clearModelPickerFlow();
         self.picker.reconcileInlinePickerAfterEdit(self.edit);
-        self.picker.resetActiveModelPickerIndex();
+        self.picker.resetActiveCompletionIndex();
         self.picker.resetFilePickerIndex();
         self.input_limit_rejection.* = input_limit_rejection.clear();
         return true;

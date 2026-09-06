@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const app_lifecycle = @import("app_lifecycle.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const app_input_runtime = @import("app_input_runtime.zig");
@@ -48,10 +49,9 @@ fn BootstrapDeps(comptime App: type) type {
             []const u8,
             types.ReasoningEffort,
             bool,
+            bool,
         ) anyerror!void;
         const InitializePersistenceFn = *const fn (*App, bool) anyerror!void;
-        const StageRequestedResumeViewFn = *const fn (*App) app_session_runtime.ResumeViewStage;
-        const PublishStagedResumeViewFn = *const fn (*App, u32) anyerror!void;
         const LoadSkillsFn = *const fn (
             Allocator,
             []const u8,
@@ -63,8 +63,6 @@ fn BootstrapDeps(comptime App: type) type {
         bootstrap_interactive_app: BootstrapInteractiveAppFn,
         configure_session_preferences: ConfigureSessionPreferencesFn,
         initialize_persistence: InitializePersistenceFn,
-        stage_requested_resume_view: StageRequestedResumeViewFn,
-        publish_staged_resume_view: PublishStagedResumeViewFn,
         load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
         load_skills: LoadSkillsFn,
         skill_root_policy: skill_contract.RootPolicy,
@@ -100,8 +98,6 @@ pub fn Runtime(comptime App: type) type {
                 .bootstrap_interactive_app = bootstrapInteractiveAppDefault,
                 .configure_session_preferences = configureSessionPreferencesDefault,
                 .initialize_persistence = initializePersistenceDefault,
-                .stage_requested_resume_view = stageRequestedResumeViewDefault,
-                .publish_staged_resume_view = publishStagedResumeViewDefault,
                 .load_mcp_runtime = capability_providers.load_mcp_runtime,
                 .load_skills = app_runtime_setup.loadSkills,
                 .skill_root_policy = capability_providers.skill_root_policy,
@@ -126,14 +122,6 @@ pub fn Runtime(comptime App: type) type {
             );
         }
 
-        fn stageRequestedResumeViewDefault(app: *App) app_session_runtime.ResumeViewStage {
-            return app_session_runtime.Runtime(App).stageRequestedResumeView(app);
-        }
-
-        fn publishStagedResumeViewDefault(app: *App, entry_id: u32) !void {
-            try app_session_runtime.Runtime(App).publishStagedResumeView(app, entry_id);
-        }
-
         fn configureSessionPreferencesDefault(
             app: *App,
             provider: model_provider.ProviderId,
@@ -142,6 +130,7 @@ pub fn Runtime(comptime App: type) type {
             selected_model: []const u8,
             effort: types.ReasoningEffort,
             fast_mode: bool,
+            fast_mode_model_bound: bool,
         ) !void {
             try app_session_runtime.Runtime(App).configureStartupPreferences(
                 app,
@@ -151,6 +140,7 @@ pub fn Runtime(comptime App: type) type {
                 selected_model,
                 effort,
                 fast_mode,
+                fast_mode_model_bound,
             );
         }
 
@@ -198,6 +188,10 @@ pub fn Runtime(comptime App: type) type {
                     app.secretStore()
                 else
                     host.unavailable_secret_store,
+                .auth_mode = if (comptime @hasDecl(@TypeOf(app.auth), "authMode"))
+                    app.auth.authMode()
+                else
+                    .local,
                 .resize_handler = resize_handler,
                 .fx_version = App.app_version,
             });
@@ -214,14 +208,16 @@ pub fn Runtime(comptime App: type) type {
             }
             app.auth.recordStartupStatus(
                 startup.stored_key_status,
+                startup.fx_login_status,
+                startup.credential_load_failure,
                 startup.credential_onboarding_skipped,
             );
-            if (comptime @hasDecl(@TypeOf(app.auth), "refreshChatGptSourceInventory")) {
-                app.auth.refreshChatGptSourceInventory(app.alloc) catch |err| {
-                    debug_trace.logf("auth", "startup ChatGPT inventory refresh failed err={s}", .{@errorName(err)});
-                };
-            } else {
+            if (comptime @hasDecl(@TypeOf(app.auth), "refreshSourceInventory")) {
                 app.auth.refreshSourceInventory(app.alloc) catch |err| {
+                    debug_trace.logf("auth", "startup source inventory refresh failed err={s}", .{@errorName(err)});
+                };
+            } else if (comptime @hasDecl(@TypeOf(app.auth), "refreshChatGptSourceInventory")) {
+                app.auth.refreshChatGptSourceInventory(app.alloc) catch |err| {
                     debug_trace.logf("auth", "startup source inventory refresh failed err={s}", .{@errorName(err)});
                 };
             }
@@ -276,6 +272,7 @@ pub fn Runtime(comptime App: type) type {
                 active_model,
                 startup.effort,
                 startup.fast_mode,
+                startup.fast_mode_model_bound,
             );
             app.permission_engine.mode = startup.permission_mode;
             app.permission_engine.replaceRules(app.alloc, startup.takePermissionRules());
@@ -313,10 +310,6 @@ pub fn Runtime(comptime App: type) type {
                 app,
                 app.requested_resume != null,
             );
-            const staged_resume_view = if (app.requested_resume != null)
-                deps.stage_requested_resume_view(app)
-            else
-                app_session_runtime.ResumeViewStage.none;
             const profile_mcp = try deps.load_mcp_runtime(
                 app.alloc,
                 app.workspace_root,
@@ -328,13 +321,15 @@ pub fn Runtime(comptime App: type) type {
                 app.mcp_runtime = profile_mcp;
             }
 
-            const loaded = try deps.load_skills(
+            var loaded = try deps.load_skills(
                 std.heap.c_allocator,
                 app.workspace_root,
                 deps.skill_root_policy,
             );
+            errdefer loaded.deinit(std.heap.c_allocator);
             skill_runtime.traceDiagnostics("interactive_startup", loaded.diagnostics);
-            app.skills.replaceLoaded(std.heap.c_allocator, loaded.dir, loaded.skills, loaded.diagnostics);
+            try app.skills.replaceLoaded(std.heap.c_allocator, loaded.dir, loaded.skills, loaded.diagnostics);
+            loaded = .{};
 
             if (app.requested_resume == null) {
                 const welcome_message = try deps.welcome_message(app.alloc);
@@ -377,12 +372,19 @@ pub fn Runtime(comptime App: type) type {
             }
             if (comptime @hasField(App, "auth")) {
                 const auth_view = app.auth.view();
-                if (auth_view.active_source == null and auth_view.stored_key_status == .unavailable) {
-                    debug_trace.logf("keychain", "interactive read skipped", .{});
+                const load_error: ?anyerror = if (startup.credential_load_failure) |failure|
+                    failure.err
+                else if (auth_view.stored_key_status == .unavailable or auth_view.fx_login_status == .unavailable)
+                    error.CredentialStorageUnavailable
+                else
+                    null;
+                if (auth_view.active_source == null and load_error != null) {
+                    const body = try auth_runtime.preparationFailureText(app.alloc, startup.provider, load_error.?);
+                    defer app.alloc.free(body);
                     try app.writeDomainNotice(.{
-                        .topic = "keychain",
+                        .topic = "auth",
                         .tone = .warning,
-                        .body = "fx could not access " ++ credentials.stored_key_backend_label ++ ". Continuing without an API key.",
+                        .body = body,
                     }, true);
                 }
             }
@@ -463,10 +465,6 @@ pub fn Runtime(comptime App: type) type {
                 app_session_runtime.Runtime(App).syncTerminalTitleWith(app, deps.terminal_title);
             }
 
-            switch (staged_resume_view) {
-                .none => {},
-                .ready => |entry_id| try deps.publish_staged_resume_view(app, entry_id),
-            }
             app.shell.render_requests.request(.first_frame);
         }
     };
@@ -486,6 +484,7 @@ const TestCapture = struct {
     runtime_model_len: usize = 0,
     configured_effort: types.ReasoningEffort = .auto,
     configured_fast_mode: bool = false,
+    configured_fast_mode_model_bound: bool = false,
     initialize_required: bool = false,
     load_skills_workspace: []const u8 = "",
     load_skills_workspace_root_count: usize = 0,
@@ -640,8 +639,6 @@ fn testDeps() BootstrapDeps(TestApp) {
         .bootstrap_interactive_app = bootstrapInteractiveAppForTest,
         .configure_session_preferences = configureSessionPreferencesForTest,
         .initialize_persistence = initializePersistenceForTest,
-        .stage_requested_resume_view = stageRequestedResumeViewForTest,
-        .publish_staged_resume_view = publishStagedResumeViewForTest,
         .load_mcp_runtime = loadMcpRuntimeForTest,
         .load_skills = loadSkillsForTest,
         .skill_root_policy = .{
@@ -714,6 +711,7 @@ fn makeStartupState(alloc: Allocator) !app_lifecycle.StartupState {
     state.permission_mode = .auto;
     state.context_enabled = false;
     state.fast_mode = true;
+    state.fast_mode_model_bound = true;
     state.auto_upgrade = false;
     state.update_channel = .dev;
     state.effort = types.ReasoningEffort.literal("high");
@@ -734,16 +732,6 @@ fn initializePersistenceForTest(
 ) !void {
     _ = app;
     active_capture.?.initialize_required = required;
-}
-
-fn stageRequestedResumeViewForTest(_: *TestApp) app_session_runtime.ResumeViewStage {
-    active_capture.?.recordEvent("resume_view_stage");
-    return .{ .ready = 1 };
-}
-
-fn publishStagedResumeViewForTest(_: *TestApp, entry_id: u32) !void {
-    try std.testing.expectEqual(@as(u32, 1), entry_id);
-    active_capture.?.recordEvent("resume_view_publish");
 }
 
 fn loadMcpRuntimeForTest(_: Allocator, _: []const u8, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
@@ -791,6 +779,7 @@ fn configureSessionPreferencesForTest(
     selected_model: []const u8,
     effort: types.ReasoningEffort,
     fast_mode: bool,
+    fast_mode_model_bound: bool,
 ) !void {
     const capture = active_capture.?;
     capture.configured_model_len = @min(
@@ -812,6 +801,7 @@ fn configureSessionPreferencesForTest(
     );
     capture.configured_effort = effort;
     capture.configured_fast_mode = fast_mode;
+    capture.configured_fast_mode_model_bound = fast_mode_model_bound;
 }
 
 fn beginFreshPersistedSessionForTest(app: *TestApp) !void {
@@ -901,6 +891,7 @@ test "app_bootstrap_runtime transfers startup state and starts a fresh session" 
         capture.configured_effort,
     );
     try std.testing.expect(capture.configured_fast_mode);
+    try std.testing.expect(capture.configured_fast_mode_model_bound);
     try std.testing.expectEqual(
         update_target.Channel.dev,
         app.upgrader.channel(),
@@ -919,7 +910,7 @@ test "app_bootstrap_runtime transfers startup state and starts a fresh session" 
     try std.testing.expectEqualStrings("title", events[5]);
     try std.testing.expectEqual(@as(usize, 1), capture.begin_calls);
     try std.testing.expectEqual(@as(usize, 1), capture.enable_calls);
-    try std.testing.expectEqualStrings("workspace · model-x", capture.titleText());
+    try std.testing.expectEqualStrings("v" ++ build_options.app_version ++ " | workspace", capture.titleText());
 
     try std.testing.expectEqualStrings("/workspace", app.workspace_root);
     try std.testing.expectEqualStrings("api-key", app.auth.apiKey().?);
@@ -964,7 +955,7 @@ test "app_bootstrap_runtime opens onboarding before first frame without a creden
     try std.testing.expect(app.shell.render_requests.hasReason(.first_frame));
 }
 
-test "app_bootstrap_runtime stages requested sessions with the first frame pending" {
+test "app_bootstrap_runtime defers requested session loading until after bootstrap" {
     const alloc = std.testing.allocator;
     var capture = TestCapture.init(alloc);
     var app = TestApp.init(alloc);
@@ -983,13 +974,14 @@ test "app_bootstrap_runtime stages requested sessions with the first frame pendi
     try std.testing.expectEqualStrings("", app.transcript.items);
     try std.testing.expect(!app.transcript_recorded);
     const events = capture.eventSlice();
-    try std.testing.expectEqualStrings("resume_view_stage", events[0]);
-    try std.testing.expectEqualStrings("load_mcp", events[1]);
-    try std.testing.expectEqualStrings("load_skills", events[2]);
-    try std.testing.expectEqualStrings("resume_view_publish", events[3]);
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{ "load_mcp", "load_skills" },
+        events,
+    );
 }
 
-test "app_bootstrap_runtime publishes a staged resume view after startup notices" {
+test "app_bootstrap_runtime renders startup notices without a resume cache" {
     const alloc = std.testing.allocator;
     var capture = TestCapture.init(alloc);
     capture.emit_skill_diagnostic = true;
@@ -1002,12 +994,10 @@ test "app_bootstrap_runtime publishes a staged resume view after startup notices
     try std.testing.expectEqualSlices(
         []const u8,
         &.{
-            "resume_view_stage",
             "load_mcp",
             "load_skills",
             "welcome",
             "welcome",
-            "resume_view_publish",
         },
         capture.eventSlice(),
     );

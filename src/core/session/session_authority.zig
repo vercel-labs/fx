@@ -1,9 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
-const session = @import("session.zig");
 const session_event = @import("session_event.zig");
-const session_json = @import("session_json.zig");
 const session_log = @import("session_log.zig");
 const session_projection = @import("session_projection.zig");
 const Allocator = std.mem.Allocator;
@@ -33,34 +31,6 @@ const AuthorityMarker = struct {
     }
 };
 
-const LegacyFingerprint = struct {
-    schema: session_json.LegacySchemaVersion,
-    primary_bytes: u64,
-    primary_sha256: session_projection.Digest,
-};
-
-const AuthorityTransitionKind = enum {
-    session_create,
-    legacy_to_v3,
-};
-
-pub const AuthorityTransition = struct {
-    session_id: []u8,
-    kind: AuthorityTransitionKind,
-    authority_id: session_event.Identifier,
-    prior: ?LegacyFingerprint,
-    proposed: session_log.CommitPosition,
-
-    pub fn deinit(self: *AuthorityTransition, alloc: Allocator) void {
-        alloc.free(self.session_id);
-        self.* = undefined;
-    }
-};
-
-/// Shared front half of the two `classifyAuthority*` entry points: rejects a
-/// pending authority fence, then returns `.schema_v3` when a valid marker is
-/// present, or `null` when none is (caller decides legacy vs. orphan).
-/// Returns `error.InvalidSessionFormat` if the marker names a different session.
 fn classifyMarker(
     alloc: Allocator,
     session_dir: *io_mod.VerifiedDir,
@@ -200,143 +170,17 @@ pub fn loadAuthorityMarkerOptional(
 /// `authority.pending.json` transition exists for this session (the "fence"),
 /// so read paths refuse a directory mid-migration.
 pub fn requireAuthorityFenceAbsent(
-    alloc: Allocator,
+    _: Allocator,
     session_dir: *io_mod.VerifiedDir,
-    session_id: []const u8,
+    _: []const u8,
 ) !void {
-    const transition = try loadAuthorityTransitionOptional(
-        alloc,
-        session_dir,
-    ) orelse return;
-    var owned = transition;
-    defer owned.deinit(alloc);
-    if (!std.mem.eql(u8, owned.session_id, session_id)) {
-        return error.InvalidSessionFormat;
+    if (try entryExistsRelative(session_dir, "authority.pending.json")) {
+        return error.SessionAuthorityBoundaryUnavailable;
     }
-    return error.SessionAuthorityBoundaryUnavailable;
 }
 
 /// Reads and exact-parses `authority.pending.json` if present, returning null
 /// when absent. Caller owns the returned transition.
-pub fn loadAuthorityTransitionOptional(
-    alloc: Allocator,
-    session_dir: *io_mod.VerifiedDir,
-) !?AuthorityTransition {
-    const bytes = try readOptionalSessionFile(
-        alloc,
-        session_dir,
-        "authority.pending.json",
-        32 * 1024,
-    ) orelse return null;
-    defer alloc.free(bytes);
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{
-        .parse_numbers = false,
-    }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidSessionFormat,
-    };
-    defer parsed.deinit();
-    const expected_keys = [_][]const u8{
-        "schema_version",
-        "session_id",
-        "operation_id",
-        "kind",
-        "authority_id",
-        "prior",
-        "proposed",
-    };
-    const object = try exactJsonObject(parsed.value, &expected_keys);
-    if (try jsonU64(object, "schema_version") != 1) {
-        return error.InvalidSessionFormat;
-    }
-    const session_id = try alloc.dupe(u8, try objectString(object, "session_id"));
-    errdefer alloc.free(session_id);
-    try validateSessionId(session_id);
-    _ = try parseIdentifier(try objectString(object, "operation_id"));
-    const kind = std.meta.stringToEnum(
-        AuthorityTransitionKind,
-        try objectString(object, "kind"),
-    ) orelse return error.InvalidSessionFormat;
-    const authority_id = try parseIdentifier(
-        try objectString(object, "authority_id"),
-    );
-    const prior_value = object.get("prior") orelse
-        return error.InvalidSessionFormat;
-    const prior: ?LegacyFingerprint = switch (kind) {
-        .session_create => blk: {
-            if (prior_value != .null) return error.InvalidSessionFormat;
-            break :blk null;
-        },
-        .legacy_to_v3 => try parseLegacyFingerprint(prior_value),
-    };
-    return .{
-        .session_id = session_id,
-        .kind = kind,
-        .authority_id = authority_id,
-        .prior = prior,
-        .proposed = try parseProposedPosition(
-            object.get("proposed") orelse return error.InvalidSessionFormat,
-        ),
-    };
-}
-
-fn parseLegacyFingerprint(value: std.json.Value) error{InvalidSessionFormat}!LegacyFingerprint {
-    const expected_keys = [_][]const u8{
-        "storage_format",
-        "primary_bytes",
-        "primary_sha256",
-    };
-    const object = try exactJsonObject(value, &expected_keys);
-    const storage = try objectString(object, "storage_format");
-    const schema: session_json.LegacySchemaVersion =
-        if (std.mem.eql(u8, storage, "legacy_snapshot_v1"))
-            .v1
-        else if (std.mem.eql(u8, storage, "legacy_snapshot_v2"))
-            .v2
-        else
-            return error.InvalidSessionFormat;
-    return .{
-        .schema = schema,
-        .primary_bytes = try jsonU64(object, "primary_bytes"),
-        .primary_sha256 = try parseDigest(
-            try objectString(object, "primary_sha256"),
-        ),
-    };
-}
-
-fn parseProposedPosition(value: std.json.Value) error{InvalidSessionFormat}!session_log.CommitPosition {
-    const expected_keys = [_][]const u8{
-        "storage_format",
-        "log_generation",
-        "through_seq",
-        "through_event_id",
-        "through_event_log_bytes",
-    };
-    const object = try exactJsonObject(value, &expected_keys);
-    if (!std.mem.eql(
-        u8,
-        try objectString(object, "storage_format"),
-        "event_log_v1",
-    )) {
-        return error.InvalidSessionFormat;
-    }
-    return .{
-        .log_generation = try parseIdentifier(
-            try objectString(object, "log_generation"),
-        ),
-        .through_seq = try jsonU64(object, "through_seq"),
-        .through_event_id = try parseIdentifier(
-            try objectString(object, "through_event_id"),
-        ),
-        .through_event_log_bytes = try jsonU64(
-            object,
-            "through_event_log_bytes",
-        ),
-    };
-}
-
-/// Returns the object only if it has exactly `expected_keys` and no others,
-/// rejecting unknown/missing keys with `error.InvalidSessionFormat`.
 pub fn exactJsonObject(
     value: std.json.Value,
     expected_keys: []const []const u8,
@@ -358,134 +202,6 @@ pub fn exactJsonObject(
     return value.object;
 }
 
-fn parseDigest(raw: []const u8) error{InvalidSessionFormat}!session_projection.Digest {
-    if (raw.len != @sizeOf(session_projection.Digest) * 2) {
-        return error.InvalidSessionFormat;
-    }
-    var result: session_projection.Digest = undefined;
-    _ = std.fmt.hexToBytes(&result, raw) catch
-        return error.InvalidSessionFormat;
-    const canonical = std.fmt.bytesToHex(result, .lower);
-    if (!std.mem.eql(u8, &canonical, raw)) {
-        return error.InvalidSessionFormat;
-    }
-    return result;
-}
-
-fn legacyFingerprintMatches(
-    alloc: Allocator,
-    bytes: []const u8,
-    expected: LegacyFingerprint,
-) !bool {
-    if (bytes.len != expected.primary_bytes) return false;
-    const schema = session_json.parseLegacySchemaVersion(
-        alloc,
-        bytes,
-    ) catch return false;
-    if (schema != expected.schema) return false;
-    const digest = session_projection.sha256(bytes);
-    return std.mem.eql(u8, &digest, &expected.primary_sha256);
-}
-
-/// Asserts a parsed transition names `session_id`; otherwise `error.InvalidSessionFormat`.
-pub fn requireAuthorityTransitionSession(
-    transition: AuthorityTransition,
-    session_id: []const u8,
-) !void {
-    if (!std.mem.eql(u8, transition.session_id, session_id)) {
-        return error.InvalidSessionFormat;
-    }
-}
-
-fn legacyPrimaryBytes(
-    alloc: Allocator,
-    session_dir: *io_mod.VerifiedDir,
-    name: []const u8,
-    expected: LegacyFingerprint,
-) !?[]u8 {
-    const max_bytes = std.math.cast(
-        usize,
-        std.math.add(u64, expected.primary_bytes, 1) catch
-            return error.LegacySessionMigrationResourceExhausted,
-    ) orelse return error.LegacySessionMigrationResourceExhausted;
-    const bytes = try readOptionalSessionFile(
-        alloc,
-        session_dir,
-        name,
-        max_bytes,
-    ) orelse return null;
-    errdefer alloc.free(bytes);
-    if (!try legacyFingerprintMatches(alloc, bytes, expected)) {
-        alloc.free(bytes);
-        return null;
-    }
-    return bytes;
-}
-
-fn removeSessionEntryIfPresent(
-    session_dir: *io_mod.VerifiedDir,
-    name: []const u8,
-) !void {
-    session_dir.dir.deleteFile(io_mod.getIo(), name) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => return err,
-    };
-}
-
-/// Rolls an interrupted migration back to its legacy snapshot: restores the
-/// fingerprint-matched primary from the stable copy, removes the v3 marker, and
-/// clears the intent. Inconsistent on-disk state yields
-/// `error.LegacySessionMigrationIndeterminate`.
-pub fn restoreLegacyAuthority(
-    alloc: Allocator,
-    writable: *session_log.WritableSessionDir,
-    transition: AuthorityTransition,
-) !void {
-    const prior = transition.prior orelse return error.InvalidSessionFormat;
-    const current = try legacyPrimaryBytes(
-        alloc,
-        &writable.dir,
-        "session.json",
-        prior,
-    );
-    if (current) |bytes| {
-        alloc.free(bytes);
-    } else {
-        const stable = try legacyPrimaryBytes(
-            alloc,
-            &writable.dir,
-            "session.legacy.json",
-            prior,
-        ) orelse return error.LegacySessionMigrationIndeterminate;
-        defer alloc.free(stable);
-        io_mod.durableReplaceVerified(
-            alloc,
-            &writable.dir,
-            "session.json",
-            stable,
-        ) catch return error.LegacySessionMigrationIndeterminate;
-    }
-    removeSessionEntryIfPresent(&writable.dir, "authority.json") catch
-        return error.LegacySessionMigrationIndeterminate;
-    io_mod.syncVerifiedDir(writable.dir.dir) catch
-        return error.LegacySessionMigrationIndeterminate;
-    const confirmed = try legacyPrimaryBytes(
-        alloc,
-        &writable.dir,
-        "session.json",
-        prior,
-    ) orelse return error.LegacySessionMigrationIndeterminate;
-    alloc.free(confirmed);
-    if (try entryExistsRelative(&writable.dir, "authority.json")) {
-        return error.LegacySessionMigrationIndeterminate;
-    }
-    deleteSessionEntry(&writable.dir, "authority.pending.json") catch
-        return error.SessionAuthorityIntentCleanupPending;
-}
-
-/// Reads an in-session file fully, capped at `max_bytes`. Returns null if the
-/// file is absent; read/parse failures collapse to `error.InvalidSessionFormat`
-/// (except `OutOfMemory`). Caller owns the returned bytes.
 pub fn readOptionalSessionFile(
     alloc: Allocator,
     session_dir: *io_mod.VerifiedDir,
@@ -694,45 +410,7 @@ pub fn parseIdentifier(raw: []const u8) error{InvalidSessionFormat}!session_even
     return result;
 }
 
-/// Structural equality of two commit positions.
-pub fn positionsEqual(
-    left: session_log.CommitPosition,
-    right: session_log.CommitPosition,
-) bool {
-    return std.mem.eql(u8, &left.log_generation, &right.log_generation) and
-        left.through_seq == right.through_seq and
-        std.mem.eql(u8, &left.through_event_id, &right.through_event_id) and
-        left.through_event_log_bytes == right.through_event_log_bytes;
-}
-
-/// Structural equality of two parsed transitions, including the optional prior
-/// legacy fingerprint.
-pub fn authorityTransitionsEqual(
-    left: AuthorityTransition,
-    right: AuthorityTransition,
-) bool {
-    if (!std.mem.eql(u8, left.session_id, right.session_id) or
-        left.kind != right.kind or
-        !std.mem.eql(u8, &left.authority_id, &right.authority_id) or
-        !positionsEqual(left.proposed, right.proposed) or
-        (left.prior == null) != (right.prior == null))
-    {
-        return false;
-    }
-    if (left.prior) |left_prior| {
-        const right_prior = right.prior.?;
-        return left_prior.schema == right_prior.schema and
-            left_prior.primary_bytes == right_prior.primary_bytes and
-            std.mem.eql(
-                u8,
-                &left_prior.primary_sha256,
-                &right_prior.primary_sha256,
-            );
-    }
-    return true;
-}
-
-/// Deletes an in-session file and fsyncs the directory so the removal is durable.
+/// Deletes one obsolete legacy-session file and syncs the directory.
 pub fn deleteSessionEntry(
     session_dir: *io_mod.VerifiedDir,
     name: []const u8,
@@ -750,13 +428,4 @@ pub fn readExactLegacyFile(
     const limit = std.math.add(u64, size, 1) catch return error.OutOfMemory;
     const max_bytes = std.math.cast(usize, limit) orelse return error.OutOfMemory;
     return io_mod.readFileToEnd(alloc, file, max_bytes);
-}
-
-/// Normalizes a canonical-replay `OutOfMemory` into
-/// `error.SessionReplayResourceExhausted`; passes every other error through.
-pub fn mapReplayError(err: anyerror) anyerror {
-    return switch (err) {
-        error.OutOfMemory => error.SessionReplayResourceExhausted,
-        else => err,
-    };
 }

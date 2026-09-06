@@ -157,6 +157,7 @@ pub fn call(
             err,
         ) };
     };
+    if (result.images.len > 0) return .{ .rich = .{ .text = result.model_output, .images = result.images } };
     return .{ .success = result.model_output };
 }
 
@@ -357,6 +358,7 @@ test "MCP feature input-required remains a typed terminal result" {
     var result = try call(ctx, input);
     defer result.deinit(alloc);
     switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .failure => |body| try std.testing.expect(isInputRequiredFailure(body)),
         .success => return error.TestUnexpectedResult,
     }

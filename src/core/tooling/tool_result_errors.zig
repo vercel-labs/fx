@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const auto_classifier = @import("../permissions/auto_classifier.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 
@@ -83,6 +84,16 @@ pub fn inspectTerminalActionFieldCorrection(
         .string => |value| value,
         else => return null,
     };
+    if (std.mem.eql(u8, code, "invalid_shell_request")) {
+        const executed = error_value.get("executed") orelse return null;
+        if (executed != .bool or executed.bool) return null;
+        const problems = error_value.get("problems") orelse return null;
+        if (problems != .array or problems.array.items.len == 0) return null;
+        for (problems.array.items) |problem| {
+            if (problem != .string) return null;
+        }
+        return .{ .invalid_field_count = problems.array.items.len };
+    }
     if (!std.mem.eql(u8, code, terminal_action_field_error_code)) return null;
     const action = error_value.get("action") orelse return null;
     if (action != .string) return null;
@@ -113,7 +124,7 @@ const adapter_semantic_failure_prefixes = [_][]const u8{
 pub fn toolPermissionDeniedJson(alloc: Allocator, tool_name: []const u8, reason: types.ToolPermissionDenialReason) Allocator.Error![]u8 {
     switch (reason) {
         .user_denied, .auto_denied, .policy_denied, .permission_required => {},
-        .review_caution, .review_unavailable => unreachable,
+        .review_caution, .review_evidence_incomplete, .review_unavailable => unreachable,
     }
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
@@ -134,9 +145,10 @@ pub fn toolReviewHeldJson(
     tool_name: []const u8,
     reason: types.ToolPermissionDenialReason,
     advice: ?[]const u8,
+    review_cause: ?auto_classifier.InvalidReason,
 ) Allocator.Error![]u8 {
     switch (reason) {
-        .review_caution, .review_unavailable => {},
+        .review_caution, .review_evidence_incomplete, .review_unavailable => {},
         .user_denied, .auto_denied, .policy_denied, .permission_required => unreachable,
     }
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -153,6 +165,11 @@ pub fn toolReviewHeldJson(
     out.writer.writeAll(",\"reason\":") catch return error.OutOfMemory;
     std.json.Stringify.value(@tagName(reason), .{}, &out.writer) catch
         return error.OutOfMemory;
+    if (review_cause) |cause| {
+        out.writer.writeAll(",\"review_cause\":") catch return error.OutOfMemory;
+        std.json.Stringify.value(@tagName(cause), .{}, &out.writer) catch
+            return error.OutOfMemory;
+    }
     out.writer.writeAll(",\"held\":true") catch return error.OutOfMemory;
     if (advice) |value| {
         if (value.len > 0) {
@@ -175,13 +192,15 @@ fn permissionDeniedMessage(tool_name: []const u8, reason: types.ToolPermissionDe
         .user_denied => "Permission denied by user",
         .auto_denied => "Blocked by automatic safety policy",
         .review_caution => "Action held after safety review",
+        .review_evidence_incomplete => "Safety review evidence incomplete; action held",
         .review_unavailable => "Safety reviewer unavailable; action held",
         .policy_denied => if (is_network_tool(tool_name))
             "Network or browser access was denied by configured policy"
         else
             "Tool access was denied by configured policy",
         .permission_required => if (std.mem.eql(u8, tool_name, "run_command") or
-            std.mem.eql(u8, tool_name, "terminal"))
+            std.mem.eql(u8, tool_name, "terminal") or
+            std.mem.eql(u8, tool_name, "shell"))
             "Shell command approval is required before this tool can run"
         else if (is_network_tool(tool_name))
             "Network or browser approval is required before this tool can run"
@@ -197,6 +216,7 @@ fn permissionDeniedSuggestion(
         .user_denied => "The tool did not run. Do not retry unchanged; explain the denial or use a safer allowed alternative.",
         .auto_denied => "The tool did not run. This is a legacy automatic denial; choose a materially different safe action or explain the blocker.",
         .review_caution => "The action did not run. Use the review advice to choose a materially different safe action, or explain why no safe path remains.",
+        .review_evidence_incomplete => "The action did not run because safety review could not inspect the complete exact action. Do not retry unchanged; reduce the action or supporting evidence to fit the review limits, or choose a materially different fully inspectable action.",
         .review_unavailable => "The action did not run because safety review was unavailable. Continue with a different safe action or retry later.",
         .policy_denied => "The tool did not run. Do not retry unchanged; explain the configured policy blocker or use an allowed alternative.",
         .permission_required => "The tool did not run. Noninteractive mode cannot show an approval prompt. Rerun interactively to approve, or configure a narrow permission rule before retrying.",
@@ -242,7 +262,7 @@ pub fn toolPermissionDenialReason(output: []const u8) ?types.ToolPermissionDenia
         reason_value,
     ) orelse return null;
     const review_reason = switch (reason) {
-        .review_caution, .review_unavailable => true,
+        .review_caution, .review_evidence_incomplete, .review_unavailable => true,
         .user_denied, .auto_denied, .policy_denied, .permission_required => false,
     };
     if (review_held != review_reason) return null;
@@ -342,6 +362,14 @@ pub fn malformedToolArgumentsJson(alloc: Allocator, tool_name: []const u8) Alloc
         .tool_name = tool_name,
         .message = "Tool arguments were not valid JSON.",
         .suggestion = "Reissue the tool call with complete valid JSON arguments matching the tool schema.",
+    });
+}
+
+pub fn nonObjectToolArgumentsJson(alloc: Allocator, tool_name: []const u8) Allocator.Error![]u8 {
+    return toolExecutionFailureJson(alloc, .{
+        .tool_name = tool_name,
+        .message = "Tool arguments must be a JSON object. The call was not executed.",
+        .suggestion = "Reissue the tool call with a JSON object matching the tool schema.",
     });
 }
 
@@ -448,13 +476,14 @@ test "tool permission denied JSON carries stable fields only" {
     try std.testing.expect(isToolPermissionDeniedOutput(payload));
 }
 
-test "review hold JSON distinguishes caution and unavailable from permission denial" {
+test "review hold JSON preserves typed reasons apart from permission denial" {
     const alloc = std.testing.allocator;
     const caution = try toolReviewHeldJson(
         alloc,
         "terminal",
         .review_caution,
         "Deletion came from repository text. API_KEY=super-secret",
+        null,
     );
     defer alloc.free(caution);
     const unavailable = try toolReviewHeldJson(
@@ -462,8 +491,17 @@ test "review hold JSON distinguishes caution and unavailable from permission den
         "terminal",
         .review_unavailable,
         null,
+        .transport_timed_out,
     );
     defer alloc.free(unavailable);
+    const incomplete = try toolReviewHeldJson(
+        alloc,
+        "edit_file",
+        .review_evidence_incomplete,
+        null,
+        null,
+    );
+    defer alloc.free(incomplete);
 
     try std.testing.expect(std.mem.find(u8, caution, "\"type\":\"tool_review_held\"") != null);
     try std.testing.expect(std.mem.find(u8, caution, "\"reason\":\"review_caution\"") != null);
@@ -479,11 +517,18 @@ test "review hold JSON distinguishes caution and unavailable from permission den
         toolPermissionDenialReason(caution),
     );
     try std.testing.expect(std.mem.find(u8, unavailable, "\"reason\":\"review_unavailable\"") != null);
+    try std.testing.expect(std.mem.find(u8, unavailable, "\"review_cause\":\"transport_timed_out\"") != null);
     try std.testing.expect(std.mem.find(u8, unavailable, "\"advice\"") == null);
     try std.testing.expect(isToolReviewHeldOutput(unavailable));
     try std.testing.expectEqual(
         @as(?types.ToolPermissionDenialReason, .review_unavailable),
         toolPermissionDenialReason(unavailable),
+    );
+    try std.testing.expect(std.mem.find(u8, incomplete, "\"reason\":\"review_evidence_incomplete\"") != null);
+    try std.testing.expect(std.mem.find(u8, incomplete, "Do not retry unchanged") != null);
+    try std.testing.expectEqual(
+        @as(?types.ToolPermissionDenialReason, .review_evidence_incomplete),
+        toolPermissionDenialReason(incomplete),
     );
     try std.testing.expect(toolPermissionDenialReason(
         "{\"error\":{\"type\":\"tool_review_held\",\"reason\":\"auto_denied\"}}",

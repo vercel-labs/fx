@@ -30,12 +30,38 @@ pub fn readLineAt(
     offset: u64,
     max_end: u64,
 ) !?LineRead {
+    return readLineAtWithCancellation(alloc, file, offset, max_end, null);
+}
+
+pub fn readLineAtCancellable(
+    alloc: Allocator,
+    file: std.Io.File,
+    offset: u64,
+    max_end: u64,
+    cancelled: *const std.atomic.Value(bool),
+) !?LineRead {
+    return readLineAtWithCancellation(alloc, file, offset, max_end, cancelled);
+}
+
+fn readLineAtWithCancellation(
+    alloc: Allocator,
+    file: std.Io.File,
+    offset: u64,
+    max_end: u64,
+    cancelled: ?*const std.atomic.Value(bool),
+) !?LineRead {
+    if (cancelled) |stop| {
+        if (stop.load(.acquire)) return error.Cancelled;
+    }
     if (offset >= max_end) return null;
     var line: std.ArrayList(u8) = .empty;
     errdefer line.deinit(alloc);
     var cursor = offset;
     var chunk: [8192]u8 = undefined;
     while (cursor < max_end) {
+        if (cancelled) |stop| {
+            if (stop.load(.acquire)) return error.Cancelled;
+        }
         const limit = @min(@as(u64, chunk.len), max_end - cursor);
         const count = try file.readPositionalAll(
             io_mod.getIo(),
@@ -67,6 +93,35 @@ pub fn readLineAt(
 }
 
 pub fn readFirstGeneration(alloc: Allocator, file: std.Io.File) !Identifier {
+    var envelope = try readSessionStarted(alloc, file);
+    defer envelope.deinit(alloc);
+    return envelope.log_generation;
+}
+
+test "cancelled event reads release work before reading another frame" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "events.jsonl", .{ .read = true });
+    defer file.close(std.testing.io);
+    const bytes = "{\"event\":1}\n";
+    try file.writeStreamingAll(std.testing.io, bytes);
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, readLineAtCancellable(alloc, file, 0, bytes.len, &cancelled));
+    cancelled.store(false, .release);
+    const line = (try readLineAtCancellable(alloc, file, 0, bytes.len, &cancelled)).?;
+    defer alloc.free(line.bytes);
+    try std.testing.expectEqualStrings(bytes, line.bytes);
+    try std.testing.expectEqual(@as(u64, bytes.len), line.next_offset);
+}
+
+pub fn readSubagentChildIdentity(alloc: Allocator, file: std.Io.File) !bool {
+    var envelope = try readSessionStarted(alloc, file);
+    defer envelope.deinit(alloc);
+    return envelope.event.session_started.subagent_child;
+}
+
+fn readSessionStarted(alloc: Allocator, file: std.Io.File) !session_event.Envelope {
     const length = try file.length(io_mod.getIo());
     const first = try readLineAt(alloc, file, 0, length) orelse
         return error.InvalidSessionFormat;
@@ -76,11 +131,11 @@ pub fn readFirstGeneration(alloc: Allocator, file: std.Io.File) !Identifier {
         error.UnsupportedEventSchema => return error.UnsupportedSessionSchema,
         else => return error.InvalidSessionFormat,
     };
-    defer envelope.deinit(alloc);
+    errdefer envelope.deinit(alloc);
     if (envelope.seq != 1 or envelope.kind() != .session_started) {
         return error.InvalidSessionFormat;
     }
-    return envelope.log_generation;
+    return envelope;
 }
 
 pub fn scanCommitPosition(
@@ -182,8 +237,47 @@ pub fn replayExactPosition(
     expected_seq: u64,
     expected_bytes: u64,
 ) !ExactReplay {
-    if (expected_bytes == 0 or
-        try file.length(io_mod.getIo()) != expected_bytes)
+    return replayPosition(
+        alloc,
+        file,
+        expected_generation,
+        expected_seq,
+        expected_bytes,
+        true,
+    );
+}
+
+/// Replays an explicitly committed prefix while ignoring later bytes. This is
+/// used only by the read-only legacy importer; current sessions never need a
+/// watermark or a generation boundary.
+pub fn replayCommittedPrefix(
+    alloc: Allocator,
+    file: std.Io.File,
+    expected_generation: Identifier,
+    expected_seq: u64,
+    expected_bytes: u64,
+) !ExactReplay {
+    return replayPosition(
+        alloc,
+        file,
+        expected_generation,
+        expected_seq,
+        expected_bytes,
+        false,
+    );
+}
+
+fn replayPosition(
+    alloc: Allocator,
+    file: std.Io.File,
+    expected_generation: Identifier,
+    expected_seq: u64,
+    expected_bytes: u64,
+    require_exact_length: bool,
+) !ExactReplay {
+    const file_bytes = try file.length(io_mod.getIo());
+    if (expected_bytes == 0 or file_bytes < expected_bytes or
+        (require_exact_length and file_bytes != expected_bytes))
     {
         return failExactReplay(error.InvalidSessionFormat);
     }
@@ -423,7 +517,7 @@ test "session replay parser honors exact copied boundary" {
     const generation: Identifier = .{0x10} ** 16;
     const first_id: Identifier = .{0x20} ** 16;
     const second_id: Identifier = .{0x30} ** 16;
-    const first = try session_event.encodeFrame(alloc, .{
+    const first = try session_event.encodeLegacyFixtureFrame(alloc, .{
         .log_generation = generation,
         .seq = 1,
         .event_id = first_id,
@@ -442,7 +536,7 @@ test "session replay parser honors exact copied boundary" {
         } },
     });
     defer alloc.free(first);
-    const second = try session_event.encodeFrame(alloc, .{
+    const second = try session_event.encodeLegacyFixtureFrame(alloc, .{
         .log_generation = generation,
         .seq = 2,
         .event_id = second_id,
@@ -475,6 +569,26 @@ test "session replay parser honors exact copied boundary" {
     defer state.deinit(alloc);
     try std.testing.expectEqualStrings("replay-boundary", state.id);
     try std.testing.expect(!state.preferences.fast_mode);
+    try std.testing.expectError(
+        error.InvalidSessionFormat,
+        replayExactPosition(
+            alloc,
+            file,
+            generation,
+            copied.through_seq,
+            copied.through_event_log_bytes,
+        ),
+    );
+    var imported = try replayCommittedPrefix(
+        alloc,
+        file,
+        generation,
+        copied.through_seq,
+        copied.through_event_log_bytes,
+    );
+    defer imported.deinit(alloc);
+    try std.testing.expectEqualStrings("replay-boundary", imported.state.id);
+    try std.testing.expect(!imported.state.preferences.fast_mode);
 
     const complete = CommitPosition{
         .log_generation = generation,
@@ -613,7 +727,7 @@ test "session replay parser frees line allocation on every caller path" {
     const alloc = std.testing.allocator;
     const generation: Identifier = .{0x80} ** 16;
     const event_id: Identifier = .{0x90} ** 16;
-    const frame = try session_event.encodeFrame(alloc, .{
+    const frame = try session_event.encodeLegacyFixtureFrame(alloc, .{
         .log_generation = generation,
         .seq = 1,
         .event_id = event_id,

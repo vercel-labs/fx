@@ -8,7 +8,7 @@ const Allocator = std.mem.Allocator;
 const max_prompt_bytes: usize = 4 * 1024;
 const header =
     "Configured MCP servers visible to this model turn are listed below.\n" ++
-    "A listed server is not a reason to use MCP. Use capability_search only when the task clearly needs a capability not already available locally. Pass the natural-language task and an optional exact server alias; the runtime owns routing and catalog traversal. Then select one exact relevant MCP result with mcp_select_tool. Do not guess identities, preload schemas, or repeat a no-match search.\n" ++
+    "A listed server is not a reason to use MCP. Use capability_search only when the task clearly needs a capability not already available locally. Pass the task and an optional exact server name. Call tools advertised after search directly. Use mcp_select_tool when a relevant result is not yet callable. Use returned identities and refine the query when needed.\n" ++
     "<mcp_servers>\n";
 const footer = "</mcp_servers>\n";
 const empty_entry = "  <none />\n";
@@ -252,7 +252,7 @@ test "render exposes sorted server summaries without tool metadata" {
 
     try std.testing.expectEqualStrings(
         "Configured MCP servers visible to this model turn are listed below.\n" ++
-            "A listed server is not a reason to use MCP. Use capability_search only when the task clearly needs a capability not already available locally. Pass the natural-language task and an optional exact server alias; the runtime owns routing and catalog traversal. Then select one exact relevant MCP result with mcp_select_tool. Do not guess identities, preload schemas, or repeat a no-match search.\n" ++
+            "A listed server is not a reason to use MCP. Use capability_search only when the task clearly needs a capability not already available locally. Pass the task and an optional exact server name. Call tools advertised after search directly. Use mcp_select_tool when a relevant result is not yet callable. Use returned identities and refine the query when needed.\n" ++
             "<mcp_servers>\n" ++
             "  <server name=\"alpha\" state=\"ready\" tools=\"2\" />\n" ++
             "  <server name=\"zeta\" state=\"authentication_required\" />\n" ++

@@ -127,8 +127,9 @@ fn isHttpToken(value: []const u8) bool {
 }
 
 pub fn validateToolInputSchemaHeaders(alloc: Allocator, schema_json: []const u8) !void {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{}) catch {
-        return error.InvalidToolInputSchema;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidToolInputSchema,
     };
     defer parsed.deinit();
     try validateToolInputSchemaValue(alloc, parsed.value);

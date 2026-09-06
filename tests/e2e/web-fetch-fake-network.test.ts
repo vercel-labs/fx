@@ -200,6 +200,7 @@ class AcpClient {
   private lines: string[] = [];
   private waiters: Array<(line: string) => void> = [];
   private closed = false;
+  private activeSessionId: string | null = null;
 
   private constructor(private proc: ChildProcess) {
     proc.stdout!.on("data", (chunk: Buffer) => {
@@ -232,7 +233,23 @@ class AcpClient {
   }
 
   send(message: object) {
-    this.proc.stdin!.write(`${JSON.stringify(message)}\n`);
+    let outgoing = message as any;
+    if (
+      this.activeSessionId !== null &&
+      [
+        "session/prompt",
+        "session/cancel",
+        "session/set_mode",
+        "session/set_config_option",
+      ].includes(outgoing.method) &&
+      outgoing.params?.sessionId === undefined
+    ) {
+      outgoing = {
+        ...outgoing,
+        params: { ...(outgoing.params ?? {}), sessionId: this.activeSessionId },
+      };
+    }
+    this.proc.stdin!.write(`${JSON.stringify(outgoing)}\n`);
   }
 
   async readLine(timeoutMs = TIMEOUT): Promise<any> {
@@ -253,7 +270,18 @@ class AcpClient {
 
   async request(method: string, params: object, id: number) {
     this.send({ jsonrpc: "2.0", id, method, params });
-    return this.readLine();
+    let response: any;
+    do {
+      response = await this.readLine();
+    } while (response.id !== id);
+    if (
+      response.error === undefined &&
+      method === "session/new" &&
+      typeof response.result?.sessionId === "string"
+    ) {
+      this.activeSessionId = response.result.sessionId;
+    }
+    return response;
   }
 
   async close() {
@@ -536,11 +564,22 @@ describe("web_fetch Gateway fixture", () => {
           (message) =>
             message.method === "session/update" &&
             message.params?.update?.sessionUpdate === "tool_call" &&
-            message.params.update.kind === "read" &&
-            message.params.update.title === "Fetching",
+            message.params.update.toolCallId === "fetch_outer_1",
         );
 
         expect(fetchStarts).toHaveLength(1);
+        expect(fetchStarts[0]?.params.update).toEqual({
+          sessionUpdate: "tool_call",
+          toolCallId: "fetch_outer_1",
+          name: "web_fetch",
+          title: "Fetching",
+          kind: "fetch",
+          status: "pending",
+          rawInput: {
+            url: "https://example.com/docs",
+            prompt: "legacy",
+          },
+        });
       } finally {
         await client.close();
         gateway.stop();

@@ -50,11 +50,15 @@ pub const ToolFallbackDisposition = enum {
 
 pub const ToolDetailRecord = struct {
     entry_id: u32,
+    // Recorded identities are archival and cannot pin live output.
+    origin: enum { live, recorded } = .live,
     created_at_ms: i64 = 0,
     tool_name: []u8,
     captured_command: bool = false,
     activity_kind: ?types.ToolActivityKind = null,
     arguments_json: ?[]u8 = null,
+    command_display: ?[]u8 = null,
+    command_action_label: ?[]u8 = null,
     result: ?[]u8 = null,
     result_handle: ?[]u8 = null,
     command_artifact_handle: ?[]u8 = null,
@@ -75,6 +79,8 @@ pub const ToolDetailRecord = struct {
     pub fn deinit(self: *ToolDetailRecord, alloc: std.mem.Allocator) void {
         alloc.free(self.tool_name);
         if (self.arguments_json) |value| alloc.free(value);
+        if (self.command_display) |value| alloc.free(value);
+        if (self.command_action_label) |value| alloc.free(value);
         if (self.result) |value| alloc.free(value);
         if (self.result_handle) |value| alloc.free(value);
         if (self.command_artifact_handle) |value| alloc.free(value);
@@ -119,6 +125,7 @@ pub const RawEntryClass = enum {
     command_output,
     diff_block,
     question_resolution,
+    turn_cancellation,
     subagent_status,
     unknown_raw,
 };
@@ -189,6 +196,7 @@ pub fn blockKindForRawClass(class: RawEntryClass) TranscriptBlockKind {
         .command_output => .command_output,
         .diff_block => .diff_block,
         .question_resolution => .cancel_notice,
+        .turn_cancellation => .cancel_notice,
         .subagent_status => .subagent_status,
         .unknown_raw => .unknown_raw,
     };
@@ -220,9 +228,8 @@ fn blockKindForEntry(entry: TranscriptEntry) TranscriptBlockKind {
 
 pub fn isEntryVisibleInCompactPresentation(entry: TranscriptEntry) bool {
     return switch (entry) {
-        .raw_bytes => true,
-        .semantic_notice => |notice| notice.visibility == .compact_and_full,
-        else => true,
+        .semantic_notice => |notice| !notice.inline_hidden and notice.visibility == .compact_and_full,
+        inline else => |payload| !payload.inline_hidden,
     };
 }
 
@@ -248,6 +255,7 @@ pub fn entryClassForEntry(entry: TranscriptEntry) TranscriptEntryClass {
             .command_output => .command_output,
             .diff_block => .diff_block,
             .question_resolution => .cancel_notice,
+            .turn_cancellation => .cancel_notice,
             .subagent_status => .subagent_status,
             .unknown_raw => .unknown_raw,
         },
@@ -310,6 +318,7 @@ pub const TranscriptEntry = union(enum) {
     pub const RawBytesEntry = struct {
         id: u32,
         created_at_ms: i64 = 0,
+        inline_hidden: bool = false,
         bytes: []const u8,
         class: RawEntryClass = .unknown_raw,
         lifecycle_pinned: bool = false,
@@ -318,6 +327,7 @@ pub const TranscriptEntry = union(enum) {
     pub const SemanticNoticeEntry = struct {
         id: u32,
         created_at_ms: i64 = 0,
+        inline_hidden: bool = false,
         topic: []const u8,
         tone: types.NoticeTone,
         body: []const u8,
@@ -330,6 +340,7 @@ pub const TranscriptEntry = union(enum) {
     pub const UserTurnEntry = struct {
         id: u32,
         created_at_ms: i64 = 0,
+        inline_hidden: bool = false,
         turn: types.UserTurn,
         skill_tokens: []input_visual_layout.SkillTokenSpan = &.{},
     };
@@ -337,25 +348,35 @@ pub const TranscriptEntry = union(enum) {
     pub const AssistantTurnEntry = struct {
         id: u32,
         created_at_ms: i64 = 0,
+        inline_hidden: bool = false,
         segments: AssistantTurnSegments,
     };
 
     pub const AssistantTableEntry = struct {
         id: u32,
         created_at_ms: i64 = 0,
+        inline_hidden: bool = false,
         table: assistant_presentation.TablePayload,
     };
 
     pub const AssistantCodeBlockEntry = struct {
         id: u32,
         created_at_ms: i64 = 0,
+        inline_hidden: bool = false,
         block: assistant_presentation.CodeBlockPayload,
     };
 
     pub const AssistantThematicRuleEntry = struct {
         id: u32,
         created_at_ms: i64 = 0,
+        inline_hidden: bool = false,
     };
+
+    pub fn hideInline(self: *TranscriptEntry) void {
+        switch (self.*) {
+            inline else => |*payload| payload.inline_hidden = true,
+        }
+    }
 
     pub fn id(self: TranscriptEntry) u32 {
         return switch (self) {
@@ -1408,6 +1429,8 @@ fn noticeLabelStyle(styles: Styles, tone: types.NoticeTone) []const u8 {
 
 fn noticeContinuationIndent(text: []const u8, cursor: usize, cols: u16) usize {
     if (cols <= 2 or cursor >= text.len) return 0;
+    const line_start = cursor > 0 and (text[cursor - 1] == '\n' or text[cursor - 1] == '\r');
+    if (line_start and (std.mem.startsWith(u8, text[cursor..], "├ ") or std.mem.startsWith(u8, text[cursor..], "└ "))) return 0;
     if (text[cursor] == '\n' or text[cursor] == '\r') return 2;
     const unit = display_width.displayUnitAt(text, cursor);
     return if (unit.cell_width <= cols - 2) 2 else 0;
@@ -2091,7 +2114,7 @@ fn renderEntriesInterruptible(
 
     for (entries, 0..) |entry, entry_index| {
         try build_checkpoint.tick(checkpoint);
-        if (options.shouldOmit(entry_index, entry)) continue;
+        if (!isEntryVisibleInCompactPresentation(entry) or options.shouldOmit(entry_index, entry)) continue;
         if (options.overrideForEntry(entry_index, entry)) |override| {
             const block = try normalizeRenderedBlockTail(
                 alloc,
@@ -2568,6 +2591,10 @@ pub fn footerBoundaryGapRowsForTail(kind: ?TranscriptBlockKind) u16 {
 }
 
 test "footer boundary gap applies to response-like and notice tail blocks" {
+    try std.testing.expectEqual(
+        TranscriptBlockKind.cancel_notice,
+        blockKindForRawClass(.turn_cancellation),
+    );
     try std.testing.expectEqual(@as(u16, 1), footerBoundaryGapRowsForTail(.assistant_turn));
     try std.testing.expectEqual(@as(u16, 1), footerBoundaryGapRowsForTail(.turn_summary));
     try std.testing.expectEqual(@as(u16, 1), footerBoundaryGapRowsForTail(.tool_status));
@@ -2824,6 +2851,33 @@ test "background semantic notices render one topic for launch and failure" {
         try std.testing.expect(std.mem.find(u8, rendered, "System: Background") == null);
         try std.testing.expect(std.mem.find(u8, rendered, "Background: Background") == null);
     }
+}
+
+test "semantic notice tree branches align with the header while wrapped prose stays indented" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { body: []const u8, cols: u16, expected: []const u8 }{
+        .{ .body = "2 skills loaded\n├ Loaded alpha\n└ Loaded beta", .cols = 40, .expected = "● 2 skills loaded\n├ Loaded alpha\n└ Loaded beta" },
+        .{ .body = "Ready\n└ alpha beta gamma", .cols = 12, .expected = "● Ready\n└ alpha beta\n  gamma" },
+        .{ .body = "alpha └ beta", .cols = 8, .expected = "● alpha\n  └ beta" },
+        .{ .body = "Ready\nordinary prose", .cols = 40, .expected = "● Ready\n  ordinary prose" },
+    };
+    for (cases) |case| {
+        const rendered = try renderSemanticNotice(alloc, .{ .topic = "", .tone = .neutral, .body = case.body }, .{}, case.cols);
+        defer alloc.free(rendered);
+        try std.testing.expectEqualStrings(case.expected, rendered);
+    }
+    const styled = try renderSemanticNotice(alloc, .{
+        .topic = "",
+        .tone = .neutral,
+        .body = cases[0].body,
+    }, .{ .system_notice_text_style = "\x1b[37m", .reset_style = "\x1b[0m" }, 40);
+    defer alloc.free(styled);
+    var grid = try vt_emulator.Grid.init(alloc, 40, 4);
+    defer grid.deinit();
+    try grid.feed(styled);
+    try std.testing.expectEqual(@as(u21, '●'), grid.cellAt(1, 1).?.codepoint);
+    try std.testing.expectEqual(@as(u21, '├'), grid.cellAt(2, 1).?.codepoint);
+    try std.testing.expectEqual(@as(u21, '└'), grid.cellAt(3, 1).?.codepoint);
 }
 
 test "semantic notice wraps words paths UTF-8 and explicit newlines without truncation" {
@@ -4004,6 +4058,23 @@ test "renderEntriesToBytes reflows parser-rendered lists at paint-time cols" {
     while (lines.next()) |line| {
         try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 20);
     }
+}
+
+test "renderEntriesToBytes preserves parser-rendered list paragraph indentation" {
+    const alloc = std.testing.allocator;
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(alloc);
+    try processor.push(alloc, "1. Heading\n   alpha beta gamma delta\n\n- Heading\n  alpha beta gamma delta\n", &source);
+    try processor.flush(alloc, &source);
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+    try appendAssistantTestEntry(&entries, alloc, 1, source.items);
+    const narrow = try renderEntriesToBytes(alloc, entries.items, 18, .{});
+    defer alloc.free(narrow);
+    try std.testing.expect(std.mem.find(u8, narrow, "     alpha beta\n     gamma delta") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "    alpha beta\n    gamma delta") != null);
 }
 
 test "renderEntriesToBytes reflows parser-rendered task lists at paint-time cols" {

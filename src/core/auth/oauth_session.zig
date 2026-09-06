@@ -1,12 +1,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
+const host_contract = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const native_keychain = @import("../hosts/native_keychain.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const js_host_auth = @import("js_host_auth.zig");
 const secret = @import("secret.zig");
+const session_presence = @import("session_presence.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -21,7 +23,6 @@ const expiry_skew_ms: i64 = 60 * 1000;
 const mutation_lock_file_name = "auth.lock";
 const mutation_lock_deadline_ms: u64 = 2000;
 const e2e_lock_contention_file_name = "auth-lock-contention";
-const LoadMode = enum { tolerate_open_failure, report_open_failure };
 
 const StorageBackend = enum {
     profile_file,
@@ -47,6 +48,7 @@ const KeychainBackend = struct {
     load_fn: *const fn (?*anyopaque, Allocator) KeychainError!?[]u8,
     store_fn: *const fn (?*anyopaque, []const u8) KeychainError!void,
     delete_fn: *const fn (?*anyopaque, Allocator) KeychainError!bool,
+    presence_fn: *const fn (?*anyopaque) native_keychain.Error!host_contract.SecretStorePresence,
 
     fn load(self: KeychainBackend, alloc: Allocator) KeychainError!?[]u8 {
         return self.load_fn(self.context, alloc);
@@ -59,13 +61,22 @@ const KeychainBackend = struct {
     fn delete(self: KeychainBackend, alloc: Allocator) KeychainError!bool {
         return self.delete_fn(self.context, alloc);
     }
+
+    fn presence(self: KeychainBackend) native_keychain.Error!host_contract.SecretStorePresence {
+        return self.presence_fn(self.context);
+    }
 };
 
 const native_keychain_backend: KeychainBackend = .{
     .load_fn = nativeKeychainLoad,
     .store_fn = nativeKeychainStore,
     .delete_fn = nativeKeychainDelete,
+    .presence_fn = nativeKeychainPresence,
 };
+
+fn nativeKeychainPresence(_: ?*anyopaque) native_keychain.Error!host_contract.SecretStorePresence {
+    return native_keychain.oauthSessionPresence();
+}
 
 fn nativeKeychainLoad(_: ?*anyopaque, alloc: Allocator) KeychainError!?[]u8 {
     return native_keychain.loadOAuthSession(alloc);
@@ -91,13 +102,46 @@ fn storageBackend() StorageBackend {
     return selectStorageBackend(builtin.os.tag, native_keychain.isDisabled());
 }
 
+pub fn presence() host_contract.SecretStorePresence {
+    const file_presence = session_presence.profileFile(
+        auth_file_name,
+        max_auth_file_bytes,
+    );
+    if (storageBackend() == .profile_file or file_presence == .present) {
+        return file_presence;
+    }
+    const keychain_presence = native_keychain.oauthSessionPresence() catch
+        return .unavailable;
+    if (keychain_presence == .present) return .present;
+    if (file_presence == .missing and keychain_presence == .missing) {
+        return .missing;
+    }
+    return .unavailable;
+}
+
+pub fn requireSignInStorage() error{CredentialStorageUnavailable}!void {
+    if (comptime host_target.is_wasm) return;
+    const file_exists = try session_presence.requireWritableProfileFile(auth_file_name, mutation_lock_file_name);
+    try requireSignInDestination(storageBackend(), file_exists, native_keychain_backend);
+}
+
+fn requireSignInDestination(backend: StorageBackend, file_exists: bool, keychain: KeychainBackend) error{CredentialStorageUnavailable}!void {
+    if (backend == .profile_file or file_exists) return;
+    const available = keychain.presence() catch return error.CredentialStorageUnavailable;
+    if (available == .unavailable) return error.CredentialStorageUnavailable;
+}
+
 fn selectResolution(file: FileState, keychain: KeychainState) Resolution {
     return switch (file) {
         .valid => if (keychain == .unavailable) .file_defer_migration else .file_migrate,
-        .absent, .unusable => switch (keychain) {
+        .absent => switch (keychain) {
             .absent => .missing,
             .valid => .keychain,
             .invalid, .unavailable => .storage_error,
+        },
+        .unusable => switch (keychain) {
+            .valid => .keychain,
+            .absent, .invalid, .unavailable => .storage_error,
         },
     };
 }
@@ -335,6 +379,12 @@ const NativeMutation = struct {
     keychain: KeychainBackend,
     authority: Authority = .unresolved,
 
+    pub fn requireWritable(self: *Mutation) error{CredentialStorageUnavailable}!void {
+        if (self.backend == .profile_file or self.authority == .profile_file) {
+            _ = try session_presence.requireWritableInDir(self.fx_dir.dir, auth_file_name);
+        }
+    }
+
     pub fn deinit(self: *Mutation) void {
         self.lock.release();
         self.fx_dir.close();
@@ -344,7 +394,7 @@ const NativeMutation = struct {
     pub fn load(self: *Mutation, alloc: Allocator) !?Session {
         if (self.backend == .profile_file) {
             self.authority = .profile_file;
-            return loadFromDir(alloc, &self.fx_dir.dir, .report_open_failure);
+            return loadFromDir(alloc, &self.fx_dir.dir);
         }
         return self.loadKeychainResolved(alloc);
     }
@@ -470,6 +520,9 @@ const HostMutation = struct {
     revision_len: usize = 0,
     exists: bool = false,
 
+    // Host storage validates writes through its revisioned save callback.
+    pub fn requireWritable(_: *HostMutation) error{CredentialStorageUnavailable}!void {}
+
     fn init(store: js_host_auth.SessionStore) HostMutation {
         return .{ .store = store };
     }
@@ -480,14 +533,14 @@ const HostMutation = struct {
     }
 
     pub fn load(self: *HostMutation, alloc: Allocator) !?Session {
-        var stored = (try self.store.load(alloc)) orelse {
+        var stored = (self.store.load(alloc) catch |err| return session_presence.storageError(auth_file_name, err)) orelse {
             self.exists = false;
             self.revision_len = 0;
             return null;
         };
         defer stored.deinit(alloc);
         try self.captureStoredRevision(stored.revision);
-        return @as(?Session, try parse(alloc, stored.bytes));
+        return @as(?Session, try parseStoredSession(alloc, stored.bytes));
     }
 
     pub fn save(self: *HostMutation, alloc: Allocator, session: Session) !void {
@@ -588,7 +641,8 @@ pub fn load(alloc: Allocator) !?Session {
     }
     var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| {
         debug_trace.logf("auth", "session load failed step=open_home err={s}", .{@errorName(err)});
-        return null;
+        if (err == error.FileNotFound) return null;
+        return session_presence.storageError(auth_file_name, err);
     };
     defer home_dir.close(io_mod.getIo());
 
@@ -597,26 +651,21 @@ pub fn load(alloc: Allocator) !?Session {
         .follow_symlinks = false,
     }) catch |err| {
         debug_trace.logf("auth", "session load failed step=open_profile err={s}", .{@errorName(err)});
-        return null;
+        if (err == error.FileNotFound) return null;
+        return session_presence.storageError(auth_file_name, err);
     };
     defer fx_dir.close(io_mod.getIo());
 
-    return loadFromDir(alloc, &fx_dir, .tolerate_open_failure);
+    return loadFromDir(alloc, &fx_dir);
 }
 
 fn loadFromHost(alloc: Allocator, store: js_host_auth.SessionStore) !?Session {
-    var stored = (try store.load(alloc)) orelse return null;
+    var stored = (store.load(alloc) catch |err| return session_presence.storageError(auth_file_name, err)) orelse return null;
     defer stored.deinit(alloc);
-    return parse(alloc, stored.bytes) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => {
-            debug_trace.logf("auth", "session load failed step=parse err={s}", .{@errorName(err)});
-            return null;
-        },
-    };
+    return try parseStoredSession(alloc, stored.bytes);
 }
 
-fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir, mode: LoadMode) !?Session {
+fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) !?Session {
     var file = fx_dir.openFile(io_mod.getIo(), auth_file_name, .{
         .mode = .read_only,
         .allow_directory = false,
@@ -626,24 +675,28 @@ fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir, mode: LoadMode) !?Session 
         error.FileNotFound => return null,
         else => {
             debug_trace.logf("auth", "session load failed step=open_file err={s}", .{@errorName(err)});
-            if (mode == .tolerate_open_failure) return null else return err;
+            return session_presence.storageError(auth_file_name, err);
         },
     };
     defer file.close(io_mod.getIo());
 
-    const stat = try file.stat(io_mod.getIo());
-    if (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0) {
+    const stat = file.stat(io_mod.getIo()) catch |err| return session_presence.storageError(auth_file_name, err);
+    if (stat.kind != .file or stat.nlink != 1 or stat.permissions.toMode() & 0o077 != 0) {
         debug_trace.logf("auth", "session load failed step=permissions err=InsecureAuthFile", .{});
-        return null;
+        return error.InsecureAuthFile;
     }
 
-    const bytes = try io_mod.readFileToEnd(alloc, &file, max_auth_file_bytes);
+    const bytes = io_mod.readFileToEnd(alloc, &file, max_auth_file_bytes) catch |err| return session_presence.storageError(auth_file_name, err);
     defer secret.zeroAndFree(alloc, bytes);
+    return try parseStoredSession(alloc, bytes);
+}
+
+fn parseStoredSession(alloc: Allocator, bytes: []const u8) !Session {
     return parse(alloc, bytes) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
             debug_trace.logf("auth", "session load failed step=parse err={s}", .{@errorName(err)});
-            return null;
+            return error.InvalidAuthSession;
         },
     };
 }
@@ -665,21 +718,21 @@ pub fn beginExistingMutation() !?Mutation {
         return @as(?Mutation, HostMutation.init(js_host_auth.oauth_session_store));
     }
     if (storageBackend() == .macos_keychain) {
-        return @as(?Mutation, try beginMutation());
+        return @as(?Mutation, beginMutation() catch |err| return session_presence.storageError(auth_file_name, err));
     }
-    return beginExistingNativeMutation();
+    return beginExistingNativeMutation() catch |err| return session_presence.storageError(auth_file_name, err);
 }
 
 fn beginExistingNativeMutation() !?Mutation {
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
     var home_dir = io_mod.VerifiedDir{
-        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
+        .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| return session_presence.storageError(auth_file_name, err),
     };
     defer home_dir.close();
 
     const fx_dir = openExistingPrivateFxDir(&home_dir) catch |err| switch (err) {
         error.FileNotFound => return null,
-        else => return err,
+        else => return session_presence.storageError(auth_file_name, err),
     };
     return @as(?Mutation, try lockMutation(fx_dir));
 }
@@ -745,12 +798,12 @@ fn lockMutationWithBackend(
     var fx_dir = open_fx_dir;
     errdefer fx_dir.close();
 
-    var lock = try io_mod.acquireTimedAdvisoryLockWithOps(
+    var lock = io_mod.acquireTimedAdvisoryLockWithOps(
         &fx_dir,
         mutation_lock_file_name,
         deadline_ms,
         ops,
-    );
+    ) catch |err| return session_presence.storageError(auth_file_name, err);
     errdefer lock.release();
 
     return .{
@@ -954,7 +1007,7 @@ fn check_parse_allocation_failures(alloc: Allocator) !void {
 }
 
 fn check_load_allocation_failures(alloc: Allocator, dir: *std.Io.Dir) !void {
-    var session = (try loadFromDir(alloc, dir, .report_open_failure)) orelse return error.TestUnexpectedMissingSession;
+    var session = (try loadFromDir(alloc, dir)) orelse return error.TestUnexpectedMissingSession;
     defer session.deinit(alloc);
 }
 
@@ -1009,7 +1062,7 @@ test "OAuth source resolution covers every file and Keychain state" {
         .{ .file = .valid, .keychain = .invalid, .expected = .file_migrate },
         .{ .file = .valid, .keychain = .unavailable, .expected = .file_defer_migration },
         .{ .file = .unusable, .keychain = .valid, .expected = .keychain },
-        .{ .file = .unusable, .keychain = .absent, .expected = .missing },
+        .{ .file = .unusable, .keychain = .absent, .expected = .storage_error },
         .{ .file = .unusable, .keychain = .invalid, .expected = .storage_error },
         .{ .file = .unusable, .keychain = .unavailable, .expected = .storage_error },
     };
@@ -1028,6 +1081,7 @@ const FakeOAuthKeychain = struct {
     delete_calls: usize = 0,
     fail_store: bool = false,
     fail_delete: bool = false,
+    unavailable: bool = false,
 
     fn deinit(self: *FakeOAuthKeychain) void {
         if (self.value) |value| secret.zeroAndFree(self.alloc, value);
@@ -1040,7 +1094,14 @@ const FakeOAuthKeychain = struct {
             .load_fn = loadCallback,
             .store_fn = storeCallback,
             .delete_fn = deleteCallback,
+            .presence_fn = presenceCallback,
         };
+    }
+
+    fn presenceCallback(raw: ?*anyopaque) native_keychain.Error!host_contract.SecretStorePresence {
+        const self: *FakeOAuthKeychain = @ptrCast(@alignCast(raw.?));
+        if (self.unavailable) return .unavailable;
+        return if (self.value != null) .present else .missing;
     }
 
     fn loadCallback(raw: ?*anyopaque, alloc: Allocator) KeychainError!?[]u8 {
@@ -1142,7 +1203,7 @@ test "new OAuth login replaces an existing file before deferred migration" {
     defer replacement.deinit(alloc);
 
     try mutation.save(alloc, replacement);
-    var persisted = (try loadFromDir(alloc, &tmp.dir, .report_open_failure)).?;
+    var persisted = (try loadFromDir(alloc, &tmp.dir)).?;
     defer persisted.deinit(alloc);
     try std.testing.expectEqualStrings("keychain-access", persisted.access_token);
     try std.testing.expectEqual(Authority.profile_file, mutation.authority);
@@ -1166,10 +1227,51 @@ test "OAuth migration preserves and updates the file when Keychain publication f
     loaded.access_token = try alloc.dupe(u8, "updated-access");
     try mutation.save(alloc, loaded);
 
-    var persisted = (try loadFromDir(alloc, &tmp.dir, .report_open_failure)).?;
+    var persisted = (try loadFromDir(alloc, &tmp.dir)).?;
     defer persisted.deinit(alloc);
     try std.testing.expectEqualStrings("updated-access", persisted.access_token);
     try std.testing.expectEqual(@as(usize, 2), fake.store_calls);
+}
+
+test "OAuth refresh preflight honors file authority after Keychain migration fails" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestAuthFile(tmp.dir, test_session_json);
+    var file = try tmp.dir.openFile(std.testing.io, auth_file_name, .{});
+    defer file.close(std.testing.io);
+    try file.setPermissions(std.testing.io, std.Io.File.Permissions.fromMode(0o400));
+    defer file.setPermissions(std.testing.io, std.Io.File.Permissions.fromMode(0o600)) catch {};
+    var fake = FakeOAuthKeychain{ .alloc = alloc, .fail_store = true };
+    defer fake.deinit();
+    var mutation = try testKeychainMutation(tmp.dir, fake.backend());
+    defer mutation.deinit();
+    var loaded = (try mutation.load(alloc)).?;
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqual(Authority.profile_file, mutation.authority);
+    try std.testing.expectError(error.CredentialStorageUnavailable, mutation.requireWritable());
+}
+
+test "OAuth sign-in requires Keychain availability only when Keychain is the destination" {
+    var fake = FakeOAuthKeychain{ .alloc = std.testing.allocator, .unavailable = true };
+    defer fake.deinit();
+    try std.testing.expectError(error.CredentialStorageUnavailable, requireSignInDestination(.macos_keychain, false, fake.backend()));
+    try requireSignInDestination(.macos_keychain, true, fake.backend());
+    try requireSignInDestination(.profile_file, false, fake.backend());
+    fake.unavailable = false;
+    try requireSignInDestination(.macos_keychain, false, fake.backend());
+}
+
+test "OAuth resolver reports an unusable file when no Keychain credential exists" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestAuthFile(tmp.dir, "not-json");
+    var fake = FakeOAuthKeychain{ .alloc = alloc };
+    defer fake.deinit();
+    var mutation = try testKeychainMutation(tmp.dir, fake.backend());
+    defer mutation.deinit();
+    try std.testing.expectError(error.InvalidOAuthStorageState, mutation.load(alloc));
 }
 
 test "OAuth resolver uses valid Keychain state without deleting an unusable file" {
@@ -1304,10 +1406,24 @@ test "OAuth mutation loads report auth file open failures" {
     defer tmp.cleanup();
     try tmp.dir.symLink(std.testing.io, "missing-auth-target", auth_file_name, .{ .is_directory = false });
 
-    try std.testing.expect((try loadFromDir(std.testing.allocator, &tmp.dir, .tolerate_open_failure)) == null);
     try std.testing.expectError(
-        error.SymLinkLoop,
-        loadFromDir(std.testing.allocator, &tmp.dir, .report_open_failure),
+        error.CredentialStorageUnavailable,
+        loadFromDir(std.testing.allocator, &tmp.dir),
+    );
+}
+
+test "OAuth mutation distinguishes an invalid session from an absent session" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, auth_file_name, .{
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    });
+    try file.writeStreamingAll(std.testing.io, "{\"version\":2}\n");
+    file.close(std.testing.io);
+
+    try std.testing.expectError(
+        error.InvalidAuthSession,
+        loadFromDir(std.testing.allocator, &tmp.dir),
     );
 }
 

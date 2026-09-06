@@ -24,9 +24,9 @@ const promptHistoryStore = {
 const encoded = new TextEncoder();
 const fetch = async () => new Response(new ReadableStream({
   start(controller) {
-    controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"ok"}\n'));
-    controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"}}\n'));
-    controller.enqueue(encoded.encode("data: [DONE]\n"));
+    controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"ok"}\n\n'));
+    controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"}}\n\n'));
+    controller.enqueue(encoded.encode("data: [DONE]\n\n"));
     controller.close();
   },
 }), { status: 200, headers: { "content-type": "text/event-stream" } });

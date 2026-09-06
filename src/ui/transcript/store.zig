@@ -186,6 +186,10 @@ fn entryRetainedBytes(entry: TranscriptEntry) usize {
     };
 }
 
+pub fn entrySnapshotRetainedBytes(entry: TranscriptEntry) usize {
+    return @sizeOf(TranscriptEntry) +| entryRetainedBytes(entry);
+}
+
 fn dupeSkillTokenSpans(alloc: Allocator, skill_tokens: []const SkillTokenSpan) ![]SkillTokenSpan {
     if (skill_tokens.len == 0) return &.{};
     const copy = try alloc.alloc(SkillTokenSpan, skill_tokens.len);
@@ -438,6 +442,10 @@ fn pruneOrphanedCommandOutputBlocks(
     var changed = false;
     var i: usize = 0;
     while (i < self.command_output_blocks.items.len) {
+        if (self.command_output_blocks.items[i].live_entry_ids.items.len != 0) {
+            i += 1;
+            continue;
+        }
         if (self.command_output_display.open_command_block) |open| {
             if (open == i) {
                 i += 1;
@@ -944,27 +952,51 @@ pub fn resetVisualEpoch(self: anytype, alloc: Allocator, welcome: []const u8) !v
     std.debug.assert(welcome.len > 0);
     try self.assertCanMutateTranscript();
 
-    const pinned_count = lifecyclePinCount(self);
     var replacement_entries: std.ArrayList(TranscriptEntry) = .empty;
-    errdefer {
-        for (replacement_entries.items) |*entry| entry.deinit(alloc);
-        replacement_entries.deinit(alloc);
-    }
-    try replacement_entries.ensureTotalCapacity(alloc, pinned_count + 1);
+    errdefer replacement_entries.deinit(alloc);
+    try replacement_entries.ensureTotalCapacity(alloc, self.entries.items.len + 1);
 
+    // Staging borrows retained payloads until publication; only the new welcome
+    // belongs to this scope on failure.
     const welcome_copy = try alloc.dupe(u8, welcome);
-    replacement_entries.appendAssumeCapacity(.{ .raw_bytes = .{
-        .id = self.next_entry_id,
-        .created_at_ms = io_mod.milliTimestamp(),
-        .bytes = welcome_copy,
-        .class = .welcome,
-    } });
-
+    errdefer alloc.free(welcome_copy);
+    var replaced_welcome = false;
+    var hidden_count: usize = 0;
+    var pinned_count: usize = 0;
     for (self.entries.items) |entry| {
-        if (entry != .raw_bytes or !entry.raw_bytes.lifecycle_pinned) continue;
-        replacement_entries.appendAssumeCapacity(
-            try cloneEntryForSnapshot(alloc, entry),
-        );
+        if (entry == .raw_bytes and entry.raw_bytes.class == .welcome) {
+            if (!replaced_welcome) {
+                replacement_entries.appendAssumeCapacity(.{ .raw_bytes = .{
+                    .id = entry.raw_bytes.id,
+                    .created_at_ms = entry.raw_bytes.created_at_ms,
+                    .bytes = welcome_copy,
+                    .class = .welcome,
+                } });
+                replaced_welcome = true;
+            }
+            continue;
+        }
+        const pinned = switch (entry) {
+            .raw_bytes => |raw| raw.lifecycle_pinned,
+            .semantic_notice => |notice| notice.pending_replacement,
+            else => false,
+        };
+        var retained = entry;
+        if (pinned) {
+            pinned_count += 1;
+        } else {
+            retained.hideInline();
+            hidden_count += 1;
+        }
+        replacement_entries.appendAssumeCapacity(retained);
+    }
+    if (!replaced_welcome) {
+        replacement_entries.appendAssumeCapacity(.{ .raw_bytes = .{
+            .id = self.next_entry_id,
+            .created_at_ms = io_mod.milliTimestamp(),
+            .bytes = welcome_copy,
+            .class = .welcome,
+        } });
     }
 
     const cols: u16 = if (self.layout.cols > 0) self.layout.cols else 80;
@@ -989,15 +1021,18 @@ pub fn resetVisualEpoch(self: anytype, alloc: Allocator, welcome: []const u8) !v
     replacement_transcript = .empty;
     self.transcript_cache_origin_untrimmed = rendered_start == 0;
 
-    for (old_entries.items) |*entry| entry.deinit(alloc);
+    for (old_entries.items) |*entry| {
+        if (entry.* == .raw_bytes and entry.raw_bytes.class == .welcome) entry.deinit(alloc);
+    }
     old_entries.deinit(alloc);
     old_transcript.deinit(alloc);
-    for (self.folded_command_blocks.items) |*block| block.deinit(alloc);
-    self.folded_command_blocks.clearRetainingCapacity();
-    for (self.command_output_blocks.items) |*block| block.deinit(alloc);
-    self.command_output_blocks.clearRetainingCapacity();
+    debug_trace.logf(
+        "transcript.visual_epoch_reset",
+        "clear display retained={d} hidden={d} pinned={d}",
+        .{ self.entries.items.len - 1, hidden_count, pinned_count },
+    );
 
-    self.next_entry_id +%= 1;
+    if (!replaced_welcome) self.next_entry_id +%= 1;
     self.last_rendered_cols = cols;
     if (comptime @hasDecl(@TypeOf(self.*), "closeFullTranscriptState")) {
         self.closeFullTranscriptState();
@@ -1186,6 +1221,7 @@ pub fn replaceSemanticNoticeAtomic(
     shadow.entries.items[entry_index] = .{ .semantic_notice = .{
         .id = entry_id,
         .created_at_ms = created_at_ms,
+        .inline_hidden = previous.semantic_notice.inline_hidden,
         .topic = owned.topic,
         .tone = owned.tone,
         .body = owned.body,
@@ -1362,7 +1398,10 @@ pub fn flushRecordedCommandOutputSummaryAtomic(
 
     var shadow = try cloneRecordedMutationState(self, alloc);
     defer shadow.deinit(alloc);
-    const dirty_entry_id = command_output_runtime.openCommandOutputDirtyEntryId(&shadow);
+    const dirty_entry_id = command_output_runtime.commandOutputDirtyEntryIdForLifecycle(
+        &shadow,
+        lifecycle_id,
+    );
     const retention_changed = try command_output_runtime.flushCommandOutputSummaryUncommitted(
         &shadow,
         alloc,
@@ -1438,6 +1477,7 @@ pub fn replacePinnedToolStatusForTerminalAtomic(
     new_bytes: []const u8,
     additional_tool_detail_capacity: usize,
     additional_command_output_capacity: usize,
+    turn_cancellation_line: ?[]const u8,
 ) !bool {
     return replacePinnedToolStatusAtomicInternal(
         self,
@@ -1449,6 +1489,7 @@ pub fn replacePinnedToolStatusForTerminalAtomic(
         .{
             .tool_details = additional_tool_detail_capacity,
             .command_output_entries = additional_command_output_capacity,
+            .turn_cancellation_line = turn_cancellation_line,
         },
     );
 }
@@ -1456,9 +1497,12 @@ pub fn replacePinnedToolStatusForTerminalAtomic(
 const LifecycleStatusReservations = struct {
     tool_details: usize = 0,
     command_output_entries: usize = 0,
+    turn_cancellation_line: ?[]const u8 = null,
 
     fn empty(self: LifecycleStatusReservations) bool {
-        return self.tool_details == 0 and self.command_output_entries == 0;
+        return self.tool_details == 0 and
+            self.command_output_entries == 0 and
+            self.turn_cancellation_line == null;
     }
 };
 
@@ -1493,7 +1537,11 @@ fn replacePinnedToolStatusAtomicInternal(
     var shadow = try cloneMutationState(self, alloc);
     defer shadow.deinit(alloc);
     try shadow.tool_details.ensureUnusedCapacity(alloc, reservations.tool_details);
-    try shadow.entries.ensureUnusedCapacity(alloc, reservations.command_output_entries);
+    try shadow.entries.ensureUnusedCapacity(
+        alloc,
+        reservations.command_output_entries +
+            @intFromBool(reservations.turn_cancellation_line != null),
+    );
     try shadow.command_output_blocks.ensureUnusedCapacity(
         alloc,
         reservations.command_output_entries,
@@ -1508,10 +1556,23 @@ fn replacePinnedToolStatusAtomicInternal(
         const entry = shadow.entries.orderedRemove(shadow_index);
         shadow.entries.appendAssumeCapacity(entry);
     }
+    var retention_anchor = entry_id;
+    if (reservations.turn_cancellation_line) |cancellation_line| {
+        const owned = try alloc.dupe(u8, cancellation_line);
+        var handed_off = false;
+        errdefer if (!handed_off) alloc.free(owned);
+        retention_anchor = try appendRawBytesEntryClassified(
+            &shadow,
+            alloc,
+            owned,
+            .turn_cancellation,
+        );
+        handed_off = true;
+    }
     const retention_changed = try enforceStructuredRetentionAndReport(
         &shadow,
         alloc,
-        entry_id,
+        retention_anchor,
     );
     try rebuildTranscriptCacheFromEntries(
         &shadow,
@@ -1537,6 +1598,7 @@ pub fn replacePinnedToolStatusesAtomic(
     alloc: Allocator,
     updates: []const LifecycleEntryUpdate,
     additional_tool_detail_capacity: usize,
+    turn_cancellation_line: ?[]const u8,
 ) !void {
     return replacePinnedToolStatusesAtomicWithRewriteMode(
         self,
@@ -1544,6 +1606,7 @@ pub fn replacePinnedToolStatusesAtomic(
         updates,
         .strict,
         additional_tool_detail_capacity,
+        turn_cancellation_line,
     );
 }
 
@@ -1552,6 +1615,7 @@ pub fn replacePinnedToolStatusesPreservingNormalBufferAnchorAtomic(
     alloc: Allocator,
     updates: []const LifecycleEntryUpdate,
     additional_tool_detail_capacity: usize,
+    turn_cancellation_line: ?[]const u8,
 ) !void {
     return replacePinnedToolStatusesAtomicWithRewriteMode(
         self,
@@ -1559,6 +1623,7 @@ pub fn replacePinnedToolStatusesPreservingNormalBufferAnchorAtomic(
         updates,
         .preserve_same_epoch,
         additional_tool_detail_capacity,
+        turn_cancellation_line,
     );
 }
 
@@ -1568,8 +1633,9 @@ fn replacePinnedToolStatusesAtomicWithRewriteMode(
     updates: []const LifecycleEntryUpdate,
     rewrite_mode: TranscriptSourceRewriteMode,
     additional_tool_detail_capacity: usize,
+    turn_cancellation_line: ?[]const u8,
 ) !void {
-    if (updates.len == 0) return;
+    if (updates.len == 0 and turn_cancellation_line == null) return;
     try self.assertCanMutateTranscript();
 
     var shadow = try cloneMutationState(self, alloc);
@@ -1577,6 +1643,10 @@ fn replacePinnedToolStatusesAtomicWithRewriteMode(
     try shadow.tool_details.ensureUnusedCapacity(
         alloc,
         additional_tool_detail_capacity,
+    );
+    try shadow.entries.ensureUnusedCapacity(
+        alloc,
+        @intFromBool(turn_cancellation_line != null),
     );
     for (updates) |update| {
         const entry_index = rawEntryIndex(&shadow, update.entry_id) orelse
@@ -1589,10 +1659,23 @@ fn replacePinnedToolStatusesAtomicWithRewriteMode(
         shadow.entries.items[entry_index].raw_bytes.bytes = replacement;
         shadow.entries.items[entry_index].raw_bytes.class = .tool_status;
     }
+    var turn_cancellation_entry_id: ?u32 = null;
+    if (turn_cancellation_line) |line| {
+        const owned = try alloc.dupe(u8, line);
+        var handed_off = false;
+        errdefer if (!handed_off) alloc.free(owned);
+        turn_cancellation_entry_id = try appendRawBytesEntryClassified(
+            &shadow,
+            alloc,
+            owned,
+            .turn_cancellation,
+        );
+        handed_off = true;
+    }
     const retention_changed = try enforceStructuredRetentionAndReport(
         &shadow,
         alloc,
-        null,
+        turn_cancellation_entry_id,
     );
     try rebuildTranscriptCacheFromEntries(
         &shadow,
@@ -1602,16 +1685,21 @@ fn replacePinnedToolStatusesAtomicWithRewriteMode(
     shadow.recomputeCursorFromTranscript();
     requestTranscriptPaint(&shadow);
 
-    var dirty_entry_index = rawEntryIndex(&shadow, updates[0].entry_id) orelse
-        return error.MissingLifecycleTranscriptEntry;
-    for (updates[1..]) |update| {
-        dirty_entry_index = @min(
-            dirty_entry_index,
-            rawEntryIndex(&shadow, update.entry_id) orelse
-                return error.MissingLifecycleTranscriptEntry,
-        );
+    var dirty_entry_id: u32 = undefined;
+    if (updates.len > 0) {
+        var dirty_entry_index = rawEntryIndex(&shadow, updates[0].entry_id) orelse
+            return error.MissingLifecycleTranscriptEntry;
+        for (updates[1..]) |update| {
+            dirty_entry_index = @min(
+                dirty_entry_index,
+                rawEntryIndex(&shadow, update.entry_id) orelse
+                    return error.MissingLifecycleTranscriptEntry,
+            );
+        }
+        dirty_entry_id = shadow.entries.items[dirty_entry_index].id();
+    } else {
+        dirty_entry_id = turn_cancellation_entry_id.?;
     }
-    const dirty_entry_id = shadow.entries.items[dirty_entry_index].id();
     try commitAuthoritativeRecordedMutationStateFromEntry(
         self,
         &shadow,
@@ -1974,6 +2062,7 @@ pub fn cloneEntryForSnapshot(alloc: Allocator, entry: TranscriptEntry) !Transcri
         .raw_bytes => |raw| .{ .raw_bytes = .{
             .id = raw.id,
             .created_at_ms = raw.created_at_ms,
+            .inline_hidden = raw.inline_hidden,
             .bytes = try alloc.dupe(u8, raw.bytes),
             .class = raw.class,
             .lifecycle_pinned = raw.lifecycle_pinned,
@@ -1988,6 +2077,7 @@ pub fn cloneEntryForSnapshot(alloc: Allocator, entry: TranscriptEntry) !Transcri
             break :blk .{ .semantic_notice = .{
                 .id = notice.id,
                 .created_at_ms = notice.created_at_ms,
+                .inline_hidden = notice.inline_hidden,
                 .topic = owned.topic,
                 .tone = owned.tone,
                 .body = owned.body,
@@ -2002,6 +2092,7 @@ pub fn cloneEntryForSnapshot(alloc: Allocator, entry: TranscriptEntry) !Transcri
             break :blk .{ .user_turn = .{
                 .id = user.id,
                 .created_at_ms = user.created_at_ms,
+                .inline_hidden = user.inline_hidden,
                 .turn = turn,
                 .skill_tokens = skill_tokens,
             } };
@@ -2013,22 +2104,26 @@ pub fn cloneEntryForSnapshot(alloc: Allocator, entry: TranscriptEntry) !Transcri
             break :blk .{ .assistant_turn = .{
                 .id = assistant.id,
                 .created_at_ms = assistant.created_at_ms,
+                .inline_hidden = assistant.inline_hidden,
                 .segments = segments,
             } };
         },
         .assistant_table => |assistant| .{ .assistant_table = .{
             .id = assistant.id,
             .created_at_ms = assistant.created_at_ms,
+            .inline_hidden = assistant.inline_hidden,
             .table = try assistant.table.clone(alloc),
         } },
         .assistant_code_block => |assistant| .{ .assistant_code_block = .{
             .id = assistant.id,
             .created_at_ms = assistant.created_at_ms,
+            .inline_hidden = assistant.inline_hidden,
             .block = try assistant.block.clone(alloc),
         } },
         .assistant_thematic_rule => |assistant| .{ .assistant_thematic_rule = .{
             .id = assistant.id,
             .created_at_ms = assistant.created_at_ms,
+            .inline_hidden = assistant.inline_hidden,
         } },
     };
 }
@@ -2058,6 +2153,16 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
     else
         null;
     errdefer if (arguments_json) |value| alloc.free(value);
+    const command_display = if (source.command_display) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (command_display) |value| alloc.free(value);
+    const command_action_label = if (source.command_action_label) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (command_action_label) |value| alloc.free(value);
     const result = if (source.result) |value|
         try alloc.dupe(u8, value)
     else
@@ -2093,6 +2198,8 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
         .captured_command = source.captured_command,
         .activity_kind = source.activity_kind,
         .arguments_json = arguments_json,
+        .command_display = command_display,
+        .command_action_label = command_action_label,
         .result = result,
         .result_handle = result_handle,
         .command_artifact_handle = command_artifact_handle,
@@ -2100,6 +2207,7 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
         .command_process_presentation = source.command_process_presentation,
         .outcome = source.outcome,
         .fallback_disposition = source.fallback_disposition,
+        .origin = source.origin,
         .lifecycle_id = lifecycle_id,
         .presentation_group_id = source.presentation_group_id,
         .command_output_entry_id = source.command_output_entry_id,
@@ -2333,27 +2441,6 @@ pub fn appendRawTranscriptEntryClassified(
     rollback_entry = false;
     try enforceStructuredRetention(self, alloc, entry_id);
     return entry_id;
-}
-
-pub fn releaseStartupResumeViewEntry(
-    self: anytype,
-    alloc: Allocator,
-    entry_id: u32,
-) !bool {
-    try self.assertCanMutateTranscript();
-    const entry_index = rawEntryIndex(self, entry_id) orelse return false;
-
-    var removed = self.entries.orderedRemove(entry_index);
-    errdefer {
-        self.entries.insertAssumeCapacity(entry_index, removed);
-    }
-
-    try rebuildTranscriptCacheFromEntries(self, alloc, "startup resume view release");
-    self.recomputeCursorFromTranscript();
-    requestTranscriptPaint(self);
-
-    removed.deinit(alloc);
-    return true;
 }
 
 pub fn updateRawBytesEntry(
@@ -2653,7 +2740,7 @@ pub fn tailAssistantSegments(self: anytype) ?*AssistantTurnSegments {
     if (self.entries.items.len == 0) return null;
     const last = &self.entries.items[self.entries.items.len - 1];
     return switch (last.*) {
-        .assistant_turn => |*e| &e.segments,
+        .assistant_turn => |*e| if (e.inline_hidden) null else &e.segments,
         else => null,
     };
 }
@@ -2896,6 +2983,7 @@ fn themeOwnsRawEntry(class: RawEntryClass) bool {
         .tool_status,
         .diff_block,
         .question_resolution,
+        .turn_cancellation,
         .subagent_status,
         => true,
         .command_output, .unknown_raw => false,

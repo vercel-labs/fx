@@ -239,11 +239,11 @@ pub fn Adapter(comptime Host: type) type {
                 -3 => .{
                     .output = "",
                     .cancelled = true,
-                    .command_result = .{ .foreground = .{
+                    .command_result = .{
                         .command = command,
                         .cwd = cwd,
                         .duration_ms = duration_ms,
-                    } },
+                    },
                 },
                 -4 => error.InvalidWorkspaceInput,
                 -5 => error.WorkspaceDeadline,
@@ -277,7 +277,7 @@ pub fn Adapter(comptime Host: type) type {
             if ((!truncated and output_total != copied_total) or
                 (truncated and output_total <= copied_total)) return error.InvalidWorkspaceResult;
 
-            var formatted = try command_contract.formatForegroundCommandResult(alloc, .{
+            var formatted = try command_contract.formatCommandResult(alloc, .{
                 .command = command,
                 .cwd = cwd,
                 .status = .{ .exit_code = record.exit_code },
@@ -287,9 +287,9 @@ pub fn Adapter(comptime Host: type) type {
                 .stderr_bytes = record.stderr_total,
                 .duration_ms = duration_ms,
             });
-            var metadata = formatted.command_result.?.foreground;
+            var metadata = formatted.command_result.?;
             metadata.truncated = truncated;
-            formatted.command_result = .{ .foreground = metadata };
+            formatted.command_result = metadata;
             return formatted;
         }
     };
@@ -530,7 +530,7 @@ test "workspace exec maps nonzero foreground output through the command contract
     try std.testing.expect(std.mem.find(u8, result.output, "exit_code=7") != null);
     try std.testing.expect(std.mem.find(u8, result.output, "<stdout>\npartial output\n</stdout>") != null);
     try std.testing.expect(std.mem.find(u8, result.output, "<stderr>\ncommand failed\n</stderr>") != null);
-    const metadata = result.command_result.?.foreground;
+    const metadata = result.command_result.?;
     try std.testing.expectEqual(@as(?i64, 7), metadata.exit_code);
     try std.testing.expect(metadata.signal == null);
     try std.testing.expect(!metadata.timed_out);
@@ -553,7 +553,7 @@ test "workspace exec preserves bounded previews and total byte counts" {
     );
     defer std.testing.allocator.free(result.output);
 
-    const metadata = result.command_result.?.foreground;
+    const metadata = result.command_result.?;
     try std.testing.expectEqual(@as(usize, 70_000), metadata.stdout_bytes);
     try std.testing.expectEqual(@as(usize, 9000), metadata.stderr_bytes);
     try std.testing.expect(metadata.truncated);
@@ -573,7 +573,7 @@ test "workspace exec maps host abort without inventing a signal" {
         30_000,
     );
     try std.testing.expect(result.cancelled);
-    const metadata = result.command_result.?.foreground;
+    const metadata = result.command_result.?;
     try std.testing.expect(metadata.exit_code == null);
     try std.testing.expect(metadata.signal == null);
     try std.testing.expect(!metadata.timed_out);

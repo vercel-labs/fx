@@ -44,10 +44,8 @@ pub fn inspect(
     images: []const image_attachments.VerifiedSnapshot,
     request: Request,
 ) !Result {
-    const messages = [_]ChatMessage{
-        .{ .role = .system, .content = system_prompt },
-        .{ .role = .user, .content = user_prompt },
-    };
+    const instructions = [_]ChatMessage{.{ .role = .system, .content = system_prompt }};
+    const messages = [_]ChatMessage{.{ .role = .user, .content = user_prompt }};
     var capture = StreamCapture{
         .alloc = alloc,
         .max_bytes = request.capture_limit_bytes,
@@ -59,14 +57,18 @@ pub fn inspect(
         request.stream_provider,
         alloc,
         .{
-            .credential = .{
-                .secret = request.api_key,
-                .source = request.credential_source,
-                .tenant = request.gateway_team,
-            },
+            .credential = if (request.credential_source == .host_managed)
+                .host_managed
+            else
+                .{ .direct = .{
+                    .secret_bytes = request.api_key,
+                    .source = request.credential_source orelse .ai_gateway_api_key,
+                    .tenant_context = request.gateway_team,
+                } },
             .session_id = request.session_id,
             .model = model,
             .retry_count = request.retry_count,
+            .instructions = &instructions,
             .messages = &messages,
             .tool_choice = .none,
             .provider_options = .{},

@@ -121,6 +121,15 @@ pub const State = struct {
         return next;
     }
 
+    pub fn defer_full_open(self: State) State {
+        var next = self;
+        next.bookmark_pending = !next.follow_tail;
+        next.bookmark_entry_id = null;
+        next.bookmark_intra_row = 0;
+        next.depth = .inline_mode;
+        return next;
+    }
+
     pub fn scroll(self: State, direction: ScrollDirection, rows: u32) State {
         var next = self;
         next.follow_tail = false;
@@ -199,7 +208,7 @@ pub const State = struct {
     }
 
     fn open_full(self: State) State {
-        var next = self.reset_viewport();
+        var next = if (self.bookmark_pending) self else self.reset_viewport();
         next.depth = .full;
         // The identity remains available for retention retargeting, but a
         // normal open starts at the tail instead of consuming the old anchor.
@@ -303,6 +312,27 @@ test "transcript presentation scroll saturates and leaves follow tail" {
     const near_end = State{ .scroll_rows = std.math.maxInt(u32) - 1 };
     const at_end = near_end.scroll(.down, 3);
     try std.testing.expectEqual(std.math.maxInt(u32), at_end.scroll_rows);
+}
+
+test "transcript presentation deferred full open retains its exact offset" {
+    const deferred = (State{
+        .depth = .full,
+        .scroll_rows = 47,
+        .follow_tail = false,
+        .bookmark_entry_id = 2,
+        .bookmark_intra_row = 7,
+    }).defer_full_open();
+    try std.testing.expectEqual(Depth.inline_mode, deferred.depth);
+    try std.testing.expect(deferred.bookmark_pending);
+    try std.testing.expectEqual(@as(?u32, null), deferred.bookmark_entry_id);
+
+    const reopened = deferred.with_depth(.full).select_visual_offset(
+        100,
+        10,
+        &.{},
+    );
+    try std.testing.expectEqual(@as(u32, 47), reopened.offset);
+    try std.testing.expect(!reopened.state.follow_tail);
 }
 
 test "transcript presentation clamps bookmarks and selects retained neighbor" {

@@ -99,7 +99,7 @@ class ShardPlanningTests(unittest.TestCase):
             {
                 "include": [
                     {"name": name}
-                    for name in ("help", "version", "status", "background", "doctor", "sessions")
+                    for name in ("help", "version", "status", "doctor", "sessions")
                 ]
             },
             run_plan("startup", missing_corpus, 20),

@@ -36,7 +36,7 @@ pub const State = struct {
         self.insertion.history.reset(alloc);
         self.insertion.vertical_navigation.reset();
         self.insertion.picker.reconcileInlinePickerAfterEdit(self.insertion.edit);
-        self.insertion.picker.resetActiveModelPickerIndex();
+        self.insertion.picker.resetActiveCompletionIndex();
         self.insertion.input_limit_rejection.* = input_limit_rejection.clear();
     }
 };

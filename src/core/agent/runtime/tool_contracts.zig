@@ -1,10 +1,13 @@
 const std = @import("std");
+const skill_contract = @import("../../skills/skill_contract.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const types = @import("../../shared/types.zig");
 const diff = @import("../../output/diff.zig");
 const file_mutation = @import("../../tooling/file_mutation.zig");
 const session_permission_state = @import("../../permissions/session_permission_state.zig");
 const command_replay_store = @import("../../session/command_replay_store.zig");
+const result_commit = @import("../../tooling/result_commit.zig");
+const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 
 pub const vision = @import("vision_contracts.zig");
 
@@ -71,6 +74,7 @@ pub const SecondaryPublicationReport = struct {
 };
 
 pub const ToolExecutionResult = struct {
+    model_content_kind: tool_dispatch.ModelContentKind = .ordinary,
     model_output: []const u8,
     status: ToolExecutionStatus = .success,
     cancelled: bool = false,
@@ -81,16 +85,18 @@ pub const ToolExecutionResult = struct {
     interactive_notice: ?types.SemanticNotice = null,
     context_notices: []const []const u8 = &.{},
     command_result_json: ?[]const u8 = null,
+    turn_control: ?tool_dispatch.TurnControl = null,
     web_search_completion: ?types.WebSearchCompletion = null,
     web_fetch_completion: ?types.WebFetchCompletion = null,
     inner_usage: ?types.ToolUsage = null,
-    selected_dynamic_tool_name: ?[]const u8 = null,
-    selected_dynamic_tool_schema_json: ?[]const u8 = null,
+    selected_dynamic_tools: []const @import("../../tooling/tool_mcp_runtime.zig").SelectedTool = &.{},
+    retired_dynamic_tool_names: []const []const u8 = &.{},
     tool_result_memory: ?types.ToolResultMemory = null,
     tool_result_memory_prepared: bool = false,
     committed_file_handoff: ?file_mutation.CommittedFileHandoff = null,
     deferred_tool_completion: ?DeferredToolCompletion = null,
     command_replay_capture: ?*command_replay_store.Capture = null,
+    result_commit: ?result_commit.Token = null,
 };
 
 test "tool result retains one memory payload across preparation" {
@@ -123,10 +129,12 @@ pub fn unavailableHostToolResult(alloc: Allocator) Allocator.Error!ToolExecution
 }
 
 pub const ToolExecutionRequest = struct {
+    skill_locations: ?*const skill_contract.Locations = null,
     call_allocator: Allocator,
     result_allocator: Allocator,
     call: ToolCall,
     authority: command_admission.ToolExecutionAuthority,
+    credential: types.CredentialLease = .{ .direct = .{} },
     /// Action-scoped root mode sampled before permission admission. Direct
     /// callers without a sampled mode retain their execution context value.
     permission_mode: ?types.PermissionMode = null,
@@ -144,6 +152,7 @@ pub const ToolExecutionRequest = struct {
     session_grants: []const PermissionGrant,
     live_authority: ?LiveToolAuthority = null,
     expected_mcp_runtime_generation: ?u64 = null,
+    expected_mcp_binding: ?types.McpToolBinding = null,
     advertised_dynamic_tool_names: []const []const u8,
     max_tool_result_bytes: usize,
     /// The owning agent loop already ran its policy-neutral idempotency and

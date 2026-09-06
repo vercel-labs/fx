@@ -13,8 +13,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
 import {
+  composerContains,
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
+  hasEmptyComposer,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -91,14 +93,15 @@ async function startFx(
     gateway = startFakeGateway(
       Array.from(
         { length: responseCount },
-        () => fakeGatewayFinalText("edit contract complete"),
+        (_, index) => fakeGatewayFinalText(`edit contract complete ${index + 1}`),
       ),
       {
         models: [{
           id: FAKE_GATEWAY_MODEL,
           type: "language",
           tags: ["vision", "file-input", "tool-use"],
-          context_window: 256_000,
+          // Exercise composer byte limits independently of context compaction.
+          context_window: 16_000_000,
           max_tokens: 64_000,
         }],
       },
@@ -148,6 +151,17 @@ function historyImageSnapshotPath(): string {
 
 async function waitForGatewayRequest(count = 1): Promise<void> {
   await waitForGatewayRequestWithin(TIMEOUT, count);
+}
+
+async function waitForCompletedTurn(active: TmuxSession, count: number): Promise<void> {
+  await active.waitForPane(
+    (pane) =>
+      pane.includes(`edit contract complete ${count}`) &&
+      hasEmptyComposer(pane) &&
+      !pane.includes("esc interrupt") &&
+      !pane.includes("Thinking"),
+    TIMEOUT,
+  );
 }
 
 async function waitForGatewayRequestWithin(
@@ -266,7 +280,7 @@ tmuxTest(
     await waitForGatewayRequest(1);
     expect(finalUserText(0)).toBe("Xabc");
 
-    await active.waitForComposer(TIMEOUT);
+    await waitForCompletedTurn(active, 1);
     await active.sendLiteralText("/");
     await active.sendHexBytes(["1b", "15", ...textHex("after")]);
     await active.sendKeys("Enter");
@@ -567,7 +581,7 @@ tmuxTest(
 
     expect(finalUserText(0)).toBe("FIRST\nHOME_SECOND_END\nTHIRD");
 
-    await active.waitForComposer(TIMEOUT);
+    await waitForCompletedTurn(active, 1);
     await pasteExact(active, "ONE\nTWO\nTHREE");
     await active.sendKeys("Up");
     await active.sendHexBytes(["01"]);
@@ -816,12 +830,17 @@ for (
 }
 
 tmuxTest(
-  "history recall preserves the selected duplicate skill source",
+  "history recall preserves duplicate skill provenance without showing it",
   async () => {
     const active = await startFx(true, 2, true);
 
     await selectReviewSkill(active, true);
-    await active.waitForText("review · workspace skills/", TIMEOUT);
+    await active.waitForPane(
+      (pane) =>
+        composerContains(pane, "review") &&
+        !composerContains(pane, "review · workspace skills/"),
+      TIMEOUT,
+    );
     await active.sendLiteralText("history skill");
     await active.sendKeys("Enter");
     await waitForGatewayRequest();
@@ -834,8 +853,13 @@ tmuxTest(
     );
 
     await active.sendKeys("Up");
-    await active.waitForText("history skill", TIMEOUT);
-    await active.waitForText("review · workspace skills/", TIMEOUT);
+    await active.waitForPane(
+      (pane) =>
+        composerContains(pane, "history skill") &&
+        composerContains(pane, "review") &&
+        !composerContains(pane, "review · workspace skills/"),
+      TIMEOUT,
+    );
     await active.sendKeys("Enter");
     await waitForGatewayRequest(2);
 
@@ -953,7 +977,7 @@ tmuxTest(
     await waitForGatewayRequest(1);
     expect(finalUserText(0)).toBe("$review @target.txt ");
 
-    await active.waitForComposer(TIMEOUT);
+    await waitForCompletedTurn(active, 1);
     await selectReviewSkill(active);
     await active.sendLiteralText("hello");
     await active.sendHexBytes(["1b", "62", "1b", "62"]);
@@ -962,7 +986,7 @@ tmuxTest(
     await waitForGatewayRequest(2);
     expect(finalUserText(1)).toBe("X$review hello");
 
-    await active.waitForComposer(TIMEOUT);
+    await waitForCompletedTurn(active, 2);
     await selectReviewSkill(active);
     await active.sendHexBytes(["1b", "7f"]);
     await active.sendLiteralText("ALT_BACKSPACE_OK");
@@ -970,7 +994,7 @@ tmuxTest(
     await waitForGatewayRequest(3);
     expect(finalUserText(2)).toBe("ALT_BACKSPACE_OK");
 
-    await active.waitForComposer(TIMEOUT);
+    await waitForCompletedTurn(active, 3);
     await selectReviewSkill(active);
     await active.sendKeys("Home");
     await active.sendHexBytes(["04"]);

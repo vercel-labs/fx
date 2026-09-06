@@ -48,6 +48,7 @@ pub const Settings = struct {
     first_call_tool_choice: ?types.ToolChoice = null,
     context: ?bool = null,
     fast_mode: ?bool = null,
+    fast_mode_model_bound: ?bool = null,
     slash_menu_categories: ?bool = null,
     collapse_tool_calls: ?bool = null,
     auto_upgrade: ?bool = null,
@@ -115,6 +116,7 @@ pub const ConfigSources = struct {
     permission_mode: ConfigSource = .compiled_default,
     effort: ConfigSource = .compiled_default,
     fast_mode: ConfigSource = .compiled_default,
+    fast_mode_model_bound: ConfigSource = .compiled_default,
     slash_menu_categories: ConfigSource = .compiled_default,
     collapse_tool_calls: ConfigSource = .compiled_default,
     startup_scrollback: ConfigSource = .compiled_default,
@@ -574,6 +576,7 @@ fn hasLegacyWorkspacePreferences(root: std.json.Value) bool {
             "model",
             "effort",
             "fast_mode",
+            "fast_mode_model_bound",
             "slash_menu_categories",
             "collapse_tool_calls",
             "startup_scrollback",
@@ -604,6 +607,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "grok_model",
         "effort",
         "fast_mode",
+        "fast_mode_model_bound",
         "slash_menu_categories",
         "collapse_tool_calls",
         "startup_scrollback",
@@ -651,6 +655,7 @@ fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: Conf
     if (settings.permission_mode != null) sources.permission_mode = source;
     if (settings.effort != null) sources.effort = source;
     if (settings.fast_mode != null) sources.fast_mode = source;
+    if (settings.fast_mode_model_bound != null) sources.fast_mode_model_bound = source;
     if (settings.slash_menu_categories != null) sources.slash_menu_categories = source;
     if (settings.collapse_tool_calls != null) sources.collapse_tool_calls = source;
     if (settings.startup_scrollback != null) sources.startup_scrollback = source;
@@ -767,10 +772,7 @@ pub fn ensureStateLayout(paths: Paths) !void {
 }
 
 pub fn parsePermissionMode(raw: []const u8) ?types.PermissionMode {
-    if (std.ascii.eqlIgnoreCase(raw, "ask")) return .ask;
-    if (std.ascii.eqlIgnoreCase(raw, "auto")) return .auto;
-    if (std.ascii.eqlIgnoreCase(raw, "yolo")) return .yolo;
-    return null;
+    return types.PermissionMode.parse(raw);
 }
 
 pub fn parsePermissionAction(raw: []const u8) ?types.PermissionAction {
@@ -1418,6 +1420,11 @@ fn parseProfileOnlyFields(
         settings.fast_mode = value.bool;
     }
 
+    if (root.object.get("fast_mode_model_bound")) |bound_value| {
+        if (bound_value != .bool) return error.InvalidFastModeBindingType;
+        settings.fast_mode_model_bound = bound_value.bool;
+    }
+
     if (root.object.get("slash_menu_categories")) |slash_menu_categories_value| {
         const value = slash_menu_categories_value;
         if (value != .bool) return error.InvalidSlashMenuCategoriesType;
@@ -1546,6 +1553,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void 
     if (incoming.first_call_tool_choice) |value| target.first_call_tool_choice = value;
     if (incoming.context) |value| target.context = value;
     if (incoming.fast_mode) |value| target.fast_mode = value;
+    if (incoming.fast_mode_model_bound) |value| target.fast_mode_model_bound = value;
     if (incoming.slash_menu_categories) |value| target.slash_menu_categories = value;
     if (incoming.collapse_tool_calls) |value| target.collapse_tool_calls = value;
     if (incoming.auto_upgrade) |value| target.auto_upgrade = value;
@@ -2443,6 +2451,11 @@ test "parsePermissionMode accepts only exact case-insensitive labels" {
     try std.testing.expectEqual(types.PermissionMode.auto, parsePermissionMode("Auto").?);
     try std.testing.expectEqual(types.PermissionMode.yolo, parsePermissionMode("yolo").?);
     try std.testing.expectEqual(types.PermissionMode.yolo, parsePermissionMode("YOLO").?);
+    try std.testing.expectEqual(types.PermissionMode.yolo, parsePermissionMode("full-access").?);
+    try std.testing.expectEqual(types.PermissionMode.yolo, parsePermissionMode("Full Access").?);
+    try std.testing.expect(parsePermissionMode("full") == null);
+    try std.testing.expect(parsePermissionMode(" full-access") == null);
+    try std.testing.expect(parsePermissionMode("full-access ") == null);
     try std.testing.expect(parsePermissionMode(" default") == null);
     try std.testing.expect(parsePermissionMode("danger") == null);
 }

@@ -19,7 +19,7 @@ pub const Callback = *const fn (
 ) anyerror!void;
 
 /// Maximum bytes added around unchanged stdout/stderr bodies by
-/// `formatForegroundCommandResult`.
+/// `formatCommandResult`.
 pub const max_foreground_result_envelope_bytes: usize =
     "exit_code=-9223372036854775808\n".len +
     "<stdout>\n".len + "\n</stdout>\n".len +

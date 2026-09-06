@@ -94,7 +94,7 @@ const LOCAL_FILE_TOOLS = [
 
 const LOCAL_INSPECTION_TOOLS = [
   ...LOCAL_FILE_TOOLS,
-  "terminal",
+  "shell",
 ] as const;
 
 const WEB_FETCH_TOOL = "web_fetch" as const;
@@ -108,7 +108,7 @@ const MCP_DISCOVERY_TOOLS = [
 const DESTRUCTIVE_OR_MUTATING_TOOLS = [
   "write_file",
   "edit_file",
-  "terminal",
+  "shell",
 ] as const;
 
 function askEntrypoint(notes: string): CoveredEntrypoint {
@@ -144,7 +144,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
       category: "local repository inspection",
       tools: LOCAL_INSPECTION_TOOLS,
       commandPattern: "^git\\s+",
-      notes: "A terminal.exec first action is acceptable only when it is a local git inspection.",
+      notes: "A shell.run first action is acceptable only when it is a local git inspection.",
     },
     forbiddenTools: [WEB_SEARCH_TOOL, "ask_user_question"],
     expectedUserVisibleBehavior:
@@ -177,7 +177,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     failureCategory: "local search",
     expectedFirstTool: {
       category: "local git command",
-      tools: ["terminal"],
+      tools: ["shell"],
       commandPattern: "^git\\s+(log|status|branch)\\b",
     },
     forbiddenTools: [WEB_SEARCH_TOOL, "ask_user_question"],
@@ -187,7 +187,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
       type: "tool-call recorder test",
       status: "implemented",
       notes:
-        "The first recorded terminal.exec can be matched against a local git command pattern; A/B runs compare pass-rate deltas rather than deterministic routing.",
+        "The first recorded shell.run can be matched against a local git command pattern; A/B runs compare pass-rate deltas rather than deterministic routing.",
     },
     modelBackedEval: {
       required: true,
@@ -377,7 +377,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     failureCategory: "GitHub routing",
     expectedFirstTool: {
       category: "GitHub CLI metadata read",
-      tools: ["terminal"],
+      tools: ["shell"],
       commandPattern: "^gh\\s+",
     },
     forbiddenTools: [WEB_SEARCH_TOOL, "ask_user_question"],
@@ -483,7 +483,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     failureCategory: "GitHub routing",
     expectedFirstTool: {
       category: "GitHub CLI metadata read",
-      tools: ["terminal"],
+      tools: ["shell"],
       commandPattern: "^gh\\s+",
     },
     forbiddenTools: [WEB_SEARCH_TOOL, "ask_user_question"],
@@ -502,7 +502,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     currentBaselineResult: {
       status: "passing",
       notes:
-        "Live ./zig-out/bin/fx ask --auto --json --no-save used terminal.exec first with gh pr view 57 --repo vercel-labs/fx --comments. Forbidden tools: none; behavior summarized PR review comments and bot deploy comments from gh output.",
+        "Live ./zig-out/bin/fx ask --auto --json --no-save used shell.run first with gh pr view 57 --repo vercel-labs/fx --comments. Forbidden tools: none; behavior summarized PR review comments and bot deploy comments from gh output.",
     },
     targetResult: "Routes known GitHub PR comments to gh and reports an actionable blocker if gh cannot run.",
     coveredEntrypoints: [
@@ -653,7 +653,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
       tools: [],
       notes: "Should answer from the latest tool result when present.",
     },
-    forbiddenTools: ["terminal", "ask_user_question"],
+    forbiddenTools: ["shell", "ask_user_question"],
     expectedUserVisibleBehavior:
       "Explains the latest tool failure from recorded evidence and avoids setup commands unless the evidence is missing.",
     deterministicCoverage: {
@@ -715,7 +715,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     failureCategory: "approval loop",
     expectedFirstTool: {
       category: "approval-required command attempt",
-      tools: ["terminal"],
+      tools: ["shell"],
     },
     forbiddenTools: ["ask_user_question"],
     expectedUserVisibleBehavior:
@@ -777,7 +777,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     failureCategory: "approval loop",
     expectedFirstTool: {
       category: "focused deterministic Bun test",
-      tools: ["terminal"],
+      tools: ["shell"],
       commandPattern:
         "^(bun\\s+test\\s+tests/evals/agent-quality-matrix\\.test\\.ts|cd\\s+tests/evals\\s+&&\\s+bun\\s+test\\s+agent-quality-matrix\\.test\\.ts|bun\\s+test\\s+agent-quality-matrix\\.test\\.ts)$",
       notes:
@@ -815,7 +815,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     failureCategory: "approval loop",
     expectedFirstTool: {
       category: "changed-file metadata inspection",
-      tools: ["terminal"],
+      tools: ["shell"],
       commandPattern: "^git\\s+(status\\s+--short|diff\\s+--name-only|diff\\s+--name-status)\\b",
       notes:
         "Start from changed-file metadata only; avoid full diff dumps before choosing focused checks.",
@@ -919,7 +919,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     failureCategory: "large output",
     expectedFirstTool: {
       category: "command with retained evidence",
-      tools: ["terminal"],
+      tools: ["shell"],
     },
     forbiddenTools: ["ask_user_question"],
     expectedUserVisibleBehavior:
@@ -1056,34 +1056,34 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     userPrompt: "A dev server is running in the background; show me its status and logs.",
     failureCategory: "large output",
     expectedFirstTool: {
-      category: "background status from runtime context",
-      tools: [],
+      category: "managed shell status",
+      tools: ["shell"],
       notes:
-        "Background task status and log summaries are runtime-visible; no new shell command is required to rediscover the process.",
+        "Use the owned handle returned by shell.run, then shell.interact for a bounded output delta without rediscovering or replaying the process.",
     },
-    forbiddenTools: [...DESTRUCTIVE_OR_MUTATING_TOOLS, "ask_user_question"],
+    forbiddenTools: ["ask_user_question"],
     expectedUserVisibleBehavior:
-      "Reports task id, state, cwd, log path, URL when known, and a bounded head/tail log summary without dumping the full long-running output.",
+      "Reports the owned session id, command state, and bounded recent output without rerunning the command or exposing a filesystem log path.",
     deterministicCoverage: {
-      type: "runtime unit test",
+      type: "e2e",
       status: "implemented",
       notes:
-        "task_helpers/background_commands unit coverage asserts bounded log summaries include path, bytes, head, and tail.",
+        "Managed execution coverage proves one handle, ordered output deltas, bounded retention, wait continuity, and opaque replay handles.",
     },
     modelBackedEval: {
       required: false,
-      reason: "The status/log visibility contract is deterministic runtime formatting.",
+      reason: "The owned-handle and output-delta contract is deterministic runtime behavior.",
     },
     currentBaselineResult: {
       status: "passing",
       notes:
-        "/background logs uses bounded head/tail summaries and background notices include log paths for running servers.",
+        "shell.interact exposes only fx-owned execution output for the exact returned handle.",
     },
     targetResult:
-      "Long-running commands remain inspectable without rerunning or losing recent log evidence.",
+      "Long-running commands remain inspectable through the same handle without replaying the command or inventing PID/log authority.",
     coveredEntrypoints: [
-      interactiveEntrypoint("Slash command and runtime context expose background task visibility."),
-      askEntrypoint("Runtime context carries background state into headless turns when available."),
+      interactiveEntrypoint("Ctrl-X exposes managed process state."),
+      askEntrypoint("Process-local shell handles remain available for the ask lifetime."),
     ],
   },
 ];
@@ -1102,7 +1102,7 @@ export function firstToolMatchesExpectation(
   }
   if (!toolCall) return false;
   if (!row.expectedFirstTool.tools.includes(toolCall.name)) return false;
-  if (toolCall.name === "terminal" && row.expectedFirstTool.commandPattern) {
+  if (toolCall.name === "shell" && row.expectedFirstTool.commandPattern) {
     return new RegExp(row.expectedFirstTool.commandPattern).test(
       toolCall.command_result?.command ?? "",
     );

@@ -158,6 +158,8 @@ function writeLogin(home: string, issuer: string, tokenSuffix: string): void {
       expires_at_ms: Date.now() - 60_000,
       scope: "openid offline_access",
       token_type: "Bearer",
+      team_id: "team_keychain_e2e",
+      team_slug: "example-team",
     }) + "\n",
     { mode: 0o600 },
   );
@@ -192,6 +194,40 @@ function keychainEnv(home: string, account: string, issuer: string) {
 }
 
 const keychainTest = test.skipIf(process.platform !== "darwin");
+
+keychainTest(
+  "Vercel sign-in checks a read-only legacy file before OAuth with Keychain enabled",
+  async () => {
+    const account = isolatedAccount();
+    const home = mkdtempSync(join(tmpdir(), "fx-oauth-keychain-readonly-"));
+    attachSystemKeychain(home);
+    const issuer = startOAuthIssuer();
+    const cleanup = () => deleteKeychainItem(account);
+    activeCleanups.add(cleanup);
+    cleanup();
+    writeLogin(home, issuer.issuer, account);
+    const path = join(home, ".fx", "auth.json");
+    const original = readFileSync(path, "utf8");
+    chmodSync(path, 0o400);
+    try {
+      const result = await runFx(["login"], {
+        env: { ...keychainEnv(home, account, issuer.issuer), FX_NO_OPEN_BROWSER: "1", FX_SOUND: "0" },
+        timeoutMs: 3000,
+      });
+      expect(result.timedOut).toBe(false);
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("Saved credential storage is unavailable");
+      expect(issuer.requests).toHaveLength(0);
+      expect(readFileSync(path, "utf8")).toBe(original);
+    } finally {
+      cleanup();
+      activeCleanups.delete(cleanup);
+      issuer.stop();
+      rmSync(home, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT,
+);
 
 keychainTest(
   "OAuth file migration survives restart and logout in an isolated Keychain account",

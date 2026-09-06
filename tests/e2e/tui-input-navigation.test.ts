@@ -322,7 +322,7 @@ tmuxTest(
     await waitForExactComposerRow(active, "┃ /");
 
     await active.sendKeys("Enter");
-    await active.waitForText("Commands 38", READY_TIMEOUT);
+    await active.waitForText("Commands 37", READY_TIMEOUT);
     await active.sendKeys("Escape");
     await active.waitForPane(
       (pane) => hasEmptyComposer(pane) && !pane.includes("Enter Open"),
@@ -829,23 +829,70 @@ tmuxTest(
     await typeLiteral(active, draft);
     await waitForActiveFooter(active, (footer) => footer === `┃ ${draft}`);
 
-    await active.sendKeys("C-l");
-    const footer = await waitForActiveFooter(
-      active,
-      (visible) => visible === `┃ ${draft}`,
+    const fullFooter = "Full detail · ctrl o close";
+    const response = "history prompt complete";
+    const openRetainedTranscript = async () => {
+      await active.sendKeys("C-o");
+      const pane = await active.waitForPane(
+        (pane) => pane.includes(fullFooter) && pane.includes(response),
+        READY_TIMEOUT,
+      );
+      expect(pane).toContain("zz-history");
+      expect(pane.split(response)).toHaveLength(2);
+    };
+    const expectClearedInline = async () => {
+      const footer = await waitForActiveFooter(
+        active,
+        (visible) => visible === `┃ ${draft}`,
+      );
+      expect(footer).toBe(`┃ ${draft}`);
+      await active.waitForPane(
+        (pane) => !pane.includes(fullFooter) && !pane.includes(response) &&
+          !pane.includes("zz-history"),
+        READY_TIMEOUT,
+      );
+      const scrollback = stripAnsi(await active.captureFullScrollbackEscapes());
+      expect(scrollback).toContain(draft);
+      expect(scrollback).not.toContain(fullFooter);
+      expect(scrollback).not.toContain(response);
+      expect(scrollback).not.toContain("zz-history");
+    };
+
+    // Establish that the viewer has the response before clearing the display.
+    await openRetainedTranscript();
+    await active.sendKeys("C-o");
+    await waitForActiveFooter(active, (footer) => footer === `┃ ${draft}`);
+    await active.waitForPane(
+      (pane) => !pane.includes(fullFooter) && pane.includes(response),
+      READY_TIMEOUT,
     );
-    expect(footer).toBe(`┃ ${draft}`);
-    await delay(100);
+
+    await active.sendKeys("C-l");
+    await expectClearedInline();
     expect(readFileSync(join(testHome!, "trace.log"), "utf8")).toContain(
       "visual_epoch_reset_requested trigger=ctrl_l",
     );
+
+    await openRetainedTranscript();
+    await active.sendKeys("C-o");
+    await expectClearedInline();
+
+    await active.resizeWindow(72, 20, 300);
+    await expectClearedInline();
+    await openRetainedTranscript();
+    await active.sendKeys("C-o");
+    await expectClearedInline();
     expect(gateway?.requests).toHaveLength(1);
 
     await active.sendKeys("Enter");
     await active.waitForPane(
-      (pane) => gateway?.requests.length === 2 && pane.includes("history prompt complete"),
+      (pane) => gateway?.requests.length === 2 && pane.includes(response),
       READY_TIMEOUT,
     );
+    await active.waitForStableComposer(READY_TIMEOUT);
+    const scrollback = stripAnsi(await active.captureFullScrollbackEscapes());
+    expect(scrollback.split(response)).toHaveLength(2);
+    expect(scrollback).not.toContain("zz-history");
     const followup = gateway!.requests[1]!.body;
     expect(followup).toContain("zz-history");
     expect(followup).toContain("history prompt complete");
@@ -1711,7 +1758,7 @@ tmuxTest(
       READY_TIMEOUT,
     );
     await active.resizeWindow(80, 24, 300);
-    await active.waitForText("Commands 38", READY_TIMEOUT);
+    await active.waitForText("Commands 37", READY_TIMEOUT);
     expect(gateway?.requests).toHaveLength(0);
     expectCleanStderr();
   },

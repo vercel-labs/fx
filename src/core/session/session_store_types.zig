@@ -15,6 +15,7 @@ pub const automatic_legacy_max_bytes: u64 = 256 * 1024 * 1024;
 
 /// On-disk storage format a readable session was found in.
 pub const StorageFormat = enum {
+    conversation,
     schema_v3,
     legacy_v1,
     legacy_v2,
@@ -23,6 +24,7 @@ pub const StorageFormat = enum {
 /// Storage format of a discovery candidate (kept distinct from `StorageFormat`
 /// so discovery and read APIs can evolve independently).
 pub const CandidateStorage = enum {
+    conversation,
     schema_v3,
     legacy_v1,
     legacy_v2,
@@ -64,7 +66,12 @@ pub const SessionSummary = struct {
     updated_at_ms: i64,
     conversation_language: session.ConversationLanguage,
     history_len: usize,
+    has_checkpoint: bool = false,
     has_managed_children: bool = false,
+
+    pub fn hasResumableContent(self: SessionSummary) bool {
+        return self.history_len != 0 or self.has_checkpoint or self.has_managed_children;
+    }
 
     /// Frees owned summary strings and poisons the value.
     pub fn deinit(self: *SessionSummary, alloc: Allocator) void {
@@ -106,18 +113,6 @@ pub const SessionListPage = struct {
     pub fn deinit(self: *SessionListPage, alloc: Allocator) void {
         for (self.summaries.items) |*summary| summary.deinit(alloc);
         self.summaries.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
-/// Aggregate cache summary: how many sessions exist and which is latest.
-pub const StateSummary = struct {
-    count: usize,
-    latest_id: ?[]u8 = null,
-
-    /// Frees the owned latest id, if any, and poisons the value.
-    pub fn deinit(self: *StateSummary, alloc: Allocator) void {
-        if (self.latest_id) |id| alloc.free(id);
         self.* = undefined;
     }
 };
@@ -319,10 +314,7 @@ pub const DoctorInspectionResult = struct {
 
 /// Thresholds that decide when committed-log growth is reported as overdue or
 /// failed compaction. Defaults match the historical behavior.
-pub const DoctorInspectionOptions = struct {
-    compaction_frame_threshold: u64 = 4096,
-    compaction_byte_threshold: u64 = 128 * 1024 * 1024,
-};
+pub const DoctorInspectionOptions = struct {};
 
 /// Copyable store state shared with discovery and migration without introducing
 /// a dependency on the `Store` facade. `canonical_root` retains value semantics.

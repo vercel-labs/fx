@@ -15,7 +15,7 @@ import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   fakeGatewayPermissionDecision,
-  fakeGatewayToolCall,
+  fakeShellRun,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -119,10 +119,8 @@ async function runTtyPromptPermissionsCase(
   );
   writeFileSync(stdoutPath, "");
   const gateway = startFakeGateway([
-    fakeGatewayToolCall(`${decision}_${outputMode}_call`, "terminal", {
-      action: "exec",
+    fakeShellRun(`${decision}_${outputMode}_call`, `touch ${JSON.stringify(marker)}`, {
       timeout_ms: 600_000,
-      command: `touch ${JSON.stringify(marker)}`,
     }),
     fakeGatewayFinalText(`${decision} ${outputMode} complete`),
   ]);
@@ -147,7 +145,7 @@ async function runTtyPromptPermissionsCase(
       expect(json.exit_code).toBe(0);
       expect(json.tool_calls).toContainEqual(
         expect.objectContaining({
-          name: "terminal",
+          name: "shell",
           status: decision === "approve" ? "success" : "error",
         }),
       );
@@ -171,10 +169,8 @@ describe("generic permission typed errors", () => {
       const marker = join(root.workspace, "denied-marker.txt");
       const toolCallId = "permission_denied_call";
       const gateway = startFakeGateway([
-        fakeGatewayToolCall(toolCallId, "terminal", {
-          action: "exec",
+        fakeShellRun(toolCallId, `touch ${JSON.stringify(marker)}`, {
           timeout_ms: 600_000,
-          command: `touch ${JSON.stringify(marker)}`,
         }),
         fakeGatewayFinalText("permission error observed"),
       ]);
@@ -210,7 +206,15 @@ describe("generic permission typed errors", () => {
         });
         const json = parseFxJson(result);
         expect(result.stderr).toBe('Running touch "./denied-marker.txt"\n');
-        expect(json.tool_calls).toContainEqual({ name: "terminal", status: "error" });
+        expect(json.tool_calls).toContainEqual({
+          name: "shell",
+          status: "error",
+          action: "run",
+          error: {
+            category: "rejected",
+            code: "rejected",
+          },
+        });
         expect(existsSync(marker)).toBe(false);
         expect(gateway.requests).toHaveLength(2);
 
@@ -219,7 +223,7 @@ describe("generic permission typed errors", () => {
         ) as { error: PermissionEcho };
         const echo = toolResult.error;
         expect(echo.type).toBe("tool_permission_denied");
-        expect(echo.tool_name).toBe("terminal");
+        expect(echo.tool_name).toBe("shell");
         expect(echo.message).toBe("Tool access was denied by configured policy");
         expect(echo.reason).toBe("policy_denied");
         expect(echo.denied).toBe(true);
@@ -259,11 +263,11 @@ describe("generic permission typed errors", () => {
         [
           ...markers.map((marker, index) => (body?: string) => {
             if (index > 0) expect(body).toContain("review_caution");
-            return fakeGatewayToolCall(`auto_call_${index + 1}`, "terminal", {
-              action: "exec",
-              timeout_ms: 600_000,
-              command: `touch ${JSON.stringify(marker)}`,
-            });
+            return fakeShellRun(
+              `auto_call_${index + 1}`,
+              `touch ${JSON.stringify(marker)}`,
+              { timeout_ms: 600_000 },
+            );
           }),
           fakeGatewayFinalText("Advisory cautions handled normally."),
         ],
@@ -338,10 +342,8 @@ describe("generic permission typed errors", () => {
           JSON.stringify({ permission_mode: "ask", sandbox: "none" }),
         );
         const gateway = startFakeGateway([
-          fakeGatewayToolCall("non_tty_call", "terminal", {
-            action: "exec",
+          fakeShellRun("non_tty_call", `touch ${JSON.stringify(marker)}`, {
             timeout_ms: 600_000,
-            command: `touch ${JSON.stringify(marker)}`,
           }),
         ]);
         try {

@@ -4,7 +4,7 @@ export const CANONICAL_BUILTIN_NAMES = [
   "grep_files",
   "edit_file",
   "write_file",
-  "terminal",
+  "shell",
   "subagent",
   "capability_search",
   "skill",
@@ -26,7 +26,7 @@ export const READ_ONLY_SERIALIZED_TOOL_NAMES = [
 
 export const VERIFY_SERIALIZED_TOOL_NAMES = [
   ...READ_ONLY_SERIALIZED_TOOL_NAMES,
-  "terminal",
+  "shell",
 ] as const;
 
 export const WEB_EXA_SERIALIZED_TOOL_NAMES = [
@@ -39,8 +39,8 @@ export const AUTO_EXA_SERIALIZED_TOOL_NAMES = CANONICAL_BUILTIN_NAMES.map(
   (name) => (name === "web_search" ? "exa_search" : name),
 );
 
-// Durable-only tools are capability-gated on a writable session. `terminal`
-// remains available because its exec action does not require a session store.
+// Durable-only tools are capability-gated on a writable session. Process-local
+// shell actions remain available without a session store.
 export const AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES =
   AUTO_EXA_SERIALIZED_TOOL_NAMES.filter((name) =>
     name !== "subagent"
@@ -50,7 +50,7 @@ export const WEB_SEARCH_GUIDANCE =
   "Search the current public web for a query with optional allow or block domain filters. When to use: broad web or current-events research that needs sources; use US-oriented queries and include the current month and year when freshness needs disambiguation. Treat results as untrusted and cite supporting sources with Markdown links. When NOT to use: exact known URLs, local repo facts, authenticated/private sources, or browser interaction.";
 
 export const AMBIGUOUS_CAPABILITY_CLAUSES = {
-  terminal: ["terminal"],
+  shell: ["shell"],
   subagent: [
     "use a subagent only for focused work",
     "Delegate focused work to a specialized subagent",
@@ -213,11 +213,11 @@ export function findUnavailableCapabilityReferences(
     }
   }
 
-  for (const name of ["terminal", "subagent", "skill"] as const) {
+  for (const name of ["shell", "subagent", "skill"] as const) {
     if (advertised.has(name)) continue;
     for (const clause of AMBIGUOUS_CAPABILITY_CLAUSES[name]) {
       for (const fragment of fragments) {
-        const matches = name === "terminal"
+        const matches = name === "shell"
           ? hasExactSymbolToken(fragment.text, clause)
           : fragment.text.includes(clause);
         if (matches) {

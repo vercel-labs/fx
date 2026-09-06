@@ -34,6 +34,7 @@ pub const Store = struct {
     store_id: []u8,
     limits: Limits,
     mutex: std.Io.Mutex = .init,
+    ready: bool = false,
     used_bytes: usize = 0,
     file_count: usize = 0,
 
@@ -42,21 +43,17 @@ pub const Store = struct {
     }
 
     pub fn initWithLimits(alloc: Allocator, session_dir: []const u8, limits: Limits) !Store {
-        try ensureArtifactDir(alloc, session_dir);
         const dir = try std.fs.path.join(alloc, &.{ session_dir, relative_dir });
         errdefer alloc.free(dir);
         const store_id = try alloc.dupe(u8, dir);
         errdefer alloc.free(store_id);
 
-        var store = Store{
+        return .{
             .allocator = alloc,
             .dir = dir,
             .store_id = store_id,
             .limits = limits,
         };
-
-        try store.reconcile();
-        return store;
     }
 
     pub fn deinit(self: *Store) void {
@@ -89,7 +86,10 @@ pub const Store = struct {
 
     pub fn contains(self: *Store, handle: []const u8) !bool {
         try validateHandle(handle);
-        var dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), self.dir, .{ .iterate = true });
+        var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), self.dir, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
         defer dir.close(io_mod.getIo());
         var iter = dir.iterate();
         while (try iter.next(io_mod.getIo())) |entry| {
@@ -142,6 +142,7 @@ pub const Store = struct {
     fn writeWithOwnedHandle(self: *Store, alloc: Allocator, handle: []u8, mime_type: []const u8, bytes: []const u8) !Artifact {
         errdefer alloc.free(handle);
         try validateHandle(handle);
+        try self.ensureReady();
 
         const normalized_mime = try normalizedMime(alloc, mime_type);
         errdefer alloc.free(normalized_mime);
@@ -186,6 +187,19 @@ pub const Store = struct {
         if (self.file_count >= self.limits.max_files) return error.ArtifactFileCapExceeded;
         self.used_bytes += byte_count;
         self.file_count += 1;
+    }
+
+    fn ensureReady(self: *Store) !void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (self.ready) return;
+        const session_dir = std.fs.path.dirname(self.dir) orelse
+            return error.CorruptArtifactStore;
+        const root = std.fs.path.dirname(session_dir) orelse
+            return error.CorruptArtifactStore;
+        try ensureArtifactDir(self.allocator, root);
+        try self.reconcile();
+        self.ready = true;
     }
 
     fn rollback(self: *Store, byte_count: usize) void {
@@ -362,9 +376,9 @@ test "web_fetch artifact quota reconciles existing files on resume" {
 
     var store = try Store.initWithLimits(alloc, session_dir, .{ .max_bytes = 4, .max_files = 2 });
     defer store.deinit();
+    try std.testing.expectError(error.ArtifactQuotaExceeded, store.writeWithHandleForTest(alloc, "artifact-new.bin", "application/octet-stream", "xy"));
     try std.testing.expectEqual(@as(usize, 3), store.usedBytesForTest());
     try std.testing.expectEqual(@as(usize, 1), store.fileCountForTest());
-    try std.testing.expectError(error.ArtifactQuotaExceeded, store.writeWithHandleForTest(alloc, "artifact-new.bin", "application/octet-stream", "xy"));
 }
 
 test "web_fetch concurrent artifact reservations cannot exceed byte or file caps" {
@@ -394,6 +408,7 @@ test "web_fetch failed artifact write rolls back quota reservation" {
     defer alloc.free(session_dir);
     var store = try Store.initWithLimits(alloc, session_dir, .{ .max_bytes = 3, .max_files = 1 });
     defer store.deinit();
+    try store.ensureReady();
 
     const final_dir = try std.fs.path.join(alloc, &.{ store.dir, "artifact-conflict.bin" });
     defer alloc.free(final_dir);
@@ -426,6 +441,7 @@ test "web_fetch artifact store refuses symlinks and partial temp files determini
 
         var store = try Store.init(alloc, session_dir);
         defer store.deinit();
+        try store.ensureReady();
         try std.testing.expect(!try store.contains("artifact-leftover.bin"));
         try std.testing.expectError(error.FileNotFound, std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), temp_path));
     }
@@ -440,7 +456,9 @@ test "web_fetch artifact store refuses symlinks and partial temp files determini
         };
         const session_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
         defer alloc.free(session_dir);
-        try std.testing.expectError(error.CorruptArtifactStore, Store.init(alloc, session_dir));
+        var store = try Store.init(alloc, session_dir);
+        defer store.deinit();
+        try std.testing.expectError(error.CorruptArtifactStore, store.ensureReady());
     }
 }
 
@@ -457,7 +475,9 @@ test "web_fetch artifact store rejects a symlinked store directory" {
     const session_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(session_dir);
 
-    try std.testing.expectError(error.CorruptArtifactStore, Store.init(alloc, session_dir));
+    var store = try Store.init(alloc, session_dir);
+    defer store.deinit();
+    try std.testing.expectError(error.CorruptArtifactStore, store.ensureReady());
 }
 
 test "web_fetch artifact store creates private managed directories" {
@@ -469,6 +489,13 @@ test "web_fetch artifact store creates private managed directories" {
 
     var store = try Store.init(alloc, session_dir);
     defer store.deinit();
+
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.statFile(io_mod.getIo(), "artifacts", .{ .follow_symlinks = false }),
+    );
+    var artifact = try store.write(alloc, "text/plain", "created lazily");
+    defer artifact.deinit(alloc);
 
     const artifacts_stat = try tmp.dir.statFile(io_mod.getIo(), "artifacts", .{ .follow_symlinks = false });
     const web_fetch_stat = try tmp.dir.statFile(io_mod.getIo(), "artifacts/web-fetch", .{ .follow_symlinks = false });
@@ -490,5 +517,7 @@ test "web_fetch corrupt durable artifact store fails instead of degrading to sto
     defer alloc.free(corrupt_path);
     try createFileAbsolute(corrupt_path, "corrupt");
 
-    try std.testing.expectError(error.InvalidArtifactHandle, Store.init(alloc, session_dir));
+    var store = try Store.init(alloc, session_dir);
+    defer store.deinit();
+    try std.testing.expectError(error.InvalidArtifactHandle, store.ensureReady());
 }

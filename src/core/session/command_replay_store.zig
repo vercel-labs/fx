@@ -14,7 +14,6 @@ const replay_magic = "FXRPLY01";
 const frame_header_bytes: usize = 9;
 const max_frame_payload_bytes: usize = 1024 * 1024;
 const max_agent_line_bytes: usize = max_frame_payload_bytes;
-const agent_projection_overlap_bytes: usize = 64;
 pub const max_public_handle_bytes: usize = 128;
 pub const CapturePolicy = enum {
     best_effort,
@@ -1115,13 +1114,11 @@ fn projectedOutput(
     stream: Stream,
     payload: []const u8,
 ) ![]u8 {
-    const masked = try text_utils.maskSecrets(alloc, payload);
-    defer if (masked.ptr != payload.ptr) alloc.free(@constCast(masked));
-    const max_encoded_bytes = std.math.mul(usize, masked.len, 12) catch
+    const max_encoded_bytes = std.math.mul(usize, payload.len, 12) catch
         return error.OutOfMemory;
     var encoded = try text_utils.encodeTerminalSafe(
         alloc,
-        masked,
+        payload,
         max_encoded_bytes,
     );
     defer encoded.deinit(alloc);
@@ -1138,16 +1135,14 @@ const AgentProjectionReader = struct {
     line: std.ArrayList(u8) = .empty,
     stream: ?Stream = null,
     pending_byte: ?Byte = null,
-    discarding_sensitive_line: bool = false,
 
     fn deinit(self: *AgentProjectionReader, alloc: Allocator) void {
         self.line.deinit(alloc);
         self.* = undefined;
     }
 
-    /// Projects logical lines so masking cannot be bypassed by a secret split
-    /// across callback frames. Non-secret oversized lines stream in bounded
-    /// chunks; suspicious oversized lines are suppressed conservatively.
+    /// Projects logical lines while keeping memory bounded. Oversized lines
+    /// stream in independent chunks without changing their content.
     fn next(self: *AgentProjectionReader, alloc: Allocator) !?[]u8 {
         while (true) {
             const next_byte = if (self.pending_byte) |byte| blk: {
@@ -1167,24 +1162,7 @@ const AgentProjectionReader = struct {
                 self.stream = next_byte.stream;
             }
 
-            if (self.discarding_sensitive_line) {
-                if (next_byte.value == '\n') return try self.finishLine(alloc);
-                continue;
-            }
             if (self.line.items.len == max_agent_line_bytes) {
-                const masked = try text_utils.maskSecrets(alloc, self.line.items);
-                defer if (masked.ptr != self.line.items.ptr) alloc.free(@constCast(masked));
-                if (masked.ptr != self.line.items.ptr or
-                    text_utils.secretMayCrossBoundary(
-                        self.line.items,
-                        agent_projection_overlap_bytes,
-                    ))
-                {
-                    self.line.clearRetainingCapacity();
-                    self.discarding_sensitive_line = true;
-                    if (next_byte.value == '\n') return try self.finishLine(alloc);
-                    continue;
-                }
                 self.pending_byte = next_byte;
                 return try self.finishChunk(alloc);
             }
@@ -1198,33 +1176,18 @@ const AgentProjectionReader = struct {
         defer {
             self.line.clearRetainingCapacity();
             self.stream = null;
-            self.discarding_sensitive_line = false;
-        }
-        if (self.discarding_sensitive_line) {
-            const stream_name = @tagName(stream);
-            return std.fmt.allocPrint(
-                alloc,
-                "[{s}]\n[secret-bearing output line omitted after {d} bytes]\n[/{s}]\n",
-                .{ stream_name, max_agent_line_bytes, stream_name },
-            );
         }
         return projectedOutput(alloc, stream, self.line.items);
     }
 
     fn finishChunk(self: *AgentProjectionReader, alloc: Allocator) ![]u8 {
         std.debug.assert(self.line.items.len == max_agent_line_bytes);
-        const flush_len = self.line.items.len - agent_projection_overlap_bytes;
         const projected = try projectedOutput(
             alloc,
             self.stream.?,
-            self.line.items[0..flush_len],
+            self.line.items,
         );
-        std.mem.copyForwards(
-            u8,
-            self.line.items[0..agent_projection_overlap_bytes],
-            self.line.items[flush_len..],
-        );
-        self.line.shrinkRetainingCapacity(agent_projection_overlap_bytes);
+        self.line.clearRetainingCapacity();
         return projected;
     }
 };
@@ -1599,12 +1562,12 @@ test "ephemeral command replay unlinks backing before publication and remains re
         4096,
     );
     defer alloc.free(page);
-    try std.testing.expect(std.mem.find(u8, page, "TOKEN=[redacted]") != null);
-    try std.testing.expect(std.mem.find(u8, page, "private-value") == null);
+    try std.testing.expect(std.mem.find(u8, page, "TOKEN=private-value") != null);
+    try std.testing.expect(std.mem.find(u8, page, "[redacted]") == null);
     try std.testing.expect(std.mem.find(u8, page, "ephemeral needle") != null);
 }
 
-test "agent command replay masks secrets split across callback frames" {
+test "agent command replay preserves secrets split across callback frames" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1631,9 +1594,8 @@ test "agent command replay masks secrets split across callback frames" {
         4096,
     );
     defer alloc.free(page);
-    try std.testing.expect(std.mem.find(u8, page, "TOKEN=[redacted]") != null);
-    try std.testing.expect(std.mem.find(u8, page, "private-") == null);
-    try std.testing.expect(std.mem.find(u8, page, "value") == null);
+    try std.testing.expect(std.mem.find(u8, page, "TOKEN=private-value") != null);
+    try std.testing.expect(std.mem.find(u8, page, "[redacted]") == null);
 
     const query = try searchAgentQueryEphemeral(
         alloc,
@@ -1698,7 +1660,7 @@ test "agent command replay pages stay contiguous across utf8 boundaries" {
     try std.testing.expect(std.mem.find(u8, second, "\xe2\x98\x83cd") != null);
 }
 
-test "agent command replay keeps split utf8 valid and omits oversized secret-bearing lines" {
+test "agent command replay keeps split utf8 valid and streams oversized secret-bearing lines" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1732,13 +1694,22 @@ test "agent command replay keeps split utf8 valid and omits oversized secret-bea
     defer alloc.free(page);
     try std.testing.expect(std.unicode.utf8ValidateSlice(page));
     try std.testing.expect(std.mem.find(u8, page, "utf8 split \xe2\x98\x83") != null);
-    try std.testing.expect(std.mem.find(u8, page, "output line omitted") != null);
-    try std.testing.expect(std.mem.find(u8, page, "TOKEN=") == null);
-    try std.testing.expect(std.mem.find(u8, page, "ssssssss") == null);
-    try std.testing.expect(std.mem.find(u8, page, "after oversized line") != null);
+    try std.testing.expect(std.mem.find(u8, page, "output line omitted") == null);
+    try std.testing.expect(std.mem.find(u8, page, "TOKEN=ssssssss") != null);
+
+    const query = try searchAgentQueryEphemeral(
+        alloc,
+        &store,
+        descriptor.handle,
+        "after oversized line",
+        4096,
+    );
+    defer alloc.free(query);
+    try std.testing.expect(std.mem.find(u8, query, "after oversized line") != null);
+    try std.testing.expect(std.mem.find(u8, query, "output line omitted") == null);
 }
 
-test "agent command replay omits oversized sensitive assignments split after delimiters" {
+test "agent command replay preserves oversized sensitive assignments split after delimiters" {
     const alloc = std.testing.allocator;
     const delimiters = [_][]const u8{ "=", "=\"", "='" };
 
@@ -1769,18 +1740,17 @@ test "agent command replay omits oversized sensitive assignments split after del
             return error.TestExpectedReplay;
         defer capture.releaseRetained(arena);
 
-        const page = try readAgentPageEphemeral(
+        const query = try searchAgentQueryEphemeral(
             alloc,
             &store,
             descriptor.handle,
-            1,
+            "secret-after-boundary",
             4096,
         );
-        defer alloc.free(page);
-        try std.testing.expect(std.mem.find(u8, page, "output line omitted") != null);
-        try std.testing.expect(std.mem.find(u8, page, "MY_VERY_LONG_TOKEN_KEY") == null);
-        try std.testing.expect(std.mem.find(u8, page, "secret-after-boundary") == null);
-        try std.testing.expect(std.mem.find(u8, page, "after line") != null);
+        defer alloc.free(query);
+        try std.testing.expect(std.mem.find(u8, query, "secret-after-boundary") != null);
+        try std.testing.expect(std.mem.find(u8, query, "output line omitted") == null);
+        try std.testing.expect(std.mem.find(u8, query, "(no matches)") == null);
     }
 }
 

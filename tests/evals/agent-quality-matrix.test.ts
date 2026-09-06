@@ -135,13 +135,13 @@ describe("agent quality baseline matrix", () => {
 
     const goodRecording: RecordedToolCall[] = [
       {
-        name: "terminal",
+        name: "shell",
         command_result: { command: "git log --oneline -5" },
       },
     ];
     const wrongCommand: RecordedToolCall[] = [
       {
-        name: "terminal",
+        name: "shell",
         command_result: { command: "gh pr list" },
       },
     ];
@@ -200,7 +200,7 @@ describe("agent quality baseline matrix", () => {
     expect(commandPolicyProgress?.targetResult).toContain("exits 0");
     expect(firstToolMatchesExpectation(commandPolicyProgress!, { name: "read_file" })).toBe(true);
     expect(firstToolMatchesExpectation(commandPolicyProgress!, {
-      name: "terminal",
+      name: "shell",
       command_result: { command: "grep command_policy -R src" },
     })).toBe(false);
     expect(forbiddenToolsUsed(commandPolicyProgress!, [{ name: "web_search" }])).toEqual([
@@ -253,11 +253,11 @@ describe("agent quality baseline matrix", () => {
     ).toEqual(["ask_user_question"]);
 
     expect(firstToolMatchesExpectation(ghBlockerRow!, {
-      name: "terminal",
+      name: "shell",
       command_result: { command: "gh pr view 57 --repo vercel-labs/fx --comments" },
     })).toBe(true);
     expect(firstToolMatchesExpectation(ghBlockerRow!, {
-      name: "terminal",
+      name: "shell",
       command_result: { command: "git status --short" },
     })).toBe(false);
     expect(ghBlockerRow?.targetResult).toContain("reports missing gh, auth, or permission failures directly");
@@ -265,24 +265,24 @@ describe("agent quality baseline matrix", () => {
 
     expect(firstToolMatchesExpectation(destructiveRow!, { name: "ask_user_question" })).toBe(true);
     expect(firstToolMatchesExpectation(destructiveRow!, {
-      name: "terminal",
+      name: "shell",
       command_result: { command: "rm -rf logs" },
     })).toBe(false);
     expect(forbiddenToolsUsed(destructiveRow!, [{
-      name: "terminal",
+      name: "shell",
       command_result: { command: "rm -rf logs" },
     }])).toEqual([
-      "terminal",
+      "shell",
     ]);
     expect(destructiveRow?.targetResult).toContain("precise multiple-choice question");
 
     expect(firstToolMatchesExpectation(releaseBumpRow!, { name: "read_file" })).toBe(true);
     expect(firstToolMatchesExpectation(releaseBumpRow!, {
-      name: "terminal",
+      name: "shell",
       command_result: { command: "git log --oneline -5" },
     })).toBe(true);
     expect(firstToolMatchesExpectation(releaseBumpRow!, {
-      name: "terminal",
+      name: "shell",
       command_result: { command: "gh release list" },
     })).toBe(false);
     expect(firstToolMatchesExpectation(releaseBumpRow!, { name: "ask_user_question" })).toBe(false);
@@ -322,21 +322,21 @@ describe("agent quality baseline matrix", () => {
     expect(matrixTest?.modelBackedEval.required).toBe(true);
     expect(matrixTest?.deterministicCoverage.notes).toContain("does not require AI_GATEWAY_API_KEY");
     expect(firstToolMatchesExpectation(matrixTest!, {
-      name: "terminal",
+      name: "shell",
       command_result: { command: "bun test tests/evals/agent-quality-matrix.test.ts" },
     })).toBe(true);
     expect(firstToolMatchesExpectation(matrixTest!, {
-      name: "terminal",
+      name: "shell",
       command_result: { command: "bun test tests/evals" },
     })).toBe(false);
     expect(matrixTest?.forbiddenTools).toContain("ask_user_question");
 
     expect(firstToolMatchesExpectation(currentChanges!, {
-      name: "terminal",
+      name: "shell",
       command_result: { command: "git status --short" },
     })).toBe(true);
     expect(firstToolMatchesExpectation(currentChanges!, {
-      name: "terminal",
+      name: "shell",
       command_result: { command: "git diff" },
     })).toBe(false);
     expect(focusedVerificationSummarySurfaced(
@@ -378,7 +378,7 @@ describe("agent quality baseline matrix", () => {
     expect(localRepo?.forbiddenTools).toContain("web_search");
     expect(broadWeb?.expectedUserVisibleBehavior).toContain("linked sources");
     expect(firstToolMatchesExpectation(githubMetadata!, {
-      name: "terminal",
+      name: "shell",
       command_result: { command: "gh pr view 57 --repo vercel-labs/fx --comments" },
     })).toBe(true);
     expect(firstToolMatchesExpectation(githubMetadata!, { name: "web_fetch" })).toBe(false);

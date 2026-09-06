@@ -44,11 +44,12 @@ fn sendPrepared(
     return openai_codex.streamPrepared(alloc, request, payload);
 }
 
-test "Codex reviewer model remains catalog-selected gpt-5.4-mini" {
-    try std.testing.expectEqualStrings("gpt-5.4-mini", openai_codex_models.reviewer_model);
+test "Codex reviewer model remains catalog-selected gpt-5.6-luna" {
+    try std.testing.expectEqualStrings("gpt-5.6-luna", openai_codex_models.reviewer_model);
 }
 
-test "Codex reviewer builds a direct Responses request with gpt-5.4-mini" {
+test "Codex reviewer builds a direct Responses request with gpt-5.6-luna" {
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "Review the pending action." }};
     const messages = [_]types.ChatMessage{
         .{ .role = .user, .content = "User requested the change." },
         .{
@@ -59,12 +60,12 @@ test "Codex reviewer builds a direct Responses request with gpt-5.4-mini" {
                 .arguments_json = "{\"path\":\"a.txt\"}",
             }},
         },
-        .{ .role = .system, .content = "Review the pending action." },
     };
     var cancelled = std.atomic.Value(bool).init(false);
     const body = try responses_reviewer.buildPayloadForTest(
         std.testing.allocator,
         openai_codex_models.reviewer_model,
+        &instructions,
         &messages,
         "call_review",
         std.Io.Clock.Timestamp.fromNow(@import("../core/shared/io.zig").getIo(), .{
@@ -76,7 +77,7 @@ test "Codex reviewer builds a direct Responses request with gpt-5.4-mini" {
     );
     defer std.testing.allocator.free(body);
 
-    try std.testing.expect(std.mem.find(u8, body, "\"model\":\"gpt-5.4-mini\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"model\":\"gpt-5.6-luna\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"tool_choice\":\"required\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"type\":\"function_call_output\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "ai-gateway") == null);

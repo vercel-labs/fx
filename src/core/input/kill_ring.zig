@@ -108,7 +108,7 @@ pub const State = struct {
         deleteInputRange(alloc, active, actual.start, actual.end);
         _ = active.edit.setCursor(actual.start);
         active.picker.reconcileInlinePickerAfterEdit(active.edit);
-        active.picker.resetActiveModelPickerIndex();
+        active.picker.resetActiveCompletionIndex();
 
         var previous = self.*;
         self.* = next;
@@ -638,7 +638,7 @@ fn insertInputSliceAssumeCapacity(
     active.edit.insertSliceAssumeCapacity(bytes);
     active.entities.shiftForInsert(alloc, insert_start, bytes.len);
     active.picker.reconcileInlinePickerAfterEdit(active.edit);
-    active.picker.resetActiveModelPickerIndex();
+    active.picker.resetActiveCompletionIndex();
 }
 
 fn removeRegisteredEntitiesOverlapping(

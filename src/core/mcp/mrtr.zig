@@ -3,7 +3,6 @@
 
 const std = @import("std");
 const elicitation = @import("elicitation.zig");
-const json_number = @import("json_number.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -19,39 +18,20 @@ pub const Limits = struct {
 pub const Error = error{
     InvalidInputRequired,
     InvalidInputResponses,
+    UnsupportedInputRequest,
     MetadataLimitExceeded,
 } || Allocator.Error || std.Io.Writer.Error;
 
-const SamplingRequest = struct {
-    params_json: []u8,
-
-    fn deinit(self: *SamplingRequest, alloc: Allocator) void {
-        alloc.free(self.params_json);
-        self.* = undefined;
-    }
-};
-
-const RootsRequest = struct {
-    params_json: ?[]u8,
-
-    fn deinit(self: *RootsRequest, alloc: Allocator) void {
-        if (self.params_json) |value| alloc.free(value);
-        self.* = undefined;
-    }
-};
-
-const ElicitationMode = elicitation.Mode;
+const UnsupportedMethod = enum { sampling, roots };
 const ElicitationRequest = elicitation.Request;
 
 const RequestPayload = union(enum) {
-    sampling_create_message: SamplingRequest,
-    roots_list: RootsRequest,
+    unsupported: UnsupportedMethod,
     elicitation_create: ElicitationRequest,
 
     fn deinit(self: *RequestPayload, alloc: Allocator) void {
         switch (self.*) {
-            .sampling_create_message => |*value| value.deinit(alloc),
-            .roots_list => |*value| value.deinit(alloc),
+            .unsupported => {},
             .elicitation_create => |*value| value.deinit(alloc),
         }
         self.* = undefined;
@@ -59,8 +39,10 @@ const RequestPayload = union(enum) {
 
     pub fn method(self: RequestPayload) []const u8 {
         return switch (self) {
-            .sampling_create_message => "sampling/createMessage",
-            .roots_list => "roots/list",
+            .unsupported => |method_name| switch (method_name) {
+                .sampling => "sampling/createMessage",
+                .roots => "roots/list",
+            },
             .elicitation_create => "elicitation/create",
         };
     }
@@ -169,10 +151,10 @@ fn parseRequestMap(
 
         const key = try alloc.dupe(u8, entry.key_ptr.*);
         errdefer alloc.free(key);
-        const payload = if (std.mem.eql(u8, method.string, "sampling/createMessage"))
-            try parseSamplingRequest(alloc, request, limits)
+        const payload: RequestPayload = if (std.mem.eql(u8, method.string, "sampling/createMessage"))
+            .{ .unsupported = .sampling }
         else if (std.mem.eql(u8, method.string, "roots/list"))
-            try parseRootsRequest(alloc, request, limits)
+            .{ .unsupported = .roots }
         else if (std.mem.eql(u8, method.string, "elicitation/create"))
             try parseElicitationRequest(alloc, request, limits, wire)
         else
@@ -181,33 +163,6 @@ fn parseRequestMap(
         parsed_count += 1;
     }
     return requests;
-}
-
-fn parseSamplingRequest(
-    alloc: Allocator,
-    request: std.json.Value,
-    limits: Limits,
-) Error!RequestPayload {
-    const params = request.object.get("params") orelse return error.InvalidInputRequired;
-    try validateSamplingParams(alloc, params, limits);
-    return .{ .sampling_create_message = .{
-        .params_json = try stringifyBounded(alloc, params, limits.max_json_bytes),
-    } };
-}
-
-fn parseRootsRequest(
-    alloc: Allocator,
-    request: std.json.Value,
-    limits: Limits,
-) Error!RequestPayload {
-    const params_json = if (request.object.get("params")) |params| blk: {
-        if (params != .object) return error.InvalidInputRequired;
-        if (params.object.get("_meta")) |metadata| if (metadata != .object) {
-            return error.InvalidInputRequired;
-        };
-        break :blk try stringifyBounded(alloc, params, limits.max_json_bytes);
-    } else null;
-    return .{ .roots_list = .{ .params_json = params_json } };
 }
 
 fn parseElicitationRequest(
@@ -265,14 +220,7 @@ fn renderRequestsFallible(
         try out.writer.writeAll(":{\"method\":");
         try std.json.Stringify.value(request.payload.method(), .{}, &out.writer);
         switch (request.payload) {
-            .sampling_create_message => |value| {
-                try out.writer.writeAll(",\"params\":");
-                try out.writer.writeAll(value.params_json);
-            },
-            .roots_list => |value| if (value.params_json) |params| {
-                try out.writer.writeAll(",\"params\":");
-                try out.writer.writeAll(params);
-            },
+            .unsupported => {},
             .elicitation_create => |value| {
                 try out.writer.writeAll(",\"params\":");
                 try out.writer.writeAll(value.raw_params_json);
@@ -309,8 +257,7 @@ pub fn validateResponses(
         const response = parsed.value.object.get(request.key) orelse
             return error.InvalidInputResponses;
         switch (request.payload) {
-            .sampling_create_message => try validateSamplingResult(response, limits),
-            .roots_list => try validateRootsResult(response, limits),
+            .unsupported => return error.UnsupportedInputRequest,
             .elicitation_create => |elicitation_request| try validateElicitationResult(
                 alloc,
                 elicitation_request,
@@ -375,206 +322,6 @@ fn validateJsonBounds(value: std.json.Value, limits: Limits, depth: usize) Error
     }
 }
 
-fn validateSamplingParams(
-    alloc: Allocator,
-    value: std.json.Value,
-    limits: Limits,
-) Error!void {
-    if (value != .object) return error.InvalidInputRequired;
-    const messages = value.object.get("messages") orelse return error.InvalidInputRequired;
-    const max_tokens = value.object.get("maxTokens") orelse return error.InvalidInputRequired;
-    if (messages != .array or messages.array.items.len > limits.max_collection_items) {
-        return error.InvalidInputRequired;
-    }
-    const parsed_max_tokens = json_number.fromValue(alloc, max_tokens, .{}) catch
-        return error.InvalidInputRequired;
-    if (parsed_max_tokens == null) return error.InvalidInputRequired;
-    var max_token_number = parsed_max_tokens.?;
-    defer max_token_number.deinit(alloc);
-    const max_token_count = max_token_number.toNonNegativeUsize() orelse
-        return error.InvalidInputRequired;
-    if (max_token_count == 0) return error.InvalidInputRequired;
-    for (messages.array.items) |message| try validateSamplingMessage(message, limits);
-    if (value.object.get("systemPrompt")) |text| try validateStringValue(
-        text,
-        limits.max_string_bytes,
-        error.InvalidInputRequired,
-    );
-    if (value.object.get("includeContext")) |context| {
-        if (context != .string or
-            (!std.mem.eql(u8, context.string, "none") and
-                !std.mem.eql(u8, context.string, "thisServer") and
-                !std.mem.eql(u8, context.string, "allServers")))
-        {
-            return error.InvalidInputRequired;
-        }
-    }
-    if (value.object.get("temperature")) |temperature| if (!isNumber(temperature)) {
-        return error.InvalidInputRequired;
-    };
-    if (value.object.get("stopSequences")) |sequences| {
-        try validateStringArray(sequences, limits);
-    }
-    if (value.object.get("metadata")) |metadata| if (metadata != .object) {
-        return error.InvalidInputRequired;
-    };
-    if (value.object.get("modelPreferences")) |preferences| if (preferences != .object) {
-        return error.InvalidInputRequired;
-    };
-    if (value.object.get("tools")) |tools| {
-        if (tools != .array or tools.array.items.len > limits.max_collection_items) {
-            return error.InvalidInputRequired;
-        }
-        for (tools.array.items) |tool| {
-            if (tool != .object or tool.object.get("name") == null or
-                tool.object.get("inputSchema") == null or
-                tool.object.get("name").? != .string or
-                tool.object.get("inputSchema").? != .object)
-            {
-                return error.InvalidInputRequired;
-            }
-        }
-    }
-    if (value.object.get("toolChoice")) |choice| {
-        if (choice != .object) return error.InvalidInputRequired;
-        if (choice.object.get("mode")) |mode| {
-            if (mode != .string or
-                (!std.mem.eql(u8, mode.string, "auto") and
-                    !std.mem.eql(u8, mode.string, "required") and
-                    !std.mem.eql(u8, mode.string, "none")))
-            {
-                return error.InvalidInputRequired;
-            }
-        }
-    }
-}
-
-fn validateSamplingMessage(value: std.json.Value, limits: Limits) Error!void {
-    if (value != .object) return error.InvalidInputRequired;
-    const role = value.object.get("role") orelse return error.InvalidInputRequired;
-    const content = value.object.get("content") orelse return error.InvalidInputRequired;
-    if (role != .string or
-        (!std.mem.eql(u8, role.string, "user") and !std.mem.eql(u8, role.string, "assistant")))
-    {
-        return error.InvalidInputRequired;
-    }
-    try validateSamplingContent(content, limits, error.InvalidInputRequired, 0);
-}
-
-fn validateSamplingResult(value: std.json.Value, limits: Limits) Error!void {
-    if (value != .object) return error.InvalidInputResponses;
-    const role = value.object.get("role") orelse return error.InvalidInputResponses;
-    const content = value.object.get("content") orelse return error.InvalidInputResponses;
-    _ = try requireString(
-        value.object,
-        "model",
-        limits.max_string_bytes,
-        error.InvalidInputResponses,
-    );
-    if (role != .string or
-        (!std.mem.eql(u8, role.string, "user") and !std.mem.eql(u8, role.string, "assistant")))
-    {
-        return error.InvalidInputResponses;
-    }
-    try validateSamplingContent(content, limits, error.InvalidInputResponses, 0);
-    if (value.object.get("stopReason")) |reason| try validateStringValue(
-        reason,
-        limits.max_string_bytes,
-        error.InvalidInputResponses,
-    );
-    if (value.object.get("_meta")) |metadata| if (metadata != .object) {
-        return error.InvalidInputResponses;
-    };
-}
-
-fn validateSamplingContent(
-    value: std.json.Value,
-    limits: Limits,
-    invalid: Error,
-    depth: usize,
-) Error!void {
-    if (depth > limits.max_depth) return error.MetadataLimitExceeded;
-    if (value == .array) {
-        if (value.array.items.len > limits.max_collection_items) return invalid;
-        for (value.array.items) |item| try validateSamplingContentItem(
-            item,
-            limits,
-            invalid,
-            depth,
-        );
-        return;
-    }
-    try validateSamplingContentItem(value, limits, invalid, depth);
-}
-
-fn validateSamplingContentItem(
-    value: std.json.Value,
-    limits: Limits,
-    invalid: Error,
-    depth: usize,
-) Error!void {
-    if (value != .object) return invalid;
-    const type_value = value.object.get("type") orelse return invalid;
-    if (type_value != .string) return invalid;
-    if (std.mem.eql(u8, type_value.string, "text")) {
-        const text = value.object.get("text") orelse return invalid;
-        try validateStringValue(text, limits.max_string_bytes, invalid);
-        return;
-    }
-    if (std.mem.eql(u8, type_value.string, "image") or
-        std.mem.eql(u8, type_value.string, "audio"))
-    {
-        const data = value.object.get("data") orelse return invalid;
-        const mime_type = value.object.get("mimeType") orelse return invalid;
-        try validateStringValue(data, limits.max_json_bytes, invalid);
-        try validateStringValue(mime_type, limits.max_name_bytes, invalid);
-        return;
-    }
-    if (std.mem.eql(u8, type_value.string, "tool_use")) {
-        const id = value.object.get("id") orelse return invalid;
-        const name = value.object.get("name") orelse return invalid;
-        const input = value.object.get("input") orelse return invalid;
-        try validateStringValue(id, limits.max_name_bytes, invalid);
-        try validateStringValue(name, limits.max_name_bytes, invalid);
-        if (input != .object) return invalid;
-        return;
-    }
-    if (std.mem.eql(u8, type_value.string, "tool_result")) {
-        const id = value.object.get("toolUseId") orelse return invalid;
-        const content = value.object.get("content") orelse return invalid;
-        try validateStringValue(id, limits.max_name_bytes, invalid);
-        if (content != .array or content.array.items.len > limits.max_collection_items) return invalid;
-        try validateSamplingContent(content, limits, invalid, depth + 1);
-        return;
-    }
-    return invalid;
-}
-
-fn validateRootsResult(value: std.json.Value, limits: Limits) Error!void {
-    if (value != .object) return error.InvalidInputResponses;
-    const roots = value.object.get("roots") orelse return error.InvalidInputResponses;
-    if (roots != .array or roots.array.items.len > limits.max_collection_items) {
-        return error.InvalidInputResponses;
-    }
-    for (roots.array.items) |root| {
-        if (root != .object) return error.InvalidInputResponses;
-        _ = try requireString(
-            root.object,
-            "uri",
-            limits.max_string_bytes,
-            error.InvalidInputResponses,
-        );
-        if (root.object.get("name")) |name| try validateStringValue(
-            name,
-            limits.max_string_bytes,
-            error.InvalidInputResponses,
-        );
-        if (root.object.get("_meta")) |metadata| if (metadata != .object) {
-            return error.InvalidInputResponses;
-        };
-    }
-}
-
 fn validateElicitationResult(
     alloc: Allocator,
     request: ElicitationRequest,
@@ -602,41 +349,6 @@ fn validateElicitationResult(
         error.OutOfMemory => return error.OutOfMemory,
         error.LimitExceeded => return error.MetadataLimitExceeded,
         else => return error.InvalidInputResponses,
-    };
-}
-
-fn requireString(
-    object: std.json.ObjectMap,
-    key: []const u8,
-    max_bytes: usize,
-    invalid: Error,
-) Error![]const u8 {
-    const value = object.get(key) orelse return invalid;
-    try validateStringValue(value, max_bytes, invalid);
-    return value.string;
-}
-
-fn validateStringValue(value: std.json.Value, max_bytes: usize, invalid: Error) Error!void {
-    if (value != .string or value.string.len > max_bytes) return invalid;
-}
-
-fn validateStringArray(value: std.json.Value, limits: Limits) Error!void {
-    if (value != .array or value.array.items.len > limits.max_collection_items) {
-        return error.InvalidInputRequired;
-    }
-    for (value.array.items) |item| try validateStringValue(
-        item,
-        limits.max_string_bytes,
-        error.InvalidInputRequired,
-    );
-}
-
-fn isNumber(value: std.json.Value) bool {
-    return switch (value) {
-        .integer => true,
-        .float => |number| std.math.isFinite(number),
-        .number_string => true,
-        else => false,
     };
 }
 
@@ -682,55 +394,43 @@ test "MRTR parses the closed request union and rejects unknown methods" {
     );
 }
 
-test "MRTR responses require exact keys and method-specific results" {
+test "MRTR validates only supported responses with exact keys" {
     const alloc = std.testing.allocator;
-    const requests = try parseRequestJson(
-        alloc,
-        \\{"sample":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":8}},"roots":{"method":"roots/list"},"form":{"method":"elicitation/create","params":{"message":"Continue?","requestedSchema":{"type":"object","properties":{"confirmed":{"type":"boolean"}},"required":["confirmed"]}}},"url":{"method":"elicitation/create","params":{"mode":"url","message":"Authenticate","url":"https://example.test/auth"}}}
-    ,
-        .{},
-    );
+    const requests = try parseRequestJson(alloc,
+        \\{"form":{"method":"elicitation/create","params":{"message":"Continue?","requestedSchema":{"type":"object","properties":{"confirmed":{"type":"boolean"}},"required":["confirmed"]}}},"url":{"method":"elicitation/create","params":{"mode":"url","message":"Authenticate","url":"https://example.test/auth"}}}
+    , .{});
     defer {
         for (requests) |*request| request.deinit(alloc);
         alloc.free(requests);
     }
-    try validateResponses(
-        alloc,
-        requests,
-        \\{"sample":{"role":"assistant","content":{"type":"text","text":"done"},"model":"fixture"},"roots":{"roots":[{"uri":"file:///tmp"}]},"form":{"action":"accept","content":{"confirmed":true}},"url":{"action":"accept"}}
-    ,
-        .{},
-    );
-    try std.testing.expectError(
-        error.InvalidInputResponses,
-        validateResponses(
-            alloc,
-            requests,
-            \\{"sample":{"role":"assistant","content":{"type":"text","text":"done"},"model":"fixture"},"roots":{"roots":[]}}
+    try validateResponses(alloc, requests,
+        \\{"form":{"action":"accept","content":{"confirmed":true}},"url":{"action":"accept"}}
+    , .{});
+    const invalid = [_][]const u8{
+        \\{"form":{"action":"accept","content":{"confirmed":true}}}
         ,
-            .{},
-        ),
-    );
-    try std.testing.expectError(
-        error.InvalidInputResponses,
-        validateResponses(
-            alloc,
-            requests,
-            \\{"sample":{"role":"assistant","content":{"type":"text","text":"done"},"model":"fixture"},"roots":{"roots":[]},"form":{"action":"accept","content":{"confirmed":"yes"}},"url":{"action":"accept"}}
+        \\{"form":{"action":"accept","content":{"confirmed":"yes"}},"url":{"action":"accept"}}
         ,
-            .{},
-        ),
-    );
-    try std.testing.expectError(
-        error.InvalidInputResponses,
-        validateResponses(
-            alloc,
-            requests,
-            \\{"sample":{"roots":[]},"roots":{"roots":[]},"form":{"action":"decline"},"url":{"action":"accept"}}
+        \\{"other":{"action":"decline"},"url":{"action":"accept"}}
         ,
-            .{},
-        ),
-    );
+    };
+    for (invalid) |response| try std.testing.expectError(error.InvalidInputResponses, validateResponses(alloc, requests, response, .{}));
+}
+
+test "MRTR recognizes unsupported methods without implementing their semantics" {
+    const alloc = std.testing.allocator;
+    const requests = try parseRequestJson(alloc,
+        \\{"sample":{"method":"sampling/createMessage","params":{"unimplemented":true}}}
+    , .{});
+    defer {
+        for (requests) |*request| request.deinit(alloc);
+        alloc.free(requests);
+    }
+    try std.testing.expectEqualStrings("sampling/createMessage", requests[0].payload.method());
+    try std.testing.expect(requests[0].payload == .unsupported);
+    try std.testing.expectError(error.UnsupportedInputRequest, validateResponses(alloc, requests,
+        \\{"sample":{}}
+    , .{}));
 }
 
 test "MRTR parser and response validation release allocation failures" {

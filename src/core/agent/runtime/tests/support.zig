@@ -6,7 +6,6 @@ const permission_auto_classifier = @import("../../../permissions/auto_classifier
 const types = @import("../../../shared/types.zig");
 const permissions = @import("../../../permissions/permissions.zig");
 const worker_runtime = @import("../../worker_runtime.zig");
-const background_runtime = @import("../../../background/background_runtime.zig");
 const builtin_context = @import("../../../../builtins/context.zig");
 const builtin_gateway = @import("../../../../builtins/gateway.zig");
 const builtin_tools = @import("../../../../builtins/tools.zig");
@@ -18,6 +17,7 @@ const command_replay_store = @import("../../../session/command_replay_store.zig"
 const session_child_store = @import("../../../session/session_child_store.zig");
 const lifecycle_hooks = @import("../../../hooks/hooks.zig");
 const model_capabilities = @import("../../../config/model_capabilities.zig");
+const provider_set = @import("../../../gateway/provider_set.zig");
 const file_mutation = @import("../../../tooling/file_mutation.zig");
 const file_mutation_contract = @import("../../../tooling/file_mutation_contract.zig");
 const context_contract = @import("../../../workspace/context_contract.zig");
@@ -38,6 +38,7 @@ else
 const runtime_config = @import("../config.zig");
 const runtime_deps = @import("../deps.zig");
 const runtime_lifecycle = @import("../lifecycle.zig");
+const runtime_agent = @import("../agent.zig");
 const model_response_recovery = @import("../model_response_recovery.zig");
 const runtime_orchestrator = @import("../orchestrator.zig");
 const runtime_tool_contracts = @import("../tool_contracts.zig");
@@ -70,12 +71,10 @@ pub const VisionAgentToolRuntime = struct {
     execution_count: usize = 0,
     result_count: usize = 0,
     worker: worker_runtime.WorkerRuntime = .{},
-    background: background_runtime.BackgroundRuntime = .{},
     session: session_runtime.SessionRuntime = .{ .max_history_turns = 8 },
 
     pub fn deinit(self: *VisionAgentToolRuntime) void {
         self.worker.deinit(self.alloc);
-        self.background.deinit(self.alloc);
         self.session.deinit(self.alloc);
     }
 
@@ -127,7 +126,6 @@ pub const VisionAgentToolRuntime = struct {
             .permission_grants = &.{},
             .permission_rules = .{},
             .worker = &self.worker,
-            .background = &self.background,
             .session = &self.session,
             .session_allocator = self.alloc,
             .context_limits = .{ .image_adapter_output_bytes = .{
@@ -142,8 +140,6 @@ pub const VisionAgentToolRuntime = struct {
             },
             .output_chunk_ctx = undefined,
             .on_output_chunk = discardVisionToolOutput,
-            .background_url_ctx = undefined,
-            .on_background_url_ready = discardVisionBackgroundUrl,
         };
     }
 };
@@ -155,8 +151,6 @@ fn discardVisionToolOutput(
     _: []const u8,
 ) anyerror!void {}
 
-fn discardVisionBackgroundUrl(_: *anyopaque, _: u64, _: []const u8) void {}
-
 const test_tools = [_]tool_dispatch.Tool{
     builtin_tools.glob_files,
     builtin_tools.grep_files,
@@ -165,7 +159,7 @@ const test_tools = [_]tool_dispatch.Tool{
     builtin_tools.edit_file,
     builtin_tools.web_fetch,
     builtin_tools.web_search,
-    builtin_tools.terminal,
+    builtin_tools.shell,
     builtin_tools.capability_search,
     builtin_tools.skill,
     builtin_tools.install_skill,
@@ -177,15 +171,14 @@ const test_tools = [_]tool_dispatch.Tool{
 const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
 
 fn testExecutionAuthority(call: ToolCall) command_admission.ToolExecutionAuthority {
-    if (!std.mem.eql(u8, call.name, "terminal")) return .ordinary;
-    if (std.mem.find(u8, call.arguments_json, "\"action\":\"exec\"") == null) {
+    if (!std.mem.eql(u8, call.name, "shell")) return .ordinary;
+    if (std.mem.find(u8, call.arguments_json, "\"action\":\"run\"") == null) {
         return .ordinary;
     }
     return .{ .run_command = .{ .shell_allowed = .{
         .fingerprint = .{
             .command = call.arguments_json,
             .resolved_cwd = "",
-            .background = false,
             .target_os = builtin.os.tag,
         },
         .source = .interactive_once,
@@ -206,9 +199,11 @@ pub const FakeCompletion = struct {
     chunks: []const []const u8 = &.{},
     reasoning_chunks: []const []const u8 = &.{},
     content: ?[]const u8 = null,
+    provider_state_json: ?[]const u8 = null,
     tool_calls: []const ToolCall = &.{},
     streamed_tool_starts: []const ToolCall = &.{},
     provider_result_identity_failure: ?types.ProviderResultIdentityFailure = null,
+    provider_failure_cause: ?types.ProviderFailureCause = null,
     provider_failure_detail: ?[]const u8 = null,
     finish_reason: ?types.ProviderFinishReason = null,
     omit_finish: bool = false,
@@ -233,6 +228,7 @@ pub const FakeGateway = struct {
     request_session_ids: std.ArrayList(?[]u8) = .empty,
     admitted_requests: usize = 0,
     recovery_pause_flag: ?*std.atomic.Value(bool) = null,
+    observe_request: ?*const fn (agent_stream_provider.ModelRequest) anyerror!void = null,
 
     pub fn init(alloc: Allocator, completions: []const FakeCompletion) FakeGateway {
         return .{ .alloc = alloc, .completions = completions };
@@ -263,11 +259,13 @@ pub const FakeGateway = struct {
         alloc: Allocator,
         request: agent_stream_provider.ModelRequest,
     ) !agent_stream_provider.Result {
-        const payload = try builtin_gateway.buildAgentRequest(alloc, request.data());
-        defer alloc.free(payload);
+        if (self.observe_request) |observe| try observe(request);
+        const payload = request.prepared_request_body orelse
+            try builtin_gateway.buildAgentRequest(alloc, request.data());
+        defer if (request.prepared_request_body == null) alloc.free(payload);
         try self.request_bodies.append(self.alloc, try self.alloc.dupe(u8, payload));
         try self.request_models.append(self.alloc, try self.alloc.dupe(u8, request.model));
-        try self.request_api_keys.append(self.alloc, try self.alloc.dupe(u8, request.credential.secret));
+        try self.request_api_keys.append(self.alloc, try self.alloc.dupe(u8, request.credential.secret() orelse ""));
         const session_id = if (request.session_id) |id| try self.alloc.dupe(u8, id) else null;
         errdefer if (session_id) |id| self.alloc.free(id);
         try self.request_session_ids.append(self.alloc, session_id);
@@ -340,8 +338,10 @@ pub const FakeGateway = struct {
         return .{ .completed = .{
             .completion = .{
                 .content = completion.content,
+                .provider_state_json = completion.provider_state_json,
                 .tool_calls = completion.tool_calls,
                 .provider_result_identity_failure = completion.provider_result_identity_failure,
+                .provider_failure_cause = completion.provider_failure_cause,
                 .provider_failure_detail = completion.provider_failure_detail,
                 .delivery_ambiguous = completion.delivery_ambiguous,
                 .finish_reason = if (completion.omit_finish)
@@ -463,9 +463,11 @@ fn captureReviewAuthority(
 ) ![]u8 {
     var captured: std.ArrayList(u8) = .empty;
     errdefer captured.deinit(alloc);
-    if (review_turn.current_root_request.len > 0) {
-        try captured.appendSlice(alloc, review_turn.current_root_request);
-        try captured.append(alloc, '\n');
+    if (review_turn.trusted_root_context.len > 0) {
+        try captured.appendSlice(alloc, review_turn.trusted_root_context);
+        if (!std.mem.endsWith(u8, review_turn.trusted_root_context, "\n")) {
+            try captured.append(alloc, '\n');
+        }
     }
     return captured.toOwnedSlice(alloc);
 }
@@ -484,6 +486,7 @@ pub const FakeAgentRuntimeDeps = struct {
     execute_mutex: std.Io.Mutex = .init,
     log: std.ArrayList([]u8) = .empty,
     texts: std.ArrayList([]u8) = .empty,
+    assistant_sources: std.ArrayList([]u8) = .empty,
     system_notices: std.ArrayList([]u8) = .empty,
     interactive_notices: std.ArrayList(types.SemanticNotice) = .empty,
     context_notices: std.ArrayList([]u8) = .empty,
@@ -509,6 +512,8 @@ pub const FakeAgentRuntimeDeps = struct {
     last_validated_arguments: ?[]u8 = null,
     last_permission_arguments: ?[]u8 = null,
     last_executed_arguments: ?[]u8 = null,
+    last_permission_credential: ?[]u8 = null,
+    last_execute_credential: ?[]u8 = null,
     last_execute_root_user_intent_context: ?[]u8 = null,
     last_execute_root_user_messages: std.ArrayList([]u8) = .empty,
     last_execute_root_user_evidence_complete: bool = false,
@@ -580,6 +585,7 @@ pub const FakeAgentRuntimeDeps = struct {
     terminal_lease_cleanup_errors: []const ?anyerror = &.{},
     terminal_lease_cleanup_index: usize = 0,
     finish_assistant_text: ?[]u8 = null,
+    finish_presentation_text: ?[]u8 = null,
     finish_summary: ?types.TurnSummary = null,
     finish_projection: ?types.FinishedPromptProjection = null,
     finish_terminal_outcome: ?types.TurnPresentationOutcome = null,
@@ -589,6 +595,7 @@ pub const FakeAgentRuntimeDeps = struct {
     background_history_log_path: ?[]u8 = null,
     background_event_log_path: ?[]u8 = null,
     history_turns: std.ArrayList(HistoryTurn) = .empty,
+    compaction_prefixes: std.ArrayList(?HistoryTurn) = .empty,
     interrupted_history_count: usize = 0,
     interrupted_event_count: usize = 0,
     interrupted_tool_name: ?[]u8 = null,
@@ -638,7 +645,6 @@ pub const FakeAgentRuntimeDeps = struct {
     last_route_recovery_unsafe_reason: ?types.RouteRecoveryUnsafeReason = null,
     default_model_capabilities: model_capabilities.Capabilities = .{
         .image_input_support = .non_native,
-        .prompt_caching = true,
         .context_window = 1_000_000,
     },
     capability_overrides: []const ModelCapabilityOverride = &.{},
@@ -651,7 +657,7 @@ pub const FakeAgentRuntimeDeps = struct {
     credential_refresh_sources: std.ArrayList(types.CredentialSource) = .empty,
     credential_refresh_modes: std.ArrayList(runtime_deps.CredentialRefreshMode) = .empty,
     credential_refresh_error: ?anyerror = null,
-    last_credential_refresh_expected_account: ?[]const u8 = null,
+    last_credential_refresh_expected_account: ?[]u8 = null,
     enable_interactive_notices: bool = false,
     enable_recovery_checkpoint: bool = false,
     recovery_checkpoints: std.ArrayList(session_codec.RecoveryCheckpoint) = .empty,
@@ -662,6 +668,12 @@ pub const FakeAgentRuntimeDeps = struct {
     pause_on_auto_retry_status: bool = false,
     recovery_pause_flag: ?*std.atomic.Value(bool) = null,
     route_recovery_status_error_attempt: ?usize = null,
+    steering_messages: []const []const u8 = &.{},
+    steering_take_at: usize = 1,
+    steering_take_count: usize = 0,
+    immediate_steering_messages: []const []const u8 = &.{},
+    immediate_steering_cancel_flag: ?*std.atomic.Value(bool) = null,
+    immediate_steering_take_count: usize = 0,
 
     pub fn init(alloc: Allocator) FakeAgentRuntimeDeps {
         return .{ .alloc = alloc };
@@ -670,6 +682,7 @@ pub const FakeAgentRuntimeDeps = struct {
     pub fn deinit(self: *FakeAgentRuntimeDeps) void {
         freeStringList(self.alloc, &self.log);
         freeStringList(self.alloc, &self.texts);
+        freeStringList(self.alloc, &self.assistant_sources);
         freeStringList(self.alloc, &self.system_notices);
         for (self.interactive_notices.items) |notice| types.freeSemanticNotice(self.alloc, notice);
         self.interactive_notices.deinit(self.alloc);
@@ -696,6 +709,8 @@ pub const FakeAgentRuntimeDeps = struct {
         if (self.last_validated_arguments) |value| self.alloc.free(value);
         if (self.last_permission_arguments) |value| self.alloc.free(value);
         if (self.last_executed_arguments) |value| self.alloc.free(value);
+        if (self.last_permission_credential) |value| self.alloc.free(value);
+        if (self.last_execute_credential) |value| self.alloc.free(value);
         if (self.last_execute_root_user_intent_context) |value| self.alloc.free(value);
         freeStringList(self.alloc, &self.last_execute_root_user_messages);
         freeGrantList(self.alloc, &self.propagated_grants);
@@ -704,12 +719,15 @@ pub const FakeAgentRuntimeDeps = struct {
         freeGrantList(self.alloc, &self.last_frozen_file_grants);
         self.execute_timeout_started_ms.deinit(self.alloc);
         if (self.finish_assistant_text) |value| self.alloc.free(value);
+        if (self.finish_presentation_text) |value| self.alloc.free(value);
         freeStringList(self.alloc, &self.terminal_lease_cleanup_ids);
         if (self.history_assistant_text) |value| self.alloc.free(value);
         if (self.background_history_log_path) |value| self.alloc.free(value);
         if (self.background_event_log_path) |value| self.alloc.free(value);
         for (self.history_turns.items) |turn| types.freeHistoryTurn(self.alloc, turn);
         self.history_turns.deinit(self.alloc);
+        for (self.compaction_prefixes.items) |prefix| if (prefix) |turn| types.freeHistoryTurn(self.alloc, turn);
+        self.compaction_prefixes.deinit(self.alloc);
         if (self.interrupted_tool_name) |value| self.alloc.free(value);
         if (self.http_detail) |value| self.alloc.free(value);
         if (self.diff_preview) |value| self.alloc.free(value);
@@ -721,6 +739,7 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.capability_queries);
         self.credential_refresh_sources.deinit(self.alloc);
         self.credential_refresh_modes.deinit(self.alloc);
+        if (self.last_credential_refresh_expected_account) |value| self.alloc.free(value);
         for (self.recovery_checkpoints.items) |*checkpoint| checkpoint.deinit(self.alloc);
         self.recovery_checkpoints.deinit(self.alloc);
     }
@@ -755,6 +774,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .execute_tool_call = execute,
             .publish_committed_file_handoff = publishCommittedFileHandoff,
             .propagate_history_turn = propagateHistory,
+            .commit_context_compaction = .{ .commit = commitCompaction },
             .recovery_checkpoint = if (self.enable_recovery_checkpoint) .{
                 .set = setRecoveryCheckpoint,
             } else null,
@@ -773,6 +793,11 @@ pub const FakeAgentRuntimeDeps = struct {
             .request_route_recovery = if (self.enable_route_recovery) requestRouteRecovery else null,
             .available_model_capabilities = availableModelCapabilities,
             .resolve_model_capabilities = resolveModelCapabilities,
+            .take_steering_boundary = if (self.steering_messages.len > 0 or
+                self.immediate_steering_messages.len > 0)
+                takeSteeringBoundary
+            else
+                null,
             .format_tool_execution_error = formatError,
             .record_tool_call_rejected = recordRejected,
             .report_inner_tool_usage = reportCapturedInnerToolUsage,
@@ -841,12 +866,42 @@ pub const FakeAgentRuntimeDeps = struct {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         try self.credential_refresh_sources.append(self.alloc, source);
         try self.credential_refresh_modes.append(self.alloc, mode);
-        self.last_credential_refresh_expected_account = expected_account_id;
+        if (self.last_credential_refresh_expected_account) |value| self.alloc.free(value);
+        self.last_credential_refresh_expected_account = if (expected_account_id) |account_id|
+            try self.alloc.dupe(u8, account_id)
+        else
+            null;
         if (self.credential_refresh_error) |err| return err;
         if (self.credential_refresh_index >= self.credential_refresh_tokens.len) return null;
         const token = self.credential_refresh_tokens[self.credential_refresh_index];
         self.credential_refresh_index += 1;
         return try alloc.dupe(u8, token);
+    }
+
+    fn takeSteeringBoundary(
+        raw: *anyopaque,
+        arena: Allocator,
+        _: u64,
+        kind: worker_runtime.SteeringBoundaryKind,
+    ) !worker_runtime.SteeringBoundaryResult {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        const source = switch (kind) {
+            .model => blk: {
+                self.steering_take_count += 1;
+                if (self.steering_take_count != self.steering_take_at) return .none;
+                break :blk self.steering_messages;
+            },
+            .cancelled => blk: {
+                self.immediate_steering_take_count += 1;
+                if (self.immediate_steering_take_count != 1) return .interrupt;
+                if (self.immediate_steering_cancel_flag) |flag| flag.store(false, .seq_cst);
+                break :blk self.immediate_steering_messages;
+            },
+        };
+        if (source.len == 0) return if (kind == .cancelled) .interrupt else .none;
+        const messages = try arena.alloc([]u8, source.len);
+        for (source, messages) |text, *copy| copy.* = try arena.dupe(u8, text);
+        return .{ .continue_turn = messages };
     }
 
     fn requestRouteRecovery(raw: *anyopaque, _: Allocator, request: runtime_deps.RouteRecoveryRequest) !runtime_deps.RouteRecoveryDecision {
@@ -1027,6 +1082,7 @@ pub const FakeAgentRuntimeDeps = struct {
         live_authority: ?runtime_tool_contracts.LiveToolAuthority,
         revalidation: ?runtime_tool_contracts.LivePermissionRevalidation,
         advertised_dynamic_tool_names: []const []const u8,
+        _: ?[]const u8,
     ) !command_admission.PermissionOutcome {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         if (self.permission_request_override) |override| {
@@ -1059,7 +1115,7 @@ pub const FakeAgentRuntimeDeps = struct {
         try self.permission_review_origins.append(self.alloc, review_turn.origin);
         try self.permission_review_root_authority_counts.append(
             self.alloc,
-            @intFromBool(review_turn.current_root_request.len > 0),
+            @intFromBool(review_turn.trusted_root_context.len > 0),
         );
         try self.permission_review_feedback_counts.append(
             self.alloc,
@@ -1068,6 +1124,11 @@ pub const FakeAgentRuntimeDeps = struct {
         try self.permission_review_pending_call_counts.append(
             self.alloc,
             review_turn.pending_assistant.tool_calls.len,
+        );
+        if (self.last_permission_credential) |value| self.alloc.free(value);
+        self.last_permission_credential = try self.alloc.dupe(
+            u8,
+            review_turn.credential.secret() orelse "",
         );
         if (self.last_permission_arguments) |value| self.alloc.free(value);
         self.last_permission_arguments = try self.alloc.dupe(u8, call.arguments_json);
@@ -1355,6 +1416,8 @@ pub const FakeAgentRuntimeDeps = struct {
             );
             if (self.last_executed_arguments) |value| self.alloc.free(value);
             self.last_executed_arguments = try self.alloc.dupe(u8, call.arguments_json);
+            if (self.last_execute_credential) |value| self.alloc.free(value);
+            self.last_execute_credential = try self.alloc.dupe(u8, request.credential.secret() orelse "");
             if (self.last_execute_root_user_intent_context) |value| self.alloc.free(value);
             self.last_execute_root_user_intent_context = try self.alloc.dupe(
                 u8,
@@ -1516,6 +1579,15 @@ pub const FakeAgentRuntimeDeps = struct {
         try self.record("rejected:{s}", .{call.name});
     }
 
+    fn commitCompaction(raw: *anyopaque, summary: types.CompactedSummaryHistoryTurn, active_prefix: ?types.AssistantHistoryTurn, _: ?types.ContextHistoryCut) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        const owned = if (active_prefix) |prefix| try types.dupeHistoryTurn(self.alloc, .{ .assistant = prefix }) else null;
+        errdefer if (owned) |turn| types.freeHistoryTurn(self.alloc, turn);
+        try self.compaction_prefixes.ensureUnusedCapacity(self.alloc, 1);
+        try propagateHistory(raw, .{ .compacted_summary = summary });
+        self.compaction_prefixes.appendAssumeCapacity(owned);
+    }
+
     fn propagateHistory(raw: *anyopaque, turn: HistoryTurn) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         self.history_propagation_count += 1;
@@ -1528,11 +1600,6 @@ pub const FakeAgentRuntimeDeps = struct {
                 if (self.history_assistant_text) |value| self.alloc.free(value);
                 self.history_assistant_text = try self.alloc.dupe(u8, entry.assistant);
                 try self.record("history:assistant", .{});
-            },
-            .background_command => |entry| {
-                if (self.background_history_log_path) |value| self.alloc.free(value);
-                self.background_history_log_path = try self.alloc.dupe(u8, entry.log_path);
-                try self.record("history:background", .{});
             },
             .interrupted => |entry| {
                 self.interrupted_history_count += 1;
@@ -1570,14 +1637,15 @@ pub const FakeAgentRuntimeDeps = struct {
                 self.finish_summary = finished.summary;
                 self.finish_projection = finished.terminal_projection;
                 self.finish_terminal_outcome = finished.terminal_outcome;
+                if (self.finish_presentation_text) |value| self.alloc.free(value);
+                self.finish_presentation_text = null;
+                if (finished.presentation_text) |value| {
+                    self.finish_presentation_text = try self.alloc.dupe(u8, value);
+                }
                 switch (finished.turn) {
                     .assistant => |entry| {
                         if (self.finish_assistant_text) |value| self.alloc.free(value);
                         self.finish_assistant_text = try self.alloc.dupe(u8, entry.assistant);
-                    },
-                    .background_command => |entry| {
-                        if (self.background_event_log_path) |value| self.alloc.free(value);
-                        self.background_event_log_path = try self.alloc.dupe(u8, entry.log_path);
                     },
                     .interrupted => self.interrupted_event_count += 1,
                     .compacted_summary => {},
@@ -1610,8 +1678,13 @@ pub const FakeAgentRuntimeDeps = struct {
     fn pushText(raw: *anyopaque, emission: runtime_deps.TextEmission) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         const text = switch (emission) {
-            .assistant_source => return,
+            .assistant_started => return,
+            .assistant_source => |text| {
+                try self.assistant_sources.append(self.alloc, try self.alloc.dupe(u8, text));
+                return;
+            },
             .assistant_rendered => |text| text,
+            .assistant_restarted => |text| text,
             .operational => |text| text,
         };
         try self.texts.append(self.alloc, try self.alloc.dupe(u8, text));
@@ -1931,7 +2004,11 @@ pub fn runFakePromptWithLifecycle(
             set_provider(delegate.ctx, deps.agent_stream_provider);
         }
     }
-    try runtime_orchestrator.processQueuedPrompt(
+    var agent: runtime_agent.Agent = .{};
+    defer agent.deinit(hooks.alloc);
+    try agent.restoreHistory(hooks.alloc, job.history);
+    try runtime_orchestrator.processAgentPrompt(
+        &agent,
         &deps,
         null,
         lifecycle,

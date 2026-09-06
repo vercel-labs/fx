@@ -3,7 +3,109 @@ const io_mod = @import("../shared/io.zig");
 
 pub const max_frontmatter_bytes: usize = 64 * 1024;
 pub const max_name_bytes: usize = 256;
-pub const max_description_bytes: usize = 4 * 1024;
+
+/// Returns the nonempty input unchanged, or the static main-document path.
+pub fn resource_path_or_main(resource: ?[]const u8) []const u8 {
+    const path = resource orelse return "SKILL.md";
+    return if (path.len == 0) "SKILL.md" else path;
+}
+
+test "skill resource defaulting preserves explicit paths" {
+    const cases = [_]struct { input: ?[]const u8, expected: []const u8 }{
+        .{ .input = null, .expected = "SKILL.md" },
+        .{ .input = "", .expected = "SKILL.md" },
+        .{ .input = "SKILL.md", .expected = "SKILL.md" },
+        .{ .input = "references/rules.md", .expected = "references/rules.md" },
+        .{ .input = " ", .expected = " " },
+        .{ .input = "../outside", .expected = "../outside" },
+    };
+    for (cases) |case| {
+        const path = resource_path_or_main(case.input);
+        try std.testing.expectEqualStrings(case.expected, path);
+        try std.testing.expectEqualStrings(path, resource_path_or_main(path));
+        if (case.input) |input| if (input.len > 0) {
+            try std.testing.expectEqual(input.ptr, path.ptr);
+        };
+    }
+}
+
+pub const Skill = struct {
+    name: []const u8,
+    description: []const u8,
+    path: []const u8,
+    source: SkillSource,
+    /// Owned with discovered entries. Null keeps managed skills strict.
+    read_authority: ?[]const u8 = null,
+    metadata_inode: std.Io.File.INode = 0,
+    metadata_size: u64 = 0,
+    metadata_mtime: std.Io.Timestamp = .zero,
+};
+
+pub const SkillDiagnosticCause = union(enum) {
+    invalid_metadata: InvalidMetadataCause,
+    linked_candidate_unavailable,
+    unreadable,
+    oversized,
+};
+
+pub const SkillDiagnosticScope = enum { root, candidate };
+
+pub const SkillDiagnostic = struct {
+    path: []const u8,
+    source: SkillSource,
+    scope: SkillDiagnosticScope,
+    cause: SkillDiagnosticCause,
+};
+
+pub const PreparedSkill = struct {
+    skill: Skill,
+    diagnostics: []SkillDiagnostic = &.{},
+};
+
+pub const ExecuteOutput = struct {
+    model_output: []const u8,
+    notice: ?[]const u8 = null,
+    diagnostic_notice: ?[]const u8 = null,
+    complete: bool = false,
+};
+
+/// Both variants own their slices in the preparation allocator.
+pub const CallPreparation = union(enum) {
+    selected: PreparedSkill,
+    failure: ExecuteOutput,
+};
+
+/// Borrows roots from the catalog retained by the active turn.
+pub const Locations = struct {
+    namespace: u64 = 0,
+    roots: []const []const u8 = &.{},
+    skills: []const Skill = &.{},
+    diagnostics: []const SkillDiagnostic = &.{},
+
+    pub fn resolve(self: Locations, alloc: std.mem.Allocator, location: []const u8) ![]u8 {
+        if (!std.mem.startsWith(u8, location, "skill:")) return alloc.dupe(u8, location);
+        const suffix = location["skill:".len..];
+        if (suffix.len < 19 or suffix[16] != ':') return error.InvalidSkillLocation;
+        const namespace = std.fmt.parseInt(u64, suffix[0..16], 16) catch return error.InvalidSkillLocation;
+        if (namespace != self.namespace) return error.StaleSkillLocation;
+        const slash = std.mem.findScalar(u8, suffix[17..], '/') orelse return error.InvalidSkillLocation;
+        const index = std.fmt.parseInt(usize, suffix[17..][0..slash], 10) catch return error.InvalidSkillLocation;
+        if (index >= self.roots.len) return error.InvalidSkillLocation;
+        const encoded_leaf = suffix[17 + slash + 1 ..];
+        var position: usize = 0;
+        while (position < encoded_leaf.len) : (position += 1) {
+            if (encoded_leaf[position] != '%') continue;
+            if (encoded_leaf.len - position < 3 or !std.ascii.isHex(encoded_leaf[position + 1]) or !std.ascii.isHex(encoded_leaf[position + 2])) return error.InvalidSkillLocation;
+            position += 2;
+        }
+        const decoded = try alloc.dupe(u8, encoded_leaf);
+        defer alloc.free(decoded);
+        const leaf = std.Uri.percentDecodeInPlace(decoded);
+        if (leaf.len == 0 or std.mem.eql(u8, leaf, ".") or std.mem.eql(u8, leaf, "..") or
+            std.mem.findAny(u8, leaf, "/\\\x00") != null or !std.unicode.utf8ValidateSlice(leaf)) return error.InvalidSkillLocation;
+        return std.fs.path.join(alloc, &.{ self.roots[index], leaf });
+    }
+};
 
 pub const SkillSource = enum {
     workspace_fx,
@@ -20,6 +122,28 @@ pub const SkillSource = enum {
     global_agents,
     global_claw,
 };
+
+test "skill locations preserve exact roots and reject stale namespaces" {
+    const alloc = std.testing.allocator;
+    const locations: Locations = .{ .namespace = 19, .roots = &.{ "/first", "/second" } };
+    const exact = try locations.resolve(alloc, "skill:0000000000000013:1/review");
+    defer alloc.free(exact);
+    try std.testing.expectEqualStrings("/second/review", exact);
+    try std.testing.expectError(error.StaleSkillLocation, locations.resolve(alloc, "skill:0000000000000012:1/review"));
+    try std.testing.expectError(error.InvalidSkillLocation, locations.resolve(alloc, "skill:0000000000000013:2/review"));
+    try std.testing.expectError(error.InvalidSkillLocation, locations.resolve(alloc, "skill:0000000000000013:0/../review"));
+    try std.testing.expectError(error.InvalidSkillLocation, locations.resolve(alloc, "skill:0000000000000013:0/.."));
+}
+
+test "skill locations decode escaped path characters without permitting traversal" {
+    const alloc = std.testing.allocator;
+    const locations: Locations = .{ .namespace = 1, .roots = &.{"/root"} };
+    const path = try locations.resolve(alloc, "skill:0000000000000001:0/review%26more");
+    defer alloc.free(path);
+    try std.testing.expectEqualStrings("/root/review&more", path);
+    try std.testing.expectError(error.InvalidSkillLocation, locations.resolve(alloc, "skill:0000000000000001:0/%2e%2e"));
+    try std.testing.expectError(error.InvalidSkillLocation, locations.resolve(alloc, "skill:0000000000000001:0/review%2fother"));
+}
 
 /// One default skill root. `path` is relative to a workspace ancestor or the
 /// home directory, depending on which table declares the spec.
@@ -38,12 +162,12 @@ pub const RootPolicy = struct {
 };
 
 pub const InvalidMetadataCause = enum {
+    frontmatter_too_long,
     missing_closing_delimiter,
     missing_name,
     duplicate_recognized_key,
     invalid_name,
     name_too_long,
-    description_too_long,
     malformed_quote,
     unsupported_multiline,
     invalid_utf8,
@@ -130,13 +254,19 @@ pub fn parseSkillFile(content: []const u8) ParsedSkillFile {
             .status = .no_frontmatter,
         };
     };
-    const closing = findClosingDelimiter(content, header_start) orelse {
+    const closing = findClosingDelimiter(content[0..@min(content.len, max_frontmatter_bytes + 1)], header_start) orelse {
         return .{
             .name = null,
             .description = null,
             .body = content,
-            .status = .{ .invalid = .missing_closing_delimiter },
+            .status = .{ .invalid = if (content.len > max_frontmatter_bytes) .frontmatter_too_long else .missing_closing_delimiter },
         };
+    };
+    if (closing.body_start > max_frontmatter_bytes) return .{
+        .name = null,
+        .description = null,
+        .body = content,
+        .status = .{ .invalid = .frontmatter_too_long },
     };
 
     const header = content[header_start..closing.header_end];
@@ -204,9 +334,7 @@ pub fn parseSkillFile(content: []const u8) ParsedSkillFile {
     }
     if (description_block == null) {
         if (description) |skill_description| {
-            if (skill_description.len > max_description_bytes) {
-                setFirstInvalidCause(&invalid_cause, .description_too_long);
-            } else if (invalidTextCause(skill_description)) |cause| {
+            if (invalidTextCause(skill_description)) |cause| {
                 setFirstInvalidCause(&invalid_cause, cause);
             }
         }
@@ -298,9 +426,6 @@ fn parse_block_description(header: []const u8, start: usize, style: BlockDescrip
         decode_block_description(raw_value, base_indent orelse 0, style, null)
     else
         0;
-    if (decoded_len > max_description_bytes) {
-        setFirstInvalidCause(&invalid_cause, .description_too_long);
-    }
 
     return .{
         .value = raw_value,
@@ -643,20 +768,24 @@ test "description blocks return to top-level metadata and reject malformed struc
     }
 }
 
-test "description blocks enforce the decoded byte limit" {
-    const exact = "d" ** max_description_bytes;
+test "skill metadata accepts descriptions within the frontmatter bound" {
+    const description = "use this workflow for the specified task " ** 160;
+    const content = "---\nname: thorough\ndescription: " ++ description ++ "\n---\nbody";
+    try std.testing.expectEqual(MetadataStatus.valid, parseSkillFile(content).status);
+}
+
+test "description blocks respect the complete frontmatter bound" {
+    const prefix = "---\nname: bounded\ndescription: >-\n  ";
+    const suffix = "\n---\n";
+    const exact = "d" ** (max_frontmatter_bytes - prefix.len - suffix.len);
     const over = exact ++ "d";
     try std.testing.expectEqual(
         MetadataStatus.valid,
-        parseSkillFile("---\nname: exact\ndescription: >-\n  " ++ exact ++ "\n---\n").status,
+        parseSkillFile(prefix ++ exact ++ suffix).status,
     );
     try std.testing.expectEqual(
-        MetadataStatus{ .invalid = .description_too_long },
-        parseSkillFile("---\nname: over\ndescription: >-\n  " ++ over ++ "\n---\n").status,
-    );
-    try std.testing.expectEqual(
-        MetadataStatus.valid,
-        parseSkillFile("---\nname: clipped\ndescription: |\n  " ++ ("d" ** (max_description_bytes - 1)) ++ "\n---\n").status,
+        MetadataStatus{ .invalid = .frontmatter_too_long },
+        parseSkillFile(prefix ++ over ++ suffix).status,
     );
 }
 
@@ -734,7 +863,9 @@ test "parseSkillFile with partial frontmatter" {
 test "parseSkillFile enforces hard metadata field bounds" {
     const valid_name = "n" ** max_name_bytes;
     const oversized_name = valid_name ++ "n";
-    const valid_description = "d" ** max_description_bytes;
+    const prefix = "---\nname: valid\ndescription: ";
+    const suffix = "\n---\n";
+    const valid_description = "d" ** (max_frontmatter_bytes - prefix.len - suffix.len);
     const oversized_description = valid_description ++ "d";
 
     const name_at_limit = parseSkillFile("---\nname: " ++ valid_name ++ "\n---\n");
@@ -746,14 +877,14 @@ test "parseSkillFile enforces hard metadata field bounds" {
     );
 
     const description_at_limit = parseSkillFile(
-        "---\nname: valid\ndescription: " ++ valid_description ++ "\n---\n",
+        prefix ++ valid_description ++ suffix,
     );
     try std.testing.expectEqual(MetadataStatus.valid, description_at_limit.status);
     const description_over_limit = parseSkillFile(
-        "---\nname: valid\ndescription: " ++ oversized_description ++ "\n---\n",
+        prefix ++ oversized_description ++ suffix,
     );
     try std.testing.expectEqual(
-        MetadataStatus{ .invalid = .description_too_long },
+        MetadataStatus{ .invalid = .frontmatter_too_long },
         description_over_limit.status,
     );
 }
@@ -951,8 +1082,8 @@ fn fuzzParseSkillFile(_: void, smith: *std.testing.Smith) !void {
     if (parsed.description) |description| {
         try expectBorrowedSlice(input, description);
         if (parsed.description_block) |block| {
-            try std.testing.expect(block.decoded_len <= max_description_bytes);
-            var decoded: [max_description_bytes]u8 = undefined;
+            try std.testing.expect(block.decoded_len <= input.len);
+            var decoded: [buffer.len]u8 = undefined;
             block.decode_into(description, decoded[0..block.decoded_len]);
         }
     }

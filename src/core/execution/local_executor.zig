@@ -87,7 +87,6 @@ test "local executor keeps route-specific foreground result limits" {
         .command_ctx = .{
             .command = "",
             .resolved_cwd = "",
-            .background = false,
             .target_os = @import("builtin").os.tag,
         },
         .reason = .process_or_system,
@@ -108,7 +107,6 @@ test "local executor runs an approved shell command with its admitted context" {
         .command_ctx = .{
             .command = "printf local-executor",
             .resolved_cwd = "/tmp",
-            .background = false,
             .target_os = @import("builtin").os.tag,
         },
         .reason = .process_or_system,
@@ -124,7 +122,7 @@ test "local executor runs an approved shell command with its admitted context" {
         executed.result.output,
         "<stdout>\nlocal-executor\n</stdout>",
     ) != null);
-    const foreground = executed.result.command_result.?.foreground;
+    const foreground = executed.result.command_result.?;
     try std.testing.expectEqualStrings(command.approved_shell.command_ctx.command, foreground.command);
     try std.testing.expectEqualStrings(command.approved_shell.command_ctx.resolved_cwd, foreground.cwd);
     try std.testing.expectEqual(@as(?i64, 0), foreground.exit_code);

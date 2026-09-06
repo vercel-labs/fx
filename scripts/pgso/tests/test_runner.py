@@ -19,6 +19,82 @@ from scripts.pgso.runner import cancellation_guard, run_checked
 
 
 class PgsoRunnerTests(unittest.TestCase):
+    def test_elapsed_stops_at_process_exit_before_output_drains(self) -> None:
+        from scripts.pgso import runner
+
+        exited = threading.Event()
+        completion_observed = threading.Event()
+        release_output = threading.Event()
+        process = mock.Mock()
+        process.stdout = io.StringIO("child output\n")
+        process.stderr = io.StringIO("")
+        process.returncode = None
+        process.poll.side_effect = lambda: process.returncode
+        waiter_ident: int | None = None
+
+        def wait(*args, **kwargs):
+            nonlocal waiter_ident
+            waiter_ident = threading.get_ident()
+            process.returncode = 0
+            exited.set()
+            return 0
+
+        def clock() -> float:
+            if release_output.is_set():
+                return 10.0
+            if exited.is_set() and threading.get_ident() == waiter_ident:
+                completion_observed.set()
+                return 2.0
+            return 1.0
+
+        stream_pipe = runner._stream_pipe
+
+        def delayed_output(*args):
+            release_output.wait()
+            stream_pipe(*args)
+
+        process.wait.side_effect = wait
+        results: list[runner.CommandResult] = []
+        errors: list[BaseException] = []
+        with tempfile.TemporaryDirectory(prefix="fx-pgso-runner-") as tmp:
+            root = pathlib.Path(tmp)
+
+            def invoke() -> None:
+                try:
+                    results.append(
+                        run_checked(
+                            ["fixture"],
+                            cwd=root,
+                            env={},
+                            timeout_s=20,
+                            log_path=root / "timing.json",
+                        )
+                    )
+                except BaseException as error:
+                    errors.append(error)
+
+            with (
+                mock.patch("scripts.pgso.runner.subprocess.Popen", return_value=process),
+                mock.patch("scripts.pgso.runner.time.monotonic", side_effect=clock),
+                mock.patch("scripts.pgso.runner._stream_pipe", side_effect=delayed_output),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                worker = threading.Thread(target=invoke, daemon=True)
+                worker.start()
+                try:
+                    observed_before_drain = completion_observed.wait(timeout=0.5)
+                finally:
+                    release_output.set()
+                    worker.join(timeout=2)
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual([], errors)
+            self.assertTrue(observed_before_drain)
+            self.assertEqual(1.0, results[0].elapsed_seconds)
+            self.assertEqual("child output\n", results[0].stdout)
+            log = json.loads((root / "timing.json").read_text())
+            self.assertEqual(results[0].elapsed_seconds, log["elapsed_seconds"])
+
     def test_cancellation_guard_converts_sigterm_and_restores_handlers(self) -> None:
         installed: dict[object, object] = {}
 

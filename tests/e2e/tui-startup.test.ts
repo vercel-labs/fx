@@ -40,7 +40,7 @@ describe.skipIf(SKIP)("tui: startup and exit", () => {
       session = await TmuxSession.create();
       await session.waitForComposer(10_000);
       await session.sendText("/help");
-      const pane = await session.waitForText("Commands 38", 5_000);
+      const pane = await session.waitForText("Commands 37", 5_000);
       expect(pane).toContain("[All]");
       expect(pane).toContain("Tab Category");
       expect(pane).toContain("Enter Open");
@@ -312,7 +312,7 @@ describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
         port: 0,
         async fetch(request) {
           const body = await request.text();
-          if (body.includes('"method":"server/discover"')) discoveryRequests += 1;
+          if (body.includes('"method":"initialize"')) discoveryRequests += 1;
           return await new Promise<Response>(() => {});
         },
       });
@@ -372,7 +372,7 @@ describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
 
 describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
   test(
-    "/setup opens an inline status-first hub",
+    "/setup opens the inline provider picker columns",
     async () => {
       const home = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-direct-setup-")));
       session = await TmuxSession.create({
@@ -388,32 +388,29 @@ describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendText("/setup");
-      const setup = await session.waitForPane(
+      const picker = await session.waitForPane(
         (pane) =>
-          pane.includes("Setup") &&
-          pane.includes("Connections") &&
-          pane.includes("Model provider") &&
-          pane.includes("Vercel team") &&
-          pane.includes("Credential source") &&
-          pane.includes("Enter Open") &&
-          pane.includes("Esc Close"),
+          pane.includes("/provider") &&
+          pane.includes("vercel") &&
+          pane.includes("codex") &&
+          pane.includes("grok"),
         TIMEOUT,
       );
-      expect(setup).not.toContain("AI_GATEWAY_API_KEY");
-      expect(setup).not.toContain("fx login");
-      expect(setup).not.toContain("Vercel account");
-      expect(setup).not.toContain("run /login");
+      expect(picker).not.toContain("Connections");
+      expect(picker).not.toContain("Credential source");
 
-      for (let index = 0; index < 2; index += 1) {
-        await session.sendKeys("Down");
-      }
       await session.sendKeys("Enter");
       await session.waitForPane(
-        (pane) => pane.includes("Credential source") && pane.includes("Automatic"),
+        (pane) => pane.includes("oauth") && pane.includes("api-key"),
         TIMEOUT,
       );
-      await session.sendKeys("Escape");
-      await session.waitForText("Setup", TIMEOUT);
+
+      // No key exists anywhere in this environment, so the api-key leaf skips
+      // the which-key column and opens the paste field directly.
+      await session.sendKeys("Down");
+      await session.sendKeys("Enter");
+      await session.waitForText("Paste or type a key", TIMEOUT);
+
       await session.sendKeys("Escape");
       await session.waitForComposer(TIMEOUT);
     },

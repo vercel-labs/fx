@@ -79,6 +79,7 @@ pub const McpAuthConfig = struct {
     client_secret_env: ?[]u8 = null,
     client_metadata_url: ?[]u8 = null,
     scopes: [][]u8 = &.{},
+    callback_port: ?u16 = null,
 
     pub fn deinit(self: *McpAuthConfig, alloc: Allocator) void {
         if (self.resource) |value| alloc.free(value);

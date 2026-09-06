@@ -4,6 +4,7 @@ const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const skill_contract = @import("skill_contract.zig");
 const skill_runtime = @import("skill_runtime.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const types = @import("../shared/types.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const context_limits = @import("../config/context_limits.zig");
 const test_debug_trace = if (@import("builtin").is_test)
@@ -14,6 +15,7 @@ else
 const Allocator = std.mem.Allocator;
 const ambiguous_skill_suffix_fmt = "; {d} additional advertised location{s} omitted by the {d}-byte tool-result limit. Refresh available skills and retry with an advertised name and location.";
 const discovery_model_notice = "<skill_discovery_warning details=\"context_notice\" />\n";
+const content_name_prefix = "<skill_content name=\"";
 const test_workspace_roots = [_]skill_contract.RootSpec{
     .{ .source = .workspace_shared, .path = "skills" },
 };
@@ -21,6 +23,101 @@ const test_root_policy: skill_contract.RootPolicy = .{
     .workspace_roots = &test_workspace_roots,
     .managed_root_source = .global_fx,
 };
+
+/// Returns a name borrowed from buffer for display only, never skill resolution.
+pub fn displayNameFromOutput(output: []const u8, buffer: *[skill_contract.max_name_bytes]u8) ?[]const u8 {
+    const content = if (std.mem.startsWith(u8, output, discovery_model_notice)) output[discovery_model_notice.len..] else output;
+    if (!std.mem.startsWith(u8, content, content_name_prefix)) return null;
+    const rest = content[content_name_prefix.len..];
+    const end = std.mem.findScalar(u8, rest[0..@min(rest.len, skill_contract.max_name_bytes * 6 + 1)], '"') orelse return null;
+    if (!std.mem.startsWith(u8, rest[end..], "\" location=\"") and
+        !std.mem.startsWith(u8, rest[end..], "\" resource=\"")) return null;
+    const encoded = rest[0..end];
+    const entities = [_]struct { encoded: []const u8, decoded: []const u8 }{
+        .{ .encoded = "&amp;", .decoded = "&" },
+        .{ .encoded = "&lt;", .decoded = "<" },
+        .{ .encoded = "&gt;", .decoded = ">" },
+        .{ .encoded = "&quot;", .decoded = "\"" },
+        .{ .encoded = "&#x85;", .decoded = "\xc2\x85" },
+        .{ .encoded = "&#x2028;", .decoded = "\xe2\x80\xa8" },
+        .{ .encoded = "&#x2029;", .decoded = "\xe2\x80\xa9" },
+    };
+    var cursor: usize = 0;
+    var written: usize = 0;
+    while (cursor < encoded.len) {
+        const bytes = if (encoded[cursor] == '&') entity: {
+            for (entities) |pair| {
+                if (!std.mem.startsWith(u8, encoded[cursor..], pair.encoded)) continue;
+                cursor += pair.encoded.len;
+                break :entity pair.decoded;
+            }
+            return null;
+        } else literal: {
+            if (encoded[cursor] == '<' or encoded[cursor] == '>') return null;
+            cursor += 1;
+            break :literal encoded[cursor - 1 .. cursor];
+        };
+        if (bytes.len > buffer.len - written) return null;
+        @memcpy(buffer[written..][0..bytes.len], bytes);
+        written += bytes.len;
+    }
+    const name = buffer[0..written];
+    return if (skill_contract.invalidSkillNameCause(name) == null) name else null;
+}
+
+test "skill display names round trip the generated result header within its preview" {
+    const names = [_][]const u8{ "workflow", "quotes\" & <name> ' café", "literal &quot; &amp;", "line\u{0085}\u{2028}\u{2029}break", "\"" ** skill_contract.max_name_bytes };
+    for (names) |name| {
+        for ([_]bool{ false, true }) |with_notice| {
+            var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+            defer out.deinit();
+            if (with_notice) try out.writer.writeAll(discovery_model_notice);
+            try out.writer.writeAll(content_name_prefix);
+            try model_context_encoding.writeScalar(&out.writer, name);
+            try out.writer.writeAll("\" location=\"/skills/" ++ ("long-path" ** 600));
+            var buffer: [skill_contract.max_name_bytes]u8 = undefined;
+            const preview = out.written()[0..@min(out.written().len, @import("../session/result_store.zig").preview_bytes)];
+            try std.testing.expectEqualStrings(name, displayNameFromOutput(preview, &buffer).?);
+        }
+    }
+}
+
+test "skill display names reject unrelated malformed and invalid metadata" {
+    const invalid = [_][]const u8{
+        "A quoted result: <skill_content name=\"workflow\" location=\"/skills/workflow\">",
+        "<skill_content>body <skill_content name=\"workflow\" location=\"/skills/workflow\">",
+        "<skill_content name=\"unfinished",
+        "<skill_content name=\"workflow\">",
+        "<skill_content name=\"\" location=\"/skills/workflow\">",
+        "<skill_content name=\"bad&unknown;\" location=\"/skills/workflow\">",
+        "<skill_content name=\"bad<value\" location=\"/skills/workflow\">",
+        "<skill_content name=\"bad&#x0a;value\" location=\"/skills/workflow\">",
+        "<skill_content name=\"../escape\" location=\"/skills/workflow\">",
+        "<skill_content name=\"\xff\" location=\"/skills/workflow\">",
+        "<skill_content name=\"" ++ ("a" ** (skill_contract.max_name_bytes + 1)) ++ "\" location=\"/skills/workflow\">",
+    };
+    for (invalid) |output| {
+        var buffer: [skill_contract.max_name_bytes]u8 = undefined;
+        try std.testing.expect(displayNameFromOutput(output, &buffer) == null);
+    }
+}
+
+test "skill display name parsing stays bounded" {
+    try std.testing.fuzz({}, struct {
+        fn check(_: void, smith: *std.testing.Smith) !void {
+            var input_buffer: [4096]u8 = undefined;
+            const input = input_buffer[0..smith.slice(&input_buffer)];
+            var buffer: [skill_contract.max_name_bytes]u8 = undefined;
+            const name = displayNameFromOutput(input, &buffer) orelse return;
+            try std.testing.expect(name.len <= buffer.len);
+            try std.testing.expect(skill_contract.invalidSkillNameCause(name) == null);
+        }
+    }.check, .{ .corpus = &.{
+        content_name_prefix ++ "workflow\" location=\"/skills/workflow\">",
+        discovery_model_notice ++ content_name_prefix ++ "name&amp;value\" resource=\"SKILL.md\">",
+        content_name_prefix ++ "bad&unknown;\" location=\"/skills/workflow\">",
+    } });
+}
 
 /// Borrows a previously discovered skill inventory for one invocation.
 pub const Catalog = struct {
@@ -46,15 +143,13 @@ const TestLoadHook = struct {
 };
 
 const LoadOptions = struct {
+    mode: enum { chunk, whole } = .chunk,
+    cancel_flag: ?*std.atomic.Value(bool) = null,
     test_after_candidate_validation: if (@import("builtin").is_test) ?TestLoadHook else void =
         if (@import("builtin").is_test) null else {},
 };
 
-const ExecuteOutput = struct {
-    model_output: []const u8,
-    notice: ?[]const u8 = null,
-    diagnostic_notice: ?[]const u8 = null,
-};
+const ExecuteOutput = skill_contract.ExecuteOutput;
 
 /// Owns every non-null output slice. Release it with `freeExecuteResult`, or
 /// transfer the model output with `takeModelOutput`.
@@ -87,16 +182,20 @@ pub const ExplicitBinding = struct {
     path: []const u8,
 };
 
-/// Owns `text` and both optional notices.
+/// Owns `text` and all optional notices.
 pub const ExplicitPromptSection = struct {
     text: []u8,
     notice: ?[]u8 = null,
     diagnostic_notice: ?[]u8 = null,
+    load_notice: ?types.SemanticNotice = null,
+    load_details: ?[]u8 = null,
 
     pub fn deinit(self: *ExplicitPromptSection, alloc: Allocator) void {
         alloc.free(self.text);
         if (self.notice) |notice| alloc.free(notice);
         if (self.diagnostic_notice) |notice| alloc.free(notice);
+        if (self.load_notice) |notice| types.freeSemanticNotice(alloc, notice);
+        if (self.load_details) |details| alloc.free(details);
         self.* = .{ .text = &.{} };
     }
 };
@@ -109,6 +208,7 @@ pub fn buildExplicitPromptSection(
     prompt: []const u8,
     bindings: []const ExplicitBinding,
     limits: context_limits.Values,
+    cancel_flag: ?*std.atomic.Value(bool),
 ) !ExplicitPromptSection {
     const binding_plan = try buildExplicitBindingPlan(alloc, catalog.skills, prompt, bindings);
     defer alloc.free(binding_plan);
@@ -122,39 +222,326 @@ pub fn buildExplicitPromptSection(
     defer notices.deinit();
     var diagnostic_notices: std.Io.Writer.Allocating = .init(alloc);
     defer diagnostic_notices.deinit();
+    var load_rows: std.Io.Writer.Allocating = .init(alloc);
+    defer load_rows.deinit();
+    var load_details: std.Io.Writer.Allocating = .init(alloc);
+    defer load_details.deinit();
+    var loaded: usize = 0;
 
-    try out.writer.writeAll("Explicitly invoked skill content for this query:\n");
-    for (binding_plan) |binding| {
-        try appendExplicitSkill(
-            alloc,
-            &out.writer,
-            &notices.writer,
-            &diagnostic_notices,
-            catalog,
-            binding.name,
-            binding.path,
-            limits,
-        );
+    try out.writer.writeAll(
+        "Explicitly invoked skill content for this query:\n" ++
+            "Use every successfully loaded skill for this query. Report blocked or ambiguous requests.\n" ++
+            "Follow each skill's complete instructions and required resources before substantive work.\n" ++
+            "If a skill cannot be followed, state the blocker instead of silently substituting another workflow.\n",
+    );
+    for (binding_plan, 0..) |entry, index| {
+        try load_rows.writer.writeAll(if (index + 1 == binding_plan.len) "\n└ " else "\n├ ");
+        switch (entry) {
+            .bound => |binding| if (try appendExplicitSkill(
+                alloc,
+                &out.writer,
+                &notices.writer,
+                &diagnostic_notices,
+                &load_rows.writer,
+                &load_details.writer,
+                catalog,
+                binding.name,
+                binding.path,
+                limits,
+                cancel_flag,
+                context_limits.emergency_ceiling_bytes -| out.written().len,
+            )) {
+                loaded += 1;
+            },
+            .ambiguous => |name| {
+                const failure = try formatAmbiguousSkill(alloc, catalog.skills, name, 4096);
+                defer alloc.free(failure);
+                try out.writer.writeAll(failure);
+                try out.writer.writeByte('\n');
+                try appendExplicitLoadRow(alloc, &load_rows.writer, name, "ambiguous name");
+                try appendExplicitLoadRow(alloc, &load_details.writer, name, failure);
+                try load_details.writer.writeByte('\n');
+            },
+        }
     }
+
+    const failed = binding_plan.len - loaded;
+    const summary = if (failed == 0)
+        try std.fmt.allocPrint(alloc, "{d} requested skill{s} loaded{s}", .{ loaded, if (loaded == 1) "" else "s", load_rows.written() })
+    else
+        try std.fmt.allocPrint(alloc, "Requested skills · {d} loaded · {d} failed (ctrl o for details){s}", .{ loaded, failed, load_rows.written() });
+    errdefer alloc.free(summary);
+    const details = if (load_details.written().len > 0) try load_details.toOwnedSlice() else null;
+    errdefer if (details) |value| alloc.free(value);
 
     const text = try out.toOwnedSlice();
     errdefer alloc.free(text);
     const notice = if (notices.written().len > 0) try notices.toOwnedSlice() else null;
     errdefer if (notice) |value| alloc.free(value);
     const diagnostic_notice = if (diagnostic_notices.written().len > 0) try diagnostic_notices.toOwnedSlice() else null;
-    return .{ .text = text, .notice = notice, .diagnostic_notice = diagnostic_notice };
+    return .{
+        .text = text,
+        .notice = notice,
+        .diagnostic_notice = diagnostic_notice,
+        .load_notice = .{ .topic = "", .tone = if (failed == 0) .neutral else .warning, .body = summary },
+        .load_details = details,
+    };
 }
+
+fn appendExplicitLoadRow(alloc: Allocator, out: *std.Io.Writer, name: []const u8, failure: ?[]const u8) !void {
+    const row = if (failure) |detail|
+        if (detail.len > 0)
+            try std.fmt.allocPrint(alloc, "Could not load {s}: {s}", .{ name, detail })
+        else
+            try std.fmt.allocPrint(alloc, "Could not load {s}", .{name})
+    else
+        try std.fmt.allocPrint(alloc, "Loaded skill {s}", .{name});
+    defer alloc.free(row);
+    const redacted = try tool_result_limits.prepareRedactedOutput(alloc, row);
+    defer alloc.free(redacted);
+    const safe = try text_utils.encodeTerminalSafe(alloc, redacted, context_limits.emergency_ceiling_bytes);
+    defer alloc.free(safe.bytes);
+    try out.writeAll(safe.bytes);
+}
+
+test "explicit skill requests report ambiguous names without selecting a source" {
+    const alloc = std.testing.allocator;
+    const skills = [_]skill_runtime.Skill{
+        .{ .name = "review", .description = "workspace", .path = "/workspace/review", .source = .workspace_fx },
+        .{ .name = "review", .description = "global", .path = "/global/review", .source = .global_fx },
+    };
+    var section = try buildExplicitPromptSection(alloc, .{ .skills = &skills }, "$review this patch", &.{}, .{}, null);
+    defer section.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, section.text, "ambiguous") != null);
+    try std.testing.expect(std.mem.find(u8, section.text, "already loaded") == null);
+    try expectContains(section.load_notice.?.body, "Requested skills · 0 loaded · 1 failed");
+    try expectContains(section.load_notice.?.body, "Could not load review:");
+    try expectNotContains(section.load_notice.?.body, "Loaded skill review");
+    try expectContains(section.load_notice.?.body, "ambiguous name");
+    try expectNotContains(section.load_notice.?.body, "/workspace/review");
+    try expectNotContains(section.load_notice.?.body, "/global/review");
+    try expectContains(section.load_notice.?.body, "ctrl o");
+    try expectContains(section.load_details.?, "/workspace/review");
+    try expectContains(section.load_details.?, "/global/review");
+    try std.testing.expect(section.notice == null);
+}
+
+test "explicit skills include complete instructions beyond the default chunk" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workflow");
+    var file = try tmp.dir.createFile(io_mod.getIo(), "workflow/SKILL.md", .{});
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(), "---\nname: workflow\ndescription: helper\n---\nBEGIN INSTRUCTIONS\n" ++ ("required step\n" ** 2000) ++ "COMPLETE TAIL\n");
+    const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workflow");
+    defer alloc.free(path);
+    const skills = [_]skill_runtime.Skill{.{ .name = "workflow", .description = "helper", .path = path, .source = .global_fx }};
+    var section = try buildExplicitPromptSection(alloc, .{ .skills = &skills }, "$workflow", &.{}, .{}, null);
+    defer section.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, section.text, "BEGIN INSTRUCTIONS") != null);
+    try std.testing.expect(std.mem.find(u8, section.text, "COMPLETE TAIL") != null);
+    try std.testing.expectEqualStrings("1 requested skill loaded\n└ Loaded skill workflow", section.load_notice.?.body);
+    try std.testing.expect(section.load_details == null);
+    const bindings = [_]ExplicitBinding{ .{ .name = "workflow", .path = path }, .{ .name = "workflow", .path = path } };
+    var repeated = try buildExplicitPromptSection(alloc, .{ .skills = &skills }, "$workflow $workflow", &bindings, .{}, null);
+    defer repeated.deinit(alloc);
+    try std.testing.expectEqualStrings(section.text, repeated.text);
+    try std.testing.expectEqualStrings(section.load_notice.?.body, repeated.load_notice.?.body);
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, buildExplicitPromptSection(alloc, .{ .skills = &skills }, "$workflow", &.{}, .{}, &cancelled));
+}
+
+test "explicit load rows keep untrusted names and diagnostics terminal safe" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try appendExplicitLoadRow(alloc, &out.writer, "workflow\n\x1b[2J", "Failed\r\nAPI_KEY=private-skill-secret");
+    try expectContains(out.written(), "Could not load workflow");
+    try std.testing.expect(text_utils.isTerminalSafe(out.written()));
+    try expectNotContains(out.written(), "\n");
+    try expectNotContains(out.written(), "\x1b");
+    try expectNotContains(out.written(), "private-skill-secret");
+}
+
+test "explicit load summary reports a missing bound skill without success" {
+    const alloc = std.testing.allocator;
+    var section = try buildExplicitPromptSection(alloc, .{ .skills = &.{} }, "Use the selected workflow", &.{.{ .name = "missing-workflow", .path = "/unavailable/workflow" }}, .{}, null);
+    defer section.deinit(alloc);
+    try expectContains(section.load_notice.?.body, "Requested skills · 0 loaded · 1 failed");
+    try expectContains(section.load_notice.?.body, "Could not load missing-workflow");
+    try expectNotContains(section.load_notice.?.body, "/unavailable/workflow");
+    try expectContains(section.load_details.?, "not found at advertised location");
+    try expectNotContains(section.text, "<skill_content");
+}
+
+test "skill resource defaults preserve whole and legacy reads" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workflow");
+    var file = try tmp.dir.createFile(io_mod.getIo(), "workflow/SKILL.md", .{});
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(), "---\nname: workflow\n---\nMAIN DOCUMENT\n");
+    const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workflow");
+    defer alloc.free(path);
+    const skills = [_]skill_runtime.Skill{.{ .name = "workflow", .description = "", .path = path, .source = .global_fx }};
+    const catalog: Catalog = .{ .skills = &skills };
+    const whole = try loadWholeByLocation(alloc, catalog, path, "SKILL.md", .{}, null, null);
+    defer freeExecuteResult(alloc, whole);
+    try std.testing.expect(whole == .loaded and whole.loaded.complete);
+    try expectContains(whole.modelOutput(), "MAIN DOCUMENT");
+    for ([_]?[]const u8{ null, "" }) |resource| {
+        const result = try loadWholeByLocation(alloc, catalog, path, resource, .{}, null, null);
+        defer freeExecuteResult(alloc, result);
+        try std.testing.expectEqualStrings(whole.modelOutput(), result.modelOutput());
+        for ([_]usize{ 0, 4 }) |offset| {
+            const expected = try loadByIdentity(alloc, catalog, "workflow", path, "SKILL.md", offset, .{}, null);
+            defer freeExecuteResult(alloc, expected);
+            const legacy = try loadByIdentity(alloc, catalog, "workflow", path, resource, offset, .{}, null);
+            defer freeExecuteResult(alloc, legacy);
+            try std.testing.expectEqualStrings(expected.modelOutput(), legacy.modelOutput());
+        }
+    }
+    for ([_][]const u8{ " ", "../outside.txt", "/outside.txt" }) |resource| {
+        try std.testing.expectError(error.InvalidSkillResourcePath, loadWholeByLocation(alloc, catalog, path, resource, .{}, null, null));
+    }
+    try std.testing.expectError(error.FileNotFound, loadWholeByLocation(alloc, catalog, path, "missing.md", .{}, null, null));
+}
+
+test "whole skill reads respect explicit bounds cancellation and recovery" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workflow");
+    var file = try tmp.dir.createFile(io_mod.getIo(), "workflow/SKILL.md", .{});
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(), "---\nname: workflow\n---\n" ++ ("required step\n" ** 2000) ++ "COMPLETE TAIL\n");
+    const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workflow");
+    defer alloc.free(path);
+    const skills = [_]skill_runtime.Skill{.{ .name = "workflow", .description = "", .path = path, .source = .global_fx }};
+    const catalog: Catalog = .{ .skills = &skills };
+    var limits = context_limits.Values{};
+    limits.skill_file_bytes = .{ .value = .{ .bytes = 128 }, .source = .command_line };
+    const file_blocked = try loadWholeByLocation(alloc, catalog, path, null, limits, null, null);
+    defer freeExecuteResult(alloc, file_blocked);
+    try std.testing.expect(file_blocked == .failure);
+    try expectContains(file_blocked.modelOutput(), "skill_file_bytes");
+    try expectNotContains(file_blocked.modelOutput(), "required step");
+
+    limits.skill_file_bytes = .{ .value = .off, .source = .command_line };
+    limits.skill_chunk_bytes = .{ .value = .{ .bytes = 128 }, .source = .command_line };
+    const chunk_blocked = try loadWholeByLocation(alloc, catalog, path, null, limits, null, null);
+    defer freeExecuteResult(alloc, chunk_blocked);
+    try std.testing.expect(chunk_blocked == .failure);
+    try expectContains(chunk_blocked.modelOutput(), "skill_chunk_bytes");
+    try expectNotContains(chunk_blocked.modelOutput(), "required step");
+
+    limits.skill_chunk_bytes = .{ .value = .off, .source = .command_line };
+    const result_blocked = try loadWholeByLocation(alloc, catalog, path, null, limits, 1024, null);
+    defer freeExecuteResult(alloc, result_blocked);
+    try std.testing.expect(result_blocked == .failure);
+    try std.testing.expect(result_blocked.modelOutput().len <= 1024);
+    try expectContains(result_blocked.modelOutput(), "max_tool_result_bytes");
+    try expectNotContains(result_blocked.modelOutput(), "required step");
+
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, loadWholeByLocation(alloc, catalog, path, null, limits, null, &cancelled));
+    cancelled.store(false, .seq_cst);
+    const Cancel = struct {
+        fn run(raw: *anyopaque) !void {
+            const flag: *std.atomic.Value(bool) = @ptrCast(@alignCast(raw));
+            flag.store(true, .seq_cst);
+        }
+    };
+    try std.testing.expectError(error.Cancelled, loadByIdentityWithOptions(alloc, catalog, "workflow", path, null, 0, limits, null, .{
+        .mode = .whole,
+        .cancel_flag = &cancelled,
+        .test_after_candidate_validation = .{ .ctx = &cancelled, .check = Cancel.run },
+    }));
+    cancelled.store(false, .seq_cst);
+    const recovered = try loadWholeByLocation(alloc, catalog, path, null, limits, null, &cancelled);
+    defer freeExecuteResult(alloc, recovered);
+    try std.testing.expect(recovered == .loaded and recovered.loaded.complete);
+    try expectContains(recovered.modelOutput(), "COMPLETE TAIL");
+}
+
+test "whole skill reads reject identity changes after candidate validation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workflow");
+    {
+        var file = try tmp.dir.createFile(io_mod.getIo(), "workflow/SKILL.md", .{});
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(io_mod.getIo(), "---\nname: workflow\ndescription: helper\n---\nORIGINAL BODY\n");
+    }
+    const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workflow");
+    defer alloc.free(path);
+    const skills = [_]skill_runtime.Skill{.{ .name = "workflow", .description = "helper", .path = path, .source = .global_fx }};
+    const Rewrite = struct {
+        fn run(raw: *anyopaque) !void {
+            const dir: *std.Io.Dir = @ptrCast(@alignCast(raw));
+            var file = try dir.createFile(io_mod.getIo(), "workflow/SKILL.md", .{});
+            defer file.close(io_mod.getIo());
+            try file.writeStreamingAll(io_mod.getIo(), "---\nname: replaced\ndescription: helper\n---\nREPLACED BODY\n");
+        }
+    };
+    const attempt = loadByIdentityWithOptions(alloc, .{ .skills = &skills }, "workflow", path, null, 0, .{}, null, .{
+        .mode = .whole,
+        .test_after_candidate_validation = .{ .ctx = &tmp.dir, .check = Rewrite.run },
+    });
+    if (attempt) |result| {
+        defer freeExecuteResult(alloc, result);
+        return error.ChangedSkillWasLoaded;
+    } else |err| {
+        try std.testing.expectEqual(error.SkillResourceChanged, err);
+    }
+}
+
+test "skill references reject primary identity changes after candidate validation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workflow");
+    var primary = try tmp.dir.createFile(io_mod.getIo(), "workflow/SKILL.md", .{});
+    defer primary.close(io_mod.getIo());
+    try primary.writeStreamingAll(io_mod.getIo(), "---\nname: workflow\n---\nORIGINAL BODY\n");
+    var reference = try tmp.dir.createFile(io_mod.getIo(), "workflow/reference.md", .{});
+    defer reference.close(io_mod.getIo());
+    try reference.writeStreamingAll(io_mod.getIo(), "REFERENCE BODY\n");
+    const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workflow");
+    defer alloc.free(path);
+    const skills = [_]skill_runtime.Skill{.{ .name = "workflow", .description = "", .path = path, .source = .global_fx }};
+    const Rewrite = struct {
+        fn run(raw: *anyopaque) !void {
+            const dir: *std.Io.Dir = @ptrCast(@alignCast(raw));
+            var file = try dir.createFile(io_mod.getIo(), "workflow/SKILL.md", .{});
+            defer file.close(io_mod.getIo());
+            try file.writeStreamingAll(io_mod.getIo(), "---\nname: renamed\n---\nCHANGED BODY\n");
+        }
+    };
+    try std.testing.expectError(error.SkillResourceChanged, loadByIdentityWithOptions(alloc, .{ .skills = &skills }, "workflow", path, "reference.md", 0, .{}, null, .{
+        .mode = .whole,
+        .test_after_candidate_validation = .{ .ctx = &tmp.dir, .check = Rewrite.run },
+    }));
+}
+
+const PlannedSkill = union(enum) {
+    bound: ExplicitBinding,
+    ambiguous: []const u8,
+};
 
 fn buildExplicitBindingPlan(
     alloc: Allocator,
     skills: []const skill_runtime.Skill,
     prompt: []const u8,
     bindings: []const ExplicitBinding,
-) ![]ExplicitBinding {
-    const matched_indices = try skill_runtime.matchExplicitSkillIndices(alloc, prompt, skills);
-    defer alloc.free(matched_indices);
+) ![]PlannedSkill {
+    const selections = try skill_runtime.collectExplicitSkillSelections(alloc, prompt, skills);
+    defer alloc.free(selections);
 
-    var plan: std.ArrayList(ExplicitBinding) = .empty;
+    var plan: std.ArrayList(PlannedSkill) = .empty;
     defer plan.deinit(alloc);
     var loaded_paths = std.StringHashMap(void).init(alloc);
     defer loaded_paths.deinit();
@@ -162,14 +549,25 @@ fn buildExplicitBindingPlan(
     for (bindings) |binding| {
         if (loaded_paths.contains(binding.path)) continue;
         try loaded_paths.put(binding.path, {});
-        try plan.append(alloc, binding);
+        try plan.append(alloc, .{ .bound = binding });
     }
-    for (matched_indices) |index| {
-        const skill = skills[index];
-        if (loaded_paths.contains(skill.path)) continue;
-        try loaded_paths.put(skill.path, {});
-        try plan.append(alloc, .{ .name = skill.name, .path = skill.path });
-    }
+    for (selections) |selection| switch (selection) {
+        .skill => |index| {
+            const skill = skills[index];
+            if (loaded_paths.contains(skill.path)) continue;
+            try loaded_paths.put(skill.path, {});
+            try plan.append(alloc, .{ .bound = .{ .name = skill.name, .path = skill.path } });
+        },
+        .ambiguous => |name| {
+            const explicitly_bound = bound: {
+                for (bindings) |binding| {
+                    if (std.ascii.eqlIgnoreCase(binding.name, name)) break :bound true;
+                }
+                break :bound false;
+            };
+            if (!explicitly_bound) try plan.append(alloc, .{ .ambiguous = name });
+        },
+    };
     return plan.toOwnedSlice(alloc);
 }
 
@@ -178,13 +576,18 @@ fn appendExplicitSkill(
     out: *std.Io.Writer,
     notices: *std.Io.Writer,
     diagnostic_notices: *std.Io.Writer.Allocating,
+    load_rows: *std.Io.Writer,
+    load_details: *std.Io.Writer,
     catalog: Catalog,
     name: []const u8,
     location: []const u8,
     limits: context_limits.Values,
-) !void {
-    const result = try loadByIdentity(alloc, catalog, name, location, null, 0, limits, null);
+    cancel_flag: ?*std.atomic.Value(bool),
+    remaining_bytes: usize,
+) !bool {
+    const result = try loadByIdentityWithOptions(alloc, catalog, name, location, null, 0, limits, null, .{ .mode = .whole, .cancel_flag = cancel_flag });
     defer freeExecuteResult(alloc, result);
+    if (result.modelOutput().len +| 1 > remaining_bytes) return error.SkillContextTooLarge;
     try out.writeAll(result.modelOutput());
     try out.writeByte('\n');
     if (result.contextNotice()) |notice| {
@@ -197,6 +600,16 @@ fn appendExplicitSkill(
             if (!std.mem.endsWith(u8, notice, "\n")) try diagnostic_notices.writer.writeByte('\n');
         }
     }
+    const failure: ?[]const u8 = switch (result) {
+        .loaded => |output| if (output.complete) null else "Complete instructions were not loaded.",
+        .failure => |output| output.model_output,
+    };
+    if (failure) |detail| {
+        try appendExplicitLoadRow(alloc, load_details, name, detail);
+        try load_details.writeByte('\n');
+    }
+    try appendExplicitLoadRow(alloc, load_rows, name, if (failure != null) "" else null);
+    return failure == null;
 }
 
 /// Resolves and reads one skill from an already discovered catalog.
@@ -224,6 +637,136 @@ pub fn loadByIdentity(
     );
 }
 
+pub fn loadWholeByLocation(
+    alloc: Allocator,
+    catalog: Catalog,
+    location: []const u8,
+    resource: ?[]const u8,
+    limits: context_limits.Values,
+    max_tool_result_bytes: ?usize,
+    cancel_flag: ?*std.atomic.Value(bool),
+) !ExecuteResult {
+    for (catalog.skills) |skill| {
+        if (!std.mem.eql(u8, skill.path, location)) continue;
+        return loadByIdentityWithOptions(alloc, catalog, skill.name, location, resource, 0, limits, max_tool_result_bytes, .{
+            .mode = .whole,
+            .cancel_flag = cancel_flag,
+        });
+    }
+    return .{ .failure = .{ .model_output = try formatExactSkillNotFound(alloc, "", location, max_tool_result_bytes orelse 4096) } };
+}
+
+/// Selects without loading instructions. The caller owns the selected entry or failure.
+pub fn prepareIdentity(alloc: Allocator, catalog: Catalog, name: ?[]const u8, location: ?[]const u8, max_tool_result_bytes: usize) !skill_contract.CallPreparation {
+    const resolution = if (name) |value|
+        skill_runtime.resolveSkill(catalog.skills, value, location)
+    else exact: {
+        const path = location orelse return error.InvalidSkillLocation;
+        for (catalog.skills, 0..) |skill, index| {
+            if (std.mem.eql(u8, skill.path, path)) break :exact skill_runtime.SkillResolution{ .found = &catalog.skills[index] };
+        }
+        break :exact skill_runtime.SkillResolution.not_found;
+    };
+    if (resolution != .found) {
+        var notice = try formatDiscoveryNotice(alloc, catalog.diagnostics, null);
+        errdefer if (notice) |value| alloc.free(value);
+        const budget = executePrimaryBudget(max_tool_result_bytes, notice != null);
+        const output = switch (resolution) {
+            .found => unreachable,
+            .not_found => if (location) |path|
+                try formatExactSkillNotFound(alloc, name orelse "", path, budget)
+            else
+                try formatMissingSkill(alloc, name.?, budget),
+            .ambiguous_name => try formatAmbiguousSkill(alloc, catalog.skills, name.?, budget),
+            .name_location_mismatch => try formatSkillLocationMismatch(alloc, name.?, location.?, budget),
+        };
+        const failure = try attachOwnedDiscoveryNotice(alloc, .{ .failure = .{ .model_output = output } }, &notice, max_tool_result_bytes);
+        return .{ .failure = failure.failure };
+    }
+    const selected = resolution.found.*;
+    const owned_name = try alloc.dupe(u8, selected.name);
+    errdefer alloc.free(owned_name);
+    const description = try alloc.dupe(u8, selected.description);
+    errdefer alloc.free(description);
+    const path = try alloc.dupe(u8, selected.path);
+    errdefer alloc.free(path);
+    const read_authority = if (selected.read_authority) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (read_authority) |value| alloc.free(value);
+    var copied = selected;
+    copied.name = owned_name;
+    copied.description = description;
+    copied.path = path;
+    copied.read_authority = read_authority;
+    const diagnostics = try alloc.alloc(skill_runtime.SkillDiagnostic, catalog.diagnostics.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (diagnostics[0..initialized]) |diagnostic| alloc.free(diagnostic.path);
+        alloc.free(diagnostics);
+    }
+    for (catalog.diagnostics, diagnostics) |diagnostic, *owned| {
+        owned.* = diagnostic;
+        owned.path = try alloc.dupe(u8, diagnostic.path);
+        initialized += 1;
+    }
+    return .{ .selected = .{ .skill = copied, .diagnostics = diagnostics } };
+}
+
+pub fn freeCallPreparation(alloc: Allocator, preparation: skill_contract.CallPreparation) void {
+    switch (preparation) {
+        .selected => |selected| {
+            skill_runtime.freeSkill(alloc, selected.skill);
+            skill_runtime.freeSkillDiagnostics(alloc, selected.diagnostics);
+        },
+        .failure => |output| freeExecuteResult(alloc, .{ .failure = output }),
+    }
+}
+
+fn checkPreparedIdentityDiagnostics(alloc: Allocator) !void {
+    const skills = [_]skill_runtime.Skill{
+        .{ .name = "workflow", .description = "first", .path = "/skills/first", .source = .workspace_agents, .read_authority = "/skills" },
+        .{ .name = "workflow", .description = "second", .path = "/skills/second", .source = .global_fx },
+    };
+    const diagnostics = [_]skill_runtime.SkillDiagnostic{.{
+        .path = "/skills/malformed",
+        .source = .global_fx,
+        .scope = .candidate,
+        .cause = .{ .invalid_metadata = .missing_name },
+    }};
+    const catalog: Catalog = .{ .skills = &skills, .diagnostics = &diagnostics };
+    const selected = try prepareIdentity(alloc, catalog, null, skills[0].path, 4096);
+    defer freeCallPreparation(alloc, selected);
+    try std.testing.expect(selected == .selected);
+    try std.testing.expectEqualStrings("workflow", selected.selected.skill.name);
+    try std.testing.expectEqual(@as(usize, 1), selected.selected.diagnostics.len);
+    try std.testing.expectEqualStrings(diagnostics[0].path, selected.selected.diagnostics[0].path);
+    try std.testing.expect(selected.selected.diagnostics[0].path.ptr != diagnostics[0].path.ptr);
+    for ([_]struct { name: []const u8, location: ?[]const u8, expected: []const u8 }{
+        .{ .name = "missing", .location = null, .expected = "not found" },
+        .{ .name = "workflow", .location = null, .expected = "ambiguous" },
+        .{ .name = "other", .location = skills[0].path, .expected = "does not match" },
+    }) |case| {
+        const failure = try prepareIdentity(alloc, catalog, case.name, case.location, 4096);
+        defer freeCallPreparation(alloc, failure);
+        try std.testing.expect(failure == .failure);
+        try expectContains(failure.failure.model_output, case.expected);
+        try expectContains(failure.failure.model_output, "skill_discovery_warning");
+        try expectContains(failure.failure.diagnostic_notice.?, "metadata is invalid (missing_name)");
+        try expectNotContains(failure.failure.model_output, "metadata is invalid");
+        if (std.mem.eql(u8, case.expected, "ambiguous")) {
+            try expectContains(failure.failure.model_output, skills[0].path);
+            try expectContains(failure.failure.model_output, skills[1].path);
+        }
+    }
+}
+
+test "prepared skill identities and selection failures preserve owned diagnostics" {
+    try checkPreparedIdentityDiagnostics(std.testing.allocator);
+}
+
+test "prepared skill diagnostic ownership survives allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkPreparedIdentityDiagnostics, .{});
+}
+
 fn loadByIdentityWithOptions(
     alloc: Allocator,
     catalog: Catalog,
@@ -235,6 +778,8 @@ fn loadByIdentityWithOptions(
     max_tool_result_bytes: ?usize,
     options: LoadOptions,
 ) !ExecuteResult {
+    if (options.cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
+    const resource_path = skill_contract.resource_path_or_main(resource);
     const resolution = skill_runtime.resolveSkill(catalog.skills, name, location);
     var opened_candidate: ?skill_runtime.OpenedSkillCandidate = null;
     defer if (opened_candidate) |*candidate| candidate.deinit();
@@ -309,10 +854,66 @@ fn loadByIdentityWithOptions(
         if (options.test_after_candidate_validation) |hook| try hook.check(hook.ctx);
     }
 
-    const resource_path = resource orelse "SKILL.md";
     const candidate = if (opened_candidate) |*current| current else unreachable;
-    const resource_read = try readSkillResource(alloc, candidate, resource_path, limits.skill_file_bytes);
+    const resource_read = try readSkillResource(alloc, candidate, resource_path, limits.skill_file_bytes, options.cancel_flag);
     defer alloc.free(resource_read.bytes);
+    if (options.cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
+    if (!skill_runtime.resourceIsSkillFile(resource_path)) {
+        try revalidatePrimaryIdentity(alloc, candidate.skillFile(), skill.*);
+    }
+    if (options.mode == .whole) {
+        if (resource_read.observed_bytes > resource_read.bytes.len) {
+            return attachOwnedDiscoveryNotice(alloc, try contextLimitFailure(alloc, try formatSkillFileBlocked(
+                alloc,
+                resource_path,
+                resource_read.observed_bytes,
+                limits.skill_file_bytes,
+            )), &discovery_notice, max_tool_result_bytes);
+        }
+        if (skill_runtime.resourceIsSkillFile(resource_path)) {
+            const metadata = switch (skill_contract.resolveMetadata(skill_contract.parseSkillFile(resource_read.bytes), std.fs.path.basename(skill.path))) {
+                .valid => |value| value,
+                .invalid => return error.SkillResourceChanged,
+            };
+            if (!std.mem.eql(u8, metadata.name, skill.name)) return error.SkillResourceChanged;
+        }
+        if (limits.skill_chunk_bytes.source != .compiled_default and resource_read.bytes.len > limits.skill_chunk_bytes.effectiveBytes()) {
+            return attachOwnedDiscoveryNotice(alloc, try contextLimitFailure(alloc, try formatSkillChunkBlocked(
+                alloc,
+                skill.name,
+                resource_path,
+                resource_read.bytes.len,
+                limits.skill_chunk_bytes,
+                0,
+            )), &discovery_notice, max_tool_result_bytes);
+        }
+        var full: std.Io.Writer.Allocating = .init(alloc);
+        defer full.deinit();
+        full.writer.writeAll(content_name_prefix) catch return error.OutOfMemory;
+        model_context_encoding.writeScalar(&full.writer, skill.name) catch return error.OutOfMemory;
+        full.writer.writeAll("\" location=\"") catch return error.OutOfMemory;
+        model_context_encoding.writeScalar(&full.writer, skill.path) catch return error.OutOfMemory;
+        full.writer.writeAll("\" resource=\"") catch return error.OutOfMemory;
+        model_context_encoding.writeScalar(&full.writer, resource_path) catch return error.OutOfMemory;
+        full.writer.writeAll("\" complete=\"true\">\n") catch return error.OutOfMemory;
+        full.writer.writeAll(resource_read.bytes) catch return error.OutOfMemory;
+        full.writer.writeAll("\n</skill_content>") catch return error.OutOfMemory;
+        const output = try tool_result_limits.prepareRedactedOutput(alloc, full.written());
+        if (output.len > primary_budget) {
+            defer alloc.free(output);
+            const message = try std.fmt.allocPrint(alloc, "Complete skill content exceeds max_tool_result_bytes ({d} bytes). No complete instructions were loaded.", .{primary_budget});
+            defer alloc.free(message);
+            return attachOwnedDiscoveryNotice(alloc, .{ .failure = .{ .model_output = try boundedSkillError(alloc, message, primary_budget) } }, &discovery_notice, max_tool_result_bytes);
+        }
+        const notice = if (!std.mem.eql(u8, output, full.written()))
+            alloc.dupe(u8, "[context] Skill content was sanitized or secret-masked before delivery.\n") catch |err| {
+                alloc.free(output);
+                return err;
+            }
+        else
+            null;
+        return attachOwnedDiscoveryNotice(alloc, .{ .loaded = .{ .model_output = output, .notice = notice, .complete = true } }, &discovery_notice, max_tool_result_bytes);
+    }
     if (offset > resource_read.bytes.len or !std.unicode.utf8ValidateSlice(resource_read.bytes[0..offset])) {
         return attachOwnedDiscoveryNotice(alloc, .{ .failure = .{ .model_output = try alloc.dupe(u8, "skill offset must be at a valid UTF-8 boundary within the selected resource") } }, &discovery_notice, max_tool_result_bytes);
     }
@@ -344,7 +945,7 @@ fn loadByIdentityWithOptions(
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    out.writer.writeAll("<skill_content name=\"") catch return error.OutOfMemory;
+    out.writer.writeAll(content_name_prefix) catch return error.OutOfMemory;
     model_context_encoding.writeScalar(&out.writer, skill.name) catch return error.OutOfMemory;
     out.writer.writeAll("\" resource=\"") catch return error.OutOfMemory;
     model_context_encoding.writeScalar(&out.writer, resource_path) catch return error.OutOfMemory;
@@ -712,11 +1313,27 @@ const SkillResourceRead = struct {
     observed_bytes: usize,
 };
 
+fn revalidatePrimaryIdentity(alloc: Allocator, file: *std.Io.File, skill: skill_runtime.Skill) !void {
+    const before = try file.stat(io_mod.getIo());
+    const length: usize = @intCast(@min(before.size, skill_contract.max_frontmatter_bytes + 1));
+    const bytes = try alloc.alloc(u8, length);
+    defer alloc.free(bytes);
+    if (try file.readPositionalAll(io_mod.getIo(), bytes, 0) != length) return error.SkillResourceChanged;
+    const after = try file.stat(io_mod.getIo());
+    if (before.size != after.size or !std.meta.eql(before.mtime, after.mtime)) return error.SkillResourceChanged;
+    const metadata = switch (skill_contract.resolveMetadata(skill_contract.parseSkillFile(bytes), std.fs.path.basename(skill.path))) {
+        .valid => |value| value,
+        .invalid => return error.SkillResourceChanged,
+    };
+    if (!std.mem.eql(u8, metadata.name, skill.name)) return error.SkillResourceChanged;
+}
+
 fn readSkillResource(
     alloc: Allocator,
     candidate: *skill_runtime.OpenedSkillCandidate,
     resource: []const u8,
     limit: context_limits.Resolved,
+    cancel_flag: ?*std.atomic.Value(bool),
 ) !SkillResourceRead {
     return readSkillResourceWithCeiling(
         alloc,
@@ -724,6 +1341,7 @@ fn readSkillResource(
         resource,
         limit,
         context_limits.emergency_ceiling_bytes,
+        cancel_flag,
     );
 }
 
@@ -733,6 +1351,7 @@ fn readSkillResourceWithCeiling(
     resource: []const u8,
     limit: context_limits.Resolved,
     safety_ceiling: usize,
+    cancel_flag: ?*std.atomic.Value(bool),
 ) !SkillResourceRead {
     if (skill_runtime.resourceIsSkillFile(resource)) {
         return readSkillResourceFile(
@@ -740,12 +1359,13 @@ fn readSkillResourceWithCeiling(
             candidate.skillFile(),
             limit,
             safety_ceiling,
+            cancel_flag,
         );
     }
 
     var file = try candidate.openResource(resource);
     defer file.close(io_mod.getIo());
-    return readSkillResourceFile(alloc, &file, limit, safety_ceiling);
+    return readSkillResourceFile(alloc, &file, limit, safety_ceiling, cancel_flag);
 }
 
 fn readSkillResourceFile(
@@ -753,17 +1373,27 @@ fn readSkillResourceFile(
     file: *std.Io.File,
     limit: context_limits.Resolved,
     safety_ceiling: usize,
+    cancel_flag: ?*std.atomic.Value(bool),
 ) !SkillResourceRead {
     const stat = try file.stat(io_mod.getIo());
     if (stat.kind != .file) return error.InvalidSkillResource;
     const observed_bytes = std.math.cast(usize, stat.size) orelse return error.SkillFileLimitExceeded;
     const effective_limit = limit.effectiveBytes();
-    try validateSkillResourceUtf8(file, @min(observed_bytes, safety_ceiling), observed_bytes);
+    try validateSkillResourceUtf8(file, @min(observed_bytes, safety_ceiling), observed_bytes, cancel_flag);
 
     const read_len = @min(observed_bytes, @min(effective_limit +| 3, safety_ceiling));
     const bytes = try alloc.alloc(u8, read_len);
     errdefer alloc.free(bytes);
-    const bytes_read = try file.readPositionalAll(io_mod.getIo(), bytes, 0);
+    var bytes_read: usize = 0;
+    while (bytes_read < bytes.len) {
+        if (cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
+        const end = bytes_read + @min(bytes.len - bytes_read, 64 * 1024);
+        const count = try file.readPositionalAll(io_mod.getIo(), bytes[bytes_read..end], bytes_read);
+        if (count == 0) break;
+        bytes_read += count;
+    }
+    const final_stat = try file.stat(io_mod.getIo());
+    if (final_stat.size != stat.size or !std.meta.eql(final_stat.mtime, stat.mtime)) return error.SkillResourceChanged;
     if (bytes_read != read_len) return error.UnexpectedEndOfFile;
     const allowed_len = context_limits.lineSafePrefixLength(bytes, effective_limit);
     if (allowed_len != bytes.len) {
@@ -778,12 +1408,13 @@ fn readSkillResourceFile(
     };
 }
 
-fn validateSkillResourceUtf8(file: *std.Io.File, byte_count: usize, observed_bytes: usize) !void {
+fn validateSkillResourceUtf8(file: *std.Io.File, byte_count: usize, observed_bytes: usize, cancel_flag: ?*std.atomic.Value(bool)) !void {
     var read_offset: usize = 0;
     var validator: text_utils.IncrementalUtf8Validator = .{};
     var chunk: [16 * 1024]u8 = undefined;
 
     while (read_offset < byte_count) {
+        if (cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
         const wanted = @min(chunk.len, byte_count - read_offset);
         const bytes_read = try file.readPositionalAll(io_mod.getIo(), chunk[0..wanted], read_offset);
         if (bytes_read != wanted) return error.UnexpectedEndOfFile;
@@ -922,7 +1553,7 @@ fn openTestSkillCandidate(
 fn expectSkillResourceRejected(alloc: Allocator, root: []const u8, resource: []const u8) !void {
     var candidate = openTestSkillCandidate(alloc, root) catch return;
     defer candidate.deinit();
-    const loaded = readSkillResource(alloc, &candidate, resource, (context_limits.Values{}).skill_file_bytes) catch return;
+    const loaded = readSkillResource(alloc, &candidate, resource, (context_limits.Values{}).skill_file_bytes, null) catch return;
     defer alloc.free(loaded.bytes);
     return error.TestUnexpectedResult;
 }
@@ -953,7 +1584,7 @@ test "skill resource validation completes UTF-8 across the safety ceiling" {
     var candidate = try openTestSkillCandidate(alloc, root);
     defer candidate.deinit();
     const limit = context_limits.Resolved{ .value = .{ .bytes = 5 }, .source = .command_line };
-    const loaded = try readSkillResourceWithCeiling(alloc, &candidate, "assets/valid.txt", limit, 5);
+    const loaded = try readSkillResourceWithCeiling(alloc, &candidate, "assets/valid.txt", limit, 5, null);
     defer alloc.free(loaded.bytes);
     try std.testing.expectEqualStrings("one\n", loaded.bytes);
     try std.testing.expectEqual(@as(usize, "one\n€\ntail\n".len), loaded.observed_bytes);
@@ -965,7 +1596,7 @@ test "skill resource validation completes UTF-8 across the safety ceiling" {
 
     try std.testing.expectError(
         error.BinarySkillResource,
-        readSkillResourceWithCeiling(alloc, &candidate, "assets/invalid.txt", limit, 5),
+        readSkillResourceWithCeiling(alloc, &candidate, "assets/invalid.txt", limit, 5, null),
     );
 }
 
@@ -1081,13 +1712,7 @@ fn checkExplicitPromptSectionAllocationFailures(
 ) !void {
     var discovery = try loadVisibleSkillsForContext(alloc, workspace_root, skills_dir);
     defer discovery.deinit(alloc);
-    var section = try buildExplicitPromptSection(
-        alloc,
-        .{ .skills = discovery.skills, .diagnostics = discovery.diagnostics },
-        "$workflow",
-        &.{},
-        limits,
-    );
+    var section = try buildExplicitPromptSection(alloc, .{ .skills = discovery.skills, .diagnostics = discovery.diagnostics }, "$workflow", &.{}, limits, null);
     defer section.deinit(alloc);
     try std.testing.expect(section.notice != null);
     try std.testing.expect(section.diagnostic_notice != null);
@@ -1401,7 +2026,7 @@ test "large skills stay discoverable and explicit overrides can continue past de
     try expectContains(unbounded.modelOutput(), tail);
 }
 
-test "explicit invocation supplies the bounded first skill chunk before the response" {
+test "explicit invocation reports user byte ceilings without partial success" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1428,52 +2053,35 @@ test "explicit invocation supplies the bounded first skill chunk before the resp
 
     var limits = context_limits.Values{};
     limits.skill_chunk_bytes = .{ .value = .{ .bytes = 64 }, .source = .command_line };
-    var explicit = try buildExplicitPromptSection(
-        alloc,
-        catalog,
-        "$workflow apply these instructions",
-        &.{},
-        limits,
-    );
+    var explicit = try buildExplicitPromptSection(alloc, catalog, "$workflow apply these instructions", &.{}, limits, null);
     defer explicit.deinit(alloc);
 
-    try expectContains(explicit.text, "Explicitly invoked skill content for this query");
-    try expectContains(explicit.text, "<skill_content name=\"workflow\" resource=\"SKILL.md\" offset=\"0\"");
-    try expectContains(explicit.text, "name=\"skill_chunk_bytes\" action=\"truncated\"");
+    try expectNotContains(explicit.text, "already loaded");
+    try expectContains(explicit.text, "Follow each skill's complete instructions and required resources before substantive work.");
+    try expectContains(explicit.text, "If a skill cannot be followed, state the blocker instead of silently substituting another workflow.");
+    try expectNotContains(explicit.text, "<skill_content");
+    try expectContains(explicit.text, "name=\"skill_chunk_bytes\" action=\"blocked\"");
     try expectNotContains(explicit.text, "TAIL MUST WAIT");
     try std.testing.expect(explicit.notice != null);
+    try expectContains(explicit.load_notice.?.body, "0 loaded · 1 failed");
+    try expectContains(explicit.load_notice.?.body, "Could not load workflow");
+    try expectContains(explicit.load_details.?, "skill_chunk_bytes");
+    try expectNotContains(explicit.load_notice.?.body, "Loaded skill workflow");
 
-    var fuzzy = try buildExplicitPromptSection(
-        alloc,
-        catalog,
-        "please improve this workflow",
-        &.{},
-        limits,
-    );
+    var fuzzy = try buildExplicitPromptSection(alloc, catalog, "please improve this workflow", &.{}, limits, null);
     defer fuzzy.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), fuzzy.text.len);
+    try std.testing.expect(fuzzy.load_notice == null);
 
     limits.skill_chunk_bytes = .{ .value = .{ .bytes = 0 }, .source = .command_line };
-    var zero_chunk = try buildExplicitPromptSection(
-        alloc,
-        catalog,
-        "$workflow",
-        &.{},
-        limits,
-    );
+    var zero_chunk = try buildExplicitPromptSection(alloc, catalog, "$workflow", &.{}, limits, null);
     defer zero_chunk.deinit(alloc);
     try expectContains(zero_chunk.text, "name=\"skill_chunk_bytes\" action=\"blocked\"");
     try std.testing.expect(zero_chunk.notice != null);
 
     limits.skill_chunk_bytes = (context_limits.Values{}).skill_chunk_bytes;
     limits.skill_file_bytes = .{ .value = .{ .bytes = 0 }, .source = .command_line };
-    var zero_file = try buildExplicitPromptSection(
-        alloc,
-        catalog,
-        "$workflow",
-        &.{},
-        limits,
-    );
+    var zero_file = try buildExplicitPromptSection(alloc, catalog, "$workflow", &.{}, limits, null);
     defer zero_file.deinit(alloc);
     try expectContains(zero_file.text, "name=\"skill_file_bytes\" action=\"blocked_remainder\"");
     try std.testing.expect(zero_file.notice != null);
@@ -1494,10 +2102,11 @@ test "explicit binding plan preserves supplied order and adds prompt matches onc
     defer alloc.free(plan);
 
     try std.testing.expectEqual(@as(usize, 2), plan.len);
-    try std.testing.expectEqualStrings("release", plan[0].name);
-    try std.testing.expectEqualStrings("/skills/release", plan[0].path);
-    try std.testing.expectEqualStrings("review", plan[1].name);
-    try std.testing.expectEqualStrings("/skills/review", plan[1].path);
+    try std.testing.expect(plan[0] == .bound and plan[1] == .bound);
+    try std.testing.expectEqualStrings("release", plan[0].bound.name);
+    try std.testing.expectEqualStrings("/skills/release", plan[0].bound.path);
+    try std.testing.expectEqualStrings("review", plan[1].bound.name);
+    try std.testing.expectEqualStrings("/skills/review", plan[1].bound.path);
 }
 
 test "explicit invocation preserves configured skill content when discovery is incomplete" {
@@ -1542,13 +2151,7 @@ test "explicit invocation preserves configured skill content when discovery is i
     var limits = context_limits.Values{};
     limits.skill_file_bytes = .{ .value = .off, .source = .command_line };
     limits.skill_chunk_bytes = .{ .value = .off, .source = .command_line };
-    var explicit = try buildExplicitPromptSection(
-        alloc,
-        catalog,
-        "$large",
-        &.{},
-        limits,
-    );
+    var explicit = try buildExplicitPromptSection(alloc, catalog, "$large", &.{}, limits, null);
     defer explicit.deinit(alloc);
 
     try expectContains(explicit.text, "skill_discovery_warning");
@@ -1559,13 +2162,7 @@ test "explicit invocation preserves configured skill content when discovery is i
     try std.testing.expect(explicit.diagnostic_notice != null);
 
     limits.skill_chunk_bytes = .{ .value = .{ .bytes = 64 }, .source = .command_line };
-    var limited = try buildExplicitPromptSection(
-        alloc,
-        catalog,
-        "$large",
-        &.{},
-        limits,
-    );
+    var limited = try buildExplicitPromptSection(alloc, catalog, "$large", &.{}, limits, null);
     defer limited.deinit(alloc);
 
     const limit_notice = limited.notice orelse return error.TestExpectedEqual;

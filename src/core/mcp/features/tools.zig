@@ -1,7 +1,6 @@
 const std = @import("std");
-const feature_cache = @import("../feature_cache.zig");
+const catalog_freshness = @import("../catalog_freshness.zig");
 const json_number = @import("../json_number.zig");
-const json_schema = @import("../json_schema.zig");
 const mcp_contract = @import("../mcp_contract.zig");
 const mrtr = @import("../mrtr.zig");
 const sort_utils = @import("../../shared/sort_utils.zig");
@@ -22,9 +21,11 @@ pub const Limits = struct {
     max_metadata_bytes: usize = 128 * 1024,
     max_content_items: usize = 256,
     max_content_field_bytes: usize = 1024 * 1024,
+    max_image_bytes: usize = @import("../../images/image_data.zig").max_encoded_image_bytes,
     max_input_requests: usize = 32,
     max_request_state_bytes: usize = 64 * 1024,
-    schema: json_schema.Limits = .{},
+    max_schema_bytes: usize = 256 * 1024,
+    max_argument_bytes: usize = 1024 * 1024,
 };
 
 pub const Error = error{
@@ -40,10 +41,14 @@ pub const Error = error{
     InvalidCallResult,
     UnsupportedResultType,
     InvalidContent,
-    InvalidStructuredContent,
+    InvalidSchema,
+    UnsupportedDialect,
+    SchemaLimitExceeded,
+    InstanceLimitExceeded,
+    InvalidJson,
     InvalidInputRequired,
     MetadataLimitExceeded,
-} || json_schema.Error || mrtr.Error || Allocator.Error || std.Io.Writer.Error;
+} || mrtr.Error || Allocator.Error || std.Io.Writer.Error;
 
 pub const CacheScope = enum { private, public };
 
@@ -101,6 +106,8 @@ pub const Catalog = struct {
 pub const CatalogBuilder = struct {
     tools: std.ArrayList(Tool) = .empty,
     cursors: std.StringHashMap(void),
+    /// Borrows a key owned by cursors, independent of the parsed page lifetime.
+    next_cursor: ?[]const u8 = null,
     protocol: Protocol,
     pages: usize = 0,
     first_received_at_ms: ?u64 = null,
@@ -123,6 +130,15 @@ pub const CatalogBuilder = struct {
         self.* = undefined;
     }
 
+    /// Decodes one response and owns its continuation until the next page.
+    pub fn appendResponse(self: *CatalogBuilder, alloc: Allocator, response: []const u8, received_at_ms: u64, limits: Limits) Error!bool {
+        var page = try parseListPage(alloc, response, self.protocol, limits);
+        defer page.deinit(alloc);
+        try self.appendPage(alloc, &page, received_at_ms, limits);
+        return self.next_cursor == null;
+    }
+
+    /// Consumes the page's tools and cursor on successful append.
     pub fn appendPage(
         self: *CatalogBuilder,
         alloc: Allocator,
@@ -148,7 +164,7 @@ pub const CatalogBuilder = struct {
         if (self.first_received_at_ms == null) {
             self.first_received_at_ms = received_at_ms;
         }
-        const page_expiry_ms = feature_cache.pageExpiry(
+        const page_expiry_ms = catalog_freshness.pageExpiry(
             switch (self.protocol) {
                 .legacy => .legacy,
                 .modern => .modern,
@@ -157,7 +173,7 @@ pub const CatalogBuilder = struct {
             page.ttl_present,
             page.ttl_ms,
         );
-        self.expires_at_ms = feature_cache.earliestExpiry(
+        self.expires_at_ms = catalog_freshness.earliestExpiry(
             self.expires_at_ms,
             page_expiry_ms,
         );
@@ -179,10 +195,10 @@ pub const CatalogBuilder = struct {
         page.tools = &.{};
 
         if (page.next_cursor) |cursor| {
-            const owned = try alloc.dupe(u8, cursor);
-            errdefer alloc.free(owned);
-            try self.cursors.put(owned, {});
-        }
+            try self.cursors.put(cursor, {});
+            self.next_cursor = cursor;
+            page.next_cursor = null;
+        } else self.next_cursor = null;
     }
 
     /// Returns one complete owned catalog sorted by protocol name. Cache expiry
@@ -348,27 +364,7 @@ pub fn parseCallOutcome(
         if (value != .bool) return error.InvalidCallResult;
         break :blk value.bool;
     } else false;
-    const structured_content = result.object.get("structuredContent");
-    if (!is_error) {
-        if (output_schema_json) |schema_json| {
-            const structured = structured_content orelse return error.InvalidStructuredContent;
-            var schema = std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{
-                .parse_numbers = false,
-            }) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.InvalidStructuredContent,
-            };
-            defer schema.deinit();
-            const validation = json_schema.validateValue(alloc, schema.value, structured, limits.schema) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.InvalidStructuredContent,
-            };
-            switch (validation) {
-                .valid, .server_authoritative => {},
-                .invalid => return error.InvalidStructuredContent,
-            }
-        }
-    }
+    _ = output_schema_json; // Tool semantics, including output assertions, belong to the server.
     const serialization_limit = std.math.add(usize, max_result_bytes, 16 * 1024) catch
         return error.MetadataLimitExceeded;
     const result_json = try stringifyValueAlloc(alloc, result, serialization_limit);
@@ -378,92 +374,48 @@ pub fn parseCallOutcome(
     } };
 }
 
-pub fn validateArguments(
-    alloc: Allocator,
-    input_schema_json: []const u8,
-    arguments_json: []const u8,
-    limits: Limits,
-) Error!json_schema.Result {
-    const direct = try json_schema.validateText(alloc, input_schema_json, arguments_json, limits.schema);
-    switch (direct) {
-        .valid, .server_authoritative => return direct,
-        .invalid => {},
-    }
-    const normalized = try normalizeOptionalHeaderNulls(
-        alloc,
-        input_schema_json,
-        arguments_json,
-        limits,
-    ) orelse return direct;
-    defer alloc.free(normalized);
-    return json_schema.validateText(alloc, input_schema_json, normalized, limits.schema);
+/// Check the wire boundary only. The server owns its tool's semantic assertions.
+pub fn validateArguments(alloc: Allocator, arguments_json: []const u8, limits: Limits) Error!void {
+    if (arguments_json.len > limits.max_argument_bytes) return error.InstanceLimitExceeded;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{ .parse_numbers = false }) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return error.InvalidJson;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidJson;
+    var remaining: usize = 4096;
+    checkValueBounds(parsed.value, 0, &remaining) catch return error.InstanceLimitExceeded;
 }
 
-/// SEP-2243 treats null values for optional x-mcp-header properties as omitted.
-/// Keep that transport-extension rule outside the general JSON Schema engine.
-fn normalizeOptionalHeaderNulls(
-    alloc: Allocator,
-    input_schema_json: []const u8,
-    arguments_json: []const u8,
-    limits: Limits,
-) Error!?[]u8 {
-    var schema = std.json.parseFromSlice(std.json.Value, alloc, input_schema_json, .{
-        .parse_numbers = false,
-    }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidJson,
-    };
-    defer schema.deinit();
-    var arguments = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{
-        .parse_numbers = false,
-    }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidJson,
-    };
-    defer arguments.deinit();
-    if (schema.value != .object or arguments.value != .object) return null;
-    const properties = schema.value.object.get("properties") orelse return null;
-    if (properties != .object) return null;
-    const required = schema.value.object.get("required");
-
-    var omitted = false;
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try out.writer.writeByte('{');
-    var wrote = false;
-    var iterator = arguments.value.object.iterator();
-    while (iterator.next()) |entry| {
-        const property_schema = properties.object.get(entry.key_ptr.*);
-        const header_null = entry.value_ptr.* == .null and
-            property_schema != null and
-            property_schema.? == .object and
-            property_schema.?.object.get("x-mcp-header") != null and
-            !requiredContains(required, entry.key_ptr.*);
-        if (header_null) {
-            omitted = true;
-            continue;
-        }
-        if (wrote) try out.writer.writeByte(',');
-        try std.json.Stringify.value(entry.key_ptr.*, .{}, &out.writer);
-        try out.writer.writeByte(':');
-        try std.json.Stringify.value(entry.value_ptr.*, .{}, &out.writer);
-        wrote = true;
+fn checkValueBounds(value: std.json.Value, depth: usize, remaining: *usize) error{SchemaLimitExceeded}!void {
+    if (depth > 64 or remaining.* == 0) return error.SchemaLimitExceeded;
+    remaining.* -= 1;
+    switch (value) {
+        .array => |array| for (array.items) |item| {
+            try checkValueBounds(item, depth + 1, remaining);
+        },
+        .object => |object| {
+            var iterator = object.iterator();
+            while (iterator.next()) |entry| try checkValueBounds(entry.value_ptr.*, depth + 1, remaining);
+        },
+        else => {},
     }
-    try out.writer.writeByte('}');
-    if (!omitted) return null;
-    if (out.writer.buffered().len > limits.schema.max_instance_bytes) {
-        return error.InstanceLimitExceeded;
-    }
-    return try out.toOwnedSlice();
 }
 
-fn requiredContains(required: ?std.json.Value, name: []const u8) bool {
-    const value = required orelse return false;
-    if (value != .array) return false;
-    for (value.array.items) |item| {
-        if (item == .string and std.mem.eql(u8, item.string, name)) return true;
+fn prepareSchema(schema: std.json.Value, object_root: bool) Error!void {
+    if (schema != .object) return error.InvalidSchema;
+    if (object_root) {
+        const kind = schema.object.get("type") orelse return error.InvalidSchema;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "object")) return error.InvalidSchema;
     }
-    return false;
+    if (schema.object.get("$schema")) |dialect| {
+        if (dialect != .string) return error.InvalidSchema;
+        const uri = std.mem.trimEnd(u8, dialect.string, "#");
+        if (!std.mem.eql(u8, uri, "https://json-schema.org/draft/2020-12/schema") and
+            !std.mem.eql(u8, uri, "http://json-schema.org/draft-07/schema")) return error.UnsupportedDialect;
+    }
+    var remaining: usize = 4096;
+    try checkValueBounds(schema, 0, &remaining);
 }
 
 pub fn buildListRequest(
@@ -508,10 +460,9 @@ fn parseTool(alloc: Allocator, value: std.json.Value, limits: Limits) Error!Tool
         if (title != .string or title.string.len > limits.max_title_bytes) return error.InvalidTool;
     }
     const input_schema = value.object.get("inputSchema") orelse return error.InvalidTool;
-    _ = try json_schema.validateSchemaValue(alloc, input_schema, limits.schema);
-    try json_schema.requireObjectRoot(input_schema);
+    try prepareSchema(input_schema, true);
     if (value.object.get("outputSchema")) |output_schema| {
-        _ = try json_schema.validateSchemaValue(alloc, output_schema, limits.schema);
+        try prepareSchema(output_schema, false);
     }
     if (value.object.get("icons")) |icons| try validateIcons(icons, limits);
     if (value.object.get("annotations")) |annotations| try validateToolAnnotations(annotations, limits);
@@ -523,10 +474,10 @@ fn parseTool(alloc: Allocator, value: std.json.Value, limits: Limits) Error!Tool
     errdefer if (title) |owned| alloc.free(owned);
     const description = try alloc.dupe(u8, if (description_value) |description| description.string else "");
     errdefer alloc.free(description);
-    const input_schema_json = try stringifyValueAlloc(alloc, input_schema, limits.schema.max_schema_bytes);
+    const input_schema_json = try stringifyValueAlloc(alloc, input_schema, limits.max_schema_bytes);
     errdefer alloc.free(input_schema_json);
     const output_schema_json = if (value.object.get("outputSchema")) |output_schema|
-        try stringifyValueAlloc(alloc, output_schema, limits.schema.max_schema_bytes)
+        try stringifyValueAlloc(alloc, output_schema, limits.max_schema_bytes)
     else
         null;
     errdefer if (output_schema_json) |owned| alloc.free(owned);
@@ -593,7 +544,7 @@ fn validateContentItem(alloc: Allocator, value: std.json.Value, limits: Limits) 
         return;
     }
     if (std.mem.eql(u8, type_value.string, "image") or std.mem.eql(u8, type_value.string, "audio")) {
-        const data = try requireBoundedString(value.object, "data", limits.max_content_field_bytes);
+        const data = try requireBoundedString(value.object, "data", if (std.mem.eql(u8, type_value.string, "image")) limits.max_image_bytes else limits.max_content_field_bytes);
         _ = try requireBoundedString(value.object, "mimeType", limits.max_title_bytes);
         if (!try validBase64(alloc, data)) return error.InvalidContent;
         return;
@@ -913,9 +864,28 @@ test "tools list tolerates negative TTL and accepts an empty opaque cursor" {
     var builder = CatalogBuilder.init(alloc, .modern);
     defer builder.deinit(alloc);
     try builder.appendPage(alloc, &page, 1_000, .{});
+    try std.testing.expectEqualStrings("", builder.next_cursor.?);
     var catalog = try builder.finish(alloc);
     defer catalog.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 1_000), catalog.expires_at_ms);
+}
+
+test "catalog response assembly retains its cursor after parsed page cleanup" {
+    const alloc = std.testing.allocator;
+    var builder = CatalogBuilder.init(alloc, .legacy);
+    defer builder.deinit(alloc);
+    try std.testing.expect(!try builder.appendResponse(alloc,
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"second","inputSchema":{"type":"object"}}],"nextCursor":"page two"}}
+    , 100, .{}));
+    try std.testing.expectEqualStrings("page two", builder.next_cursor.?);
+    try std.testing.expect(try builder.appendResponse(alloc,
+        \\{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"first","inputSchema":{"type":"object"}}]}}
+    , 110, .{}));
+    var catalog = try builder.finish(alloc);
+    defer catalog.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), catalog.tools.len);
+    try std.testing.expectEqualStrings("first", catalog.tools[0].name);
+    try std.testing.expectEqualStrings("second", catalog.tools[1].name);
 }
 
 test "tools catalog rejects cache scope changes across pages" {
@@ -945,7 +915,7 @@ test "tools catalog rejects cache scope changes across pages" {
     );
 }
 
-test "tools list pagination rejects repeated cursors duplicate tools and external schema references" {
+test "tools list rejects repeated cursors and duplicate tools while retaining schema references" {
     const alloc = std.testing.allocator;
     var page = try parseListPage(
         alloc,
@@ -976,32 +946,14 @@ test "tools list pagination rejects repeated cursors duplicate tools and externa
     );
     defer duplicates.deinit(alloc);
     try std.testing.expectError(error.DuplicateTool, builder.appendPage(alloc, &duplicates, 102, .{}));
-    try std.testing.expectError(
-        error.ExternalReference,
-        parseListPage(
-            alloc,
-            \\{"jsonrpc":"2.0","id":4,"result":{"tools":[{"name":"bad","inputSchema":{"type":"object","properties":{"x":{"$ref":"https://example.com/x"}}}}]}}
-        ,
-            .legacy,
-            .{},
-        ),
-    );
+    var references = try parseListPage(alloc,
+        \\{"jsonrpc":"2.0","id":4,"result":{"tools":[{"name":"remote","inputSchema":{"type":"object","properties":{"x":{"$ref":"https://example.com/x"}}}}]}}
+    , .legacy, .{});
+    defer references.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, references.tools[0].input_schema_json, "https://example.com/x") != null);
 }
 
-test "tools list rejects malformed schemas behind local references" {
-    try std.testing.expectError(
-        error.InvalidSchema,
-        parseListPage(
-            std.testing.allocator,
-            \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"bad","inputSchema":{"$schema":"http://json-schema.org/draft-07/schema#","type":"object","default":{"type":7},"$ref":"#/default"}}]}}
-        ,
-            .modern,
-            .{},
-        ),
-    );
-}
-
-test "MCP tool call results preserve content types errors and structured validation" {
+test "MCP tool call results preserve content types errors and server output" {
     const alloc = std.testing.allocator;
     var outcome = try parseCallOutcome(
         alloc,
@@ -1035,61 +987,18 @@ test "MCP tool call results preserve content types errors and structured validat
         "No active project",
     ) != null);
 
-    try std.testing.expectError(
-        error.InvalidStructuredContent,
-        parseCallOutcome(
-            alloc,
-            \\{"jsonrpc":"2.0","id":3,"result":{"content":[],"structuredContent":"wrong"}}
-        ,
-            .modern,
-            \\{"type":"array"}
-        ,
-            64 * 1024,
-            .{},
-        ),
-    );
-    try std.testing.expectError(
-        error.InvalidStructuredContent,
-        parseCallOutcome(
-            alloc,
-            \\{"jsonrpc":"2.0","id":4,"result":{"content":[]}}
-        ,
-            .modern,
-            \\{"type":"object"}
-        ,
-            64 * 1024,
-            .{},
-        ),
-    );
+    var different_output = try parseCallOutcome(alloc,
+        \\{"jsonrpc":"2.0","id":3,"result":{"content":[],"structuredContent":"server result"}}
+    , .modern, "{\"type\":\"array\"}", 64 * 1024, .{});
+    defer different_output.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, different_output.complete.result_json, "server result") != null);
 }
 
-test "tool arguments and structured results delegate unsupported provider assertions" {
-    const alloc = std.testing.allocator;
-    const schema =
-        \\{"type":"object","properties":{"email":{"type":"string","pattern":"^(?!\\.)(?!.*\\.\\.)[A-Za-z0-9_+.-]+@[A-Za-z0-9.-]+$"}}}
-    ;
-    try std.testing.expectEqual(
-        json_schema.Result.server_authoritative,
-        try validateArguments(
-            alloc,
-            schema,
-            \\{"email":"person@example.com"}
-        ,
-            .{},
-        ),
-    );
-
-    var outcome = try parseCallOutcome(
-        alloc,
-        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"ok"}],"structuredContent":{"email":"person@example.com"}}}
-    ,
-        .modern,
-        schema,
-        64 * 1024,
-        .{},
-    );
-    defer outcome.deinit(alloc);
-    try std.testing.expect(!outcome.complete.is_error);
+test "tool argument boundary leaves semantic validation to the server" {
+    try validateArguments(std.testing.allocator, "{\"email\":42,\"optional_header\":null}", .{});
+    try std.testing.expectError(error.InvalidJson, validateArguments(std.testing.allocator, "[]", .{}));
+    try std.testing.expectError(error.InvalidJson, validateArguments(std.testing.allocator, "{", .{}));
+    try std.testing.expectError(error.InstanceLimitExceeded, validateArguments(std.testing.allocator, "{}", .{ .max_argument_bytes = 1 }));
 }
 
 test "tool call content rejects malformed payloads and enforces item limits" {
@@ -1180,20 +1089,5 @@ test "tools list request carries pagination cursor after modern metadata" {
     try std.testing.expectEqualStrings(
         "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/list\",\"params\":{\"cursor\":\"next\"}}",
         request,
-    );
-}
-
-test "optional SEP-2243 header null validates as omitted without weakening schema core" {
-    const alloc = std.testing.allocator;
-    const schema =
-        \\{"type":"object","properties":{"verbose":{"type":"boolean","x-mcp-header":"Verbose"},"plain":{"type":"boolean"}},"required":[]}
-    ;
-    try std.testing.expectEqual(
-        json_schema.Result.valid,
-        try validateArguments(alloc, schema, "{\"verbose\":null}", .{}),
-    );
-    try std.testing.expectEqual(
-        json_schema.Result{ .invalid = .properties },
-        try validateArguments(alloc, schema, "{\"plain\":null}", .{}),
     );
 }

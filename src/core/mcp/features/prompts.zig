@@ -1,6 +1,6 @@
 const std = @import("std");
 const common = @import("common.zig");
-const feature_cache = @import("../feature_cache.zig");
+const catalog_freshness = @import("../catalog_freshness.zig");
 const mrtr = @import("../mrtr.zig");
 const sort_utils = @import("../../shared/sort_utils.zig");
 
@@ -160,7 +160,7 @@ pub const CatalogBuilder = struct {
         self.pages = next_pages;
         if (self.first_received_at_ms == null) self.first_received_at_ms = received_at_ms;
         self.cache_scope = self.cache_scope orelse page.cache.scope;
-        const page_expiry = feature_cache.pageExpiry(
+        const page_expiry = catalog_freshness.pageExpiry(
             switch (self.protocol) {
                 .legacy => .legacy,
                 .modern => .modern,
@@ -169,7 +169,7 @@ pub const CatalogBuilder = struct {
             page.cache.ttl_present,
             page.cache.ttl_ms,
         );
-        self.expires_at_ms = feature_cache.earliestExpiry(self.expires_at_ms, page_expiry);
+        self.expires_at_ms = catalog_freshness.earliestExpiry(self.expires_at_ms, page_expiry);
         try self.prompts.ensureUnusedCapacity(alloc, page.prompts.len);
         for (page.prompts) |*prompt| {
             self.prompts.appendAssumeCapacity(prompt.*);

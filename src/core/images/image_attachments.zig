@@ -470,6 +470,70 @@ pub fn captureBoundImageAttachment(
     return attachment;
 }
 
+/// Captures caller-supplied image bytes into the immutable session snapshot
+/// contract. The caller owns the returned attachment and must release it with
+/// `types.freeImageAttachment` or `discardImageAttachment`.
+pub fn captureInlineImageBytes(
+    alloc: std.mem.Allocator,
+    image_id: usize,
+    declared_media_type: []const u8,
+    bytes: []const u8,
+    snapshot_dir: []const u8,
+) !types.ImageAttachment {
+    if (image_id == 0) return error.InvalidImageId;
+    if (bytes.len == 0 or declared_media_type.len == 0) return error.UnsupportedImageType;
+    if (bytes.len > max_image_bytes or !fitsEncodedLimit(bytes.len)) return error.ImageTooLarge;
+
+    var snapshot_dir_handle = try openOrCreateSnapshotDirectoryNoFollow(snapshot_dir);
+    defer snapshot_dir_handle.close(io_mod.getIo());
+    var random_suffix: u64 = undefined;
+    io_mod.getIo().random(std.mem.asBytes(&random_suffix));
+    const source_name = try std.fmt.allocPrint(
+        alloc,
+        "image-{d}.acp-source.{x}",
+        .{ image_id, random_suffix },
+    );
+    defer alloc.free(source_name);
+    defer deleteSnapshotFile(snapshot_dir_handle, source_name, "capture_acp_source");
+
+    {
+        var source = try snapshot_dir_handle.createFile(
+            io_mod.getIo(),
+            source_name,
+            .{
+                .truncate = false,
+                .exclusive = true,
+                .permissions = std.Io.File.Permissions.fromMode(0o600),
+                .resolve_beneath = true,
+            },
+        );
+        defer source.close(io_mod.getIo());
+        try source.writeStreamingAll(io_mod.getIo(), bytes);
+        try source.sync(io_mod.getIo());
+    }
+
+    const source_path = try std.fs.path.join(alloc, &.{ snapshot_dir, source_name });
+    defer alloc.free(source_path);
+    var attachment = types.ImageAttachment{
+        .id = image_id,
+        .path = try alloc.dupe(u8, source_path),
+        .media_type = try alloc.dupe(u8, declared_media_type),
+    };
+    errdefer discardImageAttachment(alloc, attachment);
+    try captureImageSnapshot(alloc, &attachment, snapshot_dir);
+    if (!std.mem.eql(u8, attachment.media_type, declared_media_type)) {
+        return error.ImageSnapshotMediaTypeMismatch;
+    }
+
+    const durable_path = try alloc.dupe(
+        u8,
+        attachment.snapshot_path orelse return error.MissingImageSnapshot,
+    );
+    alloc.free(attachment.path);
+    attachment.path = durable_path;
+    return attachment;
+}
+
 fn captureImageSnapshotFromOpenFileWithBudget(
     alloc: std.mem.Allocator,
     attachment: *types.ImageAttachment,
@@ -1806,13 +1870,7 @@ fn normalizePathInput(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
     return out.toOwnedSlice();
 }
 
-fn detectMediaTypeFromBytes(bytes: []const u8) ?[]const u8 {
-    if (bytes.len >= 8 and std.mem.eql(u8, bytes[0..8], "\x89PNG\r\n\x1a\n")) return "image/png";
-    if (bytes.len >= 3 and bytes[0] == 0xff and bytes[1] == 0xd8 and bytes[2] == 0xff) return "image/jpeg";
-    if (bytes.len >= 6 and (std.mem.eql(u8, bytes[0..6], "GIF87a") or std.mem.eql(u8, bytes[0..6], "GIF89a"))) return "image/gif";
-    if (bytes.len >= 12 and std.mem.eql(u8, bytes[0..4], "RIFF") and std.mem.eql(u8, bytes[8..12], "WEBP")) return "image/webp";
-    return null;
-}
+const detectMediaTypeFromBytes = @import("image_data.zig").detectMediaTypeFromBytes;
 
 pub const ImagePathToken = struct {
     path: []const u8,
@@ -2699,6 +2757,25 @@ test "encoded image limit uses exact padded base64 length" {
 
     try std.testing.expect(fitsEncodedLimit(largest_fitting_raw_image));
     try std.testing.expect(!fitsEncodedLimit(largest_fitting_raw_image + 1));
+}
+
+test "inline capture rejects one byte beyond encoded limit before directory effects" {
+    const alloc = std.testing.allocator;
+    const largest_fitting_raw_image = (max_encoded_image_bytes / 4) * 3;
+    const bytes = try alloc.alloc(u8, largest_fitting_raw_image + 1);
+    defer alloc.free(bytes);
+    @memset(bytes, 0);
+
+    try std.testing.expectError(
+        error.ImageTooLarge,
+        captureInlineImageBytes(
+            alloc,
+            1,
+            "image/png",
+            bytes,
+            "/path/that/does/not/exist",
+        ),
+    );
 }
 
 test "capture rejection distinguishes source size from preparation failure" {

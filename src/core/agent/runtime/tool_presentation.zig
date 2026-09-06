@@ -1,5 +1,6 @@
 const std = @import("std");
 const command_admission = @import("../../permissions/command_admission.zig");
+const managed_execution = @import("../../execution/managed_execution.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const types = @import("../../shared/types.zig");
 const text_utils = @import("../../shared/text_utils.zig");
@@ -46,7 +47,7 @@ fn fallbackToolDisplay(
     tool_name: []const u8,
 ) []const u8 {
     const lookup_name = if (std.mem.eql(u8, tool_name, "run_command"))
-        "terminal"
+        "shell"
     else
         tool_name;
     return if (registry.lookup(lookup_name) != null) "tool call" else tool_name;
@@ -93,7 +94,7 @@ pub const ProvisionalToolStatuses = struct {
             } };
         }
         const lookup_name = if (std.mem.eql(u8, tool_name, "run_command"))
-            "terminal"
+            "shell"
         else
             tool_name;
         const spec = registry.lookup(lookup_name) orelse return null;
@@ -164,8 +165,8 @@ pub const ProvisionalToolStatuses = struct {
         const call_id = self.visibleId(call) orelse return;
         const summary = try std.fmt.allocPrint(
             arena,
-            "{s} failed: invalid JSON arguments",
-            .{fallbackToolDisplay(hooks.tool_registry, call.name)},
+            "{s} failed: {s}",
+            .{ fallbackToolDisplay(hooks.tool_registry, call.name), if (call.argument_integrity == .non_object_json) "non-object arguments" else "invalid JSON arguments" },
         );
         try hooks.push_tool_lifecycle(hooks.ctx, .{
             .terminal = .{
@@ -894,15 +895,25 @@ pub fn finishCancelledToolStatus(
     advertised_dynamic_tool_names: []const []const u8,
 ) !void {
     if (!status_started) return;
+    const label = if (try isShellWaitCall(arena, call))
+        "Stopped waiting for"
+    else
+        "Cancelled";
     const line = try hooks.describe_tool_action_denied(
         hooks.ctx,
         arena,
         call,
         display_target,
-        "Cancelled",
+        label,
         advertised_dynamic_tool_names,
     );
-    const command_artifact_handle = if (activityKindForCall(arena, hooks.tool_registry, call) == .command)
+    const command_activity = activityKindForCall(
+        arena,
+        hooks.tool_registry,
+        call,
+    ) == .command;
+    const shell_command = command_activity and std.mem.eql(u8, call.name, "shell");
+    const command_artifact_handle = if (command_activity and !shell_command)
         commandArtifactHandle(arena, result.command_result_json) catch |err| blk: {
             debug_trace.logf("tool", "cancelled command artifact handle omitted err={s}", .{@errorName(err)});
             break :blk null;
@@ -915,8 +926,36 @@ pub fn finishCancelledToolStatus(
             .kind = .cancelled,
             .summary = line,
         },
+        .result_memory = result.tool_result_memory,
         .command_artifact_handle = command_artifact_handle,
     } });
+}
+
+fn isShellWaitCall(arena: Allocator, call: ToolCall) Allocator.Error!bool {
+    if (!std.mem.eql(u8, call.name, "shell")) return false;
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        arena,
+        call.arguments_json,
+        .{},
+    ) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => false,
+    };
+    defer parsed.deinit();
+    const outer = switch (parsed.value) {
+        .object => |object| object,
+        else => return false,
+    };
+    const object = if (outer.get("request")) |request| switch (request) {
+        .object => |value| value,
+        else => return false,
+    } else outer;
+    const action = switch (object.get("action") orelse return false) {
+        .string => |value| value,
+        else => return false,
+    };
+    return std.mem.eql(u8, action, "wait");
 }
 
 pub fn finishExecutedToolStatus(
@@ -938,7 +977,7 @@ pub fn finishExecutedToolStatus(
         try commandOutcomeDecision(arena, result_memory.command_process_presentation)
     else
         null;
-    const terminal_action_decision = if (std.mem.eql(u8, call.name, "terminal"))
+    const terminal_action_decision = if (std.mem.eql(u8, call.name, "shell"))
         try terminalActionOutcomeDecision(arena, result_memory.terminal_action_presentation)
     else
         null;
@@ -973,10 +1012,10 @@ pub fn finishExecutedToolStatus(
                 arena,
                 call,
                 display_target,
-                "Failed",
+                try tooling_presentation.subagentFailureLabel(arena, call, safe_result),
                 advertised_dynamic_tool_names,
             );
-            if (std.mem.eql(u8, call.name, "terminal")) {
+            if (std.mem.eql(u8, call.name, "shell")) {
                 if (try tool_result_errors.inspectTerminalActionFieldCorrection(
                     arena,
                     safe_result,
@@ -1012,7 +1051,21 @@ pub fn finishExecutedToolStatus(
     const line = if (diff_entry) |payload| blk: {
         break :blk try formatToolStatusWithStats(arena, summary_line, payload.additions, payload.deletions, hooks.diff_marker_styles);
     } else summary_line;
-    const command_artifact_handle = if (activity_kind == .command)
+    const shell_command = activity_kind == .command and
+        std.mem.eql(u8, call.name, "shell");
+    const presentation_result = try presentedToolResult(
+        arena,
+        call,
+        activity_kind,
+        if (shell_command) result.model_output else safe_result,
+    );
+    var presentation_memory = result_memory;
+    if (shell_command) {
+        presentation_memory.output_handle = null;
+        presentation_memory.preview = presentation_result;
+    }
+    const command_artifact_handle = if (activity_kind == .command and
+        !shell_command)
         try commandArtifactHandle(arena, result.command_result_json)
     else
         null;
@@ -1028,11 +1081,58 @@ pub fn finishExecutedToolStatus(
                     .failed,
                 .summary = line,
             },
-            .result = safe_result,
-            .result_memory = result_memory,
+            .result = presentation_result,
+            .result_memory = presentation_memory,
             .command_artifact_handle = command_artifact_handle,
         },
     });
+}
+
+fn presentedToolResult(
+    arena: Allocator,
+    call: ToolCall,
+    activity_kind: types.ToolActivityKind,
+    safe_result: []const u8,
+) Allocator.Error![]const u8 {
+    if (activity_kind != .command or !std.mem.eql(u8, call.name, "shell")) {
+        return safe_result;
+    }
+    return try managed_execution.modelOutputDelta(arena, safe_result) orelse
+        safe_result;
+}
+
+test "shell command presentation projects output delta without changing other results" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const shell_call = ToolCall{
+        .id = "shell-result",
+        .name = "shell",
+        .arguments_json = "{}",
+    };
+    try std.testing.expectEqualStrings(
+        "visible output\n",
+        try presentedToolResult(
+            arena,
+            shell_call,
+            .command,
+            "{\"output_delta\":\"visible output\\n\",\"exit_code\":0}",
+        ),
+    );
+    const malformed = "not-json";
+    try std.testing.expectEqualStrings(
+        malformed,
+        try presentedToolResult(arena, shell_call, .command, malformed),
+    );
+    const read_call = ToolCall{
+        .id = "read-result",
+        .name = "read_file",
+        .arguments_json = "{}",
+    };
+    try std.testing.expectEqualStrings(
+        "unchanged",
+        try presentedToolResult(arena, read_call, .read, "unchanged"),
+    );
 }
 
 pub const ToolOutcomeDecision = struct {
@@ -1105,24 +1205,27 @@ fn failureStatusDetail(
     advertised_dynamic_tool_names: []const []const u8,
 ) !?[]const u8 {
     if (result.status_detail) |detail| {
-        if (!std.mem.eql(u8, detail, "preflight failed") or
-            !file_mutation_contract.isToolName(call.name) or
-            !std.mem.startsWith(u8, safe_result, call.name))
+        if (!std.mem.eql(u8, detail, "preflight failed")) return detail;
+
+        if (file_mutation_contract.isToolName(call.name) and
+            std.mem.startsWith(u8, safe_result, call.name))
         {
-            return detail;
+            const failure_prefix = " failed: ";
+            const remainder = safe_result[call.name.len..];
+            if (std.mem.startsWith(u8, remainder, failure_prefix)) {
+                const actionable = remainder[failure_prefix.len..];
+                if (actionable.len > 0 and
+                    std.mem.findScalar(u8, actionable, '\n') == null and
+                    std.mem.findScalar(u8, actionable, '\r') == null)
+                {
+                    return actionable;
+                }
+            }
         }
 
-        const failure_prefix = " failed: ";
-        const remainder = safe_result[call.name.len..];
-        if (!std.mem.startsWith(u8, remainder, failure_prefix)) return detail;
-        const actionable = remainder[failure_prefix.len..];
-        if (actionable.len == 0 or
-            std.mem.findScalar(u8, actionable, '\n') != null or
-            std.mem.findScalar(u8, actionable, '\r') != null)
-        {
-            return detail;
-        }
-        return actionable;
+        if (safe_result.len == 0) return detail;
+        const encoded = try text_utils.encodeTerminalSafe(arena, safe_result, 256);
+        return if (encoded.bytes.len == 0) detail else encoded.bytes;
     }
 
     if (safe_result.len == 0 or
@@ -1199,7 +1302,8 @@ fn commandArtifactHandle(
         .string => |value| value,
         else => return null,
     };
-    if (!std.mem.eql(u8, kind, "foreground")) return null;
+    if (!std.mem.eql(u8, kind, "command") and
+        !std.mem.eql(u8, kind, "foreground")) return null;
     const output_file = switch (object.get("output_file") orelse return null) {
         .string => |value| value,
         else => return null,
@@ -1216,11 +1320,11 @@ fn commandArtifactHandle(
 pub fn malformedToolArgumentsResult(arena: Allocator, call: ToolCall) !ToolExecutionResult {
     return .{
         .status = .failure,
-        .model_output = try tool_result_errors.malformedToolArgumentsJson(
-            arena,
-            call.name,
-        ),
-        .status_detail = "invalid JSON arguments",
+        .model_output = if (call.argument_integrity == .non_object_json)
+            try tool_result_errors.nonObjectToolArgumentsJson(arena, call.name)
+        else
+            try tool_result_errors.malformedToolArgumentsJson(arena, call.name),
+        .status_detail = if (call.argument_integrity == .non_object_json) "non-object arguments" else "invalid JSON arguments",
     };
 }
 
@@ -1310,7 +1414,7 @@ const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.read_file,
     test_builtin_tools.write_file,
     test_builtin_tools.edit_file,
-    test_builtin_tools.terminal,
+    test_builtin_tools.shell,
     test_builtin_tools.ask_user_question,
 };
 const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
@@ -1364,7 +1468,7 @@ const ProvisionalStatusTestCapture = struct {
     }
 
     fn noopAppendRuntimeContext(_: *anyopaque, _: Allocator, _: *std.ArrayList(types.ChatMessage)) !void {}
-    fn noopRequestPermission(_: *anyopaque, _: Allocator, _: ToolCall, _: permission_auto_classifier.ReviewTurnContext, _: types.PermissionMode, _: []const types.PermissionGrant, _: ?runtime_tool_contracts.LiveToolAuthority, _: ?runtime_tool_contracts.LivePermissionRevalidation, _: []const []const u8) !command_admission.PermissionOutcome {
+    fn noopRequestPermission(_: *anyopaque, _: Allocator, _: ToolCall, _: permission_auto_classifier.ReviewTurnContext, _: types.PermissionMode, _: []const types.PermissionGrant, _: ?runtime_tool_contracts.LiveToolAuthority, _: ?runtime_tool_contracts.LivePermissionRevalidation, _: []const []const u8, _: ?[]const u8) !command_admission.PermissionOutcome {
         return .{ .decision = .once, .execution_authority = .ordinary };
     }
     fn describeToolAction(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, _: []const []const u8) ![]const u8 {
@@ -1439,7 +1543,7 @@ test "formatToolStatusWithStats accents the +/- counts and falls back to neutral
 test "provisional lifecycle preflight distinguishes unknown eligible and ineligible tools" {
     try std.testing.expect(ProvisionalToolStatuses.preflight(test_tool_registry, "unknown_tool") == null);
 
-    for ([_][]const u8{ "ask_user_question", "write_file", "edit_file", "terminal", "run_command" }) |name| {
+    for ([_][]const u8{ "ask_user_question", "write_file", "edit_file", "shell", "run_command" }) |name| {
         const preflight = ProvisionalToolStatuses.preflight(test_tool_registry, name) orelse return error.TestExpectedEqual;
         switch (preflight) {
             .ineligible => {},
@@ -2038,6 +2142,47 @@ test "file edit preflight failure reports the exact mismatch" {
     );
 }
 
+test "permission target preflight failure reports the actionable reason" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    const failure = "Permission target resolution failed for grep_files: FileNotFound";
+
+    try finishExecutedToolStatus(
+        &hooks,
+        arena,
+        5,
+        .{
+            .id = "grep_preflight",
+            .name = "grep_files",
+            .arguments_json = "{\"pattern\":\"upgrade\",\"path\":\"/tmp/missing\"}",
+        },
+        true,
+        null,
+        .{
+            .status = .failure,
+            .model_output = failure,
+            .status_detail = "preflight failed",
+        },
+        failure,
+        .{ .output_bytes = failure.len, .stored_output_bytes = failure.len },
+        null,
+        &.{},
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), capture.events.items.len);
+    const terminal = capture.events.items[0].terminal;
+    try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
+    try std.testing.expectEqualStrings(
+        "Failed grep_files: Permission target resolution failed for grep_files: FileNotFound",
+        terminal.outcome.summary,
+    );
+}
+
 test "dynamic MCP failure derives a bounded terminal-safe detail from the safe result" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -2105,7 +2250,7 @@ test "terminal path scope failure appends the exact status detail" {
         5,
         .{
             .id = "terminal_path_scope",
-            .name = "terminal",
+            .name = "shell",
             .arguments_json = "{\"action\":\"start\"}",
         },
         true,
@@ -2149,7 +2294,7 @@ test "command completion publishes its combined artifact handle" {
         .{
             .model_output = "truncated command preview",
             .command_result_json =
-            \\{"kind":"foreground","output_file":"/tmp/fx-command-combined.log"}
+            \\{"kind":"command","output_file":"/tmp/fx-command-combined.log"}
             ,
         },
         "truncated command preview",
@@ -2258,7 +2403,7 @@ test "command timeout and output capture failure name their actual cause" {
     defer capture.deinit();
     const hooks = capture.hooks();
 
-    const timeout = try command_result_mapping.Foreground.timeoutFailure(
+    const timeout = try command_result_mapping.Command.timeoutFailure(
         arena,
         "sleep 5",
         "/tmp",
@@ -2279,7 +2424,7 @@ test "command timeout and output capture failure name their actual cause" {
         &.{},
     );
 
-    const capture_failure = try command_result_mapping.Foreground.outputCaptureFailure(arena);
+    const capture_failure = try command_result_mapping.Command.outputCaptureFailure(arena);
     try finishExecutedToolStatus(
         &hooks,
         arena,
@@ -2410,4 +2555,41 @@ test "cancelled command ignores malformed artifact metadata" {
     const terminal = capture.events.items[0].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.cancelled, terminal.outcome.kind);
     try std.testing.expect(terminal.command_artifact_handle == null);
+}
+
+test "cancelled shell wait names the observation instead of the process" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+
+    try finishCancelledToolStatus(
+        &hooks,
+        arena_state.allocator(),
+        5,
+        .{
+            .id = "shell-wait",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"wait\",\"session_id\":\"shell-running\"}",
+        },
+        true,
+        "long-running command",
+        .{
+            .status = .failure,
+            .cancelled = true,
+            .model_output = "wait cancelled\n",
+        },
+        &.{},
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), capture.events.items.len);
+    const terminal = capture.events.items[0].terminal;
+    try std.testing.expectEqual(types.ToolOutcomeKind.cancelled, terminal.outcome.kind);
+    try std.testing.expect(std.mem.find(
+        u8,
+        terminal.outcome.summary,
+        "Stopped waiting for",
+    ) != null);
 }

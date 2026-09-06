@@ -7,32 +7,24 @@ const session_event = @import("session_event.zig");
 const session_json = @import("session_json.zig");
 const session_log = @import("session_log.zig");
 const session_projection = @import("session_projection.zig");
+const session_replay = @import("session_replay.zig");
 const Allocator = std.mem.Allocator;
 
 const authority_module = @import("session_authority.zig");
 const paths = @import("session_store_paths.zig");
 const types = @import("session_store_types.zig");
 
-const AuthorityTransition = authority_module.AuthorityTransition;
-const deleteSessionEntry = authority_module.deleteSessionEntry;
-const entryExistsRelative = authority_module.entryExistsRelative;
-const eventFileStat = authority_module.eventFileStat;
-const exactJsonObject = authority_module.exactJsonObject;
-const jsonU64 = authority_module.jsonU64;
-const loadAuthorityMarkerOptional = authority_module.loadAuthorityMarkerOptional;
-const mapReplayError = authority_module.mapReplayError;
-const objectString = authority_module.objectString;
 const openSessionFile = authority_module.openSessionFile;
-const parseIdentifier = authority_module.parseIdentifier;
-const positionsEqual = authority_module.positionsEqual;
 const readExactLegacyFile = authority_module.readExactLegacyFile;
-const readOptionalSessionFile = authority_module.readOptionalSessionFile;
-const requireAuthorityFenceAbsent = authority_module.requireAuthorityFenceAbsent;
 const validateWorkspaceRoot = paths.validateWorkspaceRoot;
 const LoadedWritableSession = types.LoadedWritableSession;
 const ResumeOptions = types.ResumeOptions;
 const automatic_legacy_max_bytes = types.automatic_legacy_max_bytes;
 const StoreContext = types.StoreContext;
+
+// Temporary read-only compatibility boundary. Remove this module's v1-v3
+// decoders once the supported upgrade window no longer includes schema v3.
+// Current sessions never write any of these formats.
 
 pub const LegacyStoredSession = struct {
     id: []u8,
@@ -59,42 +51,6 @@ pub const MigrationPreferenceSource = enum {
     preserved_workspace,
 };
 
-const MigrationCanonical = struct {
-    events: []u8,
-    watermark: []u8,
-    watermark_name: []u8,
-    checkpoint: []u8,
-    authority: []u8,
-    intent: []u8,
-    authority_id: session_event.Identifier,
-    position: session_log.CommitPosition,
-    generation_base_bytes: u64,
-
-    fn deinit(self: *MigrationCanonical, alloc: Allocator) void {
-        alloc.free(self.events);
-        alloc.free(self.watermark);
-        alloc.free(self.watermark_name);
-        alloc.free(self.checkpoint);
-        alloc.free(self.authority);
-        alloc.free(self.intent);
-        self.* = undefined;
-    }
-};
-
-const RandomEventIds = struct {
-    fn next(_: *anyopaque) session_event.Identifier {
-        return randomIdentifier();
-    }
-};
-
-fn runBoundary(test_controls: session_log.TestControls, boundary: session_log.Boundary) !void {
-    try test_controls.boundary(boundary);
-}
-
-/// Migrates legacy state to schema v3 while the caller holds the writer lock.
-/// Commit order is fixed: migration fence, stable snapshot, projection write,
-/// unchanged recheck, then intent, marker, manifest, validation, and intent removal.
-/// Resume handles partial disk state. Ownership transfers only on success.
 pub fn migrateLegacyLocked(
     ctx: StoreContext,
     alloc: Allocator,
@@ -102,7 +58,6 @@ pub fn migrateLegacyLocked(
     workspace_root: []const u8,
     preference_source: MigrationPreferenceSource,
     options: ResumeOptions,
-    lifecycle: *?session_log.CommitLifecycle,
 ) !LoadedWritableSession {
     var loaded: LoadedWritableSession = undefined;
     try migrateLegacyLockedInto(
@@ -113,7 +68,6 @@ pub fn migrateLegacyLocked(
         workspace_root,
         preference_source,
         options,
-        lifecycle,
     );
     return loaded;
 }
@@ -128,14 +82,7 @@ noinline fn migrateLegacyLockedInto(
     workspace_root: []const u8,
     preference_source: MigrationPreferenceSource,
     options: ResumeOptions,
-    lifecycle: *?session_log.CommitLifecycle,
 ) !void {
-    try assertMigratable(
-        alloc,
-        writable,
-        options.log.commit_lock_deadline_ms,
-    );
-
     var primary = try openSessionFile(&writable.dir, "session.json", .read_only);
     defer primary.close(io_mod.getIo());
     const primary_stat = try primary.stat(io_mod.getIo());
@@ -153,13 +100,7 @@ noinline fn migrateLegacyLockedInto(
         else => return error.LegacySessionMigrationFailed,
     };
     defer alloc.free(primary_bytes);
-    const primary_digest = session_projection.sha256(primary_bytes);
-    const schema = session_json.parseLegacySchemaVersion(
-        alloc,
-        primary_bytes,
-    ) catch |err| return err;
-
-    try ensureStableLegacyCopy(alloc, writable, primary_bytes, primary_stat.size);
+    const schema = try session_json.parseLegacySchemaVersion(alloc, primary_bytes);
 
     var legacy = session_json.parseLegacyExact(
         LegacyStoredSession,
@@ -183,808 +124,160 @@ noinline fn migrateLegacyLockedInto(
         options.seed_preferences,
     );
     errdefer state.deinit(alloc);
-    if (!legacy_had_workspace) {
-        if (!std.mem.eql(u8, state.workspace_root, workspace_root)) {
-            return error.InvalidDurableField;
-        }
-    }
-    if (lifecycle.*) |*value| {
-        try value.prepare(
-            alloc,
-            writable.session_id,
-            state.workspace_root,
-            state.workspace_root,
-            options.log.commit_lock_deadline_ms,
-        );
+    if (!legacy_had_workspace and
+        !std.mem.eql(u8, state.workspace_root, workspace_root))
+    {
+        return error.InvalidDurableField;
     }
 
-    var canonical = try buildMigrationCanonical(
+    try repairLegacyImages(ctx, alloc, writable.session_id, state.history);
+
+    const loaded = try session_log.importLegacySnapshotState(
         alloc,
+        writable,
         state,
-        schema,
-        primary_bytes,
+        @intFromEnum(schema),
+        primary_stat.size,
+        null,
     );
-    defer canonical.deinit(alloc);
-
-    const manifest = try writeCanonicalProjection(alloc, writable, state, canonical);
-    defer alloc.free(manifest);
-
-    try assertLegacyUnchanged(alloc, writable, primary_stat.size, primary_digest);
-
-    try commitMigrationAuthorityLocked(alloc, writable, canonical, manifest, options);
-
-    var root = ctx.canonical_root;
-    var replayed = root.loadReadOnly(
-        alloc,
-        writable.session_id,
-        options.log,
-    ) catch |err| return mapReplayError(err);
     state.deinit(alloc);
-    state = replayed;
-    replayed = undefined;
-    const active_id = try alloc.dupe(u8, writable.session_id);
-    errdefer alloc.free(active_id);
-    var result = LoadedWritableSession{
-        .active_id = active_id,
-        .state = state,
-        .log = writable.*,
-        .position = canonical.position,
-        .authority_id = canonical.authority_id,
-        .generation_base_seq = 1,
-        .generation_base_bytes = canonical.generation_base_bytes,
-        .checkpoint_seq = canonical.position.through_seq,
-        .checkpoint_sha256 = session_projection.sha256(canonical.checkpoint),
-        .projection_status = .current,
-        .migration_source_schema_version = @intFromEnum(schema),
-        .migration_source_bytes = primary_stat.size,
-        .commit_lifecycle = lifecycle.*,
-    };
-    lifecycle.* = null;
-    writable.* = undefined;
-    _ = result.publishCommitLifecycle(alloc);
-    out.* = result;
+    out.* = loaded;
 }
 
-/// Asserts the session may be migrated: takes the commit lock, requires no
-/// pending authority fence, and rejects a directory that already owns a
-/// schema-v3 authority marker. Releases the lock before returning.
-fn assertMigratable(
-    alloc: Allocator,
-    writable: *session_log.WritableSessionDir,
-    commit_lock_deadline_ms: u64,
-) !void {
-    var commit_lock = io_mod.acquireTimedAdvisoryLock(
-        &writable.dir,
-        "commit.lock",
-        commit_lock_deadline_ms,
-    ) catch |err| switch (err) {
-        error.LockBusy, error.LockUnsupported => return error.SessionCommitBoundaryUnavailable,
-        else => return error.LegacySessionMigrationFailed,
-    };
-    defer commit_lock.release();
-    try requireAuthorityFenceAbsent(alloc, &writable.dir, writable.session_id);
-    if (try entryExistsRelative(&writable.dir, "authority.json")) {
-        return error.InvalidSessionFormat;
-    }
-}
-
-/// Ensures `session.legacy.json` holds an exact copy of the primary snapshot,
-/// writing it durably if absent and rejecting a mismatched existing copy. This
-/// is the rollback source if the authority swap is interrupted.
-fn ensureStableLegacyCopy(
-    alloc: Allocator,
-    writable: *session_log.WritableSessionDir,
-    primary_bytes: []const u8,
-    primary_size: u64,
-) !void {
-    if (try readOptionalSessionFile(
-        alloc,
-        &writable.dir,
-        "session.legacy.json",
-        std.math.cast(usize, primary_size + 1) orelse
-            return error.LegacySessionMigrationResourceExhausted,
-    )) |existing_copy| {
-        defer alloc.free(existing_copy);
-        if (!std.mem.eql(u8, existing_copy, primary_bytes)) {
-            return error.InvalidSessionFormat;
-        }
-    } else {
-        io_mod.durableReplaceVerified(
-            alloc,
-            &writable.dir,
-            "session.legacy.json",
-            primary_bytes,
-        ) catch return error.LegacySessionMigrationFailed;
-    }
-}
-
-/// Durably writes the canonical projection files (event log, watermark,
-/// checkpoint) and returns the encoded manifest bytes for the caller to commit.
-/// Caller owns and frees the returned slice.
-fn writeCanonicalProjection(
-    alloc: Allocator,
-    writable: *session_log.WritableSessionDir,
+/// Reads one valid schema-v3 committed prefix and converts it directly to the
+/// current conversation format. The v3 log is an import source only; none of
+/// its watermark, checkpoint, or replacement writers run.
+pub const SchemaV3Import = struct {
     state: session_codec.DurableSessionState,
-    canonical: MigrationCanonical,
-) ![]u8 {
-    io_mod.durableReplaceVerified(
-        alloc,
-        &writable.dir,
-        "events.jsonl",
-        canonical.events,
-    ) catch return error.LegacySessionMigrationFailed;
-    io_mod.durableReplaceVerified(
-        alloc,
-        &writable.dir,
-        canonical.watermark_name,
-        canonical.watermark,
-    ) catch return error.LegacySessionMigrationFailed;
-    io_mod.durableReplaceVerified(
-        alloc,
-        &writable.dir,
-        "checkpoint.json",
-        canonical.checkpoint,
-    ) catch return error.LegacySessionMigrationFailed;
-    return encodeMigrationManifest(
-        alloc,
-        &writable.dir,
-        state,
-        canonical,
-    ) catch return error.LegacySessionMigrationFailed;
-}
-
-/// Re-reads the primary snapshot and fails with `error.LegacySessionChanged`
-/// if its size or digest no longer matches what was staged, guarding against a
-/// concurrent writer between staging and commit.
-fn assertLegacyUnchanged(
-    alloc: Allocator,
-    writable: *session_log.WritableSessionDir,
-    primary_size: u64,
-    primary_digest: session_projection.Digest,
-) !void {
-    var current_primary = try openSessionFile(
-        &writable.dir,
-        "session.json",
-        .read_only,
-    );
-    defer current_primary.close(io_mod.getIo());
-    const current_stat = try current_primary.stat(io_mod.getIo());
-    if (current_stat.size != primary_size) return error.LegacySessionChanged;
-    const current_bytes = readExactLegacyFile(
-        alloc,
-        &current_primary,
-        current_stat.size,
-    ) catch return error.LegacySessionChanged;
-    defer alloc.free(current_bytes);
-    const current_digest = session_projection.sha256(current_bytes);
-    if (!std.mem.eql(u8, &current_digest, &primary_digest)) {
-        return error.LegacySessionChanged;
-    }
-}
-
-/// Atomically swaps legacy authority to schema-v3 under the commit lock:
-/// intent -> marker -> manifest -> validate -> drop intent, each step gated by
-/// a crash-injection test boundary. Once the marker is written, failures map to
-/// `LegacySessionMigrationIndeterminate` so recovery re-runs validation rather
-/// than restarting. Releases the lock before returning.
-fn commitMigrationAuthorityLocked(
-    alloc: Allocator,
-    writable: *session_log.WritableSessionDir,
-    canonical: MigrationCanonical,
-    manifest: []const u8,
-    options: ResumeOptions,
-) !void {
-    var commit_lock = io_mod.acquireTimedAdvisoryLock(
-        &writable.dir,
-        "commit.lock",
-        options.log.commit_lock_deadline_ms,
-    ) catch |err| switch (err) {
-        error.LockBusy, error.LockUnsupported => return error.SessionCommitBoundaryUnavailable,
-        else => return error.LegacySessionMigrationFailed,
-    };
-    defer commit_lock.release();
-    try requireAuthorityFenceAbsent(alloc, &writable.dir, writable.session_id);
-    io_mod.durableReplaceVerified(
-        alloc,
-        &writable.dir,
-        "authority.pending.json",
-        canonical.intent,
-    ) catch return error.LegacySessionMigrationFailed;
-    runBoundary(options.log.test_controls, .after_authority_intent_sync) catch
-        return error.LegacySessionMigrationIndeterminate;
-    io_mod.durableReplaceVerified(
-        alloc,
-        &writable.dir,
-        "authority.json",
-        canonical.authority,
-    ) catch return error.LegacySessionMigrationIndeterminate;
-    runBoundary(options.log.test_controls, .after_authority_marker_rename) catch
-        return error.LegacySessionMigrationIndeterminate;
-    io_mod.durableReplaceVerified(
-        alloc,
-        &writable.dir,
-        "session.json",
-        manifest,
-    ) catch return error.LegacySessionMigrationIndeterminate;
-    io_mod.syncVerifiedDir(writable.dir.dir) catch
-        return error.LegacySessionMigrationIndeterminate;
-    var validated_state = try validateMigrationTarget(
-        alloc,
-        &writable.dir,
-        writable.session_id,
-        canonical.authority_id,
-        canonical.position,
-    );
-    validated_state.deinit(alloc);
-    runBoundary(options.log.test_controls, .after_authority_namespace_sync) catch
-        return error.LegacySessionMigrationIndeterminate;
-    deleteSessionEntry(&writable.dir, "authority.pending.json") catch
-        return error.SessionAuthorityIntentCleanupPending;
-    runBoundary(options.log.test_controls, .after_authority_intent_remove) catch
-        return error.SessionAuthorityIntentCleanupPending;
-}
-
-fn buildMigrationCanonical(
-    alloc: Allocator,
-    state: session_codec.DurableSessionState,
-    schema: session_json.LegacySchemaVersion,
-    primary_bytes: []const u8,
-) !MigrationCanonical {
-    const generation = randomIdentifier();
-    const first_event_id = randomIdentifier();
-    const authority_id = randomIdentifier();
-    const started = session_event.Envelope{
-        .log_generation = generation,
-        .seq = 1,
-        .event_id = first_event_id,
-        .timestamp_ms = state.created_at_ms,
-        .event = .{ .session_started = .{
-            .id = state.id,
-            .created_at_ms = state.created_at_ms,
-            .origin_workspace_root = state.origin_workspace_root,
-            .workspace_root = state.workspace_root,
-            .conversation_language = state.conversation_language,
-            .preferences = state.preferences,
-            .usage = state.usage,
-        } },
-    };
-    const first_line = try session_event.encodeFrame(alloc, started);
-    defer alloc.free(first_line);
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try out.writer.writeAll(first_line);
-    var random_ids: u8 = 0;
-    const replacement = try session_event.writeStateReplacement(
-        alloc,
-        &out.writer,
-        state,
-        .{
-            .log_generation = generation,
-            .first_seq = 2,
-            .replacement_id = randomIdentifier(),
-            .event_ids = .{
-                .context = &random_ids,
-                .next_fn = RandomEventIds.next,
-            },
-            .timestamp_ms = state.updated_at_ms,
-            .reason = .migration,
-        },
-    );
-    const events = try out.toOwnedSlice();
-    errdefer alloc.free(events);
-    const position = session_log.CommitPosition{
-        .log_generation = generation,
-        .through_seq = replacement.last_seq,
-        .through_event_id = replacement.last_event_id,
-        .through_event_log_bytes = events.len,
-    };
-    const watermark = try encodeMigrationWatermark(alloc, state.id, position);
-    errdefer alloc.free(watermark);
-    const watermark_name = try migrationWatermarkName(alloc, generation);
-    errdefer alloc.free(watermark_name);
-
-    const checkpoint_value = session_projection.Checkpoint{
-        .session_id = state.id,
-        .log_generation = generation,
-        .through_seq = position.through_seq,
-        .through_event_id = position.through_event_id,
-        .through_event_log_bytes = position.through_event_log_bytes,
-        .state = state,
-    };
-    const checkpoint = try session_projection.encodeCheckpoint(alloc, checkpoint_value);
-    errdefer alloc.free(checkpoint);
-    const authority = try encodeMigrationAuthority(
-        alloc,
-        state.id,
-        authority_id,
-    );
-    errdefer alloc.free(authority);
-    const intent = try encodeMigrationIntent(
-        alloc,
-        state.id,
-        schema,
-        primary_bytes,
-        authority_id,
-        position,
-    );
-    errdefer alloc.free(intent);
-    return .{
-        .events = events,
-        .watermark = watermark,
-        .watermark_name = watermark_name,
-        .checkpoint = checkpoint,
-        .authority = authority,
-        .intent = intent,
-        .authority_id = authority_id,
-        .position = position,
-        .generation_base_bytes = first_line.len,
-    };
-}
-
-fn encodeMigrationManifest(
-    alloc: Allocator,
-    session_dir: *io_mod.VerifiedDir,
-    state: session_codec.DurableSessionState,
-    canonical: MigrationCanonical,
-) ![]u8 {
-    const stat = try eventFileStat(session_dir, "events.jsonl");
-    const fingerprint = try session_projection.eventFileStatFingerprint(
-        stat,
-        canonical.position.through_event_log_bytes,
-    );
-    return session_projection.encodeManifest(alloc, .{
-        .id = state.id,
-        .authority_id = canonical.authority_id,
-        .log_generation = canonical.position.log_generation,
-        .created_at_ms = state.created_at_ms,
-        .updated_at_ms = state.updated_at_ms,
-        .origin_workspace_root = state.origin_workspace_root,
-        .workspace_root = state.workspace_root,
-        .conversation_language = state.conversation_language,
-        .history_len = state.history.len,
-        .total_input_tokens = state.total_input_tokens,
-        .total_output_tokens = state.total_output_tokens,
-        .last_event_seq = canonical.position.through_seq,
-        .event_log_bytes = canonical.position.through_event_log_bytes,
-        .event_log_stat_fingerprint = fingerprint,
-        .generation_base_seq = 1,
-        .generation_base_bytes = canonical.generation_base_bytes,
-        .checkpoint_seq = canonical.position.through_seq,
-        .checkpoint_sha256 = session_projection.sha256(canonical.checkpoint),
-        .preferences = state.preferences,
-    });
-}
-
-fn encodeMigrationWatermark(
-    alloc: Allocator,
-    session_id: []const u8,
-    position: session_log.CommitPosition,
-) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    const generation = std.fmt.bytesToHex(position.log_generation, .lower);
-    const event_id = std.fmt.bytesToHex(position.through_event_id, .lower);
-    try out.writer.writeAll("{\"schema_version\":1,\"session_id\":");
-    try std.json.Stringify.value(session_id, .{}, &out.writer);
-    try out.writer.print(
-        ",\"log_generation\":\"{s}\",\"through_seq\":{d},\"through_event_id\":\"{s}\",\"through_event_log_bytes\":{d}}}\n",
-        .{
-            generation,
-            position.through_seq,
-            event_id,
-            position.through_event_log_bytes,
-        },
-    );
-    return out.toOwnedSlice();
-}
-
-fn migrationWatermarkName(
-    alloc: Allocator,
+    source_bytes: u64,
     generation: session_event.Identifier,
-) ![]u8 {
-    const hex = std.fmt.bytesToHex(generation, .lower);
-    return std.fmt.allocPrint(alloc, "commit.{s}.json", .{hex});
-}
 
-fn encodeMigrationAuthority(
-    alloc: Allocator,
-    session_id: []const u8,
-    authority_id: session_event.Identifier,
-) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    const authority = std.fmt.bytesToHex(authority_id, .lower);
-    try out.writer.writeAll("{\"schema_version\":1,\"session_id\":");
-    try std.json.Stringify.value(session_id, .{}, &out.writer);
-    try out.writer.print(
-        ",\"authority_id\":\"{s}\",\"storage_format\":\"event_log_v1\",\"source\":\"legacy_migration\"}}\n",
-        .{authority},
-    );
-    return out.toOwnedSlice();
-}
+    pub fn deinit(self: *SchemaV3Import, alloc: Allocator) void {
+        self.state.deinit(alloc);
+        self.* = undefined;
+    }
 
-fn encodeMigrationIntent(
-    alloc: Allocator,
-    session_id: []const u8,
-    schema: session_json.LegacySchemaVersion,
-    primary_bytes: []const u8,
-    authority_id: session_event.Identifier,
-    position: session_log.CommitPosition,
-) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    const operation = std.fmt.bytesToHex(randomIdentifier(), .lower);
-    const authority = std.fmt.bytesToHex(authority_id, .lower);
-    const digest = std.fmt.bytesToHex(session_projection.sha256(primary_bytes), .lower);
-    const generation = std.fmt.bytesToHex(position.log_generation, .lower);
-    const event_id = std.fmt.bytesToHex(position.through_event_id, .lower);
-    try out.writer.writeAll("{\"schema_version\":1,\"session_id\":");
-    try std.json.Stringify.value(session_id, .{}, &out.writer);
-    try out.writer.print(
-        ",\"operation_id\":\"{s}\",\"kind\":\"legacy_to_v3\",\"authority_id\":\"{s}\",\"prior\":{{\"storage_format\":\"legacy_snapshot_v{d}\",\"primary_bytes\":{d},\"primary_sha256\":\"{s}\"}},\"proposed\":{{\"storage_format\":\"event_log_v1\",\"log_generation\":\"{s}\",\"through_seq\":{d},\"through_event_id\":\"{s}\",\"through_event_log_bytes\":{d}}}}}\n",
-        .{
-            operation,
-            authority,
-            @intFromEnum(schema),
-            primary_bytes.len,
-            digest,
-            generation,
-            position.through_seq,
-            event_id,
-            position.through_event_log_bytes,
-        },
-    );
-    return out.toOwnedSlice();
-}
+    pub fn takeState(self: *SchemaV3Import) session_codec.DurableSessionState {
+        const state = self.state;
+        self.* = undefined;
+        return state;
+    }
+};
 
-/// Validates that an on-disk schema-v3 target exactly matches a proposed
-/// commit position (marker, manifest, event fingerprint, watermark, replay,
-/// checkpoint). Returns the replayed state on success; any mismatch yields
-/// `error.LegacySessionMigrationIndeterminate`. Caller owns the returned state.
-pub fn validateMigrationTarget(
+/// Reads the schema-v3 watermark's committed prefix. The manifest is only a
+/// derived projection and may lag an acknowledged commit or be absent.
+pub fn loadSchemaV3ReadOnly(
     alloc: Allocator,
     session_dir: *io_mod.VerifiedDir,
     session_id: []const u8,
-    authority_id: session_event.Identifier,
-    position: session_log.CommitPosition,
-) !session_codec.DurableSessionState {
-    var marker = (try loadAuthorityMarkerOptional(alloc, session_dir)) orelse
-        return error.LegacySessionMigrationIndeterminate;
-    defer marker.deinit(alloc);
-    if (!std.mem.eql(u8, marker.session_id, session_id) or
-        !std.mem.eql(u8, &marker.authority_id, &authority_id) or
-        marker.source != .legacy_migration)
-    {
-        return error.LegacySessionMigrationIndeterminate;
-    }
-    const manifest_bytes = (try readOptionalSessionFile(
-        alloc,
-        session_dir,
-        "session.json",
-        session_projection.manifest_max_bytes,
-    )) orelse return error.LegacySessionMigrationIndeterminate;
-    defer alloc.free(manifest_bytes);
-    var manifest = session_projection.decodeManifest(alloc, manifest_bytes) catch
-        return error.LegacySessionMigrationIndeterminate;
-    defer manifest.deinit(alloc);
-    if (!std.mem.eql(u8, manifest.id, session_id) or
-        !std.mem.eql(u8, &manifest.authority_id, &authority_id) or
-        !std.mem.eql(u8, &manifest.log_generation, &position.log_generation) or
-        manifest.last_event_seq != position.through_seq or
-        manifest.event_log_bytes != position.through_event_log_bytes)
-    {
-        return error.LegacySessionMigrationIndeterminate;
-    }
+) !SchemaV3Import {
     var events = try openSessionFile(session_dir, "events.jsonl", .read_only);
     defer events.close(io_mod.getIo());
-    const events_stat = try eventFileStat(session_dir, "events.jsonl");
-    const fingerprint = session_projection.eventFileStatFingerprint(
-        events_stat,
-        position.through_event_log_bytes,
-    ) catch return error.LegacySessionMigrationIndeterminate;
-    if (!std.mem.eql(
-        u8,
-        &fingerprint,
-        &manifest.event_log_stat_fingerprint,
-    )) {
-        return error.LegacySessionMigrationIndeterminate;
-    }
-    const watermark_name = try migrationWatermarkName(alloc, position.log_generation);
+    const generation = try session_replay.readFirstGeneration(alloc, events);
+    const watermark_name = try std.fmt.allocPrint(alloc, "commit.{s}.json", .{
+        std.fmt.bytesToHex(generation, .lower),
+    });
     defer alloc.free(watermark_name);
-    const watermark = (try readOptionalSessionFile(
+    const watermark_bytes = try authority_module.readOptionalSessionFile(
         alloc,
         session_dir,
         watermark_name,
         16 * 1024,
-    )) orelse return error.LegacySessionMigrationIndeterminate;
-    defer alloc.free(watermark);
-    const watermark_position = decodeMigrationWatermark(
-        alloc,
-        watermark,
-        session_id,
-    ) catch return error.LegacySessionMigrationIndeterminate;
-    if (!positionsEqual(watermark_position, position)) {
-        return error.LegacySessionMigrationIndeterminate;
-    }
-    var state = replayMigrationEvents(
-        alloc,
-        events,
-        position,
-    ) catch return error.LegacySessionMigrationIndeterminate;
-    errdefer state.deinit(alloc);
-    if (!session_projection.stateMatchesManifest(state, manifest)) {
-        return error.LegacySessionMigrationIndeterminate;
-    }
-
-    const checkpoint_bytes = (try readOptionalSessionFile(
-        alloc,
-        session_dir,
-        "checkpoint.json",
-        session_projection.checkpoint_max_bytes,
-    )) orelse return error.LegacySessionMigrationIndeterminate;
-    defer alloc.free(checkpoint_bytes);
-    var checkpoint = session_projection.decodeCheckpoint(
-        alloc,
-        checkpoint_bytes,
-    ) catch return error.LegacySessionMigrationIndeterminate;
-    defer checkpoint.deinit(alloc);
-    const boundary = session_projection.EventBoundary{
-        .log_generation = position.log_generation,
-        .seq = position.through_seq,
-        .event_id = position.through_event_id,
-        .event_log_bytes = position.through_event_log_bytes,
-        .semantic = true,
-    };
-    session_projection.validateCheckpointReference(
-        manifest,
-        checkpoint_bytes,
-        checkpoint,
-        boundary,
-        boundary,
-    ) catch return error.LegacySessionMigrationIndeterminate;
-    return state;
-}
-
-/// Assembles a `LoadedWritableSession` from an already-committed migration
-/// target, reading manifest metadata and carrying source schema/bytes from the
-/// transition. Consumes `writable`.
-pub fn loadedMigrationTarget(
-    alloc: Allocator,
-    writable: *session_log.WritableSessionDir,
-    state: session_codec.DurableSessionState,
-    transition: AuthorityTransition,
-) !LoadedWritableSession {
-    const manifest_bytes = (try readOptionalSessionFile(
-        alloc,
-        &writable.dir,
-        "session.json",
-        session_projection.manifest_max_bytes,
-    )) orelse return error.LegacySessionMigrationIndeterminate;
-    defer alloc.free(manifest_bytes);
-    var manifest = session_projection.decodeManifest(
-        alloc,
-        manifest_bytes,
-    ) catch return error.LegacySessionMigrationIndeterminate;
-    defer manifest.deinit(alloc);
-    const active_id = try alloc.dupe(u8, writable.session_id);
-    errdefer alloc.free(active_id);
-    const source_schema_version: ?u8 = if (transition.prior) |prior|
-        @intFromEnum(prior.schema)
-    else
-        null;
-    const source_bytes: ?u64 = if (transition.prior) |prior|
-        prior.primary_bytes
-    else
-        null;
-    const loaded = LoadedWritableSession{
-        .active_id = active_id,
-        .state = state,
-        .log = writable.*,
-        .position = transition.proposed,
-        .authority_id = transition.authority_id,
-        .generation_base_seq = manifest.generation_base_seq,
-        .generation_base_bytes = manifest.generation_base_bytes,
-        .checkpoint_seq = manifest.checkpoint_seq,
-        .checkpoint_sha256 = manifest.checkpoint_sha256,
-        .projection_status = .current,
-        .migration_source_schema_version = source_schema_version,
-        .migration_source_bytes = source_bytes,
-    };
-    writable.* = undefined;
-    return loaded;
-}
-
-fn decodeMigrationWatermark(
-    alloc: Allocator,
-    bytes: []const u8,
-    session_id: []const u8,
-) !session_log.CommitPosition {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{
+    ) orelse return error.InvalidSessionFormat;
+    defer alloc.free(watermark_bytes);
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, watermark_bytes, .{
         .parse_numbers = false,
-    }) catch return error.InvalidSessionFormat;
-    defer parsed.deinit();
-    const expected_keys = [_][]const u8{
-        "schema_version",
-        "session_id",
-        "log_generation",
-        "through_seq",
-        "through_event_id",
-        "through_event_log_bytes",
-    };
-    const object = try exactJsonObject(parsed.value, &expected_keys);
-    if (try jsonU64(object, "schema_version") != 1 or
-        !std.mem.eql(u8, try objectString(object, "session_id"), session_id))
-    {
-        return error.InvalidSessionFormat;
-    }
-    return .{
-        .log_generation = try parseIdentifier(
-            try objectString(object, "log_generation"),
-        ),
-        .through_seq = try jsonU64(object, "through_seq"),
-        .through_event_id = try parseIdentifier(
-            try objectString(object, "through_event_id"),
-        ),
-        .through_event_log_bytes = try jsonU64(
-            object,
-            "through_event_log_bytes",
-        ),
-    };
-}
-
-const EventLine = struct {
-    bytes: []u8,
-    next_offset: u64,
-};
-
-fn readEventLineAt(
-    alloc: Allocator,
-    file: std.Io.File,
-    offset: u64,
-    max_end: u64,
-) !?EventLine {
-    if (offset >= max_end) return null;
-    var line: std.ArrayList(u8) = .empty;
-    errdefer line.deinit(alloc);
-    var cursor = offset;
-    var chunk: [8192]u8 = undefined;
-    while (cursor < max_end) {
-        const limit = @min(@as(u64, chunk.len), max_end - cursor);
-        const count = try file.readPositionalAll(
-            io_mod.getIo(),
-            chunk[0..@intCast(limit)],
-            cursor,
-        );
-        if (count == 0) return error.InvalidSessionFormat;
-        if (std.mem.findScalar(u8, chunk[0..count], '\n')) |newline| {
-            try line.appendSlice(alloc, chunk[0 .. newline + 1]);
-            cursor += newline + 1;
-            if (line.items.len > session_event.event_frame_max_bytes) {
-                return error.InvalidSessionFormat;
-            }
-            return .{
-                .bytes = try line.toOwnedSlice(alloc),
-                .next_offset = cursor,
-            };
-        }
-        try line.appendSlice(alloc, chunk[0..count]);
-        if (line.items.len > session_event.event_frame_max_bytes) {
-            return error.InvalidSessionFormat;
-        }
-        cursor += count;
-    }
-    return error.InvalidSessionFormat;
-}
-
-fn replayMigrationEvents(
-    alloc: Allocator,
-    file: std.Io.File,
-    position: session_log.CommitPosition,
-) !session_codec.DurableSessionState {
-    const length = try file.length(io_mod.getIo());
-    if (position.through_event_log_bytes == 0 or
-        length < position.through_event_log_bytes)
-    {
-        return error.InvalidSessionFormat;
-    }
-    var validator: session_event.SequenceValidator = .{};
-    var offset: u64 = 0;
-    var last_seq: u64 = 0;
-    var last_event_id: session_event.Identifier = undefined;
-    var replacement_open = false;
-    var replacement_id: session_event.Identifier = undefined;
-    while (offset < position.through_event_log_bytes) {
-        const line = try readEventLineAt(
-            alloc,
-            file,
-            offset,
-            position.through_event_log_bytes,
-        ) orelse return error.InvalidSessionFormat;
-        defer alloc.free(line.bytes);
-        var envelope = session_event.decodeFrame(
-            alloc,
-            line.bytes,
-        ) catch |err| switch (err) {
-            error.UnsupportedEventSchema => return error.UnsupportedSessionSchema,
-            else => return error.InvalidSessionFormat,
-        };
-        defer envelope.deinit(alloc);
-        validator.validate(envelope) catch return error.InvalidSessionFormat;
-        if (!std.mem.eql(
-            u8,
-            &envelope.log_generation,
-            &position.log_generation,
-        )) {
-            return error.InvalidSessionFormat;
-        }
-        switch (envelope.event) {
-            .state_replacement_started => |start| {
-                if (replacement_open) return error.InvalidSessionFormat;
-                replacement_open = true;
-                replacement_id = start.replacement_id;
-            },
-            .state_replacement_chunk => |chunk| {
-                if (!replacement_open or
-                    !std.mem.eql(
-                        u8,
-                        &replacement_id,
-                        &chunk.replacement_id,
-                    ))
-                {
-                    return error.InvalidSessionFormat;
-                }
-            },
-            .state_replacement_committed => |commit| {
-                if (!replacement_open or
-                    !std.mem.eql(
-                        u8,
-                        &replacement_id,
-                        &commit.replacement_id,
-                    ))
-                {
-                    return error.InvalidSessionFormat;
-                }
-                replacement_open = false;
-                last_seq = envelope.seq;
-                last_event_id = envelope.event_id;
-            },
-            else => {
-                if (replacement_open) return error.InvalidSessionFormat;
-                last_seq = envelope.seq;
-                last_event_id = envelope.event_id;
-            },
-        }
-        offset = line.next_offset;
-    }
-    if (offset != position.through_event_log_bytes or
-        replacement_open or
-        last_seq != position.through_seq or
-        !std.mem.eql(u8, &last_event_id, &position.through_event_id))
-    {
-        return error.InvalidSessionFormat;
-    }
-
-    var file_buffer: [8192]u8 = undefined;
-    var file_reader = file.reader(io_mod.getIo(), &file_buffer);
-    var limit_buffer: [4096]u8 = undefined;
-    var limited = file_reader.interface.limited(
-        .limited64(position.through_event_log_bytes),
-        &limit_buffer,
-    );
-    var reduction = session_event.reduceJsonl(
-        alloc,
-        &limited.interface,
-        null,
-    ) catch |err| switch (err) {
+    }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.UnsupportedEventSchema => return error.UnsupportedSessionSchema,
         else => return error.InvalidSessionFormat,
     };
-    errdefer reduction.deinit(alloc);
-    if (reduction.truncate_from != null) return error.InvalidSessionFormat;
-    const state = reduction.state;
-    reduction.state = undefined;
-    return state;
+    defer parsed.deinit();
+    const object = try authority_module.exactJsonObject(parsed.value, &.{
+        "schema_version",   "session_id",              "log_generation", "through_seq",
+        "through_event_id", "through_event_log_bytes",
+    });
+    const recorded_generation = try authority_module.parseIdentifier(
+        try authority_module.objectString(object, "log_generation"),
+    );
+    if (try authority_module.jsonU64(object, "schema_version") != 1 or
+        !std.mem.eql(u8, try authority_module.objectString(object, "session_id"), session_id) or
+        !std.mem.eql(u8, &recorded_generation, &generation))
+    {
+        return error.InvalidSessionFormat;
+    }
+    const event_id = try authority_module.parseIdentifier(
+        try authority_module.objectString(object, "through_event_id"),
+    );
+    const committed_bytes = try authority_module.jsonU64(object, "through_event_log_bytes");
+    var replayed = try session_replay.replayCommittedPrefix(
+        alloc,
+        events,
+        generation,
+        try authority_module.jsonU64(object, "through_seq"),
+        committed_bytes,
+    );
+    errdefer replayed.deinit(alloc);
+    if (!std.mem.eql(u8, replayed.state.id, session_id) or
+        !std.mem.eql(u8, &replayed.position.through_event_id, &event_id))
+    {
+        return error.InvalidSessionFormat;
+    }
+    if (try replayed.state.archive_legacy_recovery(alloc)) {
+        @import("../shared/debug_trace.zig").logf("session", "legacy recovery archived session_id={s} reason=unverifiable_route_authority", .{session_id});
+    }
+    const state = replayed.takeState();
+    return .{
+        .state = state,
+        .source_bytes = committed_bytes,
+        .generation = generation,
+    };
+}
+
+/// Reads one valid schema-v3 committed prefix and converts it directly to the
+/// current conversation format. The v3 log is an import source only; none of
+/// its watermark, checkpoint, or replacement writers run.
+pub fn migrateSchemaV3Locked(
+    ctx: StoreContext,
+    alloc: Allocator,
+    writable: *session_log.WritableSessionDir,
+) !LoadedWritableSession {
+    var source = try loadSchemaV3ReadOnly(
+        alloc,
+        &writable.dir,
+        writable.session_id,
+    );
+    defer source.deinit(alloc);
+    try repairLegacyImages(
+        ctx,
+        alloc,
+        writable.session_id,
+        source.state.history,
+    );
+    return session_log.importLegacySnapshotState(
+        alloc,
+        writable,
+        source.state,
+        3,
+        source.source_bytes,
+        source.generation,
+    );
+}
+
+fn repairLegacyImages(
+    ctx: StoreContext,
+    alloc: Allocator,
+    session_id: []const u8,
+    history: []session.HistoryTurn,
+) !void {
+    const session_dir = try paths.sessionDirPath(alloc, ctx.sessions_dir, session_id);
+    defer alloc.free(session_dir);
+    const snapshot_dir = try std.fs.path.join(alloc, &.{ session_dir, "images" });
+    defer alloc.free(snapshot_dir);
+    _ = try session.repair_legacy_images_transactionally(
+        alloc,
+        history,
+        snapshot_dir,
+    );
 }
 
 /// Converts a parsed legacy session into a validated `DurableSessionState`,
@@ -1063,40 +356,158 @@ fn loadMigrationPreferences(
     };
 }
 
-fn randomIdentifier() session_event.Identifier {
-    var id: session_event.Identifier = undefined;
-    io_mod.getIo().random(&id);
-    return id;
+test "schema v3 import archives legacy recovery with allocation failure cleanup" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{}) };
+    defer dir.close();
+    const generation = [_]u8{1} ** 16;
+    const started = try session_event.encodeLegacyFixtureFrame(alloc, .{
+        .log_generation = generation,
+        .seq = 1,
+        .event_id = [_]u8{1} ** 16,
+        .timestamp_ms = 10,
+        .event = .{ .session_started = .{
+            .id = @constCast("legacy-recovery"),
+            .created_at_ms = 10,
+            .origin_workspace_root = @constCast("/workspace"),
+            .workspace_root = @constCast("/workspace"),
+            .conversation_language = .literal("en"),
+            .preferences = .{ .model = @constCast("test/model"), .effort = .auto, .fast_mode = false },
+        } },
+    });
+    defer alloc.free(started);
+    const recovery = "{\"schema_version\":1,\"log_generation\":\"01010101010101010101010101010101\",\"seq\":2,\"event_id\":\"02020202020202020202020202020202\",\"timestamp_ms\":20,\"kind\":\"recovery_checkpoint_set\",\"payload\":{\"checkpoint\":{\"version\":2,\"route_identity\":{\"connection_id\":\"vercel\",\"adapter_kind\":\"vercel_ai_gateway\",\"permission_review_model_id\":\"review\"},\"delivery\":\"possibly_sent\",\"turn_id\":1,\"user\":{\"text\":\"saved request\",\"images\":[]},\"assistant_source\":\"saved partial\",\"execution\":{\"schema_version\":3,\"tool_steps\":[],\"files\":[]},\"cause\":\"response_interrupted\",\"action\":\"continuing_response\",\"tool_state\":\"uncertain\",\"route_model\":\"test/model\",\"requested_fast_mode\":false,\"fast_mode\":false,\"max_provider_attempts\":3,\"consumed_provider_attempts\":0,\"outstanding_reservation\":false}}}\n";
+    const events = try std.mem.concat(alloc, u8, &.{ started, recovery });
+    defer alloc.free(events);
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "events.jsonl", .data = events });
+    const watermark = try std.fmt.allocPrint(alloc, "{{\"schema_version\":1,\"session_id\":\"legacy-recovery\",\"log_generation\":\"01010101010101010101010101010101\",\"through_seq\":2,\"through_event_id\":\"02020202020202020202020202020202\",\"through_event_log_bytes\":{d}}}", .{events.len});
+    defer alloc.free(watermark);
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "commit.01010101010101010101010101010101.json", .data = watermark });
+    try std.testing.checkAllAllocationFailures(alloc, struct {
+        fn check(a: Allocator, source: *io_mod.VerifiedDir) !void {
+            var imported = try loadSchemaV3ReadOnly(a, source, "legacy-recovery");
+            defer imported.deinit(a);
+            try std.testing.expect(imported.state.recovery_checkpoint == null);
+            try std.testing.expectEqual(@as(usize, 1), imported.state.history.len);
+            try std.testing.expectEqualStrings("saved partial", imported.state.history[0].interrupted.assistant.?);
+        }
+    }.check, .{&dir});
 }
 
-/// Reads the retained `session.legacy.json` to report the migrated source
-/// schema version. Used to populate `SessionMigrationResult` after the fact.
-pub fn migratedSourceSchemaVersion(
-    alloc: Allocator,
-    session_dir: *io_mod.VerifiedDir,
-    allow_large: bool,
-) !u8 {
-    const source_bytes = try migratedSourceBytes(session_dir);
-    const max_bytes = if (allow_large)
-        (std.math.cast(usize, source_bytes + 1) orelse return error.LegacySessionMigrationResourceExhausted)
-    else
-        automatic_legacy_max_bytes + 1;
-    const bytes = (try readOptionalSessionFile(
+test "schema v3 import follows the committed watermark beyond a stale manifest" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const id = "legacy-committed-prefix";
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var store = try @import("session_store.zig").Store.initFromHome(alloc, home, "/workspace");
+    defer store.deinit(alloc);
+    try store.canonical_root.sessions.?.dir.createDir(std.testing.io, id, .fromMode(0o700));
+    var dir = io_mod.VerifiedDir{ .dir = try store.canonical_root.sessions.?.dir.openDir(std.testing.io, id, .{}) };
+    defer dir.close();
+    const generation = [_]u8{1} ** 16;
+    const event_id = [_]u8{2} ** 16;
+    const language = try session.ConversationLanguage.fromSlice("en");
+    var usage = @import("session_usage.zig").Usage.initFresh();
+    defer usage.deinit(alloc);
+    var usage_snapshot = try usage.snapshot(alloc);
+    defer usage_snapshot.deinit(alloc);
+    const started = try session_event.encodeLegacyFixtureFrame(alloc, .{
+        .log_generation = generation,
+        .seq = 1,
+        .event_id = [_]u8{1} ** 16,
+        .timestamp_ms = 10,
+        .event = .{ .session_started = .{
+            .id = @constCast(id),
+            .created_at_ms = 10,
+            .origin_workspace_root = @constCast("/workspace"),
+            .workspace_root = @constCast("/workspace"),
+            .conversation_language = language,
+            .preferences = .{ .model = @constCast("test/model"), .effort = .auto, .fast_mode = false },
+            .usage = usage_snapshot,
+        } },
+    });
+    defer alloc.free(started);
+    const committed = try session_event.encodeLegacyFixtureFrame(alloc, .{
+        .log_generation = generation,
+        .seq = 2,
+        .event_id = event_id,
+        .timestamp_ms = 20,
+        .event = .{ .history_turn_committed = .{
+            .conversation_language = language,
+            .total_input_tokens = 0,
+            .total_output_tokens = 0,
+            .turn = .{ .assistant = .{
+                .user = .{ .text = @constCast("acknowledged request") },
+                .assistant = @constCast("acknowledged answer"),
+            } },
+        } },
+    });
+    defer alloc.free(committed);
+    const events = try std.mem.concat(alloc, u8, &.{ started, committed, "uncommitted tail" });
+    defer alloc.free(events);
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "events.jsonl", .data = events });
+    const manifest = try session_projection.encodeManifest(alloc, .{
+        .id = @constCast(id),
+        .authority_id = [_]u8{3} ** 16,
+        .log_generation = generation,
+        .created_at_ms = 10,
+        .updated_at_ms = 10,
+        .origin_workspace_root = @constCast("/workspace"),
+        .workspace_root = @constCast("/workspace"),
+        .conversation_language = language,
+        .history_len = 0,
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+        .last_event_seq = 1,
+        .event_log_bytes = started.len,
+        .event_log_stat_fingerprint = [_]u8{0} ** 32,
+        .generation_base_seq = 1,
+        .generation_base_bytes = started.len,
+        .checkpoint_seq = null,
+        .checkpoint_sha256 = null,
+        .preferences = .{ .model = @constCast("test/model"), .effort = .auto, .fast_mode = false },
+    });
+    defer alloc.free(manifest);
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "session.json", .data = manifest });
+    const watermark_name = "commit.01010101010101010101010101010101.json";
+    const watermark = try std.fmt.allocPrint(
         alloc,
-        session_dir,
-        "session.legacy.json",
-        max_bytes,
-    )) orelse return error.SessionNotFound;
-    defer alloc.free(bytes);
-    return @intFromEnum(try session_json.parseLegacySchemaVersion(alloc, bytes));
-}
-
-/// Returns the byte size of the retained `session.legacy.json` source.
-pub fn migratedSourceBytes(session_dir: *io_mod.VerifiedDir) !u64 {
-    const stat = try session_dir.dir.statFile(
-        io_mod.getIo(),
-        "session.legacy.json",
-        .{ .follow_symlinks = false },
+        "{{\"schema_version\":1,\"session_id\":\"{s}\",\"log_generation\":\"{s}\",\"through_seq\":2,\"through_event_id\":\"{s}\",\"through_event_log_bytes\":{d}}}\n",
+        .{ id, std.fmt.bytesToHex(generation, .lower), std.fmt.bytesToHex(event_id, .lower), started.len + committed.len },
     );
-    return stat.size;
+    defer alloc.free(watermark);
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = watermark_name, .data = watermark });
+    {
+        var imported = try loadSchemaV3ReadOnly(alloc, &dir, id);
+        defer imported.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), imported.state.history.len);
+        try std.testing.expectEqualStrings("acknowledged answer", imported.state.history[0].assistant.assistant);
+        try std.testing.expectEqual(started.len + committed.len, imported.source_bytes);
+    }
+    try dir.dir.deleteFile(std.testing.io, "session.json");
+    {
+        var imported = try loadSchemaV3ReadOnly(alloc, &dir, id);
+        defer imported.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), imported.state.history.len);
+    }
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = watermark_name, .data = "{}" });
+    try std.testing.expectError(error.InvalidSessionFormat, loadSchemaV3ReadOnly(alloc, &dir, id));
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "session.json", .data = manifest });
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "authority.json",
+        .data = "{\"schema_version\":1,\"storage_format\":\"event_log_v1\",\"session_id\":\"legacy-committed-prefix\",\"authority_id\":\"03030303030303030303030303030303\",\"source\":\"native_create\"}",
+    });
+    var recovered = try store.recoverSessionCopy(alloc, id, .{});
+    defer recovered.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), recovered.history_len);
+    var restored = try store.canonical_root.loadReadOnly(alloc, recovered.recovered_session_id, .{});
+    defer restored.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), restored.history.len);
+    const source_after = try authority_module.readOptionalSessionFile(alloc, &dir, "events.jsonl", events.len + 1);
+    defer if (source_after) |bytes| alloc.free(bytes);
+    try std.testing.expectEqualStrings(events, source_after.?);
 }

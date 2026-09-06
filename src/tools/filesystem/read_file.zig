@@ -604,6 +604,7 @@ test "read_file access denial returns structured recovery" {
     const alloc = std.testing.allocator;
     const result = try readFileFailure(alloc, error.AccessDenied, "/tmp/blocked/read.txt");
     switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .failure => |body| {
             defer alloc.free(body);
             try std.testing.expect(tool_result_errors.isToolExecutionFailedOutput(body));
@@ -623,6 +624,7 @@ test "read_file non-regular paths return structured recovery" {
     const alloc = std.testing.allocator;
     const result = try readFileFailure(alloc, error.NotRegularFile, "/tmp/search-pipe");
     switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .failure => |body| {
             defer alloc.free(body);
             try std.testing.expect(tool_result_errors.isToolExecutionFailedOutput(body));

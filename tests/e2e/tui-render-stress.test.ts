@@ -114,7 +114,7 @@ describe.skipIf(SKIP)("tui: render stress", () => {
 
         await session.sendKeys("C-u");
         await session.sendText("/help");
-        await session.waitForText("Commands 38", 5_000);
+        await session.waitForText("Commands 37", 5_000);
         await session.sendKeys("Escape");
         await session.waitForPane((pane) => !pane.includes("Enter Open"), 5_000);
         await session.sendText("/status");

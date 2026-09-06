@@ -46,7 +46,7 @@ pub const Target = union(Channel) {
     pub fn initStable(alloc: Allocator, raw_version: []const u8) !Target {
         const trimmed = std.mem.trim(u8, raw_version, " \t\r\n");
         const normalized_version = normalizeVersion(trimmed);
-        if (!validVersion(normalized_version)) return error.InvalidVersion;
+        if (!isValidVersion(normalized_version)) return error.InvalidVersion;
 
         const owned_version = try alloc.dupe(u8, normalized_version);
         errdefer alloc.free(owned_version);
@@ -75,7 +75,7 @@ pub const Target = union(Channel) {
 
         const normalized_version = normalizeVersion(version_value.string);
         const manifest_revision = revision_value.string;
-        if (!validVersion(normalized_version) or !validRevision(manifest_revision)) {
+        if (!isValidVersion(normalized_version) or !isValidRevision(manifest_revision)) {
             return error.InvalidManifest;
         }
 
@@ -160,7 +160,7 @@ pub fn compareVersions(a: []const u8, b: []const u8) std.math.Order {
     return std.math.order(av[2], bv[2]);
 }
 
-fn validVersion(raw: []const u8) bool {
+pub fn isValidVersion(raw: []const u8) bool {
     if (raw.len == 0 or raw.len > max_version_bytes) return false;
     var count: usize = 0;
     var parts = std.mem.splitScalar(u8, raw, '.');
@@ -173,7 +173,7 @@ fn validVersion(raw: []const u8) bool {
     return count == 3;
 }
 
-fn validRevision(raw: []const u8) bool {
+pub fn isValidRevision(raw: []const u8) bool {
     if (raw.len < min_revision_bytes or raw.len > max_revision_bytes) return false;
     for (raw) |byte| if (!std.ascii.isHex(byte)) return false;
     return true;
@@ -189,7 +189,7 @@ fn parseVersionParts(raw: []const u8) [3]u32 {
     return values;
 }
 
-fn revisionsEqual(full: []const u8, current: []const u8) bool {
+pub fn revisionsEqual(full: []const u8, current: []const u8) bool {
     if (std.mem.eql(u8, current, "unknown")) return false;
     const common_len = @min(full.len, current.len);
     if (common_len < min_revision_bytes) return false;

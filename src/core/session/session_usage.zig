@@ -113,6 +113,7 @@ pub const InvocationObservation = struct {
         usage_outcome: stream_provider.UsageOutcome,
     ) !void {
         const ledger = self.usage orelse return;
+        ledger.observeContextUsage(self.sequence, completion.usage);
         switch (usage_outcome) {
             .unavailable => |availability| {
                 const delivery: DeliveryOutcome = switch (availability) {
@@ -373,6 +374,8 @@ pub const Usage = struct {
     reasoning_tokens: ?u64,
     request_count: ?u64,
     billable_web_search_calls: u64 = 0,
+    latest_context_sequence: u64 = 0,
+    latest_context_used: ?u64 = null,
     lines_added: u64 = 0,
     lines_removed: u64 = 0,
     models: std.ArrayList(ModelAggregate) = .empty,
@@ -1480,6 +1483,41 @@ pub const Usage = struct {
         self.dirty = true;
     }
 
+    pub const LiveContextSnapshot = struct {
+        used: u64,
+        complete_cost: ?f64,
+    };
+
+    /// Returns the latest provider-reported context usage. This state is
+    /// intentionally runtime-only: a restored billing aggregate cannot prove
+    /// how much context the next model request currently occupies.
+    pub fn liveContextSnapshot(self: *Usage) ?LiveContextSnapshot {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        return .{
+            .used = self.latest_context_used orelse return null,
+            .complete_cost = if (self.billing == .complete and std.math.isFinite(self.total_cost))
+                self.total_cost
+            else
+                null,
+        };
+    }
+
+    fn observeContextUsage(self: *Usage, sequence: u64, provider_usage: types.Usage) void {
+        const used: ?u64 = if (provider_usage.input_tokens) |input|
+            if (provider_usage.output_tokens) |output|
+                std.math.add(u64, input, output) catch null
+            else
+                null
+        else
+            null;
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (sequence < self.latest_context_sequence) return;
+        self.latest_context_sequence = sequence;
+        self.latest_context_used = used;
+    }
+
     /// Returns an owned point-in-time snapshot. The caller must call `deinit`.
     pub fn snapshot(self: *Usage, alloc: Allocator) !Snapshot {
         self.finishReconciliationIfDone();
@@ -1661,6 +1699,8 @@ pub const Usage = struct {
             self.active_started_at_ms = session_started_at_ms;
         }
         self.active_sequence_count = 0;
+        self.latest_context_sequence = 0;
+        self.latest_context_used = null;
         self.total_cost = copied.total_cost;
         self.input_tokens = copied.input_tokens;
         self.output_tokens = copied.output_tokens;
@@ -1717,6 +1757,23 @@ pub const Usage = struct {
         self.startReconciliationWithCredential(
             alloc,
             credential,
+            .{
+                .provider = reference.provider,
+                .credential_identity = reference.credential_identity,
+            },
+            false,
+            null,
+        );
+    }
+
+    pub fn startHostManagedDeferredReconciliation(
+        self: *Usage,
+        alloc: Allocator,
+        reference: stream_provider.DeferredUsageReference,
+    ) void {
+        self.startReconciliationWithCredential(
+            alloc,
+            null,
             .{
                 .provider = reference.provider,
                 .credential_identity = reference.credential_identity,
@@ -1783,6 +1840,23 @@ pub const Usage = struct {
         );
     }
 
+    pub fn replaceHostManagedReconciliationAuthority(
+        self: *Usage,
+        alloc: Allocator,
+        provider: model_provider.ProviderId,
+    ) void {
+        self.startReconciliationWithCredential(
+            alloc,
+            null,
+            .{
+                .provider = provider,
+                .credential_identity = credential_authority.derive(.host_managed, null),
+            },
+            true,
+            null,
+        );
+    }
+
     /// Replaces a producer's key only while that key is still authoritative.
     pub fn refreshReconciliationCredential(
         self: *Usage,
@@ -1819,13 +1893,16 @@ pub const Usage = struct {
     fn startReconciliationWithCredential(
         self: *Usage,
         alloc: Allocator,
-        api_key: []const u8,
+        credential: ?[]const u8,
         authority: ReconciliationAuthority,
         replace_existing: bool,
         expected_api_key: ?[]const u8,
     ) void {
-        if (api_key.len == 0) return;
-        const key_digest = reconciliationKeyDigest(api_key);
+        if (credential) |api_key| if (api_key.len == 0) return;
+        const key_digest = if (credential) |api_key|
+            reconciliationKeyDigest(api_key)
+        else
+            hostManagedReconciliationDigest();
         const expected_digest = if (expected_api_key) |expected|
             reconciliationKeyDigest(expected)
         else
@@ -1876,21 +1953,24 @@ pub const Usage = struct {
         self.mutex.unlock(io_mod.getIo());
         if (!still_has_pending) return;
 
-        const api_key_copy = alloc.dupe(u8, api_key) catch |err| {
-            debug_trace.logf(
-                "session",
-                "usage reconciliation start failed reason={s}",
-                .{@errorName(err)},
-            );
-            return;
-        };
+        const credential_copy = if (credential) |api_key|
+            alloc.dupe(u8, api_key) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "usage reconciliation start failed reason={s}",
+                    .{@errorName(err)},
+                );
+                return;
+            }
+        else
+            null;
         self.reconciliation_cancel.store(false, .seq_cst);
         self.reconciliation_done.store(false, .seq_cst);
         self.reconciliation_key_digest = key_digest;
         self.reconciliation_thread = std.Thread.spawn(
             .{},
             reconciliationThreadMain,
-            .{ self, alloc, api_key_copy, authority, self.generation_usage_providers },
+            .{ self, alloc, credential_copy, authority, self.generation_usage_providers },
         ) catch |err| {
             self.reconciliation_done.store(true, .seq_cst);
             debug_trace.logf(
@@ -1898,7 +1978,7 @@ pub const Usage = struct {
                 "usage reconciliation start failed reason={s}",
                 .{@errorName(err)},
             );
-            secret.zeroAndFree(alloc, api_key_copy);
+            if (credential_copy) |api_key| secret.zeroAndFree(alloc, api_key);
             return;
         };
     }
@@ -2121,6 +2201,8 @@ pub const Usage = struct {
         self.wall_duration_ms = 0;
         self.active_started_at_ms = io_mod.milliTimestamp();
         self.active_sequence_count = 0;
+        self.latest_context_sequence = 0;
+        self.latest_context_used = null;
         self.total_cost = 0;
         self.input_tokens = 0;
         self.output_tokens = 0;
@@ -2949,18 +3031,18 @@ fn writeOptionalU64(writer: *std.Io.Writer, value: ?u64) !void {
 fn reconciliationThreadMain(
     usage: *Usage,
     alloc: Allocator,
-    api_key: []u8,
+    credential: ?[]u8,
     authority: ReconciliationAuthority,
     providers: generation_usage.Set,
 ) void {
-    defer secret.zeroAndFree(alloc, api_key);
+    defer if (credential) |api_key| secret.zeroAndFree(alloc, api_key);
     defer usage.reconciliation_done.store(true, .seq_cst);
     var observed_epoch = usage.reconciliation_work_epoch.load(.seq_cst);
     while (!usage.reconciliation_cancel.load(.seq_cst)) {
         reconcilePendingBlocking(
             usage,
             alloc,
-            api_key,
+            credential,
             &usage.reconciliation_cancel,
             authority,
             providers,
@@ -2987,16 +3069,21 @@ fn reconciliationKeyDigest(api_key: []const u8) [Sha256.digest_length]u8 {
     return digest;
 }
 
+fn hostManagedReconciliationDigest() [Sha256.digest_length]u8 {
+    return reconciliationKeyDigest("fx-host-managed-auth-v1");
+}
+
 fn reconcilePendingBlocking(
     usage: *Usage,
     alloc: Allocator,
-    api_key: []const u8,
+    credential: ?[]const u8,
     cancel_flag: *std.atomic.Value(bool),
     authority: ReconciliationAuthority,
     providers: generation_usage.Set,
     max_attempts: usize,
 ) void {
-    if (api_key.len == 0 or cancel_flag.load(.seq_cst)) return;
+    if (credential) |api_key| if (api_key.len == 0) return;
+    if (cancel_flag.load(.seq_cst)) return;
     var attempt: usize = 0;
     while (attempt < max_attempts and !cancel_flag.load(.seq_cst)) : (attempt += 1) {
         var current = usage.snapshot(alloc) catch |err| {
@@ -3026,7 +3113,7 @@ fn reconcilePendingBlocking(
                 continue;
             };
             var outcome = provider.lookup(alloc, .{
-                .credential = api_key,
+                .credential = credential,
                 .tenant = pending.team,
                 .origin = pending.origin,
                 .generation_id = pending.id,
@@ -3275,6 +3362,29 @@ fn exactUsageOrigin(provider: model_provider.ProviderId) []const u8 {
     };
 }
 
+test "live context usage keeps the newest completed provider observation" {
+    var usage = Usage.initFresh();
+    defer usage.deinit(std.testing.allocator);
+
+    usage.observeContextUsage(2, .{ .input_tokens = 30, .output_tokens = 7 });
+    usage.observeContextUsage(1, .{ .input_tokens = 1, .output_tokens = 1 });
+    const snapshot = usage.liveContextSnapshot().?;
+    try std.testing.expectEqual(@as(u64, 37), snapshot.used);
+    try std.testing.expectEqual(@as(?f64, 0), snapshot.complete_cost);
+}
+
+test "newer missing context usage clears the prior observation" {
+    var usage = Usage.initFresh();
+    defer usage.deinit(std.testing.allocator);
+
+    usage.observeContextUsage(1, .{ .input_tokens = 30, .output_tokens = 7 });
+    usage.observeContextUsage(2, .{ .input_tokens = 40 });
+    try std.testing.expect(usage.liveContextSnapshot() == null);
+
+    usage.observeContextUsage(1, .{ .input_tokens = 90, .output_tokens = 10 });
+    try std.testing.expect(usage.liveContextSnapshot() == null);
+}
+
 test "direct exact generation IDs are deterministic and provider scoped" {
     var first_buffer: [30]u8 = undefined;
     var replay_buffer: [30]u8 = undefined;
@@ -3408,7 +3518,7 @@ fn parseCredentialSourceOptional(value: ?std.json.Value) !?types.CredentialSourc
     const actual = value orelse return error.InvalidUsageSnapshot;
     return switch (actual) {
         .null => null,
-        .string => |text| types.parseCredentialSource(text) orelse return error.InvalidUsageSnapshot,
+        .string => |text| types.parseRuntimeCredentialSource(text) orelse return error.InvalidUsageSnapshot,
         else => error.InvalidUsageSnapshot,
     };
 }
@@ -3495,6 +3605,34 @@ test "usage snapshot JSON round trips" {
     defer decoded.deinit(alloc);
     try std.testing.expectEqual(snapshot.billing, decoded.billing);
     try std.testing.expectEqual(snapshot.wall_duration_ms, decoded.wall_duration_ms);
+}
+
+test "host-managed deferred usage authority round trips" {
+    const alloc = std.testing.allocator;
+    var usage = Usage.initFresh();
+    defer usage.deinit(alloc);
+    const identity = credential_authority.derive(.host_managed, null).?;
+    const observation = try InvocationObservation.begin(&usage);
+    try observation.complete(alloc, .{}, .{ .deferred = .{
+        .provider = .gateway,
+        .generation_id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        .scope = "https://ai-gateway.vercel.sh",
+        .credential_source = .host_managed,
+        .credential_identity = identity,
+    } });
+
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    try writeSnapshot(&encoded.writer, snapshot);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+    defer parsed.deinit();
+    var decoded = try parseSnapshotValue(alloc, parsed.value);
+    defer decoded.deinit(alloc);
+
+    try std.testing.expectEqual(types.CredentialSource.host_managed, decoded.pending[0].credential_source.?);
+    try std.testing.expect(decoded.pending[0].credential_identity.?.eql(identity));
 }
 
 test "profile recovery hint follows unresolved durable usage" {
@@ -4570,7 +4708,8 @@ const TestGenerationUsageProvider = struct {
         const self: *@This() = @ptrCast(@alignCast(raw_context.?));
         self.calls += 1;
         self.saw_expected_input =
-            std.mem.eql(u8, input.credential, "credential") and
+            input.credential != null and
+            std.mem.eql(u8, input.credential.?, "credential") and
             std.mem.eql(
                 u8,
                 input.generation_id,
@@ -5728,4 +5867,18 @@ test "resumed provider reconciliation uses Gateway credential slot identity" {
     try std.testing.expect(usage.reconciliation_key_digest == null);
     try std.testing.expect(usage.reconciliation_authority == null);
     try std.testing.expect(usage.reconciliation_credential_blocked);
+}
+
+test "host-managed reconciliation records authority without credential bytes" {
+    var usage = Usage.initFresh();
+    defer usage.deinit(std.testing.allocator);
+
+    usage.replaceHostManagedReconciliationAuthority(std.testing.allocator, .gateway);
+
+    try std.testing.expect(usage.reconciliation_key_digest != null);
+    try std.testing.expectEqual(model_provider.ProviderId.gateway, usage.reconciliation_authority.?.provider);
+    try std.testing.expect(usage.reconciliation_authority.?.credential_identity.?.eql(
+        credential_authority.derive(.host_managed, null).?,
+    ));
+    try std.testing.expect(!usage.reconciliation_credential_blocked);
 }

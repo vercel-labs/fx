@@ -85,11 +85,18 @@ pub fn streamModelCompletion(
             );
             if (comptime @import("builtin").os.tag != .wasi) {
                 if (std.meta.activeTag(completed.usage) == .deferred) if (usage) |ledger| {
-                    ledger.startDeferredReconciliation(
-                        usage_allocator,
-                        completed.usage.deferred,
-                        request.credential.secret,
-                    );
+                    if (request.credential.secret()) |credential| {
+                        ledger.startDeferredReconciliation(
+                            usage_allocator,
+                            completed.usage.deferred,
+                            credential,
+                        );
+                    } else if (request.credential.credentialSource() == .host_managed) {
+                        ledger.startHostManagedDeferredReconciliation(
+                            usage_allocator,
+                            completed.usage.deferred,
+                        );
+                    }
                 };
             }
         },
@@ -167,17 +174,66 @@ fn clampTokenCount(value: ?u64) u32 {
 
 pub const VisionToolMode = agent_stream_provider.VisionMode;
 
-pub fn recordSelectedDynamicTool(
-    alloc: Allocator,
-    names: *std.ArrayList([]const u8),
-    tools: *std.ArrayList(agent_stream_provider.DynamicFunctionTool),
-    execution: ToolExecutionResult,
-) !void {
-    const name = execution.selected_dynamic_tool_name orelse return;
-    const schema_json = execution.selected_dynamic_tool_schema_json orelse return;
-    for (names.items) |existing| {
-        if (std.mem.eql(u8, existing, name)) return;
+pub fn projectToolImageMessages(alloc: Allocator, messages: []const types.ChatMessage, supports_images: bool, text_limit: usize) ![]const types.ChatMessage {
+    if (supports_images) return messages;
+    const has_images = for (messages) |message| {
+        if (message.tool_result_memory) |memory| if (memory.tool_images.len > 0 or memory.tool_image_handle != null) break true;
+    } else false;
+    if (!has_images) return messages;
+    const projected = try alloc.dupe(types.ChatMessage, messages);
+    for (projected) |*message| {
+        if (message.tool_result_memory) |*memory| {
+            if (memory.tool_images.len == 0 and memory.tool_image_handle == null) continue;
+            memory.tool_images = &.{};
+            const notice = "[Tool images were retained but not sent because this model does not support image input.]\n";
+            const content = message.content orelse "";
+            const keep = @import("../../config/context_limits.zig").utf8PrefixLength(content, text_limit -| notice.len);
+            memory.truncated = memory.truncated or keep < content.len;
+            message.content = try std.mem.concat(alloc, u8, &.{ notice[0..@min(notice.len, text_limit)], content[0..keep] });
+        }
     }
+    return projected;
+}
+
+pub fn snapshotDynamicTools(alloc: Allocator, deps: *const @import("deps.zig").AgentRuntimeDeps, selected: *std.ArrayList(agent_stream_provider.DynamicFunctionTool)) ![]const agent_stream_provider.DynamicFunctionTool {
+    var offered: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
+    errdefer offered.deinit(alloc);
+    const count = selected.items.len;
+    for (0..count) |index| {
+        const tool = selected.items[index];
+        if (tool.mcp_binding) |binding| {
+            const snapshot = deps.snapshot_mcp_definition orelse continue;
+            switch (try snapshot(deps.ctx, alloc, tool.name, binding)) {
+                .current => {},
+                .unavailable => continue,
+                .updated => |definition| {
+                    if (!std.mem.eql(u8, definition.name, tool.name) or definition.mcp_binding == null) return error.InvalidToolSchema;
+                    try recordSelectedDynamicTool(alloc, selected, definition);
+                    try offered.append(alloc, selected.items[index]);
+                    continue;
+                },
+            }
+        }
+        try offered.append(alloc, tool);
+    }
+    return offered.toOwnedSlice(alloc);
+}
+
+pub fn recordSelectedDynamicTools(alloc: Allocator, tools: *std.ArrayList(agent_stream_provider.DynamicFunctionTool), execution: ToolExecutionResult) !void {
+    for (execution.retired_dynamic_tool_names) |name| {
+        for (tools.items, 0..) |tool, index| {
+            if (std.mem.eql(u8, name, tool.name)) {
+                _ = tools.orderedRemove(index);
+                break;
+            }
+        }
+    }
+    for (execution.selected_dynamic_tools) |selected| try recordSelectedDynamicTool(alloc, tools, selected);
+}
+
+fn recordSelectedDynamicTool(alloc: Allocator, tools: *std.ArrayList(agent_stream_provider.DynamicFunctionTool), selected: @import("../../tooling/tool_mcp_runtime.zig").SelectedTool) !void {
+    const name = selected.name;
+    const schema_json = selected.schema_json;
     const schema = try std.json.parseFromSliceLeaky(
         std.json.Value,
         alloc,
@@ -193,12 +249,15 @@ pub fn recordSelectedDynamicTool(
     {
         return error.InvalidToolSchema;
     }
-    try names.append(alloc, name);
-    try tools.append(alloc, .{
-        .name = name,
-        .description = description.string,
-        .input_schema = input_schema,
-    });
+    for (tools.items) |*existing| {
+        if (std.mem.eql(u8, existing.name, name)) {
+            existing.description = description.string;
+            existing.input_schema = input_schema;
+            existing.mcp_binding = selected.mcp_binding;
+            return;
+        }
+    }
+    try tools.append(alloc, .{ .name = name, .description = description.string, .input_schema = input_schema, .mcp_binding = selected.mcp_binding });
 }
 
 pub fn gatewayHttpErrorDetail(
@@ -269,7 +328,7 @@ test "provider preflight failure does not reserve usage" {
         agent_stream_provider.unavailable_provider,
         alloc,
         .{
-            .credential = .{ .secret = "test-key" },
+            .credential = .{ .direct = .{ .secret_bytes = "test-key" } },
             .model = "test/model",
             .retry_count = 1,
             .messages = &.{},
@@ -337,7 +396,7 @@ test "caller admission publishes before provider attempt is admitted" {
         .{ .context = &provider, .stream_fn = Provider.stream },
         alloc,
         .{
-            .credential = .{ .secret = "test-key" },
+            .credential = .{ .direct = .{ .secret_bytes = "test-key" } },
             .model = "test/model",
             .retry_count = 1,
             .messages = &.{},
@@ -405,7 +464,7 @@ test "caller admission failure settles usage and prevents request open" {
             .{ .context = &provider, .stream_fn = Provider.stream },
             alloc,
             .{
-                .credential = .{ .secret = "test-key" },
+                .credential = .{ .direct = .{ .secret_bytes = "test-key" } },
                 .model = "test/model",
                 .retry_count = 1,
                 .messages = &.{},
@@ -462,7 +521,7 @@ test "possibly sent gateway failure marks billing incomplete" {
         .{ .stream_fn = Gateway.stream },
         alloc,
         .{
-            .credential = .{ .secret = "test-key" },
+            .credential = .{ .direct = .{ .secret_bytes = "test-key" } },
             .model = "test/model",
             .retry_count = 1,
             .messages = &.{},
@@ -542,11 +601,11 @@ test "provider-local exact usage reaches session accounting" {
         provider,
         alloc,
         .{
-            .credential = .{
-                .secret = "subscription-token",
+            .credential = .{ .direct = .{
+                .secret_bytes = "subscription-token",
                 .source = .chatgpt_subscription,
                 .account_id = "acct_test",
-            },
+            } },
             .session_id = "session-test",
             .model = "gpt-test",
             .retry_count = 1,
@@ -581,4 +640,33 @@ test "provider-local exact usage reaches session accounting" {
     try std.testing.expectEqualStrings("codex/gpt-test", snapshot.models[0].model);
     try std.testing.expectEqual(@as(usize, 0), snapshot.pending.len);
     try std.testing.expectEqual(@as(usize, 0), snapshot.publication_backlog.len);
+}
+
+test "selected MCP schemas replace old definitions without duplicate names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tools: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
+    try recordSelectedDynamicTools(alloc, &tools, .{
+        .model_output = "selected",
+        .selected_dynamic_tools = &.{
+            .{ .name = "mcp_fixture_lookup", .schema_json =
+            \\{"name":"mcp_fixture_lookup","description":"Lookup","inputSchema":{"type":"object","properties":{"old_value":{"type":"string"}}}}
+            },
+            .{ .name = "mcp_fixture_other", .schema_json =
+            \\{"name":"mcp_fixture_other","description":"Other","inputSchema":{"type":"object"}}
+            },
+        },
+    });
+    try recordSelectedDynamicTools(alloc, &tools, .{
+        .model_output = "selected",
+        .selected_dynamic_tools = &.{.{ .name = "mcp_fixture_lookup", .schema_json =
+        \\{"name":"mcp_fixture_lookup","description":"Updated lookup","inputSchema":{"type":"object","properties":{"new_value":{"type":"string"}}}}
+        }},
+    });
+    try std.testing.expectEqual(@as(usize, 2), tools.items.len);
+    try std.testing.expectEqualStrings("Updated lookup", tools.items[0].description);
+    const properties = tools.items[0].input_schema.object.get("properties").?.object;
+    try std.testing.expect(properties.contains("new_value"));
+    try std.testing.expect(!properties.contains("old_value"));
 }

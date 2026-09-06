@@ -1,5 +1,6 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
+const image_attachments = @import("../images/image_attachments.zig");
 const io_mod = @import("../shared/io.zig");
 const session = @import("session.zig");
 
@@ -78,7 +79,6 @@ fn firstPromptCandidate(history: []const session.HistoryTurn) ?PromptCandidate {
     for (history) |turn| {
         switch (turn) {
             .assistant => |entry| if (promptCandidateFromUser(entry.user)) |candidate| return candidate,
-            .background_command => |entry| if (promptCandidateFromUser(entry.user)) |candidate| return candidate,
             .interrupted => |entry| if (promptCandidateFromUser(entry.user)) |candidate| return candidate,
             .compacted_summary => {},
         }
@@ -88,9 +88,26 @@ fn firstPromptCandidate(history: []const session.HistoryTurn) ?PromptCandidate {
 
 fn promptCandidateFromUser(user: session.UserTurn) ?PromptCandidate {
     const trimmed = std.mem.trim(u8, user.text, " \t\r\n");
+    if (isCanonicalImageOnlyText(user.text, user.images)) return .image_only;
     if (trimmed.len > 0 and !isSlashCommandOnly(trimmed)) return .{ .text = user.text };
     if (user.images.len > 0) return .image_only;
     return null;
+}
+
+fn isCanonicalImageOnlyText(text: []const u8, images: []const session.ImageAttachment) bool {
+    if (images.len == 0) return false;
+
+    var text_offset: usize = 0;
+    for (images, 0..) |image, index| {
+        if (index > 0) {
+            if (text_offset >= text.len or text[text_offset] != '\n') return false;
+            text_offset += 1;
+        }
+        const placeholder = image_attachments.matchImagePlaceholder(text, text_offset) orelse return false;
+        if (placeholder.id != image.id) return false;
+        text_offset += placeholder.length;
+    }
+    return text_offset == text.len;
 }
 
 fn isSlashCommandOnly(trimmed: []const u8) bool {
@@ -358,6 +375,43 @@ test "display metadata skips slash-only turns and handles image-only sessions" {
     try std.testing.expect(image_metadata.present);
     try std.testing.expectEqualStrings("Image session", image_metadata.title);
     try std.testing.expect(image_metadata.preview == null);
+}
+
+test "display metadata treats canonical image placeholders as image-only syntax" {
+    const alloc = std.testing.allocator;
+    const first = session.ImageAttachment{
+        .id = 7,
+        .path = @constCast("/tmp/first.png"),
+        .media_type = @constCast("image/png"),
+    };
+    const second = session.ImageAttachment{
+        .id = 9,
+        .path = @constCast("/tmp/second.png"),
+        .media_type = @constCast("image/png"),
+    };
+    var images = [_]session.ImageAttachment{ first, second };
+
+    const image_only = [_]session.HistoryTurn{
+        makeAssistantTurnWithImages("[Image #7]\n[Image #9]", images[0..]),
+    };
+    var image_metadata = try deriveFromHistory(alloc, &image_only);
+    defer image_metadata.deinit(alloc);
+    try std.testing.expectEqualStrings(image_title, image_metadata.title);
+    try std.testing.expect(image_metadata.preview == null);
+
+    const mixed = [_]session.HistoryTurn{
+        makeAssistantTurnWithImages("Describe [Image #7]", images[0..1]),
+    };
+    var mixed_metadata = try deriveFromHistory(alloc, &mixed);
+    defer mixed_metadata.deinit(alloc);
+    try std.testing.expectEqualStrings("Describe [Image #7]", mixed_metadata.title);
+
+    const mismatched = [_]session.HistoryTurn{
+        makeAssistantTurnWithImages("[Image #8]", images[0..1]),
+    };
+    var mismatched_metadata = try deriveFromHistory(alloc, &mismatched);
+    defer mismatched_metadata.deinit(alloc);
+    try std.testing.expectEqualStrings("[Image #8]", mismatched_metadata.title);
 }
 
 test "display metadata sidecar round trips and invalid sidecar falls back" {

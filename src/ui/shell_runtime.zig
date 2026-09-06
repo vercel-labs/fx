@@ -59,8 +59,6 @@ pub const AlternateScreenOwner = enum {
     file_approval,
     full_transcript,
     catalog_menu,
-    subagent_manager,
-    terminal_session,
 };
 
 pub const TerminalState = struct {
@@ -83,14 +81,6 @@ pub const TerminalState = struct {
 
     pub fn catalogMenuScreenActive(self: TerminalState) bool {
         return self.alternate_screen_owner == .catalog_menu;
-    }
-
-    pub fn subagentManagerScreenActive(self: TerminalState) bool {
-        return self.alternate_screen_owner == .subagent_manager;
-    }
-
-    pub fn terminalSessionScreenActive(self: TerminalState) bool {
-        return self.alternate_screen_owner == .terminal_session;
     }
 
     pub fn ensureInteractive(self: TerminalState) !void {
@@ -408,6 +398,28 @@ pub fn focusedToolActivityKind(
 
 pub fn activeToolActivityCount(shell: anytype) usize {
     return shell.activeToolActivityCount();
+}
+
+pub fn presentActiveToolCancellation(
+    alloc: Allocator,
+    shell: anytype,
+) !bool {
+    const Shell = @TypeOf(shell.*);
+    if (comptime !@hasDecl(Shell, "presentActiveToolCancellation")) {
+        return false;
+    }
+    return shell.presentActiveToolCancellation(alloc);
+}
+
+pub fn writeTurnCancellation(
+    alloc: Allocator,
+    shell: anytype,
+    metrics: *Metrics,
+    record: bool,
+) !void {
+    const Shell = @TypeOf(shell.*);
+    if (comptime !@hasDecl(Shell, "writeTurnCancellation")) return;
+    try shell.writeTurnCancellation(alloc, metrics, record);
 }
 
 pub fn requestRedraw(

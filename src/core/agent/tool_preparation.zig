@@ -35,7 +35,6 @@ pub const Classifiers = struct {
     idempotent: ClassifierFn,
     validation: ClassifierFn,
     availability: ClassifierFn,
-    stop_policy: ClassifierFn,
     deferred_dynamic: ?CandidateClassifierFn = null,
 };
 
@@ -58,7 +57,6 @@ pub const TerminalKind = enum {
     validation_failure,
     availability_failure,
     unsupported,
-    stop_policy,
     file_mutation_failure,
 };
 
@@ -158,7 +156,7 @@ pub const ReadyCallBatch = struct {
 /// Classifies one effective `.ready` lifecycle call without permission,
 /// presentation, execution, or product-state mutation.
 pub fn prepareReadyCall(alloc: Allocator, call: ToolCall, config: Config) !Result {
-    if (call.provenance == .provider_executed or call.argument_integrity == .malformed_json) {
+    if (call.provenance == .provider_executed or call.argument_integrity != .valid) {
         return error.NotLifecycleReady;
     }
     try checkCancellation(config.cancel_flag);
@@ -182,15 +180,6 @@ pub fn prepareReadyCall(alloc: Allocator, call: ToolCall, config: Config) !Resul
                 call,
             )) |terminal| {
                 return .{ .terminal = terminalFromCallback(.availability_failure, terminal) };
-            }
-            if (try classifyWithCallback(
-                alloc,
-                config.cancel_flag,
-                config.classifiers,
-                config.classifiers.stop_policy,
-                call,
-            )) |terminal| {
-                return .{ .terminal = terminalFromCallback(.stop_policy, terminal) };
             }
             return .{ .candidate = .{ .kind = .advertised_dynamic } };
         }
@@ -231,16 +220,6 @@ pub fn prepareReadyCall(alloc: Allocator, call: ToolCall, config: Config) !Resul
     )) |terminal| {
         return .{ .terminal = terminalFromCallback(.availability_failure, terminal) };
     }
-    if (try classifyWithCallback(
-        alloc,
-        config.cancel_flag,
-        config.classifiers,
-        config.classifiers.stop_policy,
-        call,
-    )) |terminal| {
-        return .{ .terminal = terminalFromCallback(.stop_policy, terminal) };
-    }
-
     const targets = if (file_mutation_contract.isToolName(call.name)) blk: {
         var projection = try tool_admission.prepareFileMutationCall(alloc, call, .{
             .tool_registry = config.tool_registry,
@@ -507,7 +486,6 @@ const test_classifiers: Classifiers = .{
     .idempotent = testNoClassification,
     .validation = testNoClassification,
     .availability = testNoClassification,
-    .stop_policy = testNoClassification,
 };
 
 test "advertised dynamic calls stay opaque while unsupported calls are terminal" {
@@ -588,7 +566,6 @@ test "classifiers are ordered" {
         var idempotent_calls: usize = 0;
         var validation_calls: usize = 0;
         var availability_calls: usize = 0;
-        var stop_calls: usize = 0;
 
         fn idempotent(_: ?*anyopaque, callback_alloc: Allocator, call: ToolCall) anyerror!?CallbackTerminal {
             idempotent_calls += 1;
@@ -606,12 +583,6 @@ test "classifiers are ordered" {
             if (!std.mem.eql(u8, call.name, "web_search")) return null;
             return .{ .model_output = try callback_alloc.dupe(u8, "search unavailable"), .status = .failure };
         }
-
-        fn stop(_: ?*anyopaque, callback_alloc: Allocator, call: ToolCall) anyerror!?CallbackTerminal {
-            stop_calls += 1;
-            if (!std.mem.eql(u8, call.name, "terminal")) return null;
-            return .{ .model_output = try callback_alloc.dupe(u8, "blocked restart"), .status = .failure };
-        }
     };
     var test_web_search = builtin_tools.read_file;
     test_web_search.name = "web_search";
@@ -619,20 +590,18 @@ test "classifiers are ordered" {
     const tools = [_]tool_dispatch.Tool{
         builtin_tools.skill,
         test_web_search,
-        builtin_tools.terminal,
+        builtin_tools.shell,
     };
     const registry = tool_dispatch.Registry{ .tools = &tools };
     const classifiers: Classifiers = .{
         .idempotent = Fixture.idempotent,
         .validation = Fixture.validation,
         .availability = Fixture.availability,
-        .stop_policy = Fixture.stop,
     };
 
     Fixture.idempotent_calls = 0;
     Fixture.validation_calls = 0;
     Fixture.availability_calls = 0;
-    Fixture.stop_calls = 0;
     var skipped = try prepareReadyCall(alloc, .{
         .id = "skill",
         .name = "skill",
@@ -643,7 +612,6 @@ test "classifiers are ordered" {
     try std.testing.expectEqual(@as(usize, 1), Fixture.idempotent_calls);
     try std.testing.expectEqual(@as(usize, 0), Fixture.validation_calls);
     try std.testing.expectEqual(@as(usize, 0), Fixture.availability_calls);
-    try std.testing.expectEqual(@as(usize, 0), Fixture.stop_calls);
 
     var unavailable = try prepareReadyCall(alloc, .{
         .id = "search",
@@ -655,19 +623,6 @@ test "classifiers are ordered" {
     try std.testing.expectEqual(@as(usize, 2), Fixture.idempotent_calls);
     try std.testing.expectEqual(@as(usize, 1), Fixture.validation_calls);
     try std.testing.expectEqual(@as(usize, 1), Fixture.availability_calls);
-    try std.testing.expectEqual(@as(usize, 0), Fixture.stop_calls);
-
-    var blocked = try prepareReadyCall(alloc, .{
-        .id = "command",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"echo hi\"}",
-    }, .{ .tool_registry = registry, .workspace_root = "/tmp/workspace", .classifiers = classifiers });
-    defer blocked.deinit(alloc);
-    try std.testing.expectEqual(TerminalKind.stop_policy, blocked.terminal.kind);
-    try std.testing.expectEqual(@as(usize, 3), Fixture.idempotent_calls);
-    try std.testing.expectEqual(@as(usize, 2), Fixture.validation_calls);
-    try std.testing.expectEqual(@as(usize, 2), Fixture.availability_calls);
-    try std.testing.expectEqual(@as(usize, 1), Fixture.stop_calls);
 }
 
 test "classifier validation failures remain terminal before execution" {
@@ -694,7 +649,6 @@ test "classifier validation failures remain terminal before execution" {
             .idempotent = testNoClassification,
             .validation = Fixture.validation,
             .availability = testNoClassification,
-            .stop_policy = testNoClassification,
         },
     });
     defer result.deinit(std.testing.allocator);
@@ -732,7 +686,7 @@ test "registered candidates expose only authoritative canonical targets" {
         builtin_tools.read_file,
         builtin_tools.write_file,
         builtin_tools.edit_file,
-        builtin_tools.terminal,
+        builtin_tools.shell,
     };
     const registry = tool_dispatch.Registry{ .tools = &tools };
 
@@ -770,8 +724,8 @@ test "registered candidates expose only authoritative canonical targets" {
 
     var command = try prepareReadyCall(alloc, .{
         .id = "command",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"cat unrelated/AGENTS.md\",\"cwd\":\"build\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"cat unrelated/AGENTS.md\",\"cwd\":\"build\"}",
     }, .{ .tool_registry = registry, .workspace_root = workspace, .classifiers = test_classifiers });
     defer command.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), command.candidate.applicable_targets.len);
@@ -780,8 +734,8 @@ test "registered candidates expose only authoritative canonical targets" {
 
     var delimiter_command = try prepareReadyCall(alloc, .{
         .id = "delimiter-command",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"pwd\",\"cwd\":\"segment::scope\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\",\"cwd\":\"segment::scope\"}",
     }, .{ .tool_registry = registry, .workspace_root = workspace, .classifiers = test_classifiers });
     defer delimiter_command.deinit(alloc);
     try std.testing.expectEqual(
@@ -840,7 +794,7 @@ test "ordinary applicable target freshness detects retarget and resolution failu
     defer alloc.free(workspace);
     const tools = [_]tool_dispatch.Tool{
         builtin_tools.read_file,
-        builtin_tools.terminal,
+        builtin_tools.shell,
     };
     const config: Config = .{
         .tool_registry = .{ .tools = &tools },
@@ -856,8 +810,8 @@ test "ordinary applicable target freshness detects retarget and resolution failu
     defer read.deinit(alloc);
     var command = try prepareReadyCall(alloc, .{
         .id = "command",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"pwd\",\"cwd\":\"link\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\",\"cwd\":\"link\"}",
     }, config);
     defer command.deinit(alloc);
     try std.testing.expect(try ordinaryApplicableTargetsFresh(
@@ -869,7 +823,7 @@ test "ordinary applicable target freshness detects retarget and resolution failu
     ));
     try std.testing.expect(try ordinaryApplicableTargetsFresh(
         alloc,
-        .{ .id = "command", .name = "terminal", .arguments_json = "{\"action\":\"exec\",\"command\":\"pwd\",\"cwd\":\"link\"}" },
+        .{ .id = "command", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\",\"cwd\":\"link\"}" },
         config.tool_registry,
         config.workspace_root,
         &command.candidate,
@@ -885,7 +839,7 @@ test "ordinary applicable target freshness detects retarget and resolution failu
     ));
     try std.testing.expect(!try ordinaryApplicableTargetsFresh(
         alloc,
-        .{ .id = "command", .name = "terminal", .arguments_json = "{\"action\":\"exec\",\"command\":\"pwd\",\"cwd\":\"link\"}" },
+        .{ .id = "command", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\",\"cwd\":\"link\"}" },
         config.tool_registry,
         config.workspace_root,
         &command.candidate,

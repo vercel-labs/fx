@@ -67,7 +67,7 @@ test "permission request exposes amendment capability" {
 
 test "owned permission request carries an independent explanation" {
     const request: PermissionRequest = .{
-        .label = "terminal.exec touch marker.txt",
+        .label = "shell.run touch marker.txt",
         .explanation = "Auto agent couldn’t approve because the action needs review",
     };
     var owned = try OwnedPermissionRequest.dupe(std.testing.allocator, request);
@@ -100,7 +100,7 @@ test "owned permission request carries an independent tool arguments preview" {
 
 test "owned permission request carries an independent subagent origin" {
     const request: PermissionRequest = .{
-        .label = "terminal.exec touch marker.txt",
+        .label = "shell.run touch marker.txt",
         .origin = .{ .subagent = "approval-child" },
     };
     var owned = try OwnedPermissionRequest.dupe(std.testing.allocator, request);
@@ -127,7 +127,7 @@ test "permission request bounds the optional explanation" {
     try std.testing.expectError(
         error.ExplanationTooLong,
         OwnedPermissionRequest.dupe(std.testing.allocator, .{
-            .label = "terminal.exec touch marker.txt",
+            .label = "shell.run touch marker.txt",
             .explanation = explanation,
         }),
     );
@@ -158,7 +158,7 @@ test "permission request bounds the subagent origin" {
     try std.testing.expectError(
         error.SubagentOriginTooLong,
         OwnedPermissionRequest.dupe(std.testing.allocator, .{
-            .label = "terminal.exec touch marker.txt",
+            .label = "shell.run touch marker.txt",
             .origin = .{ .subagent = child_name },
         }),
     );

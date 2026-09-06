@@ -353,6 +353,7 @@ class AcpClient {
   private lines: string[] = [];
   private waiters: Array<(line: string) => void> = [];
   private closed = false;
+  private activeSessionId: string | null = null;
 
   private constructor(private proc: ChildProcess) {
     proc.stdout!.on("data", (chunk: Buffer) => {
@@ -385,7 +386,23 @@ class AcpClient {
   }
 
   send(message: object) {
-    this.proc.stdin!.write(`${JSON.stringify(message)}\n`);
+    let outgoing = message as any;
+    if (
+      this.activeSessionId !== null &&
+      [
+        "session/prompt",
+        "session/cancel",
+        "session/set_mode",
+        "session/set_config_option",
+      ].includes(outgoing.method) &&
+      outgoing.params?.sessionId === undefined
+    ) {
+      outgoing = {
+        ...outgoing,
+        params: { ...(outgoing.params ?? {}), sessionId: this.activeSessionId },
+      };
+    }
+    this.proc.stdin!.write(`${JSON.stringify(outgoing)}\n`);
   }
 
   async readLine(timeoutMs = TIMEOUT): Promise<any> {
@@ -406,7 +423,18 @@ class AcpClient {
 
   async request(method: string, params: object, id: number) {
     this.send({ jsonrpc: "2.0", id, method, params });
-    return this.readLine();
+    let response: any;
+    do {
+      response = await this.readLine();
+    } while (response.id !== id);
+    if (
+      response.error === undefined &&
+      method === "session/new" &&
+      typeof response.result?.sessionId === "string"
+    ) {
+      this.activeSessionId = response.result.sessionId;
+    }
+    return response;
   }
 
   async close() {
@@ -588,6 +616,88 @@ describe("web_search Gateway fixture", () => {
       }
     },
     TIMEOUT,
+  );
+
+  test(
+    "saved search replays restarted segments with their own metadata",
+    async () => {
+      const model = "anthropic/claude-opus-4.6";
+      const root = createIsolatedRoot(null);
+      const gateway = startFakeGateway([
+        sse([
+          { type: "reasoning-start", id: "0" },
+          { type: "reasoning-delta", id: "0", delta: "" },
+          { type: "reasoning-end", id: "0", providerMetadata: { anthropic: { signature: "before-search" } } },
+          { type: "text-start", id: "1" },
+          { type: "text-delta", id: "1", delta: "Checking sources. " },
+          { type: "text-end", id: "1" },
+          { type: "tool-input-start", id: "search-1", toolName: "exa_search" },
+          { type: "tool-call", toolCallId: "search-1", toolName: "exa_search", input: { query: "Zig release" }, providerExecuted: true },
+          { type: "tool-result", toolCallId: "search-1", result: { results: [{ title: "Zig downloads", url: SOURCE_URL }] } },
+          { type: "reasoning-start", id: "0" },
+          { type: "reasoning-delta", id: "0", delta: "" },
+          { type: "reasoning-end", id: "0", providerMetadata: { anthropic: { signature: "after-search" } } },
+          { type: "text-start", id: "1" },
+          { type: "text-delta", id: "1", delta: "Found the release information." },
+          { type: "text-end", id: "1" },
+          { type: "finish", finishReason: { unified: "stop", raw: "end_turn" } },
+        ]),
+        outerText("The saved search context is available."),
+      ], model);
+      const env = fakeGatewayEnv(root, gateway, { FX_MODEL: model });
+      try {
+        const first = await runFx(
+          ["ask", "--auto", "--json", "Search the web for the latest Zig release."],
+          { cwd: root.workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(first.code).toBe(0);
+        const saved = JSON.parse(first.stdout.trim());
+        expect(saved.final_output).toBe("Checking sources. Found the release information.");
+        expect(saved.session_id).toMatch(/^[A-Za-z0-9_-]{12}$/);
+        expect(gateway.requests).toHaveLength(1);
+
+        const resumed = await runFx(
+          ["ask", "--auto", "--json", "--resume-id", saved.session_id, "Summarize the saved search."],
+          { cwd: root.workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(resumed.code).toBe(0);
+        expect(JSON.parse(resumed.stdout.trim()).final_output).toBe("The saved search context is available.");
+        expect(resumed.stderr).toBe("");
+        expect(gateway.requests).toHaveLength(2);
+        const prompt = JSON.parse(gateway.requests[1]!.body).prompt as Array<{
+          role: string;
+          content: string | Array<Record<string, any>>;
+        }>;
+        const parts = prompt.flatMap((message) =>
+          Array.isArray(message.content) ? message.content : []
+        );
+        const reasoning = parts.filter((part) => part.type === "reasoning");
+        expect(reasoning.map((part) => part.providerOptions?.anthropic?.signature)).toEqual([
+          "before-search",
+          "after-search",
+        ]);
+        const calls = parts.filter((part) => part.type === "tool-call");
+        expect(calls.map((part) => [part.toolCallId, part.toolName])).toEqual([
+          ["search-1", "exa_search"],
+        ]);
+        const results = parts.filter((part) => part.type === "tool-result");
+        expect(results.map((part) => part.toolCallId)).toEqual(["search-1"]);
+        expect(contentText(results[0]!.output)).toContain(SOURCE_URL);
+        const text = prompt
+          .filter((message) => message.role === "assistant")
+          .flatMap((message) => Array.isArray(message.content) ? message.content : [])
+          .filter((part) => part.type === "text");
+        expect(text.map((part) => part.text).join("")).toBe(
+          "Checking sources. Found the release information.",
+        );
+        expect(first.stdout + resumed.stdout).not.toContain("before-search");
+        expect(first.stdout + resumed.stdout).not.toContain("after-search");
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
   );
 
   test(
@@ -852,7 +962,7 @@ describe("web_search Gateway fixture", () => {
           const request = JSON.parse(gateway.requests[0].body);
           expect(request).not.toHaveProperty("reasoning");
           expect(request).not.toHaveProperty("fast");
-          expect(request.providerOptions?.gateway).toBeUndefined();
+          expect(request.providerOptions?.gateway).toEqual({ caching: "auto" });
           expect(gateway.requests[0].body).not.toContain('"thinking"');
 
           const stored = JSON.parse(
@@ -1027,6 +1137,9 @@ describe("web_search Gateway fixture", () => {
         await startAcpCodeSession(client);
         const messages = await runAcpPrompt(client, "Search the web for the latest Zig release.");
         const updates = JSON.stringify(messages);
+        const toolUpdates = messages
+          .filter((message: any) => message.params?.update?.toolCallId === "search_direct_1")
+          .map((message: any) => message.params.update);
 
         expect(gateway.requests).toHaveLength(2);
         expect(gateway.requests[0].body).toContain("gateway.exa_search");
@@ -1042,6 +1155,21 @@ describe("web_search Gateway fixture", () => {
         );
         expect(updates).not.toContain("Searching latest Zig release");
         expect(updates).not.toContain("Found 1 result for latest Zig release");
+        expect(toolUpdates).toHaveLength(2);
+        expect(toolUpdates[0]).toEqual({
+          sessionUpdate: "tool_call",
+          toolCallId: "search_direct_1",
+          name: "web_search",
+          title: "Searching web",
+          kind: "search",
+          status: "pending",
+          rawInput: {},
+        });
+        expect(toolUpdates[1]?.sessionUpdate).toBe("tool_call_update");
+        expect(toolUpdates[1]?.status).toBe("completed");
+        expect(updates).not.toContain("exa_search");
+        expect(updates).not.toContain("perplexity_search");
+        expect(updates).not.toContain("parallel_search");
         expect(updates).toContain(SOURCE_URL);
       } finally {
         await client.close();

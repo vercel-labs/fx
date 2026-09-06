@@ -63,6 +63,15 @@ pub fn openCommandOutputDirtyEntryId(shell: anytype) ?u32 {
     return commandBlockDirtyEntryId(shell.command_output_blocks.items[index]);
 }
 
+pub fn commandOutputDirtyEntryIdForLifecycle(
+    shell: anytype,
+    lifecycle_id: ?types.ToolLifecycleId,
+) ?u32 {
+    const index = commandOutputBlockIndexForLifecycle(shell, lifecycle_id) orelse
+        return null;
+    return commandBlockDirtyEntryId(shell.command_output_blocks.items[index]);
+}
+
 pub const CommandOutputLine = struct {
     stream: command_output_content.Stream,
     text: []u8,
@@ -373,12 +382,12 @@ pub fn prepareCommandOutputMutation(
     text: []const u8,
     record: bool,
 ) !PreparedCommandOutputMutation {
-    const block_index = shell.command_output_display.open_command_block orelse
+    const block_index = commandOutputBlockIndexForLifecycle(
+        shell,
+        lifecycle_id,
+    ) orelse
         return .decode;
     const block = &shell.command_output_blocks.items[block_index];
-    if (!sameLifecycleId(block.lifecycle_id, lifecycle_id)) {
-        return error.CommandOutputLifecycleMismatch;
-    }
 
     const stream_index = commandStreamIndex(stream);
     if (record and
@@ -804,7 +813,7 @@ pub fn flushCommandOutputSummaryForLifecycle(
 ) !void {
     const Runtime = @TypeOf(shell.*);
     if (record and comptime @hasDecl(Runtime, "flushRecordedCommandOutputSummaryAtomic")) {
-        if (hasMatchingOpenCommandOutputBlock(shell, lifecycle_id)) {
+        if (commandOutputBlockIndexForLifecycle(shell, lifecycle_id) != null) {
             return shell.flushRecordedCommandOutputSummaryAtomic(
                 alloc,
                 metrics,
@@ -821,17 +830,6 @@ pub fn flushCommandOutputSummaryForLifecycle(
         styles,
         lifecycle_id,
         record,
-    );
-}
-
-fn hasMatchingOpenCommandOutputBlock(
-    shell: anytype,
-    lifecycle_id: ?types.ToolLifecycleId,
-) bool {
-    const index = shell.command_output_display.open_command_block orelse return false;
-    return sameLifecycleId(
-        shell.command_output_blocks.items[index].lifecycle_id,
-        lifecycle_id,
     );
 }
 
@@ -854,35 +852,34 @@ pub fn flushCommandOutputSummaryUncommitted(
     _ = metrics;
     setCommandOutputRenderPolicy(shell, styles);
 
+    const block_index = commandOutputBlockIndexForLifecycle(
+        shell,
+        lifecycle_id,
+    ) orelse return false;
+    const was_displayed = shell.command_output_display.open_command_block == block_index;
+    try finishCommandOutputBlock(
+        shell,
+        alloc,
+        block_index,
+        record,
+        null,
+    );
     var retention_changed = false;
-    if (shell.command_output_display.open_command_block) |block_index| {
-        const open_block = &shell.command_output_blocks.items[block_index];
-        if (!sameLifecycleId(open_block.lifecycle_id, lifecycle_id)) {
-            debug_trace.logf("command_output", "ignoring command output completion for mismatched lifecycle", .{});
-            return false;
+    if (record) {
+        // Completion makes the block pruneable; retention must not treat
+        // a terminal count-only block as still active.
+        if (was_displayed) {
+            shell.command_output_display.open_command_block = null;
         }
-        try finishCommandOutputBlock(
+        retention_changed = try consolidateCommandOutputBlock(
             shell,
             alloc,
             block_index,
-            record,
-            null,
         );
-        if (record) {
-            // Completion makes the block pruneable; retention must not treat
-            // a terminal count-only block as still active.
-            shell.command_output_display.open_command_block = null;
-            retention_changed = try consolidateCommandOutputBlock(
-                shell,
-                alloc,
-                block_index,
-            );
-        } else {
-            var block = shell.command_output_blocks.orderedRemove(block_index);
-            block.deinit(alloc);
-        }
+    } else {
+        removeCommandOutputBlock(shell, alloc, block_index);
     }
-    shell.command_output_display = .{};
+    if (was_displayed) shell.command_output_display = .{};
     return retention_changed;
 }
 
@@ -897,18 +894,15 @@ pub fn flushCommandOutputSummaryDetached(
     created_at_ms: i64,
 ) !void {
     setCommandOutputRenderPolicy(shell, styles);
-    const block_index = shell.command_output_display.open_command_block orelse {
-        shell.command_output_display = .{};
-        return;
-    };
-    const open_block = &shell.command_output_blocks.items[block_index];
-    if (!sameLifecycleId(open_block.lifecycle_id, lifecycle_id)) {
-        return error.CommandOutputLifecycleMismatch;
-    }
+    const block_index = commandOutputBlockIndexForLifecycle(
+        shell,
+        lifecycle_id,
+    ) orelse return;
+    const was_displayed = shell.command_output_display.open_command_block == block_index;
     try finishCommandOutputBlock(shell, alloc, block_index, true, created_at_ms);
-    shell.command_output_display.open_command_block = null;
+    if (was_displayed) shell.command_output_display.open_command_block = null;
     try sealCommandOutputBlock(shell, alloc, block_index);
-    shell.command_output_display = .{};
+    if (was_displayed) shell.command_output_display = .{};
 }
 
 fn finishCommandOutputBlock(
@@ -1062,29 +1056,16 @@ fn ensureOpenCommandOutputBlock(
     alloc: Allocator,
     lifecycle_id: ?types.ToolLifecycleId,
 ) !usize {
-    if (shell.command_output_display.open_command_block) |index| {
-        const block = &shell.command_output_blocks.items[index];
-        if (!sameLifecycleId(block.lifecycle_id, lifecycle_id)) {
-            debug_trace.logf("command_output", "refusing multiplexed command output block", .{});
-            return error.CommandOutputLifecycleMismatch;
-        }
-        return index;
-    }
-    if (lifecycle_id != null) {
-        var index = shell.command_output_blocks.items.len;
-        while (index > 0) {
-            index -= 1;
-            const block = &shell.command_output_blocks.items[index];
-            if (block.entry_id == null or
-                !sameLifecycleId(block.lifecycle_id, lifecycle_id)) continue;
-            shell.command_output_display.open_command_block = index;
+    if (commandOutputBlockIndexForLifecycle(shell, lifecycle_id)) |index| {
+        if (shell.command_output_display.open_command_block != index) {
             debug_trace.logf(
                 "command_output",
-                "reopening completed command output block for late lifecycle output",
+                "switching command output display to matching lifecycle",
                 .{},
             );
-            return index;
         }
+        shell.command_output_display.open_command_block = index;
+        return index;
     }
     const owned_lifecycle_id = try dupeLifecycleId(alloc, lifecycle_id);
     errdefer if (owned_lifecycle_id) |id| alloc.free(@constCast(id.call_id));
@@ -1092,6 +1073,28 @@ fn ensureOpenCommandOutputBlock(
     const index = shell.command_output_blocks.items.len - 1;
     shell.command_output_display.open_command_block = index;
     return index;
+}
+
+fn commandOutputBlockIndexForLifecycle(
+    shell: anytype,
+    lifecycle_id: ?types.ToolLifecycleId,
+) ?usize {
+    if (shell.command_output_display.open_command_block) |index| {
+        if (index < shell.command_output_blocks.items.len and sameLifecycleId(
+            shell.command_output_blocks.items[index].lifecycle_id,
+            lifecycle_id,
+        )) return index;
+    }
+    if (lifecycle_id == null) return null;
+    var index = shell.command_output_blocks.items.len;
+    while (index > 0) {
+        index -= 1;
+        if (sameLifecycleId(
+            shell.command_output_blocks.items[index].lifecycle_id,
+            lifecycle_id,
+        )) return index;
+    }
+    return null;
 }
 
 fn CommandOutputRecordSink(comptime Shell: type) type {

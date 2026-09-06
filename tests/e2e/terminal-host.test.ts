@@ -574,7 +574,7 @@ int main(int argc, char **argv) {
 buildCurrentClientFixture();
 
 function hostPaths(home: string) {
-  const dir = join(home, ".fx", "terminal-host");
+  const dir = join(home, ".fx", "terminal-host-v7");
   return {
     dir,
     socket: join(dir, "host.sock"),
@@ -598,7 +598,7 @@ function terminalTransportPaths(home: string) {
     };
   }
   const digest = createHash("sha256")
-    .update("fx.terminal.transport.v1\0")
+    .update("fx.terminal.transport.v3\0")
     .update(home)
     .digest("hex")
     .slice(0, 32);
@@ -615,7 +615,7 @@ function terminalTransportPaths(home: string) {
 
 function makeLongHome(endpointBytes = 141): string {
   const root = mkdtempSync(join(tmpdir(), "fx-terminal-long-home-"));
-  const endpointSuffix = join(".fx", "terminal-host", "host.sock");
+  const endpointSuffix = join(".fx", "terminal-host-v7", "host.sock");
   const componentBytes = endpointBytes -
     Buffer.byteLength(root) -
     Buffer.byteLength(endpointSuffix) -
@@ -974,12 +974,11 @@ const actionSubjects = {
   screen: 2,
   write: 3,
   wait: 4,
-  monitor: 5,
-  inspect: 6,
-  list: 7,
-  resize: 8,
-  signal: 9,
-  close: 10,
+  inspect: 5,
+  list: 6,
+  resize: 7,
+  signal: 8,
+  close: 9,
 } as const;
 
 async function requestAction(
@@ -1207,22 +1206,6 @@ function authorityVariant(
 function withPersistence(value: Record<string, unknown>): Record<string, unknown> {
   const cwd = typeof value.cwd === "string" ? value.cwd : "/";
   const backend = value.backend === "tmux" ? "tmux" : "native";
-  const repeatedProbes = (
-    value.initial_monitors as Array<{
-      condition: { custom_probe?: { command: string; cwd: string } };
-      check_schedule?: { interval_ms: number };
-      notify_schedule: unknown;
-      lifetime: unknown;
-    }> | undefined
-  )?.flatMap((monitor) => monitor.condition.custom_probe && monitor.check_schedule
-    ? [{
-      command: monitor.condition.custom_probe.command,
-      cwd: monitor.condition.custom_probe.cwd,
-      check_schedule: monitor.check_schedule,
-      notify_schedule: monitor.notify_schedule,
-      lifetime: monitor.lifetime,
-    }]
-    : []) ?? [];
   return {
     ...value,
     persistence: {
@@ -1242,7 +1225,6 @@ function withPersistence(value: Record<string, unknown>): Record<string, unknown
           screen: true,
           write: true,
           wait: true,
-          monitor: true,
           inspect: true,
           list: true,
           resize: true,
@@ -1250,7 +1232,6 @@ function withPersistence(value: Record<string, unknown>): Record<string, unknown
           close: true,
         },
         generation: { value: 1 },
-        repeated_probes: repeatedProbes,
       },
       proof: { bytes: Array(32).fill(7) },
       direct_human_model_read_only: false,
@@ -1316,7 +1297,6 @@ async function startCommand(
     returnWhen?: unknown;
     waitMs?: number;
     dimensions?: { rows: number; columns: number };
-    initialMonitors?: unknown[];
     startupAttempts?: number;
   },
 ): Promise<Record<string, unknown>> {
@@ -1339,7 +1319,6 @@ async function startCommand(
         return_when: options.returnWhen ?? { started: {} },
         wait_ceiling_ms: options.waitMs ?? 20_000,
         dimensions: options.dimensions ?? { rows: 24, columns: 80 },
-        initial_monitors: options.initialMonitors ?? [],
       },
     );
     if (failureCode(frame) !== "startup_failed" || attempt + 1 === startupAttempts) {
@@ -1671,6 +1650,29 @@ test("fresh hidden host is singular, correlated, reconnectable, private, and idl
   }
 });
 
+test("host handshake is ready before slow durable recovery", async () => {
+  const home = makeHome();
+  const paths = hostPaths(home);
+  const child = startHost(home, { minimum: 4, current: 5 }, 350, {
+    FX_TERMINAL_TEST_STARTUP_RECOVERY_DELAY_MS: "5500",
+  });
+  await waitFor(() => existsSync(paths.socket) && existsSync(paths.identity));
+
+  const startedAt = Date.now();
+  const connected = await handshake(paths.socket, { minimum: 4, current: 5 });
+  expect(Date.now() - startedAt).toBeLessThan(2_000);
+  const response = await requestScreen(connected.client, connected.revision!, 73);
+  expect(response.payload).toMatchObject({
+    response: {
+      failure: { action: "screen", code: "protocol_incompatible" },
+    },
+  });
+  connected.client.close();
+  expect(await waitForExit(child)).toBe(0);
+  expect(await streamText(child.stdout)).toBe("");
+  expect(await streamText(child.stderr)).toBe("");
+}, 15_000);
+
 test("idle shutdown survives removal of the endpoint directory", async () => {
   const home = makeHome();
   const paths = hostPaths(home);
@@ -1719,6 +1721,24 @@ test("fatal host drain timeout exits before shared-state teardown", async () => 
   expect(await waitForExit(replacement)).toBe(0);
   expect(existsSync(paths.socket)).toBe(false);
   expect(existsSync(paths.identity)).toBe(false);
+}, 15_000);
+
+test("startup recovery failure exits before stalled client teardown", async () => {
+  const home = makeHome();
+  const paths = hostPaths(home);
+  const host = startHost(home, undefined, 10_000, {
+    FX_TERMINAL_TEST_STARTUP_RECOVERY_DELAY_MS: "1000",
+    FX_TERMINAL_TEST_STARTUP_RECOVERY_FAILURE: "1",
+  });
+  await waitFor(() => existsSync(paths.socket) && existsSync(paths.identity));
+
+  const stalled = await FrameClient.connect(paths.socket);
+  expect(await waitForExit(host)).toBe(1);
+  expect(await streamText(host.stdout)).toBe("");
+  expect(await streamText(host.stderr)).toBe("");
+  expect(existsSync(paths.socket)).toBe(true);
+  expect(existsSync(paths.identity)).toBe(true);
+  stalled.close();
 }, 15_000);
 
 test("client reconciles an idle-retiring host before admitting a request", async () => {
@@ -1774,7 +1794,6 @@ test("native PTY starts in the requested cwd and reports exact command exit", as
       return_when: { exit: {} },
       wait_ceiling_ms: 20_000,
       dimensions: { rows: 17, columns: 61 },
-      initial_monitors: [],
     },
   );
   expect(started.payload).toMatchObject({
@@ -1850,7 +1869,6 @@ test("native PTY starts in the requested cwd and reports exact command exit", as
         return_when: { started: {} },
         wait_ceiling_ms: 1_000,
         dimensions: { rows: 24, columns: 80 },
-        initial_monitors: [],
       },
     ),
   ).rejects.toThrow("socket closed");
@@ -1883,7 +1901,6 @@ test.skipIf(!tmuxAvailable())("explicit tmux backend is isolated and reports exa
         return_when: { exit: {} },
         wait_ceiling_ms: TMUX_INITIAL_STARTUP_OBSERVATION_BUDGET_MS,
         dimensions: { rows: 17, columns: 61 },
-        initial_monitors: [],
       }),
       "start",
     ),
@@ -2134,7 +2151,6 @@ test.skipIf(!tmuxAvailable())(
             return_when: { started: {} },
             wait_ceiling_ms: 5_000,
             dimensions: { rows: 24, columns: 80 },
-            initial_monitors: [],
           },
         );
         expect(failure(response), `${fixture.owner}:${fixture.point}:${pass}`)
@@ -2179,7 +2195,7 @@ test.skipIf(!tmuxAvailable())(
       }
     }
   },
-  120_000,
+  180_000,
 );
 
 test.skipIf(!tmuxAvailable())(
@@ -2227,7 +2243,6 @@ test.skipIf(!tmuxAvailable())(
               return_when: { started: {} },
               wait_ceiling_ms: 5_000,
               dimensions: { rows: 24, columns: 80 },
-              initial_monitors: [],
             },
           );
           expect(Date.now() - startedAt, `${fixture.name}:${pass}`).toBeLessThan(
@@ -2353,7 +2368,6 @@ test.skipIf(!tmuxAvailable())(
         return_when: { exit: {} },
         wait_ceiling_ms: 5_000,
         dimensions: { rows: 24, columns: 80 },
-        initial_monitors: [],
       },
     );
     expect(Date.now() - startedAt).toBeLessThan(5_000);
@@ -2556,7 +2570,6 @@ exec /bin/bash "$@"
         return_when: { exit: {} },
         wait_ceiling_ms: 5_000,
         dimensions: { rows: 24, columns: 80 },
-        initial_monitors: [],
       },
     );
     await waitFor(
@@ -2747,7 +2760,6 @@ test("missing tmux fails explicitly without changing native selection", async ()
       return_when: { exit: {} },
       wait_ceiling_ms: 2_000,
       dimensions: { rows: 24, columns: 80 },
-      initial_monitors: [],
     },
   );
   expect(failure(unavailable)).toMatchObject({ action: "start", code: "pty_unavailable" });
@@ -2794,7 +2806,6 @@ test("incompatible tmux fails explicitly without native fallback", async () => {
       return_when: { exit: {} },
       wait_ceiling_ms: 2_000,
       dimensions: { rows: 24, columns: 80 },
-      initial_monitors: [],
     },
   );
   expect(failure(incompatible)).toMatchObject({
@@ -2928,7 +2939,6 @@ test.skipIf(!tmuxAvailable())("revision four client cannot opt into Part 8 tmux 
       return_when: { exit: {} },
       wait_ceiling_ms: 2_000,
       dimensions: { rows: 24, columns: 80 },
-      initial_monitors: [],
     },
   );
   expect(failure(response).code).toBe("protocol_incompatible");
@@ -3246,7 +3256,6 @@ test.skipIf(!tmuxAvailable())("transient tmux recovery failures preserve the pan
     "screen-capture",
     "after-gap",
     "screen-reanchor",
-    "monitor-arm",
     "begin-capture",
     "accept-capture",
     "output-thread",
@@ -3439,306 +3448,6 @@ test.skipIf(!tmuxAvailable())("transient tmux recovery failures preserve the pan
       .toBe(false);
   }
 }, 180_000);
-
-test.skipIf(!tmuxAvailable())("tmux recovery restores the saved workspace scope", async () => {
-  if (!existsSync("/bin/zsh")) return;
-  const home = makeHome();
-  const workspace = join(home, "workspace");
-  const cwd = join(workspace, "cwd");
-  const scopeMarker = join(workspace, "scope-ready");
-  const outsideWrite = join(home, "outside-workspace");
-  mkdirSync(cwd, { recursive: true });
-  const paths = hostPaths(home);
-  const tmuxResource = rememberPrivateTmuxServer(home);
-  const scopeProbe = `test -f ${JSON.stringify(scopeMarker)}`;
-  const initialMonitors: Array<Record<string, unknown>> = [{
-    condition: { custom_probe: { command: scopeProbe, cwd: workspace } },
-    check_schedule: { interval_ms: 25 },
-    notify_schedule: { on_state_change: {} },
-    lifetime: { until_session_end: {} },
-  }];
-  if (process.platform === "darwin") {
-    initialMonitors.push({
-      condition: {
-        custom_probe: {
-          command: `printf escaped > ${JSON.stringify(outsideWrite)}`,
-          cwd: workspace,
-        },
-      },
-      check_schedule: { interval_ms: 25 },
-      notify_schedule: { on_state_change: {} },
-      lifetime: { until_session_end: {} },
-    });
-  }
-  const startRequest = withPersistence({
-    cwd,
-    command:
-      "printf 'scope-recovery-ready\\n'; while IFS= read -r line; do printf 'scope-recovery:%s\\n' \"$line\"; done",
-    shell: { executable: { path: "/bin/zsh", clean_start: true } },
-    backend: "tmux",
-    return_when: { match: "scope-recovery-ready" },
-    wait_ceiling_ms: 8_000,
-    dimensions: { rows: 24, columns: 80 },
-    initial_monitors: initialMonitors,
-  });
-  const persistence = startRequest.persistence as {
-    grant: { principal: Record<string, unknown> };
-  };
-  persistence.grant.principal.workspace_root = workspace;
-
-  const firstHost = startHost(home, undefined, 30_000);
-  const firstStdout = streamText(firstHost.stdout);
-  const firstStderr = streamText(firstHost.stderr);
-  await waitFor(() => existsSync(paths.socket));
-  const first = await handshake(paths.socket, { minimum: 4, current: 5 });
-  const started = success(
-    await requestAction(
-      first.client,
-      first.revision!,
-      151,
-      "start",
-      startRequest,
-    ),
-    "start",
-  );
-  const invalidStarted = success(
-    await requestAction(
-      first.client,
-      first.revision!,
-      156,
-      "start",
-      withPersistence({
-        cwd,
-        command:
-          "printf 'invalid-sibling-ready\\n'; while IFS= read -r line; do printf 'invalid-sibling:%s\\n' \"$line\"; done",
-        shell: { executable: { path: "/bin/zsh", clean_start: true } },
-        backend: "tmux",
-        return_when: { match: "invalid-sibling-ready" },
-        wait_ceiling_ms: 8_000,
-        dimensions: { rows: 24, columns: 80 },
-        initial_monitors: [],
-      }),
-    ),
-    "start",
-  );
-  rememberPrivateTmuxIdentities(tmuxResource);
-  const sessionId = (started.session as { session_id: string }).session_id;
-  const invalidSessionId = (invalidStarted.session as { session_id: string })
-    .session_id;
-  const stateDir = join(
-    home,
-    ".fx",
-    "sessions",
-    TERMINAL_OWNER_SESSION,
-    "terminal",
-    "state",
-  );
-  const monitorFile = join(
-    stateDir,
-    `monitors-${sessionId}.json`,
-  );
-  const monitorRuntimes = (): Array<{
-    check_count: number;
-    condition_matched: boolean;
-  }> => {
-    const persisted = JSON.parse(readFileSync(monitorFile, "utf8")) as {
-      monitors: Array<{
-        runtime: { check_count: number; condition_matched: boolean };
-      }>;
-    };
-    return persisted.monitors.map(({ runtime }) => runtime);
-  };
-  const tmuxSocket = terminalTransportPaths(home).tmuxSocket;
-  const durableIdentity = (id: string): string => {
-    const record = JSON.parse(
-      readFileSync(join(stateDir, `record-${id}.json`), "utf8"),
-    ) as { backend_identity: string };
-    return record.backend_identity;
-  };
-  const backendIdentity = durableIdentity(sessionId);
-  const invalidBackendIdentity = durableIdentity(invalidSessionId);
-  const sessionName = `fx-${backendIdentity}`;
-  const invalidSessionName = `fx-${invalidBackendIdentity}`;
-  const panePid = Number(execFileSync(
-    "tmux",
-    ["-S", tmuxSocket, "display-message", "-p", "-t", sessionName, "#{pane_pid}"],
-    { encoding: "utf8" },
-  ).trim());
-  const invalidPanePid = Number(execFileSync(
-    "tmux",
-    [
-      "-S",
-      tmuxSocket,
-      "display-message",
-      "-p",
-      "-t",
-      invalidSessionName,
-      "#{pane_pid}",
-    ],
-    { encoding: "utf8" },
-  ).trim());
-  const invalidAuthorityPath = join(
-    stateDir,
-    `authority-${invalidSessionId}.json`,
-  );
-  const invalidAuthority = JSON.parse(
-    readFileSync(invalidAuthorityPath, "utf8"),
-  ) as { grant: { principal: { workspace_root: string } } };
-  invalidAuthority.grant.principal.workspace_root = join(home, "tampered-workspace");
-  writeFileSync(invalidAuthorityPath, JSON.stringify(invalidAuthority), {
-    mode: 0o600,
-  });
-  const before = success(
-    await requestAction(first.client, first.revision!, 152, "inspect", {
-      session_id: sessionId,
-    }),
-    "inspect",
-  ) as {
-    monitors: Array<{ monitor_id: string; state: string }>;
-    events: unknown[];
-  };
-  expect(before.monitors).toEqual(initialMonitors.map((_, index) => ({
-    monitor_id: `monitor-${index + 1}`,
-    state: process.platform === "darwin" && index === 1 ? "matched" : "active",
-  })));
-  if (process.platform === "darwin") {
-    expect(before.events).toHaveLength(1);
-    expect(before.events[0]).toMatchObject({ monitor_id: "monitor-2" });
-  } else {
-    expect(before.events).toEqual([]);
-  }
-  expect(JSON.stringify(before)).not.toContain("proof");
-  let preRecoveryProbeChecks = 0;
-  if (process.platform === "darwin") {
-    await waitFor(() => monitorRuntimes()[1]!.check_count > 0);
-    preRecoveryProbeChecks = monitorRuntimes()[1]!.check_count;
-    expect(existsSync(outsideWrite)).toBe(true);
-  }
-
-  const oldIdentity = readFileSync(paths.identity, "utf8");
-  first.client.close();
-  firstHost.kill("SIGKILL");
-  await waitForExit(firstHost);
-  expect(await firstStdout).toBe("");
-  expect(await firstStderr).toBe("");
-
-  const replacement = startHost(home, undefined, 5_000);
-  const replacementStdout = streamText(replacement.stdout);
-  const replacementStderr = streamText(replacement.stderr);
-  await waitFor(() =>
-    existsSync(paths.socket) &&
-    existsSync(paths.identity) &&
-    readFileSync(paths.identity, "utf8") !== oldIdentity
-  , 8_000);
-  const recovered = await handshake(paths.socket, { minimum: 4, current: 5 });
-  await waitFor(() => !processExists(invalidPanePid), 5_000);
-  const recoveredSessionNames = execFileSync(
-    "tmux",
-    ["-S", tmuxSocket, "list-sessions", "-F", "#{session_name}"],
-    { encoding: "utf8" },
-  ).trim().split("\n");
-  const recoveredPanePid = Number(execFileSync(
-    "tmux",
-    ["-S", tmuxSocket, "display-message", "-p", "-t", sessionName, "#{pane_pid}"],
-    { encoding: "utf8" },
-  ).trim());
-  expect(recoveredSessionNames).toEqual([sessionName]);
-  expect(recoveredPanePid).toBe(panePid);
-  const invalidInspect = await requestAction(
-    recovered.client,
-    recovered.revision!,
-    157,
-    "inspect",
-    { session_id: invalidSessionId },
-  );
-  expect(failure(invalidInspect).code).toBe("authority_denied");
-  expect(JSON.stringify(invalidInspect)).not.toContain("proof");
-  expect(existsSync(`/tmp/fx-tmux-capture-${invalidBackendIdentity}.sock`)).toBe(
-    false,
-  );
-  expect(existsSync(`/tmp/fx-tmux-marker-${invalidBackendIdentity}.sock`)).toBe(
-    false,
-  );
-
-  const recoveredInspect = success(
-    await requestAction(recovered.client, recovered.revision!, 153, "inspect", {
-      session_id: sessionId,
-    }),
-    "inspect",
-  ) as typeof before;
-  expect(recoveredInspect.monitors).toEqual(before.monitors);
-  if (process.platform === "darwin") {
-    expect(recoveredInspect.events).toHaveLength(1);
-    expect(recoveredInspect.events[0]).toMatchObject({ monitor_id: "monitor-2" });
-  } else {
-    expect(recoveredInspect.events).toEqual([]);
-  }
-  expect(JSON.stringify(recoveredInspect)).not.toContain("proof");
-  if (process.platform === "darwin") {
-    await waitFor(() =>
-      monitorRuntimes()[1]!.check_count > preRecoveryProbeChecks
-    );
-    expect(existsSync(outsideWrite)).toBe(true);
-  }
-
-  writeFileSync(scopeMarker, "ready");
-  await waitFor(() => monitorRuntimes()[0]!.condition_matched, 5_000);
-  const after = success(
-    await requestAction(
-      recovered.client,
-      recovered.revision!,
-      154,
-      "inspect",
-      { session_id: sessionId },
-    ),
-    "inspect",
-  ) as {
-    monitors: Array<{ monitor_id: string; state: string }>;
-    events: Array<{ monitor_id: string; reason: string }>;
-  };
-  expect(after.monitors).toEqual(before.monitors.map((monitor, index) => ({
-    ...monitor,
-    state: index === 0 ? "matched" : monitor.state,
-  })));
-  expect(after.events).toContainEqual(expect.objectContaining({
-    monitor_id: "monitor-1",
-    reason: "state_changed",
-  }));
-
-  success(
-    await requestAction(
-      recovered.client,
-      recovered.revision!,
-      155,
-      "close",
-      { session_id: sessionId, policy: "force" },
-    ),
-    "close",
-  );
-  await waitFor(() => !existsSync(tmuxSocket));
-  recovered.client.close();
-  expect(await waitForExit(replacement)).toBe(0);
-  expect(await replacementStdout).toBe("");
-  expect(await replacementStderr).toBe("");
-  await waitFor(() =>
-    !processExists(panePid) &&
-    !processExists(invalidPanePid) &&
-    privateTmuxProcessPids(
-        tmuxSocket,
-        [backendIdentity, invalidBackendIdentity],
-      ).length === 0
-  , 5_000);
-  expect(existsSync(paths.socket)).toBe(false);
-  expect(existsSync(paths.identity)).toBe(false);
-  expect(existsSync(`/tmp/fx-tmux-capture-${backendIdentity}.sock`)).toBe(false);
-  expect(existsSync(`/tmp/fx-tmux-marker-${backendIdentity}.sock`)).toBe(false);
-  expect(existsSync(`/tmp/fx-tmux-capture-${invalidBackendIdentity}.sock`)).toBe(
-    false,
-  );
-  expect(existsSync(`/tmp/fx-tmux-marker-${invalidBackendIdentity}.sock`)).toBe(
-    false,
-  );
-}, 30_000);
 
 test.skipIf(!tmuxAvailable())("private tmux teardown owns partial recovery resources", async () => {
   if (!existsSync("/bin/zsh")) return;
@@ -4035,174 +3744,6 @@ test.skipIf(!tmuxAvailable())("tmux recovery records one raw gap and refuses an 
   await waitForExit(replacement);
 }, 25_000);
 
-test.skipIf(!tmuxAvailable())("tmux reconnect keeps one protocol responder and degrades gap monitors", async () => {
-  if (!existsSync("/bin/zsh")) return;
-  const home = makeHome();
-  const paths = hostPaths(home);
-  const resume = join(home, "resume-query");
-  const command = [
-    "function fx_query() {",
-    "  printf '\\033[6'; sleep 0.03; printf 'n'",
-    "  local fx_reply='' fx_char=''",
-    "  while IFS= read -r -k 1 -t 2 fx_char; do fx_reply+=\"$fx_char\"; [[ $fx_char == R ]] && break; done",
-    "  local fx_hex=$(printf %s \"$fx_reply\" | od -An -tx1 | tr -d ' \\n')",
-    "  printf 'dsr-%s:%s\\n' \"$1\" \"$fx_hex\"",
-    "}",
-    "fx_query one",
-    `while [[ ! -f ${JSON.stringify(resume)} ]]; do sleep 0.02; done`,
-    "fx_query two",
-    "printf 'input-ready\\n'",
-    "IFS= read -r fx_input",
-    "printf 'input:%s\\n' \"$fx_input\"",
-    "trap 'exit 37' TERM",
-    "sleep 30",
-  ].join("\n");
-  const firstHost = startHost(home, undefined, 30_000);
-  await waitFor(() => existsSync(paths.socket));
-  const first = await handshake(paths.socket, { minimum: 4, current: 5 });
-  const started = await startCommand(first.client, first.revision!, 117, {
-    cwd: home,
-    command,
-    shell: { executable: { path: "/bin/zsh", clean_start: true } },
-    backend: "tmux",
-    returnWhen: { match: "dsr-one:" },
-    waitMs: 8_000,
-    initialMonitors: [
-      {
-        condition: { output_contains: "never-cross-gap" },
-        notify_schedule: { on_state_change: {} },
-        lifetime: { until_session_end: {} },
-      },
-      {
-        condition: { process_exit: {} },
-        notify_schedule: { on_match: {} },
-        lifetime: { until_session_end: {} },
-      },
-    ],
-  });
-  const sessionId = (started.session as { session_id: string }).session_id;
-  const firstOutput = await readSession(first.client, first.revision!, 118, sessionId);
-  expect(firstOutput.output.match(/dsr-one:1b5b[0-9a-f]+52/g)).toHaveLength(1);
-
-  const oldIdentity = readFileSync(paths.identity, "utf8");
-  first.client.close();
-  firstHost.kill("SIGKILL");
-  await waitForExit(firstHost);
-  const replacement = startHost(home, undefined, 30_000);
-  await waitFor(
-    () =>
-      existsSync(paths.socket) &&
-      existsSync(paths.identity) &&
-      readFileSync(paths.identity, "utf8") !== oldIdentity,
-    5_000,
-  );
-  const recovered = await handshake(paths.socket, { minimum: 4, current: 5 });
-  const inspected = success(
-    await requestAction(recovered.client, recovered.revision!, 119, "inspect", {
-      session_id: sessionId,
-    }),
-    "inspect",
-  ) as {
-    session: { lifecycle: string; raw_gap: { available_from: { segment: number; offset: number } } };
-    monitors: Array<{ monitor_id: string; state: string }>;
-  };
-  expect(inspected.session.lifecycle).toBe("running");
-  expect(inspected.session.raw_gap.available_from.segment).toBe(2);
-  expect(inspected.monitors).toEqual([
-    { monitor_id: "monitor-1", state: "degraded" },
-    { monitor_id: "monitor-2", state: "active" },
-  ]);
-
-  expect(failure(
-    await requestAction(recovered.client, recovered.revision!, 120, "screen", {
-      session_id: sessionId,
-    }),
-  ).code).toBe("screen_unavailable");
-  writeFileSync(resume, "go");
-  const secondReply = success(
-    await requestAction(recovered.client, recovered.revision!, 121, "wait", {
-      session_id: sessionId,
-      return_when: { match: "dsr-two:" },
-      safety_ceiling_ms: 5_000,
-    }),
-    "wait",
-  );
-  expect(secondReply.outcome).toEqual({ condition_met: {} });
-  const gapCursor = inspected.session.raw_gap.available_from;
-  const afterGap = success(
-    await requestAction(recovered.client, recovered.revision!, 122, "read", {
-      session_id: sessionId,
-      cursor: gapCursor,
-    }),
-    "read",
-  ) as { output: string };
-  expect(afterGap.output.match(/dsr-two:1b5b[0-9a-f]+52/g)).toHaveLength(1);
-
-  const written = success(
-    await requestAction(recovered.client, recovered.revision!, 123, "write", {
-      session_id: sessionId,
-      payload: { text: "hello\n" },
-    }),
-    "write",
-  );
-  expect(written.accepted_bytes).toBe(6);
-  success(
-    await requestAction(recovered.client, recovered.revision!, 124, "wait", {
-      session_id: sessionId,
-      return_when: { match: "input:hello" },
-      safety_ceiling_ms: 5_000,
-    }),
-    "wait",
-  );
-  const screen = await requestAction(
-    recovered.client,
-    recovered.revision!,
-    125,
-    "screen",
-    {
-      session_id: sessionId,
-    },
-  );
-  expect(failure(screen).code).toBe("screen_unavailable");
-
-  success(
-    await requestAction(recovered.client, recovered.revision!, 126, "signal", {
-      session_id: sessionId,
-      signal: "kill",
-    }),
-    "signal",
-  );
-  const waited = success(
-    await requestAction(recovered.client, recovered.revision!, 127, "wait", {
-      session_id: sessionId,
-      return_when: { exit: {} },
-      safety_ceiling_ms: 5_000,
-    }),
-    "wait",
-  );
-  expect(waited.outcome).toEqual({ signal: 9 });
-  success(
-    await requestAction(recovered.client, recovered.revision!, 128, "close", {
-      session_id: sessionId,
-      policy: "force",
-    }),
-    "close",
-  );
-  const rejected = await requestAction(
-    recovered.client,
-    recovered.revision!,
-    129,
-    "write",
-    { session_id: sessionId, payload: { text: "stale\n" } },
-  );
-  expect(failure(rejected).code).toBe("authority_denied");
-  await waitFor(() => !existsSync(join(paths.dir, "tmux.sock")));
-
-  recovered.client.close();
-  replacement.kill("SIGKILL");
-  await waitForExit(replacement);
-}, 30_000);
-
 test.skipIf(!tmuxAvailable())("tmux recovery rejects a replaced pane without signaling it", async () => {
   if (!existsSync("/bin/zsh") || !existsSync("/bin/sleep")) return;
   const home = makeHome();
@@ -4438,7 +3979,6 @@ test("durable authority survives reconnect and rejects every foreign scope", asy
     return_when: { match: "observer-ready" },
     wait_ceiling_ms: NATIVE_STARTUP_OBSERVATION_BUDGET_MS * 2,
     dimensions: { rows: 24, columns: 80 },
-    initial_monitors: [],
   });
   const observerPersistence = observerStart.persistence as {
     grant: { controls: Record<string, boolean> };
@@ -4448,7 +3988,6 @@ test("durable authority survives reconnect and rejects every foreign scope", asy
     screen: true,
     write: false,
     wait: false,
-    monitor: false,
     inspect: true,
     list: true,
     resize: false,
@@ -4530,7 +4069,6 @@ test("direct human leases keep the owning model observational", async () => {
     return_when: { match: "direct-ready" },
     wait_ceiling_ms: 5_000,
     dimensions: { rows: 24, columns: 80 },
-    initial_monitors: [],
   });
   const persistence = directStart.persistence as {
     grant: { actor: string };
@@ -4576,7 +4114,6 @@ test("direct human leases keep the owning model observational", async () => {
       screen: true,
       write: false,
       wait: false,
-      monitor: false,
       inspect: true,
       list: true,
       resize: false,
@@ -4633,7 +4170,6 @@ test("direct human leases keep the owning model observational", async () => {
   expect(failure(deniedLease).code).toBe("authority_denied");
   for (const [action, value] of [
     ["wait", { return_when: { exit: {} }, safety_ceiling_ms: 1 }],
-    ["monitor", { operation: { pause: "model-denied" } }],
     ["resize", { dimensions: { rows: 20, columns: 60 } }],
     ["signal", { signal: "interrupt" }],
     ["close", { policy: "force" }],
@@ -4641,7 +4177,7 @@ test("direct human leases keep the owning model observational", async () => {
     const denied = await requestAction(
       connected.client,
       connected.revision!,
-      189 + ["wait", "monitor", "resize", "signal", "close"].indexOf(action),
+      189 + ["wait", "resize", "signal", "close"].indexOf(action),
       action,
       { session_id: sessionId, ...value, authority: modelAuthority },
     );
@@ -4658,1995 +4194,6 @@ test("direct human leases keep the owning model observational", async () => {
   connected.client.close();
   host.kill("SIGKILL");
   await waitForExit(host);
-}, 20_000);
-
-test.each([
-  { point: "allocation" },
-  { point: "validation" },
-  { point: "persistence" },
-  { point: "timer" },
-  { point: "installation" },
-])("initial monitor $point failure rolls back before child release", async ({ point }) => {
-  const home = makeHome();
-  const paths = hostPaths(home);
-  const marker = join(home, "monitor-started");
-  const host = startHost(home, undefined, 400, {
-    FX_TERMINAL_TEST_FAIL_MONITOR_INSTALL: point,
-  });
-  await waitFor(() => existsSync(paths.socket));
-  const connected = await handshake(paths.socket, { minimum: 4, current: 5 });
-  const initialMonitor = point === "allocation"
-    ? {
-      condition: { custom_probe: { command: "true", cwd: home } },
-      check_schedule: { interval_ms: 25 },
-      notify_schedule: { on_match: {} },
-      lifetime: { until_match: {} },
-    }
-    : {
-      condition: { output_contains: "ready" },
-      notify_schedule: { on_match: {} },
-      lifetime: { until_session_end: {} },
-    };
-  const frame = await requestAction(
-    connected.client,
-    connected.revision!,
-    210,
-    "start",
-    {
-      cwd: home,
-      command: `: > '${marker}'; sleep 30`,
-      shell: { executable: { path: TERMINAL_FIXTURE_SHELL, clean_start: true } },
-      backend: "native",
-      return_when: { started: {} },
-      wait_ceiling_ms: 5_000,
-      dimensions: { rows: 24, columns: 80 },
-      initial_monitors: [initialMonitor],
-    },
-  );
-  expect(failure(frame)).toMatchObject({
-    action: "start",
-    code: ["timer", "installation"].includes(point)
-      ? "startup_failed"
-      : "invalid_request",
-  });
-  expect(existsSync(marker)).toBe(false);
-  expect(directChildPids(host.pid!)).toEqual([]);
-  const terminalState = join(home, ".fx", "sessions", TERMINAL_OWNER_SESSION);
-  expect(readdirSync(terminalState).filter((name) => name.includes("terminal-")))
-    .toEqual([]);
-  connected.client.close();
-  expect(await waitForExit(host)).toBe(0);
-}, 10_000);
-
-test("poll path escapes preserve exact failures only for capable peers", async () => {
-  for (const testCase of [
-    { capabilities: 31, expectedCode: "path_outside_workspace" },
-    { capabilities: 7, expectedCode: "invalid_request" },
-  ]) {
-    const home = makeHome();
-    const outside = mkdtempSync(join(tmpdir(), "fx-terminal-monitor-outside-"));
-    homes.push(outside);
-    writeFileSync(join(outside, "ready"), "ready");
-    symlinkSync(outside, join(home, "escape"));
-    const paths = hostPaths(home);
-    const marker = join(home, "monitor-started");
-    const host = startHost(home, undefined, 500);
-    await waitFor(() => existsSync(paths.socket));
-    const connected = await handshake(
-      paths.socket,
-      { minimum: 4, current: 5 },
-      testCase.capabilities,
-    );
-    const frame = await requestAction(connected.client, connected.revision!, 211, "start", {
-      cwd: home,
-      command: `: > '${marker}'`,
-      shell: { executable: { path: TERMINAL_FIXTURE_SHELL, clean_start: true } },
-      backend: "native",
-      return_when: { exit: {} },
-      wait_ceiling_ms: 5_000,
-      dimensions: { rows: 24, columns: 80 },
-      initial_monitors: [{
-        condition: { path_exists: join(home, "escape", "ready") },
-        check_schedule: { interval_ms: 25 },
-        notify_schedule: { on_match: {} },
-        lifetime: { until_match: {} },
-      }],
-    });
-    expect(failure(frame).code).toBe(testCase.expectedCode);
-    expect(existsSync(marker)).toBe(false);
-    expect(directChildPids(host.pid!)).toEqual([]);
-    const terminalState = join(home, ".fx", "sessions", TERMINAL_OWNER_SESSION);
-    expect(readdirSync(terminalState).filter((name) => name.includes("terminal-")))
-      .toEqual([]);
-    connected.client.close();
-    expect(await waitForExit(host)).toBe(0);
-  }
-}, 10_000);
-
-test("custom probe re-canonicalization rejects a post-install symlink swap", async () => {
-  const home = makeHome();
-  const inside = join(home, "inside");
-  mkdirSync(inside);
-  const outside = mkdtempSync(join(tmpdir(), "fx-terminal-monitor-swap-"));
-  homes.push(outside);
-  const alias = join(home, "probe-cwd");
-  const executed = join(outside, "executed");
-  symlinkSync(inside, alias);
-  const paths = hostPaths(home);
-  const host = startHost(home, undefined, 300);
-  await waitFor(() => existsSync(paths.socket));
-  const connected = await handshake(paths.socket, { minimum: 4, current: 5 });
-  const started = await requestAction(connected.client, connected.revision!, 211, "start", {
-    cwd: home,
-    command: "sleep 30",
-    shell: { executable: { path: TERMINAL_FIXTURE_SHELL, clean_start: true } },
-    backend: "native",
-    return_when: { started: {} },
-    wait_ceiling_ms: 5_000,
-    dimensions: { rows: 24, columns: 80 },
-    initial_monitors: [{
-      condition: {
-        custom_probe: {
-          command: `[ "$(pwd -P)" = '${outside}' ] && : > '${executed}'`,
-          cwd: alias,
-        },
-      },
-      check_schedule: { interval_ms: 500 },
-      notify_schedule: { on_match: {} },
-      lifetime: { until_session_end: {} },
-    }],
-  });
-  const sessionId = (
-    success(started, "start").session as { session_id: string }
-  ).session_id;
-  rmSync(alias);
-  symlinkSync(outside, alias);
-  await Bun.sleep(750);
-  const inspected = success(await requestAction(
-    connected.client,
-    connected.revision!,
-    212,
-    "inspect",
-    { session_id: sessionId },
-  ), "inspect") as { events: unknown[] };
-  expect(inspected.events).toEqual([]);
-  expect(existsSync(executed)).toBe(false);
-  await requestAction(connected.client, connected.revision!, 213, "close", {
-    session_id: sessionId,
-    policy: "force",
-  });
-  connected.client.close();
-  expect(await waitForExit(host)).toBe(0);
-}, 15_000);
-
-test("paused duration monitor expires once and releases idle ownership", async () => {
-  const home = makeHome();
-  const paths = hostPaths(home);
-  const host = startHost(home, undefined, 5_000);
-  await waitFor(() => existsSync(paths.socket));
-  const connected = await handshake(paths.socket, { minimum: 4, current: 5 });
-  const started = await requestAction(connected.client, connected.revision!, 214, "start", {
-    cwd: home,
-    command: "sleep 30",
-    shell: { executable: { path: TERMINAL_FIXTURE_SHELL, clean_start: true } },
-    backend: "native",
-    return_when: { started: {} },
-    wait_ceiling_ms: 5_000,
-    dimensions: { rows: 24, columns: 80 },
-  });
-  const sessionId = (
-    success(started, "start").session as { session_id: string }
-  ).session_id;
-  const added = success(await requestAction(
-    connected.client,
-    connected.revision!,
-    215,
-    "monitor",
-    {
-      session_id: sessionId,
-      operation: {
-        add: {
-          condition: { output_contains: "never" },
-          notify_schedule: { on_state_change: {} },
-          lifetime: { duration_ms: 5_000 },
-        },
-      },
-    },
-  ), "monitor");
-  expect(added.monitor_id).toBe("monitor-1");
-  await Bun.sleep(2_000);
-  success(await requestAction(connected.client, connected.revision!, 216, "monitor", {
-    session_id: sessionId,
-    operation: { pause: "monitor-1" },
-  }), "monitor");
-  await Bun.sleep(3_500);
-  const inspected = success(await requestAction(
-    connected.client,
-    connected.revision!,
-    217,
-    "inspect",
-    { session_id: sessionId },
-  ), "inspect") as {
-    session: { active_monitor_count: number };
-    monitors: unknown[];
-    events: Array<{ reason: string; created_at_ms: number }>;
-  };
-  expect(inspected.session.active_monitor_count).toBe(0);
-  expect(inspected.monitors).toEqual([]);
-  expect(inspected.events.map((event) => event.reason)).toEqual([
-    "paused",
-    "expired",
-  ]);
-  const pausedEvent = inspected.events[0]!;
-  const expiredEvent = inspected.events[1]!;
-  expect(expiredEvent.created_at_ms).toBeGreaterThanOrEqual(pausedEvent.created_at_ms);
-  expect(expiredEvent.created_at_ms - pausedEvent.created_at_ms).toBeLessThan(4_000);
-  await requestAction(connected.client, connected.revision!, 218, "close", {
-    session_id: sessionId,
-    policy: "force",
-  });
-  connected.client.close();
-  expect(await waitForExit(host)).toBe(0);
-}, 20_000);
-
-test("fast split output and exit monitors replay and acknowledge exactly once", async () => {
-  const home = makeHome();
-  const paths = hostPaths(home);
-  const host = startHost(home, undefined, 10_000);
-  await waitFor(() => existsSync(paths.socket));
-  let connected = await handshake(paths.socket, { minimum: 4, current: 5 });
-  const start = await startNativeCommandFixture(
-    connected.client,
-    connected.revision!,
-    211_000,
-    {
-      cwd: home,
-      command: "printf monitor-; sleep 0.05; printf ready; exit 17",
-      shell: { executable: { path: TERMINAL_FIXTURE_SHELL, clean_start: true } },
-      returnWhen: { exit: {} },
-      waitMs: NATIVE_STARTUP_OBSERVATION_BUDGET_MS * 2,
-      dimensions: { rows: 24, columns: 80 },
-      initialMonitors: [
-        {
-          condition: { output_contains: "monitor-ready" },
-          notify_schedule: { on_match: {} },
-          lifetime: { until_session_end: {} },
-        },
-        {
-          condition: { process_exit: {} },
-          notify_schedule: { on_match: {} },
-          lifetime: { until_session_end: {} },
-        },
-        {
-          condition: { exit_code: 17 },
-          notify_schedule: { on_match: {} },
-          lifetime: { until_session_end: {} },
-        },
-        {
-          condition: { output_matches: "monitor-*ready" },
-          notify_schedule: { on_match: {} },
-          lifetime: { until_session_end: {} },
-        },
-        {
-          condition: { screen_matches: "monitor-*ready" },
-          notify_schedule: { on_match: {} },
-          lifetime: { until_session_end: {} },
-        },
-      ],
-    },
-  );
-  const sessionId = (start.session as { session_id: string }).session_id;
-  expect(start.outcome).toEqual({ exited: 17 });
-
-  const firstInspect = await requestAction(
-    connected.client,
-    connected.revision!,
-    212,
-    "inspect",
-    { session_id: sessionId },
-  );
-  const first = success(firstInspect, "inspect") as {
-    events: Array<{ event_id: number; monitor_id: string; reason: string }>;
-  };
-  expect(first.events.map((event) => event.monitor_id).sort()).toEqual([
-    "monitor-1",
-    "monitor-2",
-    "monitor-3",
-    "monitor-4",
-    "monitor-5",
-  ]);
-  expect(first.events.every((event) => event.reason === "matched")).toBe(true);
-  expect(new Set(first.events.map((event) => event.event_id)).size).toBe(5);
-  const lastEventId = Math.max(...first.events.map((event) => event.event_id));
-  connected.client.close();
-
-  await waitFor(() => {
-    if (host.exitCode !== null || !processExists(host.pid!)) {
-      throw new Error("terminal host exited before replay reconnect");
-    }
-    return existsSync(paths.socket);
-  }, 2_000);
-  connected = await handshake(paths.socket, { minimum: 4, current: 5 });
-  const replayed = success(await requestAction(
-    connected.client,
-    connected.revision!,
-    213,
-    "inspect",
-    { session_id: sessionId },
-  ), "inspect") as { events: Array<{ event_id: number }> };
-  expect(replayed.events.map((event) => event.event_id)).toEqual(
-    first.events.map((event) => event.event_id),
-  );
-
-  const currentAuthority = authorityBySession.get(sessionId)! as {
-    proof: { bytes: number[] };
-  };
-  const deniedAcknowledgement = await requestAction(
-    connected.client,
-    connected.revision!,
-    214,
-    "inspect",
-    {
-      session_id: sessionId,
-      acknowledge_event_id: lastEventId,
-      authority: authorityVariant(sessionId, {
-        proof: {
-          bytes: [8, ...currentAuthority.proof.bytes.slice(1)],
-        },
-      }),
-    },
-  );
-  expect(failure(deniedAcknowledgement).code).toBe("authority_denied");
-  const retained = success(await requestAction(
-    connected.client,
-    connected.revision!,
-    215,
-    "inspect",
-    { session_id: sessionId },
-  ), "inspect") as { events: Array<{ event_id: number }> };
-  expect(retained.events.map((event) => event.event_id)).toEqual(
-    first.events.map((event) => event.event_id),
-  );
-
-  const acknowledged = success(await requestAction(
-    connected.client,
-    connected.revision!,
-    216,
-    "inspect",
-    {
-      session_id: sessionId,
-      after_event_id: lastEventId,
-      acknowledge_event_id: lastEventId,
-    },
-  ), "inspect") as { events: unknown[] };
-  expect(acknowledged.events).toEqual([]);
-  connected.client.close();
-  expect(await waitForExit(host)).toBe(0);
-}, NATIVE_STARTUP_OBSERVATION_BUDGET_MS * 6 + 30_000);
-
-const automaticTransitionCases = [
-  "output",
-  "screen",
-  "quiet",
-  "polling",
-  "expiry",
-] as const;
-
-test.each(automaticTransitionCases)(
-  "automatic %s notification and removal survive reconnect as one transition",
-  async (kind) => {
-    const home = makeHome();
-    const paths = hostPaths(home);
-    const watched = join(home, "automatic-ready");
-    if (kind === "polling") writeFileSync(watched, "ready");
-    const condition = kind === "output"
-      ? { output_contains: "transition-ready" }
-      : kind === "screen"
-      ? { screen_matches: "*transition-ready*" }
-      : kind === "quiet"
-      ? { output_quiet_ms: 50 }
-      : kind === "polling"
-      ? { path_exists: watched }
-      : { output_contains: "never" };
-    const definition = {
-      condition,
-      ...(kind === "polling"
-        ? { check_schedule: { interval_ms: 25 } }
-        : {}),
-      notify_schedule: kind === "expiry"
-        ? { on_state_change: {} }
-        : { on_match: {} },
-      lifetime: kind === "expiry"
-        ? { duration_ms: 100 }
-        : { until_match: {} },
-    };
-    const host = startHost(home, undefined, 300);
-    await waitFor(() => existsSync(paths.socket));
-    let connected = await handshake(paths.socket, { minimum: 4, current: 5 });
-    const started = await startInteractiveNativeFixture(
-      connected.client,
-      connected.revision!,
-      230,
-      {
-        cwd: home,
-        command:
-          "stty -echo; printf automatic-fixture-ready; while IFS= read -r line; do eval \"$line\"; done",
-        marker: "automatic-fixture-ready",
-        dimensions: { rows: 6, columns: 40 },
-      },
-    );
-    let correlation = 234;
-    const sessionId = (
-      started.session as { session_id: string }
-    ).session_id;
-    success(await requestAction(
-      connected.client,
-      connected.revision!,
-      correlation++,
-      "monitor",
-      { session_id: sessionId, operation: { add: definition } },
-    ), "monitor");
-    if (kind === "output" || kind === "screen") {
-      success(await requestAction(
-        connected.client,
-        connected.revision!,
-        correlation++,
-        "write",
-        { session_id: sessionId, payload: { text: "printf transition-ready\n" } },
-      ), "write");
-    }
-    let settled: {
-      session: { active_monitor_count: number };
-      monitors: unknown[];
-      events: Array<{ event_id: number; monitor_id: string; reason: string }>;
-    } | undefined;
-    await waitFor(async () => {
-      settled = success(await requestAction(
-        connected.client,
-        connected.revision!,
-        correlation++,
-        "inspect",
-        { session_id: sessionId },
-      ), "inspect") as typeof settled;
-      return settled!.monitors.length === 0 && settled!.events.length === 1;
-    }, 5_000);
-    expect(settled!.session.active_monitor_count).toBe(0);
-    expect(settled!.events).toHaveLength(1);
-    expect(settled!.events[0]).toMatchObject({
-      monitor_id: "monitor-1",
-      reason: kind === "expiry" ? "expired" : "matched",
-    });
-    const eventId = settled!.events[0]!.event_id;
-    connected.client.close();
-
-    await waitFor(() => {
-      if (host.exitCode !== null || !processExists(host.pid!)) {
-        throw new Error(`terminal host exited before ${kind} replay`);
-      }
-      return existsSync(paths.socket);
-    });
-    connected = await handshake(paths.socket, { minimum: 4, current: 5 });
-    const replayed = success(await requestAction(
-      connected.client,
-      connected.revision!,
-      correlation++,
-      "inspect",
-      { session_id: sessionId },
-    ), "inspect") as typeof settled;
-    expect(replayed.monitors).toEqual([]);
-    expect(replayed.events.map((event) => event.event_id)).toEqual([eventId]);
-    const acknowledged = success(await requestAction(
-      connected.client,
-      connected.revision!,
-      correlation++,
-      "inspect",
-      {
-        session_id: sessionId,
-        after_event_id: eventId,
-        acknowledge_event_id: eventId,
-      },
-    ), "inspect") as typeof settled;
-    expect(acknowledged.events).toEqual([]);
-    await requestAction(
-      connected.client,
-      connected.revision!,
-      correlation++,
-      "close",
-      { session_id: sessionId, policy: "force" },
-    );
-    connected.client.close();
-    expect(await waitForExit(host)).toBe(0);
-  },
-  NATIVE_STARTUP_OBSERVATION_BUDGET_MS * 6 + 30_000,
-);
-
-test("non-notifying until-match removal persists without retaining a monitor", async () => {
-  const home = makeHome();
-  const paths = hostPaths(home);
-  const host = startHost(
-    home,
-    undefined,
-    NATIVE_STARTUP_OBSERVATION_BUDGET_MS * 3,
-  );
-  await waitFor(() => existsSync(paths.socket));
-  const connected = await handshake(paths.socket, { minimum: 4, current: 5 });
-  const started = await startNativeShellFixture(
-    connected.client,
-    connected.revision!,
-    240,
-    {
-      cwd: home,
-      shell: { executable: { path: TERMINAL_FIXTURE_SHELL, clean_start: true } },
-      dimensions: { rows: 6, columns: 40 },
-      initialMonitors: [{
-        condition: { output_contains: "silent-ready" },
-        notify_schedule: { on_exit: {} },
-        lifetime: { until_match: {} },
-      }],
-    },
-  );
-  const sessionId = (started.session as { session_id: string }).session_id;
-  let correlation = 241;
-  success(
-    await requestAction(
-      connected.client,
-      connected.revision!,
-      correlation++,
-      "write",
-      {
-        session_id: sessionId,
-        payload: { text: "printf silent-ready\n" },
-      },
-    ),
-    "write",
-  );
-  await waitFor(async () => {
-    const inspected = success(await requestAction(
-      connected.client,
-      connected.revision!,
-      correlation++,
-      "inspect",
-      { session_id: sessionId },
-    ), "inspect") as { monitors: unknown[]; events: unknown[] };
-    if (inspected.monitors.length !== 0) return false;
-    expect(inspected.events).toEqual([]);
-    return true;
-  });
-  await requestAction(
-    connected.client,
-    connected.revision!,
-    correlation++,
-    "close",
-    { session_id: sessionId, policy: "force" },
-  );
-  connected.client.close();
-  host.kill("SIGKILL");
-  await waitForExit(host);
-}, NATIVE_STARTUP_OBSERVATION_BUDGET_MS * 2 + 15_000);
-
-test("every-check schedules follow polling output screen quiet and exit evaluations", async () => {
-  const home = makeHome();
-  const paths = hostPaths(home);
-  const host = startHost(home, undefined, 5_000);
-  await waitFor(() => existsSync(paths.socket));
-  const connected = await handshake(paths.socket, { minimum: 4, current: 5 });
-  const started = await startNativeCommandFixture(
-    connected.client,
-    connected.revision!,
-    214,
-    {
-      cwd: home,
-      command:
-        "sleep 0.08; printf schedule-output; sleep 0.08; printf tail; sleep 0.2; exit 0",
-      shell: { executable: { path: TERMINAL_FIXTURE_SHELL, clean_start: true } },
-      returnWhen: { exit: {} },
-      waitMs: 5_000,
-      dimensions: { rows: 4, columns: 40 },
-      initialMonitors: [
-        {
-          condition: { path_exists: join(home, "never-created") },
-          check_schedule: { interval_ms: 25 },
-          notify_schedule: { every_n_checks: 2 },
-          lifetime: { until_session_end: {} },
-        },
-        {
-          condition: { output_contains: "schedule-output" },
-          notify_schedule: { every_check: {} },
-          lifetime: { until_session_end: {} },
-        },
-        {
-          condition: { screen_matches: "schedule-output*" },
-          notify_schedule: { every_check: {} },
-          lifetime: { duration_ms: 2_000 },
-        },
-        {
-          condition: { output_quiet_ms: 50 },
-          notify_schedule: { every_check: {} },
-          lifetime: { until_session_end: {} },
-        },
-        {
-          condition: { process_exit: {} },
-          notify_schedule: { every_check: {} },
-          lifetime: { until_session_end: {} },
-        },
-      ],
-    },
-  );
-  const sessionId = (started.session as { session_id: string }).session_id;
-  const inspected = success(await requestAction(
-    connected.client,
-    connected.revision!,
-    215,
-    "inspect",
-    { session_id: sessionId },
-  ), "inspect") as {
-    events: Array<{ monitor_id: string; reason: string }>;
-  };
-  const eventsByMonitor = new Map<string, string[]>();
-  for (const event of inspected.events) {
-    const reasons = eventsByMonitor.get(event.monitor_id) ?? [];
-    reasons.push(event.reason);
-    eventsByMonitor.set(event.monitor_id, reasons);
-  }
-  for (let sequence = 1; sequence <= 5; sequence++) {
-    expect(eventsByMonitor.get(`monitor-${sequence}`)).toContain("check");
-  }
-  expect(eventsByMonitor.get("monitor-2")!.length).toBeGreaterThanOrEqual(2);
-  expect(eventsByMonitor.get("monitor-3")!.length).toBeGreaterThanOrEqual(2);
-  connected.client.close();
-  expect(await waitForExit(host)).toBe(0);
-}, NATIVE_STARTUP_OBSERVATION_BUDGET_MS * 2 + 15_000);
-
-test("successful resize alone evaluates the changed screen monitor", async () => {
-  const home = makeHome();
-  const paths = hostPaths(home);
-  const host = startHost(home, undefined, 300);
-  await waitFor(() => existsSync(paths.socket));
-  const connected = await handshake(paths.socket, { minimum: 4, current: 5 });
-  const started = await startNativeCommandFixture(
-    connected.client,
-    connected.revision!,
-    214,
-    {
-      cwd: home,
-      command: "printf 'ab界'; sleep 90",
-      shell: { executable: { path: TERMINAL_FIXTURE_SHELL, clean_start: true } },
-      returnWhen: { match: "ab界" },
-      waitMs: 5_000,
-      dimensions: { rows: 2, columns: 4 },
-      initialMonitors: [{
-        condition: { screen_matches: "ab\n" },
-        notify_schedule: { on_match: {} },
-        lifetime: { until_match: {} },
-      }],
-    },
-  );
-  const sessionId = (started.session as { session_id: string }).session_id;
-  const before = success(await requestAction(
-    connected.client,
-    connected.revision!,
-    215,
-    "inspect",
-    { session_id: sessionId },
-  ), "inspect") as { events: unknown[] };
-  expect(before.events).toEqual([]);
-  success(await requestAction(connected.client, connected.revision!, 216, "resize", {
-    session_id: sessionId,
-    dimensions: { rows: 2, columns: 3 },
-  }), "resize");
-  const after = success(await requestAction(
-    connected.client,
-    connected.revision!,
-    217,
-    "inspect",
-    { session_id: sessionId },
-  ), "inspect") as {
-    events: Array<{ monitor_id: string; reason: string }>;
-  };
-  expect(after.events).toEqual([{
-    event_id: expect.any(Number),
-    monitor_id: "monitor-1",
-    reason: "matched",
-    lifecycle: "running",
-    cursor: expect.any(Object),
-    created_at_ms: expect.any(Number),
-  }]);
-  await requestAction(connected.client, connected.revision!, 218, "close", {
-    session_id: sessionId,
-    policy: "force",
-  });
-  connected.client.close();
-  expect(await waitForExit(host)).toBe(0);
-}, NATIVE_STARTUP_OBSERVATION_BUDGET_MS * 2 + 15_000);
-
-test("screen projection failure leaves every resize owner unchanged", async () => {
-  const home = makeHome();
-  const paths = hostPaths(home);
-  const winchMarker = join(home, "unexpected-winch");
-  const sizeFile = join(home, "pty-size");
-  const host = startHost(home, undefined, 5_000, {
-    FX_TERMINAL_TEST_FAIL_MONITOR_SCREEN_PROJECTION_ALLOCATION: "1",
-  });
-  await waitFor(() => existsSync(paths.socket));
-  const connected = await handshake(paths.socket, { minimum: 4, current: 5 });
-  const started = await startInteractiveNativeFixture(
-    connected.client,
-    connected.revision!,
-    219_000,
-    {
-      cwd: home,
-      command:
-        `trap ': > "${winchMarker}"' WINCH; printf resize-ready; ` +
-        `while IFS= read -r line; do eval "$line"; done`,
-      marker: "resize-ready",
-      dimensions: { rows: 4, columns: 12 },
-      initialMonitors: [{
-        condition: { screen_matches: "never-match" },
-        notify_schedule: { on_match: {} },
-        lifetime: { until_session_end: {} },
-      }],
-    },
-  );
-  const sessionId = (started.session as { session_id: string }).session_id;
-  await Bun.sleep(100);
-  const beforeInspect = success(await requestAction(
-    connected.client,
-    connected.revision!,
-    220,
-    "inspect",
-    { session_id: sessionId },
-  ), "inspect");
-  const beforeScreen = success(await requestAction(
-    connected.client,
-    connected.revision!,
-    221,
-    "screen",
-    { session_id: sessionId },
-  ), "screen");
-  const stateDir = join(
-    home,
-    ".fx",
-    "sessions",
-    TERMINAL_OWNER_SESSION,
-    "terminal",
-    "state",
-  );
-  const durableBefore = new Map(
-    readdirSync(stateDir)
-      .filter((name) => name.includes(sessionId))
-      .map((name) => [name, readFileSync(join(stateDir, name))]),
-  );
-
-  const resized = await requestAction(
-    connected.client,
-    connected.revision!,
-    222,
-    "resize",
-    { session_id: sessionId, dimensions: { rows: 7, columns: 19 } },
-  );
-  expect(failure(resized)).toMatchObject({
-    action: "resize",
-    code: "invalid_request",
-  });
-  await Bun.sleep(100);
-  const afterInspect = success(await requestAction(
-    connected.client,
-    connected.revision!,
-    223,
-    "inspect",
-    { session_id: sessionId },
-  ), "inspect");
-  const afterScreen = success(await requestAction(
-    connected.client,
-    connected.revision!,
-    224,
-    "screen",
-    { session_id: sessionId },
-  ), "screen");
-  expect(afterInspect).toEqual(beforeInspect);
-  expect(afterScreen).toEqual(beforeScreen);
-  expect(existsSync(winchMarker)).toBe(false);
-  const durableAfter = new Map(
-    readdirSync(stateDir)
-      .filter((name) => name.includes(sessionId))
-      .map((name) => [name, readFileSync(join(stateDir, name))]),
-  );
-  expect([...durableAfter.keys()].sort()).toEqual([...durableBefore.keys()].sort());
-  for (const [name, bytes] of durableBefore) {
-    expect(durableAfter.get(name)).toEqual(bytes);
-  }
-
-  success(await requestAction(
-    connected.client,
-    connected.revision!,
-    225,
-    "write",
-    { session_id: sessionId, payload: { text: `stty size > '${sizeFile}'\n` } },
-  ), "write");
-  await waitFor(() =>
-    existsSync(sizeFile) && readFileSync(sizeFile, "utf8").trim() === "4 12"
-  );
-  expect(readFileSync(sizeFile, "utf8").trim()).toBe("4 12");
-  await requestAction(connected.client, connected.revision!, 226, "close", {
-    session_id: sessionId,
-    policy: "force",
-  });
-  connected.client.close();
-  expect(await waitForExit(host)).toBe(0);
-}, NATIVE_STARTUP_OBSERVATION_BUDGET_MS * 6 + 30_000);
-
-test("PTY output projection failure skips screen checks while output checks continue", async () => {
-  const home = makeHome();
-  const paths = hostPaths(home);
-  const host = startHost(home, undefined, 300, {
-    FX_TERMINAL_TEST_FAIL_MONITOR_OUTPUT_SCREEN_PROJECTION_ALLOCATION: "1",
-  });
-  await waitFor(() => existsSync(paths.socket));
-  const connected = await handshake(paths.socket, { minimum: 4, current: 5 });
-  const started = await startInteractiveNativeFixture(
-    connected.client,
-    connected.revision!,
-    227,
-    {
-      cwd: home,
-      command: "printf projection-ready; IFS= read -r _",
-      marker: "projection-ready",
-      dimensions: { rows: 6, columns: 40 },
-      initialMonitors: [
-        {
-          condition: { output_contains: "projection-ready" },
-          notify_schedule: { on_match: {} },
-          lifetime: { until_match: {} },
-        },
-        {
-          condition: { screen_matches: "*projection-ready*" },
-          notify_schedule: { every_check: {} },
-          lifetime: { until_session_end: {} },
-        },
-      ],
-    },
-  );
-  const sessionId = (
-    started.session as { session_id: string }
-  ).session_id;
-  let correlation = 231;
-  let inspected: {
-    monitors: Array<{ monitor_id: string; state: string }>;
-    events: Array<{ monitor_id: string; reason: string }>;
-  } | undefined;
-  await waitFor(async () => {
-    inspected = success(await requestAction(
-      connected.client,
-      connected.revision!,
-      correlation++,
-      "inspect",
-      { session_id: sessionId },
-    ), "inspect") as typeof inspected;
-    return inspected!.events.length === 1;
-  });
-  expect(inspected!.events).toEqual([{
-    event_id: expect.any(Number),
-    monitor_id: "monitor-1",
-    reason: "matched",
-    lifecycle: "running",
-    cursor: expect.any(Object),
-    created_at_ms: expect.any(Number),
-  }]);
-  expect(inspected!.monitors).toEqual([{
-    monitor_id: "monitor-2",
-    state: "active",
-  }]);
-  const monitorFile = join(
-    home,
-    ".fx",
-    "sessions",
-    TERMINAL_OWNER_SESSION,
-    "terminal",
-    "state",
-    `monitors-${sessionId}.json`,
-  );
-  const durable = JSON.parse(readFileSync(monitorFile, "utf8")) as {
-    monitors: Array<{
-      monitor_id: string;
-      runtime: { check_count: number; notification_count: number };
-    }>;
-  };
-  expect(durable.monitors).toHaveLength(1);
-  expect(durable.monitors[0]).toMatchObject({
-    monitor_id: "monitor-2",
-    runtime: { check_count: 0, notification_count: 0 },
-  });
-  await requestAction(
-    connected.client,
-    connected.revision!,
-    correlation++,
-    "close",
-    { session_id: sessionId, policy: "force" },
-  );
-  connected.client.close();
-  expect(await waitForExit(host)).toBe(0);
-}, NATIVE_STARTUP_OBSERVATION_BUDGET_MS * 6 + 30_000);
-
-test("filesystem quiet and exact custom-probe monitors run without a client", async () => {
-  const home = makeHome();
-  const paths = hostPaths(home);
-  const watched = join(home, "watched.txt");
-  const probeMarker = join(home, "probe-ready");
-  const host = startHost(home, undefined, 10_000);
-  await waitFor(() => existsSync(paths.socket));
-  let connected = await handshake(paths.socket, { minimum: 4, current: 5 });
-  const probe = `test -f '${probeMarker}'`;
-  const started = await requestAction(
-    connected.client,
-    connected.revision!,
-    215,
-    "start",
-    {
-      cwd: home,
-      command: "sleep 30",
-      shell: { executable: { path: TERMINAL_FIXTURE_SHELL, clean_start: true } },
-      backend: "native",
-      return_when: { started: {} },
-      wait_ceiling_ms: 5_000,
-      dimensions: { rows: 24, columns: 80 },
-      initial_monitors: [
-        {
-          condition: { path_exists: watched },
-          check_schedule: { interval_ms: 25 },
-          notify_schedule: { on_match: {} },
-          lifetime: { until_match: {} },
-        },
-        {
-          condition: { path_changed: watched },
-          check_schedule: { interval_ms: 25 },
-          notify_schedule: { on_match: {} },
-          lifetime: { until_match: {} },
-        },
-        {
-          condition: { path_size: { path: watched, minimum_bytes: 5 } },
-          check_schedule: { interval_ms: 25 },
-          notify_schedule: { on_match: {} },
-          lifetime: { until_match: {} },
-        },
-        {
-          condition: { output_quiet_ms: 50 },
-          notify_schedule: { on_match: {} },
-          lifetime: { until_match: {} },
-        },
-        {
-          condition: { custom_probe: { command: probe, cwd: home } },
-          check_schedule: { interval_ms: 25 },
-          notify_schedule: { on_match: {} },
-          lifetime: { until_match: {} },
-        },
-      ],
-    },
-  );
-  const sessionId = (success(started, "start").session as { session_id: string }).session_id;
-
-  const broadened = await requestAction(
-    connected.client,
-    connected.revision!,
-    216,
-    "monitor",
-    {
-      session_id: sessionId,
-      operation: {
-        update: {
-          monitor_id: "monitor-5",
-          definition: {
-            condition: { custom_probe: { command: "true", cwd: home } },
-            check_schedule: { interval_ms: 25 },
-            notify_schedule: { on_match: {} },
-            lifetime: { until_match: {} },
-          },
-        },
-      },
-    },
-  );
-  expect(failure(broadened).code).toBe("authority_denied");
-
-  connected.client.close();
-  writeFileSync(watched, "ready");
-  writeFileSync(probeMarker, "ready");
-  await Bun.sleep(250);
-  connected = await handshake(paths.socket, { minimum: 4, current: 5 });
-  let inspectValue: { events: Array<{ monitor_id: string }> } = { events: [] };
-  let correlation = 217;
-  await waitFor(async () => {
-    inspectValue = success(await requestAction(
-      connected.client,
-      connected.revision!,
-      correlation++,
-      "inspect",
-      { session_id: sessionId },
-    ), "inspect") as typeof inspectValue;
-    return new Set(inspectValue.events.map((event) => event.monitor_id)).size === 5;
-  }, 5_000);
-  expect(new Set(inspectValue.events.map((event) => event.monitor_id))).toEqual(
-    new Set(["monitor-1", "monitor-2", "monitor-3", "monitor-4", "monitor-5"]),
-  );
-  const inspected = success(await requestAction(
-    connected.client,
-    connected.revision!,
-    correlation++,
-    "inspect",
-    { session_id: sessionId },
-  ), "inspect") as { session: { active_monitor_count: number } };
-  expect(inspected.session.active_monitor_count).toBe(0);
-  await requestAction(connected.client, connected.revision!, correlation++, "close", {
-    session_id: sessionId,
-    policy: "force",
-  });
-  connected.client.close();
-  host.kill("SIGKILL");
-  await waitForExit(host);
-}, 20_000);
-
-test("TCP and HTTP readiness use bounded local polling fixtures", async () => {
-  let requestedPath = "";
-  const server = Bun.serve({
-    hostname: "127.0.0.1",
-    port: 0,
-    fetch: (request) => {
-      requestedPath = new URL(request.url).pathname + new URL(request.url).search;
-      return new Response("ready");
-    },
-  });
-  try {
-    const home = makeHome();
-    const paths = hostPaths(home);
-    const host = startHost(home, undefined, 10_000);
-    await waitFor(() => existsSync(paths.socket));
-    const connected = await handshake(paths.socket, { minimum: 4, current: 5 });
-    const started = await requestAction(
-      connected.client,
-      connected.revision!,
-      230,
-      "start",
-      {
-        cwd: home,
-        command: "sleep 30",
-        shell: { executable: { path: TERMINAL_FIXTURE_SHELL, clean_start: true } },
-        backend: "native",
-        return_when: { started: {} },
-        wait_ceiling_ms: 5_000,
-        dimensions: { rows: 24, columns: 80 },
-        initial_monitors: [
-          {
-            condition: { tcp_ready: { host: "127.0.0.1", port: server.port } },
-            check_schedule: { interval_ms: 25 },
-            notify_schedule: { on_match: {} },
-            lifetime: { until_match: {} },
-          },
-          {
-            condition: { http_ready: `http://127.0.0.1:${server.port}/ready?probe=1` },
-            check_schedule: { interval_ms: 25 },
-            notify_schedule: { on_match: {} },
-            lifetime: { until_match: {} },
-          },
-        ],
-      },
-    );
-    const sessionId = (success(started, "start").session as { session_id: string }).session_id;
-    let events: Array<{ monitor_id: string }> = [];
-    let correlation = 231;
-    await waitFor(async () => {
-      const inspected = success(await requestAction(
-        connected.client,
-        connected.revision!,
-        correlation++,
-        "inspect",
-        { session_id: sessionId },
-      ), "inspect") as { events: typeof events };
-      events = inspected.events;
-      return events.length === 2;
-    }, 5_000);
-    expect(events.map((event) => event.monitor_id).sort()).toEqual([
-      "monitor-1",
-      "monitor-2",
-    ]);
-    expect(requestedPath).toBe("/ready?probe=1");
-    await requestAction(connected.client, connected.revision!, correlation++, "close", {
-      session_id: sessionId,
-      policy: "force",
-    });
-    connected.client.close();
-    host.kill("SIGKILL");
-    await waitForExit(host);
-  } finally {
-    server.stop(true);
-  }
-}, 20_000);
-
-test("closing a start-ceiling session releases initial monitor ownership", async () => {
-  const home = makeHome();
-  const paths = hostPaths(home);
-  const host = startHost(home, undefined, 300, {
-    FX_TERMINAL_TEST_COMMAND_BOUNDARY_DELAY_MS: "1000",
-  });
-  await waitFor(() => existsSync(paths.socket));
-  const connected = await handshake(paths.socket, { minimum: 4, current: 5 });
-  const started = success(await requestAction(
-    connected.client,
-    connected.revision!,
-    240,
-    "start",
-    {
-      cwd: home,
-      command: "sleep 30",
-      shell: { executable: { path: TERMINAL_FIXTURE_SHELL, clean_start: true } },
-      backend: "native",
-      return_when: { started: {} },
-      wait_ceiling_ms: 25,
-      dimensions: { rows: 24, columns: 80 },
-      initial_monitors: [{
-        condition: { output_contains: "never-produced" },
-        notify_schedule: { on_match: {} },
-        lifetime: { until_session_end: {} },
-      }],
-    },
-  ), "start") as {
-    session: {
-      session_id: string;
-      lifecycle: string;
-      active_monitor_count: number;
-    };
-    outcome: unknown;
-  };
-  expect(started.session).toMatchObject({
-    lifecycle: "starting",
-    active_monitor_count: 1,
-  });
-  expect(started.outcome).toEqual({ safety_ceiling: {} });
-
-  const closed = success(await requestAction(
-    connected.client,
-    connected.revision!,
-    241,
-    "close",
-    { session_id: started.session.session_id, policy: "force" },
-  ), "close");
-  expect(closed.session).toMatchObject({
-    lifecycle: "closed",
-    active_monitor_count: 0,
-  });
-  connected.client.close();
-  await waitFor(() => !existsSync(paths.identity), 2_000);
-  expect(await waitForExit(host)).toBe(0);
-}, 10_000);
-
-test("custom probes bound failures output timeout and close cleanup", async () => {
-  const home = makeHome();
-  const paths = hostPaths(home);
-  const probePidPath = join(home, "probe.pid");
-  const host = startHost(home, undefined, 500);
-  await waitFor(() => existsSync(paths.socket));
-  const connected = await handshake(paths.socket, { minimum: 4, current: 5 });
-  const started = await requestAction(connected.client, connected.revision!, 240, "start", {
-    cwd: home,
-    command: "sleep 30",
-    shell: { executable: { path: TERMINAL_FIXTURE_SHELL, clean_start: true } },
-    backend: "native",
-    return_when: { started: {} },
-    wait_ceiling_ms: 5_000,
-    dimensions: { rows: 24, columns: 80 },
-    initial_monitors: [
-      {
-        condition: {
-          custom_probe: {
-            command: "yes x | head -c 65536",
-            cwd: home,
-          },
-        },
-        check_schedule: { interval_ms: 10 },
-        notify_schedule: { on_match: {} },
-        lifetime: { until_session_end: {} },
-      },
-      {
-        condition: { custom_probe: { command: "exit 7", cwd: home } },
-        check_schedule: { interval_ms: 10 },
-        notify_schedule: { on_match: {} },
-        lifetime: { until_session_end: {} },
-      },
-      {
-        condition: {
-          custom_probe: {
-            command: `printf '%s' "$$" > '${probePidPath}'; sleep 20`,
-            cwd: home,
-          },
-        },
-        check_schedule: { interval_ms: 10 },
-        notify_schedule: { on_match: {} },
-        lifetime: { until_session_end: {} },
-      },
-    ],
-  });
-  const sessionId = (success(started, "start").session as { session_id: string }).session_id;
-  await waitFor(() => existsSync(probePidPath), 8_000);
-  const probePid = Number(readFileSync(probePidPath, "utf8"));
-  expect(processExists(probePid)).toBe(true);
-  const beforeClose = success(await requestAction(
-    connected.client,
-    connected.revision!,
-    241,
-    "inspect",
-    { session_id: sessionId },
-  ), "inspect") as {
-    session: { active_monitor_count: number };
-    events: Array<{ monitor_id: string }>;
-  };
-  expect(beforeClose.session.active_monitor_count).toBe(3);
-  expect(beforeClose.events).toEqual([]);
-  const closeStartedAt = Date.now();
-  const closed = success(await requestAction(
-    connected.client,
-    connected.revision!,
-    242,
-    "close",
-    { session_id: sessionId, policy: "force" },
-  ), "close");
-  expect(closed.session).toMatchObject({ lifecycle: "closed" });
-  expect(Date.now() - closeStartedAt).toBeLessThan(5_500);
-  await waitFor(() => !processExists(probePid), 5_000);
-  connected.client.close();
-  expect(await waitForExit(host)).toBe(0);
-}, 30_000);
-
-test("slow custom probe does not block output monitoring or inspect replies", async () => {
-  const home = makeHome();
-  const paths = hostPaths(home);
-  const probeStarted = join(home, "slow-probe-started");
-  const host = startHost(home, undefined, 300);
-  await waitFor(() => existsSync(paths.socket));
-  const connected = await handshake(paths.socket, { minimum: 4, current: 5 });
-  const started = await startInteractiveNativeFixture(
-    connected.client,
-    connected.revision!,
-    245_000,
-    {
-      cwd: home,
-      command: "printf slow-probe-fixture-ready; while IFS= read -r _; do :; done",
-      marker: "slow-probe-fixture-ready",
-      dimensions: { rows: 24, columns: 80 },
-      initialMonitors: [
-        {
-          condition: {
-            custom_probe: {
-              command: `: > '${probeStarted}'; sleep 1.5; false`,
-              cwd: home,
-            },
-          },
-          check_schedule: { interval_ms: 10 },
-          notify_schedule: { on_match: {} },
-          lifetime: { until_session_end: {} },
-        },
-        {
-          condition: { output_contains: "fast-ready" },
-          notify_schedule: { on_match: {} },
-          lifetime: { until_session_end: {} },
-        },
-        {
-          condition: { screen_matches: "*fast-ready*" },
-          notify_schedule: { on_match: {} },
-          lifetime: { until_session_end: {} },
-        },
-      ],
-    },
-  );
-  const sessionId = (started.session as { session_id: string }).session_id;
-  await waitFor(() => existsSync(probeStarted), 3_000);
-  const startedAt = Date.now();
-  success(await requestAction(connected.client, connected.revision!, 246, "write", {
-    session_id: sessionId,
-    payload: { text: "printf 'fast-ready\\n'\n" },
-  }), "write");
-  let events: Array<{ monitor_id: string }> = [];
-  let correlation = 247;
-  await waitFor(async () => {
-    const inspected = success(await requestAction(
-      connected.client,
-      connected.revision!,
-      correlation++,
-      "inspect",
-      { session_id: sessionId },
-    ), "inspect") as { events: typeof events };
-    events = inspected.events;
-    const monitorIds = new Set(events.map((event) => event.monitor_id));
-    return monitorIds.has("monitor-2") && monitorIds.has("monitor-3");
-  }, 1_000);
-  expect(Date.now() - startedAt).toBeLessThan(1_000);
-  await requestAction(connected.client, connected.revision!, correlation++, "close", {
-    session_id: sessionId,
-    policy: "force",
-  });
-  connected.client.close();
-  expect(await waitForExit(host)).toBe(0);
-}, NATIVE_STARTUP_OBSERVATION_BUDGET_MS * 6 + 30_000);
-
-test.skipIf(!tmuxAvailable())("simultaneous notifications compose with ordered acknowledgement and mutation", async () => {
-  const home = makeHome();
-  const paths = hostPaths(home);
-  const barrier = join(home, "monitor-event-order");
-  const gate = join(home, "monitor-event-gate");
-  const host = startHost(home, undefined, 300, {
-    FX_TERMINAL_TEST_ORDER_BARRIER: barrier,
-    FX_TERMINAL_TEST_ORDER_HOLD_CORRELATION: "248",
-  });
-  await waitFor(() => existsSync(paths.socket));
-  const control = await handshake(paths.socket, { minimum: 4, current: 5 });
-  const mutation = await handshake(paths.socket, { minimum: 4, current: 5 });
-  const definition = {
-    condition: { path_exists: gate },
-    check_schedule: { interval_ms: 25 },
-    notify_schedule: { on_match: {} },
-    lifetime: { until_session_end: {} },
-  };
-  const started = await startCommand(control.client, control.revision!, 244, {
-    cwd: home,
-    command: "sleep 30",
-    shell: { executable: { path: TERMINAL_FIXTURE_SHELL, clean_start: true } },
-    backend: "tmux",
-    initialMonitors: [
-      definition,
-      definition,
-      {
-        condition: { output_contains: "never" },
-        notify_schedule: { on_state_change: {} },
-        lifetime: { until_session_end: {} },
-      },
-    ],
-  });
-  const sessionId = (started.session as { session_id: string }).session_id;
-  success(await requestAction(
-    control.client,
-    control.revision!,
-    245,
-    "monitor",
-    { session_id: sessionId, operation: { pause: "monitor-3" } },
-  ), "monitor");
-  const before = success(await requestAction(
-    control.client,
-    control.revision!,
-    246,
-    "inspect",
-    { session_id: sessionId },
-  ), "inspect") as {
-    events: Array<{ event_id: number; monitor_id: string; reason: string }>;
-  };
-  const acknowledgedThrough = before.events.at(-1)?.event_id;
-  expect(acknowledgedThrough).toBeDefined();
-
-  control.client.send(encodeFrame(
-    control.revision!,
-    1,
-    actionSubjects.inspect,
-    248,
-    { request: { inspect: withAuthority("inspect", {
-      session_id: sessionId,
-      after_event_id: acknowledgedThrough,
-      acknowledge_event_id: acknowledgedThrough,
-    }) } },
-    1,
-  ));
-  await waitFor(() => existsSync(`${barrier}.248.ready`));
-  mutation.client.send(encodeFrame(
-    mutation.revision!,
-    1,
-    actionSubjects.monitor,
-    249,
-    { request: { monitor: withAuthority("monitor", {
-      session_id: sessionId,
-      operation: { resume: "monitor-3" },
-    }) } },
-    1,
-  ));
-  await waitFor(() => existsSync(`${barrier}.249.admitted`));
-
-  writeFileSync(gate, "ready");
-  await waitFor(
-    () => durableEventIds(home, sessionId).filter(
-      (eventId) => eventId > acknowledgedThrough!,
-    ).length >= 2,
-    5_000,
-  );
-  writeFileSync(`${barrier}.248.release`, "release");
-  success(await control.client.read(), "inspect");
-  success(await mutation.client.read(), "monitor");
-
-  const after = success(await requestAction(
-    control.client,
-    control.revision!,
-    250,
-    "inspect",
-    { session_id: sessionId, after_event_id: acknowledgedThrough },
-  ), "inspect") as {
-    monitors: Array<{ monitor_id: string; state: string }>;
-    events: Array<{ event_id: number; monitor_id: string; reason: string }>;
-  };
-  expect(after.events).toHaveLength(3);
-  expect(after.events.map((event) => event.event_id)).toEqual(
-    [...after.events.map((event) => event.event_id)].sort(
-      (left, right) => left - right,
-    ),
-  );
-  expect(new Set(after.events.map((event) => event.event_id)).size).toBe(3);
-  expect(after.events.slice(0, 2).map((event) => event.reason)).toEqual([
-    "matched",
-    "matched",
-  ]);
-  expect(after.events[2]).toMatchObject({
-    monitor_id: "monitor-3",
-    reason: "resumed",
-  });
-  expect(after.monitors).toContainEqual({
-    monitor_id: "monitor-3",
-    state: "active",
-  });
-  const eventIds = after.events.map((event) => event.event_id);
-  const monitorFile = join(
-    home,
-    ".fx",
-    "sessions",
-    TERMINAL_OWNER_SESSION,
-    "terminal",
-    "state",
-    `monitors-${sessionId}.json`,
-  );
-  const checkCounts = () => {
-    const persisted = JSON.parse(readFileSync(monitorFile, "utf8")) as {
-      monitors: Array<{
-        monitor_id: string;
-        runtime: { check_count: number };
-      }>;
-    };
-    return new Map(
-      persisted.monitors.map((monitor) => [
-        monitor.monitor_id,
-        monitor.runtime.check_count,
-      ]),
-    );
-  };
-  const beforeRecovery = checkCounts();
-  const oldIdentity = readFileSync(paths.identity, "utf8");
-  control.client.close();
-  mutation.client.close();
-  host.kill("SIGKILL");
-  await waitForExit(host);
-
-  const replacement = startHost(home, undefined, 300);
-  await waitFor(() =>
-    existsSync(paths.socket) && existsSync(paths.identity) &&
-    readFileSync(paths.identity, "utf8") !== oldIdentity
-  );
-  const reopened = await handshake(paths.socket, { minimum: 4, current: 5 });
-  const replayed = success(await requestAction(
-    reopened.client,
-    reopened.revision!,
-    251,
-    "inspect",
-    { session_id: sessionId, after_event_id: acknowledgedThrough },
-  ), "inspect") as {
-    events: Array<{ event_id: number }>;
-  };
-  expect(replayed.events.map((event) => event.event_id)).toEqual(eventIds);
-  const afterRecovery = checkCounts();
-  for (const monitorId of ["monitor-1", "monitor-2"]) {
-    expect(afterRecovery.get(monitorId)).toBeGreaterThanOrEqual(
-      beforeRecovery.get(monitorId)!,
-    );
-  }
-
-  await forceCloseTerminalFixture(
-    reopened.client,
-    reopened.revision!,
-    252,
-    sessionId,
-  );
-  reopened.client.close();
-  expect(await waitForExit(replacement)).toBe(0);
-}, 20_000);
-
-test("private monitor add update pause resume and remove preserve stable IDs", async () => {
-  const home = makeHome();
-  const paths = hostPaths(home);
-  const host = startHost(home, undefined, 10_000);
-  await waitFor(() => existsSync(paths.socket));
-  const connected = await handshake(paths.socket, { minimum: 4, current: 5 });
-  const started = await startNativeShellFixture(
-    connected.client,
-    connected.revision!,
-    250_000,
-    {
-      cwd: home,
-      shell: { executable: { path: TERMINAL_FIXTURE_SHELL, clean_start: true } },
-    },
-  );
-  const sessionId = (started.session as { session_id: string }).session_id;
-  const firstDefinition = {
-    condition: { path_exists: join(home, "later") },
-    check_schedule: { interval_ms: 25 },
-    notify_schedule: { on_match: {} },
-    lifetime: { until_session_end: {} },
-  };
-  const added = success(await requestAction(
-    connected.client,
-    connected.revision!,
-    251,
-    "monitor",
-    { session_id: sessionId, operation: { add: firstDefinition } },
-  ), "monitor");
-  expect(added.monitor_id).toBe("monitor-1");
-
-  await requestAction(connected.client, connected.revision!, 252, "monitor", {
-    session_id: sessionId,
-    operation: { pause: "monitor-1" },
-  });
-  let inspected = success(await requestAction(
-    connected.client,
-    connected.revision!,
-    253,
-    "inspect",
-    { session_id: sessionId },
-  ), "inspect") as { monitors: Array<{ monitor_id: string; state: string }> };
-  expect(inspected.monitors).toEqual([{ monitor_id: "monitor-1", state: "paused" }]);
-
-  await requestAction(connected.client, connected.revision!, 254, "monitor", {
-    session_id: sessionId,
-    operation: { resume: "monitor-1" },
-  });
-  const updated = success(await requestAction(
-    connected.client,
-    connected.revision!,
-    255,
-    "monitor",
-    {
-      session_id: sessionId,
-      operation: {
-        update: {
-          monitor_id: "monitor-1",
-          definition: {
-            condition: { output_contains: "never" },
-            notify_schedule: { on_state_change: {} },
-            lifetime: { until_session_end: {} },
-          },
-        },
-      },
-    },
-  ), "monitor");
-  expect(updated.monitor_id).toBe("monitor-1");
-  inspected = success(await requestAction(
-    connected.client,
-    connected.revision!,
-    256,
-    "inspect",
-    { session_id: sessionId },
-  ), "inspect") as typeof inspected;
-  expect(inspected.monitors).toEqual([{ monitor_id: "monitor-1", state: "active" }]);
-
-  await requestAction(connected.client, connected.revision!, 257, "monitor", {
-    session_id: sessionId,
-    operation: { remove: "monitor-1" },
-  });
-  inspected = success(await requestAction(
-    connected.client,
-    connected.revision!,
-    258,
-    "inspect",
-    { session_id: sessionId },
-  ), "inspect") as typeof inspected;
-  expect(inspected.monitors).toEqual([]);
-  const second = success(await requestAction(
-    connected.client,
-    connected.revision!,
-    259,
-    "monitor",
-    { session_id: sessionId, operation: { add: firstDefinition } },
-  ), "monitor");
-  expect(second.monitor_id).toBe("monitor-2");
-  await requestAction(connected.client, connected.revision!, 260, "monitor", {
-    session_id: sessionId,
-    operation: { remove: "monitor-2" },
-  });
-  await requestAction(connected.client, connected.revision!, 261, "close", {
-    session_id: sessionId,
-    policy: "force",
-  });
-  connected.client.close();
-  host.kill("SIGKILL");
-  await waitForExit(host);
-}, NATIVE_STARTUP_OBSERVATION_BUDGET_MS * 2 + 30_000);
-
-const monitorOperationFailureCases = (
-  ["add", "update", "pause", "resume", "remove"] as const
-).flatMap((operation) => (
-  ["allocation", "arming", "persistence"] as const
-).map((boundary) => ({ operation, boundary })));
-
-test.each(monitorOperationFailureCases)(
-  "monitor $operation is failure-atomic at $boundary",
-  async ({ operation, boundary }) => {
-    const home = makeHome();
-    const paths = hostPaths(home);
-    const host = startHost(home, undefined, 300, {
-      FX_TERMINAL_TEST_FAIL_MONITOR_OPERATION: `${operation}:${boundary}`,
-    });
-    await waitFor(() => existsSync(paths.socket));
-    const connected = await handshake(paths.socket, { minimum: 4, current: 5 });
-    const originalDefinition = {
-      condition: { output_contains: "original-never" },
-      notify_schedule: { on_state_change: {} },
-      lifetime: { until_session_end: {} },
-    };
-    const started = await requestAction(
-      connected.client,
-      connected.revision!,
-      262,
-      "start",
-      {
-        cwd: home,
-        command: "sleep 30",
-        shell: { executable: { path: TERMINAL_FIXTURE_SHELL, clean_start: true } },
-        backend: "native",
-        return_when: { started: {} },
-        wait_ceiling_ms: 20_000,
-        dimensions: { rows: 24, columns: 80 },
-        initial_monitors: operation === "add" ? [] : [originalDefinition],
-      },
-    );
-    const sessionId = (
-      success(started, "start").session as { session_id: string }
-    ).session_id;
-    if (operation === "resume") {
-      success(await requestAction(
-        connected.client,
-        connected.revision!,
-        263,
-        "monitor",
-        { session_id: sessionId, operation: { pause: "monitor-1" } },
-      ), "monitor");
-    }
-    const before = success(await requestAction(
-      connected.client,
-      connected.revision!,
-      264,
-      "inspect",
-      { session_id: sessionId },
-    ), "inspect") as {
-      session: { active_monitor_count: number };
-      monitors: unknown[];
-      events: unknown[];
-    };
-    const failedOperation = operation === "add"
-      ? { add: originalDefinition }
-      : operation === "update"
-      ? {
-        update: {
-          monitor_id: "monitor-1",
-          definition: {
-            condition: { output_contains: "replacement-never" },
-            notify_schedule: { on_state_change: {} },
-            lifetime: { until_session_end: {} },
-          },
-        },
-      }
-      : { [operation]: "monitor-1" };
-    const failureFrame = await requestAction(
-      connected.client,
-      connected.revision!,
-      265,
-      "monitor",
-      { session_id: sessionId, operation: failedOperation },
-    );
-    expect(failure(failureFrame)).toMatchObject({
-      action: "monitor",
-      code: "invalid_request",
-    });
-    const after = success(await requestAction(
-      connected.client,
-      connected.revision!,
-      266,
-      "inspect",
-      { session_id: sessionId },
-    ), "inspect") as typeof before;
-    expect(after.session.active_monitor_count).toBe(
-      before.session.active_monitor_count,
-    );
-    expect(after.monitors).toEqual(before.monitors);
-    expect(after.events).toEqual(before.events);
-    await requestAction(connected.client, connected.revision!, 267, "close", {
-      session_id: sessionId,
-      policy: "force",
-    });
-    connected.client.close();
-    expect(await waitForExit(host)).toBe(0);
-  },
-  30_000,
-);
-
-test("monitor byte ceiling rejects sequential add and update without changing state", async () => {
-  const home = makeHome();
-  const paths = hostPaths(home);
-  const host = startHost(home, undefined, 5_000);
-  await waitFor(() => existsSync(paths.socket));
-  const connected = await handshake(paths.socket, { minimum: 4, current: 5 });
-  const largeCommand = "x".repeat(64 * 1024);
-  const largeDefinition = {
-    condition: { custom_probe: { command: largeCommand, cwd: home } },
-    check_schedule: { interval_ms: 24 * 60 * 60 * 1_000 },
-    notify_schedule: { on_match: {} },
-    lifetime: { until_session_end: {} },
-  };
-  const smallDefinition = {
-    condition: { custom_probe: { command: "false", cwd: home } },
-    check_schedule: { interval_ms: 24 * 60 * 60 * 1_000 },
-    notify_schedule: { on_match: {} },
-    lifetime: { until_session_end: {} },
-  };
-  const started = await requestAction(
-    connected.client,
-    connected.revision!,
-    274,
-    "start",
-    {
-      cwd: home,
-      command: "sleep 30",
-      shell: { executable: { path: TERMINAL_FIXTURE_SHELL, clean_start: true } },
-      backend: "native",
-      return_when: { started: {} },
-      wait_ceiling_ms: 5_000,
-      dimensions: { rows: 24, columns: 80 },
-      initial_monitors: [smallDefinition, largeDefinition],
-    },
-  );
-  const sessionId = (
-    success(started, "start").session as { session_id: string }
-  ).session_id;
-  let correlation = 275;
-  let rejectedAdd: WireFrame | undefined;
-  for (let count = 0; count < 30; count++) {
-    const response = await requestAction(
-      connected.client,
-      connected.revision!,
-      correlation++,
-      "monitor",
-      { session_id: sessionId, operation: { add: largeDefinition } },
-    );
-    if (failureCode(response) === "capacity_exceeded") {
-      rejectedAdd = response;
-      break;
-    }
-    success(response, "monitor");
-  }
-  expect(rejectedAdd).toBeDefined();
-  expect(failure(rejectedAdd!)).toMatchObject({
-    action: "monitor",
-    code: "capacity_exceeded",
-  });
-  const beforeUpdate = success(await requestAction(
-    connected.client,
-    connected.revision!,
-    correlation++,
-    "inspect",
-    { session_id: sessionId },
-  ), "inspect");
-  const rejectedUpdate = await requestAction(
-    connected.client,
-    connected.revision!,
-    correlation++,
-    "monitor",
-    {
-      session_id: sessionId,
-      operation: {
-        update: { monitor_id: "monitor-1", definition: largeDefinition },
-      },
-    },
-  );
-  expect(failure(rejectedUpdate)).toMatchObject({
-    action: "monitor",
-    code: "capacity_exceeded",
-  });
-  const afterUpdate = success(await requestAction(
-    connected.client,
-    connected.revision!,
-    correlation++,
-    "inspect",
-    { session_id: sessionId },
-  ), "inspect");
-  expect(afterUpdate).toEqual(beforeUpdate);
-  await requestAction(connected.client, connected.revision!, correlation++, "close", {
-    session_id: sessionId,
-    policy: "force",
-  });
-  connected.client.close();
-  expect(await waitForExit(host)).toBe(0);
-}, 30_000);
-
-test("failed first monitor arming leaves the host idle-owned", async () => {
-  const home = makeHome();
-  const paths = hostPaths(home);
-  const host = startHost(home, undefined, 250, {
-    FX_TERMINAL_TEST_FAIL_MONITOR_OPERATION: "add:arming",
-  });
-  await waitFor(() => existsSync(paths.socket));
-  const connected = await handshake(paths.socket, { minimum: 4, current: 5 });
-  const started = await startInteractiveNativeFixture(
-    connected.client,
-    connected.revision!,
-    268_000,
-    {
-      cwd: home,
-      command: "printf arming-fixture-ready; IFS= read -r _; exit 0",
-      marker: "arming-fixture-ready",
-    },
-  );
-  const sessionId = (started.session as { session_id: string }).session_id;
-  const failed = await requestAction(connected.client, connected.revision!, 269, "monitor", {
-    session_id: sessionId,
-    operation: {
-      add: {
-        condition: { output_contains: "never" },
-        notify_schedule: { on_match: {} },
-        lifetime: { until_session_end: {} },
-      },
-    },
-  });
-  expect(failure(failed)).toMatchObject({
-    action: "monitor",
-    code: "invalid_request",
-  });
-  const inspected = success(await requestAction(
-    connected.client,
-    connected.revision!,
-    270,
-    "inspect",
-    { session_id: sessionId },
-  ), "inspect") as {
-    session: { active_monitor_count: number };
-    monitors: unknown[];
-    events: unknown[];
-  };
-  expect(inspected.session.active_monitor_count).toBe(0);
-  expect(inspected.monitors).toEqual([]);
-  expect(inspected.events).toEqual([]);
-  success(await requestAction(connected.client, connected.revision!, 271, "write", {
-    session_id: sessionId,
-    payload: { text: "\n" },
-  }), "write");
-  const exited = success(await requestAction(
-    connected.client,
-    connected.revision!,
-    272,
-    "wait",
-    {
-      session_id: sessionId,
-      return_when: { exit: {} },
-      safety_ceiling_ms: TERMINAL_OPERATION_OBSERVATION_BUDGET_MS,
-    },
-  ), "wait");
-  expect(exited.outcome).toEqual({ exited: 0 });
-  connected.client.close();
-  expect(await waitForExit(host)).toBe(0);
-}, NATIVE_STARTUP_OBSERVATION_BUDGET_MS * 6 + 30_000);
-
-test("exact signal monitor reports the shell termination once", async () => {
-  const home = makeHome();
-  const paths = hostPaths(home);
-  const host = startHost(home, undefined, 5_000);
-  await waitFor(() => existsSync(paths.socket));
-  const connected = await handshake(paths.socket, { minimum: 4, current: 5 });
-  const started = await startInteractiveNativeFixture(
-    connected.client,
-    connected.revision!,
-    260_000,
-    {
-      cwd: home,
-      command: "printf signal-fixture-ready; IFS= read -r _",
-      marker: "signal-fixture-ready",
-      dimensions: { rows: 24, columns: 80 },
-      initialMonitors: [{
-        condition: { signal: "kill" },
-        notify_schedule: { on_match: {} },
-        lifetime: { until_session_end: {} },
-      }],
-    },
-  );
-  const sessionId = (started.session as { session_id: string }).session_id;
-  await requestAction(connected.client, connected.revision!, 261, "signal", {
-    session_id: sessionId,
-    signal: "kill",
-  });
-  const waited = success(await requestAction(
-    connected.client,
-    connected.revision!,
-    262,
-    "wait",
-    {
-      session_id: sessionId,
-      return_when: { exit: {} },
-      safety_ceiling_ms: TERMINAL_OPERATION_OBSERVATION_BUDGET_MS,
-    },
-  ), "wait");
-  expect(waited.outcome).toEqual({ signal: 9 });
-  const inspected = success(await requestAction(
-    connected.client,
-    connected.revision!,
-    263,
-    "inspect",
-    { session_id: sessionId },
-  ), "inspect") as { events: Array<{ monitor_id: string; reason: string }> };
-  expect(inspected.events).toEqual([{
-    monitor_id: "monitor-1",
-    reason: "matched",
-    event_id: expect.any(Number),
-    lifecycle: "exited",
-    cursor: expect.any(Object),
-    created_at_ms: expect.any(Number),
-  }]);
-  connected.client.close();
-  expect(await waitForExit(host)).toBe(0);
-}, NATIVE_STARTUP_OBSERVATION_BUDGET_MS * 6 + 30_000);
-
-test("host restart finalizes monitor ownership and queues on-exit delivery", async () => {
-  const home = makeHome();
-  const paths = hostPaths(home);
-  const firstHost = startHost(home, undefined, 10_000);
-  await waitFor(() => existsSync(paths.socket));
-  let connected = await handshake(paths.socket, { minimum: 4, current: 5 });
-  const started = await requestAction(connected.client, connected.revision!, 270, "start", {
-    cwd: home,
-    command: "sleep 30",
-    shell: { executable: { path: TERMINAL_FIXTURE_SHELL, clean_start: true } },
-    backend: "native",
-    return_when: { started: {} },
-    wait_ceiling_ms: 5_000,
-    dimensions: { rows: 24, columns: 80 },
-    initial_monitors: [{
-      condition: { path_exists: join(home, "never-created") },
-      check_schedule: { interval_ms: 25 },
-      notify_schedule: { on_exit: {} },
-      lifetime: { until_session_end: {} },
-    }],
-  });
-  const sessionId = (success(started, "start").session as { session_id: string }).session_id;
-  const firstIdentity = readFileSync(paths.identity, "utf8");
-  connected.client.close();
-  firstHost.kill("SIGKILL");
-  await waitForExit(firstHost);
-
-  const replacement = startHost(home, undefined, 1_000);
-  await waitFor(() =>
-    existsSync(paths.socket) &&
-    existsSync(paths.identity) &&
-    readFileSync(paths.identity, "utf8") !== firstIdentity
-  );
-  connected = await handshake(paths.socket, { minimum: 4, current: 5 });
-  const inspected = success(await requestAction(
-    connected.client,
-    connected.revision!,
-    271,
-    "inspect",
-    { session_id: sessionId },
-  ), "inspect") as {
-    session: { lifecycle: string; active_monitor_count: number };
-    monitors: unknown[];
-    events: Array<{ monitor_id: string; reason: string }>;
-  };
-  expect(inspected.session).toMatchObject({
-    lifecycle: "lost",
-    active_monitor_count: 0,
-  });
-  expect(inspected.monitors).toEqual([]);
-  expect(inspected.events).toEqual([{
-    monitor_id: "monitor-1",
-    reason: "session_exit",
-    event_id: expect.any(Number),
-    lifecycle: "lost",
-    cursor: expect.any(Object),
-    created_at_ms: expect.any(Number),
-  }]);
-  connected.client.close();
-  expect(await waitForExit(replacement)).toBe(0);
 }, 20_000);
 
 test("revoke and close quiesce writes already queued under stale authority", async () => {
@@ -7202,7 +4749,6 @@ test("Bash and zsh preserve trusted normal startup and controlled clean startup"
       return_when: { match: boundaryMatch },
       wait_ceiling_ms: 5_000,
       dimensions: { rows: 24, columns: 80 },
-      initial_monitors: [],
     });
     connected.client.send(
       encodeFrame(
@@ -7406,7 +4952,6 @@ test("Bash and zsh preserve trusted normal startup and controlled clean startup"
         return_when: { exit: {} },
         wait_ceiling_ms: 5_000,
         dimensions: { rows: 24, columns: 80 },
-        initial_monitors: [],
       },
     );
     expect(failure(failedStartup)).toMatchObject({
@@ -7486,7 +5031,6 @@ test("Bash and zsh preserve trusted normal startup and controlled clean startup"
       return_when: { started: {} },
       wait_ceiling_ms: 2_000,
       dimensions: { rows: 24, columns: 80 },
-      initial_monitors: [],
     },
   );
   expect(failure(missing)).toMatchObject({
@@ -7508,7 +5052,6 @@ test("Bash and zsh preserve trusted normal startup and controlled clean startup"
       return_when: { started: {} },
       wait_ceiling_ms: 2_000,
       dimensions: { rows: 24, columns: 80 },
-      initial_monitors: [],
     },
   );
   expect(failure(unsupported)).toMatchObject({
@@ -7531,7 +5074,6 @@ test("Bash and zsh preserve trusted normal startup and controlled clean startup"
         return_when: { started: {} },
         wait_ceiling_ms: 2_000,
         dimensions: { rows: 24, columns: 80 },
-        initial_monitors: [],
       },
     );
     expect(failure(tmux)).toMatchObject({
@@ -8168,6 +5710,18 @@ test.skipIf(!tmuxAvailable())(
       readFileSync(paths.identity, "utf8") !== oldIdentity
     , 8_000);
     const recovered = await handshake(paths.socket, { minimum: 4, current: 5 });
+    const listed = success(await requestAction(
+      recovered.client,
+      recovered.revision!,
+      315,
+      "list",
+      {},
+    ), "list") as {
+      sessions: Array<{
+        session_id: string;
+        lifecycle: string;
+      }>;
+    };
     await waitFor(() => !processExists(invalidPanePid), 5_000);
     expect(processExists(validPanePid)).toBe(true);
     const sessionNames = execFileSync(
@@ -8186,19 +5740,6 @@ test.skipIf(!tmuxAvailable())(
       `close-transaction-${invalidId}.json`,
     );
 
-    const listed = success(await requestAction(
-      recovered.client,
-      recovered.revision!,
-      315,
-      "list",
-      {},
-    ), "list") as {
-      sessions: Array<{
-        session_id: string;
-        lifecycle: string;
-        active_monitor_count: number;
-      }>;
-    };
     expect(listed.sessions).toContainEqual(expect.objectContaining({
       session_id: validId,
       lifecycle: "running",
@@ -8206,7 +5747,6 @@ test.skipIf(!tmuxAvailable())(
     expect(listed.sessions).toContainEqual(expect.objectContaining({
       session_id: invalidId,
       lifecycle: "closed",
-      active_monitor_count: 0,
     }));
     const invalidInspect = await requestAction(
       recovered.client,
@@ -8381,6 +5921,13 @@ test.skipIf(!tmuxAvailable())(
       8_000,
     );
     const recovered = await handshake(paths.socket, { minimum: 4, current: 5 });
+    success(await requestAction(
+      recovered.client,
+      recovered.revision!,
+      341,
+      "write",
+      { session_id: siblingId, payload: { text: "after-restart\n" } },
+    ), "write");
     expect(readdirSync(stateDir)).not.toContain(transactionName);
     expect(existsSync(tmuxSocket)).toBe(true);
     const names = execFileSync(
@@ -8389,13 +5936,6 @@ test.skipIf(!tmuxAvailable())(
       { encoding: "utf8" },
     ).trim().split("\n");
     expect(names).toEqual([`fx-${siblingIdentity}`]);
-    success(await requestAction(
-      recovered.client,
-      recovered.revision!,
-      341,
-      "write",
-      { session_id: siblingId, payload: { text: "after-restart\n" } },
-    ), "write");
     const afterRestart = success(await requestAction(
       recovered.client,
       recovered.revision!,
@@ -8536,6 +6076,13 @@ test.skipIf(!tmuxAvailable())(
     const replacementStderr = streamText(replacement.stderr);
     await waitFor(() => existsSync(paths.socket) && existsSync(paths.identity), 8_000);
     const recovered = await handshake(paths.socket, { minimum: 4, current: 5 });
+    success(await requestAction(
+      recovered.client,
+      recovered.revision!,
+      333,
+      "write",
+      { session_id: siblingId, payload: { text: "survived\n" } },
+    ), "write");
     await waitFor(() => !processExists(closingPanePid), 5_000);
     expect(processExists(siblingPanePid)).toBe(true);
     expect(readdirSync(stateDir)).not.toContain(transactionName);
@@ -8550,13 +6097,6 @@ test.skipIf(!tmuxAvailable())(
     ).trim().split("\n");
     expect(names).toEqual([`fx-${siblingIdentity}`]);
 
-    success(await requestAction(
-      recovered.client,
-      recovered.revision!,
-      333,
-      "write",
-      { session_id: siblingId, payload: { text: "survived\n" } },
-    ), "write");
     const waited = success(await requestAction(
       recovered.client,
       recovered.revision!,
@@ -8623,15 +6163,11 @@ test(
     reopened.client.send(encodeFrame(
       reopened.revision!,
       1,
-      actionSubjects.monitor,
+      actionSubjects.resize,
       335,
-      { request: { monitor: withAuthority("monitor", {
+      { request: { resize: withAuthority("resize", {
         session_id: sessionId,
-        operation: { add: {
-          condition: { output_contains: "never" },
-          notify_schedule: { on_match: {} },
-          lifetime: { until_session_end: {} },
-        } },
+        dimensions: { rows: 25, columns: 81 },
       }) } },
       1,
     ));
@@ -9034,7 +6570,6 @@ test("process-token capture failure kills and reaps before returning failure", a
         return_when: { exit: {} },
         wait_ceiling_ms: NATIVE_STARTUP_OBSERVATION_BUDGET_MS,
         dimensions: { rows: 24, columns: 80 },
-        initial_monitors: [],
       },
     );
     if (failureCode(result) !== undefined) break;
@@ -9441,21 +6976,6 @@ test("concurrent sessions survive disconnect and complete waits independently", 
   expect(screenValue.snapshot.cells).toHaveLength(24 * 80);
   expect(screenValue.snapshot.cells.map((cell) => cell.text).join(""))
     .toContain("first-ready");
-  const monitor = await requestAction(
-    reconnected.client,
-    reconnected.revision!,
-    511,
-    "monitor",
-    {
-      session_id: firstId,
-      operation: { pause: "not-implemented" },
-    },
-  );
-  expect(failure(monitor)).toMatchObject({
-    action: "monitor",
-    code: "invalid_request",
-  });
-
   await requestAction(
     reconnected.client,
     reconnected.revision!,
@@ -9593,30 +7113,6 @@ test("lazy private client starts once, reconnects, and leaves the host independe
   expect(() => process.kill(hostPid, 0)).toThrow();
   hostPids.pop();
 });
-
-test("official short-lived clients preserve host-wide mutation order and inspect acknowledgement", async () => {
-  const home = makeHome();
-  const paths = hostPaths(home);
-  const barrier = join(home, "ordered-request");
-  const result = await runClientFixture(home, 400, {
-    FX_TERMINAL_OUTCOME_FIXTURE: "ordering",
-    FX_TERMINAL_TEST_ORDER_BARRIER: barrier,
-    FX_TERMINAL_TEST_ORDER_HOLD_CORRELATION: "3",
-    FX_TERMINAL_TEST_ORDER_HOLD_CORRELATION_2: "7",
-  });
-
-  expect(result).toEqual({
-    exitCode: 0,
-    stdout: JSON.stringify({
-      ordered: true,
-      acknowledged: true,
-      read_only_concurrent: true,
-      cancelled_turn_abandoned: true,
-    }) + "\n",
-    stderr: "",
-  });
-  await waitFor(() => !existsSync(paths.identity), 2_000);
-}, NATIVE_STARTUP_OBSERVATION_BUDGET_MS * 4 + 30_000);
 
 test("official client retains every reserved outcome through the exact capacity boundary", async () => {
   const home = makeHome();
@@ -10014,7 +7510,6 @@ test("current client permits graceful close and rejects force close on signal li
       return_when: { match: "authority-reload-ready" },
       wait_ceiling_ms: 5_000,
       dimensions: { rows: 24, columns: 80 },
-      initial_monitors: [],
     },
   ), "start");
   const sessionId = (started.session as { session_id: string }).session_id;
@@ -10132,7 +7627,6 @@ test("protocol fixtures advertise exact evidence and interoperate in both direct
         return_when: { match: "compatibility-ready" },
         wait_ceiling_ms: 5_000,
         dimensions: { rows: 24, columns: 80 },
-        initial_monitors: [],
       },
     ), "start");
     const sessionId = (started.session as { session_id: string }).session_id;

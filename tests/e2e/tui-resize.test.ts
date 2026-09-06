@@ -22,6 +22,7 @@ import {
   fakeGatewayFinalText,
   fakeGatewaySse,
   fakeGatewayToolCall,
+  fakeShellRun,
   hasEmptyComposer,
   paneExitMatches,
   startFakeGateway,
@@ -1646,7 +1647,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const command =
         "for i in $(seq 1 96); do printf 'resize-stream-marker %03d\\n' \"$i\"; sleep 0.03; done";
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("resize-live-command", "terminal", { action: "exec", timeout_ms: 600_000, command }),
+        fakeShellRun("resize-live-command", command, { timeout_ms: 600_000 }),
         fakeGatewayFinalText(finalResponse),
       ]);
       gateways.push(gateway);
@@ -1780,7 +1781,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const command =
         `awk 'BEGIN { for (i = 0; i < 13500; i++) printf "RETENTION_SEED_%05d alpha beta gamma delta epsilon zeta eta theta iota kappa lambda\\n", i }'`;
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("retention-seed", "terminal", { action: "exec", timeout_ms: 600_000, command }),
+        fakeShellRun("retention-seed", command, { timeout_ms: 600_000 }),
         response,
       ]);
       gateways.push(gateway);
@@ -1881,11 +1882,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
 
       const gateway = startFakeGateway([
         fakeGatewayFinalText(seedMarker),
-        fakeGatewayToolCall("approval-cancel-resize", "terminal", {
-          action: "exec",
-          timeout_ms: 600_000,
-          command,
-        }),
+        fakeShellRun("approval-cancel-resize", command, { timeout_ms: 600_000 }),
       ]);
       gateways.push(gateway);
       const active = await createResizeSession({
@@ -2107,6 +2104,168 @@ describe.skipIf(SKIP)("tui: resize", () => {
       expectEmptyStderr(stderrPath);
     },
     TIMEOUT,
+  );
+
+  test(
+    "list paragraph indentation survives streaming and resize from 167 to 72 columns",
+    async () => {
+      const root = realpathSync(
+        mkdtempSync(join(tmpdir(), "fx-resize-list-paragraph-")),
+      );
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const tracePath = join(root, "trace.log");
+      const tapePath = join(root, "session.fxtape");
+      tempDirs.push(root);
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(stderrPath, "");
+
+      const paragraph =
+        "I recommend checking the dev channel every 60 seconds rather than the current 30 minutes. Leave stable-channel behavior unchanged. This detects published releases periodically, not instantly on a main merge.";
+      const source = [
+        "Recommended fix",
+        "",
+        "1. Continue polling while ready.",
+        `   ${paragraph}`,
+        "",
+        `2. ${paragraph}`,
+        "",
+        "- Bullet heading.",
+        `  ${paragraph}`,
+        "",
+        `- ${paragraph}`,
+        "",
+        "WRAP_REPRO_END",
+        "",
+      ].join("\n");
+      // Split both paragraph prefixes across deltas, including a spaces-only delta.
+      const chunks = [
+        "Recommended fix\n\n1. Continue polling while ready.\n ",
+        "  ",
+        paragraph.slice(0, 83),
+        `${paragraph.slice(83)}\n\n2. ${paragraph}\n\n- Bullet heading.\n `,
+        ` ${paragraph.slice(0, 83)}`,
+        `${paragraph.slice(83)}\n\n- ${paragraph}\n\nWRAP_REPRO_END\n`,
+      ];
+      expect(chunks.join("")).toBe(source);
+      const gateway = startFakeGateway([
+        fakeGatewaySse([
+          { type: "text-start", id: "list-paragraph" },
+          ...chunks.map((delta) => ({ type: "text-delta", id: "list-paragraph", delta })),
+          { type: "text-end", id: "list-paragraph" },
+          {
+            type: "finish",
+            finishReason: { unified: "stop", raw: "stop" },
+            usage: { inputTokens: { total: 1 }, outputTokens: { total: 200 } },
+          },
+        ]),
+      ]);
+      gateways.push(gateway);
+      session = await createResizeSession({
+        cmd: FX_BIN,
+        cwd: workspace,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-list-paragraph-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_AUTO_UPGRADE: "0",
+          FX_SOUND: "0",
+          FX_RECORD: tapePath,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "resize,frame_schedule,scroll",
+          NO_COLOR: "1",
+        },
+        width: 167,
+        height: 40,
+        stderrPath,
+        isolated: true,
+        remainOnExit: true,
+        minimumHistoryLines: MINIMUM_RESIZE_HISTORY_LINES,
+      });
+      const active = session;
+      await active.waitForComposer(10_000);
+      await active.sendText("render the list wrapping fixture");
+
+      const expectListParagraphs = async (cols: number) => {
+        await active.waitForStableScrollback((text) => text.includes("WRAP_REPRO_END"));
+        await active.waitForStableComposer();
+        const scrollback = (await active.captureFullScrollbackEscapes())
+          .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+        const lines = scrollback.split("\n");
+        const markers = [
+          "Recommended fix",
+          "1. Continue polling while ready.",
+          "2. I recommend checking",
+          "• Bullet heading.",
+          "• I recommend checking",
+          "WRAP_REPRO_END",
+        ];
+        const rows = semanticMarkerRows(scrollback, markers);
+        for (let index = 1; index < rows.length; index++) {
+          expect(rows[index]!).toBeGreaterThan(rows[index - 1]!);
+        }
+        const normalize = (text: string) => text.trim().replace(/\s+/g, " ");
+        expect(normalize(lines.slice(rows[0], rows[5]! + 1).join("\n")))
+          .toBe(normalize(source.replace(/^- /gm, "• ")));
+        expect(countOccurrences(scrollback, "I recommend checking")).toBe(4);
+
+        for (const [start, end, indent, marker] of [
+          [rows[1]! + 1, rows[2]!, 5, ""],
+          [rows[2]!, rows[3]!, 5, "2. "],
+          [rows[3]! + 1, rows[4]!, 4, ""],
+          [rows[4]!, rows[5]!, 4, "• "],
+        ] as const) {
+          const paragraphRows = lines.slice(start, end).filter((line) => line.trim() !== "");
+          expect(paragraphRows.length).toBeGreaterThan(1);
+          for (const [index, line] of paragraphRows.entries()) {
+            const expectedIndent = index === 0 && marker ? 2 : indent;
+            expect(line.length - line.trimStart().length).toBe(expectedIndent);
+            expect(line.length).toBeLessThanOrEqual(cols);
+          }
+          const text = paragraphRows.map((line) => line.trim());
+          expect(text[0]!.startsWith(marker)).toBe(true);
+          text[0] = text[0]!.slice(marker.length);
+          expect(text.join(" ")).toBe(paragraph);
+        }
+        const grid = await active.capturePaneGrid();
+        expect(grid.filter((line) => line.trim() === "┃")).toHaveLength(1);
+        expect(findFooter(grid)).not.toBeNull();
+        expect(active.paneStatus()).toEqual({ dead: false, status: null });
+        expectEmptyStderr(stderrPath);
+      };
+
+      await expectListParagraphs(167);
+      await active.resizeWindow(72, 40, 500);
+      await waitForTraceCount(tracePath, "settled_reset_committed", 1);
+      await expectListParagraphs(72);
+      await active.sendLiteralText("composer remains usable");
+      await active.waitForText("┃ composer remains usable");
+      await active.sendKeys("C-u");
+      await active.waitForStableComposer();
+      expect(gateway.requests).toHaveLength(1);
+      await active.sendText("/quit");
+      const exitDeadline = Date.now() + TIMEOUT;
+      while (!active.paneStatus().dead && Date.now() < exitDeadline) {
+        await Bun.sleep(25);
+      }
+      expect(active.paneStatus()).toEqual({ dead: true, status: 0 });
+      expectEmptyStderr(stderrPath);
+
+      const replay = Bun.spawnSync([FX_BIN, "replay", tapePath, "--json"], {
+        cwd: workspace,
+        env: { ...process.env, HOME: home, FX_SOUND: "0", FX_AUTO_UPGRADE: "0" },
+      });
+      expect(replay.exitCode).toBe(0);
+      expect(replay.stderr.toString()).toBe("");
+      expect(JSON.parse(replay.stdout.toString()).resize_count).toBe(1);
+    },
+    60_000,
   );
 
   test(
@@ -2449,7 +2608,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       await session.waitForText("/help", 10_000);
       await waitForSelectedSlashLabel(session, "/help");
       const shrinkStage = await session.captureFullScrollback();
-      expect(shrinkStage).toContain("Commands 38 · Type to filter");
+      expect(shrinkStage).toContain("Commands 37 · Type to filter");
       expect(shrinkStage).toContain("1–4");
       writeFileSync(join(root, "scrollback-after-shrink.txt"), shrinkStage);
 
@@ -3426,11 +3585,11 @@ describe.skipIf(SKIP)("tui: resize", () => {
     async () => {
       session = await launchAt(120, 40);
       await session.sendText("/help");
-      await session.waitForText("Commands 38", 5_000);
+      await session.waitForText("Commands 37", 5_000);
       await session.resizeWindow(76, 24, 400);
 
       const grid = await session.capturePaneGrid();
-      expect(grid.join("\n")).toContain("Commands 38");
+      expect(grid.join("\n")).toContain("Commands 37");
       expect(findInlineHelpPicker(grid)).not.toBeNull();
 
       await session.sendKeys("Escape");
@@ -3448,7 +3607,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
     async () => {
       session = await launchAt(120, 40);
       await session.sendText("/help");
-      await session.waitForText("Commands 38", 5_000);
+      await session.waitForText("Commands 37", 5_000);
 
       const captureScrollback = () =>
         execSync(`tmux capture-pane -t ${session!.name} -p -S -`, {
@@ -3456,7 +3615,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
           stdio: "pipe",
         });
       const expectHelpCatalog = (grid: string[]) => {
-        expect(grid.join("\n")).toContain("Commands 38");
+        expect(grid.join("\n")).toContain("Commands 37");
         expect(findInlineHelpPicker(grid)).not.toBeNull();
       };
 
@@ -3474,7 +3633,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const restored = captureScrollback();
       expect(restored.match(/𝒇x v\d+\.\d+\.\d+\b/g)).toHaveLength(1);
       expect(restored.match(/Run \/help for commands/g)).toHaveLength(1);
-      expect(restored).not.toContain("Commands 38");
+      expect(restored).not.toContain("Commands 37");
       expect(findFooter(await session.capturePaneGrid())).not.toBeNull();
     },
     TIMEOUT,
@@ -3669,7 +3828,13 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const stderrPath = join(dir, "stderr.log");
       const gateway = startFakeGateway([
         fakeGatewayFinalText("large paste resize complete"),
-      ]);
+      ], { models: [{
+        id: FAKE_GATEWAY_MODEL,
+        type: "language",
+        tags: ["tool-use"],
+        context_window: 16_000_000,
+        max_tokens: 64_000,
+      }] });
       gateways.push(gateway);
 
       session = await createResizeSession({
@@ -3679,6 +3844,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
         env: {
           AI_GATEWAY_API_KEY: "test-key",
           VERCEL_OIDC_TOKEN: undefined,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "input,worker,resize",
@@ -3715,6 +3882,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
       expect(await waitForQueuedPromptBytes(tracePath, 60_000)).toBe(
         payload.length,
       );
+      expect(await waitForSubmittedUserText(gateway, tracePath, stderrPath))
+        .toBe(payload);
       expectEmptyStderr(stderrPath);
     },
     90_000,
@@ -3729,7 +3898,13 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const stderrPath = join(dir, "stderr.log");
       const gateway = startFakeGateway([
         fakeGatewayFinalText("CPR-shaped paste resize complete"),
-      ]);
+      ], { models: [{
+        id: FAKE_GATEWAY_MODEL,
+        type: "language",
+        tags: ["tool-use"],
+        context_window: 16_000_000,
+        max_tokens: 64_000,
+      }] });
       gateways.push(gateway);
 
       session = await createResizeSession({
@@ -3739,6 +3914,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
         env: {
           AI_GATEWAY_API_KEY: "test-key",
           VERCEL_OIDC_TOKEN: undefined,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "input,worker,resize",
@@ -3988,7 +4165,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         expect(await session.captureFullScrollback()).toContain(marker);
 
         await session.sendText("/help");
-        await session.waitForText("Commands 38", 5_000);
+        await session.waitForText("Commands 37", 5_000);
         await session.resizeWindow(84, 28, 500);
 
         const catalog = await session.capturePaneGrid();
@@ -4002,7 +4179,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         );
         const scrollback = await session.captureFullScrollback();
         expect(scrollback).not.toContain(marker);
-        expect(scrollback).not.toContain("Commands 38");
+        expect(scrollback).not.toContain("Commands 37");
         const finalGrid = await session.capturePaneGrid();
         expect(findFooter(finalGrid), finalGrid.join("\n")).not.toBeNull();
 

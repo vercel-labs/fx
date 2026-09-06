@@ -223,7 +223,7 @@ test "footer rows keep tint multiline and picker offsets coherent" {
     try std.testing.expectEqual(@as(u16, 24), rows.hint);
 }
 
-test "footer rows keep tint queued banner above input" {
+test "footer rows keep the steering banner above input" {
     const rows = resolve(.{
         .footer_top_for_extra = 20,
         .terminal_rows = 24,
@@ -264,7 +264,7 @@ test "footer rows can replace input row with picker panel" {
     try std.testing.expectEqual(@as(u16, 23), rows.hint);
 }
 
-test "footer rows reserve a banner row when queued prompt is active" {
+test "footer rows reserve an active steering banner" {
     const rows = resolve(.{
         .footer_top_for_extra = 8,
         .terminal_rows = 24,

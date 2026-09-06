@@ -83,24 +83,33 @@ function gatewayEnv(
 }
 
 function commandCall(command: string, id: string) {
-  return fakeGatewayToolCall(id, "terminal", { action: "exec", timeout_ms: 600_000, command });
+  return fakeGatewayToolCall(id, "shell", {
+    request: { action: "run", command, yield_time_ms: 30_000 },
+  });
 }
 
 function userCommandCall(command: string, id: string) {
-  return fakeGatewayToolCall(id, "terminal", {
-    action: "exec",
-    timeout_ms: 600_000,
-    command,
-    profile: "user",
+  return fakeGatewayToolCall(id, "shell", {
+    request: { action: "run", command, profile: "user", yield_time_ms: 30_000 },
   });
 }
 
 function cleanCommandCall(command: string, id: string) {
-  return fakeGatewayToolCall(id, "terminal", {
-    action: "exec",
-    timeout_ms: 600_000,
-    command,
-    profile: "clean",
+  return fakeGatewayToolCall(id, "shell", {
+    request: { action: "run", command, profile: "clean", yield_time_ms: 30_000 },
+  });
+}
+
+function cleanTtyCommandCall(command: string, id: string) {
+  return fakeGatewayToolCall(id, "shell", {
+    request: {
+      action: "run",
+      command,
+      profile: "clean",
+      tty: true,
+      yield_time_ms: 0,
+      timeout_ms: 5_000,
+    },
   });
 }
 
@@ -121,6 +130,17 @@ function toolResultText(
   const content = outputType === "execution-denied" ? output.reason : output.value;
   expect(typeof content).toBe("string");
   return content as string;
+}
+
+function reviewerText(body: string): string {
+  const request = JSON.parse(body) as {
+    prompt?: Array<{ content?: Array<{ type?: string; text?: string }> }>;
+  };
+  return (request.prompt ?? [])
+    .flatMap((message) => message.content ?? [])
+    .filter((part) => part.type === "text")
+    .map((part) => part.text ?? "")
+    .join("\n");
 }
 
 function installRecorder(root: IsolatedRoot, name: string, marker: string) {
@@ -208,7 +228,7 @@ describe("lean auto mode reliability", () => {
         tool_calls: Array<{ name: string; status: string }>;
       };
       expect(json.tool_calls).toContainEqual(
-        expect.objectContaining({ name: "terminal", status: "success" }),
+        expect.objectContaining({ name: "shell", status: "success" }),
       );
     },
     TIMEOUT,
@@ -306,7 +326,7 @@ describe("lean auto mode reliability", () => {
         tool_calls: Array<{ name: string; status: string }>;
       };
       expect(json.tool_calls).toContainEqual(
-        expect.objectContaining({ name: "terminal", status: "success" }),
+        expect.objectContaining({ name: "shell", status: "success" }),
       );
     },
     TIMEOUT,
@@ -325,29 +345,33 @@ describe("lean auto mode reliability", () => {
             {
               type: "tool-call",
               toolCallId: "clean_direct_pwd",
-              toolName: "terminal",
-              input: { action: "exec", timeout_ms: 600_000, command: "pwd", profile: "clean" },
+              toolName: "shell",
+              input: { request: { action: "run", command: "pwd", profile: "clean", yield_time_ms: 30_000 } },
             },
             {
               type: "tool-call",
               toolCallId: "clean_direct_git_status",
-              toolName: "terminal",
+              toolName: "shell",
               input: {
-                action: "exec",
-                timeout_ms: 600_000,
-                command: "git status --short",
-                profile: "clean",
+                request: {
+                  action: "run",
+                  command: "git status --short",
+                  profile: "clean",
+                  yield_time_ms: 30_000,
+                },
               },
             },
             {
               type: "tool-call",
               toolCallId: "clean_blocked_reset",
-              toolName: "terminal",
+              toolName: "shell",
               input: {
-                action: "exec",
-                timeout_ms: 600_000,
-                command: "git reset --hard",
-                profile: "clean",
+                request: {
+                  action: "run",
+                  command: "git reset --hard",
+                  profile: "clean",
+                  yield_time_ms: 30_000,
+                },
               },
             },
             {
@@ -356,8 +380,8 @@ describe("lean auto mode reliability", () => {
             },
           ]),
           (body) => {
-            expect(toolResultText(body, "clean_direct_pwd")).toContain("exit_code=0");
-            expect(toolResultText(body, "clean_direct_git_status")).toContain("exit_code=0");
+            expect(toolResultText(body, "clean_direct_pwd")).toContain("\"exit_code\":0");
+            expect(toolResultText(body, "clean_direct_git_status")).toContain("\"exit_code\":0");
             expect(toolResultText(body, "clean_blocked_reset", "execution-denied")).toContain("review_caution");
             return fakeGatewayFinalText("Clean command group complete.");
           },
@@ -390,7 +414,7 @@ describe("lean auto mode reliability", () => {
         tool_calls: Array<{ name: string; status: string }>;
       };
       const terminalStatuses = json.tool_calls
-        .filter(({ name }) => name === "terminal")
+        .filter(({ name }) => name === "shell")
         .map(({ status }) => status);
       expect(terminalStatuses.filter((status) => status === "success")).toHaveLength(2);
       expect(terminalStatuses.filter((status) => status === "error")).toHaveLength(1);
@@ -400,24 +424,181 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
+    "contextual deployment review clears despite conflicting task text",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.root, "deployment-ran");
+      const bin = installRecorder(root, "vercel", marker);
+      const deployCommand = `${join(bin, "vercel")} deploy --prod`;
+      const gateway = startGateway(
+        [
+          userCommandCall(deployCommand, "normal_deploy"),
+          fakeGatewayFinalText("deployment completed"),
+        ],
+        [fakeGatewayPermissionDecision("clear", "normal_deploy_clear")],
+      );
+
+      const result = await runFx(
+        [
+          "ask",
+          "--quiet",
+          "--json",
+          "--no-save",
+          "Inspect the local site only. Do not deploy it.",
+        ],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(1);
+      const review = reviewerText(gateway.classifierRequests[0]!.body);
+      expect(review).toContain("review_context_kind: contextual");
+      expect(review).toContain("Inspect the local site only");
+      expect(existsSync(marker)).toBe(true);
+      expect(result.stderr).not.toContain(COMMAND_APPROVAL_PROMPT);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "clean TTY reads require shell review before execution",
+    async () => {
+      const root = createIsolatedRoot();
+      const tracePath = join(root.root, "trace.log");
+      const gateway = startGateway(
+        [
+          cleanTtyCommandCall("git status --short --branch", "clean_tty_status"),
+          (body) => {
+            expect(
+              toolResultText(body, "clean_tty_status", "execution-denied"),
+            ).toContain("review_caution");
+            return fakeGatewayFinalText("clean TTY review blocked execution");
+          },
+        ],
+        [fakeGatewayPermissionDecision("caution", "tty_requires_shell_review")],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "Inspect the working directory in a TTY."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            FX_TRACE_LOG: tracePath,
+            FX_TRACE_SCOPES: "permission,tool,terminal",
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(gateway.requests).toHaveLength(2);
+      const json = JSON.parse(result.stdout.trim()) as {
+        tool_calls: Array<{ name: string; status: string }>;
+      };
+      expect(json.tool_calls).toContainEqual(
+        expect.objectContaining({ name: "shell", status: "error" }),
+      );
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).toContain(
+        "event=auto_review_start tool_name=shell action_kind=command " +
+          "call_id=clean_tty_status",
+      );
+      expect(trace).not.toContain(
+        "event=execution_start turn_id=1 step_id=1 " +
+          "call_id=clean_tty_status name=shell",
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "reviewed clean TTY reads execute with shell authority",
+    async () => {
+      const root = createIsolatedRoot();
+      const tracePath = join(root.root, "trace.log");
+      const gateway = startGateway(
+        [
+          cleanTtyCommandCall("printf 'TTY_REVIEWED_OK\\n'", "reviewed_clean_tty"),
+          (body) => {
+            const started = JSON.parse(
+              toolResultText(body, "reviewed_clean_tty"),
+            ) as { session_id: string; state: string };
+            expect(started.state).toBe("running");
+            return fakeGatewayToolCall("wait_reviewed_clean_tty", "shell", {
+              request: {
+                action: "interact",
+                session_id: started.session_id,
+                yield_time_ms: 5_000,
+              },
+            });
+          },
+          (body) => {
+            expect(toolResultText(body, "wait_reviewed_clean_tty")).toContain(
+              "TTY_REVIEWED_OK",
+            );
+            return fakeGatewayFinalText("reviewed clean TTY complete");
+          },
+        ],
+        [fakeGatewayPermissionDecision("clear", "tty_shell_review_clear")],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "Inspect through the reviewed clean TTY."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            FX_TRACE_LOG: tracePath,
+            FX_TRACE_SCOPES: "core,permission,tool,terminal",
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(gateway.requests).toHaveLength(3);
+      const json = JSON.parse(result.stdout.trim()) as {
+        tool_calls: Array<{ name: string; status: string }>;
+      };
+      expect(json.tool_calls).toContainEqual(
+        expect.objectContaining({ name: "shell", status: "success" }),
+      );
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        "approval_source=auto_classifier",
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
     "explicit destructive commands reach the reviewer and clear exact actions",
     async () => {
-      for (const [name, command] of [
-        ["rm", "rm disposable.txt"],
-        ["rmdir", "rmdir disposable-dir"],
-        ["unlink", "unlink disposable-link"],
-        ["shred", "shred disposable.txt"],
-        ["git_clean", "git clean -fd"],
-        ["git_rm", "git rm tracked.txt"],
-        ["git_rm_separator", "git rm -- -n"],
-        ["git_clean_separator", "git clean -f -- -n"],
-        ["git_clean_exclude_short", "git clean -f -e --dry-run"],
-        ["git_clean_exclude_long", "git clean -f --exclude --dry-run"],
-        ["git_reset", "git reset --hard HEAD~1"],
-        ["git_reset_boundary", "git reset --hard; printf ok"],
-        ["compound_rm", "pwd && rm compound.txt"],
-        ["rm_boundary", "rm victim; printf ok"],
-        ["escaped_space_rm", "printf foo\\ #bar; rm victim"],
+      for (const [name, commandForBin] of [
+        ["rm", (bin: string) => `${join(bin, "rm")} disposable.txt`],
+        ["rmdir", (bin: string) => `${join(bin, "rmdir")} disposable-dir`],
+        ["unlink", (bin: string) => `${join(bin, "unlink")} disposable-link`],
+        ["shred", (bin: string) => `${join(bin, "shred")} disposable.txt`],
+        ["git_clean", (bin: string) => `${join(bin, "git")} clean -fd`],
+        ["git_rm", (bin: string) => `${join(bin, "git")} rm tracked.txt`],
+        ["git_rm_separator", (bin: string) => `${join(bin, "git")} rm -- -n`],
+        ["git_clean_separator", (bin: string) => `${join(bin, "git")} clean -f -- -n`],
+        ["git_clean_exclude_short", (bin: string) => `${join(bin, "git")} clean -f -e --dry-run`],
+        ["git_clean_exclude_long", (bin: string) => `${join(bin, "git")} clean -f --exclude --dry-run`],
+        ["git_reset", (bin: string) => `${join(bin, "git")} reset --hard HEAD~1`],
+        ["git_reset_boundary", (bin: string) => `${join(bin, "git")} reset --hard; printf ok`],
+        ["compound_rm", (bin: string) => `pwd && ${join(bin, "rm")} compound.txt`],
+        ["rm_boundary", (bin: string) => `${join(bin, "rm")} victim; printf ok`],
+        ["escaped_space_rm", (bin: string) => `printf foo\\ #bar; ${join(bin, "rm")} victim`],
       ] as const) {
         const root = createIsolatedRoot();
         const marker = join(root.root, `${name}-reviewed-and-ran`);
@@ -425,12 +606,12 @@ describe("lean auto mode reliability", () => {
         for (const executable of ["rmdir", "unlink", "shred", "git"]) {
           bin = installRecorder(root, executable, marker);
         }
-        const reviewedCommand = `export PATH=${JSON.stringify(bin)}:$PATH; ${command}`;
+        const reviewedCommand = commandForBin(bin);
         const gateway = startGateway(
           [
             userCommandCall(reviewedCommand, `reviewed_${name}`),
             (body) => {
-              expect(toolResultText(body, `reviewed_${name}`)).toContain("exit_code=0");
+              expect(toolResultText(body, `reviewed_${name}`)).toContain("\"exit_code\":0");
               return fakeGatewayFinalText(`${name} reviewed and ran`);
             },
           ],
@@ -451,13 +632,104 @@ describe("lean auto mode reliability", () => {
 
         expect(
           result.code,
-          `command: ${command}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
+          `command: ${reviewedCommand}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
         ).toBe(0);
         expect(result.stdout).toContain(`${name} reviewed and ran`);
         expect(gateway.classifierRequests).toHaveLength(1);
+        const review = reviewerText(gateway.classifierRequests[0]!.body);
+        expect(review).toContain("review_context_kind: contextual");
+        expect(review).toContain(`Run exactly this requested ${name} command.`);
+        expect(review).not.toContain("trusted_user_permission_feedback:");
         expect(gateway.requests).toHaveLength(2);
         expect(existsSync(marker)).toBe(true);
       }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "unresolved destructive commands receive contextual review",
+    async () => {
+      for (const shape of ["expanded", "wrapped", "find_delete"] as const) {
+        const root = createIsolatedRoot();
+        const protectedPath = join(root.workspace, `${shape}-must-remain`);
+        mkdirSync(protectedPath);
+        writeFileSync(join(protectedPath, "keep.txt"), "keep\n");
+
+        let command: string;
+        if (shape === "expanded") {
+          command = `target=${JSON.stringify(protectedPath)}; rm -rf \"$target\"`;
+        } else if (shape === "wrapped") {
+          const wrapper = join(root.root, "custom-wrapper");
+          writeFileSync(wrapper, "#!/bin/sh\n/bin/rm -rf \"$1\"\n");
+          chmodSync(wrapper, 0o755);
+          command = `${wrapper} ${JSON.stringify(protectedPath)}`;
+        } else {
+          command = `/usr/bin/find ${JSON.stringify(protectedPath)} -delete`;
+        }
+
+        const prompt = "Inspect the repository without deleting files.";
+        const gateway = startGateway(
+          [
+            userCommandCall(command, `${shape}_destructive`),
+            fakeGatewayFinalText(`${shape} destructive action held`),
+          ],
+          [fakeGatewayPermissionDecision("caution", `${shape}_destructive_caution`)],
+        );
+        const result = await runFx(
+          ["ask", "--quiet", "--json", "--no-save", prompt],
+          {
+            cwd: root.workspace,
+            env: gatewayEnv(root, gateway),
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+        expect(gateway.classifierRequests).toHaveLength(1);
+        const review = reviewerText(gateway.classifierRequests[0]!.body);
+        expect(review).toContain("review_context_kind: contextual");
+        expect(review).toContain(prompt);
+        expect(existsSync(join(protectedPath, "keep.txt"))).toBe(true);
+        expect(result.stderr).not.toContain(COMMAND_APPROVAL_PROMPT);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "an explicitly requested unknown wrapper clears contextual review",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.root, "unknown-wrapper-ran");
+      const wrapper = join(root.root, "custom-build");
+      writeFileSync(wrapper, `#!/bin/sh\nprintf 'ran\\n' > ${JSON.stringify(marker)}\n`);
+      chmodSync(wrapper, 0o755);
+      const prompt = "Run the custom build wrapper exactly once.";
+      const gateway = startGateway(
+        [
+          userCommandCall(wrapper, "unknown_wrapper_clear"),
+          fakeGatewayFinalText("custom build completed"),
+        ],
+        [fakeGatewayPermissionDecision("clear", "unknown_wrapper_clear")],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", prompt],
+        {
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway),
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(1);
+      const review = reviewerText(gateway.classifierRequests[0]!.body);
+      expect(review).toContain("review_context_kind: contextual");
+      expect(review).toContain(prompt);
+      expect(readFileSync(marker, "utf8")).toBe("ran\n");
+      expect(result.stderr).not.toContain(COMMAND_APPROVAL_PROMPT);
     },
     TIMEOUT,
   );
@@ -669,7 +941,271 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
-    "oversized history gives the reviewer only the current root request",
+    "symbolic credential references remain reviewable in external startup edits",
+    async () => {
+      const root = createIsolatedRoot();
+      const startup = join(root.home, ".zshrc");
+      const before = "alias r='cd ~/projects/research && fx'\n";
+      const after = before +
+        "\n_rfx() {\n" +
+        "  local key\n" +
+        "  key=\"$(create-key)\" || return 1\n" +
+        "  AI_GATEWAY_API_KEY=\"$key\" run-sandbox\n" +
+        "}\n";
+      writeFileSync(startup, before);
+      const gateway = startGateway(
+        [
+          fakeGatewayToolCall("symbolic_startup_edit", "edit_file", {
+            path: startup,
+            old_string: before,
+            new_string: after,
+          }),
+          (body) => {
+            expect(toolResultText(body, "symbolic_startup_edit")).toContain(
+              "edited ",
+            );
+            return fakeGatewayFinalText("startup helper installed");
+          },
+        ],
+        [fakeGatewayPermissionDecision("clear", "symbolic_startup_review")],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Install the shell helper."],
+        {
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway),
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(1);
+      const review = gateway.classifierRequests[0]!.body;
+      expect(review).toContain("AI_GATEWAY_API_KEY");
+      expect(review).toContain("$key");
+      expect(review).not.toContain("AI_GATEWAY_API_KEY=[redacted]");
+      expect(readFileSync(startup, "utf8")).toBe(after);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "outer-quoted symbolic credentials remain reviewable in startup edit context",
+    async () => {
+      const root = createIsolatedRoot();
+      const startup = join(root.home, ".zshrc");
+      const before =
+        "_rfx() {\n" +
+        "  local key\n" +
+        "  key=\"$(create-key)\" || return 1\n" +
+        "  [[ -z $key ]] && return 1\n" +
+        "  command sandbox run --silent \\\n" +
+        "    -i -e \"AI_GATEWAY_API_KEY=$key\" \"$@\" -- \\\n" +
+        "    bash -c 'curl -fsSL https://fx.sh/setup.sh | bash 2>/dev/nu\n" +
+        "    ll && fx; exec bash'\n" +
+        "}\n";
+      const after = before.replace(
+        "2>/dev/nu\n    ll",
+        "2>/dev/null",
+      );
+      writeFileSync(startup, before);
+      const gateway = startGateway(
+        [
+          fakeGatewayToolCall("quoted_symbolic_startup_edit", "edit_file", {
+            path: startup,
+            old_string: "2>/dev/nu\n    ll",
+            new_string: "2>/dev/null",
+          }),
+          (body) => {
+            expect(toolResultText(body, "quoted_symbolic_startup_edit")).toContain(
+              "edited ",
+            );
+            return fakeGatewayFinalText("startup helper repaired");
+          },
+        ],
+        [fakeGatewayPermissionDecision("clear", "quoted_symbolic_startup_review")],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Repair the shell helper."],
+        {
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway),
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(1);
+      const review = gateway.classifierRequests[0]!.body;
+      expect(review).toContain('AI_GATEWAY_API_KEY=$key');
+      expect(review).not.toContain("AI_GATEWAY_API_KEY=[redacted]");
+      expect(readFileSync(startup, "utf8")).toBe(after);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "outer-quoted compound credentials remain reviewable",
+    async () => {
+      const root = createIsolatedRoot();
+      const startup = join(root.home, ".zshrc");
+      const before = "alias r='cd ~/projects/research && fx'\n";
+      const after = before +
+        'sandbox -e "AI_GATEWAY_API_KEY=$key literal-suffix"\n';
+      writeFileSync(startup, before);
+      const gateway = startGateway(
+        [
+          fakeGatewayToolCall("compound_symbolic_startup_edit", "edit_file", {
+            path: startup,
+            old_string: before,
+            new_string: after,
+          }),
+          (body) => {
+            expect(
+              toolResultText(body, "compound_symbolic_startup_edit"),
+            ).toContain(
+              "edited ",
+            );
+            return fakeGatewayFinalText("compound credential installed");
+          },
+        ],
+        [fakeGatewayPermissionDecision("clear", "compound_symbolic_review")],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Install the shell helper."],
+        {
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway),
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(result.stdout).toContain("compound credential installed");
+      expect(gateway.classifierRequests).toHaveLength(1);
+      const review = gateway.classifierRequests[0]!.body;
+      expect(review).toContain("AI_GATEWAY_API_KEY=$key literal-suffix");
+      expect(review).not.toContain("[redacted]");
+      expect(readFileSync(startup, "utf8")).toBe(after);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "literal credentials reach review transport unchanged",
+    async () => {
+      const root = createIsolatedRoot();
+      const startup = join(root.home, ".zshrc");
+      const before = "alias r='cd ~/projects/research && fx'\n";
+      const after = before + 'AI_GATEWAY_API_KEY="literal-fixture-value" run-sandbox\n';
+      writeFileSync(startup, before);
+      const gateway = startGateway(
+        [
+          fakeGatewayToolCall("literal_startup_edit", "edit_file", {
+            path: startup,
+            old_string: before,
+            new_string: after,
+          }),
+          (body) => {
+            expect(toolResultText(body, "literal_startup_edit")).toContain(
+              "edited ",
+            );
+            return fakeGatewayFinalText("literal credential installed");
+          },
+        ],
+        [fakeGatewayPermissionDecision("clear", "literal_credential_review")],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Install the shell helper."],
+        {
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway),
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(result.stdout).toContain("literal credential installed");
+      expect(gateway.classifierRequests).toHaveLength(1);
+      const review = gateway.classifierRequests[0]!.body;
+      expect(review).toContain('AI_GATEWAY_API_KEY=\\"literal-fixture-value\\"');
+      expect(review).not.toContain("[redacted]");
+      expect(readFileSync(startup, "utf8")).toBe(after);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "secret-like generated output reaches review and remains retrievable",
+    async () => {
+      const root = createIsolatedRoot();
+      writeFileSync(join(root.workspace, "effects.txt"), "EFFECT_ONE_608\n");
+      const command =
+        "python3 -c 'import secrets; from pathlib import Path; " +
+        "print(\"EFFECT_LINES=\"+str(len(Path(\"effects.txt\").read_text().splitlines()))); " +
+        "print((\"A\"*1024+\"\\n\")*80,end=\"\"); " +
+        "print(\"TOOL_DATA_TOKEN=\"+secrets.token_hex(12)); " +
+        "print((\"B\"*1024+\"\\n\")*80,end=\"\"); print(\"OUTPUT_DONE\")'";
+      let outputHandle = "";
+      let retrievedToken = "";
+      const gateway = startGateway(
+        [
+          commandCall(command, "secret_like_output"),
+          (body) => {
+            const commandResult = JSON.parse(
+              toolResultText(body, "secret_like_output"),
+            ) as { full_output_handle?: string; exit_code?: number };
+            expect(commandResult.exit_code).toBe(0);
+            outputHandle = commandResult.full_output_handle ?? "";
+            expect(outputHandle).toMatch(/^fx-command-replay-.+\.bin$/);
+            return fakeGatewayToolCall("read_secret_like_output", "read_tool_result", {
+              request: { handle: outputHandle, query: "TOOL_DATA_TOKEN=" },
+            });
+          },
+          (body) => {
+            const retrieved = toolResultText(body, "read_secret_like_output");
+            const match = retrieved.match(/TOOL_DATA_TOKEN=([a-f0-9]{24})/);
+            retrievedToken = match?.[1] ?? "";
+            expect(retrievedToken, retrieved).toMatch(/^[a-f0-9]{24}$/);
+            expect(retrieved).not.toContain("A".repeat(1024));
+            expect(retrieved).not.toContain("B".repeat(1024));
+            return fakeGatewayFinalText("secret-like output retrieved");
+          },
+        ],
+        [fakeGatewayPermissionDecision("clear", "exact_unmasked_action")],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Run the exact output retrieval fixture once."],
+        {
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway),
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(result.stdout).toContain("secret-like output retrieved");
+      expect(gateway.classifierRequests).toHaveLength(1);
+      const review = gateway.classifierRequests[0]!.body;
+      expect(review).toContain("TOOL_DATA_TOKEN=");
+      expect(review).toContain("secrets.token_hex(12)");
+      expect(review).not.toContain("[redacted]");
+      expect(readFileSync(join(root.workspace, "effects.txt"), "utf8")).toBe(
+        "EFFECT_ONE_608\n",
+      );
+      expect(outputHandle).not.toBe("");
+      expect(retrievedToken).not.toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "contextual command review keeps oversized root history bounded",
     async () => {
       const root = createIsolatedRoot();
       const blockedMarker = join(root.workspace, "oversized-history-must-not-run");
@@ -729,17 +1265,27 @@ describe("lean auto mode reliability", () => {
           content: Array<{ type: string; text?: string }>;
         }>;
       };
-      const rootMessage = reviewerPayload.prompt[0];
+      const firstConversationIndex = reviewerPayload.prompt.findIndex(
+        (message) => message.role !== "system",
+      );
+      expect(firstConversationIndex).toBeGreaterThan(0);
+      expect(
+        reviewerPayload.prompt.slice(firstConversationIndex).map((message) => message.role),
+      ).not.toContain("system");
+      const rootMessage = reviewerPayload.prompt[firstConversationIndex];
       expect(rootMessage?.role).toBe("user");
       const rootContext = (rootMessage?.content ?? [])
         .filter((part) => part.type === "text")
         .map((part) => part.text ?? "")
         .join("");
-      expect(Buffer.byteLength(rootContext)).toBeLessThanOrEqual(1024);
-      expect(rootContext).toContain("current-required-marker");
-      expect(rootContext).not.toContain("first-required-marker");
-      expect(rootContext).not.toContain("newest-recent-required-marker");
-      expect(rootContext).not.toContain("older-middle-marker");
+      const prefix = "review_context_kind: contextual\ntrusted_root_context:\n";
+      expect(rootContext.startsWith(prefix)).toBe(true);
+      const trustedRootContext = rootContext.slice(prefix.length);
+      expect(Buffer.byteLength(trustedRootContext)).toBeLessThanOrEqual(1024);
+      expect(trustedRootContext).toContain("current-required-marker");
+      expect(trustedRootContext).toContain("first-required-marker");
+      expect(trustedRootContext).toContain("newest-recent-required-marker");
+      expect(trustedRootContext).not.toContain("older-middle-marker");
     },
     TIMEOUT,
   );
@@ -788,6 +1334,76 @@ describe("lean auto mode reliability", () => {
       expect(gateway.classifierRequests).toHaveLength(1);
       const json = JSON.parse(result.stdout.trim()) as { output: string };
       expect(json.output).toContain("safe replan complete");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a benign agent-browser workflow clears after appearing in prior output",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.root, "agent-browser.log");
+      const bin = installRecorder(root, "agent-browser", marker);
+      const tracePath = join(root.workspace, "prior-trace.txt");
+      writeFileSync(
+        tracePath,
+        "Earlier run: agent-browser skills get core 2>&1 | head -120\n",
+      );
+      const command = "agent-browser skills get core";
+      const gateway = startGateway(
+        [
+          fakeGatewayToolCall("read_prior_trace", "read_file", {
+            path: tracePath,
+          }),
+          (body) => {
+            expect(toolResultText(body, "read_prior_trace")).toContain(command);
+            return commandCall(command, "browser_workflow");
+          },
+          (body) => {
+            expect(toolResultText(body, "browser_workflow")).toContain(
+              '"exit_code":0',
+            );
+            return fakeGatewayFinalText("Browser workflow loaded.");
+          },
+        ],
+        [
+          (body) => {
+            expect(body).toContain(
+              "prior_tool_result[0].tool_call_id: read_prior_trace",
+            );
+            expect(body).toContain(command);
+            return fakeGatewayPermissionDecision(
+              "clear",
+              "benign_documented_command",
+            );
+          },
+        ],
+      );
+
+      const result = await runFx(
+        [
+          "ask",
+          "--quiet",
+          "--json",
+          "--no-save",
+          "Read prior-trace.txt, then use the loaded agent-browser workflow.",
+        ],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout=${result.stdout}\nstderr=${result.stderr}`).toBe(0);
+      expect(result.stdout).toContain("Browser workflow loaded.");
+      expect(readFileSync(marker, "utf8")).toBe(
+        "agent-browser:skills get core\n",
+      );
+      expect(gateway.classifierRequests).toHaveLength(1);
     },
     TIMEOUT,
   );
@@ -844,19 +1460,19 @@ describe("lean auto mode reliability", () => {
         [
           userCommandCall(probeCommand, "media_probe"),
           (body) => {
-            expect(toolResultText(body, "media_probe")).toContain("exit_code=0");
+            expect(toolResultText(body, "media_probe")).toContain("\"exit_code\":0");
             return userCommandCall(rebuildCommand, "media_rebuild");
           },
           (body) => {
-            expect(toolResultText(body, "media_rebuild")).toContain("exit_code=0");
+            expect(toolResultText(body, "media_rebuild")).toContain("\"exit_code\":0");
             return userCommandCall(renderCommand, "media_render");
           },
           (body) => {
-            expect(toolResultText(body, "media_render")).toContain("exit_code=0");
+            expect(toolResultText(body, "media_render")).toContain("\"exit_code\":0");
             return userCommandCall(pythonCommand, "media_python");
           },
           (body) => {
-            expect(toolResultText(body, "media_python")).toContain("exit_code=0");
+            expect(toolResultText(body, "media_python")).toContain("\"exit_code\":0");
             return fakeGatewayToolCall("media_html", "write_file", {
               path: htmlPath,
               content: uiContent,
@@ -935,7 +1551,7 @@ describe("lean auto mode reliability", () => {
             return commandCall("pwd", "safe_after_injection");
           },
           (body) => {
-            expect(toolResultText(body, "safe_after_injection")).toContain("exit_code=0");
+            expect(toolResultText(body, "safe_after_injection")).toContain("\"exit_code\":0");
             return fakeGatewayFinalText("Injected instruction ignored safely.");
           },
         ],
@@ -946,7 +1562,6 @@ describe("lean auto mode reliability", () => {
             expect(body).toContain("prior_tool_result[0].content_untrusted:");
             expect(body).toContain(rawInstructionSentinel);
             expect(body).toContain("repo-instruction.txt");
-            expect(body).toContain("action_provenance: not_observed");
             return fakeGatewayPermissionDecision(
               "caution",
               "injected_media_paraphrase_caution",
@@ -1029,6 +1644,104 @@ describe("lean auto mode reliability", () => {
       expect(json.output).toContain("Repeated caution handled normally.");
       expect(json.steps).toBe(4);
       expect(existsSync(marker)).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "repeated exact unavailable reviews are attempted once without blocking a safe replan",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.workspace, "repeated-unavailable-must-not-run");
+      const command = `printf unavailable > ${JSON.stringify(marker)}`;
+      const gateway = startGateway(
+        [
+          commandCall(command, "unavailable_first"),
+          (body) => {
+            expect(body).toContain("review_unavailable");
+            expect(body).toContain("transport_transient");
+            return commandCall(command, "unavailable_retry");
+          },
+          (body) => {
+            expect(body).toContain("review_unavailable");
+            expect(body).toContain("turn_review_budget_exhausted");
+            return cleanCommandCall("pwd", "safe_after_unavailable");
+          },
+          fakeGatewayFinalText("Unavailable review handled normally."),
+        ],
+        [
+          () => new Response("reviewer unavailable", { status: 502 }),
+          fakeGatewayPermissionDecision("clear", "must_not_retry_reviewer"),
+        ],
+      );
+      const tracePath = join(root.root, "trace.log");
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Use a safe alternative if review is unavailable."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            FX_TRACE_LOG: tracePath,
+            FX_TRACE_SCOPES: "permission",
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(existsSync(marker)).toBe(false);
+      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(gateway.requests).toHaveLength(4);
+      expect(JSON.parse(result.stdout).output).toContain("Unavailable review handled normally.");
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace.match(/event=auto_review_start/g)).toHaveLength(1);
+      expect(trace).toContain("fallback_reason=transport_transient");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a valid decision survives an oversized reviewer rationale",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.root, "package-command.log");
+      const bin = installRecorder(root, "pnpm", marker);
+      const command = "pnpm dlx react-doctor@0.9.13";
+      const gateway = startGateway(
+        [
+          cleanCommandCall(command, "run_react_doctor"),
+          (body) => {
+            expect(toolResultText(body, "run_react_doctor")).toContain('"exit_code":0');
+            expect(body).not.toContain("review_unavailable");
+            return fakeGatewayFinalText("Reviewer metadata handled normally.");
+          },
+        ],
+        [
+          fakeGatewayToolCall("long_rationale_clear", "permission_decision", {
+            decision: "clear",
+            rationale: "x".repeat(512),
+          }),
+        ],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Run React Doctor."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(gateway.requests).toHaveLength(2);
+      expect(readFileSync(marker, "utf8")).toBe("pnpm:dlx react-doctor@0.9.13\n");
+      expect(JSON.parse(result.stdout).output).toContain("Reviewer metadata handled normally.");
     },
     TIMEOUT,
   );
@@ -1136,14 +1849,14 @@ describe("lean auto mode reliability", () => {
             {
               type: "tool-call",
               toolCallId: "mixed_block_3",
-              toolName: "terminal",
-              input: { action: "exec", timeout_ms: 600_000, command: `touch ${JSON.stringify(markers[2]!)}` },
+              toolName: "shell",
+              input: { request: { action: "run", yield_time_ms: 30_000, command: `touch ${JSON.stringify(markers[2]!)}` } },
             },
             {
               type: "tool-call",
               toolCallId: "mixed_safe_pwd",
-              toolName: "terminal",
-              input: { action: "exec", timeout_ms: 600_000, command: "pwd" },
+              toolName: "shell",
+              input: { request: { action: "run", yield_time_ms: 30_000, command: "pwd" } },
             },
             {
               type: "finish",
@@ -1270,7 +1983,7 @@ describe("lean auto mode reliability", () => {
       await activeSession.sendText("Initialize the saved allow session.");
       await activeSession.waitForText("allow session initialized", TIMEOUT);
       await activeSession.sendText(
-        `/permissions remember allow terminal ${JSON.stringify({ action: "exec", timeout_ms: 600_000, command: allowedCommand })}`,
+        `/permissions remember allow shell ${JSON.stringify({ action: "run", timeout_ms: 600_000, command: allowedCommand })}`,
       );
       await activeSession.waitForText("Remember allow for this saved session", TIMEOUT);
       await activeSession.sendKeys("1");
@@ -1392,7 +2105,7 @@ describe("lean auto mode reliability", () => {
       await activeSession.sendText("Initialize this saved session.");
       await activeSession.waitForText("session initialized", TIMEOUT);
       await activeSession.sendText(
-        `/permissions remember deny terminal ${JSON.stringify({ action: "exec", timeout_ms: 600_000, command: blockedCommand })}`,
+        `/permissions remember deny shell ${JSON.stringify({ action: "run", timeout_ms: 600_000, command: blockedCommand })}`,
       );
       await activeSession.waitForText("Remember deny for this saved session", TIMEOUT);
       await activeSession.sendKeys("1");

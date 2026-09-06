@@ -62,6 +62,7 @@ pub const ClientConfig = struct {
     client_secret: ?[]const u8 = null,
     client_metadata_url: ?[]const u8 = null,
     scopes: []const []const u8 = &.{},
+    callback_port: ?u16 = null,
 };
 
 pub const Credentials = struct {
@@ -582,6 +583,18 @@ const AuthorizationMetadataOutcome = union(enum) {
     issuer_mismatch: IssuerMismatch,
 };
 
+fn issuerWithoutTrailingSlash(issuer: []const u8) []const u8 {
+    if (issuer.len > 1 and issuer[issuer.len - 1] == '/') return issuer[0 .. issuer.len - 1];
+    return issuer;
+}
+
+/// Accept a trailing-slash discrepancy between protected-resource discovery
+/// and authorization-server metadata. Authorization responses still require
+/// the exact metadata issuer required by RFC 9207.
+fn authorizationMetadataIssuersEqual(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, issuerWithoutTrailingSlash(a), issuerWithoutTrailingSlash(b));
+}
+
 fn parseAuthorizationMetadataOutcome(
     alloc: Allocator,
     bytes: []const u8,
@@ -592,7 +605,7 @@ fn parseAuthorizationMetadataOutcome(
     if (parsed.value != .object) return error.InvalidAuthorizationMetadata;
     const object = parsed.value.object;
     const issuer = try requiredString(object, "issuer");
-    if (!std.mem.eql(u8, issuer, expected_issuer)) {
+    if (!authorizationMetadataIssuersEqual(issuer, expected_issuer)) {
         return .{ .issuer_mismatch = try IssuerMismatch.init(
             alloc,
             .authorization_metadata,
@@ -1014,6 +1027,144 @@ pub fn authorizeAutomated(
     );
 }
 
+fn callbackRedirectUri(alloc: Allocator, configured_port: ?u16, bound_port: u16) ![]u8 {
+    if (configured_port) |port| {
+        return std.fmt.allocPrint(alloc, "http://localhost:{d}/callback", .{port});
+    }
+    return std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/callback", .{bound_port});
+}
+
+const CallbackSocketCreation = struct {
+    flags: u32,
+    needs_cloexec_fallback: bool,
+};
+
+fn callbackSocketCreation(comptime os_tag: std.Target.Os.Tag) CallbackSocketCreation {
+    const needs_fallback = os_tag.isDarwin() or os_tag == .haiku;
+    return .{
+        .flags = std.posix.SOCK.STREAM |
+            if (needs_fallback) 0 else std.posix.SOCK.CLOEXEC,
+        .needs_cloexec_fallback = needs_fallback,
+    };
+}
+
+fn listenPinnedCallback(address: std.Io.net.IpAddress) std.Io.net.IpAddress.ListenError!std.Io.net.Server {
+    const posix = std.posix;
+    const SocketAddress = extern union {
+        any: posix.sockaddr,
+        ip4: posix.sockaddr.in,
+        ip6: posix.sockaddr.in6,
+    };
+    const AddressDetails = struct {
+        family: posix.sa_family_t,
+        len: posix.socklen_t,
+    };
+
+    var socket_address: SocketAddress = undefined;
+    const details: AddressDetails = switch (address) {
+        .ip4 => |value| values: {
+            socket_address.ip4 = .{
+                .port = std.mem.nativeToBig(u16, value.port),
+                .addr = @bitCast(value.bytes),
+            };
+            break :values .{ .family = posix.AF.INET, .len = @sizeOf(posix.sockaddr.in) };
+        },
+        .ip6 => |value| values: {
+            socket_address.ip6 = .{
+                .port = std.mem.nativeToBig(u16, value.port),
+                .flowinfo = value.flow,
+                .addr = value.bytes,
+                .scope_id = value.interface.index,
+            };
+            break :values .{ .family = posix.AF.INET6, .len = @sizeOf(posix.sockaddr.in6) };
+        },
+    };
+    const socket_creation = comptime callbackSocketCreation(builtin.os.tag);
+
+    const socket_fd = while (true) {
+        const rc = posix.system.socket(details.family, socket_creation.flags, 0);
+        switch (posix.errno(rc)) {
+            .SUCCESS => break @as(posix.socket_t, @intCast(rc)),
+            .INTR => continue,
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            .INVAL => return error.ProtocolUnsupportedBySystem,
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            .NOBUFS, .NOMEM => return error.SystemResources,
+            .PROTONOSUPPORT => return error.ProtocolUnsupportedByAddressFamily,
+            .PROTOTYPE => return error.SocketModeUnsupported,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    };
+    const socket: std.Io.net.Socket = .{ .handle = socket_fd, .address = address };
+    errdefer socket.close(io_mod.getIo());
+
+    if (comptime socket_creation.needs_cloexec_fallback) {
+        while (true) switch (posix.errno(posix.system.fcntl(
+            socket_fd,
+            posix.F.SETFD,
+            @as(usize, posix.FD_CLOEXEC),
+        ))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => |err| return posix.unexpectedErrno(err),
+        };
+    }
+
+    // Zig's reuse_address also enables SO_REUSEPORT on POSIX. Pinned OAuth
+    // callbacks need TIME_WAIT reuse without allowing concurrent listeners.
+    const reuse_address: u32 = 1;
+    const reuse_bytes = std.mem.asBytes(&reuse_address);
+    while (true) switch (posix.errno(posix.system.setsockopt(
+        socket_fd,
+        posix.SOL.SOCKET,
+        posix.SO.REUSEADDR,
+        reuse_bytes.ptr,
+        @intCast(reuse_bytes.len),
+    ))) {
+        .SUCCESS => break,
+        .INTR => continue,
+        .NOPROTOOPT => return error.OptionUnsupported,
+        else => |err| return posix.unexpectedErrno(err),
+    };
+
+    while (true) switch (posix.errno(posix.system.bind(
+        socket_fd,
+        &socket_address.any,
+        details.len,
+    ))) {
+        .SUCCESS => break,
+        .INTR => continue,
+        .ADDRINUSE => return error.AddressInUse,
+        .ADDRNOTAVAIL => return error.AddressUnavailable,
+        .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+        .NOBUFS, .NOMEM => return error.SystemResources,
+        else => |err| return posix.unexpectedErrno(err),
+    };
+
+    while (true) switch (posix.errno(posix.system.listen(
+        socket_fd,
+        std.Io.net.default_kernel_backlog,
+    ))) {
+        .SUCCESS => break,
+        .INTR => continue,
+        .ADDRINUSE => return error.AddressInUse,
+        else => |err| return posix.unexpectedErrno(err),
+    };
+
+    return .{
+        .socket = socket,
+        .options = if (std.Io.net.Server.AcceptOptions != void) .{
+            .mode = .stream,
+            .protocol = .tcp,
+        },
+    };
+}
+
+fn isUnavailableIpv6CallbackError(err: std.Io.net.IpAddress.ListenError) bool {
+    return err == error.AddressFamilyUnsupported or err == error.AddressUnavailable;
+}
+
 pub fn authorizeInteractive(
     alloc: Allocator,
     options: InteractiveAuthorizationOptions,
@@ -1021,17 +1172,31 @@ pub fn authorizeInteractive(
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         return error.InteractiveMcpAuthorizationUnsupported;
     }
-    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-    var listener = try address.listen(io_mod.getIo(), .{ .reuse_address = true });
+    const configured_port = options.config.callback_port;
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", configured_port orelse 0);
+    var listener = if (configured_port != null)
+        listenPinnedCallback(address) catch return error.McpCallbackPortUnavailable
+    else
+        try address.listen(io_mod.getIo(), .{ .reuse_address = true });
     defer listener.deinit(io_mod.getIo());
-    const redirect_uri = try std.fmt.allocPrint(
+    var ipv6_listener: ?std.Io.net.Server = null;
+    if (configured_port) |port| {
+        const ipv6_address = try std.Io.net.IpAddress.parse("::1", port);
+        ipv6_listener = listenPinnedCallback(ipv6_address) catch |err| fallback: {
+            if (isUnavailableIpv6CallbackError(err)) break :fallback null;
+            return error.McpCallbackPortUnavailable;
+        };
+    }
+    defer if (ipv6_listener) |*value| value.deinit(io_mod.getIo());
+    const redirect_uri = try callbackRedirectUri(
         alloc,
-        "http://127.0.0.1:{d}/callback",
-        .{listener.socket.address.getPort()},
+        configured_port,
+        listener.socket.address.getPort(),
     );
     defer alloc.free(redirect_uri);
     var context = InteractiveAuthorizationContext{
         .listener = &listener,
+        .ipv6_listener = if (ipv6_listener) |*value| value else null,
         .open_ctx = options.open_ctx,
         .open_url = options.open_url,
         .cancellation = .{
@@ -1247,6 +1412,7 @@ fn requestAutomatedAuthorization(
 
 const InteractiveAuthorizationContext = struct {
     listener: *std.Io.net.Server,
+    ipv6_listener: ?*std.Io.net.Server,
     open_ctx: ?*anyopaque,
     open_url: OpenUrlFn,
     cancellation: operation_control.CancellationSources,
@@ -1254,6 +1420,7 @@ const InteractiveAuthorizationContext = struct {
 
 const interactive_callback_timeout_ms: i32 = 5 * 60 * 1000;
 const interactive_callback_poll_ms: i32 = 50;
+const interactive_callback_max_accepts: usize = 16;
 
 fn checkAuthorizationCancellation(
     cancellation: operation_control.CancellationSources,
@@ -1263,25 +1430,37 @@ fn checkAuthorizationCancellation(
 
 fn waitForInteractiveCallback(
     listener: *std.Io.net.Server,
+    ipv6_listener: ?*std.Io.net.Server,
     cancellation: operation_control.CancellationSources,
-) !void {
-    var fds = [_]std.posix.pollfd{.{
+) !*std.Io.net.Server {
+    var fds = [_]std.posix.pollfd{ .{
         .fd = listener.socket.handle,
         .events = std.posix.POLL.IN,
         .revents = 0,
-    }};
+    }, undefined };
+    const listeners = [_]*std.Io.net.Server{ listener, ipv6_listener orelse listener };
+    const listener_count: usize = if (ipv6_listener == null) 1 else 2;
+    if (ipv6_listener) |value| {
+        fds[1] = .{
+            .fd = value.socket.handle,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        };
+    }
     var remaining_ms = interactive_callback_timeout_ms;
     while (remaining_ms > 0) {
         try checkAuthorizationCancellation(cancellation);
-        fds[0].revents = 0;
+        for (fds[0..listener_count]) |*fd| fd.revents = 0;
         const wait_ms = @min(remaining_ms, interactive_callback_poll_ms);
-        const ready = try std.posix.poll(&fds, wait_ms);
+        const ready = try std.posix.poll(fds[0..listener_count], wait_ms);
         if (ready > 0) {
-            if ((fds[0].revents & std.posix.POLL.IN) == 0) {
-                return error.McpAuthorizationCallbackTimedOut;
+            for (fds[0..listener_count], listeners[0..listener_count]) |fd, ready_listener| {
+                if ((fd.revents & std.posix.POLL.IN) != 0) {
+                    try checkAuthorizationCancellation(cancellation);
+                    return ready_listener;
+                }
             }
-            try checkAuthorizationCancellation(cancellation);
-            return;
+            return error.McpAuthorizationCallbackTimedOut;
         }
         remaining_ms -= wait_ms;
     }
@@ -1299,10 +1478,36 @@ fn requestInteractiveAuthorization(
     if (!try ctx.open_url(ctx.open_ctx, alloc, authorization_url)) {
         return error.McpAuthorizationBrowserOpenFailed;
     }
-    try waitForInteractiveCallback(ctx.listener, ctx.cancellation);
+    const max_accepts = if (ctx.ipv6_listener == null)
+        1
+    else
+        interactive_callback_max_accepts;
+    var accepts: usize = 0;
+    while (accepts < max_accepts) : (accepts += 1) {
+        const listener = try waitForInteractiveCallback(ctx.listener, ctx.ipv6_listener, ctx.cancellation);
+        var stream = listener.accept(io_mod.getIo()) catch |err| {
+            if (ctx.ipv6_listener != null and
+                (err == error.ConnectionAborted or err == error.WouldBlock))
+            {
+                continue;
+            }
+            return err;
+        };
+        const response = readInteractiveAuthorizationCallback(alloc, stream) catch |err| {
+            stream.close(io_mod.getIo());
+            if (ctx.ipv6_listener != null and err == error.ReadFailed) continue;
+            return err;
+        };
+        stream.close(io_mod.getIo());
+        return response;
+    }
+    return error.InvalidAuthorizationCallback;
+}
 
-    var stream = try ctx.listener.accept(io_mod.getIo());
-    defer stream.close(io_mod.getIo());
+fn readInteractiveAuthorizationCallback(
+    alloc: Allocator,
+    stream: std.Io.net.Stream,
+) !AuthorizationResponse {
     setSocketTimeouts(stream.socket.handle, callback_io_timeout_seconds);
     var socket_buffer: [4096]u8 = undefined;
     var reader = stream.reader(io_mod.getIo(), &socket_buffer);
@@ -1870,27 +2075,36 @@ fn validateJsonContentType(content_type: ?[]const u8) !void {
 fn setSocketTimeouts(socket: std.posix.socket_t, seconds: i64) void {
     if (comptime host_target.is_wasm) return;
     const timeout = std.posix.timeval{ .sec = seconds, .usec = 0 };
-    const bytes = std.mem.asBytes(&timeout);
-    std.posix.setsockopt(
+    const receive_rc = std.c.setsockopt(
         socket,
-        std.posix.SOL.SOCKET,
-        std.posix.SO.RCVTIMEO,
-        bytes,
-    ) catch |err| debug_trace.logf(
-        "mcp",
-        "OAuth receive timeout setup failed err={s}",
-        .{@errorName(err)},
+        std.c.SOL.SOCKET,
+        std.c.SO.RCVTIMEO,
+        &timeout,
+        @sizeOf(std.posix.timeval),
     );
-    std.posix.setsockopt(
+    if (receive_rc != 0) {
+        const err = std.posix.errno(receive_rc);
+        debug_trace.logf(
+            "mcp",
+            "OAuth receive timeout setup failed errno={s}",
+            .{@tagName(err)},
+        );
+    }
+    const send_rc = std.c.setsockopt(
         socket,
-        std.posix.SOL.SOCKET,
-        std.posix.SO.SNDTIMEO,
-        bytes,
-    ) catch |err| debug_trace.logf(
-        "mcp",
-        "OAuth send timeout setup failed err={s}",
-        .{@errorName(err)},
+        std.c.SOL.SOCKET,
+        std.c.SO.SNDTIMEO,
+        &timeout,
+        @sizeOf(std.posix.timeval),
     );
+    if (send_rc != 0) {
+        const err = std.posix.errno(send_rc);
+        debug_trace.logf(
+            "mcp",
+            "OAuth send timeout setup failed errno={s}",
+            .{@tagName(err)},
+        );
+    }
 }
 
 fn dupeRequiredSecret(
@@ -2338,7 +2552,7 @@ test "authorization metadata mismatch retains exact issuer values and fails clos
     var outcome = try parseAuthorizationMetadataOutcome(
         alloc,
         bytes,
-        "https://login.example.com/",
+        "https://login.evil.example/",
     );
     defer switch (outcome) {
         .metadata => |*metadata| metadata.deinit(alloc),
@@ -2352,7 +2566,7 @@ test "authorization metadata mismatch retains exact issuer values and fails clos
                 mismatch.source,
             );
             try std.testing.expectEqualStrings(
-                "https://login.example.com/",
+                "https://login.evil.example/",
                 mismatch.expected,
             );
             try std.testing.expectEqualStrings(
@@ -2366,6 +2580,40 @@ test "authorization metadata mismatch retains exact issuer values and fails clos
         parseAuthorizationMetadata(
             alloc,
             bytes,
+            "https://login.evil.example/",
+        ),
+    );
+}
+
+test "authorization metadata accepts an issuer that differs only by a trailing slash" {
+    const alloc = std.testing.allocator;
+    const bytes =
+        "{\"issuer\":\"https://login.example.com\",\"authorization_endpoint\":\"https://login.example.com/authorize\",\"token_endpoint\":\"https://login.example.com/token\"}";
+
+    var metadata = try parseAuthorizationMetadata(
+        alloc,
+        bytes,
+        "https://login.example.com/",
+    );
+    defer metadata.deinit(alloc);
+    try std.testing.expectEqualStrings("https://login.example.com", metadata.issuer);
+
+    var reverse = try parseAuthorizationMetadata(
+        alloc,
+        "{\"issuer\":\"https://login.example.com/\",\"authorization_endpoint\":\"https://login.example.com/authorize\",\"token_endpoint\":\"https://login.example.com/token\"}",
+        "https://login.example.com",
+    );
+    defer reverse.deinit(alloc);
+    try std.testing.expectEqualStrings("https://login.example.com/", reverse.issuer);
+}
+
+test "authorization metadata rejects an issuer whose path differs" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(
+        error.AuthorizationMetadataIssuerMismatch,
+        parseAuthorizationMetadata(
+            alloc,
+            "{\"issuer\":\"https://login.example.com/tenant\",\"authorization_endpoint\":\"https://login.example.com/authorize\",\"token_endpoint\":\"https://login.example.com/token\"}",
             "https://login.example.com/",
         ),
     );
@@ -2449,6 +2697,24 @@ test "authorization response uses exact state and issuer comparison" {
             response,
         ),
     );
+    try std.testing.expectError(
+        error.OAuthStateMismatch,
+        validateAuthorizationResponse(
+            "state-2",
+            "https://login.example.com",
+            true,
+            response,
+        ),
+    );
+    try std.testing.expectError(
+        error.AuthorizationResponseIssuerMismatch,
+        validateAuthorizationResponse(
+            "state-1",
+            "https://login.evil.example",
+            true,
+            response,
+        ),
+    );
 }
 
 test "authorization redirect target must match the registered callback" {
@@ -2463,6 +2729,138 @@ test "authorization redirect target must match the registered callback" {
             "http://localhost:3000/callback",
         ),
     );
+}
+
+test "interactive callback redirect honors a pinned port" {
+    const alloc = std.testing.allocator;
+
+    const pinned = try callbackRedirectUri(alloc, 3118, 54321);
+    defer alloc.free(pinned);
+    try std.testing.expectEqualStrings("http://localhost:3118/callback", pinned);
+    try std.testing.expect(isLoopbackEndpoint(pinned));
+    try validateRedirectTarget("http://localhost:3118/callback?code=one&state=two", pinned);
+
+    const ephemeral = try callbackRedirectUri(alloc, null, 54321);
+    defer alloc.free(ephemeral);
+    try std.testing.expectEqualStrings("http://127.0.0.1:54321/callback", ephemeral);
+    try std.testing.expect(isLoopbackEndpoint(ephemeral));
+}
+
+test "interactive callback rejects a pinned port already listening" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try address.listen(std.testing.io, .{ .reuse_address = true });
+    defer listener.deinit(std.testing.io);
+    var cancelled = std.atomic.Value(bool).init(true);
+    const OpenUrl = struct {
+        fn run(_: ?*anyopaque, _: Allocator, _: []const u8) anyerror!bool {
+            return true;
+        }
+    };
+    try std.testing.expectError(
+        error.McpCallbackPortUnavailable,
+        authorizeInteractive(std.testing.allocator, .{
+            .endpoint = "http://127.0.0.1:8080",
+            .challenge = .{},
+            .config = .{ .callback_port = listener.socket.address.getPort() },
+            .open_url = OpenUrl.run,
+            .cancel_flag = &cancelled,
+        }),
+    );
+}
+
+test "interactive callback rejects a pinned IPv6 port already listening" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    var address = try std.Io.net.IpAddress.parse("::1", 0);
+    var listener = address.listen(std.testing.io, .{ .reuse_address = true }) catch |err| switch (err) {
+        error.AddressFamilyUnsupported, error.AddressUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer listener.deinit(std.testing.io);
+    var cancelled = std.atomic.Value(bool).init(true);
+    const OpenUrl = struct {
+        fn run(_: ?*anyopaque, _: Allocator, _: []const u8) anyerror!bool {
+            return true;
+        }
+    };
+    try std.testing.expectError(
+        error.McpCallbackPortUnavailable,
+        authorizeInteractive(std.testing.allocator, .{
+            .endpoint = "http://127.0.0.1:8080",
+            .challenge = .{},
+            .config = .{ .callback_port = listener.socket.address.getPort() },
+            .open_url = OpenUrl.run,
+            .cancel_flag = &cancelled,
+        }),
+    );
+}
+
+test "interactive callback immediately reuses a completed pinned port" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try address.listen(std.testing.io, .{ .reuse_address = true });
+    var listener_open = true;
+    defer if (listener_open) listener.deinit(std.testing.io);
+    const port = listener.socket.address.getPort();
+
+    address.setPort(port);
+    var client = try address.connect(std.testing.io, .{ .mode = .stream });
+    var client_open = true;
+    defer if (client_open) client.close(std.testing.io);
+    var accepted = try listener.accept(std.testing.io);
+    var accepted_open = true;
+    defer if (accepted_open) accepted.close(std.testing.io);
+    accepted.close(std.testing.io);
+    accepted_open = false;
+    var socket_buffer: [1]u8 = undefined;
+    var reader = client.reader(std.testing.io, &socket_buffer);
+    try std.testing.expectError(error.EndOfStream, reader.interface.takeByte());
+    client.close(std.testing.io);
+    client_open = false;
+    listener.deinit(std.testing.io);
+    listener_open = false;
+
+    var cancelled = std.atomic.Value(bool).init(true);
+    const OpenUrl = struct {
+        fn run(_: ?*anyopaque, _: Allocator, _: []const u8) anyerror!bool {
+            return true;
+        }
+    };
+    try std.testing.expectError(
+        error.Cancelled,
+        authorizeInteractive(std.testing.allocator, .{
+            .endpoint = "http://127.0.0.1:8080",
+            .challenge = .{},
+            .config = .{ .callback_port = port },
+            .open_url = OpenUrl.run,
+            .cancel_flag = &cancelled,
+        }),
+    );
+}
+
+test "interactive callback treats unavailable IPv6 as optional" {
+    try std.testing.expect(isUnavailableIpv6CallbackError(error.AddressFamilyUnsupported));
+    try std.testing.expect(isUnavailableIpv6CallbackError(error.AddressUnavailable));
+    try std.testing.expect(!isUnavailableIpv6CallbackError(error.AddressInUse));
+    try std.testing.expect(!isUnavailableIpv6CallbackError(error.SystemResources));
+}
+
+test "pinned callback sockets create close-on-exec atomically where supported" {
+    const linux = callbackSocketCreation(.linux);
+    try std.testing.expect((linux.flags & std.posix.SOCK.CLOEXEC) != 0);
+    try std.testing.expect(!linux.needs_cloexec_fallback);
+
+    inline for (.{ .macos, .haiku }) |os_tag| {
+        const fallback = callbackSocketCreation(os_tag);
+        try std.testing.expectEqual(std.posix.SOCK.STREAM, fallback.flags);
+        try std.testing.expect(fallback.needs_cloexec_fallback);
+    }
 }
 
 test "interactive callback wait observes caller and lifecycle cancellation" {
@@ -2489,7 +2887,7 @@ test "interactive callback wait observes caller and lifecycle cancellation" {
         const started_ms = io_mod.milliTimestamp();
         try std.testing.expectError(
             error.Cancelled,
-            waitForInteractiveCallback(&listener, .{
+            waitForInteractiveCallback(&listener, null, .{
                 .caller = &caller,
                 .runtime = &runtime,
             }),

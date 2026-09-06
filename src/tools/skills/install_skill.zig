@@ -86,7 +86,7 @@ pub fn executeRunCommand(
         error.OutOfMemory => return error.OutOfMemory,
         else => return .{ .failure = try tool_result_errors.formatToolExecutionErrorJson(
             ctx.allocator,
-            "terminal",
+            "shell",
             err,
         ) },
     };
@@ -316,6 +316,7 @@ test "run command compatibility reports managed filesystem failures" {
     }, command);
 
     switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .success => try std.testing.expect(false),
         .failure => |body| try std.testing.expect(tool_result_errors.isToolExecutionFailedOutput(body)),
     }

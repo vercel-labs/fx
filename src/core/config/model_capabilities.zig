@@ -48,6 +48,7 @@ pub const Capabilities = struct {
     supports_reasoning: bool = false,
     reasoning_efforts: ReasoningEffortOptions = .{},
     supports_fast_mode: bool = false,
+    intrinsic_fast: bool = false,
     supports_tool_use: bool = false,
     supports_vision: bool = false,
     supports_file_input: bool = false,
@@ -55,7 +56,6 @@ pub const Capabilities = struct {
     supports_web_search: bool = false,
     supports_explicit_caching: bool = false,
     supports_implicit_caching: bool = false,
-    prompt_caching: bool = false,
     parallel_tool_calls: ?bool = null,
     context_window: ?u32 = null,
     max_output_tokens: ?u32 = null,
@@ -98,19 +98,22 @@ pub fn mergeCapabilities(capabilities_value: Capabilities, gateway_metadata: ?Ga
     return capabilities;
 }
 
-pub fn resolveCapabilities(_: []const u8, gateway_metadata: ?GatewayMetadata) Capabilities {
-    return mergeCapabilities(.{}, gateway_metadata);
+pub fn resolveCapabilities(model: []const u8, gateway_metadata: ?GatewayMetadata) Capabilities {
+    return mergeCapabilities(capabilitiesForModel(model), gateway_metadata);
 }
 
 pub fn capabilitiesForModel(model: []const u8) Capabilities {
-    return resolveCapabilities(model, null);
+    return .{ .intrinsic_fast = std.mem.endsWith(u8, model, "-fast") };
 }
 
 pub fn resolveForApp(comptime App: type, app: *App, model: []const u8) Capabilities {
-    if (comptime @hasDecl(App, "resolvedModelCapabilities")) {
-        return app.resolvedModelCapabilities(model);
-    }
-    return capabilitiesForModel(model);
+    const generic = capabilitiesForModel(model);
+    var capabilities = if (comptime @hasDecl(App, "resolvedModelCapabilities"))
+        app.resolvedModelCapabilities(model)
+    else
+        generic;
+    capabilities.intrinsic_fast = capabilities.intrinsic_fast or generic.intrinsic_fast;
+    return capabilities;
 }
 
 pub fn reasoningEffortSupported(capabilities: Capabilities, effort: types.ReasoningEffort) bool {
@@ -150,7 +153,6 @@ pub fn resolveProviderOptionsForCapabilities(
 ) ResolvedProviderOptions {
     var resolved: ResolvedProviderOptions = .{
         .parallel_tool_calls = capabilities.parallel_tool_calls,
-        .prompt_caching = capabilities.prompt_caching,
     };
     if (!effort.isDefault() and reasoningEffortSupported(capabilities, effort)) {
         resolved.reasoning = effort;
@@ -159,18 +161,32 @@ pub fn resolveProviderOptionsForCapabilities(
     return resolved;
 }
 
-test "capabilities never infer reasoning or Fast controls from model IDs" {
-    const models = [_][]const u8{
-        "openai/gpt-5.6-sol",
-        "anthropic/claude-opus-4.8",
-        "zai/glm-5.2",
-        "zai/glm-5.2-fast",
+test "capabilities infer intrinsic fast identity but not controls from model IDs" {
+    const models = [_]struct { id: []const u8, intrinsic_fast: bool }{
+        .{ .id = "openai/gpt-5.6-sol", .intrinsic_fast = false },
+        .{ .id = "anthropic/claude-opus-4.8", .intrinsic_fast = false },
+        .{ .id = "zai/glm-5.2", .intrinsic_fast = false },
+        .{ .id = "zai/glm-5.2-fast", .intrinsic_fast = true },
+        .{ .id = "provider/breakfast", .intrinsic_fast = false },
     };
     for (models) |model| {
-        const capabilities = capabilitiesForModel(model);
+        const capabilities = capabilitiesForModel(model.id);
         try std.testing.expectEqual(@as(usize, 0), capabilities.reasoning_efforts.len);
         try std.testing.expect(!capabilities.supports_fast_mode);
+        try std.testing.expectEqual(model.intrinsic_fast, capabilities.intrinsic_fast);
     }
+}
+
+test "resolveForApp adds intrinsic fast identity to provider capabilities" {
+    const App = struct {
+        pub fn resolvedModelCapabilities(_: *@This(), _: []const u8) Capabilities {
+            return .{};
+        }
+    };
+    var app = App{};
+
+    try std.testing.expect(resolveForApp(App, &app, "provider/model-fast").intrinsic_fast);
+    try std.testing.expect(!resolveForApp(App, &app, "provider/model-default").intrinsic_fast);
 }
 
 test "mergeCapabilities preserves provider controls and supplied fallback policy" {
@@ -178,7 +194,7 @@ test "mergeCapabilities preserves provider controls and supplied fallback policy
         types.ReasoningEffort.literal("future-tier"),
         types.ReasoningEffort.literal("high"),
     };
-    const capabilities = mergeCapabilities(.{ .prompt_caching = true }, .{
+    const capabilities = mergeCapabilities(.{ .intrinsic_fast = true }, .{
         .reasoning_efforts = .fromSlice(&efforts),
         .supports_fast_mode = true,
         .supports_tool_use = true,
@@ -192,6 +208,7 @@ test "mergeCapabilities preserves provider controls and supplied fallback policy
     });
 
     try std.testing.expect(capabilities.supports_reasoning);
+    try std.testing.expect(capabilities.intrinsic_fast);
     try std.testing.expectEqual(@as(usize, 2), capabilities.reasoning_efforts.len);
     try std.testing.expectEqualStrings("future-tier", capabilities.reasoning_efforts.values[0].label());
     try std.testing.expect(capabilities.supports_fast_mode);
@@ -201,7 +218,6 @@ test "mergeCapabilities preserves provider controls and supplied fallback policy
     try std.testing.expect(capabilities.supports_web_search);
     try std.testing.expect(capabilities.supports_explicit_caching);
     try std.testing.expect(capabilities.supports_implicit_caching);
-    try std.testing.expect(capabilities.prompt_caching);
     try std.testing.expectEqual(@as(?u32, 300_000), capabilities.context_window);
     try std.testing.expectEqual(@as(?u32, 32_000), capabilities.max_output_tokens);
 }
@@ -302,6 +318,5 @@ test "request controls remain safe across repeated state transitions" {
 
 test "generic fallback capabilities contain no vendor policy" {
     const fallback = capabilitiesForModel("anthropic/claude-any");
-    try std.testing.expect(!fallback.prompt_caching);
     try std.testing.expect(fallback.context_window == null);
 }

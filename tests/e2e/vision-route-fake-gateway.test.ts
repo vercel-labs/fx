@@ -18,12 +18,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
-import {
-  hasEmptyComposer,
-  POST_TOOL_DECISION_PROMPT,
-  TmuxSession,
-  tmuxAvailable,
-} from "./tmux-helpers";
+import { hasEmptyComposer, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
 const TIMEOUT = 15_000;
 const GLM_MODEL = "zai/glm-5.2-fast";
@@ -507,7 +502,7 @@ async function expectChangedCanonicalVisionPathFailure(
 }
 
 function parseFxJson(result: Awaited<ReturnType<typeof runFx>>) {
-  expect(result.code).toBe(0);
+  expect(result.code, result.stdout + result.stderr).toBe(0);
   return JSON.parse(result.stdout.trim()) as {
     output: string;
     exit_code: number;
@@ -540,11 +535,7 @@ function textFromContent(content: unknown): string {
 
 function lastUserText(body: string): string {
   const parsed = JSON.parse(body) as { prompt: Array<{ role?: string; content?: unknown }> };
-  const users = parsed.prompt.filter(
-    (entry) =>
-      entry.role === "user" &&
-      textFromContent(entry.content) !== POST_TOOL_DECISION_PROMPT,
-  );
+  const users = parsed.prompt.filter((entry) => entry.role === "user");
   expect(users.length).toBeGreaterThan(0);
   return textFromContent(users[users.length - 1].content);
 }
@@ -733,10 +724,20 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "fx ask ends the post-Vision prompt with user decision guidance",
+    "fx ask recovers when the model rejects the post-Vision prompt as assistant prefill",
     async () => {
       const root = createIsolatedRoot();
       const fixture = createScopedImageFixture(root);
+      const prefillRejection = new Response(
+        JSON.stringify({
+          error: {
+            message:
+              "AI_APICallError: This model does not support assistant message prefill. " +
+              "The conversation must end with a user message.",
+          },
+        }),
+        { status: 400, headers: { "content-type": "application/json" } },
+      );
       const gateway = startImageGateway([
         sseToolCall(
           "vision",
@@ -744,6 +745,7 @@ describe("Vision route fake Gateway", () => {
           "vision_prefill_recovery",
         ),
         sseText(VISION_RESULT),
+        prefillRejection,
         sseText("Recovered final image answer"),
       ]);
       try {
@@ -767,12 +769,14 @@ describe("Vision route fake Gateway", () => {
         const json = parseFxJson(result);
         expect(json.exit_code).toBe(0);
         expect(json.output).toContain("Recovered final image answer");
-        expect(gateway.chatRequests).toHaveLength(3);
+        expect(gateway.chatRequests).toHaveLength(4);
 
-        const selectedPrompt = JSON.parse(gateway.chatRequests[2].body).prompt;
-        expect(selectedPrompt.at(-1)).toMatchObject({ role: "user" });
-        expect(JSON.stringify(selectedPrompt.at(-1))).toContain(
-          POST_TOOL_DECISION_PROMPT,
+        const rejectedPrompt = JSON.parse(gateway.chatRequests[2].body).prompt;
+        expect(rejectedPrompt.at(-1)).toMatchObject({ role: "tool" });
+        const retryPrompt = JSON.parse(gateway.chatRequests[3].body).prompt;
+        expect(retryPrompt.at(-1)).toMatchObject({ role: "user" });
+        expect(JSON.stringify(retryPrompt.at(-1))).toContain(
+          "Continue from the preceding tool result.",
         );
         expect(result.stderr).toBe("Inspecting images\n");
       } finally {
@@ -977,6 +981,7 @@ describe("Vision route fake Gateway", () => {
       writeFileSync(forbiddenPath, forbiddenContents);
       const gateway = startImageGateway([
         sseToolCall("read_file", { path: forbiddenPath }, "read_before_vision"),
+        sseToolCall("read_file", [], "non_object_before_vision"),
         sseToolCall("vision", { image_ids: [1], focus: "inspect" }, "vision_after_rejection"),
         sseText(VISION_RESULT),
         sseText("Recovered after required Vision rejection"),
@@ -1004,7 +1009,7 @@ describe("Vision route fake Gateway", () => {
         expect(json.output).toContain("Recovered after required Vision rejection");
         expect(json.tool_calls).toContainEqual({ name: "read_file", status: "error" });
         expect(json.tool_calls).toContainEqual({ name: "vision", status: "success" });
-        expect(gateway.chatRequests).toHaveLength(4);
+        expect(gateway.chatRequests).toHaveLength(5);
         expect(gateway.chatRequests[0].body).toContain('"toolChoice":{"type":"required"}');
         expect(gateway.chatRequests[1].body).toContain('"toolChoice":{"type":"required"}');
         expect(gateway.chatRequests[1].body).toContain("read_before_vision");
@@ -1012,10 +1017,14 @@ describe("Vision route fake Gateway", () => {
           "Only Vision can be called while attached images are pending.",
         );
         expect(gateway.chatRequests[1].body).not.toContain(forbiddenContents);
-        expect(gateway.chatRequests[2].headers.get("ai-language-model-id")).toBe(GEMINI_MODEL);
-        expect(filePartCount(gateway.chatRequests[2].body)).toBe(1);
-        expect(gateway.chatRequests[3].body).toContain("FX LOGO");
-        expect(gateway.chatRequests[3].body).not.toContain(forbiddenContents);
+        const rejectedCall = JSON.parse(gateway.chatRequests[2].body).prompt
+          .flatMap((message: { content: unknown }) => Array.isArray(message.content) ? message.content : [])
+          .find((part: { toolCallId?: string; type?: string }) => part.type === "tool-call" && part.toolCallId === "non_object_before_vision");
+        expect(rejectedCall.input).toEqual({});
+        expect(gateway.chatRequests[3].headers.get("ai-language-model-id")).toBe(GEMINI_MODEL);
+        expect(filePartCount(gateway.chatRequests[3].body)).toBe(1);
+        expect(gateway.chatRequests[4].body).toContain("FX LOGO");
+        expect(gateway.chatRequests[4].body).not.toContain(forbiddenContents);
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
@@ -1478,7 +1487,7 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "text-only non-native ask resolves capability and exposes Vision",
+    "text-only GLM ask resolves context capacity and exposes Vision without Vision IO",
     async () => {
       const root = createIsolatedRoot();
       const gateway = startImageGateway([sseText("text only answer")]);
@@ -2964,7 +2973,6 @@ describe("Vision route fake Gateway", () => {
         expect(gateway.chatRequests).toHaveLength(3);
         const selectedFollowup = gateway.chatRequests[2].body;
         expect(lastUserText(selectedFollowup)).toBe(feedback);
-        expect(selectedFollowup).toContain(POST_TOOL_DECISION_PROMPT);
         expect(selectedFollowup.split("<available_images>")).toHaveLength(2);
         expect(selectedFollowup).toContain(rootRequest);
         expect(selectedFollowup).not.toContain(imagePath);

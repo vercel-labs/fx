@@ -139,7 +139,7 @@ Runtime state lives under `~/.fx/`:
 
 Sessions are global and portable across workspaces. Each session tracks a `workspace_root` that updates when resumed from a different directory.
 
-Subagent children are ordinary sessions with their own `~/.fx/sessions/<child-id>/` directory and their own history. The `subagent/` directory is per session on both sides of the relationship: a parent records create-operation identities there, and a child records its own control state there.
+Subagent children are internal ordinary sessions with their own `~/.fx/sessions/<child-id>/` directory and history. The parent owns one bounded `subagent/children.json` registry; each child carries only an immutable owner marker. Child sessions are hidden from ordinary session discovery and cannot be resumed directly. A first `subagent.message` creates a named persistent child for that parent; later messages continue it, and optional instructions replace only its child-specific system overlay.
 
 ## Skills
 
@@ -157,11 +157,12 @@ The interactive agent can also install skills via the `install_skill` tool when 
 
 ## MCP
 
-fx negotiates MCP `2026-07-28` over local stdio and stateless Streamable HTTP.
-Version-scoped adapters retain legacy stdio,
-`2025-11-25`/`2025-06-18`/`2025-03-26` Streamable HTTP, and deprecated
-`2024-11-05` HTTP+SSE. Native sessions load trusted MCP configuration from the
-profile:
+Native fx connections use MCP v1 initialization by default over stdio,
+Streamable HTTP, and deprecated `2024-11-05` HTTP+SSE. Servers using the newer
+`2026-07-28` discovery lifecycle opt in with
+`FX_MCP_PROTOCOL_VERSION=2026-07-28` in their configured `environment` map.
+The SDK's host-owned client controls its own protocol negotiation. Native
+sessions load trusted MCP configuration from the profile:
 
 * `~/.fx/mcp.json`
 
@@ -200,10 +201,11 @@ Completion, pagination, cache-aware discovery, subscriptions, progress,
 cancellation, and form or URL elicitation. Keep modern and legacy protocol
 behavior in their existing version-scoped modules.
 
-Tool schemas without `$schema` use JSON Schema 2020-12. fx also accepts the
-canonical 2020-12 declaration and the canonical Draft 7 declaration used by
-legacy SDKs, evaluates each with dialect-specific semantics, and rejects other
-dialects or references that would require network fetching before publication.
+fx bounds schema size and structure before publication. It accepts schemas
+without `$schema`, the canonical JSON Schema 2020-12 declaration, and the
+canonical Draft 7 declaration used by legacy SDKs; other declared dialects are
+rejected. fx does not resolve network references or evaluate semantic schema
+assertions. Servers validate their tool arguments and results.
 
 The interactive surface supports:
 
@@ -300,10 +302,23 @@ backend explicitly for deterministic tests and local troubleshooting.
 
 Servers are optional by default. Required startup failures block the first TUI
 or `fx ask` model request; optional failures publish a reduced, degraded
-capability set. One-shot `fx ask` starts required servers before its first model
-request and defers optional servers until the turn first performs an MCP
-operation or delegates MCP capability to a child. `/mcp list` renders a bounded,
-secret-free health snapshot.
+capability set. Terminal `fx ask` completes admitted MCP discovery before its
+first model request. JSON and other headless asks start required servers first
+and defer optional servers until the turn performs an MCP operation or delegates
+MCP capability to a child. Server-filtered searches, selected tools, and feature
+operations activate only their target; a broad search activates the broader
+catalog. Each server owns its startup and recovery progress. Connection deadlines
+cover discovery, fallback, and restarts together. Interactive authentication and
+logout change only the affected connection. `/mcp list` renders a bounded, secret-free health
+snapshot. The interactive menu refreshes that view while it is open.
+
+Search and explicit selection share bounded schema publication. Definitions are
+checked against their runtime, connection, catalog, and credential generations
+before execution. Tool argument JSON must be bounded and object-shaped; semantic
+schema assertions belong to the server. Image results use the shared tool-result,
+provider, and versioned history paths. Saved native images use managed result
+artifacts that `read_tool_result` can load without repeating the original tool.
+
 `/mcp reload` evaluates a replacement before publication, so invalid config or
 a required-server failure leaves the prior runtime callable.
 
@@ -316,7 +331,7 @@ capability. Missing, revoked, stale, or closed authority fails before transport.
 
 Security is permission-first.
 
-* `permission_mode` controls baseline behavior (`ask`, `auto`, or `yolo`)
+* `permission_mode` controls baseline behavior (`ask`, `auto`, or `full-access`; `yolo` remains an alias)
 
 * `permission` config applies OpenCode-style wildcard rules
 
@@ -328,13 +343,13 @@ Security is permission-first.
 
 * routine parsed development commands and reversible new-file creation can execute without model review after configured and saved-session policy; unknown, destructive, hidden, credential-bearing, public, and overwrite effects remain on the review or approval path
 
-* every unresolved `auto` action receives one narrow safety review after configured policy, saved-session rules, grants, and deterministic safe authority; review input contains the current proven root request, the exact action and targets, origin and call identity, optional host-proven current-branch evidence, exact-copy provenance, and bounded masked terminal-safe excerpts of earlier current-turn tool results. Those excerpts are untrusted evidence and never authority; assistant prose, permission feedback, the pending tool group, later results, and historical requests do not enter review
+* every unresolved `auto` action receives one narrow security review after configured policy, saved-session rules, grants, and deterministic safe authority; review input always contains the exact unmasked action and targets, origin and call identity, optional host-proven current-branch evidence, and bounded unmasked terminal-safe excerpts of earlier current-turn tool results. A text match between the action and prior tool output is evidence to inspect, not proof of prompt injection or malicious activity. Prepared file mutations and static root tools omit task text. Reviewed commands, dynamic tools, and subagent actions also receive bounded unmasked canonical current, first, and recent root requests plus explicit omission counts; the reviewer may use that context only to distinguish trusted user intent from malicious or injected influence, never to judge task quality, alignment, or authorization. Assistant prose, permission feedback, compacted summaries, the pending tool group, later results, and tool or repository text never become authority
 
-* a `clear` review authorizes only the exact unchanged action; a `caution` or unavailable review holds only that action and returns advice without opening a human permission screen, disabling tools, or ending the turn
+* the reviewer returns `caution` only for concrete prompt injection or malicious activity; destructive, risky, external, public, remote, unrequested, or task-conflicting actions clear when they are not malicious. A `clear` review authorizes only the exact unchanged action; a `caution`, incomplete-evidence result, or unavailable review holds only that action and returns guidance without opening a human permission screen, disabling tools, or ending the turn
 
-* exact cautions are cached only for the current turn; changed actions receive a new review, unavailable reviews are not cached as security judgments, and legacy `permission_request_id` input is rejected without prompting
+* exact cautions and deterministic incomplete-evidence results are cached only for the current turn; an unavailable outcome is not cached as a security judgment, but the same exact action spends at most one unavailable transport attempt per turn and changed actions remain independently reviewable until the bounded current-turn transport budget is exhausted. Legacy `permission_request_id` input is rejected without prompting
 
-* the sandbox backend is configured independently; yolo uses an effective backend of `none` without rewriting the saved sandbox setting
+* the sandbox backend is configured independently; full access uses an effective backend of `none` without rewriting the saved sandbox setting
 
 Do not add new sensitive tool behavior without integrating it into `src/core/permissions/permissions.zig`.
 
@@ -407,7 +422,7 @@ Check in the golden file and wire a regression test that re-runs `fx replay` in 
 
 * Do not commit generated state from `.fx/`, `.zig-cache/`, or `zig-out/`
 
-* Do not add a general alternate-screen (`\x1b[?1049h/l`) render path. fx is inline by design except for the five exclusive owner classes represented by `AlternateScreenOwner`: interactive tool-approval review, the full-transcript screen, catalog menus, the ctrl+x subagent manager, and the hosted child-terminal takeover. The terminal-session owner is entered only from the manager after `TerminalHost` grants the human write lease, has no permanent fx chrome, and must release the lease on detach. Every owner must leave or explicitly hand off the alternate buffer and restore the main grid, composer, cursor, paste, mouse, focus, and keyboard modes before resolving, cancelling, or shutting down
+* Do not add a general alternate-screen (`\x1b[?1049h/l`) render path. fx is inline by design except for the three exclusive owner classes represented by `AlternateScreenOwner`: interactive tool-approval review, the full-transcript screen, and catalog menus. Every owner must leave or explicitly hand off the alternate buffer and restore the main grid, composer, cursor, paste, mouse, focus, and keyboard modes before resolving, cancelling, or shutting down
 
 ## Releases
 
@@ -460,6 +475,24 @@ brew install hyperfine             # macOS (one-time)
 CI uses `--runs 100` with a reduced warmup and skips the build step because the
 workflow builds ReleaseSafe first. Results are written to
 `benchmarks/results/` (gitignored).
+
+The libfx runtime job measures cold startup, warm prompts, host-tool calls,
+stream throughput, and Agent cleanup. Its direct Pi comparison uses an external
+Zig HTTP server, Pi 0.84.4, and three alternating 100-sample rounds. On Bun,
+native libfx must match or beat Pi p50 and stay within 0.25 ms of Pi p95.
+The Node comparison is report-only because Node's bundled fetch client and
+Pi's dispatcher have different warm-request overhead. Both runtimes still
+require valid measurements, 300 samples, and exactly one inference request per
+prompt. Native/Wasm latency, host-tool, and resource gates remain blocking.
+Live model latency and bulk-stream throughput remain informational.
+
+```sh
+zig build-exe benchmarks/libfx/fake-inference-server.zig -O ReleaseSafe -femit-bin=/tmp/libfx-bench-server
+node benchmarks/libfx/bench-competitive.mjs --server /tmp/libfx-bench-server --pi-root /tmp/libfx-pi --out benchmarks/results/libfx
+```
+
+Build the SDK artifacts and install the pinned Pi package first, as shown in
+`.github/workflows/bench.yml`. Raw per-prompt samples remain in the output directory.
 
 ## Before Marking a PR Ready
 

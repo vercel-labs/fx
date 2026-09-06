@@ -91,7 +91,11 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
 
     const owned_pattern = try ctx.allocator.dupe(u8, pattern_value.string);
     errdefer ctx.allocator.free(owned_pattern);
-    const owned_path = try ctx.allocator.dupe(u8, path_string orelse ".");
+    const effective_path = if (path_string) |path|
+        if (path.len == 0) "." else path
+    else
+        ".";
+    const owned_path = try ctx.allocator.dupe(u8, effective_path);
     errdefer ctx.allocator.free(owned_path);
     const owned_include = if (include_string) |value| try ctx.allocator.dupe(u8, value) else null;
     errdefer if (owned_include) |include| ctx.allocator.free(include);
@@ -736,6 +740,7 @@ fn grepFilesFailureWithOps(
 
     const result = try callWithOps(.{ .allocator = alloc, .workspace_root = workspace_root }, .{ .ptr = &input, .deinit_fn = noopInputDeinit }, ops);
     switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .failure => |body| return body,
         .success => |body| {
             defer alloc.free(body);
@@ -826,6 +831,7 @@ test "grep_files validate preserves active raw pattern and path values" {
 
 test "grep_files decodes defaults and all fields" {
     try expectDecodeInput("{\"pattern\":\"needle\"}", "needle", ".", null, false, output_cap, 0);
+    try expectDecodeInput("{\"pattern\":\"needle\",\"path\":\"\"}", "needle", ".", null, false, output_cap, 0);
     try expectDecodeInput(
         "{\"pattern\":\"needle\",\"path\":\"src\",\"include\":\"*.zig\",\"case_insensitive\":true,\"head_limit\":5,\"offset\":2}",
         "needle",

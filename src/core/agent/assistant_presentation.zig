@@ -216,35 +216,6 @@ pub const MarkdownProcessor = struct {
         }
     }
 
-    /// Rebuilds structural Markdown state from source that is already visible.
-    /// Buffered bytes are discarded so later chunks emit only new content.
-    pub fn restorePresentedPrefix(
-        self: *MarkdownProcessor,
-        alloc: Allocator,
-        source: []const u8,
-    ) !void {
-        self.reset(alloc);
-        var discarded: std.ArrayList(u8) = .empty;
-        defer discarded.deinit(alloc);
-
-        try self.push(alloc, source, &discarded);
-        if (self.line_buf.items.len > 0) {
-            try self.handleLine(
-                alloc,
-                self.line_buf.items,
-                false,
-                &discarded,
-                .{},
-            );
-            self.line_buf.clearRetainingCapacity();
-        }
-        self.pending_top_level_line.clearRetainingCapacity();
-        self.pipe_buf.clearRetainingCapacity();
-        self.in_pipe_block = false;
-        self.pipe_last_line_has_lf = false;
-        self.code_buf.clearRetainingCapacity();
-    }
-
     pub fn flush(self: *MarkdownProcessor, alloc: Allocator, out: *std.ArrayList(u8)) !void {
         try self.flushWithCompletions(alloc, out, .{});
     }
@@ -2549,52 +2520,6 @@ test "code fence toggles block state" {
     const expected = "\x1b[2m\xe2\x94\x82 \x1b[22mconst x = 1;\n";
     try std.testing.expectEqualStrings(expected, out.items);
     try std.testing.expect(!processor.in_code_block);
-}
-
-test "presented prefix restores an unfinished code fence without replaying its bytes" {
-    const alloc = std.testing.allocator;
-    const Capture = struct {
-        block: ?CodeBlockPayload = null,
-
-        fn deinit(self: *@This()) void {
-            if (self.block) |*block| block.deinit(alloc);
-        }
-
-        fn deliver(raw: *anyopaque, block: CodeBlockPayload, _: *std.ArrayList(u8)) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.block = block;
-        }
-    };
-
-    var processor = MarkdownProcessor{};
-    defer processor.deinit(alloc);
-    var capture = Capture{};
-    defer capture.deinit();
-    var completion = CodeBlockCompletion{
-        .ctx = &capture,
-        .deliver = Capture.deliver,
-    };
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(alloc);
-
-    try processor.restorePresentedPrefix(alloc, "```zig\nconst value =");
-    try std.testing.expect(processor.in_code_block);
-    try std.testing.expectEqual(@as(?u8, '`'), processor.code_fence_marker);
-    try std.testing.expectEqualStrings("zig", processor.code_language.items);
-    try std.testing.expectEqual(@as(usize, 0), processor.code_buf.items.len);
-
-    try processor.pushWithCompletions(
-        alloc,
-        " 1;\n```\nafter\n",
-        &out,
-        .{ .code = &completion },
-    );
-    try processor.flushWithCompletions(alloc, &out, .{ .code = &completion });
-
-    const block = capture.block orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("zig", block.language);
-    try std.testing.expectEqualStrings(" 1;\n", block.code);
-    try std.testing.expectEqualStrings("after\n", out.items);
 }
 
 test "code block preserves inline markers literally" {

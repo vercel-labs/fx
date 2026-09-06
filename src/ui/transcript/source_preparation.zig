@@ -60,7 +60,7 @@ fn entryHiddenByActions(
 
 /// Nominate the entries whose rendered start bytes bound the final flow
 /// prefix: the first entry carrying a live mutation pin, the first rendered
-/// entry of each tool turn, and a trailing assistant entry. Omitted and
+/// entry of each live tool turn, and a trailing assistant entry. Omitted and
 /// hidden entries contribute no flow bytes and are skipped.
 fn collectFinalityNominations(
     self: anytype,
@@ -86,6 +86,7 @@ fn collectFinalityNominations(
     var group_terminality: std.AutoHashMapUnmanaged(types.ToolPresentationGroupId, bool) = .empty;
     defer group_terminality.deinit(alloc);
     for (self.tool_details.items) |detail| {
+        if (detail.origin == .recorded) continue;
         const group = detail.presentation_group_id orelse continue;
         const result = try group_terminality.getOrPut(alloc, group);
         if (!result.found_existing) result.value_ptr.* = true;
@@ -95,6 +96,7 @@ fn collectFinalityNominations(
     var entry_tool_identities: std.AutoHashMapUnmanaged(u32, ToolFinalityIdentity) = .empty;
     defer entry_tool_identities.deinit(alloc);
     for (self.tool_details.items) |detail| {
+        if (detail.origin == .recorded) continue;
         const identity: ToolFinalityIdentity = if (detail.presentation_group_id) |group|
             .{
                 .turn_id = group.turn_id,
@@ -452,6 +454,41 @@ pub fn prepareFullTranscriptViewportSourceInterruptible(
         .welcome_boundary = null,
         .cols = self.layout.cols,
     };
+}
+
+/// Takes ownership of one bounded width-rendered full-transcript window and
+/// builds its reusable line index once on the page worker.
+pub fn prepareIndexedFullTranscriptWindowSourceInterruptible(
+    alloc: Allocator,
+    bytes: []u8,
+    cols: u16,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !TranscriptPreparationSource {
+    var source = TranscriptPreparationSource{
+        .bytes = bytes,
+        .folded_summary_indices = &.{},
+        .preview = .{ .natural_visual_rows = 0 },
+        .tail_kind = null,
+        .tracked_entry_id = null,
+        .tracked_entry_start_line = null,
+        .replaceable_last_line = false,
+        .replaceable_start = 0,
+        .replaceable_row = 1,
+        .welcome_cut_line = null,
+        .welcome_boundary = null,
+        .cols = cols,
+    };
+    errdefer source.deinit(alloc);
+    try source.ensureLineIndexInterruptible(alloc, checkpoint);
+    const total_rows = if (source.transcript_visual_row_offsets.len > 0)
+        source.transcript_visual_row_offsets[source.transcript_visual_row_offsets.len - 1]
+    else
+        0;
+    source.preview.natural_visual_rows = @intCast(@min(
+        total_rows,
+        std.math.maxInt(u16),
+    ));
+    return source;
 }
 
 fn prepareTranscriptSourceInternal(

@@ -44,3 +44,81 @@ jobs:
           for run in 1 2 3; do
             zig build run-bench-ui-activity -Doptimize=ReleaseSafe
           done
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Run interactive terminal performance gate
+        working-directory: tests/e2e
+        env:
+          FX_TUI_PERFORMANCE: "1"
+          FX_TUI_PERFORMANCE_REPORT: ${{ runner.temp }}/tui-performance.json
+        run: bun test tui-performance.test.ts
+
+      - name: Upload interactive terminal performance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tui-performance
+          path: ${{ runner.temp }}/tui-performance.json
+          if-no-files-found: warn
+
+  libfx-ttft:
+    name: libfx Runtime
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+
+      - name: Build libfx artifacts
+        run: |
+          zig build -Dnapi-surface=core -Doptimize=ReleaseSafe
+          zig build -Dwasm-surface=core -Doptimize=ReleaseSmall
+
+      - name: Install pinned Pi benchmark target
+        run: npm install --prefix /tmp/libfx-pi @earendil-works/pi-coding-agent@0.84.4
+
+      - name: Build external inference fixture
+        run: zig build-exe benchmarks/libfx/fake-inference-server.zig -O ReleaseSafe -femit-bin=${{ runner.temp }}/libfx-fake-inference-server
+
+      - name: Measure libfx and Pi
+        run: |
+          node benchmarks/libfx/bench-suite.mjs --samples 100 --pi-root /tmp/libfx-pi --out benchmarks/results/libfx
+          node benchmarks/libfx/bench-bridge.mjs --backend native --samples 100 > benchmarks/results/libfx/bridge-node-native.json
+          node --experimental-wasm-jspi benchmarks/libfx/bench-bridge.mjs --backend wasm --samples 100 > benchmarks/results/libfx/bridge-node-wasm.json
+          bun benchmarks/libfx/bench-bridge.mjs --backend native --samples 100 > benchmarks/results/libfx/bridge-bun-native.json
+          bun benchmarks/libfx/bench-bridge.mjs --backend wasm --samples 100 > benchmarks/results/libfx/bridge-bun-wasm.json
+          node benchmarks/libfx/bench-runtime.mjs --backend native --warm-samples 100 --stream-samples 30 > benchmarks/results/libfx/runtime-node-native.json
+          node --experimental-wasm-jspi benchmarks/libfx/bench-runtime.mjs --backend wasm --warm-samples 100 --stream-samples 30 > benchmarks/results/libfx/runtime-node-wasm.json
+          bun benchmarks/libfx/bench-runtime.mjs --backend native --warm-samples 100 --stream-samples 30 > benchmarks/results/libfx/runtime-bun-native.json
+          bun benchmarks/libfx/bench-runtime.mjs --backend wasm --warm-samples 100 --stream-samples 30 > benchmarks/results/libfx/runtime-bun-wasm.json
+          node --expose-gc benchmarks/libfx/bench-capacity.mjs --backend native --count 25 > benchmarks/results/libfx/capacity-node-native.json
+          node --experimental-wasm-jspi --expose-gc benchmarks/libfx/bench-capacity.mjs --backend wasm --count 25 > benchmarks/results/libfx/capacity-node-wasm.json
+          bun benchmarks/libfx/bench-capacity.mjs --backend native --count 25 > benchmarks/results/libfx/capacity-bun-native.json
+          bun benchmarks/libfx/bench-capacity.mjs --backend wasm --count 25 > benchmarks/results/libfx/capacity-bun-wasm.json
+          node benchmarks/libfx/bench-competitive.mjs --server ${{ runner.temp }}/libfx-fake-inference-server --pi-root /tmp/libfx-pi --out benchmarks/results/libfx --samples 100 --warmups 3 --rounds 3
+
+      - name: Enforce deterministic libfx contracts
+        run: node benchmarks/libfx/check-results.mjs --dir benchmarks/results/libfx
+
+      - name: Upload raw libfx TTFT samples
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: libfx-ttft-${{ github.sha }}
+          path: benchmarks/results/libfx/*.json
+          if-no-files-found: error

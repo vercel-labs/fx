@@ -23,7 +23,6 @@ REQUIRED_DIRECT_COMMANDS = (
     ("help",),
     ("--version",),
     ("status", "--json"),
-    ("background", "--json"),
     ("doctor", "--json"),
     ("sessions", "--json"),
 )

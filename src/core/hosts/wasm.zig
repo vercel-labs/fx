@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const background_processes = false;
+pub const process_control = false;
 
 pub fn isTarget(arch: std.Target.Cpu.Arch) bool {
     return arch == .wasm32 or arch == .wasm64;
@@ -18,7 +18,7 @@ test "WASM targets expose no native process capabilities" {
     try std.testing.expect(isTarget(.wasm32));
     try std.testing.expect(isTarget(.wasm64));
     try std.testing.expect(!isTarget(.x86_64));
-    try std.testing.expect(!background_processes);
+    try std.testing.expect(!process_control);
 }
 
 test "WASM operating system text does not require native discovery" {

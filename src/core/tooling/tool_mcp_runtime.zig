@@ -12,8 +12,8 @@ pub const HasToolFn = *const fn (*anyopaque, []const u8, Access) bool;
 pub const ValidateToolFn = *const fn (*anyopaque, Allocator, []const u8, []const u8, Access) anyerror!ValidationResult;
 pub const CallToolFn = *const fn (*anyopaque, Allocator, []const u8, []const u8, usize, CallOptions) anyerror!?CallResult;
 pub const SearchRequest = capability_retrieval.Request;
-pub const SearchToolsFn = *const fn (*anyopaque, Allocator, SearchRequest, types.PermissionRuleSet, context_limits.Values, Access) anyerror!SearchResult;
-pub const ToolSchemaFn = *const fn (*anyopaque, Allocator, []const u8, types.PermissionRuleSet, context_limits.Values, Access) anyerror!?ToolSchemaResult;
+pub const SearchToolsFn = *const fn (*anyopaque, Allocator, SearchRequest, types.PermissionRuleSet, context_limits.Values, Access, ?*std.atomic.Value(bool)) anyerror!SearchResult;
+pub const ToolSchemaFn = *const fn (*anyopaque, Allocator, []const u8, types.PermissionRuleSet, context_limits.Values, Access, ?*std.atomic.Value(bool)) anyerror!?ToolSchemaResult;
 pub const FeatureCallFn = *const fn (
     *anyopaque,
     Allocator,
@@ -75,7 +75,18 @@ pub const Access = union(enum) {
     }
 };
 
+pub const DefinitionSnapshot = union(enum) {
+    current,
+    unavailable,
+    updated: SelectedTool,
+};
+
+pub const SnapshotToolFn = *const fn (*anyopaque, Allocator, []const u8, Binding, types.PermissionRuleSet, context_limits.Values, Access) anyerror!DefinitionSnapshot;
+
+pub const Binding = types.McpToolBinding;
+
 pub const CallOptions = struct {
+    expected_binding: ?Binding = null,
     expected_runtime_generation: ?u64 = null,
     cancel_flag: ?*std.atomic.Value(bool) = null,
     progress: ?ProgressSink = null,
@@ -139,6 +150,20 @@ pub const InputResponder = struct {
     legacy_url_manual_completion: bool = false,
     callback: *const fn (*anyopaque, Allocator, InputOrigin, InputRequired) anyerror![]const u8,
     continuation_terminal: ?*const fn (*anyopaque, Allocator, InputOrigin, ContinuationTerminal) void = null,
+
+    pub fn finish(self: InputResponder, alloc: Allocator, origin: InputOrigin, outcome: ContinuationTerminal) void {
+        const callback = self.continuation_terminal orelse return;
+        callback(self.context, alloc, origin, outcome);
+    }
+};
+
+pub const InputCompletion = struct {
+    responder: InputResponder,
+    origin: InputOrigin,
+
+    pub fn finish(self: InputCompletion, alloc: Allocator, outcome: ContinuationTerminal) void {
+        self.responder.finish(alloc, self.origin, outcome);
+    }
 };
 
 pub const LegacyUrlCompletion = struct {
@@ -219,9 +244,11 @@ pub const FeatureCallOptions = struct {
 
 pub const FeatureResult = struct {
     model_output: []u8,
+    images: []types.ToolImage = &.{},
 
     pub fn deinit(self: *FeatureResult, alloc: Allocator) void {
         alloc.free(self.model_output);
+        types.freeToolImages(alloc, self.images);
         self.* = undefined;
     }
 };
@@ -235,17 +262,26 @@ pub const CallStatus = enum {
 
 pub const CallResult = struct {
     model_output: []const u8,
+    images: []types.ToolImage = &.{},
     status: CallStatus = .success,
     input_required: ?InputRequired = null,
 
     pub fn deinit(self: *CallResult, alloc: Allocator) void {
         alloc.free(self.model_output);
+        types.freeToolImages(alloc, self.images);
         self.deinitInputRequired(alloc);
         self.* = undefined;
     }
 
+    pub fn takeImages(self: *CallResult) []types.ToolImage {
+        const images = self.images;
+        self.images = &.{};
+        return images;
+    }
+
     pub fn takeModelOutput(self: *CallResult, alloc: Allocator) []const u8 {
         const model_output = self.model_output;
+        types.freeToolImages(alloc, self.images);
         self.deinitInputRequired(alloc);
         self.* = undefined;
         return model_output;
@@ -265,12 +301,31 @@ pub const ValidationResult = union(enum) {
     not_available,
 };
 
+/// Owned by a search result, or borrowed from a tool execution arena.
+pub const SelectedTool = struct {
+    name: []const u8,
+    schema_json: []const u8,
+    mcp_binding: ?Binding = null,
+
+    pub fn deinit(self: SelectedTool, alloc: Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.schema_json);
+    }
+};
+
+pub fn freeSelectedTools(alloc: Allocator, tools: []const SelectedTool) void {
+    for (tools) |tool| tool.deinit(alloc);
+    alloc.free(tools);
+}
+
 pub const SearchResult = struct {
     model_output: []u8,
     notice: ?[]u8 = null,
+    selected_tools: []const SelectedTool = &.{},
 
     pub fn deinit(self: *SearchResult, alloc: Allocator) void {
         alloc.free(self.model_output);
+        freeSelectedTools(alloc, self.selected_tools);
         if (self.notice) |notice| alloc.free(notice);
         self.* = undefined;
     }
@@ -283,6 +338,7 @@ pub const ToolSchemaResult = union(enum) {
     pub const Payload = struct {
         model_output: []u8,
         notice: ?[]u8 = null,
+        mcp_binding: ?Binding = null,
     };
 
     pub fn deinit(self: *ToolSchemaResult, alloc: Allocator) void {
@@ -301,7 +357,6 @@ pub const RuntimeCapabilities = struct {
     has_tool: ?HasToolFn = null,
     validate_tool: ?ValidateToolFn = null,
     call_tool: ?CallToolFn = null,
-    tool_schema: ?ToolSchemaFn = null,
     access: Access = .unrestricted,
 };
 
@@ -368,7 +423,7 @@ fn callAdvertisedDynamicTool(
 pub fn notSelectedOutput(arena: Allocator, name: []const u8) ![]const u8 {
     return std.fmt.allocPrint(
         arena,
-        "Dynamic MCP tool not selected for this model step: {s}. Use capability_search and mcp_select_tool first; the selected tool can be called on the next model step after its schema is advertised.",
+        "Dynamic MCP tool not selected for this model step: {s}. Use capability_search or mcp_select_tool to load its definition; the selected tool can be called on the next model step after its schema is advertised.",
         .{name},
     );
 }

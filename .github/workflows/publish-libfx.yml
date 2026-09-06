@@ -261,12 +261,17 @@ jobs:
 
           rm -rf sdk/dist/libfx
           mkdir -p sdk/dist/libfx
-          cp sdk/package.json sdk/README.md sdk/browser.js sdk/node.js sdk/fx-sdk.js LICENSE sdk/dist/libfx/
+          cp sdk/package.json sdk/README.md sdk/browser.js sdk/node.js sdk/fx-sdk.js sdk/core-output.js sdk/mcp.js sdk/skills.js sdk/skills-node.js LICENSE sdk/dist/libfx/
           cp wasm-artifacts/fx-core.wasm wasm-artifacts/fx-term.wasm sdk/dist/libfx/
           cp native-addons/*.node sdk/dist/libfx/
           jq --arg version "$LIBFX_VERSION" '.version = $version | del(.files)' \
             sdk/dist/libfx/package.json > sdk/dist/libfx/package.json.tmp
           mv sdk/dist/libfx/package.json.tmp sdk/dist/libfx/package.json
+
+      - name: Run packed public API example
+        run: |
+          node sdk/tests/test-packed-example.mjs sdk/dist/libfx native
+          node --experimental-wasm-jspi sdk/tests/test-packed-example.mjs sdk/dist/libfx wasm
 
       - name: Validate package archive
         run: |
@@ -277,6 +282,7 @@ jobs:
             const names = new Set(report.files.map(({ path }) => path));
             const required = [
               "package.json", "README.md", "LICENSE", "browser.js", "node.js", "fx-sdk.js",
+              "core-output.js", "mcp.js", "skills.js", "skills-node.js",
               "fx-core.wasm", "fx-term.wasm",
               "libfx.linux-x64.node", "libfx.linux-arm64.node",
               "libfx.darwin-x64.node", "libfx.darwin-arm64.node",

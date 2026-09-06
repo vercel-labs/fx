@@ -87,6 +87,13 @@ jobs:
       - name: Test Node + WASM
         run: npm run --prefix sdk test:node-wasm
 
+      - name: Test libfx Wasm integrations
+        run: |
+          node --experimental-wasm-jspi sdk/tests/test-host-tools.mjs wasm
+          node --experimental-wasm-jspi sdk/tests/test-host-tool-cancel.mjs wasm
+          node --experimental-wasm-jspi sdk/tests/test-mcp-adapter.mjs http wasm
+          node --experimental-wasm-jspi sdk/tests/test-skills-adapter.mjs host wasm
+
   sdk-node-napi:
     name: SDK (Node + N-API)
     runs-on: ubuntu-latest
@@ -108,6 +115,67 @@ jobs:
 
       - name: Test Node + N-API
         run: npm run --prefix sdk test:node-napi
+
+      - name: Test minimal native integrations
+        run: |
+          node sdk/tests/test-minimal-api.mjs
+          node sdk/tests/test-host-tools.mjs native
+          node sdk/tests/test-host-tool-cancel.mjs native
+          node sdk/tests/test-mcp-adapter.mjs stdio native
+          node sdk/tests/test-skills-adapter.mjs disk native
+
+  sdk-bun:
+    name: SDK (Bun + N-API/WASM)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+
+      - name: Build SDK artifacts
+        run: |
+          zig build -Dnapi-surface=core -Doptimize=ReleaseSafe
+          zig build -Dwasm-surface=core -Doptimize=ReleaseSmall
+          zig build -Dwasm-surface=term -Doptimize=ReleaseSmall
+
+      - name: Install terminal test dependencies
+        run: npm ci --prefix sdk/node
+
+      - name: Test Bun + N-API
+        run: bun sdk/tests/test-node-napi.mjs
+
+      - name: Test Bun + WASM
+        run: bun sdk/tests/test-node-wasm.mjs
+
+      - name: Test Bun benchmark path
+        run: bun sdk/tests/test-libfx-benchmark.mjs
+
+      - name: Test Bun cross-backend integrations
+        run: |
+          bun sdk/tests/test-agent-bootstrap.mjs auto
+          bun sdk/tests/test-checkpoint.mjs native wasm
+          bun sdk/tests/test-checkpoint.mjs wasm native
+          bun sdk/tests/test-host-tools.mjs native
+          bun sdk/tests/test-host-tools.mjs wasm
+          bun sdk/tests/test-host-tool-cancel.mjs native
+          bun sdk/tests/test-host-tool-cancel.mjs wasm
+          bun sdk/tests/test-mcp-adapter.mjs stdio native
+          bun sdk/tests/test-mcp-adapter.mjs http wasm
+          bun sdk/tests/test-skills-adapter.mjs disk native
+          bun sdk/tests/test-skills-adapter.mjs host wasm
 
   sdk-browser-wasm:
     name: SDK (Browser + WASM)

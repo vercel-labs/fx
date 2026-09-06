@@ -1,16 +1,16 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const contracts = @import("contracts.zig");
-const monitor_core = @import("monitor.zig");
 const terminal_engine = @import("engine.zig");
 const shell_resolver = @import("shell_resolver.zig");
 const terminal_store = @import("store.zig");
 const tmux_session = @import("tmux_session.zig");
 const host_capabilities = @import("../hosts/host.zig");
 const session_layout = @import("../session/session_layout.zig");
-const process_supervisor = @import("../background/process_supervisor.zig");
-const background_process_provider = @import(
-    "../execution/background_process_provider.zig",
+const process_identity = @import("../execution/process_identity.zig");
+const managed_execution_contract = @import("../execution/managed_execution_contract.zig");
+const process_provider_mod = @import(
+    "../execution/process_provider.zig",
 );
 const process_tree = @import("../execution/process_tree.zig");
 const command_admission = @import("../permissions/command_admission.zig");
@@ -27,7 +27,8 @@ const Allocator = std.mem.Allocator;
 const launcher_mode = "--fx-internal-terminal-launcher";
 const control_mode = "--fx-internal-terminal-control";
 
-const max_sessions: usize = 16;
+const max_sessions = managed_execution_contract.max_live_entries;
+
 const max_read_bytes: usize = 64 * 1024;
 const launcher_config_bytes: usize = contracts.max_command_bytes * 6 +
     contracts.max_authority_text_bytes * 2 +
@@ -247,15 +248,9 @@ const LauncherControl = struct {
 pub const WorkTracker = struct {
     context: ?*anyopaque,
     update_fn: *const fn (?*anyopaque, bool) void,
-    monitor_update_fn: ?*const fn (?*anyopaque, bool) void = null,
 
     fn update(self: WorkTracker, live: bool) void {
         self.update_fn(self.context, live);
-    }
-
-    fn updateMonitor(self: WorkTracker, required: bool) void {
-        const callback = self.monitor_update_fn orelse return;
-        callback(self.context, required);
     }
 };
 
@@ -758,13 +753,6 @@ const SupportedRegistry = struct {
                     durable.record.backend_identity,
                 );
             }
-            finalizeRecoveredMonitors(alloc, &durable, io_mod.milliTimestamp()) catch |err| {
-                debug_trace.logf(
-                    "terminal_monitor",
-                    "recovered monitor cleanup deferred id={s} err={s}",
-                    .{ durable.record.session_id, @errorName(err) },
-                );
-            };
         }
         registry.recovery = recovered;
         recovered_owned = false;
@@ -789,7 +777,6 @@ const SupportedRegistry = struct {
             session.deinitRecoveryAttempt();
             self.alloc.destroy(session);
         };
-        try session.initMonitorOwner();
         try self.profile.register_resident(&session.durable);
         const slot = self.reserve(session) orelse return error.CapacityExceeded;
         std.debug.assert(slot.evicted == null);
@@ -816,20 +803,10 @@ const SupportedRegistry = struct {
                 return cleanup_err;
             };
             session.markLost();
-            finalizeRecoveredMonitors(
-                self.alloc,
-                &session.durable,
-                io_mod.milliTimestamp(),
-            ) catch {};
             return;
         };
         if (!remains_live) {
             session.markNotLive();
-            finalizeRecoveredMonitors(
-                self.alloc,
-                &session.durable,
-                io_mod.milliTimestamp(),
-            ) catch {};
             return;
         }
         self.releaseReference(slot.index, session);
@@ -914,7 +891,6 @@ const SupportedRegistry = struct {
             .screen => |value| self.screen(value),
             .write => |value| self.write(value, cancelled),
             .wait => |value| self.wait(value, cancelled),
-            .monitor => |value| self.monitor(value, cancelled),
             .inspect => |value| self.inspect(value),
             .list => |value| self.list(value),
             .resize => |value| self.withSession(
@@ -1007,25 +983,6 @@ const SupportedRegistry = struct {
             .inspect,
         ) catch |err| return self.actionError(.inspect, request.session_id, err);
         const facts = projectedFacts(durable.facts(), authorization);
-        var events = projectMonitorEvents(self.alloc, durable, request) catch |err| {
-            return self.actionError(.inspect, request.session_id, err);
-        };
-        defer events.deinit();
-        var monitor_set = durable.load_monitor_set(self.alloc) catch |err| {
-            return self.actionError(.inspect, request.session_id, err);
-        };
-        defer monitor_set.deinit();
-        const monitors = try self.alloc.alloc(
-            contracts.MonitorSummary,
-            monitor_set.parsed.value.monitors.len,
-        );
-        defer self.alloc.free(monitors);
-        for (monitor_set.parsed.value.monitors, 0..) |entry, index| {
-            monitors[index] = .{
-                .monitor_id = entry.monitor_id,
-                .state = entry.runtime.state,
-            };
-        }
         return contracts.OwnedResult.init(
             self.alloc,
             .{ .success = .{ .inspect = .{
@@ -1033,10 +990,6 @@ const SupportedRegistry = struct {
                 .shell = durable.record.shell,
                 .cwd = durable.record.cwd,
                 .command = durable.record.command,
-                .monitors = monitors,
-                .events = events.items,
-                .event_gap_through = events.gap_through,
-                .next_event_id = events.next_event_id,
             } } },
         ) catch return error.OutOfMemory;
     }
@@ -1107,7 +1060,7 @@ const SupportedRegistry = struct {
         const persistence = request.persistence orelse
             return self.failure(.start, .authority_denied, null);
 
-        const session_id = try session_layout.generateSessionId(self.alloc);
+        const session_id = try session_layout.generateTerminalSessionId(self.alloc);
         var session_id_owned = true;
         defer if (session_id_owned) self.alloc.free(session_id);
         const session = try self.alloc.create(Session);
@@ -1142,24 +1095,6 @@ const SupportedRegistry = struct {
             );
         };
         session_id_owned = false;
-        session.initMonitorOwner() catch |err| {
-            debug_trace.logf(
-                "terminal_host",
-                "session monitor owner init failed id={s} err={s}",
-                .{ session.id, @errorName(err) },
-            );
-            session.durable.rollback_unreleased_start() catch {};
-            session.deinitUnlaunched();
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            return self.failure(
-                .start,
-                if (err == error.PathOutsideWorkspace)
-                    .path_outside_workspace
-                else
-                    .invalid_request,
-                null,
-            );
-        };
         self.profile.register_resident(&session.durable) catch {
             session.deinitUnlaunched();
             return error.OutOfMemory;
@@ -1191,7 +1126,7 @@ const SupportedRegistry = struct {
             if (!session.child_released) {
                 session.durable.rollback_unreleased_start() catch |rollback_err| {
                     debug_trace.logf(
-                        "terminal_monitor",
+                        "terminal_host",
                         "unreleased start rollback failed id={s} err={s}",
                         .{ session.id, @errorName(rollback_err) },
                     );
@@ -1311,54 +1246,6 @@ const SupportedRegistry = struct {
             io_mod.milliTimestamp(),
         ) catch |err| return self.actionError(.wait, request.session_id, err);
         return reference.session.waitResult(outcome, authorization);
-    }
-
-    fn monitor(
-        self: *SupportedRegistry,
-        request: contracts.MonitorRequest,
-        cancelled: *const std.atomic.Value(bool),
-    ) Allocator.Error!contracts.OwnedResult {
-        const reference = self.find(request.session_id) orelse
-            return self.failure(.monitor, .session_not_found, request.session_id);
-        defer self.releaseReference(reference.index, reference.session);
-        const authorization = switch (request.operation) {
-            .add => |definition| reference.session.durable.authorize_monitor_definition(
-                request.authority.?,
-                definition,
-            ) catch |err| return self.actionError(.monitor, request.session_id, err),
-            .update => |value| reference.session.durable.authorize_monitor_definition(
-                request.authority.?,
-                value.definition,
-            ) catch |err| return self.actionError(.monitor, request.session_id, err),
-            .pause, .@"resume", .remove => reference.session.durable.authorize(
-                request.authority.?,
-                .monitor,
-            ) catch |err| return self.actionError(.monitor, request.session_id, err),
-        };
-        const owner = reference.session.monitor_owner orelse
-            return self.failure(.monitor, .monitor_unavailable, request.session_id);
-        const monitor_sequence = owner.applyOperation(
-            request.operation,
-            io_mod.milliTimestamp(),
-            cancelled,
-        ) catch |err| return self.actionError(.monitor, request.session_id, err);
-        var monitor_id_buffer: [64]u8 = undefined;
-        const monitor_id = if (monitor_sequence) |sequence|
-            monitor_core.stable_id(&monitor_id_buffer, sequence) catch
-                return self.failure(.monitor, .invalid_request, request.session_id)
-        else
-            null;
-        const facts = projectedFacts(
-            reference.session.durable.facts(),
-            authorization,
-        );
-        return contracts.OwnedResult.init(
-            self.alloc,
-            .{ .success = .{ .monitor = .{
-                .session = facts,
-                .monitor_id = monitor_id,
-            } } },
-        ) catch return error.OutOfMemory;
     }
 
     fn withSession(
@@ -1576,7 +1463,7 @@ const SupportedRegistry = struct {
 
 fn finalizeRecoveredCloseBackend(
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
     durable_root: []const u8,
     transport_root: []const u8,
     record: terminal_store.Record,
@@ -1606,12 +1493,12 @@ fn finalizeRecoveredCloseBackend(
 
 fn finalizeRecoveredNativeClose(
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
     record: terminal_store.Record,
 ) !void {
     const pid = record.pid orelse return;
     const token_text = record.process_token orelse return;
-    const token = process_supervisor.ProcessInstanceToken.parse(token_text) catch
+    const token = process_identity.ProcessInstanceToken.parse(token_text) catch
         return error.ProcessIdentityUnavailable;
     switch (process_provider.matchToken(alloc, pid, token)) {
         .missing, .mismatched => return,
@@ -1619,93 +1506,10 @@ fn finalizeRecoveredNativeClose(
         .matched => {},
     }
     process_provider.signalProcess(alloc, pid, token) catch |err| switch (err) {
-        error.BackgroundProcessIdentityMismatch, error.ProcessNotFound => return,
-        error.BackgroundProcessIdentityIndeterminate => return error.ProcessIdentityUnavailable,
+        error.ProcessIdentityMismatch, error.ProcessNotFound => return,
+        error.ProcessIdentityIndeterminate => return error.ProcessIdentityUnavailable,
         else => return err,
     };
-}
-
-fn finalizeRecoveredMonitors(
-    alloc: Allocator,
-    durable: *terminal_store.DurableSession,
-    now_ms: i64,
-) !void {
-    var set = try durable.load_monitor_set(alloc);
-    defer set.deinit();
-    while (set.parsed.value.monitors.len != 0) {
-        var candidate = try terminal_store.MonitorSet.clone(
-            alloc,
-            set.parsed.value,
-        );
-        var candidate_owned = true;
-        defer if (candidate_owned) candidate.deinit();
-        const monitor = &candidate.parsed.value.monitors[0];
-        const sequence = monitorSequence(monitor.monitor_id) orelse
-            return error.InvalidMonitor;
-        var reason: ?monitor_core.EventReason = null;
-        if (monitor.definition.condition == .process_exit or
-            monitor.definition.condition == .exit_code or
-            monitor.definition.condition == .signal)
-        {
-            const condition_matches = recoveredExitMatches(
-                monitor.definition.condition,
-                durable.record.termination,
-            );
-            const decision = try monitor_core.observe(
-                monitor,
-                .exit,
-                condition_matches,
-                now_ms,
-            );
-            reason = decision.notify;
-        }
-        if (reason == null and
-            monitor.definition.notify_schedule == .on_exit and
-            monitor.runtime.last_event_reason != .session_exit)
-        {
-            const decision = try monitor_core.observe(
-                monitor,
-                .session_exit,
-                false,
-                now_ms,
-            );
-            reason = decision.notify;
-        }
-        removeMonitorFromCandidate(&candidate, 0);
-        try requireMonitorCandidate(
-            durable.record.session_id,
-            durable.commit_monitor_transition(
-                candidate.parsed.value,
-                if (reason) |event_reason| .{
-                    .sequence = sequence,
-                    .reason = event_reason,
-                } else null,
-                now_ms,
-            ),
-        );
-        set.deinit();
-        set = candidate;
-        candidate_owned = false;
-    }
-}
-
-fn requireMonitorCandidate(
-    session_id: []const u8,
-    outcome: terminal_store.MonitorTransitionOutcome,
-) !void {
-    switch (outcome) {
-        .candidate => return,
-        .previous => |err| return err,
-        .cancelled => return error.Cancelled,
-        .indeterminate => |err| {
-            debug_trace.logf(
-                "terminal_monitor",
-                "monitor transition indeterminate id={s} err={s}",
-                .{ session_id, @errorName(err) },
-            );
-            return error.SessionChildCommitIndeterminate;
-        },
-    }
 }
 
 fn requireCloseCandidate(
@@ -1748,1478 +1552,9 @@ fn definitiveTmuxRecoveryLoss(err: anyerror) bool {
     };
 }
 
-fn recoveredExitMatches(
-    condition: contracts.MonitorCondition,
-    termination: ?terminal_store.PersistedTermination,
-) bool {
-    const term = termination orelse return false;
-    return switch (condition) {
-        .process_exit => true,
-        .exit_code => |expected| switch (term) {
-            .exited => |actual| expected == actual,
-            .signal => false,
-        },
-        .signal => |expected| switch (term) {
-            .signal => |actual| @intFromEnum(signalValue(expected)) == actual,
-            .exited => false,
-        },
-        else => false,
-    };
-}
-
-const MonitorOwner = struct {
-    alloc: Allocator,
-    session: *Session,
-    mutex: std.Io.Mutex = .init,
-    set: terminal_store.MonitorSet,
-    wake: std.Io.Event = .unset,
-    ready: std.Io.Event = .unset,
-    thread: ?std.Thread = null,
-    stopping: std.atomic.Value(bool) = .init(false),
-    monitor_counted: bool = false,
-    poll_cursor: usize = 0,
-
-    fn init(alloc: Allocator, session: *Session) !MonitorOwner {
-        var set = try session.durable.load_monitor_set(alloc);
-        errdefer set.deinit();
-        if (set.parsed.value.monitors.len != 0 and
-            monitorInstallFailure("allocation")) return error.InjectedFailure;
-        if (monitorInstallFailure("validation")) return error.InjectedFailure;
-        var effects_changed = false;
-        for (set.parsed.value.monitors) |*monitor| {
-            effects_changed = try prepareMonitorEffects(session, monitor) or
-                effects_changed;
-        }
-        if (effects_changed) {
-            try session.durable.persist_monitor_set(
-                set.parsed.value,
-                io_mod.milliTimestamp(),
-            );
-        }
-        if (monitorInstallFailure("persistence")) return error.InjectedFailure;
-        return .{ .alloc = alloc, .session = session, .set = set };
-    }
-
-    fn arm(self: *MonitorOwner) !void {
-        if (self.set.parsed.value.monitors.len == 0) return;
-        try self.ensureThread();
-        self.acquireRequirement();
-    }
-
-    fn ensureThread(self: *MonitorOwner) !void {
-        if (self.thread != null) return;
-        if (monitorInstallFailure("timer")) return error.InjectedFailure;
-        self.ready.reset();
-        self.stopping.store(false, .release);
-        self.thread = std.Thread.spawn(.{}, monitorMain, .{self}) catch |err| {
-            return err;
-        };
-        self.ready.waitUncancelable(io_mod.getIo());
-        if (monitorInstallFailure("installation")) {
-            self.stop();
-            return error.InjectedFailure;
-        }
-    }
-
-    fn deinit(self: *MonitorOwner) void {
-        self.stop();
-        self.set.deinit();
-        self.* = undefined;
-    }
-
-    fn stop(self: *MonitorOwner) void {
-        self.stopping.store(true, .release);
-        self.wake.set(io_mod.getIo());
-        if (self.thread) |thread| {
-            thread.join();
-            self.thread = null;
-        }
-        self.releaseRequirement();
-    }
-
-    fn acquireRequirement(self: *MonitorOwner) void {
-        if (self.monitor_counted) return;
-        self.monitor_counted = true;
-        self.session.tracker.updateMonitor(true);
-    }
-
-    fn releaseRequirement(self: *MonitorOwner) void {
-        if (!self.monitor_counted) return;
-        self.monitor_counted = false;
-        self.session.tracker.updateMonitor(false);
-    }
-
-    fn syncRequirement(self: *MonitorOwner) void {
-        if (self.set.parsed.value.monitors.len == 0) {
-            self.releaseRequirement();
-        } else {
-            self.acquireRequirement();
-        }
-    }
-
-    fn nextPollingSequence(self: *MonitorOwner, now_ms: i64) ?u64 {
-        const monitors = self.set.parsed.value.monitors;
-        if (monitors.len == 0) {
-            self.poll_cursor = 0;
-            return null;
-        }
-        self.poll_cursor %= monitors.len;
-        for (0..monitors.len) |offset| {
-            const index = (self.poll_cursor + offset) % monitors.len;
-            if (!monitor_core.polling_due(monitors[index], now_ms)) continue;
-            self.poll_cursor = (index + 1) % monitors.len;
-            return monitorSequence(monitors[index].monitor_id);
-        }
-        return null;
-    }
-
-    fn screenEvaluationRequired(self: *MonitorOwner) bool {
-        const zio = io_mod.getIo();
-        self.mutex.lockUncancelable(zio);
-        defer self.mutex.unlock(zio);
-        for (self.set.parsed.value.monitors) |monitor| {
-            if (monitor.runtime.state != .paused and
-                monitor.runtime.state != .degraded and
-                monitor.definition.condition == .screen_matches)
-            {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    fn publishCandidate(
-        self: *MonitorOwner,
-        candidate: *terminal_store.MonitorSet,
-        notification: ?terminal_store.MonitorNotification,
-        now_ms: i64,
-        control: terminal_store.MonitorReconciliationControl,
-    ) !void {
-        try requireMonitorCandidate(
-            self.session.id,
-            self.session.durable.commit_monitor_transition_controlled(
-                candidate.parsed.value,
-                notification,
-                now_ms,
-                control,
-            ),
-        );
-        self.set.deinit();
-        self.set = candidate.*;
-        candidate.* = undefined;
-        self.syncRequirement();
-        self.wake.set(io_mod.getIo());
-    }
-
-    fn commitAutomaticCandidate(
-        self: *MonitorOwner,
-        candidate: *terminal_store.MonitorSet,
-        index: usize,
-        decision: monitor_core.Decision,
-        now_ms: i64,
-        control: terminal_store.MonitorReconciliationControl,
-    ) !bool {
-        const monitor = &candidate.parsed.value.monitors[index];
-        const sequence = monitorSequence(monitor.monitor_id) orelse
-            return error.InvalidMonitor;
-        if (decision.remove) removeMonitorFromCandidate(candidate, index);
-        try self.publishCandidate(
-            candidate,
-            if (decision.notify) |reason| .{
-                .sequence = sequence,
-                .reason = reason,
-            } else null,
-            now_ms,
-            control,
-        );
-        return decision.remove;
-    }
-
-    fn degradeForRawGap(self: *MonitorOwner, now_ms: i64) !void {
-        const zio = io_mod.getIo();
-        self.mutex.lockUncancelable(zio);
-        defer self.mutex.unlock(zio);
-        var candidate = try self.session.durable.load_monitor_set(self.alloc);
-        var candidate_owned = true;
-        defer if (candidate_owned) candidate.deinit();
-        var changed = false;
-        for (candidate.parsed.value.monitors) |*persisted| {
-            changed = try monitor_core.degrade_for_raw_gap(persisted) or changed;
-        }
-        if (!changed) return;
-        try self.publishCandidate(&candidate, null, now_ms, .{
-            .cancelled = &self.stopping,
-        });
-        candidate_owned = false;
-    }
-
-    fn onOutput(
-        self: *MonitorOwner,
-        bytes: []const u8,
-        screen_text: ?[]const u8,
-        now_ms: i64,
-    ) void {
-        if (self.stopping.load(.acquire)) return;
-        const zio = io_mod.getIo();
-        self.mutex.lockUncancelable(zio);
-        defer self.mutex.unlock(zio);
-        var index: usize = 0;
-        while (index < self.set.parsed.value.monitors.len) {
-            const current = self.set.parsed.value.monitors[index];
-            if (current.runtime.state == .paused or
-                current.runtime.state == .degraded)
-            {
-                index += 1;
-                continue;
-            }
-            if (!monitorOutputRelevant(
-                current.definition.condition,
-                screen_text != null,
-            )) {
-                index += 1;
-                continue;
-            }
-            var candidate = terminal_store.MonitorSet.clone(
-                self.alloc,
-                self.set.parsed.value,
-            ) catch |err| {
-                debug_trace.logf(
-                    "terminal_monitor",
-                    "output candidate deferred id={s} err={s}",
-                    .{ self.session.id, @errorName(err) },
-                );
-                return;
-            };
-            var candidate_owned = true;
-            defer if (candidate_owned) candidate.deinit();
-            const monitor = &candidate.parsed.value.monitors[index];
-            if (monitor.definition.condition == .output_quiet_ms) {
-                monitor_core.quiet_output(monitor, now_ms) catch |err| {
-                    debug_trace.logf(
-                        "terminal_monitor",
-                        "quiet reset failed id={s} err={s}",
-                        .{ self.session.id, @errorName(err) },
-                    );
-                    index += 1;
-                    continue;
-                };
-                self.publishCandidate(&candidate, null, now_ms, .{
-                    .cancelled = &self.stopping,
-                }) catch |err| {
-                    debug_trace.logf(
-                        "terminal_monitor",
-                        "quiet reset persistence deferred id={s} err={s}",
-                        .{ self.session.id, @errorName(err) },
-                    );
-                    return;
-                };
-                candidate_owned = false;
-                index += 1;
-                continue;
-            }
-            const matched = switch (monitor.definition.condition) {
-                .output_contains => |pattern| monitor_core.pattern_feed(
-                    pattern,
-                    false,
-                    &monitor.runtime.matcher_states,
-                    bytes,
-                ) catch false,
-                .output_matches => |pattern| monitor_core.pattern_feed(
-                    pattern,
-                    true,
-                    &monitor.runtime.matcher_states,
-                    bytes,
-                ) catch false,
-                .screen_matches => |pattern| if (screen_text) |text|
-                    monitor_core.pattern_matches(pattern, true, text) catch false
-                else
-                    false,
-                .output_quiet_ms => unreachable,
-                else => {
-                    index += 1;
-                    continue;
-                },
-            };
-            const decision = monitor_core.observe(
-                monitor,
-                if (monitor.definition.condition == .screen_matches) .screen else .output,
-                matched,
-                now_ms,
-            ) catch {
-                index += 1;
-                continue;
-            };
-            const removed = self.commitAutomaticCandidate(
-                &candidate,
-                index,
-                decision,
-                now_ms,
-                .{ .cancelled = &self.stopping },
-            ) catch |err| {
-                debug_trace.logf(
-                    "terminal_monitor",
-                    "output transition deferred id={s} err={s}",
-                    .{ self.session.id, @errorName(err) },
-                );
-                return;
-            };
-            candidate_owned = false;
-            if (!removed) {
-                index += 1;
-            }
-        }
-    }
-
-    fn onScreen(self: *MonitorOwner, screen_text: []const u8, now_ms: i64) void {
-        if (self.stopping.load(.acquire)) return;
-        const zio = io_mod.getIo();
-        self.mutex.lockUncancelable(zio);
-        defer self.mutex.unlock(zio);
-        var index: usize = 0;
-        while (index < self.set.parsed.value.monitors.len) {
-            const current = self.set.parsed.value.monitors[index];
-            if (current.runtime.state == .paused or
-                current.runtime.state == .degraded or
-                current.definition.condition != .screen_matches)
-            {
-                index += 1;
-                continue;
-            }
-            var candidate = terminal_store.MonitorSet.clone(
-                self.alloc,
-                self.set.parsed.value,
-            ) catch |err| {
-                debug_trace.logf(
-                    "terminal_monitor",
-                    "screen candidate deferred id={s} err={s}",
-                    .{ self.session.id, @errorName(err) },
-                );
-                return;
-            };
-            var candidate_owned = true;
-            defer if (candidate_owned) candidate.deinit();
-            const monitor = &candidate.parsed.value.monitors[index];
-            const matched = monitor_core.pattern_matches(
-                monitor.definition.condition.screen_matches,
-                true,
-                screen_text,
-            ) catch false;
-            const decision = monitor_core.observe(
-                monitor,
-                .screen,
-                matched,
-                now_ms,
-            ) catch {
-                index += 1;
-                continue;
-            };
-            const removed = self.commitAutomaticCandidate(
-                &candidate,
-                index,
-                decision,
-                now_ms,
-                .{ .cancelled = &self.stopping },
-            ) catch |err| {
-                debug_trace.logf(
-                    "terminal_monitor",
-                    "screen transition deferred id={s} err={s}",
-                    .{ self.session.id, @errorName(err) },
-                );
-                return;
-            };
-            candidate_owned = false;
-            if (!removed) {
-                index += 1;
-            }
-        }
-    }
-
-    fn onSessionEnd(
-        self: *MonitorOwner,
-        term: ?std.process.Child.Term,
-        now_ms: i64,
-    ) void {
-        const zio = io_mod.getIo();
-        self.mutex.lockUncancelable(zio);
-        defer self.mutex.unlock(zio);
-        while (self.set.parsed.value.monitors.len != 0) {
-            var candidate = terminal_store.MonitorSet.clone(
-                self.alloc,
-                self.set.parsed.value,
-            ) catch |err| {
-                debug_trace.logf(
-                    "terminal_monitor",
-                    "exit candidate deferred id={s} err={s}",
-                    .{ self.session.id, @errorName(err) },
-                );
-                break;
-            };
-            var candidate_owned = true;
-            defer if (candidate_owned) candidate.deinit();
-            const monitor = &candidate.parsed.value.monitors[0];
-            var decision = monitor_core.Decision{};
-            if (term) |trusted_term| {
-                if (monitor.definition.condition == .process_exit or
-                    monitor.definition.condition == .exit_code or
-                    monitor.definition.condition == .signal)
-                {
-                    const matches = exitConditionMatches(
-                        monitor.definition.condition,
-                        trusted_term,
-                    );
-                    decision = monitor_core.observe(
-                        monitor,
-                        .exit,
-                        matches,
-                        now_ms,
-                    ) catch monitor_core.Decision{};
-                }
-            }
-            if (decision.notify == null and
-                monitor.definition.notify_schedule == .on_exit and
-                monitor.runtime.last_event_reason != .session_exit)
-            {
-                decision = monitor_core.observe(
-                    monitor,
-                    .session_exit,
-                    false,
-                    now_ms,
-                ) catch monitor_core.Decision{};
-            }
-            decision.remove = true;
-            _ = self.commitAutomaticCandidate(
-                &candidate,
-                0,
-                decision,
-                now_ms,
-                .{},
-            ) catch |err| {
-                debug_trace.logf(
-                    "terminal_monitor",
-                    "exit transition deferred id={s} err={s}",
-                    .{ self.session.id, @errorName(err) },
-                );
-                break;
-            };
-            candidate_owned = false;
-        }
-    }
-
-    fn applyOperation(
-        self: *MonitorOwner,
-        operation_value: contracts.MonitorOperation,
-        now_ms: i64,
-        cancelled: *const std.atomic.Value(bool),
-    ) !?u64 {
-        const zio = io_mod.getIo();
-        self.session.write_mutex.lockUncancelable(zio);
-        defer self.session.write_mutex.unlock(zio);
-        self.mutex.lockUncancelable(zio);
-        var started_thread = false;
-        const result = self.applyOperationLocked(
-            operation_value,
-            now_ms,
-            &started_thread,
-            cancelled,
-        ) catch |err| {
-            self.mutex.unlock(zio);
-            if (started_thread) self.stop();
-            return err;
-        };
-        self.mutex.unlock(zio);
-        return result;
-    }
-
-    fn applyOperationLocked(
-        self: *MonitorOwner,
-        operation_value: contracts.MonitorOperation,
-        now_ms: i64,
-        started_thread: *bool,
-        cancelled: *const std.atomic.Value(bool),
-    ) !?u64 {
-        const operation_name = monitorOperationName(operation_value);
-        if (monitorOperationFailure(operation_name, "allocation")) {
-            return error.InjectedFailure;
-        }
-        var candidate = try self.operationCandidate(operation_value, now_ms);
-        var candidate_owned = true;
-        defer if (candidate_owned) candidate.deinit();
-
-        const transition = try operationTransition(
-            &candidate.parsed.value,
-            operation_value,
-            now_ms,
-        );
-        switch (operation_value) {
-            .add, .update => try self.session.durable.ensure_monitor_admission(
-                candidate.parsed.value,
-            ),
-            .pause, .@"resume", .remove => {},
-        }
-        if (monitorOperationFailure(operation_name, "effects")) {
-            return error.InjectedFailure;
-        }
-        if (transition.prepare_sequence) |sequence| {
-            const persisted = findMonitor(
-                candidate.parsed.value.monitors,
-                sequence,
-            ) orelse return error.MonitorNotFound;
-            _ = try prepareMonitorEffects(self.session, persisted);
-        }
-
-        started_thread.* = self.thread == null and
-            candidate.parsed.value.monitors.len != 0;
-        if (monitorOperationFailure(operation_name, "arming")) {
-            return error.InjectedFailure;
-        }
-        if (started_thread.*) {
-            try self.ensureThread();
-        }
-        if (monitorOperationFailure(operation_name, "persistence")) {
-            return error.InjectedFailure;
-        }
-
-        if (transition.event_reason) |reason| {
-            try self.publishCandidate(&candidate, .{
-                .sequence = transition.sequence,
-                .reason = reason,
-            }, now_ms, .{ .cancelled = cancelled });
-        } else {
-            try self.publishCandidate(
-                &candidate,
-                null,
-                now_ms,
-                .{ .cancelled = cancelled },
-            );
-        }
-        candidate_owned = false;
-        return transition.result_sequence;
-    }
-
-    fn operationCandidate(
-        self: *MonitorOwner,
-        operation_value: contracts.MonitorOperation,
-        now_ms: i64,
-    ) !terminal_store.MonitorSet {
-        const current = self.set.parsed.value;
-        return switch (operation_value) {
-            .add => |definition| blk: {
-                if (current.monitors.len >= contracts.max_monitor_definitions) {
-                    return error.CapacityExceeded;
-                }
-                const sequence = current.next_monitor_id;
-                var id_buffer: [64]u8 = undefined;
-                const monitor_id = try monitor_core.stable_id(&id_buffer, sequence);
-                const replacement = try self.alloc.alloc(
-                    monitor_core.PersistedMonitor,
-                    current.monitors.len + 1,
-                );
-                defer self.alloc.free(replacement);
-                @memcpy(replacement[0..current.monitors.len], current.monitors);
-                replacement[replacement.len - 1] = .{
-                    .monitor_id = monitor_id,
-                    .definition = definition,
-                    .runtime = try monitor_core.initial_runtime(definition, now_ms),
-                };
-                break :blk terminal_store.MonitorSet.clone(self.alloc, .{
-                    .next_monitor_id = std.math.add(u64, sequence, 1) catch
-                        return error.MonitorIdExhausted,
-                    .monitors = replacement,
-                });
-            },
-            .update => |value| blk: {
-                const sequence = monitorSequence(value.monitor_id) orelse
-                    return error.MonitorNotFound;
-                const replacement = try self.alloc.dupe(
-                    monitor_core.PersistedMonitor,
-                    current.monitors,
-                );
-                defer self.alloc.free(replacement);
-                const persisted = findMonitor(replacement, sequence) orelse
-                    return error.MonitorNotFound;
-                const generation = std.math.add(
-                    u64,
-                    persisted.runtime.generation,
-                    1,
-                ) catch return error.CounterOverflow;
-                persisted.definition = value.definition;
-                persisted.runtime = try monitor_core.initial_runtime(value.definition, now_ms);
-                persisted.runtime.generation = generation;
-                break :blk terminal_store.MonitorSet.clone(self.alloc, .{
-                    .next_monitor_id = current.next_monitor_id,
-                    .monitors = replacement,
-                });
-            },
-            .pause, .@"resume", .remove => terminal_store.MonitorSet.clone(
-                self.alloc,
-                current,
-            ),
-        };
-    }
-};
-
-fn removeMonitorFromCandidate(
-    candidate: *terminal_store.MonitorSet,
-    index: usize,
-) void {
-    const monitors = candidate.parsed.value.monitors;
-    std.debug.assert(index < monitors.len);
-    std.mem.copyForwards(
-        monitor_core.PersistedMonitor,
-        monitors[index .. monitors.len - 1],
-        monitors[index + 1 ..],
-    );
-    candidate.parsed.value.monitors = monitors[0 .. monitors.len - 1];
-}
-
-const OperationTransition = struct {
-    sequence: u64,
-    result_sequence: ?u64,
-    prepare_sequence: ?u64 = null,
-    event_reason: ?monitor_core.EventReason = null,
-};
-
-fn operationTransition(
-    candidate: *monitor_core.PersistedSet,
-    operation_value: contracts.MonitorOperation,
-    now_ms: i64,
-) !OperationTransition {
-    return switch (operation_value) {
-        .add => .{
-            .sequence = candidate.next_monitor_id - 1,
-            .result_sequence = candidate.next_monitor_id - 1,
-            .prepare_sequence = candidate.next_monitor_id - 1,
-        },
-        .update => |value| blk: {
-            const sequence = monitorSequence(value.monitor_id) orelse
-                return error.MonitorNotFound;
-            const persisted = findMonitor(candidate.monitors, sequence) orelse
-                return error.MonitorNotFound;
-            break :blk .{
-                .sequence = sequence,
-                .result_sequence = sequence,
-                .prepare_sequence = sequence,
-                .event_reason = if (persisted.definition.notify_schedule == .on_state_change)
-                    .updated
-                else
-                    null,
-            };
-        },
-        .pause => |monitor_id| blk: {
-            const persisted = findMonitorById(candidate.monitors, monitor_id) orelse
-                return error.MonitorNotFound;
-            const sequence = monitorSequence(persisted.monitor_id) orelse
-                return error.InvalidMonitor;
-            if (!monitor_core.pause(persisted)) return error.InvalidMonitorState;
-            try monitor_core.bump_generation(persisted);
-            break :blk .{
-                .sequence = sequence,
-                .result_sequence = sequence,
-                .event_reason = if (persisted.definition.notify_schedule == .on_state_change)
-                    .paused
-                else
-                    null,
-            };
-        },
-        .@"resume" => |monitor_id| blk: {
-            const persisted = findMonitorById(candidate.monitors, monitor_id) orelse
-                return error.MonitorNotFound;
-            const sequence = monitorSequence(persisted.monitor_id) orelse
-                return error.InvalidMonitor;
-            if (!try monitor_core.resume_monitor(persisted, now_ms)) {
-                return error.InvalidMonitorState;
-            }
-            try monitor_core.bump_generation(persisted);
-            break :blk .{
-                .sequence = sequence,
-                .result_sequence = sequence,
-                .event_reason = if (persisted.definition.notify_schedule == .on_state_change)
-                    .resumed
-                else
-                    null,
-            };
-        },
-        .remove => |monitor_id| blk: {
-            const index = findMonitorIndex(candidate.monitors, monitor_id) orelse
-                return error.MonitorNotFound;
-            const persisted = candidate.monitors[index];
-            const sequence = monitorSequence(persisted.monitor_id) orelse
-                return error.InvalidMonitor;
-            const notify = persisted.definition.notify_schedule == .on_state_change and
-                persisted.runtime.last_event_reason != .removed;
-            const replacement = candidate.monitors;
-            std.mem.copyForwards(
-                monitor_core.PersistedMonitor,
-                replacement[index .. replacement.len - 1],
-                replacement[index + 1 ..],
-            );
-            candidate.monitors = replacement[0 .. replacement.len - 1];
-            break :blk .{
-                .sequence = sequence,
-                .result_sequence = null,
-                .event_reason = if (notify) .removed else null,
-            };
-        },
-    };
-}
-
-fn monitorOperationName(operation_value: contracts.MonitorOperation) []const u8 {
-    return switch (operation_value) {
-        .add => "add",
-        .update => "update",
-        .pause => "pause",
-        .@"resume" => "resume",
-        .remove => "remove",
-    };
-}
-
-fn monitorOperationFailure(operation_name: []const u8, boundary: []const u8) bool {
-    const requested = io_mod.getenv("FX_TERMINAL_TEST_FAIL_MONITOR_OPERATION") orelse
-        return false;
-    var buffer: [64]u8 = undefined;
-    const expected = std.fmt.bufPrint(
-        &buffer,
-        "{s}:{s}",
-        .{ operation_name, boundary },
-    ) catch return false;
-    return std.mem.eql(u8, requested, expected);
-}
-
-fn monitorScreenProjectionAllocationFailure() bool {
-    const requested = io_mod.getenv(
-        "FX_TERMINAL_TEST_FAIL_MONITOR_SCREEN_PROJECTION_ALLOCATION",
-    ) orelse return false;
-    return std.mem.eql(u8, requested, "1");
-}
-
-fn monitorOutputScreenProjectionAllocationFailure() bool {
-    const requested = io_mod.getenv(
-        "FX_TERMINAL_TEST_FAIL_MONITOR_OUTPUT_SCREEN_PROJECTION_ALLOCATION",
-    ) orelse return false;
-    return std.mem.eql(u8, requested, "1");
-}
-
-const PollingCheck = struct {
-    snapshot: terminal_store.MonitorSet,
-    sequence: u64,
-    generation: u64,
-    check_count: u64,
-
-    fn deinit(self: *PollingCheck) void {
-        self.snapshot.deinit();
-        self.* = undefined;
-    }
-
-    fn monitor(self: *PollingCheck) *monitor_core.PersistedMonitor {
-        return &self.snapshot.parsed.value.monitors[0];
-    }
-};
-
-fn monitorOutputRelevant(
-    condition: contracts.MonitorCondition,
-    screen_available: bool,
-) bool {
-    return switch (condition) {
-        .output_contains, .output_matches, .output_quiet_ms => true,
-        .screen_matches => screen_available,
-        else => false,
-    };
-}
-
-fn monitorMain(owner: *MonitorOwner) void {
-    const zio = io_mod.getIo();
-    owner.ready.set(zio);
-    while (!owner.stopping.load(.acquire)) {
-        owner.mutex.lockUncancelable(zio);
-        const now_ms = io_mod.milliTimestamp();
-        var index: usize = 0;
-        while (index < owner.set.parsed.value.monitors.len) {
-            const current = owner.set.parsed.value.monitors[index];
-            if (if (monitor_core.next_deadline(current)) |due| due <= now_ms else false) {
-                var candidate = terminal_store.MonitorSet.clone(
-                    owner.alloc,
-                    owner.set.parsed.value,
-                ) catch |err| {
-                    debug_trace.logf(
-                        "terminal_monitor",
-                        "timer candidate deferred id={s} err={s}",
-                        .{ owner.session.id, @errorName(err) },
-                    );
-                    index += 1;
-                    continue;
-                };
-                var candidate_owned = true;
-                defer if (candidate_owned) candidate.deinit();
-                const interval = monitor_core.timer_decision(
-                    &candidate.parsed.value.monitors[index],
-                    now_ms,
-                ) catch |err| blk: {
-                    debug_trace.logf(
-                        "terminal_monitor",
-                        "timer decision failed id={s} err={s}",
-                        .{ owner.session.id, @errorName(err) },
-                    );
-                    break :blk monitor_core.Decision{};
-                };
-                if (interval.notify != null or interval.remove) {
-                    const removed = owner.commitAutomaticCandidate(
-                        &candidate,
-                        index,
-                        interval,
-                        now_ms,
-                        .{ .cancelled = &owner.stopping },
-                    ) catch |err| {
-                        debug_trace.logf(
-                            "terminal_monitor",
-                            "timer transition deferred id={s} err={s}",
-                            .{ owner.session.id, @errorName(err) },
-                        );
-                        index += 1;
-                        continue;
-                    };
-                    candidate_owned = false;
-                    if (removed) continue;
-                }
-            }
-
-            if (monitor_core.quiet_due(
-                owner.set.parsed.value.monitors[index],
-                now_ms,
-            )) {
-                var candidate = terminal_store.MonitorSet.clone(
-                    owner.alloc,
-                    owner.set.parsed.value,
-                ) catch |err| {
-                    debug_trace.logf(
-                        "terminal_monitor",
-                        "quiet candidate deferred id={s} err={s}",
-                        .{ owner.session.id, @errorName(err) },
-                    );
-                    index += 1;
-                    continue;
-                };
-                var candidate_owned = true;
-                defer if (candidate_owned) candidate.deinit();
-                const decision = monitor_core.observe(
-                    &candidate.parsed.value.monitors[index],
-                    .quiet,
-                    true,
-                    now_ms,
-                ) catch {
-                    index += 1;
-                    continue;
-                };
-                const removed = owner.commitAutomaticCandidate(
-                    &candidate,
-                    index,
-                    decision,
-                    now_ms,
-                    .{ .cancelled = &owner.stopping },
-                ) catch |err| {
-                    debug_trace.logf(
-                        "terminal_monitor",
-                        "quiet transition deferred id={s} err={s}",
-                        .{ owner.session.id, @errorName(err) },
-                    );
-                    index += 1;
-                    continue;
-                };
-                candidate_owned = false;
-                if (removed) continue;
-            }
-            index += 1;
-        }
-        var polling_check = takePollingCheck(owner, now_ms) catch |err| blk: {
-            debug_trace.logf(
-                "terminal_monitor",
-                "poll snapshot deferred id={s} err={s}",
-                .{ owner.session.id, @errorName(err) },
-            );
-            break :blk null;
-        };
-        var next_due: ?i64 = null;
-        for (owner.set.parsed.value.monitors) |monitor| {
-            if (monitor_core.next_deadline(monitor)) |due| {
-                next_due = if (next_due) |current| @min(current, due) else due;
-            }
-        }
-        owner.wake.reset();
-        owner.mutex.unlock(zio);
-        if (owner.stopping.load(.acquire)) {
-            if (polling_check) |*check| check.deinit();
-            break;
-        }
-        if (polling_check) |*check| {
-            defer check.deinit();
-            const matched = pollCondition(owner.session, check.monitor()) catch |err| blk: {
-                debug_trace.logf(
-                    "terminal_monitor",
-                    "poll failed session={s} monitor={s} err={s}",
-                    .{ owner.session.id, check.monitor().monitor_id, @errorName(err) },
-                );
-                break :blk false;
-            };
-            const completed_at_ms = io_mod.milliTimestamp();
-            owner.mutex.lockUncancelable(zio);
-            applyPollingCheck(owner, check, matched, completed_at_ms) catch |err| {
-                debug_trace.logf(
-                    "terminal_monitor",
-                    "poll result deferred id={s} err={s}",
-                    .{ owner.session.id, @errorName(err) },
-                );
-            };
-            owner.mutex.unlock(zio);
-            continue;
-        }
-        if (next_due) |due| {
-            const current = io_mod.milliTimestamp();
-            const delay_ms: i64 = if (due <= current) 1 else due - current;
-            owner.wake.waitTimeout(zio, .{ .duration = .{
-                .clock = .awake,
-                .raw = .fromMilliseconds(delay_ms),
-            } }) catch {};
-        } else {
-            owner.wake.waitUncancelable(zio);
-        }
-    }
-}
-
-fn takePollingCheck(
-    owner: *MonitorOwner,
-    now_ms: i64,
-) !?PollingCheck {
-    const sequence = owner.nextPollingSequence(now_ms) orelse return null;
-    const persisted = findMonitor(
-        owner.set.parsed.value.monitors,
-        sequence,
-    ) orelse return null;
-    var one = [_]monitor_core.PersistedMonitor{persisted.*};
-    const snapshot = try terminal_store.MonitorSet.clone(owner.alloc, .{
-        .next_monitor_id = owner.set.parsed.value.next_monitor_id,
-        .monitors = &one,
-    });
-    return .{
-        .snapshot = snapshot,
-        .sequence = sequence,
-        .generation = persisted.runtime.generation,
-        .check_count = persisted.runtime.check_count,
-    };
-}
-
-fn applyPollingCheck(
-    owner: *MonitorOwner,
-    check: *PollingCheck,
-    matched: bool,
-    now_ms: i64,
-) !void {
-    const current = findMonitor(
-        owner.set.parsed.value.monitors,
-        check.sequence,
-    ) orelse return;
-    if (current.runtime.generation != check.generation or
-        current.runtime.check_count != check.check_count or
-        current.runtime.state == .paused)
-    {
-        return;
-    }
-    const current_index = findMonitorSequenceIndex(
-        owner.set.parsed.value.monitors,
-        check.sequence,
-    ) orelse return;
-    var candidate = try terminal_store.MonitorSet.clone(
-        owner.alloc,
-        owner.set.parsed.value,
-    );
-    var candidate_owned = true;
-    defer if (candidate_owned) candidate.deinit();
-    const persisted = &candidate.parsed.value.monitors[current_index];
-    if (persisted.definition.condition == .path_changed) {
-        persisted.runtime.path_baseline = check.monitor().runtime.path_baseline;
-    }
-    const decision = try monitor_core.observe(
-        persisted,
-        .check,
-        matched,
-        now_ms,
-    );
-    _ = try owner.commitAutomaticCandidate(
-        &candidate,
-        current_index,
-        decision,
-        now_ms,
-        .{ .cancelled = &owner.stopping },
-    );
-    candidate_owned = false;
-}
-
-fn validateMonitorEffects(
-    session: *Session,
-    definition: contracts.MonitorDefinition,
-) !void {
-    try monitor_core.validate_definition(definition);
-    switch (definition.condition) {
-        .path_exists, .path_changed => |path| {
-            const resolved = try resolveMonitorPath(
-                session.alloc,
-                session,
-                path,
-                .create,
-            );
-            session.alloc.free(resolved);
-        },
-        .path_size => |condition| {
-            const resolved = try resolveMonitorPath(
-                session.alloc,
-                session,
-                condition.path,
-                .create,
-            );
-            session.alloc.free(resolved);
-        },
-        .custom_probe => |probe| {
-            const resolved = try resolveMonitorPath(
-                session.alloc,
-                session,
-                probe.cwd,
-                .existing,
-            );
-            session.alloc.free(resolved);
-        },
-        .http_ready => |url| {
-            const uri = std.Uri.parse(url) catch return error.InvalidMonitorCondition;
-            if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") or
-                uri.host == null or uri.user != null or uri.password != null)
-            {
-                return error.InvalidMonitorCondition;
-            }
-        },
-        else => {},
-    }
-}
-
-fn prepareMonitorEffects(
-    session: *Session,
-    persisted: *monitor_core.PersistedMonitor,
-) !bool {
-    try validateMonitorEffects(session, persisted.definition);
-    switch (persisted.definition.condition) {
-        .path_changed => |path| {
-            const baseline = try pathBaseline(session.alloc, session, path);
-            const changed = if (persisted.runtime.path_baseline) |current|
-                !std.meta.eql(current, baseline)
-            else
-                true;
-            persisted.runtime.path_baseline = baseline;
-            return changed;
-        },
-        .custom_probe => |probe| {
-            const canonical = try resolveMonitorPath(
-                session.alloc,
-                session,
-                probe.cwd,
-                .existing,
-            );
-            defer session.alloc.free(canonical);
-            const fingerprint = contracts.checkpoint_checksum(canonical);
-            const changed = if (persisted.runtime.probe_cwd_fingerprint) |current|
-                !std.mem.eql(u8, &current, &fingerprint)
-            else
-                true;
-            persisted.runtime.probe_cwd_fingerprint = fingerprint;
-            return changed;
-        },
-        else => return false,
-    }
-}
-
-fn resolveMonitorPath(
-    alloc: Allocator,
-    session: *Session,
-    path: []const u8,
-    mode: types.ResolveMode,
-) ![]u8 {
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const lexical = try std.fs.path.resolve(
-        arena,
-        if (std.fs.path.isAbsolute(path)) &.{path} else &.{ session.cwd, path },
-    );
-    const canonical_root = try io_mod.realpathAlloc(arena, session.workspace_root);
-    const resolved = try workspace_pathing.resolveWorkspacePath(
-        arena,
-        canonical_root,
-        lexical,
-        mode,
-    );
-    return alloc.dupe(u8, resolved);
-}
-
-fn pollCondition(
-    session: *Session,
-    monitor: *monitor_core.PersistedMonitor,
-) !bool {
-    return switch (monitor.definition.condition) {
-        .tcp_ready => |condition| tcpReady(session.alloc, condition.host, condition.port),
-        .http_ready => |url| httpReady(session.alloc, url),
-        .path_exists => |path| blk: {
-            const baseline = try pathBaseline(session.alloc, session, path);
-            break :blk baseline.exists;
-        },
-        .path_changed => |path| blk: {
-            const current = try pathBaseline(session.alloc, session, path);
-            const previous = monitor.runtime.path_baseline orelse {
-                monitor.runtime.path_baseline = current;
-                break :blk false;
-            };
-            monitor.runtime.path_baseline = current;
-            break :blk !std.meta.eql(previous, current);
-        },
-        .path_size => |condition| blk: {
-            const baseline = try pathBaseline(session.alloc, session, condition.path);
-            break :blk baseline.exists and baseline.size >= condition.minimum_bytes;
-        },
-        .custom_probe => |probe| try runCustomProbe(
-            session,
-            probe,
-            monitor.runtime.probe_cwd_fingerprint orelse return false,
-        ),
-        else => false,
-    };
-}
-
-fn pathBaseline(
-    alloc: Allocator,
-    session: *Session,
-    path: []const u8,
-) !monitor_core.PathBaseline {
-    const resolved = try resolveMonitorPath(alloc, session, path, .create);
-    defer alloc.free(resolved);
-    const stat = std.Io.Dir.cwd().statFile(
-        io_mod.getIo(),
-        resolved,
-        .{ .follow_symlinks = false },
-    ) catch |err| switch (err) {
-        error.FileNotFound => return .{ .exists = false },
-        else => return err,
-    };
-    return .{
-        .exists = true,
-        .size = stat.size,
-        .modified_ns = stat.mtime.nanoseconds,
-    };
-}
-
-fn runCustomProbe(
-    session: *Session,
-    probe: contracts.CustomProbeCondition,
-    approved_cwd: contracts.CheckpointChecksum,
-) !bool {
-    const canonical_cwd = try resolveMonitorPath(
-        session.alloc,
-        session,
-        probe.cwd,
-        .existing,
-    );
-    defer session.alloc.free(canonical_cwd);
-    const current_cwd = contracts.checkpoint_checksum(canonical_cwd);
-    if (!std.mem.eql(u8, &approved_cwd, &current_cwd)) return false;
-    const command_ctx = command_admission.CommandContext{
-        .command = probe.command,
-        .resolved_cwd = canonical_cwd,
-        .background = false,
-        .target_os = builtin.os.tag,
-    };
-    const authority = command_admission.CommandExecutionAuthority{ .shell_allowed = .{
-        .fingerprint = .init(command_ctx),
-        .source = .session_grant,
-    } };
-    var arena_state = std.heap.ArenaAllocator.init(session.alloc);
-    defer arena_state.deinit();
-    var output_budget = ProbeOutputBudget{};
-    const executed = execution_router.executePlannedCommand(.{
-        .max_command_output_bytes = ProbeOutputBudget.capture_bytes,
-        .timeout_ms = monitor_core.probe_timeout_ms,
-        .timeout_started_ms = io_mod.milliTimestamp(),
-        .accepted_output_chunk_ctx = @ptrCast(&output_budget),
-        .on_accepted_output_chunk = ProbeOutputBudget.accept,
-    }, arena_state.allocator(), command_ctx, authority) catch return false;
-    const foreground = executed.result.command_result orelse return false;
-    return output_budget.total <= monitor_core.probe_output_bytes and
-        foreground.foreground.stdout_bytes +| foreground.foreground.stderr_bytes <=
-            monitor_core.probe_output_bytes and
-        !foreground.foreground.truncated and
-        foreground.foreground.exit_code == 0;
-}
-
-const ProbeOutputBudget = struct {
-    const capture_bytes = monitor_core.probe_output_bytes + 8 * 1024;
-    total: usize = 0,
-
-    fn accept(
-        raw: *anyopaque,
-        _: ?types.ToolLifecycleId,
-        _: command_runner.CommandOutputStream,
-        bytes: []const u8,
-    ) !void {
-        const self: *ProbeOutputBudget = @ptrCast(@alignCast(raw));
-        self.total = std.math.add(usize, self.total, bytes.len) catch
-            return error.ProbeOutputLimitExceeded;
-        if (self.total > monitor_core.probe_output_bytes) {
-            return error.ProbeOutputLimitExceeded;
-        }
-    }
-};
-
-fn exitConditionMatches(
-    condition: contracts.MonitorCondition,
-    term: std.process.Child.Term,
-) bool {
-    return switch (condition) {
-        .process_exit => true,
-        .exit_code => |expected| switch (term) {
-            .exited => |actual| expected == actual,
-            else => false,
-        },
-        .signal => |expected| switch (term) {
-            .signal => |actual| signalValue(expected) == actual,
-            else => false,
-        },
-        else => false,
-    };
-}
-
-fn monitorSequence(monitor_id: []const u8) ?u64 {
-    const prefix = "monitor-";
-    if (!std.mem.startsWith(u8, monitor_id, prefix)) return null;
-    return std.fmt.parseInt(u64, monitor_id[prefix.len..], 10) catch null;
-}
-
-fn monitorInstallFailure(point: []const u8) bool {
-    const requested = io_mod.getenv("FX_TERMINAL_TEST_FAIL_MONITOR_INSTALL") orelse
-        return false;
-    return std.mem.eql(u8, requested, point);
-}
-
-fn findMonitor(
-    monitors: []monitor_core.PersistedMonitor,
-    sequence: u64,
-) ?*monitor_core.PersistedMonitor {
-    for (monitors) |*monitor| {
-        if (monitorSequence(monitor.monitor_id) == sequence) return monitor;
-    }
-    return null;
-}
-
-fn findMonitorById(
-    monitors: []monitor_core.PersistedMonitor,
-    monitor_id: []const u8,
-) ?*monitor_core.PersistedMonitor {
-    for (monitors) |*monitor| {
-        if (std.mem.eql(u8, monitor.monitor_id, monitor_id)) return monitor;
-    }
-    return null;
-}
-
-fn findMonitorIndex(
-    monitors: []const monitor_core.PersistedMonitor,
-    monitor_id: []const u8,
-) ?usize {
-    for (monitors, 0..) |monitor, index| {
-        if (std.mem.eql(u8, monitor.monitor_id, monitor_id)) return index;
-    }
-    return null;
-}
-
-fn findMonitorSequenceIndex(
-    monitors: []const monitor_core.PersistedMonitor,
-    sequence: u64,
-) ?usize {
-    for (monitors, 0..) |monitor, index| {
-        if (monitorSequence(monitor.monitor_id) == sequence) return index;
-    }
-    return null;
-}
-
-const LookupSelection = union(enum) {
-    lookup: anyerror![]std.Io.net.IpAddress,
-    timeout: anyerror!void,
-};
-
-const ConnectSelection = union(enum) {
-    connect: anyerror!std.Io.net.Stream,
-    timeout: anyerror!void,
-};
-
-fn tcpReady(alloc: Allocator, host_name: []const u8, port: u16) bool {
-    const addresses = resolveMonitorHost(alloc, host_name, port) catch return false;
-    defer alloc.free(addresses);
-    for (addresses[0..@min(addresses.len, 4)]) |address| {
-        const stream = connectMonitorAddress(address) catch continue;
-        stream.close(io_mod.getIo());
-        return true;
-    }
-    return false;
-}
-
-fn resolveMonitorHost(
-    alloc: Allocator,
-    host_name: []const u8,
-    port: u16,
-) ![]std.Io.net.IpAddress {
-    if (std.Io.net.IpAddress.parse(host_name, port)) |address| {
-        const result = try alloc.alloc(std.Io.net.IpAddress, 1);
-        result[0] = address;
-        return result;
-    } else |_| {}
-    const host = try std.Io.net.HostName.init(host_name);
-    const zio = io_mod.getIo();
-    var buffer: [2]LookupSelection = undefined;
-    var select: std.Io.Select(LookupSelection) = .init(zio, &buffer);
-    try select.concurrent(.lookup, collectMonitorLookup, .{ alloc, host, port });
-    try select.concurrent(.timeout, waitMonitorNetworkDeadline, .{});
-    const result = try select.await();
-    return switch (result) {
-        .lookup => |lookup| blk: {
-            select.cancelDiscard();
-            break :blk try lookup;
-        },
-        .timeout => |timeout| blk: {
-            while (select.cancel()) |item| switch (item) {
-                .lookup => |lookup| if (lookup) |addresses| alloc.free(addresses) else |_| {},
-                .timeout => {},
-            };
-            try timeout;
-            break :blk error.Timeout;
-        },
-    };
-}
-
-fn collectMonitorLookup(
-    alloc: Allocator,
-    host: std.Io.net.HostName,
-    port: u16,
-) ![]std.Io.net.IpAddress {
-    const zio = io_mod.getIo();
-    var lookup_buffer: [16]std.Io.net.HostName.LookupResult = undefined;
-    var queue: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&lookup_buffer);
-    try std.Io.net.HostName.lookup(host, zio, &queue, .{ .port = port });
-    var addresses: std.ArrayList(std.Io.net.IpAddress) = .empty;
-    errdefer addresses.deinit(alloc);
-    while (queue.getOne(zio)) |item| switch (item) {
-        .address => |address| if (addresses.items.len < 4) try addresses.append(alloc, address),
-        .canonical_name => {},
-    } else |err| switch (err) {
-        error.Closed => {},
-        error.Canceled => return error.Canceled,
-    }
-    if (addresses.items.len == 0) return error.NoAddressReturned;
-    return addresses.toOwnedSlice(alloc);
-}
-
-fn connectMonitorAddress(address: std.Io.net.IpAddress) !std.Io.net.Stream {
-    const zio = io_mod.getIo();
-    var buffer: [2]ConnectSelection = undefined;
-    var select: std.Io.Select(ConnectSelection) = .init(zio, &buffer);
-    try select.concurrent(.connect, connectMonitorAddressTask, .{address});
-    try select.concurrent(.timeout, waitMonitorNetworkDeadline, .{});
-    const result = try select.await();
-    return switch (result) {
-        .connect => |connected| blk: {
-            select.cancelDiscard();
-            break :blk try connected;
-        },
-        .timeout => |timeout| blk: {
-            while (select.cancel()) |item| switch (item) {
-                .connect => |connected| if (connected) |stream| stream.close(zio) else |_| {},
-                .timeout => {},
-            };
-            try timeout;
-            break :blk error.Timeout;
-        },
-    };
-}
-
-fn connectMonitorAddressTask(address: std.Io.net.IpAddress) !std.Io.net.Stream {
-    return std.Io.net.IpAddress.connect(&address, io_mod.getIo(), .{ .mode = .stream });
-}
-
-fn waitMonitorNetworkDeadline() !void {
-    const zio = io_mod.getIo();
-    const now = std.Io.Clock.Timestamp.now(zio, .awake);
-    const due = std.Io.Clock.Timestamp{
-        .clock = .awake,
-        .raw = now.raw.addDuration(.fromMilliseconds(250)),
-    };
-    try due.wait(zio);
-    return error.Timeout;
-}
-
-fn httpReady(alloc: Allocator, url: []const u8) bool {
-    const uri = std.Uri.parse(url) catch return false;
-    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http")) return false;
-    var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-    const host = (uri.host orelse return false).toRaw(&host_buffer) catch return false;
-    const port = uri.port orelse 80;
-    const addresses = resolveMonitorHost(alloc, host, port) catch return false;
-    defer alloc.free(addresses);
-    var stream: ?std.Io.net.Stream = null;
-    for (addresses[0..@min(addresses.len, 4)]) |address| {
-        stream = connectMonitorAddress(address) catch continue;
-        break;
-    }
-    const connected = stream orelse return false;
-    defer connected.close(io_mod.getIo());
-    applyMonitorSocketTimeout(connected, 500);
-    var write_buffer: [contracts.max_authority_text_bytes + 512]u8 = undefined;
-    var writer = connected.writer(io_mod.getIo(), &write_buffer);
-    writer.interface.writeAll("GET ") catch return false;
-    const path: std.Uri.Component = if (uri.path.isEmpty())
-        .{ .percent_encoded = "/" }
-    else
-        uri.path;
-    path.formatPath(&writer.interface) catch return false;
-    if (uri.query) |query| {
-        writer.interface.writeByte('?') catch return false;
-        query.formatQuery(&writer.interface) catch return false;
-    }
-    writer.interface.print(
-        " HTTP/1.0\r\nHost: {s}\r\nConnection: close\r\n\r\n",
-        .{host},
-    ) catch return false;
-    writer.interface.flush() catch return false;
-    var response: [1024]u8 = undefined;
-    const message = connected.socket.receiveTimeout(
-        io_mod.getIo(),
-        &response,
-        .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(500) } },
-    ) catch return false;
-    const bytes = message.data;
-    return bytes.len >= 12 and std.mem.startsWith(u8, bytes, "HTTP/");
-}
-
-fn applyMonitorSocketTimeout(stream: std.Io.net.Stream, timeout_ms: i64) void {
-    const timeout = std.posix.timeval{
-        .sec = @intCast(@divTrunc(timeout_ms, 1000)),
-        .usec = @intCast(@mod(timeout_ms, 1000) * 1000),
-    };
-    std.posix.setsockopt(
-        stream.socket.handle,
-        std.posix.SOL.SOCKET,
-        std.posix.SO.RCVTIMEO,
-        std.mem.asBytes(&timeout),
-    ) catch {};
-    std.posix.setsockopt(
-        stream.socket.handle,
-        std.posix.SOL.SOCKET,
-        std.posix.SO.SNDTIMEO,
-        std.mem.asBytes(&timeout),
-    ) catch {};
-}
-
 const SignalTarget = struct {
     pid: std.posix.pid_t,
-    token: process_supervisor.ProcessInstanceToken,
+    token: process_identity.ProcessInstanceToken,
 };
 
 const ProcessGroupDelivery = enum {
@@ -3251,7 +1586,7 @@ const Session = struct {
     lifecycle: contracts.Lifecycle = .starting,
     last_output_ms: i64,
     child_pid: ?std.posix.pid_t = null,
-    child_token: ?process_supervisor.ProcessInstanceToken = null,
+    child_token: ?process_identity.ProcessInstanceToken = null,
     recovered_start_identity: bool = false,
     term: ?std.process.Child.Term = null,
     shell_ready_seen: bool = false,
@@ -3265,6 +1600,9 @@ const Session = struct {
     liveness_file: ?std.Io.File = null,
     output_thread: ?std.Thread = null,
     control_thread: ?std.Thread = null,
+    timeout_thread: ?std.Thread = null,
+    timeout_done: std.Io.Event = .unset,
+    timeout_at_ms: ?i64 = null,
     output_done: std.Io.Event = .unset,
     output_active: std.atomic.Value(bool) = .init(false),
     command_boundary_requested: std.atomic.Value(bool) = .init(false),
@@ -3281,7 +1619,6 @@ const Session = struct {
     screen_available: bool = true,
     durable: terminal_store.DurableSession,
     workspace_root: []u8,
-    monitor_owner: ?*MonitorOwner = null,
     child_released: bool = false,
 
     fn init(
@@ -3332,10 +1669,10 @@ const Session = struct {
             .shell = shell,
             .cwd = cwd,
             .command = command,
+            .timeout_ms = request.timeout_ms,
             .backend = request.backend,
             .dimensions = dimensions,
             .persistence = persistence,
-            .initial_monitors = request.initial_monitors,
             .now_ms = now_ms,
         });
         return .{
@@ -3397,7 +1734,7 @@ const Session = struct {
         else
             null;
         const child_token = if (durable.record.process_token) |value|
-            process_supervisor.ProcessInstanceToken.parse(value) catch null
+            process_identity.ProcessInstanceToken.parse(value) catch null
         else
             null;
         return .{
@@ -3411,6 +1748,7 @@ const Session = struct {
             .dimensions = durable.record.dimensions,
             .lifecycle = durable.record.lifecycle,
             .last_output_ms = durable.record.updated_at_ms,
+            .timeout_at_ms = durable.record.timeout_at_ms,
             .child_pid = child_pid,
             .child_token = child_token,
             .term = if (durable.record.termination) |termination| switch (termination) {
@@ -3428,18 +1766,7 @@ const Session = struct {
         };
     }
 
-    fn initMonitorOwner(self: *Session) !void {
-        const owner = try self.alloc.create(MonitorOwner);
-        errdefer self.alloc.destroy(owner);
-        owner.* = try MonitorOwner.init(self.alloc, self);
-        self.monitor_owner = owner;
-    }
-
     fn deinitUnlaunched(self: *Session) void {
-        if (self.monitor_owner) |owner| {
-            owner.deinit();
-            self.alloc.destroy(owner);
-        }
         self.engine.deinit();
         self.durable.deinit();
         if (self.startup_match) |pattern| self.alloc.free(pattern);
@@ -3457,10 +1784,57 @@ const Session = struct {
         durable_root: []const u8,
         transport_root: []const u8,
     ) !void {
-        return switch (request.backend) {
+        try switch (request.backend) {
             .native => self.launchNative(request),
             .tmux => self.launchTmux(request, durable_root, transport_root),
         };
+    }
+
+    fn startTimeoutWatcher(self: *Session) !void {
+        if (self.timeout_thread != null or self.timeout_at_ms == null or
+            self.timeout_done.isSet()) return;
+        self.timeout_thread = try std.Thread.spawn(.{}, timeoutMain, .{self});
+    }
+
+    fn stopTimeoutWatcher(self: *Session) void {
+        self.timeout_done.set(io_mod.getIo());
+        if (self.timeout_thread) |thread| {
+            thread.join();
+            self.timeout_thread = null;
+        }
+    }
+
+    fn timeoutMain(self: *Session) void {
+        const deadline_ms = self.timeout_at_ms orelse return;
+        while (!self.timeout_done.isSet()) {
+            const now_ms = io_mod.milliTimestamp();
+            if (now_ms >= deadline_ms) break;
+            const remaining_ms = deadline_ms - now_ms;
+            self.timeout_done.waitTimeout(io_mod.getIo(), .{ .duration = .{
+                .clock = .awake,
+                .raw = .fromMilliseconds(remaining_ms),
+            } }) catch |err| switch (err) {
+                error.Timeout => continue,
+                error.Canceled => return,
+            };
+        }
+        if (self.timeout_done.isSet()) return;
+
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        if (self.lifecycle != .starting and self.lifecycle != .running) {
+            self.mutex.unlock(zio);
+            return;
+        }
+        self.mutex.unlock(zio);
+        self.durable.mark_timed_out(io_mod.milliTimestamp()) catch |err| {
+            debug_trace.logf(
+                "terminal_host",
+                "terminal timeout persistence failed id={s} err={s}",
+                .{ self.id, @errorName(err) },
+            );
+        };
+        if (!self.signalProcess(.kill)) self.markLost();
     }
 
     fn launchTmux(
@@ -3541,7 +1915,6 @@ const Session = struct {
         var capture = try backend.acceptCapture();
         var capture_owned = true;
         errdefer if (capture_owned) capture.close(io_mod.getIo());
-        if (self.monitor_owner) |owner| try owner.arm();
 
         self.tmux_backend = backend;
         backend_owned = false;
@@ -3690,8 +2063,6 @@ const Session = struct {
         if (self.lifecycle == .running) {
             self.tmux_lifecycle_index = tmuxStartupFrameCount(frames);
         }
-        if (self.monitor_owner) |owner| try owner.arm();
-        if (tmuxRecoveryFailure(self.id, "monitor-arm")) return error.InjectedFailure;
         recovered.beginCapture() catch |err| {
             debug_trace.logf("terminal_host", "tmux recovery stage=begin-capture id={s} err={s}", .{ self.id, @errorName(err) });
             return err;
@@ -3720,6 +2091,7 @@ const Session = struct {
         if (tmuxRecoveryFailure(self.id, "control-thread")) return error.InjectedFailure;
         self.control_thread = try std.Thread.spawn(.{}, tmuxControlMain, .{self});
         self.backend_started = true;
+        try self.startTimeoutWatcher();
         return true;
     }
 
@@ -3731,7 +2103,6 @@ const Session = struct {
         if (self.durable.record.raw_gap == null) {
             _ = try self.durable.begin_raw_gap(now_ms);
         }
-        if (self.monitor_owner) |owner| try owner.degradeForRawGap(now_ms);
         if (tmuxRecoveryFailure(self.id, "after-gap")) return error.InjectedFailure;
         if (capture.dimensions.rows != self.dimensions.rows or
             capture.dimensions.columns != self.dimensions.columns)
@@ -3935,13 +2306,13 @@ const Session = struct {
         }
         self.liveness_file = input;
         input_open = false;
-        if (self.monitor_owner) |owner| try owner.arm();
         try input.writeStreamingAll(io_mod.getIo(), &.{1});
         self.child_released = true;
     }
 
     fn deinit(self: *Session) void {
         self.shutdown();
+        self.stopTimeoutWatcher();
         if (self.backend_started) {
             self.finalizeBackend();
         } else {
@@ -4028,6 +2399,7 @@ const Session = struct {
     }
 
     fn shutdown(self: *Session) void {
+        self.timeout_done.set(io_mod.getIo());
         const zio = io_mod.getIo();
         self.mutex.lockUncancelable(zio);
         const running = self.lifecycle == .starting or self.lifecycle == .running;
@@ -4042,6 +2414,7 @@ const Session = struct {
         defer self.backend_join_mutex.unlock(zio);
         if (!self.backend_started) return;
         self.backend_done.waitUncancelable(zio);
+        self.stopTimeoutWatcher();
         if (self.control_thread) |thread| {
             thread.join();
             self.control_thread = null;
@@ -4305,15 +2678,8 @@ const Session = struct {
         const zio = io_mod.getIo();
         self.write_mutex.lockUncancelable(zio);
         defer self.write_mutex.unlock(zio);
-        const screen_evaluation_required = if (self.monitor_owner) |owner|
-            owner.screenEvaluationRequired()
-        else
-            false;
         var feed_result: ?terminal_engine.FeedResult = null;
         var checkpoint_cursor: ?contracts.RawCursor = null;
-        var screen_text: std.ArrayList(u8) = .empty;
-        var screen_projection_available = false;
-        defer screen_text.deinit(self.alloc);
         self.mutex.lockUncancelable(zio);
         const now_ms = io_mod.milliTimestamp();
         self.durable.append(bytes, now_ms) catch |err| {
@@ -4346,30 +2712,6 @@ const Session = struct {
             };
             if (feed_result != null) {
                 checkpoint_cursor = self.durable.checkpoint_due_cursor();
-                if (screen_evaluation_required) {
-                    if (monitorOutputScreenProjectionAllocationFailure()) {
-                        debug_trace.logf(
-                            "terminal_monitor",
-                            "screen output evaluation skipped id={s} err={s}",
-                            .{ self.id, @errorName(error.InjectedFailure) },
-                        );
-                    } else {
-                        var projection_failed = false;
-                        self.appendScreenTextLocked(
-                            &self.engine,
-                            &screen_text,
-                        ) catch |err| {
-                            debug_trace.logf(
-                                "terminal_monitor",
-                                "screen output evaluation skipped id={s} err={s}",
-                                .{ self.id, @errorName(err) },
-                            );
-                            screen_text.clearRetainingCapacity();
-                            projection_failed = true;
-                        };
-                        screen_projection_available = !projection_failed;
-                    }
-                }
             }
         }
         self.last_output_ms = now_ms;
@@ -4387,12 +2729,6 @@ const Session = struct {
         }
         const master_fd = if (self.input_quiesced) null else self.master_fd;
         self.mutex.unlock(zio);
-
-        if (self.monitor_owner) |owner| owner.onOutput(
-            bytes,
-            if (screen_projection_available) screen_text.items else null,
-            now_ms,
-        );
 
         if (feed_result) |*result| {
             defer result.deinit(self.alloc);
@@ -4591,7 +2927,7 @@ const Session = struct {
             self.child_token
         else
             null;
-        const token: ?process_supervisor.ProcessInstanceToken =
+        const token: ?process_identity.ProcessInstanceToken =
             if (recovered_token) |value|
                 value
             else
@@ -4637,6 +2973,7 @@ const Session = struct {
             };
             self.child_pid = pid;
             self.child_token = token;
+            self.timeout_at_ms = self.durable.record.timeout_at_ms;
             self.recovered_start_identity = false;
             self.lifecycle = contracts.transition_lifecycle(
                 self.lifecycle,
@@ -4645,11 +2982,23 @@ const Session = struct {
         }
         const failed = self.lifecycle == .lost;
         self.mutex.unlock(zio);
-        if (failed) self.closeLiveness();
+        if (failed) {
+            self.closeLiveness();
+            return;
+        }
+        self.startTimeoutWatcher() catch |err| {
+            debug_trace.logf(
+                "terminal_host",
+                "terminal timeout watcher failed id={s} err={s}",
+                .{ self.id, @errorName(err) },
+            );
+            self.markLost();
+        };
     }
 
     fn setTerm(self: *Session, term: std.process.Child.Term) void {
         const zio = io_mod.getIo();
+        self.timeout_done.set(zio);
         self.write_mutex.lockUncancelable(zio);
         self.mutex.lockUncancelable(zio);
         const final_checkpoint = self.lifecycle == .running and self.screen_available;
@@ -4722,7 +3071,6 @@ const Session = struct {
             ) catch .lost;
         }
         self.mutex.unlock(zio);
-        if (self.monitor_owner) |owner| owner.onSessionEnd(term, now_ms);
     }
 
     fn failClosed(
@@ -4757,6 +3105,7 @@ const Session = struct {
             .{self.id},
         );
         const zio = io_mod.getIo();
+        self.timeout_done.set(zio);
         self.mutex.lockUncancelable(zio);
         if (self.lifecycle == .starting or self.lifecycle == .running) {
             self.persistLostLocked(io_mod.milliTimestamp());
@@ -5267,25 +3616,9 @@ fn inspectAction(
         request.authority.?,
         .inspect,
     );
-    var events = try projectMonitorEvents(session.alloc, &session.durable, request);
-    defer events.deinit();
     const zio = io_mod.getIo();
     session.mutex.lockUncancelable(zio);
     defer session.mutex.unlock(zio);
-    const owner = session.monitor_owner orelse return error.InvalidMonitorState;
-    owner.mutex.lockUncancelable(zio);
-    defer owner.mutex.unlock(zio);
-    const monitors = try session.alloc.alloc(
-        contracts.MonitorSummary,
-        owner.set.parsed.value.monitors.len,
-    );
-    defer session.alloc.free(monitors);
-    for (owner.set.parsed.value.monitors, 0..) |monitor, index| {
-        monitors[index] = .{
-            .monitor_id = monitor.monitor_id,
-            .state = monitor.runtime.state,
-        };
-    }
     return contracts.OwnedResult.init(
         session.alloc,
         .{ .success = .{ .inspect = .{
@@ -5293,65 +3626,8 @@ fn inspectAction(
             .shell = session.shell,
             .cwd = session.cwd,
             .command = session.command,
-            .monitors = monitors,
-            .events = events.items,
-            .event_gap_through = events.gap_through,
-            .next_event_id = events.next_event_id,
         } } },
     ) catch return error.OutOfMemory;
-}
-
-const ProjectedMonitorEvents = struct {
-    alloc: Allocator,
-    items: []contracts.MonitorEvent,
-    gap_through: u64,
-    next_event_id: u64,
-
-    fn deinit(self: *ProjectedMonitorEvents) void {
-        for (self.items) |event| self.alloc.free(event.monitor_id);
-        self.alloc.free(self.items);
-        self.* = undefined;
-    }
-};
-
-fn projectMonitorEvents(
-    alloc: Allocator,
-    durable: *terminal_store.DurableSession,
-    request: contracts.SessionRequest,
-) !ProjectedMonitorEvents {
-    if (request.acknowledge_event_id) |event_id| {
-        try durable.acknowledge(event_id, io_mod.milliTimestamp());
-    }
-    var replay = try durable.replay_events(
-        alloc,
-        request.after_event_id,
-        request.max_events,
-    );
-    defer replay.deinit(alloc);
-    var projected: std.ArrayList(contracts.MonitorEvent) = .empty;
-    errdefer {
-        for (projected.items) |event| alloc.free(event.monitor_id);
-        projected.deinit(alloc);
-    }
-    for (replay.events) |event| {
-        const sequence = event.monitor_sequence orelse continue;
-        var buffer: [64]u8 = undefined;
-        const monitor_id = try monitor_core.stable_id(&buffer, sequence);
-        try projected.append(alloc, .{
-            .event_id = event.id,
-            .monitor_id = try alloc.dupe(u8, monitor_id),
-            .reason = event.monitor_reason.?,
-            .lifecycle = event.lifecycle,
-            .cursor = event.cursor,
-            .created_at_ms = event.created_at_ms,
-        });
-    }
-    return .{
-        .alloc = alloc,
-        .items = try projected.toOwnedSlice(alloc),
-        .gap_through = replay.gap_through,
-        .next_event_id = replay.next_event_id,
-    };
 }
 
 fn resizeAction(
@@ -5365,12 +3641,6 @@ fn resizeAction(
         request.authority.?,
         .resize,
     );
-    const screen_evaluation_required = if (session.monitor_owner) |owner|
-        owner.screenEvaluationRequired()
-    else
-        false;
-    var screen_text: std.ArrayList(u8) = .empty;
-    defer screen_text.deinit(session.alloc);
     session.mutex.lockUncancelable(zio);
     const fd = session.master_fd;
     const tmux_ready = session.tmux_backend != null;
@@ -5410,16 +3680,6 @@ fn resizeAction(
         session.mutex.unlock(zio);
         return err;
     };
-    if (screen_evaluation_required) {
-        if (monitorScreenProjectionAllocationFailure()) {
-            session.mutex.unlock(zio);
-            return error.InjectedFailure;
-        }
-        session.appendScreenTextLocked(&resized_engine, &screen_text) catch |err| {
-            session.mutex.unlock(zio);
-            return err;
-        };
-    }
     session.durable.resize(request.dimensions, now_ms) catch |err| {
         session.mutex.unlock(zio);
         return err;
@@ -5486,9 +3746,6 @@ fn resizeAction(
         return err;
     };
     session.mutex.unlock(zio);
-    if (screen_evaluation_required) if (session.monitor_owner) |owner| {
-        owner.onScreen(screen_text.items, now_ms);
-    };
     session.mutex.lockUncancelable(zio);
     defer session.mutex.unlock(zio);
     return contracts.OwnedResult.init(
@@ -5707,24 +3964,17 @@ fn closeAction(
 ) !contracts.OwnedResult {
     const zio = io_mod.getIo();
     session.write_mutex.lockUncancelable(zio);
-    const owner = session.monitor_owner orelse {
-        session.write_mutex.unlock(zio);
-        return error.InvalidMonitorState;
-    };
-    owner.mutex.lockUncancelable(zio);
     const close_started_at = io_mod.milliTimestamp();
     requireCloseCandidate(
         session.id,
         session.durable.begin_close(request.authority.?, close_started_at),
     ) catch |err| {
-        owner.mutex.unlock(zio);
         session.write_mutex.unlock(zio);
         return err;
     };
     if (session.durable.record.backend == .tmux and
         io_mod.getenv("FX_TERMINAL_TEST_INTERRUPT_CLOSE_AFTER_COMMIT") != null)
     {
-        owner.mutex.unlock(zio);
         session.write_mutex.unlock(zio);
         return error.InjectedTmuxCloseInterruption;
     }
@@ -5732,10 +3982,7 @@ fn closeAction(
     session.input_quiesced = true;
     session.close_committed = true;
     session.mutex.unlock(zio);
-    owner.stopping.store(true, .release);
-    owner.mutex.unlock(zio);
     session.write_mutex.unlock(zio);
-    owner.stop();
 
     session.mutex.lockUncancelable(zio);
     var still_live = session.lifecycle == .starting or
@@ -6210,6 +4457,17 @@ fn readOutputChunk(
     buffer: []u8,
     timeout_ms: i32,
 ) !bool {
+    const total = try readAvailableFd(fd, buffer, timeout_ms);
+    if (total == 0) return false;
+    session.appendOutput(buffer[0..total]);
+    return true;
+}
+
+fn readAvailableFd(
+    fd: std.posix.fd_t,
+    buffer: []u8,
+    timeout_ms: i32,
+) !usize {
     var total: usize = 0;
     var poll_timeout = timeout_ms;
     while (total < buffer.len) {
@@ -6221,12 +4479,19 @@ fn readOutputChunk(
         _ = try std.posix.poll(&poll_fds, poll_timeout);
         const revents = poll_fds[0].revents;
         if (revents == 0) break;
-        if (revents & std.posix.POLL.IN == 0) {
+        if (revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR) == 0) {
             if (total == 0) return error.EndOfStream;
             break;
         }
         const count = std.posix.read(fd, buffer[total..]) catch |err| {
-            if (err == error.WouldBlock) break;
+            if (err == error.WouldBlock) {
+                if (total == 0 and
+                    revents & (std.posix.POLL.HUP | std.posix.POLL.ERR) != 0)
+                {
+                    return error.EndOfStream;
+                }
+                break;
+            }
             if (total != 0) break;
             return err;
         };
@@ -6237,9 +4502,33 @@ fn readOutputChunk(
         total += count;
         poll_timeout = 1;
     }
-    if (total == 0) return false;
-    session.appendOutput(buffer[0..total]);
-    return true;
+    return total;
+}
+
+test "terminal output drain reads final bytes after peer close" {
+    if (comptime !isSupported()) return;
+    var handles: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(
+        std.c.AF.UNIX,
+        std.c.SOCK.STREAM,
+        0,
+        &handles,
+    ) != 0) return error.SocketPairFailed;
+    defer closeFd(handles[0]);
+    const sentinel = "FINAL_OUTPUT_SENTINEL";
+    try (std.Io.File{
+        .handle = handles[1],
+        .flags = .{ .nonblocking = false },
+    }).writeStreamingAll(io_mod.getIo(), sentinel);
+    closeFd(handles[1]);
+
+    var buffer: [128]u8 = undefined;
+    const count = try readAvailableFd(handles[0], &buffer, 1000);
+    try std.testing.expectEqualStrings(sentinel, buffer[0..count]);
+    try std.testing.expectError(
+        error.EndOfStream,
+        readAvailableFd(handles[0], &buffer, 0),
+    );
 }
 
 fn maybeDelayForTest(name: []const u8) void {
@@ -6498,7 +4787,7 @@ const TestDurableFixture = struct {
             .profile = try terminal_store.ProfileStore.init(
                 alloc,
                 home,
-                background_process_provider.process_supervisor_test_provider,
+                process_provider_mod.process_identity_test_provider,
             ),
         };
     }
@@ -6528,155 +4817,6 @@ fn testPersistence(cwd: []const u8) contracts.StartPersistence {
         },
         .proof = .{ .bytes = @splat(7) },
     };
-}
-
-fn outputOwnerTestDefinition(
-    condition: contracts.MonitorCondition,
-) contracts.MonitorDefinition {
-    return .{
-        .condition = condition,
-        .check_schedule = if (condition.requires_polling())
-            .{ .interval_ms = 25 }
-        else
-            null,
-        .notify_schedule = .on_match,
-        .lifetime = .until_session_end,
-    };
-}
-
-test "monitor owner skips every output-irrelevant condition without allocating" {
-    const alloc = std.testing.allocator;
-    const conditions = [_]contracts.MonitorCondition{
-        .process_exit,
-        .{ .exit_code = 0 },
-        .{ .signal = .terminate },
-        .{ .tcp_ready = .{ .host = "127.0.0.1", .port = 3000 } },
-        .{ .http_ready = "http://127.0.0.1/health" },
-        .{ .path_exists = "/workspace/ready" },
-        .{ .path_changed = "/workspace/output" },
-        .{ .path_size = .{ .path = "/workspace/output", .minimum_bytes = 1 } },
-        .{ .custom_probe = .{ .command = "true", .cwd = "/workspace" } },
-        .{ .screen_matches = "ready" },
-    };
-    var id_buffers: [conditions.len][32]u8 = undefined;
-    var monitors: [conditions.len]monitor_core.PersistedMonitor = undefined;
-    for (conditions, 0..) |condition, index| {
-        const definition = outputOwnerTestDefinition(condition);
-        monitors[index] = .{
-            .monitor_id = try monitor_core.stable_id(
-                &id_buffers[index],
-                @intCast(index + 1),
-            ),
-            .definition = definition,
-            .runtime = try monitor_core.initial_runtime(definition, 1),
-        };
-    }
-    var set = try terminal_store.MonitorSet.clone(alloc, .{
-        .next_monitor_id = conditions.len + 1,
-        .monitors = &monitors,
-    });
-    var session: Session = undefined;
-    var counting = std.testing.FailingAllocator.init(alloc, .{});
-    var owner = MonitorOwner{
-        .alloc = counting.allocator(),
-        .session = &session,
-        .set = set,
-    };
-    set = undefined;
-    defer owner.set.deinit();
-
-    owner.onOutput("irrelevant", null, 10);
-
-    try std.testing.expectEqual(@as(usize, 0), counting.alloc_index);
-    try std.testing.expectEqual(@as(usize, 0), counting.allocations);
-    try std.testing.expectEqual(@as(usize, 0), counting.deallocations);
-    try std.testing.expect(!counting.has_induced_failure);
-}
-
-test "monitor owner relevant output is allocation and persistence atomic" {
-    const alloc = std.testing.allocator;
-    const cases = [_]struct {
-        condition: contracts.MonitorCondition,
-        bytes: []const u8,
-        screen_text: ?[]const u8,
-    }{
-        .{ .condition = .{ .output_contains = "ready" }, .bytes = "re", .screen_text = null },
-        .{ .condition = .{ .output_matches = "re*dy" }, .bytes = "ready", .screen_text = null },
-        .{ .condition = .{ .output_quiet_ms = 50 }, .bytes = "noise", .screen_text = null },
-        .{ .condition = .{ .screen_matches = "*ready*" }, .bytes = "screen", .screen_text = "ready" },
-    };
-
-    var fixture = try TestDurableFixture.init(alloc);
-    defer fixture.deinit();
-    for (cases, 0..) |case, index| {
-        const session_id = try std.fmt.allocPrint(
-            alloc,
-            "terminal-output-owner-{d}",
-            .{index},
-        );
-        defer alloc.free(session_id);
-        const owned_id = try alloc.dupe(u8, session_id);
-        var owned_id_owned = true;
-        errdefer if (owned_id_owned) alloc.free(owned_id);
-        const definition = outputOwnerTestDefinition(case.condition);
-        var session = try Session.init(
-            alloc,
-            .{ .context = null, .update_fn = ignoreWorkUpdate },
-            &fixture.profile,
-            "test-host",
-            owned_id,
-            .{
-                .cwd = "/workspace",
-                .shell = .{ .executable = .{ .path = "/bin/zsh" } },
-                .initial_monitors = &.{definition},
-            },
-            testPersistence("/workspace"),
-        );
-        owned_id_owned = false;
-        defer session.deinitUnlaunched();
-        try session.initMonitorOwner();
-        const owner = session.monitor_owner.?;
-        const initial_runtime = owner.set.parsed.value.monitors[0].runtime;
-
-        var failing = std.testing.FailingAllocator.init(alloc, .{
-            .fail_index = 0,
-        });
-        owner.alloc = failing.allocator();
-        owner.onOutput(case.bytes, case.screen_text, 10);
-        owner.alloc = alloc;
-        try std.testing.expect(failing.has_induced_failure);
-        try std.testing.expectEqual(@as(usize, 0), failing.allocations);
-        try std.testing.expect(std.meta.eql(
-            initial_runtime,
-            owner.set.parsed.value.monitors[0].runtime,
-        ));
-
-        fixture.profile.options.fail_at = .after_monitor_transaction_prepare;
-        owner.onOutput(case.bytes, case.screen_text, 20);
-        fixture.profile.options.fail_at = null;
-        try std.testing.expect(std.meta.eql(
-            initial_runtime,
-            owner.set.parsed.value.monitors[0].runtime,
-        ));
-        var durable_after_failure = try session.durable.load_monitor_set(alloc);
-        defer durable_after_failure.deinit();
-        try std.testing.expect(std.meta.eql(
-            initial_runtime,
-            durable_after_failure.parsed.value.monitors[0].runtime,
-        ));
-
-        owner.onOutput(case.bytes, case.screen_text, 30);
-        try std.testing.expect(!std.meta.eql(
-            initial_runtime,
-            owner.set.parsed.value.monitors[0].runtime,
-        ));
-        var durable_after_success = try session.durable.load_monitor_set(alloc);
-        defer durable_after_success.deinit();
-        try std.testing.expect(std.meta.eql(
-            owner.set.parsed.value.monitors[0].runtime,
-            durable_after_success.parsed.value.monitors[0].runtime,
-        ));
-    }
 }
 
 fn checkSessionInitAllocationFailures(alloc: Allocator) !void {
@@ -6727,7 +4867,6 @@ test "recovered session owns the saved workspace scope" {
         .backend = .tmux,
         .dimensions = .{ .rows = 24, .columns = 80 },
         .persistence = persistence,
-        .initial_monitors = &.{},
         .now_ms = 1,
     });
     var session = try Session.initRecovered(
@@ -7467,7 +5606,6 @@ test "durable release and exit wait survive resident session removal" {
         .backend = .native,
         .dimensions = .{ .rows = 24, .columns = 80 },
         .persistence = persistence,
-        .initial_monitors = &.{},
         .now_ms = 1,
     });
     var durable_owned = true;

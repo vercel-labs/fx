@@ -60,7 +60,11 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
 
     const owned_pattern = try ctx.allocator.dupe(u8, pattern_value.string);
     errdefer ctx.allocator.free(owned_pattern);
-    const owned_path = try ctx.allocator.dupe(u8, path_string orelse ".");
+    const effective_path = if (path_string) |path|
+        if (path.len == 0) "." else path
+    else
+        ".";
+    const owned_path = try ctx.allocator.dupe(u8, effective_path);
     errdefer ctx.allocator.free(owned_path);
 
     const input = try ctx.allocator.create(Input);
@@ -608,6 +612,7 @@ test "glob_files decodes invalid argument shapes as failures" {
 
 test "glob_files decodes omitted path and valid input" {
     try expectDecodeInput("{\"pattern\":\"*.zig\"}", "*.zig", ".");
+    try expectDecodeInput("{\"pattern\":\"*.zig\",\"path\":\"\"}", "*.zig", ".");
     try expectDecodeInput("{\"pattern\":\"*.zig\",\"path\":\"src\"}", "*.zig", "src");
     try expectDecodeInput("{\"pattern\":\"*.zig\",\"path\":1}", "*.zig", ".");
 }
@@ -654,6 +659,7 @@ test "glob_files reports overlong patterns during matching" {
     const expected = try std.fmt.allocPrint(alloc, "glob_files field \"pattern\" must be at most {d} bytes", .{glob_pattern.max_pattern_bytes});
     defer alloc.free(expected);
     switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .failure => |body| try std.testing.expectEqualStrings(expected, body),
         .success => try std.testing.expect(false),
     }
@@ -877,6 +883,7 @@ test "glob_files path narrowing applies before candidate cap" {
     defer result.deinit(alloc);
 
     switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .success => |body| try std.testing.expectEqualStrings("[glob] 1 matches for target.zig\n - src/core/workspace/target.zig\n", body),
         .failure => try std.testing.expect(false),
     }
@@ -913,6 +920,7 @@ test "glob_files extracts static base before candidate cap" {
     defer result.deinit(alloc);
 
     switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .success => |body| try std.testing.expectEqualStrings("[glob] 1 matches for src/tools/**/*.zig\n - src/tools/target.zig\n", body),
         .failure => try std.testing.expect(false),
     }

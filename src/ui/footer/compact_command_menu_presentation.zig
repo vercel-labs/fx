@@ -90,7 +90,6 @@ fn composeTurnPickerRow(
         } else {
             const text = switch (picker.history[index]) {
                 .assistant => |turn| turn.user.text,
-                .background_command => |turn| turn.user.text,
                 .interrupted => |turn| turn.user.text,
                 .compacted_summary => "[compacted summary]",
             };

@@ -82,7 +82,7 @@ function createRoot(
     JSON.stringify({
       mcp: {
         fixture: {
-          type: "http",
+          type: "http", environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
           url: activeFixture.url,
           headers: { "X-Workspace": "one" },
           ...(required ? { required: true } : {}),
@@ -116,6 +116,7 @@ function fixtureEnv(
     AI_GATEWAY_API_KEY: "fake-mcp-http-key",
     VERCEL_OIDC_TOKEN: undefined,
     FX_AUTO_UPGRADE: "0",
+    FX_MCP_PROTOCOL_VERSION: "2026-07-28",
     FX_PERMISSION_MODE: "auto",
     FX_GATEWAY_BASE_URL: activeGateway.baseUrl,
     FX_GATEWAY_CHAT_URL: activeGateway.chatUrl,
@@ -211,6 +212,57 @@ function assertModernWire(
 }
 
 describe("modern MCP Streamable HTTP", () => {
+  test("an OAuth-configured server failure does not invent an authentication challenge", async () => {
+    let hits = 0;
+    const failing = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch() {
+        hits += 1;
+        return new Response("server unavailable", { status: 500 });
+      },
+    });
+    const root = createRoot("oauth-server-failure", { url: `http://127.0.0.1:${failing.port}/mcp` });
+    writeFileSync(join(root.home, ".fx", "mcp.json"), JSON.stringify({
+      mcp: {
+        fixture: {
+          type: "http", environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
+          url: `http://127.0.0.1:${failing.port}/mcp`,
+          oauth: { client_id: "fixture-client" },
+          startup_timeout_ms: 1_000,
+        },
+      },
+    }));
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("search_fixture", "capability_search", { query: "fixture", server: "fixture" }),
+      fakeGatewayFinalText("Server failure observed."),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    try {
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Find the fixture tools"], {
+        cwd: root.workspace,
+        env: {
+          HOME: root.home,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_AUTO_UPGRADE: "0",
+          FX_SKIP_ONBOARDING: "1",
+          FX_SOUND: "0",
+          AI_GATEWAY_API_KEY: "local-fixture-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_MODEL: MODEL,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        },
+        timeoutMs: 15_000,
+      });
+      expect(result.code).toBe(0);
+      expect(hits).toBeGreaterThan(0);
+      expect(gateway.requests.length).toBe(2);
+      expect(gateway.requests[1]!.body).not.toContain("authentication_required");
+    } finally {
+      failing.stop(true);
+    }
+  }, 20_000);
+
   test("MongoDB-like session-required discovery falls back to legacy initialize", async () => {
     fixture = startModernMcpHttpFixture("legacy_session_required");
     const root = createRoot("mongodb-legacy-fallback", fixture);
@@ -452,6 +504,7 @@ describe("modern MCP Streamable HTTP", () => {
         server: "fixture",
       }),
       async () => {
+        await fixture!.waitForSubscription();
         fixture!.stormResourceListChanges(25);
         await Bun.sleep(50);
         return fakeGatewayToolCall("storm_resource_list_refreshed", "mcp_features", {
@@ -486,6 +539,7 @@ describe("modern MCP Streamable HTTP", () => {
         server: "fixture",
       }),
       async () => {
+        await fixture!.waitForSubscription();
         fixture!.failNextResourceRefresh();
         await Bun.sleep(25);
         return fakeGatewayToolCall("failed_resource_list_stale", "mcp_features", {
@@ -699,6 +753,57 @@ describe("modern MCP Streamable HTTP", () => {
       "JsonDepthLimitExceeded",
     );
     expect(fixture.resourcesListCalls).toBe(1);
+  }, 30_000);
+
+  test("private resource caches isolate servers and URIs with identical credentials", async () => {
+    fixture = startModernMcpHttpFixture("features", "FIRST_SERVER_RESOURCE");
+    const second = startModernMcpHttpFixture("features", "SECOND_SERVER_RESOURCE");
+    try {
+      const root = createRoot("private-server-isolation", fixture);
+      const profilePath = join(root.home, ".fx", "mcp.json");
+      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+      profile.mcp.fixture.bearer_token_env = "FX_TEST_SHARED_MCP_TOKEN";
+      profile.mcp.second = { ...profile.mcp.fixture, url: second.url };
+      writeFileSync(profilePath, JSON.stringify(profile));
+      const calls = [
+        ["first_read", "fixture", "FIRST_SERVER_RESOURCE", "custom://alpha"],
+        ["second_read", "second", "SECOND_SERVER_RESOURCE", "custom://alpha"],
+        ["first_beta", "fixture", "FIRST_SERVER_RESOURCE", "custom://beta"],
+        ["second_beta", "second", "SECOND_SERVER_RESOURCE", "custom://beta"],
+        ["first_cached", "fixture", "FIRST_SERVER_RESOURCE", "custom://alpha"],
+        ["second_cached", "second", "SECOND_SERVER_RESOURCE", "custom://alpha"],
+        ["first_beta_cached", "fixture", "FIRST_SERVER_RESOURCE", "custom://beta"],
+        ["second_beta_cached", "second", "SECOND_SERVER_RESOURCE", "custom://beta"],
+      ];
+      gateway = startFakeGateway([
+        ...calls.map(([id, server, , uri]) => fakeGatewayToolCall(id, "mcp_features", {
+          action: "resource_read", server, uri,
+        })),
+        fakeGatewayFinalText("Private resource caches stayed separate."),
+      ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Read the same resource on both configured servers twice."],
+        { cwd: root.workspace, env: { ...fixtureEnv(root, gateway), FX_TEST_SHARED_MCP_TOKEN: "shared-fixture-token" }, timeoutMs: 25_000 },
+      );
+      preserveHttpFailure("private-server-isolation", root, result, fixture, gateway);
+      expect(result.code).toBe(0);
+      expect(gateway.requests).toHaveLength(calls.length + 1);
+      const finalRequest = gateway.requests.at(-1)!.body;
+      for (const [id, , expected, uri] of calls) {
+        const text = toolResultText(finalRequest, id);
+        expect(text).toContain(expected);
+        expect(JSON.parse(text).contents[0].uri).toBe(uri);
+        expect(text).not.toContain(expected === "FIRST_SERVER_RESOURCE" ? "SECOND_SERVER_RESOURCE" : "FIRST_SERVER_RESOURCE");
+      }
+      for (const source of [fixture, second]) {
+        const reads = source.requests.filter((entry) => entry.message.method === "resources/read");
+        // Watching beta replaces the subscription and expires alpha; the final beta read stays cached.
+        expect(reads.map((entry) => entry.message.params?.uri)).toEqual(["custom://alpha", "custom://beta", "custom://alpha"]);
+        expect(reads[0].headers.authorization).toBe("Bearer shared-fixture-token");
+      }
+    } finally {
+      second.stop();
+    }
   }, 30_000);
 
   test("typed Resources Prompts Completion and resource updates use modern HTTP", async () => {
@@ -1125,6 +1230,7 @@ describe("modern MCP Streamable HTTP", () => {
         name: TOOL_NAME,
       }),
       async () => {
+        await fixture!.waitForSubscription();
         fixture!.invalidateTools();
         await Bun.sleep(100);
         return fakeGatewayToolCall("call_old", TOOL_NAME, { text: "old" });
@@ -1157,9 +1263,7 @@ describe("modern MCP Streamable HTTP", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]?.message.params?.name).toBe("fresh");
     expect(fixture.toolsListCalls).toBe(2);
-    expect(gateway.requests[2]?.body).toContain(
-      "Unsupported tool: mcp_fixture_echo",
-    );
+    expect(toolResultText(gateway.requests[2]!.body, "call_old", "error-text")).toContain("before execution");
     expect(gateway.requests.some((entry) => entry.body.includes(freshTool)))
       .toBe(true);
     const trace = readFileSync(root.traceLogPath, "utf8");
@@ -1457,7 +1561,7 @@ describe("modern MCP Streamable HTTP", () => {
       JSON.stringify({
         mcp: {
           fixture: {
-            type: "http",
+            type: "http", environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
             url: fixture.url,
             header_env: { "X-Workspace": "MCP_WORKSPACE" },
             bearer_token_env: "MCP_BEARER_TOKEN",
@@ -1506,7 +1610,7 @@ describe("modern MCP Streamable HTTP", () => {
       JSON.stringify({
         mcpServers: {
           fixture: {
-            type: "http",
+            type: "http", environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
             url: fixture.url,
             headers: {
               Authorization: "Bearer ${WORKSPACE_HTTP_TOKEN}",
@@ -1666,98 +1770,4 @@ describe("modern MCP Streamable HTTP", () => {
     40_000,
   );
 
-  test.skipIf(!tmuxAvailable())(
-    "MCP reload retires a stalled child HTTP call and keeps the replacement usable",
-    async () => {
-      fixture = startModernMcpHttpFixture("stall_call");
-      const root = createRoot("reload-stalled-child", fixture, 60_000);
-      const childPrompt = "RELOAD_STALLED_HTTP_CHILD_PROMPT";
-      const afterReloadPrompt = "AFTER_HTTP_RELOAD_ROOT_PROMPT";
-      gateway = startDynamicFakeGateway((body) => {
-        if (body.includes(afterReloadPrompt)) {
-          return fakeGatewayFinalText("AFTER_HTTP_RELOAD_ROOT_READY");
-        }
-        if (body.includes('"toolCallId":"reload_http_child_call"')) {
-          return fakeGatewayFinalText("RELOAD_HTTP_CHILD_CANCELLED");
-        }
-        if (body.includes('"toolCallId":"reload_http_child_select"')) {
-          return fakeGatewayToolCall("reload_http_child_call", TOOL_NAME, { text: "stall" });
-        }
-        if (body.includes('"toolCallId":"reload_http_child_create"')) {
-          return fakeGatewayFinalText("RELOAD_HTTP_PARENT_READY");
-        }
-        if (body.includes(childPrompt)) {
-          return fakeGatewayToolCall("reload_http_child_select", "mcp_select_tool", {
-            name: TOOL_NAME,
-          });
-        }
-        return fakeGatewayToolCall("reload_http_child_create", "subagent", {
-          command: {
-            create: {
-              name: "reload-http-child",
-              mode: "persistent",
-              prompt: childPrompt,
-            },
-          },
-        });
-      }, {
-        classifierDecision: "clear",
-        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
-      });
-      tui = await TmuxSession.create({
-        isolated: true,
-        cwd: root.workspace,
-        width: 100,
-        height: 30,
-        env: fixtureEnv(root, gateway),
-      });
-
-      await tui.waitForComposer(15_000);
-      await tui.sendText("Create the reload HTTP child.");
-      await tui.waitForText("RELOAD_HTTP_PARENT_READY", 15_000);
-      const callDeadline = Date.now() + 10_000;
-      while (
-        !fixture.requests.some((entry) => entry.message.method === "tools/call") &&
-        Date.now() < callDeadline
-      ) {
-        await Bun.sleep(25);
-      }
-      expect(
-        fixture.requests.filter((entry) => entry.message.method === "tools/call"),
-      ).toHaveLength(1);
-
-      const reloadStarted = Date.now();
-      await tui.sendText("/mcp reload");
-      await tui.waitForText("MCP configuration reloaded successfully.", 5_000);
-      const cancelDeadline = Date.now() + 5_000;
-      while (fixture.cancelledCalls === 0 && Date.now() < cancelDeadline) {
-        await Bun.sleep(25);
-      }
-      expect(fixture.cancelledCalls).toBe(1);
-      expect(Date.now() - reloadStarted).toBeLessThan(5_000);
-
-      const childWakeDeadline = Date.now() + 10_000;
-      while (
-        !gateway.requests.some((request) =>
-          request.body.includes('"toolCallId":"reload_http_child_call"')
-        ) &&
-        Date.now() < childWakeDeadline
-      ) {
-        await Bun.sleep(25);
-      }
-      expect(gateway.requests.some((request) =>
-        request.body.includes('"toolCallId":"reload_http_child_call"')
-      )).toBe(true);
-      expect(
-        fixture.requests.filter((entry) => entry.message.method === "tools/call"),
-      ).toHaveLength(1);
-      expect(
-        fixture.requests.filter((entry) => entry.message.method === "server/discover"),
-      ).toHaveLength(2);
-
-      await tui.sendText(afterReloadPrompt);
-      await tui.waitForText("AFTER_HTTP_RELOAD_ROOT_READY", 10_000);
-    },
-    45_000,
-  );
 });

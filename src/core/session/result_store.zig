@@ -1,4 +1,5 @@
 const std = @import("std");
+const image_data = @import("../images/image_data.zig");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
@@ -24,7 +25,7 @@ const StorageTarget = union(enum) {
     managed: *session_child_store.SessionChildCapability,
 };
 
-/// Read-only, validated access to a persisted redacted tool result. The
+/// Read-only, validated access to persisted tool-result text. The
 /// caller chooses bounded raw pages and owns each returned allocation.
 pub const ResultReader = struct {
     file: session_child_store.ManagedFile,
@@ -56,7 +57,9 @@ pub fn prepare(
     inline_cap: usize,
 ) !PreparedResult {
     if (result_dir) |dir| {
-        if (output_bytes > large_result_threshold_bytes) {
+        if (output_bytes > large_result_threshold_bytes or
+            durable_output.len > inline_cap)
+        {
             return prepareStoredResult(
                 alloc,
                 .{ .legacy_dir = dir },
@@ -66,6 +69,14 @@ pub fn prepare(
                 durable_output,
             );
         }
+        return prepareExternallyBackedInlineResult(
+            alloc,
+            .{ .legacy_dir = dir },
+            tool_call_id,
+            tool_name,
+            output_bytes,
+            durable_output,
+        );
     }
     const capped = try cappedInlineOutput(alloc, tool_name, durable_output, inline_cap);
     return .{
@@ -88,7 +99,9 @@ pub fn prepareManaged(
     inline_cap: usize,
 ) !PreparedResult {
     if (capability) |managed| {
-        if (output_bytes > large_result_threshold_bytes) {
+        if (output_bytes > large_result_threshold_bytes or
+            durable_output.len > inline_cap)
+        {
             return prepareStoredResult(
                 alloc,
                 .{ .managed = managed },
@@ -98,6 +111,14 @@ pub fn prepareManaged(
                 durable_output,
             );
         }
+        return prepareExternallyBackedInlineResult(
+            alloc,
+            .{ .managed = managed },
+            tool_call_id,
+            tool_name,
+            output_bytes,
+            durable_output,
+        );
     }
     const capped = try cappedInlineOutput(alloc, tool_name, durable_output, inline_cap);
     return .{
@@ -106,6 +127,46 @@ pub fn prepareManaged(
             .output_bytes = output_bytes,
             .stored_output_bytes = durable_output.len,
             .truncated = capped.len < durable_output.len,
+        },
+    };
+}
+
+fn prepareExternallyBackedInlineResult(
+    alloc: Allocator,
+    target: StorageTarget,
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    output_bytes: usize,
+    durable_output: []const u8,
+) !PreparedResult {
+    const handle = try makeHandle(alloc, tool_call_id, tool_name, durable_output);
+    errdefer alloc.free(handle);
+    const model_output = try alloc.dupe(u8, durable_output);
+    errdefer alloc.free(model_output);
+    const preview = try previewText(alloc, durable_output, preview_bytes);
+    errdefer alloc.free(preview);
+    switch (target) {
+        .legacy_dir => |dir| try storeLargeResultAtHandle(
+            alloc,
+            dir,
+            handle,
+            durable_output,
+        ),
+        .managed => |capability| try storeLargeResultAtHandleManaged(
+            alloc,
+            capability,
+            handle,
+            durable_output,
+        ),
+    }
+    return .{
+        .model_output = model_output,
+        .memory = .{
+            .output_handle = handle,
+            .preview = preview,
+            .output_bytes = output_bytes,
+            .stored_output_bytes = durable_output.len,
+            .truncated = false,
         },
     };
 }
@@ -192,6 +253,51 @@ fn storeLargeResultAtHandle(
         handle,
         text,
     );
+}
+
+pub fn storeToolImages(alloc: Allocator, capability: *session_child_store.SessionChildCapability, call_id: []const u8, tool_name: []const u8, images: []const types.ToolImage) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeByte('[');
+    for (images, 0..) |image, index| {
+        if (index > 0) try out.writer.writeByte(',');
+        try out.writer.writeAll("{\"type\":\"image\",\"mimeType\":");
+        try std.json.Stringify.value(image.mime_type, .{}, &out.writer);
+        try out.writer.writeAll(",\"data\":");
+        try std.json.Stringify.value(image.data, .{}, &out.writer);
+        try out.writer.writeByte('}');
+    }
+    try out.writer.writeByte(']');
+    if (out.written().len > image_data.max_result_frame_bytes) return error.ResultTooLarge;
+    const base = try makeHandle(alloc, call_id, tool_name, out.written());
+    defer alloc.free(base);
+    const handle = try std.fmt.allocPrint(alloc, "image-{s}", .{base});
+    errdefer alloc.free(handle);
+    try storeLargeResultAtHandleManaged(alloc, capability, handle, out.written());
+    return handle;
+}
+
+pub fn isImageHandle(handle: []const u8) bool {
+    return std.mem.startsWith(u8, handle, "image-result-");
+}
+
+pub fn loadToolImages(alloc: Allocator, capability: *session_child_store.SessionChildCapability, handle: []const u8) ![]types.ToolImage {
+    if (!isImageHandle(handle)) return error.InvalidResultHandle;
+    var reader = try openReaderManaged(alloc, capability, handle);
+    defer reader.deinit();
+    if (reader.size > image_data.max_result_frame_bytes) return error.ResultTooLarge;
+    const bytes = try reader.readPage(alloc, 0, image_data.max_result_frame_bytes);
+    defer alloc.free(bytes);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    if (!handleMatchesContentDigest(handle, digest)) return error.ImageArtifactChanged;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .array) return error.InvalidImageArtifact;
+    const images = try image_data.parseToolImages(alloc, parsed.value.array.items);
+    errdefer types.freeToolImages(alloc, images);
+    if (images.len != parsed.value.array.items.len) return error.InvalidImageArtifact;
+    return images;
 }
 
 pub fn storeLargeResultManaged(
@@ -388,7 +494,7 @@ fn cappedInlineOutput(alloc: Allocator, tool_name: []const u8, text: []const u8,
     return try std.mem.concat(alloc, u8, &.{ text[0..prefix_len], marker });
 }
 
-fn previewText(alloc: Allocator, text: []const u8, max_bytes: usize) ![]u8 {
+pub fn previewText(alloc: Allocator, text: []const u8, max_bytes: usize) ![]u8 {
     return try alloc.dupe(u8, text_utils.utf8PrefixByBytes(text, max_bytes));
 }
 
@@ -451,6 +557,7 @@ fn readStoredTextManaged(
 }
 
 fn validateHandle(handle: []const u8) !void {
+    if (isImageHandle(handle)) return validateHandle(handle[6..]);
     if (handle.len == 0 or handle.len > 160) return error.InvalidHandle;
     if (std.mem.find(u8, handle, "..") != null) return error.InvalidHandle;
     for (handle) |byte| {
@@ -481,6 +588,39 @@ test "large result storage creates stable handle and bounded preview" {
     defer alloc.free(@constCast(again.memory.output_handle.?));
     defer alloc.free(@constCast(again.memory.preview.?));
     try std.testing.expectEqualStrings(prepared.memory.output_handle.?, again.memory.output_handle.?);
+}
+
+test "saved preparation externalizes small results" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+
+    const prepared = try prepare(
+        alloc,
+        dir,
+        "call-small",
+        "read_file",
+        4,
+        "done",
+        64 * 1024,
+    );
+    defer alloc.free(prepared.model_output);
+    defer if (prepared.memory.output_handle) |handle| alloc.free(@constCast(handle));
+    defer if (prepared.memory.preview) |preview| alloc.free(@constCast(preview));
+
+    const handle = prepared.memory.output_handle orelse return error.TestExpectedResultHandle;
+    const stored = try readByRange(
+        alloc,
+        dir,
+        handle,
+        0,
+        16,
+    );
+    defer alloc.free(stored);
+    try std.testing.expect(std.mem.find(u8, stored, "total_bytes=\"4\"") != null);
+    try std.testing.expect(std.mem.find(u8, stored, "\ndone\n") != null);
 }
 
 test "inline cap and stored preview keep complete codepoints" {
@@ -977,4 +1117,27 @@ test "managed result handles authenticate stored content" {
         "result-run_command-legacy.txt",
         digest,
     ));
+}
+
+test "stored tool images round trip and reject changed artifacts" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "images");
+    const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "images");
+    defer alloc.free(path);
+    var capability = try session_child_store.SessionChildCapability.initLegacyRoute(alloc, path, .tool_results, .writable);
+    defer capability.deinit();
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=";
+    const handle = try storeToolImages(alloc, &capability, "screenshot", "browser", &.{.{ .data = @constCast(png), .mime_type = @constCast("image/png") }});
+    defer alloc.free(handle);
+    const loaded = try loadToolImages(alloc, &capability, handle);
+    defer types.freeToolImages(alloc, loaded);
+    try std.testing.expectEqual(@as(usize, 1), loaded.len);
+    try std.testing.expectEqualStrings(png, loaded[0].data);
+    try std.testing.expectEqualStrings("image/png", loaded[0].mime_type);
+    var entry = try capability.atomicReplace(alloc, .tool_results, handle, "[]");
+    entry.deinit(alloc);
+    try std.testing.expectError(error.ImageArtifactChanged, loadToolImages(alloc, &capability, handle));
+    try std.testing.expectError(error.InvalidHandle, loadToolImages(alloc, &capability, "image-result-../../elsewhere"));
 }

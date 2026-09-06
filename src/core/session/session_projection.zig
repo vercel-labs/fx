@@ -1,7 +1,6 @@
 const std = @import("std");
 const session = @import("session.zig");
 const session_codec = @import("session_codec.zig");
-const model_provider = @import("../config/model_provider.zig");
 const session_event = @import("session_event.zig");
 const types = @import("../shared/types.zig");
 
@@ -487,22 +486,9 @@ fn writePreferences(
 }
 
 fn parsePreferences(alloc: Allocator, value: std.json.Value) !session_codec.DurableSessionPreferences {
-    const raw_object = if (value == .object) value.object else return error.InvalidManifest;
-    const object = if (raw_object.get("provider") != null)
-        try exactObject(value, &.{ "provider", "model", "effort", "fast_mode" })
-    else
-        try exactObject(value, &.{ "model", "effort", "fast_mode" });
-    const model = try dupeString(alloc, object, "model");
-    errdefer alloc.free(model);
-    return .{
-        .provider = if (object.get("provider")) |provider_value| blk: {
-            if (provider_value != .string) return error.InvalidManifest;
-            break :blk model_provider.parse(provider_value.string) orelse return error.InvalidManifest;
-        } else .gateway,
-        .model = model,
-        .effort = types.ReasoningEffort.parse(try requireString(object, "effort")) orelse
-            return error.InvalidManifest,
-        .fast_mode = try requireBool(object, "fast_mode"),
+    return session_codec.parse_preferences(alloc, value) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidManifest,
     };
 }
 
@@ -530,12 +516,6 @@ fn requireString(object: std.json.ObjectMap, key: []const u8) ![]const u8 {
 
 fn dupeString(alloc: Allocator, object: std.json.ObjectMap, key: []const u8) ![]u8 {
     return try alloc.dupe(u8, try requireString(object, key));
-}
-
-fn requireBool(object: std.json.ObjectMap, key: []const u8) !bool {
-    const value = object.get(key) orelse return error.InvalidManifest;
-    if (value != .bool) return error.InvalidManifest;
-    return value.bool;
 }
 
 fn requireI64(object: std.json.ObjectMap, key: []const u8) !i64 {

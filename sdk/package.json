@@ -23,12 +23,19 @@
     },
     "./node": "./node.js",
     "./browser": "./browser.js",
-    "./wasm": "./fx-sdk.js"
+    "./wasm": "./fx-sdk.js",
+    "./mcp": "./mcp.js",
+    "./skills": "./skills.js",
+    "./skills/node": "./skills-node.js"
   },
   "files": [
     "browser.js",
     "node.js",
     "fx-sdk.js",
+    "core-output.js",
+    "mcp.js",
+    "skills.js",
+    "skills-node.js",
     "fx-core.wasm",
     "fx-term.wasm",
     "*.node",

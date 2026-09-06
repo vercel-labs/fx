@@ -125,6 +125,7 @@ const FooterSurfaceProjection = struct {
     show_picker: bool,
     picker_kind: PickerKind,
     picker_items: []const []const u8,
+    picker_annotations: []const []const u8,
     file_picker_items: []const file_index.SearchResult,
     picker_selection_index: usize,
     picker_window_start: usize,
@@ -179,6 +180,7 @@ const FooterSurfaceProjection = struct {
             .show_picker = self.show_picker,
             .picker_kind = self.picker_kind,
             .picker_items = self.picker_items,
+            .picker_annotations = self.picker_annotations,
             .file_picker_items = self.file_picker_items,
             .picker_selection_index = self.picker_selection_index,
             .picker_window_start = self.picker_window_start,
@@ -330,15 +332,16 @@ fn applyResolvedBottomReservation(
     force_redraw.* = true;
 }
 
-fn queuedBannerRowsForLayout(
+fn steeringBannerRowsForLayout(
     ctx: RenderContext,
+    terminal_cols: u16,
     terminal_rows: u16,
     input_visible: bool,
     composer_top_chrome_rows: u16,
     input_extra: u16,
 ) u16 {
-    const requested = render_input.queuedBannerRows(ctx);
-    return clampQueuedBannerRows(
+    const requested = render_input.steeringBannerRows(ctx, terminal_cols);
+    return clampSteeringBannerRows(
         requested,
         terminal_rows,
         input_visible,
@@ -347,7 +350,7 @@ fn queuedBannerRowsForLayout(
     );
 }
 
-pub fn clampQueuedBannerRows(
+pub fn clampSteeringBannerRows(
     requested: u16,
     terminal_rows: u16,
     input_visible: bool,
@@ -389,7 +392,10 @@ fn buildFooterSurfaceProjection(
     };
     const input_visible = ctx.composer_visible and !modal_active and !viewer_active;
     const composer_top_chrome_rows = footer_paint_plan.composerTopChromeRows();
-    const show_auth_picker = !viewer_active and !modal_active and !ctx.stream.active and ctx.auth_picker.active;
+    // The provider flow's inline API-key field is rendered in the composer column,
+    // not as the legacy auth panel.
+    const inline_api_key = ctx.auth_picker.active and ctx.auth_picker.stage == .api_key and ctx.auth_picker.api_key_inline;
+    const show_auth_picker = !viewer_active and !modal_active and !ctx.stream.active and ctx.auth_picker.active and !inline_api_key;
     const show_settings_menu = !viewer_active and !show_auth_picker and !modal_active and ctx.settings_menu.active;
     const show_mcp_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !modal_active and ctx.mcp_menu.state.active;
     const show_help_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !modal_active and ctx.help_menu.active;
@@ -397,9 +403,11 @@ fn buildFooterSurfaceProjection(
     const show_models_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_menu and !modal_active and ctx.model_menu.active;
     const show_inline_catalog = show_settings_menu or show_mcp_menu or show_help_menu or show_session_menu or show_models_menu;
     const show_skills_query = !viewer_active and !show_auth_picker and !show_inline_catalog and !modal_active and ctx.skills_menu.active;
-    const stream_suppresses_file_query = ctx.stream.active and !ctx.queued_editor_active;
-    const show_model_query = !viewer_active and !show_auth_picker and !show_inline_catalog and !show_skills_query and !modal_active and !ctx.stream.active and ctx.model_query_active;
-    const show_file_query = !viewer_active and !show_inline_catalog and !show_skills_query and !modal_active and !stream_suppresses_file_query and ctx.file_query_active and !show_model_query;
+    const show_model_query = !viewer_active and !show_auth_picker and !show_inline_catalog and !show_skills_query and !modal_active and
+        ctx.model_query_active;
+    const show_provider_query = !viewer_active and !show_auth_picker and !show_inline_catalog and !show_skills_query and !modal_active and !ctx.stream.active and
+        ctx.provider_query_active and !show_model_query;
+    const show_file_query = !viewer_active and !show_inline_catalog and !show_skills_query and !modal_active and ctx.file_query_active and !show_model_query and !show_provider_query;
     const prepared_slash_prefix = if (!show_auth_picker and
         !show_inline_catalog and
         !show_skills_query)
@@ -407,7 +415,7 @@ fn buildFooterSurfaceProjection(
             ctx,
             modal_active,
             show_model_query,
-            show_file_query,
+            show_provider_query or show_file_query,
         )
     else
         null;
@@ -421,19 +429,26 @@ fn buildFooterSurfaceProjection(
     else
         picker_presentation.PreparedSlashMenu{};
     errdefer prepared_slash_menu.deinit(alloc);
-    const geometry = input_presentation.measureRawInputGeometryPrepared(
+    const geometry = input_presentation.measureRawInputGeometryPreparedWithProvider(
         ctx,
         shell.layout.cols,
         shell.layout.content_bottom,
         input_visible,
         modal_active,
         show_model_query,
+        show_provider_query,
         show_file_query,
         if (prepared_slash_prefix != null) prepared_slash_menu.resultCount() else null,
     );
     const show_slash_query = prepared_slash_prefix != null and geometry.show_slash_query;
-    const show_picker = show_auth_picker or show_inline_catalog or show_skills_query or show_model_query or show_file_query or show_slash_query;
-    const picker_items: []const []const u8 = if (show_model_query) ctx.model_completions else &.{};
+    const show_picker = show_auth_picker or show_inline_catalog or show_skills_query or show_model_query or show_provider_query or show_file_query or show_slash_query;
+    const picker_items: []const []const u8 = if (show_model_query)
+        ctx.model_completions
+    else if (show_provider_query)
+        ctx.provider_picker_completions
+    else
+        &.{};
+    const picker_annotations: []const []const u8 = if (show_provider_query) ctx.provider_picker_annotations else &.{};
     const file_picker_items: []const file_index.SearchResult = if (show_file_query) ctx.file_completions else &.{};
     const picker_selection_index: usize = if (show_skills_query)
         ctx.skills_menu.selected_index
@@ -443,6 +458,8 @@ fn buildFooterSurfaceProjection(
         ctx.auth_picker.selectedIndex()
     else if (show_model_query)
         ctx.model_completion_index
+    else if (show_provider_query)
+        ctx.provider_picker_completion_index
     else if (show_file_query)
         ctx.file_completion_index
     else
@@ -453,6 +470,8 @@ fn buildFooterSurfaceProjection(
         ctx.input.picker.slash_completion_window_start
     else if (show_model_query)
         ctx.model_completion_window_start
+    else if (show_provider_query)
+        ctx.provider_picker_completion_window_start
     else if (show_file_query)
         ctx.file_completion_window_start
     else
@@ -487,14 +506,17 @@ fn buildFooterSurfaceProjection(
         .auth
     else if (show_model_query)
         .model_stage
+    else if (show_provider_query)
+        .provider_stage
     else if (show_file_query)
         .file
     else
         .model_stage;
     const sizing_request = if (approval) |value| value.request else null;
     const file_request = if (sizing_request) |request| request.file else null;
-    const banner_rows = if (viewer_active) 0 else queuedBannerRowsForLayout(
+    const banner_rows = if (viewer_active) 0 else steeringBannerRowsForLayout(
         ctx,
+        shell.layout.cols,
         shell.layout.rows,
         input_visible,
         composer_top_chrome_rows,
@@ -628,8 +650,8 @@ fn buildFooterSurfaceProjection(
     return .{
         .active_label = active_label,
         .activity_projection = activity_projection,
-        .input_display = if (ctx.queued_editor_active) "" else ctx.input.edit_state.input.items,
-        .input_cursor = if (ctx.queued_editor_active) 0 else ctx.input.edit_state.cursor,
+        .input_display = ctx.input.edit_state.input.items,
+        .input_cursor = ctx.input.edit_state.cursor,
         .input_summary = geometry.summary,
         .input_window = geometry.window,
         .input_extra = geometry.input_extra,
@@ -637,7 +659,7 @@ fn buildFooterSurfaceProjection(
         .composer_top_chrome_rows = composer_top_chrome_rows,
         .picker_rows = picker_rows,
         .top_gap_rows = if (viewer_active or modal_active) 1 else 0,
-        .footer_gap_active = !viewer_active and (modal_active or ctx.queued_count > 0),
+        .footer_gap_active = !viewer_active and (modal_active or ctx.steering_messages.len > 0),
         .banner_active = banner_active,
         .banner_rows = banner_rows,
         .footer_extra = geometry.input_extra + banner_rows + picker_extra,
@@ -645,6 +667,7 @@ fn buildFooterSurfaceProjection(
         .show_picker = show_picker,
         .picker_kind = picker_kind,
         .picker_items = picker_items,
+        .picker_annotations = picker_annotations,
         .file_picker_items = file_picker_items,
         .picker_selection_index = picker_selection_index,
         .picker_window_start = picker_window_start,
@@ -845,6 +868,7 @@ pub const SurfaceFooterMeasurement = struct {
     show_picker: bool = false,
     picker_kind: PickerKind = .model_stage,
     picker_items: []const []const u8 = &.{},
+    picker_annotations: []const []const u8 = &.{},
     file_picker_items: []const file_index.SearchResult = &.{},
     picker_selection_index: usize = 0,
     picker_window_start: usize = 0,
@@ -985,6 +1009,7 @@ pub const SurfaceFooterMeasurement = struct {
             .show_picker = self.show_picker,
             .picker_kind = self.picker_kind,
             .picker_items = self.picker_items,
+            .picker_annotations = self.picker_annotations,
             .file_picker_items = self.file_picker_items,
             .picker_selection_index = self.picker_selection_index,
             .picker_window_start = self.picker_window_start,
@@ -1024,7 +1049,7 @@ pub fn commandApprovalFitsInline(
     label: []const u8,
     command: ?[]const u8,
     layout: types.Layout,
-    queued_rows: usize,
+    banner_row_count: usize,
 ) !bool {
     const picker_rows = try approval_ui.inlineApprovalPanelRowsForCommand(
         alloc,
@@ -1033,7 +1058,7 @@ pub fn commandApprovalFitsInline(
         layout.cols,
         layout.rows,
     );
-    const banner_rows: u16 = @intCast(@min(queued_rows, std.math.maxInt(u16)));
+    const banner_rows: u16 = @intCast(@min(banner_row_count, std.math.maxInt(u16)));
     const measurement = SurfaceFooterMeasurement{
         .input_visible = false,
         .picker_rows = picker_rows,
@@ -1112,6 +1137,7 @@ pub noinline fn measureSurfaceFooter(
     measurement.input_visible = projection.input_visible;
     measurement.show_picker = projection.show_picker;
     measurement.picker_items = projection.picker_items;
+    measurement.picker_annotations = projection.picker_annotations;
     measurement.file_picker_items = projection.file_picker_items;
     measurement.picker_selection_index = projection.picker_selection_index;
     measurement.picker_window_start = projection.picker_window_start;
@@ -1238,8 +1264,9 @@ pub noinline fn resolveSurfaceFooterReservation(
     const input_visible_for_transient =
         ctx.composer_visible and approval == null;
     const composer_top_chrome_rows_for_transient = footer_paint_plan.composerTopChromeRows();
-    const banner_rows_for_transient = queuedBannerRowsForLayout(
+    const banner_rows_for_transient = steeringBannerRowsForLayout(
         ctx,
+        shell.layout.cols,
         shell.layout.rows,
         input_visible_for_transient,
         composer_top_chrome_rows_for_transient,
@@ -1337,8 +1364,9 @@ fn prepareSurfaceFooterFrameInternal(
         const input_visible_for_transient =
             ctx.composer_visible and approval == null;
         const composer_top_chrome_rows_for_transient = footer_paint_plan.composerTopChromeRows();
-        const banner_rows_for_transient = queuedBannerRowsForLayout(
+        const banner_rows_for_transient = steeringBannerRowsForLayout(
             ctx,
+            shell.layout.cols,
             shell.layout.rows,
             input_visible_for_transient,
             composer_top_chrome_rows_for_transient,
@@ -1451,12 +1479,6 @@ fn surfaceTestContext(input: *InputRuntime) RenderContext {
         .stream = .{},
         .has_api_key = true,
         .model = "gpt-5.1",
-        .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .input = input,
     };
 }
@@ -1557,12 +1579,6 @@ test "surface footer measurement preserves the narrow tool activity projection" 
         .stream = .{ .active = true, .last_activity_kind = .read, .read_count = 1 },
         .has_api_key = true,
         .model = "gpt-5.1",
-        .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .activity = .{ .tool_slot = .{
             .entry_id = 123,
             .fallback_label = "reading src/main.zig",
@@ -1598,12 +1614,6 @@ test "surface footer measurement preserves route recovery status tone" {
         .stream = .{},
         .has_api_key = true,
         .model = "gpt-5.1",
-        .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .activity = .{ .turn_thinking = .{
             .label = "⚠ blocked · content filter",
             .tone = .danger,
@@ -1667,12 +1677,6 @@ test "surface footer measurement keeps clipped command status transcript-owned" 
         },
         .has_api_key = true,
         .model = "gpt-5.1",
-        .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .activity = .{ .tool_slot = .{
             .entry_id = status_id,
             .fallback_label = "running read-only tools",
@@ -1838,7 +1842,7 @@ test "surface footer measurement reserves capped picker rows for active list pic
     try expectMeasuredPickerRows(alloc, &file_empty_shell, approval.projection(), file_ctx, .file, expected_rows);
 }
 
-test "queued editor exposes only its file picker while a response streams" {
+test "surface footer exposes file picker while a response streams" {
     const alloc = std.testing.allocator;
     var approval = ApprovalPrompt{};
     defer approval.deinit(alloc);
@@ -1851,24 +1855,31 @@ test "queued editor exposes only its file picker while a response streams" {
     ctx.file_query_active = true;
     ctx.file_completions = &.{.{ .path = "src/main.zig", .kind = .file, .matched_spans = &.{} }};
 
-    var hidden = try measureSurfaceFooter(alloc, &shell, approval.projection(), ctx);
-    defer hidden.deinit(alloc);
-    try std.testing.expect(!hidden.show_picker);
-
-    ctx.queued_editor_active = true;
     var visible = try measureSurfaceFooter(alloc, &shell, approval.projection(), ctx);
     defer visible.deinit(alloc);
     try std.testing.expect(visible.show_picker);
     try std.testing.expectEqual(PickerKind.file, visible.picker_kind);
     try std.testing.expect(visible.picker_rows > 0);
+}
 
-    ctx.file_query_active = false;
-    ctx.file_completions = &.{};
+test "surface footer exposes model picker while a response streams" {
+    const alloc = std.testing.allocator;
+    var approval = ApprovalPrompt{};
+    defer approval.deinit(alloc);
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var shell = surfaceTestShell(24, 80);
+    defer shell.deinit(alloc);
+    var ctx = surfaceTestContext(&input);
+    ctx.stream.active = true;
     ctx.model_query_active = true;
-    ctx.model_completions = &.{"provider/queued-hidden-model"};
-    var hidden_model = try measureSurfaceFooter(alloc, &shell, approval.projection(), ctx);
-    defer hidden_model.deinit(alloc);
-    try std.testing.expect(!hidden_model.show_picker);
+    ctx.model_completions = &.{"provider/visible-model"};
+
+    var visible = try measureSurfaceFooter(alloc, &shell, approval.projection(), ctx);
+    defer visible.deinit(alloc);
+    try std.testing.expect(visible.show_picker);
+    try std.testing.expectEqual(PickerKind.model_stage, visible.picker_kind);
+    try std.testing.expect(visible.picker_rows > 0);
 }
 
 test "surface footer measurement reserves only the compact auth picker rows" {
@@ -2537,7 +2548,7 @@ test "approval surface footer measurement accounts for both divider rails" {
     try std.testing.expectEqual(interaction_state.approval_panel_rows_spacious, neutral.picker_rows);
 }
 
-test "command approval fit includes the queued prompt banner" {
+test "command approval fit includes the steering banner" {
     const layout: types.Layout = .{
         .rows = 11,
         .cols = 20,
@@ -2547,7 +2558,7 @@ test "command approval fit includes the queued prompt banner" {
         .divider_bottom_row = 10,
         .hint_row = 11,
     };
-    const label = "terminal.exec 12345678901234567";
+    const label = "shell.run 12345678901234567";
 
     try std.testing.expect(try commandApprovalFitsInline(
         std.testing.allocator,
@@ -2573,7 +2584,7 @@ test "command approval footer sizing paths use the complete command" {
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(alloc);
     try std.testing.expect(try prompt.syncRequest(alloc, .{
-        .label = "terminal.exec printf 'SURFACE_COMMAND_START...",
+        .label = "shell.run printf 'SURFACE_COMMAND_START...",
         .command = command,
     }));
 
@@ -2985,12 +2996,7 @@ test "file approval reservation-only sizing matches measured subagent view" {
     };
     defer shell.deinit(alloc);
 
-    var ctx = surfaceTestContext(&input);
-    ctx.subagent_count = 1;
-    ctx.subagent_view_active = true;
-    ctx.selected_subagent_id = 7;
-    ctx.selected_subagent_label = "reviewer";
-    ctx.selected_subagent_status = .running;
+    const ctx = surfaceTestContext(&input);
 
     var measured = try measureSurfaceFooter(
         alloc,
@@ -3054,12 +3060,7 @@ test "file approval preparation over active subagent view keeps a valid footer i
         .hint = 40,
     };
 
-    var ctx = surfaceTestContext(&input);
-    ctx.subagent_count = 1;
-    ctx.subagent_view_active = true;
-    ctx.selected_subagent_id = 7;
-    ctx.selected_subagent_label = "reviewer";
-    ctx.selected_subagent_status = .completed;
+    const ctx = surfaceTestContext(&input);
 
     var metrics = Metrics{};
     var force_redraw = false;

@@ -281,10 +281,6 @@ fn renderSkillTokensForCard(
         try out.writer.writeAll(text[pos..token.raw_start]);
         try out.writer.writeAll(accent_style);
         try out.writer.writeAll(token.name);
-        if (visual_layout.skillTokenSourceLabel(token)) |source_label| {
-            try out.writer.writeAll(visual_layout.skill_source_separator);
-            try out.writer.writeAll(source_label);
-        }
         try out.writer.writeAll(restore_prompt_text_style);
         pos = token.raw_end;
     }
@@ -569,7 +565,7 @@ test "buildUserPromptCardWithSkillTokens colors selected skills without dollar p
     try std.testing.expect(std.mem.find(u8, card, "$review") == null);
 }
 
-test "buildUserPromptCardWithSkillTokens labels an ambiguous source" {
+test "buildUserPromptCardWithSkillTokens hides an ambiguous source" {
     setStyle(false, null);
     const alloc = std.testing.allocator;
     const tokens = [_]visual_layout.SkillTokenSpan{.{
@@ -582,7 +578,8 @@ test "buildUserPromptCardWithSkillTokens labels an ambiguous source" {
     const card = try buildUserPromptCardWithSkillTokens(alloc, "use $review now", &.{}, 80, &tokens);
     defer alloc.free(card);
 
-    try std.testing.expect(std.mem.find(u8, card, "review · workspace .codex") != null);
+    try std.testing.expect(std.mem.find(u8, card, "review") != null);
+    try std.testing.expect(std.mem.find(u8, card, "workspace .codex") == null);
     try std.testing.expect(std.mem.find(u8, card, "$review") == null);
 }
 
