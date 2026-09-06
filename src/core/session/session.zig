@@ -3202,6 +3202,11 @@ fn appendHistoryChatMessagesImpl(
                         .tool_call_id = tool_call.id,
                         .tool_name = tool_call.name,
                         .tool_result_status = .failure,
+                        .tool_result_memory = .{
+                            .output_bytes = tool_output.len,
+                            .stored_output_bytes = tool_output.len,
+                            .truncated = false,
+                        },
                     });
                 } else if (interrupted_projection == .steering_continuation) {
                     if (entry.assistant) |assistant| {
@@ -4541,6 +4546,50 @@ test "interrupted history projects marker and aborted tool result" {
     for (chat_messages.items) |entry| {
         if (entry.content) |content| {
             try std.testing.expect(std.mem.find(u8, content, artifact_sentinel) == null);
+        }
+    }
+}
+
+test "interrupted tool diagnostics remain complete for compaction" {
+    const compaction = @import("../agent/runtime/context_compaction.zig");
+    const replay_handle = "cancelled-output.bin";
+    const oversized_handle = "h" ** 129;
+    const presentations = [_]?CancelledCommandPresentation{
+        null,
+        .{},
+        .{ .output_replay = .unavailable },
+        .{ .output_replay = .{ .available = .{ .handle = replay_handle, .framed_bytes = 42 } } },
+        .{ .output_replay = .{ .available = .{ .handle = oversized_handle, .framed_bytes = 42 } } },
+    };
+    for (presentations, 0..) |presentation, index| {
+        for ([_]InterruptedTerminalReason{ .cancelled, .failed }) |reason| {
+            for ([_]InterruptedChatProjection{ .closed, .steering_continuation }) |projection| {
+                var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+                defer arena_state.deinit();
+                const alloc = arena_state.allocator();
+                const history = [_]HistoryTurn{.{ .interrupted = .{
+                    .user = .{ .text = @constCast("Stop the current tool.") },
+                    .tool_call = .{ .id = "cancelled-call", .name = "subagent", .arguments_json = "{}" },
+                    .cancelled_command = presentation,
+                    .terminal_reason = reason,
+                } }};
+                var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+                try appendHistoryChatMessagesImpl(alloc, &messages, &history, projection);
+                // Compaction must accept the complete diagnostic, not claim the tool completed.
+                try compaction.promoteMessageResults(alloc, messages.items, .unavailable, 0);
+                const result = messages.items[2];
+                try std.testing.expectEqual(.failure, result.tool_result_status.?);
+                try std.testing.expectEqualStrings("cancelled-call", result.tool_call_id.?);
+                const memory = result.tool_result_memory.?;
+                try std.testing.expectEqual(result.content.?.len, memory.output_bytes);
+                try std.testing.expectEqual(result.content.?.len, memory.stored_output_bytes);
+                try std.testing.expect(!memory.truncated);
+                try std.testing.expect(memory.output_handle == null);
+                try std.testing.expect(std.mem.startsWith(u8, result.content.?, aborted_tool_output));
+                try std.testing.expectEqual(@as(usize, if (index == 3) 1 else 0), std.mem.count(u8, result.content.?, replay_handle));
+                try std.testing.expect(std.mem.find(u8, result.content.?, oversized_handle) == null);
+                try std.testing.expectEqual(reason, history[0].interrupted.terminal_reason);
+            }
         }
     }
 }
