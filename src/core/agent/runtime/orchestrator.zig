@@ -8504,12 +8504,6 @@ fn processQueuedPromptLoop(
             switch (prepared_tool_call) {
                 .blocked => |blocked| {
                     if (blocked.kind == .malformed_arguments) {
-                        try stream_ctx.provisional_statuses.finishMalformedToolArguments(
-                            deps,
-                            arena,
-                            turn_id,
-                            tool_call,
-                        );
                         debug_trace.eventf(
                             "tool",
                             "argument_integrity_rejected",
@@ -8547,8 +8541,7 @@ fn processQueuedPromptLoop(
                         .model_output = blocked.model_output.?,
                     };
                     const prepared = try runtime_execution_memory.prepareToolExecutionOutput(arena, config, tool_call, execution, null);
-                    if (blocked.kind != .malformed_arguments and
-                        blocked.kind != .route_unavailable and
+                    if (blocked.kind != .route_unavailable and
                         blocked.kind != .required_vision)
                     {
                         _ = try stream_ctx.provisional_statuses.finishExecutedCall(

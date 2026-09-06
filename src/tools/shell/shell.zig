@@ -317,10 +317,6 @@ fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: boo
         try problems.append(arena, problem);
         repairable = false;
     }
-    if (candidate.timeout_ms == 0) {
-        try problems.append(arena, "request.timeout_ms must be at least 1; choose the intended deadline.");
-        repairable = false;
-    }
     if (!supports_tty and (canonical.contains("tty") or canonical.contains("shell") or canonical.contains("chars"))) {
         try problems.append(arena, "Interactive Shell fields require a saved session.");
         repairable = false;
@@ -354,6 +350,7 @@ fn argument_problem(input: Input) ?[]const u8 {
         .run => {
             const command = input.command orelse return "request.command is required.";
             if (command.len == 0 or command.len > terminal_contracts.max_command_bytes) return "request.command must contain 1-65536 bytes.";
+            if (input.timeout_ms == 0) return "request.timeout_ms must be at least 1; choose the intended deadline.";
             if (input.profile != null and input.shell != null) return "Choose either request.profile or request.shell.";
             if (!input.tty and input.shell != null) return "request.shell requires tty=true; choose the intended execution mode.";
             if (input.yield_time_ms > managed_contract.max_yield_time_ms) return "request.yield_time_ms must be between 0 and 30000.";
@@ -1787,6 +1784,39 @@ test "shell action fields are closed and command authority covers every run" {
         &.{ "action", "session_id", "chars", "yield_time_ms" },
         actionFieldContract(.interact).allowed,
     );
+}
+
+test "shell timeout minimum is enforced before correction and execution" {
+    const alloc = std.testing.allocator;
+    const zero = try decode(.{ .allocator = alloc }, "{\"action\":\"run\",\"command\":\"true\",\"timeout_ms\":0}");
+    switch (zero) {
+        .input => |input| {
+            input.deinit(alloc);
+            return error.TestUnexpectedResult;
+        },
+        .failure => |failure| {
+            defer alloc.free(failure);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, failure, .{});
+            defer parsed.deinit();
+            const detail = parsed.value.object.get("error").?.object;
+            try std.testing.expectEqualStrings("invalid_shell_request", detail.get("code").?.string);
+            try std.testing.expect(!detail.get("executed").?.bool);
+            try std.testing.expect(detail.get("retry_with") == null);
+        },
+    }
+    for ([_][]const u8{
+        "{\"action\":\"run\",\"command\":\"true\"}",
+        "{\"action\":\"run\",\"command\":\"true\",\"timeout_ms\":1}",
+    }) |args| {
+        const decoded = try decode(.{ .allocator = alloc }, args);
+        switch (decoded) {
+            .input => |input| input.deinit(alloc),
+            .failure => |failure| {
+                alloc.free(failure);
+                return error.TestUnexpectedResult;
+            },
+        }
+    }
 }
 
 test "shell request correction suggests only unambiguous repairs without executing" {
