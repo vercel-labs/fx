@@ -1041,6 +1041,49 @@ test "processQueuedPrompt recovers malformed local arguments before tool semanti
     try std.testing.expect(tool_result_errors.isToolExecutionFailedOutput(execution.tool_steps[0].tool_results[0].output));
 }
 
+test "processQueuedPrompt settles rejected shell arguments without streamed activity" {
+    const alloc = std.testing.allocator;
+    for ([_]types.ToolArgumentIntegrity{ .malformed_json, .non_object_json }) |integrity| {
+        const calls = [_]ToolCall{.{
+            .id = "rejected_shell",
+            .name = "shell",
+            .arguments_json = "{}",
+            .argument_integrity = integrity,
+        }};
+        const completions = [_]FakeCompletion{
+            .{ .tool_calls = &calls },
+            .{ .content = "Recovered." },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+        try expectSingleTerminalOutcome(hooks.lifecycle_events.items, "rejected_shell", .failed);
+        try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+        try std.testing.expectEqual(@as(usize, 0), hooks.validated_names.items.len);
+        try std.testing.expectEqual(@as(usize, 0), hooks.permission_names.items.len);
+        try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+        try std.testing.expectEqual(@as(usize, 1), hooks.rejected_names.items.len);
+        const steps = hooks.history_turns.items[0].assistant.execution.tool_steps;
+        try std.testing.expectEqual(@as(usize, 1), steps.len);
+        try std.testing.expectEqualStrings("{}", steps[0].tool_calls[0].arguments_json);
+        try std.testing.expectEqual(@as(usize, 1), steps[0].tool_results.len);
+        try std.testing.expectEqual(types.PersistedToolStatus.failure, steps[0].tool_results[0].status);
+        for (hooks.lifecycle_events.items) |event| switch (event) {
+            .terminal => |terminal| {
+                try std.testing.expectEqualStrings(steps[0].tool_results[0].output, terminal.result.?);
+                const detail = if (integrity == .malformed_json) "invalid JSON arguments" else "non-object arguments";
+                try std.testing.expect(std.mem.find(u8, terminal.outcome.summary, detail) != null);
+            },
+            else => {},
+        };
+    }
+}
+
 test "processQueuedPrompt malformed parallel call preserves valid sibling exactly once" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{
@@ -1078,10 +1121,8 @@ test "processQueuedPrompt malformed parallel call preserves valid sibling exactl
     try std.testing.expectEqual(@as(usize, 1), hooks.rejected_names.items.len);
     try std.testing.expectEqualStrings("web_fetch", hooks.rejected_names.items[0]);
     try std.testing.expectEqual(@as(usize, 0), hooks.propagated_grants.items.len);
-    try expectLifecycleCallIds(
-        hooks.lifecycle_events.items,
-        &.{ "call_read", "call_read", "call_read" },
-    );
+    try expectSingleTerminalOutcome(hooks.lifecycle_events.items, "call_fetch", .failed);
+    try expectSingleTerminalOutcome(hooks.lifecycle_events.items, "call_read", .completed);
 }
 
 test "processQueuedPrompt malformed parallel fallback emits one terminal and rejection trace" {

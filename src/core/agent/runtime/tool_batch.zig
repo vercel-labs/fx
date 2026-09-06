@@ -209,11 +209,19 @@ pub fn assembleParallelToolResults(
                 };
             }
         } else if (original_call.argument_integrity != .valid) {
-            try provisional_statuses.finishMalformedToolArguments(
+            _ = try provisional_statuses.finishExecutedCall(
                 hooks,
+                provisional_alloc,
                 arena,
                 turn_id,
                 original_call,
+                parallel_status_started[original_index],
+                null,
+                execution,
+                safe_tool_output,
+                prepared.memory,
+                null,
+                advertised_dynamic_tool_names,
             );
             debug_trace.eventf(
                 "tool",

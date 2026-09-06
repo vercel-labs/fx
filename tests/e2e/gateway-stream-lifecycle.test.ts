@@ -3907,6 +3907,83 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
+  test.skipIf(!tmuxAvailable())("rejected shell calls remain visible without streamed activity", async () => {
+    const root = createFixtureRoot("shell-rejection-status");
+    const tracePath = join(root.root, "trace.log");
+    const stderrPath = join(root.root, "stderr.log");
+    const tapePath = join(root.root, "session.fxtape");
+    const clipboardBin = join(root.root, "bin");
+    mkdirSync(clipboardBin);
+    const clipboardStub = join(clipboardBin, "osascript");
+    writeFileSync(clipboardStub, "#!/bin/sh\nexit 1\n");
+    chmodSync(clipboardStub, 0o755);
+    const marker = join(root.workspace, "executions.txt");
+    let step = 0;
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeGatewaySse([
+            { type: "tool-call", toolCallId: "invalid_shell", toolName: "shell", input: '{"request":{"action":"run","command":"touch MUST_NOT_EXECUTE"' },
+            { type: "tool-call", toolCallId: "valid_shell", toolName: "shell", input: { request: { action: "run", command: "printf 'once\\n' >> executions.txt", profile: "clean" } } },
+            { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+          ]);
+        case 1:
+          expect(toolResultOutput(body, "invalid_shell")).toContain("Tool arguments were not valid JSON.");
+          expect(shellResult(body, "valid_shell").exit_code).toBe(0);
+          expect(readFileSync(marker, "utf8")).toBe("once\n");
+          return fakeGatewayFinalText("REJECTION_RECOVERED");
+        case 2:
+          return fakeGatewayToolCall("later_shell", "shell", { request: { action: "run", command: "printf 'later\\n' >> executions.txt", profile: "clean" } });
+        case 3:
+          expect(shellResult(body, "later_shell").exit_code).toBe(0);
+          return fakeGatewayFinalText("LATER_TURN_COMPLETE");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+    let tui: TmuxSession | null = null;
+    try {
+      tui = await TmuxSession.create({
+        cwd: root.workspace, width: 110, height: 40, stderrPath,
+        env: { ...fixtureEnv(root, gateway, tracePath), PATH: `${clipboardBin}:${process.env.PATH}`, TMPDIR: root.root, FX_PERMISSION_MODE: "yolo", FX_RECORD: tapePath, FX_TRACE_SCOPES: "agent,sse,tool,permission,ui_activity" },
+      });
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Run the fixture and recover from its rejected input.");
+      await tui.waitForPane((pane) => pane.includes("REJECTION_RECOVERED") && hasEmptyComposer(pane), 15_000);
+      const recovered = await tui.captureFullScrollback();
+      expect(recovered.match(/Failed shell request: invalid JSON arguments/g)).toHaveLength(1);
+      expect(recovered).not.toContain("MUST_NOT_EXECUTE");
+      await tui.sendText("Run the next fixture command once.");
+      await tui.waitForPane((pane) => pane.includes("LATER_TURN_COMPLETE") && hasEmptyComposer(pane), 15_000);
+      expect((await tui.captureFullScrollback()).match(/Failed shell request: invalid JSON arguments/g)).toHaveLength(1);
+      await tui.sendText("/trace");
+      await tui.waitForText("Trace saved at", 10_000);
+      const traceFile = readdirSync(root.root).find((name) => name.startsWith("fx-trace-") && name.endsWith(".md"));
+      expect(traceFile).toBeDefined();
+      const report = readFileSync(join(root.root, traceFile!), "utf8");
+      expect(report).toContain("invalid JSON arguments");
+      expect(report).not.toContain("MUST_NOT_EXECUTE");
+      await tui.sendText("/quit");
+      expect(await tui.waitForSessionEnd(10_000)).toBe(true);
+      tui = null;
+      expect(readFileSync(marker, "utf8")).toBe("once\nlater\n");
+      expect(existsSync(join(root.workspace, "MUST_NOT_EXECUTE"))).toBe(false);
+      expect(gateway.requestCount()).toBe(4);
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).toContain("event=argument_integrity_rejected");
+      expect(trace.split("\n").filter((line) => line.includes("call_id=invalid_shell") &&
+        (line.includes("permission_requested") || line.includes("execution_start")))).toHaveLength(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      const replay = await runFx(["replay", tapePath], { timeoutMs: 15_000 });
+      expect(replay.code).toBe(0);
+      expect(replay.stdout).toContain("invalid JSON arguments");
+    } finally {
+      if (tui) await tui.kill();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45_000);
+
   test("shell request correction repairs one call before its only execution", async () => {
     const root = createFixtureRoot("shell-request-correction");
     const tracePath = join(root.root, "trace.log");
@@ -3916,11 +3993,21 @@ describe("gateway stream lifecycle", () => {
     const gateway = startGateway((body) => {
       switch (step++) {
         case 0:
+          return fakeGatewayToolCall("zero_timeout", "shell", {
+            request: { action: "run", command, profile: "clean", timeout_ms: 0 },
+          });
+        case 1: {
+          expect(existsSync(marker)).toBe(false);
+          const correction = JSON.parse(toolResultOutput(body, "zero_timeout")).error;
+          expect(correction.code).toBe("invalid_shell_request");
+          expect(correction.executed).toBe(false);
+          expect(correction.retry_with).toBeUndefined();
           return fakeGatewayToolCall("repair_invalid", "shell", {
             request: { command, profile: "clean" },
             yield_time_ms: "1000",
           });
-        case 1: {
+        }
+        case 2: {
           expect(existsSync(marker)).toBe(false);
           const correction = JSON.parse(toolResultOutput(body, "repair_invalid")).error;
           expect(correction.code).toBe("invalid_shell_request");
@@ -3931,7 +4018,7 @@ describe("gateway stream lifecycle", () => {
           });
           return fakeGatewayToolCall("repair_valid", "shell", correction.retry_with);
         }
-        case 2:
+        case 3:
           expect(shellResult(body, "repair_valid")).toMatchObject({
             state: "completed", exit_code: 0, output_delta: "REPAIRED_SHELL_OK",
           });
@@ -3949,12 +4036,12 @@ describe("gateway stream lifecycle", () => {
       expect(result.code).toBe(0);
       expect(parseAskJson(result.stdout).output).toContain("SHELL_REPAIR_COMPLETE");
       expect(readFileSync(marker, "utf8")).toBe("once\n");
-      expect(gateway.requestCount()).toBe(3);
+      expect(gateway.requestCount()).toBe(4);
       expect(gateway.classifierRequests).toHaveLength(0);
       const trace = readFileSync(tracePath, "utf8");
       expect(trace).toContain("call_id=repair_invalid");
       expect(trace.split("\n").filter((line) =>
-        line.includes("call_id=repair_invalid") &&
+        (line.includes("call_id=repair_invalid") || line.includes("call_id=zero_timeout")) &&
         (line.includes("permission_request") || line.includes("execution_start"))
       )).toHaveLength(0);
       expect(result.stderr).not.toMatch(/panic|error:|error\./i);
