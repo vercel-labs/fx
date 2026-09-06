@@ -257,7 +257,6 @@ fn historyTurnKindName(turn: HistoryTurn) []const u8 {
     return switch (turn) {
         .compacted_summary => "compacted_summary",
         .assistant => "assistant",
-        .background_command => "background_command",
         .interrupted => "interrupted",
     };
 }

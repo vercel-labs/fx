@@ -72,19 +72,6 @@ pub const Decoder = struct {
         }
 
         if (self.stage != 0) {
-            if (context.child_route_active and self.stage == 1 and byte == 0x1b) {
-                const was_cancel_pending = self.cancel_pending;
-                self.reset();
-                debug_trace.logf(
-                    "input",
-                    "event=child_escape_replay boundary=selected_child",
-                    .{},
-                );
-                appendAction(&ingress, .escape, was_cancel_pending);
-                ingress.replay_byte_after_routing = 0x1b;
-                return ingress;
-            }
-
             const prior_stage = self.stage;
             const action = escape_parser.consumeInputEscapeByteWithMouse(
                 &self.stage,
@@ -250,7 +237,6 @@ test "plain byte carries composer fallback without consuming product routing" {
         .now_ms = 1,
         .paste_active = false,
         .cancel_pending = false,
-        .child_route_active = false,
     });
 
     try std.testing.expectEqual(@as(u8, 11), ingress.event.?.raw.byte);
@@ -266,13 +252,11 @@ test "bare Escape control replay preserves event order" {
         .now_ms = 1,
         .paste_active = false,
         .cancel_pending = true,
-        .child_route_active = false,
     });
     const ingress = decoder.feed(3, .{
         .now_ms = 2,
         .paste_active = false,
         .cancel_pending = true,
-        .child_route_active = false,
     });
 
     try std.testing.expectEqual(input_action.Action.escape, ingress.event.?.action.action);
@@ -286,7 +270,6 @@ test "escape timeout emits one semantic action" {
         .now_ms = 1,
         .paste_active = false,
         .cancel_pending = true,
-        .child_route_active = false,
     });
     const ingress = decoder.flush(31, 30, false);
 
@@ -295,43 +278,12 @@ test "escape timeout emits one semantic action" {
     try std.testing.expect(!decoder.hasPending());
 }
 
-test "selected child defers the next Escape until after action routing" {
-    var decoder = Decoder{};
-    _ = decoder.feed(0x1b, .{
-        .now_ms = 1,
-        .paste_active = false,
-        .cancel_pending = true,
-        .child_route_active = true,
-    });
-    const ingress = decoder.feed(0x1b, .{
-        .now_ms = 2,
-        .paste_active = false,
-        .cancel_pending = true,
-        .child_route_active = true,
-    });
-
-    try std.testing.expectEqual(input_action.Action.escape, ingress.event.?.action.action);
-    try std.testing.expectEqual(@as(?u8, 0x1b), ingress.replay_byte_after_routing);
-    try std.testing.expect(!decoder.hasPending());
-
-    const replay = decoder.feed(0x1b, .{
-        .now_ms = 3,
-        .paste_active = false,
-        .cancel_pending = false,
-        .child_route_active = false,
-    });
-    try std.testing.expect(replay.event == null);
-    try std.testing.expect(decoder.hasPending());
-    try std.testing.expect(!decoder.cancel_pending);
-}
-
 test "active paste bypasses decoding and preserves pending text ownership" {
     var decoder = Decoder{};
     const ingress = decoder.feed(0x1b, .{
         .now_ms = 1,
         .paste_active = true,
         .cancel_pending = true,
-        .child_route_active = false,
     });
 
     try std.testing.expectEqual(@as(u8, 0x1b), ingress.event.?.paste_byte);
@@ -345,13 +297,11 @@ test "unknown escape resolves to ignore instead of Escape" {
         .now_ms = 1,
         .paste_active = false,
         .cancel_pending = true,
-        .child_route_active = false,
     });
     const ingress = decoder.feed('x', .{
         .now_ms = 2,
         .paste_active = false,
         .cancel_pending = false,
-        .child_route_active = false,
     });
 
     try std.testing.expectEqual(input_action.Action.ignore, ingress.event.?.action.action);
@@ -365,7 +315,6 @@ test "unknown complete CSI stays pending until its final byte and resolves to ig
         .now_ms = 1,
         .paste_active = false,
         .cancel_pending = true,
-        .child_route_active = false,
     };
 
     _ = decoder.feed(0x1b, context);
@@ -386,7 +335,6 @@ test "incomplete CSI expires without producing Escape" {
         .now_ms = 1,
         .paste_active = false,
         .cancel_pending = true,
-        .child_route_active = false,
     };
 
     _ = decoder.feed(0x1b, context);

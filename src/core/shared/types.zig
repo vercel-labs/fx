@@ -1,5 +1,6 @@
 const std = @import("std");
 const text_utils = @import("text_utils.zig");
+const skill_contract = @import("../skills/skill_contract.zig");
 
 pub const Layout = struct {
     rows: u16,
@@ -94,17 +95,88 @@ pub const CredentialSource = enum {
     stored_key,
     chatgpt_subscription,
     grok_subscription,
+    host_managed,
 };
 
+pub const DirectCredentialLease = struct {
+    secret_bytes: []const u8 = "",
+    source: ?CredentialSource = null,
+    account_id: ?[]const u8 = null,
+    tenant_context: ?[]const u8 = null,
+};
+
+/// Borrowed authorization for one provider request. Host-managed requests
+/// cannot carry credential or account bytes into the embedded runtime.
+pub const CredentialLease = union(enum) {
+    direct: DirectCredentialLease,
+    host_managed,
+
+    pub fn secret(self: CredentialLease) ?[]const u8 {
+        return switch (self) {
+            .direct => |direct| if (direct.secret_bytes.len > 0) direct.secret_bytes else null,
+            .host_managed => null,
+        };
+    }
+
+    pub fn credentialSource(self: CredentialLease) ?CredentialSource {
+        return switch (self) {
+            .direct => |direct| direct.source,
+            .host_managed => .host_managed,
+        };
+    }
+
+    pub fn accountId(self: CredentialLease) ?[]const u8 {
+        return switch (self) {
+            .direct => |direct| direct.account_id,
+            .host_managed => null,
+        };
+    }
+
+    pub fn tenant(self: CredentialLease) ?[]const u8 {
+        return switch (self) {
+            .direct => |direct| direct.tenant_context,
+            .host_managed => null,
+        };
+    }
+};
+
+test "host-managed credential lease carries no local authority bytes" {
+    const lease: CredentialLease = .host_managed;
+    try std.testing.expect(lease.secret() == null);
+    try std.testing.expect(lease.accountId() == null);
+    try std.testing.expect(lease.tenant() == null);
+    try std.testing.expectEqual(CredentialSource.host_managed, lease.credentialSource().?);
+}
+
+test "empty direct credential lease preserves absent authority" {
+    const lease = CredentialLease{ .direct = .{} };
+    try std.testing.expect(lease.secret() == null);
+    try std.testing.expect(lease.credentialSource() == null);
+}
+
 pub fn parseCredentialSource(text: []const u8) ?CredentialSource {
+    const source = parseRuntimeCredentialSource(text) orelse return null;
+    return if (source == .host_managed) null else source;
+}
+
+pub fn parseRuntimeCredentialSource(text: []const u8) ?CredentialSource {
     return std.meta.stringToEnum(CredentialSource, text);
 }
 
 test "credential source round trips through its persisted name" {
     for (std.meta.tags(CredentialSource)) |source| {
+        if (source == .host_managed) continue;
         try std.testing.expectEqual(source, parseCredentialSource(@tagName(source)).?);
     }
     try std.testing.expect(parseCredentialSource("keychain") == null);
+}
+
+test "host-managed authority is runtime-only and cannot be persisted" {
+    try std.testing.expect(parseCredentialSource("host_managed") == null);
+    try std.testing.expectEqual(
+        CredentialSource.host_managed,
+        parseRuntimeCredentialSource("host_managed").?,
+    );
 }
 
 pub const TurnPresentationOutcome = enum {
@@ -221,6 +293,7 @@ pub const RouteRecoveryStatusTone = enum {
 pub const ModelRecoveryCause = enum {
     network_interrupted,
     response_interrupted,
+    provider_stream_timeout,
     provider_unavailable,
     rate_limited,
     system_resumed,
@@ -255,6 +328,7 @@ pub const ModelFailureDiagnostic = struct {
         return switch (cause) {
             .network_interrupted => "NetworkInterrupted",
             .response_interrupted => "StreamInterrupted",
+            .provider_stream_timeout => "gateway_stream_timeout",
             .provider_unavailable => "provider_error",
             .rate_limited => "HTTP 429",
             .system_resumed => "SystemResumed",
@@ -401,6 +475,7 @@ pub const RouteRecoveryStatus = struct {
         const cause = switch (self.cause orelse .provider_unavailable) {
             .network_interrupted => "Network interrupted",
             .response_interrupted => "Response ended early",
+            .provider_stream_timeout => "Gateway stream timed out",
             .provider_unavailable => "Provider unavailable",
             .rate_limited => "Rate limited",
             .system_resumed => "Mac woke from sleep",
@@ -409,7 +484,7 @@ pub const RouteRecoveryStatus = struct {
         };
         const action = switch (self.action orelse .retrying_request) {
             .retrying_request => "retrying request",
-            .continuing_response => "continuing response",
+            .continuing_response => "restarting response",
             .regenerating_tool => "regenerating unstarted tool",
             .continuing_after_tool => "continuing after confirmed tool",
             .reconciling_tool => "checking uncertain tool state",
@@ -474,6 +549,20 @@ pub const RouteRecoveryStatus = struct {
                 .{ self.failed_attempt, self.attempt_limit },
             ) catch "⚠ Connection unavailable · recovery paused";
         }
+        if (cause == .provider_stream_timeout) {
+            if (self.diagnostic) |diagnostic| {
+                return std.fmt.bufPrint(
+                    buf,
+                    "⚠ Gateway stream timed out · {s} · automatic retry paused · attempt {d}/{d}",
+                    .{ diagnostic.view(), self.failed_attempt, self.attempt_limit },
+                ) catch "⚠ Gateway stream timed out · automatic retry paused";
+            }
+            return std.fmt.bufPrint(
+                buf,
+                "⚠ Gateway stream timed out · automatic retry paused · attempt {d}/{d}",
+                .{ self.failed_attempt, self.attempt_limit },
+            ) catch "⚠ Gateway stream timed out · automatic retry paused";
+        }
         if (cause == .request_limit_reached) {
             if (self.diagnostic) |diagnostic| {
                 return std.fmt.bufPrint(
@@ -491,6 +580,7 @@ pub const RouteRecoveryStatus = struct {
         const name = switch (cause) {
             .network_interrupted => "Network interrupted",
             .response_interrupted => "Response ended early",
+            .provider_stream_timeout => "Gateway stream timed out",
             .provider_unavailable => "Provider unavailable",
             .rate_limited => "Rate limited",
             .system_resumed => "Mac woke from sleep",
@@ -603,6 +693,7 @@ pub const ProviderResultIdentityFailure = enum {
 pub const ToolArgumentIntegrity = enum {
     valid,
     malformed_json,
+    non_object_json,
 
     pub fn classifySerialized(
         alloc: std.mem.Allocator,
@@ -615,6 +706,33 @@ pub const ToolArgumentIntegrity = enum {
         defer parsed.deinit();
         return .valid;
     }
+
+    pub fn classifyFunctionInput(
+        alloc: std.mem.Allocator,
+        serialized: []const u8,
+    ) std.mem.Allocator.Error!ToolArgumentIntegrity {
+        const integrity = try classifySerialized(alloc, serialized);
+        if (integrity != .valid) return integrity;
+        // A complete JSON root is nonempty; only an object can start with '{'.
+        return if (std.mem.trimStart(u8, serialized, " \t\r\n")[0] == '{') .valid else .non_object_json;
+    }
+};
+
+/// Identifies the server and catalog offered to one model step.
+pub const McpToolBinding = struct {
+    runtime_generation: u64,
+    connection_generation: u64,
+    catalog_generation: u64,
+    auth_generation: u64,
+    authority_id: u64 = 0,
+    definition_digest: [32]u8 = .{0} ** 32,
+
+    /// Transport renewal may change epochs without changing the advertised action.
+    pub fn sameDefinition(self: McpToolBinding, other: McpToolBinding) bool {
+        return self.runtime_generation == other.runtime_generation and
+            self.authority_id == other.authority_id and
+            std.mem.eql(u8, &self.definition_digest, &other.definition_digest);
+    }
 };
 
 pub const ToolCall = struct {
@@ -626,6 +744,8 @@ pub const ToolCall = struct {
     provider_result: ?[]const u8 = null,
     final_identity: FinalToolIdentity = .valid,
     provenance: ToolExecutionProvenance = .fx_local,
+    /// Borrowed only for this action. Copies and durable/provider encodings omit it.
+    resolved_skill: ?*const skill_contract.PreparedSkill = null,
 };
 
 pub const WebSearchProgress = union(enum) {
@@ -724,6 +844,8 @@ pub const CommittedFilePresentation = struct {
 };
 
 pub const PersistedToolResult = struct {
+    tool_images: []ToolImage = &.{},
+    tool_image_handle: ?[]u8 = null,
     tool_call_id: []u8,
     tool_name: []u8,
     status: PersistedToolStatus,
@@ -789,7 +911,6 @@ pub const TerminalFailurePresentation = enum {
     lease_conflict,
     cursor_gap,
     screen_unavailable,
-    monitor_unavailable,
     protocol_incompatible,
     capacity_exceeded,
     cancelled,
@@ -811,7 +932,6 @@ pub const TerminalFailurePresentation = enum {
             .lease_conflict => "terminal control lease conflict",
             .cursor_gap => "terminal output cursor gap",
             .screen_unavailable => "terminal screen is unavailable",
-            .monitor_unavailable => "terminal monitor is unavailable",
             .protocol_incompatible => "terminal protocol is incompatible",
             .capacity_exceeded => "terminal capacity exceeded",
             .cancelled => "terminal action was cancelled",
@@ -841,7 +961,7 @@ pub const TerminalActionPresentation = union(enum) {
 
 pub const deferred_tool_result_output = "Not executed";
 pub const context_deferred_tool_result_output = "Scoped project instructions were added before execution. Review them and reissue this tool call if it is still appropriate.";
-pub const context_deferred_tool_status_label = "Context updated";
+pub const context_deferred_tool_status_label = "Reading project instructions before continuing:";
 
 pub fn isContextDeferredToolResult(result: PersistedToolResult) bool {
     return result.status == .failure and
@@ -887,6 +1007,8 @@ test "persisted deferred tool result classifier is exact" {
 }
 
 pub const ToolResultMemory = struct {
+    tool_images: []const ToolImage = &.{},
+    tool_image_handle: ?[]const u8 = null,
     output_handle: ?[]const u8 = null,
     preview: ?[]const u8 = null,
     output_bytes: usize = 0,
@@ -903,6 +1025,13 @@ pub const ToolExecutionStep = struct {
     assistant: ?[]u8 = null,
     tool_calls: []ToolCall = &.{},
     tool_results: []PersistedToolResult = &.{},
+    provider_replay: ?ProviderReplay = null,
+};
+
+pub const PersistedSteering = struct {
+    text: []u8,
+    assistant_prefix: ?[]u8 = null,
+    after_tool_step_count: usize,
 };
 
 pub const FileEvidence = struct {
@@ -919,13 +1048,53 @@ pub const FileEvidence = struct {
 pub const ExecutionMemory = struct {
     tool_steps: []ToolExecutionStep = &.{},
     files: []FileEvidence = &.{},
-    /// User guidance consumed between model steps, in presentation order.
-    steering: [][]u8 = &.{},
+    /// User guidance consumed between model steps, with its chronological tool boundary.
+    steering: []PersistedSteering = &.{},
     turn_summary: ?TurnSummary = null,
 
     pub fn isEmpty(self: ExecutionMemory) bool {
         return self.tool_steps.len == 0 and self.files.len == 0 and self.steering.len == 0;
     }
+};
+
+/// Image bytes returned by a tool; never a grant to read a user file.
+pub const ToolImage = struct {
+    data: []u8,
+    mime_type: []u8,
+};
+
+pub fn freeToolImages(alloc: std.mem.Allocator, images: []const ToolImage) void {
+    for (images) |image| {
+        alloc.free(image.data);
+        alloc.free(image.mime_type);
+    }
+    alloc.free(images);
+}
+
+pub fn dupeToolImages(alloc: std.mem.Allocator, images: []const ToolImage) ![]ToolImage {
+    const copies = try alloc.alloc(ToolImage, images.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (copies[0..initialized]) |image| {
+            alloc.free(image.data);
+            alloc.free(image.mime_type);
+        }
+        alloc.free(copies);
+    }
+    for (images, 0..) |image, index| {
+        const data = try alloc.dupe(u8, image.data);
+        errdefer alloc.free(data);
+        copies[index] = .{ .data = data, .mime_type = try alloc.dupe(u8, image.mime_type) };
+        initialized += 1;
+    }
+    return copies;
+}
+
+/// A cut in the active context, not a second persisted history.
+pub const ContextHistoryCut = struct {
+    turns: usize = 0,
+    tool_steps: usize = 0,
+    steering: usize = 0,
 };
 
 pub const ImageAttachment = struct {
@@ -944,10 +1113,28 @@ pub const UserTurn = struct {
     work_id: ?[]u8 = null,
 };
 
-pub const ChatCachePolicy = enum {
-    default,
-    no_cache,
+/// Borrows both strings; use dupeProviderReplay/freeProviderReplay for ownership.
+pub const ProviderReplay = struct {
+    pub const max_bytes: usize = 4 * 1024 * 1024;
+    source: @import("../config/model_provider.zig").ProviderSelection,
+    parts_json: []const u8,
+
+    pub fn matches(self: ProviderReplay, source: @import("../config/model_provider.zig").ProviderSelection) bool {
+        return self.source.provider == source.provider and std.mem.eql(u8, self.source.model, source.model);
+    }
 };
+
+pub fn dupeProviderReplay(alloc: std.mem.Allocator, value: ProviderReplay) !ProviderReplay {
+    const model = try alloc.dupe(u8, value.source.model);
+    errdefer alloc.free(model);
+    const parts = try alloc.dupe(u8, value.parts_json);
+    return .{ .source = .{ .provider = value.source.provider, .model = model }, .parts_json = parts };
+}
+
+pub fn freeProviderReplay(alloc: std.mem.Allocator, value: ProviderReplay) void {
+    alloc.free(value.source.model);
+    alloc.free(value.parts_json);
+}
 
 pub const ChatMessage = struct {
     role: ChatRole,
@@ -956,14 +1143,57 @@ pub const ChatMessage = struct {
     tool_call_id: ?[]const u8 = null,
     tool_name: ?[]const u8 = null,
     tool_calls: []const ToolCall = &.{},
-    /// Provider-owned opaque response items needed only for stateless within-turn continuation.
-    /// The value is a validated JSON array and is never sent across provider routes.
-    provider_state_json: ?[]const u8 = null,
+    provider_replay: ?ProviderReplay = null,
     tool_result_status: ?PersistedToolStatus = null,
     tool_result_memory: ?ToolResultMemory = null,
     permission_feedback: bool = false,
-    cache_policy: ChatCachePolicy = .default,
+    standalone_response: bool = false,
 };
+
+/// Returns a caller-owned shallow projection only when incompatible replay exists.
+pub fn projectProviderReplay(
+    alloc: std.mem.Allocator,
+    messages: []const ChatMessage,
+    source: @import("../config/model_provider.zig").ProviderSelection,
+) !?[]ChatMessage {
+    var projected: ?[]ChatMessage = null;
+    errdefer if (projected) |owned| alloc.free(owned);
+    for (messages, 0..) |message, index| {
+        const replay = message.provider_replay orelse continue;
+        if (replay.matches(source)) continue;
+        if (projected == null) projected = try alloc.dupe(ChatMessage, messages);
+        projected.?[index].provider_replay = null;
+    }
+    return projected;
+}
+
+test "provider replay projection preserves matching origin and excludes other routes" {
+    const alloc = std.testing.allocator;
+    const source = @import("../config/model_provider.zig").ProviderSelection{ .provider = .gateway, .model = "model" };
+    const messages = [_]ChatMessage{.{ .role = .assistant, .content = "answer", .provider_replay = .{ .source = source, .parts_json = "[]" } }};
+    try std.testing.expect(try projectProviderReplay(alloc, &messages, source) == null);
+    for ([_]@import("../config/model_provider.zig").ProviderSelection{
+        .{ .provider = .codex, .model = "model" },
+        .{ .provider = .grok, .model = "model" },
+        .{ .provider = .gateway, .model = "different" },
+    }) |other| {
+        const projected = (try projectProviderReplay(alloc, &messages, other)).?;
+        defer alloc.free(projected);
+        try std.testing.expect(projected[0].provider_replay == null);
+        try std.testing.expectEqualStrings("answer", projected[0].content.?);
+        try std.testing.expect(messages[0].provider_replay != null);
+        try std.testing.expect(try projectProviderReplay(alloc, projected, other) == null);
+    }
+    try std.testing.checkAllAllocationFailures(alloc, struct {
+        fn check(a: std.mem.Allocator) !void {
+            const input = [_]ChatMessage{.{ .role = .assistant, .provider_replay = .{ .source = .{ .provider = .gateway, .model = "model" }, .parts_json = "[]" } }};
+            const projected = (try projectProviderReplay(a, &input, .{ .provider = .codex, .model = "model" })).?;
+            defer a.free(projected);
+            const copy = try dupeProviderReplay(a, input[0].provider_replay.?);
+            defer freeProviderReplay(a, copy);
+        }
+    }.check, .{});
+}
 
 pub const Usage = struct {
     input_tokens: ?u64 = null,
@@ -1046,6 +1276,12 @@ pub const ProviderFinishReason = enum {
     }
 };
 
+pub const ProviderFailureCause = enum {
+    gateway_stream_timeout,
+    non_retryable,
+    rate_limited,
+};
+
 pub const ModelCompletion = struct {
     content: ?[]const u8 = null,
     tool_calls: []const ToolCall = &.{},
@@ -1056,6 +1292,7 @@ pub const ModelCompletion = struct {
     /// An earlier delivery may have billed outside this generation identity.
     delivery_ambiguous: bool = false,
     provider_result_identity_failure: ?ProviderResultIdentityFailure = null,
+    provider_failure_cause: ?ProviderFailureCause = null,
     provider_failure_detail: ?[]const u8 = null,
     /// Provider-owned opaque response items for the next stateless request in this turn.
     provider_state_json: ?[]const u8 = null,
@@ -1220,6 +1457,14 @@ pub fn validGatewayTeam(team: []const u8) bool {
     return true;
 }
 
+pub fn validCredentialAccountId(account_id: []const u8) bool {
+    if (account_id.len == 0 or account_id.len > 1024) return false;
+    for (account_id) |byte| {
+        if (byte < 0x21 or byte > 0x7e) return false;
+    }
+    return true;
+}
+
 pub const ProviderCompletionDisposition = enum {
     completed,
     length_limited,
@@ -1353,9 +1598,25 @@ test "ProviderFinishReason accepts only the canonical provider domain" {
     try std.testing.expectEqual(ProviderFinishReason.content_filter, ProviderFinishReason.parse_legacy("content_filter").?);
 }
 
+pub const ConversationIdentity = struct {
+    pub const max_bytes: usize = 256;
+    pub const Failure = enum { empty, too_long, invalid_utf8 };
+
+    pub fn invalidReason(value: []const u8) ?Failure {
+        if (value.len == 0) return .empty;
+        if (value.len > max_bytes) return .too_long;
+        if (!std.unicode.utf8ValidateSlice(value)) return .invalid_utf8;
+        return null;
+    }
+};
+
 pub const AuthoritativeToolAdmission = union(enum) {
     admitted,
     reject_malformed_identity: FinalToolIdentity,
+    reject_unstorable_identity: struct {
+        field: enum { id, name, provisional_id },
+        reason: ConversationIdentity.Failure,
+    },
     reject_malformed_provider_result: ProviderResultIdentityFailure,
     reject_malformed_provider_arguments,
     reject_duplicate_identity,
@@ -1367,7 +1628,7 @@ pub fn authoritativeToolAdmission(completion: ModelCompletion) AuthoritativeTool
     }
 
     for (completion.tool_calls) |call| {
-        const final_identity = if (call.final_identity == .valid and call.id.len == 0)
+        const final_identity = if (call.final_identity == .valid and std.mem.trim(u8, call.id, " \t\r\n").len == 0)
             FinalToolIdentity.empty
         else
             call.final_identity;
@@ -1391,6 +1652,20 @@ pub fn authoritativeToolAdmission(completion: ModelCompletion) AuthoritativeTool
     }
 
     for (completion.tool_calls) |call| {
+        if (ConversationIdentity.invalidReason(call.id)) |reason| {
+            return .{ .reject_unstorable_identity = .{ .field = .id, .reason = reason } };
+        }
+        if (ConversationIdentity.invalidReason(call.name)) |reason| {
+            return .{ .reject_unstorable_identity = .{ .field = .name, .reason = reason } };
+        }
+        if (call.provisional_id) |id| {
+            if (ConversationIdentity.invalidReason(id)) |reason| {
+                return .{ .reject_unstorable_identity = .{ .field = .provisional_id, .reason = reason } };
+            }
+        }
+    }
+
+    for (completion.tool_calls) |call| {
         if (call.provenance == .provider_executed and
             call.argument_integrity == .malformed_json)
         {
@@ -1405,6 +1680,72 @@ pub fn authoritativeToolAdmission(completion: ModelCompletion) AuthoritativeTool
     }
 
     return .admitted;
+}
+
+test "authoritative tool admission rejects blank current call ids" {
+    for ([_][]const u8{ "", " ", "\t\r\n" }) |id| {
+        const calls = [_]ToolCall{.{ .id = id, .name = "read_file", .arguments_json = "{}" }};
+        try std.testing.expectEqualDeep(
+            AuthoritativeToolAdmission{ .reject_malformed_identity = .empty },
+            authoritativeToolAdmission(.{ .tool_calls = &calls }),
+        );
+    }
+}
+
+test "authoritative tool admission rejects unstorable names" {
+    const oversized = [_]u8{'n'} ** 257;
+    const cases = [_]struct { value: []const u8, reason: ConversationIdentity.Failure }{
+        .{ .value = "", .reason = .empty },
+        .{ .value = &oversized, .reason = .too_long },
+        .{ .value = "\xff", .reason = .invalid_utf8 },
+    };
+    for ([_]ToolExecutionProvenance{ .fx_local, .provider_executed }) |provenance| {
+        for (cases) |case| {
+            const calls = [_]ToolCall{.{ .id = "call", .name = case.value, .arguments_json = "{}", .provenance = provenance, .provider_result = "result" }};
+            try std.testing.expectEqualDeep(
+                AuthoritativeToolAdmission{ .reject_unstorable_identity = .{ .field = .name, .reason = case.reason } },
+                authoritativeToolAdmission(.{ .tool_calls = &calls }),
+            );
+        }
+    }
+}
+
+test "authoritative tool admission rejects unstorable correlation identities" {
+    const oversized = [_]u8{'i'} ** 257;
+    const cases = [_]struct { value: []const u8, reason: ConversationIdentity.Failure }{
+        .{ .value = &oversized, .reason = .too_long },
+        .{ .value = "\xff", .reason = .invalid_utf8 },
+    };
+    for (cases) |case| {
+        const calls = [_]ToolCall{.{ .id = case.value, .name = "read_file", .arguments_json = "{}" }};
+        try std.testing.expectEqualDeep(
+            AuthoritativeToolAdmission{ .reject_unstorable_identity = .{ .field = .id, .reason = case.reason } },
+            authoritativeToolAdmission(.{ .tool_calls = &calls }),
+        );
+        const provisional = [_]ToolCall{.{ .id = "call", .name = "read_file", .arguments_json = "{}", .provisional_id = case.value }};
+        try std.testing.expectEqualDeep(
+            AuthoritativeToolAdmission{ .reject_unstorable_identity = .{ .field = .provisional_id, .reason = case.reason } },
+            authoritativeToolAdmission(.{ .tool_calls = &provisional }),
+        );
+    }
+    const empty_provisional = [_]ToolCall{.{ .id = "call", .name = "read_file", .arguments_json = "{}", .provisional_id = "" }};
+    try std.testing.expectEqualDeep(
+        AuthoritativeToolAdmission{ .reject_unstorable_identity = .{ .field = .provisional_id, .reason = .empty } },
+        authoritativeToolAdmission(.{ .tool_calls = &empty_provisional }),
+    );
+}
+
+test "authoritative tool admission preserves bounded canonical identity formats" {
+    const boundary = [_]u8{'i'} ** 256;
+    const unicode_boundary = "é" ** 128;
+    for ([_][]const u8{ &boundary, unicode_boundary, "functions.read_file:0", "unknown/tool" }) |identity| {
+        for ([_]ToolExecutionProvenance{ .fx_local, .provider_executed }) |provenance| {
+            const calls = [_]ToolCall{.{ .id = identity, .name = identity, .provisional_id = identity, .arguments_json = "{}", .provenance = provenance, .provider_result = "result" }};
+            try std.testing.expectEqual(AuthoritativeToolAdmission.admitted, authoritativeToolAdmission(.{ .tool_calls = &calls }));
+            try std.testing.expectEqualStrings(identity, calls[0].id);
+            try std.testing.expectEqualStrings(identity, calls[0].name);
+        }
+    }
 }
 
 test "authoritative tool admission rejects duplicate final ids across provenance" {
@@ -1516,18 +1857,7 @@ pub const AssistantHistoryTurn = struct {
     user: UserTurn,
     assistant: []u8,
     execution: ExecutionMemory = .{},
-};
-
-pub const StableBackgroundRecordId = [16]u8;
-
-pub const BackgroundCommandHistoryTurn = struct {
-    user: UserTurn,
-    assistant: ?[]u8 = null,
-    execution: ExecutionMemory = .{},
-    log_path: []u8,
-    expect_url: bool,
-    url: ?[]u8 = null,
-    background_record_id: ?StableBackgroundRecordId = null,
+    provider_replay: ?ProviderReplay = null,
 };
 
 pub const InterruptedTerminalReason = enum {
@@ -1544,6 +1874,9 @@ pub const InterruptedHistoryTurn = struct {
     cancelled_command: ?CancelledCommandPresentation = null,
     terminal_reason: InterruptedTerminalReason = .cancelled,
 };
+
+pub const context_handoff_open = "<context_handoff>";
+pub const context_handoff_close = "</context_handoff>";
 
 pub const CompactedSummaryHistoryTurn = struct {
     summary: []u8,
@@ -1564,14 +1897,12 @@ pub const CompactedSummaryHistoryTurn = struct {
 pub const HistoryTurn = union(enum) {
     compacted_summary: CompactedSummaryHistoryTurn,
     assistant: AssistantHistoryTurn,
-    background_command: BackgroundCommandHistoryTurn,
     interrupted: InterruptedHistoryTurn,
 };
 
 pub fn setHistoryTurnSummary(turn: *HistoryTurn, summary: TurnSummary) void {
     switch (turn.*) {
         .assistant => |*entry| entry.execution.turn_summary = summary,
-        .background_command => |*entry| entry.execution.turn_summary = summary,
         .interrupted => |*entry| entry.execution.turn_summary = summary,
         .compacted_summary => {},
     }
@@ -1580,7 +1911,6 @@ pub fn setHistoryTurnSummary(turn: *HistoryTurn, summary: TurnSummary) void {
 pub fn historyTurnSummary(turn: HistoryTurn) ?TurnSummary {
     return switch (turn) {
         .assistant => |entry| entry.execution.turn_summary,
-        .background_command => |entry| entry.execution.turn_summary,
         .interrupted => |entry| entry.execution.turn_summary,
         .compacted_summary => null,
     };
@@ -1614,6 +1944,8 @@ pub const SnapshotFileOwnership = struct {
 
 pub const FinishedPrompt = struct {
     turn: HistoryTurn,
+    /// Owned display-only text; never serialized as conversation history.
+    presentation_text: ?[]const u8 = null,
     summary: ?TurnSummary = null,
     terminal_projection: FinishedPromptProjection = .history_default,
     terminal_outcome: ?TurnPresentationOutcome = null,
@@ -1624,6 +1956,15 @@ pub const PermissionMode = enum {
     ask,
     auto,
     yolo,
+
+    pub fn parse(raw: []const u8) ?PermissionMode {
+        if (std.ascii.eqlIgnoreCase(raw, "ask")) return .ask;
+        if (std.ascii.eqlIgnoreCase(raw, "auto")) return .auto;
+        if (std.ascii.eqlIgnoreCase(raw, "full-access") or
+            std.ascii.eqlIgnoreCase(raw, "full access") or
+            std.ascii.eqlIgnoreCase(raw, "yolo")) return .yolo;
+        return null;
+    }
 };
 
 pub const RuleDecision = enum {
@@ -1742,6 +2083,7 @@ pub const ToolPermissionDenialReason = enum {
     user_denied,
     auto_denied,
     review_caution,
+    review_evidence_incomplete,
     review_unavailable,
     policy_denied,
     permission_required,
@@ -1840,14 +2182,8 @@ pub fn freeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) void {
         .assistant => |entry| {
             freeUserTurn(alloc, entry.user);
             alloc.free(entry.assistant);
+            if (entry.provider_replay) |replay| freeProviderReplay(alloc, replay);
             freeExecutionMemory(alloc, entry.execution);
-        },
-        .background_command => |entry| {
-            freeUserTurn(alloc, entry.user);
-            if (entry.assistant) |assistant| alloc.free(assistant);
-            freeExecutionMemory(alloc, entry.execution);
-            alloc.free(entry.log_path);
-            if (entry.url) |url| alloc.free(url);
         },
         .interrupted => |entry| {
             freeUserTurn(alloc, entry.user);
@@ -1871,6 +2207,7 @@ pub fn freeHistoryTurnSlice(alloc: std.mem.Allocator, turns: []HistoryTurn) void
 
 pub fn freeFinishedPrompt(alloc: std.mem.Allocator, finished: FinishedPrompt) void {
     freeHistoryTurn(alloc, finished.turn);
+    if (finished.presentation_text) |text| alloc.free(text);
     if (finished.snapshot_file_ownership) |ownership| ownership.release();
 }
 
@@ -1906,36 +2243,13 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
             errdefer alloc.free(assistant);
 
             const execution = try dupeExecutionMemory(alloc, entry.execution);
+            errdefer freeExecutionMemory(alloc, execution);
+            const replay = if (entry.provider_replay) |value| try dupeProviderReplay(alloc, value) else null;
             break :blk .{ .assistant = .{
                 .user = user,
                 .assistant = assistant,
                 .execution = execution,
-            } };
-        },
-        .background_command => |entry| blk: {
-            const user = try dupeUserTurn(alloc, entry.user);
-            errdefer freeUserTurn(alloc, user);
-
-            const assistant = if (entry.assistant) |text| try alloc.dupe(u8, text) else null;
-            errdefer if (assistant) |text| alloc.free(text);
-
-            const execution = try dupeExecutionMemory(alloc, entry.execution);
-            errdefer freeExecutionMemory(alloc, execution);
-
-            const log_path = try alloc.dupe(u8, entry.log_path);
-            errdefer alloc.free(log_path);
-
-            const url = if (entry.url) |src| try alloc.dupe(u8, src) else null;
-            errdefer if (url) |owned| alloc.free(owned);
-
-            break :blk .{ .background_command = .{
-                .user = user,
-                .assistant = assistant,
-                .execution = execution,
-                .log_path = log_path,
-                .expect_url = entry.expect_url,
-                .url = url,
-                .background_record_id = entry.background_record_id,
+                .provider_replay = replay,
             } };
         },
         .interrupted => |entry| blk: {
@@ -2002,9 +2316,12 @@ pub fn freeCancelledCommandPresentation(
 
 pub fn dupeFinishedPrompt(alloc: std.mem.Allocator, finished: FinishedPrompt) !FinishedPrompt {
     const turn = try dupeHistoryTurn(alloc, finished.turn);
+    errdefer freeHistoryTurn(alloc, turn);
+    const presentation_text = if (finished.presentation_text) |text| try alloc.dupe(u8, text) else null;
     if (finished.snapshot_file_ownership) |ownership| ownership.retain();
     return .{
         .turn = turn,
+        .presentation_text = presentation_text,
         .summary = finished.summary,
         .terminal_projection = finished.terminal_projection,
         .terminal_outcome = finished.terminal_outcome,
@@ -2043,7 +2360,7 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
     errdefer freeToolExecutionSteps(alloc, tool_steps);
     const files = try dupeFileEvidenceSlice(alloc, memory.files);
     errdefer freeFileEvidenceSlice(alloc, files);
-    const steering = try dupePermissionFeedback(alloc, memory.steering);
+    const steering = try dupePersistedSteering(alloc, memory.steering);
     return .{
         .tool_steps = tool_steps,
         .files = files,
@@ -2055,7 +2372,45 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
 pub fn freeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) void {
     freeToolExecutionSteps(alloc, memory.tool_steps);
     freeFileEvidenceSlice(alloc, memory.files);
-    freePermissionFeedback(alloc, memory.steering);
+    freePersistedSteering(alloc, memory.steering);
+}
+
+pub fn dupePersistedSteering(
+    alloc: std.mem.Allocator,
+    steering: []const PersistedSteering,
+) ![]PersistedSteering {
+    if (steering.len == 0) return &.{};
+    const copy = try alloc.alloc(PersistedSteering, steering.len);
+    errdefer alloc.free(copy);
+    var copied: usize = 0;
+    errdefer for (copy[0..copied]) |item| {
+        alloc.free(item.text);
+        if (item.assistant_prefix) |prefix| alloc.free(prefix);
+    };
+    for (steering, copy) |item, *dest| {
+        const text = try alloc.dupe(u8, item.text);
+        errdefer alloc.free(text);
+        const assistant_prefix = if (item.assistant_prefix) |prefix|
+            try alloc.dupe(u8, prefix)
+        else
+            null;
+        errdefer if (assistant_prefix) |prefix| alloc.free(prefix);
+        dest.* = .{
+            .text = text,
+            .assistant_prefix = assistant_prefix,
+            .after_tool_step_count = item.after_tool_step_count,
+        };
+        copied += 1;
+    }
+    return copy;
+}
+
+pub fn freePersistedSteering(alloc: std.mem.Allocator, steering: []PersistedSteering) void {
+    for (steering) |item| {
+        alloc.free(item.text);
+        if (item.assistant_prefix) |prefix| alloc.free(prefix);
+    }
+    if (steering.len > 0) alloc.free(steering);
 }
 
 pub fn dupeToolExecutionSteps(alloc: std.mem.Allocator, steps: []const ToolExecutionStep) ![]ToolExecutionStep {
@@ -2089,9 +2444,11 @@ fn dupeToolExecutionStep(alloc: std.mem.Allocator, step: ToolExecutionStep) !Too
     errdefer freeToolCallSlice(alloc, tool_calls);
     const tool_results = try dupePersistedToolResults(alloc, step.tool_results);
     errdefer freePersistedToolResults(alloc, tool_results);
+    const replay = if (step.provider_replay) |value| try dupeProviderReplay(alloc, value) else null;
 
     return .{
         .assistant = assistant,
+        .provider_replay = replay,
         .tool_calls = tool_calls,
         .tool_results = tool_results,
     };
@@ -2099,6 +2456,7 @@ fn dupeToolExecutionStep(alloc: std.mem.Allocator, step: ToolExecutionStep) !Too
 
 fn freeToolExecutionStep(alloc: std.mem.Allocator, step: ToolExecutionStep) void {
     if (step.assistant) |assistant| alloc.free(assistant);
+    if (step.provider_replay) |replay| freeProviderReplay(alloc, replay);
     freeToolCallSlice(alloc, step.tool_calls);
     freePersistedToolResults(alloc, step.tool_results);
 }
@@ -2235,7 +2593,12 @@ fn dupePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult
     else
         null;
     errdefer if (command_output_replay) |replay| freeCommandOutputReplay(alloc, replay);
+    const tool_image_handle = if (result.tool_image_handle) |handle| try alloc.dupe(u8, handle) else null;
+    errdefer if (tool_image_handle) |handle| alloc.free(handle);
+    const tool_images = try dupeToolImages(alloc, result.tool_images);
     return .{
+        .tool_images = tool_images,
+        .tool_image_handle = tool_image_handle,
         .tool_call_id = tool_call_id,
         .tool_name = tool_name,
         .status = result.status,
@@ -2259,6 +2622,8 @@ fn freePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult
     alloc.free(result.tool_call_id);
     alloc.free(result.tool_name);
     alloc.free(result.output);
+    freeToolImages(alloc, result.tool_images);
+    if (result.tool_image_handle) |handle| alloc.free(handle);
     if (result.output_handle) |handle| alloc.free(handle);
     if (result.preview) |preview| alloc.free(preview);
     freePermissionFeedback(alloc, result.permission_feedback);
@@ -2360,7 +2725,8 @@ fn dupeFileEvidence(alloc: std.mem.Allocator, file: FileEvidence) !FileEvidence 
     };
 }
 
-fn freeFileEvidence(alloc: std.mem.Allocator, file: FileEvidence) void {
+/// Frees one entry's owned strings, not its containing slice.
+pub fn freeFileEvidence(alloc: std.mem.Allocator, file: FileEvidence) void {
     alloc.free(file.path);
     if (file.new_path) |new_path| alloc.free(new_path);
     alloc.free(file.tool_call_id);
@@ -2410,6 +2776,39 @@ test "dupeToolCall preserves argument integrity" {
     defer freeToolCall(std.testing.allocator, copy);
 
     try std.testing.expectEqual(ToolArgumentIntegrity.malformed_json, copy.argument_integrity);
+}
+
+test "dupeToolCall drops action scoped skill bindings" {
+    const skill: skill_contract.PreparedSkill = .{ .skill = .{ .name = "workflow", .description = "", .path = "/skills/workflow", .source = .global_fx } };
+    const source: ToolCall = .{ .id = "skill", .name = "skill", .arguments_json = "{\"location\":\"/skills/workflow\"}", .resolved_skill = &skill };
+    const copy = try dupeToolCall(std.testing.allocator, source);
+    defer freeToolCall(std.testing.allocator, copy);
+    try std.testing.expect(copy.resolved_skill == null);
+    try std.testing.expectEqualStrings(source.arguments_json, copy.arguments_json);
+}
+
+test "function input classification distinguishes syntax from object shape" {
+    const cases = [_]struct { input: []const u8, expected: ToolArgumentIntegrity }{
+        .{ .input = "{}", .expected = .valid },
+        .{ .input = " \n{\"nested\":[1,null,{}]}\t", .expected = .valid },
+        .{ .input = "[]", .expected = .non_object_json },
+        .{ .input = "42", .expected = .non_object_json },
+        .{ .input = "null", .expected = .non_object_json },
+        .{ .input = "true", .expected = .non_object_json },
+        .{ .input = "\"text\"", .expected = .non_object_json },
+        .{ .input = "", .expected = .malformed_json },
+        .{ .input = "{} trailing", .expected = .malformed_json },
+        .{ .input = "{\"a\":1,\"a\":2}", .expected = .malformed_json },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, try ToolArgumentIntegrity.classifyFunctionInput(std.testing.allocator, case.input));
+        try std.testing.expectEqual(case.expected, try ToolArgumentIntegrity.classifyFunctionInput(std.testing.allocator, case.input));
+        if (case.expected == .non_object_json) {
+            try std.testing.expectEqual(ToolArgumentIntegrity.valid, try ToolArgumentIntegrity.classifySerialized(std.testing.allocator, case.input));
+        }
+    }
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, ToolArgumentIntegrity.classifyFunctionInput(failing.allocator(), "{\"path\":\"file\"}"));
 }
 
 test "ToolArgumentIntegrity accepts complete serialized JSON roots" {
@@ -2697,37 +3096,6 @@ test "HistoryTurn helpers duplicate and free owned turns" {
     freeHistoryTurn(alloc, summary_copy);
     freeHistoryTurn(alloc, summary_original);
 
-    const background_original: HistoryTurn = .{ .background_command = .{
-        .user = .{ .text = try alloc.dupe(u8, "run dev") },
-        .assistant = try alloc.dupe(u8, "Starting the server."),
-        .execution = .{ .files = blk: {
-            const files = try alloc.alloc(FileEvidence, 1);
-            files[0] = .{
-                .path = try alloc.dupe(u8, "src/main.zig"),
-                .tool_call_id = try alloc.dupe(u8, "call_1"),
-                .tool_name = try alloc.dupe(u8, "read_file"),
-                .action = .read,
-                .status = .success,
-                .model_view_covers_full_file = true,
-            };
-            break :blk files;
-        } },
-        .log_path = try alloc.dupe(u8, "/tmp/fx.log"),
-        .expect_url = true,
-        .url = try alloc.dupe(u8, "http://localhost:3000"),
-    } };
-    const background_copy = try dupeHistoryTurn(alloc, background_original);
-    try std.testing.expectEqualStrings("run dev", background_copy.background_command.user.text);
-    try std.testing.expectEqualStrings("/tmp/fx.log", background_copy.background_command.log_path);
-    try std.testing.expectEqualStrings("http://localhost:3000", background_copy.background_command.url.?);
-    try std.testing.expectEqualStrings("Starting the server.", background_copy.background_command.assistant.?);
-    try std.testing.expectEqualStrings("src/main.zig", background_copy.background_command.execution.files[0].path);
-    try std.testing.expect(background_copy.background_command.log_path.ptr != background_original.background_command.log_path.ptr);
-    try std.testing.expect(background_copy.background_command.assistant.?.ptr != background_original.background_command.assistant.?.ptr);
-    try std.testing.expect(background_copy.background_command.execution.files[0].path.ptr != background_original.background_command.execution.files[0].path.ptr);
-    freeHistoryTurn(alloc, background_copy);
-    freeHistoryTurn(alloc, background_original);
-
     const interrupted_original: HistoryTurn = .{ .interrupted = .{
         .user = .{ .text = try alloc.dupe(u8, "stop") },
         .execution = .{ .files = blk: {
@@ -2781,12 +3149,34 @@ test "HistoryTurn helpers duplicate and free owned turns" {
         } },
         .terminal_projection = .assistant_text,
         .terminal_outcome = .completed,
+        .presentation_text = try alloc.dupe(u8, "Earlier reply.\nI stopped here."),
     };
     const finished_copy = try dupeFinishedPrompt(alloc, finished_original);
     try std.testing.expectEqual(FinishedPromptProjection.assistant_text, finished_copy.terminal_projection);
     try std.testing.expectEqual(@as(?TurnPresentationOutcome, .completed), finished_copy.terminal_outcome);
+    try std.testing.expectEqualStrings(finished_original.presentation_text.?, finished_copy.presentation_text.?);
+    try std.testing.expect(finished_original.presentation_text.?.ptr != finished_copy.presentation_text.?.ptr);
     freeFinishedPrompt(alloc, finished_copy);
     freeFinishedPrompt(alloc, finished_original);
+}
+
+test "finished prompt presentation allocation failures preserve ownership" {
+    const Case = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            const original: FinishedPrompt = .{
+                .turn = .{ .assistant = .{
+                    .user = .{ .text = @constCast("request") },
+                    .assistant = @constCast("current"),
+                } },
+                .presentation_text = "earlier\ncurrent",
+            };
+            const copy = try dupeFinishedPrompt(alloc, original);
+            defer freeFinishedPrompt(alloc, copy);
+            try std.testing.expectEqualStrings("current", copy.turn.assistant.assistant);
+            try std.testing.expectEqualStrings("earlier\ncurrent", copy.presentation_text.?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
 test "TurnSummary carries shared turn token progress" {

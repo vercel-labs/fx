@@ -39,7 +39,7 @@ const OwnedCatalogAccess = struct {
 
     fn init(alloc: Allocator, access: credentials.CatalogAccess) !OwnedCatalogAccess {
         return switch (access) {
-            .public_only => .{ .access = access },
+            .public_only, .host_managed => .{ .access = access },
             .authenticated => |authenticated| blk: {
                 const credential = try alloc.dupe(u8, authenticated.credential);
                 errdefer secret.zeroAndFree(alloc, credential);
@@ -72,7 +72,7 @@ const OwnedCatalogAccess = struct {
 
     fn deinit(self: *OwnedCatalogAccess, alloc: Allocator) void {
         switch (self.access) {
-            .public_only => {},
+            .public_only, .host_managed => {},
             .authenticated => |access| {
                 secret.zeroAndFree(alloc, @constCast(access.credential));
                 if (access.team_context) |team| alloc.free(@constCast(team));
@@ -320,7 +320,7 @@ pub const Runtime = struct {
         provider: model_catalog.Provider,
         access: credentials.CatalogAccess,
     ) void {
-        if (!self.beginLoad(access)) return;
+        if (!self.beginLoad(access, provider.refresh_interval_ms)) return;
 
         const owned_access = OwnedCatalogAccess.init(self.alloc, access) catch {
             self.markFailed(.{
@@ -350,7 +350,7 @@ pub const Runtime = struct {
         provider: model_catalog.Provider,
         access: credentials.CatalogAccess,
     ) void {
-        if (!self.beginLoad(access)) return;
+        if (!self.beginLoad(access, provider.refresh_interval_ms)) return;
 
         const result = model_catalog.fetchWithPublicFallback(provider, self.alloc, .{
             .access = access,
@@ -393,7 +393,7 @@ pub const Runtime = struct {
         self.mutex.unlock(io_mod.getIo());
     }
 
-    fn beginLoad(self: *Self, access: credentials.CatalogAccess) bool {
+    fn beginLoad(self: *Self, access: credentials.CatalogAccess, refresh_interval_ms: ?i64) bool {
         self.finishThreadIfDone();
 
         const requested_access = model_catalog.AccessMetadata.init(access);
@@ -424,13 +424,17 @@ pub const Runtime = struct {
 
         const now = io_mod.milliTimestamp();
         self.mutex.lockUncancelable(io_mod.getIo());
+        const expired = if (refresh_interval_ms) |interval|
+            now < self.last_attempt_ms or now - self.last_attempt_ms >= interval
+        else
+            false;
         const should_load = switch (self.state) {
             .idle => true,
             .failed => now - self.last_attempt_ms >= 1000,
             .ready => if (self.outcome.last_failure) |failed|
-                failed.failure.retryable and now - self.last_attempt_ms >= 1000
+                expired or (failed.failure.retryable and now - self.last_attempt_ms >= 1000)
             else
-                false,
+                expired,
             .loading => false,
         };
         if (!should_load) {
@@ -465,6 +469,16 @@ pub const Runtime = struct {
         self.requested_access = null;
         self.mutex.unlock(io_mod.getIo());
         self.cancel_requested.store(false, .seq_cst);
+    }
+
+    pub fn resetForProviderChange(self: *Self) void {
+        debug_trace.logf("catalog", "model catalog reset reason=provider_changed", .{});
+        self.reset();
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        model_catalog.freeModelCatalog(self.alloc, &self.catalog);
+        self.catalog = .empty;
+        self.outcome = .{};
     }
 
     /// Installs a catalog that was completely fetched and validated before the
@@ -930,6 +944,24 @@ const StaleCatalog = struct {
         return .{ .context = self, .fetch_fn = fetch };
     }
 };
+
+test "model cache expires successful catalogs only when the provider requests refresh" {
+    for ([_]bool{ false, true }) |expires| {
+        var runtime = Runtime.init(std.testing.allocator, "/v1/models");
+        defer runtime.deinit();
+        var source = AuthChangeCatalog{ .model_id = "first" };
+        var provider = source.provider();
+        provider.refresh_interval_ms = if (expires) 60_000 else null;
+        runtime.loadCooperative(provider, .{ .public_only = .no_credential });
+        source.model_id = "new-release";
+        runtime.loadCooperative(provider, .{ .public_only = .no_credential });
+        try std.testing.expectEqual(@as(usize, 1), source.calls);
+        runtime.last_attempt_ms -= 60_000;
+        runtime.loadCooperative(provider, .{ .public_only = .no_credential });
+        try std.testing.expectEqual(@as(usize, if (expires) 2 else 1), source.calls);
+        try std.testing.expectEqualStrings(if (expires) "new-release" else "first", runtime.catalog.items[0].id);
+    }
+}
 
 test "model cache clears an old failure after a clean empty refresh" {
     var runtime = Runtime.init(std.testing.allocator, "/v1/models");
@@ -1495,6 +1527,31 @@ test "model cache completion hydrates an open menu and reports once" {
     try std.testing.expect(!runtime.menu.active);
     try std.testing.expectEqual(ModelCacheState.idle, runtime.state);
     if (fixture.failure()) |err| return err;
+}
+
+test "provider changes discard public catalog fallback without changing ordinary reset" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc, "/v1/models");
+    defer runtime.deinit();
+    {
+        const id = try alloc.dupe(u8, "gateway-model");
+        errdefer alloc.free(id);
+        const model_type = try alloc.dupe(u8, "language");
+        errdefer alloc.free(model_type);
+        try runtime.catalog.append(alloc, .{ .id = id, .model_type = model_type });
+    }
+    runtime.outcome = .{ .loaded = .{
+        .access = model_catalog.AccessMetadata.init(.{ .public_only = .no_credential }),
+    } };
+    runtime.state = .ready;
+
+    runtime.reset();
+    try std.testing.expectEqual(@as(usize, 1), runtime.catalog.items.len);
+    try std.testing.expect(runtime.outcome.loaded != null);
+    runtime.resetForProviderChange();
+    try std.testing.expectEqual(@as(usize, 0), runtime.catalog.items.len);
+    try std.testing.expect(runtime.outcome.loaded == null);
+    try std.testing.expectEqual(ModelCacheState.idle, runtime.state);
 }
 
 test "model cache reset replaces ready public catalog with team catalog" {

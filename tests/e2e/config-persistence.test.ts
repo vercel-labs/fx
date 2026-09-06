@@ -235,6 +235,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         expect(stored.permission_mode).toBe("auto");
         expect(stored.effort).toBe("auto");
         expect(stored.fast_mode).toBe(true);
+        expect(stored.fast_mode_model_bound).toBe(true);
         expect(stored.startup_scrollback).toBe(false);
         expect(stored.prompt_history).toMatchObject({ enabled: false });
         expect(stored.statusLine).toMatchObject({
@@ -606,75 +607,118 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
   );
 
   test(
-    "configured effort and Fast are visible before model catalog resolves",
+    "Fast indicator remains stable while model catalog resolves",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-startup-preferences-"));
-      let releaseCatalog: (() => void) | null = null;
-      const catalogRelease = new Promise<void>((resolve) => {
-        releaseCatalog = resolve;
-      });
-      const gateway = startFakeGateway([], {
-        models: async () => {
-          await catalogRelease;
-          return [{
-            id: "anthropic/claude-opus-4.8",
-            type: "language",
-            released: 1,
-            tags: ["fast", "tool-use"],
-            reasoning_options: [{ type: "effort", values: ["high", "xhigh"] }],
-            pricing: {
-              fast: { input: "0.1", output: "0.2" },
-            },
-          }];
+      const cases = [
+        {
+          label: "normal",
+          model: "moonshotai/kimi-k3",
+          fastMode: false,
+          modelBound: true,
+          supportsFastMode: true,
+          expectedFastIndicator: false,
         },
-      });
-      try {
-        const home = join(root, "home");
-        const workspace = join(root, "workspace");
-        const stderrPath = join(root, "stderr.log");
-        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
-        mkdirSync(workspace);
-        writeFileSync(
-          join(home, ".fx", "settings.json"),
-          JSON.stringify({
-            model: "anthropic/claude-opus-4.8",
-            permission_mode: "auto",
-            effort: "xhigh",
-            fast_mode: true,
-          }) + "\n",
-          { mode: 0o600 },
-        );
+        {
+          label: "toggle",
+          model: "moonshotai/kimi-k3",
+          fastMode: true,
+          modelBound: true,
+          supportsFastMode: true,
+          expectedFastIndicator: true,
+        },
+        {
+          label: "intrinsic",
+          model: "moonshotai/kimi-k3-fast",
+          fastMode: false,
+          modelBound: true,
+          supportsFastMode: false,
+          expectedFastIndicator: true,
+        },
+        {
+          label: "legacy-unbound",
+          model: "zai/glm-5.3",
+          fastMode: true,
+          modelBound: false,
+          supportsFastMode: false,
+          expectedFastIndicator: false,
+        },
+      ] as const;
 
-        session = await TmuxSession.create({
-          cwd: realpathSync(workspace),
-          env: {
-            ...NO_AUTH,
-            HOME: home,
-            FX_AUTO_UPGRADE: "0",
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
-          },
-          stderrPath,
+      for (const testCase of cases) {
+        const root = mkdtempSync(join(tmpdir(), `fx-startup-fast-${testCase.label}-`));
+        let releaseCatalog: (() => void) | null = null;
+        const catalogRelease = new Promise<void>((resolve) => {
+          releaseCatalog = resolve;
         });
-        const pane = await session.waitForText("auto · opus 4.8", TIMEOUT);
-        expect(pane).toContain("auto · opus 4.8 · xhigh · ⚡︎");
-        releaseCatalog?.();
-        releaseCatalog = null;
+        const gateway = startFakeGateway([], {
+          models: async () => {
+            await catalogRelease;
+            return [{
+              id: testCase.model,
+              type: "language",
+              released: 1,
+              tags: ["reasoning", "tool-use"],
+              pricing: testCase.supportsFastMode
+                ? { fast: { input: "0.1", output: "0.2" } }
+                : undefined,
+            }];
+          },
+        });
+        try {
+          const home = join(root, "home");
+          const workspace = join(root, "workspace");
+          const stderrPath = join(root, "stderr.log");
+          mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+          mkdirSync(workspace);
+          writeFileSync(
+            join(home, ".fx", "settings.json"),
+            JSON.stringify({
+              model: testCase.model,
+              permission_mode: "auto",
+              fast_mode: testCase.fastMode,
+              fast_mode_model_bound: testCase.modelBound,
+            }) + "\n",
+            { mode: 0o600 },
+          );
 
-        await session.sendText("/quit");
-        await session.waitForSessionEnd(TIMEOUT);
-        session = null;
-        expect(readFileSync(stderrPath, "utf8")).toBe("");
-      } finally {
-        releaseCatalog?.();
-        gateway.stop();
-        rmSync(root, { recursive: true, force: true });
+          session = await TmuxSession.create({
+            cwd: realpathSync(workspace),
+            env: {
+              ...NO_AUTH,
+              HOME: home,
+              FX_AUTO_UPGRADE: "0",
+              FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            },
+            stderrPath,
+          });
+          const modelLabel = testCase.model.split("/").at(-1)!;
+          const before = await session.waitForText(`auto · ${modelLabel}`, TIMEOUT);
+          expect(before.includes("⚡︎")).toBe(testCase.expectedFastIndicator);
+          releaseCatalog?.();
+          releaseCatalog = null;
+
+          await session.sendText("/model");
+          await session.waitForText(testCase.model, TIMEOUT);
+          await session.sendKeys("Escape");
+          const settled = await session.waitForStableComposer(TIMEOUT);
+          expect(settled.includes("⚡︎")).toBe(testCase.expectedFastIndicator);
+
+          await session.sendText("/quit");
+          await session.waitForSessionEnd(TIMEOUT);
+          session = null;
+          expect(readFileSync(stderrPath, "utf8")).toBe("");
+        } finally {
+          releaseCatalog?.();
+          gateway.stop();
+          rmSync(root, { recursive: true, force: true });
+        }
       }
     },
-    30_000,
+    60_000,
   );
 
   test(
-    "Fast command rejects a tag-only intrinsic Fast alias",
+    "Fast command rejects an intrinsic Fast alias",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-fast-unsupported-"));
       const gateway = startFakeGateway([], {
@@ -682,7 +726,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           id: "anthropic/claude-opus-4.8-fast",
           type: "language",
           released: 1,
-          tags: ["fast", "tool-use"],
+          tags: ["reasoning", "tool-use"],
         }],
       });
       try {
@@ -714,7 +758,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           "This model does not come with a fast mode.",
           TIMEOUT,
         );
-        expect(pane).not.toContain("⚡︎");
+        expect(pane).toContain("⚡︎");
         expect(gateway.requests).toHaveLength(0);
         expect(readFileSync(settingsPath, "utf8")).toBe(initialSettings);
 
@@ -1130,7 +1174,8 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         for (let i = 0; i < 2; i += 1) await session.sendKeys("Down");
         await session.waitForText("xhigh", TIMEOUT);
         await session.sendKeys("Enter");
-        await session.waitForText("fable-5 · xhigh", TIMEOUT);
+        const selected = await session.waitForText("fable-5 · xhigh", TIMEOUT);
+        expect(selected).not.toContain("⚡︎");
         await session.sendText("/quit");
         await session.waitForSessionEnd(TIMEOUT);
         session = null;
@@ -1140,7 +1185,8 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           models: { gateway: "anthropic/claude-fable-5" },
           effort: "xhigh",
         });
-        expect(stored).not.toHaveProperty("fast_mode");
+        expect(stored.fast_mode).toBe(false);
+        expect(stored.fast_mode_model_bound).toBe(true);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {
         gateway.stop();
@@ -1202,7 +1248,8 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         const stored = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
         expect(stored.models.gateway).toBe("xai/grok-build-1");
         expect(stored).not.toHaveProperty("effort");
-        expect(stored).not.toHaveProperty("fast_mode");
+        expect(stored.fast_mode).toBe(false);
+        expect(stored.fast_mode_model_bound).toBe(true);
 
         const scrollback = await session.captureFullScrollbackEscapes();
         expect(scrollback).toContain("grok-build-1");
@@ -1281,7 +1328,8 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
 
         let stored = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
         expect(stored.models.gateway).toBe("provider/new-reasoning-model");
-        expect(stored).not.toHaveProperty("fast_mode");
+        expect(stored.fast_mode).toBe(false);
+        expect(stored.fast_mode_model_bound).toBe(true);
 
         await session.sendText("Use portable auto.");
         await session.waitForText("portable auto complete", TIMEOUT);
@@ -1329,9 +1377,9 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         expect(JSON.parse(gateway.requests[1]!.body)).toMatchObject({
           reasoning: "future-tier",
         });
-        expect(JSON.parse(gateway.requests[1]!.body)).not.toHaveProperty(
-          "providerOptions",
-        );
+        expect(JSON.parse(gateway.requests[1]!.body).providerOptions).toEqual({
+          gateway: { caching: "auto" },
+        });
 
         await session.sendText("/quit");
         await session.waitForSessionEnd(TIMEOUT);
@@ -1342,7 +1390,8 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           models: { gateway: "provider/new-reasoning-model" },
           effort: "future-tier",
         });
-        expect(stored).not.toHaveProperty("fast_mode");
+        expect(stored.fast_mode).toBe(false);
+        expect(stored.fast_mode_model_bound).toBe(true);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {
         gateway.stop();

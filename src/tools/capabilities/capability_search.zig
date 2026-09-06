@@ -3,6 +3,7 @@ const lexical_relevance = @import("../../core/shared/lexical_relevance.zig");
 const result_store = @import("../../core/session/result_store.zig");
 const capability_retrieval = @import("../../core/tooling/capability_retrieval.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
+const tool_mcp_runtime = @import("../../core/tooling/tool_mcp_runtime.zig");
 const tool_result_limits = @import("../../core/tooling/tool_result_limits.zig");
 const skill_search = @import("../skills/skill_search.zig");
 
@@ -73,14 +74,6 @@ pub fn decode(
     errdefer ctx.allocator.free(query);
     const prepared = lexical_relevance.prepare(query) catch |err| switch (err) {
         error.QueryTooLong => unreachable,
-        error.TooManyTokens => {
-            const result = try failure(
-                ctx.allocator,
-                "capability_search query must not exceed 64 tokens",
-            );
-            ctx.allocator.free(query);
-            return result;
-        },
     };
     const server = if (server_value) |value|
         try ctx.allocator.dupe(u8, value.string)
@@ -144,27 +137,24 @@ pub fn call(
         );
     defer ctx.allocator.free(skill_output);
 
-    var mcp_notice: ?[]u8 = null;
-    defer if (mcp_notice) |notice| ctx.allocator.free(notice);
-    const mcp_output = if (searches_mcp)
-        try searchMcp(ctx, request, domain_cap, &mcp_notice)
+    var mcp_result: tool_mcp_runtime.SearchResult = if (searches_mcp)
+        try searchMcp(ctx, request, domain_cap)
     else
-        try ctx.allocator.dupe(
-            u8,
-            "{\"tools\":[],\"count\":0,\"total_matches\":0,\"more_available\":false,\"next_cursor\":null}",
-        );
-    defer ctx.allocator.free(mcp_output);
-    if (mcp_notice) |notice| try tool_dispatch.reportContextNotice(ctx, notice);
+        .{ .model_output = try ctx.allocator.dupe(u8, "{\"tools\":[],\"count\":0,\"total_matches\":0,\"more_available\":false,\"next_cursor\":null}") };
+    defer mcp_result.deinit(ctx.allocator);
+    if (mcp_result.notice) |notice| try tool_dispatch.reportContextNotice(ctx, notice);
 
     const combined = combineProjected(
         ctx.allocator,
         skill_output,
-        mcp_output,
+        mcp_result.model_output,
         output_cap,
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return executionFailure(ctx.allocator, "combined", err),
     };
+    errdefer ctx.allocator.free(combined);
+    for (mcp_result.selected_tools) |selected| try tool_dispatch.reportSelectedDynamicTool(ctx, selected.name, selected.schema_json, selected.mcp_binding);
     return .{ .success = combined };
 }
 
@@ -202,34 +192,28 @@ fn searchMcp(
     ctx: tool_dispatch.DispatchContext,
     request: capability_retrieval.Request,
     max_bytes: usize,
-    notice_out: *?[]u8,
-) tool_dispatch.DispatchError![]u8 {
+) tool_dispatch.DispatchError!tool_mcp_runtime.SearchResult {
     const runtime_context = ctx.mcp_ctx orelse
-        return ctx.allocator.dupe(u8, "{\"tools\":[],\"count\":0,\"state\":\"unavailable\"}");
+        return .{ .model_output = try ctx.allocator.dupe(u8, "{\"tools\":[],\"count\":0,\"state\":\"unavailable\"}") };
     const search_tools = ctx.mcp_search_tools orelse
-        return ctx.allocator.dupe(u8, "{\"tools\":[],\"count\":0,\"state\":\"unavailable\"}");
+        return .{ .model_output = try ctx.allocator.dupe(u8, "{\"tools\":[],\"count\":0,\"state\":\"unavailable\"}") };
     var limits = ctx.context_limits;
     if (max_bytes < limits.mcp_search_result_bytes.effectiveBytes()) {
         limits.mcp_search_result_bytes.value = .{ .bytes = max_bytes };
     }
-    var result = search_tools(
+    return search_tools(
         runtime_context,
         ctx.allocator,
         request,
         ctx.mcp_permission_rules,
         limits,
         ctx.mcp_access,
+        ctx.cancel_flag,
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return std.fmt.allocPrint(
-            ctx.allocator,
-            "{{\"tools\":[],\"count\":0,\"error\":\"{s}\"}}",
-            .{@errorName(err)},
-        ),
+        error.Cancelled => return error.Cancelled,
+        else => return .{ .model_output = try std.fmt.allocPrint(ctx.allocator, "{{\"tools\":[],\"count\":0,\"error\":\"{s}\"}}", .{@errorName(err)}) },
     };
-    notice_out.* = result.notice;
-    result.notice = null;
-    return result.model_output;
 }
 
 fn combineProjected(

@@ -21,9 +21,16 @@ pub const State = enum(u8) {
 pub const RelaunchRequest = struct {
     executable_path_buf: [std.fs.max_path_bytes]u8 = undefined,
     executable_path_len: usize = 0,
+    previous_revision_buf: [update_target.max_revision_bytes]u8 = undefined,
+    previous_revision_len: u8 = 0,
 
     pub fn executablePath(self: *const RelaunchRequest) []const u8 {
         return self.executable_path_buf[0..self.executable_path_len];
+    }
+
+    pub fn previousRevision(self: *const RelaunchRequest) ?[]const u8 {
+        if (self.previous_revision_len == 0) return null;
+        return self.previous_revision_buf[0..self.previous_revision_len];
     }
 };
 
@@ -47,6 +54,8 @@ pub const AutoUpgrade = struct {
     version_mutex: std.Io.Mutex = .init,
     latest_version_buf: [64]u8 = undefined,
     latest_version_len: u8 = 0,
+    previous_revision_buf: [update_target.max_revision_bytes]u8 = undefined,
+    previous_revision_len: u8 = 0,
 
     selected_channel: update_target.Channel = .stable,
 
@@ -65,6 +74,7 @@ pub const AutoUpgrade = struct {
         alloc: Allocator,
         current: update_target.CurrentBuild,
     ) void {
+        self.setPreviousRevision(current.revision);
         self.thread = std.Thread.spawn(.{}, runLoop, .{ self, alloc, current }) catch return;
     }
 
@@ -89,6 +99,15 @@ pub const AutoUpgrade = struct {
             request.executable_path_buf[0..executable_path.len],
             executable_path,
         );
+        self.version_mutex.lockUncancelable(io_mod.getIo());
+        defer self.version_mutex.unlock(io_mod.getIo());
+        if (self.selected_channel == .dev and self.previous_revision_len > 0) {
+            @memcpy(
+                request.previous_revision_buf[0..self.previous_revision_len],
+                self.previous_revision_buf[0..self.previous_revision_len],
+            );
+            request.previous_revision_len = self.previous_revision_len;
+        }
         self.relaunch_request = request;
     }
 
@@ -130,6 +149,15 @@ pub const AutoUpgrade = struct {
         const next = @intFromEnum(state);
         const previous = self.state.swap(next, .acq_rel);
         if (previous != next) self.markRenderDirty();
+    }
+
+    fn setPreviousRevision(self: *AutoUpgrade, revision: []const u8) void {
+        const valid = update_target.isValidRevision(revision);
+        const len: u8 = if (valid) @intCast(revision.len) else 0;
+        self.version_mutex.lockUncancelable(io_mod.getIo());
+        defer self.version_mutex.unlock(io_mod.getIo());
+        if (len > 0) @memcpy(self.previous_revision_buf[0..len], revision);
+        self.previous_revision_len = len;
     }
 
     fn setLatestVersion(self: *AutoUpgrade, version: []const u8) void {
@@ -304,15 +332,23 @@ test "setLatestVersion stores normalized version" {
     try std.testing.expect(au.takeRenderDirty());
 }
 
-test "relaunch request owns the executable path and is consumed once" {
+test "relaunch request owns its path and previous revision and is consumed once" {
     var au = AutoUpgrade{};
-    var source = [_]u8{ '/', 't', 'm', 'p', '/', 'f', 'x' };
-    try au.requestRelaunch(&source);
-    source[1] = 'x';
+    var path = [_]u8{ '/', 't', 'm', 'p', '/', 'f', 'x' };
+    var revision = [_]u8{'1'} ** 40;
+    au.configure_channel(.dev);
+    au.setPreviousRevision(&revision);
+    try au.requestRelaunch(&path);
+    path[1] = 'x';
+    revision[0] = '2';
 
     const request = au.takeRelaunchRequest() orelse
         return error.TestExpectedRelaunchRequest;
     try std.testing.expectEqualStrings("/tmp/fx", request.executablePath());
+    try std.testing.expectEqualStrings(
+        "1111111111111111111111111111111111111111",
+        request.previousRevision().?,
+    );
     try std.testing.expect(au.takeRelaunchRequest() == null);
 }
 

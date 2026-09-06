@@ -10,7 +10,6 @@ pub const max_shell_path_bytes: usize = 4096;
 pub const max_write_bytes: usize = 64 * 1024;
 pub const max_write_items: usize = 4096;
 pub const max_match_bytes: usize = 4096;
-pub const max_monitor_id_bytes: usize = 128;
 pub const max_monitor_definitions: usize = 32;
 pub const max_list_results: usize = 256;
 pub const max_cell_text_bytes: usize = 64;
@@ -42,7 +41,6 @@ pub const Action = enum {
     screen,
     write,
     wait,
-    monitor,
     inspect,
     list,
     resize,
@@ -303,151 +301,6 @@ pub const MonitorLifetime = union(enum) {
     }
 };
 
-pub const TcpReadyCondition = struct {
-    host: []const u8,
-    port: u16,
-};
-
-pub const PathSizeCondition = struct {
-    path: []const u8,
-    minimum_bytes: u64,
-};
-
-pub const CustomProbeCondition = struct {
-    command: []const u8,
-    cwd: []const u8,
-};
-
-pub const MonitorCondition = union(enum) {
-    process_exit,
-    exit_code: i32,
-    signal: Signal,
-    output_contains: []const u8,
-    output_matches: []const u8,
-    output_quiet_ms: u64,
-    screen_matches: []const u8,
-    tcp_ready: TcpReadyCondition,
-    http_ready: []const u8,
-    path_exists: []const u8,
-    path_changed: []const u8,
-    path_size: PathSizeCondition,
-    custom_probe: CustomProbeCondition,
-
-    pub fn requires_polling(self: MonitorCondition) bool {
-        return switch (self) {
-            .tcp_ready,
-            .http_ready,
-            .path_exists,
-            .path_changed,
-            .path_size,
-            .custom_probe,
-            => true,
-            .process_exit,
-            .exit_code,
-            .signal,
-            .output_contains,
-            .output_matches,
-            .output_quiet_ms,
-            .screen_matches,
-            => false,
-        };
-    }
-
-    pub fn validate(self: MonitorCondition) error{InvalidMonitorCondition}!void {
-        switch (self) {
-            .process_exit, .exit_code, .signal => {},
-            .output_contains, .output_matches, .screen_matches => |pattern| {
-                if (!valid_bounded_text(pattern, max_match_bytes)) {
-                    return error.InvalidMonitorCondition;
-                }
-            },
-            .output_quiet_ms => |duration_ms| {
-                if (duration_ms == 0) return error.InvalidMonitorCondition;
-            },
-            .tcp_ready => |condition| {
-                if (!valid_bounded_text(condition.host, max_authority_text_bytes) or
-                    condition.port == 0)
-                {
-                    return error.InvalidMonitorCondition;
-                }
-            },
-            .http_ready, .path_exists, .path_changed => |text| {
-                if (!valid_bounded_text(text, max_authority_text_bytes)) {
-                    return error.InvalidMonitorCondition;
-                }
-            },
-            .path_size => |condition| {
-                if (!valid_bounded_text(condition.path, max_authority_text_bytes)) {
-                    return error.InvalidMonitorCondition;
-                }
-            },
-            .custom_probe => |condition| {
-                if (!valid_bounded_text(condition.command, max_command_bytes) or
-                    !valid_bounded_text(condition.cwd, max_authority_text_bytes))
-                {
-                    return error.InvalidMonitorCondition;
-                }
-            },
-        }
-    }
-};
-
-pub const MonitorDefinition = struct {
-    condition: MonitorCondition,
-    check_schedule: ?PollSchedule = null,
-    notify_schedule: NotifySchedule,
-    lifetime: MonitorLifetime,
-
-    pub fn validate(self: MonitorDefinition) error{
-        InvalidMonitorCondition,
-        InvalidMonitorLifetime,
-        InvalidSchedule,
-        MissingCheckSchedule,
-        UnexpectedCheckSchedule,
-    }!void {
-        try self.condition.validate();
-        try self.notify_schedule.validate();
-        try self.lifetime.validate();
-        if (self.condition.requires_polling()) {
-            const schedule = self.check_schedule orelse return error.MissingCheckSchedule;
-            try schedule.validate();
-        } else if (self.check_schedule != null) {
-            return error.UnexpectedCheckSchedule;
-        }
-    }
-};
-
-pub const MonitorOperation = union(enum) {
-    add: MonitorDefinition,
-    update: struct {
-        monitor_id: []const u8,
-        definition: MonitorDefinition,
-    },
-    pause: []const u8,
-    @"resume": []const u8,
-    remove: []const u8,
-
-    pub fn validate(self: MonitorOperation) error{
-        InvalidMonitor,
-        InvalidMonitorCondition,
-        InvalidMonitorLifetime,
-        InvalidSchedule,
-        MissingCheckSchedule,
-        UnexpectedCheckSchedule,
-    }!void {
-        switch (self) {
-            .add => |definition| try definition.validate(),
-            .update => |value| {
-                if (!valid_monitor_id(value.monitor_id)) return error.InvalidMonitor;
-                try value.definition.validate();
-            },
-            .pause, .@"resume", .remove => |monitor_id| {
-                if (!valid_monitor_id(monitor_id)) return error.InvalidMonitor;
-            },
-        }
-    }
-};
-
 pub const StartRequest = struct {
     cwd: []const u8,
     command: ?[]const u8 = null,
@@ -455,8 +308,8 @@ pub const StartRequest = struct {
     backend: Backend = .native,
     return_when: ?ReturnCondition = null,
     wait_ceiling_ms: ?u64 = null,
+    timeout_ms: ?u64 = null,
     dimensions: ?Dimensions = null,
-    initial_monitors: []const MonitorDefinition = &.{},
     persistence: ?StartPersistence = null,
 };
 
@@ -495,9 +348,6 @@ pub const ReadRequest = struct {
 pub const SessionRequest = struct {
     session_id: []const u8,
     authority: ?AuthorityClaim = null,
-    after_event_id: u64 = 0,
-    acknowledge_event_id: ?u64 = null,
-    max_events: u16 = 64,
 };
 
 pub const WriteLeaseIntent = enum {
@@ -522,12 +372,6 @@ pub const WaitRequest = struct {
     session_id: []const u8,
     return_when: ReturnCondition,
     safety_ceiling_ms: u64,
-    authority: ?AuthorityClaim = null,
-};
-
-pub const MonitorRequest = struct {
-    session_id: []const u8,
-    operation: MonitorOperation,
     authority: ?AuthorityClaim = null,
 };
 
@@ -578,16 +422,11 @@ pub const RequestValidationError = error{
     MissingReturnCondition,
     MissingWaitCeiling,
     InvalidWaitCeiling,
+    InvalidTimeout,
     InvalidDimensions,
     InvalidSessionId,
     InvalidRawCursor,
     InvalidWritePayload,
-    InvalidMonitor,
-    InvalidMonitorCondition,
-    InvalidMonitorLifetime,
-    InvalidSchedule,
-    MissingCheckSchedule,
-    UnexpectedCheckSchedule,
     InvalidListFilter,
     InvalidPrincipal,
     InvalidAuthorityGeneration,
@@ -603,7 +442,6 @@ pub const ActionRequest = union(enum) {
     screen: SessionRequest,
     write: WriteRequest,
     wait: WaitRequest,
-    monitor: MonitorRequest,
     inspect: SessionRequest,
     list: ListFilters,
     resize: ResizeRequest,
@@ -617,7 +455,6 @@ pub const ActionRequest = union(enum) {
             .screen => .screen,
             .write => .write,
             .wait => .wait,
-            .monitor => .monitor,
             .inspect => .inspect,
             .list => .list,
             .resize => .resize,
@@ -652,11 +489,12 @@ pub const ActionRequest = union(enum) {
                 if (request.wait_ceiling_ms) |ceiling_ms| {
                     if (ceiling_ms == 0) return error.InvalidWaitCeiling;
                 }
-                if (request.dimensions) |dimensions| try dimensions.validate();
-                if (request.initial_monitors.len > max_monitor_definitions) {
-                    return error.InvalidMonitor;
+                if (request.timeout_ms) |timeout_ms| {
+                    if (timeout_ms == 0 or timeout_ms > std.math.maxInt(i64)) {
+                        return error.InvalidTimeout;
+                    }
                 }
-                for (request.initial_monitors) |definition| try definition.validate();
+                if (request.dimensions) |dimensions| try dimensions.validate();
                 if (request.persistence) |persistence| {
                     try persistence.validate(request);
                 }
@@ -669,24 +507,10 @@ pub const ActionRequest = union(enum) {
             .screen => |request| {
                 try validate_session_id(request.session_id);
                 try validate_optional_authority_claim(request.authority);
-                if (request.after_event_id != 0 or
-                    request.acknowledge_event_id != null or
-                    request.max_events != 64)
-                {
-                    return error.InvalidRawCursor;
-                }
             },
             .inspect => |request| {
                 try validate_session_id(request.session_id);
                 try validate_optional_authority_claim(request.authority);
-                if (request.max_events == 0 or request.max_events > 256 or
-                    if (request.acknowledge_event_id) |event_id|
-                        event_id == 0 or event_id < request.after_event_id
-                    else
-                        false)
-                {
-                    return error.InvalidRawCursor;
-                }
             },
             .write => |request| {
                 try validate_session_id(request.session_id);
@@ -700,11 +524,6 @@ pub const ActionRequest = union(enum) {
                 try validate_session_id(request.session_id);
                 try request.return_when.validate();
                 if (request.safety_ceiling_ms == 0) return error.InvalidWaitCeiling;
-                try validate_optional_authority_claim(request.authority);
-            },
-            .monitor => |request| {
-                try validate_session_id(request.session_id);
-                try request.operation.validate();
                 try validate_optional_authority_claim(request.authority);
             },
             .list => |filters| {
@@ -751,7 +570,6 @@ pub fn required_capabilities(request: ActionRequest) u64 {
         .screen,
         .write,
         .wait,
-        .monitor,
         .inspect,
         .list,
         .resize,
@@ -831,17 +649,6 @@ fn clone_action_request(alloc: Allocator, request: ActionRequest) Allocator.Erro
                 .authority = try clone_optional_authority_claim(alloc, value.authority),
             } };
         },
-        .monitor => |value| blk: {
-            const session_id = try alloc.dupe(u8, value.session_id);
-            errdefer alloc.free(session_id);
-            const operation = try clone_monitor_operation(alloc, value.operation);
-            errdefer deinit_monitor_operation(alloc, operation);
-            break :blk .{ .monitor = .{
-                .session_id = session_id,
-                .operation = operation,
-                .authority = try clone_optional_authority_claim(alloc, value.authority),
-            } };
-        },
         .inspect => |value| .{ .inspect = try clone_session_request(alloc, value) },
         .list => |value| .{ .list = try clone_list_filters(alloc, value) },
         .resize => |value| blk: {
@@ -892,9 +699,6 @@ fn clone_session_request(
     return .{
         .session_id = session_id,
         .authority = try clone_optional_authority_claim(alloc, request.authority),
-        .after_event_id = request.after_event_id,
-        .acknowledge_event_id = request.acknowledge_event_id,
-        .max_events = request.max_events,
     };
 }
 
@@ -928,11 +732,6 @@ fn clone_start_request(alloc: Allocator, request: StartRequest) Allocator.Error!
     else
         null;
     errdefer if (return_when) |value| deinit_return_condition(alloc, value);
-    const initial_monitors = try clone_monitor_definitions(
-        alloc,
-        request.initial_monitors,
-    );
-    errdefer deinit_monitor_definitions(alloc, initial_monitors);
     const persistence = if (request.persistence) |value|
         StartPersistence{
             .grant = try clone_authority_grant(alloc, value.grant),
@@ -948,8 +747,8 @@ fn clone_start_request(alloc: Allocator, request: StartRequest) Allocator.Error!
         .backend = request.backend,
         .return_when = return_when,
         .wait_ceiling_ms = request.wait_ceiling_ms,
+        .timeout_ms = request.timeout_ms,
         .dimensions = request.dimensions,
-        .initial_monitors = initial_monitors,
         .persistence = persistence,
     };
 }
@@ -1150,143 +949,6 @@ fn deinit_write_payload(alloc: Allocator, payload: WritePayload) void {
     }
 }
 
-fn clone_monitor_definitions(
-    alloc: Allocator,
-    definitions: []const MonitorDefinition,
-) Allocator.Error![]MonitorDefinition {
-    const owned = try alloc.alloc(MonitorDefinition, definitions.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (owned[0..initialized]) |definition| {
-            deinit_monitor_definition(alloc, definition);
-        }
-        alloc.free(owned);
-    }
-    for (definitions, 0..) |definition, index| {
-        owned[index] = try clone_monitor_definition(alloc, definition);
-        initialized += 1;
-    }
-    return owned;
-}
-
-fn deinit_monitor_definitions(
-    alloc: Allocator,
-    definitions: []const MonitorDefinition,
-) void {
-    for (definitions) |definition| deinit_monitor_definition(alloc, definition);
-    alloc.free(definitions);
-}
-
-fn clone_monitor_definition(
-    alloc: Allocator,
-    definition: MonitorDefinition,
-) Allocator.Error!MonitorDefinition {
-    return .{
-        .condition = try clone_monitor_condition(alloc, definition.condition),
-        .check_schedule = definition.check_schedule,
-        .notify_schedule = definition.notify_schedule,
-        .lifetime = definition.lifetime,
-    };
-}
-
-fn deinit_monitor_definition(alloc: Allocator, definition: MonitorDefinition) void {
-    deinit_monitor_condition(alloc, definition.condition);
-}
-
-fn clone_monitor_condition(
-    alloc: Allocator,
-    condition: MonitorCondition,
-) Allocator.Error!MonitorCondition {
-    return switch (condition) {
-        .process_exit => .process_exit,
-        .exit_code => |code| .{ .exit_code = code },
-        .signal => |signal| .{ .signal = signal },
-        .output_contains => |pattern| .{
-            .output_contains = try alloc.dupe(u8, pattern),
-        },
-        .output_matches => |pattern| .{
-            .output_matches = try alloc.dupe(u8, pattern),
-        },
-        .output_quiet_ms => |duration_ms| .{ .output_quiet_ms = duration_ms },
-        .screen_matches => |pattern| .{
-            .screen_matches = try alloc.dupe(u8, pattern),
-        },
-        .tcp_ready => |value| .{ .tcp_ready = .{
-            .host = try alloc.dupe(u8, value.host),
-            .port = value.port,
-        } },
-        .http_ready => |url| .{ .http_ready = try alloc.dupe(u8, url) },
-        .path_exists => |path| .{ .path_exists = try alloc.dupe(u8, path) },
-        .path_changed => |path| .{ .path_changed = try alloc.dupe(u8, path) },
-        .path_size => |value| .{ .path_size = .{
-            .path = try alloc.dupe(u8, value.path),
-            .minimum_bytes = value.minimum_bytes,
-        } },
-        .custom_probe => |value| blk: {
-            const command = try alloc.dupe(u8, value.command);
-            errdefer alloc.free(command);
-            break :blk .{ .custom_probe = .{
-                .command = command,
-                .cwd = try alloc.dupe(u8, value.cwd),
-            } };
-        },
-    };
-}
-
-fn deinit_monitor_condition(alloc: Allocator, condition: MonitorCondition) void {
-    switch (condition) {
-        .output_contains,
-        .output_matches,
-        .screen_matches,
-        .http_ready,
-        .path_exists,
-        .path_changed,
-        => |text| alloc.free(text),
-        .tcp_ready => |value| alloc.free(value.host),
-        .path_size => |value| alloc.free(value.path),
-        .custom_probe => |value| {
-            alloc.free(value.command);
-            alloc.free(value.cwd);
-        },
-        .process_exit, .exit_code, .signal, .output_quiet_ms => {},
-    }
-}
-
-fn clone_monitor_operation(
-    alloc: Allocator,
-    operation: MonitorOperation,
-) Allocator.Error!MonitorOperation {
-    return switch (operation) {
-        .add => |definition| .{
-            .add = try clone_monitor_definition(alloc, definition),
-        },
-        .update => |value| blk: {
-            const monitor_id = try alloc.dupe(u8, value.monitor_id);
-            errdefer alloc.free(monitor_id);
-            break :blk .{ .update = .{
-                .monitor_id = monitor_id,
-                .definition = try clone_monitor_definition(alloc, value.definition),
-            } };
-        },
-        .pause => |monitor_id| .{ .pause = try alloc.dupe(u8, monitor_id) },
-        .@"resume" => |monitor_id| .{
-            .@"resume" = try alloc.dupe(u8, monitor_id),
-        },
-        .remove => |monitor_id| .{ .remove = try alloc.dupe(u8, monitor_id) },
-    };
-}
-
-fn deinit_monitor_operation(alloc: Allocator, operation: MonitorOperation) void {
-    switch (operation) {
-        .add => |definition| deinit_monitor_definition(alloc, definition),
-        .update => |value| {
-            alloc.free(value.monitor_id);
-            deinit_monitor_definition(alloc, value.definition);
-        },
-        .pause, .@"resume", .remove => |monitor_id| alloc.free(monitor_id),
-    }
-}
-
 fn clone_list_filters(alloc: Allocator, filters: ListFilters) Allocator.Error!ListFilters {
     const task_id = if (filters.task_id) |value| try alloc.dupe(u8, value) else null;
     errdefer if (task_id) |value| alloc.free(value);
@@ -1322,7 +984,6 @@ fn deinit_action_request(alloc: Allocator, request: *ActionRequest) void {
             if (value.return_when) |condition| {
                 deinit_return_condition(alloc, condition);
             }
-            deinit_monitor_definitions(alloc, value.initial_monitors);
             if (value.persistence) |persistence| {
                 deinit_authority_grant(alloc, persistence.grant);
             }
@@ -1343,11 +1004,6 @@ fn deinit_action_request(alloc: Allocator, request: *ActionRequest) void {
         .wait => |value| {
             alloc.free(value.session_id);
             deinit_return_condition(alloc, value.return_when);
-            deinit_optional_authority_claim(alloc, value.authority);
-        },
-        .monitor => |value| {
-            alloc.free(value.session_id);
-            deinit_monitor_operation(alloc, value.operation);
             deinit_optional_authority_claim(alloc, value.authority);
         },
         .inspect => |value| {
@@ -1375,10 +1031,6 @@ fn return_condition_is_immediate(condition: ReturnCondition) bool {
         .started => true,
         .exit, .quiet, .match => false,
     };
-}
-
-fn valid_monitor_id(monitor_id: []const u8) bool {
-    return valid_bounded_text(monitor_id, max_monitor_id_bytes);
 }
 
 fn valid_bounded_text(text: []const u8, maximum: usize) bool {
@@ -1863,7 +1515,6 @@ pub const AllowedControls = packed struct {
             .screen = true,
             .write = true,
             .wait = true,
-            .monitor = true,
             .inspect = true,
             .list = true,
             .resize = true,
@@ -1900,7 +1551,6 @@ pub const AllowedControls = packed struct {
             .screen => self.screen,
             .write => self.write,
             .wait => self.wait,
-            .monitor => self.monitor,
             .inspect => self.inspect,
             .list => self.list,
             .resize => self.resize,
@@ -1935,7 +1585,6 @@ pub fn lifecycle_controls(lifecycle: Lifecycle) AllowedControls {
             .screen = true,
             .write = true,
             .wait = true,
-            .monitor = true,
             .inspect = true,
             .list = true,
             .resize = true,
@@ -2058,22 +1707,6 @@ pub const RepeatedProbeAuthority = struct {
         try self.check_schedule.validate();
         try self.notify_schedule.validate();
         try self.lifetime.validate();
-    }
-
-    pub fn matches(
-        self: RepeatedProbeAuthority,
-        definition: MonitorDefinition,
-    ) bool {
-        const probe = switch (definition.condition) {
-            .custom_probe => |value| value,
-            else => return false,
-        };
-        const schedule = definition.check_schedule orelse return false;
-        return std.mem.eql(u8, self.command, probe.command) and
-            std.mem.eql(u8, self.cwd, probe.cwd) and
-            std.meta.eql(self.check_schedule, schedule) and
-            std.meta.eql(self.notify_schedule, definition.notify_schedule) and
-            std.meta.eql(self.lifetime, definition.lifetime);
     }
 };
 
@@ -2257,7 +1890,6 @@ pub const CorrelationId = struct {
 pub const HostEvent = enum {
     lifecycle,
     output,
-    monitor,
     screen_recovery,
     authority_revoked,
 };
@@ -2407,7 +2039,6 @@ pub const StructuredErrorCode = enum {
     lease_conflict,
     cursor_gap,
     screen_unavailable,
-    monitor_unavailable,
     protocol_incompatible,
     capacity_exceeded,
     cancelled,
@@ -2430,11 +2061,12 @@ pub const SessionFacts = struct {
     attention: AttentionState,
     backend: Backend,
     persistence: PersistenceLevel = .durable,
+    model_managed: bool = true,
+    timed_out: bool = false,
     output_cursor: RawCursor,
     unread_range: ?RawRange = null,
     raw_gap: ?RawGap = null,
     screen_recovery: ScreenRecovery,
-    active_monitor_count: u16 = 0,
     next_actions: AllowedControls = .{},
 
     pub fn validate(self: SessionFacts) error{
@@ -2524,54 +2156,11 @@ pub const WaitResult = struct {
     outcome: ReturnOutcome,
 };
 
-pub const MonitorResult = struct {
-    session: SessionFacts,
-    monitor_id: ?[]const u8 = null,
-};
-
-pub const MonitorState = enum {
-    active,
-    paused,
-    matched,
-    degraded,
-};
-
-pub const MonitorEventReason = enum {
-    matched,
-    state_changed,
-    session_exit,
-    check,
-    interval,
-    expired,
-    removed,
-    paused,
-    resumed,
-    updated,
-};
-
-pub const MonitorSummary = struct {
-    monitor_id: []const u8,
-    state: MonitorState,
-};
-
-pub const MonitorEvent = struct {
-    event_id: u64,
-    monitor_id: []const u8,
-    reason: MonitorEventReason,
-    lifecycle: Lifecycle,
-    cursor: RawCursor,
-    created_at_ms: i64,
-};
-
 pub const InspectResult = struct {
     session: SessionFacts,
     shell: []const u8,
     cwd: []const u8,
     command: ?[]const u8 = null,
-    monitors: []const MonitorSummary = &.{},
-    events: []const MonitorEvent = &.{},
-    event_gap_through: u64 = 0,
-    next_event_id: u64 = 1,
 };
 
 pub const ListResult = struct {
@@ -2607,7 +2196,6 @@ pub const ResultValidationError = error{
     InvalidRenderCell,
     RenderSnapshotTooLarge,
     HostFrameTooLarge,
-    InvalidMonitor,
     InvalidReturnOutcome,
 };
 
@@ -2617,7 +2205,6 @@ pub const ActionResult = union(enum) {
     screen: ScreenResult,
     write: WriteResult,
     wait: WaitResult,
-    monitor: MonitorResult,
     inspect: InspectResult,
     list: ListResult,
     resize: ResizeResult,
@@ -2631,7 +2218,6 @@ pub const ActionResult = union(enum) {
             .screen => .screen,
             .write => .write,
             .wait => .wait,
-            .monitor => .monitor,
             .inspect => .inspect,
             .list => .list,
             .resize => .resize,
@@ -2675,12 +2261,6 @@ pub const ActionResult = union(enum) {
                 try value.session.validate();
                 try value.outcome.validate();
             },
-            .monitor => |value| {
-                try value.session.validate();
-                if (value.monitor_id) |monitor_id| {
-                    if (!valid_monitor_id(monitor_id)) return error.InvalidMonitor;
-                }
-            },
             .inspect => |value| {
                 try value.session.validate();
                 if (!valid_bounded_text(value.shell, max_shell_path_bytes) or
@@ -2692,31 +2272,6 @@ pub const ActionResult = union(enum) {
                     if (!valid_bounded_text(command, max_command_bytes)) {
                         return error.InvalidResult;
                     }
-                }
-                if (value.monitors.len > max_list_results) {
-                    return error.InvalidResult;
-                }
-                for (value.monitors) |monitor| {
-                    if (!valid_monitor_id(monitor.monitor_id)) {
-                        return error.InvalidMonitor;
-                    }
-                }
-                if (value.events.len > 256 or value.next_event_id == 0 or
-                    value.event_gap_through >= value.next_event_id)
-                {
-                    return error.InvalidResult;
-                }
-                var previous_event_id: u64 = 0;
-                for (value.events) |event| {
-                    if (event.event_id == 0 or
-                        event.event_id <= previous_event_id or
-                        event.event_id >= value.next_event_id or
-                        !valid_monitor_id(event.monitor_id))
-                    {
-                        return error.InvalidResult;
-                    }
-                    try event.cursor.validate();
-                    previous_event_id = event.event_id;
                 }
             },
             .list => |value| {
@@ -2765,7 +2320,6 @@ pub const OwnedSuccessResult = union(enum) {
     screen: OwnedScreenResult,
     write: WriteResult,
     wait: WaitResult,
-    monitor: MonitorResult,
     inspect: InspectResult,
     list: ListResult,
     resize: ResizeResult,
@@ -2782,7 +2336,6 @@ pub const OwnedSuccessResult = union(enum) {
             } },
             .write => |value| .{ .write = value },
             .wait => |value| .{ .wait = value },
-            .monitor => |value| .{ .monitor = value },
             .inspect => |value| .{ .inspect = value },
             .list => |value| .{ .list = value },
             .resize => |value| .{ .resize = value },
@@ -2873,17 +2426,6 @@ fn clone_success_result(
             .session = try clone_session_facts(alloc, value.session),
             .outcome = value.outcome,
         } },
-        .monitor => |value| blk: {
-            const session = try clone_session_facts(alloc, value.session);
-            errdefer deinit_session_facts(alloc, session);
-            break :blk .{ .monitor = .{
-                .session = session,
-                .monitor_id = if (value.monitor_id) |monitor_id|
-                    try alloc.dupe(u8, monitor_id)
-                else
-                    null,
-            } };
-        },
         .inspect => |value| .{
             .inspect = try clone_inspect_result(alloc, value),
         },
@@ -2917,69 +2459,12 @@ fn clone_inspect_result(
     errdefer alloc.free(cwd);
     const command = if (result.command) |value| try alloc.dupe(u8, value) else null;
     errdefer if (command) |value| alloc.free(value);
-    const monitors = try clone_monitor_summaries(alloc, result.monitors);
-    errdefer deinit_monitor_summaries(alloc, monitors);
     return .{
         .session = session,
         .shell = shell,
         .cwd = cwd,
         .command = command,
-        .monitors = monitors,
-        .events = try clone_monitor_events(alloc, result.events),
-        .event_gap_through = result.event_gap_through,
-        .next_event_id = result.next_event_id,
     };
-}
-
-fn clone_monitor_events(
-    alloc: Allocator,
-    events: []const MonitorEvent,
-) Allocator.Error![]MonitorEvent {
-    const owned = try alloc.alloc(MonitorEvent, events.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (owned[0..initialized]) |event| alloc.free(event.monitor_id);
-        alloc.free(owned);
-    }
-    for (events, 0..) |event, index| {
-        owned[index] = event;
-        owned[index].monitor_id = try alloc.dupe(u8, event.monitor_id);
-        initialized += 1;
-    }
-    return owned;
-}
-
-fn deinit_monitor_events(alloc: Allocator, events: []const MonitorEvent) void {
-    for (events) |event| alloc.free(event.monitor_id);
-    alloc.free(events);
-}
-
-fn clone_monitor_summaries(
-    alloc: Allocator,
-    monitors: []const MonitorSummary,
-) Allocator.Error![]MonitorSummary {
-    const owned = try alloc.alloc(MonitorSummary, monitors.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (owned[0..initialized]) |monitor| alloc.free(monitor.monitor_id);
-        alloc.free(owned);
-    }
-    for (monitors, 0..) |monitor, index| {
-        owned[index] = .{
-            .monitor_id = try alloc.dupe(u8, monitor.monitor_id),
-            .state = monitor.state,
-        };
-        initialized += 1;
-    }
-    return owned;
-}
-
-fn deinit_monitor_summaries(
-    alloc: Allocator,
-    monitors: []const MonitorSummary,
-) void {
-    for (monitors) |monitor| alloc.free(monitor.monitor_id);
-    alloc.free(monitors);
 }
 
 fn clone_session_facts(
@@ -3033,17 +2518,11 @@ fn deinit_success_result(alloc: Allocator, result: *OwnedSuccessResult) void {
         },
         .write => |value| deinit_session_facts(alloc, value.session),
         .wait => |value| deinit_session_facts(alloc, value.session),
-        .monitor => |value| {
-            deinit_session_facts(alloc, value.session);
-            if (value.monitor_id) |monitor_id| alloc.free(monitor_id);
-        },
         .inspect => |value| {
             deinit_session_facts(alloc, value.session);
             alloc.free(value.shell);
             alloc.free(value.cwd);
             if (value.command) |command| alloc.free(command);
-            deinit_monitor_summaries(alloc, value.monitors);
-            deinit_monitor_events(alloc, value.events);
         },
         .list => |value| deinit_session_facts_slice(alloc, value.sessions),
         .resize => |value| deinit_session_facts(alloc, value.session),
@@ -3053,20 +2532,7 @@ fn deinit_success_result(alloc: Allocator, result: *OwnedSuccessResult) void {
     result.* = undefined;
 }
 
-fn test_monitor_definition() MonitorDefinition {
-    return .{
-        .condition = .{ .custom_probe = .{
-            .command = "curl -fsS http://127.0.0.1:3000",
-            .cwd = "/workspace",
-        } },
-        .check_schedule = .{ .interval_ms = 250 },
-        .notify_schedule = .{ .every_n_checks = 2 },
-        .lifetime = .until_session_end,
-    };
-}
-
 test "action requests own every accepted action input" {
-    const monitors = [_]MonitorDefinition{test_monitor_definition()};
     const requests = [_]ActionRequest{
         .{ .start = .{
             .cwd = "/workspace",
@@ -3079,7 +2545,6 @@ test "action requests own every accepted action input" {
             .return_when = .{ .match = "Build Summary" },
             .wait_ceiling_ms = 30_000,
             .dimensions = .{ .rows = 24, .columns = 80 },
-            .initial_monitors = &monitors,
         } },
         .{ .read = .{
             .session_id = "terminal-1",
@@ -3094,13 +2559,6 @@ test "action requests own every accepted action input" {
             .session_id = "terminal-1",
             .return_when = .{ .quiet = 100 },
             .safety_ceiling_ms = 1_000,
-        } },
-        .{ .monitor = .{
-            .session_id = "terminal-1",
-            .operation = .{ .update = .{
-                .monitor_id = "health",
-                .definition = test_monitor_definition(),
-            } },
         } },
         .{ .inspect = .{ .session_id = "terminal-1" } },
         .{ .list = .{
@@ -3155,101 +2613,6 @@ test "write requests own text keys controls and paste bytes" {
         defer owned.deinit(std.testing.allocator);
         try owned.value.validate();
     }
-}
-
-test "monitor vocabulary validates every accepted condition schedule lifetime and operation" {
-    const conditions = [_]MonitorCondition{
-        .process_exit,
-        .{ .exit_code = 0 },
-        .{ .signal = .terminate },
-        .{ .output_contains = "ready" },
-        .{ .output_matches = "ready.*" },
-        .{ .output_quiet_ms = 100 },
-        .{ .screen_matches = "Press Enter" },
-        .{ .tcp_ready = .{ .host = "127.0.0.1", .port = 3000 } },
-        .{ .http_ready = "https://example.test/health" },
-        .{ .path_exists = "/tmp/ready" },
-        .{ .path_changed = "/tmp/output.log" },
-        .{ .path_size = .{ .path = "/tmp/output.log", .minimum_bytes = 1 } },
-        .{ .custom_probe = .{
-            .command = "test -f /tmp/ready",
-            .cwd = "/workspace",
-        } },
-    };
-    for (conditions) |condition| {
-        const definition = MonitorDefinition{
-            .condition = condition,
-            .check_schedule = if (condition.requires_polling())
-                .{ .interval_ms = 100 }
-            else
-                null,
-            .notify_schedule = .on_match,
-            .lifetime = .until_match,
-        };
-        try definition.validate();
-    }
-
-    const notify_schedules = [_]NotifySchedule{
-        .on_match,
-        .on_state_change,
-        .on_exit,
-        .every_check,
-        .{ .every_n_checks = 2 },
-        .{ .interval = .{ .interval_ms = 100 } },
-    };
-    for (notify_schedules) |schedule| try schedule.validate();
-
-    const lifetimes = [_]MonitorLifetime{
-        .until_match,
-        .until_session_end,
-        .{ .duration_ms = 1_000 },
-    };
-    for (lifetimes) |lifetime| try lifetime.validate();
-
-    const operations = [_]MonitorOperation{
-        .{ .add = test_monitor_definition() },
-        .{ .update = .{
-            .monitor_id = "health",
-            .definition = test_monitor_definition(),
-        } },
-        .{ .pause = "health" },
-        .{ .@"resume" = "health" },
-        .{ .remove = "health" },
-    };
-    for (operations) |operation| {
-        var owned = try OwnedActionRequest.init(std.testing.allocator, .{
-            .monitor = .{
-                .session_id = "terminal-1",
-                .operation = operation,
-            },
-        });
-        defer owned.deinit(std.testing.allocator);
-        try owned.value.validate();
-    }
-
-    try std.testing.expectError(
-        error.InvalidSchedule,
-        (NotifySchedule{ .every_n_checks = 0 }).validate(),
-    );
-    try std.testing.expectError(
-        error.InvalidSchedule,
-        (NotifySchedule{ .interval = .{ .interval_ms = 0 } }).validate(),
-    );
-    try std.testing.expectError(
-        error.InvalidMonitorLifetime,
-        (MonitorLifetime{ .duration_ms = 0 }).validate(),
-    );
-    try std.testing.expectError(
-        error.InvalidMonitorCondition,
-        (MonitorCondition{ .tcp_ready = .{
-            .host = "127.0.0.1",
-            .port = 0,
-        } }).validate(),
-    );
-    try std.testing.expectError(
-        error.InvalidMonitorCondition,
-        (MonitorCondition{ .output_matches = "" }).validate(),
-    );
 }
 
 test "action request validation enforces binding and bounded input rules" {
@@ -3322,36 +2685,6 @@ test "action request validation enforces binding and bounded input rules" {
             .payload = .{ .controls = &.{
                 .{ .character = '1' },
             } },
-        } }).validate(),
-    );
-    try std.testing.expectError(
-        error.MissingCheckSchedule,
-        (ActionRequest{ .monitor = .{
-            .session_id = "terminal-1",
-            .operation = .{ .add = .{
-                .condition = .{ .http_ready = "https://example.test" },
-                .notify_schedule = .on_match,
-                .lifetime = .until_match,
-            } },
-        } }).validate(),
-    );
-    try std.testing.expectError(
-        error.UnexpectedCheckSchedule,
-        (ActionRequest{ .monitor = .{
-            .session_id = "terminal-1",
-            .operation = .{ .add = .{
-                .condition = .process_exit,
-                .check_schedule = .{ .interval_ms = 10 },
-                .notify_schedule = .on_exit,
-                .lifetime = .until_session_end,
-            } },
-        } }).validate(),
-    );
-    try std.testing.expectError(
-        error.InvalidMonitor,
-        (ActionRequest{ .monitor = .{
-            .session_id = "terminal-1",
-            .operation = .{ .pause = "" },
         } }).validate(),
     );
     try std.testing.expectError(
@@ -3452,7 +2785,6 @@ test "start persistence binds authority to cwd backend and a nonzero proof" {
 }
 
 fn check_owned_action_request_allocation_failures(alloc: Allocator) !void {
-    const monitors = [_]MonitorDefinition{test_monitor_definition()};
     var request = try OwnedActionRequest.init(alloc, .{ .start = .{
         .cwd = "/workspace",
         .command = "zig build",
@@ -3463,7 +2795,6 @@ fn check_owned_action_request_allocation_failures(alloc: Allocator) !void {
         .return_when = .{ .match = "Build Summary" },
         .wait_ceiling_ms = 30_000,
         .dimensions = .{ .rows = 24, .columns = 80 },
-        .initial_monitors = &monitors,
         .persistence = .{
             .grant = .{
                 .principal = .{
@@ -3809,16 +3140,12 @@ fn test_session_facts() SessionFacts {
             .end = .{ .segment = 1, .offset = 8 },
         },
         .screen_recovery = .{ .unavailable = .missing },
-        .active_monitor_count = 1,
         .next_actions = .full(),
     };
 }
 
 test "results own every action-specific success and structured failure" {
     const cells = test_render_cells();
-    const monitors = [_]MonitorSummary{
-        .{ .monitor_id = "health", .state = .active },
-    };
     const sessions = [_]SessionFacts{test_session_facts()};
     const successes = [_]ActionResult{
         .{ .start = .{
@@ -3849,16 +3176,11 @@ test "results own every action-specific success and structured failure" {
             .session = test_session_facts(),
             .outcome = .condition_met,
         } },
-        .{ .monitor = .{
-            .session = test_session_facts(),
-            .monitor_id = "health",
-        } },
         .{ .inspect = .{
             .session = test_session_facts(),
             .shell = "/bin/zsh",
             .cwd = "/workspace",
             .command = "zig build",
-            .monitors = &monitors,
         } },
         .{ .list = .{ .sessions = &sessions } },
         .{ .resize = .{
@@ -3989,17 +3311,6 @@ test "action-specific result validation rejects incoherent values" {
             },
         } }).validate(),
     );
-    try std.testing.expectError(
-        error.InvalidMonitor,
-        (ActionResult{ .inspect = .{
-            .session = test_session_facts(),
-            .shell = "/bin/zsh",
-            .cwd = "/workspace",
-            .monitors = &.{
-                .{ .monitor_id = "", .state = .active },
-            },
-        } }).validate(),
-    );
 }
 
 fn check_owned_result_allocation_failures(alloc: Allocator) !void {
@@ -4111,13 +3422,13 @@ test "next actions are the pure lifecycle authority and lease intersection" {
 
     const lifecycle_cases = [_]struct {
         lifecycle: Lifecycle,
-        monitor: bool,
+        signal: bool,
     }{
-        .{ .lifecycle = .starting, .monitor = true },
-        .{ .lifecycle = .running, .monitor = true },
-        .{ .lifecycle = .exited, .monitor = false },
-        .{ .lifecycle = .lost, .monitor = false },
-        .{ .lifecycle = .closed, .monitor = false },
+        .{ .lifecycle = .starting, .signal = true },
+        .{ .lifecycle = .running, .signal = true },
+        .{ .lifecycle = .exited, .signal = false },
+        .{ .lifecycle = .lost, .signal = false },
+        .{ .lifecycle = .closed, .signal = false },
     };
     for (lifecycle_cases) |case| {
         const projected = project_next_actions(
@@ -4126,7 +3437,7 @@ test "next actions are the pure lifecycle authority and lease intersection" {
             .agent,
             .{},
         );
-        try std.testing.expectEqual(case.monitor, projected.monitor);
+        try std.testing.expectEqual(case.signal, projected.signal);
     }
 
     const leased = project_next_actions(
@@ -4264,13 +3575,6 @@ test "durable actions derive policy specific protocol capabilities" {
                 .session_id = "terminal-a",
                 .return_when = .exit,
                 .safety_ceiling_ms = 1,
-            } },
-            .expected = authority,
-        },
-        .{
-            .request = .{ .monitor = .{
-                .session_id = "terminal-a",
-                .operation = .{ .pause = "monitor-a" },
             } },
             .expected = authority,
         },

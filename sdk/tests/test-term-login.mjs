@@ -22,6 +22,7 @@ const verificationUrlComplete = `${verificationUrl}?user_code=TEST-CODE`;
 const accessToken = "term-login-access-token-sentinel";
 const refreshToken = "term-login-refresh-token-sentinel";
 const placeholder = "term-login-placeholder";
+const teamId = "team_sdk_e2e";
 const gatewayRequests = [];
 const openedUrls = [];
 let tokenPolls = 0;
@@ -83,10 +84,14 @@ const stubFetch = async (input, init = {}) => {
     if (headers.get("authorization") !== `Bearer ${accessToken}`) {
       throw new Error("teams request did not use the granted credential");
     }
-    return json({ teams: [] });
+    return json({ teams: [{ id: teamId, slug: "example-team", name: "Example Team" }] });
   }
   if (url.href === "https://api.vercel.com/login/oauth/revoke") return json({});
-  if (url.href === "https://ai-gateway.vercel.sh/coding-agent/v1/models") {
+  if (`${url.origin}${url.pathname}` === "https://ai-gateway.vercel.sh/coding-agent/v1/models") {
+    const requestTeam = url.searchParams.get("teamId") ?? headers.get("x-vercel-ai-gateway-team");
+    if (headers.get("authorization") === `Bearer ${accessToken}` && requestTeam !== teamId) {
+      throw new Error("authenticated model catalog omitted the selected team");
+    }
     return json({
       object: "list",
       data: [{ id: "stub/login-model", type: "language", released: 1, tags: ["tool-use"] }],
@@ -219,11 +224,28 @@ await waitFor(
   "cooperative OAuth completion",
   () => `polls=${tokenPolls}, output=${JSON.stringify(first.capture.transcript().slice(-1500))}`,
 );
+await waitFor(
+  () => first.capture.transcript().includes("Vercel team · Search:"),
+  "team selection",
+  () => JSON.stringify(first.capture.transcript().slice(-1500)),
+);
+first.runtime.write("\r");
+await waitFor(
+  () => first.capture.transcript().includes("Changed Vercel team to Example Team") ||
+    first.capture.transcript().includes("The Vercel team changed and a valid model was selected for this run"),
+  "validated team activation",
+  () => JSON.stringify(first.capture.transcript().slice(-1500)),
+);
 if (tokenPolls !== 3) throw new Error(`expected three token polls, received ${tokenPolls}`);
-if (storeFacts.commits.length !== 1 || storeFacts.commits[0].expectedRevision !== undefined) {
+if (storeFacts.commits.length !== 2 || storeFacts.commits[0].expectedRevision !== undefined) {
   throw new Error("initial OAuth commit did not honor the empty revision contract");
 }
-if (!storedRecord || !storeFacts.commits[0].opaque) throw new Error("OAuth session was not committed as an opaque record");
+if (storeFacts.commits[1].expectedRevision !== storeFacts.commits[0].revision) {
+  throw new Error("team selection did not update the current OAuth revision");
+}
+if (!storedRecord || !storeFacts.commits.every((commit) => commit.opaque)) {
+  throw new Error("OAuth session was not committed as opaque records");
+}
 
 first.runtime.write("first authenticated prompt\r");
 await waitFor(
@@ -263,7 +285,7 @@ await waitFor(
   () => JSON.stringify(second.capture.transcript().slice(-1500)),
 );
 if (storedRecord !== null || storeFacts.removes.length !== 1) throw new Error("logout did not remove the OAuth record");
-if (storeFacts.removes[0].expectedRevision !== storeFacts.commits[0].revision) {
+if (storeFacts.removes[0].expectedRevision !== storeFacts.commits[1].revision) {
   throw new Error("logout did not remove the expected OAuth revision");
 }
 assertNoSecretLeaks(second.capture, "restored terminal");

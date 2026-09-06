@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { strict as assert } from "node:assert";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -10,8 +10,8 @@ import { fileURLToPath } from "node:url";
 const require = createRequire(import.meta.url);
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const addonPath = resolve(process.argv[2] || resolve(scriptDir, "../../zig-out/lib/libfx.node"));
-const traceChild = process.env.LIBFX_STALE_TRACE_CHILD === "1";
-if (!traceChild) {
+const ambientTraceChild = process.env.LIBFX_AMBIENT_TRACE_CHILD === "1";
+if (!ambientTraceChild) {
   delete process.env.FX_TRACE;
   delete process.env.FX_TRACE_LOG;
   delete process.env.FX_TRACE_SCOPES;
@@ -19,7 +19,7 @@ if (!traceChild) {
 }
 const addon = require(addonPath);
 
-if (traceChild) {
+if (ambientTraceChild) {
   const traceCore = addon.createCore({
     apiKey: "trace-test-key",
     home: "/tmp",
@@ -36,6 +36,7 @@ if (traceChild) {
 
 for (const [name, args] of [
   ["createCore", []],
+  ["takeCoreReadyFd", []],
   ["writeCore", []],
   ["writeCore", [{}]],
   ["closeCore", []],
@@ -156,7 +157,17 @@ try {
   const sessionId = created.result.sessionId;
 
   const firstPrompt = sendPrompt(sessionId, "first low-level prompt");
+  const catalogFetch = await Promise.race([takeFetch(), timeout("model catalog fetch")]);
+  assert.equal(catalogFetch.method, "GET");
+  assert.equal(catalogFetch.url, "https://ai-gateway.vercel.sh/coding-agent/v1/models");
+  assert.equal(addon.startCoreFetchResponse(lifecycleCore, catalogFetch.handle, 200), 1);
+  assert.equal(addon.pushCoreFetchResponse(lifecycleCore, catalogFetch.handle, Buffer.from(JSON.stringify({
+    object: "list", data: [{ id: "native/test-model", type: "language" }],
+  }))), 1);
+  assert.equal(addon.finishCoreFetch(lifecycleCore, catalogFetch.handle), 1);
   const firstFetch = await Promise.race([takeFetch(), timeout("first host fetch")]);
+  assert.equal(firstFetch.method, "POST");
+  assert.equal(firstFetch.url, "http://127.0.0.1:31337/chat");
   assert.ok(Number.isInteger(firstFetch.handle) && firstFetch.handle > 0, "fetch request must carry a positive handle");
   const firstHandle = firstFetch.handle;
   const futureHandle = firstHandle + 1;
@@ -172,6 +183,7 @@ try {
 
   const secondPrompt = sendPrompt(sessionId, "second low-level prompt");
   const secondFetch = await Promise.race([takeFetch(), timeout("second host fetch")]);
+  assert.equal(secondFetch.method, "POST");
   assert.notEqual(secondFetch.handle, firstHandle, "sequential fetches must use unique handles");
   const secondHandle = secondFetch.handle;
   assert.equal(addon.startCoreFetchResponse(lifecycleCore, firstHandle, 200), 0);
@@ -201,29 +213,27 @@ try {
   addon.destroyCore(lifecycleCore);
 }
 
-const traceDir = mkdtempSync(resolve(tmpdir(), "libfx-stale-trace-"));
+const traceDir = mkdtempSync(resolve(tmpdir(), "libfx-ambient-trace-"));
 const traceLog = resolve(traceDir, "trace.log");
 try {
-  const traced = spawnSync(process.execPath, [fileURLToPath(import.meta.url), addonPath], {
+  const isolated = spawnSync(process.execPath, [fileURLToPath(import.meta.url), addonPath], {
     cwd: process.cwd(),
     encoding: "utf8",
     env: {
       ...process.env,
-      LIBFX_STALE_TRACE_CHILD: "1",
+      LIBFX_AMBIENT_TRACE_CHILD: "1",
+      FX_TRACE: "1",
       FX_TRACE_LOG: traceLog,
-      FX_TRACE_SCOPES: "napi",
+      FX_TRACE_SCOPES: "napi,acp,interrupt",
+      FX_TRACE_STDERR: "1",
     },
   });
-  assert.equal(traced.status, 0, traced.stderr || traced.stdout);
-  assert.equal(traced.stdout, "", "stale tracing must not change normal stdout");
-  assert.equal(traced.stderr, "", "file tracing must not write stderr");
-  const trace = readFileSync(traceLog, "utf8");
-  const staleLines = trace.split("\n").filter((line) => line.includes("dropping stale host fetch"));
-  assert.equal(staleLines.length, 1, "one stale operation must emit one bounded trace");
-  assert.match(staleLines[0], /operation=push handle=17 reason=no_active_fetch/);
-  assert.doesNotMatch(trace, /secret-response-payload/);
+  assert.equal(isolated.status, 0, isolated.stderr || isolated.stdout);
+  assert.equal(isolated.stdout, "", "ambient fx tracing must not change libfx stdout");
+  assert.equal(isolated.stderr, "", "ambient fx tracing must not change libfx stderr");
+  assert.equal(existsSync(traceLog), false, "ambient fx tracing must not create a libfx trace file");
 } finally {
   rmSync(traceDir, { recursive: true, force: true });
 }
 
-console.log("native core misuse passed: argument, handle, stale, trace, backpressure, and closed-handle checks are enforced");
+console.log("native core misuse passed: argument, handle, stale, ambient trace isolation, backpressure, and closed-handle checks are enforced");

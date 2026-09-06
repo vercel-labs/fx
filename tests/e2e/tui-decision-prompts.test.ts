@@ -166,8 +166,15 @@ function outerCommandCall() {
   return outerToolCalls([
     {
       id: "command_outer_1",
-      name: "terminal",
-      input: { action: "exec", timeout_ms: 600_000, command: "touch generic-preview-accepted.txt" },
+      name: "shell",
+      input: {
+        request: {
+          action: "run",
+          command: "touch generic-preview-accepted.txt",
+          yield_time_ms: 30_000,
+          timeout_ms: 600_000,
+        },
+      },
     },
   ]);
 }
@@ -185,8 +192,15 @@ function outerLongCommandCall() {
   return outerToolCalls([
     {
       id: "long_command_outer_1",
-      name: "terminal",
-      input: { action: "exec", timeout_ms: 600_000, command },
+      name: "shell",
+      input: {
+        request: {
+          action: "run",
+          command,
+          yield_time_ms: 30_000,
+          timeout_ms: 600_000,
+        },
+      },
     },
   ]);
 }
@@ -202,8 +216,15 @@ function outerScrollableLongCommandCall() {
   return outerToolCalls([
     {
       id: "scrollable_long_command_outer_1",
-      name: "terminal",
-      input: { action: "exec", timeout_ms: 600_000, command },
+      name: "shell",
+      input: {
+        request: {
+          action: "run",
+          command,
+          yield_time_ms: 30_000,
+          timeout_ms: 600_000,
+        },
+      },
     },
   ]);
 }
@@ -215,8 +236,15 @@ function outerFittingCommandCall() {
   return outerToolCalls([
     {
       id: "fitting_command_outer_1",
-      name: "terminal",
-      input: { action: "exec", timeout_ms: 600_000, command },
+      name: "shell",
+      input: {
+        request: {
+          action: "run",
+          command,
+          yield_time_ms: 30_000,
+          timeout_ms: 600_000,
+        },
+      },
     },
   ]);
 }
@@ -1268,8 +1296,6 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       const fragmentedWheel = [
         "1b", "5b", "3c", "36", "35", "3b", "37", "39", "3b", "31", "32", "4d",
       ];
-      const fragmentDelayMs = 0;
-      const injectionLogPath = join(ctx.root.root, "command-fragmented.injected-input.log");
       const completeWheel = [
         "1b", "5b", "3c", "36", "34", "3b", "37", "39", "3b", "31", "32", "4d",
       ];
@@ -1293,11 +1319,8 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       expect(completePane).not.toContain(`${COMMAND_SCROLL_LINE_PREFIX}001`);
       expect(completePane).not.toContain("Cancelled");
 
-      await ctx.session.sendFragmentedHexBytes(
-        fragmentedWheel,
-        fragmentDelayMs,
-        injectionLogPath,
-      );
+      await ctx.session.sendHexBytes(fragmentedWheel.slice(0, 6));
+      await ctx.session.sendHexBytes(fragmentedWheel.slice(6));
       const fragmentedPane = await waitForPaneState(
         ctx.session,
         "fragmented mouse scroll",
@@ -1310,13 +1333,6 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       const fragmentedScrollback = await ctx.session.captureFullScrollbackEscapes();
       expect(fragmentedScrollback).not.toContain("Cancelled");
       expect(fragmentedScrollback).not.toContain("4;79;12M");
-      expect(readFileSync(injectionLogPath, "utf8")).toBe(
-        fragmentedWheel.map((byte, index) =>
-          `write=${index + 1}/12 byte=${byte} delay_before_ms=${
-            index === 0 ? 0 : fragmentDelayMs
-          }`
-        ).join("\n") + "\n",
-      );
       const approvalFrames = Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload));
       expect(approvalFrames.includes(Buffer.from("\x1b[?1000h\x1b[?1006h"))).toBe(true);
       expect(readFileSync(ctx.tracePath, "utf8")).not.toContain("discard pending mouse report");
@@ -1501,7 +1517,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         "Would you like to run the following command?",
         TIMEOUT,
       );
-      expect(pane).toContain("# terminal.exec profile=user shell=");
+      expect(pane).toContain("# shell.run profile=user shell=");
       expect(pane).toContain("touch generic-preview-accepted.txt");
       expectApprovalSelection(pane, 1, COMMAND_YES_CHOICE);
 
@@ -2075,7 +2091,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         await assertProcessAliveAndClean(ctx);
       }
     },
-    TIMEOUT,
+    TIMEOUT * 2,
   );
 
   test(

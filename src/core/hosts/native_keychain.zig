@@ -1,8 +1,24 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
+const host = @import("host.zig");
 const io_mod = @import("../shared/io.zig");
 const secret = @import("../auth/secret.zig");
+
+const err_sec_success: i32 = 0;
+const err_sec_item_not_found: i32 = -25300;
+const security_framework_path = "/System/Library/Frameworks/Security.framework/Security";
+
+const FindGenericPasswordFn = *const fn (
+    keychain_or_array: ?*const anyopaque,
+    service_name_length: u32,
+    service_name: [*]const u8,
+    account_name_length: u32,
+    account_name: [*]const u8,
+    password_length: ?*u32,
+    password_data: ?*?*anyopaque,
+    item_ref: ?*?*anyopaque,
+) callconv(.c) i32;
 
 pub const service_name = "FX_AI_GATEWAY_API_KEY";
 const mcp_credentials_service_name = "FX_MCP_OAUTH_CREDENTIALS_V1";
@@ -132,6 +148,52 @@ fn posixAccountName(buf: *AccountBuffer) ?[]const u8 {
 
 pub fn load(alloc: std.mem.Allocator) !?[]u8 {
     return loadFromService(alloc, service_name);
+}
+
+/// Checks Keychain metadata only. It never asks Security.framework for the
+/// secret value and never spawns the `security` command-line tool.
+pub fn contains() Error!host.SecretStorePresence {
+    return containsService(service_name);
+}
+
+pub fn oauthSessionPresence() Error!host.SecretStorePresence {
+    return containsService(oauth_session_service_name);
+}
+
+fn containsService(service: []const u8) Error!host.SecretStorePresence {
+    if (comptime builtin.os.tag != .macos) return .missing;
+    var account_buf: AccountBuffer = undefined;
+    const account = try accountName(&account_buf);
+    const service_len = std.math.cast(u32, service.len) orelse
+        return error.KeychainReadFailed;
+    const account_len = std.math.cast(u32, account.len) orelse
+        return error.KeychainReadFailed;
+    var security = std.DynLib.open(security_framework_path) catch |err| {
+        debug_trace.logf("keychain", "presence failed step=open err={s}", .{@errorName(err)});
+        return error.KeychainReadFailed;
+    };
+    defer security.close();
+    const find_generic_password = security.lookup(
+        FindGenericPasswordFn,
+        "SecKeychainFindGenericPassword",
+    ) orelse {
+        debug_trace.logf("keychain", "presence failed step=lookup", .{});
+        return error.KeychainReadFailed;
+    };
+    const status = find_generic_password(
+        null,
+        service_len,
+        service.ptr,
+        account_len,
+        account.ptr,
+        null,
+        null,
+        null,
+    );
+    if (status == err_sec_success) return .present;
+    if (status == err_sec_item_not_found) return .missing;
+    debug_trace.logf("keychain", "presence failed status={d}", .{status});
+    return error.KeychainReadFailed;
 }
 
 pub fn loadMcpCredentials(alloc: std.mem.Allocator) !?[]u8 {

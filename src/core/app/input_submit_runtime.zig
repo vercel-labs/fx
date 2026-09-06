@@ -8,7 +8,6 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const entity_spans = @import("../shared/entity_spans.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
-const input_queue_runtime = @import("input_queue_runtime.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const input_limit_feedback = @import("input_limit_feedback.zig");
 
@@ -16,22 +15,38 @@ pub const PendingPhase = enum {
     awaiting_frame,
     awaiting_adoption,
     adopted,
+    awaiting_auth,
     queued,
 };
 
 const PendingPhaseError = error{InvalidPendingPhase};
 
-pub const PendingSubmission = struct {
-    draft: worker_runtime.QueuedPromptDraft,
-    phase: PendingPhase = .awaiting_frame,
+pub const PendingPromptDraft = struct {
+    turn_id: u64,
+    prompt: []u8,
+    images: []types.ImageAttachment,
+    skill_display_spans: []worker_runtime.SkillDisplaySpan,
 
-    fn init(draft: worker_runtime.QueuedPromptDraft) PendingSubmission {
+    fn deinit(self: PendingPromptDraft, alloc: std.mem.Allocator) void {
+        alloc.free(self.prompt);
+        types.freeImageAttachmentSlice(alloc, self.images);
+        worker_runtime.freeSkillDisplaySpans(alloc, self.skill_display_spans);
+    }
+};
+
+pub const PendingSubmission = struct {
+    draft: PendingPromptDraft,
+    phase: PendingPhase = .awaiting_frame,
+    credential_admitted: bool = false,
+    skill_refresh_generation: ?u64 = null,
+
+    fn init(draft: PendingPromptDraft) PendingSubmission {
         std.debug.assert(draft.turn_id != 0);
         return .{ .draft = draft };
     }
 
     pub fn deinit(self: *PendingSubmission, alloc: std.mem.Allocator) void {
-        worker_runtime.freeQueuedPromptDraft(alloc, self.draft);
+        self.draft.deinit(alloc);
         self.* = undefined;
     }
 
@@ -57,17 +72,24 @@ pub const PendingSubmission = struct {
     }
 };
 
-pub const State = struct {
-    pending: ?PendingSubmission = null,
+pub const PendingSkillRefresh = enum {
+    pending,
+    current,
 };
 
-fn buildQueuedPromptDraft(
+pub const State = struct {
+    pending: ?PendingSubmission = null,
+    retry_after_auth: bool = false,
+    compaction_pending: bool = false,
+};
+
+fn buildPendingPromptDraft(
     alloc: std.mem.Allocator,
     turn_id: u64,
     prompt_source: []const u8,
     image_source: []const types.ImageAttachment,
     skill_tokens: []const registered_entities.SkillTokenSpan,
-) !worker_runtime.QueuedPromptDraft {
+) !PendingPromptDraft {
     if (turn_id == 0) return error.InvalidTurnId;
 
     const prompt = try alloc.dupe(u8, prompt_source);
@@ -111,7 +133,112 @@ fn buildQueuedPromptDraft(
 
 pub fn SubmitRuntime(comptime App: type) type {
     return struct {
-        const queue_rt = input_queue_runtime.Runtime(App);
+        pub fn request_context_compaction(app: *App) !void {
+            if (app.submission.compaction_pending) return;
+            if (!app.hasContextToCompact()) {
+                try app.writeDomainNotice(.{ .topic = "context", .tone = .neutral, .body = "No context to compact." }, true);
+                return;
+            }
+            if (app.submission.pending != null or app.worker.isProcessing() or
+                app.worker.queuedPromptCount() > 0 or app.worker.contextCompactionStatus() != .idle)
+            {
+                try app.writeDomainNotice(.{ .topic = "context", .tone = .warning, .body = "Wait for the active work to finish before compacting context." }, true);
+                return;
+            }
+            app.submission.compaction_pending = true;
+            errdefer clear_context_compaction(app, "notice_failed");
+            collect_context_compaction(app);
+            if (app.submission.compaction_pending) {
+                debug_trace.logf("input", "manual_compaction_auth_pending", .{});
+                try app.writeDomainNotice(.{ .topic = "context", .tone = .neutral, .body = "Preparing authentication for compaction. Press Ctrl+C to cancel." }, true);
+            }
+        }
+
+        fn collect_context_compaction(app: *App) void {
+            if (comptime !@hasDecl(App, "enqueueContextCompaction")) return;
+            if (!app.submission.compaction_pending) return;
+            admit_context_compaction(app) catch |err| {
+                clear_context_compaction(app, "admission_failed");
+                app.submission.retry_after_auth = false;
+                debug_trace.logf("input", "manual compaction admission failed err={s}", .{@errorName(err)});
+                var buffer: [256]u8 = undefined;
+                const body = std.fmt.bufPrint(&buffer, "Compaction was not started ({s}). Your conversation is unchanged. Check authentication and try /compact again.", .{@errorName(err)}) catch "Compaction was not started. Your conversation is unchanged. Try /compact again.";
+                app.writeDomainNotice(.{ .topic = "context", .tone = .@"error", .body = body }, true) catch |notice_err| {
+                    debug_trace.logf("input", "manual compaction failure notice failed err={s}", .{@errorName(notice_err)});
+                };
+            };
+        }
+
+        fn admit_context_compaction(app: *App) !void {
+            switch (try App.collectPendingPromptCredential(app)) {
+                .pending => return,
+                .rejected => {
+                    clear_context_compaction(app, "auth_rejected");
+                    app.submission.retry_after_auth = false;
+                    return;
+                },
+                .current => {},
+            }
+            app.submission.compaction_pending = false;
+            const queued = try app.enqueueContextCompaction();
+            app.writeDomainNotice(.{
+                .topic = "context",
+                .tone = if (queued) .neutral else .warning,
+                .body = if (queued) "Compaction queued." else "Wait for the active work to finish before compacting context.",
+            }, true) catch |err| {
+                debug_trace.logf("input", "manual compaction admission notice failed queued={} err={s}", .{ queued, @errorName(err) });
+            };
+        }
+
+        fn clear_context_compaction(app: *App, reason: []const u8) void {
+            if (!app.submission.compaction_pending) return;
+            app.submission.compaction_pending = false;
+            debug_trace.logf("input", "manual compaction intent cleared reason={s}", .{reason});
+            if (comptime @hasField(App, "auth")) {
+                if (comptime @hasDecl(@TypeOf(app.auth), "cancelPromptCredentialRefresh")) app.auth.cancelPromptCredentialRefresh();
+            }
+        }
+
+        pub fn requestPromptRetryAfterAuth(app: *App) void {
+            app.submission.retry_after_auth = true;
+        }
+
+        pub fn cancelPromptRetryAfterAuth(app: *App) void {
+            app.submission.retry_after_auth = false;
+            const pending = app.submission.pending orelse return;
+            if (pending.phase != .awaiting_auth) return;
+            clearPendingSubmission(app, "auth_retry_cancelled");
+            app.shell.render_requests.request(.transcript);
+            app.shell.render_requests.request(.footer);
+        }
+
+        fn takePromptRetryAfterAuth(app: *App) bool {
+            const pending = app.submission.retry_after_auth;
+            app.submission.retry_after_auth = false;
+            return pending;
+        }
+
+        fn resumePendingPromptAfterAuth(app: *App, trigger: []const u8) bool {
+            const pending = if (app.submission.pending) |*value| value else return false;
+            if (pending.phase != .awaiting_auth) return false;
+            pending.phase = .adopted;
+            app.submission.retry_after_auth = false;
+            app.shell.render_requests.request(.footer);
+            debug_trace.eventf(
+                "input",
+                "pending_prompt_auth_resumed",
+                .{ .turn_id = pending.draft.turn_id },
+                "trigger={s}",
+                .{trigger},
+            );
+            return true;
+        }
+
+        pub fn resumePromptAfterAuth(app: *App, max_prompt_history: usize) !void {
+            if (!takePromptRetryAfterAuth(app)) return;
+            if (resumePendingPromptAfterAuth(app, "auth_completion")) return;
+            try submit(app, max_prompt_history);
+        }
         const completion_rt = input_completion_runtime.CompletionRuntime(App);
 
         const PromptAdmission = enum {
@@ -130,19 +257,26 @@ pub fn SubmitRuntime(comptime App: type) type {
             preserve,
         };
 
-        const AcceptedDraftProjection = struct {
+        const ComposerHistoryProjection = struct {
             input: []const u8,
             pasted_blocks: std.ArrayList(paste_blocks.PastedBlock) = .empty,
             image_tokens: std.ArrayList(entity_spans.ImageTokenSpan) = .empty,
             skill_tokens: std.ArrayList(registered_entities.SkillTokenSpan) = .empty,
 
-            fn deinit(self: *AcceptedDraftProjection, alloc: std.mem.Allocator) void {
+            fn deinit(self: *ComposerHistoryProjection, alloc: std.mem.Allocator) void {
                 self.pasted_blocks.deinit(alloc);
                 self.image_tokens.deinit(alloc);
                 self.skill_tokens.deinit(alloc);
                 self.* = undefined;
             }
         };
+
+        fn composerHistoryEnabled(app: *const App) bool {
+            if (comptime @hasField(App, "prompt_history")) {
+                return app.prompt_history.enabled;
+            }
+            return true;
+        }
 
         pub fn noteCommittedFrame(app: *App) void {
             if (comptime !@hasField(App, "submission")) return;
@@ -168,6 +302,7 @@ pub fn SubmitRuntime(comptime App: type) type {
 
         pub fn collectPendingSubmissionFacts(app: *App) void {
             if (comptime !@hasField(App, "submission")) return;
+            collect_context_compaction(app);
             var pending = if (app.submission.pending) |*value| value else return;
             if (pending.phase == .awaiting_adoption) {
                 adoptPendingSubmission(app) catch |err| {
@@ -183,6 +318,60 @@ pub fn SubmitRuntime(comptime App: type) type {
                 pending = &app.submission.pending.?;
             }
             if (pending.phase != .adopted) return;
+
+            if (!pending.credential_admitted) {
+                if (comptime @hasDecl(App, "collectPendingPromptCredential")) {
+                    const readiness = App.collectPendingPromptCredential(app) catch |err| {
+                        finishPendingSubmissionFailure(app, err);
+                        return;
+                    };
+                    switch (readiness) {
+                        .pending => return,
+                        .current => {},
+                        .rejected => {
+                            pending = &app.submission.pending.?;
+                            pending.phase = .awaiting_auth;
+                            requestPromptRetryAfterAuth(app);
+                            debug_trace.eventf(
+                                "input",
+                                "pending_prompt_awaiting_auth",
+                                .{ .turn_id = pending.draft.turn_id },
+                                "",
+                                .{},
+                            );
+                            return;
+                        },
+                    }
+                } else if (comptime @hasDecl(App, "ensurePromptCredential")) {
+                    const admitted = preflightPrompt(app) catch |err| {
+                        finishPendingSubmissionFailure(app, err);
+                        return;
+                    };
+                    pending = &app.submission.pending.?;
+                    if (!admitted) {
+                        pending.phase = .awaiting_auth;
+                        requestPromptRetryAfterAuth(app);
+                        debug_trace.eventf(
+                            "input",
+                            "pending_prompt_awaiting_auth",
+                            .{ .turn_id = pending.draft.turn_id },
+                            "",
+                            .{},
+                        );
+                        return;
+                    }
+                }
+                app.submission.pending.?.credential_admitted = true;
+                pending = &app.submission.pending.?;
+            }
+
+            if (comptime @hasDecl(App, "collectPendingSkillRefresh")) {
+                const readiness = App.collectPendingSkillRefresh(app, pending) catch |err| {
+                    finishPendingSubmissionFailure(app, err);
+                    return;
+                };
+                if (readiness == .pending) return;
+            }
 
             if (pending.draft.prompt.len > 0 and pending.draft.images.len == 0) {
                 recordAcceptedInput(app, pending.draft.prompt);
@@ -231,12 +420,20 @@ pub fn SubmitRuntime(comptime App: type) type {
 
         pub fn cancelPendingSubmission(app: *App) bool {
             if (comptime !@hasField(App, "submission")) return false;
+            if (app.submission.compaction_pending) {
+                clear_context_compaction(app, "cancelled");
+                app.writeDomainNotice(.{ .topic = "context", .tone = .neutral, .body = "Context compaction cancelled." }, true) catch |err| {
+                    debug_trace.logf("input", "manual compaction cancellation notice failed err={s}", .{@errorName(err)});
+                };
+                app.shell.render_requests.request(.footer);
+                return true;
+            }
             const pending = app.submission.pending orelse return false;
             if (pending.phase == .queued) {
-                if (comptime !@hasDecl(@TypeOf(app.worker), "deleteQueuedPromptDraft")) {
+                if (comptime !@hasDecl(@TypeOf(app.worker), "removeQueuedPrompt")) {
                     return false;
                 }
-                if (!app.worker.deleteQueuedPromptDraft(
+                if (!app.worker.removeQueuedPrompt(
                     std.heap.c_allocator,
                     pending.draft.turn_id,
                     pending.draft.images,
@@ -274,6 +471,7 @@ pub fn SubmitRuntime(comptime App: type) type {
         }
 
         pub fn clearPendingSubmission(app: *App, reason: []const u8) void {
+            if (comptime @hasField(App, "submission")) clear_context_compaction(app, reason);
             const snapshot_cleanup: PendingSnapshotCleanup = if (transferPendingImageSnapshotsToComposerHistory(app))
                 .preserve
             else
@@ -282,6 +480,10 @@ pub fn SubmitRuntime(comptime App: type) type {
         }
 
         pub fn clearPendingSubmissionForSessionTransition(app: *App) void {
+            if (comptime @hasField(App, "submission")) clear_context_compaction(app, "session_transition");
+            if (comptime @hasField(App, "auth")) {
+                if (comptime @hasDecl(@TypeOf(app.auth), "cancelProviderPreparation")) _ = app.auth.cancelProviderPreparation();
+            }
             if (comptime !@hasField(App, "submission")) {
                 app.worker.clearQueuedPrompts(std.heap.c_allocator, &.{});
                 return;
@@ -415,31 +617,57 @@ pub fn SubmitRuntime(comptime App: type) type {
             );
         }
 
-        pub const Intent = enum { queue, steer };
-
         pub fn submitInput(app: *App, max_prompt_history: usize) !void {
             try submit(app, max_prompt_history);
         }
 
-        pub fn submitSteering(app: *App, max_prompt_history: usize) !void {
-            try submitWithIntent(app, max_prompt_history, .steer);
-        }
-
         pub fn submit(app: *App, max_prompt_history: usize) !void {
-            try submitWithIntent(app, max_prompt_history, .queue);
-        }
-
-        fn submitWithIntent(app: *App, max_prompt_history: usize, intent: Intent) !void {
             if (comptime @hasField(App, "submission")) {
+                if (app.submission.compaction_pending and !pendingAuthRoutesLocalCommand(app)) return;
                 if (app.submission.pending) |pending| {
-                    debug_trace.eventf(
-                        "input",
-                        "prompt_submit_deferred_for_pending",
-                        .{ .turn_id = pending.draft.turn_id },
-                        "phase={s}",
-                        .{@tagName(pending.phase)},
-                    );
-                    return;
+                    const route_local_command = pending.phase == .awaiting_auth and
+                        pendingAuthRoutesLocalCommand(app);
+                    if (!route_local_command and
+                        pending.phase == .awaiting_auth and
+                        app.input_runtime.edit_state.input.items.len == 0)
+                    {
+                        if (comptime @hasDecl(App, "retryPendingPromptCredential")) {
+                            switch (try App.retryPendingPromptCredential(app)) {
+                                .pending => {
+                                    app.submission.retry_after_auth = false;
+                                    app.submission.pending.?.phase = .adopted;
+                                    app.shell.render_requests.request(.footer);
+                                },
+                                .current => {
+                                    const resumed = resumePendingPromptAfterAuth(app, "submit");
+                                    std.debug.assert(resumed);
+                                },
+                                .rejected => {},
+                            }
+                        } else if (try preflightPrompt(app)) {
+                            const resumed = resumePendingPromptAfterAuth(app, "submit");
+                            std.debug.assert(resumed);
+                        }
+                        return;
+                    }
+                    if (route_local_command) {
+                        debug_trace.eventf(
+                            "input",
+                            "pending_prompt_auth_command_routed",
+                            .{ .turn_id = pending.draft.turn_id },
+                            "",
+                            .{},
+                        );
+                    } else {
+                        debug_trace.eventf(
+                            "input",
+                            "prompt_submit_deferred_for_pending",
+                            .{ .turn_id = pending.draft.turn_id },
+                            "phase={s}",
+                            .{@tagName(pending.phase)},
+                        );
+                        return;
+                    }
                 }
             }
             const expanded_len = paste_blocks.expandedLen(
@@ -507,8 +735,7 @@ pub fn SubmitRuntime(comptime App: type) type {
 
             if (trimmed.len == 0) {
                 if (app.pending_images.items.len > 0) {
-                    if (!try preflightPrompt(app)) return;
-                    const admission = try enqueuePromptForSubmit(app, "", &.{}, null, intent);
+                    const admission = try enqueuePromptForSubmit(app, "", &.{});
                     if (admission == .rejected) return;
                     releasePendingImages(app);
                     app.input_runtime.inputResetState().clearCurrent(app.alloc);
@@ -516,11 +743,6 @@ pub fn SubmitRuntime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                     }
                     return;
-                }
-                if (comptime @hasField(App, "queued_prompt_review")) {
-                    if (try queue_rt.submitPausedQueueUnchanged(app)) {
-                        return;
-                    }
                 }
                 app.input_runtime.inputResetState().clearCurrent(app.alloc);
                 app.shell.render_requests.request(.footer);
@@ -562,8 +784,6 @@ pub fn SubmitRuntime(comptime App: type) type {
 
             const has_inline_images = extracted.images.len > 0;
             const effective_text = if (has_inline_images) extracted.text else expanded.text;
-
-            if (!try preflightPrompt(app)) return;
 
             var staged_images = if (app.pending_images.items.len > 0 or extracted.images.len > 0)
                 try stagePendingImages(app.alloc, app.pending_images.items, extracted.images)
@@ -611,15 +831,18 @@ pub fn SubmitRuntime(comptime App: type) type {
                 image_occurrences.items,
             );
             defer if (display_skill_tokens.len > 0) app.alloc.free(display_skill_tokens);
-            var accepted_draft = try prepareAcceptedDraftProjection(
-                app,
-                expanded.text,
-                visual_text.text,
-                display_skill_tokens,
-                image_occurrences.items,
-                has_inline_images,
-            );
-            defer accepted_draft.deinit(app.alloc);
+            var history_projection: ?ComposerHistoryProjection = if (composerHistoryEnabled(app))
+                try prepareComposerHistoryProjection(
+                    app,
+                    expanded.text,
+                    visual_text.text,
+                    display_skill_tokens,
+                    image_occurrences.items,
+                    has_inline_images,
+                )
+            else
+                null;
+            defer if (history_projection) |*projection| projection.deinit(app.alloc);
             const has_images_for_submit = if (staged_images) |*images|
                 images.items.len > 0
             else
@@ -630,27 +853,25 @@ pub fn SubmitRuntime(comptime App: type) type {
                     app,
                     visual_text.text,
                     display_skill_tokens,
-                    &accepted_draft,
                     images,
-                    intent,
                 )
             else
                 try enqueuePromptForSubmit(
                     app,
                     visual_text.text,
                     display_skill_tokens,
-                    &accepted_draft,
-                    intent,
                 );
             if (admission == .rejected) return;
             commitStableExtractedImageIds(app, extracted.images);
             commitRemappedImageIds(app, visual_text.next_image_id);
             if (visual_text.text.len > 0) {
-                recordAcceptedPromptComposerHistory(
-                    app,
-                    max_prompt_history,
-                    &accepted_draft,
-                );
+                if (history_projection) |*projection| {
+                    recordAcceptedPromptComposerHistory(
+                        app,
+                        max_prompt_history,
+                        projection,
+                    );
+                }
             }
             if (admission == .enqueued and !has_images_for_submit and visual_text.text.len > 0) {
                 recordAcceptedInput(app, visual_text.text);
@@ -674,6 +895,17 @@ pub fn SubmitRuntime(comptime App: type) type {
                 return App.ensurePromptCredential(app);
             }
             return true;
+        }
+
+        fn pendingAuthRoutesLocalCommand(app: *App) bool {
+            const input = std.mem.trimStart(
+                u8,
+                app.input_runtime.edit_state.input.items,
+                " \t\r\n",
+            );
+            const submission = resolvedSlashSubmission(app, input);
+            const command = knownSlashCommand(app, submission) orelse return false;
+            return !requiresPromptCredential(command, submission);
         }
 
         fn knownSlashCommand(app: *const App, text: []const u8) ?*const command_specs.SlashSpec {
@@ -853,64 +1085,17 @@ pub fn SubmitRuntime(comptime App: type) type {
             app: *App,
             prompt: []const u8,
             skill_tokens: []const registered_entities.SkillTokenSpan,
-            accepted_draft: ?*const AcceptedDraftProjection,
-            intent: Intent,
         ) !PromptAdmission {
-            if (intent == .queue) {
-                switch (try installPendingSubmission(app, prompt, skill_tokens)) {
-                    .installed => return .pending,
-                    .unavailable => {},
-                }
+            switch (try installPendingSubmission(app, prompt, skill_tokens)) {
+                .installed => return .pending,
+                .unavailable => {},
             }
-            const resume_review = if (comptime @hasField(App, "queued_prompt_review"))
-                app.queued_prompt_review.active()
-            else
-                false;
-            if (comptime @hasField(App, "queued_prompt_review")) {
-                switch (try queue_rt.promptAdmission(
-                    app,
-                    if (accepted_draft) |draft| draft.input else prompt,
-                    if (accepted_draft) |draft| draft.pasted_blocks.items else &.{},
-                    if (accepted_draft) |draft| draft.image_tokens.items else &.{},
-                    if (accepted_draft) |draft| draft.skill_tokens.items else skill_tokens,
-                )) {
-                    .replaced => {
-                        return .enqueued;
-                    },
-                    .enqueue => {},
-                }
-            }
-
-            const accepted = if (intent == .steer and
-                (comptime @hasDecl(App, "steerPrompt")))
-                try App.steerPrompt(app, prompt)
-            else if (comptime @hasDecl(App, "enqueuePromptWithReviewDraft")) blk: {
-                if (accepted_draft) |draft| {
-                    break :blk try App.enqueuePromptWithReviewDraft(
-                        app,
-                        prompt,
-                        skill_tokens,
-                        draft.input,
-                        draft.pasted_blocks.items,
-                        draft.image_tokens.items,
-                        draft.skill_tokens.items,
-                    );
-                }
-                break :blk try App.enqueuePromptWithSkillBindings(
-                    app,
-                    prompt,
-                    skill_tokens,
-                );
-            } else if (comptime @hasDecl(App, "enqueuePromptWithSkillBindings"))
+            if (!try preflightPrompt(app)) return .rejected;
+            const accepted = if (comptime @hasDecl(App, "enqueuePromptWithSkillBindings"))
                 try App.enqueuePromptWithSkillBindings(app, prompt, skill_tokens)
             else
                 try App.enqueuePrompt(app, prompt);
             if (!accepted) return .rejected;
-            if (resume_review) {
-                if (comptime @hasField(App, "queued_prompt_review")) {
-                    queue_rt.resumeAfterNewPrompt(app);
-                }
-            }
             return .enqueued;
         }
 
@@ -943,7 +1128,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             if (!app.worker.tryHoldTurnStart()) return .unavailable;
             errdefer app.worker.releaseTurnStartHold();
 
-            const draft = try buildQueuedPromptDraft(
+            const draft = try buildPendingPromptDraft(
                 app.alloc,
                 debug_trace.nextTurnId(),
                 prompt,
@@ -967,9 +1152,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             app: *App,
             prompt: []const u8,
             skill_tokens: []const registered_entities.SkillTokenSpan,
-            accepted_draft: *const AcceptedDraftProjection,
             staged_images: *std.ArrayList(types.ImageAttachment),
-            intent: Intent,
         ) !PromptAdmission {
             const original_images = app.pending_images;
             app.pending_images = staged_images.*;
@@ -983,8 +1166,6 @@ pub fn SubmitRuntime(comptime App: type) type {
                 app,
                 prompt,
                 skill_tokens,
-                accepted_draft,
-                intent,
             );
             if (admission == .rejected) {
                 staged_images.* = app.pending_images;
@@ -1183,16 +1364,16 @@ pub fn SubmitRuntime(comptime App: type) type {
         fn recordAcceptedPromptComposerHistory(
             app: *App,
             max_prompt_history: usize,
-            accepted: *const AcceptedDraftProjection,
+            projection: *const ComposerHistoryProjection,
         ) void {
             recordComposerHistory(
                 app,
                 max_prompt_history,
-                accepted.input,
-                accepted.pasted_blocks.items,
+                projection.input,
+                projection.pasted_blocks.items,
                 app.pending_images.items,
-                accepted.image_tokens.items,
-                accepted.skill_tokens.items,
+                projection.image_tokens.items,
+                projection.skill_tokens.items,
             );
         }
 
@@ -1242,14 +1423,14 @@ pub fn SubmitRuntime(comptime App: type) type {
             };
         }
 
-        fn prepareAcceptedDraftProjection(
+        fn prepareComposerHistoryProjection(
             app: *App,
             expanded_text: []const u8,
             visual_text: []const u8,
             display_skill_tokens: []const registered_entities.SkillTokenSpan,
             image_occurrences: []const ImageOccurrence,
             has_extracted_images: bool,
-        ) !AcceptedDraftProjection {
+        ) !ComposerHistoryProjection {
             var submitted_image_tokens: std.ArrayList(entity_spans.ImageTokenSpan) = .empty;
             defer submitted_image_tokens.deinit(app.alloc);
             try submitted_image_tokens.ensureTotalCapacity(
@@ -1270,7 +1451,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             if (app.input_runtime.entities.pasted_blocks.items.len > 0 and
                 !has_extracted_images)
             {
-                if (try prepareCompactAcceptedDraftProjection(
+                if (try prepareCompactComposerHistoryProjection(
                     app,
                     expanded_text,
                     visual_text,
@@ -1293,7 +1474,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                 );
             }
 
-            var fallback = AcceptedDraftProjection{ .input = visual_text };
+            var fallback = ComposerHistoryProjection{ .input = visual_text };
             errdefer fallback.deinit(app.alloc);
             try fallback.image_tokens.appendSlice(
                 app.alloc,
@@ -1306,19 +1487,19 @@ pub fn SubmitRuntime(comptime App: type) type {
             return fallback;
         }
 
-        fn prepareCompactAcceptedDraftProjection(
+        fn prepareCompactComposerHistoryProjection(
             app: *App,
             expanded_text: []const u8,
             visual_text: []const u8,
             display_skill_tokens: []const registered_entities.SkillTokenSpan,
             submitted_image_tokens: []const entity_spans.ImageTokenSpan,
-        ) !?AcceptedDraftProjection {
+        ) !?ComposerHistoryProjection {
             const raw_input = app.input_runtime.edit_state.input.items;
             if (!std.mem.eql(u8, expanded_text, visual_text)) return null;
             const raw_start: usize = 0;
             const raw_end = raw_input.len;
 
-            var compact = AcceptedDraftProjection{
+            var compact = ComposerHistoryProjection{
                 .input = raw_input[raw_start..raw_end],
             };
             var transferred = false;
@@ -1963,7 +2144,7 @@ test "direct terminal route requires the literal first character" {
 
 test "pending submission phase methods keep hold ownership explicit" {
     const alloc = std.testing.allocator;
-    var pending = PendingSubmission.init(try buildQueuedPromptDraft(
+    var pending = PendingSubmission.init(try buildPendingPromptDraft(
         alloc,
         41,
         "use $review",
@@ -2001,7 +2182,7 @@ test "pending submission phase methods keep hold ownership explicit" {
 }
 
 fn checkPendingDraftConstructionAllocationFailure(alloc: std.mem.Allocator) !void {
-    const draft = try buildQueuedPromptDraft(
+    const draft = try buildPendingPromptDraft(
         alloc,
         77,
         "hello $review",
@@ -2017,7 +2198,7 @@ fn checkPendingDraftConstructionAllocationFailure(alloc: std.mem.Allocator) !voi
             .path = "/tmp/review/SKILL.md",
         }},
     );
-    defer worker_runtime.freeQueuedPromptDraft(alloc, draft);
+    defer draft.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 77), draft.turn_id);
     try std.testing.expectEqualStrings("hello $review", draft.prompt);
     try std.testing.expectEqual(@as(usize, 1), draft.images.len);
@@ -2032,7 +2213,163 @@ test "pending draft construction frees every partial allocation" {
     );
 }
 
+const CompactionAdmissionFake = struct {
+    alloc: std.mem.Allocator = std.testing.allocator,
+    submission: State = .{},
+    has_context: bool = true,
+    readiness: enum { pending, current, rejected } = .pending,
+    readiness_error: ?anyerror = null,
+    enqueue_error: ?anyerror = null,
+    credential_checks: usize = 0,
+    enqueue_count: usize = 0,
+    notice_error: bool = false,
+    notice_count: usize = 0,
+    notices: std.ArrayList(u8) = .empty,
+    auth: struct {
+        cancelled: usize = 0,
+        pub fn cancelPromptCredentialRefresh(self: *@This()) void {
+            self.cancelled += 1;
+        }
+    } = .{},
+    shell: struct { render_requests: @import("../../ui/render_request.zig").RenderRequestState = .{} } = .{},
+    worker: struct {
+        busy: bool = false,
+        queued: usize = 0,
+        status: worker_runtime.ContextCompactionStatus = .idle,
+        released_holds: usize = 0,
+        pub fn isProcessing(self: *@This()) bool {
+            return self.busy;
+        }
+        pub fn queuedPromptCount(self: *@This()) usize {
+            return self.queued;
+        }
+        pub fn contextCompactionStatus(self: *@This()) worker_runtime.ContextCompactionStatus {
+            return self.status;
+        }
+        pub fn releaseTurnStartHold(self: *@This()) void {
+            self.released_holds += 1;
+        }
+        pub fn clearQueuedPrompts(self: *@This(), _: std.mem.Allocator, _: []const types.ImageAttachment) void {
+            self.queued = 0;
+        }
+    } = .{},
+
+    fn deinit(self: *CompactionAdmissionFake) void {
+        SubmitRuntime(CompactionAdmissionFake).clear_context_compaction(self, "test_cleanup");
+        self.notices.deinit(self.alloc);
+    }
+    pub fn hasContextToCompact(self: *CompactionAdmissionFake) bool {
+        return self.has_context;
+    }
+    pub fn collectPendingPromptCredential(self: *CompactionAdmissionFake) !@TypeOf(self.readiness) {
+        self.credential_checks += 1;
+        if (self.readiness_error) |err| return err;
+        return self.readiness;
+    }
+    pub fn enqueueContextCompaction(self: *CompactionAdmissionFake) !bool {
+        if (self.enqueue_error) |err| return err;
+        self.enqueue_count += 1;
+        return true;
+    }
+    pub fn writeDomainNotice(self: *CompactionAdmissionFake, notice: types.SemanticNotice, _: bool) !void {
+        self.notice_count += 1;
+        if (self.notice_error) return error.OutOfMemory;
+        try self.notices.appendSlice(self.alloc, notice.body);
+    }
+};
+
+test "manual compaction admission waits for authentication and enqueues once" {
+    var app: CompactionAdmissionFake = .{};
+    defer app.deinit();
+    const Runtime = SubmitRuntime(CompactionAdmissionFake);
+    try Runtime.request_context_compaction(&app);
+    try Runtime.request_context_compaction(&app);
+    try std.testing.expect(app.submission.compaction_pending);
+    try std.testing.expectEqual(@as(usize, 1), app.credential_checks);
+    try std.testing.expectEqual(@as(usize, 0), app.enqueue_count);
+    app.readiness = .current;
+    Runtime.collect_context_compaction(&app);
+    Runtime.collect_context_compaction(&app);
+    try std.testing.expect(!app.submission.compaction_pending);
+    try std.testing.expectEqual(@as(usize, 1), app.enqueue_count);
+    try std.testing.expectEqual(@as(usize, 0), app.auth.cancelled);
+}
+
+test "manual compaction empty and busy admission does not prepare authentication" {
+    for (0..4) |case| {
+        var app: CompactionAdmissionFake = .{};
+        defer app.deinit();
+        switch (case) {
+            0 => app.has_context = false,
+            1 => app.worker.busy = true,
+            2 => app.worker.queued = 1,
+            3 => app.worker.status = .queued,
+            else => unreachable,
+        }
+        try SubmitRuntime(CompactionAdmissionFake).request_context_compaction(&app);
+        try std.testing.expect(!app.submission.compaction_pending);
+        try std.testing.expectEqual(@as(usize, 0), app.credential_checks);
+        try std.testing.expectEqual(@as(usize, 0), app.enqueue_count);
+    }
+}
+
+test "manual compaction rejected authentication cannot submit a draft later" {
+    var app: CompactionAdmissionFake = .{ .readiness = .rejected };
+    defer app.deinit();
+    app.submission.retry_after_auth = true;
+    try SubmitRuntime(CompactionAdmissionFake).request_context_compaction(&app);
+    try std.testing.expect(!app.submission.compaction_pending);
+    try std.testing.expect(!app.submission.retry_after_auth);
+    app.readiness = .current;
+    SubmitRuntime(CompactionAdmissionFake).collect_context_compaction(&app);
+    try std.testing.expectEqual(@as(usize, 0), app.enqueue_count);
+}
+
+test "manual compaction admission errors stay local and release pending ownership" {
+    for ([_]bool{ false, true }) |after_readiness| {
+        var app: CompactionAdmissionFake = .{ .readiness = .current };
+        defer app.deinit();
+        if (after_readiness) app.enqueue_error = error.MissingApiKey else app.readiness_error = error.OutOfMemory;
+        try SubmitRuntime(CompactionAdmissionFake).request_context_compaction(&app);
+        try std.testing.expect(!app.submission.compaction_pending);
+        try std.testing.expectEqual(@as(usize, 0), app.enqueue_count);
+        try std.testing.expect(std.mem.find(u8, app.notices.items, "Your conversation is unchanged.") != null);
+    }
+}
+
+test "manual compaction queued work is not reported unstarted after a notice failure" {
+    var app: CompactionAdmissionFake = .{ .readiness = .current, .notice_error = true };
+    defer app.deinit();
+    try SubmitRuntime(CompactionAdmissionFake).request_context_compaction(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.enqueue_count);
+    try std.testing.expectEqual(@as(usize, 1), app.notice_count);
+    try std.testing.expect(!app.submission.compaction_pending);
+}
+
+test "manual compaction cancellation and transition clearing prevent late enqueue" {
+    for (0..3) |boundary| {
+        var app: CompactionAdmissionFake = .{};
+        defer app.deinit();
+        const Runtime = SubmitRuntime(CompactionAdmissionFake);
+        try Runtime.request_context_compaction(&app);
+        switch (boundary) {
+            0 => try std.testing.expect(Runtime.cancelPendingSubmission(&app)),
+            1 => Runtime.clearPendingSubmissionForSessionTransition(&app),
+            2 => Runtime.clearPendingSubmission(&app, "shutdown"),
+            else => unreachable,
+        }
+        Runtime.clearPendingSubmission(&app, "repeated_cleanup");
+        app.readiness = .current;
+        Runtime.collect_context_compaction(&app);
+        try std.testing.expectEqual(@as(usize, 1), app.auth.cancelled);
+        try std.testing.expectEqual(@as(usize, 0), app.enqueue_count);
+        try std.testing.expectEqual(@as(usize, 0), app.worker.released_holds);
+    }
+}
+
 const PendingLifecycleFake = struct {
+    const CredentialReadiness = enum { pending, current, rejected };
+
     alloc: std.mem.Allocator,
     submission: State = .{},
     worker: struct {
@@ -2049,7 +2386,7 @@ const PendingLifecycleFake = struct {
             self.release_count += 1;
         }
 
-        pub fn deleteQueuedPromptDraft(
+        pub fn removeQueuedPrompt(
             self: *@This(),
             _: std.mem.Allocator,
             turn_id: u64,
@@ -2077,6 +2414,9 @@ const PendingLifecycleFake = struct {
     finalization_count: usize = 0,
     finalization_error: bool = false,
     notice_count: usize = 0,
+    credential_checks: usize = 0,
+    skill_refresh: enum { pending, current, failed } = .current,
+    skill_refresh_checks: usize = 0,
 
     fn deinit(self: *PendingLifecycleFake) void {
         SubmitRuntime(PendingLifecycleFake).clearPendingSubmission(self, "test_deinit");
@@ -2084,7 +2424,7 @@ const PendingLifecycleFake = struct {
 
     pub fn adoptPendingUserPrompt(
         self: *PendingLifecycleFake,
-        _: *const worker_runtime.QueuedPromptDraft,
+        _: *const PendingPromptDraft,
     ) !void {
         if (self.adoption_failures_remaining > 0) {
             self.adoption_failures_remaining -= 1;
@@ -2095,11 +2435,33 @@ const PendingLifecycleFake = struct {
 
     pub fn finalizePendingSubmission(
         self: *PendingLifecycleFake,
-        draft: *const worker_runtime.QueuedPromptDraft,
+        draft: *const PendingPromptDraft,
     ) !void {
         self.finalization_count += 1;
         if (self.finalization_error) return error.InjectedFinalizationFailure;
         self.worker.queued_turn_id = draft.turn_id;
+    }
+
+    pub fn collectPendingPromptCredential(
+        self: *PendingLifecycleFake,
+    ) !CredentialReadiness {
+        self.credential_checks += 1;
+        return .current;
+    }
+
+    pub fn collectPendingSkillRefresh(
+        self: *PendingLifecycleFake,
+        pending: *PendingSubmission,
+    ) !PendingSkillRefresh {
+        self.skill_refresh_checks += 1;
+        if (pending.skill_refresh_generation == null) {
+            pending.skill_refresh_generation = 1;
+        }
+        return switch (self.skill_refresh) {
+            .pending => .pending,
+            .current => .current,
+            .failed => error.InjectedSkillRefreshFailure,
+        };
     }
 
     pub fn writeDomainNotice(
@@ -2114,7 +2476,7 @@ const PendingLifecycleFake = struct {
 fn pendingLifecycleFake(alloc: std.mem.Allocator, turn_id: u64) !PendingLifecycleFake {
     return .{
         .alloc = alloc,
-        .submission = .{ .pending = PendingSubmission.init(try buildQueuedPromptDraft(
+        .submission = .{ .pending = PendingSubmission.init(try buildPendingPromptDraft(
             alloc,
             turn_id,
             "visible prompt",
@@ -2131,7 +2493,7 @@ fn pendingLifecycleFakeWithSnapshot(
 ) !PendingLifecycleFake {
     return .{
         .alloc = alloc,
-        .submission = .{ .pending = PendingSubmission.init(try buildQueuedPromptDraft(
+        .submission = .{ .pending = PendingSubmission.init(try buildPendingPromptDraft(
             alloc,
             turn_id,
             "visible image prompt",
@@ -2187,6 +2549,31 @@ test "post-commit adoption failure keeps one retryable owner and hold" {
     try Runtime.acceptPresentedPrompt(&app, 501);
     try std.testing.expect(app.submission.pending == null);
     try std.testing.expectEqual(@as(usize, 1), app.worker.release_count);
+}
+
+test "pending submission waits for its skill catalog generation before queueing" {
+    const Runtime = SubmitRuntime(PendingLifecycleFake);
+    var app = try pendingLifecycleFake(std.testing.allocator, 502);
+    defer app.deinit();
+    app.skill_refresh = .pending;
+
+    Runtime.noteCommittedFrame(&app);
+    Runtime.collectPendingSubmissionFacts(&app);
+    try std.testing.expectEqual(PendingPhase.adopted, app.submission.pending.?.phase);
+    try std.testing.expect(app.worker.held);
+    try std.testing.expectEqual(@as(usize, 1), app.credential_checks);
+    try std.testing.expectEqual(@as(usize, 0), app.finalization_count);
+    try std.testing.expectEqual(@as(?u64, 1), app.submission.pending.?.skill_refresh_generation);
+
+    Runtime.collectPendingSubmissionFacts(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.credential_checks);
+
+    app.skill_refresh = .current;
+    Runtime.collectPendingSubmissionFacts(&app);
+    try std.testing.expectEqual(PendingPhase.queued, app.submission.pending.?.phase);
+    try std.testing.expect(!app.worker.held);
+    try std.testing.expectEqual(@as(usize, 1), app.credential_checks);
+    try std.testing.expectEqual(@as(usize, 1), app.finalization_count);
 }
 
 test "post-ack finalization failure leaves notice and consumes pending owner" {

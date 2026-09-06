@@ -589,6 +589,7 @@ fn replaceActiveComposer(
         );
     }
     active.picker.clearModelPickerFlow();
+    active.picker.clearProviderPickerFlow();
 
     var previous_text: std.ArrayList(u8) = .empty;
     active.edit.swapInput(&previous_text);

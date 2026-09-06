@@ -158,20 +158,6 @@ fn projectPayloadV4(payload: contracts.MessagePayload) contracts.MessagePayload 
 }
 
 fn projectResultV4(result: contracts.Result) contracts.Result {
-    const inspect = switch (result) {
-        .success => |success| switch (success) {
-            .inspect => |value| value,
-            else => return result,
-        },
-        .failure => return result,
-    };
-    for (inspect.monitors) |monitor| {
-        if (monitor.state == .degraded) return .{ .failure = .{
-            .action = .inspect,
-            .code = .protocol_incompatible,
-            .session_id = inspect.session.session_id,
-        } };
-    }
     return result;
 }
 
@@ -468,35 +454,6 @@ test "host protocol preserves opaque terminal output bytes" {
         .failure => return error.TestExpectedSuccess,
     };
     try std.testing.expectEqualSlices(u8, &output, read.output);
-}
-
-test "revision four projection never exposes degraded monitor state" {
-    var response = try encodeFrame(
-        std.testing.allocator,
-        contracts.previous_protocol_revision,
-        0,
-        .{ .value = 1 },
-        .{ .response = .{ .success = .{ .inspect = .{
-            .session = .{
-                .session_id = "terminal-1",
-                .lifecycle = .running,
-                .attention = .{},
-                .backend = .tmux,
-                .output_cursor = .{ .segment = 1, .offset = 0 },
-                .screen_recovery = .{ .unavailable = .raw_gap },
-            },
-            .shell = "/bin/sh",
-            .cwd = "/workspace",
-            .monitors = &.{.{
-                .monitor_id = "monitor-1",
-                .state = .degraded,
-            }},
-        } } } },
-    );
-    defer response.deinit(std.testing.allocator);
-    const response_json = response.bytes[header_len..];
-    try std.testing.expect(std.mem.find(u8, response_json, "degraded") == null);
-    try std.testing.expect(std.mem.find(u8, response_json, "protocol_incompatible") != null);
 }
 
 fn expectProjectedErrorCode(

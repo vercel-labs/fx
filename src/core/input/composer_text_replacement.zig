@@ -79,6 +79,7 @@ pub const State = struct {
         self.vertical_navigation.reset();
         input_reset.discardSelectionWithTrace(self.edit, "input_replaced");
         self.picker.clearModelPickerFlow();
+        self.picker.clearProviderPickerFlow();
         traceDroppedEntities(prepared_replacement.dropped_entities);
         pasted_blocks.clearBlocks(alloc, &self.entities.pasted_blocks);
         self.entities.clearImageAndSkillTokens(alloc);

@@ -57,6 +57,7 @@
   </form>
   <script type="module">
     import { createFxAgent, supportsJspi } from "./browser.js";
+    import { createSkillsAdapter } from "./skills.js";
 
     const configPrefix = "fx.core.config.";
     const configStore = {
@@ -73,6 +74,8 @@
     const initialMode = params.get("mode");
     const permission = params.get("permission") || "prompt";
     const forceUnsupported = params.has("force-unsupported");
+    const hostToolEnabled = params.has("host-tool");
+    const hostSkillEnabled = params.has("host-skill");
     const status = document.querySelector("#status");
     const timeline = document.querySelector("#timeline");
     const form = document.querySelector("form");
@@ -92,10 +95,14 @@
       chunks: [],
       fetchCalls: 0,
       fetchAborted: false,
+      toolCalls: 0,
+      toolAdvertised: false,
+      toolResultSent: false,
+      skillSent: false,
       stopReason: null,
       error: null,
     };
-    let session;
+    let agent;
     let activeTurn = false;
     let currentTurn = null;
 
@@ -135,11 +142,6 @@
       if (event.type === "acp.send" && message?.method === "session/prompt") return;
       if (event.type === "acp.receive" && message?.method === "session/update") {
         const update = message.params.update;
-        if (update.sessionUpdate === "agent_message_chunk") {
-          test.chunks.push(update.content.text);
-          append("agent", update.content.text, { tone: "agent", timestamp: event.timestamp });
-          return;
-        }
         append(`update.${update.sessionUpdate}`, update.sessionUpdate, { timestamp: event.timestamp, raw: update });
         return;
       }
@@ -167,13 +169,28 @@
         }, { once: true });
         return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
       }
+      if (hostToolEnabled && test.fetchCalls === 1) {
+        const payload = JSON.parse(new TextDecoder().decode(init.body));
+        test.toolAdvertised = payload.tools?.some((tool) => tool.name === "browser_echo") === true;
+        test.skillSent = JSON.stringify(payload).includes("BROWSER_SKILL_SENTINEL");
+        return new Response([
+          'data: {"type":"tool-call","toolCallId":"browser_tool_1","toolName":"browser_echo","input":{"value":"hello"}}',
+          'data: {"type":"finish","finishReason":{"unified":"tool-calls","raw":"tool-calls"}}',
+          "data: [DONE]",
+          "",
+        ].join("\n\n"), { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
+      if (hostToolEnabled && test.fetchCalls === 2) {
+        test.toolResultSent = new TextDecoder().decode(init.body).includes("browser:hello");
+        return new Response('data: {"type":"text-delta","delta":"tool done"}\n\ndata: {"type":"finish","finishReason":{"unified":"stop","raw":"stop"}}\n\ndata: [DONE]\n\n', { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
       return new Response(new ReadableStream({
         async start(controller) {
-          controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"hello"}\n'));
+          controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"hello"}\n\n'));
           await sleep(chunkDelay);
-          controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":" world"}\n'));
-          controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"},"usage":{"inputTokens":{"total":3},"outputTokens":{"total":2}}}\n'));
-          controller.enqueue(encoded.encode("data: [DONE]\n"));
+          controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":" world"}\n\n'));
+          controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"},"usage":{"inputTokens":{"total":3},"outputTokens":{"total":2}}}\n\n'));
+          controller.enqueue(encoded.encode("data: [DONE]\n\n"));
           controller.close();
         },
       }), { status: 200, headers: { "content-type": "text/event-stream" } });
@@ -255,11 +272,15 @@
       status.textContent = "running";
       let cancelTimer;
       try {
-        const turn = session.prompt(prompt);
+        const turn = agent.prompt(prompt);
         currentTurn = turn;
         if (cancelAfter > 0) cancelTimer = setTimeout(() => turn.cancel(), cancelAfter);
-        for await (const _update of turn) {}
-        const reason = await turn.stopReason;
+        for await (const event of turn) {
+          if (event.type !== "text_delta") continue;
+          test.chunks.push(event.delta);
+          append("agent", event.delta, { tone: "agent" });
+        }
+        const reason = (await turn.result).stopReason;
         test.stopReason = reason;
         append("turn.stop", reason, { tone: "lifecycle" });
         status.textContent = `ready · last stop: ${reason}`;
@@ -281,34 +302,37 @@
       setState("unsupported");
     } else {
       try {
-        const agent = await createFxAgent({
+        const skillAdapter = hostSkillEnabled ? createSkillsAdapter([{
+          name: "browser-skill",
+          instructions: "BROWSER_SKILL_SENTINEL",
+        }]) : { instructions: "", tools: [] };
+        agent = await createFxAgent({
           wasm: location.hostname === "localhost" || location.hostname === "127.0.0.1"
             ? "../zig-out/bin/fx-core.wasm"
             : "./fx-core.wasm",
-          env: { AI_GATEWAY_API_KEY: localStorage.getItem("FX_API_KEY") || "sdk-test-key" },
+          apiKey: localStorage.getItem("FX_API_KEY") || "sdk-test-key",
+          ...(initialModel ? { model: initialModel } : {}),
           fetch: dispatchFetch,
           onEvent: observe,
           onPermission: resolvePermission,
-          configStore,
+          instructions: skillAdapter.instructions,
+          tools: hostToolEnabled ? [{
+            name: "browser_echo",
+            description: "Echo in the browser host",
+            inputSchema: { type: "object", properties: { value: { type: "string" } }, required: ["value"] },
+            execute(input, { signal }) {
+              if (signal.aborted) throw new DOMException("aborted", "AbortError");
+              test.toolCalls += 1;
+              return `browser:${input.value}`;
+            },
+          }] : skillAdapter.tools,
         });
-        session = await agent.createSession();
-        test.sessionId = session.id;
-        renderConfigOptions(session.configOptions);
-        if (initialModel) {
-          modelSelect.value = initialModel;
-          renderConfigOptions(await session.setModel(initialModel));
-        }
-        if (initialMode) {
-          modeSelect.value = initialMode;
-          renderConfigOptions(await session.setMode(initialMode));
-        }
-        modelSelect.dataset.current = modelSelect.value;
-        modeSelect.dataset.current = modeSelect.value;
-        test.model = modelSelect.value;
-        test.mode = modeSelect.value;
-        status.textContent = `ready · ${session.id}`;
+        test.model = initialModel || "default";
+        test.mode = initialMode || "default";
+        test.api = Object.keys(agent).sort();
+        status.textContent = "ready";
         status.className = "ready";
-        append("session.ready", session.id, { tone: "lifecycle", raw: session.modes });
+        append("agent.ready", "prompt · checkpoint · close", { tone: "lifecycle" });
         setState("ready");
         setActive(false);
         if (autorun) await runPrompt(autorun);
@@ -327,8 +351,6 @@
       await runPrompt(prompt);
     });
 
-    modelSelect.addEventListener("change", () => applyConfig(modelSelect, "model", (value) => session.setModel(value)));
-    modeSelect.addEventListener("change", () => applyConfig(modeSelect, "mode", (value) => session.setMode(value)));
     transportSelect.addEventListener("change", () => {
       transport = transportSelect.value;
       test.transport = transport;

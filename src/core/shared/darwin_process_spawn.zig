@@ -259,7 +259,7 @@ fn add_inherit_or_dup(
     }
 }
 
-fn inherited_fd_target(source: std.posix.fd_t) std.posix.fd_t {
+pub fn inherited_fd_target(source: std.posix.fd_t) std.posix.fd_t {
     return if (source == preferred_inherited_fd_target)
         preferred_inherited_fd_target + 1
     else

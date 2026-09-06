@@ -1,7 +1,6 @@
 const std = @import("std");
 
 pub const max_source_entries: usize = 256;
-pub const live_refresh_revision_stride: u64 = 8;
 
 pub const Anchor = union(enum) {
     tail,
@@ -47,10 +46,6 @@ pub fn sameRequest(lhs: Request, rhs: Request) bool {
 
 pub fn sameSurface(lhs: Request, rhs: Request) bool {
     return lhs.cols == rhs.cols and std.meta.eql(lhs.anchor, rhs.anchor);
-}
-
-pub fn liveRefreshDue(installed_revision: u64, current_revision: u64) bool {
-    return current_revision -% installed_revision >= live_refresh_revision_stride;
 }
 
 pub fn previousAnchor(range: SourceRange) ?Anchor {
@@ -136,12 +131,6 @@ test "full transcript page surface ignores revisions but not width or anchor" {
     changed.cols = original.cols;
     changed.anchor = .{ .entry_index = 42 };
     try std.testing.expect(!sameSurface(original, changed));
-}
-
-test "live full transcript refresh is bounded by revision stride" {
-    try std.testing.expect(!liveRefreshDue(40, 47));
-    try std.testing.expect(liveRefreshDue(40, 48));
-    try std.testing.expect(liveRefreshDue(std.math.maxInt(u64) - 3, 4));
 }
 
 test "full transcript page navigation stops at document boundaries" {

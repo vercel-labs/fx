@@ -1,6 +1,6 @@
 const std = @import("std");
 const common = @import("common.zig");
-const feature_cache = @import("../feature_cache.zig");
+const catalog_freshness = @import("../catalog_freshness.zig");
 const json_number = @import("../json_number.zig");
 const mrtr = @import("../mrtr.zig");
 const sort_utils = @import("../../shared/sort_utils.zig");
@@ -948,7 +948,7 @@ fn validatePageTransition(
     pages.* = next_pages;
     if (first_received_at_ms.* == null) first_received_at_ms.* = received_at_ms;
     cache_scope.* = cache_scope.* orelse cache.scope;
-    const page_expiry = feature_cache.pageExpiry(
+    const page_expiry = catalog_freshness.pageExpiry(
         switch (protocol) {
             .legacy => .legacy,
             .modern => .modern,
@@ -957,7 +957,7 @@ fn validatePageTransition(
         cache.ttl_present,
         cache.ttl_ms,
     );
-    expires_at_ms.* = feature_cache.earliestExpiry(expires_at_ms.*, page_expiry);
+    expires_at_ms.* = catalog_freshness.earliestExpiry(expires_at_ms.*, page_expiry);
 }
 
 fn buildPaginatedRequest(alloc: Allocator, request_id: u64, protocol: Protocol, method: []const u8, cursor: ?[]const u8, write_modern_metadata: *const fn (*std.Io.Writer) anyerror!void) ![]u8 {

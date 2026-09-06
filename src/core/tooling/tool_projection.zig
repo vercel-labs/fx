@@ -1,6 +1,5 @@
 const std = @import("std");
 const model_tool_schema = @import("model_tool_schema.zig");
-const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const permissions = @import("../permissions/permissions.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
 const tool_set_contract = @import("tool_set.zig");
@@ -11,7 +10,6 @@ const Allocator = std.mem.Allocator;
 pub const Options = struct {
     permission_mode: types.PermissionMode = .auto,
     permission_rules: types.PermissionRuleSet = .{},
-    mcp_runtime: ?*mcp_runtime.McpRuntime = null,
     subagent_available: bool = false,
 };
 
@@ -223,16 +221,16 @@ const test_web_search = blk: {
     break :blk spec;
 };
 
-const test_terminal = blk: {
+const test_shell = blk: {
     var spec = test_read_file;
-    spec.name = "terminal";
-    spec.description = "Test terminal. When to use: exercise registered terminal projection. When NOT to use: assert product-specific terminal behavior.";
+    spec.name = "shell";
+    spec.description = "Test shell. When to use: exercise registered shell projection. When NOT to use: assert product-specific shell behavior.";
     spec.model_schema = .{
-        .name = "terminal",
+        .name = "shell",
         .description = spec.description,
         .input_schema = .{
             .properties = &.{
-                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"exec"} } },
+                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"run"} } },
                 .{ .name = "command", .json_type = .string },
             },
             .required = &.{ "action", "command" },
@@ -242,8 +240,8 @@ const test_terminal = blk: {
     spec.executor_kind = .terminal;
     spec.activity_kind = .command;
     spec.requires_approval = true;
-    spec.action_label = "Using terminal";
-    spec.completed_action_label = "Used terminal";
+    spec.action_label = "Running shell";
+    spec.completed_action_label = "Ran shell";
     spec.label_arg_kind = .action;
     spec.label_arg_default = "session";
     spec.permission_target_kind = .none;
@@ -437,65 +435,6 @@ pub const EffectiveToolProjection = struct {
     }
 };
 
-pub const TurnToolProjection = struct {
-    advertised_names: []const []const u8,
-    advertised_functions: []const model_tool_schema.FunctionSchema,
-};
-
-pub fn projectForTurn(
-    arena: Allocator,
-    advertised_names: []const []const u8,
-    advertised_functions: []const model_tool_schema.FunctionSchema,
-    current_turn_messages: []const types.ChatMessage,
-) Allocator.Error!TurnToolProjection {
-    if (!latestToolGroupHasTerminalCapabilityNoMatch(current_turn_messages)) {
-        return .{
-            .advertised_names = advertised_names,
-            .advertised_functions = advertised_functions,
-        };
-    }
-
-    const names = try arena.alloc([]const u8, advertised_names.len);
-    errdefer arena.free(names);
-    var name_count: usize = 0;
-    for (advertised_names) |name| {
-        if (std.mem.eql(u8, name, "capability_search")) continue;
-        names[name_count] = name;
-        name_count += 1;
-    }
-    const functions = try arena.alloc(
-        model_tool_schema.FunctionSchema,
-        advertised_functions.len,
-    );
-    var function_count: usize = 0;
-    for (advertised_functions) |function| {
-        if (std.mem.eql(u8, function.name, "capability_search")) continue;
-        functions[function_count] = function;
-        function_count += 1;
-    }
-    return .{
-        .advertised_names = names[0..name_count],
-        .advertised_functions = functions[0..function_count],
-    };
-}
-
-fn latestToolGroupHasTerminalCapabilityNoMatch(
-    messages: []const types.ChatMessage,
-) bool {
-    var index = messages.len;
-    while (index > 0 and messages[index - 1].role == .tool) {
-        index -= 1;
-        const message = messages[index];
-        const tool_name = message.tool_name orelse continue;
-        if (!std.mem.eql(u8, tool_name, "capability_search")) continue;
-        const content = message.content orelse continue;
-        if (std.mem.find(u8, content, "\"state\":\"no_match\"") != null) {
-            return true;
-        }
-    }
-    return false;
-}
-
 pub fn containsName(names: []const []const u8, expected: []const u8) bool {
     for (names) |name| if (std.mem.eql(u8, name, expected)) return true;
     return false;
@@ -509,7 +448,7 @@ const test_all_tools = [_]tool_dispatch.Tool{
     test_edit_file,
     test_web_fetch,
     test_web_search,
-    test_terminal,
+    test_shell,
     test_capability_search,
     test_skill,
     test_install_skill,
@@ -526,7 +465,7 @@ const test_order = [_][]const u8{
     "grep_files",
     "edit_file",
     "write_file",
-    "terminal",
+    "shell",
     "subagent",
     "capability_search",
     "skill",
@@ -548,50 +487,6 @@ const test_tool_set = tool_set_contract.ToolSet{
     .order = test_order[0..],
     .read_only_tool_names = test_read_only_names[0..],
 };
-
-test "terminal capability no-match suppresses only the next tool group" {
-    const names = [_][]const u8{ "capability_search", "read_file" };
-    const functions = [_]model_tool_schema.FunctionSchema{
-        test_capability_search.model_schema,
-        test_read_file.model_schema,
-    };
-    const terminal_messages = [_]types.ChatMessage{
-        .{ .role = .assistant },
-        .{
-            .role = .tool,
-            .tool_name = "capability_search",
-            .content = "{\"state\":\"no_match\"}",
-        },
-    };
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const suppressed = try projectForTurn(
-        arena_state.allocator(),
-        &names,
-        &functions,
-        &terminal_messages,
-    );
-    try std.testing.expectEqual(@as(usize, 1), suppressed.advertised_names.len);
-    try std.testing.expectEqualStrings("read_file", suppressed.advertised_names[0]);
-    try std.testing.expectEqual(@as(usize, 1), suppressed.advertised_functions.len);
-    try std.testing.expectEqualStrings(
-        "read_file",
-        suppressed.advertised_functions[0].name,
-    );
-
-    const later_messages = terminal_messages ++ [_]types.ChatMessage{
-        .{ .role = .assistant },
-        .{ .role = .tool, .tool_name = "read_file", .content = "local evidence" },
-    };
-    const restored = try projectForTurn(
-        arena_state.allocator(),
-        &names,
-        &functions,
-        &later_messages,
-    );
-    try std.testing.expectEqual(@as(usize, 2), restored.advertised_names.len);
-    try std.testing.expect(containsName(restored.advertised_names, "capability_search"));
-}
 
 fn testToolSetForRegistry(tools: []const tool_dispatch.Tool) tool_set_contract.ToolSet {
     return .{
@@ -744,36 +639,6 @@ fn indexOfName(names: []const []const u8, expected: []const u8) !usize {
     return error.TestExpectedEqual;
 }
 
-fn appendTestMcpTool(runtime: *mcp_runtime.McpRuntime, server_index: usize, name: []const u8) !void {
-    const alloc = runtime.alloc;
-    const description = try alloc.dupe(u8, "test MCP tool");
-    errdefer alloc.free(description);
-    const input_schema = try alloc.dupe(u8, "{\"type\":\"object\"}");
-    errdefer alloc.free(input_schema);
-    const tags = try alloc.alloc([]u8, 1);
-    errdefer alloc.free(tags);
-    tags[0] = try alloc.dupe(u8, "test");
-    errdefer alloc.free(tags[0]);
-    try runtime.servers.items[server_index].tool_catalog.tools.append(alloc, .{
-        .original_name = try alloc.dupe(u8, name),
-        .prefixed_name = try alloc.dupe(u8, name),
-        .description = description,
-        .input_schema_json = input_schema,
-        .tags = tags,
-    });
-}
-
-fn appendTestMcpServer(runtime: *mcp_runtime.McpRuntime, name: []const u8) !usize {
-    const config = mcp_runtime.McpServerConfig{
-        .name = try runtime.alloc.dupe(u8, name),
-        .enabled = true,
-    };
-    try runtime.addServer(config);
-    const index = runtime.servers.items.len - 1;
-    runtime.servers.items[index].state = .ready;
-    return index;
-}
-
 test "provider-executed search follows settled advertisement permission" {
     const cases = [_]struct {
         action: ?types.PermissionAction,
@@ -858,7 +723,7 @@ test "yolo advertisement ignores permission filtering" {
         .permission_rules = .{ .rules = &rules },
     });
     defer projection.deinit(std.testing.allocator);
-    try expectContainsName(projection.advertised_names, "terminal");
+    try expectContainsName(projection.advertised_names, "shell");
     try expectContainsName(projection.advertised_names, "write_file");
     try expectContainsName(projection.advertised_names, "web_search");
 }
@@ -907,39 +772,20 @@ test "effective tool projection cleans up every partial allocation failure" {
     );
 }
 
-test "MCP tools stay deferred and base selection is stable across catalog churn" {
+test "base tool projection includes MCP discovery and explicit selection" {
     const alloc = std.testing.allocator;
-    var first_runtime = mcp_runtime.McpRuntime.init(alloc);
-    defer first_runtime.deinit();
-    const first_server = try appendTestMcpServer(&first_runtime, "first");
-    try appendTestMcpTool(&first_runtime, first_server, "mcp_first_a");
-
-    var second_runtime = mcp_runtime.McpRuntime.init(alloc);
-    defer second_runtime.deinit();
-    const second_server = try appendTestMcpServer(&second_runtime, "second");
-    try appendTestMcpTool(&second_runtime, second_server, "mcp_second_a");
-    try appendTestMcpTool(&second_runtime, second_server, "mcp_second_b");
-
-    var first = try buildTestModelToolProjection(alloc, .{ .mcp_runtime = &first_runtime });
-    defer first.deinit(alloc);
-    var second = try buildTestModelToolProjection(alloc, .{ .mcp_runtime = &second_runtime });
-    defer second.deinit(alloc);
-
-    try expectContainsName(first.advertised_names, "capability_search");
-    try expectContainsName(first.advertised_names, "mcp_select_tool");
-    try expectNotContainsName(first.advertised_names, "mcp_first_a");
-    try std.testing.expectEqual(first.advertised_names.len, second.advertised_names.len);
-    for (first.advertised_names, second.advertised_names) |left, right| {
-        try std.testing.expectEqualStrings(left, right);
-    }
+    var projection = try buildTestModelToolProjection(alloc, .{});
+    defer projection.deinit(alloc);
+    try expectContainsName(projection.advertised_names, "capability_search");
+    try expectContainsName(projection.advertised_names, "mcp_select_tool");
 }
 
-test "subagent and terminal selection follow host capability" {
+test "subagent and shell selection follow host capability" {
     var unavailable = try buildTestModelToolProjection(std.testing.allocator, .{});
     defer unavailable.deinit(std.testing.allocator);
     try expectNotContainsName(unavailable.advertised_names, "subagent");
     try expectNotContainsName(unavailable.advertised_names, "task");
-    try expectContainsName(unavailable.advertised_names, "terminal");
+    try expectContainsName(unavailable.advertised_names, "shell");
 
     var available = try buildTestModelToolProjection(std.testing.allocator, .{
         .subagent_available = true,
@@ -947,5 +793,5 @@ test "subagent and terminal selection follow host capability" {
     defer available.deinit(std.testing.allocator);
     try expectContainsName(available.advertised_names, "subagent");
     try expectNotContainsName(available.advertised_names, "task");
-    try expectContainsName(available.advertised_names, "terminal");
+    try expectContainsName(available.advertised_names, "shell");
 }

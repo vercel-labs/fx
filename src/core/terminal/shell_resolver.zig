@@ -141,6 +141,21 @@ pub fn environment(
     };
 }
 
+pub fn environmentForShellSpec(
+    alloc: Allocator,
+    configured_login_shell: ?[]const u8,
+    shell: contracts.ShellSpec,
+) (ResolveError || Allocator.Error)!Environment {
+    const invocation = try resolve(configured_login_shell, shell);
+    return switch (shell) {
+        .user_login => .{ .user = try alloc.dupe(u8, invocation.path) },
+        .executable => |value| if (value.clean_start)
+            .{ .clean = try alloc.dupe(u8, invocation.path) }
+        else
+            .{ .user = try alloc.dupe(u8, invocation.path) },
+    };
+}
+
 pub fn profileShell(
     alloc: Allocator,
     configured_login_shell: ?[]const u8,
@@ -346,6 +361,32 @@ test "resolver makes clean startup explicit" {
         &.{ "/bin/zsh", "-f", "-i" },
         zsh.argv(),
     );
+}
+
+test "shell environments bind executable path and startup mode" {
+    const alloc = std.testing.allocator;
+    const clean = try environmentForShellSpec(
+        alloc,
+        null,
+        .{ .executable = .{ .path = "/bin/bash", .clean_start = true } },
+    );
+    defer switch (clean) {
+        .clean => |path| alloc.free(@constCast(path)),
+        else => {},
+    };
+    try std.testing.expectEqualStrings("/bin/bash", clean.clean);
+
+    const user = try environmentForShellSpec(
+        alloc,
+        null,
+        .{ .executable = .{ .path = "/bin/bash" } },
+    );
+    defer switch (user) {
+        .user => |path| alloc.free(@constCast(path)),
+        else => {},
+    };
+    try std.testing.expectEqualStrings("/bin/bash", user.user);
+    try std.testing.expect(!clean.eql(user));
 }
 
 test "resolver rejects missing relative and unsupported shells" {

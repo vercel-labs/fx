@@ -9,6 +9,23 @@ pub const legacy_2025_03_protocol_version = "2025-03-26";
 pub const legacy_2025_06_protocol_version = "2025-06-18";
 pub const legacy_2025_11_protocol_version = "2025-11-25";
 pub const modern_protocol_version = "2026-07-28";
+pub const protocol_version_environment = "FX_MCP_PROTOCOL_VERSION";
+
+pub fn startupMode(server_environment: []const mcp_contract.McpEnvVar, inherited_version: ?[]const u8) !Protocol {
+    const requested = for (server_environment) |entry| {
+        if (std.mem.eql(u8, entry.key, protocol_version_environment)) break entry.value;
+    } else inherited_version orelse return .legacy;
+    if (std.mem.eql(u8, requested, modern_protocol_version)) return .modern;
+    if (std.mem.eql(u8, requested, legacy_2025_11_protocol_version)) return .legacy;
+    return error.McpUnsupportedProtocolVersion;
+}
+
+test "MCP uses initialization unless newer discovery is explicitly enabled" {
+    try std.testing.expectEqual(Protocol.legacy, try startupMode(&.{}, null));
+    try std.testing.expectEqual(Protocol.modern, try startupMode(&.{}, modern_protocol_version));
+    try std.testing.expectEqual(Protocol.legacy, try startupMode(&.{.{ .key = @constCast(protocol_version_environment), .value = @constCast(legacy_2025_11_protocol_version) }}, modern_protocol_version));
+    try std.testing.expectError(error.McpUnsupportedProtocolVersion, startupMode(&.{}, "unknown"));
+}
 pub const unsupported_protocol_version_code: i64 = -32022;
 const missing_required_client_capability_code: i64 = -32021;
 

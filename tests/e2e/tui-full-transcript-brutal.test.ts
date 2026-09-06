@@ -19,12 +19,15 @@ import {
   composerContains,
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
-  fakeGatewaySse,
   fakeGatewayToolCall,
+  fakeGatewaySse,
+  fakeShellRun,
+  startDynamicFakeGateway,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { stdoutFrames } from "./render-lab/tape";
 
 const TIMEOUT = 30_000;
 const INPUT_SANITY_BUDGET_MS = 5_000;
@@ -36,6 +39,8 @@ const LIVE_DONE = "CTRL_O_BRUTAL_LIVE_DONE";
 const DRAFT = "CTRL_O_BRUTAL_UNSENT_DRAFT";
 const RESUME_DRAFT = "CTRL_O_BRUTAL_RESUME_DRAFT";
 const TAIL_SENTINEL = "CTRL_O_TAIL_SENTINEL";
+const VIEWPORT_ALLOWANCE_BYTES = 64 * 1024;
+const RESIZE_SIZES = [[48, 18], [132, 42], [80, 24], [104, 30]] as const;
 const CTRL_O = ["0f"] as const;
 const PAGE_UP = ["1b", "5b", "35", "7e"] as const;
 const PAGE_DOWN = ["1b", "5b", "36", "7e"] as const;
@@ -138,13 +143,9 @@ function committedAssistantOccurrences(home: string, assistant: string): number 
     for (const line of readFileSync(eventsPath, "utf8").split("\n")) {
       if (line.length === 0) continue;
       const event = JSON.parse(line) as {
-        kind?: string;
-        payload?: { turn?: { assistant?: string } };
+        event?: { assistant?: { text?: string } };
       };
-      if (
-        event.kind === "history_turn_committed" &&
-        event.payload?.turn?.assistant === assistant
-      ) {
+      if (event.event?.assistant?.text === assistant) {
         count += 1;
       }
     }
@@ -389,14 +390,21 @@ done
     responses.push(batchResponse(batch, config));
   }
   responses.push(fakeGatewayFinalText(`${HISTORY_DONE}\n${TAIL_SENTINEL}`));
-  responses.push(fakeGatewayToolCall("ctrl-o-brutal-live", "terminal", {
-    action: "exec",
+  responses.push(fakeShellRun("ctrl-o-brutal-live", "./ctrl-o-live.sh", {
     timeout_ms: 600_000,
-    command: "./ctrl-o-live.sh",
   }));
   responses.push(fakeGatewayFinalText(LIVE_DONE));
 
-  return { paths, gateway: startFakeGateway(responses), totalTools };
+  const gateway = startDynamicFakeGateway((body) => {
+    const request = JSON.parse(body);
+    if (request.toolChoice?.type === "none" && request.tools?.length === 0) {
+      return fakeGatewayFinalText(
+        "Continue the prepared mixed-history workload without repeating completed tools, then run the requested live command.",
+      );
+    }
+    return responses.shift() ?? new Response("Unexpected stress-fixture request", { status: 500 });
+  });
+  return { paths, gateway, totalTools };
 }
 
 async function waitForScrollback(
@@ -447,6 +455,71 @@ async function waitForTraceAfter(
   );
 }
 
+async function waitForCommittedFrameAfter(
+  tracePath: string,
+  startByte: number,
+  markers: string[],
+): Promise<void> {
+  const deadline = Date.now() + TIMEOUT;
+  let appended = "";
+  while (Date.now() < deadline) {
+    appended = readFileSync(tracePath).subarray(startByte).toString("utf8");
+    let offset = 0;
+    const committed = [...markers, "attempt_end outcome=committed"].every((marker) => {
+      const index = appended.indexOf(marker, offset);
+      if (index < 0) return false;
+      offset = index + marker.length;
+      return true;
+    });
+    if (committed) return;
+    await sleep(25);
+  }
+  throw new Error(`Timed out waiting for committed ${markers.join(", ")}.\n${appended}`);
+}
+
+async function terminalOutputBytes(tapePath: string): Promise<number> {
+  const deadline = Date.now() + TIMEOUT;
+  while (true) {
+    try {
+      return stdoutFrames(tapePath).reduce((bytes, frame) => bytes + frame.payload.length, 0);
+    } catch (error) {
+      if (!(error instanceof Error) ||
+        !error.message.startsWith("truncated tape frame") || Date.now() >= deadline) throw error;
+      await sleep(25);
+    }
+  }
+}
+
+async function measurePrimaryResize(
+  session: TmuxSession,
+  tracePath: string,
+  tapePath: string,
+  cols: number,
+  rows: number,
+): Promise<number> {
+  const before = await terminalOutputBytes(tapePath);
+  const start = traceSize(tracePath);
+  await session.resizeWindow(cols, rows, 0);
+  await waitForCommittedFrameAfter(tracePath, start, ["settled_reset_committed"]);
+  return await terminalOutputBytes(tapePath) - before;
+}
+
+async function waitForAnyTraceAfter(
+  tracePath: string,
+  startByte: number,
+  needles: readonly string[],
+  timeoutMs = TIMEOUT,
+): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const appended = readFileSync(tracePath).subarray(startByte).toString("utf8");
+    const matched = needles.find((needle) => appended.includes(needle));
+    if (matched) return matched;
+    await sleep(25);
+  }
+  throw new Error(`Timed out waiting for any trace marker ${JSON.stringify(needles)}.`);
+}
+
 function projectionWindows(text: string): ProjectionWindowTrace[] {
   return [...text.matchAll(
     /\[full_transcript_cache\] window cols=(\d+) offset=(\d+)/g,
@@ -491,8 +564,15 @@ async function waitForScrolledViewport(
     appended = readFileSync(tracePath).subarray(startByte).toString("utf8");
     const scrollIndex = appended.indexOf("[full_transcript_cache] scroll ");
     if (scrollIndex >= 0) {
-      const windows = projectionWindows(appended.slice(scrollIndex));
+      const afterScroll = appended.slice(scrollIndex);
+      const windows = projectionWindows(afterScroll);
       if (windows.some((window) => window.offset !== previousOffset)) return;
+      const after = afterScroll.match(/ after=(\d+)/)?.[1];
+      if (
+        after !== undefined &&
+        Number(after) !== previousOffset &&
+        /frame_plan\] build [^\n]*body=transcript transcript_body=paint/.test(afterScroll)
+      ) return;
     }
     await sleep(10);
   }
@@ -510,7 +590,11 @@ async function waitForRenderedViewportAfter(
   let appended = "";
   while (Date.now() < deadline) {
     appended = readFileSync(tracePath).subarray(startByte).toString("utf8");
-    if (projectionWindows(appended).length > 0) return;
+    if (
+      projectionWindows(appended).length > 0 ||
+      /attempt_end outcome=committed reasons=[^\n]*modal/.test(appended) ||
+      /frame_plan\] build [^\n]*body=transcript transcript_body=paint/.test(appended)
+    ) return;
     await sleep(10);
   }
   throw new Error(
@@ -543,13 +627,13 @@ async function timeTransition(
   visible: () => Promise<unknown>,
   tapePath?: string,
 ): Promise<void> {
-  const bytesBefore = tapePath === undefined ? undefined : statSync(tapePath).size;
+  const bytesBefore = tapePath === undefined ? undefined : await terminalOutputBytes(tapePath);
   const started = performance.now();
   await action();
   await visible();
   metrics.transitions[kind].push(performance.now() - started);
   if (bytesBefore !== undefined) {
-    metrics.terminalBytes[kind].push(statSync(tapePath!).size - bytesBefore);
+    metrics.terminalBytes[kind].push(await terminalOutputBytes(tapePath!) - bytesBefore);
   }
 }
 
@@ -681,13 +765,7 @@ async function thrashViewer(
       );
     }
 
-    const sizes = [
-      [48, 18],
-      [132, 42],
-      [80, 24],
-      [104, 30],
-    ] as const;
-    const [cols, rows] = sizes[cycle % sizes.length]!;
+    const [cols, rows] = RESIZE_SIZES[cycle % RESIZE_SIZES.length]!;
     const resizeTraceStart = traceSize(tracePath);
     await timeTransition(
       metrics,
@@ -709,12 +787,19 @@ async function thrashViewer(
       tapePath,
     );
 
+    const closeTraceStart = traceSize(tracePath);
     const closeKey = cycle % 3 === 0 ? "C-o" : cycle % 3 === 1 ? "Escape" : "C-c";
     await timeTransition(
       metrics,
       "close",
       () => closeKey === "C-o" ? session.sendHexBytes(CTRL_O) : session.sendKeys(closeKey),
-      () => waitForMode(session, "main", draft),
+      async () => {
+        await waitForCommittedFrameAfter(tracePath, closeTraceStart, [
+          "close_full_transcript restore=resized",
+          "transcript_transition_commit state=stable",
+        ]);
+        await waitForMode(session, "main", draft);
+      },
       tapePath,
     );
     expect(session.paneStatus().dead).toBe(false);
@@ -742,7 +827,9 @@ async function verifyOldestTranscriptEntrySurvives(
   await session.sendHexBytes(CTRL_O);
   const newest = await waitForMode(session, "full", draft);
   expect(newest).toContain(LIVE_DONE);
-  const pageCount = config.oldestPageCount ?? 1_024;
+  const sourceLines = config.batches *
+    (config.chatLinesPerBatch + config.toolsPerBatch * config.fileLines) + config.liveLines;
+  const pageCount = config.oldestPageCount ?? Math.max(1_024, sourceLines);
   const pageChunk = 64;
   for (let sent = 0; sent < pageCount; sent += pageChunk) {
     await sendRepeatedKey(
@@ -789,12 +876,15 @@ async function verifyResumedTranscriptNavigation(
   const newest = await waitForMode(session, "full", draft);
   expect(newest).toContain(LIVE_DONE);
 
-  // Resume reconstructs the compact transcript under the product's 256 KiB
-  // retention cap, so the original first line is not expected to survive.
+  // The footer can stay visible while the scrolled page is still being built.
   let older = newest;
   for (let sent = 0; sent < 512; sent += 64) {
+    const previous = older;
     await sendRepeatedKey(session, "PPage", 64, 64, 300);
-    older = await waitForMode(session, "full", draft);
+    older = await session.waitForPane(
+      (pane) => pane.includes(FULL_FOOTER) && pane !== previous,
+      TIMEOUT,
+    );
     if (
       olderRetainedChatMarker(older, config) !== undefined ||
       [...older.matchAll(/CTRL_O_BRUTAL_TOOL_(\d{4})/g)]
@@ -860,7 +950,7 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
         FX_RECORD_INPUT: "1",
         FX_TRACE_LOG: paths.tracePath,
         FX_TRACE_SCOPES:
-          "full_transcript_cache,full_transcript,scroll,frame_render,terminal_diff,frame_schedule",
+          "full_transcript_cache,full_transcript,scroll,frame_render,terminal_diff,frame_schedule,frame_plan,resize",
       },
       stderrPath: paths.stderrPath,
       width: 104,
@@ -901,9 +991,18 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
 
     const immediateTraceStart = traceSize(paths.tracePath);
     const escapeStarted = performance.now();
-    session.sendKeysImmediate(["C-o", "Escape"]);
-    await waitForTraceAfter(paths.tracePath, immediateTraceStart, [
-      "attempt_restore outcome=input_pending",
+    session.sendKeysImmediate(["C-o"]);
+    await waitForAnyTraceAfter(
+      paths.tracePath,
+      immediateTraceStart,
+      [
+        "open_request state=pending",
+        "depth_transition from=inline to=full route=root trigger=ctrl_o",
+      ],
+    );
+    session.sendKeysImmediate(["Escape"]);
+    await waitForAnyTraceAfter(paths.tracePath, immediateTraceStart, [
+      "open_request state=cancelled",
       "depth_transition from=full to=inline route=root trigger=escape",
     ]);
     await waitForMode(session, "main", DRAFT);
@@ -979,6 +1078,7 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
       paths.tracePath,
       paths.tapePath,
     );
+    const primaryResizeBytes: number[] = [];
     const writeMetrics = () => {
       const summary = {
         config,
@@ -1014,6 +1114,7 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
         resumedMemory: resumedRssKib.length > 0
           ? summarizeMemory(resumedRssKib)
           : null,
+        primaryResizeBytes,
         raw: metrics,
         rawSettled: settledMetrics,
         rawMemory: { primaryRssKib, resumedRssKib },
@@ -1037,6 +1138,13 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
         paths.tracePath,
         paths.tapePath,
       );
+    }
+    // Settled history bounds the streaming prefix measured above at every geometry.
+    await measurePrimaryResize(session, paths.tracePath, paths.tapePath, 120, 36);
+    for (const [cols, rows] of RESIZE_SIZES) {
+      primaryResizeBytes.push(await measurePrimaryResize(
+        session, paths.tracePath, paths.tapePath, cols, rows,
+      ));
     }
     await verifyOldestTranscriptEntrySurvives(session, DRAFT, config);
 
@@ -1075,7 +1183,9 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
     }
     // Full-open cost must remain independent of total chat size.
     expect(summary.terminalBytes.full.maxBytes).toBeLessThan(128 * 1024);
-    expect(summary.terminalBytes.close.maxBytes).toBeLessThan(256 * 1024);
+    expect(summary.terminalBytes.close.maxBytes).toBeLessThan(
+      Math.max(...primaryResizeBytes) + VIEWPORT_ALLOWANCE_BYTES,
+    );
     expect(summary.memory.growthRssKib).toBeLessThan(256 * 1024);
 
     await session.sendKeys("C-u");
@@ -1094,7 +1204,7 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
           ...gatewayEnv(paths.home, resumedGateway),
           FX_TRACE_LOG: paths.resumedTracePath,
           FX_TRACE_SCOPES:
-            "full_transcript_cache,full_transcript,scroll,frame_render,terminal_diff",
+            "full_transcript_cache,full_transcript,scroll,frame_render,terminal_diff,frame_schedule,frame_plan,resize",
         },
         stderrPath: paths.resumedStderrPath,
         width: 96,
@@ -1172,6 +1282,215 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
     }
   }
 }
+
+test.skipIf(!tmuxAvailable())(
+  "Ctrl-O keeps saved tool output intact across window replacement",
+  async () => {
+    const paths = makeRoot("saved-result-lifetime");
+    mkdirSync(join(paths.home, ".fx"), { recursive: true });
+    mkdirSync(paths.workspace);
+    const lines = Array.from({ length: 300 }, (_, i) =>
+      `SAVED_ROW_${String(i + 1).padStart(4, "0")} original tool output`,
+    );
+    writeFileSync(join(paths.workspace, "saved.txt"), lines.join("\n") + "\n");
+    const savedGateway = startFakeGateway([
+      fakeGatewayToolCall("saved-read", "read_file", { path: "saved.txt", line_count: 300 }),
+      fakeGatewayFinalText("Saved read complete."),
+    ]);
+    let active: TmuxSession | null = null;
+    try {
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: paths.workspace,
+        env: { ...gatewayEnv(paths.home, savedGateway), FX_RECORD: paths.tapePath },
+        stderrPath: paths.stderrPath,
+        width: 100,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Read saved.txt completely.");
+      await active.waitForText("Saved read complete.", TIMEOUT);
+      for (const width of [100, 80]) {
+        await active.resizeWindow(width, 32);
+        await active.sendHexBytes(CTRL_O);
+        await active.waitForText(FULL_FOOTER, TIMEOUT);
+        let previous = await active.waitForText("SAVED_ROW_0300", TIMEOUT);
+        // Each accepted page must show earlier original rows, including cache misses.
+        for (let page = 0; page < 6; page++) {
+          const first = Number(previous.match(/SAVED_ROW_(\d+)/)?.[1]);
+          expect(first).toBeGreaterThan(1);
+          await active.sendHexBytes(PAGE_UP);
+          previous = await active.waitForPane((pane) => {
+            const current = Number(pane.match(/SAVED_ROW_(\d+)/)?.[1]);
+            return current > 0 && current < first;
+          }, TIMEOUT);
+          expect(previous).not.toContain("Full saved result unavailable.");
+          for (const marker of previous.matchAll(/SAVED_ROW_(\d+)/g)) {
+            expect(previous).toContain(lines[Number(marker[1]) - 1]!);
+          }
+        }
+        await active.sendHexBytes(CTRL_O);
+        await active.waitForComposer(TIMEOUT);
+      }
+      const scrollback = await active.captureFullScrollback();
+      expect(scrollback).toContain("Saved read complete.");
+      expect(scrollback).not.toContain("Full saved result unavailable.");
+      expect(savedGateway.requests).toHaveLength(2);
+      expect(active.isAlive()).toBe(true);
+      expect(readFileSync(paths.stderrPath, "utf8")).toBe("");
+    } finally {
+      await active?.kill();
+      savedGateway.stop();
+      rmSync(paths.root, { recursive: true, force: true });
+    }
+  },
+  60_000,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "Ctrl-O fills a viewport taller than the prepared overscan cache",
+  async () => {
+    const paths = makeRoot("tall-viewport");
+    mkdirSync(join(paths.home, ".fx"), { recursive: true });
+    mkdirSync(paths.workspace);
+    writeFileSync(paths.stderrPath, "");
+    const tallTail = "TALL_TRANSCRIPT_TAIL";
+    const response = Array.from(
+      { length: 500 },
+      (_, index) => index === 499
+        ? tallTail
+        : `TALL_TRANSCRIPT_ROW_${String(index).padStart(3, "0")}`,
+    ).join("\n");
+    const tallGateway = startFakeGateway([fakeGatewayFinalText(response)]);
+    let active: TmuxSession | null = null;
+    try {
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: realpathSync(paths.workspace),
+        env: gatewayEnv(paths.home, tallGateway),
+        stderrPath: paths.stderrPath,
+        width: 80,
+        height: 220,
+        minimumHistoryLines: 2_000,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Build a tall transcript.");
+      await active.waitForText(tallTail, TIMEOUT);
+      await active.sendHexBytes(CTRL_O);
+      const full = await active.waitForText(FULL_FOOTER, TIMEOUT);
+      const rows = full.split("\n");
+      const tail_row = rows.findIndex((row) => row.includes(tallTail));
+      const footer_row = rows.findIndex((row) => row.includes(FULL_FOOTER));
+      expect(tail_row).toBeGreaterThanOrEqual(0);
+      expect(footer_row).toBeGreaterThan(tail_row);
+      expect(footer_row - tail_row).toBeLessThanOrEqual(6);
+
+      await active.sendHexBytes(CTRL_O);
+      await active.waitForComposer(TIMEOUT);
+      expect(readFileSync(paths.stderrPath, "utf8")).toBe("");
+    } finally {
+      await active?.kill();
+      tallGateway.stop();
+      rmSync(paths.root, { recursive: true, force: true });
+    }
+  },
+  60_000,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "Ctrl-O resized close preserves long history within ordinary resize cost",
+  async () => {
+    const paths = makeRoot("resize-recovery-cost");
+    mkdirSync(join(paths.home, ".fx"), { recursive: true });
+    mkdirSync(paths.workspace);
+    const paragraphs = Array.from({ length: 4_000 }, (_, index) =>
+      `ROW${pad(index + 1)} ALPHA_abcdefghijklmnopqrstuvwxyz0123456789 ` +
+      "BRAVO_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    );
+    const gateway = startFakeGateway([fakeGatewayFinalText(paragraphs.join("\n\n"))]);
+    let session: TmuxSession | null = null;
+    let passed = false;
+    try {
+      session = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: paths.workspace,
+        env: {
+          ...gatewayEnv(paths.home, gateway),
+          FX_RECORD: paths.tapePath,
+          FX_TRACE_LOG: paths.tracePath,
+          FX_TRACE_SCOPES: "full_transcript,full_transcript_cache,scroll,frame_schedule,resize",
+        },
+        stderrPath: paths.stderrPath,
+        width: 120,
+        height: 36,
+        minimumHistoryLines: 50_000,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Return the prepared long response.");
+      await session.waitForText("ROW4000", TIMEOUT);
+      await session.waitForStableComposer(TIMEOUT);
+      await session.sendLiteralText(DRAFT);
+      await waitForMode(session, "main", DRAFT);
+      const completeHistory = async () => {
+        const text = (await session!.captureFullScrollback()).replace(/\s+/g, "");
+        let previous = -1;
+        for (const paragraph of paragraphs) {
+          const needle = paragraph.replace(/\s+/g, "");
+          const index = text.indexOf(needle);
+          expect(index).toBeGreaterThan(previous);
+          expect(text.indexOf(needle, index + 1)).toBe(-1);
+          previous = index;
+        }
+      };
+      await completeHistory();
+      const primaryBytes = await measurePrimaryResize(session, paths.tracePath, paths.tapePath, 88, 24);
+      await completeHistory();
+      await measurePrimaryResize(session, paths.tracePath, paths.tapePath, 120, 36);
+      await session.sendHexBytes(CTRL_O);
+      await waitForMode(session, "full", DRAFT);
+      const resizeStart = traceSize(paths.tracePath);
+      await session.resizeWindow(88, 24, 0);
+      await waitForCommittedFrameAfter(paths.tracePath, resizeStart, ["settled_reset_committed"]);
+      const closeStart = traceSize(paths.tracePath);
+      const beforeClose = await terminalOutputBytes(paths.tapePath);
+      const started = performance.now();
+      session.sendKeysImmediate(["Escape"]);
+      await waitForCommittedFrameAfter(paths.tracePath, closeStart, [
+        "close_full_transcript restore=resized",
+        "transcript_transition_commit state=stable",
+      ]);
+      await waitForMode(session, "main", DRAFT);
+      expect(performance.now() - started).toBeLessThan(2_500);
+      const closeBytes = await terminalOutputBytes(paths.tapePath) - beforeClose;
+      expect(closeBytes).toBeLessThan(primaryBytes + VIEWPORT_ALLOWANCE_BYTES);
+      await completeHistory();
+
+      await session.sendHexBytes(CTRL_O);
+      await waitForMode(session, "full", DRAFT);
+      const beforeOrdinaryClose = await terminalOutputBytes(paths.tapePath);
+      const ordinaryCloseStart = traceSize(paths.tracePath);
+      await session.sendKeys("Escape");
+      await waitForCommittedFrameAfter(paths.tracePath, ordinaryCloseStart, [
+        "close_full_transcript restore=exact",
+        "transcript_transition_commit state=stable",
+      ]);
+      await waitForMode(session, "main", DRAFT);
+      expect(await terminalOutputBytes(paths.tapePath) - beforeOrdinaryClose).toBeLessThan(256 * 1024);
+      await completeHistory();
+      expect(readFileSync(paths.stderrPath, "utf8")).toBe("");
+      await session.sendKeys("C-u");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      passed = true;
+    } finally {
+      await session?.kill();
+      gateway.stop();
+      if (passed) rmSync(paths.root, { recursive: true, force: true });
+      else console.error(`retained recovery cost artifacts at ${paths.root}`);
+    }
+  },
+  60_000,
+);
 
 test.skipIf(!tmuxAvailable())(
   "Ctrl-O repeatedly survives mixed long chats, dense tool batches, live output, resize storms, and resume",

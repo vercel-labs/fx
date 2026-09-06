@@ -39,7 +39,7 @@ describe("eval: multi-tool workflow", () => {
       assertFileContains(workDir, "src/greet.js", "Goodbye");
       assertToolUsed(result, "read_file");
       assertToolUsed(result, "edit_file");
-      assertToolUsed(result, "terminal");
+      assertToolUsed(result, "shell");
       expect(result.json.output).toContain("Goodbye");
       expect(result.json.exit_code).toBe(0);
     },

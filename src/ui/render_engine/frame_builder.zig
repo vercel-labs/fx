@@ -102,6 +102,7 @@ pub fn buildAndFlushFrame(
             plan.layout,
         ),
         options.terminal_transition,
+        terminal_diff.FrameReset.fromPlan(plan.reset_terminal, shell.history_reset_uses_ris),
     );
     defer movement.deinit(alloc);
 

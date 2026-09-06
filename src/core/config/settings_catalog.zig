@@ -65,7 +65,7 @@ pub const Snapshot = struct {
             .model => self.model,
             .effort => self.effort,
             .fast_mode => onOff(self.fast_mode),
-            .permission_mode => self.permission_mode,
+            .permission_mode => if (std.mem.eql(u8, self.permission_mode, "yolo")) "full access" else self.permission_mode,
             .statusline_context => onOff(self.statusline_context),
             .statusline_session => onOff(self.statusline_session),
             .statusline_workspace => onOff(self.statusline_workspace),
@@ -267,7 +267,7 @@ const specs = [_]Spec{
 };
 
 const on_off_options = [_][]const u8{ "off", "on" };
-const permission_options = [_][]const u8{ "ask", "auto", "yolo" };
+const permission_options = [_][]const u8{ "ask", "auto", "full access" };
 const sound_level_options = [_][]const u8{ "off", "on", "max" };
 
 pub fn filteredCount(snapshot: Snapshot, category: Category, query: []const u8) usize {
@@ -446,6 +446,14 @@ test "settings catalog projects grouped searchable preferences" {
     try std.testing.expect(itemAt(snapshot, .all, "missing preference", 0) == null);
 }
 
+test "settings catalog displays legacy yolo as full access and cycles from it" {
+    const snapshot: Snapshot = .{ .permission_mode = "yolo" };
+    try std.testing.expectEqualStrings("full access", snapshot.value(.permission_mode));
+    try std.testing.expectEqual(@as(usize, 2), selectedOptionIndex(&snapshot, .permission_mode).?);
+    try std.testing.expectEqualStrings("ask", cycleChange(&snapshot, .permission_mode, 1).?.value);
+    try std.testing.expectEqualStrings("auto", cycleChange(&snapshot, .permission_mode, -1).?.value);
+}
+
 test "settings catalog returns typed edit choices without effects" {
     const efforts = [_]types.ReasoningEffort{
         types.ReasoningEffort.literal("future-tier"),
@@ -466,7 +474,7 @@ test "settings catalog returns typed edit choices without effects" {
 
     try std.testing.expect(changeAt(&snapshot, .model, 0) == null);
     try std.testing.expectEqual(@as(usize, 3), optionCount(&snapshot, .permission_mode));
-    try std.testing.expectEqualStrings("yolo", optionAt(&snapshot, .permission_mode, 2).?);
+    try std.testing.expectEqualStrings("full access", optionAt(&snapshot, .permission_mode, 2).?);
     try std.testing.expectEqual(@as(usize, 3), optionCount(&snapshot, .effort));
     try std.testing.expectEqualStrings("default", optionAt(&snapshot, .effort, 0).?);
     try std.testing.expectEqualStrings("future-tier", optionAt(&snapshot, .effort, 1).?);

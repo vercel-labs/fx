@@ -15,6 +15,17 @@ import { join, resolve } from "node:path";
 export const FX_BIN = resolve(import.meta.dirname, "../../zig-out/bin/fx");
 export const REPO_ROOT = resolve(import.meta.dirname, "../..");
 
+export function providerVersionTestEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
+  const result = { ...env };
+  if (env.FX_E2E_OPENAI_CODEX_MODELS_URL && !env.FX_E2E_CODEX_VERSION_URL && !env.FX_E2E_CODEX_CLIENT_VERSION) {
+    result.FX_E2E_CODEX_CLIENT_VERSION = "0.153.0";
+  }
+  if ((env.FX_E2E_XAI_GROK_MODELS_URL || env.FX_E2E_XAI_GROK_RESPONSES_URL) && !env.FX_E2E_GROK_VERSION_URL && !env.FX_E2E_GROK_CLIENT_VERSION) {
+    result.FX_E2E_GROK_CLIENT_VERSION = "1.0.6";
+  }
+  return result;
+}
+
 export const EVAL_MODELS = [
   "anthropic/claude-sonnet-4.6",
   "xai/grok-4.20-multi-agent-beta",
@@ -402,7 +413,7 @@ export function assertNoTerminalExecMatches(
 function recordedTerminalExecCommands(result: EvalResult): string[] {
   const commands = new Set<string>();
   for (const tc of result.json.tool_calls ?? []) {
-    if (tc.name !== "terminal") continue;
+    if (tc.name !== "shell") continue;
     const command = tc.command_result?.command;
     if (command) commands.add(command);
   }
@@ -418,7 +429,7 @@ export function assertFirstTerminalExecMatches(
   pattern: RegExp,
 ): void {
   const first = result.json.tool_calls?.[0];
-  expect(first?.name).toBe("terminal");
+  expect(first?.name).toBe("shell");
   expect(pattern.test(first?.command_result?.command ?? "")).toBe(true);
 }
 
@@ -483,7 +494,7 @@ export async function runFx(
       }
     }
     const child = nodeSpawn(FX_BIN, args, {
-      env,
+      env: providerVersionTestEnv(env),
       cwd: cwd ?? REPO_ROOT,
       stdio: ["pipe", "pipe", "pipe"],
     });

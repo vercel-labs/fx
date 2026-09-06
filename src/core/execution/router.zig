@@ -34,12 +34,12 @@ pub fn prepareAuthorizedRoute(
                 alloc,
                 command_ctx.command,
                 command_ctx.resolved_cwd,
-                command_ctx.background,
+                false,
                 command_ctx.target_os,
             ) catch return error.CommandAdmissionChanged;
             switch (admission) {
                 .direct_read_only => |plan| {
-                    debug_trace.logf("core", "terminal.exec authority=direct_only route=direct_read_only", .{});
+                    debug_trace.logf("core", "shell.run authority=direct_only route=direct_read_only", .{});
                     break :blk .{ .direct_read_only = plan };
                 },
                 .approval_required => {
@@ -55,7 +55,7 @@ pub fn prepareAuthorizedRoute(
             if (command_ctx.environment.requiresShellRoute()) {
                 debug_trace.logf(
                     "core",
-                    "terminal.exec authority=shell_allowed source={s} route=approved_shell environment={s}",
+                    "shell.run authority=shell_allowed source={s} route=approved_shell environment={s}",
                     .{
                         @tagName(shell.source),
                         @tagName(std.meta.activeTag(command_ctx.environment)),
@@ -71,7 +71,7 @@ pub fn prepareAuthorizedRoute(
                 alloc,
                 command_ctx.command,
                 command_ctx.resolved_cwd,
-                command_ctx.background,
+                false,
                 command_ctx.target_os,
             ) catch break :blk .{ .approved_shell = .{
                 .command_ctx = command_ctx,
@@ -80,11 +80,11 @@ pub fn prepareAuthorizedRoute(
             } };
             switch (admission) {
                 .direct_read_only => |plan| {
-                    debug_trace.logf("core", "terminal.exec authority=shell_allowed source={s} route=direct_read_only", .{@tagName(shell.source)});
+                    debug_trace.logf("core", "shell.run authority=shell_allowed source={s} route=direct_read_only", .{@tagName(shell.source)});
                     break :blk .{ .direct_read_only = plan };
                 },
                 .approval_required => |reason| {
-                    debug_trace.logf("core", "terminal.exec authority=shell_allowed source={s} route=approved_shell reason={s}", .{ @tagName(shell.source), @tagName(reason) });
+                    debug_trace.logf("core", "shell.run authority=shell_allowed source={s} route=approved_shell reason={s}", .{ @tagName(shell.source), @tagName(reason) });
                     break :blk .{ .approved_shell = .{
                         .command_ctx = command_ctx,
                         .reason = reason,
@@ -124,10 +124,10 @@ pub fn validateConfigContext(
 }
 
 fn context(command: []const u8, background: bool) command_admission.CommandContext {
+    _ = background;
     return .{
         .command = command,
         .resolved_cwd = "/tmp",
-        .background = background,
         .target_os = builtin.os.tag,
     };
 }
@@ -277,6 +277,6 @@ test "router executes direct plan without consulting approved shell capacity" {
     try std.testing.expect(std.mem.find(u8, routed.result.output, "<stdout>\n1\n</stdout>") != null);
     try std.testing.expectEqual(
         @as(?[]const u8, null),
-        routed.result.command_result.?.foreground.output_file,
+        routed.result.command_result.?.output_file,
     );
 }

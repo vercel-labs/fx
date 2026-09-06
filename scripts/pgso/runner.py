@@ -206,9 +206,9 @@ def run_checked(
     if timeout_s <= 0:
         raise PgsoError("command timeout must be positive")
 
-    started = time.monotonic()
     command_display = shlex.join(argv_tuple)
     emit_progress(f"command started: {command_display} (log: {log_path})")
+    started = time.monotonic()
     try:
         process = subprocess.Popen(
             argv_tuple,
@@ -259,10 +259,27 @@ def run_checked(
     stdout_thread.start()
     stderr_thread.start()
 
+    # POSIX timed waits poll; observe exit before supervision and log-drain delays.
+    completed = threading.Event()
+    completed_at = started
+    wait_error: BaseException | None = None
+
+    def wait_for_exit() -> None:
+        nonlocal completed_at, wait_error
+        try:
+            process.wait()
+        except BaseException as error:
+            wait_error = error
+        finally:
+            completed_at = time.monotonic()
+            completed.set()
+
+    wait_thread = threading.Thread(target=wait_for_exit, daemon=True)
     timed_out = False
     deadline = time.monotonic() + timeout_s
     next_heartbeat = time.monotonic() + COMMAND_HEARTBEAT_SECONDS
     try:
+        wait_thread.start()
         while process.poll() is None:
             now = time.monotonic()
             if now >= deadline:
@@ -270,23 +287,27 @@ def run_checked(
                 _terminate_process_group(process)
                 break
             wait_seconds = max(0.001, min(deadline, next_heartbeat) - now)
-            try:
-                process.wait(timeout=wait_seconds)
-            except subprocess.TimeoutExpired:
-                now = time.monotonic()
-                if now >= deadline:
-                    timed_out = True
-                    _terminate_process_group(process)
-                    break
-                if now >= next_heartbeat:
-                    emit_progress(
-                        f"command still running after {now - started:.1f}s: "
-                        f"{command_display} (log: {log_path})"
-                    )
-                    while next_heartbeat <= now:
-                        next_heartbeat += COMMAND_HEARTBEAT_SECONDS
+            if completed.wait(wait_seconds):
+                break
+            now = time.monotonic()
+            if now >= deadline:
+                timed_out = True
+                _terminate_process_group(process)
+                break
+            if now >= next_heartbeat:
+                emit_progress(
+                    f"command still running after {now - started:.1f}s: "
+                    f"{command_display} (log: {log_path})"
+                )
+                while next_heartbeat <= now:
+                    next_heartbeat += COMMAND_HEARTBEAT_SECONDS
+        wait_thread.join()
+        if wait_error is not None:
+            raise wait_error
     except BaseException:
         _terminate_process_group(process)
+        if wait_thread.ident is not None:
+            wait_thread.join()
         stdout_thread.join()
         stderr_thread.join()
         elapsed_seconds = time.monotonic() - started
@@ -306,6 +327,7 @@ def run_checked(
         emit_progress(f"command cancelled after {elapsed_seconds:.3f}s: {command_display}")
         raise
 
+    elapsed_seconds = completed_at - started
     stdout_thread.join()
     stderr_thread.join()
     stdout = stdout_capture.text()
@@ -315,7 +337,7 @@ def run_checked(
         _write_log(
             log_path,
             argv=argv_tuple,
-            elapsed_seconds=time.monotonic() - started,
+            elapsed_seconds=elapsed_seconds,
             returncode=process.returncode,
             stdout=stdout,
             stderr=stderr,
@@ -327,7 +349,6 @@ def run_checked(
         )
 
     if timed_out:
-        elapsed_seconds = time.monotonic() - started
         write_status("timed_out")
         emit_progress(
             f"command timed out in {elapsed_seconds:.3f}s: {command_display}"
@@ -336,7 +357,6 @@ def run_checked(
             f"command timed out after {timeout_s:g} seconds: {argv_tuple[0]}"
         )
 
-    elapsed_seconds = time.monotonic() - started
     result = CommandResult(
         argv=argv_tuple,
         returncode=process.returncode,

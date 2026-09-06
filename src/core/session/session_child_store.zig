@@ -502,6 +502,19 @@ const CapabilityImpl = struct {
 pub const SessionChildCapability = struct {
     impl: *CapabilityImpl,
 
+    pub fn duplicate(
+        self: *const SessionChildCapability,
+        alloc: Allocator,
+    ) !SessionChildCapability {
+        return initWithOptions(
+            alloc,
+            self.impl.session_dir.dir,
+            self.impl.display_session_path,
+            self.impl.mode,
+            .{},
+        );
+    }
+
     pub fn init(
         alloc: Allocator,
         session_dir: std.Io.Dir,
@@ -981,7 +994,9 @@ pub const SessionChildCapability = struct {
                 else => return err,
             };
             try verifyPrivateStat(file_stat);
-            try names.append(alloc, try alloc.dupe(u8, entry.name));
+            const owned_name = try alloc.dupe(u8, entry.name);
+            errdefer alloc.free(owned_name);
+            try names.append(alloc, owned_name);
         }
         return .{
             .alloc = alloc,

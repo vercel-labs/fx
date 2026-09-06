@@ -1,5 +1,7 @@
 const runtime_assistant_stream = @import("runtime/assistant_stream.zig");
+const runtime_agent = @import("runtime/agent.zig");
 const runtime_config = @import("runtime/config.zig");
+const runtime_checkpoint = @import("runtime/checkpoint.zig");
 const runtime_deps = @import("runtime/deps.zig");
 const runtime_execution_memory = @import("runtime/execution_memory.zig");
 const runtime_finalization = @import("runtime/finalization.zig");
@@ -8,6 +10,8 @@ const runtime_orchestrator = @import("runtime/orchestrator.zig");
 const runtime_tool_contracts = @import("runtime/tool_contracts.zig");
 
 pub const ToolExecutionStatus = runtime_tool_contracts.ToolExecutionStatus;
+pub const Agent = runtime_agent.Agent;
+pub const checkpoint = runtime_checkpoint;
 pub const DeferredToolCompletion = runtime_tool_contracts.DeferredToolCompletion;
 pub const TransportPublicationOutcome = runtime_tool_contracts.TransportPublicationOutcome;
 pub const SecondarySinkOutcome = runtime_tool_contracts.SecondarySinkOutcome;
@@ -34,13 +38,17 @@ pub const prepareToolCallForLifecycle = runtime_lifecycle.prepareToolCallForLife
 pub const dispatchAttentionRequiredCheckpoint = runtime_lifecycle.dispatchAttentionRequiredCheckpoint;
 pub const TurnFinalizationGuard = runtime_finalization.TurnFinalizationGuard;
 pub const Config = runtime_config.Config;
-pub const processQueuedPrompt = runtime_orchestrator.processQueuedPrompt;
+pub const processAgentPrompt = runtime_orchestrator.processAgentPrompt;
+pub const compactContextTransaction = runtime_orchestrator.compactContextTransaction;
+pub const prepareManualCompactionContinuation = runtime_orchestrator.prepareManualCompactionContinuation;
+pub const prepareRetainedCompactionWindow = runtime_orchestrator.prepareRetainedCompactionWindow;
 pub const persistedStatusForCurrentFxLocalResult = runtime_execution_memory.persistedStatusForCurrentFxLocalResult;
 pub const classifyProviderExecutedResultStatus = runtime_execution_memory.classifyProviderExecutedResultStatus;
 pub const normalizeAssistantTextForDisplay = runtime_assistant_stream.normalizeAssistantTextForDisplay;
 
 test {
     _ = @import("stream_provider.zig");
+    _ = @import("runtime/context_compaction.zig");
     _ = @import("runtime/tests/gateway_flow.zig");
     _ = @import("runtime/tests/tool_flow.zig");
     _ = @import("runtime/tests/interruption_flow.zig");

@@ -1,10 +1,12 @@
 const std = @import("std");
+const image_data = @import("../images/image_data.zig");
 const session = @import("session.zig");
 const session_usage = @import("session_usage.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const types = @import("../shared/types.zig");
 const captured_command = @import("../tooling/captured_command.zig");
 const model_provider = @import("../config/model_provider.zig");
+const context_limits = @import("../config/context_limits.zig");
 const credential_authority = @import("../auth/credential_authority.zig");
 
 const Allocator = std.mem.Allocator;
@@ -30,6 +32,64 @@ pub const DurableSessionPreferences = struct {
         };
     }
 };
+
+/// Decodes persisted preferences; the caller owns the returned model.
+pub fn parse_preferences(alloc: Allocator, value: std.json.Value) !DurableSessionPreferences {
+    const raw = try requireObject(value);
+    const legacy = raw.contains("connection_id") or raw.contains("model_id");
+    const object = if (legacy)
+        try exactObject(value, &.{ "connection_id", "model_id", "effort", "fast_mode" })
+    else if (raw.contains("provider"))
+        try exactObject(value, &.{ "provider", "model", "effort", "fast_mode" })
+    else
+        try exactObject(value, &.{ "model", "effort", "fast_mode" });
+    const provider: model_provider.ProviderId = if (legacy) blk: {
+        if (!std.mem.eql(u8, try requireString(object, "connection_id"), "vercel")) return error.InvalidDurableField;
+        break :blk .gateway;
+    } else if (object.contains("provider"))
+        model_provider.parse(try requireString(object, "provider")) orelse return error.InvalidDurableField
+    else
+        .gateway;
+    const model = try requireString(object, if (legacy) "model_id" else "model");
+    try validateModel(model);
+    const effort = types.ReasoningEffort.parse(try requireString(object, "effort")) orelse return error.InvalidDurableField;
+    const fast_mode = try requireBool(object, "fast_mode");
+    return .{ .provider = provider, .model = try alloc.dupe(u8, model), .effort = effort, .fast_mode = fast_mode };
+}
+
+test "legacy connection preferences decode through the shared state codec" {
+    const alloc = std.testing.allocator;
+    const state_json = "{\"id\":\"legacy\",\"origin_workspace_root\":\"/workspace\",\"workspace_root\":\"/workspace\",\"created_at_ms\":1,\"updated_at_ms\":2,\"conversation_language\":\"en\",\"preferences\":{\"connection_id\":\"vercel\",\"model_id\":\"test/model\",\"effort\":\"high\",\"fast_mode\":true},\"history\":[],\"total_input_tokens\":0,\"total_output_tokens\":0}";
+    try std.testing.checkAllAllocationFailures(alloc, struct {
+        fn check(a: Allocator, bytes: []const u8) !void {
+            var source = std.Io.Reader.fixed(bytes);
+            var state = try decodeState(a, &source, .{});
+            defer state.deinit(a);
+            try std.testing.expectEqual(model_provider.ProviderId.gateway, state.preferences.provider);
+            try std.testing.expectEqualStrings("test/model", state.preferences.model);
+            try std.testing.expectEqualStrings("high", state.preferences.effort.label());
+            try std.testing.expect(state.preferences.fast_mode);
+        }
+    }.check, .{state_json});
+}
+
+test "legacy connection preferences reject unknown identities and mixed fields" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{
+        "{\"connection_id\":\"custom\",\"model_id\":\"test\",\"effort\":\"auto\",\"fast_mode\":false}",
+        "{\"connection_id\":\"vercel\",\"model_id\":\"test\",\"model\":\"other\",\"effort\":\"auto\",\"fast_mode\":false}",
+        "{\"connection_id\":\"vercel\",\"model_id\":\"test\",\"provider\":\"codex\",\"effort\":\"auto\",\"fast_mode\":false}",
+        "{\"connection_id\":\"vercel\",\"model_id\":\"\",\"effort\":\"auto\",\"fast_mode\":false}",
+    }) |bytes| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+        defer parsed.deinit();
+        if (parse_preferences(alloc, parsed.value)) |value| {
+            var owned = value;
+            owned.deinit(alloc);
+            return error.TestUnexpectedResult;
+        } else |err| try std.testing.expect(err == error.InvalidSessionFormat or err == error.InvalidDurableField);
+    }
+}
 
 pub const RecoveryToolState = enum {
     none,
@@ -61,6 +121,7 @@ pub const TurnAuthority = struct {
 
 pub const RecoveryCheckpoint = struct {
     version: u8 = 2,
+    disposition: enum { continuable, history_only } = .continuable,
     turn_id: u64,
     user: session.UserTurn,
     assistant_source: []u8,
@@ -74,6 +135,16 @@ pub const RecoveryCheckpoint = struct {
     max_provider_attempts: usize,
     consumed_provider_attempts: usize,
     outstanding_reservation: bool = false,
+
+    /// Borrows the checkpoint's exact user and uncommitted response suffix.
+    pub fn interruptedTurn(self: RecoveryCheckpoint) types.HistoryTurn {
+        return .{ .interrupted = .{
+            .user = self.user,
+            .assistant = if (self.assistant_source.len > 0) self.assistant_source else null,
+            .execution = self.execution,
+            .terminal_reason = .failed,
+        } };
+    }
 
     pub fn deinit(self: *RecoveryCheckpoint, alloc: Allocator) void {
         session.freeUserTurn(alloc, self.user);
@@ -93,6 +164,7 @@ pub const RecoveryCheckpoint = struct {
         const authority = try self.authority.dupe(alloc);
         return .{
             .version = self.version,
+            .disposition = self.disposition,
             .turn_id = self.turn_id,
             .user = user,
             .assistant_source = assistant_source,
@@ -126,6 +198,10 @@ pub const DurableSessionState = struct {
     /// Last ordinary history commit correlated to durable subagent work. This
     /// control-only marker is not included in model history.
     last_subagent_work_id: ?[]u8 = null,
+    /// True only for a parent-owned subagent session. This durable identity
+    /// keeps the session private even if owner sidecar publication is
+    /// interrupted immediately after creation.
+    subagent_child: bool = false,
     /// Null only for sessions written before durable usage accounting.
     usage: ?session_usage.Snapshot = null,
     /// Active control state. It is never projected into model history and a
@@ -143,6 +219,20 @@ pub const DurableSessionState = struct {
         if (self.usage) |*usage| usage.deinit(alloc);
         if (self.recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
         self.* = undefined;
+    }
+
+    /// Retains legacy recovery evidence without granting permission to replay its route.
+    pub fn archive_legacy_recovery(self: *DurableSessionState, alloc: Allocator) !bool {
+        const checkpoint = if (self.recovery_checkpoint) |*value| value else return false;
+        if (checkpoint.disposition != .history_only) return false;
+        const turn = try session.dupeHistoryTurn(alloc, checkpoint.interruptedTurn());
+        errdefer session.freeHistoryTurn(alloc, turn);
+        const len = try std.math.add(usize, self.history.len, 1);
+        self.history = try alloc.realloc(self.history, len);
+        self.history[len - 1] = turn;
+        checkpoint.deinit(alloc);
+        self.recovery_checkpoint = null;
+        return true;
     }
 
     pub fn dupe(self: DurableSessionState, alloc: Allocator) !DurableSessionState {
@@ -192,11 +282,163 @@ pub const DurableSessionState = struct {
             .total_output_tokens = self.total_output_tokens,
             .permission_state = permission_state,
             .last_subagent_work_id = last_subagent_work_id,
+            .subagent_child = self.subagent_child,
             .usage = usage,
             .recovery_checkpoint = recovery_checkpoint,
         };
     }
 };
+
+pub const session_metadata_schema_version: u8 = 4;
+pub const max_session_metadata_bytes: usize = 64 * 1024;
+pub const max_session_title_bytes: usize = 240;
+
+pub const SessionMetadata = struct {
+    schema_version: u8 = session_metadata_schema_version,
+    id: []const u8,
+    origin_workspace_root: []const u8,
+    workspace_root: []const u8,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+    conversation_language: []const u8,
+    provider: []const u8,
+    model: []const u8,
+    effort: []const u8,
+    fast_mode: bool,
+    title: ?[]const u8 = null,
+    subagent_child: bool = false,
+};
+
+pub const DecodedSessionMetadata = std.json.Parsed(SessionMetadata);
+pub const max_permission_state_bytes: usize = 1024 * 1024;
+pub const max_recovery_checkpoint_bytes: usize = context_limits.emergency_ceiling_bytes;
+
+pub fn encodeSessionMetadata(
+    alloc: Allocator,
+    metadata: SessionMetadata,
+) ![]u8 {
+    try validateSessionMetadata(metadata);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try std.json.Stringify.value(metadata, .{}, &out.writer);
+    if (out.written().len == 0 or out.written().len > max_session_metadata_bytes) {
+        return error.SessionMetadataTooLarge;
+    }
+    return out.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+pub fn decodeSessionMetadata(
+    alloc: Allocator,
+    bytes: []const u8,
+) !DecodedSessionMetadata {
+    if (bytes.len == 0 or bytes.len > max_session_metadata_bytes) {
+        return error.SessionMetadataTooLarge;
+    }
+    var parsed = std.json.parseFromSlice(SessionMetadata, alloc, bytes, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = false,
+        .max_value_len = max_session_metadata_bytes,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidSessionMetadata,
+    };
+    errdefer parsed.deinit();
+    validateSessionMetadata(parsed.value) catch return error.InvalidSessionMetadata;
+    return parsed;
+}
+
+pub fn encodePermissionState(
+    alloc: Allocator,
+    state: session_permission_state.State,
+) ![]u8 {
+    try session_permission_state.validate(state);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try writePermissionState(&out.writer, state);
+    if (out.written().len == 0 or out.written().len > max_permission_state_bytes) {
+        return error.PermissionStateTooLarge;
+    }
+    return out.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+pub fn decodePermissionState(
+    alloc: Allocator,
+    bytes: []const u8,
+) !session_permission_state.State {
+    if (bytes.len == 0 or bytes.len > max_permission_state_bytes) {
+        return error.PermissionStateTooLarge;
+    }
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{
+        .max_value_len = max_permission_state_bytes,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidPermissionState,
+    };
+    defer parsed.deinit();
+    return parsePermissionState(alloc, parsed.value) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidPermissionState,
+    };
+}
+
+pub fn encodeRecoveryCheckpoint(
+    alloc: Allocator,
+    checkpoint: RecoveryCheckpoint,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try writeRecoveryCheckpoint(&out.writer, checkpoint);
+    if (out.written().len == 0 or out.written().len > max_recovery_checkpoint_bytes) {
+        return error.RecoveryCheckpointTooLarge;
+    }
+    return out.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+pub fn decodeRecoveryCheckpoint(
+    alloc: Allocator,
+    bytes: []const u8,
+) !RecoveryCheckpoint {
+    if (bytes.len == 0 or bytes.len > max_recovery_checkpoint_bytes) {
+        return error.RecoveryCheckpointTooLarge;
+    }
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{
+        .max_value_len = max_recovery_checkpoint_bytes,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidRecoveryCheckpoint,
+    };
+    defer parsed.deinit();
+    return parseRecoveryCheckpoint(alloc, parsed.value) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidRecoveryCheckpoint,
+    };
+}
+
+fn validateSessionMetadata(metadata: SessionMetadata) !void {
+    if (metadata.schema_version != session_metadata_schema_version) {
+        return error.UnsupportedSessionSchema;
+    }
+    try validateSessionId(metadata.id);
+    try validateWorkspaceRoot(metadata.origin_workspace_root);
+    try validateWorkspaceRoot(metadata.workspace_root);
+    if (metadata.created_at_ms < 0 or metadata.updated_at_ms < metadata.created_at_ms) {
+        return error.InvalidSessionMetadata;
+    }
+    try validateConversationLanguageBytes(metadata.conversation_language);
+    if (model_provider.parse(metadata.provider) == null) return error.InvalidSessionMetadata;
+    try validateModel(metadata.model);
+    if (types.ReasoningEffort.parse(metadata.effort) == null) {
+        return error.InvalidSessionMetadata;
+    }
+    if (metadata.title) |title| {
+        if (title.len == 0 or
+            title.len > max_session_title_bytes or
+            !std.unicode.utf8ValidateSlice(title))
+        {
+            return error.InvalidSessionMetadata;
+        }
+    }
+}
 
 pub const EncodeSummary = struct {
     encoded_bytes: u64,
@@ -307,32 +549,10 @@ pub fn writeHistoryTurn(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
             try writeUserTurn(writer, entry.user);
             try writer.writeAll(",\"assistant\":");
             try writeDurableBytes(writer, entry.assistant);
+            try writer.writeAll(",\"provider_replay\":");
+            try std.json.Stringify.value(entry.provider_replay, .{}, writer);
             try writer.writeAll(",\"execution\":");
             try writeExecutionMemory(writer, entry.execution);
-            try writer.writeByte('}');
-        },
-        .background_command => |entry| {
-            const extended = entry.assistant != null or hasDurableExecutionMemory(entry.execution);
-            try writer.writeAll("{\"kind\":\"background_command\",\"user\":");
-            try writeUserTurn(writer, entry.user);
-            try writer.writeAll(",\"log_path\":");
-            try writeDurableBytes(writer, entry.log_path);
-            try writer.print(",\"expect_url\":{s},\"url\":", .{
-                if (entry.expect_url) "true" else "false",
-            });
-            try writeOptionalDurableBytes(writer, entry.url);
-            try writer.writeAll(",\"background_record_id\":");
-            if (entry.background_record_id) |record_id| {
-                try writeHexString(writer, &record_id);
-            } else {
-                try writer.writeAll("null");
-            }
-            if (extended) {
-                try writer.writeAll(",\"assistant\":");
-                try writeOptionalDurableBytes(writer, entry.assistant);
-                try writer.writeAll(",\"execution\":");
-                try writeExecutionMemory(writer, entry.execution);
-            }
             try writer.writeByte('}');
         },
         .interrupted => |entry| {
@@ -365,6 +585,29 @@ pub fn writeHistoryTurn(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
             try writer.writeByte('}');
         },
     }
+}
+
+fn formatLegacyBackgroundAssistant(
+    alloc: Allocator,
+    assistant: ?[]const u8,
+    log_path: []const u8,
+    url: ?[]const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    if (assistant) |text| {
+        if (text.len != 0) {
+            try out.writer.writeAll(text);
+            if (!std.mem.endsWith(u8, text, "\n")) try out.writer.writeByte('\n');
+        }
+    }
+    try out.writer.writeAll(
+        "[Historical command record: fx no longer owns or controls this process",
+    );
+    if (log_path.len != 0) try out.writer.print("; former log={s}", .{log_path});
+    if (url) |value| try out.writer.print("; recorded url={s}", .{value});
+    try out.writer.writeAll("]");
+    return out.toOwnedSlice();
 }
 
 pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.HistoryTurn {
@@ -422,17 +665,20 @@ pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Histor
         } };
     }
     if (std.mem.eql(u8, kind, "assistant")) {
-        const object = try exactObject(value, &.{ "kind", "user", "assistant", "execution" });
+        const shape = try exactVariantObject(value, &.{ "kind", "user", "assistant", "execution" }, &.{ "kind", "user", "assistant", "execution", "provider_replay" });
+        const object = shape.object;
         const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat);
         errdefer session.freeUserTurn(alloc, user);
         const assistant = try parseRequiredDurableBytes(alloc, object, "assistant");
         errdefer alloc.free(assistant);
         const execution = try parseExecutionMemory(alloc, object.get("execution") orelse return error.InvalidSessionFormat);
         errdefer session.freeExecutionMemory(alloc, execution);
+        const replay = try parseProviderReplay(alloc, object.get("provider_replay") orelse .null);
         return .{ .assistant = .{
             .user = user,
             .assistant = assistant,
             .execution = execution,
+            .provider_replay = replay,
         } };
     }
     if (std.mem.eql(u8, kind, "background_command")) {
@@ -444,29 +690,32 @@ pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Histor
         const object = shape.object;
         const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat);
         errdefer session.freeUserTurn(alloc, user);
-        const assistant = if (shape.extended)
+        const legacy_assistant = if (shape.extended)
             try parseOptionalDurableBytes(alloc, object.get("assistant") orelse return error.InvalidSessionFormat)
         else
             null;
-        errdefer if (assistant) |owned| alloc.free(owned);
+        defer if (legacy_assistant) |owned| alloc.free(owned);
         const execution = if (shape.extended)
             try parseExecutionMemory(alloc, object.get("execution") orelse return error.InvalidSessionFormat)
         else
             session.ExecutionMemory{};
         errdefer session.freeExecutionMemory(alloc, execution);
         const log_path = try parseRequiredDurableBytes(alloc, object, "log_path");
-        errdefer alloc.free(log_path);
+        defer alloc.free(log_path);
         const url = try parseOptionalDurableBytes(alloc, object.get("url") orelse return error.InvalidSessionFormat);
-        errdefer if (url) |owned| alloc.free(owned);
-        const background_record_id = try parseOptionalIdentifier(object.get("background_record_id") orelse return error.InvalidSessionFormat);
-        return .{ .background_command = .{
+        defer if (url) |owned| alloc.free(owned);
+        _ = try requireBool(object, "expect_url");
+        _ = try parseOptionalIdentifier(object.get("background_record_id") orelse return error.InvalidSessionFormat);
+        const assistant = try formatLegacyBackgroundAssistant(
+            alloc,
+            legacy_assistant,
+            log_path,
+            url,
+        );
+        return .{ .assistant = .{
             .user = user,
             .assistant = assistant,
             .execution = execution,
-            .log_path = log_path,
-            .expect_url = try requireBool(object, "expect_url"),
-            .url = url,
-            .background_record_id = background_record_id,
         } };
     }
     if (std.mem.eql(u8, kind, "interrupted")) {
@@ -646,6 +895,9 @@ fn writeState(writer: *std.Io.Writer, state: DurableSessionState) !void {
         try writer.writeAll(",\"last_subagent_work_id\":");
         try writeJsonString(writer, id);
     }
+    if (state.subagent_child) {
+        try writer.writeAll(",\"subagent_child\":true");
+    }
     if (state.recovery_checkpoint) |checkpoint| {
         try writer.writeAll(",\"recovery_checkpoint\":");
         try writeRecoveryCheckpoint(writer, checkpoint);
@@ -752,6 +1004,7 @@ fn parsePermissionState(
 }
 
 pub fn writeRecoveryCheckpoint(writer: *std.Io.Writer, checkpoint: RecoveryCheckpoint) !void {
+    if (checkpoint.disposition == .history_only) return error.InvalidDurableField;
     try writer.print("{{\"version\":{d},\"turn_id\":{d},\"user\":", .{
         checkpoint.version,
         checkpoint.turn_id,
@@ -818,25 +1071,19 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
     const conversation_language = try parseConversationLanguage(language_raw);
 
     try expectKey(&json_reader, alloc, "preferences");
-    try expectToken(try json_reader.next(), .object_begin);
-    try expectKey(&json_reader, alloc, "model");
-    const model = try readStringOwned(&json_reader, alloc, 1024);
-    errdefer alloc.free(model);
-    try expectKey(&json_reader, alloc, "effort");
-    const effort_raw = try readStringOwned(&json_reader, alloc, types.ReasoningEffort.max_name_bytes);
-    defer alloc.free(effort_raw);
-    const effort = types.ReasoningEffort.parse(effort_raw) orelse
-        return error.InvalidDurableField;
-    try expectKey(&json_reader, alloc, "fast_mode");
-    const fast_mode = try readBool(&json_reader);
-    var provider: model_provider.ProviderId = .gateway;
-    if (try json_reader.peekNextTokenType() != .object_end) {
-        try expectKey(&json_reader, alloc, "provider");
-        const provider_raw = try readStringOwned(&json_reader, alloc, 16);
-        defer alloc.free(provider_raw);
-        provider = model_provider.parse(provider_raw) orelse return error.InvalidDurableField;
-    }
-    try expectToken(try json_reader.next(), .object_end);
+    var preferences = preferences: {
+        var buffer: [8 * 1024]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+        const value = std.json.Value.jsonParse(fixed.allocator(), &json_reader, .{
+            .max_value_len = 1024,
+            .allocate = .alloc_always,
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.InvalidSessionFormat,
+            else => return err,
+        };
+        break :preferences try parse_preferences(alloc, value);
+    };
+    errdefer preferences.deinit(alloc);
 
     try expectKey(&json_reader, alloc, "history");
     try expectToken(try json_reader.next(), .array_begin);
@@ -873,13 +1120,15 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
     var usage_seen = false;
     var last_subagent_work_id: ?[]u8 = null;
     errdefer if (last_subagent_work_id) |work_id| alloc.free(work_id);
+    var subagent_child = false;
+    var subagent_child_seen = false;
     var recovery_checkpoint: ?RecoveryCheckpoint = null;
     errdefer if (recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
     while (try json_reader.peekNextTokenType() != .object_end) {
         const key = try readStringOwned(&json_reader, alloc, 64);
         defer alloc.free(key);
         if (std.mem.eql(u8, key, "context_history_start")) {
-            if (context_seen or permission_state_seen or usage_seen or last_subagent_work_id != null or recovery_checkpoint != null) {
+            if (context_seen or permission_state_seen or usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) {
                 return error.InvalidSessionFormat;
             }
             const raw = try readU64(&json_reader, alloc);
@@ -887,7 +1136,7 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
                 return error.InvalidSessionFormat;
             context_seen = true;
         } else if (std.mem.eql(u8, key, "permission_state")) {
-            if (permission_state_seen or usage_seen or last_subagent_work_id != null or recovery_checkpoint != null) {
+            if (permission_state_seen or usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) {
                 return error.InvalidSessionFormat;
             }
             var arena = std.heap.ArenaAllocator.init(alloc);
@@ -900,7 +1149,7 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
             permission_state = try parsePermissionState(alloc, value);
             permission_state_seen = true;
         } else if (std.mem.eql(u8, key, "usage")) {
-            if (usage_seen or last_subagent_work_id != null or recovery_checkpoint != null) return error.InvalidSessionFormat;
+            if (usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) return error.InvalidSessionFormat;
             const parse_limit = @min(
                 limits.max_value_bytes,
                 session_usage.max_snapshot_bytes,
@@ -916,8 +1165,13 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
             usage = try session_usage.parseSnapshotValue(alloc, value);
             usage_seen = true;
         } else if (std.mem.eql(u8, key, "last_subagent_work_id")) {
-            if (last_subagent_work_id != null or recovery_checkpoint != null) return error.InvalidSessionFormat;
+            if (last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) return error.InvalidSessionFormat;
             last_subagent_work_id = try readStringOwned(&json_reader, alloc, 128);
+        } else if (std.mem.eql(u8, key, "subagent_child")) {
+            if (subagent_child_seen or recovery_checkpoint != null) return error.InvalidSessionFormat;
+            subagent_child = try readBool(&json_reader);
+            if (!subagent_child) return error.InvalidDurableField;
+            subagent_child_seen = true;
         } else if (std.mem.eql(u8, key, "recovery_checkpoint")) {
             if (recovery_checkpoint != null) return error.InvalidSessionFormat;
             var arena = std.heap.ArenaAllocator.init(alloc);
@@ -943,18 +1197,14 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
         .created_at_ms = created_at_ms,
         .updated_at_ms = updated_at_ms,
         .conversation_language = conversation_language,
-        .preferences = .{
-            .provider = provider,
-            .model = model,
-            .effort = effort,
-            .fast_mode = fast_mode,
-        },
+        .preferences = preferences,
         .history = owned_history,
         .context_history_start = context_history_start,
         .total_input_tokens = total_input_tokens,
         .total_output_tokens = total_output_tokens,
         .permission_state = permission_state,
         .last_subagent_work_id = last_subagent_work_id,
+        .subagent_child = subagent_child,
         .usage = usage,
         .recovery_checkpoint = recovery_checkpoint,
     };
@@ -965,7 +1215,17 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
 pub fn parseRecoveryCheckpoint(alloc: Allocator, value: std.json.Value) !RecoveryCheckpoint {
     const raw_object = try requireObject(value);
     const version = try requireU64(raw_object, "version");
-    const object = switch (version) {
+    const legacy_route = raw_object.contains("route_identity");
+    const object = if (legacy_route) legacy: {
+        try validate_legacy_recovery_route(raw_object.get("route_identity").?, version);
+        const delivery = try requireString(raw_object, "delivery");
+        if (!std.mem.eql(u8, delivery, "possibly_sent") and !std.mem.eql(u8, delivery, "definitely_unsent")) return error.InvalidDurableField;
+        break :legacy try exactObject(value, &.{
+            "version",                    "route_identity",          "delivery",   "turn_id",     "user",                "assistant_source", "execution",
+            "cause",                      "action",                  "tool_state", "route_model", "requested_fast_mode", "fast_mode",        "max_provider_attempts",
+            "consumed_provider_attempts", "outstanding_reservation",
+        });
+    } else switch (version) {
         1 => if (raw_object.get("route_provider") != null)
             try exactObject(value, &.{
                 "version",             "turn_id",   "user",                  "assistant_source",           "execution",
@@ -991,7 +1251,10 @@ pub fn parseRecoveryCheckpoint(alloc: Allocator, value: std.json.Value) !Recover
     errdefer alloc.free(assistant_source);
     const execution = try parseExecutionMemory(alloc, object.get("execution") orelse return error.InvalidSessionFormat);
     errdefer session.freeExecutionMemory(alloc, execution);
-    const authority = if (version == 1) legacy: {
+    const authority = if (legacy_route) TurnAuthority{
+        .provider = .gateway,
+        .model = try parseDurableBytes(alloc, object.get("route_model") orelse return error.InvalidSessionFormat),
+    } else if (version == 1) legacy: {
         const model = try parseDurableBytes(alloc, object.get("route_model") orelse return error.InvalidSessionFormat);
         break :legacy TurnAuthority{
             .provider = if (object.get("route_provider")) |provider_value| blk: {
@@ -1011,6 +1274,7 @@ pub fn parseRecoveryCheckpoint(alloc: Allocator, value: std.json.Value) !Recover
         return error.InvalidDurableField;
     return .{
         .version = 2,
+        .disposition = if (legacy_route) .history_only else .continuable,
         .turn_id = try requireU64(object, "turn_id"),
         .user = user,
         .assistant_source = assistant_source,
@@ -1030,6 +1294,77 @@ pub fn parseRecoveryCheckpoint(alloc: Allocator, value: std.json.Value) !Recover
     };
 }
 
+test "legacy route checkpoints retain history without resumable authority" {
+    const alloc = std.testing.allocator;
+    const routes = [_][]const u8{
+        "{\"connection_id\":\"vercel\",\"adapter_kind\":\"vercel_ai_gateway\",\"permission_review_model_id\":\"review\"}",
+        "{\"connection_id\":\"vercel\",\"adapter_kind\":\"vercel_ai_gateway\",\"permission_review_model_id\":\"review\",\"vision_model_id\":\"vision\",\"subagent_model_id\":\"child\"}",
+        "{\"version\":1,\"connection_id\":\"vercel\",\"adapter_kind\":\"vercel_ai_gateway\",\"endpoint\":\"https://unused.invalid\",\"protocol\":\"vercel_ai_gateway\",\"credential_ref\":\"unused\",\"permission_review_model_id\":\"review\",\"vision_model_id\":\"vision\",\"subagent_model_id\":\"child\"}",
+    };
+    const fields = "\"turn_id\":1,\"user\":{\"text\":\"saved request\",\"images\":[]},\"assistant_source\":\"saved partial\",\"execution\":{\"schema_version\":3,\"tool_steps\":[],\"files\":[]},\"cause\":\"response_interrupted\",\"action\":\"continuing_response\",\"tool_state\":\"uncertain\",\"route_model\":\"test/model\",\"requested_fast_mode\":false,\"fast_mode\":false,\"max_provider_attempts\":3,\"consumed_provider_attempts\":0,\"outstanding_reservation\":false}";
+    for (routes, 2..) |route, version| {
+        for ([_][]const u8{ "possibly_sent", "definitely_unsent" }) |delivery| {
+            const bytes = try std.fmt.allocPrint(alloc, "{{\"version\":{d},\"route_identity\":{s},\"delivery\":\"{s}\",{s}", .{ version, route, delivery, fields });
+            defer alloc.free(bytes);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+            defer parsed.deinit();
+            var checkpoint = try parseRecoveryCheckpoint(alloc, parsed.value);
+            defer checkpoint.deinit(alloc);
+            try std.testing.expectEqual(.history_only, checkpoint.disposition);
+            try std.testing.expect(checkpoint.authority.credential_source == null);
+            try std.testing.expect(checkpoint.authority.credential_identity == null);
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            defer out.deinit();
+            try std.testing.expectError(error.InvalidDurableField, writeRecoveryCheckpoint(&out.writer, checkpoint));
+            try std.testing.expectEqual(@as(usize, 0), out.written().len);
+            const borrowed = DurableSessionState{
+                .id = @constCast("legacy"),
+                .origin_workspace_root = @constCast("/workspace"),
+                .workspace_root = @constCast("/workspace"),
+                .created_at_ms = 1,
+                .updated_at_ms = 2,
+                .conversation_language = .literal("en"),
+                .preferences = .{ .model = @constCast("test/model"), .effort = .auto, .fast_mode = false },
+                .history = &.{},
+                .total_input_tokens = 0,
+                .total_output_tokens = 0,
+                .recovery_checkpoint = checkpoint,
+            };
+            try std.testing.checkAllAllocationFailures(alloc, struct {
+                fn check(a: Allocator, original: DurableSessionState) !void {
+                    var state = try original.dupe(a);
+                    defer state.deinit(a);
+                    try std.testing.expect(try state.archive_legacy_recovery(a));
+                    try std.testing.expect(!(try state.archive_legacy_recovery(a)));
+                    try std.testing.expect(state.recovery_checkpoint == null);
+                    try std.testing.expectEqual(@as(usize, 1), state.history.len);
+                    try std.testing.expectEqualStrings("saved request", state.history[0].interrupted.user.text);
+                    try std.testing.expectEqualStrings("saved partial", state.history[0].interrupted.assistant.?);
+                }
+            }.check, .{borrowed});
+        }
+    }
+}
+
+fn validate_legacy_recovery_route(value: std.json.Value, version: u64) !void {
+    const object = switch (version) {
+        2 => try exactObject(value, &.{ "connection_id", "adapter_kind", "permission_review_model_id" }),
+        3 => try exactObject(value, &.{ "connection_id", "adapter_kind", "permission_review_model_id", "vision_model_id", "subagent_model_id" }),
+        4 => try exactObject(value, &.{ "version", "connection_id", "adapter_kind", "endpoint", "protocol", "credential_ref", "permission_review_model_id", "vision_model_id", "subagent_model_id" }),
+        else => return error.InvalidDurableField,
+    };
+    if (!std.mem.eql(u8, try requireString(object, "connection_id"), "vercel") or
+        !std.mem.eql(u8, try requireString(object, "adapter_kind"), "vercel_ai_gateway")) return error.InvalidDurableField;
+    if (version == 4 and (try requireU64(object, "version") != 1 or
+        !std.mem.eql(u8, try requireString(object, "protocol"), "vercel_ai_gateway"))) return error.InvalidDurableField;
+    var fields = object.iterator();
+    while (fields.next()) |field| {
+        if (std.mem.eql(u8, field.key_ptr.*, "version")) continue;
+        if (field.value_ptr.* != .string or field.value_ptr.string.len > 4096 or
+            !std.unicode.utf8ValidateSlice(field.value_ptr.string)) return error.InvalidDurableField;
+    }
+}
+
 fn parseTurnAuthority(alloc: Allocator, value: std.json.Value) !TurnAuthority {
     const object = try exactObject(value, &.{
         "provider",
@@ -1043,7 +1378,7 @@ fn parseTurnAuthority(alloc: Allocator, value: std.json.Value) !TurnAuthority {
     errdefer alloc.free(model);
     const credential_source = if (object.get("credential_source")) |source| switch (source) {
         .null => null,
-        .string => |text| types.parseCredentialSource(text) orelse return error.InvalidDurableField,
+        .string => |text| types.parseRuntimeCredentialSource(text) orelse return error.InvalidDurableField,
         else => return error.InvalidDurableField,
     } else return error.InvalidSessionFormat;
     const credential_identity = if (object.get("credential_identity")) |identity| switch (identity) {
@@ -1103,11 +1438,13 @@ fn writeSnapshotLocator(writer: *std.Io.Writer, value: ?[]const u8) !void {
 }
 
 fn writeExecutionMemory(writer: *std.Io.Writer, execution: session.ExecutionMemory) !void {
-    try writer.writeAll("{\"schema_version\":5,\"tool_steps\":[");
+    try writer.writeAll("{\"schema_version\":9,\"tool_steps\":[");
     for (execution.tool_steps, 0..) |step, i| {
         if (i > 0) try writer.writeByte(',');
         try writer.writeAll("{\"assistant\":");
         try writeOptionalDurableBytes(writer, step.assistant);
+        try writer.writeAll(",\"provider_replay\":");
+        try std.json.Stringify.value(step.provider_replay, .{}, writer);
         try writer.writeAll(",\"tool_calls\":[");
         for (step.tool_calls, 0..) |tool_call, call_index| {
             if (call_index > 0) try writer.writeByte(',');
@@ -1124,6 +1461,15 @@ fn writeExecutionMemory(writer: *std.Io.Writer, execution: session.ExecutionMemo
     for (execution.files, 0..) |file, i| {
         if (i > 0) try writer.writeByte(',');
         try writeFileEvidence(writer, file);
+    }
+    try writer.writeAll("],\"steering\":[");
+    for (execution.steering, 0..) |steering, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writer.writeAll("{\"text\":");
+        try writeDurableBytes(writer, steering.text);
+        try writer.writeAll(",\"assistant_prefix\":");
+        try writeOptionalDurableBytes(writer, steering.assistant_prefix);
+        try writer.print(",\"after_tool_step_count\":{d}}}", .{steering.after_tool_step_count});
     }
     try writer.writeAll("],\"turn_summary\":");
     if (execution.turn_summary) |summary| {
@@ -1212,6 +1558,21 @@ fn writePersistedToolResult(writer: *std.Io.Writer, result: session.PersistedToo
         writer,
         result.terminal_action_presentation,
     );
+    if (result.tool_image_handle) |handle| {
+        try writer.writeAll(",\"tool_image_handle\":");
+        try writeDurableBytes(writer, handle);
+    } else if (result.tool_images.len > 0) {
+        try writer.writeAll(",\"tool_images\":[");
+        for (result.tool_images, 0..) |image, index| {
+            if (index > 0) try writer.writeByte(',');
+            try writer.writeAll("{\"type\":\"image\",\"mimeType\":");
+            try std.json.Stringify.value(image.mime_type, .{}, writer);
+            try writer.writeAll(",\"data\":");
+            try std.json.Stringify.value(image.data, .{}, writer);
+            try writer.writeByte('}');
+        }
+        try writer.writeByte(']');
+    }
     try writer.writeByte('}');
 }
 
@@ -1476,17 +1837,14 @@ fn imageAttachmentObject(value: std.json.Value) !std.json.ObjectMap {
 
 fn parseExecutionMemory(alloc: Allocator, value: std.json.Value) !session.ExecutionMemory {
     const source = try requireObject(value);
-    const has_turn_summary = source.get("turn_summary") != null;
-    const object = if (has_turn_summary)
-        try exactObject(value, &.{ "schema_version", "tool_steps", "files", "turn_summary" })
-    else
-        try exactObject(value, &.{ "schema_version", "tool_steps", "files" });
-    const schema_version = try requireU64(object, "schema_version");
-    if (schema_version < 1 or schema_version > 5 or
-        (schema_version == 5) != has_turn_summary)
-    {
-        return error.InvalidSessionFormat;
-    }
+    const schema_version = try requireU64(source, "schema_version");
+    const object = switch (schema_version) {
+        1...4 => try exactObject(value, &.{ "schema_version", "tool_steps", "files" }),
+        5 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "turn_summary" }),
+        6 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary" }),
+        7...9 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary" }),
+        else => return error.InvalidSessionFormat,
+    };
     const tool_steps = try parseToolSteps(
         alloc,
         object.get("tool_steps") orelse return error.InvalidSessionFormat,
@@ -1494,15 +1852,81 @@ fn parseExecutionMemory(alloc: Allocator, value: std.json.Value) !session.Execut
     );
     errdefer session.freeExecutionMemory(alloc, .{ .tool_steps = tool_steps });
     const files = try parseFiles(alloc, object.get("files") orelse return error.InvalidSessionFormat);
-    const turn_summary = if (has_turn_summary)
+    errdefer types.freeFileEvidenceSlice(alloc, files);
+    const steering: []types.PersistedSteering = if (schema_version >= 6)
+        try parsePersistedSteering(
+            alloc,
+            object.get("steering") orelse return error.InvalidSessionFormat,
+            schema_version,
+            tool_steps.len,
+        )
+    else
+        &.{};
+    errdefer types.freePersistedSteering(alloc, steering);
+    const turn_summary = if (schema_version >= 5)
         try parseOptionalTurnSummary(object.get("turn_summary").?)
     else
         null;
     return .{
         .tool_steps = tool_steps,
         .files = files,
+        .steering = steering,
         .turn_summary = turn_summary,
     };
+}
+
+fn parsePersistedSteering(
+    alloc: Allocator,
+    value: std.json.Value,
+    schema_version: u64,
+    tool_step_count: usize,
+) ![]types.PersistedSteering {
+    if (value != .array) return error.InvalidSessionFormat;
+    if (value.array.items.len == 0) return &.{};
+    const steering = try alloc.alloc(types.PersistedSteering, value.array.items.len);
+    errdefer alloc.free(steering);
+    var parsed_count: usize = 0;
+    errdefer for (steering[0..parsed_count]) |item| {
+        alloc.free(item.text);
+        if (item.assistant_prefix) |prefix| alloc.free(prefix);
+    };
+    var prior_tool_step_count: usize = 0;
+    for (value.array.items, 0..) |item, index| {
+        const parsed = if (schema_version == 6)
+            types.PersistedSteering{
+                .text = try parseDurableBytes(alloc, item),
+                .after_tool_step_count = tool_step_count,
+            }
+        else blk: {
+            const object = try exactObject(item, &.{ "text", "assistant_prefix", "after_tool_step_count" });
+            const after_tool_step_count = try requireUsize(object, "after_tool_step_count");
+            if (after_tool_step_count > tool_step_count or
+                (index > 0 and after_tool_step_count < prior_tool_step_count))
+            {
+                return error.InvalidSessionFormat;
+            }
+            const text = try parseDurableBytes(
+                alloc,
+                object.get("text") orelse return error.InvalidSessionFormat,
+            );
+            const assistant_prefix = parseOptionalDurableBytes(
+                alloc,
+                object.get("assistant_prefix") orelse return error.InvalidSessionFormat,
+            ) catch |err| {
+                alloc.free(text);
+                return err;
+            };
+            break :blk types.PersistedSteering{
+                .text = text,
+                .assistant_prefix = assistant_prefix,
+                .after_tool_step_count = after_tool_step_count,
+            };
+        };
+        steering[index] = parsed;
+        parsed_count += 1;
+        prior_tool_step_count = parsed.after_tool_step_count;
+    }
+    return steering;
 }
 
 fn parseOptionalTurnSummary(value: std.json.Value) !?types.TurnSummary {
@@ -1550,11 +1974,15 @@ fn parseToolSteps(
     var parsed_count: usize = 0;
     errdefer for (steps[0..parsed_count]) |step| {
         if (step.assistant) |assistant| alloc.free(assistant);
+        if (step.provider_replay) |replay| types.freeProviderReplay(alloc, replay);
         session.freeToolCallSlice(alloc, step.tool_calls);
         session.freePersistedToolResults(alloc, step.tool_results);
     };
     for (value.array.items, 0..) |step_value, i| {
-        const object = try exactObject(step_value, &.{ "assistant", "tool_calls", "tool_results" });
+        const object = if (schema_version >= 9)
+            try exactObject(step_value, &.{ "assistant", "tool_calls", "tool_results", "provider_replay" })
+        else
+            try exactObject(step_value, &.{ "assistant", "tool_calls", "tool_results" });
         const assistant = try parseOptionalDurableBytes(alloc, object.get("assistant") orelse return error.InvalidSessionFormat);
         errdefer if (assistant) |owned| alloc.free(owned);
         const tool_calls = try parseToolCalls(alloc, object.get("tool_calls") orelse return error.InvalidSessionFormat);
@@ -1566,14 +1994,30 @@ fn parseToolSteps(
         );
         errdefer session.freePersistedToolResults(alloc, tool_results);
         try session.repairPersistedToolArguments(alloc, tool_calls, tool_results, .schema_v3);
+        const replay = try parseProviderReplay(alloc, object.get("provider_replay") orelse .null);
         steps[i] = .{
             .assistant = assistant,
+            .provider_replay = replay,
             .tool_calls = tool_calls,
             .tool_results = tool_results,
         };
         parsed_count += 1;
     }
     return steps;
+}
+
+fn parseProviderReplay(alloc: Allocator, value: std.json.Value) !?types.ProviderReplay {
+    if (value == .null) return null;
+    const parsed = std.json.parseFromValue(types.ProviderReplay, alloc, value, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidSessionFormat,
+    };
+    defer parsed.deinit();
+    const replay = parsed.value;
+    if (types.ConversationIdentity.invalidReason(replay.source.model) != null or
+        replay.parts_json.len == 0 or replay.parts_json.len > types.ProviderReplay.max_bytes or
+        !std.unicode.utf8ValidateSlice(replay.parts_json)) return error.InvalidSessionFormat;
+    return try types.dupeProviderReplay(alloc, replay);
 }
 
 fn parseToolCalls(alloc: Allocator, value: std.json.Value) ![]session.ToolCall {
@@ -1603,7 +2047,7 @@ fn parseToolCall(alloc: Allocator, value: std.json.Value) !session.ToolCall {
     errdefer alloc.free(name);
     var arguments_json = try parseRequiredDurableBytes(alloc, object, "arguments_json");
     errdefer alloc.free(arguments_json);
-    const argument_integrity = try types.ToolArgumentIntegrity.classifySerialized(alloc, arguments_json);
+    const argument_integrity = try types.ToolArgumentIntegrity.classifyFunctionInput(alloc, arguments_json);
     if (argument_integrity == .malformed_json) {
         const safe_arguments = try alloc.dupe(u8, "{}");
         alloc.free(arguments_json);
@@ -1627,7 +2071,8 @@ fn parseOptionalToolCall(alloc: Allocator, value: std.json.Value) !?session.Tool
         .null => null,
         .object => blk: {
             var call = try parseToolCall(alloc, value);
-            session.repairPersistedInterruptedToolArguments(&call, .schema_v3);
+            errdefer session.freeToolCall(alloc, call);
+            try session.repairPersistedInterruptedToolArguments(alloc, &call, .schema_v3);
             break :blk call;
         },
         else => error.InvalidSessionFormat,
@@ -1648,6 +2093,8 @@ fn parseToolResults(
         alloc.free(result.tool_call_id);
         alloc.free(result.tool_name);
         alloc.free(result.output);
+        types.freeToolImages(alloc, result.tool_images);
+        if (result.tool_image_handle) |handle| alloc.free(handle);
         if (result.output_handle) |handle| alloc.free(handle);
         if (result.preview) |preview| alloc.free(preview);
         types.freePermissionFeedback(alloc, result.permission_feedback);
@@ -1729,7 +2176,7 @@ fn parseToolResult(
         "command_output_replay",
         "command_process_presentation",
     };
-    const v4_keys = &.{
+    const v4_keys = &[_][]const u8{
         "tool_call_id",
         "tool_name",
         "status",
@@ -1751,7 +2198,13 @@ fn parseToolResult(
         1 => .{ .object = try exactObject(value, v1_keys), .extended = false },
         2 => try exactVariantObject(value, v2_keys, v2_extended_keys),
         3 => .{ .object = try exactObject(value, v3_keys), .extended = true },
-        4, 5 => .{ .object = try exactObject(value, v4_keys), .extended = true },
+        4, 5, 6, 7 => .{ .object = try exactObject(value, v4_keys), .extended = true },
+        8, 9 => .{ .object = if (value == .object and value.object.contains("tool_images"))
+            try exactObject(value, &(v4_keys.* ++ [_][]const u8{"tool_images"}))
+        else if (value == .object and value.object.contains("tool_image_handle"))
+            try exactObject(value, &(v4_keys.* ++ [_][]const u8{"tool_image_handle"}))
+        else
+            try exactObject(value, v4_keys), .extended = true },
         else => return error.InvalidSessionFormat,
     };
     const object = result_shape.object;
@@ -1759,7 +2212,7 @@ fn parseToolResult(
     errdefer alloc.free(tool_call_id);
     const tool_name = try parseRequiredDurableBytes(alloc, object, "tool_name");
     errdefer alloc.free(tool_name);
-    const output = try parseRequiredDurableBytes(alloc, object, "output");
+    var output = try parseRequiredDurableBytes(alloc, object, "output");
     errdefer alloc.free(output);
     const output_handle = try parseOptionalDurableBytes(
         alloc,
@@ -1811,7 +2264,30 @@ fn parseToolResult(
         )
     else
         null;
+    const tool_image_handle = if (object.get("tool_image_handle")) |value_handle| try parseOptionalDurableBytes(alloc, value_handle) else null;
+    errdefer if (tool_image_handle) |handle| alloc.free(handle);
+    const tool_images = if (object.get("tool_images")) |images| images: {
+        if (images != .array) return error.InvalidSessionFormat;
+        const parsed_images = image_data.parseToolImages(alloc, images.array.items) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            const notice = try std.fmt.allocPrint(alloc, "{s}\n[Saved tool image unavailable: {s}]", .{ output, @errorName(err) });
+            alloc.free(output);
+            output = notice;
+            break :images try alloc.alloc(types.ToolImage, 0);
+        };
+        if (parsed_images.len != images.array.items.len) {
+            types.freeToolImages(alloc, parsed_images);
+            const notice = try std.fmt.allocPrint(alloc, "{s}\n[Saved tool image unavailable: unsupported content]", .{output});
+            alloc.free(output);
+            output = notice;
+            break :images try alloc.alloc(types.ToolImage, 0);
+        }
+        break :images parsed_images;
+    } else try alloc.alloc(types.ToolImage, 0);
+    errdefer types.freeToolImages(alloc, tool_images);
     return .{
+        .tool_images = tool_images,
+        .tool_image_handle = tool_image_handle,
         .tool_call_id = tool_call_id,
         .tool_name = tool_name,
         .status = std.meta.stringToEnum(
@@ -2142,7 +2618,7 @@ noinline fn parseOptionalDurableBytes(alloc: Allocator, value: std.json.Value) !
     };
 }
 
-fn parseOptionalIdentifier(value: std.json.Value) !?types.StableBackgroundRecordId {
+fn parseOptionalIdentifier(value: std.json.Value) !?[16]u8 {
     return switch (value) {
         .null => null,
         .string => |hex| try parseHexIdentifier(hex),
@@ -2150,9 +2626,9 @@ fn parseOptionalIdentifier(value: std.json.Value) !?types.StableBackgroundRecord
     };
 }
 
-fn parseHexIdentifier(hex: []const u8) !types.StableBackgroundRecordId {
+fn parseHexIdentifier(hex: []const u8) ![16]u8 {
     if (hex.len != 32) return error.InvalidSessionFormat;
-    var result: types.StableBackgroundRecordId = undefined;
+    var result: [16]u8 = undefined;
     _ = std.fmt.hexToBytes(&result, hex) catch return error.InvalidSessionFormat;
     const canonical = std.fmt.bytesToHex(result, .lower);
     if (!std.mem.eql(u8, &canonical, hex)) return error.InvalidSessionFormat;
@@ -2485,11 +2961,6 @@ test "durable state round trips live history while discarding legacy authority" 
     const invalid_b = [_]u8{ 0xfe, 'b', 0x00 };
     const invalid_c = [_]u8{ 'c', 0xf8 };
     const exact_arguments = " \n{\"number\":1e+02}\t";
-    const record_id: types.StableBackgroundRecordId = .{
-        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-    };
-
     var images = [_]session.ImageAttachment{.{
         .id = 7,
         .path = @constCast(invalid_a[0..]),
@@ -2548,7 +3019,7 @@ test "durable state round trips live history while discarding legacy authority" 
                 .files = files[0..],
             },
         } },
-        .{ .background_command = .{
+        .{ .assistant = .{
             .user = .{
                 .text = @constCast(invalid_b[0..]),
                 .work_id = @constCast("work-background"),
@@ -2558,10 +3029,6 @@ test "durable state round trips live history while discarding legacy authority" 
                 .tool_steps = tool_steps[0..],
                 .files = files[0..],
             },
-            .log_path = @constCast(invalid_c[0..]),
-            .expect_url = true,
-            .url = @constCast(invalid_a[0..]),
-            .background_record_id = record_id,
         } },
         .{ .interrupted = .{
             .user = .{
@@ -2614,6 +3081,7 @@ test "durable state round trips live history while discarding legacy authority" 
         .total_input_tokens = 1234,
         .total_output_tokens = 567,
         .last_subagent_work_id = @constCast("work-17"),
+        .subagent_child = true,
         .usage = usage,
     };
 
@@ -2709,6 +3177,83 @@ test "durable state repairs duplicate-key execution and interrupted tool argumen
     const interrupted = decoded.history[1].interrupted.tool_call.?;
     try std.testing.expectEqualStrings("{}", interrupted.arguments_json);
     try std.testing.expectEqual(types.ToolArgumentIntegrity.valid, interrupted.argument_integrity);
+}
+
+test "non-object saved function inputs are repaired without changing recorded outcomes" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "[]", "42", "null", "true", "\"text\"" }) |arguments| {
+        for ([_]session.PersistedToolStatus{ .success, .failure }) |status| {
+            for (0..3) |native_kind| {
+                var calls = [_]session.ToolCall{.{ .id = "call", .name = "read_file", .arguments_json = arguments }};
+                calls[0].provider_result = if (native_kind == 1) "provider result" else null;
+                var results = [_]session.PersistedToolResult{persistedResultForTest("call", "read_file")};
+                results[0].status = status;
+                results[0].provider_native = native_kind == 2;
+                results[0].output_handle = @constCast("retained-handle");
+                results[0].preview = @constCast("retained-preview");
+                var steps = [_]session.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+                const turn: session.HistoryTurn = .{ .assistant = .{
+                    .user = .{ .text = @constCast("read") },
+                    .assistant = @constCast("done"),
+                    .execution = .{ .tool_steps = &steps },
+                } };
+                var encoded: std.Io.Writer.Allocating = .init(alloc);
+                defer encoded.deinit();
+                try writeHistoryTurn(&encoded.writer, turn);
+                var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+                defer parsed.deinit();
+                const decoded = try parseHistoryTurn(alloc, parsed.value);
+                defer session.freeHistoryTurn(alloc, decoded);
+                const step = decoded.assistant.execution.tool_steps[0];
+                try std.testing.expectEqualStrings(if (native_kind == 0) "{}" else arguments, step.tool_calls[0].arguments_json);
+                try std.testing.expectEqual(if (native_kind == 0) types.ToolExecutionProvenance.fx_local else .provider_executed, step.tool_calls[0].provenance);
+                try std.testing.expectEqual(types.ToolArgumentIntegrity.valid, step.tool_calls[0].argument_integrity);
+                try std.testing.expectEqual(status, step.tool_results[0].status);
+                try std.testing.expectEqualStrings("stale", step.tool_results[0].output);
+                try std.testing.expectEqualStrings("retained-handle", step.tool_results[0].output_handle.?);
+                try std.testing.expectEqualStrings("retained-preview", step.tool_results[0].preview.?);
+                try std.testing.expectEqualStrings(arguments, calls[0].arguments_json);
+                try session.repairPersistedToolArguments(alloc, step.tool_calls, step.tool_results, .schema_v3);
+                try std.testing.expectEqualStrings(if (native_kind == 0) "{}" else arguments, step.tool_calls[0].arguments_json);
+                if (native_kind == 0 and status == .failure and std.mem.eql(u8, arguments, "[]")) {
+                    try std.testing.checkAllAllocationFailures(alloc, checkNonObjectHistoryAllocationFailures, .{parsed.value});
+                }
+            }
+        }
+    }
+}
+
+fn checkNonObjectHistoryAllocationFailures(alloc: Allocator, value: std.json.Value) !void {
+    const decoded = try parseHistoryTurn(alloc, value);
+    defer session.freeHistoryTurn(alloc, decoded);
+    try std.testing.expectEqualStrings("{}", decoded.assistant.execution.tool_steps[0].tool_calls[0].arguments_json);
+    try std.testing.expectEqual(session.PersistedToolStatus.failure, decoded.assistant.execution.tool_steps[0].tool_results[0].status);
+}
+
+test "non-object interrupted inputs repair locally and preserve provider-owned records" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |native| {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try writeToolCall(&out.writer, .{
+            .id = "interrupted",
+            .name = "read_file",
+            .arguments_json = "[]",
+            .provider_result = if (native) "provider result" else null,
+        });
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+        defer parsed.deinit();
+        const repaired = (try parseOptionalToolCall(alloc, parsed.value)).?;
+        defer session.freeToolCall(alloc, repaired);
+        try std.testing.expectEqualStrings(if (native) "[]" else "{}", repaired.arguments_json);
+        if (!native) try std.testing.checkAllAllocationFailures(alloc, checkNonObjectInterruptedAllocationFailures, .{parsed.value});
+    }
+}
+
+fn checkNonObjectInterruptedAllocationFailures(alloc: Allocator, value: std.json.Value) !void {
+    const call = (try parseOptionalToolCall(alloc, value)).?;
+    defer session.freeToolCall(alloc, call);
+    try std.testing.expectEqualStrings("{}", call.arguments_json);
 }
 
 test "current history decode rejects ambiguous malformed tool result pairings" {
@@ -2886,6 +3431,7 @@ test "durable state rejects invalid metadata fields before returning" {
 
 test "execution memory codec preserves feedback and reads v1 results without it" {
     const alloc = std.testing.allocator;
+    const provider_state = types.ProviderReplay{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"kept\"}]" };
     var feedback = [_][]u8{@constCast("read it after writing")};
     const presentation_lines = [_]types.CommittedFilePresentationLine{
         .{ .kind = .addition, .new_line = 1, .text = "persisted line" },
@@ -2901,6 +3447,7 @@ test "execution memory codec preserves feedback and reads v1 results without it"
         .tool_name = @constCast("write_file"),
         .status = .success,
         .output = @constCast("wrote note.txt"),
+        .tool_image_handle = @constCast("saved-tool-image"),
         .output_bytes = 15,
         .stored_output_bytes = 15,
         .permission_feedback = feedback[0..],
@@ -2924,14 +3471,22 @@ test "execution memory codec preserves feedback and reads v1 results without it"
         .command_process_presentation = .{ .exit_code = 7 },
     }};
     var steps = [_]session.ToolExecutionStep{.{
+        .provider_replay = provider_state,
         .tool_calls = calls[0..],
         .tool_results = results[0..],
     }};
+    var steering = [_]types.PersistedSteering{.{
+        .text = @constCast("focus on persistence"),
+        .assistant_prefix = @constCast("partial assistant"),
+        .after_tool_step_count = 1,
+    }};
     const turn: session.HistoryTurn = .{ .assistant = .{
+        .provider_replay = provider_state,
         .user = .{ .text = @constCast("write a note") },
         .assistant = @constCast("done"),
         .execution = .{
             .tool_steps = steps[0..],
+            .steering = steering[0..],
             .turn_summary = .{
                 .started_at_ms = 100,
                 .completed_at_ms = 250,
@@ -2945,7 +3500,10 @@ test "execution memory codec preserves feedback and reads v1 results without it"
     var encoded: std.Io.Writer.Allocating = .init(alloc);
     defer encoded.deinit();
     try writeHistoryTurn(&encoded.writer, turn);
-    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"schema_version\":5") != null);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"schema_version\":9") != null);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"text\":\"focus on persistence\"") != null);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"assistant_prefix\":\"partial assistant\"") != null);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"after_tool_step_count\":1") != null);
     try std.testing.expect(std.mem.find(u8, encoded.written(), "\"permission_feedback\"") != null);
     try std.testing.expect(std.mem.find(u8, encoded.written(), "\"committed_file_presentation\"") != null);
     try std.testing.expect(std.mem.find(u8, encoded.written(), "\"command_output_replay\"") != null);
@@ -2956,9 +3514,25 @@ test "execution memory codec preserves feedback and reads v1 results without it"
     const decoded = try parseHistoryTurn(alloc, parsed.value);
     defer session.freeHistoryTurn(alloc, decoded);
     const decoded_result = decoded.assistant.execution.tool_steps[0].tool_results[0];
+    try std.testing.expectEqualStrings(provider_state.parts_json, decoded.assistant.provider_replay.?.parts_json);
+    try std.testing.expectEqualStrings(provider_state.parts_json, decoded.assistant.execution.tool_steps[0].provider_replay.?.parts_json);
+    try std.testing.expectEqualStrings("saved-tool-image", decoded_result.tool_image_handle.?);
     try std.testing.expectEqual(
         turn.assistant.execution.turn_summary,
         decoded.assistant.execution.turn_summary,
+    );
+    try std.testing.expectEqual(@as(usize, 1), decoded.assistant.execution.steering.len);
+    try std.testing.expectEqualStrings(
+        "focus on persistence",
+        decoded.assistant.execution.steering[0].text,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        decoded.assistant.execution.steering[0].after_tool_step_count,
+    );
+    try std.testing.expectEqualStrings(
+        "partial assistant",
+        decoded.assistant.execution.steering[0].assistant_prefix.?,
     );
     try std.testing.expectEqual(@as(usize, 1), decoded_result.permission_feedback.len);
     try std.testing.expectEqualStrings("read it after writing", decoded_result.permission_feedback[0]);
@@ -2984,6 +3558,16 @@ test "execution memory codec preserves feedback and reads v1 results without it"
         decoded_result.command_process_presentation.?,
     );
 
+    try std.testing.expect(parsed.value.object.swapRemove("provider_replay"));
+    const legacy_execution = parsed.value.object.getPtr("execution").?;
+    legacy_execution.object.getPtr("schema_version").?.* = .{ .integer = 8 };
+    try std.testing.expect(legacy_execution.object.getPtr("tool_steps").?.array.items[0].object.swapRemove("provider_replay"));
+    const v8_decoded = try parseHistoryTurn(alloc, parsed.value);
+    defer session.freeHistoryTurn(alloc, v8_decoded);
+    try std.testing.expect(v8_decoded.assistant.provider_replay == null);
+    try std.testing.expect(v8_decoded.assistant.execution.tool_steps[0].provider_replay == null);
+    try std.testing.expectEqualStrings("saved-tool-image", v8_decoded.assistant.execution.tool_steps[0].tool_results[0].tool_image_handle.?);
+
     const v1 =
         "{\"kind\":\"assistant\",\"user\":{\"text\":\"write a note\",\"images\":[]},\"assistant\":\"done\",\"execution\":{\"schema_version\":1,\"tool_steps\":[{\"assistant\":null,\"tool_calls\":[{\"id\":\"call_feedback\",\"name\":\"write_file\",\"arguments_json\":\"{\\\"path\\\":\\\"note.txt\\\"}\",\"provider_result\":null}],\"tool_results\":[{\"tool_call_id\":\"call_feedback\",\"tool_name\":\"write_file\",\"status\":\"success\",\"output\":\"wrote note.txt\",\"output_handle\":null,\"preview\":null,\"output_bytes\":15,\"stored_output_bytes\":15,\"truncated\":false,\"provider_native\":false,\"created_at_ms\":1}]}],\"files\":[]}}";
     var v1_parsed = try std.json.parseFromSlice(std.json.Value, alloc, v1, .{});
@@ -3006,9 +3590,54 @@ test "execution memory codec preserves feedback and reads v1 results without it"
     try std.testing.expect(v2_decoded.assistant.execution.tool_steps[0].tool_results[0].committed_file_presentation == null);
     try std.testing.expect(v2_decoded.assistant.execution.tool_steps[0].tool_results[0].command_output_replay == null);
     try std.testing.expect(v2_decoded.assistant.execution.tool_steps[0].tool_results[0].command_process_presentation == null);
+
+    const v5 =
+        "{\"kind\":\"assistant\",\"user\":{\"text\":\"prompt\",\"images\":[]},\"assistant\":\"done\",\"execution\":{\"schema_version\":5,\"tool_steps\":[],\"files\":[],\"turn_summary\":null}}";
+    var v5_parsed = try std.json.parseFromSlice(std.json.Value, alloc, v5, .{});
+    defer v5_parsed.deinit();
+    const v5_decoded = try parseHistoryTurn(alloc, v5_parsed.value);
+    defer session.freeHistoryTurn(alloc, v5_decoded);
+    try std.testing.expectEqual(@as(usize, 0), v5_decoded.assistant.execution.steering.len);
+
+    const v6 =
+        "{\"kind\":\"assistant\",\"user\":{\"text\":\"prompt\",\"images\":[]},\"assistant\":\"done\",\"execution\":{\"schema_version\":6,\"tool_steps\":[],\"files\":[],\"steering\":[\"legacy steer\"],\"turn_summary\":null}}";
+    var v6_parsed = try std.json.parseFromSlice(std.json.Value, alloc, v6, .{});
+    defer v6_parsed.deinit();
+    const v6_decoded = try parseHistoryTurn(alloc, v6_parsed.value);
+    defer session.freeHistoryTurn(alloc, v6_decoded);
+    try std.testing.expectEqualStrings("legacy steer", v6_decoded.assistant.execution.steering[0].text);
+    try std.testing.expectEqual(@as(usize, 0), v6_decoded.assistant.execution.steering[0].after_tool_step_count);
+
+    const invalid_v7 =
+        "{\"kind\":\"assistant\",\"user\":{\"text\":\"prompt\",\"images\":[]},\"assistant\":\"done\",\"execution\":{\"schema_version\":7,\"tool_steps\":[],\"files\":[],\"steering\":[{\"text\":\"invalid\",\"assistant_prefix\":null,\"after_tool_step_count\":1}],\"turn_summary\":null}}";
+    var invalid_v7_parsed = try std.json.parseFromSlice(std.json.Value, alloc, invalid_v7, .{});
+    defer invalid_v7_parsed.deinit();
+    try std.testing.expectError(
+        error.InvalidSessionFormat,
+        parseHistoryTurn(alloc, invalid_v7_parsed.value),
+    );
 }
 
-test "private codec preserves summary-only specialized turns" {
+fn checkV7SteeringAllocationFailures(alloc: Allocator) !void {
+    const json =
+        "[{\"text\":\"first\",\"assistant_prefix\":\"prefix one\",\"after_tool_step_count\":0}," ++
+        "{\"text\":\"second\",\"assistant_prefix\":\"prefix two\",\"after_tool_step_count\":1}]";
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const steering = try parsePersistedSteering(alloc, parsed.value, 7, 1);
+    defer types.freePersistedSteering(alloc, steering);
+    try std.testing.expectEqual(@as(usize, 2), steering.len);
+}
+
+test "v7 steering cleans up every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkV7SteeringAllocationFailures,
+        .{},
+    );
+}
+
+test "private codec preserves summary-only interrupted turns" {
     const alloc = std.testing.allocator;
     const summary = types.TurnSummary{
         .started_at_ms = 100,
@@ -3018,18 +3647,10 @@ test "private codec preserves summary-only specialized turns" {
         .token_progress = .{ .input_tokens = 12, .output_tokens = 34 },
     };
 
-    const turns = [_]session.HistoryTurn{
-        .{ .background_command = .{
-            .user = .{ .text = @constCast("start server") },
-            .execution = .{ .turn_summary = summary },
-            .log_path = @constCast("/tmp/server.log"),
-            .expect_url = false,
-        } },
-        .{ .interrupted = .{
-            .user = .{ .text = @constCast("inspect repository") },
-            .execution = .{ .turn_summary = summary },
-        } },
-    };
+    const turns = [_]session.HistoryTurn{.{ .interrupted = .{
+        .user = .{ .text = @constCast("inspect repository") },
+        .execution = .{ .turn_summary = summary },
+    } }};
 
     for (turns) |turn| {
         var encoded: std.Io.Writer.Allocating = .init(alloc);
@@ -3274,12 +3895,15 @@ test "durable specialized history accepts only legacy or complete extended shape
         defer session.freeHistoryTurn(alloc, turn);
         switch (case.expected) {
             .background_legacy => {
-                try std.testing.expect(turn.background_command.assistant == null);
-                try std.testing.expect(turn.background_command.execution.isEmpty());
+                try std.testing.expect(turn == .assistant);
+                try std.testing.expect(std.mem.find(u8, turn.assistant.assistant, "no longer owns") != null);
+                try std.testing.expect(turn.assistant.execution.isEmpty());
             },
             .background_extended => {
-                try std.testing.expectEqualStrings("candidate", turn.background_command.assistant.?);
-                try std.testing.expect(turn.background_command.execution.isEmpty());
+                try std.testing.expect(turn == .assistant);
+                try std.testing.expect(std.mem.find(u8, turn.assistant.assistant, "candidate") != null);
+                try std.testing.expect(std.mem.find(u8, turn.assistant.assistant, "no longer owns") != null);
+                try std.testing.expect(turn.assistant.execution.isEmpty());
             },
             .interrupted_legacy => try std.testing.expect(turn.interrupted.execution.isEmpty()),
             .interrupted_extended => {
@@ -3300,28 +3924,15 @@ test "durable specialized history accepts only legacy or complete extended shape
         try std.testing.expectError(error.InvalidSessionFormat, parseHistoryTurn(alloc, parsed.value));
     }
 
-    const legacy_background = session.HistoryTurn{ .background_command = .{
+    const migrated = session.HistoryTurn{ .assistant = .{
         .user = .{ .text = @constCast("run") },
-        .log_path = @constCast("/tmp/log"),
-        .expect_url = false,
+        .assistant = @constCast("historical command"),
     } };
     var legacy_encoded: std.Io.Writer.Allocating = .init(alloc);
     defer legacy_encoded.deinit();
-    try writeHistoryTurn(&legacy_encoded.writer, legacy_background);
-    try std.testing.expect(std.mem.find(u8, legacy_encoded.written(), "\"assistant\"") == null);
-    try std.testing.expect(std.mem.find(u8, legacy_encoded.written(), "\"execution\"") == null);
-
-    const extended_background = session.HistoryTurn{ .background_command = .{
-        .user = .{ .text = @constCast("run") },
-        .assistant = @constCast("candidate"),
-        .log_path = @constCast("/tmp/log"),
-        .expect_url = false,
-    } };
-    var extended_encoded: std.Io.Writer.Allocating = .init(alloc);
-    defer extended_encoded.deinit();
-    try writeHistoryTurn(&extended_encoded.writer, extended_background);
-    try std.testing.expect(std.mem.find(u8, extended_encoded.written(), "\"assistant\"") != null);
-    try std.testing.expect(std.mem.find(u8, extended_encoded.written(), "\"execution\"") != null);
+    try writeHistoryTurn(&legacy_encoded.writer, migrated);
+    try std.testing.expect(std.mem.find(u8, legacy_encoded.written(), "\"kind\":\"assistant\"") != null);
+    try std.testing.expect(std.mem.find(u8, legacy_encoded.written(), "background_command") == null);
 }
 
 test "interrupted command presentation is strict and round trips" {
@@ -3416,6 +4027,7 @@ fn expectStateEqual(expected: DurableSessionState, actual: DurableSessionState) 
     try std.testing.expectEqual(expected.context_history_start, actual.context_history_start);
     try std.testing.expectEqual(expected.total_input_tokens, actual.total_input_tokens);
     try std.testing.expectEqual(expected.total_output_tokens, actual.total_output_tokens);
+    try std.testing.expectEqual(expected.subagent_child, actual.subagent_child);
     try expectPermissionStateEqual(expected.permission_state, actual.permission_state);
     try std.testing.expectEqual(expected.last_subagent_work_id != null, actual.last_subagent_work_id != null);
     if (expected.last_subagent_work_id) |work_id| {
@@ -3479,19 +4091,6 @@ fn expectHistoryTurnEqual(expected: session.HistoryTurn, actual: session.History
             try std.testing.expectEqualSlices(u8, entry.assistant, got.assistant);
             try expectExecutionMemoryEqual(entry.execution, got.execution);
         },
-        .background_command => |entry| {
-            const got = actual.background_command;
-            try expectUserTurnEqual(entry.user, got.user);
-            try expectOptionalBytesEqual(entry.assistant, got.assistant);
-            try expectExecutionMemoryEqual(entry.execution, got.execution);
-            try std.testing.expectEqualSlices(u8, entry.log_path, got.log_path);
-            try std.testing.expectEqual(entry.expect_url, got.expect_url);
-            try expectOptionalBytesEqual(entry.url, got.url);
-            try std.testing.expectEqual(entry.background_record_id != null, got.background_record_id != null);
-            if (entry.background_record_id) |record_id| {
-                try std.testing.expectEqualSlices(u8, &record_id, &got.background_record_id.?);
-            }
-        },
         .interrupted => |entry| {
             const got = actual.interrupted;
             try expectUserTurnEqual(entry.user, got.user);
@@ -3511,6 +4110,12 @@ fn expectHistoryTurnEqual(expected: session.HistoryTurn, actual: session.History
 
 fn expectExecutionMemoryEqual(expected: session.ExecutionMemory, actual: session.ExecutionMemory) !void {
     try std.testing.expectEqual(expected.turn_summary, actual.turn_summary);
+    try std.testing.expectEqual(expected.steering.len, actual.steering.len);
+    for (expected.steering, actual.steering) |steering, got_steering| {
+        try std.testing.expectEqualSlices(u8, steering.text, got_steering.text);
+        try expectOptionalBytesEqual(steering.assistant_prefix, got_steering.assistant_prefix);
+        try std.testing.expectEqual(steering.after_tool_step_count, got_steering.after_tool_step_count);
+    }
     try std.testing.expectEqual(expected.tool_steps.len, actual.tool_steps.len);
     for (expected.tool_steps, actual.tool_steps) |step, got_step| {
         try expectOptionalBytesEqual(step.assistant, got_step.assistant);
@@ -3714,6 +4319,29 @@ test "recovery checkpoint round trips while legacy state stays absent" {
     try std.testing.expectEqual(@as(?RecoveryCheckpoint, null), legacy_state.recovery_checkpoint);
 }
 
+test "recovery checkpoint accepts the exact composer byte limit" {
+    const alloc = std.testing.allocator;
+    const prompt = try alloc.alloc(u8, 8 * 1024 * 1024);
+    defer alloc.free(prompt);
+    @memset(prompt, 'x');
+    const checkpoint = RecoveryCheckpoint{
+        .turn_id = 1,
+        .user = .{ .text = prompt },
+        .assistant_source = @constCast(""),
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 3,
+        .consumed_provider_attempts = 0,
+    };
+    const encoded = try encodeRecoveryCheckpoint(alloc, checkpoint);
+    defer alloc.free(encoded);
+    try std.testing.expect(encoded.len > prompt.len);
+    try std.testing.expect(encoded.len <= max_recovery_checkpoint_bytes);
+}
+
 test "session permission state round trips while legacy state stays empty" {
     const alloc = std.testing.allocator;
     const key = try session_permission_state.RuleKey.init(
@@ -3891,4 +4519,34 @@ fn fuzzDurableSessionOptionalFields(_: void, smith: *std.testing.Smith) !void {
         .max_value_bytes = buffer.len,
     }) catch return;
     state.deinit(std.testing.allocator);
+}
+
+test "session metadata round trips without conversation or control state" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeSessionMetadata(alloc, .{
+        .id = "session-1",
+        .origin_workspace_root = "/tmp/origin",
+        .workspace_root = "/tmp/current",
+        .created_at_ms = 10,
+        .updated_at_ms = 20,
+        .conversation_language = "en",
+        .provider = "gateway",
+        .model = "openai/gpt-5.6",
+        .effort = "high",
+        .fast_mode = false,
+        .title = "Compaction work",
+        .subagent_child = false,
+    });
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.find(u8, encoded, "history") == null);
+    try std.testing.expect(std.mem.find(u8, encoded, "usage") == null);
+    try std.testing.expect(std.mem.find(u8, encoded, "permission") == null);
+    try std.testing.expect(std.mem.find(u8, encoded, "checkpoint") == null);
+
+    var decoded = try decodeSessionMetadata(alloc, encoded);
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings("session-1", decoded.value.id);
+    try std.testing.expectEqualStrings("/tmp/current", decoded.value.workspace_root);
+    try std.testing.expectEqualStrings("openai/gpt-5.6", decoded.value.model);
+    try std.testing.expectEqualStrings("Compaction work", decoded.value.title.?);
 }

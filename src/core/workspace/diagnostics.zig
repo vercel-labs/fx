@@ -11,6 +11,7 @@ pub const NetworkCall = network_metrics.NetworkCall;
 pub const NetworkCallKind = network_metrics.NetworkCallKind;
 pub const ToolCallMetric = tool_call_metrics.ToolCallMetric;
 pub const ToolCallRecord = tool_call_metrics.ToolCallRecord;
+pub const ToolCallOutcome = tool_call_metrics.ToolCallOutcome;
 pub const network_ring_capacity = network_metrics.ring_capacity;
 pub const tool_call_ring_capacity = tool_call_metrics.ring_capacity;
 

@@ -87,7 +87,7 @@ describe.skipIf(!LIVE_ENABLED || !HAS_API_KEY)("live source context limits", () 
         expect(json.output.length).toBeGreaterThan(0);
         expect(result.stderr).toContain("project instruction file");
         expect(result.stderr).toContain("skill description");
-        expect(result.stderr).toContain("skill resource");
+        expect(result.stderr).toContain('name="skill_chunk_bytes" action="blocked"');
         expect(result.stderr).toContain("source=command line");
         expect(trace).toContain("event=request_built");
         expect(trace).toContain("event=prompt_finish");

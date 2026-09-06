@@ -15,7 +15,6 @@ pub const Terminal = struct {
 
 pub const Phase = union(enum) {
     idle,
-    cancel_pending,
     request_pending: Handle,
     awaiting_response: Handle,
     streaming: Handle,
@@ -39,7 +38,6 @@ pub const Action = enum {
     applied,
     stale,
     no_request,
-    cancelled,
     unavailable,
     shutting_down,
 };
@@ -65,7 +63,6 @@ pub fn decide(phase: Phase, event: Event) Decision {
                 .phase = .{ .request_pending = handle },
                 .action = .applied,
             },
-            .cancel_pending => .{ .phase = .idle, .action = .cancelled },
             .shutdown => .{ .phase = .shutdown, .action = .shutting_down },
             else => .{ .phase = phase, .action = .unavailable },
         },
@@ -123,7 +120,7 @@ pub fn decide(phase: Phase, event: Event) Decision {
             else => stale(phase, handle),
         },
         .cancel => switch (phase) {
-            .idle => .{ .phase = .cancel_pending, .action = .applied },
+            .idle => .{ .phase = .idle, .action = .no_request },
             .request_pending, .awaiting_response, .streaming => |handle| .{
                 .phase = .{ .terminal = .{ .handle = handle, .kind = .aborted } },
                 .action = .applied,
@@ -150,7 +147,7 @@ fn stale(phase: Phase, handle: Handle) Decision {
         .phase = phase,
         .action = .stale,
         .stale_reason = switch (phase) {
-            .idle, .cancel_pending => .no_active_fetch,
+            .idle => .no_active_fetch,
             .shutdown => .shutdown,
             .terminal => |terminal| if (terminal.handle == handle) .terminal else .handle_mismatch,
             .request_pending, .awaiting_response, .streaming => |active| if (active == handle)
@@ -253,12 +250,9 @@ test "N-API fetch state handles failure cancellation and shutdown" {
     }, cancelled);
     try std.testing.expect(!is_active(cancelled.phase, handle));
 
-    const pending_cancel = decide(.idle, .cancel);
-    try expectDecision(.{ .phase = .cancel_pending, .action = .applied }, pending_cancel);
-    try expectDecision(.{ .phase = .idle, .action = .cancelled }, decide(
-        pending_cancel.phase,
-        .{ .open = 20 },
-    ));
+    const idle_cancel = decide(.idle, .cancel);
+    try expectDecision(.{ .phase = .idle, .action = .no_request }, idle_cancel);
+    try expectDecision(.{ .phase = .{ .request_pending = 20 }, .action = .applied }, decide(idle_cancel.phase, .{ .open = 20 }));
 
     const stopped = decide(.{ .request_pending = handle }, .shutdown);
     try expectDecision(.{ .phase = .shutdown, .action = .applied }, stopped);

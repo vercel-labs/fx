@@ -311,6 +311,7 @@ test "validate retains the primary transcript after a normal-screen transition" 
         4,
         0,
         .{ .restore_normal_screen = .{ .mouse_tracking_active = true } },
+        .none,
     );
     defer movement.deinit(std.testing.allocator);
 

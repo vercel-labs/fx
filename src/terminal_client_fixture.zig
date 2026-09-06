@@ -1,8 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const background_process = @import("tools/shell/background_process.zig");
-const background_process_provider = @import("core/execution/background_process_provider.zig");
-const process_supervisor = @import("core/background/process_supervisor.zig");
+const shell_process_provider = @import("tools/shell/process_provider.zig");
+const process_provider_mod = @import("core/execution/process_provider.zig");
+const process_identity = @import("core/execution/process_identity.zig");
 const client = @import("core/terminal/client.zig");
 const contracts = @import("core/terminal/contracts.zig");
 const debug_trace = @import("core/shared/debug_trace.zig");
@@ -71,14 +71,14 @@ fn mainInner(
     }
     if (host.isInternalModeRaw(args)) {
         var failure_provider = CaptureFailureProvider{
-            .delegate = background_process.provider,
+            .delegate = shell_process_provider.provider,
         };
         const provider = if (io_mod.getenv(
             "FX_TERMINAL_FIXTURE_FAIL_PROCESS_TOKEN",
         ) != null)
             failure_provider.provider()
         else
-            background_process.provider;
+            shell_process_provider.provider;
         return host.run(
             process_allocator,
             try host.Config.fromEnvironment(provider),
@@ -93,17 +93,16 @@ fn mainInner(
     if (command_runner.isForegroundSessionInvocation(cli_args)) {
         return command_runner.runForegroundSessionBootstrap(cli_args);
     }
-    try runFixture(process_allocator, background_process.provider);
+    try runFixture(process_allocator, shell_process_provider.provider);
 }
 
 const CaptureFailureProvider = struct {
-    delegate: background_process_provider.Provider,
+    delegate: process_provider_mod.Provider,
     captures: usize = 0,
 
-    fn provider(self: *@This()) background_process_provider.Provider {
+    fn provider(self: *@This()) process_provider_mod.Provider {
         return .{
             .context = self,
-            .spawn_prepared_fn = spawnPrepared,
             .capture_token_fn = captureToken,
             .match_token_fn = matchToken,
             .signal_process_fn = signalProcess,
@@ -114,19 +113,11 @@ const CaptureFailureProvider = struct {
         return @ptrCast(@alignCast(raw.?));
     }
 
-    fn spawnPrepared(
-        raw: ?*anyopaque,
-        alloc: Allocator,
-        request: background_process_provider.SpawnRequest,
-    ) background_process_provider.ProviderError!background_process_provider.PreparedProcess {
-        return from(raw).delegate.spawnPrepared(alloc, request);
-    }
-
     fn captureToken(
         raw: ?*anyopaque,
         alloc: Allocator,
         pid: []const u8,
-    ) background_process_provider.ProviderError!process_supervisor.ProcessInstanceToken {
+    ) process_provider_mod.ProviderError!process_identity.ProcessInstanceToken {
         const self = from(raw);
         self.captures += 1;
         if (self.captures > 2) return error.ProcessIdentityUnavailable;
@@ -137,8 +128,8 @@ const CaptureFailureProvider = struct {
         raw: ?*anyopaque,
         alloc: Allocator,
         pid: []const u8,
-        expected: process_supervisor.ProcessInstanceToken,
-    ) process_supervisor.TokenMatch {
+        expected: process_identity.ProcessInstanceToken,
+    ) process_identity.TokenMatch {
         return from(raw).delegate.matchToken(alloc, pid, expected);
     }
 
@@ -146,48 +137,45 @@ const CaptureFailureProvider = struct {
         raw: ?*anyopaque,
         alloc: Allocator,
         pid: []const u8,
-        expected: process_supervisor.ProcessInstanceToken,
-    ) background_process_provider.ProviderError!void {
+        expected: process_identity.ProcessInstanceToken,
+    ) process_provider_mod.ProviderError!void {
         return from(raw).delegate.signalProcess(alloc, pid, expected);
     }
 };
 
 fn runFixture(
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider_value: process_provider_mod.Provider,
 ) !void {
     if (io_mod.getenv("FX_TERMINAL_CAPABILITY_FIXTURE")) |mode| {
         if (std.mem.eql(u8, mode, "start")) {
-            return runCapabilityStartFixture(alloc, process_provider);
+            return runCapabilityStartFixture(alloc, process_provider_value);
         }
         if (std.mem.eql(u8, mode, "force_close")) {
-            return runCapabilityForceCloseFixture(alloc, process_provider);
+            return runCapabilityForceCloseFixture(alloc, process_provider_value);
         }
         return error.InvalidTerminalCapabilityFixtureMode;
     }
     if (io_mod.getenv("FX_TERMINAL_OUTCOME_FIXTURE")) |mode| {
-        if (std.mem.eql(u8, mode, "ordering")) {
-            return runOutcomeOrderingFixture(alloc, process_provider);
-        }
         if (std.mem.eql(u8, mode, "retention")) {
-            return runOutcomeRetentionFixture(alloc, process_provider);
+            return runOutcomeRetentionFixture(alloc, process_provider_value);
         }
         if (std.mem.eql(u8, mode, "failure")) {
-            return runOutcomeFailureFixture(alloc, process_provider);
+            return runOutcomeFailureFixture(alloc, process_provider_value);
         }
         return error.InvalidTerminalOutcomeFixtureMode;
     }
     if (io_mod.getenv("FX_TERMINAL_AUTHORITY_FIXTURE")) |mode| {
         if (std.mem.eql(u8, mode, "start")) {
-            return runAuthorityStartFixture(alloc, process_provider);
+            return runAuthorityStartFixture(alloc, process_provider_value);
         }
         if (std.mem.eql(u8, mode, "reload")) {
-            return runAuthorityReloadFixture(alloc, process_provider);
+            return runAuthorityReloadFixture(alloc, process_provider_value);
         }
         return error.InvalidTerminalAuthorityFixtureMode;
     }
 
-    var runtime = client.Runtime.init(process_provider);
+    var runtime = client.Runtime.init(process_provider_value);
     defer runtime.deinit();
     const correlation_id = contracts.CorrelationId{ .value = 1 };
     try runtime.admit(
@@ -202,7 +190,7 @@ fn runFixture(
 
 fn runCapabilityStartFixture(
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
 ) !void {
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
     var runtime = client.Runtime.init(process_provider);
@@ -216,7 +204,7 @@ fn runCapabilityStartFixture(
 
 fn runCapabilityForceCloseFixture(
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
 ) !void {
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
     const terminal_session_id = io_mod.getenv(
@@ -284,37 +272,14 @@ fn authorityFixturePrincipal(home: []const u8) contracts.Principal {
 
 fn runAuthorityStartFixture(
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
 ) !void {
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
-    const compatibility_fixture = if (io_mod.getenv(
-        "FX_TERMINAL_AUTHORITY_FIXTURE_COMPAT",
-    )) |value|
-        std.mem.eql(u8, value, "1")
-    else
-        false;
-    const repeated_probes = [_]contracts.RepeatedProbeAuthority{.{
-        .command = "true",
-        .cwd = home,
-        .check_schedule = .{ .interval_ms = 25 },
-        .notify_schedule = .on_match,
-        .lifetime = .until_session_end,
-    }};
-    var preparation = fixturePreparation(home);
-    if (!compatibility_fixture) preparation.repeated_probes = &repeated_probes;
+    const preparation = fixturePreparation(home);
     var prepared = try operation.prepareStartPersistence(alloc, preparation);
     defer prepared.deinit();
     var runtime = client.Runtime.init(process_provider);
     defer runtime.deinit();
-    const initial_monitors = [_]contracts.MonitorDefinition{.{
-        .condition = .{ .custom_probe = .{
-            .command = "true",
-            .cwd = home,
-        } },
-        .check_schedule = .{ .interval_ms = 25 },
-        .notify_schedule = .on_match,
-        .lifetime = .until_session_end,
-    }};
     try runtime.admit(alloc, .{ .value = 1 }, .{ .start = .{
         .cwd = home,
         .command = "printf 'authority-reload-ready\\n'; sleep 30",
@@ -324,7 +289,6 @@ fn runAuthorityStartFixture(
         } },
         .return_when = .{ .match = fixture_marker },
         .wait_ceiling_ms = 5_000,
-        .initial_monitors = if (compatibility_fixture) &.{} else &initial_monitors,
         .persistence = prepared.view(),
     } });
     var completion = try awaitCompletionFor(&runtime, .{ .value = 1 });
@@ -343,7 +307,7 @@ fn runAuthorityStartFixture(
 
 fn runAuthorityReloadFixture(
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
 ) !void {
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
     const terminal_session_id = io_mod.getenv(
@@ -426,7 +390,7 @@ fn openFixtureOwnerCapability(
 
 fn runOutcomeRetentionFixture(
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
 ) !void {
     var runtime = client.Runtime.init(process_provider);
     defer runtime.deinit();
@@ -479,7 +443,7 @@ fn runOutcomeRetentionFixture(
 
 fn runOutcomeFailureFixture(
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
 ) !void {
     const point = io_mod.getenv("FX_TERMINAL_TEST_HOST_FAILURE_POINT") orelse
         return error.TerminalOutcomeFixtureFailurePointMissing;
@@ -512,146 +476,6 @@ fn runOutcomeFailureFixture(
         .failure = point,
         .first = @tagName(first.kind),
         .later = @tagName(second.kind),
-    });
-}
-
-fn runOutcomeOrderingFixture(
-    alloc: Allocator,
-    process_provider: background_process_provider.Provider,
-) !void {
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
-    const shell = io_mod.getenv("SHELL") orelse return error.ShellNotSet;
-    const initial_monitors = [_]contracts.MonitorDefinition{.{
-        .condition = .{ .output_contains = "ordered-event" },
-        .notify_schedule = .on_match,
-        .lifetime = .until_session_end,
-    }};
-    var prepared = try operation.prepareStartPersistence(
-        alloc,
-        fixturePreparation(home),
-    );
-    defer prepared.deinit();
-    const persistence = prepared.view();
-    const authority = contracts.AuthorityClaim{
-        .principal = persistence.grant.principal,
-        .actor = persistence.grant.actor,
-        .generation = persistence.grant.generation,
-        .proof = persistence.proof,
-    };
-    var runtime = client.Runtime.init(process_provider);
-    defer runtime.deinit();
-
-    try runtime.admit(alloc, .{ .value = 1 }, .{ .start = .{
-        .cwd = home,
-        .command = "printf 'ordered-event\\n'; IFS= read -r _",
-        .shell = .{ .executable = .{ .path = shell, .clean_start = true } },
-        .return_when = .{ .match = "ordered-event" },
-        .wait_ceiling_ms = fixture_observation_timeout_ms,
-        .initial_monitors = &initial_monitors,
-        .persistence = persistence,
-    } });
-    var started = try awaitCompletionFor(&runtime, .{ .value = 1 });
-    defer started.deinit();
-    const start_result = try fixtureSuccess(started, .start);
-    const session_id = switch (start_result) {
-        .start => |value| try alloc.dupe(u8, value.session.session_id),
-        else => return error.TerminalOutcomeFixtureUnexpectedResult,
-    };
-    defer alloc.free(session_id);
-
-    try runtime.admit(alloc, .{ .value = 2 }, .{ .inspect = .{
-        .session_id = session_id,
-        .authority = authority,
-    } });
-    var before = try awaitCompletionFor(&runtime, .{ .value = 2 });
-    defer before.deinit();
-    const before_result = try fixtureSuccess(before, .inspect);
-    const event_id = switch (before_result) {
-        .inspect => |value| if (value.events.len == 0)
-            return error.TerminalOutcomeFixtureEventMissing
-        else
-            value.events[value.events.len - 1].event_id,
-        else => return error.TerminalOutcomeFixtureUnexpectedResult,
-    };
-
-    try runtime.admit(alloc, .{ .value = 3 }, .{ .write = .{
-        .session_id = session_id,
-        .lease = .acquire,
-        .authority = authority,
-    } });
-    try awaitOrderingMarker(3, "ready");
-    try runtime.admit(alloc, .{ .value = 4 }, .{ .inspect = .{
-        .session_id = session_id,
-        .after_event_id = event_id,
-        .acknowledge_event_id = event_id,
-        .authority = authority,
-    } });
-    try awaitOrderingMarker(4, "admitted");
-    if (runtime.takeCompletionFor(.{ .value = 4 }) != null) {
-        return error.TerminalOutcomeFixtureOrderingViolation;
-    }
-
-    try runtime.admit(alloc, .{ .value = 5 }, .{ .inspect = .{
-        .session_id = session_id,
-        .authority = authority,
-    } });
-    var concurrent = try awaitCompletionFor(&runtime, .{ .value = 5 });
-    defer concurrent.deinit();
-    try expectFixtureEvent(concurrent, event_id, true);
-    try createOrderingMarker(3, "release");
-
-    var acquired = try awaitCompletionFor(&runtime, .{ .value = 3 });
-    defer acquired.deinit();
-    _ = try fixtureSuccess(acquired, .write);
-    var acknowledged = try awaitCompletionFor(&runtime, .{ .value = 4 });
-    defer acknowledged.deinit();
-    _ = try fixtureSuccess(acknowledged, .inspect);
-
-    try runtime.admit(alloc, .{ .value = 6 }, .{ .inspect = .{
-        .session_id = session_id,
-        .authority = authority,
-    } });
-    var after = try awaitCompletionFor(&runtime, .{ .value = 6 });
-    defer after.deinit();
-    try expectFixtureEvent(after, event_id, false);
-
-    try runtime.admit(alloc, .{ .value = 7 }, .{ .write = .{
-        .session_id = session_id,
-        .lease = .release,
-        .authority = authority,
-    } });
-    try awaitOrderingMarker(7, "ready");
-    try runtime.admit(alloc, .{ .value = 8 }, .{ .resize = .{
-        .session_id = session_id,
-        .dimensions = .{ .rows = 24, .columns = 80 },
-        .authority = authority,
-    } });
-    try awaitOrderingMarker(8, "admitted");
-    if (!runtime.cancel(.{ .value = 7 })) {
-        return error.TerminalOutcomeFixtureCancellationMissing;
-    }
-    var cancelled = try awaitCompletionFor(&runtime, .{ .value = 7 });
-    defer cancelled.deinit();
-    if (cancelled.kind != .cancelled) {
-        return error.TerminalOutcomeFixtureExpectedCancellation;
-    }
-    var resized = try awaitCompletionFor(&runtime, .{ .value = 8 });
-    defer resized.deinit();
-    _ = try fixtureSuccess(resized, .resize);
-
-    try runtime.admit(alloc, .{ .value = 9 }, .{ .close = .{
-        .session_id = session_id,
-        .policy = .force,
-        .authority = authority,
-    } });
-    var closed = try awaitCompletionFor(&runtime, .{ .value = 9 });
-    defer closed.deinit();
-    _ = try fixtureSuccess(closed, .close);
-    try writeJson(alloc, .{
-        .ordered = true,
-        .acknowledged = true,
-        .read_only_concurrent = true,
-        .cancelled_turn_abandoned = true,
     });
 }
 
@@ -703,60 +527,6 @@ fn expectFixtureFailure(
         },
         else => return error.TerminalOutcomeFixtureUnexpectedResult,
     }
-}
-
-fn expectFixtureEvent(
-    completion: client.Completion,
-    event_id: u64,
-    present: bool,
-) !void {
-    const result = try fixtureSuccess(completion, .inspect);
-    const events = switch (result) {
-        .inspect => |inspect| inspect.events,
-        else => return error.TerminalOutcomeFixtureUnexpectedResult,
-    };
-    const found = for (events) |event| {
-        if (event.event_id == event_id) break true;
-    } else false;
-    if (found != present) return error.TerminalOutcomeFixtureOrderingViolation;
-}
-
-fn awaitOrderingMarker(correlation_id: u64, suffix: []const u8) !void {
-    const started = io_mod.milliTimestamp();
-    while (io_mod.milliTimestamp() - started < fixture_observation_timeout_ms) {
-        if (orderingMarkerExists(correlation_id, suffix)) return;
-        io_mod.sleep(5 * std.time.ns_per_ms);
-    }
-    return error.TerminalClientFixtureTimeout;
-}
-
-fn createOrderingMarker(correlation_id: u64, suffix: []const u8) !void {
-    var path_buffer: [4096]u8 = undefined;
-    const path = try orderingMarkerPath(&path_buffer, correlation_id, suffix);
-    var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), path, .{});
-    file.close(io_mod.getIo());
-}
-
-fn orderingMarkerExists(correlation_id: u64, suffix: []const u8) bool {
-    var path_buffer: [4096]u8 = undefined;
-    const path = orderingMarkerPath(&path_buffer, correlation_id, suffix) catch
-        return false;
-    std.Io.Dir.accessAbsolute(io_mod.getIo(), path, .{}) catch return false;
-    return true;
-}
-
-fn orderingMarkerPath(
-    buffer: []u8,
-    correlation_id: u64,
-    suffix: []const u8,
-) ![]const u8 {
-    const prefix = io_mod.getenv("FX_TERMINAL_TEST_ORDER_BARRIER") orelse
-        return error.TerminalOutcomeFixtureBarrierMissing;
-    return std.fmt.bufPrint(
-        buffer,
-        "{s}.{d}.{s}",
-        .{ prefix, correlation_id, suffix },
-    );
 }
 
 fn writeCompletionJson(alloc: Allocator, completion: client.Completion) !void {

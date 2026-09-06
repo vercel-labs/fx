@@ -12,6 +12,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
@@ -74,6 +75,11 @@ export interface AbConfig {
   outputDir: string;
   workspaceRoot: string;
   timeoutMs: number;
+}
+
+export interface AbRunOptions {
+  env?: Record<string, string | undefined>;
+  score?: (result: HeadlessResult) => AbScore;
 }
 
 export function createTrialOrder(trialIndex: number): [AbSide, AbSide] {
@@ -277,10 +283,12 @@ export async function runAbTrial(
   side: AbSide,
   trialIndex: number,
   orderIndex: number,
+  options: AbRunOptions = {},
 ): Promise<AbRunResult> {
   const binaryPath = sideBinary(config, side);
   const trialHome = mkdtempSync(join(tmpdir(), `fx-ab-${row.id}-${trialIndex}-${side}-`));
   const env: Record<string, string | undefined> = {
+    ...options.env,
     PATH: process.env.PATH ?? "",
     HOME: trialHome,
     NO_COLOR: "1",
@@ -289,62 +297,74 @@ export async function runAbTrial(
     VERCEL_OIDC_TOKEN: process.env.VERCEL_OIDC_TOKEN,
   };
 
-  const versionOutput = await versionFor(binaryPath, env);
-  const result = await runProcess(
-    binaryPath,
-    [
-      "ask",
-      "--auto",
-      "--json",
-      "--no-save",
-      "--timeout",
-      String(config.timeoutMs),
-      row.userPrompt,
-    ],
-    {
-      cwd: config.workspaceRoot,
-      env,
-      timeoutMs: config.timeoutMs + 10_000,
-    },
-  );
-
-  let json: HeadlessResult | undefined;
-  let score: AbScore;
   try {
-    json = JSON.parse(result.stdout.trim()) as HeadlessResult;
-    score = scoreAbTrial(row, json);
-    if (json.model && json.model !== config.model) {
+    const versionOutput = await versionFor(binaryPath, env);
+    const result = await runProcess(
+      binaryPath,
+      [
+        "ask",
+        "--auto",
+        "--json",
+        "--no-save",
+        "--timeout",
+        String(config.timeoutMs),
+        row.userPrompt,
+      ],
+      {
+        cwd: config.workspaceRoot,
+        env,
+        timeoutMs: config.timeoutMs + 10_000,
+      },
+    );
+
+    let json: HeadlessResult | undefined;
+    let score: AbScore;
+    try {
+      json = JSON.parse(result.stdout.trim()) as HeadlessResult;
+      score = options.score ? options.score(json) : scoreAbTrial(row, json);
+      if (json.model !== config.model) {
+        score = {
+          ...score,
+          passed: false,
+          reason: `${score.reason}; json.model ${json.model} did not match FX_AB_MODEL ${config.model}`,
+        };
+      }
+    } catch (err) {
+      score = {
+        passed: false,
+        reason: `failed to parse JSON output: ${err instanceof Error ? err.message : String(err)}`,
+        forbiddenTools: [],
+        predicatePassed: false,
+      };
+    }
+
+    if (result.code !== 0 || (json && json.exit_code !== 0)) {
       score = {
         ...score,
         passed: false,
-        reason: `${score.reason}; json.model ${json.model} did not match FX_AB_MODEL ${config.model}`,
+        reason: `${score.reason}; process exit ${result.code}, reported exit ${json?.exit_code}`,
       };
     }
-  } catch (err) {
-    score = {
-      passed: false,
-      reason: `failed to parse JSON output: ${err instanceof Error ? err.message : String(err)}`,
-      forbiddenTools: [],
-      predicatePassed: false,
-    };
-  }
 
-  const run: AbRunResult = {
-    side,
-    rowId: row.id,
-    trialIndex,
-    orderIndex,
-    binaryPath,
-    binarySha256: sha256File(binaryPath),
-    versionOutput,
-    stdout: result.stdout,
-    stderr: result.stderr,
-    code: result.code,
-    json,
-    score,
-  };
-  writeArtifact(config, run);
-  return run;
+    const run: AbRunResult = {
+      side,
+      rowId: row.id,
+      trialIndex,
+      orderIndex,
+      binaryPath,
+      binarySha256: sha256File(binaryPath),
+      versionOutput,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      code: result.code,
+      json,
+      score,
+    };
+    writeArtifact(config, run);
+    return run;
+  } finally {
+    rmSync(trialHome, { recursive: true, force: true });
+  }
 }
 
 function writeArtifact(config: AbConfig, run: AbRunResult): void {

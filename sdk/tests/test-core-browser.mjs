@@ -180,16 +180,22 @@ try {
     expect(modelChunks.join("").trimEnd() === "hello world", `unexpected chunks ${JSON.stringify(result.chunks)}`);
     expect(modelChunks.filter((chunk) => chunk.trim()).length >= 2, "browser stream was buffered");
     expect(result.fetchCalls === 1, `expected one prompt fetch, got ${result.fetchCalls}`);
-    expect(result.models.includes("sdk/catalog-alpha"), "browser model options omitted sdk/catalog-alpha");
-    expect(result.models.includes("sdk/catalog-beta"), "browser model options omitted sdk/catalog-beta");
     expect(result.model === "sdk/chrome-model", `unexpected model ${result.model}`);
-    expect(result.mode === "code", `unexpected mode ${result.mode}`);
+    expect(JSON.stringify(result.api) === JSON.stringify(["checkpoint", "close", "prompt"]), `unexpected public API ${JSON.stringify(result.api)}`);
   });
   await runCase("stalled cancellation", "transport=stall&autorun=wait&cancel-after=50", (result) => {
     expect(result.stopReason === "cancelled", `unexpected stop reason ${result.stopReason}`);
     expect(result.fetchAborted, "browser fetch did not receive abort");
-    expect(result.model === "sdk/chrome-model", `stored browser model was not restored: ${result.model}`);
-    expect(result.mode === "code", `stored browser mode was not restored: ${result.mode}`);
+    expect(JSON.stringify(result.api) === JSON.stringify(["checkpoint", "close", "prompt"]), `unexpected public API ${JSON.stringify(result.api)}`);
+  });
+  await runCase("host tool and skill", "transport=mock&autorun=use%20the%20tool&host-tool=1&host-skill=1&model=sdk%2Fchrome-model", (result) => {
+    expect(result.stopReason === "end_turn", `unexpected stop reason ${result.stopReason}`);
+    expect(result.chunks.join("").trimEnd() === "tool done", `unexpected chunks ${JSON.stringify(result.chunks)}`);
+    expect(result.fetchCalls === 2, `expected two prompt fetches, got ${result.fetchCalls}`);
+    expect(result.toolAdvertised, "browser host tool was not advertised");
+    expect(result.toolCalls === 1, `browser host tool ran ${result.toolCalls} times`);
+    expect(result.toolResultSent, "browser host tool result did not reach the next model step");
+    expect(result.skillSent, "browser host-provided skill instructions were omitted");
   });
   await runCase("unsupported UI", "force-unsupported=1", (result) => {
     expect(result.state === "unsupported", `unexpected state ${result.state}`);

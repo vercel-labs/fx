@@ -15,7 +15,7 @@ import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
-  fakeGatewayToolCall,
+  fakeShellRun,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -276,10 +276,8 @@ test.skipIf(!tmuxAvailable())(
     const fixture = createNotificationRoot();
     const marker = join(fixture.workspace, "ask-permission-marker.txt");
     const gateway = startFakeGateway([
-      fakeGatewayToolCall("ask_permission_1", "terminal", {
-        action: "exec",
+      fakeShellRun("ask_permission_1", "touch ask-permission-marker.txt", {
         timeout_ms: 600_000,
-        command: "touch ask-permission-marker.txt",
       }),
       fakeGatewayFinalText("NOTIFICATION_ASK_PERMISSION_COMPLETE"),
     ]);
@@ -329,10 +327,8 @@ test.skipIf(!tmuxAvailable())(
     });
     const marker = join(fixture.workspace, "permission-marker.txt");
     const gateway = startFakeGateway([
-      fakeGatewayToolCall("permission_1", "terminal", {
-        action: "exec",
+      fakeShellRun("permission_1", "touch permission-marker.txt", {
         timeout_ms: 600_000,
-        command: "touch permission-marker.txt",
       }),
       fakeGatewayFinalText("NOTIFICATION_PERMISSION_COMPLETE"),
     ]);

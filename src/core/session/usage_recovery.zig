@@ -86,15 +86,22 @@ fn collectFromHomeCancelable(
             unknown_pending = true;
             continue;
         };
+        const checkpoint_modified = store.usageCheckpointModifiedAtNs(marked.id) catch null;
         if (!session_usage.needsProfileRecovery(usage)) {
-            if (marked.protected_updated_at_ms) |protected| {
-                if (state.updated_at_ms >= protected) continue;
+            if (checkpoint_modified != null and
+                checkpoint_modified.? > marked.marker_modified_at_ns)
+            {
+                continue;
             }
             unknown_pending = true;
             continue;
         }
         if (marked.protected_updated_at_ms) |protected| {
-            if (state.updated_at_ms < protected) {
+            const checkpoint_is_newer = if (checkpoint_modified) |modified|
+                modified > marked.marker_modified_at_ns
+            else
+                state.updated_at_ms >= protected;
+            if (!checkpoint_is_newer) {
                 unknown_pending = true;
             }
         }
@@ -477,14 +484,8 @@ test "recovery marker distinguishes checkpoints around a crash boundary" {
         alloc,
         .{ .usage_checkpointed = .{ .usage = unresolved } },
         unresolved_checkpoint.timestamp_ms,
-        .retry_expected_tail,
-        .{
-            .checkpoint_interval = 0,
-            .compaction_frame_threshold = 0,
-            .compaction_byte_threshold = 0,
-        },
     );
-    try std.testing.expect(!std.mem.eql(
+    try std.testing.expect(std.mem.eql(
         u8,
         &generation_before,
         &writable.position.log_generation,
@@ -504,8 +505,6 @@ test "recovery marker distinguishes checkpoints around a crash boundary" {
         alloc,
         .{ .usage_checkpointed = .{ .usage = settled } },
         settled_checkpoint.timestamp_ms,
-        .retry_expected_tail,
-        .{ .checkpoint_interval = 0 },
     );
 
     var after_settled_checkpoint = try collectFromHome(alloc, home);

@@ -16,7 +16,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { runFx } from "../evals/eval-helpers";
+import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
   startLegacyHttpSseFixture,
   startLegacyStreamableHttpFixture,
@@ -147,6 +147,17 @@ async function waitForFileText(
   return existsSync(path) && readFileSync(path, "utf8").includes(expected);
 }
 
+function unusedCallbackPort(): number {
+  const listener = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch: () => new Response("reserved"),
+  });
+  const port = listener.port;
+  listener.stop(true);
+  return port;
+}
+
 afterEach(async () => {
   const activeTui = tui;
   const activeGateway = gateway;
@@ -194,6 +205,7 @@ function startAuthFixture(
     rejectResourceTemplateAuth?: boolean;
     authorizationServerTrailingSlash?: boolean;
     authorizationResponseIssuer?: string;
+    authorizationResponseTrailingSlash?: boolean;
     omitScopes?: boolean;
     rejectDiscoveryWithoutChallenge?: boolean;
     rejectDiscoveryWithRestAuthorizationDocument?: boolean;
@@ -456,7 +468,8 @@ function startAuthFixture(
         );
         redirect.searchParams.set(
           "iss",
-          options.authorizationResponseIssuer ?? origin,
+          options.authorizationResponseIssuer ??
+            (options.authorizationResponseTrailingSlash ? `${origin}/` : origin),
         );
         return Response.redirect(redirect, 302);
       }
@@ -599,6 +612,7 @@ function createRoot(
         fixture: {
           type: transport,
           url: serverUrl,
+          environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
           ...(configureOauth
             ? {
                 oauth: {
@@ -643,6 +657,7 @@ function baseEnv(root: ReturnType<typeof createRoot>) {
     AI_GATEWAY_API_KEY: "fake-mcp-auth-key",
     VERCEL_OIDC_TOKEN: undefined,
     FX_AUTO_UPGRADE: "0",
+    FX_MCP_PROTOCOL_VERSION: "2026-07-28",
     FX_PERMISSION_MODE: "auto",
     FX_MODEL: MODEL,
     FX_TRACE_LOG: root.trace,
@@ -835,6 +850,57 @@ async function preserveAuthTuiFailure(
 }
 
 describe("MCP remote authentication lifecycle", () => {
+  test("top-level MCP auth accepts a manual callback when browser launch fails", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth, true, "http", auth.url, false);
+    for (const name of ["open", "xdg-open"]) {
+      writeFileSync(join(root.bin, name),
+        `#!/bin/sh\nprintf '%s\\n' "$1" > '${root.openLog}'\nexit 1\n`);
+    }
+    const authentication = Bun.spawn([FX_BIN, "mcp", "auth", "fixture"], {
+      cwd: root.workspace,
+      env: { ...process.env, ...baseEnv(root), AI_GATEWAY_API_KEY: undefined, FX_NO_OPEN_BROWSER: undefined },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    let stdout = "";
+    let authorizationUrl: string | undefined;
+    let callback: Promise<Response | null> | undefined;
+    const readStdout = (async () => {
+      const decoder = new TextDecoder();
+      for await (const chunk of authentication.stdout) {
+        stdout += decoder.decode(chunk, { stream: true });
+        const match = stdout.match(/^(https?:\/\/[^\r\n]+)\r?\n/m);
+        if (!authorizationUrl && match) {
+          authorizationUrl = match[1];
+          callback = fetch(authorizationUrl).catch(() => null);
+        }
+      }
+    })();
+    const timer = setTimeout(() => authentication.kill(), 10_000);
+    let code: number;
+    let stderr: string;
+    try {
+      [code, stderr] = await Promise.all([
+        authentication.exited,
+        new Response(authentication.stderr).text(),
+        readStdout,
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+    expect(code).toBe(0);
+    expect(authorizationUrl).toBeDefined();
+    expect(stdout).toContain("Authenticated MCP server 'fixture'");
+    expect(stderr).toBe("");
+    const response = await callback;
+    expect(response?.status).toBe(200);
+    expect(auth.tokenExchanges).toBe(1);
+    expect(existsSync(join(root.home, ".fx", "mcp-credentials", "credentials.json"))).toBe(true);
+  }, 15_000);
+
   test("top-level MCP auth and logout complete without TUI or Gateway", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);
@@ -904,6 +970,79 @@ describe("MCP remote authentication lifecycle", () => {
     expect(existsSync(credentialPath)).toBe(false);
     expect(auth.revocations).toBe(2);
   }, 30_000);
+
+  test("pinned localhost callback reuses one port without aborting", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth, true, "http", auth.url, false);
+    const callbackPort = unusedCallbackPort();
+    const profilePath = join(root.home, ".fx", "mcp.json");
+    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+    profile.mcp.fixture.oauth.callback_port = callbackPort;
+    writeFileSync(profilePath, JSON.stringify(profile));
+    const env = {
+      ...baseEnv(root),
+      AI_GATEWAY_API_KEY: undefined,
+    };
+
+    const attempts = 12;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      rmSync(root.openLog, { force: true });
+      const authentication = runFx(["mcp", "auth", "fixture"], {
+        cwd: root.workspace,
+        env,
+        timeoutMs: 20_000,
+      });
+      const opened = await waitForFileText(root.openLog, "http", 5_000);
+      let callbackStatus: number | null = null;
+      let callbackBody = "";
+      let callbackError: unknown = null;
+      if (opened) {
+        try {
+          const authorizationUrl = readFileSync(root.openLog, "utf8").trim();
+          const authorizationResponse = await fetch(authorizationUrl, {
+            redirect: "manual",
+          });
+          const callbackUrl = authorizationResponse.headers.get("location");
+          if (!callbackUrl) throw new Error("authorization redirect is missing");
+          const callbackResponse = await fetch(callbackUrl);
+          callbackStatus = callbackResponse.status;
+          callbackBody = await callbackResponse.text();
+        } catch (error) {
+          callbackError = error;
+        }
+      }
+      const authenticated = await authentication;
+      if (
+        !opened ||
+        callbackError !== null ||
+        callbackStatus !== 200 ||
+        authenticated.code !== 0 ||
+        authenticated.stderr !== ""
+      ) {
+        throw new Error(JSON.stringify({
+          attempt,
+          callbackPort,
+          opened,
+          callbackStatus,
+          callbackError: callbackError === null ? null : String(callbackError),
+          authenticated,
+        }, null, 2));
+      }
+      expect(callbackBody).toContain("Authorization complete");
+      expect(authenticated.stdout).toContain("Authenticated MCP server 'fixture'");
+
+      const loggedOut = await runFx(["mcp", "logout", "fixture"], {
+        cwd: root.workspace,
+        env,
+        timeoutMs: 20_000,
+      });
+      expect(loggedOut.code).toBe(0);
+      expect(loggedOut.stderr).toBe("");
+    }
+    expect(auth.authorizationRequests).toBe(attempts);
+    expect(auth.tokenExchanges).toBe(attempts);
+  }, 90_000);
 
   test("rejected stored credentials report required auth without discovery fallback", async () => {
     upstream = startModernMcpHttpFixture("json");
@@ -1126,7 +1265,7 @@ describe("MCP remote authentication lifecycle", () => {
       const profile = JSON.parse(readFileSync(profilePath, "utf8"));
       delete profile.mcp.fixture.oauth.scopes;
       profile.mcp.canary = {
-        type: "http",
+        type: "http", environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
         url: canary.url,
         startup_timeout_ms: 5_000,
         operation_timeout_ms: 5_000,
@@ -1168,6 +1307,7 @@ describe("MCP remote authentication lifecycle", () => {
         expect(authenticated).toContain(
           "Removed 1 unreadable MCP credential entry.",
         );
+        await tui.sendText("/mcp reload");
         await tui.waitForText("MCP configuration reloaded", 15_000);
         await tui.sendText("/mcp list");
         let pane = await tui.waitForText("MCP health (2 servers):", 10_000);
@@ -1895,13 +2035,13 @@ describe("MCP remote authentication lifecycle", () => {
         JSON.stringify({
           mcp: {
             linear: {
-              type: "http",
+              type: "http", environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
               url: upstream.url,
               startup_timeout_ms: 5_000,
               operation_timeout_ms: 5_000,
             },
             slack: {
-              type: "http",
+              type: "http", environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
               url: auth.url,
               oauth: {
                 client_id: "fx-mcp-auth-test",
@@ -1970,8 +2110,8 @@ describe("MCP remote authentication lifecycle", () => {
     30_000,
   );
 
-  test(
-    "fx ask reports an actionable auth requirement without opening a browser",
+  for (const targeted of [false, true]) test(
+    `fx ask reports an actionable auth requirement for ${targeted ? "named" : "broad"} search without opening a browser`,
     async () => {
       upstream = startModernMcpHttpFixture("json");
       auth = startAuthFixture(upstream.url);
@@ -1979,6 +2119,7 @@ describe("MCP remote authentication lifecycle", () => {
       gateway = startFakeGateway([
         fakeGatewayToolCall("search_auth", "capability_search", {
           query: "fixture",
+          ...(targeted ? { server: "fixture" } : {}),
         }),
         fakeGatewayFinalText("MCP authentication is required."),
       ], {
@@ -2005,7 +2146,7 @@ describe("MCP remote authentication lifecycle", () => {
       ).toHaveLength(1);
       expect(gateway.requests[1]?.body).toContain("authentication_required");
       expect(gateway.requests[1]?.body).toContain(
-        "Run /mcp auth for this server in an interactive fx session.",
+        "Run /mcp auth fixture --open in an interactive fx session.",
       );
       expect(
         existsSync(join(root.home, ".fx", "mcp-credentials")),
@@ -2309,11 +2450,56 @@ describe("MCP remote authentication lifecycle", () => {
   }, 30_000);
 
   test.skipIf(!tmuxAvailable())(
+    "reauthentication replaces a modern HTTP connection with an active subscription",
+    async () => {
+      upstream = startModernMcpHttpFixture("features");
+      auth = startAuthFixture(upstream.url);
+      const root = createRoot(auth);
+      const initial = await runFx(["mcp", "auth", "fixture"], {
+        cwd: root.workspace,
+        env: baseEnv(root),
+        timeoutMs: 20_000,
+      });
+      expect(initial.code).toBe(0);
+      gateway = startToolGateway();
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        env: {
+          ...baseEnv(root),
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        },
+      });
+      await tui.waitForComposer(15_000);
+      await upstream.waitForSubscription();
+      const subscriptions = () => upstream!.requests.filter((entry) =>
+        entry.message.method === "subscriptions/listen"
+      ).length;
+      const before = subscriptions();
+      expect(before).toBeGreaterThan(0);
+      await tui.sendText("/mcp auth fixture --open");
+      await tui.waitForText("Authenticated MCP server 'fixture'.", 15_000);
+      const deadline = Date.now() + 8_000;
+      while (subscriptions() === before && Date.now() < deadline) await Bun.sleep(25);
+      expect(subscriptions()).toBe(before + 1);
+      await tui.sendText("Call the authenticated MCP echo tool.");
+      await tui.waitForText("Authenticated MCP call complete.", 15_000);
+      expect(upstream.requests.filter((entry) => entry.message.method === "tools/call")).toHaveLength(1);
+    },
+    45_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
     "fresh TUI login persists, ask refreshes after restart, and logout revokes",
     async () => {
       upstream = startModernMcpHttpFixture("json");
       auth = startAuthFixture(upstream.url);
       const root = createRoot(auth);
+      const profilePath = join(root.home, ".fx", "mcp.json");
+      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+      profile.mcp.healthy = { type: "http", environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28" }, url: upstream.url, headers: { "x-test-healthy": "1" }, startup_timeout_ms: 5_000 };
+      writeFileSync(profilePath, JSON.stringify(profile));
       gateway = startFakeGateway([
         fakeGatewayFinalText("TUI idle."),
       ], {
@@ -2333,6 +2519,11 @@ describe("MCP remote authentication lifecycle", () => {
       });
       await tui.waitForComposer(15_000);
 
+      const healthyDeadline = Date.now() + 10_000;
+      while (!upstream.requests.some((entry) => entry.headers["x-test-healthy"] === "1" && entry.message.method === "tools/list") && Date.now() < healthyDeadline) await Bun.sleep(25);
+      const healthyRequests = () => upstream!.requests.filter((entry) => entry.headers["x-test-healthy"] === "1").length;
+      const healthyBeforeAuth = healthyRequests();
+      expect(healthyBeforeAuth).toBeGreaterThan(0);
       await tui.sendText("/mcp auth fixture");
       await tui.waitForText(
         "Run /mcp auth fixture --open to confirm opening your browser.",
@@ -2358,7 +2549,8 @@ describe("MCP remote authentication lifecycle", () => {
         await Bun.sleep(25);
       }
       expect(auth.tokenExchanges).toBe(1);
-      await tui.waitForText("MCP configuration reloaded.", 15_000);
+      await tui.waitForText("Authenticated MCP server 'fixture'.", 15_000);
+      expect(healthyRequests()).toBe(healthyBeforeAuth);
       expect(auth.authorizationRequests).toBe(1);
       expect(auth.tokenExchanges).toBe(1);
       const credentialPath = join(
@@ -2372,7 +2564,7 @@ describe("MCP remote authentication lifecycle", () => {
       expect(stored.credentials[0].access_token).toBe(ACCESS_INITIAL);
 
       await tui.sendKeys("Escape");
-      await tui.waitForText("fixture", 5_000);
+      await tui.waitForText("Enter Inspect", 5_000);
       await tui.sendKeys("Escape");
       await tui.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
       expect(await tui.captureFullScrollback()).toBe(beforeMenu);
@@ -2433,7 +2625,7 @@ describe("MCP remote authentication lifecycle", () => {
       });
       await tui.waitForComposer(15_000);
       await tui.sendText("/mcp");
-      const summary = await tui.waitForText("MCP 1", 5_000);
+      const summary = await tui.waitForText("MCP 2", 5_000);
       expect(summary).toContain("fixture");
       expect(summary).toContain("Ready");
       await tui.sendKeys("Escape");
@@ -2449,7 +2641,7 @@ describe("MCP remote authentication lifecycle", () => {
       await tui.sendKeys("L");
       await tui.waitForText("Log out of this MCP server?", 5_000);
       await tui.sendKeys("Enter");
-      await tui.waitForText("MCP reloaded with 1 unavailable server.", 15_000);
+      await tui.waitForText("Logged out of MCP server 'fixture'.", 15_000);
       expect(existsSync(credentialPath)).toBe(false);
       expect(auth.revocations).toBe(2);
       await tui.sendKeys("Escape");
@@ -2480,7 +2672,7 @@ describe("MCP remote authentication lifecycle", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "issuer mismatch stays exact and reports the configuration override",
+    "authorization metadata accepts a trailing-slash discrepancy",
     async () => {
       upstream = startModernMcpHttpFixture("json");
       auth = startAuthFixture(upstream.url, {
@@ -2504,43 +2696,23 @@ describe("MCP remote authentication lifecycle", () => {
       await tui.waitForComposer(15_000);
 
       await tui.sendText("/mcp auth fixture --open");
-      const mismatch = await tui.waitForText(
-        "Add \"oauth\":{\"issuer\":",
-        15_000,
-      );
-      const origin = new URL(auth.url).origin;
-      const compactMismatch = mismatch.replace(/\s+/g, " ");
-      expect(compactMismatch).toContain(`expected issuer "${origin}/"`);
-      expect(compactMismatch).toContain(`metadata returned "${origin}"`);
-      expect(compactMismatch).toContain(`\"issuer\":\"${origin}\"`);
-      expect(auth.authorizationRequests).toBe(0);
-      expect(auth.tokenExchanges).toBe(0);
-
-      const profilePath = join(root.home, ".fx", "mcp.json");
-      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
-      profile.mcp.fixture.oauth.issuer = origin;
-      writeFileSync(profilePath, JSON.stringify(profile));
-      await tui.sendText("/mcp reload");
-      await tui.waitForText(
-        "MCP configuration reloaded, but server 'fixture' is unavailable.",
-        15_000,
-      );
-      await tui.sendText("/mcp auth fixture --open");
       await tui.waitForText("Authenticated MCP server 'fixture'.", 15_000);
       expect(auth.authorizationRequests).toBe(1);
       expect(auth.tokenExchanges).toBe(1);
+      expect(existsSync(join(root.home, ".fx", "mcp-credentials", "credentials.json")))
+        .toBe(true);
     },
-    45_000,
+    30_000,
   );
 
   test.skipIf(!tmuxAvailable())(
     "authorization response issuer mismatch names the response and preserves the trust boundary",
     async () => {
       upstream = startModernMcpHttpFixture("json");
-      const returnedIssuer = "https://authorization-response.example.test";
       auth = startAuthFixture(upstream.url, {
-        authorizationResponseIssuer: returnedIssuer,
+        authorizationResponseTrailingSlash: true,
       });
+      const returnedIssuer = `${new URL(auth.url).origin}/`;
       const root = createRoot(auth);
       gateway = startFakeGateway([], {
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -2562,7 +2734,7 @@ describe("MCP remote authentication lifecycle", () => {
       const mismatch = await tui.waitForText("was rejected", 15_000);
       const compactMismatch = mismatch.replace(/\s+/g, " ");
       expect(compactMismatch).toContain("authorization response returned issuer");
-      expect(compactMismatch).toContain("authorization-response.example.test");
+      expect(compactMismatch).toContain(returnedIssuer);
       expect(compactMismatch).toContain("stopped before token exchange");
       expect(compactMismatch).toContain("Contact the MCP server provider");
       expect(compactMismatch).not.toContain('Add "oauth":{"issuer":');
@@ -3255,7 +3427,7 @@ describe("MCP remote authentication lifecycle", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "legacy Streamable HTTP logout closes its session and deletes stored credentials",
+    "legacy Streamable HTTP logout closes its session and permits sign-in from the inspector",
     async () => {
       legacyStreamable = startLegacyStreamableHttpFixture("2025-06-18");
       auth = startAuthFixture(legacyStreamable.url);
@@ -3292,6 +3464,19 @@ describe("MCP remote authentication lifecycle", () => {
       );
       expect(deleteRequest?.authorization).toBe(`Bearer ${ACCESS_INITIAL}`);
       expect(existsSync(credentialPath)).toBe(false);
+      await tui.sendText("/mcp");
+      await tui.waitForPane((pane) => /fixture\s+Disconnected/.test(pane), 5_000);
+      expect(auth.authorizationRequests).toBe(0);
+      await tui.sendKeys("Enter");
+      await tui.waitForText("Enter Sign in", 5_000);
+      expect(await tui.capturePane()).toMatch(/State\s+Disconnected/);
+
+      await tui.sendKeys("Enter");
+      await tui.waitForPane((pane) => /State\s+Ready/.test(pane), 15_000);
+      expect(auth.authorizationRequests).toBe(1);
+      expect(auth.tokenExchanges).toBe(1);
+      expect(existsSync(credentialPath)).toBe(true);
+      expect(gateway.requests).toHaveLength(0);
     },
     30_000,
   );

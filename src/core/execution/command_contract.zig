@@ -1,29 +1,17 @@
 const std = @import("std");
-const process_supervisor = @import("../background/process_supervisor.zig");
-const types = @import("../shared/types.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
 
 pub const CommandOutputStream = command_output_content.Stream;
 pub const CommandOutputCallback = command_output_content.Callback;
 
-pub const BackgroundCommand = struct {
-    pid: []const u8,
-    process_token: ?process_supervisor.ProcessInstanceToken = null,
-    background_record_id: ?types.StableBackgroundRecordId = null,
-    command: []const u8,
-    cwd: []const u8,
-    log_path: []const u8,
-    url: ?[]const u8 = null,
-    expect_url: bool = false,
-};
-
-pub const ForegroundCommandResult = struct {
+pub const CommandResult = struct {
     command: []const u8,
     cwd: []const u8,
     exit_code: ?i64 = null,
     signal: ?u32 = null,
     timed_out: bool = false,
     termination_indeterminate: bool = false,
+    output_incomplete: bool = false,
     duration_ms: ?u64 = null,
     stdout_bytes: usize = 0,
     stderr_bytes: usize = 0,
@@ -31,27 +19,9 @@ pub const ForegroundCommandResult = struct {
     output_file: ?[]const u8 = null,
     stdout_file: ?[]const u8 = null,
     stderr_file: ?[]const u8 = null,
-};
-
-pub const BackgroundCommandResult = struct {
-    command: []const u8,
-    cwd: []const u8,
-    background_id: ?u64 = null,
-    pid: []const u8,
-    log_path: []const u8,
-    state: []const u8 = "running",
-    server_url: ?[]const u8 = null,
-};
-
-pub const CommandResult = union(enum) {
-    foreground: ForegroundCommandResult,
-    background: BackgroundCommandResult,
 
     pub fn writeJson(self: CommandResult, writer: *std.Io.Writer) !void {
-        switch (self) {
-            .foreground => |result| try writeForegroundJson(result, writer),
-            .background => |result| try writeBackgroundJson(result, writer),
-        }
+        try writeCommandJson(self, writer);
     }
 
     pub fn toJson(self: CommandResult, alloc: std.mem.Allocator) ![]u8 {
@@ -64,38 +34,38 @@ pub const CommandResult = union(enum) {
 
 pub const RunCommandResult = struct {
     output: []const u8,
-    background: ?BackgroundCommand = null,
     command_result: ?CommandResult = null,
     cancelled: bool = false,
 };
 
-pub const ForegroundCommandStatus = union(enum) {
+pub const CommandStatus = union(enum) {
     exit_code: i64,
     signal: u32,
     finished,
     indeterminate,
 };
 
-pub const ForegroundCommandResultSnapshot = struct {
+pub const CommandResultSnapshot = struct {
     command: []const u8,
     cwd: []const u8,
-    status: ForegroundCommandStatus,
+    status: CommandStatus,
     stdout_display: []const u8,
     stderr_display: []const u8,
     stdout_bytes: usize,
     stderr_bytes: usize,
+    output_incomplete: bool = false,
     duration_ms: ?u64 = null,
 };
 
-pub const ForegroundStatusProjection = struct {
+pub const StatusProjection = struct {
     exit_code: ?i64,
     signal: ?u32,
     termination_indeterminate: bool,
 };
 
-pub fn formatForegroundCommandResult(
+pub fn formatCommandResult(
     alloc: std.mem.Allocator,
-    snapshot: ForegroundCommandResultSnapshot,
+    snapshot: CommandResultSnapshot,
 ) !RunCommandResult {
     const stdout_text = std.mem.trim(u8, snapshot.stdout_display, " \r\n\t");
     const stderr_text = std.mem.trim(u8, snapshot.stderr_display, " \r\n\t");
@@ -103,26 +73,27 @@ pub fn formatForegroundCommandResult(
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
-    try writeForegroundStatusLine(&out.writer, snapshot.status);
-    try writeForegroundOutputEnvelopes(&out.writer, stdout_text, stderr_text);
-    const status = projectForegroundStatus(snapshot.status);
+    try writeStatusLine(&out.writer, snapshot.status);
+    try writeOutputEnvelopes(&out.writer, stdout_text, stderr_text);
+    const status = projectStatus(snapshot.status);
 
     return .{
         .output = try out.toOwnedSlice(),
-        .command_result = .{ .foreground = .{
+        .command_result = .{
             .command = snapshot.command,
             .cwd = snapshot.cwd,
             .exit_code = status.exit_code,
             .signal = status.signal,
             .termination_indeterminate = status.termination_indeterminate,
+            .output_incomplete = snapshot.output_incomplete,
             .duration_ms = snapshot.duration_ms,
             .stdout_bytes = snapshot.stdout_bytes,
             .stderr_bytes = snapshot.stderr_bytes,
-        } },
+        },
     };
 }
 
-pub fn writeForegroundStatusLine(writer: *std.Io.Writer, status: ForegroundCommandStatus) !void {
+pub fn writeStatusLine(writer: *std.Io.Writer, status: CommandStatus) !void {
     switch (status) {
         .exit_code => |code| try writer.print("exit_code={d}\n", .{code}),
         .signal => |signal| try writer.print("signal={d}\n", .{signal}),
@@ -134,7 +105,7 @@ pub fn writeForegroundStatusLine(writer: *std.Io.Writer, status: ForegroundComma
     }
 }
 
-fn writeForegroundOutputEnvelopes(writer: *std.Io.Writer, stdout_text: []const u8, stderr_text: []const u8) !void {
+fn writeOutputEnvelopes(writer: *std.Io.Writer, stdout_text: []const u8, stderr_text: []const u8) !void {
     if (stdout_text.len > 0) {
         try writer.writeAll("<stdout>\n");
         try writer.writeAll(stdout_text);
@@ -150,9 +121,9 @@ fn writeForegroundOutputEnvelopes(writer: *std.Io.Writer, stdout_text: []const u
     }
 }
 
-pub fn projectForegroundStatus(
-    status: ForegroundCommandStatus,
-) ForegroundStatusProjection {
+pub fn projectStatus(
+    status: CommandStatus,
+) StatusProjection {
     return switch (status) {
         .exit_code => |code| .{
             .exit_code = code,
@@ -177,8 +148,8 @@ pub fn projectForegroundStatus(
     };
 }
 
-fn writeForegroundJson(result: ForegroundCommandResult, writer: *std.Io.Writer) !void {
-    try writer.writeAll("{\"kind\":\"foreground\"");
+fn writeCommandJson(result: CommandResult, writer: *std.Io.Writer) !void {
+    try writer.writeAll("{\"kind\":\"command\"");
     try writeStringField(writer, "command", result.command);
     try writeStringField(writer, "cwd", result.cwd);
     try writeOptionalIntField(writer, "exit_code", result.exit_code);
@@ -187,6 +158,9 @@ fn writeForegroundJson(result: ForegroundCommandResult, writer: *std.Io.Writer) 
     if (result.termination_indeterminate) {
         try writeBoolField(writer, "termination_indeterminate", true);
     }
+    if (result.output_incomplete) {
+        try writeBoolField(writer, "output_incomplete", true);
+    }
     try writeOptionalIntField(writer, "duration_ms", result.duration_ms);
     try writeIntField(writer, "stdout_bytes", result.stdout_bytes);
     try writeIntField(writer, "stderr_bytes", result.stderr_bytes);
@@ -194,18 +168,6 @@ fn writeForegroundJson(result: ForegroundCommandResult, writer: *std.Io.Writer) 
     try writeOptionalStringField(writer, "output_file", result.output_file);
     try writeOptionalStringField(writer, "stdout_file", result.stdout_file);
     try writeOptionalStringField(writer, "stderr_file", result.stderr_file);
-    try writer.writeByte('}');
-}
-
-fn writeBackgroundJson(result: BackgroundCommandResult, writer: *std.Io.Writer) !void {
-    try writer.writeAll("{\"kind\":\"background\"");
-    try writeStringField(writer, "command", result.command);
-    try writeStringField(writer, "cwd", result.cwd);
-    try writeOptionalIntField(writer, "background_id", result.background_id);
-    try writeStringField(writer, "pid", result.pid);
-    try writeStringField(writer, "log_path", result.log_path);
-    try writeStringField(writer, "state", result.state);
-    try writeOptionalStringField(writer, "server_url", result.server_url);
     try writer.writeByte('}');
 }
 
@@ -243,7 +205,7 @@ fn writeOptionalIntField(writer: *std.Io.Writer, comptime name: []const u8, valu
 }
 
 test "foreground result preserves envelopes metadata and json" {
-    const result = try formatForegroundCommandResult(std.testing.allocator, .{
+    const result = try formatCommandResult(std.testing.allocator, .{
         .command = "printf hello",
         .cwd = "/tmp",
         .status = .{ .exit_code = 7 },
@@ -259,25 +221,25 @@ test "foreground result preserves envelopes metadata and json" {
         "exit_code=7\n<stdout>\nhello\n</stdout>\n<stderr>\nwarn\n</stderr>\n",
         result.output,
     );
-    const foreground = result.command_result.?.foreground;
-    try std.testing.expectEqualStrings("printf hello", foreground.command);
-    try std.testing.expectEqualStrings("/tmp", foreground.cwd);
-    try std.testing.expectEqual(@as(?i64, 7), foreground.exit_code);
-    try std.testing.expectEqual(@as(?u32, null), foreground.signal);
-    try std.testing.expectEqual(@as(?u64, 12), foreground.duration_ms);
-    try std.testing.expectEqual(@as(usize, 7), foreground.stdout_bytes);
-    try std.testing.expectEqual(@as(usize, 6), foreground.stderr_bytes);
+    const command = result.command_result.?;
+    try std.testing.expectEqualStrings("printf hello", command.command);
+    try std.testing.expectEqualStrings("/tmp", command.cwd);
+    try std.testing.expectEqual(@as(?i64, 7), command.exit_code);
+    try std.testing.expectEqual(@as(?u32, null), command.signal);
+    try std.testing.expectEqual(@as(?u64, 12), command.duration_ms);
+    try std.testing.expectEqual(@as(usize, 7), command.stdout_bytes);
+    try std.testing.expectEqual(@as(usize, 6), command.stderr_bytes);
 
     const json = try result.command_result.?.toJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"foreground\",\"command\":\"printf hello\",\"cwd\":\"/tmp\",\"exit_code\":7,\"signal\":null,\"timed_out\":false,\"duration_ms\":12,\"stdout_bytes\":7,\"stderr_bytes\":6,\"truncated\":false,\"output_file\":null,\"stdout_file\":null,\"stderr_file\":null}",
+        "{\"kind\":\"command\",\"command\":\"printf hello\",\"cwd\":\"/tmp\",\"exit_code\":7,\"signal\":null,\"timed_out\":false,\"duration_ms\":12,\"stdout_bytes\":7,\"stderr_bytes\":6,\"truncated\":false,\"output_file\":null,\"stdout_file\":null,\"stderr_file\":null}",
         json,
     );
 }
 
 test "foreground result preserves empty finished output" {
-    const result = try formatForegroundCommandResult(std.testing.allocator, .{
+    const result = try formatCommandResult(std.testing.allocator, .{
         .command = "cmd",
         .cwd = "/tmp",
         .status = .finished,
@@ -291,7 +253,7 @@ test "foreground result preserves empty finished output" {
 }
 
 test "foreground result represents indeterminate termination without implying no execution" {
-    const result = try formatForegroundCommandResult(std.testing.allocator, .{
+    const result = try formatCommandResult(std.testing.allocator, .{
         .command = "printf effect > marker",
         .cwd = "/tmp",
         .status = .indeterminate,
@@ -308,15 +270,41 @@ test "foreground result represents indeterminate termination without implying no
         "termination_indeterminate=true",
     ) != null);
     try std.testing.expect(std.mem.find(u8, result.output, "do not retry unchanged") != null);
-    const foreground = result.command_result.?.foreground;
-    try std.testing.expect(foreground.termination_indeterminate);
-    try std.testing.expectEqual(@as(?i64, null), foreground.exit_code);
-    try std.testing.expectEqual(@as(?u32, null), foreground.signal);
+    const command = result.command_result.?;
+    try std.testing.expect(command.termination_indeterminate);
+    try std.testing.expectEqual(@as(?i64, null), command.exit_code);
+    try std.testing.expectEqual(@as(?u32, null), command.signal);
     const json = try result.command_result.?.toJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.find(
         u8,
         json,
         "\"termination_indeterminate\":true",
+    ) != null);
+}
+
+test "command result preserves observed status when output is incomplete" {
+    const result = try formatCommandResult(std.testing.allocator, .{
+        .command = "printf effect > marker",
+        .cwd = "/tmp",
+        .status = .{ .exit_code = 0 },
+        .stdout_display = "partial output",
+        .stderr_display = "",
+        .stdout_bytes = 14,
+        .stderr_bytes = 0,
+        .output_incomplete = true,
+    });
+    defer std.testing.allocator.free(result.output);
+
+    const command = result.command_result.?;
+    try std.testing.expectEqual(@as(?i64, 0), command.exit_code);
+    try std.testing.expect(command.output_incomplete);
+
+    const json = try command.toJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.find(
+        u8,
+        json,
+        "\"output_incomplete\":true",
     ) != null);
 }

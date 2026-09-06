@@ -2,7 +2,9 @@ const std = @import("std");
 const credentials = @import("../auth/credentials.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const io_mod = @import("../shared/io.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const model_catalog = @import("model_catalog.zig");
 const model_catalog_metadata = @import("model_catalog_metadata.zig");
@@ -149,9 +151,56 @@ const CapabilityResolverState = enum {
 pub const CapabilityResolver = struct {
     catalog: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty,
     state: CapabilityResolverState = .idle,
+    last_attempt_ms: i64 = 0,
+    requested_access: ?model_catalog.AccessMetadata = null,
+    provider_id: ?model_provider.ProviderId = null,
 
     pub fn deinit(self: *CapabilityResolver, alloc: Allocator) void {
         model_catalog.freeModelCatalog(alloc, &self.catalog);
+    }
+
+    /// The owner must exclude capability readers during refresh. Borrowed
+    /// catalog entries stay valid until the next exclusive refresh or adoption.
+    pub fn refreshIfDue(
+        self: *CapabilityResolver,
+        alloc: Allocator,
+        provider: model_catalog.Provider,
+        input: model_catalog.FetchInput,
+    ) model_capabilities.ResolveError!void {
+        const now = io_mod.milliTimestamp();
+        const requested = model_catalog.AccessMetadata.init(input.access);
+        const access_changed = self.provider_id != provider.provider_id or
+            self.requested_access == null or !std.meta.eql(self.requested_access.?, requested);
+        const expired = if (provider.refresh_interval_ms) |interval|
+            now < self.last_attempt_ms or now - self.last_attempt_ms >= interval
+        else
+            false;
+        if (self.state != .idle and !access_changed and !expired) return;
+
+        const result = model_catalog.fetchWithPublicFallback(provider, alloc, input);
+        const loaded = switch (result) {
+            .loaded => |loaded| loaded,
+            .failed => |failed| {
+                if (failed.failure.category == .cancellation) return error.Cancelled;
+                self.last_attempt_ms = now;
+                self.requested_access = requested;
+                self.provider_id = provider.provider_id;
+                if (access_changed) {
+                    if (self.catalog.items.len > 0) debug_trace.logf("gateway", "dropping model catalog after access changed entries={d}", .{self.catalog.items.len});
+                    model_catalog.freeModelCatalog(alloc, &self.catalog);
+                    self.catalog = .empty;
+                }
+                if (self.catalog.items.len == 0) self.state = .failed;
+                debug_trace.logf("gateway", "model catalog refresh failed category={t} retained={}", .{ failed.failure.category, self.state == .ready });
+                return;
+            },
+        };
+        model_catalog.freeModelCatalog(alloc, &self.catalog);
+        self.catalog = loaded.catalog;
+        self.state = .ready;
+        self.last_attempt_ms = now;
+        self.requested_access = requested;
+        self.provider_id = provider.provider_id;
     }
 
     pub fn resolve(
@@ -163,30 +212,7 @@ pub const CapabilityResolver = struct {
         fallback: model_capabilities.Capabilities,
     ) model_capabilities.ResolveError!model_capabilities.Capabilities {
         if (self.state == .idle) {
-            const result = model_catalog.fetchWithPublicFallback(provider, alloc, input);
-            const loaded = switch (result) {
-                .loaded => |loaded| loaded,
-                .failed => |failed| {
-                    const failure = failed.failure;
-                    if (failure.category == .cancellation) {
-                        debug_trace.logf(
-                            "gateway",
-                            "model catalog lookup outcome=cancelled model={s}",
-                            .{model},
-                        );
-                        return failCapabilities(error.Cancelled);
-                    }
-                    self.state = .failed;
-                    debug_trace.logf(
-                        "gateway",
-                        "model catalog lookup outcome=fetch_failed model={s} category={t}",
-                        .{ model, failure.category },
-                    );
-                    return fallback;
-                },
-            };
-            self.catalog = loaded.catalog;
-            self.state = .ready;
+            try self.refreshIfDue(alloc, provider, input);
         }
 
         if (self.state == .failed) {
@@ -244,12 +270,17 @@ pub const CapabilityResolver = struct {
     pub fn adoptOwnedCatalog(
         self: *CapabilityResolver,
         alloc: Allocator,
+        provider: model_catalog.Provider,
+        access: credentials.CatalogAccess,
         owned_catalog: *std.ArrayList(model_catalog.ModelCatalogEntry),
     ) void {
         model_catalog.freeModelCatalog(alloc, &self.catalog);
         self.catalog = owned_catalog.*;
         owned_catalog.* = .empty;
         self.state = .ready;
+        self.last_attempt_ms = io_mod.milliTimestamp();
+        self.requested_access = .init(access);
+        self.provider_id = provider.provider_id;
     }
 };
 
@@ -332,6 +363,67 @@ const FakeCatalog = struct {
         };
     }
 };
+
+test "capability resolver refreshes expired snapshots at the owner boundary and retains a usable catalog" {
+    const alloc = std.testing.allocator;
+    var fake = FakeCatalog{ .outcome = .unavailable };
+    var provider = fake.provider();
+    provider.refresh_interval_ms = 60_000;
+    var resolver: CapabilityResolver = .{};
+    defer resolver.deinit(alloc);
+    const input = model_catalog.FetchInput{ .endpoint = "https://example.invalid" };
+    try resolver.refreshIfDue(alloc, provider, input);
+    try std.testing.expect(resolver.catalogEntries() == null);
+    fake.outcome = .ready;
+    try resolver.refreshIfDue(alloc, provider, input);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    resolver.last_attempt_ms -= 60_000;
+    // Worker capability reads keep the established snapshot until its owner refreshes.
+    _ = try resolver.resolve(alloc, provider, input, "provider/model", .{});
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try resolver.refreshIfDue(alloc, provider, input);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), resolver.catalogEntries().?.len);
+    fake.outcome = .unavailable;
+    resolver.last_attempt_ms -= 60_000;
+    try resolver.refreshIfDue(alloc, provider, input);
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
+    try std.testing.expectEqualStrings("provider/model", resolver.catalogEntries().?[0].id);
+}
+
+test "capability refresh does not retain a catalog for changed access" {
+    const alloc = std.testing.allocator;
+    var fake = FakeCatalog{ .outcome = .ready };
+    var resolver: CapabilityResolver = .{};
+    defer resolver.deinit(alloc);
+    try resolver.refreshIfDue(alloc, fake.provider(), .{ .endpoint = "https://example.invalid" });
+    fake.outcome = .unavailable;
+    try resolver.refreshIfDue(alloc, fake.provider(), .{
+        .endpoint = "https://example.invalid",
+        .access = .host_managed,
+    });
+    try std.testing.expect(resolver.catalogEntries() == null);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+}
+
+test "capability refresh keys host-managed catalogs by provider" {
+    const alloc = std.testing.allocator;
+    var fake = FakeCatalog{ .outcome = .ready };
+    var provider = fake.provider();
+    provider.refresh_interval_ms = 60_000;
+    var resolver: CapabilityResolver = .{};
+    defer resolver.deinit(alloc);
+    const input = model_catalog.FetchInput{ .endpoint = "https://example.invalid", .access = .host_managed };
+    try resolver.refreshIfDue(alloc, provider, input);
+    provider.provider_id = .codex;
+    try resolver.refreshIfDue(alloc, provider, input);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    fake.outcome = .unavailable;
+    provider.provider_id = .grok;
+    try resolver.refreshIfDue(alloc, provider, input);
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
+    try std.testing.expect(resolver.catalogEntries() == null);
+}
 
 test "available capabilities never fetch and use a completed catalog snapshot" {
     const alloc = std.testing.allocator;

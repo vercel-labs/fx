@@ -94,7 +94,7 @@ pub const PermissionTargetKind = enum {
 
 pub const web_search_permission = "web_search";
 pub const web_fetch_permission = "web_fetch";
-pub const yolo_warning_text = "YOLO enabled: fx permission checks disabled";
+pub const yolo_warning_text = "Full access enabled: fx permission checks disabled";
 
 pub fn isWebSearchToolName(tool_name: []const u8) bool {
     return std.mem.eql(u8, tool_name, web_search_permission);
@@ -109,6 +109,15 @@ pub fn permissionModeLabel(mode: PermissionMode) []const u8 {
         .ask => "ask",
         .auto => "auto",
         .yolo => "yolo",
+    };
+}
+
+/// Human-readable name; permissionModeLabel retains the persisted and wire value.
+pub fn permissionModeDisplayLabel(mode: PermissionMode) []const u8 {
+    return switch (mode) {
+        .ask => "ask",
+        .auto => "auto",
+        .yolo => "full access",
     };
 }
 
@@ -167,6 +176,7 @@ pub fn permissionTargetForCall(
     }
 
     if (std.mem.eql(u8, call.name, "skill")) {
+        if (call.resolved_skill) |prepared| return arena.dupe(u8, prepared.skill.name);
         const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
         return arena.dupe(u8, try tool_args.requiredStringArg(args, "name"));
     }
@@ -191,7 +201,7 @@ pub fn permissionTargetForCall(
         .url => arena.dupe(u8, try tool_args.requiredStringArg(args, "url")),
         .path_optional_existing => blk: {
             const path_arg = tool_args.optionalStringArg(args, "path") orelse ".";
-            break :blk if (std.mem.eql(u8, path_arg, "."))
+            break :blk if (path_arg.len == 0 or std.mem.eql(u8, path_arg, "."))
                 arena.dupe(u8, workspace_root)
             else
                 try resolveFileToolPath(arena, workspace_root, call.name, path_arg, .existing);
@@ -1956,6 +1966,8 @@ test "PermissionEngine stores deduplicates clears replaces and deinitializes own
 test "permissionModeLabel maps active permission mode labels" {
     try std.testing.expectEqualStrings("ask", permissionModeLabel(.ask));
     try std.testing.expectEqualStrings("auto", permissionModeLabel(.auto));
+    try std.testing.expectEqualStrings("yolo", permissionModeLabel(.yolo));
+    try std.testing.expectEqualStrings("full access", permissionModeDisplayLabel(.yolo));
 }
 
 test "permissionDecisionFromIndex maps approval choices" {
@@ -2192,6 +2204,16 @@ test "permissionTargetForCall covers active target kinds" {
             .call = .{ .id = "grep", .name = "grep_files", .arguments_json = "{\"pattern\":\"main\",\"path\":\"src\"}" },
             .target_kind = .path_optional_existing,
             .expected = src_dir,
+        },
+        .{
+            .call = .{ .id = "glob_root", .name = "glob_files", .arguments_json = "{\"pattern\":\"*.zig\",\"path\":\"\"}" },
+            .target_kind = .path_optional_existing,
+            .expected = workspace,
+        },
+        .{
+            .call = .{ .id = "grep_root", .name = "grep_files", .arguments_json = "{\"pattern\":\"main\"}" },
+            .target_kind = .path_optional_existing,
+            .expected = workspace,
         },
         .{
             .call = .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"src/app.zig\"}" },

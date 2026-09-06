@@ -126,20 +126,27 @@ const SkillsMenuLayout = struct {
 
 pub const PreparedSkillsMenu = struct {
     layout: SkillsMenuLayout,
+    projection: SkillsMenuProjection,
     source_filter: skill_runtime.SkillMenuSourceFilter,
     catalog_empty: bool,
     window_start: usize,
-    visible_skills: []*const skill_runtime.Skill,
     inline_name_column_width: ?usize,
     scope_column_width: usize,
 
-    pub fn deinit(self: *PreparedSkillsMenu, alloc: Allocator) void {
-        if (self.visible_skills.len > 0) alloc.free(self.visible_skills);
+    pub fn deinit(self: *PreparedSkillsMenu, _: Allocator) void {
         self.* = undefined;
     }
 
     pub fn rowCount(self: PreparedSkillsMenu) u16 {
         return self.layout.row_count;
+    }
+
+    pub fn skillAtVisibleOffset(
+        self: PreparedSkillsMenu,
+        visible_offset: usize,
+    ) ?*const skill_runtime.Skill {
+        if (visible_offset >= self.layout.visible_items) return null;
+        return self.projection.itemAt(self.window_start + visible_offset);
     }
 };
 
@@ -164,7 +171,7 @@ pub fn prepareInlineSkillsMenu(
 }
 
 fn prepareSkillsMenuWithLayout(
-    alloc: Allocator,
+    _: Allocator,
     projection: SkillsMenuProjection,
     layout: SkillsMenuLayout,
     inline_mode: bool,
@@ -176,28 +183,18 @@ fn prepareSkillsMenuWithLayout(
         layout.visible_items,
     );
 
-    var visible_skills: []*const skill_runtime.Skill = &.{};
-    errdefer if (visible_skills.len > 0) alloc.free(visible_skills);
-    if (layout.visible_items > 0) {
-        visible_skills = try alloc.alloc(*const skill_runtime.Skill, layout.visible_items);
-        const written = skill_runtime.fillSkillMenuRangeAtQuery(
-            projection.items,
-            projection.source_filter,
-            projection.query,
-            window_start,
-            visible_skills,
-        );
-        if (written != visible_skills.len) return error.InconsistentSkillsMenuProjection;
-    }
-
     return .{
         .layout = layout,
+        .projection = projection,
         .source_filter = projection.source_filter,
         .catalog_empty = projection.items.len == 0,
         .window_start = window_start,
-        .visible_skills = visible_skills,
         .inline_name_column_width = if (inline_mode) matching_name_column_width(projection) else null,
-        .scope_column_width = scopeColumnWidth(visible_skills),
+        .scope_column_width = scopeColumnWidth(
+            projection,
+            window_start,
+            layout.visible_items,
+        ),
     };
 }
 
@@ -262,9 +259,8 @@ pub fn composeSkillsMenuRow(
     const visible_offset = body_offset / layout.item_stride;
     if (visible_offset >= layout.visible_items) return row;
 
-    if (visible_offset >= prepared.visible_skills.len) return row;
     const display_index = prepared.window_start + visible_offset;
-    const skill = prepared.visible_skills[visible_offset].*;
+    const skill = (prepared.skillAtVisibleOffset(visible_offset) orelse return row).*;
 
     // item_stride is 1: every skill is a single row.
     return composeSkillTitleRow(
@@ -279,9 +275,9 @@ pub fn composeSkillsMenuRow(
 
 fn matching_name_column_width(projection: SkillsMenuProjection) usize {
     var col: usize = 0;
-    for (projection.items) |skill| {
-        if (!skill_runtime.skillSourceMatchesFilter(skill.source, projection.source_filter)) continue;
-        if (!skill_runtime.skill_matches_menu_query(skill, projection.query)) continue;
+    var display_index: usize = 0;
+    while (display_index < projection.itemCount()) : (display_index += 1) {
+        const skill = projection.itemAt(display_index) orelse continue;
         col = @max(col, display_width.visibleWidth(skill.name));
     }
     return col;
@@ -289,9 +285,15 @@ fn matching_name_column_width(projection: SkillsMenuProjection) usize {
 
 // Widest source-scope label across the visible skills, so the scope column
 // lines up vertically instead of drifting with each row's own width.
-fn scopeColumnWidth(visible_skills: []const *const skill_runtime.Skill) usize {
+fn scopeColumnWidth(
+    projection: SkillsMenuProjection,
+    window_start: usize,
+    visible_items: u16,
+) usize {
     var col: usize = 0;
-    for (visible_skills) |skill| {
+    var visible_offset: usize = 0;
+    while (visible_offset < visible_items) : (visible_offset += 1) {
+        const skill = projection.itemAt(window_start + visible_offset) orelse continue;
         col = @max(col, display_width.visibleWidth(skillSourceScopeLabel(skill.source)));
     }
     return col;
@@ -462,7 +464,7 @@ fn cloneClippedRow(alloc: Allocator, text: []const u8, width: u16) !std.ArrayLis
 }
 
 fn visibleSkillCount(projection: SkillsMenuProjection) usize {
-    return skill_runtime.skillMenuFilterQueryCount(projection.items, projection.source_filter, projection.query);
+    return projection.itemCount();
 }
 
 test "skills menu labels native workspace skills with lowercase product name" {
@@ -605,6 +607,30 @@ test "inline skills menu shows six roomy items and prioritizes selection when ti
     try std.testing.expect(std.mem.find(u8, tiny_row.items, "Skills") == null);
 }
 
+test "prepared skills menu borrows one indexed query without allocating" {
+    const skills = [_]skill_runtime.Skill{
+        .{ .name = "ignored", .description = "", .path = "/skills/ignored", .source = .global_fx },
+        .{ .name = "selected", .description = "", .path = "/skills/selected", .source = .global_codex },
+    };
+    const actual_indices = [_]u32{1};
+    const projection: SkillsMenuProjection = .{
+        .active = true,
+        .items = &skills,
+        .selected_index = 0,
+        .actual_indices = &actual_indices,
+        .index_ready = true,
+    };
+    var failing = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 0 },
+    );
+
+    var prepared = try prepareInlineSkillsMenu(failing.allocator(), projection, 4);
+    defer prepared.deinit(failing.allocator());
+    try std.testing.expectEqual(@as(u16, 3), prepared.rowCount());
+    try std.testing.expectEqualStrings("selected", prepared.skillAtVisibleOffset(0).?.name);
+}
+
 test "inline skills menu keeps an empty result visible at one row" {
     const alloc = std.testing.allocator;
     const skills = [_]skill_runtime.Skill{.{
@@ -728,9 +754,9 @@ test "prepared skills menu aligns sources beside the widest visible name" {
     var prepared = try prepareInlineSkillsMenu(alloc, projection, 4);
     defer prepared.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), prepared.window_start);
-    try std.testing.expectEqual(@as(usize, 2), prepared.visible_skills.len);
-    try std.testing.expectEqualStrings("a", prepared.visible_skills[0].name);
-    try std.testing.expectEqualStrings("much-longer", prepared.visible_skills[1].name);
+    try std.testing.expectEqual(@as(u16, 2), prepared.layout.visible_items);
+    try std.testing.expectEqualStrings("a", prepared.skillAtVisibleOffset(0).?.name);
+    try std.testing.expectEqualStrings("much-longer", prepared.skillAtVisibleOffset(1).?.name);
 
     var first = try composeSkillsMenuRow(alloc, prepared, 2, 80);
     defer first.deinit(alloc);

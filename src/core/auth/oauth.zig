@@ -31,6 +31,7 @@ pub const OAuthError = error{
     AccessDenied,
     ExpiredToken,
     InvalidClient,
+    InvalidGrant,
     OAuthRequestFailed,
 };
 
@@ -331,6 +332,7 @@ fn mapOAuthHttpError(alloc: Allocator, body: []const u8) !void {
     if (std.mem.eql(u8, value.string, "access_denied")) return OAuthError.AccessDenied;
     if (std.mem.eql(u8, value.string, "expired_token")) return OAuthError.ExpiredToken;
     if (std.mem.eql(u8, value.string, "invalid_client")) return OAuthError.InvalidClient;
+    if (std.mem.eql(u8, value.string, "invalid_grant")) return OAuthError.InvalidGrant;
     return OAuthError.OAuthRequestFailed;
 }
 
@@ -551,6 +553,7 @@ test "oauth maps provider errors" {
     try std.testing.expectError(OAuthError.OAuthRequestFailed, mapOAuthHttpError(std.testing.allocator, "{\"error\":\"invalid_request\"}"));
     try std.testing.expectError(OAuthError.OAuthRequestFailed, mapOAuthHttpError(std.testing.allocator, "{\"error\":42}"));
     try std.testing.expectError(OAuthError.InvalidClient, mapOAuthHttpError(std.testing.allocator, "{\"error\":\"invalid_client\"}"));
+    try std.testing.expectError(OAuthError.InvalidGrant, mapOAuthHttpError(std.testing.allocator, "{\"error\":\"invalid_grant\"}"));
 }
 
 test "oauth parses token set" {

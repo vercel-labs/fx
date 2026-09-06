@@ -782,22 +782,49 @@ pub noinline fn composePickerOptionRow(
     selected: bool,
     width: u16,
 ) !std.ArrayList(u8) {
+    return composePickerOptionRowAnnotated(alloc, kind, start_col, item, "", selected, width);
+}
+
+const picker_annotation_separator = " · ";
+
+pub noinline fn composePickerOptionRowAnnotated(
+    alloc: Allocator,
+    kind: input_presentation.PickerKind,
+    start_col: u16,
+    item: []const u8,
+    annotation: []const u8,
+    selected: bool,
+    width: u16,
+) !std.ArrayList(u8) {
     var row: std.ArrayList(u8) = .empty;
     const width_usize: usize = width;
     if (width_usize == 0 or start_col == 0 or start_col > width) return row;
 
     if (start_col > 1) try row_text.appendAbsoluteColumn(alloc, &row, start_col);
-    // The model picker (including its effort and fast stages) signals
-    // selection by brightness alone, like the question panel; the other
-    // pickers keep the filled row.
+    // Model, provider, and model-catalog pickers signal selection by
+    // brightness alone, like the question panel; other pickers keep the filled row.
     const selected_style = switch (kind) {
-        .model_stage, .models => ui_render.selected_completion_style,
+        .model_stage, .provider_stage, .models => ui_render.selected_completion_style,
         .file, .slash, .skills, .help, .settings, .sessions, .mcp, .auth => ui_render.approval_button_inactive_style,
     };
-    try row.appendSlice(alloc, if (selected) selected_style else ui_render.dim_style);
+    const base_style = if (selected) selected_style else ui_render.dim_style;
+    const available = width_usize - @as(usize, start_col - 1);
+    const annotation_width = if (annotation.len == 0)
+        0
+    else
+        display_width.visibleWidth(picker_annotation_separator) + display_width.visibleWidth(annotation);
+    const show_annotation = annotation_width > 0 and
+        available >= display_width.visibleWidth(item) + annotation_width;
+    const label_width = if (show_annotation) available - annotation_width else available;
 
-    const label_width: u16 = @intCast(width_usize - @as(usize, start_col - 1));
-    try row_text.appendClipped(alloc, &row, item, label_width);
+    try row.appendSlice(alloc, base_style);
+    try row_text.appendClipped(alloc, &row, item, @intCast(label_width));
+    if (show_annotation) {
+        try row.appendSlice(alloc, ui_render.reset_style);
+        try row.appendSlice(alloc, ui_render.dim_style);
+        try row.appendSlice(alloc, picker_annotation_separator);
+        try row.appendSlice(alloc, annotation);
+    }
     try row.appendSlice(alloc, ui_render.reset_style);
     return row;
 }
@@ -836,6 +863,19 @@ pub fn composePickerStatusRow(
     start_col: u16,
     width: u16,
 ) !std.ArrayList(u8) {
+    return composePickerStatusRowWithProvider(alloc, kind, model_stage, .provider, loading, failed, start_col, width);
+}
+
+pub fn composePickerStatusRowWithProvider(
+    alloc: Allocator,
+    kind: input_presentation.PickerKind,
+    model_stage: picker_state.ModelPickerStage,
+    provider_stage: picker_state.ProviderPickerStage,
+    loading: bool,
+    failed: bool,
+    start_col: u16,
+    width: u16,
+) !std.ArrayList(u8) {
     var row: std.ArrayList(u8) = .empty;
     const width_usize: usize = width;
     if (width_usize == 0 or start_col == 0 or start_col > width) return row;
@@ -853,6 +893,13 @@ pub fn composePickerStatusRow(
                 "no matching models",
             .effort => "no matching effort",
             .fast => "no matching mode",
+        },
+        .provider_stage => switch (provider_stage) {
+            .provider => "no matching providers",
+            .method => "no matching sign-in methods",
+            .team => if (loading) "loading teams..." else if (failed) "unable to load teams" else "no matching teams",
+            .key_source => "no matching key sources",
+            .api_key => "",
         },
         .models => "no models available",
         .file => if (loading)
@@ -1469,7 +1516,7 @@ const picker_test_slash_specs = [_]command_specs.SlashSpec{
     .{ .kind = .clear_screen, .command = "/clear", .help_entry = "/clear", .completion_description = "clear the terminal transcript", .presentation_category = .general },
     .{ .kind = .model, .command = "/model", .help_entry = "/model <id-or-query>", .completion_description = "choose what model and reasoning effort to use", .presentation_category = .model, .has_args = true },
     .{ .kind = .mcp, .command = "/mcp", .help_entry = "/mcp [list|resource|prompt|add|remove]", .completion_description = "manage MCP servers, resources, and prompts", .presentation_category = .extensions, .has_args = true },
-    .{ .kind = .permissions, .command = "/permissions", .help_entry = "/permissions [ask|auto|remember|revoke|yolo|reset]", .completion_description = "choose permission behavior", .presentation_category = .security, .has_args = true },
+    .{ .kind = .permissions, .command = "/permissions", .help_entry = "/permissions [ask|auto|remember|revoke|full-access|reset]", .completion_description = "choose permission behavior", .presentation_category = .security, .has_args = true },
     .{ .kind = .credits, .command = "/credits", .aliases = &.{"/balance"}, .help_entry = "/credits (/balance)", .completion_description = "show gateway credits balance", .presentation_category = .account },
     .{ .kind = .settings, .command = "/settings", .help_entry = "/settings", .completion_description = "configure fx", .presentation_category = .general },
 };

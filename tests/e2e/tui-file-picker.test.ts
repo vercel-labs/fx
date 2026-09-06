@@ -17,6 +17,7 @@ import { FX_BIN, HAS_API_KEY, runFx } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
+  heldFakeGatewayFinalText,
   isComposerLine,
   startFakeGateway,
   TmuxSession,
@@ -426,6 +427,46 @@ async function replayTape(current: Fixture): Promise<void> {
 }
 
 describe("@ file picker", () => {
+  tmuxTest(
+    "opens and selects a file while a turn is in flight",
+    async () => {
+      const current = createFixture("fx-file-picker-in-flight-");
+      initGit(current.workspace);
+      writeFileSync(join(current.workspace, "in-flight-context.txt"), "context");
+      git(current.workspace, "add", "in-flight-context.txt");
+      const held = heldFakeGatewayFinalText();
+
+      try {
+        const active = await startMockFx(current, [held.response], 1_000);
+        await active.sendText("Keep this turn active.");
+        await waitForGatewayRequestCount(1);
+
+        await active.sendLiteral("@in-flight");
+        await active.waitForPane(
+          (pane) => pane.includes("in-flight-context.txt"),
+          5_000,
+        );
+        await active.sendKeys("Enter");
+        await active.waitForPane(
+          (pane) => composerTextFromPane(pane).includes("@in-flight-context.txt"),
+          5_000,
+        );
+
+        expect(gateway?.requests).toHaveLength(1);
+        held.release("IN_FLIGHT_FILE_PICKER_COMPLETE");
+        await active.waitForText("IN_FLIGHT_FILE_PICKER_COMPLETE", TIMEOUT);
+        expectCleanRuntime(current, active);
+        await clearComposer(active);
+        await active.sendText("/quit");
+        expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+        session = null;
+      } finally {
+        held.dispose();
+      }
+    },
+    TIMEOUT,
+  );
+
   tmuxTest(
     "keeps the completed result visible through rapid large-index refreshes",
     async () => {

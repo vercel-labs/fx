@@ -98,11 +98,11 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
       session = launched.terminal;
 
       await session.sendText("/permissions");
-      await session.waitForText("usage: /permissions [ask|auto|yolo|reset]", 5_000);
+      await session.waitForText("usage: /permissions [ask|auto|full-access|reset]", 5_000);
       const scrollback = await session.captureFullScrollback();
       const statusIndex = scrollback.search(/● Permissions: mode=(?:ask|auto)/);
       const usageIndex = scrollback.indexOf(
-        "usage: /permissions [ask|auto|yolo|reset]",
+        "usage: /permissions [ask|auto|full-access|reset]",
       );
       expect(statusIndex).toBeGreaterThanOrEqual(0);
       expect(usageIndex).toBeGreaterThan(statusIndex);
@@ -215,12 +215,14 @@ describe.skipIf(SKIP)("tui: slash commands", () => {
   );
 
   test(
-    "/compact shows compaction message",
+    "/compact reports when there is no eligible context",
     async () => {
-      session = await launchAndWait();
+      const launched = await launchNoKeyAndWait();
+      session = launched.terminal;
       await session.sendText("/compact");
-      const pane = await session.waitForText(/compact/i, 5_000);
-      expect(pane.toLowerCase()).toContain("compact");
+      const pane = await session.waitForText("No context to compact.", 5_000);
+      expect(pane).toContain("No context to compact.");
+      expect(readFileSync(launched.stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
   );

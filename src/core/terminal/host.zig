@@ -10,10 +10,10 @@ const host_capabilities = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
-const background_process_provider = @import(
-    "../execution/background_process_provider.zig",
+const process_provider_mod = @import(
+    "../execution/process_provider.zig",
 );
-const process_supervisor = @import("../background/process_supervisor.zig");
+const process_identity = @import("../execution/process_identity.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -21,13 +21,15 @@ pub const internal_mode = "--fx-internal-terminal-host";
 pub const endpoint_name = "host.sock";
 pub const lock_name = "host.lock";
 const identity_name = "host.json";
-const host_dir_name = "terminal-host";
+const host_dir_name = "terminal-host-v7";
 const default_idle_grace_ms: u64 = 30_000;
 const identity_max_bytes: usize = 1024;
+// macOS GUI apps commonly inherit 256, below the host's 64-session budget.
+const desired_file_descriptor_limit: u64 = 1024;
 const max_connection_requests: usize = 32;
 const listener_poll_ms = 50;
 const transport_hash_bytes: usize = 16;
-const transport_hash_context = "fx.terminal.transport.v1\x00";
+const transport_hash_context = "fx.terminal.transport.v3\x00";
 const socket_permissions: std.Io.File.Permissions = switch (builtin.os.tag) {
     .macos, .linux => .fromMode(0o600),
     else => .default_file,
@@ -158,8 +160,8 @@ fn resolveEndpointSelection(
 }
 
 pub const Config = struct {
-    process_provider: background_process_provider.Provider =
-        background_process_provider.unavailable_provider,
+    process_provider: process_provider_mod.Provider =
+        process_provider_mod.unavailable_provider,
     hello: contracts.ProtocolHello = .{
         .range = contracts.local_protocol_range,
         .capabilities = contracts.known_protocol_capabilities,
@@ -167,7 +169,7 @@ pub const Config = struct {
     idle_grace_ms: u64 = default_idle_grace_ms,
 
     pub fn fromEnvironment(
-        process_provider: background_process_provider.Provider,
+        process_provider: process_provider_mod.Provider,
     ) !Config {
         var config: Config = .{ .process_provider = process_provider };
         if (io_mod.getenv("FX_TERMINAL_HOST_PROTOCOL_MIN")) |value| {
@@ -377,7 +379,50 @@ const IdentityRecord = struct {
 
 pub fn run(alloc: Allocator, config: Config) !void {
     if (comptime !isSupported()) return error.TerminalHostUnsupported;
-    return runSupported(alloc, config);
+    ensureFileDescriptorBudget();
+    return runSupported(alloc, config) catch |err| {
+        debug_trace.logf(
+            "terminal_host",
+            "host startup failed err={s}",
+            .{@errorName(err)},
+        );
+        return err;
+    };
+}
+
+fn fileDescriptorLimitTarget(current: u64, maximum: u64) ?u64 {
+    const target = @min(maximum, desired_file_descriptor_limit);
+    return if (current < target) target else null;
+}
+
+fn ensureFileDescriptorBudget() void {
+    if (comptime builtin.os.tag != .macos and builtin.os.tag != .linux) return;
+    var limits = std.posix.getrlimit(.NOFILE) catch |err| {
+        debug_trace.logf(
+            "terminal_host",
+            "host file descriptor limit unavailable err={s}",
+            .{@errorName(err)},
+        );
+        return;
+    };
+    const target = fileDescriptorLimitTarget(
+        @intCast(limits.cur),
+        @intCast(limits.max),
+    ) orelse return;
+    limits.cur = @intCast(target);
+    std.posix.setrlimit(.NOFILE, limits) catch |err| {
+        debug_trace.logf(
+            "terminal_host",
+            "host file descriptor limit unchanged target={d} err={s}",
+            .{ target, @errorName(err) },
+        );
+        return;
+    };
+    debug_trace.logf(
+        "terminal_host",
+        "host file descriptor limit raised soft={d}",
+        .{target},
+    );
 }
 
 fn runSupported(alloc: Allocator, config: Config) !void {
@@ -435,6 +480,41 @@ fn runSupported(alloc: Allocator, config: Config) !void {
     var state = HostState{
         .idle_grace_ms = config.idle_grace_ms,
     };
+    var startup = HostStartup{};
+    var accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{
+        alloc,
+        &server,
+        config.process_provider,
+        config.hello,
+        &state,
+        &startup,
+    });
+    var startup_complete = false;
+    var accept_joined = false;
+    errdefer if (!startup_complete) {
+        state.stopping.store(true, .release);
+        startup.ready.set(io_mod.getIo());
+        accept_thread.join();
+        accept_joined = true;
+        if (!drainConnectedClients(&state, client_drain_timeout_ms)) {
+            debug_trace.logf(
+                "terminal_host",
+                "host startup failed with {d} client thread(s) still running; preserving shared state until process exit",
+                .{state.connected_clients.load(.acquire)},
+            );
+            std.process.exit(1);
+        }
+    };
+
+    debug_trace.logf(
+        "terminal_host",
+        "host listening pid={d} protocol={d}-{d}",
+        .{ std.c.getpid(), config.hello.range.minimum, config.hello.range.current },
+    );
+    maybeDelayForTest("FX_TERMINAL_TEST_STARTUP_RECOVERY_DELAY_MS");
+    if (io_mod.getenv("FX_TERMINAL_TEST_STARTUP_RECOVERY_FAILURE") != null) {
+        return error.TerminalHostStartupRecoveryFailed;
+    }
     var persistent_store = try terminal_store.ProfileStore.init(
         alloc,
         home,
@@ -450,7 +530,6 @@ fn runSupported(alloc: Allocator, config: Config) !void {
     var registry = try native_session.Registry.init(alloc, .{
         .context = &state,
         .update_fn = updateLiveWork,
-        .monitor_update_fn = updateMonitorWork,
     }, &persistent_store, &host_instance, paths.authority_root_path, paths.transport_root_path);
     defer if (clients_drained) registry.deinit();
     defer {
@@ -470,6 +549,16 @@ fn runSupported(alloc: Allocator, config: Config) !void {
             std.process.exit(1);
         }
     }
+    defer if (!accept_joined) {
+        state.stopping.store(true, .release);
+        state.changed.set(io_mod.getIo());
+        startup.ready.set(io_mod.getIo());
+        accept_thread.join();
+        accept_joined = true;
+    };
+    startup.registry = &registry;
+    startup.ready.set(io_mod.getIo());
+    startup_complete = true;
     var idle_thread = try std.Thread.spawn(.{}, idleOwner, .{&state});
     defer {
         state.stopping.store(true, .release);
@@ -477,40 +566,11 @@ fn runSupported(alloc: Allocator, config: Config) !void {
         idle_thread.join();
     }
 
-    debug_trace.logf(
-        "terminal_host",
-        "host listening pid={d} protocol={d}-{d}",
-        .{ std.c.getpid(), config.hello.range.minimum, config.hello.range.current },
-    );
-
-    while (!state.stopping.load(.acquire)) {
-        if (testAcceptFailureRequested()) return error.InjectedAcceptFailure;
-        if (!try listenerReady(server.socket.handle)) continue;
-        if (state.stopping.load(.acquire)) break;
-        var stream = server.accept(io_mod.getIo()) catch |err| switch (err) {
-            error.SocketNotListening => break,
-            else => return err,
-        };
-        if (state.stopping.load(.acquire)) {
-            stream.close(io_mod.getIo());
-            break;
-        }
-        _ = state.connected_clients.fetchAdd(1, .acq_rel);
-        state.noteChanged();
-        var thread = std.Thread.spawn(.{}, clientMain, .{
-            alloc,
-            stream,
-            config.process_provider,
-            config.hello,
-            &state,
-            &registry,
-        }) catch |err| {
-            stream.close(io_mod.getIo());
-            _ = state.connected_clients.fetchSub(1, .acq_rel);
-            state.noteChanged();
-            return err;
-        };
-        thread.detach();
+    debug_trace.logf("terminal_host", "host recovery ready", .{});
+    accept_thread.join();
+    accept_joined = true;
+    if (startup.accept_failed.load(.acquire)) {
+        return error.HostAcceptFailed;
     }
 
     debug_trace.logf("terminal_host", "host retiring idle=true", .{});
@@ -532,7 +592,6 @@ const HostState = struct {
     connected_clients: std.atomic.Value(usize) = .init(0),
     pending_requests: std.atomic.Value(usize) = .init(0),
     live_work: std.atomic.Value(usize) = .init(0),
-    monitor_required: std.atomic.Value(usize) = .init(0),
     generation: std.atomic.Value(u64) = .init(0),
     stopping: std.atomic.Value(bool) = .init(false),
     changed: std.Io.Event = .unset,
@@ -546,7 +605,6 @@ const HostState = struct {
             .connected_clients = self.connected_clients.load(.acquire),
             .pending_requests = self.pending_requests.load(.acquire),
             .live_work = self.live_work.load(.acquire),
-            .monitor_required = self.monitor_required.load(.acquire) != 0,
         };
     }
 
@@ -588,23 +646,84 @@ const HostState = struct {
     }
 };
 
+const HostStartup = struct {
+    ready: std.Io.Event = .unset,
+    registry: ?*native_session.Registry = null,
+    accept_failed: std.atomic.Value(bool) = .init(false),
+};
+
+fn acceptLoop(
+    alloc: Allocator,
+    server: *std.Io.net.Server,
+    process_provider: process_provider_mod.Provider,
+    hello: contracts.ProtocolHello,
+    state: *HostState,
+    startup: *HostStartup,
+) void {
+    while (!state.stopping.load(.acquire)) {
+        if (testAcceptFailureRequested()) {
+            startup.accept_failed.store(true, .release);
+            state.stopping.store(true, .release);
+            return;
+        }
+        if (!(listenerReady(server.socket.handle) catch |err| {
+            debug_trace.logf(
+                "terminal_host",
+                "host listener failed err={s}",
+                .{@errorName(err)},
+            );
+            startup.accept_failed.store(true, .release);
+            state.stopping.store(true, .release);
+            return;
+        })) continue;
+        if (state.stopping.load(.acquire)) break;
+        var stream = server.accept(io_mod.getIo()) catch |err| switch (err) {
+            error.SocketNotListening => break,
+            else => {
+                debug_trace.logf(
+                    "terminal_host",
+                    "host accept failed err={s}",
+                    .{@errorName(err)},
+                );
+                startup.accept_failed.store(true, .release);
+                state.stopping.store(true, .release);
+                return;
+            },
+        };
+        if (state.stopping.load(.acquire)) {
+            stream.close(io_mod.getIo());
+            break;
+        }
+        _ = state.connected_clients.fetchAdd(1, .acq_rel);
+        state.noteChanged();
+        var thread = std.Thread.spawn(.{}, clientMain, .{
+            alloc,
+            stream,
+            process_provider,
+            hello,
+            state,
+            startup,
+        }) catch |err| {
+            stream.close(io_mod.getIo());
+            _ = state.connected_clients.fetchSub(1, .acq_rel);
+            state.noteChanged();
+            debug_trace.logf(
+                "terminal_host",
+                "host client thread failed err={s}",
+                .{@errorName(err)},
+            );
+            continue;
+        };
+        thread.detach();
+    }
+}
+
 fn updateLiveWork(raw: ?*anyopaque, live: bool) void {
     const state: *HostState = @ptrCast(@alignCast(raw.?));
     if (live) {
         _ = state.live_work.fetchAdd(1, .acq_rel);
     } else {
         const previous = state.live_work.fetchSub(1, .acq_rel);
-        std.debug.assert(previous > 0);
-    }
-    state.noteChanged();
-}
-
-fn updateMonitorWork(raw: ?*anyopaque, required: bool) void {
-    const state: *HostState = @ptrCast(@alignCast(raw.?));
-    if (required) {
-        _ = state.monitor_required.fetchAdd(1, .acq_rel);
-    } else {
-        const previous = state.monitor_required.fetchSub(1, .acq_rel);
         std.debug.assert(previous > 0);
     }
     state.noteChanged();
@@ -685,10 +804,10 @@ fn listenerReady(handle: std.Io.net.Socket.Handle) !bool {
 fn clientMain(
     alloc: Allocator,
     stream: std.Io.net.Stream,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
     host_hello: contracts.ProtocolHello,
     state: *HostState,
-    registry: *native_session.Registry,
+    startup: *HostStartup,
 ) void {
     defer {
         _ = state.connected_clients.fetchSub(1, .acq_rel);
@@ -700,7 +819,7 @@ fn clientMain(
         process_provider,
         host_hello,
         state,
-        registry,
+        startup,
     ) catch |err| {
         debug_trace.logf(
             "terminal_host",
@@ -713,10 +832,10 @@ fn clientMain(
 fn handleClient(
     alloc: Allocator,
     stream: std.Io.net.Stream,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
     host_hello: contracts.ProtocolHello,
     state: *HostState,
-    registry: *native_session.Registry,
+    startup: *HostStartup,
 ) !void {
     defer stream.close(io_mod.getIo());
     if (!peerMatchesCurrentUser(stream.socket.handle)) {
@@ -762,6 +881,8 @@ fn handleClient(
         .compatible => |compatible| compatible,
         .incompatible => return,
     };
+    startup.ready.waitUncancelable(io_mod.getIo());
+    const registry = startup.registry orelse return error.TerminalHostStartupFailed;
 
     var connection = Connection{
         .alloc = alloc,
@@ -1272,7 +1393,7 @@ fn peerMatchesCurrentUser(handle: std.Io.net.Socket.Handle) bool {
 
 fn peerProcessOwner(
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
     handle: std.Io.net.Socket.Handle,
 ) !contracts.ProcessOwner {
     const pid: std.c.pid_t = if (comptime builtin.os.tag == .macos) blk: {
@@ -1320,7 +1441,7 @@ fn peerProcessOwner(
 
 fn writeIdentity(
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
     host_dir: *io_mod.VerifiedDir,
     range: contracts.ProtocolRange,
     instance: []const u8,
@@ -1351,7 +1472,7 @@ fn writeIdentity(
 
 pub fn identityEvidence(
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
     host_dir: *io_mod.VerifiedDir,
 ) policy.IdentityEvidence {
     var file = host_dir.dir.openFile(io_mod.getIo(), identity_name, .{
@@ -1378,7 +1499,7 @@ pub fn identityEvidence(
         .{ .allocate = .alloc_always },
     ) catch return .unverifiable;
     defer parsed.deinit();
-    const token = process_supervisor.ProcessInstanceToken.parse(
+    const token = process_identity.ProcessInstanceToken.parse(
         parsed.value.process_token,
     ) catch return .unverifiable;
     return switch (process_provider.matchToken(
@@ -1462,38 +1583,44 @@ test "terminal host selection follows canonical platform support" {
     try std.testing.expectEqual(isSupportedForOs(builtin.os.tag), isSupported());
 }
 
+test "terminal host file descriptor target is bounded by the hard limit" {
+    try std.testing.expectEqual(
+        @as(?u64, desired_file_descriptor_limit),
+        fileDescriptorLimitTarget(256, std.math.maxInt(u64)),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, 512),
+        fileDescriptorLimitTarget(256, 512),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        fileDescriptorLimitTarget(desired_file_descriptor_limit, 4096),
+    );
+}
+
 test "host identity capture and reconciliation use the injected provider" {
     const Fake = struct {
         captures: usize = 0,
         matches: usize = 0,
-        match_result: process_supervisor.TokenMatch = .matched,
+        match_result: process_identity.TokenMatch = .matched,
 
-        fn provider(self: *@This()) background_process_provider.Provider {
+        fn provider(self: *@This()) process_provider_mod.Provider {
             return .{
                 .context = self,
-                .spawn_prepared_fn = spawnPrepared,
                 .capture_token_fn = captureToken,
                 .match_token_fn = matchToken,
                 .signal_process_fn = signalProcess,
             };
         }
 
-        fn spawnPrepared(
-            _: ?*anyopaque,
-            _: Allocator,
-            _: background_process_provider.SpawnRequest,
-        ) background_process_provider.ProviderError!background_process_provider.PreparedProcess {
-            return error.Unsupported;
-        }
-
         fn captureToken(
             raw: ?*anyopaque,
             _: Allocator,
             _: []const u8,
-        ) background_process_provider.ProviderError!process_supervisor.ProcessInstanceToken {
+        ) process_provider_mod.ProviderError!process_identity.ProcessInstanceToken {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.captures += 1;
-            return process_supervisor.ProcessInstanceToken.parse(
+            return process_identity.ProcessInstanceToken.parse(
                 "macos:00000000000000000000000000000000:1:2",
             ) catch unreachable;
         }
@@ -1502,8 +1629,8 @@ test "host identity capture and reconciliation use the injected provider" {
             raw: ?*anyopaque,
             _: Allocator,
             _: []const u8,
-            _: process_supervisor.ProcessInstanceToken,
-        ) process_supervisor.TokenMatch {
+            _: process_identity.ProcessInstanceToken,
+        ) process_identity.TokenMatch {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.matches += 1;
             return self.match_result;
@@ -1513,8 +1640,8 @@ test "host identity capture and reconciliation use the injected provider" {
             _: ?*anyopaque,
             _: Allocator,
             _: []const u8,
-            _: process_supervisor.ProcessInstanceToken,
-        ) background_process_provider.ProviderError!void {
+            _: process_identity.ProcessInstanceToken,
+        ) process_provider_mod.ProviderError!void {
             return error.Unsupported;
         }
     };
@@ -1562,7 +1689,7 @@ test "host identity capture and reconciliation use the injected provider" {
         error.Unsupported,
         writeIdentity(
             std.testing.allocator,
-            background_process_provider.unavailable_provider,
+            process_provider_mod.unavailable_provider,
             &host_dir,
             contracts.local_protocol_range,
             "test-instance",
@@ -1631,7 +1758,7 @@ test "endpoint selection preserves short homes and deterministically separates l
     try std.testing.expect(std.mem.endsWith(
         u8,
         first.authority_root,
-        "/.fx/terminal-host",
+        "/.fx/terminal-host-v7",
     ));
     try std.testing.expect(!std.mem.eql(
         u8,

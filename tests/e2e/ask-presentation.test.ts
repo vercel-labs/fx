@@ -19,6 +19,7 @@ import {
   fakeGatewaySse,
   fakeGatewaySerializedToolCall,
   fakeGatewayToolCall,
+  fakeShellRun,
   startDynamicFakeGateway,
   startFakeGateway,
   terminalFixtureShell,
@@ -47,7 +48,7 @@ afterEach(async () => {
 });
 
 async function waitForTerminalHostExit(root: string): Promise<void> {
-  const identityPath = join(root, "home", ".fx", "terminal-host", "host.json");
+  const identityPath = join(root, "home", ".fx", "terminal-host-v7", "host.json");
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
     if (!existsSync(identityPath)) return;
@@ -144,14 +145,14 @@ describe("fx ask presentation", () => {
         {
           type: "tool-call",
           toolCallId: "no-final-newline",
-          toolName: "terminal",
-          input: { action: "exec", timeout_ms: 600_000, command: "printf no-final-newline" },
+          toolName: "shell",
+          input: { request: { action: "run", profile: "clean", yield_time_ms: 30_000, command: "printf no-final-newline" } },
         },
         {
           type: "tool-call",
           toolCallId: "next-command",
-          toolName: "terminal",
-          input: { action: "exec", timeout_ms: 600_000, command: "printf 'next-output\\n'" },
+          toolName: "shell",
+          input: { request: { action: "run", profile: "clean", yield_time_ms: 30_000, command: "printf 'next-output\\n'" } },
         },
         {
           type: "finish",
@@ -172,14 +173,12 @@ describe("fx ask presentation", () => {
     );
 
     expect(result.code).toBe(0);
-    expect(result.stderr).toContain(
-      "no-final-newline\nRunning printf 'next-output\\n'\nnext-output\n",
-    );
-    expect(result.stderr).not.toContain("no-final-newlineRunning printf");
+    expect(result.stderr).toContain("Running printf no-final-newline\n");
+    expect(result.stderr).toContain("Running printf 'next-output\\n'\n");
     expect(JSON.parse(result.stdout).output).toBe("Commands complete.\n");
   }, TIMEOUT);
 
-  test("no-save advertises exec only and preserves terminal exec profiles", async () => {
+  test("no-save advertises process-local shell actions and preserves run profiles", async () => {
     const configuredShell = userInfo().shell;
     if (!configuredShell.endsWith("/bash") && !configuredShell.endsWith("/zsh")) return;
 
@@ -214,47 +213,39 @@ describe("fx ask presentation", () => {
       "if command -v fx_profile_function >/dev/null; then fx_profile_function; else printf no-function; fi";
     const nestedExecMarker = join(root.workspace, "nested-no-save-ran");
     const gateway = startFakeGateway([
-      fakeGatewayToolCall("terminal-omitted", "terminal", {
-        action: "exec",
-        timeout_ms: 600_000,
-        command: profileCommand,
+      fakeGatewayToolCall("shell-omitted", "shell", {
+        request: { action: "run", command: profileCommand, yield_time_ms: 30_000 },
       }),
-      fakeGatewayToolCall("terminal-clean", "terminal", {
-        action: "exec",
-        timeout_ms: 600_000,
-        command: profileCommand,
-        profile: "clean",
+      fakeGatewayToolCall("shell-clean", "shell", {
+        request: { action: "run", command: profileCommand, profile: "clean", yield_time_ms: 30_000 },
       }),
-      fakeGatewayToolCall("terminal-user", "terminal", {
-        action: "exec",
-        timeout_ms: 600_000,
-        command: profileCommand,
-        profile: "user",
+      fakeGatewayToolCall("shell-user", "shell", {
+        request: { action: "run", command: profileCommand, profile: "user", yield_time_ms: 30_000 },
       }),
-      fakeGatewayToolCall("terminal-stale-start", "terminal", {
-        action: "start",
-        command: "printf should-not-start",
-        return_when: { kind: "exit" },
-        wait_ceiling_ms: 8_000,
-      }),
-      fakeGatewayToolCall("terminal-nested-exec", "terminal", {
+      fakeGatewayToolCall("shell-stale-tty", "shell", {
         request: {
-          action: "exec",
-          timeout_ms: 600_000,
+          action: "run",
+          command: "printf should-not-start",
+          tty: true,
+        },
+      }),
+      fakeGatewayToolCall("shell-nested-run", "shell", {
+        request: {
+          action: "run",
+          profile: "clean",
+          yield_time_ms: 30_000,
           command: `printf nested > ${JSON.stringify(nestedExecMarker)}`,
         },
       }),
-      fakeGatewayToolCall("terminal-neighbor-exec", "terminal", {
-        action: "exec",
-        timeout_ms: 600_000,
-        command: "printf neighbor-exec",
+      fakeGatewayToolCall("shell-neighbor-run", "shell", {
+        request: { action: "run", profile: "clean", yield_time_ms: 30_000, command: "printf neighbor-exec" },
       }),
-      fakeGatewayFinalText("Terminal no-save profiles verified.\n"),
+      fakeGatewayFinalText("Shell no-save profiles verified.\n"),
     ]);
     gateways.push(gateway);
 
     const result = await runFx(
-      ["ask", "--json", "--yolo", "--no-save", "Verify terminal exec profiles."],
+      ["ask", "--json", "--yolo", "--no-save", "Verify shell run profiles."],
       {
         cwd: root.workspace,
         env: gatewayEnv(root.home, gateway),
@@ -267,68 +258,35 @@ describe("fx ask presentation", () => {
       output: string;
       tool_calls: Array<{ name: string; status: string }>;
     };
-    expect(output.output).toBe("Terminal no-save profiles verified.\n");
+    expect(output.output).toBe("Shell no-save profiles verified.\n");
     expect(output.tool_calls.map(({ name, status }) => ({ name, status }))).toEqual([
-      { name: "terminal", status: "success" },
-      { name: "terminal", status: "success" },
-      { name: "terminal", status: "success" },
-      { name: "terminal", status: "error" },
-      { name: "terminal", status: "error" },
-      { name: "terminal", status: "success" },
+      { name: "shell", status: "success" },
+      { name: "shell", status: "success" },
+      { name: "shell", status: "success" },
+      { name: "shell", status: "error" },
+      { name: "shell", status: "success" },
+      { name: "shell", status: "success" },
     ]);
     expect(gateway.requests).toHaveLength(7);
 
     const firstRequest = JSON.parse(gateway.requests[0]!.body) as {
-      tools: Array<{
-        name?: string;
-        description?: string;
-        inputSchema?: {
-          properties?: Record<string, {
-            enum?: string[];
-            description?: string;
-          }>;
-          required?: string[];
-          additionalProperties?: boolean;
-        };
-      }>;
+      tools: Array<any>;
     };
-    const terminalTool = firstRequest.tools.find(({ name }) => name === "terminal");
-    expect(terminalTool?.description).toBe(
-      "Run one captured command with a required finite timeout_ms and return its result. Timeout cleanup covers the process group and tracked descendants; fully detached descendant cleanup is best effort on macOS.",
-    );
-    const terminalSchema = terminalTool?.inputSchema;
-    expect(terminalSchema?.properties?.action?.enum).toEqual(["exec"]);
-    expect(Object.keys(terminalSchema?.properties ?? {})).toEqual([
-      "action",
-      "command",
-      "cwd",
-      "profile",
-      "timeout_ms",
+    const shellTool = firstRequest.tools.find(({ name }) => name === "shell");
+    const shellSchema = shellTool?.inputSchema;
+    expect(Object.keys(shellSchema?.properties ?? {})).toEqual(["request"]);
+    expect(shellSchema?.required).toEqual(["request"]);
+    expect(shellSchema?.additionalProperties).toBe(false);
+    const branches = shellSchema?.properties?.request?.oneOf ?? [];
+    expect(branches.map((branch: any) => branch.properties.action.enum[0])).toEqual([
+      "run",
+      "interact",
+      "stop",
     ]);
-    expect(terminalSchema?.required).toEqual([
-      "action",
-      "command",
-      "cwd",
-      "profile",
-      "timeout_ms",
-    ]);
-    expect(terminalSchema?.additionalProperties).toBe(false);
-    expect(terminalSchema?.properties?.command?.description).toBe(
-      "Command to run. Set null when the selected action does not use this field.",
-    );
-    expect(terminalSchema?.properties?.cwd?.description).toBe(
-      "Working directory; defaults to the workspace. Set null when the selected action does not use this field.",
-    );
-    expect(terminalSchema?.properties?.profile?.description).toBe(
-      "Profile for exec; omission defaults to user, while clean skips user initialization files. User execution supports the configured Bash or zsh login shell. Bash login execution reads login initialization files; .bashrc is available only when sourced by the login profile. Set null when the selected action does not use this field.",
-    );
-    expect(terminalSchema?.properties?.timeout_ms?.description).toBe(
-      "Maximum foreground runtime in milliseconds. Choose the shortest realistic finite budget; use terminal start for work that must remain alive.",
-    );
-    const serializedTerminalTool = JSON.stringify(terminalTool);
-    expect(serializedTerminalTool).not.toContain("Use start");
-    expect(serializedTerminalTool).not.toContain("Other actions");
-    expect(serializedTerminalTool).not.toContain("durable");
+    const serializedShellTool = JSON.stringify(shellTool);
+    expect(serializedShellTool).not.toContain('"tty"');
+    expect(serializedShellTool).not.toContain('"write"');
+    expect(serializedShellTool).not.toContain('"terminal"');
 
     for (const requestIndex of [1, 3]) {
       expect(gateway.requests[requestIndex]!.body).toContain("mode=login:rc:path-user:");
@@ -337,75 +295,16 @@ describe("fx ask presentation", () => {
     expect(gateway.requests[2]!.body).toContain("mode=unset:unset:path-clean:");
     expect(gateway.requests[2]!.body).toContain("no-alias:no-function");
     expect(gateway.requests[4]!.body).toContain("tool_execution_failed");
-    expect(gateway.requests[4]!.body).toContain(
-      "Durable terminal actions require a saved fx session.",
-    );
-    expect(gateway.requests[4]!.body).toContain(
-      "Use terminal.exec, or rerun without --no-save.",
-    );
+    expect(gateway.requests[4]!.body).toContain("tool_execution_failed");
     expect(gateway.requests[4]!.body).not.toContain("authority_denied");
     expect(gateway.requests[4]!.body).not.toContain("tool_permission_denied");
-    expect(gateway.requests[5]!.body).toContain(
-      "terminal arguments must match the advertised action schema",
-    );
-    expect(gateway.requests[5]!.body).not.toContain("tool_permission_denied");
-    expect(gateway.requests[5]!.body).toContain('"request"');
-    expect(existsSync(nestedExecMarker)).toBe(false);
+    expect(gateway.requests[5]!.body).toContain("nested");
+    expect(existsSync(nestedExecMarker)).toBe(true);
     expect(gateway.requests[6]!.body).toContain("neighbor-exec");
     expect(
-      existsSync(join(root.home, ".fx", "terminal-host", "host.json")),
+      existsSync(join(root.home, ".fx", "terminal-host-v7", "host.json")),
     ).toBe(false);
   }, TIMEOUT);
-
-  test.skipIf(!tmuxAvailable())(
-    "fx ask executes the shared public terminal tool through the tmux backend",
-    async () => {
-      const root = createShortRoot();
-      const toolCallId = "ask_terminal_tmux_1";
-      const gateway = startFakeGateway([
-        fakeGatewayToolCall(toolCallId, "terminal", {
-          action: "start",
-          cwd: root.workspace,
-          command: "printf ASK_PUBLIC_TERMINAL_TMUX",
-          shell: {
-            kind: "executable",
-            path: TERMINAL_FIXTURE_SHELL,
-            clean_start: true,
-          },
-          backend: "tmux",
-          return_when: { kind: "exit" },
-          wait_ceiling_ms: 8_000,
-          dimensions: { rows: 24, columns: 80 },
-        }),
-        fakeGatewayFinalText("Ask public terminal complete.\n"),
-      ]);
-      gateways.push(gateway);
-
-      const result = await runFx(
-        ["ask", "--yolo", "Run the tmux public terminal fixture."],
-        {
-          cwd: root.workspace,
-          env: {
-            ...gatewayEnv(root.home, gateway),
-            FX_TERMINAL_HOST_IDLE_MS: "200",
-          },
-          timeoutMs: TIMEOUT,
-        },
-      );
-
-      expect(result.code).toBe(0);
-      expect(result.stdout).toBe("Ask public terminal complete.\n");
-      expect(result.stderr).toContain("Starting printf ASK_PUBLIC_TERMINAL_TMUX");
-      expect(result.stderr).not.toContain("Using terminal");
-      expect(result.stderr).not.toContain("Preparing command");
-      expect(result.stderr).not.toContain("failed");
-      expect(gateway.requests).toHaveLength(2);
-      expect(gateway.requests[1]!.body).toContain(toolCallId);
-      expect(gateway.requests[1]!.body).toContain('\\"backend\\":\\"tmux\\"');
-      expect(gateway.requests[1]!.body).toContain('\\"exited\\":0');
-    },
-    TIMEOUT,
-  );
 
   test("redirected and JSON stdout preserve raw assistant Markdown", async () => {
     const root = createRoot();
@@ -482,6 +381,79 @@ describe("fx ask presentation", () => {
     ]);
     expect(gateway.requests).toHaveLength(2);
     expect(result.stderr).toContain("Reading fixture.txt");
+  }, TIMEOUT);
+
+  test("tool recovery keeps progress updates ordered before the final response", async () => {
+    const root = createRoot();
+    writeFileSync(join(root.workspace, "fallback.txt"), "fallback contents\n");
+    const initial = "I will inspect the requested file first.";
+    const recovery = "The requested file was missing, so I will inspect fallback.txt next.";
+    const final = "The fallback inspection is complete.";
+    const gateway = startFakeGateway([
+      fakeGatewaySerializedToolCall(
+        "read_missing_for_progress",
+        "read_file",
+        JSON.stringify({ path: "missing.txt" }),
+        initial,
+      ),
+      fakeGatewaySerializedToolCall(
+        "read_fallback_for_progress",
+        "read_file",
+        JSON.stringify({ path: "fallback.txt" }),
+        recovery,
+      ),
+      fakeGatewayFinalText(final),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Inspect missing.txt and recover with fallback.txt."],
+      {
+        cwd: root.workspace,
+        env: gatewayEnv(root.home, gateway),
+        timeoutMs: TIMEOUT,
+      },
+    );
+
+    expect(result.code).toBe(0);
+    expect(gateway.requests).toHaveLength(3);
+    const firstPrompt = (JSON.parse(gateway.requests[0]!.body) as GatewayRequestBody)
+      .prompt
+      .filter((message) => message.role === "system")
+      .map((message) => typeof message.content === "string" ? message.content : "")
+      .join("\n");
+    expect(firstPrompt).toContain(
+      "Before the first tool call in a tool-driven task, always send one brief user-visible update",
+    );
+    expect(firstPrompt).toContain("Never start the first tool silently.");
+    expect(firstPrompt).toContain(
+      "If another tool call will follow, always first tell the user what failed",
+    );
+    expect(firstPrompt).toContain("Do not narrate each routine tool call.");
+
+    const output = JSON.parse(result.stdout) as {
+      output: string;
+      final_output: string;
+      tool_calls: Array<{ name: string; status: string }>;
+    };
+    expect(output.output).toContain(initial);
+    expect(output.output).toContain(recovery);
+    expect(output.output).toContain(final);
+    expect(output.output.indexOf(initial)).toBeLessThan(
+      output.output.indexOf(recovery),
+    );
+    expect(output.output.indexOf(recovery)).toBeLessThan(
+      output.output.indexOf(final),
+    );
+    expect(output.final_output).toBe(final);
+    expect(output.tool_calls).toEqual([
+      { name: "read_file", status: "error" },
+      { name: "read_file", status: "success" },
+    ]);
+    expect(gateway.requests[1]!.body).toContain("FileNotFound");
+    expect(gateway.requests[2]!.body).toContain(recovery);
+    expect(result.stderr).toContain("Reading missing.txt");
+    expect(result.stderr).toContain("Reading fallback.txt");
   }, TIMEOUT);
 
   test.skipIf(!tmuxAvailable())(
@@ -859,10 +831,8 @@ describe("fx ask presentation", () => {
       symlinkSync(instructions, join(root.workspace, "AGENTS.md"));
       const gateway = startFakeGateway(
         [
-          fakeGatewayToolCall("write_fixture", "terminal", {
-            action: "exec",
+          fakeShellRun("write_fixture", "printf notice-test > ask-notice.txt", {
             timeout_ms: 600_000,
-            command: "printf notice-test > ask-notice.txt",
           }),
           fakeGatewayFinalText("Notice filtering complete.\n"),
         ],

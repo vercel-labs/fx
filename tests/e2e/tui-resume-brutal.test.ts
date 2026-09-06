@@ -10,6 +10,7 @@ import {
   realpathSync,
   rmSync,
   statSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { platform, tmpdir } from "node:os";
@@ -20,6 +21,7 @@ import {
   fakeGatewayFinalText,
   fakeGatewaySse,
   hasEmptyComposer,
+  startDynamicFakeGateway,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -42,6 +44,7 @@ type Config = {
 };
 
 type Metrics = {
+  coldProcessOpenMs?: number;
   open: number[];
   scope: number[];
   page: number[];
@@ -208,18 +211,34 @@ function historyBatch(batch: number, config: Config): Response {
 }
 
 async function seedRealSession(paths: Paths, config: Config): Promise<IndexedSummary> {
-  const responses: Response[] = [];
-  for (let batch = 0; batch < config.chatBatches; batch += 1) {
-    responses.push(historyBatch(batch, config));
-  }
-  responses.push(fakeGatewayFinalText(FINAL_MARKER));
-  const gateway = startFakeGateway(responses);
+  let nextBatch = 0;
+  let finalSent = false;
+  const gateway = startDynamicFakeGateway((body) => {
+    const request = JSON.parse(body);
+    if (request.toolChoice?.type === "none" && request.tools?.length === 0) {
+      return fakeGatewayFinalText(
+        "The session is building a large, heterogeneous transcript and reading bounded ranges from resume-tool-payload.txt. Continue the same task without repeating completed reads.",
+      );
+    }
+    if (nextBatch < config.chatBatches) {
+      return historyBatch(nextBatch++, config);
+    }
+    if (!finalSent) {
+      finalSent = true;
+      return fakeGatewayFinalText(FINAL_MARKER);
+    }
+    return new Response("unexpected request", { status: 500 });
+  });
   let session: TmuxSession | null = null;
   try {
     session = await TmuxSession.create({
       cmd: FX_BIN,
       cwd: realpathSync(paths.workspace),
-      env: gatewayEnv(paths.home, gateway),
+      env: {
+        ...gatewayEnv(paths.home, gateway),
+        FX_TRACE_LOG: paths.trace,
+        FX_TRACE_SCOPES: "prompt,session,context_compaction,worker",
+      },
       stderrPath: paths.stderr,
       width: 104,
       height: 30,
@@ -230,24 +249,59 @@ async function seedRealSession(paths: Paths, config: Config): Promise<IndexedSum
     });
     await session.waitForComposer(TIMEOUT);
     await session.sendText(`${REAL_TITLE}: build the prepared long chat and tool history.`);
-    await session.waitForText(FINAL_MARKER, TIMEOUT * 20);
+    await session.waitForPane((pane) =>
+      stripAnsi(pane).includes(FINAL_MARKER) && hasEmptyComposer(pane),
+    TIMEOUT * 20);
+    const savedSessionsRoot = join(paths.home, ".fx", "sessions");
+    await session.waitForPane(() => readdirSync(savedSessionsRoot).some((id) => {
+      const path = join(savedSessionsRoot, id, "events.jsonl");
+      return existsSync(path) && readFileSync(path, "utf8").includes('"turn_completed"');
+    }), TIMEOUT);
     await session.sendText("/quit");
     expect(await session.waitForSessionEnd(TIMEOUT * 2)).toBe(true);
   } finally {
     if (session) await session.kill();
     gateway.stop();
   }
+  expect(readFileSync(paths.stderr, "utf8")).toBe("");
 
-  const indexPath = join(paths.home, ".fx", "sessions", "index.json");
-  const parsed = JSON.parse(readFileSync(indexPath, "utf8")) as {
-    sessions: IndexedSummary[];
+  const sessionsRoot = join(paths.home, ".fx", "sessions");
+  const sessionIds = readdirSync(sessionsRoot, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name);
+  expect(sessionIds).toHaveLength(1);
+  const metadata = JSON.parse(
+    readFileSync(join(sessionsRoot, sessionIds[0]!, "session.json"), "utf8"),
+  ) as {
+    id: string;
+    created_at_ms: number;
+    updated_at_ms: number;
+    workspace_root: string;
+    origin_workspace_root: string;
+    conversation_language: string;
+    title?: string | null;
   };
-  expect(parsed.sessions).toHaveLength(1);
-  const actual = parsed.sessions[0]!;
-  actual.title = REAL_TITLE;
-  actual.preview = `${REAL_TITLE}\n50K chat and large tools`;
-  actual.display_metadata_present = true;
-  return actual;
+  const events = readFileSync(
+    join(sessionsRoot, sessionIds[0]!, "events.jsonl"),
+    "utf8",
+  );
+  const updatedAtMs = Math.max(
+    metadata.updated_at_ms,
+    Math.floor(statSync(join(sessionsRoot, sessionIds[0]!, "events.jsonl")).mtimeMs),
+  );
+  const metadataPath = join(sessionsRoot, sessionIds[0]!, "session.json");
+  writeFileSync(metadataPath, JSON.stringify({ ...metadata, title: REAL_TITLE }));
+  chmodSync(metadataPath, 0o600);
+  return {
+    ...metadata,
+    updated_at_ms: updatedAtMs,
+    title: REAL_TITLE,
+    history_len: events.split("\n").filter((line) =>
+      line.includes('"turn_completed"') || line.includes('"interrupted"')
+    ).length,
+    display_metadata_present: metadata.title != null,
+    preview: `${REAL_TITLE}\n50K chat and large tools`,
+  };
 }
 
 function installLargeCatalog(
@@ -257,8 +311,7 @@ function installLargeCatalog(
 ): void {
   const sessionsRoot = join(paths.home, ".fx", "sessions");
   const base = Math.max(Date.now(), real.updated_at_ms + config.catalogEntries + 10);
-  const entries: IndexedSummary[] = [];
-  entries.push({
+  const entries: IndexedSummary[] = [{
     id: "resume-foreign-newest",
     created_at_ms: base,
     updated_at_ms: base,
@@ -267,22 +320,14 @@ function installLargeCatalog(
     history_len: 50_000,
     display_metadata_present: true,
     title: FOREIGN_TITLE,
-  });
-  entries.push({
-    ...real,
-    updated_at_ms: base - 1,
-    workspace_root: realpathSync(paths.workspace),
-    // The stress conversation is one very large user turn spanning many
-    // tool continuations. Its projection can lag the committed event tail,
-    // but the catalog row must remain resumable while that tail is replayed.
-    history_len: Math.max(1, real.history_len),
-  });
+  }];
   for (let index = 2; index < config.catalogEntries; index += 1) {
     const foreign = index % 4 === 0;
+    const timestamp = real.updated_at_ms - index;
     entries.push({
       id: `resume-stress-${pad(index)}`,
-      created_at_ms: base - index,
-      updated_at_ms: base - index,
+      created_at_ms: timestamp,
+      updated_at_ms: timestamp,
       workspace_root: foreign
         ? realpathSync(paths.foreignWorkspace)
         : realpathSync(paths.workspace),
@@ -292,11 +337,60 @@ function installLargeCatalog(
       title: index % 101 === 0 ? `S${pad(index)} 界` : `S${pad(index)}`,
     });
   }
-  const indexPath = join(sessionsRoot, "index.json");
-  writeFileSync(indexPath, JSON.stringify({ schema_version: 3, sessions: entries }));
-  chmodSync(indexPath, 0o600);
-  const bytes = statSync(indexPath).size;
-  expect(bytes).toBeLessThanOrEqual(16 * 1024 * 1024);
+  for (const entry of entries) {
+    const sessionDir = join(sessionsRoot, entry.id);
+    mkdirSync(sessionDir);
+    chmodSync(sessionDir, 0o700);
+    writeFileSync(
+      join(sessionDir, "session.json"),
+      JSON.stringify({
+        schema_version: 4,
+        id: entry.id,
+        origin_workspace_root: entry.workspace_root,
+        workspace_root: entry.workspace_root,
+        created_at_ms: entry.created_at_ms,
+        updated_at_ms: entry.updated_at_ms,
+        conversation_language: entry.conversation_language,
+        provider: "gateway",
+        model: FAKE_GATEWAY_MODEL,
+        effort: "auto",
+        fast_mode: false,
+        title: entry.title ?? null,
+        subagent_child: false,
+      }),
+    );
+    const eventTimestamp = entry.updated_at_ms;
+    const eventsPath = join(sessionDir, "events.jsonl");
+    writeFileSync(
+      eventsPath,
+      [
+        JSON.stringify({
+          schema_version: 1,
+          seq: 1,
+          timestamp_ms: eventTimestamp,
+          event: { user: { text: "catalog fixture", images: [], work_id: null } },
+        }),
+        JSON.stringify({
+          schema_version: 1,
+          seq: 2,
+          timestamp_ms: eventTimestamp,
+          event: { assistant: { text: "catalog fixture ready" } },
+        }),
+        JSON.stringify({
+          schema_version: 1,
+          seq: 3,
+          timestamp_ms: eventTimestamp,
+          event: { turn_completed: {} },
+        }),
+        "",
+      ].join("\n"),
+    );
+    chmodSync(join(sessionDir, "session.json"), 0o600);
+    chmodSync(eventsPath, 0o600);
+    const modified = new Date(entry.updated_at_ms);
+    utimesSync(eventsPath, modified, modified);
+  }
+  expect(real.history_len).toBeGreaterThan(0);
 }
 
 function menuCount(text: string): number {
@@ -358,6 +452,7 @@ async function thrash(
   config: Config,
   metrics: Metrics,
   pid: number,
+  coldStarted: number,
 ): Promise<void> {
   const sizes = [
     [60, 12],
@@ -371,11 +466,17 @@ async function thrash(
       () => session.sendText("/resume"),
       () => waitForMenu(session, REAL_TITLE, "Current workspace"),
     );
+    if (cycle === 0) {
+      metrics.coldProcessOpenMs = performance.now() - coldStarted;
+      expect(metrics.coldProcessOpenMs).toBeLessThan(2_000);
+      expect(metrics.open[0]).toBeLessThan(2_000);
+    }
     await time(
       metrics.scope,
       () => session.sendKeys("Tab"),
       () => waitForMenu(session, FOREIGN_TITLE, "All workspaces"),
     );
+    if (cycle === 0) expect(metrics.scope[0]).toBeLessThan(2_000);
     await time(
       metrics.scope,
       () => session.sendKeys("Tab"),
@@ -429,7 +530,34 @@ async function runStress(config: Config): Promise<Paths> {
   let session: TmuxSession | null = null;
   let profiler: ReturnType<typeof Bun.spawn> | null = null;
   let passed = false;
+  let cacheBuildMs = 0;
   try {
+    const cachePath = join(paths.home, ".fx", "sessions", ".resume-catalog");
+    rmSync(cachePath, { force: true });
+    const buildStarted = performance.now();
+    session = await TmuxSession.create({
+      cmd: FX_BIN,
+      cwd: realpathSync(paths.workspace),
+      env: { ...gatewayEnv(paths.home, gateway), FX_TRACE_LOG: paths.trace, FX_TRACE_SCOPES: "core,session" },
+      stderrPath: paths.stderr, width: 112, height: 32, minimumHistoryLines: 50_000,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/resume");
+    await waitForMenu(session, REAL_TITLE, "Current workspace");
+    cacheBuildMs = performance.now() - buildStarted;
+    expect(existsSync(cachePath)).toBe(true);
+    await session.sendKeys("Escape");
+    await session.waitForPane((pane) => {
+      const plain = stripAnsi(pane);
+      return hasEmptyComposer(plain) && !plain.includes("[Current workspace]");
+    }, TIMEOUT);
+    await session.sendText("/quit");
+    expect(await session.waitForSessionEnd(TIMEOUT * 2)).toBe(true);
+    await session.kill();
+    session = null;
+    expect(readFileSync(paths.stderr, "utf8")).toBe("");
+    writeFileSync(paths.stderr, "");
+    const coldStarted = performance.now();
     session = await TmuxSession.create({
       cmd: FX_BIN,
       cwd: realpathSync(paths.workspace),
@@ -441,6 +569,7 @@ async function runStress(config: Config): Promise<Paths> {
       stderrPath: paths.stderr,
       width: 112,
       height: 32,
+      startupWaitMs: 0,
       minimumHistoryLines: Math.max(
         50_000,
         config.chatBatches * config.chatLinesPerBatch * 2,
@@ -465,7 +594,7 @@ async function runStress(config: Config): Promise<Paths> {
       ], { stdout: "pipe", stderr: "pipe" });
     }
 
-    await thrash(session, config, metrics, pid);
+    await thrash(session, config, metrics, pid, coldStarted);
 
     await session.sendText("/resume");
     await waitForMenu(session, REAL_TITLE, "Current workspace");
@@ -487,7 +616,9 @@ async function runStress(config: Config): Promise<Paths> {
 
     const report = {
       config,
-      catalogBytes: statSync(join(paths.home, ".fx", "sessions", "index.json")).size,
+      catalogEntries: readdirSync(join(paths.home, ".fx", "sessions"), {
+        withFileTypes: true,
+      }).filter((entry) => entry.isDirectory()).length,
       transitions: {
         open: summarize(metrics.open),
         scope: summarize(metrics.scope),
@@ -496,7 +627,10 @@ async function runStress(config: Config): Promise<Paths> {
         close: summarize(metrics.close),
         resume: summarize(metrics.resume),
       },
+      cacheBuildMs: Number(cacheBuildMs.toFixed(3)),
+      coldProcessOpenMs: Number(metrics.coldProcessOpenMs!.toFixed(3)),
       firstOpenMs: Number(metrics.open[0]!.toFixed(3)),
+      firstScopeSwitchMs: Number(metrics.scope[0]!.toFixed(3)),
       samples: metrics,
       resources: {
         startRssKib: metrics.rssKib[0],
@@ -533,6 +667,9 @@ async function runStress(config: Config): Promise<Paths> {
     passed = true;
     return paths;
   } finally {
+    if (!passed) {
+      writeFileSync(paths.metrics, `${JSON.stringify({ config, cacheBuildMs, samples: metrics }, null, 2)}\n`);
+    }
     if (profiler) {
       try {
         profiler.kill();

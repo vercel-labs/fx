@@ -6,6 +6,7 @@ pub const max_retry_after_seconds: u64 = 30;
 pub const FailureCause = enum {
     transport_interrupted,
     response_interrupted,
+    provider_stream_timeout,
     provider_unavailable,
     rate_limited,
     system_resumed,
@@ -113,6 +114,13 @@ pub noinline fn decide(evidence: Evidence) Decision {
             .strategy = .stop,
             .required_action = .change_request,
         },
+        .provider_stream_timeout => return .{
+            .strategy = .pause,
+            .required_action = if (evidence.tool == .uncertain)
+                .inspect_uncertain_tool
+            else
+                .continue_later,
+        },
         .request_limit_reached => return .{
             .strategy = .pause,
             .required_action = .continue_later,
@@ -186,92 +194,6 @@ pub fn shouldDisableFastRoute(
     return fast_mode and cause == .provider_unavailable and replay_safe;
 }
 
-pub const ContinuationProbeOutcome = enum {
-    may_extend,
-    cannot_extend,
-    budget_exhausted,
-};
-
-pub const ContinuationProbe = struct {
-    outcome: ContinuationProbeOutcome,
-    comparisons: usize,
-};
-
-/// Determines whether more incoming bytes could extend the overlap while
-/// performing no more than `comparison_budget` byte comparisons.
-pub fn probeContinuationExtension(
-    existing: []const u8,
-    incoming: []const u8,
-    comparison_budget: usize,
-) ContinuationProbe {
-    if (incoming.len >= existing.len) return .{
-        .outcome = .cannot_extend,
-        .comparisons = 0,
-    };
-
-    const candidate_count = existing.len - incoming.len;
-    var comparisons: usize = 0;
-    var start: usize = 0;
-    while (start < candidate_count) : (start += 1) {
-        var matched = true;
-        for (incoming, 0..) |byte, offset| {
-            if (comparisons == comparison_budget) return .{
-                .outcome = .budget_exhausted,
-                .comparisons = comparisons,
-            };
-            comparisons += 1;
-            if (existing[start + offset] != byte) {
-                matched = false;
-                break;
-            }
-        }
-        if (matched) return .{
-            .outcome = .may_extend,
-            .comparisons = comparisons,
-        };
-    }
-    return .{
-        .outcome = .cannot_extend,
-        .comparisons = comparisons,
-    };
-}
-
-/// Returns only the longest byte-exact suffix/prefix overlap in linear time.
-/// This deliberately avoids fuzzy or semantic matching, which could delete
-/// legitimate output.
-pub fn exactContinuationOverlap(
-    alloc: std.mem.Allocator,
-    existing: []const u8,
-    incoming: []const u8,
-) !usize {
-    if (existing.len == 0 or incoming.len == 0) return 0;
-
-    const prefix = try alloc.alloc(usize, incoming.len);
-    defer alloc.free(prefix);
-    prefix[0] = 0;
-
-    var matched: usize = 0;
-    var incoming_idx: usize = 1;
-    while (incoming_idx < incoming.len) : (incoming_idx += 1) {
-        while (matched > 0 and incoming[incoming_idx] != incoming[matched]) {
-            matched = prefix[matched - 1];
-        }
-        if (incoming[incoming_idx] == incoming[matched]) matched += 1;
-        prefix[incoming_idx] = matched;
-    }
-
-    matched = 0;
-    for (existing) |byte| {
-        while (matched > 0 and
-            (matched == incoming.len or incoming[matched] != byte))
-        {
-            matched = prefix[matched - 1];
-        }
-        if (incoming[matched] == byte) matched += 1;
-    }
-    return matched;
-}
-
 test "model response recovery policy is deterministic and bounded" {
     const base = Evidence{
         .cause = .transport_interrupted,
@@ -311,6 +233,39 @@ test "model response recovery policy is deterministic and bounded" {
     const request_limit_pause = decide(request_limit);
     try std.testing.expectEqual(Strategy.pause, request_limit_pause.strategy);
     try std.testing.expect(!request_limit_pause.reserve_provider_attempt);
+}
+
+test "gateway stream timeout pauses without reserving another attempt" {
+    const paused = decide(.{
+        .cause = .provider_stream_timeout,
+        .delivery = .possibly_sent,
+        .attempts = .{ .consumed = 1 },
+    });
+    try std.testing.expectEqual(Strategy.pause, paused.strategy);
+    try std.testing.expectEqual(RequiredAction.continue_later, paused.required_action);
+    try std.testing.expect(!paused.reserve_provider_attempt);
+    try std.testing.expectEqual(@as(u64, 0), paused.delay_ns);
+
+    const uncertain_tool = decide(.{
+        .cause = .provider_stream_timeout,
+        .delivery = .possibly_sent,
+        .attempts = .{ .consumed = 1 },
+        .tool = .uncertain,
+    });
+    try std.testing.expectEqual(Strategy.pause, uncertain_tool.strategy);
+    try std.testing.expectEqual(
+        RequiredAction.inspect_uncertain_tool,
+        uncertain_tool.required_action,
+    );
+    try std.testing.expect(!uncertain_tool.reserve_provider_attempt);
+
+    const cancelled = decide(.{
+        .cause = .provider_stream_timeout,
+        .delivery = .possibly_sent,
+        .attempts = .{ .consumed = 1 },
+        .cancelled = true,
+    });
+    try std.testing.expectEqual(Strategy.stop, cancelled.strategy);
 }
 
 test "retry after and cancellation override automatic recovery" {
@@ -453,64 +408,4 @@ test "fast fallback is limited to replay safe provider outages" {
     try std.testing.expect(!shouldDisableFastRoute(true, .provider_unavailable, false));
     try std.testing.expect(!shouldDisableFastRoute(true, .rate_limited, true));
     try std.testing.expect(!shouldDisableFastRoute(true, .transport_interrupted, true));
-}
-
-test "continuation overlap removes exact repetition only" {
-    const alloc = std.testing.allocator;
-    const cases = [_]struct {
-        existing: []const u8,
-        incoming: []const u8,
-        expected: usize,
-    }{
-        .{ .existing = "", .incoming = "next", .expected = 0 },
-        .{ .existing = "hello", .incoming = " world", .expected = 0 },
-        .{ .existing = "hello world", .incoming = "world again", .expected = 5 },
-        .{ .existing = "abcabc", .incoming = "abcX", .expected = 3 },
-        .{ .existing = "same", .incoming = "same", .expected = 4 },
-        .{ .existing = "caf\xc3\xa9", .incoming = "\xc3\xa9 noir", .expected = 2 },
-        .{ .existing = "almost", .incoming = "Almost", .expected = 0 },
-    };
-    for (cases) |case| {
-        try std.testing.expectEqual(
-            case.expected,
-            try exactContinuationOverlap(alloc, case.existing, case.incoming),
-        );
-    }
-}
-
-test "continuation overlap remains exact for a long repetitive no-match boundary" {
-    const alloc = std.testing.allocator;
-    const boundary_len = 32 * 1024;
-    const existing = try alloc.alloc(u8, boundary_len);
-    defer alloc.free(existing);
-    const incoming = try alloc.alloc(u8, boundary_len);
-    defer alloc.free(incoming);
-    @memset(existing, 'a');
-    @memset(incoming, 'a');
-    existing[existing.len - 1] = 'b';
-
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        try exactContinuationOverlap(alloc, existing, incoming),
-    );
-}
-
-test "continuation extension probe never exceeds its comparison budget" {
-    const alloc = std.testing.allocator;
-    const boundary_len = 4096;
-    const existing = try alloc.alloc(u8, boundary_len);
-    defer alloc.free(existing);
-    const incoming = try alloc.alloc(u8, boundary_len - 1);
-    defer alloc.free(incoming);
-    @memset(existing, 'a');
-    @memset(incoming, 'a');
-    existing[existing.len - 1] = 'b';
-
-    const possible = probeContinuationExtension(existing, incoming, incoming.len);
-    try std.testing.expectEqual(ContinuationProbeOutcome.may_extend, possible.outcome);
-    try std.testing.expectEqual(incoming.len, possible.comparisons);
-
-    const exhausted = probeContinuationExtension(existing, incoming, 1);
-    try std.testing.expectEqual(ContinuationProbeOutcome.budget_exhausted, exhausted.outcome);
-    try std.testing.expectEqual(@as(usize, 1), exhausted.comparisons);
 }

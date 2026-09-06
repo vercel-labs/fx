@@ -153,21 +153,6 @@ HOME="$SESSION_FIXTURE_HOME" hyperfine \
 
 echo ""
 
-# Benchmark 5: fx background --json (file I/O path)
-echo "--- fx background --json ---"
-(
-  cd "$SESSION_FIXTURE_WORKSPACE"
-  HOME="$SESSION_FIXTURE_HOME" hyperfine \
-    "${SHELL_OPTS[@]}" \
-    --runs "$RUNS" \
-    --warmup "$WARMUP" \
-    --export-json "${RESULTS_DIR}/background.json" \
-    --command-name "fx background --json" \
-    "$FX_BIN background --json"
-)
-
-echo ""
-
 # Combine results into a single summary for CI
 echo "--- summary ---"
 python3 "${REPO_ROOT}/benchmarks/summarize.py"

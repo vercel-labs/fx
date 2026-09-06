@@ -50,14 +50,14 @@ function gatewayEnvironment(home: string) {
   };
 }
 
-function eventLogs(directory: string): string[] {
-  const logs: string[] = [];
+function filesNamed(directory: string, name: string): string[] {
+  const files: string[] = [];
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
     const path = join(directory, entry.name);
-    if (entry.isDirectory()) logs.push(...eventLogs(path));
-    if (entry.isFile() && entry.name === "events.jsonl") logs.push(path);
+    if (entry.isDirectory()) files.push(...filesNamed(path, name));
+    if (entry.isFile() && entry.name === name) files.push(path);
   }
-  return logs;
+  return files;
 }
 
 type UsageCheckpoint = {
@@ -69,28 +69,28 @@ type UsageCheckpoint = {
   models: Array<{ model: string }>;
 };
 
-type SessionEvent = {
-  kind: string;
-  payload?: { usage?: UsageCheckpoint };
-};
-
-function eventRecords(events: string): SessionEvent[] {
-  return events
-    .trim()
-    .split("\n")
-    .filter((line) => line.length > 0)
-    .map((line) => JSON.parse(line) as SessionEvent);
+function readUsageCheckpoint(path: string): UsageCheckpoint {
+  return JSON.parse(readFileSync(path, "utf8")).snapshot;
 }
 
-function latestUsageCheckpoint(events: string): UsageCheckpoint {
-  const records = eventRecords(events);
-  for (let index = records.length - 1; index >= 0; index -= 1) {
-    const record = records[index]!;
-    if (record.kind === "usage_checkpointed" && record.payload?.usage) {
-      return record.payload.usage;
+function latestUsageCheckpoint(home: string): UsageCheckpoint {
+  const paths = filesNamed(home, "usage-v2.json");
+  if (paths.length === 0) throw new Error("missing usage sidecar");
+  return readUsageCheckpoint(paths[paths.length - 1]!);
+}
+
+function conversationTurnCount(home: string): number {
+  let count = 0;
+  for (const path of filesNamed(home, "events.jsonl")) {
+    for (const line of readFileSync(path, "utf8").trim().split("\n")) {
+      if (line.length === 0) continue;
+      const event = JSON.parse(line).event;
+      if (event?.turn_completed !== undefined || event?.interrupted !== undefined) {
+        count += 1;
+      }
     }
   }
-  throw new Error("missing usage checkpoint");
+  return count;
 }
 
 function authoritativeGeneration(generationId: string): Response {
@@ -212,15 +212,11 @@ test(
     expect(exitCode).toBe(0);
     expect(gateway.generationRequests).toEqual([]);
     await waitForProfileUsage(home, GENERATION_ID);
-    const events = eventLogs(home)
+    const events = filesNamed(home, "events.jsonl")
       .map((path) => readFileSync(path, "utf8"))
       .join("\n");
-    const checkpoint = events.indexOf('"kind":"usage_checkpointed"');
-    const history = events.indexOf('"kind":"history_turn_committed"');
-    expect(checkpoint).toBeGreaterThanOrEqual(0);
-    expect(checkpoint).toBeLessThan(history);
-    expect(events).toContain(GENERATION_ID);
-    const usage = latestUsageCheckpoint(events);
+    expect(events).toContain('"turn_completed"');
+    const usage = latestUsageCheckpoint(home);
     expect(usage.billing).toBe("complete");
     expect(usage.pending).toEqual([]);
     expect(usage.total_cost).toBe(0.0123);
@@ -274,10 +270,7 @@ test("fx ask gives immediate generation reconciliation a bounded drain", async (
   expect(exitCode, stderr).toBe(0);
   expect(gateway.generationRequests).toEqual([GENERATION_ID]);
 
-  const events = eventLogs(home)
-    .map((path) => readFileSync(path, "utf8"))
-    .join("\n");
-  const usage = latestUsageCheckpoint(events);
+  const usage = latestUsageCheckpoint(home);
   expect(usage.billing).toBe("complete");
   expect(usage.total_cost).toBe(0.0123);
   expect(usage.pending).toEqual([]);
@@ -468,12 +461,9 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
         expect(await fixture.exited).toBe(0);
         expect(gateway.generationRequests).toEqual([GENERATION_ID]);
 
-        const fixtureLogs = eventLogs(home);
-        expect(fixtureLogs).toHaveLength(1);
-        const resumedEventsPath = fixtureLogs[0]!;
-        const beforeResume = latestUsageCheckpoint(
-          readFileSync(resumedEventsPath, "utf8"),
-        );
+        const usageSidecars = filesNamed(home, "usage-v2.json");
+        expect(usageSidecars).toHaveLength(1);
+        const beforeResume = readUsageCheckpoint(usageSidecars[0]!);
         expect(beforeResume.billing).toBe("pending");
         expect(beforeResume.pending.map((item) => item.id))
           .toEqual([GENERATION_ID]);
@@ -521,16 +511,12 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
         session = null;
 
         expect(readFileSync(stderrPath, "utf8")).toBe("");
-        const resumedEvents = readFileSync(resumedEventsPath, "utf8");
-        const afterResume = latestUsageCheckpoint(resumedEvents);
+        const afterResume = readUsageCheckpoint(usageSidecars[0]!);
         expect(afterResume.pending).toEqual([]);
         expect(afterResume.total_cost).toBe(0.0123);
         expect(afterResume.models.map((item) => item.model))
           .toContain(MODEL);
-        expect(
-          eventRecords(resumedEvents)
-            .filter((record) => record.kind === "history_turn_committed"),
-        ).toHaveLength(2);
+        expect(conversationTurnCount(home)).toBe(2);
       },
       TIMEOUT * 2,
     );

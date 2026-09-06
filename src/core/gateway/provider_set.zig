@@ -109,7 +109,7 @@ test "provider set selects each provider's complete route" {
             _: auto_classifier.ProviderInput,
             _: auto_classifier.ReviewRequest,
         ) anyerror!auto_classifier.ParseOutcome {
-            return .invalid;
+            return .{ .invalid = .provider_failed };
         }
     };
 

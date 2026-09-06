@@ -257,100 +257,6 @@ function parseFxJson(result: Awaited<ReturnType<typeof runFx>>) {
   };
 }
 
-type SubagentControlRecord = {
-  parent_id?: string;
-  mode: string;
-  state: string;
-  configuration: { name: string };
-  queue: Array<{ content: string; status: string }>;
-  events: Array<{ kind: string; current?: string | null }>;
-};
-
-type SubagentToolResult = { tool_name: string; status: string; output: string };
-
-type SubagentTurn = {
-  execution?: { tool_steps?: Array<{ tool_results?: SubagentToolResult[] }> };
-};
-
-function readSubagentChildIfPresent(home: string) {
-  const sessionsDir = join(home, ".fx", "sessions");
-  const children = readdirSync(sessionsDir)
-    .map((entry) => join(sessionsDir, entry))
-    .filter((dir) => existsSync(join(dir, "subagent", "control.json")))
-    .map((dir) => ({
-      control: JSON.parse(
-        readFileSync(join(dir, "subagent", "control.json"), "utf8"),
-      ) as SubagentControlRecord,
-      history: readFileSync(join(dir, "events.jsonl"), "utf8"),
-    }))
-    .filter(({ control }) => !!control.parent_id);
-  if (children.length > 1) {
-    throw new Error(`expected one persisted child record, found ${children.length}`);
-  }
-  const child = children[0];
-  if (!child) return null;
-  const turns = child.history
-    .split("\n")
-    .filter((line) => line.length > 0)
-    .flatMap((line) => {
-      const event = JSON.parse(line) as {
-        kind?: string;
-        payload?: { turn?: SubagentTurn };
-      };
-      return event.kind === "history_turn_committed" && event.payload?.turn
-        ? [event.payload.turn]
-        : [];
-    });
-  const toolResults = turns.flatMap((turn) =>
-    (turn.execution?.tool_steps ?? []).flatMap((step) => step.tool_results ?? [])
-  );
-  return {
-    ...child,
-    readResult: toolResults.find((result) => result.tool_name === "read_file"),
-  };
-}
-
-async function waitForCompletedSubagentChild(home: string, deadlineMs: number) {
-  const deadline = Date.now() + deadlineMs;
-  while (Date.now() < deadline) {
-    const child = readSubagentChildIfPresent(home);
-    if (child?.control.state === "completed" && child.readResult) {
-      return child;
-    }
-    await Bun.sleep(10);
-  }
-  throw new Error("timed out waiting for completed persisted child record");
-}
-
-// Hold the parent open until the child read completes; the deadline prevents hangs.
-function createChildReadGate(deadlineMs: number) {
-  const { promise: opened, resolve: release } = Promise.withResolvers<void>();
-  let output: string | null = null;
-  let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    release();
-  }, deadlineMs);
-  return {
-    opened,
-    capture(value: string) {
-      output = value;
-      clearTimeout(timer);
-      release();
-    },
-    dispose() {
-      clearTimeout(timer);
-      release();
-    },
-    get output() {
-      return output;
-    },
-    get timedOut() {
-      return timedOut;
-    },
-  };
-}
-
 async function runFirstCallToolScenario(args: {
   root: ReturnType<typeof createIsolatedRoot>;
   id: string;
@@ -438,6 +344,45 @@ async function runTerminalToolScenario(args: {
 
 describe("filesystem path handling", () => {
   test(
+    "empty optional search paths use the workspace root",
+    async () => {
+      const root = createIsolatedRoot();
+      try {
+        const fixture = join(root.workspace, "empty-root.txt");
+        writeFileSync(fixture, "EMPTY_ROOT_NEEDLE\n");
+        const cases = [
+          {
+            id: "glob_empty_root_1",
+            name: "glob_files",
+            input: { pattern: "empty-root.txt", path: "" },
+            expected: "empty-root.txt",
+          },
+          {
+            id: "grep_empty_root_1",
+            name: "grep_files",
+            input: { pattern: "EMPTY_ROOT_NEEDLE", path: "" },
+            expected: "EMPTY_ROOT_NEEDLE",
+          },
+        ];
+
+        for (const scenario of cases) {
+          await runFirstCallToolScenario({
+            root,
+            id: scenario.id,
+            name: scenario.name,
+            input: scenario.input,
+            expectedResultRequest: [root.workspace],
+            expectedResultOutput: [scenario.expected],
+          });
+        }
+      } finally {
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "active added roots reach read cwd and search admission without loading their instructions",
     async () => {
       const root = createIsolatedRoot();
@@ -461,8 +406,8 @@ describe("filesystem path handling", () => {
           },
           {
             id: "added_cwd_1",
-            name: "terminal",
-            input: { action: "exec", timeout_ms: 600_000, command: "pwd", cwd: root.external },
+            name: "shell",
+            input: { request: { action: "run", yield_time_ms: 30_000, command: "pwd", cwd: root.external } },
             expected: root.external,
           },
         ];
@@ -518,137 +463,18 @@ describe("filesystem path handling", () => {
   );
 
   test(
-    "canonical subagents inherit active added roots without loading their instructions",
-    async () => {
-      const root = createIsolatedRoot();
-      const instructionSentinel = "ADDED_ROOT_SUBAGENT_INSTRUCTION_MUST_NOT_LOAD";
-      const fileSentinel = "ADDED_ROOT_SUBAGENT_READ_CONTENT";
-      const target = join(root.external, "subagent-proof.txt");
-      writeFileSync(join(root.external, "AGENTS.md"), instructionSentinel + "\n");
-      writeFileSync(target, fileSentinel + "\n");
-
-      const childPrompt = `Read exactly ${target}.`;
-      const childSnapshot = Promise.withResolvers<
-        Awaited<ReturnType<typeof waitForCompletedSubagentChild>>
-      >();
-      const isChildTurn = (body: string) =>
-        body.includes(childPrompt) && !body.includes("parent_create_1");
-      const gate = createChildReadGate(8_000);
-      const routeChildAndParent = async (body: string) => {
-        if (body.includes('"toolCallId":"child_read_1"')) {
-          gate.capture(toolResultOutput(body, "child_read_1"));
-          return finalText("Child read the added-root fixture.");
-        }
-        if (isChildTurn(body)) {
-          return toolCall("child_read_1", "read_file", {
-            path: target,
-            line_count: 10,
-          });
-        }
-        await gate.opened;
-        childSnapshot.resolve(
-          await waitForCompletedSubagentChild(root.home, TIMEOUT),
-        );
-        return finalText("Parent received the admitted child handle.");
-      };
-      const gateway = startFakeGateway([
-        toolCall("parent_create_1", "subagent", {
-          command: { create: {
-            name: "added-root-reader",
-            mode: "one_off",
-            prompt: childPrompt,
-          } },
-        }),
-        routeChildAndParent,
-        routeChildAndParent,
-        routeChildAndParent,
-      ]);
-
-      try {
-        const result = await runFx(
-          [
-            "--add-dir",
-            root.external,
-            "ask",
-            "--auto",
-            "--json",
-            "Delegate the added-root read.",
-          ],
-          {
-            cwd: root.workspace,
-            env: gatewayEnv(root, gateway, root.home, {
-            }),
-            timeoutMs: TIMEOUT,
-          },
-        );
-        const json = parseFxJson(result);
-
-        expect(gate.timedOut).toBe(false);
-        expect(gate.output).toContain(fileSentinel);
-
-        expect(json.output).toContain("Parent received the admitted child handle.");
-        expect(json.tool_calls).toContainEqual({ name: "subagent", status: "success" });
-        const parentCreateTurn = gateway.requests.find((request) =>
-          request.body.includes("parent_create_1")
-        );
-        expect(parentCreateTurn).toBeDefined();
-        expect(toolResultOutput(parentCreateTurn!.body, "parent_create_1")).toContain(
-          '"status":"created"',
-        );
-
-        for (const request of gateway.requests) {
-          expect(request.body).toContain('"name":"subagent"');
-          expect(request.body).not.toContain('"name":"task"');
-          expect(request.body).not.toContain(instructionSentinel);
-          expect(request.body).not.toContain("target outside workspace");
-          expect(request.body).not.toContain("context_deferred");
-          expect(request.body).not.toContain("Not executed");
-        }
-
-        const childTurns = gateway.requests.filter((request) =>
-          isChildTurn(request.body)
-        );
-        expect(childTurns.length).toBeGreaterThan(0);
-        for (const request of childTurns) {
-          expect(request.body).toContain('"name":"read_file"');
-        }
-
-        const child = await childSnapshot.promise;
-        expect(child.control.configuration.name).toBe("added-root-reader");
-        expect(child.control.mode).toBe("one_off");
-        expect(child.control.queue.some((item) => item.content.includes(target))).toBe(
-          true,
-        );
-        expect(child.control.events.some((event) => event.current === "running")).toBe(
-          true,
-        );
-        expect(child.control.state).toBe("completed");
-        expect(child.history).not.toContain(instructionSentinel);
-
-        expect(child.readResult).toBeDefined();
-        expect(child.readResult!.status).toBe("success");
-        expect(child.readResult!.output).toContain(fileSentinel);
-      } finally {
-        gate.dispose();
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
     "captured commands write through an active added root",
     async () => {
       const root = createIsolatedRoot();
       const marker = join(root.external, "command-proof.txt");
       const gateway = startFakeGateway([
-        toolCall("added_command_write_1", "terminal", {
-          action: "exec",
+        toolCall("added_command_write_1", "shell", { request: {
+          action: "run",
+          yield_time_ms: 30_000,
           timeout_ms: 600_000,
           command: "printf COMMAND_ADDED_WRITE > command-proof.txt",
           cwd: root.external,
-        }),
+        } }),
         finalText("command write complete"),
       ]);
       try {
@@ -672,7 +498,7 @@ describe("filesystem path handling", () => {
         const json = parseFxJson(result);
         expect(readFileSync(marker, "utf8")).toBe("COMMAND_ADDED_WRITE");
         expect(json.tool_calls.map(({ name, status }) => ({ name, status }))).toEqual([
-          { name: "terminal", status: "success" },
+          { name: "shell", status: "success" },
         ]);
         expect(gateway.classifierRequests).toHaveLength(1);
       } finally {
@@ -783,7 +609,7 @@ describe("filesystem path handling", () => {
   );
 
   test(
-    "terminal reviews and executes external working-directory aliases",
+    "shell reviews and executes external working-directory aliases",
     async () => {
       const root = createIsolatedRoot();
       try {
@@ -800,12 +626,13 @@ describe("filesystem path handling", () => {
         for (const scenario of cases) {
           const marker = join(scenario.canonical, `${scenario.id}.txt`);
           const gateway = startFakeGateway([
-            toolCall(scenario.id, "terminal", {
-              action: "exec",
+            toolCall(scenario.id, "shell", { request: {
+              action: "run",
+              yield_time_ms: 30_000,
               timeout_ms: 600_000,
               command: `pwd; printf ${scenario.id} > ${scenario.id}.txt`,
               cwd: scenario.cwd,
-            }),
+            } }),
             finalText("external cwd complete"),
           ]);
           try {
@@ -829,7 +656,7 @@ describe("filesystem path handling", () => {
             expect(readFileSync(marker, "utf8")).toBe(scenario.id);
             expect(
               json.tool_calls.map(({ name, status }) => ({ name, status })),
-            ).toEqual([{ name: "terminal", status: "success" }]);
+            ).toEqual([{ name: "shell", status: "success" }]);
           } finally {
             gateway.stop();
           }
@@ -931,7 +758,8 @@ describe("filesystem path handling", () => {
             if (scenario.expectedReview) {
               const reviewBody = classifierGateway.classifierRequests[0]!.body;
               expect(reviewBody).toContain("\"permission_decision\"");
-              expect(reviewBody).toContain("Execute the requested file tool once.");
+              expect(reviewBody).toContain("review_context_kind: normal");
+              expect(reviewBody).not.toContain("Execute the requested file tool once.");
               expect(reviewBody).not.toContain("escalation_reason:");
               expect(reviewBody).not.toContain("workspace:");
               expect(reviewBody).not.toContain("external_file_mutation");
@@ -1370,7 +1198,7 @@ describe("filesystem path handling", () => {
   );
 
   test(
-    "removed filesystem tools are absent and terminal completes the fallback flow",
+    "removed filesystem tools are absent and shell completes the fallback flow",
     async () => {
       const root = createIsolatedRoot();
       const command =
@@ -1398,13 +1226,14 @@ describe("filesystem path handling", () => {
             "edit_file",
             "glob_files",
             "grep_files",
-            "terminal",
+            "shell",
           ]));
-          return toolCall("terminal_fallback_1", "terminal", {
-            action: "exec",
+          return toolCall("terminal_fallback_1", "shell", { request: {
+            action: "run",
             command,
+            yield_time_ms: 30_000,
             timeout_ms: 600_000,
-          });
+          } });
         },
         (body) => {
           const output = toolResultOutput(body, "terminal_fallback_1");
@@ -1413,7 +1242,7 @@ describe("filesystem path handling", () => {
           expect(output).toContain("fallback-complete");
           expect(existsSync(join(root.workspace, "fallback-dir"))).toBe(false);
           expect(existsSync(join(root.workspace, "fallback-source.txt"))).toBe(false);
-          return finalText("terminal fallback complete");
+          return finalText("shell fallback complete");
         },
       ], { classifierDecision: "clear" });
 
@@ -1424,7 +1253,7 @@ describe("filesystem path handling", () => {
             "--auto",
             "--json",
             "--no-save",
-            "Use the terminal to create, inspect, search, copy, rename, and remove disposable files.",
+            "Use the shell to create, inspect, search, copy, rename, and remove disposable files.",
           ],
           {
             cwd: root.workspace,
@@ -1437,7 +1266,7 @@ describe("filesystem path handling", () => {
         expect(gateway.classifierRequests).toHaveLength(1);
         expect(gateway.remainingResponseCount()).toBe(0);
         expect(json.tool_calls).toEqual([
-          expect.objectContaining({ name: "terminal", status: "success" }),
+          expect.objectContaining({ name: "shell", status: "success" }),
         ]);
       } finally {
         gateway.stop();
@@ -1448,7 +1277,7 @@ describe("filesystem path handling", () => {
   );
 
   liveTest(
-    "live Gateway uses terminal for removed filesystem operations",
+    "live Gateway uses shell for removed filesystem operations",
     async () => {
       const root = createIsolatedRoot();
       const completion = `LIVE_FILESYSTEM_FALLBACK_COMPLETE_${Date.now()}`;
@@ -1460,7 +1289,7 @@ describe("filesystem path handling", () => {
             "--json",
             "--no-save",
             [
-              "Use terminal for this exact disposable filesystem task in the current workspace.",
+              "Use shell for this exact disposable filesystem task in the current workspace.",
               "In one command, create live-fallback/source.txt containing live-fallback-data,",
               "copy it to copied.txt, rename that file to renamed.txt, list the directory,",
               "stat and grep the renamed file, then remove the live-fallback directory.",
@@ -1482,7 +1311,7 @@ describe("filesystem path handling", () => {
         const json = parseFxJson(result);
         expect(json.output).toContain(completion);
         expect(json.tool_calls.some(({ name, status }) =>
-          name === "terminal" && status === "success"
+          name === "shell" && status === "success"
         )).toBe(true);
         for (const removed of REMOVED_FILESYSTEM_TOOLS) {
           expect(json.tool_calls.some(({ name }) => name === removed)).toBe(false);

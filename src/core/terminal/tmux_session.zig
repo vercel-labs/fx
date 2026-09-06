@@ -4,9 +4,9 @@ const contracts = @import("contracts.zig");
 const host_capabilities = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
-const process_supervisor = @import("../background/process_supervisor.zig");
-const background_process_provider = @import(
-    "../execution/background_process_provider.zig",
+const process_identity = @import("../execution/process_identity.zig");
+const process_provider_mod = @import(
+    "../execution/process_provider.zig",
 );
 
 const Allocator = std.mem.Allocator;
@@ -286,7 +286,7 @@ const ShellIdentityWire = struct {
 
 pub const ShellIdentity = struct {
     pid: std.posix.pid_t,
-    process_token: process_supervisor.ProcessInstanceToken,
+    process_token: process_identity.ProcessInstanceToken,
 };
 
 const Pane = struct {
@@ -351,7 +351,7 @@ pub const Backend = struct {
 
     pub fn start(
         alloc: Allocator,
-        process_provider: background_process_provider.Provider,
+        process_provider: process_provider_mod.Provider,
         durable_root: []const u8,
         transport_root: []const u8,
         backend_identity: []const u8,
@@ -471,7 +471,7 @@ pub const Backend = struct {
 
     pub fn recover(
         alloc: Allocator,
-        process_provider: background_process_provider.Provider,
+        process_provider: process_provider_mod.Provider,
         durable_root: []const u8,
         transport_root: []const u8,
         backend_identity: []const u8,
@@ -707,7 +707,7 @@ pub const Backend = struct {
 
     pub fn cleanupChecked(
         self: *Backend,
-        process_provider: background_process_provider.Provider,
+        process_provider: process_provider_mod.Provider,
     ) !void {
         try cleanupOwnedNamespaceWithEvidence(
             self.alloc,
@@ -811,7 +811,7 @@ fn writeTmuxBuffer(
 
 pub fn cleanupOwnedNamespace(
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
     durable_root: []const u8,
     transport_root: []const u8,
     backend_identity: []const u8,
@@ -830,7 +830,7 @@ pub fn cleanupOwnedNamespace(
 
 pub fn cleanupOwnedNamespaceChecked(
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
     durable_root: []const u8,
     transport_root: []const u8,
     backend_identity: []const u8,
@@ -870,7 +870,7 @@ pub fn cleanupOwnedNamespaceChecked(
 
 fn cleanupOwnedNamespaceWithEvidence(
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
     paths: *const Paths,
     backend_identity: []const u8,
     evidence: OwnerEvidence,
@@ -966,7 +966,7 @@ pub fn isCaptureModeRaw(raw_args: []const [*:0]const u8) bool {
 
 pub fn runLauncher(
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
     raw_args: []const [*:0]const u8,
 ) !void {
     if (comptime !supported()) return error.TerminalHostUnsupported;
@@ -1194,7 +1194,7 @@ fn waitForCaptureStop() !void {
 
 const LauncherControl = struct {
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
     server: *std.Io.net.Server,
     config: LauncherConfig,
     child_pid: std.posix.pid_t,
@@ -1409,7 +1409,7 @@ const OwnedPaneState = union(enum) {
 
 fn validateOwnedPane(
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
     paths: *const Paths,
     evidence: OwnerEvidence,
 ) !OwnedPaneState {
@@ -1434,7 +1434,7 @@ fn validateOwnedPane(
         .process_identity => {},
     }
     if (!pane.dead) {
-        const token = process_supervisor.ProcessInstanceToken.parse(
+        const token = process_identity.ProcessInstanceToken.parse(
             identity.process_token,
         ) catch return error.TmuxRecoveryReplaced;
         switch (process_provider.matchToken(alloc, pane.pane_pid, token)) {
@@ -1761,11 +1761,11 @@ fn requireSessionAbsent(alloc: Allocator, paths: *const Paths) !void {
 
 fn requireSavedPaneProcessAbsent(
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
     evidence: OwnerEvidence,
 ) !void {
     const identity = evidence.processIdentity();
-    const token = process_supervisor.ProcessInstanceToken.parse(
+    const token = process_identity.ProcessInstanceToken.parse(
         identity.process_token,
     ) catch return error.TmuxRecoveryReplaced;
     switch (process_provider.matchToken(alloc, identity.pid, token)) {
@@ -1777,7 +1777,7 @@ fn requireSavedPaneProcessAbsent(
 
 fn requireOwnedNamespaceAbsent(
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
     paths: *const Paths,
     evidence: OwnerEvidence,
 ) !void {
@@ -1787,7 +1787,7 @@ fn requireOwnedNamespaceAbsent(
 
 fn waitForOwnedNamespaceAbsent(
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
     paths: *const Paths,
     evidence: OwnerEvidence,
 ) !void {
@@ -1949,7 +1949,7 @@ fn writeLifecycle(path: []const u8, kind: LifecycleKind, value: u32) !void {
 
 fn writeShellIdentity(
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
     path: []const u8,
     pid: std.posix.pid_t,
 ) !void {
@@ -1985,7 +1985,7 @@ fn loadShellIdentity(alloc: Allocator, path: []const u8) !ShellIdentity {
     if (pid <= 0) return error.MalformedTmuxShellIdentity;
     return .{
         .pid = pid,
-        .process_token = process_supervisor.ProcessInstanceToken.parse(
+        .process_token = process_identity.ProcessInstanceToken.parse(
             parsed.value.process_token,
         ) catch return error.MalformedTmuxShellIdentity,
     };
@@ -2500,7 +2500,7 @@ test "tmux peer deadline bounds accept receive partial frames and cancellation" 
 test "checked tmux cleanup requires saved process absence without a socket" {
     const alloc = std.testing.allocator;
     const MatchStub = struct {
-        result: process_supervisor.TokenMatch,
+        result: process_identity.TokenMatch,
         matches_before_result: usize = 0,
         match_calls: usize = 0,
 
@@ -2508,8 +2508,8 @@ test "checked tmux cleanup requires saved process absence without a socket" {
             raw: ?*anyopaque,
             _: Allocator,
             _: []const u8,
-            _: process_supervisor.ProcessInstanceToken,
-        ) process_supervisor.TokenMatch {
+            _: process_identity.ProcessInstanceToken,
+        ) process_identity.TokenMatch {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.match_calls += 1;
             if (self.matches_before_result > 0) {
@@ -2548,7 +2548,7 @@ test "checked tmux cleanup requires saved process absence without a socket" {
     try writePrivateFile(paths.config, "owner evidence", true);
 
     var stub = MatchStub{ .result = .matched };
-    var provider = background_process_provider.unavailable_provider;
+    var provider = process_provider_mod.unavailable_provider;
     provider.context = &stub;
     provider.match_token_fn = MatchStub.match;
     try std.testing.expectError(

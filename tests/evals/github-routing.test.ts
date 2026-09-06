@@ -19,7 +19,7 @@ const LOCAL_FIRST_TOOLS = [
   "glob_files",
   "grep_files",
   "read_file",
-  "terminal",
+  "shell",
 ] as const;
 
 let workDir: string | null = null;
@@ -76,7 +76,7 @@ function assertNoWebSearchOrHandleQuestion(result: EvalResult): void {
 function assertFirstActionIsLocal(result: EvalResult): void {
   assertFirstToolIn(result, LOCAL_FIRST_TOOLS);
   const first = result.json.tool_calls[0];
-  if (first?.name === "terminal") {
+  if (first?.name === "shell") {
     expect(/^git\s+/.test(first.command_result?.command ?? "")).toBe(true);
   }
 }

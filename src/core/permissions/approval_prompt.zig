@@ -253,9 +253,9 @@ test "approval prompt owns replaces and clears structured requests" {
 
     try std.testing.expect(try prompt.syncRequest(
         alloc,
-        .{ .label = "terminal.exec npm test" },
+        .{ .label = "shell.run npm test" },
     ));
-    try std.testing.expectEqualStrings("terminal.exec npm test", prompt.request.?.label);
+    try std.testing.expectEqualStrings("shell.run npm test", prompt.request.?.label);
     try std.testing.expect(prompt.request.?.file == null);
     try std.testing.expectEqual(@as(u8, 0), prompt.decision.choice_index);
 
@@ -349,7 +349,7 @@ test "command approval ignores absent file review" {
     defer prompt.deinit(alloc);
     try std.testing.expect(try prompt.syncRequest(alloc, .{
         .id = 21,
-        .label = "terminal.exec printf '%s' command-review",
+        .label = "shell.run printf '%s' command-review",
     }));
 
     try std.testing.expect(!prompt.syncReview(null));

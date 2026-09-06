@@ -1,4 +1,5 @@
 const std = @import("std");
+const debug_trace = @import("../core/shared/debug_trace.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const grok_session = @import("../core/auth/grok_session.zig");
 const secret = @import("../core/auth/secret.zig");
@@ -7,12 +8,13 @@ const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
 const responses_protocol = @import("responses_protocol.zig");
+const sse_stream = @import("sse.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 
 const Allocator = std.mem.Allocator;
 const endpoint = "https://cli-chat-proxy.grok.com/v1/responses";
 // The proxy gates this as Grok wire compatibility; fx identifies itself separately below.
-const proxy_compatibility_version = "1.0.6";
+const version_lookup = @import("provider_versions.zig");
 const e2e_endpoint_env = "FX_E2E_XAI_GROK_RESPONSES_URL";
 const max_error_body_bytes: usize = 256 * 1024;
 const max_sse_line_bytes: usize = 1024 * 1024;
@@ -27,6 +29,8 @@ const connect_timeout_ms: i64 = 30_000;
 
 pub const agent_stream_provider = stream_provider.Provider{
     .stream_fn = streamCompletion,
+    .build_request_fn = buildRequestForProvider,
+    .project_replay_fn = responses_protocol.selectReplayParts,
 };
 
 fn validateModel(model: []const u8) !void {
@@ -40,17 +44,21 @@ pub fn buildRequest(
     alloc: Allocator,
     request: stream_provider.RequestData,
 ) ![]u8 {
+    try request.validatePrompt();
     try validateModel(request.model);
-    if (request.budget) |budget| {
-        if (budget.cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
-        _ = budget.deadline;
-    }
+    const budget: image_attachments.CaptureBudget = if (request.budget) |value|
+        .{ .deadline = value.deadline, .cancel_flag = value.cancel_flag }
+    else
+        .{};
+    try budget.check();
+    const projected = try types.projectProviderReplay(alloc, request.messages, .{ .provider = .grok, .model = request.model });
+    defer if (projected) |messages| alloc.free(messages);
+    if (projected != null) debug_trace.logf("gateway", "provider_replay_omitted provider=grok reason=source_mismatch", .{});
 
     var instructions: std.Io.Writer.Allocating = .init(alloc);
     defer instructions.deinit();
-    for (request.messages) |message| {
-        if (message.role != .system) continue;
-        const text = message.content orelse continue;
+    for (request.instructions) |instruction| {
+        const text = instruction.content.?;
         if (text.len == 0) continue;
         if (instructions.written().len > 0) try instructions.writer.writeAll("\n\n");
         try instructions.writer.writeAll(text);
@@ -65,13 +73,16 @@ pub fn buildRequest(
     try writer.writeAll(",\"store\":false,\"stream\":true,\"instructions\":");
     try std.json.Stringify.value(instructions.written(), .{}, writer);
     try writer.writeAll(",\"input\":[");
-    try writeResponsesInput(writer, alloc, request.messages, request.verified_images);
+    try writeResponsesInput(writer, std.heap.c_allocator, projected orelse request.messages, request.verified_images, budget);
     try writer.writeByte(']');
 
-    _ = try responses_protocol.writeTools(writer, alloc, request.tools);
-    try writer.writeAll(",\"tool_choice\":");
-    try std.json.Stringify.value(request.tool_choice.label(), .{}, writer);
-    try writer.writeAll(",\"parallel_tool_calls\":true,\"include\":[\"reasoning.encrypted_content\"]");
+    const tool_count = try responses_protocol.writeTools(writer, alloc, request.tools);
+    if (tool_count > 0) {
+        try writer.writeAll(",\"tool_choice\":");
+        try std.json.Stringify.value(request.tool_choice.label(), .{}, writer);
+        try writer.writeAll(",\"parallel_tool_calls\":true");
+    }
+    try writer.writeAll(",\"include\":[\"reasoning.encrypted_content\"]");
     try writer.writeAll(",\"text\":{\"verbosity\":\"low\"");
     if (request.response_format) |format| {
         if (format.schema != .object) return error.InvalidStructuredResponseSchema;
@@ -95,18 +106,27 @@ pub fn buildRequest(
     return out.toOwnedSlice();
 }
 
+fn buildRequestForProvider(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    request: stream_provider.RequestData,
+) anyerror![]u8 {
+    return buildRequest(alloc, request);
+}
+
 fn writeResponsesInput(
     writer: *std.Io.Writer,
     alloc: Allocator,
     messages: []const types.ChatMessage,
     images: ?[]const image_attachments.VerifiedSnapshot,
+    budget: image_attachments.CaptureBudget,
 ) !void {
     return responses_protocol.writeInput(writer, alloc, messages, images, .{
         .tool_calls = max_tool_calls,
         .tool_identity_bytes = max_tool_identity_bytes,
         .tool_arguments_bytes = max_tool_arguments_bytes,
         .provider_state_bytes = max_provider_state_bytes,
-    }) catch |err| switch (err) {
+    }, budget) catch |err| switch (err) {
         error.ProviderStateTooLarge => error.XaiGrokProviderStateTooLarge,
         error.InvalidProviderState => error.InvalidXaiGrokProviderState,
         error.ToolCallLimitExceeded => error.XaiGrokToolCallLimitExceeded,
@@ -121,17 +141,22 @@ fn streamCompletion(
     request: stream_provider.ModelRequest,
 ) !stream_provider.Result {
     if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
-    if (request.credential.source != .grok_subscription) {
+    if (request.credential.credentialSource() != .grok_subscription and
+        request.credential.credentialSource() != .host_managed)
+    {
         return stream_provider.failResult(error.GrokSubscriptionCredentialRequired);
     }
-    const account_id = request.credential.account_id orelse
-        return stream_provider.failResult(error.GrokSubscriptionAccountRequired);
-    if (!grok_session.validAccountId(account_id)) {
-        return stream_provider.failResult(error.InvalidGrokSubscriptionAccount);
+    if (request.credential.credentialSource() != .host_managed) {
+        const account_id = request.credential.accountId() orelse
+            return stream_provider.failResult(error.GrokSubscriptionAccountRequired);
+        if (!grok_session.validAccountId(account_id)) {
+            return stream_provider.failResult(error.InvalidGrokSubscriptionAccount);
+        }
     }
     try validateModel(request.model);
-    const payload = try buildRequest(alloc, request.data());
-    defer alloc.free(payload);
+    const payload = request.prepared_request_body orelse
+        try buildRequest(alloc, request.data());
+    defer if (request.prepared_request_body == null) alloc.free(payload);
     var result = streamPrepared(alloc, request, payload) catch |err| {
         if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
         if (requestDeadlineExpired(request)) return stream_provider.failResult(error.Timeout);
@@ -169,17 +194,20 @@ const OpenedRequest = struct {
 const OpenRequestOperation = struct {
     client: *std.http.Client,
     uri: std.Uri,
-    auth_header: []const u8,
+    auth_header: ?[]const u8,
     extra_headers: []const std.http.Header,
 
     pub fn run(self: *@This()) !OpenedRequest {
+        var headers: std.http.Client.Request.Headers = .{
+            .content_type = .{ .override = "application/json" },
+            .accept_encoding = .omit,
+            .user_agent = .{ .override = gateway_client.user_agent },
+        };
+        if (self.auth_header) |authorization| {
+            headers.authorization = .{ .override = authorization };
+        }
         return .{ .request = try self.client.request(.POST, self.uri, .{
-            .headers = .{
-                .content_type = .{ .override = "application/json" },
-                .authorization = .{ .override = self.auth_header },
-                .accept_encoding = .omit,
-                .user_agent = .{ .override = gateway_client.user_agent },
-            },
+            .headers = headers,
             .extra_headers = self.extra_headers,
             .keep_alive = false,
             .redirect_behavior = .unhandled,
@@ -187,15 +215,36 @@ const OpenRequestOperation = struct {
     }
 };
 
+const RequestAuthHeaders = struct {
+    authorization: ?[]u8 = null,
+    account_id: ?[]const u8 = null,
+    include_subscription_headers: bool = false,
+
+    fn deinit(self: *RequestAuthHeaders, alloc: Allocator) void {
+        if (self.authorization) |value| secret.zeroAndFree(alloc, value);
+        self.* = .{};
+    }
+};
+
+fn requestAuthHeaders(alloc: Allocator, auth: stream_provider.CredentialLease) !RequestAuthHeaders {
+    return switch (auth) {
+        .host_managed => .{},
+        .direct => |direct| .{
+            .authorization = try std.fmt.allocPrint(alloc, "Bearer {s}", .{direct.secret_bytes}),
+            .account_id = direct.account_id,
+            .include_subscription_headers = true,
+        },
+    };
+}
+
 pub fn streamPrepared(
     alloc: Allocator,
     request: stream_provider.ModelRequest,
     payload: []const u8,
 ) !stream_provider.Result {
     if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
-    const account_id = request.credential.account_id.?;
-    const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.credential.secret});
-    defer secret.zeroAndFree(alloc, auth_header);
+    var auth_headers = try requestAuthHeaders(alloc, request.credential);
+    defer auth_headers.deinit(alloc);
     const request_endpoint = if (io_mod.getenv(e2e_endpoint_env)) |override| endpoint: {
         if (!gateway_client.isLoopbackHttpUrl(override)) {
             return stream_provider.failResult(error.InvalidE2EXaiGrokEndpoint);
@@ -203,23 +252,33 @@ pub fn streamPrepared(
         break :endpoint override;
     } else endpoint;
     const uri = try std.Uri.parse(request_endpoint);
+    const compatibility = if (auth_headers.include_subscription_headers)
+        try version_lookup.resolve(alloc, .grok, request.cancel_flag, request.deadline)
+    else
+        null;
 
     var extra_headers_buf: [8]std.http.Header = undefined;
     var extra_count: usize = 0;
     extra_headers_buf[extra_count] = .{ .name = "accept", .value = "text/event-stream" };
     extra_count += 1;
-    extra_headers_buf[extra_count] = .{ .name = "X-XAI-Token-Auth", .value = "xai-grok-cli" };
-    extra_count += 1;
-    extra_headers_buf[extra_count] = .{ .name = "x-authenticateresponse", .value = "authenticate-response" };
-    extra_count += 1;
-    extra_headers_buf[extra_count] = .{ .name = "x-grok-client-version", .value = proxy_compatibility_version };
-    extra_count += 1;
+    if (auth_headers.include_subscription_headers) {
+        extra_headers_buf[extra_count] = .{ .name = "X-XAI-Token-Auth", .value = "xai-grok-cli" };
+        extra_count += 1;
+        extra_headers_buf[extra_count] = .{ .name = "x-authenticateresponse", .value = "authenticate-response" };
+        extra_count += 1;
+    }
+    if (compatibility) |*version| {
+        extra_headers_buf[extra_count] = .{ .name = "x-grok-client-version", .value = version.slice() };
+        extra_count += 1;
+    }
     extra_headers_buf[extra_count] = .{ .name = "x-grok-client-identifier", .value = "fx" };
     extra_count += 1;
     extra_headers_buf[extra_count] = .{ .name = "x-grok-model-override", .value = request.model };
     extra_count += 1;
-    extra_headers_buf[extra_count] = .{ .name = "x-grok-user-id", .value = account_id };
-    extra_count += 1;
+    if (auth_headers.account_id) |account_id| {
+        extra_headers_buf[extra_count] = .{ .name = "x-grok-user-id", .value = account_id };
+        extra_count += 1;
+    }
     if (request.session_id) |session_id| if (session_id.len > 0) {
         extra_headers_buf[extra_count] = .{ .name = "x-grok-conv-id", .value = session_id };
         extra_count += 1;
@@ -230,7 +289,7 @@ pub fn streamPrepared(
     var open_operation = OpenRequestOperation{
         .client = &client,
         .uri = uri,
-        .auth_header = auth_header,
+        .auth_header = auth_headers.authorization,
         .extra_headers = extra_headers_buf[0..extra_count],
     };
     var connect_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
@@ -381,90 +440,9 @@ fn failureKind(status: std.http.Status) stream_provider.FailureKind {
     };
 }
 
-const SseReader = struct {
-    pending_line: std.ArrayList(u8) = .empty,
-    aggregate_bytes: usize = 0,
-
-    const Line = struct {
-        bytes: []const u8,
-        wire_bytes: usize,
-    };
-
-    fn deinit(self: *SseReader, alloc: Allocator) void {
-        self.pending_line.deinit(alloc);
-    }
-
-    fn release(self: *SseReader) void {
-        self.pending_line.clearRetainingCapacity();
-    }
-
-    fn next(self: *SseReader, alloc: Allocator, reader: anytype) !?[]const u8 {
-        while (true) {
-            const line = try self.readLine(alloc, reader) orelse return null;
-            self.aggregate_bytes = responses_protocol.checkedAccumulatedSize(
-                self.aggregate_bytes,
-                line.wire_bytes,
-                max_sse_aggregate_bytes,
-            ) catch return error.XaiGrokResourceLimitExceeded;
-            const trimmed = std.mem.trim(u8, line.bytes, " \t\r");
-            if (trimmed.len == 0 or trimmed[0] == ':') {
-                self.release();
-                continue;
-            }
-            if (!std.mem.startsWith(u8, trimmed, "data:")) {
-                self.release();
-                continue;
-            }
-            const data = std.mem.trim(u8, trimmed["data:".len..], " \t");
-            if (std.mem.eql(u8, data, "[DONE]")) return null;
-            return data;
-        }
-    }
-
-    fn readLine(self: *SseReader, alloc: Allocator, reader: anytype) !?Line {
-        while (true) {
-            const fragment = reader.takeDelimiter('\n') catch |err| switch (err) {
-                error.StreamTooLong => {
-                    const buffered = reader.buffered();
-                    if (buffered.len == 0) return error.XaiGrokSseReadStalled;
-                    if (buffered.len > max_sse_line_bytes - self.pending_line.items.len) {
-                        return error.XaiGrokSseEventTooLarge;
-                    }
-                    try self.pending_line.appendSlice(alloc, buffered);
-                    reader.tossBuffered();
-                    continue;
-                },
-                error.ReadFailed => return error.ReadFailed,
-            } orelse {
-                if (self.pending_line.items.len > 0) {
-                    return .{
-                        .bytes = self.pending_line.items,
-                        .wire_bytes = self.pending_line.items.len,
-                    };
-                }
-                return null;
-            };
-            if (fragment.len > max_sse_line_bytes - self.pending_line.items.len) {
-                return error.XaiGrokSseEventTooLarge;
-            }
-            if (self.pending_line.items.len == 0) {
-                return .{
-                    .bytes = fragment,
-                    .wire_bytes = fragment.len + 1,
-                };
-            }
-            try self.pending_line.appendSlice(alloc, fragment);
-            return .{
-                .bytes = self.pending_line.items,
-                .wire_bytes = self.pending_line.items.len + 1,
-            };
-        }
-    }
-};
-
 fn consumeSse(
     alloc: Allocator,
-    reader: anytype,
+    reader: *std.Io.Reader,
     callback_ctx: *anyopaque,
     on_content_chunk: stream_provider.StreamCallback,
     on_tool_start: ?stream_provider.ToolStartCallback,
@@ -475,7 +453,7 @@ fn consumeSse(
 ) !types.ModelCompletion {
     var reducer = responses_protocol.Reducer.init(alloc);
     defer reducer.deinit(alloc);
-    var sse: SseReader = .{};
+    var sse: sse_stream.Reader = .{ .max_event_bytes = max_sse_line_bytes, .max_total_bytes = max_sse_aggregate_bytes };
     defer sse.deinit(alloc);
     const callbacks = responses_protocol.StreamCallbacks{
         .context = callback_ctx,
@@ -493,8 +471,8 @@ fn consumeSse(
         .tool_arguments_bytes = max_tool_arguments_bytes,
         .provider_state_bytes = max_provider_state_bytes,
     };
-    while (try sse.next(alloc, reader)) |json_text| {
-        defer sse.release();
+    while (sse.next(alloc, reader, cancel_flag) catch |err| return mapReducerError(err)) |json_text| {
+        if (std.mem.eql(u8, json_text, "[DONE]")) break;
         if (reducer.applyJson(
             alloc,
             json_text,
@@ -510,8 +488,9 @@ fn consumeSse(
 
 fn mapReducerError(err: anyerror) anyerror {
     return switch (err) {
+        error.EventTooLarge => error.XaiGrokSseEventTooLarge,
+        error.StreamTooLarge => error.XaiGrokResourceLimitExceeded,
         error.InvalidEvent => error.InvalidXaiGrokSseEvent,
-        error.ResponseFailed => error.XaiGrokResponseFailed,
         error.StreamIncomplete => error.XaiGrokStreamIncomplete,
         error.ToolCallLimitExceeded => error.XaiGrokToolCallLimitExceeded,
         error.ToolArgumentsTooLarge => error.XaiGrokToolArgumentsTooLarge,
@@ -526,18 +505,19 @@ test "xAI Grok request uses Responses input and converts AI SDK tool schemas" {
         .description = "Read",
         .input_schema = .{},
     };
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "Be concise." }};
     const messages = [_]types.ChatMessage{
-        .{ .role = .system, .content = "Be concise." },
         .{ .role = .user, .content = "Read it." },
         .{
             .role = .assistant,
             .tool_calls = &.{.{ .id = "call_1", .name = "read_file", .arguments_json = "{\"path\":\"README.md\"}" }},
-            .provider_state_json = "[{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}]",
+            .provider_replay = .{ .source = .{ .provider = .grok, .model = "grok-4.20" }, .parts_json = "[{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}]" },
         },
         .{ .role = .tool, .tool_call_id = "call_1", .tool_name = "read_file", .content = "contents" },
     };
     const body = try buildRequest(std.testing.allocator, .{
         .model = "grok-4.20",
+        .instructions = &instructions,
         .messages = &messages,
         .tools = .{ .additional_functions = &.{read_file_schema} },
         .tool_choice = .auto,
@@ -567,6 +547,8 @@ test "xAI Grok standard requests omit the priority service tier" {
     defer std.testing.allocator.free(body);
 
     try std.testing.expect(std.mem.find(u8, body, "\"service_tier\"") == null);
+    try std.testing.expect(std.mem.find(u8, body, "\"tool_choice\"") == null);
+    try std.testing.expect(std.mem.find(u8, body, "\"parallel_tool_calls\"") == null);
 }
 
 test "xAI Grok serializes each verified image directly once" {
@@ -645,11 +627,11 @@ fn testModelRequest(
     callback_context: *u8,
 ) stream_provider.ModelRequest {
     return .{
-        .credential = .{
-            .secret = secret_value,
+        .credential = .{ .direct = .{
+            .secret_bytes = secret_value,
             .source = source,
             .account_id = account_id,
-        },
+        } },
         .model = "grok-4.20",
         .retry_count = 1,
         .messages = &.{},
@@ -890,6 +872,7 @@ const XaiTestEnvironment = struct {
         };
         errdefer self.map.deinit();
         try self.map.put(e2e_endpoint_env, responses_url);
+        try self.map.put("FX_E2E_GROK_CLIENT_VERSION", "1.0.6");
         io_mod.setEnvironMap(&self.map);
         return self;
     }
@@ -955,6 +938,15 @@ test "xAI Grok request deadline closes slow headers and stalled SSE" {
 fn ignoreTestChunk(_: *anyopaque, _: []const u8) void {}
 fn ignoreTestEvent(_: *anyopaque, _: stream_provider.Event) void {}
 fn admitTestRequest(_: *anyopaque) !void {}
+
+test "host-managed Grok request auth omits bearer and subscription headers" {
+    var headers = try requestAuthHeaders(std.testing.allocator, .host_managed);
+    defer headers.deinit(std.testing.allocator);
+
+    try std.testing.expect(headers.authorization == null);
+    try std.testing.expect(headers.account_id == null);
+    try std.testing.expect(!headers.include_subscription_headers);
+}
 
 test "xAI Grok error-body reader accepts the exact bound and replaces one beyond" {
     inline for (.{ TestResponseMode.error_body_exact, TestResponseMode.error_body_excess }) |mode| {
@@ -1033,7 +1025,7 @@ fn buildEventCountSse(alloc: Allocator, event_count: usize) ![]u8 {
 
 fn buildIgnoredAggregateSse(alloc: Allocator, wire_bytes: usize) ![]u8 {
     const mixed_ignored_and_data = ": keepalive\n\nretry: 1000\ndata: {}\n\n";
-    const terminal = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n";
+    const terminal = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
     if (wire_bytes < mixed_ignored_and_data.len + terminal.len) return error.NoSpaceLeft;
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
@@ -1078,23 +1070,22 @@ fn buildToolArgumentsSse(alloc: Allocator, argument_bytes: usize) ![]u8 {
 
 fn buildProviderStateSse(alloc: Allocator, provider_state_bytes: usize) ![]u8 {
     const item_count: usize = 8;
-    const event_prefix = "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":";
-    const item_prefix = "{\"id\":\"rs\",\"type\":\"reasoning\",\"encrypted_content\":\"";
+    const item_prefix = "{\"id\":\"rs";
+    const item_middle = "\",\"type\":\"reasoning\",\"encrypted_content\":\"";
     const item_suffix = "\"}";
     const event_suffix = "}\n\n";
     const terminal = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
-    const framing_bytes = 2 + (item_count - 1) + item_count * (item_prefix.len + item_suffix.len);
+    const framing_bytes = 2 + (item_count - 1) + item_count * (item_prefix.len + 1 + item_middle.len + item_suffix.len);
     const content_bytes = provider_state_bytes - framing_bytes;
     const bytes_per_item = content_bytes / item_count;
     var remainder = content_bytes % item_count;
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    for (0..item_count) |_| {
+    for (0..item_count) |index| {
         const extra: usize = if (remainder > 0) 1 else 0;
         remainder -|= extra;
-        try out.writer.writeAll(event_prefix);
-        try out.writer.writeAll(item_prefix);
+        try out.writer.print("data: {{\"type\":\"response.output_item.done\",\"output_index\":{d},\"item\":{s}{d}{s}", .{ index, item_prefix, index, item_middle });
         try out.writer.splatByteAll('a', bytes_per_item + extra);
         try out.writer.writeAll(item_suffix);
         try out.writer.writeAll(event_suffix);
@@ -1105,21 +1096,23 @@ fn buildProviderStateSse(alloc: Allocator, provider_state_bytes: usize) ![]u8 {
 
 test "xAI Grok SSE reader accepts the exact line bound and rejects one beyond" {
     inline for (.{ max_sse_line_bytes, max_sse_line_bytes + 1 }) |line_bytes| {
-        const bytes = try std.testing.allocator.alloc(u8, line_bytes + 1);
+        const bytes = try std.testing.allocator.alloc(u8, line_bytes + 2);
         defer std.testing.allocator.free(bytes);
         @memcpy(bytes[0.."data: ".len], "data: ");
         @memset(bytes["data: ".len..line_bytes], 'a');
         bytes[line_bytes] = '\n';
+        bytes[line_bytes + 1] = '\n';
         var reader: std.Io.Reader = .fixed(bytes);
-        var sse: SseReader = .{};
+        var sse: sse_stream.Reader = .{ .max_event_bytes = max_sse_line_bytes };
         defer sse.deinit(std.testing.allocator);
+        const cancelled = std.atomic.Value(bool).init(false);
         if (line_bytes == max_sse_line_bytes) {
-            const value = (try sse.next(std.testing.allocator, &reader)).?;
+            const value = (try sse.next(std.testing.allocator, &reader, &cancelled)).?;
             try std.testing.expectEqual(max_sse_line_bytes - "data: ".len, value.len);
         } else {
             try std.testing.expectError(
-                error.XaiGrokSseEventTooLarge,
-                sse.next(std.testing.allocator, &reader),
+                error.EventTooLarge,
+                sse.next(std.testing.allocator, &reader, &cancelled),
             );
         }
     }

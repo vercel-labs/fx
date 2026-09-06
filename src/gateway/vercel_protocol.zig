@@ -1,9 +1,11 @@
 const std = @import("std");
+const stream_provider = @import("../core/agent/stream_provider.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const io_mod = @import("../core/shared/io.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
 const tool_result_errors = @import("../core/tooling/tool_result_errors.zig");
 const types = @import("../core/shared/types.zig");
+const tool_call_ids = @import("tool_call_ids.zig");
 
 pub const ChatRole = types.ChatRole;
 pub const ChatMessage = types.ChatMessage;
@@ -27,20 +29,12 @@ pub fn roleName(role: ChatRole) []const u8 {
     };
 }
 
-pub fn writeChatMessageJson(
+fn writeChatMessageJson(
     scratch_alloc: std.mem.Allocator,
     writer: *std.Io.Writer,
     message: ChatMessage,
 ) !void {
-    writeChatMessageJsonInner(scratch_alloc, writer, message, false, null, null) catch |err| return err;
-}
-
-pub fn writeChatMessageJsonCached(
-    scratch_alloc: std.mem.Allocator,
-    writer: *std.Io.Writer,
-    message: ChatMessage,
-) !void {
-    writeChatMessageJsonInner(scratch_alloc, writer, message, true, null, null) catch |err| return err;
+    writeChatMessageJsonInner(scratch_alloc, writer, message, null, null, &.{}) catch |err| return err;
 }
 
 pub fn buildGatewayRequestBody(
@@ -208,6 +202,7 @@ pub fn buildGatewayRequiredToolRequestBodyWithMaxOutputTokens(
 pub fn buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
     alloc: std.mem.Allocator,
     tools_json: []const u8,
+    instructions: []const ChatMessage,
     messages: []const ChatMessage,
     target_call_id: []const u8,
     options: model_capabilities.ResolvedProviderOptions,
@@ -216,6 +211,8 @@ pub fn buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
     cancel_flag: *std.atomic.Value(bool),
 ) ![]u8 {
     const budget = BuildBudget{ .deadline = deadline, .cancel_flag = cancel_flag };
+    stream_provider.validate_prompt_lanes(instructions, messages) catch
+        return error.InvalidGatewayHistory;
     const expanded = try expandPendingToolReviewMessages(
         alloc,
         messages,
@@ -225,10 +222,16 @@ pub fn buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
     );
     defer alloc.free(expanded);
 
+    const prompt_len = try std.math.add(usize, instructions.len, expanded.len);
+    const prompt = try alloc.alloc(ChatMessage, prompt_len);
+    defer alloc.free(prompt);
+    @memcpy(prompt[0..instructions.len], instructions);
+    @memcpy(prompt[instructions.len..], expanded);
+
     return buildGatewayRequestBodyValidated(
         alloc,
         tools_json,
-        expanded,
+        prompt,
         options,
         "required",
         max_output_tokens,
@@ -238,8 +241,8 @@ pub fn buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
     );
 }
 
-/// Returns an owned message slice that closes the pending tool call before the
-/// reviewer instruction. Message contents remain borrowed from `messages`.
+/// Returns an owned message slice that closes the pending tool call. Message
+/// contents remain borrowed from `messages`.
 pub fn expandPendingToolReviewMessages(
     alloc: std.mem.Allocator,
     messages: []const ChatMessage,
@@ -252,23 +255,22 @@ pub fn expandPendingToolReviewMessages(
     try validatePendingToolReviewMessages(alloc, messages, target_call_id, budget);
     try budget.check();
 
-    const pending_index = messages.len - 2;
+    const pending_index = messages.len - 1;
     const pending = messages[pending_index];
     const expanded_len = try std.math.add(usize, messages.len, pending.tool_calls.len);
     const expanded = try alloc.alloc(ChatMessage, expanded_len);
     errdefer alloc.free(expanded);
 
-    @memcpy(expanded[0 .. pending_index + 1], messages[0 .. pending_index + 1]);
+    @memcpy(expanded[0..messages.len], messages);
     for (pending.tool_calls, 0..) |call, i| {
         try budget.check();
-        expanded[pending_index + 1 + i] = .{
+        expanded[messages.len + i] = .{
             .role = .tool,
             .content = pending_tool_review_result_text,
             .tool_call_id = call.id,
             .tool_name = call.name,
         };
     }
-    expanded[expanded.len - 1] = messages[messages.len - 1];
     try budget.check();
     try validateToolMessageHistory(alloc, expanded);
     try budget.check();
@@ -324,38 +326,47 @@ fn buildGatewayRequestBodyValidated(
     verified_image_override: ?VerifiedImageOverride,
 ) ![]u8 {
     if (budget) |active| try active.check();
+    var saw_conversation = false;
+    for (messages) |message| {
+        if (message.role == .system) {
+            if (saw_conversation) return error.InvalidGatewayHistory;
+        } else {
+            saw_conversation = true;
+        }
+    }
 
+    var ids = try tool_call_ids.Projection.init(alloc, messages);
+    defer ids.deinit(alloc);
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
-    const cache_breakpoint_idx = if (options.prompt_caching) findCacheBreakpoint(messages) else null;
-    var prefix_cacheable = true;
-
     try out.writer.writeAll("{\"prompt\":[");
-    for (messages, 0..) |message, i| {
+    var i: usize = 0;
+    while (i < messages.len) {
+        const message = messages[i];
         if (budget) |active| try active.check();
         if (i > 0) try out.writer.writeByte(',');
-        const use_cache = prefix_cacheable and shouldCacheMessage(message, i, cache_breakpoint_idx, options.prompt_caching);
+        if (message.role == .tool) {
+            const results = tool_result_prefix(messages[i..]);
+            try write_tool_result_group(alloc, &out.writer, results, budget, &ids);
+            i += results.len;
+            if (budget) |active| try active.check();
+            continue;
+        }
         const verified_images = if (verified_image_override) |override|
             if (override.message_index == i) override.images else null
         else
             null;
-        if (budget) |active| {
-            try writeChatMessageJsonInner(
-                std.heap.c_allocator,
-                &out.writer,
-                message,
-                use_cache,
-                active,
-                verified_images,
-            );
-        } else if (use_cache) {
-            try writeChatMessageJsonCached(std.heap.c_allocator, &out.writer, message);
-        } else {
-            try writeChatMessageJson(std.heap.c_allocator, &out.writer, message);
-        }
-        if (message.cache_policy == .no_cache) prefix_cacheable = false;
+        try writeChatMessageJsonInner(
+            std.heap.c_allocator,
+            &out.writer,
+            message,
+            budget,
+            verified_images,
+            &ids,
+        );
         if (budget) |active| try active.check();
+        i += 1;
     }
     try out.writer.writeAll("],\"tools\":");
     try out.writer.writeAll(tools_json);
@@ -429,12 +440,10 @@ fn validatePendingToolReviewMessages(
     budget: BuildBudget,
 ) !void {
     try budget.check();
-    if (messages.len < 2 or target_call_id.len == 0) return error.InvalidGatewayHistory;
-    const pending = messages[messages.len - 2];
-    const instruction = messages[messages.len - 1];
+    if (messages.len < 1 or target_call_id.len == 0) return error.InvalidGatewayHistory;
+    const pending = messages[messages.len - 1];
     if (pending.role != .assistant or pending.tool_calls.len == 0) return error.InvalidGatewayHistory;
-    if (instruction.role != .system or instruction.content == null) return error.InvalidGatewayHistory;
-    try validateToolMessageHistory(alloc, messages[0 .. messages.len - 2]);
+    try validateToolMessageHistory(alloc, messages[0 .. messages.len - 1]);
     try budget.check();
     try validateAssistantToolCalls(alloc, pending.tool_calls);
     try budget.check();
@@ -448,12 +457,21 @@ fn validatePendingToolReviewMessages(
 }
 
 pub fn writeProviderOptions(writer: *std.Io.Writer, options: model_capabilities.ResolvedProviderOptions) !void {
-    if (!options.fast and options.parallel_tool_calls == null) return;
+    const gateway_options = options.fast or options.prompt_caching;
+    if (!gateway_options and options.parallel_tool_calls == null) return;
 
     try writer.writeAll(",\"providerOptions\":{");
-    if (options.fast) try writer.writeAll("\"gateway\":{\"speed\":\"fast\"}");
+    if (gateway_options) {
+        try writer.writeAll("\"gateway\":{");
+        if (options.fast) try writer.writeAll("\"speed\":\"fast\"");
+        if (options.prompt_caching) {
+            if (options.fast) try writer.writeByte(',');
+            try writer.writeAll("\"caching\":\"auto\"");
+        }
+        try writer.writeByte('}');
+    }
     if (options.parallel_tool_calls) |parallel_tool_calls| {
-        if (options.fast) try writer.writeByte(',');
+        if (gateway_options) try writer.writeByte(',');
         try writer.writeAll("\"xai\":{\"parallelToolCalls\":");
         try writer.writeAll(if (parallel_tool_calls) "true" else "false");
         try writer.writeByte('}');
@@ -509,13 +527,88 @@ fn validateAssistantToolResultBlock(
 fn validateAssistantToolCalls(alloc: std.mem.Allocator, calls: []const ToolCall) !void {
     for (calls, 0..) |call, i| {
         if (call.id.len == 0 or call.name.len == 0 or call.arguments_json.len == 0) return error.InvalidGatewayHistory;
-        if (try types.ToolArgumentIntegrity.classifySerialized(alloc, call.arguments_json) == .malformed_json) {
+        const integrity = if (call.provenance == .provider_executed)
+            try types.ToolArgumentIntegrity.classifySerialized(alloc, call.arguments_json)
+        else
+            try types.ToolArgumentIntegrity.classifyFunctionInput(alloc, call.arguments_json);
+        if (integrity != .valid) {
             return error.InvalidGatewayHistory;
         }
         var j = i + 1;
         while (j < calls.len) : (j += 1) {
             if (std.mem.eql(u8, call.id, calls[j].id)) return error.InvalidGatewayHistory;
         }
+    }
+}
+
+test "Gateway request projects nonportable call ids without changing source history" {
+    const source_id = "functions.read_file:0";
+    const second_id = "functions/read_file:0";
+    const calls = [_]ToolCall{
+        .{ .id = source_id, .name = "read_file", .arguments_json = "{}" },
+        .{ .id = second_id, .name = "read_file", .arguments_json = "{}" },
+    };
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .tool_call_id = second_id, .tool_name = "read_file", .content = "second" },
+        .{ .role = .tool, .tool_call_id = source_id, .tool_name = "read_file", .content = "result" },
+    };
+    const body = try buildGatewayRequestBody(std.testing.allocator, "[]", &messages);
+    defer std.testing.allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const prompt = parsed.value.object.get("prompt").?.array.items;
+    const call_id = prompt[0].object.get("content").?.array.items[0].object.get("toolCallId").?.string;
+    const results = prompt[1].object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    const result_id = results[1].object.get("toolCallId").?.string;
+    try std.testing.expect(!std.mem.eql(u8, source_id, call_id));
+    try std.testing.expect(call_id.len <= 64);
+    for (call_id) |byte| try std.testing.expect(std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-');
+    try std.testing.expectEqualStrings(call_id, result_id);
+    const second_call_id = prompt[0].object.get("content").?.array.items[1].object.get("toolCallId").?.string;
+    try std.testing.expect(!std.mem.eql(u8, call_id, second_call_id));
+    try std.testing.expectEqualStrings(second_call_id, results[0].object.get("toolCallId").?.string);
+    try std.testing.expectEqualStrings(source_id, calls[0].id);
+    try std.testing.expectEqualStrings(source_id, messages[2].tool_call_id.?);
+}
+
+test "Gateway request preserves provider-owned call ids" {
+    const calls = [_]ToolCall{.{ .id = "native:0", .name = "native", .arguments_json = "{}", .provenance = .provider_executed, .provider_result = "result" }};
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .tool_call_id = "native:0", .tool_name = "native", .content = "result" },
+    };
+    const body = try buildGatewayRequestBody(std.testing.allocator, "[]", &messages);
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.find(u8, body, "\"toolCallId\":\"native:0\"") != null);
+}
+
+test "non-object provider-owned arguments retain their Gateway representation" {
+    const calls = [_]ToolCall{.{ .id = "native", .name = "native_tool", .arguments_json = "[]", .provenance = .provider_executed, .provider_result = "native result" }};
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .tool_call_id = "native", .tool_name = "native_tool", .content = "native result" },
+    };
+    const body = try buildGatewayRequestBody(std.testing.allocator, "[]", &messages);
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.find(u8, body, "\"input\":[]") != null);
+}
+
+test "non-object function arguments cannot enter a Gateway request" {
+    for ([_][]const u8{ "[]", "42", "null", "true", "\"text\"" }) |arguments| {
+        const calls = [_]ToolCall{.{ .id = "call", .name = "read_file", .arguments_json = arguments }};
+        const messages = [_]ChatMessage{
+            .{ .role = .user, .content = "read" },
+            .{ .role = .assistant, .tool_calls = &calls },
+            .{ .role = .tool, .tool_call_id = "call", .tool_name = "read_file", .content = "not executed", .tool_result_status = .failure },
+        };
+        const body = buildGatewayRequestBody(std.testing.allocator, "[]", &messages) catch |err| {
+            try std.testing.expectEqual(error.InvalidGatewayHistory, err);
+            continue;
+        };
+        defer std.testing.allocator.free(body);
+        return error.TestExpectedError;
     }
 }
 
@@ -526,25 +619,89 @@ fn findToolCallIndex(calls: []const ToolCall, id: []const u8) ?usize {
     return null;
 }
 
-pub fn shouldCacheMessage(message: ChatMessage, index: usize, cache_breakpoint_idx: ?usize, prompt_caching: bool) bool {
-    if (!prompt_caching) return false;
-    if (message.cache_policy == .no_cache) return false;
-    return message.role == .system or (cache_breakpoint_idx != null and index == cache_breakpoint_idx.?);
+const max_prompt_shape_entries: usize = 12;
+
+fn tool_result_prefix(messages: []const ChatMessage) []const ChatMessage {
+    var end: usize = 0;
+    while (end < messages.len and messages[end].role == .tool) : (end += 1) {}
+    return messages[0..end];
 }
 
-const anthropic_cache_meta = ",\"providerOptions\":{\"anthropic\":{\"cacheControl\":{\"type\":\"ephemeral\"}}}";
-const max_prompt_shape_entries: usize = 12;
+fn write_tool_result_group(
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    results: []const ChatMessage,
+    budget: ?BuildBudget,
+    ids: *const tool_call_ids.Projection,
+) !void {
+    try writer.writeAll("{\"role\":\"tool\",\"content\":[");
+    for (results, 0..) |result, index| {
+        if (budget) |active| try active.check();
+        if (index > 0) try writer.writeByte(',');
+        try write_tool_result_part(alloc, writer, result, ids);
+    }
+    try writer.writeAll("]}");
+}
+
+fn write_tool_result_part(scratch_alloc: std.mem.Allocator, writer: *std.Io.Writer, message: ChatMessage, ids: *const tool_call_ids.Projection) !void {
+    try writer.writeAll("{\"type\":\"tool-result\",\"toolCallId\":");
+    try std.json.Stringify.value(ids.resolve(message.tool_call_id orelse ""), .{}, writer);
+    try writer.writeAll(",\"toolName\":");
+    try std.json.Stringify.value(message.tool_name orelse "unknown", .{}, writer);
+    const content = message.content orelse "";
+    const failed = if (message.tool_result_status) |status|
+        status == .failure
+    else
+        false;
+    const denied = failed and tool_result_errors.toolPermissionDenialReason(content) != null;
+    const tool_images = if (message.tool_result_memory) |memory| memory.tool_images else &.{};
+    if (tool_images.len > 0 and !denied) {
+        try writer.writeAll(",\"output\":{\"type\":\"content\",\"value\":[");
+        const text = if (failed) try std.fmt.allocPrint(scratch_alloc, "Tool error: {s}", .{content}) else content;
+        defer if (failed) scratch_alloc.free(text);
+        if (text.len > 0) {
+            try writer.writeAll("{\"type\":\"text\",\"text\":");
+            try std.json.Stringify.value(text, .{}, writer);
+            try writer.writeByte('}');
+        }
+        for (tool_images, 0..) |image, index| {
+            if (index > 0 or text.len > 0) try writer.writeByte(',');
+            try writer.writeAll("{\"type\":\"image-data\",\"data\":");
+            try std.json.Stringify.value(image.data, .{}, writer);
+            try writer.writeAll(",\"mediaType\":");
+            try std.json.Stringify.value(image.mime_type, .{}, writer);
+            try writer.writeByte('}');
+        }
+        try writer.writeAll("]}}");
+        return;
+    }
+    if (denied) {
+        try writer.writeAll(",\"output\":{\"type\":\"execution-denied\",\"reason\":");
+    } else if (failed) {
+        try writer.writeAll(",\"output\":{\"type\":\"error-text\",\"value\":");
+    } else {
+        try writer.writeAll(",\"output\":{\"type\":\"text\",\"value\":");
+    }
+    try std.json.Stringify.value(content, .{}, writer);
+    try writer.writeAll("}}");
+}
 
 fn writeChatMessageJsonInner(
     scratch_alloc: std.mem.Allocator,
     writer: *std.Io.Writer,
     message: ChatMessage,
-    cached: bool,
     budget: ?BuildBudget,
     verified_images: ?[]const image_attachments.VerifiedSnapshot,
+    ids: *const tool_call_ids.Projection,
 ) !void {
     try writer.writeAll("{\"role\":");
     try std.json.Stringify.value(roleName(message.role), .{}, writer);
+
+    if (message.role == .assistant) if (message.provider_replay) |replay| {
+        try writeReplayContent(scratch_alloc, writer, message, replay, ids, budget);
+        try writer.writeByte('}');
+        return;
+    };
 
     switch (message.role) {
         .system => {
@@ -613,50 +770,172 @@ fn writeChatMessageJsonInner(
             }
             for (message.tool_calls) |tool_call| {
                 if (wrote_part) try writer.writeByte(',');
-                try writer.writeAll("{\"type\":\"tool-call\",\"toolCallId\":");
-                try std.json.Stringify.value(tool_call.id, .{}, writer);
-                try writer.writeAll(",\"toolName\":");
-                try std.json.Stringify.value(tool_call.name, .{}, writer);
-                try writer.writeAll(",\"input\":");
-                try writer.writeAll(tool_call.arguments_json);
-                try writer.writeByte('}');
+                try writeToolCallPart(writer, tool_call, null, ids);
                 wrote_part = true;
             }
             try writer.writeByte(']');
         },
         .tool => {
-            try writer.writeAll(",\"content\":[{\"type\":\"tool-result\",\"toolCallId\":");
-            if (message.tool_call_id) |tool_call_id| {
-                try std.json.Stringify.value(tool_call_id, .{}, writer);
-            } else {
-                try writer.writeAll("\"\"");
-            }
-            try writer.writeAll(",\"toolName\":");
-            if (message.tool_name) |tool_name| {
-                try std.json.Stringify.value(tool_name, .{}, writer);
-            } else {
-                try writer.writeAll("\"unknown\"");
-            }
-            const content = message.content orelse "";
-            const failed = if (message.tool_result_status) |status|
-                status == .failure
-            else
-                false;
-            const denied = failed and tool_result_errors.toolPermissionDenialReason(content) != null;
-            if (denied) {
-                try writer.writeAll(",\"output\":{\"type\":\"execution-denied\",\"reason\":");
-            } else if (failed) {
-                try writer.writeAll(",\"output\":{\"type\":\"error-text\",\"value\":");
-            } else {
-                try writer.writeAll(",\"output\":{\"type\":\"text\",\"value\":");
-            }
-            try std.json.Stringify.value(content, .{}, writer);
-            try writer.writeAll("}}]");
+            try writer.writeAll(",\"content\":[");
+            try write_tool_result_part(scratch_alloc, writer, message, ids);
+            try writer.writeByte(']');
         },
     }
 
-    if (cached) try writer.writeAll(anthropic_cache_meta);
     try writer.writeAll("}");
+}
+
+fn writeToolCallPart(writer: *std.Io.Writer, call: ToolCall, metadata: ?std.json.Value, ids: *const tool_call_ids.Projection) !void {
+    try writer.writeAll("{\"type\":\"tool-call\",\"toolCallId\":");
+    try std.json.Stringify.value(ids.resolve(call.id), .{}, writer);
+    try writer.writeAll(",\"toolName\":");
+    try std.json.Stringify.value(call.name, .{}, writer);
+    try writer.writeAll(",\"input\":");
+    try writer.writeAll(call.arguments_json);
+    try writeReplayMetadata(writer, metadata);
+    try writer.writeByte('}');
+}
+
+fn writeReplayMetadata(writer: *std.Io.Writer, metadata: ?std.json.Value) !void {
+    const value = metadata orelse return;
+    if (value != .object) return error.InvalidProviderState;
+    for (value.object.values()) |options| if (options != .object) return error.InvalidProviderState;
+    try writer.writeAll(",\"providerOptions\":");
+    try std.json.Stringify.value(value, .{}, writer);
+}
+
+/// Borrows unchanged replay, otherwise uses the caller's request arena. Selects
+/// metadata for the assistant unit after core splits a provider-executed reply.
+pub fn selectReplayParts(
+    arena: std.mem.Allocator,
+    replay: ?types.ProviderReplay,
+    calls: []const ToolCall,
+    include_text: bool,
+    include_reasoning: bool,
+) !?types.ProviderReplay {
+    const source = replay orelse return null;
+    if (source.source.provider != .gateway) return error.InvalidProviderState;
+    if (source.parts_json.len > types.ProviderReplay.max_bytes) return error.ProviderStateTooLarge;
+    const parsed = std.json.parseFromSlice(std.json.Value, arena, source.parts_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidProviderState,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .array) return error.InvalidProviderState;
+    var selected: std.ArrayList(std.json.Value) = .empty;
+    defer selected.deinit(arena);
+    for (parsed.value.array.items) |part| {
+        if (part != .object) return error.InvalidProviderState;
+        const kind = part.object.get("type") orelse return error.InvalidProviderState;
+        if (kind != .string) return error.InvalidProviderState;
+        const keep = if (std.mem.eql(u8, kind.string, "text")) include_text else if (std.mem.eql(u8, kind.string, "reasoning")) include_reasoning else if (std.mem.eql(u8, kind.string, "tool-call")) blk: {
+            const id = part.object.get("toolCallId") orelse return error.InvalidProviderState;
+            if (id != .string) return error.InvalidProviderState;
+            break :blk findToolCallIndex(calls, id.string) != null;
+        } else return error.InvalidProviderState;
+        if (keep) try selected.append(arena, part);
+    }
+    if (selected.items.len == 0) return null;
+    if (selected.items.len == parsed.value.array.items.len) return source;
+    var out: std.Io.Writer.Allocating = .init(arena);
+    errdefer out.deinit();
+    try std.json.Stringify.value(selected.items, .{}, &out.writer);
+    return .{ .source = source.source, .parts_json = try out.toOwnedSlice() };
+}
+
+test "split provider completion retains metadata with each canonical assistant unit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const replay = types.ProviderReplay{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"reason\"},{\"type\":\"tool-call\",\"toolCallId\":\"call\",\"providerOptions\":{\"vertex\":{\"thoughtSignature\":\"signed\"}}},{\"type\":\"text\",\"offset\":0,\"length\":4,\"providerOptions\":{\"openai\":{\"itemId\":\"text\"}}}]" };
+    const calls = [_]ToolCall{.{ .id = "call", .name = "search", .arguments_json = "{}", .provenance = .provider_executed }};
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls, .provider_replay = try selectReplayParts(alloc, replay, &calls, false, true) },
+        .{ .role = .tool, .tool_call_id = "call", .tool_name = "search", .content = "result" },
+        .{ .role = .assistant, .content = "done", .provider_replay = try selectReplayParts(alloc, replay, &.{}, true, false) },
+    };
+    const body = try buildGatewayRequestBody(alloc, "[]", &messages);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    const prompt = parsed.value.object.get("prompt").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), prompt[0].object.get("content").?.array.items.len);
+    try std.testing.expectEqualStrings("signed", prompt[0].object.get("content").?.array.items[1].object.get("providerOptions").?.object.get("vertex").?.object.get("thoughtSignature").?.string);
+    try std.testing.expectEqual(@as(usize, 1), prompt[2].object.get("content").?.array.items.len);
+    try std.testing.expectEqualStrings("text", prompt[2].object.get("content").?.array.items[0].object.get("providerOptions").?.object.get("openai").?.object.get("itemId").?.string);
+}
+
+fn writeReplayContent(
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    message: ChatMessage,
+    replay: types.ProviderReplay,
+    ids: *const tool_call_ids.Projection,
+    budget: ?BuildBudget,
+) !void {
+    if (replay.source.provider != .gateway) return error.InvalidProviderState;
+    if (replay.parts_json.len > types.ProviderReplay.max_bytes) return error.ProviderStateTooLarge;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, replay.parts_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidProviderState,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .array) return error.InvalidProviderState;
+    const seen_calls = try alloc.alloc(bool, message.tool_calls.len);
+    defer alloc.free(seen_calls);
+    @memset(seen_calls, false);
+    const content = message.content orelse "";
+    var text_end: usize = 0;
+    var wrote_part = false;
+    try writer.writeAll(",\"content\":[");
+    for (parsed.value.array.items) |part| {
+        if (budget) |active| try active.check();
+        if (part != .object) return error.InvalidProviderState;
+        const kind = part.object.get("type") orelse return error.InvalidProviderState;
+        if (kind != .string) return error.InvalidProviderState;
+        if (wrote_part) try writer.writeByte(',');
+        const metadata = part.object.get("providerOptions");
+        if (std.mem.eql(u8, kind.string, "reasoning")) {
+            const text_value = part.object.get("text") orelse return error.InvalidProviderState;
+            if (text_value != .string) return error.InvalidProviderState;
+            try writer.writeAll("{\"type\":\"reasoning\",\"text\":");
+            try std.json.Stringify.value(text_value.string, .{}, writer);
+            try writeReplayMetadata(writer, metadata);
+            try writer.writeByte('}');
+        } else if (std.mem.eql(u8, kind.string, "text")) {
+            const offset_value = part.object.get("offset") orelse return error.InvalidProviderState;
+            const length_value = part.object.get("length") orelse return error.InvalidProviderState;
+            if (offset_value != .integer or length_value != .integer) return error.InvalidProviderState;
+            const offset = std.math.cast(usize, offset_value.integer) orelse return error.InvalidProviderState;
+            const length = std.math.cast(usize, length_value.integer) orelse return error.InvalidProviderState;
+            if (offset != text_end or offset > content.len or length > content.len - offset) return error.InvalidProviderState;
+            text_end = offset + length;
+            try writer.writeAll("{\"type\":\"text\",\"text\":");
+            try std.json.Stringify.value(content[offset..text_end], .{}, writer);
+            try writeReplayMetadata(writer, metadata);
+            try writer.writeByte('}');
+        } else if (std.mem.eql(u8, kind.string, "tool-call")) {
+            const call_id = part.object.get("toolCallId") orelse return error.InvalidProviderState;
+            if (call_id != .string) return error.InvalidProviderState;
+            const index = findToolCallIndex(message.tool_calls, call_id.string) orelse return error.InvalidProviderState;
+            if (seen_calls[index]) return error.InvalidProviderState;
+            seen_calls[index] = true;
+            try writeToolCallPart(writer, message.tool_calls[index], metadata, ids);
+        } else return error.InvalidProviderState;
+        wrote_part = true;
+    }
+    if (text_end < content.len) {
+        if (wrote_part) try writer.writeByte(',');
+        try writer.writeAll("{\"type\":\"text\",\"text\":");
+        try std.json.Stringify.value(content[text_end..], .{}, writer);
+        try writer.writeByte('}');
+        wrote_part = true;
+    }
+    for (message.tool_calls, seen_calls) |call, seen| {
+        if (seen) continue;
+        if (wrote_part) try writer.writeByte(',');
+        try writeToolCallPart(writer, call, null, ids);
+        wrote_part = true;
+    }
+    try writer.writeByte(']');
 }
 
 pub fn formatGatewayRequestShapeSummary(alloc: std.mem.Allocator, payload: []const u8) ![]u8 {
@@ -774,16 +1053,6 @@ fn jsonKindName(value: std.json.Value) []const u8 {
         .array => "array",
         .object => "object",
     };
-}
-
-fn findCacheBreakpoint(messages: []const ChatMessage) ?usize {
-    if (messages.len < 3) return null;
-    var i = messages.len - 2;
-    while (i > 0) : (i -= 1) {
-        const role = messages[i].role;
-        if (role == .user or role == .assistant) return i;
-    }
-    return null;
 }
 
 pub fn parseGatewayCompletion(alloc: std.mem.Allocator, body: []const u8) !GatewayCompletion {
@@ -1093,60 +1362,74 @@ test "writeChatMessageJson maps tool result status to the Vercel output variant"
     }
 }
 
-test "writeChatMessageJsonCached adds provider options and non-cached omits them" {
+test "Gateway request replays reasoning and call metadata without changing canonical input" {
     const alloc = std.testing.allocator;
-    var cached_out: std.Io.Writer.Allocating = .init(alloc);
-    defer cached_out.deinit();
-    var uncached_out: std.Io.Writer.Allocating = .init(alloc);
-    defer uncached_out.deinit();
-
-    const message: ChatMessage = .{ .role = .system, .content = "rules" };
-    try writeChatMessageJsonCached(alloc, &cached_out.writer, message);
-    try writeChatMessageJson(alloc, &uncached_out.writer, message);
-
-    try std.testing.expect(std.mem.find(u8, cached_out.written(), "\"providerOptions\"") != null);
-    try std.testing.expect(std.mem.find(u8, cached_out.written(), "\"cacheControl\":{\"type\":\"ephemeral\"}") != null);
-    try std.testing.expect(std.mem.find(u8, uncached_out.written(), "providerOptions") == null);
+    const calls = [_]ToolCall{.{ .id = "call-1", .name = "read_file", .arguments_json = "{\"path\":\"file\"}" }};
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .content = "visible", .tool_calls = &calls, .provider_replay = .{
+            .source = .{ .provider = .gateway, .model = "test" },
+            .parts_json = "[{\"type\":\"reasoning\",\"text\":\"\",\"providerOptions\":{\"openai\":{\"reasoningEncryptedContent\":\"opaque\"}}},{\"type\":\"text\",\"offset\":0,\"length\":7},{\"type\":\"tool-call\",\"toolCallId\":\"call-1\",\"providerOptions\":{\"vertex\":{\"thoughtSignature\":\"signature\"}}}]",
+        } },
+        .{ .role = .tool, .tool_call_id = "call-1", .tool_name = "read_file", .content = "result" },
+    };
+    const body = try buildGatewayRequestBody(alloc, "[]", &messages);
+    defer alloc.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const parts = parsed.value.object.get("prompt").?.array.items[0].object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), parts.len);
+    try std.testing.expectEqualStrings("reasoning", parts[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("opaque", parts[0].object.get("providerOptions").?.object.get("openai").?.object.get("reasoningEncryptedContent").?.string);
+    try std.testing.expectEqualStrings("visible", parts[1].object.get("text").?.string);
+    try std.testing.expectEqualStrings("read_file", parts[2].object.get("toolName").?.string);
+    try std.testing.expectEqualStrings("file", parts[2].object.get("input").?.object.get("path").?.string);
+    try std.testing.expectEqualStrings("signature", parts[2].object.get("providerOptions").?.object.get("vertex").?.object.get("thoughtSignature").?.string);
 }
 
-fn promptStringEntryHasCacheControl(body: []const u8, needle: []const u8) !bool {
+test "Gateway automatic caching preserves transient context and grouped tool results" {
     const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{
+        .{ .id = "first", .name = "read_file", .arguments_json = "{}" },
+        .{ .id = "second", .name = "read_file", .arguments_json = "{}" },
+    };
+    const messages = [_]ChatMessage{
+        .{ .role = .system, .content = "stable instructions" },
+        .{ .role = .system, .content = "runtime context" },
+        .{ .role = .user, .content = "read both" },
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .tool_call_id = "first", .tool_name = "read_file", .content = "A" },
+        .{ .role = .tool, .tool_call_id = "second", .tool_name = "read_file", .content = "B" },
+    };
+    const body = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, .{
+        .prompt_caching = true,
+        .fast = true,
+        .parallel_tool_calls = false,
+    }, .auto);
+    defer alloc.free(body);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
+    const options = parsed.value.object.get("providerOptions").?.object;
+    const gateway = options.get("gateway").?.object;
+    const caching = gateway.get("caching") orelse return error.TestExpectedAutomaticCaching;
+    try std.testing.expectEqualStrings("auto", caching.string);
+    try std.testing.expectEqualStrings("fast", gateway.get("speed").?.string);
+    try std.testing.expect(!options.get("xai").?.object.get("parallelToolCalls").?.bool);
+    try std.testing.expect(std.mem.find(u8, body, "cacheControl") == null);
+    const prompt = parsed.value.object.get("prompt").?.array.items;
+    try std.testing.expectEqualStrings("runtime context", prompt[1].object.get("content").?.string);
+    const results = prompt[4].object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("A", results[0].object.get("output").?.object.get("value").?.string);
+    try std.testing.expectEqualStrings("B", results[1].object.get("output").?.object.get("value").?.string);
 
-    const prompt = parsed.value.object.get("prompt") orelse return error.TestExpectedPromptMissing;
-    if (prompt != .array) return error.TestExpectedPromptMissing;
-    for (prompt.array.items) |entry| {
-        if (entry != .object) continue;
-        const content = entry.object.get("content") orelse continue;
-        if (content != .string) continue;
-        if (std.mem.find(u8, content.string, needle) == null) continue;
-        return entry.object.get("providerOptions") != null;
-    }
-    return error.TestExpectedPromptMessageMissing;
-}
-
-test "buildGatewayRequestBodyWithOptions leaves transient system messages uncached" {
-    const alloc = std.testing.allocator;
-    const msgs = [_]ChatMessage{
-        .{ .role = .system, .content = "stable system prompt" },
-        .{ .role = .system, .content = "static project context" },
-        .{ .role = .system, .content = "volatile runtime overlay", .cache_policy = .no_cache },
-        .{ .role = .user, .content = "first question" },
-        .{ .role = .assistant, .content = "answer" },
-        .{ .role = .user, .content = "follow up" },
-    };
-    const body = try buildGatewayRequestBodyWithOptions(alloc, "[]", &msgs, .{ .prompt_caching = true }, .auto);
-    defer alloc.free(body);
-
-    const cache_marker = "\"cacheControl\":{\"type\":\"ephemeral\"}";
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, body, cache_marker));
-    try std.testing.expect(try promptStringEntryHasCacheControl(body, "stable system prompt"));
-    try std.testing.expect(try promptStringEntryHasCacheControl(body, "static project context"));
-    try std.testing.expect(!try promptStringEntryHasCacheControl(body, "volatile runtime overlay"));
-
-    const overlay_idx = std.mem.indexOf(u8, body, "volatile runtime overlay") orelse return error.TestExpectedPromptMessageMissing;
-    try std.testing.expect(std.mem.find(u8, body[overlay_idx..], "cacheControl") == null);
+    const default_body = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, .{
+        .fast = true,
+        .parallel_tool_calls = false,
+    }, .auto);
+    defer alloc.free(default_body);
+    const without_cache_option = try std.mem.replaceOwned(u8, alloc, body, ",\"caching\":\"auto\"", "");
+    defer alloc.free(without_cache_option);
+    try std.testing.expectEqualStrings(default_body, without_cache_option);
 }
 
 test "buildGatewayRequestBodyWithOptions keeps Anthropic default silent and named effort provider neutral" {
@@ -1200,24 +1483,37 @@ test "required gateway request validates history" {
     );
 }
 
+test "gateway request rejects system messages after conversation" {
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "question" },
+        .{ .role = .system, .content = "late instruction" },
+    };
+
+    try std.testing.expectError(
+        error.InvalidGatewayHistory,
+        buildGatewayRequestBody(std.testing.allocator, "[]", &messages),
+    );
+}
+
 test "pending tool review closes the exact assistant step with synthetic pending results" {
     var cancel = std.atomic.Value(bool).init(false);
     const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,
         .raw = .fromMilliseconds(1000),
     });
+    const instructions = [_]ChatMessage{.{ .role = .system, .content = "Review only install." }};
     const messages = [_]ChatMessage{
         .{ .role = .user, .content = "Install dependencies." },
         .{ .role = .assistant, .tool_calls = &.{
             .{ .id = "install", .name = "run_command", .arguments_json = "{\"command\":\"pnpm install\"}" },
             .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"package.json\"}" },
         } },
-        .{ .role = .system, .content = "Review only install." },
     };
 
     const body = try buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
         std.testing.allocator,
         "[]",
+        &instructions,
         &messages,
         "install",
         .{ .reasoning = types.ReasoningEffort.literal("minimal") },
@@ -1229,11 +1525,15 @@ test "pending tool review closes the exact assistant step with synthetic pending
 
     try std.testing.expect(std.mem.find(u8, body, "\"toolCallId\":\"install\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"toolCallId\":\"read\"") != null);
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, body, "\"role\":\"tool\""));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "\"role\":\"tool\""));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, body, "\"type\":\"tool-result\""));
     try std.testing.expectEqual(
         @as(usize, 2),
         std.mem.count(u8, body, "Tool call has not executed; it is pending permission review."),
     );
+    const system_index = std.mem.find(u8, body, "\"role\":\"system\"").?;
+    const user_index = std.mem.find(u8, body, "\"role\":\"user\"").?;
+    try std.testing.expect(system_index < user_index);
     try std.testing.expect(std.mem.find(u8, body, "\"maxOutputTokens\":2048") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"reasoning\":\"minimal\"") != null);
     try std.testing.expectError(
@@ -1242,19 +1542,63 @@ test "pending tool review closes the exact assistant step with synthetic pending
     );
 }
 
-test "pending tool review rejects missing or duplicate target ids" {
+test "pending review and model requests enforce the same prompt lanes" {
     var cancel = std.atomic.Value(bool).init(false);
     const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,
         .raw = .fromMilliseconds(1000),
     });
     const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "Read this." },
+        .{ .role = .assistant, .tool_calls = &.{
+            .{ .id = "read", .name = "read_file", .arguments_json = "{}" },
+        } },
+    };
+    const invalid = [_]ChatMessage{
+        .{ .role = .user, .content = "not instructions" },
+        .{ .role = .system },
+        .{ .role = .system, .content = "rules", .provider_replay = .{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "{}" } },
+        .{ .role = .system, .content = "rules", .permission_feedback = true },
+    };
+    for (invalid) |instruction| {
+        const request = stream_provider.RequestData{
+            .model = "review-model",
+            .instructions = &.{instruction},
+            .messages = &messages,
+            .tool_choice = .auto,
+            .provider_options = .{},
+        };
+        try std.testing.expectError(error.InvalidProviderPrompt, request.validatePrompt());
+        try std.testing.expectError(
+            error.InvalidGatewayHistory,
+            buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
+                std.testing.allocator,
+                "[]",
+                &.{instruction},
+                &messages,
+                "read",
+                .{},
+                2048,
+                deadline,
+                &cancel,
+            ),
+        );
+    }
+}
+
+test "pending tool review rejects missing or duplicate target ids" {
+    var cancel = std.atomic.Value(bool).init(false);
+    const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(1000),
+    });
+    const instructions = [_]ChatMessage{.{ .role = .system, .content = "Review it." }};
+    const messages = [_]ChatMessage{
         .{ .role = .user, .content = "Run this." },
         .{ .role = .assistant, .tool_calls = &.{
             .{ .id = "duplicate", .name = "run_command", .arguments_json = "{}" },
             .{ .id = "duplicate", .name = "read_file", .arguments_json = "{}" },
         } },
-        .{ .role = .system, .content = "Review it." },
     };
 
     try std.testing.expectError(
@@ -1262,6 +1606,7 @@ test "pending tool review rejects missing or duplicate target ids" {
         buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
             std.testing.allocator,
             "[]",
+            &instructions,
             &messages,
             "duplicate",
             .{},
@@ -1275,6 +1620,7 @@ test "pending tool review rejects missing or duplicate target ids" {
         buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
             std.testing.allocator,
             "[]",
+            &instructions,
             &messages,
             "missing",
             .{},
@@ -1378,58 +1724,7 @@ test "formatGatewayRequestShapeSummary reports content kinds without request con
     try std.testing.expect(std.mem.find(u8, mutated_summary, "SECRET_MUTATED_SYSTEM") == null);
 }
 
-test "findCacheBreakpoint returns null for short conversations" {
-    const messages = [_]ChatMessage{
-        .{ .role = .system, .content = "sys" },
-        .{ .role = .user, .content = "hi" },
-    };
-    try std.testing.expect(findCacheBreakpoint(&messages) == null);
-}
-
-test "findCacheBreakpoint returns last user/assistant before final message" {
-    const messages = [_]ChatMessage{
-        .{ .role = .system, .content = "sys" },
-        .{ .role = .user, .content = "first" },
-        .{ .role = .assistant, .content = "reply" },
-        .{ .role = .user, .content = "second" },
-    };
-    try std.testing.expectEqual(@as(?usize, 2), findCacheBreakpoint(&messages));
-}
-
-test "findCacheBreakpoint skips tool messages" {
-    const messages = [_]ChatMessage{
-        .{ .role = .system, .content = "sys" },
-        .{ .role = .user, .content = "do it" },
-        .{ .role = .assistant, .content = "ok" },
-        .{ .role = .tool, .content = "result", .tool_call_id = "t1", .tool_name = "read_file" },
-        .{ .role = .user, .content = "next" },
-    };
-    try std.testing.expectEqual(@as(?usize, 2), findCacheBreakpoint(&messages));
-}
-
-test "buildGatewayRequestBodyWithOptions includes cache markers for anthropic" {
-    const alloc = std.testing.allocator;
-    const messages = [_]ChatMessage{
-        .{ .role = .system, .content = "system prompt" },
-        .{ .role = .user, .content = "first question" },
-        .{ .role = .assistant, .content = "answer" },
-        .{ .role = .user, .content = "follow up" },
-    };
-    const body = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, .{ .prompt_caching = true }, .auto);
-    defer alloc.free(body);
-
-    const cache_marker = "\"providerOptions\":{\"anthropic\":{\"cacheControl\":{\"type\":\"ephemeral\"}}}";
-
-    var count: usize = 0;
-    var pos: usize = 0;
-    while (std.mem.find(u8, body[pos..], cache_marker)) |idx| {
-        count += 1;
-        pos += idx + cache_marker.len;
-    }
-    try std.testing.expectEqual(@as(usize, 2), count);
-}
-
-test "buildGatewayRequestBodyWithOptions omits cache markers when disabled" {
+test "buildGatewayRequestBodyWithOptions leaves one-shot caching to the provider" {
     const alloc = std.testing.allocator;
     const messages = [_]ChatMessage{
         .{ .role = .system, .content = "system prompt" },
@@ -1439,6 +1734,169 @@ test "buildGatewayRequestBodyWithOptions omits cache markers when disabled" {
     defer alloc.free(body);
 
     try std.testing.expect(std.mem.find(u8, body, "cacheControl") == null);
+    try std.testing.expect(std.mem.find(u8, body, "providerOptions") == null);
+}
+
+test "tool result grouping borrows only the leading contiguous results" {
+    const messages = [_]ChatMessage{
+        .{ .role = .tool, .content = "first" },
+        .{ .role = .tool, .content = "second" },
+        .{ .role = .user, .content = "boundary" },
+        .{ .role = .tool, .content = "later" },
+    };
+    const group = tool_result_prefix(&messages);
+    try std.testing.expectEqual(@as(usize, 2), group.len);
+    try std.testing.expect(group.ptr == messages[0..].ptr);
+    try std.testing.expectEqual(@as(usize, 0), tool_result_prefix(messages[2..]).len);
+    try std.testing.expectEqual(@as(usize, 1), tool_result_prefix(messages[3..]).len);
+    try std.testing.expectEqual(@as(usize, 0), tool_result_prefix(&.{}).len);
+    try std.testing.expectEqualStrings("boundary", messages[2].content.?);
+}
+
+test "gateway request serialization keeps each tool result group together" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{
+        .{ .id = "call_a", .name = "read_a", .arguments_json = "{}" },
+        .{ .id = "call_b", .name = "read_b", .arguments_json = "{}" },
+        .{ .id = "call_c", .name = "read_c", .arguments_json = "{}" },
+    };
+    const denial = "{\"error\":{\"type\":\"tool_permission_denied\",\"reason\":\"policy_denied\"}}";
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "read all three" },
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .tool_call_id = "call_a", .tool_name = "read_a", .content = "A\n\"quoted\"", .tool_result_status = .success },
+        .{ .role = .tool, .tool_call_id = "call_b", .tool_name = "read_b", .content = "failed", .tool_result_status = .failure },
+        .{ .role = .tool, .tool_call_id = "call_c", .tool_name = "read_c", .content = denial, .tool_result_status = .failure },
+        .{ .role = .user, .content = "try again" },
+        .{ .role = .assistant, .tool_calls = calls[0..1] },
+        .{ .role = .tool, .tool_call_id = "call_a", .tool_name = "read_a", .content = "", .tool_result_status = .success },
+        .{ .role = .assistant, .content = "done" },
+    };
+    const body = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, .{}, .auto);
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const prompt = parsed.value.object.get("prompt").?.array.items;
+    try std.testing.expectEqual(@as(usize, 7), prompt.len);
+    const roles = [_][]const u8{ "user", "assistant", "tool", "user", "assistant", "tool", "assistant" };
+    for (prompt, roles) |message, role| {
+        try std.testing.expectEqualStrings(role, message.object.get("role").?.string);
+    }
+    const results = prompt[2].object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    const output_types = [_][]const u8{ "text", "error-text", "execution-denied" };
+    const output_values = [_][]const u8{ "A\n\"quoted\"", "failed", denial };
+    for (results, calls, output_types, output_values) |result, call, output_type, output_value| {
+        try std.testing.expectEqualStrings("tool-result", result.object.get("type").?.string);
+        try std.testing.expectEqualStrings(call.id, result.object.get("toolCallId").?.string);
+        try std.testing.expectEqualStrings(call.name, result.object.get("toolName").?.string);
+        const output = result.object.get("output").?.object;
+        try std.testing.expectEqualStrings(output_type, output.get("type").?.string);
+        const value = output.get("value") orelse output.get("reason").?;
+        try std.testing.expectEqualStrings(output_value, value.string);
+    }
+    const later = prompt[5].object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), later.len);
+    try std.testing.expectEqualStrings("", later[0].object.get("output").?.object.get("value").?.string);
+    const repeated = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, .{}, .auto);
+    defer alloc.free(repeated);
+    try std.testing.expectEqualStrings(body, repeated);
+    try std.testing.expectEqualStrings("A\n\"quoted\"", messages[2].content.?);
+    try std.testing.expectEqualStrings(denial, messages[4].content.?);
+}
+
+test "grouped tool results retain images and individual error status" {
+    const alloc = std.testing.allocator;
+    const images = [_]types.ToolImage{.{ .data = @constCast("cG5n"), .mime_type = @constCast("image/png") }};
+    const source_id = "functions.capture:0";
+    const calls = [_]ToolCall{
+        .{ .id = source_id, .name = "capture", .arguments_json = "{}" },
+        .{ .id = "labels", .name = "read_labels", .arguments_json = "{}" },
+    };
+    for ([_]types.PersistedToolStatus{ .success, .failure }) |status| {
+        const messages = [_]ChatMessage{
+            .{ .role = .assistant, .tool_calls = &calls },
+            .{ .role = .tool, .tool_call_id = source_id, .tool_name = "capture", .content = "capture", .tool_result_status = status, .tool_result_memory = .{ .tool_images = &images } },
+            .{ .role = .tool, .tool_call_id = "labels", .tool_name = "read_labels", .content = "labels", .tool_result_status = .success },
+        };
+        const body = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, .{ .prompt_caching = true }, .auto);
+        defer alloc.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer parsed.deinit();
+        const prompt = parsed.value.object.get("prompt").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), prompt.len);
+        const results = prompt[1].object.get("content").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), results.len);
+        const projected_id = prompt[0].object.get("content").?.array.items[0].object.get("toolCallId").?.string;
+        try std.testing.expectEqualStrings("auto", parsed.value.object.get("providerOptions").?.object.get("gateway").?.object.get("caching").?.string);
+        try std.testing.expect(std.mem.find(u8, body, "cacheControl") == null);
+        try std.testing.expect(!std.mem.eql(u8, source_id, projected_id));
+        try std.testing.expectEqualStrings(projected_id, results[0].object.get("toolCallId").?.string);
+        try std.testing.expectEqualStrings(source_id, messages[1].tool_call_id.?);
+        const media = results[0].object.get("output").?.object;
+        try std.testing.expectEqualStrings("content", media.get("type").?.string);
+        const parts = media.get("value").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), parts.len);
+        try std.testing.expectEqualStrings(if (status == .failure) "Tool error: capture" else "capture", parts[0].object.get("text").?.string);
+        try std.testing.expectEqualStrings("image-data", parts[1].object.get("type").?.string);
+        try std.testing.expectEqualStrings(images[0].data, parts[1].object.get("data").?.string);
+        try std.testing.expectEqualStrings("image/png", parts[1].object.get("mediaType").?.string);
+        try std.testing.expectEqualStrings("labels", results[1].object.get("toolCallId").?.string);
+        const plain = results[1].object.get("output").?.object;
+        try std.testing.expectEqualStrings("text", plain.get("type").?.string);
+        try std.testing.expectEqualStrings("labels", plain.get("value").?.string);
+    }
+}
+
+test "grouped tool results preserve request budgets with automatic caching" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{
+        .{ .id = "a", .name = "read_file", .arguments_json = "{}" },
+        .{ .id = "b", .name = "read_file", .arguments_json = "{}" },
+    };
+    const messages = [_]ChatMessage{
+        .{ .role = .system, .content = "rules" },
+        .{ .role = .user, .content = "read" },
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .tool_call_id = "a", .tool_name = "read_file", .content = "A" },
+        .{ .role = .tool, .tool_call_id = "b", .tool_name = "read_file", .content = "B" },
+        .{ .role = .assistant, .content = "summary" },
+        .{ .role = .user, .content = "continue" },
+    };
+    const body = try buildGatewayRequestBodyWithOptionsAndBudget(alloc, "[]", &messages, .{ .prompt_caching = true }, .auto, null, .{});
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const prompt = parsed.value.object.get("prompt").?.array.items;
+    try std.testing.expectEqual(@as(usize, 6), prompt.len);
+    try std.testing.expectEqual(@as(usize, 2), prompt[3].object.get("content").?.array.items.len);
+    try std.testing.expectEqualStrings("auto", parsed.value.object.get("providerOptions").?.object.get("gateway").?.object.get("caching").?.string);
+    var cancel = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, buildGatewayRequestBodyWithOptionsAndBudget(alloc, "[]", &messages, .{ .prompt_caching = true }, .auto, null, .{ .cancel_flag = &cancel }));
+    const expired = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(-1) });
+    try std.testing.expectError(error.TimedOut, buildGatewayRequestBodyWithOptionsAndBudget(alloc, "[]", &messages, .{ .prompt_caching = true }, .auto, null, .{ .deadline = expired }));
+}
+
+fn check_grouped_request_allocations(alloc: std.mem.Allocator) !void {
+    const calls = [_]ToolCall{
+        .{ .id = "a", .name = "read_file", .arguments_json = "{}" },
+        .{ .id = "b", .name = "read_file", .arguments_json = "{}" },
+    };
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .tool_call_id = "a", .tool_name = "read_file", .content = "first" },
+        .{ .role = .tool, .tool_call_id = "b", .tool_name = "read_file", .content = "second" },
+    };
+    const body = buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, .{ .prompt_caching = true }, .auto) catch |err| switch (err) {
+        // The allocation checker expects OOM; this writer has no other failure source.
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    defer alloc.free(body);
+}
+
+test "grouped tool result serialization releases failed allocations" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_grouped_request_allocations, .{});
 }
 
 test "gateway request validation accepts paired assistant tool calls and results" {

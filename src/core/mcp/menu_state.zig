@@ -1,4 +1,5 @@
 const std = @import("std");
+const health = @import("health.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
 pub const Section = enum {
@@ -43,6 +44,69 @@ pub const Action = enum {
     trust_reset,
     insert_preview,
 };
+
+pub fn serverActionAvailable(action: Action, server: *const health.ServerSnapshot) bool {
+    return switch (action) {
+        .authenticate => server.transport == .http and server.connection != .connecting and
+            (server.authentication == .required or
+                (server.connection == .disconnected and server.authentication != .authenticated)),
+        .logout => server.transport == .http and server.authentication == .authenticated,
+        .remove => server.source == .profile,
+        .trust_approve => server.workspace_admission == .pending,
+        .trust_reject => server.source == .workspace and server.workspace_admission != .rejected,
+        else => true,
+    };
+}
+
+test "MCP sign-in action is available for disconnected remote servers" {
+    const alloc = std.testing.allocator;
+    var server = health.ServerSnapshot{
+        .configured_name = try alloc.dupe(u8, "fixture"),
+        .negotiated_name = null,
+        .negotiated_version = null,
+        .source = .profile,
+        .scope = .profile,
+        .required = false,
+        .transport = .http,
+        .protocol_version = null,
+        .connection = .disconnected,
+        .authentication = .none,
+        .counts = .{},
+        .cache_freshness = .unavailable,
+        .subscription = .unavailable,
+        .runtime_generation = 0,
+        .catalog_generation = 0,
+        .retry_attempt = 0,
+        .retry_in_ms = null,
+        .last_successful_discovery_ms = null,
+        .failure = null,
+    };
+    defer server.deinit(alloc);
+    const cases = [_]struct {
+        connection: health.ConnectionState,
+        authentication: health.AuthenticationState,
+        expected: bool,
+    }{
+        .{ .connection = .disconnected, .authentication = .none, .expected = true },
+        .{ .connection = .disconnected, .authentication = .configured, .expected = true },
+        .{ .connection = .disconnected, .authentication = .required, .expected = true },
+        .{ .connection = .disconnected, .authentication = .authenticated, .expected = false },
+        .{ .connection = .ready, .authentication = .none, .expected = false },
+        .{ .connection = .failed, .authentication = .none, .expected = false },
+        .{ .connection = .failed, .authentication = .required, .expected = true },
+        .{ .connection = .connecting, .authentication = .required, .expected = false },
+        .{ .connection = .disabled, .authentication = .none, .expected = false },
+    };
+    for (cases) |case| {
+        server.connection = case.connection;
+        server.authentication = case.authentication;
+        try std.testing.expectEqual(case.expected, serverActionAvailable(.authenticate, &server));
+    }
+    server.transport = .stdio;
+    server.connection = .disconnected;
+    server.authentication = .required;
+    try std.testing.expect(!serverActionAvailable(.authenticate, &server));
+}
 
 pub const Request = struct {
     generation: u64,
@@ -130,6 +194,18 @@ const Transition = struct {
     effect: ?Effect = null,
 };
 
+test "server selection stays coherent through details navigation" {
+    var state: State = .{};
+    _ = apply(&state, .{ .open = 3 });
+    _ = apply(&state, .show_details);
+    _ = apply(&state, .{ .move = .{ .delta = 1, .item_count = 3, .visible_count = 3 } });
+    try std.testing.expectEqual(@as(usize, 1), state.selected_server_index);
+    _ = apply(&state, .back);
+    try std.testing.expectEqual(state.selected_server_index, state.selected_index);
+    _ = apply(&state, .show_details);
+    try std.testing.expectEqual(@as(usize, 1), state.selected_server_index);
+}
+
 fn reduce(current: State, event: Event) Transition {
     var state = current;
     const effect = apply(&state, event);
@@ -177,7 +253,7 @@ pub fn apply(next: *State, event: Event) ?Effect {
                     next.selected_index - 1;
             }
             clampSelection(next, move.item_count, move.visible_count);
-            if (next.section == .servers and next.screen == .browse) {
+            if (next.section == .servers) {
                 next.selected_server_index = next.selected_index;
             }
             break :blk null;

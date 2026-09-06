@@ -173,6 +173,22 @@ function preserveLegacyFailure(
 }
 
 describe("version-scoped legacy MCP remote transports", () => {
+  for (const version of VERSIONS) {
+    test(`default MCP v1 initializes Streamable HTTP ${version} without probing discovery`, async () => {
+      streamable = startLegacyStreamableHttpFixture(version);
+      const root = createRoot(`default-v1-${version}`, "http", streamable.url);
+      gateway = startToolGateway("Default remote MCP v1 complete.");
+      const result = await runAsk(root, gateway, "Use the MCP tool.");
+      expect(result.code).toBe(0);
+      expect(streamable.initializeCalls).toBe(1);
+      expect(streamable.toolsListCalls).toBe(1);
+      expect(streamable.toolCallCalls).toBe(1);
+      const requests = streamable.requests.filter((entry) => entry.message?.method);
+      expect(requests[0]?.message?.method).toBe("initialize");
+      expect(requests.filter((entry) => entry.message?.method === "server/discover")).toHaveLength(0);
+    }, 30_000);
+  }
+
   for (const sdkDiscoveryError of [
     "uninitialized",
     "unsupported-version",
@@ -183,6 +199,10 @@ describe("version-scoped legacy MCP remote transports", () => {
         sdkDiscoveryError,
       });
       const root = createRoot(`sdk-discovery-${sdkDiscoveryError}`, "http", streamable.url);
+      const profilePath = join(root.home, ".fx", "mcp.json");
+      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+      profile.mcp.fixture.environment = { FX_MCP_PROTOCOL_VERSION: "2026-07-28" };
+      writeFileSync(profilePath, JSON.stringify(profile));
       gateway = startToolGateway("Stock SDK fallback complete.");
 
       const result = await runAsk(root, gateway, "Use the legacy MCP tool.");
@@ -428,7 +448,6 @@ describe("version-scoped legacy MCP remote transports", () => {
         .filter((entry) => entry.message)
         .map((entry) => entry.message!.method);
       expect(messages).toEqual([
-        "server/discover",
         "initialize",
         "notifications/initialized",
         "tools/list",

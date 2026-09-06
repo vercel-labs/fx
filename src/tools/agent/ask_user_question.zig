@@ -424,6 +424,7 @@ test "ask_user_question noninteractive returns sentinel before parsing" {
     defer result.deinit(alloc);
 
     switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .success => |body| try std.testing.expectEqualStrings(not_available_sentinel, body),
         .failure => return error.TestExpectedEqual,
     }

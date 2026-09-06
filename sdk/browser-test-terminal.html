@@ -83,17 +83,17 @@
           streamChunkCount += 1;
           testState.chunks = streamChunkCount;
           if (streamChunkCount === 1) {
-            controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"STREAM_STARTED"}\n'));
+            controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"STREAM_STARTED"}\n\n'));
             return;
           }
           if (streamChunkCount <= 128) {
-            controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"."}\n'));
+            controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"."}\n\n'));
             return;
           }
           await bufferedStreamFinished;
-          controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"STREAM_FINISHED"}\n'));
-          controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":2}}}\n'));
-          controller.enqueue(encoded.encode("data: [DONE]\n"));
+          controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"STREAM_FINISHED"}\n\n'));
+          controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":2}}}\n\n'));
+          controller.enqueue(encoded.encode("data: [DONE]\n\n"));
           controller.close();
           streamSourceClosed = true;
         },

@@ -79,6 +79,7 @@ pub fn subscriptionStateFor(observation: SubscriptionObservation) SubscriptionSt
 
 pub const ServerSnapshot = struct {
     configured_name: []u8,
+    identity_name: ?[]u8 = null,
     negotiated_name: ?[]u8,
     negotiated_version: ?[]u8,
     source: mcp_contract.ConfigSource,
@@ -88,6 +89,7 @@ pub const ServerSnapshot = struct {
     transport: mcp_contract.McpTransport,
     protocol_version: ?[]u8,
     connection: ConnectionState,
+    reloading: bool = false,
     authentication: AuthenticationState,
     counts: CapabilityCounts,
     cache_freshness: CacheFreshness,
@@ -101,13 +103,40 @@ pub const ServerSnapshot = struct {
 
     pub fn deinit(self: *ServerSnapshot, alloc: Allocator) void {
         alloc.free(self.configured_name);
+        if (self.identity_name) |name| alloc.free(name);
         if (self.negotiated_name) |value| alloc.free(value);
         if (self.negotiated_version) |value| alloc.free(value);
         if (self.protocol_version) |value| alloc.free(value);
         if (self.failure) |value| alloc.free(value);
         self.* = undefined;
     }
+
+    /// Borrows the exact configured identity for this snapshot's lifetime.
+    pub fn identity(self: *const ServerSnapshot) []const u8 {
+        return self.identity_name orelse self.configured_name;
+    }
 };
+
+pub fn sameState(a: Snapshot, b: Snapshot) bool {
+    if (a.servers.len != b.servers.len or a.configuration_issues.len != b.configuration_issues.len) return false;
+    for (a.configuration_issues, b.configuration_issues) |left, right| {
+        if (!std.mem.eql(u8, left.message, right.message)) return false;
+    }
+    for (a.servers, b.servers) |left, right| {
+        const left_text = [_]?[]const u8{ left.identity(), left.configured_name, left.negotiated_name, left.negotiated_version, left.protocol_version, left.failure };
+        const right_text = [_]?[]const u8{ right.identity(), right.configured_name, right.negotiated_name, right.negotiated_version, right.protocol_version, right.failure };
+        for (left_text, right_text) |x, y| {
+            if (x) |value| {
+                if (y == null or !std.mem.eql(u8, value, y.?)) return false;
+            } else if (y != null) return false;
+        }
+        if (!std.meta.eql(
+            .{ left.source, left.scope, left.workspace_admission, left.required, left.transport, left.connection, left.reloading, left.authentication, left.counts, left.cache_freshness, left.subscription, left.runtime_generation, left.catalog_generation, left.retry_attempt, left.retry_in_ms, left.last_successful_discovery_ms },
+            .{ right.source, right.scope, right.workspace_admission, right.required, right.transport, right.connection, right.reloading, right.authentication, right.counts, right.cache_freshness, right.subscription, right.runtime_generation, right.catalog_generation, right.retry_attempt, right.retry_in_ms, right.last_successful_discovery_ms },
+        )) return false;
+    }
+    return true;
+}
 
 pub const ConfigurationIssue = struct {
     message: []u8,
@@ -524,6 +553,24 @@ test "compact health summary names pending workspace servers" {
         "Pending approval: docs, db.",
     ) != null);
     try std.testing.expect(std.mem.find(u8, summary, "Pending approval: approved") == null);
+}
+
+test "health equality compares values and ignores capture time" {
+    const alloc = std.testing.allocator;
+    var left = emptyServerSnapshot();
+    left.configured_name = try alloc.dupe(u8, "plain");
+    defer left.deinit(alloc);
+    var right = emptyServerSnapshot();
+    right.configured_name = try alloc.dupe(u8, "plain");
+    defer right.deinit(alloc);
+    const a: Snapshot = .{ .captured_at_ms = 1, .servers = @as(*[1]ServerSnapshot, &left) };
+    const b: Snapshot = .{ .captured_at_ms = 200, .servers = @as(*[1]ServerSnapshot, &right) };
+    try std.testing.expect(sameState(a, b));
+    right.reloading = true;
+    try std.testing.expect(!sameState(a, b));
+    right.reloading = false;
+    right.connection = .failed;
+    try std.testing.expect(!sameState(a, b));
 }
 
 fn emptyServerSnapshot() ServerSnapshot {

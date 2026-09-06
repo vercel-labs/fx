@@ -16,9 +16,34 @@ try {
   while (!addon.coreExited(core) && Date.now() < deadline) {
     await new Promise((resolveWait) => setTimeout(resolveWait, 5));
   }
-  assert.equal(addon.coreExited(core), true, "output backpressure did not stop the native runtime");
-  assert.notEqual(addon.coreExitCode(core), 0, "native output failure must not report a graceful exit");
-  console.log("native exit code passed: output backpressure reports a nonzero runtime status");
+  assert.equal(addon.coreExited(core), false, "queue pressure must pause output rather than stop the runtime");
+  let count = 0;
+  let buffered = "";
+  const drainDeadline = Date.now() + 5000;
+  while (count < 180_000 && Date.now() < drainDeadline) {
+    const chunk = addon.drainCore(core);
+    if (!chunk.length) { await new Promise((resolveWait) => setTimeout(resolveWait, 1)); continue; }
+    buffered += chunk.toString("utf8");
+    const lines = buffered.split("\n");
+    buffered = lines.pop();
+    for (const line of lines) {
+      assert.equal(JSON.parse(line).error.code, -32600);
+      count++;
+    }
+  }
+  assert.equal(count, 180_000, "backpressured output lost replies");
+  addon.closeCore(core);
+  while (!addon.coreExited(core) && Date.now() < drainDeadline) {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 1));
+  }
+  assert.equal(addon.coreExited(core), true);
+  assert.equal(addon.coreExitCode(core), 0);
 } finally {
   addon.destroyCore(core);
 }
+
+const blocked = addon.createCore({ apiKey: "blocked-close-key", home: "/tmp", workspaceRoot: "/tmp" });
+addon.writeCore(blocked, Buffer.from("{}\n".repeat(180_000)));
+await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+addon.destroyCore(blocked);
+console.log("native output passed: lossless backpressure, graceful drain and blocked destruction");

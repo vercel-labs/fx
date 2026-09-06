@@ -85,8 +85,10 @@ jobs:
       - name: Package web artifacts
         run: |
           cp sdk/fx-sdk.js fx-sdk.js
+          cp sdk/core-output.js core-output.js
           cp zig-out/bin/fx-term.wasm fx-term.wasm
           sha256sum fx-sdk.js > fx-sdk.js.sha256
+          sha256sum core-output.js > core-output.js.sha256
           sha256sum fx-term.wasm > fx-term.wasm.sha256
 
       - name: Upload artifact
@@ -96,6 +98,8 @@ jobs:
           path: |
             fx-sdk.js
             fx-sdk.js.sha256
+            core-output.js
+            core-output.js.sha256
             fx-term.wasm
             fx-term.wasm.sha256
 
@@ -146,9 +150,10 @@ jobs:
           set -euo pipefail
 
           sha256sum --check fx-sdk.js.sha256
+          sha256sum --check core-output.js.sha256
           sha256sum --check fx-term.wasm.sha256
 
-          for FILE in fx-sdk.js fx-sdk.js.sha256 fx-term.wasm fx-term.wasm.sha256; do
+          for FILE in fx-sdk.js fx-sdk.js.sha256 core-output.js core-output.js.sha256 fx-term.wasm fx-term.wasm.sha256; do
             CONTENT_TYPE="application/octet-stream"
             [[ "$FILE" == *.js ]] && CONTENT_TYPE="text/javascript"
             [[ "$FILE" == *.wasm ]] && CONTENT_TYPE="application/wasm"

@@ -12,10 +12,18 @@ pub const max_args_len: usize = 1200;
 pub const max_result_len: usize = 2000;
 pub const ring_capacity: usize = 64;
 
+pub const ToolCallOutcome = enum(u8) {
+    succeeded,
+    rejected,
+    command_failed,
+    tool_failed,
+    runtime_failed,
+};
+
 pub const ToolCallMetric = struct {
     started_at_ms: i64 = 0,
     duration_ms: u32 = 0,
-    ok: bool = true,
+    outcome: ToolCallOutcome = .succeeded,
     subagent_id: u64 = 0,
     name_buf: [max_name_len]u8 = [_]u8{0} ** max_name_len,
     name_len: u8 = 0,
@@ -82,7 +90,7 @@ pub const ToolCallRecord = struct {
     name: []const u8,
     arguments_json: []const u8,
     model_output: []const u8,
-    ok: bool,
+    outcome: ToolCallOutcome,
     started_at_ms: i64,
     subagent_id: u64 = 0,
 };
@@ -117,7 +125,7 @@ pub fn recordResult(input: ToolCallRecord) void {
     var metric: ToolCallMetric = .{
         .started_at_ms = input.started_at_ms,
         .duration_ms = @intCast(@min(@as(i64, elapsed), std.math.maxInt(u32))),
-        .ok = input.ok,
+        .outcome = input.outcome,
         .subagent_id = input.subagent_id,
     };
     metric.setName(input.name);
@@ -190,4 +198,23 @@ test "args and result are truncated and total length tracked" {
     try std.testing.expectEqual(@as(u32, huge_len), buf[0].args_total_bytes);
     try std.testing.expectEqual(@as(u16, max_result_len), buf[0].result_len);
     try std.testing.expectEqual(@as(u32, huge_len), buf[0].result_total_bytes);
+}
+
+test "tool call outcome labels remain exact" {
+    const cases = [_]struct {
+        outcome: ToolCallOutcome,
+        label: []const u8,
+        success: bool,
+    }{
+        .{ .outcome = .succeeded, .label = "succeeded", .success = true },
+        .{ .outcome = .rejected, .label = "rejected", .success = false },
+        .{ .outcome = .command_failed, .label = "command_failed", .success = false },
+        .{ .outcome = .tool_failed, .label = "tool_failed", .success = false },
+        .{ .outcome = .runtime_failed, .label = "runtime_failed", .success = false },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqualStrings(case.label, @tagName(case.outcome));
+        try std.testing.expectEqual(case.success, case.outcome == .succeeded);
+    }
+    try std.testing.expectEqual(@as(u8, 0), @intFromEnum(ToolCallOutcome.succeeded));
 }

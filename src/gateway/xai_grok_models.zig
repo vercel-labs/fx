@@ -7,6 +7,8 @@ const io_mod = @import("../core/shared/io.zig");
 const secret = @import("../core/auth/secret.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
+const versions = @import("../core/gateway/provider_versions.zig");
+const version_lookup = @import("provider_versions.zig");
 
 const max_catalog_models: usize = 128;
 const max_model_id_bytes: usize = 256;
@@ -19,6 +21,8 @@ const e2e_modalities_endpoint_env = "FX_E2E_XAI_GROK_MODALITIES_URL";
 
 pub const model_catalog_provider = model_catalog.Provider{
     .fetch_fn = fetchCatalogForProvider,
+    .provider_id = .grok,
+    .refresh_interval_ms = versions.refresh_interval_ms,
 };
 
 pub const cli_model_catalog_provider = gateway_provider.CliModelCatalogProvider{
@@ -58,15 +62,12 @@ fn fetchCatalogForProvider(
     alloc: std.mem.Allocator,
     input: model_catalog.FetchInput,
 ) std.mem.Allocator.Error!model_catalog.ProviderResult {
-    if (input.access.credentialSource() != .grok_subscription) {
+    const request_auth = catalogRequestAuth(input.access) orelse
         return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
-    }
-    const credential = input.access.authorizationCredential() orelse
-        return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
-    const account_id = input.access.accountId() orelse
-        return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
-    if (!grok_session.validAccountId(account_id)) {
-        return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
+    if (request_auth.account_id) |account_id| {
+        if (!grok_session.validAccountId(account_id)) {
+            return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
+        }
     }
     const request_url = modelsUrl(alloc) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -85,11 +86,20 @@ fn fetchCatalogForProvider(
         .clock = .awake,
         .raw = .fromMilliseconds(fetch_timeout_ms),
     });
+    const version = if (request_auth.include_subscription_headers)
+        version_lookup.resolve(alloc, .grok, cancel_flag, deadline) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return .{ .failure = catalogFetchFailure(err) };
+        }
+    else
+        null;
     var response = fetchCatalogResponse(
         alloc,
         request_url,
-        credential,
-        account_id,
+        request_auth.credential,
+        request_auth.account_id,
+        request_auth.include_subscription_headers,
+        version,
         cancel_flag,
         deadline,
     ) catch |err| {
@@ -103,7 +113,9 @@ fn fetchCatalogForProvider(
     var modalities_response = fetchCatalogResponse(
         alloc,
         modalities_url,
-        credential,
+        request_auth.credential,
+        null,
+        false,
         null,
         cancel_flag,
         deadline,
@@ -120,6 +132,28 @@ fn fetchCatalogForProvider(
         return .{ .failure = .{ .category = .malformed_response, .http_status = .ok } };
     };
     return .{ .catalog = catalog };
+}
+
+const CatalogRequestAuth = struct {
+    credential: ?[]const u8 = null,
+    account_id: ?[]const u8 = null,
+    include_subscription_headers: bool = false,
+};
+
+fn catalogRequestAuth(access: credentials.CatalogAccess) ?CatalogRequestAuth {
+    return switch (access) {
+        .host_managed => .{},
+        .public_only => null,
+        .authenticated => |authenticated| if (authenticated.source == .grok_subscription and
+            authenticated.account_id != null)
+            .{
+                .credential = authenticated.credential,
+                .account_id = authenticated.account_id,
+                .include_subscription_headers = true,
+            }
+        else
+            null,
+    };
 }
 
 fn catalogFetchFailure(err: anyerror) model_catalog.Failure {
@@ -141,35 +175,49 @@ const FetchResponse = struct {
 const FetchOperation = struct {
     alloc: std.mem.Allocator,
     url: []const u8,
-    credential: []const u8,
+    credential: ?[]const u8,
     account_id: ?[]const u8,
+    include_subscription_headers: bool,
+    client_version: ?versions.Version = null,
 
     pub fn run(self: *@This()) !FetchResponse {
         var client: std.http.Client = .{ .allocator = self.alloc, .io = io_mod.getIo() };
         defer client.deinit();
-        const auth_header = try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{self.credential});
-        defer secret.zeroAndFree(self.alloc, auth_header);
+        var auth_header: ?[]u8 = null;
+        defer if (auth_header) |value| secret.zeroAndFree(self.alloc, value);
+        var headers: std.http.Client.Request.Headers = .{
+            .user_agent = .{ .override = gateway_client.user_agent },
+            .accept_encoding = .omit,
+        };
+        if (self.credential) |credential| {
+            auth_header = try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{credential});
+            headers.authorization = .{ .override = auth_header.? };
+        }
         const body_buffer = try self.alloc.alloc(u8, max_catalog_bytes + 1);
         defer secret.zeroAndFree(self.alloc, body_buffer);
         var response_writer = std.Io.Writer.fixed(body_buffer);
-        var extra_headers_buffer: [3]std.http.Header = undefined;
+        var extra_headers_buffer: [5]std.http.Header = undefined;
         var extra_headers_len: usize = 0;
         extra_headers_buffer[extra_headers_len] = .{ .name = "accept", .value = "application/json" };
         extra_headers_len += 1;
-        if (self.account_id) |account_id| {
+        if (self.include_subscription_headers) {
             extra_headers_buffer[extra_headers_len] = .{ .name = "X-XAI-Token-Auth", .value = "xai-grok-cli" };
             extra_headers_len += 1;
+        }
+        if (self.account_id) |account_id| {
             extra_headers_buffer[extra_headers_len] = .{ .name = "x-userid", .value = account_id };
+            extra_headers_len += 1;
+        }
+        if (self.client_version) |*version| {
+            extra_headers_buffer[extra_headers_len] = .{ .name = "x-grok-client-version", .value = version.slice() };
+            extra_headers_len += 1;
+            extra_headers_buffer[extra_headers_len] = .{ .name = "x-grok-client-identifier", .value = "fx" };
             extra_headers_len += 1;
         }
         const result = client.fetch(.{
             .location = .{ .url = self.url },
             .method = .GET,
-            .headers = .{
-                .authorization = .{ .override = auth_header },
-                .user_agent = .{ .override = gateway_client.user_agent },
-                .accept_encoding = .omit,
-            },
+            .headers = headers,
             .extra_headers = extra_headers_buffer[0..extra_headers_len],
             .response_writer = &response_writer,
             .redirect_behavior = .unhandled,
@@ -189,8 +237,10 @@ const FetchOperation = struct {
 fn fetchCatalogResponse(
     alloc: std.mem.Allocator,
     url: []const u8,
-    credential: []const u8,
+    credential: ?[]const u8,
     account_id: ?[]const u8,
+    include_subscription_headers: bool,
+    client_version: ?versions.Version,
     cancel_flag: *std.atomic.Value(bool),
     deadline: std.Io.Clock.Timestamp,
 ) !FetchResponse {
@@ -199,6 +249,8 @@ fn fetchCatalogResponse(
         .url = url,
         .credential = credential,
         .account_id = account_id,
+        .include_subscription_headers = include_subscription_headers,
+        .client_version = client_version,
     };
     return gateway_client.runBoundedHttpOperation(
         FetchResponse,
@@ -645,6 +697,13 @@ test "Grok catalog fixture cleanup joins without a client" {
     try std.testing.expect(fixture.failure == null);
 }
 
+test "host-managed Grok catalog auth carries no local headers" {
+    const auth = catalogRequestAuth(.host_managed) orelse return error.TestExpectedHostManagedCatalogAuth;
+    try std.testing.expect(auth.credential == null);
+    try std.testing.expect(auth.account_id == null);
+    try std.testing.expect(!auth.include_subscription_headers);
+}
+
 var stable_catalog_test_environ: ?*std.process.Environ.Map = null;
 
 fn stableCatalogTestEnviron() !*const std.process.Environ.Map {
@@ -675,6 +734,7 @@ const CatalogEndpointEnvironment = struct {
         errdefer self.map.deinit();
         try self.map.put(e2e_models_endpoint_env, models_url);
         try self.map.put(e2e_modalities_endpoint_env, modalities_url);
+        try self.map.put("FX_E2E_GROK_CLIENT_VERSION", "1.0.6");
         io_mod.setEnvironMap(&self.map);
         return self;
     }
@@ -723,6 +783,7 @@ fn fetchCatalogFixture(body: []const u8) !FetchResponse {
         .url = url,
         .credential = "grok-test-token",
         .account_id = "acct_test",
+        .include_subscription_headers = true,
     };
     const result = operation.run();
     fixture.deinit();

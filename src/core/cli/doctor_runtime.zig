@@ -272,14 +272,20 @@ fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator, workspace_
         try appendSessionDiagnosticsTruncatedCheck(checks, alloc, inspection.inspected_count);
     }
 
-    if (try store.readStateSummary(alloc)) |summary_value| {
-        var summary = summary_value;
-        defer summary.deinit(alloc);
-        try appendSessionsCountCheck(checks, alloc, summary.count, summary.latest_id orelse "");
+    var summaries = store.list(alloc) catch {
+        try appendSessionsCountUnavailableCheck(checks, alloc);
         return;
+    };
+    defer {
+        for (summaries.items) |*summary| summary.deinit(alloc);
+        summaries.deinit(alloc);
     }
-
-    try appendSessionsCountUnavailableCheck(checks, alloc);
+    try appendSessionsCountCheck(
+        checks,
+        alloc,
+        summaries.items.len,
+        if (summaries.items.len > 0) summaries.items[0].id else "",
+    );
 }
 
 fn appendSessionDiagnosticsTruncatedCheck(
@@ -681,7 +687,7 @@ fn permissionModeLabel(mode: types.PermissionMode) []const u8 {
     return switch (mode) {
         .ask => "ask",
         .auto => "auto",
-        .yolo => "yolo",
+        .yolo => "full access",
     };
 }
 

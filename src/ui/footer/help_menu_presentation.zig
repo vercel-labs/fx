@@ -332,7 +332,7 @@ test "help menu places descriptions after the widest matching command" {
 test "help menu keeps a four column gutter after command names" {
     const alloc = std.testing.allocator;
     const long_specs = [_]command_specs.SlashSpec{
-        .{ .kind = .permissions, .command = "/permissions", .help_entry = "/permissions [ask|auto|remember|revoke|yolo|reset]", .completion_description = "choose permission behavior", .presentation_category = .security },
+        .{ .kind = .permissions, .command = "/permissions", .help_entry = "/permissions [ask|auto|remember|revoke|full-access|reset]", .completion_description = "choose permission behavior", .presentation_category = .security },
     };
     const projection: render_input.HelpMenuProjection = .{
         .active = true,

@@ -138,7 +138,6 @@ const Summary = struct {
     timed_out: usize = 0,
     denied: usize = 0,
     cancelled: usize = 0,
-    deferred: usize = 0,
     completion_unreported: usize = 0,
     not_executed: usize = 0,
 };
@@ -280,7 +279,7 @@ fn observeTool(summary: *Summary, detail: ?*const ToolDetailRecord) void {
             },
             .denied => summary.denied += 1,
             .cancelled => summary.cancelled += 1,
-            .deferred => summary.deferred += 1,
+            .deferred => {},
         }
     }
 }
@@ -421,7 +420,6 @@ fn formatGroupHeader(
     try appendSegment(&out.writer, summary.failed, "failed");
     try appendSegment(&out.writer, summary.denied, "denied");
     try appendSegment(&out.writer, summary.cancelled, "cancelled");
-    try appendSegment(&out.writer, summary.deferred, "deferred");
 
     const plain = try out.toOwnedSlice();
     defer alloc.free(plain);
@@ -476,10 +474,15 @@ fn formatGroupBlock(
         const detail = detailForEntry(details, detail_indices, entry_id, null);
         if (statusNamesAsk(entry, detail) or focused_entry_id == entry_id) continue;
 
-        const phrase = switch (entry) {
+        const raw_phrase = switch (entry) {
             .raw_bytes => |raw| try normalizeCanonicalStatus(scratch, raw.bytes),
             else => null,
         } orelse if (detail) |record| record.tool_name else "tool activity";
+        const phrase = try reprojectTruncatedCommandPhrase(
+            scratch,
+            raw_phrase,
+            detail,
+        ) orelse raw_phrase;
         static_index += 1;
         const connector = if (!focused_in_group and static_index == static_count) "└" else "├";
         const child = try std.fmt.allocPrint(scratch, "{s} {s}", .{ connector, phrase });
@@ -504,6 +507,19 @@ fn formatGroupBlock(
         terminal.deinit(scratch);
     }
     return out.toOwnedSlice();
+}
+
+fn reprojectTruncatedCommandPhrase(
+    scratch: std.mem.Allocator,
+    phrase: []const u8,
+    detail: ?*const ToolDetailRecord,
+) !?[]const u8 {
+    const record = detail orelse return null;
+    if (!record.isCapturedCommand() or record.outcome != .completed) return null;
+    if (!std.mem.endsWith(u8, phrase, "...")) return null;
+    const command = record.command_display orelse return null;
+    const action = record.command_action_label orelse return null;
+    return try std.fmt.allocPrint(scratch, "{s} {s}", .{ action, command });
 }
 
 fn formatExpandedChild(
@@ -874,6 +890,7 @@ fn buildWithStyleAndStats(
 
     for (entries, 0..) |entry, entry_index| {
         try build_checkpoint.tick(checkpoint);
+        if (mode == .compact and !transcript_blocks.isEntryVisibleInCompactPresentation(entry)) continue;
         const entry_id = toolStatusEntryId(entry) orelse continue;
         const detail = detailForEntry(details, &detail_indices, entry_id, stats);
         if (statusNamesAsk(entry, detail)) continue;
@@ -1025,6 +1042,7 @@ fn buildWithStyleAndStats(
 
         while (index < entries.len) : (index += 1) {
             try build_checkpoint.tick(checkpoint);
+            if (!transcript_blocks.isEntryVisibleInCompactPresentation(entries[index])) continue;
             if (presentation_group_indices[index] != null) break;
             if (toolStatusEntryId(entries[index])) |group_entry_id| {
                 const group_detail = detailForEntry(details, &detail_indices, group_entry_id, stats);
@@ -1162,11 +1180,11 @@ test "small minimal tool groups surface canonical action targets" {
     );
 }
 
-test "minimal tool groups preserve denied and deferred action text" {
+test "minimal tool groups keep instruction refresh neutral and denials visible" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{ .id = 1, .bytes = "⊘ Denied by auto agent zig build\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "↻ Context updated runtime.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "↻ Reading project instructions before continuing: runtime.zig\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("terminal"), .activity_kind = .command, .outcome = .denied },
@@ -1177,11 +1195,28 @@ test "minimal tool groups preserve denied and deferred action text" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 2 tool calls · 1 read · 1 command · 1 denied · 1 deferred\n" ++
+        "● 2 tool calls · 1 read · 1 command · 1 denied\n" ++
             "├ Denied by auto agent zig build\n" ++
-            "└ Context updated runtime.zig",
+            "└ Reading project instructions before continuing: runtime.zig",
         projection.entry_actions.items[0].override.bytes,
     );
+}
+
+test "minimal tool group counts instruction refresh attempts without failure counts" {
+    const alloc = std.testing.allocator;
+    var summary = Summary{};
+    for (0..3) |_| {
+        observeTool(&summary, &.{
+            .entry_id = 1,
+            .tool_name = @constCast("shell"),
+            .activity_kind = .command,
+            .outcome = .deferred,
+        });
+    }
+    const header = try formatGroupHeader(alloc, summary, 120, .{});
+    defer alloc.free(header);
+
+    try std.testing.expectEqualStrings("● 3 tool calls · 3 commands", header);
 }
 
 test "focused tool remains counted but is omitted from stable child rows" {
@@ -1227,6 +1262,121 @@ test "minimal command details expose running completed and failed process states
             "├ Ran zig build\n" ++
             "└ Ran zig build test",
         projection.entry_actions.items[0].override.bytes,
+    );
+}
+
+test "minimal completed command rows reproject stored arguments at the current width" {
+    const alloc = std.testing.allocator;
+    const command = "printf " ++ ("alpha-beta-gamma-delta-" ** 8);
+    const arguments_json = try std.fmt.allocPrint(
+        alloc,
+        "{{\"command\":{f}}}",
+        .{std.json.fmt(command, .{})},
+    );
+    defer alloc.free(arguments_json);
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{
+            .id = 1,
+            .bytes = "● Ran\x1b[0m \x1b[38;5;245mprintf alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-...\x1b[0m\n",
+            .class = .tool_status,
+        } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{
+            .entry_id = 1,
+            .tool_name = @constCast("shell"),
+            .captured_command = true,
+            .activity_kind = .command,
+            .arguments_json = arguments_json,
+            .command_display = @constCast(command),
+            .command_action_label = @constCast("Ran"),
+            .outcome = .completed,
+            .command_process_presentation = .{ .exit_code = 0 },
+        },
+    };
+
+    var narrow = try build(alloc, &entries, &details, 80);
+    defer narrow.deinit(alloc);
+    const narrow_row = narrow.entry_actions.items[0].override.bytes;
+    try std.testing.expect(std.mem.endsWith(u8, narrow_row, "…"));
+    try std.testing.expect(std.mem.find(u8, narrow_row, "alpha-beta-gamma") != null);
+
+    var wide = try build(alloc, &entries, &details, 240);
+    defer wide.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "● 1 tool call · 1 command\n└ Ran " ++ command,
+        wide.entry_actions.items[0].override.bytes,
+    );
+
+    const legacy_details = [_]ToolDetailRecord{
+        .{
+            .entry_id = 1,
+            .tool_name = @constCast("run_command"),
+            .activity_kind = .command,
+            .outcome = .completed,
+        },
+    };
+    var legacy = try build(alloc, &entries, &legacy_details, 240);
+    defer legacy.deinit(alloc);
+    try std.testing.expect(std.mem.endsWith(u8, legacy.entry_actions.items[0].override.bytes, "..."));
+
+    const relative_command = "cd ./packages/cli && " ++ ("printf relative-path " ** 6);
+    const relative_arguments_json = try std.fmt.allocPrint(
+        alloc,
+        "{{\"command\":{f}}}",
+        .{std.json.fmt(relative_command, .{})},
+    );
+    defer alloc.free(relative_arguments_json);
+    const relative_entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{
+            .id = 1,
+            .bytes = "● Ran cd ./packages/cli && printf relative-path printf relative-path printf relative-path printf relative-path printf relative-path pri...\n",
+            .class = .tool_status,
+        } },
+    };
+    const relative_details = [_]ToolDetailRecord{
+        .{
+            .entry_id = 1,
+            .tool_name = @constCast("shell"),
+            .captured_command = true,
+            .activity_kind = .command,
+            .arguments_json = relative_arguments_json,
+            .command_display = @constCast(relative_command),
+            .command_action_label = @constCast("Ran"),
+            .outcome = .completed,
+            .command_process_presentation = .{ .exit_code = 0 },
+        },
+    };
+    var relative = try build(alloc, &relative_entries, &relative_details, 240);
+    defer relative.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "● 1 tool call · 1 command\n└ Ran " ++ relative_command,
+        relative.entry_actions.items[0].override.bytes,
+    );
+
+    const compatibility_entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{
+            .id = 1,
+            .bytes = "● Installed skill printf alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-...\n",
+            .class = .tool_status,
+        } },
+    };
+    const compatibility_details = [_]ToolDetailRecord{.{
+        .entry_id = 1,
+        .tool_name = @constCast("shell"),
+        .captured_command = true,
+        .activity_kind = .command,
+        .arguments_json = arguments_json,
+        .command_display = @constCast(command),
+        .command_action_label = @constCast("Installed skill"),
+        .outcome = .completed,
+        .command_process_presentation = .{ .exit_code = 0 },
+    }};
+    var compatibility = try build(alloc, &compatibility_entries, &compatibility_details, 240);
+    defer compatibility.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "● 1 tool call · 1 command\n└ Installed skill " ++ command,
+        compatibility.entry_actions.items[0].override.bytes,
     );
 }
 

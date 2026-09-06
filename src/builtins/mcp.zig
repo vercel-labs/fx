@@ -137,8 +137,8 @@ fn handleCommand(alloc: Allocator, rest: []const u8, command_request: CommandReq
         return lineLiteral(alloc, "Usage: /mcp trust approve|reject <server> | approve-all | reset", false);
     }
 
-    if (std.mem.startsWith(u8, trimmed, "auth ")) {
-        var tokens = std.mem.tokenizeAny(u8, trimmed[5..], " \t");
+    if (std.mem.eql(u8, trimmed, "auth") or std.mem.startsWith(u8, trimmed, "auth ")) {
+        var tokens = std.mem.tokenizeAny(u8, trimmed[4..], " \t");
         const name = tokens.next() orelse
             return lineLiteral(alloc, "Usage: /mcp auth <name> [--open]", false);
         const confirmation = tokens.next();
@@ -251,20 +251,20 @@ fn handleCommand(alloc: Allocator, rest: []const u8, command_request: CommandReq
                 );
             return .{
                 .display = .{ .line = text },
-                .reload = !result.local_only,
+                .reload = false,
             };
         }
         if (result.revocation_failed) {
             return lineParts(
                 alloc,
                 &.{ "Logged out of MCP server '", name, "' locally; remote revocation failed." },
-                !result.local_only,
+                false,
             );
         }
         return lineParts(
             alloc,
             &.{ "Logged out of MCP server '", name, "'." },
-            !result.local_only,
+            false,
         );
     }
 
@@ -1100,6 +1100,11 @@ fn renderConfigJson(alloc: Allocator, configs: []const McpServerConfig) ![]u8 {
                 }
                 try out.writer.writeByte(']');
             }
+            if (auth.callback_port) |port| {
+                if (!first_auth) try out.writer.writeByte(',');
+                first_auth = false;
+                try out.writer.print("\"callback_port\":{d}", .{port});
+            }
             try out.writer.writeByte('}');
         }
         if (config.env.len > 0) {
@@ -1485,7 +1490,7 @@ test "built-in MCP runtime loads disabled configured servers without spawning" {
     runtime.connectAll(builtin_tools.registry);
 
     try std.testing.expectEqual(@as(usize, 1), runtime.servers.items.len);
-    try std.testing.expectEqual(mcp_runtime.ServerState.disabled, runtime.servers.items[0].state);
+    try std.testing.expectEqual(mcp_runtime.ServerState.disabled, runtime.servers.items[0].state.load(.acquire));
     try std.testing.expectEqualStrings("noop", runtime.servers.items[0].config.name);
 }
 
@@ -1510,7 +1515,7 @@ test "built-in MCP runtime loading leaves enabled servers disconnected" {
     }
 
     try std.testing.expectEqual(@as(usize, 1), runtime.servers.items.len);
-    try std.testing.expectEqual(mcp_runtime.ServerState.disconnected, runtime.servers.items[0].state);
+    try std.testing.expectEqual(mcp_runtime.ServerState.disconnected, runtime.servers.items[0].state.load(.acquire));
 }
 
 test "built-in MCP runtime config transfer cleans its unvisited suffix on append failure" {
@@ -1582,7 +1587,7 @@ test "built-in MCP runtime reserves active registry names" {
     runtime.connectAll(builtin_tools.registry);
 
     try std.testing.expectEqual(@as(usize, 1), runtime.servers.items.len);
-    try std.testing.expectEqual(mcp_runtime.ServerState.ready, runtime.servers.items[0].state);
+    try std.testing.expectEqual(mcp_runtime.ServerState.ready, runtime.servers.items[0].state.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), runtime.servers.items[0].tool_catalog.tools.items.len);
     try std.testing.expectEqualStrings("mcp_select_tool_2", runtime.servers.items[0].tool_catalog.tools.items[0].prefixed_name);
 }
@@ -2022,7 +2027,7 @@ test "MCP auth requires explicit browser confirmation and logout stays non-secre
 
     var logged_out = try handleCommand(alloc, "logout remote", command_request);
     defer logged_out.deinit(alloc);
-    try expectLine(logged_out, "Logged out of MCP server 'remote'.", true);
+    try expectLine(logged_out, "Logged out of MCP server 'remote'.", false);
     try std.testing.expectEqual(@as(usize, 2), fixture.logout_calls);
 
     fixture.logout_repaired_entries = 2;
@@ -2031,7 +2036,7 @@ test "MCP auth requires explicit browser confirmation and logout stays non-secre
     try expectLine(
         repaired,
         "Logged out of MCP server 'remote'. Removed 2 unreadable MCP credential entries.",
-        true,
+        false,
     );
 }
 
@@ -2212,6 +2217,40 @@ test "remote config keeps credential references and OAuth policy without secrets
     try std.testing.expectEqualStrings("fx-client", auth.client_id.?);
     try std.testing.expectEqualStrings("MCP_CLIENT_SECRET", auth.client_secret_env.?);
     try std.testing.expectEqual(@as(usize, 2), auth.scopes.len);
+    try std.testing.expectEqual(@as(?u16, null), auth.callback_port);
+}
+
+test "remote config keeps a pinned OAuth callback port" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"mcp":{"slack":{"type":"http","url":"https://mcp.slack.com/mcp","oauth":{"client_id":"fx-client","callback_port":3118}}}}
+    ;
+    var configs = try loadConfigFromJson(alloc, json);
+    defer freeConfigs(alloc, &configs);
+
+    try std.testing.expectEqual(@as(usize, 1), configs.items.len);
+    const auth = configs.items[0].auth.?;
+    try std.testing.expectEqualStrings("fx-client", auth.client_id.?);
+    try std.testing.expectEqual(@as(?u16, 3118), auth.callback_port);
+}
+
+test "profile config rejects out-of-range OAuth callback ports" {
+    const cases = [_][]const u8{
+        \\{"mcp":{"api":{"type":"http","url":"https://api.example.com/mcp","oauth":{"callback_port":null}}}}
+        ,
+        \\{"mcp":{"api":{"type":"http","url":"https://api.example.com/mcp","oauth":{"callback_port":0}}}}
+        ,
+        \\{"mcp":{"api":{"type":"http","url":"https://api.example.com/mcp","oauth":{"callback_port":65536}}}}
+        ,
+        \\{"mcp":{"api":{"type":"http","url":"https://api.example.com/mcp","oauth":{"callback_port":"3118"}}}}
+        ,
+    };
+    for (cases) |json| {
+        try std.testing.expectError(
+            error.McpConfigInvalidOAuth,
+            loadConfigFromJson(std.testing.allocator, json),
+        );
+    }
 }
 
 test "profile config rejects a mixed set containing invalid client metadata URLs" {

@@ -88,6 +88,30 @@ pub fn writeEncoded(
     );
 }
 
+pub fn load(
+    alloc: Allocator,
+    session_dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+) !?session_usage.Snapshot {
+    var captured = try capture(alloc, session_dir);
+    defer captured.deinit(alloc);
+    const bytes = switch (captured) {
+        .missing => return null,
+        .invalid => return error.InvalidUsageSidecar,
+        .encoded => |value| value,
+    };
+    var decoded = try decode(alloc, bytes);
+    var decoded_owned = true;
+    defer if (decoded_owned) decoded.deinit(alloc);
+    if (!std.mem.eql(u8, decoded.session_id, session_id)) {
+        return error.UsageSidecarSessionMismatch;
+    }
+    const snapshot = decoded.snapshot;
+    alloc.free(decoded.session_id);
+    decoded_owned = false;
+    return snapshot;
+}
+
 pub fn capture(
     alloc: Allocator,
     session_dir: *io_mod.VerifiedDir,

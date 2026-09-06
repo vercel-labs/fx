@@ -64,6 +64,7 @@ export function startLegacyStreamableHttpFixture(
   let initializeCalls = 0;
   let resumeCalls = 0;
   let toolCallCalls = 0;
+  let resumableCallId: string | number | undefined;
   let toolsListCalls = 0;
   let resourcesListCalls = 0;
   let resourceReadCalls = 0;
@@ -248,7 +249,7 @@ export function startLegacyStreamableHttpFixture(
         return sseResponse([
           {
             id: `resume-${resumeCalls}`,
-            data: toolCallResponse(4, "resumed"),
+            data: toolCallResponse(resumableCallId!, "resumed"),
           },
         ], true);
       }
@@ -527,6 +528,7 @@ export function startLegacyStreamableHttpFixture(
           }]);
         }
         if (mode === "resume") {
+          resumableCallId = message!.id;
           return sseResponse([
             {
               id: "call-event-1",

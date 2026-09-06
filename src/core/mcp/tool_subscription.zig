@@ -6,7 +6,7 @@ const build_options = @import("build_options");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const elicitation = @import("elicitation.zig");
-const feature_cache = @import("feature_cache.zig");
+const catalog_freshness = @import("catalog_freshness.zig");
 const legacy_http_sse = @import("legacy_http_sse.zig");
 const legacy_streamable_http = @import("legacy_streamable_http.zig");
 const mcp_contract = @import("mcp_contract.zig");
@@ -126,7 +126,7 @@ pub const State = struct {
     pub fn createStdio(
         owner_allocator: Allocator,
         dispatcher: *stdio_dispatcher.StdioDispatcher,
-        protocol: feature_cache.Protocol,
+        protocol: catalog_freshness.Protocol,
         connection_generation: u64,
         request_id: u64,
         subscription_generation: u64,
@@ -175,7 +175,7 @@ pub const State = struct {
     fn createStdioCommon(
         owner_allocator: Allocator,
         dispatcher: *stdio_dispatcher.StdioDispatcher,
-        protocol: feature_cache.Protocol,
+        protocol: catalog_freshness.Protocol,
         connection_generation: u64,
         request_id: u64,
         subscription_generation: u64,
@@ -474,7 +474,7 @@ pub const State = struct {
         self.commit_lock.unlock(io_mod.getIo());
     }
 
-    pub fn identity(self: *const State) feature_cache.SubscriptionIdentity {
+    pub fn identity(self: *const State) catalog_freshness.SubscriptionIdentity {
         return .{
             .request_id = self.active_request_id.load(.acquire),
             .generation = self.active_generation.load(.acquire),
@@ -562,7 +562,7 @@ pub const State = struct {
         var first_attempt = true;
         while (!self.cancel_flag.load(.acquire)) {
             if (!first_attempt) {
-                const delay_ms = feature_cache.retryDelayMs(retry_attempt);
+                const delay_ms = catalog_freshness.retryDelayMs(retry_attempt);
                 if (!waitForRetry(self, delay_ms)) return;
                 retry_attempt +|= 1;
                 saturatingIncrement(&self.active_generation);
@@ -770,12 +770,12 @@ fn notificationCallback(raw: *anyopaque, value: std.json.Value) void {
         );
         return;
     };
-    const protocol: feature_cache.Protocol = switch (self.transport) {
+    const protocol: catalog_freshness.Protocol = switch (self.transport) {
         .legacy_stdio, .legacy_http, .legacy_sse => .legacy,
         .modern_stdio, .modern_http => .modern,
     };
     const identity = self.identity();
-    const decision = feature_cache.classifyNotification(.{
+    const decision = classifyNotification(.{
         .protocol = protocol,
         .capability_advertised = true,
         .connection_generation = self.connection_generation,
@@ -797,7 +797,7 @@ fn notificationCallback(raw: *anyopaque, value: std.json.Value) void {
             self.commit_lock.lockUncancelable(io_mod.getIo());
             defer self.commit_lock.unlock(io_mod.getIo());
             saturatingIncrement(&self.notifications_seen);
-            const coalesce = feature_cache.decideCoalesce(
+            const coalesce = decideCoalesce(
                 notificationInvalidationPending(self, notification.kind),
                 decision,
             );
@@ -846,7 +846,7 @@ fn notificationCallback(raw: *anyopaque, value: std.json.Value) void {
 
 fn notificationInvalidationPending(
     self: *const State,
-    kind: feature_cache.NotificationKind,
+    kind: NotificationKind,
 ) bool {
     return switch (kind) {
         .tools_list_changed => self.hasInvalidation(),
@@ -863,7 +863,7 @@ fn notificationInvalidationPending(
 fn parseNotification(
     value: std.json.Value,
     filters: Filters,
-) ?feature_cache.Notification {
+) ?Notification {
     if (value != .object) return null;
     const jsonrpc = value.object.get("jsonrpc") orelse return null;
     if (jsonrpc != .string or !std.mem.eql(u8, jsonrpc.string, "2.0")) return null;
@@ -1113,7 +1113,7 @@ test "subscription parser retains official acknowledgement and change identities
     defer acknowledged.deinit();
     const filters = Filters{ .tools_list_changed = true };
     const ack = parseNotification(acknowledged.value, filters).?;
-    try std.testing.expectEqual(feature_cache.NotificationKind.subscription_acknowledged, ack.kind);
+    try std.testing.expectEqual(NotificationKind.subscription_acknowledged, ack.kind);
     try std.testing.expectEqual(@as(?u64, 7), ack.subscription_id);
 
     var changed = try std.json.parseFromSlice(
@@ -1124,7 +1124,7 @@ test "subscription parser retains official acknowledgement and change identities
     );
     defer changed.deinit();
     const event = parseNotification(changed.value, filters).?;
-    try std.testing.expectEqual(feature_cache.NotificationKind.tools_list_changed, event.kind);
+    try std.testing.expectEqual(NotificationKind.tools_list_changed, event.kind);
     try std.testing.expectEqual(@as(?u64, 7), event.subscription_id);
 }
 
@@ -1151,7 +1151,7 @@ test "subscription request and parser support the complete modern filter set" {
     );
     defer acknowledged.deinit();
     try std.testing.expectEqual(
-        feature_cache.NotificationKind.subscription_acknowledged,
+        NotificationKind.subscription_acknowledged,
         parseNotification(acknowledged.value, filters).?.kind,
     );
 
@@ -1163,7 +1163,7 @@ test "subscription request and parser support the complete modern filter set" {
     );
     defer updated.deinit();
     const event = parseNotification(updated.value, filters).?;
-    try std.testing.expectEqual(feature_cache.NotificationKind.resource_updated, event.kind);
+    try std.testing.expectEqual(NotificationKind.resource_updated, event.kind);
     try std.testing.expectEqualStrings("custom://one", event.resource_uri.?);
 }
 
@@ -1179,7 +1179,7 @@ test "subscription acknowledgement fails closed without an exclusive Tools grant
     const filters = Filters{ .tools_list_changed = true };
     const parsed = parseNotification(unsupported.value, filters).?;
     try std.testing.expectEqual(
-        feature_cache.NotificationKind.subscription_filter_unsupported,
+        NotificationKind.subscription_filter_unsupported,
         parsed.kind,
     );
     try std.testing.expectEqual(@as(?u64, 7), parsed.subscription_id);
@@ -1193,7 +1193,7 @@ test "subscription acknowledgement fails closed without an exclusive Tools grant
     defer unrequested.deinit();
     const unexpected = parseNotification(unrequested.value, filters).?;
     try std.testing.expectEqual(
-        feature_cache.NotificationKind.subscription_filter_unsupported,
+        NotificationKind.subscription_filter_unsupported,
         unexpected.kind,
     );
     try std.testing.expectEqual(@as(?u64, 7), unexpected.subscription_id);
@@ -1206,7 +1206,7 @@ test "subscription acknowledgement fails closed without an exclusive Tools grant
     );
     defer false_tools.deinit();
     try std.testing.expectEqual(
-        feature_cache.NotificationKind.subscription_filter_unsupported,
+        NotificationKind.subscription_filter_unsupported,
         parseNotification(false_tools.value, filters).?.kind,
     );
 }
@@ -1386,4 +1386,207 @@ test "modern stdio readiness connection failure joins the listener and clears at
     create_thread.join();
     create_joined = true;
     try expectFailedStdioCreateCleanedUp(dispatcher, attempt, error.McpConnectionClosed);
+}
+
+const NotificationKind = enum {
+    subscription_acknowledged,
+    subscription_filter_unsupported,
+    tools_list_changed,
+    resources_list_changed,
+    resource_updated,
+    prompts_list_changed,
+    subscription_cancelled,
+    other,
+};
+
+const Notification = struct {
+    kind: NotificationKind,
+    subscription_id: ?u64 = null,
+    cancelled_request_id: ?u64 = null,
+    resource_uri: ?[]const u8 = null,
+};
+
+const SubscriptionExpectation = struct {
+    protocol: catalog_freshness.Protocol,
+    capability_advertised: bool,
+    connection_generation: u64,
+    event_connection_generation: u64,
+    subscription: ?catalog_freshness.SubscriptionIdentity,
+    acknowledged: bool,
+};
+
+const NotificationDecision = enum {
+    acknowledge,
+    invalidate,
+    close_subscription,
+    close_unsupported,
+    ignore_unadvertised,
+    ignore_malformed,
+    ignore_duplicate,
+    ignore_late_generation,
+    ignore_unrelated,
+};
+
+fn classifyNotification(
+    expectation: SubscriptionExpectation,
+    notification: Notification,
+) NotificationDecision {
+    if (!expectation.capability_advertised) return .ignore_unadvertised;
+    if (expectation.connection_generation != expectation.event_connection_generation) {
+        return .ignore_late_generation;
+    }
+    if (expectation.protocol == .legacy) {
+        return switch (notification.kind) {
+            .tools_list_changed,
+            .resources_list_changed,
+            .resource_updated,
+            .prompts_list_changed,
+            => .invalidate,
+            else => .ignore_unrelated,
+        };
+    }
+
+    const subscription = expectation.subscription orelse return .ignore_late_generation;
+    return switch (notification.kind) {
+        .subscription_acknowledged => {
+            const subscription_id = notification.subscription_id orelse
+                return .ignore_malformed;
+            if (subscription_id != subscription.request_id) return .ignore_late_generation;
+            if (expectation.acknowledged) return .ignore_duplicate;
+            return .acknowledge;
+        },
+        .subscription_filter_unsupported => {
+            const subscription_id = notification.subscription_id orelse
+                return .ignore_malformed;
+            if (subscription_id != subscription.request_id) return .ignore_late_generation;
+            if (expectation.acknowledged) return .ignore_duplicate;
+            return .close_unsupported;
+        },
+        .tools_list_changed,
+        .resources_list_changed,
+        .resource_updated,
+        .prompts_list_changed,
+        => {
+            const subscription_id = notification.subscription_id orelse
+                return .ignore_malformed;
+            if (subscription_id != subscription.request_id) return .ignore_late_generation;
+            if (!expectation.acknowledged) return .ignore_late_generation;
+            return .invalidate;
+        },
+        .subscription_cancelled => {
+            const request_id = notification.cancelled_request_id orelse
+                return .ignore_malformed;
+            return if (request_id == subscription.request_id)
+                .close_subscription
+            else
+                .ignore_late_generation;
+        },
+        .other => .ignore_unrelated,
+    };
+}
+
+const CoalesceDecision = enum {
+    enqueue,
+    already_pending,
+    ignore,
+};
+
+fn decideCoalesce(pending: bool, notification: NotificationDecision) CoalesceDecision {
+    if (notification != .invalidate) return .ignore;
+    return if (pending) .already_pending else .enqueue;
+}
+
+test "duplicate notifications are idempotent" {
+    const subscription = catalog_freshness.SubscriptionIdentity{ .request_id = 17, .generation = 3 };
+    const notification = Notification{
+        .kind = .tools_list_changed,
+        .subscription_id = 17,
+    };
+    const expectation = SubscriptionExpectation{
+        .protocol = .modern,
+        .capability_advertised = true,
+        .connection_generation = 4,
+        .event_connection_generation = 4,
+        .subscription = subscription,
+        .acknowledged = true,
+    };
+    const classified = classifyNotification(expectation, notification);
+    try std.testing.expectEqual(NotificationDecision.invalidate, classified);
+    try std.testing.expectEqual(CoalesceDecision.enqueue, decideCoalesce(false, classified));
+    try std.testing.expectEqual(CoalesceDecision.already_pending, decideCoalesce(true, classified));
+}
+
+test "modern notification classification rejects malformed late and duplicate events" {
+    const subscription = catalog_freshness.SubscriptionIdentity{ .request_id = 8, .generation = 2 };
+    const base = SubscriptionExpectation{
+        .protocol = .modern,
+        .capability_advertised = true,
+        .connection_generation = 5,
+        .event_connection_generation = 5,
+        .subscription = subscription,
+        .acknowledged = false,
+    };
+    try std.testing.expectEqual(
+        NotificationDecision.ignore_malformed,
+        classifyNotification(base, .{ .kind = .subscription_acknowledged }),
+    );
+    try std.testing.expectEqual(
+        NotificationDecision.ignore_late_generation,
+        classifyNotification(base, .{
+            .kind = .subscription_acknowledged,
+            .subscription_id = 9,
+        }),
+    );
+    try std.testing.expectEqual(
+        NotificationDecision.acknowledge,
+        classifyNotification(base, .{
+            .kind = .subscription_acknowledged,
+            .subscription_id = 8,
+        }),
+    );
+    var acknowledged = base;
+    acknowledged.acknowledged = true;
+    try std.testing.expectEqual(
+        NotificationDecision.ignore_duplicate,
+        classifyNotification(acknowledged, .{
+            .kind = .subscription_acknowledged,
+            .subscription_id = 8,
+        }),
+    );
+    var late = acknowledged;
+    late.event_connection_generation = 4;
+    try std.testing.expectEqual(
+        NotificationDecision.ignore_late_generation,
+        classifyNotification(late, .{
+            .kind = .tools_list_changed,
+            .subscription_id = 8,
+        }),
+    );
+    try std.testing.expectEqual(
+        NotificationDecision.close_subscription,
+        classifyNotification(acknowledged, .{
+            .kind = .subscription_cancelled,
+            .cancelled_request_id = 8,
+        }),
+    );
+    try std.testing.expectEqual(
+        NotificationDecision.close_unsupported,
+        classifyNotification(base, .{
+            .kind = .subscription_filter_unsupported,
+            .subscription_id = 8,
+        }),
+    );
+    try std.testing.expectEqual(
+        NotificationDecision.ignore_malformed,
+        classifyNotification(base, .{
+            .kind = .subscription_filter_unsupported,
+        }),
+    );
+    try std.testing.expectEqual(
+        NotificationDecision.ignore_late_generation,
+        classifyNotification(acknowledged, .{
+            .kind = .subscription_cancelled,
+            .cancelled_request_id = 7,
+        }),
+    );
 }

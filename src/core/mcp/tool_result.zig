@@ -8,6 +8,9 @@ const mrtr = @import("mrtr.zig");
 const protocol_negotiation = @import("protocol_negotiation.zig");
 const tools_feature = @import("features/tools.zig");
 
+const tool_content = @import("../tooling/tool_content.zig");
+const image_data = @import("../images/image_data.zig");
+const types = @import("../shared/types.zig");
 const Allocator = std.mem.Allocator;
 
 pub const ExtractOptions = struct {
@@ -28,7 +31,7 @@ pub fn extract(alloc: Allocator, options: ExtractOptions) !tool_mcp_runtime.Call
         options.response,
         options.protocol,
         options.output_schema_json,
-        options.max_tool_result_bytes,
+        @max(options.max_tool_result_bytes, image_data.max_result_frame_bytes),
         .{},
     ) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -58,7 +61,14 @@ pub fn extract(alloc: Allocator, options: ExtractOptions) !tool_mcp_runtime.Call
                 .{ .parse_numbers = false },
             ) catch return error.McpInvalidJson;
             defer parsed.deinit();
+            var images: []types.ToolImage = &.{};
+            errdefer types.freeToolImages(alloc, images);
+            if (parsed.value.object.getPtr("content")) |content| {
+                if (content.* == .array) images = try image_data.parseToolImages(alloc, content.array.items);
+                try tool_content.projectMediaForText(parsed.arena.allocator(), content);
+            }
             break :blk .{
+                .images = images,
                 .model_output = try serialize_capped(
                     alloc,
                     options.server_name,
@@ -498,7 +508,7 @@ fn extract_legacy(alloc: Allocator, response: []const u8) !tool_mcp_runtime.Call
 test "tool result extracts all content" {
     const alloc = std.testing.allocator;
     const response =
-        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"hello "},{"type":"image","data":"AA==","mimeType":"image/png"},{"type":"text","text":"world"}]}}
+        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"hello "},{"type":"image","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=","mimeType":"image/png"},{"type":"text","text":"world"}]}}
     ;
     var result = try extract_legacy(alloc, response);
     defer result.deinit(alloc);
@@ -516,7 +526,10 @@ test "tool result extracts all content" {
     );
     const content = parsed.value.object.get("result").?.object.get("content").?.array.items;
     try std.testing.expectEqualStrings("hello ", content[0].object.get("text").?.string);
-    try std.testing.expectEqualStrings("AA==", content[1].object.get("data").?.string);
+    try std.testing.expect(content[1].object.get("data") == null);
+    try std.testing.expectEqual(@as(usize, 1), result.images.len);
+    try std.testing.expectEqualStrings("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=", result.images[0].data);
+    try std.testing.expectEqualStrings("image/png", result.images[0].mime_type);
     try std.testing.expectEqualStrings("world", content[2].object.get("text").?.string);
 }
 

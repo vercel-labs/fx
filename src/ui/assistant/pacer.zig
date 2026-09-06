@@ -406,14 +406,11 @@ fn makeAssistantTurn(alloc: Allocator) !HistoryTurn {
     } };
 }
 
-fn makeBackgroundTurn(alloc: Allocator) !HistoryTurn {
-    return .{ .background_command = .{
-        .user = .{
-            .text = try alloc.dupe(u8, "u"),
-            .images = &.{},
-        },
-        .log_path = try alloc.dupe(u8, "/tmp/fx-background.log"),
-        .expect_url = false,
+fn makeCompactedTurn(alloc: Allocator) !HistoryTurn {
+    return .{ .compacted_summary = .{
+        .summary = try alloc.dupe(u8, "summary"),
+        .removed_turn_count = 1,
+        .compaction_count = 1,
     } };
 }
 
@@ -726,7 +723,7 @@ test "completed assistant summary is the only deferred presentation tail" {
         var pacer = AssistantPacer{};
         defer pacer.deinit(alloc);
         try pacer.enqueue(alloc, "tail");
-        const turn = try makeBackgroundTurn(alloc);
+        const turn = try makeCompactedTurn(alloc);
         defer types.freeHistoryTurn(alloc, turn);
         try std.testing.expect(try pacer.deferFinish(alloc, .{
             .turn = turn,

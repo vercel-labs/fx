@@ -772,10 +772,10 @@ fn formatDirectResult(
     stderr_bytes: usize,
     duration_ms: u64,
 ) !command_contract.RunCommandResult {
-    return command_contract.formatForegroundCommandResult(alloc, .{
+    return command_contract.formatCommandResult(alloc, .{
         .command = plan.command,
         .cwd = plan.cwd,
-        .status = foregroundCommandStatusFromTerm(term),
+        .status = commandStatusFromTerm(term),
         .stdout_display = stdout_projected,
         .stderr_display = stderr_projected,
         .stdout_bytes = stdout_bytes,
@@ -784,7 +784,7 @@ fn formatDirectResult(
     });
 }
 
-fn foregroundCommandStatusFromTerm(term: std.process.Child.Term) command_contract.ForegroundCommandStatus {
+fn commandStatusFromTerm(term: std.process.Child.Term) command_contract.CommandStatus {
     return switch (term) {
         .exited => |code| .{ .exit_code = @intCast(code) },
         .signal => |sig| .{ .signal = @intFromEnum(sig) },
@@ -952,7 +952,7 @@ test "direct executor runs fixed argv with sanitized environment and no artifact
     try std.testing.expect(std.mem.find(u8, result.output, "LC_ALL=C") != null);
     try std.testing.expect(std.mem.find(u8, result.output, "LANG=C") != null);
     try std.testing.expect(std.mem.find(u8, result.output, "HOME=") == null);
-    try std.testing.expectEqual(@as(?[]const u8, null), result.command_result.?.foreground.output_file);
+    try std.testing.expectEqual(@as(?[]const u8, null), result.command_result.?.output_file);
 }
 
 test "git direct profile removes ambient authority and disables optional mutation" {
@@ -988,7 +988,7 @@ test "direct executor runs a supported pipeline and reports final output" {
     defer std.testing.allocator.free(result.output);
 
     try std.testing.expect(std.mem.find(u8, result.output, "<stdout>\n1\n</stdout>") != null);
-    const foreground = result.command_result.?.foreground;
+    const foreground = result.command_result.?;
     try std.testing.expectEqualStrings("printf x | wc -c", foreground.command);
     try std.testing.expectEqual(@as(?i64, 0), foreground.exit_code);
     const expected_stdout_bytes: usize = if (builtin.os.tag == .linux) 2 else 9;
@@ -1089,15 +1089,15 @@ test "direct executor enforces canonical capacity with native large ls output" {
         defer alloc.free(result.output);
         try std.testing.expectEqual(
             case.expected_bytes,
-            result.command_result.?.foreground.stdout_bytes,
+            result.command_result.?.stdout_bytes,
         );
         try std.testing.expectEqualStrings(
             case.command,
-            result.command_result.?.foreground.command,
+            result.command_result.?.command,
         );
         try std.testing.expectEqual(
             @as(?[]const u8, null),
-            result.command_result.?.foreground.output_file,
+            result.command_result.?.output_file,
         );
     }
 
@@ -1139,8 +1139,8 @@ test "direct executor admits exact output limit and rejects limit plus one witho
         .max_command_output_bytes = 1,
     }, std.testing.allocator, injectedPlan("/tmp", &exact_stages), 8);
     defer std.testing.allocator.free(exact.output);
-    try std.testing.expectEqual(@as(usize, 8), exact.command_result.?.foreground.stdout_bytes);
-    try std.testing.expectEqual(@as(?[]const u8, null), exact.command_result.?.foreground.output_file);
+    try std.testing.expectEqual(@as(usize, 8), exact.command_result.?.stdout_bytes);
+    try std.testing.expectEqual(@as(?[]const u8, null), exact.command_result.?.output_file);
 
     const over_argv = [_][]const u8{ "/usr/bin/printf", "123456789" };
     const over_stages = [_]command_effect.DirectStage{.{
@@ -1174,11 +1174,11 @@ test "direct executor canonical limit covers stderr and counted pipeline relays"
     defer std.testing.allocator.free(exact_stderr.output);
     try std.testing.expectEqual(
         direct_output_limit_bytes,
-        exact_stderr.command_result.?.foreground.stderr_bytes,
+        exact_stderr.command_result.?.stderr_bytes,
     );
     try std.testing.expectEqual(
         @as(?[]const u8, null),
-        exact_stderr.command_result.?.foreground.stderr_file,
+        exact_stderr.command_result.?.stderr_file,
     );
 
     const over_stderr_argv = [_][]const u8{
@@ -1221,7 +1221,7 @@ test "direct executor canonical limit covers stderr and counted pipeline relays"
     defer std.testing.allocator.free(exact_relay.output);
     try std.testing.expectEqual(
         exact_relay_bytes,
-        exact_relay.command_result.?.foreground.stdout_bytes,
+        exact_relay.command_result.?.stdout_bytes,
     );
 
     const over_data = try std.testing.allocator.alloc(u8, exact_relay_bytes + 1);
@@ -1288,8 +1288,8 @@ test "direct executor enforces one budget across concurrent stdout and stderr" {
         .max_command_output_bytes = 1_000_000,
     }, std.testing.allocator, injectedPlan("/tmp", &exact_stages), 16);
     defer std.testing.allocator.free(exact.output);
-    try std.testing.expectEqual(@as(usize, 8), exact.command_result.?.foreground.stdout_bytes);
-    try std.testing.expectEqual(@as(usize, 8), exact.command_result.?.foreground.stderr_bytes);
+    try std.testing.expectEqual(@as(usize, 8), exact.command_result.?.stdout_bytes);
+    try std.testing.expectEqual(@as(usize, 8), exact.command_result.?.stderr_bytes);
 
     const over_argv = [_][]const u8{
         "/bin/sh",
@@ -1476,7 +1476,7 @@ test "direct executor projects hostile final stdout and stderr" {
     defer std.testing.allocator.free(stderr_result.output);
     try std.testing.expect(std.mem.findScalar(u8, stderr_result.output, 0x1b) == null);
     try std.testing.expect(std.mem.find(u8, stderr_result.output, "\\x1b[31m-missing") != null);
-    try std.testing.expect(stderr_result.command_result.?.foreground.stderr_bytes > 0);
+    try std.testing.expect(stderr_result.command_result.?.stderr_bytes > 0);
 }
 
 const CallbackCapture = struct {
@@ -1539,7 +1539,7 @@ test "direct executor callbacks receive only bounded projected output" {
     try std.testing.expect(std.mem.findScalar(u8, stderr, 0x1b) == null);
     try std.testing.expect(std.mem.find(u8, stdout, "\\x1b]52;c;stdout\\x07") != null);
     try std.testing.expect(std.mem.find(u8, stderr, "\\x1b[31mstderr\\xff") != null);
-    const foreground = result.command_result.?.foreground;
+    const foreground = result.command_result.?;
     try std.testing.expect(
         stdout.len + stderr.len <=
             4 * (foreground.stdout_bytes + foreground.stderr_bytes),
@@ -1655,7 +1655,7 @@ test "direct executor reports final stage status without pipefail" {
         .max_command_output_bytes = 1,
     }, std.testing.allocator, injectedPlan("/tmp", &stages));
     defer std.testing.allocator.free(result.output);
-    try std.testing.expectEqual(@as(?i64, 1), result.command_result.?.foreground.exit_code);
+    try std.testing.expectEqual(@as(?i64, 1), result.command_result.?.exit_code);
 }
 
 test "direct relay treats a closed downstream pipe as normal completion" {
@@ -1705,7 +1705,7 @@ test "direct executor treats downstream pipe closure as normal pipeline completi
     }, std.testing.allocator, injectedPlan("/tmp", &stages));
     defer std.testing.allocator.free(result.output);
 
-    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.foreground.exit_code);
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
     const physical_tmp = try io_mod.realpathAlloc(std.testing.allocator, "/tmp");
     defer std.testing.allocator.free(physical_tmp);
     const expected_output = try std.fmt.allocPrint(
