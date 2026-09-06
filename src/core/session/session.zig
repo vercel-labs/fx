@@ -3870,6 +3870,70 @@ test "resume history projects steering before the final assistant" {
     }
 }
 
+test "history projection keeps reasoning-only segments with their replay parts" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const step_parts = [_]core_types.AssistantPart{
+        .{ .reasoning = .{ .text = "The note holds it.", .provider_options = "{\"anthropic\":{\"signature\":\"sig_step\"}}" } },
+        .{ .tool_call_ref = .{ .id = "call_read" } },
+    };
+    var calls = [_]ToolCall{.{
+        .id = "call_read",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"note.txt\"}",
+    }};
+    var results = [_]PersistedToolResult{.{
+        .tool_call_id = @constCast("call_read"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("note contents"),
+        .output_bytes = 13,
+        .stored_output_bytes = 13,
+    }};
+    var steps = [_]ToolExecutionStep{.{
+        .tool_calls = calls[0..],
+        .tool_results = results[0..],
+        .assistant_parts = @constCast(&step_parts),
+    }};
+    const final_parts = [_]core_types.AssistantPart{
+        .{ .reasoning = .{ .text = "", .provider_options = "{\"anthropic\":{\"redactedData\":\"red_1\"}}" } },
+    };
+    const history = [_]HistoryTurn{.{
+        .assistant = .{
+            .user = .{ .text = @constCast("inspect the note") },
+            // A reasoning-only final answer has no display text.
+            .assistant = @constCast(""),
+            .execution = .{ .tool_steps = steps[0..] },
+            .assistant_parts = @constCast(&final_parts),
+        },
+    }};
+
+    var chat_messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer chat_messages.deinit(arena);
+    try appendHistoryChatMessages(arena, &chat_messages, &history);
+
+    // user, assistant step (reasoning-only, parts-carried), tool result, final
+    // assistant (reasoning-only, parts-carried): nothing disappears.
+    try std.testing.expectEqual(@as(usize, 4), chat_messages.items.len);
+    try std.testing.expectEqual(.assistant, chat_messages.items[1].role);
+    const projected_step_parts = chat_messages.items[1].assistant_parts orelse
+        return error.TestExpectedAssistantParts;
+    try std.testing.expectEqual(@as(usize, 2), projected_step_parts.len);
+    try std.testing.expectEqualStrings("call_read", projected_step_parts[1].tool_call_ref.id);
+    try std.testing.expectEqual(.tool, chat_messages.items[2].role);
+    try std.testing.expectEqual(.assistant, chat_messages.items[3].role);
+    const projected_final_parts = chat_messages.items[3].assistant_parts orelse
+        return error.TestExpectedAssistantParts;
+    try std.testing.expectEqual(@as(usize, 1), projected_final_parts.len);
+    try std.testing.expectEqualStrings(
+        "{\"anthropic\":{\"redactedData\":\"red_1\"}}",
+        projected_final_parts[0].reasoning.provider_options.?,
+    );
+}
+
 test "resume history preserves steering between tool episodes" {
     const alloc = std.testing.allocator;
     var first_calls = [_]ToolCall{.{

@@ -142,13 +142,17 @@ pub fn durableRetainedAssistantParts(
     persisted_calls: []const types.ToolCall,
 ) !?[]types.AssistantPart {
     const source = parts orelse return null;
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(alloc);
     for (source) |part| {
         switch (part) {
             .text => |text_part| {
                 if (!try textUnalteredByRedaction(alloc, text_part.text)) return null;
+                try joined.appendSlice(alloc, text_part.text);
             },
             .reasoning => |reasoning_part| {
                 if (!try textUnalteredByRedaction(alloc, reasoning_part.text)) return null;
+                try joined.appendSlice(alloc, reasoning_part.text);
             },
             .tool_call_ref => |ref| {
                 const call = findToolCallById(persisted_calls, ref.id) orelse return null;
@@ -156,6 +160,9 @@ pub fn durableRetainedAssistantParts(
             },
         }
     }
+    // A secret split across part boundaries would mask the joined text but not
+    // the individual parts; the display projection checks the joined form.
+    if (!try textUnalteredByRedaction(alloc, joined.items)) return null;
     return try types.dupeAssistantParts(alloc, source);
 }
 
@@ -1732,6 +1739,71 @@ fn expectEquivalentNormalExecutionMemory(
         );
         try std.testing.expectEqual(expected_file.stale, actual_file.stale);
     }
+}
+
+test "durable replay parts persist only when redaction leaves the segment exact" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{.{ .id = "call_clean", .name = "read_file", .arguments_json = "{}" }};
+    const clean_parts = [_]types.AssistantPart{
+        .{ .reasoning = .{ .text = "Read the note first.", .provider_options = "{\"anthropic\":{\"signature\":\"sig_1\"}}" } },
+        .{ .tool_call_ref = .{ .id = "call_clean" } },
+    };
+    const retained = try durableRetainedAssistantParts(alloc, &clean_parts, &calls);
+    defer if (retained) |parts| types.freeAssistantParts(alloc, parts);
+    try std.testing.expectEqual(@as(usize, 2), retained.?.len);
+
+    // A reasoning block whose text masks a secret-looking value: the durable
+    // step keeps the masked display text, and the signed replay unit becomes
+    // unavailable instead of attaching the signature to altered content.
+    const masked_parts = [_]types.AssistantPart{
+        .{ .reasoning = .{ .text = "The token is sk-abcdefghijklmnop here.", .provider_options = "{\"anthropic\":{\"signature\":\"sig_1\"}}" } },
+        .{ .tool_call_ref = .{ .id = "call_clean" } },
+    };
+    const dropped = try durableRetainedAssistantParts(alloc, &masked_parts, &calls);
+    try std.testing.expect(dropped == null);
+
+    // A secret split across part boundaries is caught on the joined text.
+    const split_parts = [_]types.AssistantPart{
+        .{ .text = .{ .text = "prefix sk-" } },
+        .{ .text = .{ .text = "abcdefghijklmnop suffix" } },
+    };
+    const split_dropped = try durableRetainedAssistantParts(alloc, &split_parts, &calls);
+    try std.testing.expect(split_dropped == null);
+
+    // A reference to a call that did not survive redaction/filtering is stale.
+    const stale_parts = [_]types.AssistantPart{
+        .{ .tool_call_ref = .{ .id = "call_gone" } },
+    };
+    const stale_dropped = try durableRetainedAssistantParts(alloc, &stale_parts, &calls);
+    try std.testing.expect(stale_dropped == null);
+}
+
+test "durable execution memory keeps signed call metadata only for unaltered calls" {
+    const alloc = std.testing.allocator;
+    const clean_call = ToolCall{
+        .id = "call_clean",
+        .name = "read_file",
+        .arguments_json = "{}",
+        .provider_options_json = "{\"google\":{\"thoughtSignature\":\"ts_1\"}}",
+    };
+    const clean = try dupeRedactedToolCall(alloc, clean_call);
+    defer types.freeToolCall(alloc, clean);
+    try std.testing.expectEqualStrings(
+        "{\"google\":{\"thoughtSignature\":\"ts_1\"}}",
+        clean.provider_options_json.?,
+    );
+
+    const secret_call = ToolCall{
+        .id = "call_secret",
+        .name = "read_file",
+        .arguments_json = "{\"api_key\":\"sk-abcdefghijklmnop\"}",
+        .provider_options_json = "{\"google\":{\"thoughtSignature\":\"ts_1\"}}",
+    };
+    const altered = try dupeRedactedToolCall(alloc, secret_call);
+    defer types.freeToolCall(alloc, altered);
+    // The masked arguments no longer match the signature's payload.
+    try std.testing.expect(altered.provider_options_json == null);
+    try std.testing.expect(std.mem.find(u8, altered.arguments_json, "sk-") == null);
 }
 
 fn expectOptionalStringEqual(
