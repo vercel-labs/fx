@@ -121,12 +121,27 @@ pub const ConversationWriter = struct {
 
     /// Takes ownership of `file` only on success.
     pub fn init(alloc: Allocator, file: std.Io.File) !ConversationWriter {
-        const length = try file.length(io_mod.getIo());
         var writer = ConversationWriter{ .alloc = alloc, .file = file };
         errdefer {
             writer.clearPendingToolCalls();
             writer.pending_tool_calls.deinit(alloc);
         }
+        try writer.replayCommitted();
+        return writer;
+    }
+
+    /// Rebuilds the in-memory view from the file, discarding an unfinished
+    /// turn the way a fresh open does. On failure the writer no longer
+    /// describes the file and must not be appended to.
+    fn replayCommitted(writer: *ConversationWriter) !void {
+        const alloc = writer.alloc;
+        const file = writer.file;
+        const length = try file.length(io_mod.getIo());
+        writer.clearPendingToolCalls();
+        writer.committed_bytes = 0;
+        writer.last_seq = 0;
+        writer.latest_checkpoint_coverage = 0;
+        writer.turn_open = false;
         var offset: u64 = 0;
         var open_turn_offset: ?u64 = null;
         var open_turn_prior_seq: u64 = 0;
@@ -186,7 +201,6 @@ pub const ConversationWriter = struct {
             writer.last_seq = open_turn_prior_seq;
             writer.turn_open = checkpointed_turn;
         }
-        return writer;
     }
 
     pub fn deinit(self: *ConversationWriter) void {
@@ -1016,6 +1030,249 @@ pub fn copy_conversation_recovery_prefix(
     try output.setLength(io_mod.getIo(), offset);
     try output.sync(io_mod.getIo());
     debug_trace.logf("session", "event=conversation_recovery_prefix bytes={d} through_seq={d} interrupted={}", .{ boundary.bytes, boundary.seq, boundary.turn_open });
+}
+
+/// Where to cut a conversation log, in the turn numbering of the surface
+/// that asked for it.
+pub const ConversationCut = union(enum) {
+    /// Turns as `loadConversationArchive` numbers them: every completed or
+    /// interrupted turn and every compaction summary, in log order. This is
+    /// what `fx session <id>` labels.
+    archive_turns: usize,
+    /// Turns as a resumed session holds them: the latest compaction summary,
+    /// if any, followed by the turns replayed after it.
+    window_turns: usize,
+    /// The whole committed log.
+    everything,
+};
+
+pub const ConversationTruncation = struct {
+    boundary: ConversationRecoveryBoundary,
+    /// Turns left after the cut, counted the way the cut was. This can exceed
+    /// the request by one when a turn was open at a compaction checkpoint,
+    /// because the cut closes that turn as interrupted, and by more when the
+    /// requested window ends before the checkpoint record that summarizes it,
+    /// because the summary cannot outlive its record.
+    retained_turns: usize,
+    /// Turns of the current log that the cut removes.
+    dropped_turns: usize,
+    /// Turns the current log holds, counted the way the cut was.
+    total_turns: usize,
+};
+
+pub fn planConversationCut(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    cut: ConversationCut,
+) !ConversationTruncation {
+    const file = try openManagedFile(dir, events_file, .read_only);
+    defer file.close(io_mod.getIo());
+    return planConversationTruncation(alloc, file, try file.length(io_mod.getIo()), cut);
+}
+
+/// Reads only. Fails with `error.SessionTurnOutOfRange` when the cut asks
+/// for more turns than the log holds.
+pub fn planConversationTruncation(
+    alloc: Allocator,
+    file: std.Io.File,
+    length: u64,
+    cut: ConversationCut,
+) !ConversationTruncation {
+    const window: ?ConversationReplayWindow = switch (cut) {
+        .window_turns => try findConversationReplayWindow(alloc, file, length),
+        .archive_turns, .everything => null,
+    };
+    const counted_from: u64 = if (window) |value| value.offset else 0;
+    const checkpoint_offset: ?u64 = if (window) |value| value.checkpoint_offset else null;
+    const summary_turns: usize = if (checkpoint_offset != null) 1 else 0;
+
+    const requested_count: ?usize = switch (cut) {
+        inline .archive_turns, .window_turns => |count| count,
+        .everything => null,
+    };
+    var total: usize = summary_turns;
+    var boundary: ?ConversationRecoveryBoundary = null;
+    var end: ConversationRecoveryBoundary = .{};
+    var checkpoint_boundary: ?ConversationRecoveryBoundary = null;
+    var turns_before_checkpoint: usize = 0;
+    var turn_open = false;
+    var offset: u64 = 0;
+    while (offset < length) {
+        const line = session_replay.readLineAt(alloc, file, offset, length) catch |err| switch (err) {
+            error.TruncatedEventFrame => break,
+            else => return err,
+        } orelse break;
+        defer alloc.free(line.bytes);
+        var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
+        defer decoded.deinit();
+        const event = decoded.value.event;
+        turn_open = try nextConversationTurnOpen(turn_open, event);
+        end = .{
+            .bytes = line.next_offset,
+            .seq = decoded.value.seq,
+            .timestamp_ms = decoded.value.timestamp_ms,
+            .turn_open = turn_open,
+        };
+        if (checkpoint_offset != null and offset == checkpoint_offset.?) {
+            checkpoint_boundary = end;
+            turns_before_checkpoint = total - summary_turns;
+        }
+        const completes = switch (cut) {
+            .archive_turns, .everything => switch (event) {
+                .turn_completed, .interrupted, .context_checkpoint => true,
+                .user, .assistant, .tool_call, .tool_result, .steering => false,
+            },
+            .window_turns => switch (event) {
+                .turn_completed, .interrupted => offset >= counted_from,
+                .user, .assistant, .tool_call, .tool_result, .steering, .context_checkpoint => false,
+            },
+        };
+        if (completes) {
+            total += 1;
+            if (boundary == null and requested_count == total) boundary = end;
+        }
+        offset = line.next_offset;
+    }
+
+    const requested = requested_count orelse total;
+    if (requested > total) return error.SessionTurnOutOfRange;
+    var chosen: ConversationRecoveryBoundary = undefined;
+    var retained: usize = undefined;
+    if (cut == .everything) {
+        chosen = end;
+        retained = total;
+    } else if (requested == 0) {
+        chosen = .{};
+        retained = 0;
+    } else if (boundary) |found| {
+        chosen = found;
+        retained = requested;
+    } else {
+        // Only the summary was requested, so no completion set the boundary.
+        std.debug.assert(requested == summary_turns);
+        chosen = checkpoint_boundary.?;
+        retained = summary_turns + turns_before_checkpoint;
+    }
+    // A kept summary needs its checkpoint record, and every turn before that
+    // record stays with it.
+    if (checkpoint_boundary) |record| {
+        if (retained > 0 and chosen.bytes < record.bytes) {
+            chosen = record;
+            retained = summary_turns + turns_before_checkpoint;
+        }
+    }
+    const dropped = total - retained;
+    if (dropped > 0 and chosen.turn_open) retained += 1;
+    return .{
+        .boundary = chosen,
+        .retained_turns = retained,
+        .dropped_turns = dropped,
+        .total_turns = total,
+    };
+}
+
+test "conversation cut plans count archive turns and close a checkpointed open turn" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir = io_mod.VerifiedDir{ .dir = tmp.dir };
+    const first =
+        "{\"schema_version\":1,\"seq\":1,\"timestamp_ms\":1,\"event\":{\"user\":{\"text\":\"one\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":2,\"timestamp_ms\":1,\"event\":{\"assistant\":{\"text\":\"first\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":3,\"timestamp_ms\":1,\"event\":{\"turn_completed\":{}}}\n";
+    const second_open =
+        "{\"schema_version\":1,\"seq\":4,\"timestamp_ms\":2,\"event\":{\"user\":{\"text\":\"two\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":5,\"timestamp_ms\":2,\"event\":{\"assistant\":{\"text\":\"partial\"}}}\n";
+    const checkpoint =
+        "{\"schema_version\":1,\"seq\":6,\"timestamp_ms\":3,\"event\":{\"context_checkpoint\":{\"covers_through_seq\":3,\"summary\":\"summary\"}}}\n";
+    const second_close =
+        "{\"schema_version\":1,\"seq\":7,\"timestamp_ms\":4,\"event\":{\"assistant\":{\"text\":\"rest\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":8,\"timestamp_ms\":4,\"event\":{\"turn_completed\":{}}}\n";
+    const bytes = first ++ second_open ++ checkpoint ++ second_close;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = events_file, .data = bytes, .flags = .{ .permissions = private_file_permissions } });
+
+    // Archive order: turn one, the summary, then turn two.
+    const whole = try planConversationCut(alloc, &dir, .{ .archive_turns = 3 });
+    try std.testing.expectEqual(@as(usize, 3), whole.total_turns);
+    try std.testing.expectEqual(@as(usize, 0), whole.dropped_turns);
+    try std.testing.expectEqual(bytes.len, whole.boundary.bytes);
+
+    const one = try planConversationCut(alloc, &dir, .{ .archive_turns = 1 });
+    try std.testing.expectEqual(first.len, one.boundary.bytes);
+    try std.testing.expectEqual(@as(u64, 3), one.boundary.seq);
+    try std.testing.expect(!one.boundary.turn_open);
+    try std.testing.expectEqual(@as(usize, 1), one.retained_turns);
+    try std.testing.expectEqual(@as(usize, 2), one.dropped_turns);
+
+    // Keeping the summary cuts inside turn two, which the cut then closes.
+    const at_summary = try planConversationCut(alloc, &dir, .{ .archive_turns = 2 });
+    try std.testing.expectEqual(first.len + second_open.len + checkpoint.len, at_summary.boundary.bytes);
+    try std.testing.expect(at_summary.boundary.turn_open);
+    try std.testing.expectEqual(@as(usize, 3), at_summary.retained_turns);
+    try std.testing.expectEqual(@as(usize, 1), at_summary.dropped_turns);
+
+    const empty = try planConversationCut(alloc, &dir, .{ .archive_turns = 0 });
+    try std.testing.expectEqual(@as(u64, 0), empty.boundary.bytes);
+    try std.testing.expectEqual(@as(usize, 3), empty.dropped_turns);
+
+    try std.testing.expectError(error.SessionTurnOutOfRange, planConversationCut(alloc, &dir, .{ .archive_turns = 4 }));
+
+    const everything = try planConversationCut(alloc, &dir, .everything);
+    try std.testing.expectEqual(bytes.len, everything.boundary.bytes);
+    try std.testing.expectEqual(@as(usize, 0), everything.dropped_turns);
+}
+
+test "conversation cut plans count window turns and keep the checkpoint record" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir = io_mod.VerifiedDir{ .dir = tmp.dir };
+    const covered =
+        "{\"schema_version\":1,\"seq\":1,\"timestamp_ms\":1,\"event\":{\"user\":{\"text\":\"one\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":2,\"timestamp_ms\":1,\"event\":{\"assistant\":{\"text\":\"first\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":3,\"timestamp_ms\":1,\"event\":{\"turn_completed\":{}}}\n";
+    const kept_verbatim =
+        "{\"schema_version\":1,\"seq\":4,\"timestamp_ms\":2,\"event\":{\"user\":{\"text\":\"two\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":5,\"timestamp_ms\":2,\"event\":{\"assistant\":{\"text\":\"second\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":6,\"timestamp_ms\":2,\"event\":{\"turn_completed\":{}}}\n";
+    const checkpoint =
+        "{\"schema_version\":1,\"seq\":7,\"timestamp_ms\":3,\"event\":{\"context_checkpoint\":{\"covers_through_seq\":3,\"summary\":\"summary\"}}}\n";
+    const after =
+        "{\"schema_version\":1,\"seq\":8,\"timestamp_ms\":4,\"event\":{\"user\":{\"text\":\"three\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":9,\"timestamp_ms\":4,\"event\":{\"assistant\":{\"text\":\"third\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":10,\"timestamp_ms\":4,\"event\":{\"turn_completed\":{}}}\n";
+    const bytes = covered ++ kept_verbatim ++ checkpoint ++ after;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = events_file, .data = bytes, .flags = .{ .permissions = private_file_permissions } });
+
+    // A resumed session holds the summary, turn two, then turn three.
+    const whole = try planConversationCut(alloc, &dir, .{ .window_turns = 3 });
+    try std.testing.expectEqual(@as(usize, 3), whole.total_turns);
+    try std.testing.expectEqual(@as(usize, 0), whole.dropped_turns);
+
+    const two = try planConversationCut(alloc, &dir, .{ .window_turns = 2 });
+    try std.testing.expectEqual(covered.len + kept_verbatim.len + checkpoint.len, two.boundary.bytes);
+    try std.testing.expectEqual(@as(usize, 2), two.retained_turns);
+    try std.testing.expectEqual(@as(usize, 1), two.dropped_turns);
+
+    // Turn two precedes the checkpoint record, so the summary cannot be kept
+    // without it.
+    const summary_only = try planConversationCut(alloc, &dir, .{ .window_turns = 1 });
+    try std.testing.expectEqual(two.boundary.bytes, summary_only.boundary.bytes);
+    try std.testing.expectEqual(@as(usize, 2), summary_only.retained_turns);
+    try std.testing.expectEqual(@as(usize, 1), summary_only.dropped_turns);
+
+    const empty = try planConversationCut(alloc, &dir, .{ .window_turns = 0 });
+    try std.testing.expectEqual(@as(u64, 0), empty.boundary.bytes);
+    try std.testing.expectEqual(@as(usize, 3), empty.dropped_turns);
+
+    try std.testing.expectError(error.SessionTurnOutOfRange, planConversationCut(alloc, &dir, .{ .window_turns = 4 }));
+
+    // Without a checkpoint the window is the archive.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = events_file, .data = covered ++ kept_verbatim, .flags = .{ .permissions = private_file_permissions } });
+    const plain = try planConversationCut(alloc, &dir, .{ .window_turns = 1 });
+    try std.testing.expectEqual(covered.len, plain.boundary.bytes);
+    try std.testing.expectEqual(@as(usize, 1), plain.retained_turns);
+    try std.testing.expectEqual(@as(usize, 2), plain.total_turns);
 }
 
 test "conversation recovery boundary validates prefix and never edits source" {
@@ -2603,6 +2860,47 @@ pub const LoadedWritableSession = struct {
         return self.finishConversationCommit(alloc, timestamp_ms);
     }
 
+    /// Cuts the conversation log at a planned boundary. A turn left open at
+    /// the cut is closed as interrupted, and a paused response is dropped with
+    /// the tail it belonged to. The hydration history is released because it
+    /// no longer matches the log; reopen the session to project it again.
+    pub fn truncateConversation(
+        self: *LoadedWritableSession,
+        alloc: Allocator,
+        plan: ConversationTruncation,
+        timestamp_ms: i64,
+    ) !void {
+        const writer = &self.conversation_writer;
+        if (plan.boundary.bytes > writer.committed_bytes) return error.InvalidConversationFrame;
+        try writer.file.setLength(io_mod.getIo(), plan.boundary.bytes);
+        try writer.file.sync(io_mod.getIo());
+        try writer.replayCommitted();
+        if (writer.turn_open) {
+            _ = try writer.append(alloc, timestamp_ms, .{
+                .interrupted = .{ .reason = .failed },
+            });
+        }
+        try writeConversationRecoveryState(alloc, &self.log.dir, null, writer.last_seq);
+        if (self.state.recovery_checkpoint) |*checkpoint| {
+            checkpoint.deinit(alloc);
+            self.state.recovery_checkpoint = null;
+        }
+        self.releaseHydrationHistory(alloc);
+        self.state.updated_at_ms = timestamp_ms;
+        self.position = .{
+            .log_generation = self.position.log_generation,
+            .through_seq = writer.last_seq,
+            .through_event_id = randomIdentifier(),
+            .through_event_log_bytes = writer.committed_bytes,
+        };
+        self.freshly_started = false;
+        debug_trace.logf(
+            "session",
+            "event=conversation_truncated session={s} bytes={d} through_seq={d} interrupted={}",
+            .{ self.active_id, plan.boundary.bytes, plan.boundary.seq, plan.boundary.turn_open },
+        );
+    }
+
     fn appendConversationHistoryEvent(
         self: *LoadedWritableSession,
         alloc: Allocator,
@@ -3975,6 +4273,115 @@ test "conversation writer flattens a canonical history turn" {
         bytes,
         "\"snapshot_path\":\"/tmp/session/images",
     ) == null);
+}
+
+test "conversation truncation cuts the log, closes an open turn, and drops a paused response" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+
+    var initial = try testState(alloc, "truncate-conversation", 10);
+    defer initial.deinit(alloc);
+    {
+        var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        for ([_][]const u8{ "one", "two", "three" }) |prompt| {
+            const turn = try session.makeAssistantTurn(alloc, prompt, "answer");
+            defer session.freeHistoryTurn(alloc, turn);
+            _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+                .conversation_language = initial.conversation_language,
+                .total_input_tokens = 0,
+                .total_output_tokens = 0,
+                .turn = turn,
+            } }, 20);
+        }
+        _ = try loaded.appendEvent(alloc, .{ .recovery_checkpoint_set = .{ .checkpoint = .{
+            .turn_id = 4,
+            .user = .{ .text = @constCast("paused") },
+            .assistant_source = @constCast(""),
+            .cause = .network_interrupted,
+            .action = .retrying_request,
+            .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+            .requested_fast_mode = false,
+            .fast_mode = false,
+            .max_provider_attempts = 10,
+            .consumed_provider_attempts = 1,
+        } } }, 30);
+
+        const writer = &loaded.conversation_writer;
+        const plan = try planConversationTruncation(alloc, writer.file, writer.committed_bytes, .{ .archive_turns = 1 });
+        try std.testing.expectEqual(@as(usize, 2), plan.dropped_turns);
+        try loaded.truncateConversation(alloc, plan, 40);
+        try std.testing.expectEqual(plan.boundary.bytes, writer.committed_bytes);
+        try std.testing.expectEqual(@as(u64, 3), writer.last_seq);
+        try std.testing.expect(!writer.turn_open);
+        try std.testing.expect(loaded.state.recovery_checkpoint == null);
+        try std.testing.expectEqual(@as(usize, 0), loaded.state.history.len);
+
+        // The writer keeps appending at the cut.
+        const turn = try session.makeAssistantTurn(alloc, "four", "answer");
+        defer session.freeHistoryTurn(alloc, turn);
+        _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+            .conversation_language = initial.conversation_language,
+            .total_input_tokens = 0,
+            .total_output_tokens = 0,
+            .turn = turn,
+        } }, 50);
+    }
+    var reopened = try temp.root.resumeForWrite(alloc, initial.id, .{});
+    defer reopened.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), reopened.state.history.len);
+    try std.testing.expectEqualStrings("one", reopened.state.history[0].assistant.user.text);
+    try std.testing.expectEqualStrings("four", reopened.state.history[1].assistant.user.text);
+    try std.testing.expect(reopened.state.recovery_checkpoint == null);
+
+    // A cut inside a checkpointed turn closes that turn as interrupted.
+    var checkpointed = try testState(alloc, "truncate-checkpointed-turn", 10);
+    defer checkpointed.deinit(alloc);
+    var loaded = try temp.root.startConversationSession(alloc, checkpointed, .{});
+    defer loaded.deinit(alloc);
+    {
+        const turn = try session.makeAssistantTurn(alloc, "before", "answer");
+        defer session.freeHistoryTurn(alloc, turn);
+        _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+            .conversation_language = checkpointed.conversation_language,
+            .total_input_tokens = 0,
+            .total_output_tokens = 0,
+            .turn = turn,
+        } }, 20);
+    }
+    _ = try loaded.commitContextCompaction(alloc, .{
+        .summary = @constCast("summary"),
+        .removed_turn_count = 1,
+        .compaction_count = 1,
+    }, .{
+        .user = .{ .text = @constCast("open request") },
+        .assistant = @constCast(""),
+        .execution = .{},
+    }, .{ .turns = 1 }, 30);
+    try std.testing.expect(loaded.conversation_writer.turn_open);
+    {
+        const turn = try session.makeAssistantTurn(alloc, "open request", "finished later");
+        defer session.freeHistoryTurn(alloc, turn);
+        _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+            .conversation_language = checkpointed.conversation_language,
+            .total_input_tokens = 0,
+            .total_output_tokens = 0,
+            .turn = turn,
+        } }, 40);
+    }
+    const writer = &loaded.conversation_writer;
+    const plan = try planConversationTruncation(alloc, writer.file, writer.committed_bytes, .{ .archive_turns = 2 });
+    try std.testing.expect(plan.boundary.turn_open);
+    try std.testing.expectEqual(@as(usize, 3), plan.retained_turns);
+    try loaded.truncateConversation(alloc, plan, 50);
+    try std.testing.expect(!writer.turn_open);
+    const archive = try loadConversationArchive(alloc, &loaded.log.dir);
+    defer session.freeHistoryTurnSlice(alloc, archive);
+    try std.testing.expectEqual(@as(usize, 3), archive.len);
+    try std.testing.expect(archive[1] == .compacted_summary);
+    try std.testing.expect(archive[2] == .interrupted);
+    try std.testing.expectEqualStrings("open request", archive[2].interrupted.user.text);
 }
 
 test "legacy import recovery restores old authority or keeps published current data" {

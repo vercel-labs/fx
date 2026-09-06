@@ -106,6 +106,8 @@
   ],
   "verification_scenarios": [
     {"name": "verify-auto-mode-reliability", "argv": ["bun", "test", "--max-concurrency", "1", "./auto-mode-reliability.test.ts"], "test_file": "auto-mode-reliability.test.ts"},
+    {"name": "verify-session-fork", "argv": ["bun", "test", "--max-concurrency", "1", "./session-fork.test.ts"], "test_file": "session-fork.test.ts", "requires_tmux": false},
+    {"name": "verify-tui-session-fork", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-session-fork.test.ts"], "test_file": "tui-session-fork.test.ts", "requires_tmux": true},
     {"name": "verify-oauth-keychain-migration", "argv": ["bun", "test", "--max-concurrency", "1", "./oauth-keychain-migration.test.ts"], "test_file": "oauth-keychain-migration.test.ts", "allow_keychain": true},
     {"name": "verify-tui-auth-source-selection", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-auth-source-selection.test.ts"], "test_file": "tui-auth-source-selection.test.ts"},
     {"name": "verify-tui-composer-edit-contracts", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-composer-edit-contracts.test.ts"], "test_file": "tui-composer-edit-contracts.test.ts"},

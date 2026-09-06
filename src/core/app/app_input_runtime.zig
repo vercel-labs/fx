@@ -2139,12 +2139,16 @@ pub fn Runtime(comptime App: type) type {
         }
 
         const CompactCommandMenuKind = enum {
+            turn_picker,
             statusline,
             usage,
             workspace,
         };
 
         fn activeCompactCommandMenu(app: *App) ?CompactCommandMenuKind {
+            if (comptime @hasField(App, "session_persistence") and @hasField(App, "session")) {
+                if (app.session_persistence.turn_picker != null) return .turn_picker;
+            }
             if (app.input_runtime.statusline_menu.active) return .statusline;
             if (app.input_runtime.usage_menu.active) return .usage;
             if (app.input_runtime.workspace_menu.active) return .workspace;
@@ -2346,6 +2350,12 @@ pub fn Runtime(comptime App: type) type {
             menu: CompactCommandMenuKind,
             max_input_len: usize,
         ) !void {
+            if (menu == .turn_picker) {
+                if (comptime @hasField(App, "session")) {
+                    _ = try app_session_runtime.Runtime(App).applyTurnPicker(app);
+                }
+                return;
+            }
             if (menu == .workspace) {
                 try prepareWorkspaceMenuCommand(app, max_input_len);
                 return;
@@ -2360,7 +2370,7 @@ pub fn Runtime(comptime App: type) type {
             const snapshot = app_commands.settingsCatalogSnapshot(app);
             const change = switch (menu) {
                 .statusline => app.input_runtime.statusline_menu.selectedChange(snapshot),
-                .usage, .workspace => unreachable,
+                .turn_picker, .usage, .workspace => unreachable,
             } orelse return;
             if (comptime @hasDecl(App, "notificationPreferences")) {
                 try app_commands.applySettingsCatalogMenuChange(app, change);
@@ -2401,6 +2411,10 @@ pub fn Runtime(comptime App: type) type {
 
         fn moveCompactCommandMenu(app: *App, menu: CompactCommandMenuKind, delta: i32) bool {
             return switch (menu) {
+                .turn_picker => if (comptime @hasField(App, "session"))
+                    app_session_runtime.Runtime(App).moveTurnPicker(app, delta, app_session_runtime.TurnPicker.window_rows)
+                else
+                    false,
                 .statusline => app.input_runtime.statusline_menu.move(delta),
                 .usage => app.input_runtime.usage_menu.moveModel(
                     delta,
@@ -2466,7 +2480,7 @@ pub fn Runtime(comptime App: type) type {
                 const delta: i32 = if (resolved == .cursor_left) -1 else 1;
                 const change = switch (menu) {
                     .statusline => app.input_runtime.statusline_menu.changeSelectedOption(&snapshot, delta),
-                    .usage, .workspace => unreachable,
+                    .turn_picker, .usage, .workspace => unreachable,
                 } orelse return;
                 if (comptime @hasDecl(App, "notificationPreferences")) {
                     try app_commands.applySettingsCatalogMenuChange(app, change);
@@ -2633,7 +2647,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasField(App, "stream")) {
                 if (app.stream.active) return false;
             }
-            if (comptime @hasField(App, "session_persistence")) {
+            if (comptime @hasField(App, "session_persistence") and @hasField(App, "session")) {
                 if (app.session_persistence.session_picker.active) return true;
             }
             if (comptime @hasField(App, "auth")) {
@@ -2954,6 +2968,12 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn cancelCompactCommandMenu(app: *App) bool {
+            if (comptime @hasField(App, "session_persistence")) {
+                if (app.session_persistence.turn_picker != null) {
+                    _ = app_session_runtime.Runtime(App).cancelTurnPicker(app) catch {};
+                    return true;
+                }
+            }
             if (app.input_runtime.statusline_menu.active) {
                 app.input_runtime.statusline_menu.close();
                 return true;

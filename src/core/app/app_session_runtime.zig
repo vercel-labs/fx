@@ -70,6 +70,195 @@ const BackgroundSessionPolicy = enum {
     stop_forget,
 };
 
+/// `/fork <turn>` and `/rewind <count>` both accept 1 through the live history
+/// length and differ only in which end they count from. Returns null when the
+/// argument falls outside it.
+fn checkedTurnArgument(history_len: usize, requested: usize) ?usize {
+    if (requested == 0 or requested > history_len) return null;
+    return requested;
+}
+
+test "turn arguments are bounded by the live history length" {
+    try std.testing.expectEqual(@as(?usize, null), checkedTurnArgument(0, 1));
+    try std.testing.expectEqual(@as(?usize, null), checkedTurnArgument(3, 0));
+    try std.testing.expectEqual(@as(?usize, null), checkedTurnArgument(3, 4));
+    try std.testing.expectEqual(@as(?usize, 1), checkedTurnArgument(3, 1));
+    try std.testing.expectEqual(@as(?usize, 3), checkedTurnArgument(3, 3));
+}
+
+/// The exact rewind a confirmation prompt described: how long the history was
+/// when it was previewed, and how many turns would survive.
+pub const RewindTarget = struct {
+    history_len: usize,
+    retained_turns: usize,
+
+    pub fn removedTurnCount(self: RewindTarget) usize {
+        return self.history_len - self.retained_turns;
+    }
+};
+
+const RewindRequest = enum {
+    confirm,
+    execute,
+};
+
+/// `/rewind` destroys turns, so it runs only when the identical request is
+/// repeated. Arming on the whole target rather than the raw count means a turn
+/// arriving between the two requests re-arms instead of silently firing a
+/// rewind the user never previewed.
+const RewindGate = union(enum) {
+    idle,
+    armed: RewindTarget,
+
+    pub fn request(self: *RewindGate, target: RewindTarget) RewindRequest {
+        switch (self.*) {
+            .armed => |pending| if (std.meta.eql(pending, target)) {
+                self.* = .idle;
+                return .execute;
+            },
+            .idle => {},
+        }
+        self.* = .{ .armed = target };
+        return .confirm;
+    }
+
+    pub fn disarm(self: *RewindGate) void {
+        self.* = .idle;
+    }
+};
+
+test "rewind gate executes only an identical repeated request" {
+    var gate: RewindGate = .idle;
+    const target = RewindTarget{ .history_len = 5, .retained_turns = 3 };
+
+    try std.testing.expectEqual(RewindRequest.confirm, gate.request(target));
+    try std.testing.expectEqual(RewindRequest.execute, gate.request(target));
+    try std.testing.expectEqual(RewindGate.idle, gate);
+    try std.testing.expectEqual(RewindRequest.confirm, gate.request(target));
+}
+
+test "rewind gate re-arms when the request changes" {
+    var gate: RewindGate = .idle;
+
+    try std.testing.expectEqual(
+        RewindRequest.confirm,
+        gate.request(.{ .history_len = 5, .retained_turns = 3 }),
+    );
+    try std.testing.expectEqual(
+        RewindRequest.confirm,
+        gate.request(.{ .history_len = 5, .retained_turns = 4 }),
+    );
+    try std.testing.expectEqual(
+        RewindRequest.confirm,
+        gate.request(.{ .history_len = 6, .retained_turns = 4 }),
+    );
+    try std.testing.expectEqual(
+        RewindRequest.execute,
+        gate.request(.{ .history_len = 6, .retained_turns = 4 }),
+    );
+}
+
+test "rewind gate disarms on an intervening command" {
+    var gate: RewindGate = .idle;
+    const target = RewindTarget{ .history_len = 5, .retained_turns = 3 };
+
+    try std.testing.expectEqual(RewindRequest.confirm, gate.request(target));
+    gate.disarm();
+    try std.testing.expectEqual(RewindRequest.confirm, gate.request(target));
+}
+
+test "rewind target reports the turns it drops" {
+    const target = RewindTarget{ .history_len = 7, .retained_turns = 4 };
+    try std.testing.expectEqual(@as(usize, 3), target.removedTurnCount());
+}
+
+pub const TurnPicker = struct {
+    history_len: usize,
+    cursor: usize,
+    window_start: usize,
+
+    pub const window_rows: usize = 8;
+
+    pub const Effect = union(enum) {
+        no_change,
+        rewind: struct {
+            dropped_turns: usize,
+            retained_turns: usize,
+        },
+    };
+
+    pub fn init(history_len: usize) TurnPicker {
+        return .{
+            .history_len = history_len,
+            .cursor = history_len,
+            .window_start = (history_len + 1) -| window_rows,
+        };
+    }
+
+    pub fn move(self: *TurnPicker, delta: i32, visible_rows: usize) void {
+        const next = std.math.clamp(
+            @as(i64, @intCast(self.cursor)) + delta,
+            0,
+            @as(i64, @intCast(self.history_len)),
+        );
+        self.cursor = @intCast(next);
+        const rows = @max(visible_rows, 1);
+        if (self.cursor < self.window_start) self.window_start = self.cursor;
+        if (self.cursor >= self.window_start + rows) {
+            self.window_start = self.cursor + 1 - rows;
+        }
+        self.window_start = @min(self.window_start, (self.history_len + 1) -| rows);
+    }
+
+    pub fn retainedTurns(self: TurnPicker) usize {
+        return self.cursor;
+    }
+
+    pub fn effectLine(self: TurnPicker) Effect {
+        if (self.cursor == self.history_len) return .no_change;
+        return .{ .rewind = .{
+            .dropped_turns = self.history_len - self.cursor,
+            .retained_turns = self.cursor,
+        } };
+    }
+
+    pub fn isCurrent(self: TurnPicker, history_len: usize) bool {
+        return self.history_len == history_len;
+    }
+};
+
+test "turn picker starts at current and moves with a clamped window" {
+    var picker = TurnPicker.init(6);
+    try std.testing.expectEqual(@as(usize, 6), picker.cursor);
+    try std.testing.expectEqual(@as(usize, 0), picker.window_start);
+    try std.testing.expectEqual(TurnPicker.Effect.no_change, picker.effectLine());
+
+    picker.move(-2, 3);
+    try std.testing.expectEqual(@as(usize, 4), picker.cursor);
+    try std.testing.expectEqual(@as(usize, 2), picker.window_start);
+    picker.move(-20, 3);
+    try std.testing.expectEqual(@as(usize, 0), picker.cursor);
+    try std.testing.expectEqual(@as(usize, 0), picker.window_start);
+    picker.move(20, 3);
+    try std.testing.expectEqual(@as(usize, 6), picker.cursor);
+    try std.testing.expectEqual(@as(usize, 4), picker.window_start);
+}
+
+test "turn picker selection restores before the selected prompt" {
+    var picker = TurnPicker.init(5);
+    picker.move(-3, 5);
+    try std.testing.expectEqual(@as(usize, 2), picker.retainedTurns());
+    try std.testing.expectEqual(TurnPicker.Effect{
+        .rewind = .{ .dropped_turns = 3, .retained_turns = 2 },
+    }, picker.effectLine());
+}
+
+test "turn picker detects history changes before selection" {
+    const picker = TurnPicker.init(4);
+    try std.testing.expect(picker.isCurrent(4));
+    try std.testing.expect(!picker.isCurrent(5));
+}
+
 const LiveSessionTransitionEvent = union(enum) {
     request: BackgroundSessionPolicy,
     settle,
@@ -257,6 +446,8 @@ const UpgradeNotice = struct {
 
 const ResumeNotice = union(enum) {
     session,
+    /// The session was re-entered after `/rewind` cut its log.
+    rewound,
     upgrade: UpgradeNotice,
 };
 
@@ -1037,12 +1228,14 @@ pub const Persistence = struct {
     image_snapshot_temp_dir: ?[]u8 = null,
     resume_handoff_intent: ResumeHandoffIntent = .none,
     pending_live_session_policy: ?BackgroundSessionPolicy = null,
+    rewind_gate: RewindGate = .idle,
+    turn_picker: ?TurnPicker = null,
 
     /// Fieldwise initialization avoids retaining undefined optional payloads
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (std.meta.fields(Persistence).len != 18) {
+            if (std.meta.fields(Persistence).len != 20) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -1065,6 +1258,8 @@ pub const Persistence = struct {
         storage.image_snapshot_temp_dir = null;
         storage.resume_handoff_intent = .none;
         storage.pending_live_session_policy = null;
+        storage.rewind_gate = .idle;
+        storage.turn_picker = null;
     }
 
     pub fn deinit(self: *Persistence, alloc: Allocator) void {
@@ -1368,6 +1563,10 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn finishLiveSessionResume(app: *App) !void {
+            try resetTerminalForTranscriptReplacement(app);
+        }
+
+        fn resetTerminalForTranscriptReplacement(app: *App) !void {
             try app.shell.requestTerminalReset(&app.metrics);
             app.shell.render_requests.request(.footer);
         }
@@ -1642,12 +1841,38 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn resumeSelectedSession(app: *App) !bool {
             const selected_id = app.session_persistence.session_picker.selectedId() orelse return false;
+            return resumeLiveSession(app, .{ .id = selected_id });
+        }
+
+        pub fn resumeLiveSession(app: *App, target: session_store.ResumeTarget) !bool {
+            if (target == .id and app.session_persistence.writable != null and
+                std.mem.eql(u8, target.id, app.session_persistence.writable.?.active_id))
+            {
+                return false;
+            }
+            if (target == .last) {
+                // Resolve "last" once, through the same summary the CLI uses, so
+                // the id compared here is the id that gets opened below.
+                const store = app.session_persistence.store orelse
+                    return error.SessionStoreUnavailable;
+                var latest = store.latestReadOnlyWorkspaceSummary(app.alloc) catch |err| switch (err) {
+                    error.NoSavedSessions => return false,
+                    else => return err,
+                };
+                defer latest.deinit(app.alloc);
+                if (app.session_persistence.writable) |writable| {
+                    if (std.mem.eql(u8, latest.id, writable.active_id)) return false;
+                }
+                const latest_id = try app.alloc.dupe(u8, latest.id);
+                defer app.alloc.free(latest_id);
+                return resumeLiveSession(app, .{ .id = latest_id });
+            }
             const log_options = session_log.Options{
                 .session_lock_deadline_ms = 0,
             };
             var loaded = try loadResumeTargetForWrite(
                 app,
-                .{ .id = selected_id },
+                target,
                 log_options,
             );
             var loaded_owned = true;
@@ -1745,26 +1970,62 @@ pub fn Runtime(comptime App: type) type {
             app.total_output_tokens = state.total_output_tokens;
             app.total_web_search_requests = 0;
 
+            const ResumeTranscriptExtras = struct {
+                display_title: []const u8,
+                notice: ResumeNotice,
+                recovery_state: session_codec.DurableSessionState,
+
+                fn writeBefore(self: @This(), target: *App, sink: anytype) !void {
+                    try writeResumeNotice(target, sink, self.display_title, self.notice);
+                }
+
+                fn writeAfter(self: @This(), target: *App, sink: anytype) !void {
+                    try writeRecoveryCheckpointToSink(target, sink, self.recovery_state);
+                }
+            };
+            const projection_workspace_root = if (std.mem.eql(
+                u8,
+                state.origin_workspace_root,
+                state.workspace_root,
+            ))
+                state.workspace_root
+            else
+                "";
+            try rebuildTranscriptFromHistory(app, state.history, projection_workspace_root, ResumeTranscriptExtras{
+                .display_title = display_title,
+                .notice = notice,
+                .recovery_state = state,
+            });
+            if (comptime @hasDecl(App, "restoreSessionCredential")) {
+                try app.restoreSessionCredential(previous_provider);
+            }
+        }
+
+        /// Redraws the transcript from `history`. Inline rendering only
+        /// appends, so resume and rewind both go through this retained-history
+        /// redraw. `extras` writes around the turns, or is `null`.
+        fn rebuildTranscriptFromHistory(
+            app: *App,
+            history: []const types.HistoryTurn,
+            projection_workspace_root: []const u8,
+            extras: anytype,
+        ) !void {
             if (comptime @hasDecl(App, "beginResumeProjection")) {
                 const projection_started_ns = io_mod.nanoTimestamp();
                 var projection = try app.beginResumeProjection();
                 defer projection.deinit();
-                const projection_workspace_root = if (std.mem.eql(
-                    u8,
-                    state.origin_workspace_root,
-                    state.workspace_root,
-                ))
-                    state.workspace_root
-                else
-                    "";
                 var sink = DetachedHistorySink(@TypeOf(projection)){
                     .app = app,
                     .projection = &projection,
                     .workspace_root = projection_workspace_root,
                 };
-                try writeResumeNotice(app, &sink, display_title, notice);
-                try replayResumedHistoryToSink(app, &sink, state.history);
-                try writeRecoveryCheckpointToSink(app, &sink, state);
+                if (comptime @TypeOf(extras) != @TypeOf(null)) {
+                    try extras.writeBefore(app, &sink);
+                }
+                try replayResumedHistoryToSink(app, &sink, history);
+                if (comptime @TypeOf(extras) != @TypeOf(null)) {
+                    try extras.writeAfter(app, &sink);
+                }
                 const projection_finished_ns = io_mod.nanoTimestamp();
                 try projection.finalize();
                 const finalization_finished_ns = io_mod.nanoTimestamp();
@@ -1774,7 +2035,7 @@ pub fn Runtime(comptime App: type) type {
                     "session",
                     "event=resume_projection turns={d} project_us={d} finalize_us={d} install_us={d}",
                     .{
-                        state.history.len,
+                        history.len,
                         @divTrunc(projection_finished_ns - projection_started_ns, std.time.ns_per_us),
                         @divTrunc(finalization_finished_ns - projection_finished_ns, std.time.ns_per_us),
                         @divTrunc(install_finished_ns - finalization_finished_ns, std.time.ns_per_us),
@@ -1782,12 +2043,13 @@ pub fn Runtime(comptime App: type) type {
                 );
             } else {
                 var sink = LiveHistorySink(App){ .app = app };
-                try writeResumeNotice(app, &sink, display_title, notice);
-                try replayResumedHistoryToSink(app, &sink, state.history);
-                try writeRecoveryCheckpointToSink(app, &sink, state);
-            }
-            if (comptime @hasDecl(App, "restoreSessionCredential")) {
-                try app.restoreSessionCredential(previous_provider);
+                if (comptime @TypeOf(extras) != @TypeOf(null)) {
+                    try extras.writeBefore(app, &sink);
+                }
+                try replayResumedHistoryToSink(app, &sink, history);
+                if (comptime @TypeOf(extras) != @TypeOf(null)) {
+                    try extras.writeAfter(app, &sink);
+                }
             }
         }
 
@@ -2132,7 +2394,17 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn appendHistoryTurn(app: *App, turn: types.HistoryTurn) !void {
+            closeStaleTurnPicker(app);
             _ = try appendHistoryTurnWithPendingPresentation(app, turn, .strict, null);
+        }
+
+        fn closeStaleTurnPicker(app: *App) void {
+            if (comptime !@hasField(App, "session_persistence")) return;
+            if (app.session_persistence.turn_picker) |picker| {
+                if (!picker.isCurrent(app.session.historyLen())) {
+                    app.session_persistence.turn_picker = null;
+                }
+            }
         }
 
         pub fn appendFinishedPrompt(
@@ -2498,6 +2770,305 @@ pub fn Runtime(comptime App: type) type {
             ensureCachedSessionTitle(app) catch {};
             commitJsHostSnapshot(app, "history_turn");
             return .committed;
+        }
+
+        /// Where the shell ended up when a fork did not finish. A fork has to
+        /// close the live session before it can run, so "which session am I in
+        /// now" is part of every failing answer.
+        pub const ForkLanding = enum {
+            source,
+            fresh_session,
+            no_session,
+        };
+
+        pub const ForkOutcome = union(enum) {
+            unavailable_during_stream,
+            unavailable,
+            out_of_range: usize,
+            branched: Branch,
+            failed: Failure,
+
+            pub const Branch = struct {
+                source_id: []u8,
+                forked_id: []u8,
+                retained_turns: usize,
+                unverified_artifacts: bool,
+            };
+
+            pub const Failure = struct {
+                source_id: []u8,
+                /// Set when the branch exists but this shell could not enter it.
+                forked_id: ?[]u8,
+                problem: anyerror,
+                landing: ForkLanding,
+            };
+
+            pub fn deinit(self: *ForkOutcome, alloc: Allocator) void {
+                switch (self.*) {
+                    .branched => |branch| {
+                        alloc.free(branch.source_id);
+                        alloc.free(branch.forked_id);
+                    },
+                    .failed => |failure| {
+                        alloc.free(failure.source_id);
+                        if (failure.forked_id) |id| alloc.free(id);
+                    },
+                    else => {},
+                }
+                self.* = undefined;
+            }
+        };
+
+        /// Branches the live session at a turn of the conversation it holds and
+        /// moves this shell into the branch. `forkSessionCopy` takes the
+        /// source's writer lock, which this process holds for as long as the
+        /// session is open, so the session is closed first. Every failure after
+        /// that point runs through `forkFailure`, which puts a session back
+        /// before answering.
+        pub fn forkLiveSession(app: *App, at_turn: usize) !ForkOutcome {
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) {
+                return .unavailable;
+            }
+            if (app.stream.active) return .unavailable_during_stream;
+            if (app.session_persistence.store == null) return .unavailable;
+            const active = app.session_persistence.writable orelse return .unavailable;
+
+            const history_len = app.session.historyLen();
+            const retained_turns = checkedTurnArgument(history_len, at_turn) orelse
+                return .{ .out_of_range = history_len };
+
+            const source_id = try app.alloc.dupe(u8, active.active_id);
+            errdefer app.alloc.free(source_id);
+
+            const log_options = session_log.Options{
+                .session_lock_deadline_ms = 0,
+            };
+            try prepareLiveSessionTransition(app, .carry_forward);
+
+            const store = app.session_persistence.store orelse
+                return forkFailure(app, source_id, null, log_options, error.SessionStoreUnavailable);
+
+            var copy = store.forkSessionCopy(
+                app.alloc,
+                source_id,
+                .{ .window_turns = retained_turns },
+                .{},
+            ) catch |err| return forkFailure(app, source_id, null, log_options, err);
+            defer copy.deinit(app.alloc);
+
+            const forked_id = app.alloc.dupe(u8, copy.forked_session_id) catch |err|
+                return forkFailure(app, source_id, null, log_options, err);
+
+            if (copy.status == .indeterminate) {
+                return forkFailure(
+                    app,
+                    source_id,
+                    forked_id,
+                    log_options,
+                    error.SessionForkUnconfirmed,
+                );
+            }
+
+            enterSessionForWrite(app, forked_id, log_options, .session) catch |err|
+                return forkFailure(app, source_id, forked_id, log_options, err);
+
+            return .{ .branched = .{
+                .source_id = source_id,
+                .forked_id = forked_id,
+                .retained_turns = retained_turns,
+                .unverified_artifacts = copy.status == .forked_with_unverified_artifacts,
+            } };
+        }
+
+        /// A fork or rewind releases the writer lock by closing the session, so
+        /// a failure past that point leaves the shell with no session at all.
+        /// Put one back before reporting.
+        fn forkFailure(
+            app: *App,
+            source_id: []u8,
+            forked_id: ?[]u8,
+            log_options: session_log.Options,
+            problem: anyerror,
+        ) ForkOutcome {
+            return .{ .failed = .{
+                .source_id = source_id,
+                .forked_id = forked_id,
+                .problem = problem,
+                .landing = reopenSession(app, source_id, log_options),
+            } };
+        }
+
+        fn enterSessionForWrite(
+            app: *App,
+            session_id: []const u8,
+            log_options: session_log.Options,
+            notice: ResumeNotice,
+        ) !void {
+            var loaded = try loadResumeTargetForWrite(
+                app,
+                .{ .id = session_id },
+                log_options,
+            );
+            try installResumedSession(app, &loaded, notice);
+            requestSubagentBackgroundRecovery(app);
+            startResumedSessionReconciliation(app);
+            try app.finishLiveSessionResume();
+        }
+
+        fn reopenSession(
+            app: *App,
+            source_id: []const u8,
+            log_options: session_log.Options,
+        ) ForkLanding {
+            enterSessionForWrite(app, source_id, log_options, .session) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "event=session_reopen_failed id={s} err={s}",
+                    .{ source_id, @errorName(err) },
+                );
+                installFreshLiveSession(app) catch |fresh_err| {
+                    debug_trace.logf(
+                        "session",
+                        "event=session_reopen_fresh_session_failed err={s}",
+                        .{@errorName(fresh_err)},
+                    );
+                    return .no_session;
+                };
+                return .fresh_session;
+            };
+            return .source;
+        }
+
+        /// Answer to one `/rewind <count>`. The gate makes the confirm step a
+        /// state of the request rather than a flag the caller has to track.
+        pub const RewindOutcome = union(enum) {
+            unavailable_during_stream,
+            out_of_range: usize,
+            confirm: RewindTarget,
+            rewound: RewindTarget,
+        };
+
+        /// Drops trailing turns from the live conversation once the same
+        /// request has been made twice. The gate makes the confirm step a
+        /// state of the request rather than a flag the caller has to track.
+        pub fn rewindLiveSession(
+            app: *App,
+            requested_turns: usize,
+        ) !RewindOutcome {
+            if (app.stream.active) return .unavailable_during_stream;
+
+            const history_len = app.session.historyLen();
+            const dropped_turns = checkedTurnArgument(history_len, requested_turns) orelse
+                return .{ .out_of_range = history_len };
+
+            const target = RewindTarget{
+                .history_len = history_len,
+                .retained_turns = history_len - dropped_turns,
+            };
+            switch (app.session_persistence.rewind_gate.request(target)) {
+                .confirm => return .{ .confirm = target },
+                .execute => {},
+            }
+
+            try rewindToRetainedTurns(app, target.retained_turns);
+            return .{ .rewound = target };
+        }
+
+        /// With a saved session the shell leaves it, cuts its log through the
+        /// store, and enters it again, so the screen and the model context are
+        /// rebuilt from exactly what the log holds. `rewindSession` needs the
+        /// writer lock this process holds while the session is open, which is
+        /// why the session is closed first. Without a saved session the turns
+        /// are dropped in memory and the transcript is redrawn in place.
+        fn rewindToRetainedTurns(app: *App, retained_turns: usize) !void {
+            app.session_persistence.rewind_gate.disarm();
+
+            if (comptime runtime_profile.allows(App, .durable_sessions)) {
+                if (app.session_persistence.writable) |*active| {
+                    if (app.session_persistence.store) |store| {
+                        const session_id = try app.alloc.dupe(u8, active.active_id);
+                        defer app.alloc.free(session_id);
+                        const log_options = session_log.Options{
+                            .session_lock_deadline_ms = 0,
+                        };
+                        try prepareLiveSessionTransition(app, .carry_forward);
+                        var result = store.rewindSession(
+                            app.alloc,
+                            session_id,
+                            .{ .window_turns = retained_turns },
+                            .{},
+                        ) catch |err| {
+                            _ = reopenSession(app, session_id, log_options);
+                            return err;
+                        };
+                        result.deinit(app.alloc);
+                        try enterSessionForWrite(app, session_id, log_options, .rewound);
+                        commitJsHostSnapshot(app, "rewind");
+                        return;
+                    }
+                }
+            }
+
+            app.session.truncateHistory(app.alloc, retained_turns);
+            commitJsHostSnapshot(app, "rewind");
+            // The projection installs on top of whatever the shell already holds,
+            // so the old turns must go before the retained ones are redrawn.
+            app.shell.clearTranscript(app.alloc);
+            try rebuildTranscriptFromHistory(app, app.session.historyTurns(), app.workspace_root, null);
+            try resetTerminalForTranscriptReplacement(app);
+        }
+
+        pub fn openTurnPicker(app: *App) !bool {
+            if (app.stream.active or app.session.historyLen() == 0) return false;
+            // The picker is an inline compact menu like /statusline, so it never
+            // takes the alternate screen and has no terminal modes to restore.
+            app.session_persistence.turn_picker = TurnPicker.init(app.session.historyLen());
+            app.shell.render_requests.request(.footer);
+            return true;
+        }
+
+        pub fn moveTurnPicker(app: *App, delta: i32, visible_rows: usize) bool {
+            if (app.session_persistence.turn_picker) |*picker| {
+                picker.move(delta, visible_rows);
+                return true;
+            }
+            return false;
+        }
+
+        pub fn cancelTurnPicker(app: *App) !bool {
+            if (app.session_persistence.turn_picker == null) return false;
+            app.session_persistence.turn_picker = null;
+            app.shell.render_requests.request(.footer);
+            return true;
+        }
+
+        pub fn applyTurnPicker(app: *App) !bool {
+            const picker = app.session_persistence.turn_picker orelse return false;
+            if (!picker.isCurrent(app.session.historyLen())) {
+                _ = try cancelTurnPicker(app);
+                return true;
+            }
+            if (picker.retainedTurns() == picker.history_len) {
+                _ = try cancelTurnPicker(app);
+                return true;
+            }
+            const prompt = switch (app.session.historyTurns()[picker.retainedTurns()]) {
+                .assistant => |turn| turn.user.text,
+                .interrupted => |turn| turn.user.text,
+                .compacted_summary => "",
+            };
+            const prompt_copy = try app.alloc.dupe(u8, prompt);
+            defer app.alloc.free(prompt_copy);
+            _ = try cancelTurnPicker(app);
+            try rewindToRetainedTurns(app, picker.retainedTurns());
+            if (prompt_copy.len > 0) {
+                try app.input_runtime.textReplacementState().replace(app.alloc, prompt_copy);
+            }
+            return true;
+        }
+
+        pub fn disarmRewind(app: *App) void {
+            app.session_persistence.rewind_gate.disarm();
         }
 
         pub fn commitRuntimePreferences(
@@ -3354,8 +3925,8 @@ pub fn Runtime(comptime App: type) type {
         ) !void {
             try setCachedSessionTitle(app, display_title);
             switch (notice) {
-                .session => try sink.appendNotice(.{
-                    .topic = "session resumed",
+                .session, .rewound => try sink.appendNotice(.{
+                    .topic = if (notice == .rewound) "session rewound" else "session resumed",
                     .tone = .neutral,
                     .body = display_title,
                 }),

@@ -9,9 +9,11 @@ pub const ParsedCommand = union(enum) {
     clear_screen,
     new_session,
     reset_session,
-    resume_session,
+    resume_session: []const u8,
     continue_recovery,
     rename_session: []const u8,
+    fork_session: []const u8,
+    rewind_session: []const u8,
     help,
     login,
     logout: []const u8,
@@ -49,7 +51,7 @@ pub const CommandHandlers = struct {
     clear_screen: *const fn (ctx: *anyopaque) anyerror!void,
     new_session: *const fn (ctx: *anyopaque) anyerror!void,
     reset_session: *const fn (ctx: *anyopaque) anyerror!void,
-    resume_session: *const fn (ctx: *anyopaque) anyerror!void,
+    resume_session: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     continue_recovery: *const fn (ctx: *anyopaque) anyerror!void,
     show_help: *const fn (ctx: *anyopaque) anyerror!void,
     login: *const fn (ctx: *anyopaque) anyerror!void,
@@ -77,6 +79,8 @@ pub const CommandHandlers = struct {
     toggle_fast: *const fn (ctx: *anyopaque) anyerror!void,
     handle_statusline: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     rename_session: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
+    fork_session: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
+    rewind_session: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_notifications: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_workspace: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_version: *const fn (ctx: *anyopaque) anyerror!void,
@@ -93,9 +97,11 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .clear_screen => .clear_screen,
         .new_session => .new_session,
         .reset_session => .reset_session,
-        .resume_session => .resume_session,
+        .resume_session => .{ .resume_session = payload },
         .continue_recovery => .continue_recovery,
         .rename_session => .{ .rename_session = payload },
+        .fork_session => .{ .fork_session = payload },
+        .rewind_session => .{ .rewind_session = payload },
         .help => .help,
         .login => .login,
         .logout => .{ .logout = payload },
@@ -141,14 +147,24 @@ pub fn parse(registry: SlashRegistry, cmd: []const u8) ParsedCommand {
 }
 
 pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []const u8) !void {
-    switch (parse(registry, cmd)) {
+    return dispatch(handlers, parse(registry, cmd), cmd);
+}
+
+pub fn dispatch(
+    handlers: *const CommandHandlers,
+    parsed: ParsedCommand,
+    cmd: []const u8,
+) !void {
+    switch (parsed) {
         .quit => try handlers.quit(handlers.ctx),
         .clear_screen => try handlers.clear_screen(handlers.ctx),
         .new_session => try handlers.new_session(handlers.ctx),
         .reset_session => try handlers.reset_session(handlers.ctx),
-        .resume_session => try handlers.resume_session(handlers.ctx),
+        .resume_session => |rest| try handlers.resume_session(handlers.ctx, rest),
         .continue_recovery => try handlers.continue_recovery(handlers.ctx),
         .rename_session => |rest| try handlers.rename_session(handlers.ctx, rest),
+        .fork_session => |rest| try handlers.fork_session(handlers.ctx, rest),
+        .rewind_session => |rest| try handlers.rewind_session(handlers.ctx, rest),
         .help => try handlers.show_help(handlers.ctx),
         .login => try handlers.login(handlers.ctx),
         .logout => |rest| try handlers.logout(handlers.ctx, rest),
@@ -232,8 +248,15 @@ test "parse distinguishes new and reset lifecycle commands" {
     try std.testing.expectEqual(ParsedCommand.reset_session, parse(testSlashRegistry(), "/reset"));
 }
 
-test "parse recognizes interactive resume" {
-    try std.testing.expectEqual(ParsedCommand.resume_session, parse(testSlashRegistry(), "/resume"));
+test "parse recognizes interactive resume targets" {
+    for ([_]struct { input: []const u8, payload: []const u8 }{
+        .{ .input = "/resume", .payload = "" },
+        .{ .input = "/resume last", .payload = "last" },
+        .{ .input = "/resume session-123", .payload = "session-123" },
+    }) |case| switch (parse(testSlashRegistry(), case.input)) {
+        .resume_session => |payload| try std.testing.expectEqualStrings(case.payload, payload),
+        else => return error.TestExpectedResumeCommand,
+    };
 }
 
 test "parse recognizes explicit recovery continuation" {
@@ -413,8 +436,10 @@ fn recordCopy(ctx: *anyopaque) anyerror!void {
     testContext(ctx).called = "copy";
 }
 
-fn recordResumeSession(ctx: *anyopaque) anyerror!void {
-    testContext(ctx).called = "resume";
+fn recordResumeSession(ctx: *anyopaque, value: []const u8) anyerror!void {
+    const test_context = testContext(ctx);
+    test_context.called = "resume";
+    test_context.payload = value;
 }
 
 fn recordContinueRecovery(ctx: *anyopaque) anyerror!void {
@@ -463,7 +488,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .clear_screen = unexpectedNoPayload,
         .new_session = unexpectedNoPayload,
         .reset_session = unexpectedNoPayload,
-        .resume_session = unexpectedNoPayload,
+        .resume_session = unexpectedPayload,
         .continue_recovery = unexpectedNoPayload,
         .show_help = unexpectedNoPayload,
         .login = unexpectedNoPayload,
@@ -491,6 +516,8 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .toggle_fast = unexpectedNoPayload,
         .handle_statusline = unexpectedPayload,
         .rename_session = unexpectedPayload,
+        .fork_session = unexpectedPayload,
+        .rewind_session = unexpectedPayload,
         .handle_notifications = unexpectedPayload,
         .handle_workspace = unexpectedPayload,
         .show_version = unexpectedNoPayload,
@@ -517,6 +544,7 @@ test "route calls interactive resume handler" {
     try route(testSlashRegistry(), &handlers, "/resume");
 
     try std.testing.expectEqualStrings("resume", ctx.called);
+    try std.testing.expectEqualStrings("", ctx.payload);
 }
 
 test "route calls explicit recovery continuation handler" {

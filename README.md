@@ -103,6 +103,30 @@ fx session resume last
 fx session resume --id <id>
 ```
 
+Inside the interactive shell, use `/resume` to open the session picker, `/resume last` for the latest workspace session, or `/resume <id>` for an exact session.
+
+`fx session <id>` prints the saved conversation with a `[turn N]` label above every turn. Those labels are the boundaries the branch and undo commands take:
+
+```bash
+fx session fork <id> --at 7
+fx session rewind <id> --by 2
+```
+
+`fork` copies the first 7 turns into a brand-new session and prints the new ID to resume. The source session is left exactly as it was. `rewind` drops the last 2 turns from the session in place, keeping its ID. Both accept `--id <id>` and `--json`.
+
+A rewind truncates the session's conversation log to the retained turns, so the dropped turns no longer appear in its transcript. Fork first if the tail should stay reachable.
+
+The interactive shell has the same two operations for the session it is already in:
+
+```
+/fork 7
+/rewind 2
+```
+
+`/fork` branches the whole session at its current point; `/fork 7` branches at turn 7. Both forms name the source ID and the new one and leave you in the branch, while the source session keeps every turn it had. Bare `/rewind` opens a turn picker that restores to before the selected prompt and puts that prompt back in the composer. `/rewind 2` asks first: the message says how many turns it will drop and how many remain, and a second identical `/rewind 2` carries it out. Any other command in between cancels it.
+
+Neither command reverts file edits, commands, commits, or API calls. They change the conversation only.
+
 `fx -c` also resumes the latest session for the current workspace. It skips unrelated current-format conversation histories during selection and attempts safe recovery of the selected session after an interrupted migration. A busy or unrecoverable selected session produces an error rather than opening an older conversation.
 
 Repeated continuation reuses validated summaries of unchanged older sessions instead of replaying their histories during selection. The first scan, or a scan after those session files change, can take longer. Opening the resume picker preserves these cached summaries.

@@ -41,6 +41,8 @@ pub const SlashKind = enum {
     resume_session,
     continue_recovery,
     rename_session,
+    fork_session,
+    rewind_session,
     help,
     login,
     logout,
@@ -1798,7 +1800,7 @@ test "slash completion categories follow canonical entries" {
 test "help catalog groups visible commands and searches all command metadata" {
     const registry = testSlashRegistry();
 
-    try std.testing.expectEqual(@as(usize, 35), helpCatalogCount(registry, ""));
+    try std.testing.expectEqual(@as(usize, 37), helpCatalogCount(registry, ""));
     try std.testing.expectEqualStrings("/help", helpCatalogSpecAt(registry, "", 0).?.command);
     try std.testing.expectEqual(@as(usize, 5), helpCatalogCategoryCount(registry, "", .general));
     try std.testing.expectEqual(@as(usize, 3), helpCatalogCount(registry, "appearance"));
@@ -1947,9 +1949,9 @@ test "slash completion prefix normalizes leading whitespace and preserves argume
 test "slash completion prefix yields to no-argument command submission" {
     const registry = testSlashRegistry();
 
-    try std.testing.expectEqualStrings("/resume", slashCompletionPrefix(registry, "/resume").?);
-    try std.testing.expect(slashCompletionPrefix(registry, "/resume ") == null);
-    try std.testing.expect(slashCompletionPrefix(registry, "\n\t/resume\nignored") == null);
+    try std.testing.expectEqualStrings("/continue", slashCompletionPrefix(registry, "/continue").?);
+    try std.testing.expect(slashCompletionPrefix(registry, "/continue ") == null);
+    try std.testing.expect(slashCompletionPrefix(registry, "\n\t/continue\nignored") == null);
     try std.testing.expect(slashCompletionPrefix(registry, "/exit\t") == null);
 }
 
