@@ -327,48 +327,8 @@ jobs:
             libfx-package.tgz.sha256
           if-no-files-found: error
 
-  qualify-vercel:
-    needs: [metadata, package]
-    runs-on: ubuntu-24.04
-    env:
-      LIBFX_VERCEL_TOKEN: ${{ secrets.LIBFX_VERCEL_TOKEN }}
-      LIBFX_VERCEL_PROJECT_ID: ${{ vars.LIBFX_VERCEL_PROJECT_ID }}
-      LIBFX_VERCEL_ORG_ID: ${{ vars.LIBFX_VERCEL_ORG_ID }}
-      AI_GATEWAY_API_KEY: ${{ secrets.AI_GATEWAY_API_KEY }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ needs.metadata.outputs.sha }}
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: "24.18.0"
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: libfx-package
-      - name: Verify release qualification access
-        run: |
-          test -n "$LIBFX_VERCEL_TOKEN"
-          test -n "$LIBFX_VERCEL_PROJECT_ID"
-          test -n "$LIBFX_VERCEL_ORG_ID"
-          test -n "$AI_GATEWAY_API_KEY"
-          sha256sum --check libfx-package.tgz.sha256
-      - run: npm install --global vercel@56.4.1 pnpm@11.1.1
-      - name: Test live native tools on Vercel
-        env:
-          LIBFX_TEST_ARTIFACT_ROOT: ${{ runner.temp }}/libfx-vercel-evidence
-        run: node sdk/tests/test-vercel-package.mjs libfx-package.tgz
-      - name: Retain Vercel qualification evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: libfx-vercel-evidence
-          path: |
-            ${{ runner.temp }}/libfx-vercel-evidence/libfx-vercel-*/*.log
-            ${{ runner.temp }}/libfx-vercel-evidence/libfx-vercel-*/results.json
-          if-no-files-found: ignore
-
   publish:
-    needs: [metadata, qualify-vercel]
+    needs: [metadata, package]
     runs-on: ubuntu-24.04
     environment: npm
     permissions:
@@ -416,11 +376,6 @@ jobs:
   verify-published:
     needs: [metadata, publish]
     runs-on: ubuntu-24.04
-    env:
-      LIBFX_VERCEL_TOKEN: ${{ secrets.LIBFX_VERCEL_TOKEN }}
-      LIBFX_VERCEL_PROJECT_ID: ${{ vars.LIBFX_VERCEL_PROJECT_ID }}
-      LIBFX_VERCEL_ORG_ID: ${{ vars.LIBFX_VERCEL_ORG_ID }}
-      AI_GATEWAY_API_KEY: ${{ secrets.AI_GATEWAY_API_KEY }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -428,18 +383,34 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "24.18.0"
-      - run: npm install --global vercel@56.4.1 pnpm@11.1.1
-      - name: Verify the immutable registry version
+      - run: npm install --global pnpm@11.1.1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: libfx-package
+      - name: Download and compare the immutable registry version
+        env:
+          LIBFX_VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          sha256sum --check libfx-package.tgz.sha256
+          npm pack "libfx@${LIBFX_VERSION}" --ignore-scripts --registry=https://registry.npmjs.org/ --json > /tmp/libfx-registry-pack.json
+          mv "$(jq -r '.[0].filename' /tmp/libfx-registry-pack.json)" libfx-registry.tgz
+          cmp libfx-package.tgz libfx-registry.tgz
+      - name: Test the registry package in Node and Next
         env:
           LIBFX_TEST_ARTIFACT_ROOT: ${{ runner.temp }}/libfx-registry-evidence
-          LIBFX_VERSION: ${{ needs.metadata.outputs.version }}
-        run: node sdk/tests/test-vercel-package.mjs "$LIBFX_VERSION"
+        run: |
+          node sdk/tests/test-packed-example.mjs libfx-registry.tgz native esm
+          node --no-experimental-require-module sdk/tests/test-packed-example.mjs libfx-registry.tgz native cjs
+          node --experimental-wasm-jspi sdk/tests/test-packed-example.mjs libfx-registry.tgz wasm esm
+          node --experimental-wasm-jspi --no-experimental-require-module sdk/tests/test-packed-example.mjs libfx-registry.tgz wasm cjs
+          node sdk/tests/test-next-package.mjs libfx-registry.tgz
       - name: Retain registry qualification evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: libfx-registry-evidence
           path: |
-            ${{ runner.temp }}/libfx-registry-evidence/libfx-vercel-*/*.log
-            ${{ runner.temp }}/libfx-registry-evidence/libfx-vercel-*/results.json
+            ${{ runner.temp }}/libfx-registry-evidence/libfx-next-*/*.log
+            ${{ runner.temp }}/libfx-registry-evidence/libfx-next-*/results.json
           if-no-files-found: ignore

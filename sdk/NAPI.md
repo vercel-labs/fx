@@ -266,19 +266,24 @@ URLs. The publish workflow builds and tests each addon on its native runner
 before combining the artifacts with both WebAssembly surfaces, the README, and
 the Apache-2.0 license.
 
-The release workflow also requires a dedicated Next.js verification project.
-Configure its project-scoped token as the `LIBFX_VERCEL_TOKEN` repository
-secret, and its IDs as the `LIBFX_VERCEL_PROJECT_ID` and
-`LIBFX_VERCEL_ORG_ID` repository variables. Live turns use the existing
-`AI_GATEWAY_API_KEY` secret. The project uses Node.js 24 and the fixture's
-per-deployment request token; platform deployment protection must allow those
-requests, including the fixture's HTTP MCP calls.
-
 Package assembly and Next tests run without npm publishing credentials. The
-exact tarball is verified on Vercel before the OIDC publish, and the immutable
-registry version is checked afterward. Missing credentials or failed
-pre-publish qualification block publication. Redacted logs and structured
-results are retained as workflow artifacts, including on failure.
+OIDC publisher uploads the tested archive. The workflow then downloads that
+immutable registry version, compares it byte-for-byte with the archive, and
+exercises its Node entrypoints and Next development, production, and isolated
+deployment output. Failed package qualification blocks publication. Next
+logs and structured results are retained as workflow artifacts, including
+on failure.
+
+Live Vercel qualification is a separate release check. Run
+`node sdk/tests/test-vercel-package.mjs <tarball>` before publication, then run
+the same command with the immutable npm version afterward. Set
+`LIBFX_VERCEL_PROJECT_ID`, `LIBFX_VERCEL_ORG_ID`, and `AI_GATEWAY_API_KEY` in
+the environment. The harness uses the local Vercel CLI login, or
+`LIBFX_VERCEL_TOKEN` when supplied; npm publication does not require a Vercel
+token in GitHub. The dedicated verification project uses Node.js 24 and the
+fixture's per-deployment request token. Platform deployment protection must
+allow those requests, including the fixture's HTTP MCP calls. The harness
+retains redacted logs and results and removes its temporary deployment.
 
 ## Error model
 
