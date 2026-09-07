@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
+import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -41,6 +42,12 @@ if (activeTransitionChildIndex >= 0) {
   const scenario = process.argv[activeTransitionChildIndex + 1];
   const command = process.argv[activeTransitionChildIndex + 2];
   await runActiveTransitionChild(scenario, command);
+  process.exit(0);
+}
+
+const failureChildIndex = process.argv.indexOf("--failure-child");
+if (failureChildIndex >= 0) {
+  await runFailureChild(process.argv[failureChildIndex + 1]);
   process.exit(0);
 }
 
@@ -172,16 +179,22 @@ await runActiveTransitionScenario("streaming", "/clear");
 await runActiveTransitionScenario("stalled", "/new");
 await runActiveTransitionScenario("stalled", "/reset");
 
+for (const scenario of ["setup-data", "setup-keydata", "setup-resize", "setup-cleanup-error", "write-headers", "write-body"]) {
+  await runTerminalChild(["--failure-child", scenario], "failure_cleanup_passed");
+}
+
 console.log("headless lifecycle passed: active session transitions recovered and Ctrl-C cancelled stalled fetch");
 
 async function runActiveTransitionScenario(scenario, command) {
+  await runTerminalChild(["--active-transition-child", scenario, command], "followup_completed");
+}
+
+async function runTerminalChild(args, expectedOutput) {
   const child = spawn(process.execPath, [
     "--experimental-wasm-jspi",
     fileURLToPath(import.meta.url),
     wasmPath,
-    "--active-transition-child",
-    scenario,
-    command,
+    ...args,
   ], {
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -206,15 +219,147 @@ async function runActiveTransitionScenario(scenario, command) {
   });
 
   if (result.timedOut) {
-    throw new Error(`active ${command} timed out during ${scenario}; child output:\n${stdout}`);
+    throw new Error(`${args.join(" ")} timed out; child output:\n${stdout}`);
   }
   if (result.code !== 0) {
-    throw new Error(`active ${command} failed during ${scenario}: code=${result.code} signal=${result.signal}\n${stderr}\n${stdout}`);
+    throw new Error(`${args.join(" ")} failed: code=${result.code} signal=${result.signal}\n${stderr}\n${stdout}`);
   }
-  if (!stdout.includes("followup_completed")) {
-    throw new Error(`active ${command} did not complete a follow-up prompt during ${scenario}:\n${stdout}`);
+  if (!stdout.includes(expectedOutput)) {
+    throw new Error(`${args.join(" ")} omitted ${expectedOutput}:\n${stdout}`);
   }
-  if (stderr !== "") throw new Error(`active ${command} wrote stderr during ${scenario}:\n${stderr}`);
+  if (stderr !== "") throw new Error(`${args.join(" ")} wrote stderr:\n${stderr}`);
+}
+
+async function runFailureChild(scenario) {
+  const listeners = { data: new Set(), keydata: new Set(), resize: new Set() };
+  const disposals = { data: 0, keydata: 0, resize: 0 };
+  const events = [];
+  const errors = [];
+  const startupError = new Error("terminal registration failed");
+  const outputError = new Error("terminal output failed");
+  let fault = scenario === "setup-cleanup-error" ? "setup-resize" : scenario;
+  let savedData;
+  let failWrite = false;
+  let output = "";
+  let requestCount = 0;
+  let requestSignal;
+  let requestAborted = false;
+  let bodyOpened = false;
+  let recovering = false;
+  const pause = () => new Promise((resolvePause) => setTimeout(resolvePause, 10));
+  const until = async (predicate) => {
+    const deadline = performance.now() + 5000;
+    while (!predicate()) {
+      assert.ok(performance.now() < deadline, `timed out in ${scenario}: ${JSON.stringify({ requestCount, bodyOpened, output: output.slice(-2000) })}`);
+      await pause();
+    }
+  };
+  const register = (kind, callback) => {
+    if (fault === `setup-${kind}`) throw startupError;
+    listeners[kind].add(callback);
+    if (kind === "data") savedData = callback;
+    return () => {
+      disposals[kind] += 1;
+      listeners[kind].delete(callback);
+      if (fault && scenario === "setup-cleanup-error" && kind === "data") throw new Error("disposer failed");
+    };
+  };
+  const host = {
+    cols: 80, rows: 24,
+    write(bytes) {
+      if (failWrite) throw outputError;
+      output += new TextDecoder().decode(bytes);
+    },
+    onData(callback) { return register("data", callback); },
+    onKeyData(callback) { return register("keydata", callback); },
+    onResize(callback) { return register("resize", callback); },
+  };
+  const options = {
+    backend: "wasm", wasm: await readFile(wasmPath), terminal: host,
+    env: { AI_GATEWAY_API_KEY: "term-lifecycle-key", FX_SOUND: "0" },
+    onEvent(event) { events.push({ ...event, requestAborted: requestSignal?.aborted }); },
+    fetch: async (_url, init) => {
+      requestCount += 1;
+      requestSignal = init.signal;
+      if (recovering) return new Response('data: {"type":"text-delta","delta":"RECOVERED_OK"}\n\ndata: {"type":"finish","finishReason":{"unified":"stop"}}\n\ndata: [DONE]\n\n', { headers: { "content-type": "text/event-stream" } });
+      const onAbort = (stop) => init.signal.addEventListener("abort", () => {
+        requestAborted = true;
+        stop(new DOMException("aborted", "AbortError"));
+      }, { once: true });
+      if (scenario === "write-body") return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('data: {"type":"text-delta","delta":"OPEN_BODY"}\n\n'));
+          onAbort((error) => controller.error(error));
+        },
+        pull() { bodyOpened = true; },
+      }, { highWaterMark: 0 }), { headers: { "content-type": "text/event-stream" } });
+      return new Promise((_, reject) => onAbort(reject));
+    },
+  };
+
+  if (scenario.startsWith("setup-")) {
+    await assert.rejects(createFxTerminal(options), (error) => error === startupError);
+    await pause();
+    const acquired = scenario === "setup-data" ? [] : scenario === "setup-keydata" ? ["data"] : ["data", "keydata"];
+    for (const kind of acquired) {
+      assert.equal(disposals[kind], 1, `${kind} subscription leaked after startup rejection`);
+      assert.equal(listeners[kind].size, 0);
+    }
+    if (savedData) assert.throws(() => savedData("SHOULD_NOT_RUN\r"), /stdin is closed/);
+    await pause();
+    assert.equal(requestCount, 0, "failed startup accepted input");
+    assert.equal(events.filter((event) => event.type === "runtime.exit").length, 1);
+    assert.equal(events.filter((event) => event.type === "terminal.cleanup_error").length, scenario === "setup-cleanup-error" ? 1 : 0);
+
+    fault = null;
+    recovering = true;
+    const retry = await createFxTerminal(options);
+    await retry.interactive;
+    for (const kind of Object.keys(listeners)) assert.equal(listeners[kind].size, 1);
+    for (const callback of listeners.data) callback("recover\r");
+    await until(() => output.includes("RECOVERED_OK"));
+    assert.equal(requestCount, 1, "retry submitted duplicate requests");
+    retry.write("/exit\r");
+    assert.equal(await retry.exited, 0);
+    retry.abort();
+    for (const kind of Object.keys(listeners)) {
+      assert.equal(listeners[kind].size, 0);
+      assert.equal(disposals[kind], acquired.includes(kind) ? 2 : 1);
+    }
+  } else {
+    const runtime = await createFxTerminal(options);
+    await runtime.interactive;
+    runtime.write("pending request\r");
+    await until(() => requestSignal && (scenario !== "write-body" || bodyOpened));
+    const originalError = console.error;
+    console.error = (error) => errors.push(error);
+    let exitCode;
+    let abortedAtExit;
+    let releasedAtExit;
+    try {
+      failWrite = true;
+      exitCode = await runtime.exited;
+      abortedAtExit = requestSignal.aborted;
+      releasedAtExit = Object.keys(listeners).every((kind) => listeners[kind].size === 0 && disposals[kind] === 1);
+    } finally {
+      failWrite = false;
+      console.error = originalError;
+      runtime.abort();
+    }
+    assert.equal(exitCode, 1);
+    assert.equal(abortedAtExit, true, "output failure published exit before cancelling request");
+    assert.equal(releasedAtExit, true, "output failure left subscriptions attached");
+    assert.equal(requestAborted, true);
+    assert.deepEqual(errors, [outputError]);
+    const exits = events.filter((event) => event.type === "runtime.exit");
+    assert.equal(exits.length, 1);
+    assert.equal(exits[0].requestAborted, true);
+    for (const kind of Object.keys(listeners)) {
+      assert.equal(listeners[kind].size, 0);
+      assert.equal(disposals[kind], 1);
+    }
+  }
+  console.log("failure_cleanup_passed");
 }
 
 async function runActiveTransitionChild(scenario, command) {
