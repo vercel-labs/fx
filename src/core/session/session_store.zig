@@ -1093,7 +1093,7 @@ pub const Store = struct {
                 true,
                 options,
             ),
-            .last => try self.resumeLatestForWrite(alloc, workspace_root, options),
+            .last => try self.resumeLatestByDiscovery(alloc, workspace_root, options),
         };
         return self.finishResumedForWrite(alloc, loaded, options);
     }
@@ -1123,15 +1123,6 @@ pub const Store = struct {
         }
         try self.attachWritableChildCapability(alloc, &loaded);
         return loaded;
-    }
-
-    fn resumeLatestForWrite(
-        self: Store,
-        alloc: Allocator,
-        workspace_root: []const u8,
-        options: ResumeOptions,
-    ) !LoadedWritableSession {
-        return self.resumeLatestByDiscovery(alloc, workspace_root, options);
     }
 
     fn resumeLatestByDiscovery(
@@ -1165,15 +1156,6 @@ pub const Store = struct {
         options: ResumeOptions,
     ) !LoadedWritableSession {
         try options.log.test_controls.boundary(.latest_barrier_completed);
-        return self.resumeLatestDiscoveryAfterBarrier(alloc, workspace_root, options);
-    }
-
-    fn resumeLatestDiscoveryAfterBarrier(
-        self: Store,
-        alloc: Allocator,
-        workspace_root: []const u8,
-        options: ResumeOptions,
-    ) !LoadedWritableSession {
         const selected = try self.selectWritableLastId(
             alloc,
             workspace_root,
@@ -1218,7 +1200,8 @@ pub const Store = struct {
         try validateSessionId(session_id);
         var dir = try self.openSessionDir(session_id);
         defer dir.close();
-        var reader = try session_log.ConversationHistoryReader.init(alloc, &dir);
+        var buffer: [8192]u8 = undefined;
+        var reader = try session_log.ConversationHistoryReader.init(alloc, &dir, &buffer);
         defer reader.deinit();
         while (try reader.next()) |turn| {
             var turns = [_]session.HistoryTurn{turn};
@@ -4841,12 +4824,10 @@ fn writeFixtureEntry(
 const LatestBarrierFailure = struct {
     injected_error: anyerror,
     completed_count: usize = 0,
-    contended_count: usize = 0,
 
     fn callback(context: ?*anyopaque, boundary: session_log.Boundary) !void {
         const self: *LatestBarrierFailure = @ptrCast(@alignCast(context.?));
         switch (boundary) {
-            .latest_barrier_contended => self.contended_count += 1,
             .latest_barrier_completed => {
                 self.completed_count += 1;
                 return self.injected_error;
@@ -4881,7 +4862,6 @@ fn waitForTestFlagInCallback(flag: *const std.atomic.Value(bool)) bool {
 
 const ResumeInterleavingControl = struct {
     pause_on_session: bool = false,
-    barrier_contended: std.atomic.Value(bool) = .init(false),
     barrier_completed_count: std.atomic.Value(usize) = .init(0),
     session_opened: std.atomic.Value(bool) = .init(false),
     release_session: std.atomic.Value(bool) = .init(false),
@@ -4890,7 +4870,6 @@ const ResumeInterleavingControl = struct {
     fn boundary(context: ?*anyopaque, point: session_log.Boundary) !void {
         const self: *ResumeInterleavingControl = @ptrCast(@alignCast(context.?));
         switch (point) {
-            .latest_barrier_contended => self.barrier_contended.store(true, .seq_cst),
             .latest_barrier_completed => _ = self.barrier_completed_count.fetchAdd(1, .seq_cst),
         }
     }
@@ -6043,7 +6022,6 @@ test "latest discovery retries only one namespace loss" {
             ),
         );
         try std.testing.expectEqual(@as(usize, 2), failure.completed_count);
-        try std.testing.expectEqual(@as(usize, 0), failure.contended_count);
     }
 
     const non_retryable = [_]anyerror{
@@ -6067,7 +6045,6 @@ test "latest discovery retries only one namespace loss" {
             ),
         );
         try std.testing.expectEqual(@as(usize, 1), failure.completed_count);
-        try std.testing.expectEqual(@as(usize, 0), failure.contended_count);
     }
 
     var empty_control = ResumeInterleavingControl{};

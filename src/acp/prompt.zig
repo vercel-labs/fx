@@ -154,7 +154,6 @@ const AcpContext = struct {
     /// session/set_mode changes never mutate a running turn.
     captured_mode: ?[]const u8 = null,
     captured_permission_mode: ?PermissionMode = null,
-    retain_external_root_user_turn: bool = false,
     current_prompt_input: ?*ParsedPromptInput = null,
 
     fn deinitPublishedToolCalls(self: *AcpContext) void {
@@ -743,7 +742,7 @@ pub fn handlePrompt(
         if (writable.conversation_writer.turn_open) {
             const checkpoint = writable.state.recovery_checkpoint orelse
                 return error.InvalidRecoveryCheckpoint;
-            try persistAcpHistoryTurn(alloc, session, checkpoint.interruptedTurn(), false, null);
+            try persistAcpHistoryTurn(alloc, session, checkpoint.interruptedTurn(), null);
         }
     }
 
@@ -838,7 +837,6 @@ pub fn handlePrompt(
             recovery_checkpoint == null
     else
         false;
-    ctx.retain_external_root_user_turn = current_prompt_is_root_authority;
     var agent_config = buildAgentConfig(state, session, .{
         .skill_catalog = .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
         .host_instructions = host_instructions,
@@ -1935,7 +1933,6 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
             ctx.alloc,
             session,
             turn,
-            ctx.retain_external_root_user_turn,
             ctx.current_prompt_input,
         );
     }
@@ -1945,7 +1942,6 @@ fn persistAcpHistoryTurn(
     alloc: Allocator,
     session: *server.ActiveSessionState,
     turn: HistoryTurn,
-    prompt_is_root_authority: bool,
     current_prompt_input: ?*ParsedPromptInput,
 ) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
@@ -1967,13 +1963,6 @@ fn persistAcpHistoryTurn(
         return;
     };
     try writable.prepareHistoryTurnForCommit(alloc, &prepared);
-    try subagent_resume_admission.retainExternalRootUserTurn(
-        session.store,
-        alloc,
-        writable,
-        prepared,
-        prompt_is_root_authority,
-    );
     _ = try writable.appendEvent(
         alloc,
         .{ .history_turn_committed = .{

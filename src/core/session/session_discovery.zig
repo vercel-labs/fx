@@ -330,19 +330,10 @@ fn classifyConversationCandidate(
         var event_file = try openSessionFile(session_dir, "events.jsonl", .read_only);
         defer event_file.close(io_mod.getIo());
         var offset: u64 = 0;
+        var buffer: [8192]u8 = undefined;
+        var reader = event_file.reader(io_mod.getIo(), &buffer);
         while (offset < event_stat.size) {
-            const read = if (cancelled) |stop| session_replay.readLineAtCancellable(
-                alloc,
-                event_file,
-                offset,
-                event_stat.size,
-                stop,
-            ) else session_replay.readLineAt(
-                alloc,
-                event_file,
-                offset,
-                event_stat.size,
-            );
+            const read = session_replay.readBufferedLine(alloc, &reader, event_stat.size, cancelled);
             const line = read catch |err| switch (err) {
                 error.TruncatedEventFrame => break,
                 else => return err,
@@ -416,8 +407,10 @@ pub fn writable_conversation_candidate(
         defer file.close(io_mod.getIo());
         const stat = try file.stat(io_mod.getIo());
         var offset: u64 = 0;
+        var buffer: [8192]u8 = undefined;
+        var reader = file.reader(io_mod.getIo(), &buffer);
         while (offset < stat.size) {
-            const line = session_replay.readLineAt(alloc, file, offset, stat.size) catch |err| switch (err) {
+            const line = session_replay.readBufferedLine(alloc, &reader, stat.size, null) catch |err| switch (err) {
                 error.TruncatedEventFrame => break,
                 else => return err,
             } orelse break;

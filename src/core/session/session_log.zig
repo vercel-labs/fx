@@ -121,6 +121,10 @@ pub const ConversationWriter = struct {
 
     /// Takes ownership of `file` only on success.
     pub fn init(alloc: Allocator, file: std.Io.File) !ConversationWriter {
+        return initWithReplayScan(alloc, file, null);
+    }
+
+    fn initWithReplayScan(alloc: Allocator, file: std.Io.File, replay_scan: ?*ConversationReplayScan) !ConversationWriter {
         const length = try file.length(io_mod.getIo());
         var writer = ConversationWriter{ .alloc = alloc, .file = file };
         errdefer {
@@ -131,8 +135,10 @@ pub const ConversationWriter = struct {
         var open_turn_offset: ?u64 = null;
         var open_turn_prior_seq: u64 = 0;
         var checkpointed_turn = false;
+        var buffer: [8192]u8 = undefined;
+        var reader = file.reader(io_mod.getIo(), &buffer);
         while (offset < length) {
-            const line = session_replay.readLineAt(alloc, file, offset, length) catch |err| switch (err) {
+            const line = session_replay.readBufferedLine(alloc, &reader, length, null) catch |err| switch (err) {
                 error.TruncatedEventFrame => {
                     try file.setLength(io_mod.getIo(), offset);
                     try file.sync(io_mod.getIo());
@@ -170,6 +176,7 @@ pub const ConversationWriter = struct {
                 },
             }
             try writer.applyReplayedEvent(decoded.value.seq, decoded.value.event);
+            if (replay_scan) |scan| try scan.observe(offset, decoded.value.seq, decoded.value.event);
             offset = line.next_offset;
             writer.committed_bytes = offset;
         }
@@ -185,6 +192,10 @@ pub const ConversationWriter = struct {
             writer.committed_bytes = truncate_from;
             writer.last_seq = open_turn_prior_seq;
             writer.turn_open = checkpointed_turn;
+            if (replay_scan) |scan| {
+                scan.last_seq = writer.last_seq;
+                if (!writer.turn_open) scan.active_user_offset = null;
+            }
         }
         return writer;
     }
@@ -385,8 +396,10 @@ pub const ConversationWriter = struct {
     fn scanContext(self: *const ConversationWriter, alloc: Allocator, progress: *ConversationProgress, cut: ?types.ContextHistoryCut) !void {
         progress.coverage = self.latest_checkpoint_coverage;
         var offset: u64 = 0;
+        var buffer: [8192]u8 = undefined;
+        var reader = self.file.reader(io_mod.getIo(), &buffer);
         while (offset < self.committed_bytes) {
-            const line = try session_replay.readLineAt(alloc, self.file, offset, self.committed_bytes) orelse break;
+            const line = try session_replay.readBufferedLine(alloc, &reader, self.committed_bytes, null) orelse break;
             defer alloc.free(line.bytes);
             var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
             defer decoded.deinit();
@@ -741,7 +754,7 @@ fn loadConversationStateIfPresent(
     dir: *io_mod.VerifiedDir,
     expected_session_id: []const u8,
 ) !?session_codec.DurableSessionState {
-    return load_conversation_state_at_boundary(alloc, dir, expected_session_id, null);
+    return load_conversation_state_at_boundary(alloc, dir, expected_session_id, null, null);
 }
 
 fn load_conversation_state_at_boundary(
@@ -749,6 +762,7 @@ fn load_conversation_state_at_boundary(
     dir: *io_mod.VerifiedDir,
     expected_session_id: []const u8,
     recovery: ?ConversationRecoveryBoundary,
+    replay_window: ?ConversationReplayWindow,
 ) !?session_codec.DurableSessionState {
     const metadata_bytes = readManagedFileAlloc(
         alloc,
@@ -786,7 +800,7 @@ fn load_conversation_state_at_boundary(
     var open_work_id: ?[]u8 = null;
     defer if (open_work_id) |work_id| alloc.free(work_id);
     const length = if (recovery) |boundary| boundary.bytes else try event_file.length(io_mod.getIo());
-    const history = try replayConversationHistory(alloc, event_file, length, &conversation_seq, &open_work_id);
+    const history = try replayConversationHistory(alloc, event_file, length, &conversation_seq, &open_work_id, replay_window);
     errdefer session.freeHistoryTurnSlice(alloc, history);
     if (recovery == null) try restoreContextResultBodies(alloc, dir, history);
     const latest_work_id = if (recovery != null and recovery.?.turn_open and open_work_id != null)
@@ -886,7 +900,8 @@ pub fn find_conversation_recovery_boundary(
     alloc: Allocator,
     dir: *io_mod.VerifiedDir,
 ) !ConversationRecoveryBoundary {
-    var reader = try ConversationHistoryReader.init(alloc, dir);
+    var history_buffer: [8192]u8 = undefined;
+    var reader = try ConversationHistoryReader.init(alloc, dir, &history_buffer);
     defer reader.deinit();
     const file = reader.file;
     const length = reader.length;
@@ -898,11 +913,14 @@ pub fn find_conversation_recovery_boundary(
     }
     var boundary: ConversationRecoveryBoundary = .{};
     var offset: u64 = 0;
-    var coverage_offset: u64 = 0;
     var coverage_seq: u64 = 0;
     var coverage_progress: ConversationProgress = .{};
+    var buffer: [8192]u8 = undefined;
+    var lines = file.reader(io_mod.getIo(), &buffer);
+    var coverage_buffer: [8192]u8 = undefined;
+    var coverage_lines = file.reader(io_mod.getIo(), &coverage_buffer);
     scan: while (offset < length) {
-        const line = session_replay.readLineAt(alloc, file, offset, length) catch |err| switch (err) {
+        const line = session_replay.readBufferedLine(alloc, &lines, length, null) catch |err| switch (err) {
             error.TruncatedEventFrame, error.EventFrameTooLarge => break,
             else => return err,
         } orelse break;
@@ -921,14 +939,13 @@ pub fn find_conversation_recovery_boundary(
             const coverage = decoded.value.event.context_checkpoint.covers_through_seq;
             // Coverage is monotone, so historical cuts need only one extra scan.
             while (coverage_seq < coverage) {
-                const covered = (try session_replay.readLineAt(alloc, file, coverage_offset, offset)) orelse
+                const covered = (try session_replay.readBufferedLine(alloc, &coverage_lines, offset, null)) orelse
                     return error.SessionRecoveryBoundaryInvalid;
                 defer alloc.free(covered.bytes);
                 var frame = try session_event.decodeConversationFrame(alloc, covered.bytes);
                 defer frame.deinit();
                 try coverage_progress.observe(frame.value.seq, frame.value.event, null);
                 coverage_seq = frame.value.seq;
-                coverage_offset = covered.next_offset;
             }
             if (coverage_progress.pending != 0) break :scan;
         }
@@ -968,7 +985,7 @@ pub fn load_conversation_recovery_state(
     session_id: []const u8,
     boundary: ConversationRecoveryBoundary,
 ) !session_codec.DurableSessionState {
-    const loaded = load_conversation_state_at_boundary(alloc, dir, session_id, boundary) catch |err| switch (err) {
+    const loaded = load_conversation_state_at_boundary(alloc, dir, session_id, boundary, null) catch |err| switch (err) {
         error.InvalidSessionMetadata, error.InvalidSessionFormat => return error.SessionRecoveryBoundaryInvalid,
         else => return err,
     };
@@ -1172,7 +1189,8 @@ fn openConversationWritableSession(
     writable: *WritableSessionDir,
 ) !LoadedWritableSession {
     var event_file = try openManagedFile(&writable.dir, events_file, .read_write);
-    var conversation_writer = ConversationWriter.init(alloc, event_file) catch |err| {
+    var replay_scan: ConversationReplayScan = .{};
+    var conversation_writer = ConversationWriter.initWithReplayScan(alloc, event_file, &replay_scan) catch |err| {
         event_file.close(io_mod.getIo());
         return err;
     };
@@ -1185,15 +1203,21 @@ fn openConversationWritableSession(
         );
         defer if (recovery) |*checkpoint| checkpoint.deinit(alloc);
         if (recovery == null) {
-            _ = try conversation_writer.append(alloc, io_mod.milliTimestamp(), .{
+            const interrupted: session_event.ConversationEvent = .{
                 .interrupted = .{ .reason = .failed },
-            });
+            };
+            const offset = conversation_writer.committed_bytes;
+            _ = try conversation_writer.append(alloc, io_mod.milliTimestamp(), interrupted);
+            try replay_scan.observe(offset, conversation_writer.last_seq, interrupted);
         }
     }
-    var state = (try loadConversationStateIfPresent(
+    const replay_window = try replay_scan.finish(alloc, event_file, conversation_writer.committed_bytes);
+    var state = (try load_conversation_state_at_boundary(
         alloc,
         &writable.dir,
         writable.session_id,
+        null,
+        replay_window,
     )) orelse return error.InvalidSessionMetadata;
     errdefer state.deinit(alloc);
     const active_id = try alloc.dupe(u8, writable.session_id);
@@ -1222,8 +1246,9 @@ fn replayConversationHistory(
     length: u64,
     conversation_seq: *u64,
     open_work_id: *?[]u8,
+    replay_window: ?ConversationReplayWindow,
 ) ![]session.HistoryTurn {
-    const window = try findConversationReplayWindow(alloc, file, length);
+    const window = replay_window orelse try findConversationReplayWindow(alloc, file, length);
     conversation_seq.* = window.last_complete_seq;
     var offset = window.offset;
     var history: std.ArrayList(session.HistoryTurn) = .empty;
@@ -1258,9 +1283,11 @@ fn replayConversationHistory(
         try turn.begin(decoded.value.event.user);
     }
     var checkpoint_turn_open = window.active_user_offset != null;
-
+    var buffer: [8192]u8 = undefined;
+    var reader = file.reader(io_mod.getIo(), &buffer);
+    reader.pos = offset;
     while (offset < length) {
-        const line = session_replay.readLineAt(alloc, file, offset, length) catch |err| switch (err) {
+        const line = session_replay.readBufferedLine(alloc, &reader, length, null) catch |err| switch (err) {
             error.TruncatedEventFrame => break,
             else => return err,
         } orelse break;
@@ -1310,17 +1337,20 @@ fn replayConversationHistory(
 pub const ConversationHistoryReader = struct {
     alloc: Allocator,
     file: std.Io.File,
+    reader: std.Io.File.Reader,
     length: u64,
     offset: u64 = 0,
     builder: ConversationTurnBuilder,
 
-    pub fn init(alloc: Allocator, dir: *io_mod.VerifiedDir) !ConversationHistoryReader {
+    /// Borrows buffer until deinit; owns the opened file and current turn.
+    pub fn init(alloc: Allocator, dir: *io_mod.VerifiedDir, buffer: []u8) !ConversationHistoryReader {
         var file = try openManagedFile(dir, events_file, .read_only);
         errdefer file.close(io_mod.getIo());
         return .{
             .alloc = alloc,
             .file = file,
             .length = try file.length(io_mod.getIo()),
+            .reader = file.reader(io_mod.getIo(), buffer),
             .builder = ConversationTurnBuilder.init(alloc),
         };
     }
@@ -1333,7 +1363,7 @@ pub const ConversationHistoryReader = struct {
 
     pub fn next(self: *ConversationHistoryReader) !?session.HistoryTurn {
         while (self.offset < self.length) {
-            const line = session_replay.readLineAt(self.alloc, self.file, self.offset, self.length) catch |err| switch (err) {
+            const line = session_replay.readBufferedLine(self.alloc, &self.reader, self.length, null) catch |err| switch (err) {
                 error.TruncatedEventFrame => return null,
                 else => return err,
             } orelse return null;
@@ -1385,7 +1415,8 @@ pub fn loadConversationHistoryRange(
     end: usize,
 ) ![]session.HistoryTurn {
     if (start > end) return error.InvalidHistoryPageCursor;
-    var reader = try ConversationHistoryReader.init(alloc, dir);
+    var buffer: [8192]u8 = undefined;
+    var reader = try ConversationHistoryReader.init(alloc, dir, &buffer);
     defer reader.deinit();
     var turns: std.ArrayList(session.HistoryTurn) = .empty;
     errdefer {
@@ -1431,8 +1462,10 @@ fn load_conversation_archive_from_file(
     defer builder.deinit();
     var raw_turn_count: usize = 0;
     var compaction_count: usize = 0;
+    var buffer: [8192]u8 = undefined;
+    var reader = file.reader(io_mod.getIo(), &buffer);
     while (offset < length) {
-        const line = session_replay.readLineAt(alloc, file, offset, length) catch |err| switch (err) {
+        const line = session_replay.readBufferedLine(alloc, &reader, length, null) catch |err| switch (err) {
             error.TruncatedEventFrame => break,
             else => return err,
         } orelse break;
@@ -1502,89 +1535,94 @@ const ConversationReplayWindow = struct {
     coverage: u64 = 0,
 };
 
-fn findConversationReplayWindow(
-    alloc: Allocator,
-    file: std.Io.File,
-    length: u64,
-) !ConversationReplayWindow {
-    var window: ConversationReplayWindow = .{};
-    var offset: u64 = 0;
-    var turn_count: usize = 0;
-    var last_seq: u64 = 0;
-    var compaction_count: usize = 0;
-    var last_complete_seq: u64 = 0;
-    var active_user_offset: ?u64 = null;
-    while (offset < length) {
-        const line = session_replay.readLineAt(alloc, file, offset, length) catch |err| switch (err) {
-            error.TruncatedEventFrame => break,
-            else => return err,
-        } orelse break;
-        defer alloc.free(line.bytes);
-        var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
-        defer decoded.deinit();
-        const expected_seq = std.math.add(u64, last_seq, 1) catch
-            return error.InvalidConversationFrame;
-        if (decoded.value.seq != expected_seq) return error.InvalidConversationFrame;
-        last_seq = decoded.value.seq;
-        switch (decoded.value.event) {
+const ConversationReplayScan = struct {
+    window: ConversationReplayWindow = .{},
+    turn_count: usize = 0,
+    last_seq: u64 = 0,
+    active_user_offset: ?u64 = null,
+
+    fn observe(self: *ConversationReplayScan, offset: u64, seq: u64, event: session_event.ConversationEvent) !void {
+        const expected_seq = std.math.add(u64, self.last_seq, 1) catch return error.InvalidConversationFrame;
+        if (seq != expected_seq) return error.InvalidConversationFrame;
+        self.last_seq = seq;
+        switch (event) {
             .user => {
-                if (active_user_offset != null) return error.InvalidConversationFrame;
-                active_user_offset = offset;
+                if (self.active_user_offset != null) return error.InvalidConversationFrame;
+                self.active_user_offset = offset;
             },
             .turn_completed, .interrupted => {
-                if (active_user_offset == null) return error.InvalidConversationFrame;
-                active_user_offset = null;
-                turn_count = std.math.add(usize, turn_count, 1) catch
-                    return error.InvalidConversationFrame;
-                last_complete_seq = decoded.value.seq;
+                if (self.active_user_offset == null) return error.InvalidConversationFrame;
+                self.active_user_offset = null;
+                self.turn_count = std.math.add(usize, self.turn_count, 1) catch return error.InvalidConversationFrame;
+                self.window.last_complete_seq = seq;
             },
             .context_checkpoint => |checkpoint| {
-                last_complete_seq = decoded.value.seq;
-                compaction_count = std.math.add(
-                    usize,
-                    compaction_count,
-                    1,
-                ) catch return error.InvalidConversationFrame;
-                window = .{
+                self.window = .{
                     .offset = offset,
-                    .prior_turn_count = turn_count,
-                    .compaction_count = compaction_count,
-                    .active_user_offset = active_user_offset,
+                    .prior_turn_count = self.turn_count,
+                    .compaction_count = std.math.add(usize, self.window.compaction_count, 1) catch return error.InvalidConversationFrame,
+                    .last_complete_seq = seq,
+                    .active_user_offset = self.active_user_offset,
                     .checkpoint_offset = offset,
                     .coverage = checkpoint.covers_through_seq,
                 };
             },
             else => {},
         }
+    }
+
+    fn finish(self: *const ConversationReplayScan, alloc: Allocator, file: std.Io.File, length: u64) !ConversationReplayWindow {
+        var window = self.window;
+        // Coverage can precede the checkpoint: retain the recent exchanges
+        // between those boundaries rather than replaying only after the record.
+        if (window.checkpoint_offset != null) {
+            window.offset = 0;
+            window.active_user_offset = null;
+            window.prior_turn_count = 0;
+            var buffer: [8192]u8 = undefined;
+            var reader = file.reader(io_mod.getIo(), &buffer);
+            while (window.offset < length) {
+                const line = try session_replay.readBufferedLine(alloc, &reader, length, null) orelse break;
+                defer alloc.free(line.bytes);
+                var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
+                defer decoded.deinit();
+                if (decoded.value.seq > window.coverage) break;
+                switch (decoded.value.event) {
+                    .user => window.active_user_offset = window.offset,
+                    .turn_completed, .interrupted => {
+                        window.active_user_offset = null;
+                        window.prior_turn_count += 1;
+                    },
+                    else => {},
+                }
+                window.offset = line.next_offset;
+            }
+        }
+        return window;
+    }
+};
+
+fn findConversationReplayWindow(
+    alloc: Allocator,
+    file: std.Io.File,
+    length: u64,
+) !ConversationReplayWindow {
+    var scan: ConversationReplayScan = .{};
+    var offset: u64 = 0;
+    var buffer: [8192]u8 = undefined;
+    var reader = file.reader(io_mod.getIo(), &buffer);
+    while (offset < length) {
+        const line = session_replay.readBufferedLine(alloc, &reader, length, null) catch |err| switch (err) {
+            error.TruncatedEventFrame => break,
+            else => return err,
+        } orelse break;
+        defer alloc.free(line.bytes);
+        var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
+        defer decoded.deinit();
+        try scan.observe(offset, decoded.value.seq, decoded.value.event);
         offset = line.next_offset;
     }
-    window.last_complete_seq = last_complete_seq;
-    // Coverage is the summarized prefix. Recent exchanges can precede the
-    // checkpoint record and must be replayed after its summary, unchanged.
-    if (window.checkpoint_offset != null) {
-        offset = 0;
-        window.offset = 0;
-        window.active_user_offset = null;
-        window.prior_turn_count = 0;
-        while (offset < length) {
-            const line = try session_replay.readLineAt(alloc, file, offset, length) orelse break;
-            defer alloc.free(line.bytes);
-            var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
-            defer decoded.deinit();
-            if (decoded.value.seq > window.coverage) break;
-            switch (decoded.value.event) {
-                .user => window.active_user_offset = offset,
-                .turn_completed, .interrupted => {
-                    window.active_user_offset = null;
-                    window.prior_turn_count += 1;
-                },
-                else => {},
-            }
-            offset = line.next_offset;
-            window.offset = offset;
-        }
-    }
-    return window;
+    return scan.finish(alloc, file, length);
 }
 
 const ConversationTurnBuilder = struct {
@@ -2323,7 +2361,6 @@ pub fn recoverInterruptedLegacyImport(
 }
 
 pub const Boundary = enum {
-    latest_barrier_contended,
     latest_barrier_completed,
 };
 
