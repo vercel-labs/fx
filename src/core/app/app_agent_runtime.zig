@@ -1092,7 +1092,7 @@ pub fn Runtime(comptime App: type) type {
                 job.model,
                 capabilities,
             );
-            const window = try agent_runtime.prepareRetainedCompactionWindow(arena, job.history, null, capabilities, source_tokens);
+            const window = try agent_runtime.prepareRetainedCompactionWindow(arena, job.history, null, capabilities, source_tokens, deps.agent_stream_provider, .{ .provider = job.provider, .model = job.model });
             const continuation_messages = try arena.alloc(ChatMessage, continuation.request.messages.len + window.retained_messages.len);
             @memcpy(continuation_messages[0..continuation.request.messages.len], continuation.request.messages);
             @memcpy(continuation_messages[continuation.request.messages.len..], window.retained_messages);
