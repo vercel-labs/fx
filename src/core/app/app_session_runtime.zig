@@ -2459,13 +2459,6 @@ pub fn Runtime(comptime App: type) type {
             };
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
             try loaded.prepareHistoryTurnForCommit(app.alloc, &prepared);
-            try subagent_resume_admission.retainExternalRootUserTurn(
-                app.session_persistence.store,
-                app.alloc,
-                loaded,
-                turn,
-                app.worker.active_prompt_is_root_authority,
-            );
             _ = loaded.appendEvent(
                 app.alloc,
                 .{ .history_turn_committed = .{

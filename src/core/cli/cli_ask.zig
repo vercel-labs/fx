@@ -599,7 +599,6 @@ const AskContext = struct {
     image_snapshot_temp_dir: ?[]u8 = null,
     prompt_snapshot_committed: bool = false,
     last_recovery_status: ?types.RouteRecoveryStatus = null,
-    retain_external_root_user_turn: bool = false,
 
     fn init(alloc: Allocator, cfg: Config, deps: RunDeps, workspace_root: []const u8) AskContext {
         const lifecycle_runtime = hooks.Runtime.init(alloc);
@@ -1785,7 +1784,6 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             recovery_checkpoint == null
     else
         false;
-    ctx.retain_external_root_user_turn = current_prompt_is_root_authority;
     options.deps.process_queued_prompt(&ctx.session.agent, &deps, semantic_presentation, ctx.lifecycleContext(), .{
         .system_prompt = cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = cfg.prompt_policy.modelPromptOverlay(ctx.model),
@@ -2854,14 +2852,6 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
         return;
     };
     try writable.prepareHistoryTurnForCommit(ctx.alloc, &prepared);
-    try subagent_resume_admission.retainExternalRootUserTurn(
-        ctx.store,
-        ctx.alloc,
-        writable,
-        prepared,
-        ctx.retain_external_root_user_turn,
-    );
-
     _ = try writable.appendEvent(
         ctx.alloc,
         .{ .history_turn_committed = .{

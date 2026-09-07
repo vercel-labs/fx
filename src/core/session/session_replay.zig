@@ -24,6 +24,162 @@ pub const LineRead = struct {
     next_offset: u64,
 };
 
+/// Returns an owned line, borrowing the caller's positional reader and buffer.
+/// Read-ahead stays within the supplied committed boundary.
+pub fn readBufferedLine(
+    alloc: Allocator,
+    reader: *std.Io.File.Reader,
+    max_end: u64,
+    cancelled: ?*const std.atomic.Value(bool),
+) !?LineRead {
+    if (cancelled) |stop| if (stop.load(.acquire)) return error.Cancelled;
+    if (reader.logicalPos() >= max_end) return null;
+    std.debug.assert(reader.interface.buffer.len > 0);
+    var line: std.ArrayList(u8) = .empty;
+    errdefer line.deinit(alloc);
+    while (reader.logicalPos() < max_end) {
+        if (cancelled) |stop| if (stop.load(.acquire)) return error.Cancelled;
+        if (reader.interface.bufferedLen() == 0) {
+            const buffer = reader.interface.buffer;
+            reader.interface = std.Io.File.Reader.initInterface(buffer[0..@intCast(@min(
+                buffer.len,
+                max_end - reader.logicalPos(),
+            ))]);
+            defer reader.interface.buffer = buffer;
+            reader.interface.fill(1) catch |err| switch (err) {
+                error.EndOfStream => {
+                    if (line.items.len == 0) return null;
+                    return error.TruncatedEventFrame;
+                },
+                error.ReadFailed => return reader.err orelse error.ReadFailed,
+            };
+        }
+        const buffered = reader.interface.buffered();
+        const bytes = buffered[0..@intCast(@min(buffered.len, max_end - reader.logicalPos()))];
+        const newline = std.mem.findScalar(u8, bytes, '\n');
+        const count = if (newline) |end| end + 1 else bytes.len;
+        try line.appendSlice(alloc, bytes[0..count]);
+        reader.interface.toss(count);
+        if (line.items.len > session_event.event_frame_max_bytes) return error.EventFrameTooLarge;
+        if (newline != null) return .{
+            .bytes = try line.toOwnedSlice(alloc),
+            .next_offset = reader.logicalPos(),
+        };
+    }
+    return error.TruncatedEventFrame;
+}
+
+test "buffered session lines retain unread bytes and exact boundaries" {
+    const Counter = struct {
+        reads: usize = 0,
+
+        fn read(raw: ?*anyopaque, file: std.Io.File, data: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.reads += 1;
+            return std.testing.io.vtable.fileReadPositional(std.testing.io.userdata, file, data, offset);
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const bytes = "one\n\ntwo-long\nignored\n";
+    var file = try tmp.dir.createFile(std.testing.io, "lines", .{ .read = true });
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, bytes);
+    var counter: Counter = .{};
+    var vtable = std.testing.io.vtable.*;
+    vtable.fileReadPositional = Counter.read;
+    var buffer: [8]u8 = undefined;
+    var reader = file.reader(.{ .userdata = &counter, .vtable = &vtable }, &buffer);
+    for ([_]struct { text: []const u8, end: u64 }{
+        .{ .text = "one\n", .end = 4 },
+        .{ .text = "\n", .end = 5 },
+        .{ .text = "two-long\n", .end = 14 },
+    }) |expected| {
+        const line = (try readBufferedLine(alloc, &reader, 14, null)) orelse return error.TestUnexpectedResult;
+        defer alloc.free(line.bytes);
+        try std.testing.expectEqualStrings(expected.text, line.bytes);
+        try std.testing.expectEqual(expected.end, line.next_offset);
+    }
+    try std.testing.expect((try readBufferedLine(alloc, &reader, 14, null)) == null);
+    try std.testing.expectEqual(@as(usize, 2), counter.reads);
+    try std.testing.expectEqual(@as(u64, 14), reader.pos);
+}
+
+test "buffered session lines preserve cancellation truncation and I/O errors" {
+    const Failure = struct {
+        fn read(_: ?*anyopaque, _: std.Io.File, _: []const []u8, _: u64) std.Io.File.ReadPositionalError!usize {
+            return error.InputOutput;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "lines", .{ .read = true });
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, "a\nb\n");
+    var buffer: [3]u8 = undefined;
+    var reader = file.reader(std.testing.io, &buffer);
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, readBufferedLine(alloc, &reader, 4, &cancelled));
+    cancelled.store(false, .release);
+    const first = (try readBufferedLine(alloc, &reader, 4, &cancelled)).?;
+    defer alloc.free(first.bytes);
+    try std.testing.expectEqualStrings("a\n", first.bytes);
+    try std.testing.expectError(error.TruncatedEventFrame, readBufferedLine(alloc, &reader, 3, null));
+    var vtable = std.testing.io.vtable.*;
+    vtable.fileReadPositional = Failure.read;
+    var failed = file.reader(.{ .userdata = null, .vtable = &vtable }, &buffer);
+    try std.testing.expectError(error.InputOutput, readBufferedLine(alloc, &failed, 4, null));
+}
+
+test "buffered session lines release allocations across buffer boundaries" {
+    const Case = struct {
+        fn run(alloc: Allocator) !void {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            var file = try tmp.dir.createFile(std.testing.io, "lines", .{ .read = true });
+            defer file.close(std.testing.io);
+            const bytes = "longer than the tiny input buffer\n";
+            try file.writeStreamingAll(std.testing.io, bytes);
+            var buffer: [3]u8 = undefined;
+            var reader = file.reader(std.testing.io, &buffer);
+            const line = (try readBufferedLine(alloc, &reader, bytes.len, null)) orelse return error.TestUnexpectedResult;
+            defer alloc.free(line.bytes);
+            try std.testing.expectEqualStrings(bytes, line.bytes);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "buffered session lines enforce frame size and physical EOF" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "lines", .{ .read = true });
+    defer file.close(std.testing.io);
+    const bytes = try alloc.alloc(u8, session_event.event_frame_max_bytes + 1);
+    defer alloc.free(bytes);
+    @memset(bytes, 'x');
+    bytes[bytes.len - 2] = '\n';
+    bytes[bytes.len - 1] = '\n';
+    try file.writeStreamingAll(std.testing.io, bytes);
+    var buffer: [8192]u8 = undefined;
+    var reader = file.reader(std.testing.io, &buffer);
+    const maximum = (try readBufferedLine(alloc, &reader, bytes.len - 1, null)).?;
+    defer alloc.free(maximum.bytes);
+    try std.testing.expectEqual(bytes.len - 1, maximum.bytes.len);
+    try file.writePositionalAll(std.testing.io, "x", bytes.len - 2);
+    reader = file.reader(std.testing.io, &buffer);
+    try std.testing.expectError(error.EventFrameTooLarge, readBufferedLine(alloc, &reader, bytes.len, null));
+    try file.setLength(std.testing.io, 1);
+    reader = file.reader(std.testing.io, &buffer);
+    try std.testing.expectError(error.TruncatedEventFrame, readBufferedLine(alloc, &reader, 2, null));
+    reader = file.reader(std.testing.io, &buffer);
+    reader.pos = 1;
+    try std.testing.expect((try readBufferedLine(alloc, &reader, 2, null)) == null);
+}
+
 pub fn readLineAt(
     alloc: Allocator,
     file: std.Io.File,
