@@ -85,6 +85,10 @@ pub fn Runtime(comptime App: type) type {
             };
 
             app.requestUpgradeRelaunch(executable_path) catch |err| {
+                if (err == error.NotReady) {
+                    try writeUpgradeNotice(app, .neutral, "no installed upgrade is ready");
+                    return .not_ready;
+                }
                 const notice = try std.fmt.allocPrint(
                     app.alloc,
                     "upgrade installed, but relaunch could not be prepared: {s}; restart fx manually",
@@ -363,6 +367,55 @@ test "app_upgrade_runtime keeps running when relaunch preparation fails" {
         app.notices.items,
         "relaunch could not be prepared: NameTooLong",
     ) != null);
+}
+
+test "app_upgrade_runtime keeps the app alive when replacement wins during path preparation" {
+    const App = struct {
+        alloc: std.mem.Allocator = std.testing.allocator,
+        upgrader: auto_upgrade.AutoUpgrade = .{},
+        should_exit: bool = false,
+        prepared: bool = false,
+        handed_off: bool = false,
+        notice: ?[]const u8 = null,
+
+        fn prepareResumeHandoffForUpgrade(self: *@This()) !void {
+            self.prepared = true;
+        }
+
+        fn requestUpgradeRelaunch(self: *@This(), path: []const u8) !void {
+            try self.upgrader.requestRelaunch(path);
+        }
+
+        fn requestResumeHandoffForUpgrade(self: *@This()) void {
+            self.handed_off = true;
+        }
+
+        fn writeDomainNotice(self: *@This(), notice: types.SemanticNotice, _: bool) !void {
+            self.notice = notice.body;
+        }
+
+        fn resolvePath(ctx: ?*anyopaque, _: []u8) upgrade_helpers.ExecutablePathError![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.upgrader.version_mutex.lockUncancelable(std.testing.io);
+            self.upgrader.state.store(@intFromEnum(auto_upgrade.State.downloading), .release);
+            self.upgrader.version_mutex.unlock(std.testing.io);
+            return "/tmp/fx-upgraded";
+        }
+    };
+    var app = App{};
+    app.upgrader.state.store(@intFromEnum(auto_upgrade.State.ready), .release);
+    const outcome = try Runtime(App).applyReadyUpgradeWithDeps(&app, .{
+        .ctx = &app,
+        .current_executable_path = App.resolvePath,
+    });
+
+    try std.testing.expectEqual(ApplyOutcome.not_ready, outcome);
+    try std.testing.expect(app.prepared);
+    try std.testing.expect(!app.handed_off);
+    try std.testing.expect(!app.should_exit);
+    try std.testing.expect(app.upgrader.takeRelaunchRequest() == null);
+    try std.testing.expect(!app.upgrader.should_stop.load(.acquire));
+    try std.testing.expectEqualStrings("no installed upgrade is ready", app.notice.?);
 }
 
 test "app_upgrade_runtime keeps the app alive when the resume boundary is invalid" {

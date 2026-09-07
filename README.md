@@ -25,6 +25,8 @@ It's open source (Apache-2.0), model-agnostic, and suitable for both local and c
 curl -fsSL https://fx.sh/setup.sh | bash
 ```
 
+For development releases, run `fx upgrade --channel dev`. Automatic updates keep checking about once a minute while an update awaits Ctrl+G, replacing it when another dev build is published. Your current conversation keeps running until you reload. A failed replacement leaves the installed binary intact and retries later. Run `fx upgrade --channel stable` to return to stable releases.
+
 ## Run fx
 
 Sign in with Vercel AI Gateway:
