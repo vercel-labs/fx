@@ -6,8 +6,9 @@ import { once } from "node:events";
 import { createWriteStream } from "node:fs";
 import { cp, mkdir, mkdtemp, readFile, rename, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { serializeError } from "./package-report.mjs";
 
@@ -107,6 +108,12 @@ try {
   manifest.dependencies.libfx = "file:./libfx.tgz";
   await writeFile(resolve(app, "package.json"), JSON.stringify(manifest, null, 2));
   await run(process.env.PNPM_BIN || "pnpm", ["install", "--no-frozen-lockfile", "--ignore-scripts"], app, "install");
+  const require = createRequire(resolve(app, "package.json"));
+  await run(process.execPath, [
+    fileURLToPath(new URL("./test-node-tracing.mjs", import.meta.url)),
+    dirname(require.resolve("libfx")),
+    require.resolve("next/dist/compiled/@vercel/nft"),
+  ], app, "node-tracing");
   const next = resolve(app, "node_modules/next/dist/bin/next");
   const dev = await start(app, [next, "dev"], "dev");
   await exercise(dev, "dev");

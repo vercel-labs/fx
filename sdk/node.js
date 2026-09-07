@@ -76,17 +76,22 @@ async function loadNativeCandidate(candidate) {
 }
 
 function defaultNativeCandidate() {
+  // Local path bindings let deployment tracers retain these assets in the generated CommonJS entry.
   if (process.platform === "linux" && process.arch === "x64") {
-    return new URL("./libfx.linux-x64.node", import.meta.url);
+    const path = fileURLToPath(new URL("./libfx.linux-x64.node", import.meta.url));
+    return path;
   }
   if (process.platform === "linux" && process.arch === "arm64") {
-    return new URL("./libfx.linux-arm64.node", import.meta.url);
+    const path = fileURLToPath(new URL("./libfx.linux-arm64.node", import.meta.url));
+    return path;
   }
   if (process.platform === "darwin" && process.arch === "x64") {
-    return new URL("./libfx.darwin-x64.node", import.meta.url);
+    const path = fileURLToPath(new URL("./libfx.darwin-x64.node", import.meta.url));
+    return path;
   }
   if (process.platform === "darwin" && process.arch === "arm64") {
-    return new URL("./libfx.darwin-arm64.node", import.meta.url);
+    const path = fileURLToPath(new URL("./libfx.darwin-arm64.node", import.meta.url));
+    return path;
   }
   return null;
 }
@@ -151,7 +156,7 @@ async function discoverNativeBackend() {
     return { backend: null, error: null, failure: "unsupported" };
   }
   try {
-    await access(fileURLToPath(candidate));
+    await access(candidate);
   } catch (error) {
     if (missingArtifact(error)) {
       return { backend: null, error: null, probeError: error, failure: "missing" };
@@ -297,7 +302,7 @@ export async function getBackendInfo(value = {}) {
   const defaultWasm = surface === "agent" ? defaultCoreWasm : defaultTermWasm;
   const wasmSource = wasm ?? defaultWasm;
   try {
-    await loadModule(wasmInput(wasmSource));
+    await loadModule(await wasmInput(wasmSource));
     attempts.push({ backend: "wasm-jspi", available: true, reason: null });
     return { surface, backend: "wasm-jspi", attempts };
   } catch (error) {
@@ -512,7 +517,7 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
     throw jspiFallbackError(surface, nativeError);
   }
   const wasmSource = runtimeOptions.wasm ?? defaultWasm;
-  return wasmFactory({ ...runtimeOptions, wasm: wasmInput(wasmSource) });
+  return wasmFactory({ ...runtimeOptions, wasm: await wasmInput(wasmSource) });
 }
 
 export async function createFxAgent(options = {}) {

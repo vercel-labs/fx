@@ -256,6 +256,11 @@ creates a separate WebAssembly instance for every Agent. Agent memory, history,
 tools, cancellation, and shutdown remain isolated. Workers and separate
 processes maintain their own module caches, as do the ESM and CommonJS entries.
 
+Node factories and `getBackendInfo()` also accept a `wasm` Promise resolving
+to an HTTP(S) URL string, a `Response`, Wasm bytes, or a compiled
+`WebAssembly.Module`. Asset resolver failures propagate from factories and
+appear as `LIBFX_WASM_LOAD_FAILED` in diagnostics.
+
 Node.js 20+ is supported. Browser WebAssembly requires a JSPI-capable browser.
 The Linux x64 and arm64 native addons require glibc 2.34 or newer. Native
 agents do not require JSPI or experimental Node flags.

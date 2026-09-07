@@ -297,6 +297,7 @@ jobs:
 
       - name: Test installed package and diagnostics
         run: |
+          node --experimental-wasm-jspi sdk/tests/test-node-async-assets.mjs sdk/dist/libfx
           node sdk/tests/test-packed-example.mjs libfx-package.tgz native esm
           node --no-experimental-require-module sdk/tests/test-packed-example.mjs libfx-package.tgz native cjs
           node --experimental-wasm-jspi sdk/tests/test-packed-example.mjs libfx-package.tgz wasm esm
@@ -324,6 +325,8 @@ jobs:
             ${{ runner.temp }}/libfx-package-evidence/resilience.json
             ${{ runner.temp }}/libfx-package-evidence/libfx-next-*/*.log
             ${{ runner.temp }}/libfx-package-evidence/libfx-next-*/results.json
+            ${{ runner.temp }}/libfx-package-evidence/libfx-trace-*/*.log
+            ${{ runner.temp }}/libfx-package-evidence/libfx-trace-*/results.json
           if-no-files-found: ignore
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -420,4 +423,6 @@ jobs:
           path: |
             ${{ runner.temp }}/libfx-registry-evidence/libfx-next-*/*.log
             ${{ runner.temp }}/libfx-registry-evidence/libfx-next-*/results.json
+            ${{ runner.temp }}/libfx-registry-evidence/libfx-trace-*/*.log
+            ${{ runner.temp }}/libfx-registry-evidence/libfx-trace-*/results.json
           if-no-files-found: ignore
