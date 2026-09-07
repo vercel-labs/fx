@@ -3193,18 +3193,24 @@ pub const Root = struct {
             return failLoadedWritableSession(error.SessionAlreadyExists);
         }
 
+        const random = randomIdentifier();
+        const suffix = std.fmt.bytesToHex(random, .lower);
+        const staging_name = try std.fmt.allocPrint(alloc, "creating+{s}", .{suffix});
+        defer alloc.free(staging_name);
         sessions.dir.createDir(
             io_mod.getIo(),
-            initial_state.id,
+            staging_name,
             private_dir_permissions,
-        ) catch |err| switch (err) {
-            error.PathAlreadyExists => return failLoadedWritableSession(error.SessionAlreadyExists),
-            else => return failLoadedWritableSession(error.SessionStartFailed),
+        ) catch return failLoadedWritableSession(error.SessionStartFailed);
+        var unpublished = true;
+        errdefer if (unpublished) {
+            debug_trace.logf("session", "session creation discarded unpublished state id={s}", .{initial_state.id});
+            sessions.dir.deleteTree(io_mod.getIo(), staging_name) catch |err| {
+                debug_trace.logf("session", "session creation cleanup retained id={s} err={s}", .{ initial_state.id, @errorName(err) });
+            };
         };
-        io_mod.syncVerifiedDir(sessions.dir) catch
-            return failLoadedWritableSession(error.SessionStartFailed);
 
-        var session_dir = try openSessionDir(sessions, initial_state.id, .writable);
+        var session_dir = try io_mod.openOrCreateVerifiedPrivateDir(sessions, staging_name);
         options.test_controls.lock(.session);
         var writer_lock = acquireLockWithDeadline(
             &session_dir,
@@ -3225,13 +3231,29 @@ pub const Root = struct {
             .writer_lock = writer_lock,
             .session_id = session_id,
         };
-        errdefer writable.deinit(alloc);
-        return createNativeSession(
+        var writable_owned = true;
+        errdefer if (writable_owned) writable.deinit(alloc);
+        var loaded = try createNativeSession(
             alloc,
             &writable,
             initial_state,
             options,
         );
+        writable_owned = false;
+        errdefer loaded.deinit(alloc);
+        try loaded.conversation_writer.file.sync(io_mod.getIo());
+        try io_mod.syncVerifiedDir(loaded.log.dir.dir);
+        publishSessionDirectory(sessions.dir, staging_name, initial_state.id) catch |err| {
+            if (err == error.PathAlreadyExists) return error.SessionAlreadyExists;
+            debug_trace.logf("session", "session creation publication failed id={s} err={s}", .{ initial_state.id, @errorName(err) });
+            return err;
+        };
+        unpublished = false;
+        io_mod.syncVerifiedDir(sessions.dir) catch |err| {
+            debug_trace.logf("session", "session creation retained published state id={s} durability=uncertain err={s}", .{ initial_state.id, @errorName(err) });
+            return error.SessionStartFailed;
+        };
+        return loaded;
     }
 
     pub fn resumeForWrite(
@@ -3369,6 +3391,34 @@ pub const Root = struct {
         return entryExists(&dir, name);
     }
 };
+
+fn publishSessionDirectory(parent: std.Io.Dir, staging: []const u8, target: []const u8) !void {
+    if (comptime @import("builtin").os.tag != .macos) {
+        return parent.renamePreserve(staging, parent, target, io_mod.getIo());
+    }
+    // Zig 0.16's Darwin preserve-rename uses hard links, which cannot publish directories.
+    const Darwin = struct {
+        extern "c" fn renameatx_np(c_int, [*:0]const u8, c_int, [*:0]const u8, c_uint) c_int;
+    };
+    var staging_buffer: [256]u8 = undefined;
+    var target_buffer: [256]u8 = undefined;
+    const staging_z = try std.fmt.bufPrintZ(&staging_buffer, "{s}", .{staging});
+    const target_z = try std.fmt.bufPrintZ(&target_buffer, "{s}", .{target});
+    while (true) {
+        try io_mod.getIo().checkCancel();
+        const err = std.posix.errno(Darwin.renameatx_np(parent.handle, staging_z, parent.handle, target_z, 0x4));
+        switch (err) {
+            .SUCCESS => return,
+            .INTR => continue,
+            .EXIST, .NOTEMPTY => return error.PathAlreadyExists,
+            .OPNOTSUPP, .NOSYS => return error.OperationUnsupported,
+            else => {
+                debug_trace.logf("session", "session directory publication failed errno={s}", .{@tagName(err)});
+                return error.SessionStartFailed;
+            },
+        }
+    }
+}
 
 fn validateLeaf(name: []const u8) !void {
     if (name.len == 0 or std.mem.eql(u8, name, ".") or
@@ -4383,6 +4433,105 @@ test "root starts a cache-free conversation session" {
     try std.testing.expect(saw_writer_lock);
     try std.testing.expect(saw_permissions);
     try std.testing.expect(saw_usage);
+}
+
+test "root session creation stays outside discovery while preparing" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "unpublished-session", 10);
+    defer initial.deinit(alloc);
+    const Probe = struct {
+        root: *Root,
+        observed: bool = false,
+        visible: bool = false,
+        failure: ?anyerror = null,
+
+        fn lock(context: ?*anyopaque, _: LockKind) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.observed = true;
+            self.visible = entryExists(&self.root.sessions.?, "unpublished-session") catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+    var probe = Probe{ .root = &temp.root };
+    var loaded = try temp.root.startConversationSession(alloc, initial, .{
+        .test_controls = .{ .context = &probe, .lock_fn = Probe.lock },
+    });
+    defer loaded.deinit(alloc);
+    if (probe.failure) |err| return err;
+    try std.testing.expect(probe.observed);
+    try std.testing.expect(!probe.visible);
+    try std.testing.expect(try entryExists(&temp.root.sessions.?, initial.id));
+    try std.testing.expectEqualStrings(initial.id, loaded.active_id);
+    var saved = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer saved.deinit(alloc);
+    try std.testing.expectEqualStrings(initial.id, saved.id);
+}
+
+test "root session creation never replaces a racing target" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "racing-session", 10);
+    defer initial.deinit(alloc);
+    const Probe = struct {
+        root: *Root,
+        created: bool = false,
+        failure: ?anyerror = null,
+
+        fn lock(context: ?*anyopaque, _: LockKind) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.root.sessions.?.dir.createDir(std.testing.io, "racing-session", private_dir_permissions) catch |err| {
+                if (err != error.PathAlreadyExists) self.failure = err;
+                return;
+            };
+            self.created = true;
+        }
+    };
+    var probe = Probe{ .root = &temp.root };
+    if (temp.root.startConversationSession(alloc, initial, .{
+        .test_controls = .{ .context = &probe, .lock_fn = Probe.lock },
+    })) |value| {
+        var loaded = value;
+        loaded.deinit(alloc);
+        return error.ExpectedSessionCollision;
+    } else |err| try std.testing.expectEqual(error.SessionAlreadyExists, err);
+    if (probe.failure) |err| return err;
+    try std.testing.expect(probe.created);
+    var preserved = try openSessionDir(&temp.root.sessions.?, initial.id, .read_only);
+    defer preserved.close();
+    var entries = preserved.dir.iterate();
+    try std.testing.expect((try entries.next(std.testing.io)) == null);
+}
+
+test "root session creation allocation failures leave no published state" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "allocation-session", 10);
+    defer initial.deinit(alloc);
+    var measured = std.testing.FailingAllocator.init(alloc, .{});
+    var successful = try temp.root.startConversationSession(measured.allocator(), initial, .{});
+    successful.deinit(measured.allocator());
+    try temp.root.sessions.?.dir.deleteTree(std.testing.io, initial.id);
+    for (0..measured.alloc_index) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
+        if (temp.root.startConversationSession(failing.allocator(), initial, .{})) |value| {
+            var loaded = value;
+            loaded.deinit(failing.allocator());
+            return error.ExpectedAllocationFailure;
+        } else |err| {
+            try std.testing.expect(failing.has_induced_failure);
+            // Existing allocating JSON writers surface allocation loss as WriteFailed.
+            try std.testing.expect(err == error.OutOfMemory or err == error.WriteFailed);
+        }
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        var entries = temp.root.sessions.?.dir.iterate();
+        try std.testing.expect((try entries.next(std.testing.io)) == null);
+    }
 }
 
 test "conversation writer appends without duplicating live history" {

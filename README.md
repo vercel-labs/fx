@@ -111,6 +111,8 @@ Older sessions that saved Vercel connection settings can be opened through `-r`,
 
 If a saved conversation is damaged, run `fx session recover <id>` to copy its validated prefix into a new session. Recovery preserves checkpoint boundaries and referenced result files, leaves the original unchanged, and prints the new session ID. Records after the damaged boundary are not included, and recovery does not rerun commands. Healthy conversations can be resumed without recovery.
 
+New sessions appear in resume selection only after their initial files are ready. Incomplete creation folders left by older builds do not block healthy conversations from resuming with `-c`; those folders remain available for diagnosis and are not deleted.
+
 Interactive terminal tabs show `fx v<version> | <folder>` using the running binary's version and current workspace folder name, for example `fx v0.0.7 | fx`. Renaming a session or switching models leaves the title unchanged. Resuming from another folder uses that folder's name. Exiting clears the fx-owned title. Noninteractive commands do not emit terminal-title controls.
 
 Run `/feedback` to open the feedback form at `fx.sh/feedback`. It does not create a diagnostic or change the clipboard.
