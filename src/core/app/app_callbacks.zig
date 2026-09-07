@@ -1068,6 +1068,7 @@ pub fn Bindings(comptime App: type) type {
                             .chatgpt_subscription => "Reconnect Codex through /login to repair this source.",
                             .grok_subscription => "Reconnect Grok through /login to repair this source.",
                             .vercel_oidc_token, .ai_gateway_api_key, .stored_key => "Run /provider to repair this source.",
+                            .deepseek_api_key => "Set DEEPSEEK_API_KEY, then retry.",
                             .host_managed => credentials.host_managed_auth_message,
                         },
                     },

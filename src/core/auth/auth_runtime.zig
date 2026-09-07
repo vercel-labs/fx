@@ -1446,6 +1446,10 @@ pub const StatusSnapshot = struct {
                 .cli => credentials.missing_grok_credential_message,
                 .interactive => credentials.missing_grok_interactive_credential_message,
             },
+            .deepseek_api_key => switch (surface) {
+                .cli => credentials.missing_deepseek_credential_message,
+                .interactive => credentials.missing_deepseek_interactive_credential_message,
+            },
             .host_managed => automatic_help,
         };
     }

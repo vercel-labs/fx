@@ -1130,10 +1130,12 @@ pub const Reducer = struct {
         };
         if (low < self.message_items.items.len and self.message_items.items[low].output_index == output_index) {
             const prior = &self.message_items.items[low];
-            if (phase) |value| {
-                if (prior.phase) |old| if (old != value) return error.ResponsesTextConflict;
-                prior.phase = value;
-            }
+            // Providers may publish a provisional phase on output_item.added
+            // and correct it on output_item.done (DeepSeek announces
+            // "final_answer" first and completes the same item as
+            // "commentary"). The completed phase is authoritative, so adopt
+            // the latest phase instead of treating the change as a conflict.
+            if (phase) |value| prior.phase = value;
             if (id_hash != null) prior.id_hash = id_hash;
             return prior;
         }
@@ -2189,7 +2191,7 @@ test "Responses captures assistant phase from terminal output" {
     try std.testing.expectEqualStrings("final_answer", replay.value.array.items[0].object.get("phase").?.string);
 }
 
-test "Responses omits unknown phases and rejects contradictory phases within one message" {
+test "Responses omits unknown phases and adopts the completed phase over a provisional one" {
     var unknown = ToolRecordTest.init(std.testing.allocator);
     defer unknown.deinit();
     try unknown.apply(
@@ -2200,14 +2202,23 @@ test "Responses omits unknown phases and rejects contradictory phases within one
     defer unknown.freeCompletion(unknown_completion);
     try std.testing.expect(unknown_completion.provider_state_json == null);
 
-    var conflicting = ToolRecordTest.init(std.testing.allocator);
-    defer conflicting.deinit();
-    try conflicting.apply(
-        "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"phase\":\"commentary\"}}",
+    var corrected = ToolRecordTest.init(std.testing.allocator);
+    defer corrected.deinit();
+    try corrected.apply(
+        "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"phase\":\"final_answer\"}}",
     );
-    try std.testing.expectError(error.ResponsesTextConflict, conflicting.apply(
-        "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"phase\":\"final_answer\",\"content\":[]}}",
-    ));
+    try corrected.apply(
+        "{\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"I will inspect the file first.\"}",
+    );
+    try corrected.apply(
+        "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"phase\":\"commentary\",\"content\":[{\"type\":\"output_text\",\"text\":\"I will inspect the file first.\"}]}}",
+    );
+    try corrected.apply(ToolRecordTest.terminal);
+    const corrected_completion = try corrected.finish();
+    defer corrected.freeCompletion(corrected_completion);
+    const replay = try std.json.parseFromSlice(std.json.Value, corrected.alloc, corrected_completion.provider_state_json.?, .{});
+    defer replay.deinit();
+    try std.testing.expectEqualStrings("commentary", replay.value.array.items[0].object.get("phase").?.string);
 }
 
 test "Responses rejects conflicting completed tool records" {
