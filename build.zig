@@ -99,6 +99,12 @@ pub fn build(b: *std.Build) void {
 
     for (0..test_shard_count) |test_shard| {
         const run_shard_tests = b.addRunArtifact(suite_tests);
+        // Without an explicit exit-code check, a plain (non-server-mode) run
+        // step defaults to `.infer_from_args`, which std.Build.Step.Run
+        // treats as having side effects and runs under a global lock, i.e.
+        // serialized with every other such step in the whole build graph.
+        // This one line is what makes the shards actually run concurrently.
+        run_shard_tests.expectExitCode(0);
         run_shard_tests.step.dependOn(&install_exe.step);
         run_shard_tests.setEnvironmentVariable(
             "FX_TEST_PRODUCT_EXE",
