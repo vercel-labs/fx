@@ -996,7 +996,10 @@ async function instantiate(options) {
       runtime.setInstance(null);
       if (options.args?.[0] === "acp" && !String(error).includes("proc_exit")) runtime.abort(error);
       else {
-        if (!String(error).includes("proc_exit")) console.error(error);
+        if (!String(error).includes("proc_exit")) {
+          runtime.abortHostEffects();
+          console.error(error);
+        }
         runtime.markExited(runtime.aborted ? 130 : 1);
       }
     },
@@ -1040,13 +1043,13 @@ export async function createFxTerminal(options) {
     if (interruptKey && data.includes(interruptKey)) runtime.abortHostEffects();
     runtime.write(data);
   };
-  const unsubscribeData = options.terminal.onData(forwardData);
-  const unsubscribeKeyData = options.terminal.onKeyData?.(forwardData) ?? (() => {});
   const signalResize = () => {
     emit("terminal.resize", { cols: options.terminal.cols, rows: options.terminal.rows });
     runtime.wake();
   };
-  const unsubscribeResize = options.terminal.onResize(signalResize);
+  let unsubscribeData;
+  let unsubscribeKeyData;
+  let unsubscribeResize;
   let subscriptionsReleased = false;
   const releaseSubscriptions = () => {
     if (subscriptionsReleased) return;
@@ -1059,6 +1062,17 @@ export async function createFxTerminal(options) {
     releaseSubscriptions();
     emit("runtime.exit", { surface: "terminal", code });
   });
+  try {
+    unsubscribeData = options.terminal.onData(forwardData);
+    unsubscribeKeyData = options.terminal.onKeyData?.(forwardData);
+    unsubscribeResize = options.terminal.onResize(signalResize);
+  } catch (error) {
+    // The rejected factory never transfers this promise to a caller.
+    interactive.catch(() => {});
+    releaseSubscriptions();
+    runtime.abort();
+    throw error;
+  }
   return {
     interactive,
     exited: runtime.exited,
