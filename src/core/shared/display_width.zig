@@ -345,7 +345,8 @@ fn isCombining(codepoint: u21) bool {
         (codepoint >= 0x1dc0 and codepoint <= 0x1dff) or
         (codepoint >= 0x20d0 and codepoint <= 0x20ff) or
         (codepoint >= 0xfe20 and codepoint <= 0xfe2f) or
-        (codepoint >= 0xfe00 and codepoint <= 0xfe0f);
+        (codepoint >= 0xfe00 and codepoint <= 0xfe0f) or
+        isInRanges(codepoint, unicode_data.combining_ranges[0..]);
 }
 
 fn isZeroWidthContinuation(codepoint: u21) bool {
@@ -519,6 +520,46 @@ test "runeWidth preserves current width table semantics" {
     try std.testing.expectEqual(@as(usize, 1), runeWidth('a'));
     try std.testing.expectEqual(@as(usize, 1), runeWidth(' '));
     try std.testing.expectEqual(@as(usize, 0), runeWidth(0x09));
+}
+
+test "runeWidth treats Thai combining marks as zero-width" {
+    // Mn/Me marks composite onto the preceding cell.
+    try std.testing.expectEqual(@as(usize, 0), runeWidth(0x0E31));
+    try std.testing.expectEqual(@as(usize, 0), runeWidth(0x0E34));
+    try std.testing.expectEqual(@as(usize, 0), runeWidth(0x0E3A));
+    try std.testing.expectEqual(@as(usize, 0), runeWidth(0x0E47));
+    try std.testing.expectEqual(@as(usize, 0), runeWidth(0x0E4E));
+    // Spacing Thai characters still occupy a cell.
+    try std.testing.expectEqual(@as(usize, 1), runeWidth(0x0E01));
+    try std.testing.expectEqual(@as(usize, 1), runeWidth(0x0E30));
+    try std.testing.expectEqual(@as(usize, 1), runeWidth(0x0E33));
+    try std.testing.expectEqual(@as(usize, 1), runeWidth(0x0E40));
+}
+
+test "visibleWidth counts Thai clusters as single cells" {
+    // Base + above-vowel + tone mark: one cell per cluster, not per codepoint.
+    try std.testing.expectEqual(@as(usize, 1), visibleWidth("\u{0E01}\u{0E31}\u{0E49}"));
+    try std.testing.expectEqual(@as(usize, 1), visibleWidth("\u{0E17}\u{0E35}\u{0E48}"));
+    // SARA AM is spacing, so it costs its own cell even after a tone mark.
+    try std.testing.expectEqual(@as(usize, 2), visibleWidth("\u{0E19}\u{0E49}\u{0E33}"));
+    // Marks without a base still cost no cells.
+    try std.testing.expectEqual(@as(usize, 0), visibleWidth("\u{0E49}"));
+}
+
+test "display unit scanner keeps Thai marks as zero-width units" {
+    const cluster = "\u{0E01}\u{0E31}\u{0E49}";
+    try std.testing.expectEqual(
+        DisplayUnit{ .byte_len = 3, .cell_width = 1 },
+        displayUnitAt(cluster, 0),
+    );
+    try std.testing.expectEqual(
+        DisplayUnit{ .byte_len = 3, .cell_width = 0 },
+        displayUnitAt(cluster, 3),
+    );
+    try std.testing.expectEqual(
+        DisplayUnit{ .byte_len = 3, .cell_width = 0 },
+        displayUnitAt(cluster, 6),
+    );
 }
 
 test "decodeNextRune preserves boundary and invalid-byte behavior" {
