@@ -195,6 +195,7 @@ jobs:
           node sdk/tests/test-node-package.mjs
           node sdk/tests/test-term-demo-package.mjs
           node sdk/scripts/package-libfx.mjs sdk/dist/libfx
+          node --experimental-wasm-jspi sdk/tests/test-node-async-assets.mjs sdk/dist/libfx
           npm pack ./sdk/dist/libfx --ignore-scripts --json > /tmp/libfx-pack.json
           mv "$(node -p 'require("/tmp/libfx-pack.json")[0].filename')" /tmp/libfx-package.tgz
           node sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz native esm
@@ -225,6 +226,8 @@ jobs:
             ${{ runner.temp }}/libfx-package-evidence/resilience.json
             ${{ runner.temp }}/libfx-package-evidence/libfx-next-*/*.log
             ${{ runner.temp }}/libfx-package-evidence/libfx-next-*/results.json
+            ${{ runner.temp }}/libfx-package-evidence/libfx-trace-*/*.log
+            ${{ runner.temp }}/libfx-package-evidence/libfx-trace-*/results.json
           if-no-files-found: ignore
 
   sdk-browser-wasm:
