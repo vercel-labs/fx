@@ -2690,14 +2690,22 @@ pub const Store = struct {
         return loaded;
     }
 
-    fn only_unpublished_lock(session_dir: *io_mod.VerifiedDir) !bool {
+    fn only_unpublished_creation(session_dir: *io_mod.VerifiedDir, allow_metadata: bool) !bool {
+        if (try authority_module.entryExistsRelative(session_dir, "events.jsonl")) return false;
         var dir = try session_dir.dir.openDir(io_mod.getIo(), ".", .{ .iterate = true });
         defer dir.close(io_mod.getIo());
         var entries = dir.iterate();
         while (try entries.next(io_mod.getIo())) |entry| {
-            if (entry.kind != .file or !std.mem.eql(u8, entry.name, "session.lock")) return false;
+            if (entry.kind != .file) return false;
+            const is_lock = std.mem.eql(u8, entry.name, "session.lock");
+            const is_metadata = allow_metadata and std.mem.eql(u8, entry.name, "session.json");
+            const prefix = ".session.json.tmp.";
+            if (!is_lock and !is_metadata) {
+                if (entry.name.len != prefix.len + 32 or !std.mem.startsWith(u8, entry.name, prefix)) return false;
+                for (entry.name[prefix.len..]) |byte| if (!std.ascii.isHex(byte)) return false;
+            }
             const stat = try dir.statFile(io_mod.getIo(), entry.name, .{ .follow_symlinks = false });
-            if (stat.kind != .file or stat.size != 0 or stat.nlink != 1) return false;
+            if (stat.kind != .file or stat.nlink != 1 or (is_lock and stat.size != 0)) return false;
         }
         return true;
     }
@@ -2882,6 +2890,12 @@ pub const Store = struct {
         if (try session_log.readConversationMetadata(alloc, &session_dir)) |value| {
             var metadata = value;
             defer metadata.deinit();
+            if (std.mem.eql(u8, metadata.value.id, session_id) and
+                try only_unpublished_creation(&session_dir, true))
+            {
+                debug_trace.logf("session", "latest selection retained incomplete creation id={s} disposition=skipped", .{session_id});
+                return null;
+            }
             return try discovery.writable_conversation_candidate(
                 alloc,
                 &session_dir,
@@ -2905,7 +2919,10 @@ pub const Store = struct {
                     &session_dir,
                     session_id,
                 ) catch |err| {
-                    if (err == error.FileNotFound and try only_unpublished_lock(&session_dir)) return null;
+                    if (err == error.FileNotFound and try only_unpublished_creation(&session_dir, false)) {
+                        debug_trace.logf("session", "latest selection retained incomplete creation id={s} disposition=skipped", .{session_id});
+                        return null;
+                    }
                     return err;
                 };
                 defer candidate.deinit(alloc);
@@ -7182,6 +7199,61 @@ test "writable last skips only unpublished lock directories" {
     const retained = try readFixtureFile(alloc, ctx.store, "lock-only", "events.jsonl", 1024);
     defer alloc.free(retained);
     try std.testing.expectEqualStrings("unidentified saved data\n", retained);
+}
+
+test "writable last skips retained incomplete creation without weakening saved-data checks" {
+    const alloc = std.testing.allocator;
+    for ([_]struct { metadata: bool, temporary: bool }{
+        .{ .metadata = false, .temporary = true },
+        .{ .metadata = true, .temporary = false },
+        .{ .metadata = true, .temporary = true },
+    }) |shape| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var ctx = try initTempStore(alloc, &tmp);
+        defer ctx.deinit(alloc);
+        try createHistoryPageFixture(alloc, ctx.store, "healthy", ctx.workspace, 1, "saved");
+        try ctx.store.canonical_root.sessions.?.dir.createDir(std.testing.io, "failed-start", .fromMode(0o700));
+        var incomplete_dir = try ctx.store.openSessionDir("failed-start");
+        defer incomplete_dir.close();
+        const lock_file = try incomplete_dir.dir.createFile(std.testing.io, "session.lock", .{ .permissions = .fromMode(0o600) });
+        lock_file.close(std.testing.io);
+        const temp_name = ".session.json.tmp.0123456789abcdef0123456789abcdef";
+        if (shape.temporary) try writeFixtureEntry(alloc, ctx.store, "failed-start", temp_name, "partial metadata");
+        if (shape.metadata) {
+            var healthy_dir = try ctx.store.openSessionDir("healthy");
+            defer healthy_dir.close();
+            var decoded = (try session_log.readConversationMetadata(alloc, &healthy_dir)).?;
+            defer decoded.deinit();
+            var metadata = decoded.value;
+            metadata.id = "failed-start";
+            const bytes = try session_codec.encodeSessionMetadata(alloc, metadata);
+            defer alloc.free(bytes);
+            try writeFixtureEntry(alloc, ctx.store, "failed-start", "session.json", bytes);
+        }
+        const retained_name = if (shape.metadata) "session.json" else temp_name;
+        const before = try readFixtureFile(alloc, ctx.store, "failed-start", retained_name, 4096);
+        defer alloc.free(before);
+        {
+            var resumed = try ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{});
+            defer resumed.deinit(alloc);
+            try std.testing.expectEqualStrings("healthy", resumed.active_id);
+            try std.testing.expectEqualStrings("saved-0", resumed.state.history[0].assistant.user.text);
+        }
+        const retained = try readFixtureFile(alloc, ctx.store, "failed-start", retained_name, 4096);
+        defer alloc.free(retained);
+        try std.testing.expectEqualStrings(before, retained);
+        if (ctx.store.resumeForWrite(alloc, "failed-start")) |value| {
+            var loaded = value;
+            loaded.deinit(alloc);
+            return error.IncompleteSessionWasResumed;
+        } else |err| try std.testing.expect(err == error.FileNotFound or err == error.SessionNotFound);
+        try writeFixtureEntry(alloc, ctx.store, "failed-start", "permissions.json", "{}");
+        try std.testing.expectError(error.FileNotFound, ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{}));
+        const controls = try readFixtureFile(alloc, ctx.store, "failed-start", "permissions.json", 1024);
+        defer alloc.free(controls);
+        try std.testing.expectEqualStrings("{}", controls);
+    }
 }
 
 test "writable last ignores unrelated conversation history" {
