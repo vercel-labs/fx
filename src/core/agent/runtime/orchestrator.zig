@@ -3357,6 +3357,102 @@ fn retainCompletedResultInTurnArena(result: *runtime_gateway_step.StreamResult) 
     }
 }
 
+fn discardCompletionProse(
+    arena: Allocator,
+    provider: agent_stream_provider.Provider,
+    source: model_provider.ProviderSelection,
+    completed: *agent_stream_provider.Completed,
+) !void {
+    const prior = completed.completion;
+    const replay: ?types.ProviderReplay = if (prior.provider_state_json) |parts|
+        .{ .source = source, .parts_json = parts }
+    else
+        null;
+    const selected = try provider.projectReplay(arena, replay, prior.tool_calls, false, true);
+    if (completed.ownership == .owned) {
+        if (prior.content) |content| arena.free(@constCast(content));
+        if (prior.provider_state_json) |parts| {
+            if (selected == null or selected.?.parts_json.ptr != parts.ptr) arena.free(@constCast(parts));
+        }
+    }
+    completed.completion.content = null;
+    completed.completion.provider_state_json = if (selected) |value| value.parts_json else null;
+}
+
+fn projectEmptyHistoryReplay(
+    arena: Allocator,
+    provider: agent_stream_provider.Provider,
+    selection: model_provider.ProviderSelection,
+    messages: []ChatMessage,
+) !void {
+    for (messages, 0..) |*message, index| {
+        if (message.role != .assistant) continue;
+        if (message.content) |content| if (content.len != 0) continue;
+        const replay = message.provider_replay orelse continue;
+        if (!replay.matches(selection)) continue;
+        const selected = try provider.projectReplay(arena, replay, message.tool_calls, false, true);
+        if (selected) |value| if (value.parts_json.ptr == replay.parts_json.ptr) continue;
+        debug_trace.logf("history", "empty_assistant_replay_projected message_index={d} prior_bytes={d} retained_bytes={d}", .{
+            index, replay.parts_json.len, if (selected) |value| value.parts_json.len else 0,
+        });
+        message.provider_replay = selected;
+    }
+}
+
+test "discarded completion prose preserves ownership and fails atomically" {
+    const Probe = struct {
+        fn project(alloc: Allocator, value: ?types.ProviderReplay, _: []const ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
+            try std.testing.expect(!text and reasoning);
+            const replay = value.?;
+            if (std.mem.eql(u8, replay.parts_json, "fail")) return error.InvalidProviderState;
+            if (std.mem.eql(u8, replay.parts_json, "drop")) return null;
+            if (std.mem.eql(u8, replay.parts_json, "kept")) return replay;
+            return .{ .source = replay.source, .parts_json = try alloc.dupe(u8, "retained") };
+        }
+
+        fn run(alloc: Allocator) !void {
+            const provider: agent_stream_provider.Provider = .{
+                .stream_fn = agent_stream_provider.unavailable_provider.stream_fn,
+                .project_replay_fn = project,
+            };
+            for ([_]bool{ false, true }) |owned| {
+                for ([_]?[]const u8{ null, "kept", "replace", "drop", "fail" }) |state| {
+                    var original: agent_stream_provider.Result = .{ .completed = .{ .ownership = .owned } };
+                    defer original.deinit(alloc);
+                    original.completed.completion.content = try alloc.dupe(u8, "prose");
+                    if (state) |value| original.completed.completion.provider_state_json = try alloc.dupe(u8, value);
+                    var result = original;
+                    if (owned) original.completed.ownership = .borrowed else result.completed.ownership = .borrowed;
+                    defer result.deinit(alloc);
+                    defer if (!owned) {
+                        if (result.completed.completion.provider_state_json) |parts| {
+                            if (original.completed.completion.provider_state_json == null or
+                                parts.ptr != original.completed.completion.provider_state_json.?.ptr) alloc.free(@constCast(parts));
+                        }
+                    };
+                    const prior = result.completed.completion;
+                    discardCompletionProse(alloc, provider, .{ .provider = .gateway, .model = "fixture-model" }, &result.completed) catch |err| {
+                        try std.testing.expectEqual(prior.content.?.ptr, result.completed.completion.content.?.ptr);
+                        try std.testing.expectEqual(prior.provider_state_json.?.ptr, result.completed.completion.provider_state_json.?.ptr);
+                        if (err == error.InvalidProviderState) continue;
+                        return err;
+                    };
+                    try std.testing.expect(result.completed.completion.content == null);
+                    if (state == null or std.mem.eql(u8, state.?, "drop")) {
+                        try std.testing.expect(result.completed.completion.provider_state_json == null);
+                    } else if (std.mem.eql(u8, state.?, "kept")) {
+                        try std.testing.expectEqual(prior.provider_state_json.?.ptr, result.completed.completion.provider_state_json.?.ptr);
+                    } else {
+                        try std.testing.expectEqualStrings("retained", result.completed.completion.provider_state_json.?);
+                    }
+                }
+            }
+        }
+    };
+    try Probe.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
 fn isRetryableModelFailure(kind: agent_stream_provider.FailureKind) bool {
     return switch (kind) {
         .rate_limited, .server_error, .bad_gateway, .unavailable, .gateway_timeout => true,
@@ -4312,6 +4408,7 @@ fn processQueuedPromptInner(
             0,
         );
     }
+    try projectEmptyHistoryReplay(arena, deps.agent_stream_provider, .{ .provider = job.provider, .model = job.model }, history_messages.items);
     const projected_roles = try runtime_telemetry.formatMessageRoles(arena, history_messages.items);
     debug_trace.eventf(
         "history",
@@ -4751,6 +4848,8 @@ pub fn prepareRetainedCompactionWindow(
     active: ?types.AssistantHistoryTurn,
     capabilities: model_capabilities.Capabilities,
     source_tokens: usize,
+    provider: agent_stream_provider.Provider,
+    provider_selection: model_provider.ProviderSelection,
 ) !RetainedCompactionWindow {
     var combined: std.ArrayList(HistoryTurn) = .empty;
     try combined.appendSlice(arena, history);
@@ -4783,6 +4882,7 @@ pub fn prepareRetainedCompactionWindow(
     const retained = try session_runtime.contextHistoryRange(arena, history, cut, null);
     var messages: std.ArrayList(ChatMessage) = .empty;
     try session_runtime.appendHistoryChatMessages(arena, &messages, retained);
+    try projectEmptyHistoryReplay(arena, provider, provider_selection, messages.items);
     return .{
         .source = source.items,
         .retained_history = retained,
@@ -4811,11 +4911,11 @@ test "retained context ends an unfinished turn at its completed exchange" {
         .execution = .{ .tool_steps = @constCast(&steps) },
     };
     const capabilities = model_capabilities.Capabilities{ .context_window = 4_000 };
-    const active = try prepareRetainedCompactionWindow(arena_state.allocator(), &.{}, turn, capabilities, 9_000);
+    const active = try prepareRetainedCompactionWindow(arena_state.allocator(), &.{}, turn, capabilities, 9_000, agent_stream_provider.unavailable_provider, .{ .provider = .gateway, .model = "fixture-model" });
     try std.testing.expectEqual(types.ContextHistoryCut{ .tool_steps = 1 }, active.cut);
     try std.testing.expectEqual(@as(usize, 3), active.source.len);
     try std.testing.expectEqual(@as(usize, 0), active.retained_messages.len);
-    const saved = try prepareRetainedCompactionWindow(arena_state.allocator(), &.{.{ .assistant = turn }}, null, capabilities, 9_000);
+    const saved = try prepareRetainedCompactionWindow(arena_state.allocator(), &.{.{ .assistant = turn }}, null, capabilities, 9_000, agent_stream_provider.unavailable_provider, .{ .provider = .gateway, .model = "fixture-model" });
     try std.testing.expectEqual(types.ContextHistoryCut{ .turns = 1 }, saved.cut);
     try std.testing.expectEqual(@as(usize, 0), saved.retained_messages.len);
 }
@@ -5713,7 +5813,7 @@ fn processQueuedPromptLoop(
                             .user = .{ .text = job.prompt, .images = job.images },
                             .assistant = @constCast(""),
                             .execution = prefix_execution,
-                        }, request_capabilities, request_cost.estimated_input_tokens);
+                        }, request_capabilities, request_cost.estimated_input_tokens, deps.agent_stream_provider, .{ .provider = job.provider, .model = job.model });
                         if (window.source.len == 0) {
                             if (context_overflow_recovery == .pending or request_cost.estimated_input_tokens > (runtime_prompt_context.usableInputTokens(request_capabilities) orelse std.math.maxInt(usize))) return error.ContextCapacityExceeded;
                             break :compact_attempt;
@@ -6664,7 +6764,7 @@ fn processQueuedPromptLoop(
                 }
             };
 
-            const attempt_completion = response_completion;
+            var attempt_completion = response_completion;
             const response_language_candidate = if (stream_ctx.raw_text.items.len > 0)
                 stream_ctx.raw_text.items
             else if (attempt_completion.content) |content|
@@ -6730,6 +6830,11 @@ fn processQueuedPromptLoop(
                 switch (language_decision) {
                     .accept, .undecidable => try stream_ctx.accept_staged_response_language(),
                     .accept_without_prose => {
+                        try discardCompletionProse(arena, deps.agent_stream_provider, .{
+                            .provider = job.provider,
+                            .model = gateway_model,
+                        }, &stream_result.completed);
+                        attempt_completion = stream_result.completed.completion;
                         debug_trace.eventf(
                             "agent",
                             "response_language_mismatch",
@@ -6744,9 +6849,6 @@ fn processQueuedPromptLoop(
                             },
                         );
                         stream_ctx.drop_staged_response_language_candidate();
-                        if (streamCompletionPtr(&stream_result)) |candidate| {
-                            candidate.content = null;
-                        }
                     },
                     .retry_once, .fail_without_commit => {
                         const observed = candidate_language.script.?;
