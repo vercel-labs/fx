@@ -240,22 +240,21 @@ function validateBackendInfoOptions(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new TypeError("getBackendInfo() options must be an object");
   }
-  const options = { ...value };
+  const { nativeAddon, backend = "auto", surface = "agent", ...options } = value;
   for (const key of Object.keys(options)) {
-    if (!new Set(["surface", "backend", "nativeAddon", "wasm"]).has(key)) {
+    if (key !== "wasm") {
       throw new TypeError(`getBackendInfo() does not accept ${key}`);
     }
   }
-  const { surface = "agent", backend = "auto" } = options;
   if (!new Set(["agent", "terminal"]).has(surface)) {
     throw new TypeError('surface must be "agent" or "terminal"');
   }
   if (!new Set(["auto", "native", "wasm"]).has(backend)) {
     throw new TypeError('backend must be "auto", "native", or "wasm"');
   }
-  if (Object.hasOwn(options, "nativeAddon") && options.nativeAddon !== undefined && options.nativeAddon !== false &&
-    typeof options.nativeAddon !== "string" && !(options.nativeAddon instanceof URL) &&
-    (typeof options.nativeAddon !== "object" || options.nativeAddon === null)) {
+  if (nativeAddon !== undefined && nativeAddon !== false &&
+    typeof nativeAddon !== "string" && !(nativeAddon instanceof URL) &&
+    (typeof nativeAddon !== "object" || nativeAddon === null)) {
     throw new TypeError("nativeAddon must be a module, path, URL, false, or undefined");
   }
   const validWasm = options.wasm === undefined || typeof options.wasm === "string" || options.wasm instanceof URL ||
@@ -264,7 +263,7 @@ function validateBackendInfoOptions(value) {
   if (Object.hasOwn(options, "wasm") && !validWasm) {
     throw new TypeError("wasm must be a URL, Response, ArrayBuffer, typed array, or WebAssembly.Module");
   }
-  return { ...options, surface, backend };
+  return { ...options, surface, backend, nativeAddon };
 }
 
 export async function getBackendInfo(value = {}) {
