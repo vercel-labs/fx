@@ -702,6 +702,9 @@ describe("cli: status", () => {
     { name: "Gateway with a stale Codex preference", provider: "gateway", source: "chatgpt_subscription", help: MISSING_AUTH_MESSAGE },
     { name: "Gateway with a stale Grok preference", provider: "gateway", source: "grok_subscription", help: MISSING_AUTH_MESSAGE },
     { name: "an exact Gateway login", provider: "gateway", source: "fx_login", help: "fx login is selected but unavailable. Run fx login to reconnect; no other credential was selected." },
+    { name: "an exact OIDC token", provider: "gateway", source: "vercel_oidc_token", help: "VERCEL_OIDC_TOKEN is selected but unavailable. Set VERCEL_OIDC_TOKEN before starting fx; no other credential was selected." },
+    { name: "an exact environment key", provider: "gateway", source: "ai_gateway_api_key", help: "AI_GATEWAY_API_KEY is selected but unavailable. Set AI_GATEWAY_API_KEY before starting fx; no other credential was selected." },
+    { name: "an exact stored key", provider: "gateway", source: "stored_key", help: "A stored API key is selected but unavailable. Start fx and open /provider to choose an available credential; no other credential was selected." },
     { name: "Codex", provider: "codex", source: undefined, help: "fx needs a Codex subscription login for this model. Run fx login codex." },
     { name: "Grok", provider: "grok", source: undefined, help: "fx needs a Grok subscription login for this model. Run fx login grok." },
   ]) {

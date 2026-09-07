@@ -2905,6 +2905,43 @@ for (const [provider, help] of [
   }, TIMEOUT);
 }
 
+for (const [source, help] of [
+  ["vercel_oidc_token", "VERCEL_OIDC_TOKEN is selected but unavailable."],
+  ["stored_key", "A stored API key is selected but unavailable."],
+] as const) {
+  tmuxTest(`/status retains ${source} until another credential is selected`, async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-status-explicit-key-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    mkdirSync(join(home, ".fx"));
+    const settingsPath = join(home, ".fx", "settings.json");
+    const settings = JSON.stringify({ provider: "gateway", credential_source: source });
+    writeFileSync(settingsPath, settings);
+    gateway = startFakeGateway([fakeGatewayFinalText("EXPLICIT_KEY_RECOVERED")]);
+    session = await startFx(home, stderrPath, gateway);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/status");
+    await session.waitForText("auth_help=", TIMEOUT);
+    const missing = await session.captureFullScrollback();
+    expect(missing).toContain(`auth_help=${help}`);
+    expect(missing).not.toContain("set AI_GATEWAY_API_KEY");
+    expect(gateway.requests).toHaveLength(0);
+    expect(readFileSync(settingsPath, "utf8")).toBe(settings);
+
+    await selectEnvKeyCredential(session);
+    await session.sendText("Verify the account with a greeting.");
+    await session.waitForText("EXPLICIT_KEY_RECOVERED", TIMEOUT);
+    await session.sendText("/status");
+    await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
+    const scrollback = await session.captureFullScrollback();
+    expect(scrollback.slice(scrollback.lastIndexOf("● Status:"))).not.toContain("auth_help=");
+    expect(JSON.parse(readFileSync(settingsPath, "utf8")).credential_source).toBe("ai_gateway_api_key");
+    expect(gateway.requests).toHaveLength(1);
+    expect(gateway.requests[0].headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  }, TIMEOUT);
+}
+
 tmuxTest("/status preserves a missing selected login through explicit key recovery", async () => {
   home = mkdtempSync(join(tmpdir(), "fx-status-selected-login-"));
   stderrPath = join(home, "stderr.log");
