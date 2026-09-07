@@ -9,6 +9,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { serializeError } from "./package-report.mjs";
 
 const tarball = resolve(process.argv[2]);
 const artifactRoot = process.env.LIBFX_TEST_ARTIFACT_ROOT || tmpdir();
@@ -21,6 +22,7 @@ const env = { ...process.env, NODE_OPTIONS: "", NODE_PATH: "", NEXT_TELEMETRY_DI
   LIBFX_LIVE: "0", LIBFX_SMOKE_TOKEN: token, LIBFX_TEST_MODEL: "" };
 const servers = new Set();
 const results = [];
+let failure;
 
 async function run(command, args, cwd, name) {
   const log = createWriteStream(resolve(root, `${name}.log`));
@@ -124,9 +126,19 @@ try {
   const standalone = await start(isolated, [resolve(isolated, "server.js")], "standalone");
   await exercise(standalone, "standalone");
   await stop(standalone);
-  await writeFile(resolve(root, "results.json"), JSON.stringify({ node: process.version, tarball, results }, null, 2));
-  console.log(`Next package integration passed: ${root}`);
+} catch (error) {
+  failure = error;
 } finally {
-  for (const server of servers) await stop(server);
+  for (const server of servers) {
+    try { await stop(server); }
+    catch (error) { failure = failure ? new AggregateError([failure, error], "Verification and cleanup failed") : error; }
+  }
+  await writeFile(resolve(root, "results.json"), JSON.stringify({
+    node: process.version, tarball, results,
+    status: failure ? "failed" : "passed",
+    error: serializeError(failure),
+  }, null, 2));
   console.log(`Next package evidence: ${root}`);
 }
+if (failure) throw failure;
+console.log(`Next package integration passed: ${root}`);

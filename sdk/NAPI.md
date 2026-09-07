@@ -274,6 +274,11 @@ deployment output. Failed package qualification blocks publication. Next
 logs and structured results are retained as workflow artifacts, including
 on failure.
 
+CI and publication also run the package resilience matrix with a bounded
+lifecycle, tool, and concurrent workload. Longer soak runs remain manual.
+The Next and Vercel harnesses retain completed scenarios and structured errors
+when qualification fails, and report success only after cleanup succeeds.
+
 Live Vercel qualification is a separate release check. Run
 `node sdk/tests/test-vercel-package.mjs <tarball>` before publication, then run
 the same command with the immutable npm version afterward. Set

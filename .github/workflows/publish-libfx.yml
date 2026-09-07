@@ -304,6 +304,12 @@ jobs:
           node --experimental-wasm-jspi sdk/tests/test-backend-info.mjs
           node sdk/tests/test-term-demo-package.mjs
 
+      - name: Test package recovery and lifecycle boundaries
+        run: |
+          node sdk/tests/test-package-resilience.mjs --package libfx-package.tgz \
+            --cheap-cycles 100 --tool-workflows 20 --duration-ms 5000 --concurrency 4 \
+            --json-out "${{ runner.temp }}/libfx-package-evidence/resilience.json"
+
       - name: Test Next development, production and isolated output
         env:
           LIBFX_TEST_ARTIFACT_ROOT: ${{ runner.temp }}/libfx-package-evidence
@@ -315,6 +321,7 @@ jobs:
         with:
           name: libfx-package-evidence
           path: |
+            ${{ runner.temp }}/libfx-package-evidence/resilience.json
             ${{ runner.temp }}/libfx-package-evidence/libfx-next-*/*.log
             ${{ runner.temp }}/libfx-package-evidence/libfx-next-*/results.json
           if-no-files-found: ignore

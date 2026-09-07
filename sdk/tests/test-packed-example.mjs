@@ -32,11 +32,38 @@ if (process.argv[2] !== "--installed") {
     await rm(temp, { recursive: true, force: true });
   }
 } else {
-  const { createFxAgent } = format === "cjs" ? createRequire(import.meta.url)("libfx") : await import("libfx");
+  const { createFxAgent, createFxTerminal, getBackendInfo } = format === "cjs" ? createRequire(import.meta.url)("libfx") : await import("libfx");
   const { createMcpAdapter } = await import("libfx/mcp");
   const { createSkillsAdapter } = await import("libfx/skills");
   assert.equal(typeof createMcpAdapter, "function");
   assert.equal(typeof createSkillsAdapter, "function");
+
+  for (const makeOptions of [
+    (key, value) => ({ [key]: value }),
+    (key, value) => Object.create({ [key]: value }),
+    (key, value) => Object.defineProperty({}, key, { value }),
+  ]) {
+    for (const invalid of [null, false, 0, "", "other"]) {
+      await assert.rejects(getBackendInfo(makeOptions("backend", invalid)), TypeError);
+      await assert.rejects(getBackendInfo(makeOptions("surface", invalid)), TypeError);
+      const backendError = { name: "TypeError", message: 'backend must be "auto", "native", or "wasm"' };
+      await assert.rejects(createFxAgent(makeOptions("backend", invalid)), backendError);
+      await assert.rejects(createFxTerminal(makeOptions("backend", invalid)), backendError);
+    }
+    for (const value of [undefined, "auto", "native", "wasm"]) {
+      assert.deepEqual(await getBackendInfo(makeOptions("backend", value)), await getBackendInfo({ backend: value }));
+    }
+    assert.deepEqual(await getBackendInfo(makeOptions("surface", undefined)), await getBackendInfo());
+    assert.deepEqual(await getBackendInfo(makeOptions("nativeAddon", false)), await getBackendInfo({ nativeAddon: false }));
+  }
+  assert.deepEqual(await getBackendInfo({ backend: undefined, surface: undefined }), await getBackendInfo());
+  assert.deepEqual(await getBackendInfo({ backend: "auto", surface: "agent" }), await getBackendInfo());
+  for (const select of [getBackendInfo, createFxAgent, createFxTerminal]) {
+    let reads = 0;
+    const options = { backend: "native", get nativeAddon() { reads++; this.backend = null; } };
+    await assert.rejects(select(options), { name: "TypeError", message: 'backend must be "auto", "native", or "wasm"' });
+    assert.equal(reads, 1);
+  }
 
   let requestedAuthorization;
   let requestedModel;

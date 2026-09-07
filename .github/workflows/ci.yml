@@ -202,6 +202,12 @@ jobs:
           node --experimental-wasm-jspi sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz wasm esm
           node --experimental-wasm-jspi --no-experimental-require-module sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz wasm cjs
 
+      - name: Test package recovery and lifecycle boundaries
+        run: |
+          node sdk/tests/test-package-resilience.mjs --package /tmp/libfx-package.tgz \
+            --cheap-cycles 100 --tool-workflows 20 --duration-ms 5000 --concurrency 4 \
+            --json-out "${{ runner.temp }}/libfx-package-evidence/resilience.json"
+
       - name: Install Next fixture package manager
         run: npm install --global pnpm@11.1.1
 
@@ -210,12 +216,13 @@ jobs:
           LIBFX_TEST_ARTIFACT_ROOT: ${{ runner.temp }}/libfx-package-evidence
         run: node sdk/tests/test-next-package.mjs /tmp/libfx-package.tgz
 
-      - name: Retain Next package evidence
+      - name: Retain package qualification evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: libfx-next-package-evidence
           path: |
+            ${{ runner.temp }}/libfx-package-evidence/resilience.json
             ${{ runner.temp }}/libfx-package-evidence/libfx-next-*/*.log
             ${{ runner.temp }}/libfx-package-evidence/libfx-next-*/results.json
           if-no-files-found: ignore

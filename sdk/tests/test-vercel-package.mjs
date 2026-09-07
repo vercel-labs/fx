@@ -7,6 +7,7 @@ import { cp, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { serializeError } from "./package-report.mjs";
 
 const input = process.argv[2];
 assert.ok(input, "provide a published libfx version or local tarball");
@@ -20,6 +21,9 @@ const directory = await mkdtemp(resolve(artifactRoot, "libfx-vercel-"));
 const app = resolve(directory, "app");
 const secret = randomUUID();
 const tokenArgs = process.env.LIBFX_VERCEL_TOKEN ? ["--token", process.env.LIBFX_VERCEL_TOKEN] : [];
+const redact = (text) => [secret, process.env.AI_GATEWAY_API_KEY, process.env.LIBFX_VERCEL_TOKEN]
+  .filter(Boolean).reduce((value, credential) => value.replaceAll(credential, "[redacted]"), text);
+const results = [];
 let deployment;
 let deploymentRef;
 let failure;
@@ -33,8 +37,6 @@ async function run(command, args, name) {
   const timeout = setTimeout(() => child.kill("SIGKILL"), 300_000);
   try {
     const [code] = await once(child, "close");
-    const redact = (text) => [secret, process.env.AI_GATEWAY_API_KEY, process.env.LIBFX_VERCEL_TOKEN]
-      .filter(Boolean).reduce((value, credential) => value.replaceAll(credential, "[redacted]"), text);
     await writeFile(resolve(directory, `${name}.log`), redact(`${output}\n${errors}`));
     assert.equal(code, 0, `Vercel ${name} failed; see ${directory}/${name}.log`);
     return output;
@@ -79,7 +81,6 @@ try {
   await vercel(["inspect", deploymentRef, "--wait", "--timeout", "5m"], "inspect");
   const unauthorized = await fetch(`${deployment}/api/fx`);
   assert.equal(unauthorized.status, 401, "live tool endpoint must require its verification token");
-  const results = [];
   for (let round = 0; round < 3; round++) {
     for (const backend of ["native", "auto"]) {
       for (const scenario of ["host", "mcp"]) {
@@ -100,8 +101,6 @@ try {
       }
     }
   }
-  await writeFile(resolve(directory, "results.json"), JSON.stringify({ input, deployment, results }, null, 2));
-  console.log(`Live Vercel package verification passed: ${directory}`);
 } catch (error) {
   failure = error;
   if (deploymentRef) {
@@ -112,6 +111,12 @@ try {
     try { await vercel(["remove", deploymentRef, "--yes"], "cleanup"); }
     catch (error) { failure = failure ? new AggregateError([failure, error], "Verification and cleanup failed") : error; }
   }
+  await writeFile(resolve(directory, "results.json"), redact(JSON.stringify({
+    input, deployment, results,
+    status: failure ? "failed" : "passed",
+    error: serializeError(failure),
+  }, null, 2)));
   console.log(`Vercel package evidence: ${directory}`);
 }
 if (failure) throw failure;
+console.log(`Live Vercel package verification passed: ${directory}`);
