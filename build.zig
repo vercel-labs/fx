@@ -93,7 +93,7 @@ pub fn build(b: *std.Build) void {
         .root_module = exe.root_module,
         .test_runner = .{
             .path = b.path("src/test_shard_runner.zig"),
-            .mode = .server,
+            .mode = .simple,
         },
     });
 
