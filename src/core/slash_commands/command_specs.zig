@@ -277,6 +277,33 @@ pub fn matchesSlashExact(registry: SlashRegistry, cmd: []const u8, kind: SlashKi
     return matched.command.kind == kind;
 }
 
+/// Longest slash-less alias in the built-in registry, used to reject ordinary
+/// prose on length before any comparison work happens.
+pub const max_bare_alias_len: usize = blk: {
+    const builtin_commands = @import("../../builtins/commands.zig");
+    var longest: usize = 0;
+    for (builtin_commands.slash_specs) |spec| {
+        for (spec.aliases) |alias| {
+            if (alias.len == 0 or alias[0] == '/') continue;
+            if (alias.len > longest) longest = alias.len;
+        }
+    }
+    break :blk longest;
+};
+
+/// Resolves a submission that carries no leading slash. Every spec `command` is
+/// slash-prefixed, so only slash-less aliases can match and the primary tokens
+/// are never compared.
+pub fn lookupBareAlias(registry: SlashRegistry, token: []const u8) ?*const SlashSpec {
+    for (registry.commands) |*spec| {
+        for (spec.aliases) |alias| {
+            if (alias.len == 0 or alias[0] == '/') continue;
+            if (std.mem.eql(u8, alias, token)) return spec;
+        }
+    }
+    return null;
+}
+
 pub fn matchedSlashPrefix(registry: SlashRegistry, cmd: []const u8, kind: SlashKind) ?[]const u8 {
     return registry.matchEntryPrefix(cmd, slashSpecPtr(registry, kind));
 }
