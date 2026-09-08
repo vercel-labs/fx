@@ -12,12 +12,14 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { findFooterBlocks, readTrace } from "./tui-render-assertions";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   fakeGatewayToolCall,
   fakeShellRun,
+  heldFakeGatewayFinalText,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -62,6 +64,66 @@ afterEach(async () => {
 });
 
 describe.skipIf(SKIP)("tui: interrupt recovery", () => {
+  for (const inject of [false, true]) test(`quit reports final history persistence failure with fault=${inject}`, async () => {
+    root = realpathSync(mkdtempSync(join(tmpdir(), "fx-shutdown-save-")));
+    const home = join(root, "home"), workspace = join(root, "workspace");
+    mkdirSync(home); mkdirSync(workspace);
+    const library = join(root, process.platform === "darwin" ? "sync-fault.dylib" : "sync-fault.so");
+    const source = join(import.meta.dirname, "fixtures", "session-sync-fault.c");
+    const flags = process.platform === "darwin" ? ["-dynamiclib"] : ["-shared", "-fPIC"];
+    const compiled = Bun.spawnSync(["cc", ...flags, "-O2", "-Wall", "-Wextra", source, "-o", library,
+      ...(process.platform === "darwin" ? [] : ["-ldl"])]);
+    expect(compiled.exitCode).toBe(0);
+    const held = heldFakeGatewayFinalText();
+    let requestHeld = false;
+    gateway = startFakeGateway([
+      fakeGatewayFinalText("SHUTDOWN_SAVED_FACT_281"),
+      () => { requestHeld = true; return held.response; },
+      fakeGatewayFinalText("SHUTDOWN_RESUMED_281"),
+    ]);
+    const env = { HOME: home, AI_GATEWAY_API_KEY: "fake-shutdown-save", VERCEL_OIDC_TOKEN: undefined,
+      FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1", FX_SOUND: "0", FX_AUTO_UPGRADE: "0",
+      FX_MODEL: FAKE_GATEWAY_MODEL, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models` };
+    try {
+      const seeded = await runFx(["ask", "--json", "Save the first fact."], { cwd: workspace, env, timeoutMs: TIMEOUT });
+      expect(seeded.code).toBe(0); expect(seeded.stderr).toBe("");
+      const id = JSON.parse(seeded.stdout).session_id;
+      const eventPath = join(home, ".fx", "sessions", id, "events.jsonl");
+      const saved = readFileSync(eventPath);
+      const stderrPath = join(root, "stderr.log"), tracePath = join(root, "trace.log");
+      const arm = join(root, "armed"), receipt = join(root, "injected.txt");
+      const quote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`;
+      session = await TmuxSession.create({ cmd: `${quote(FX_BIN)} --resume ${quote(id)}`, cwd: workspace,
+        isolated: true, remainOnExit: true, width: 110, height: 36, stderrPath,
+        env: { ...env, [process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD"]: library,
+          FX_TEST_SYNC_TARGET: eventPath, FX_TEST_SYNC_ARM: arm, FX_TEST_SYNC_RECORD: receipt,
+          FX_TEST_SYNC_MATCH: "SHUTDOWN_PENDING_REQUEST_392", FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "session,worker,input", FX_RECORD: join(root, "shutdown.fxtape") } });
+      await session.waitForStableComposer(TIMEOUT);
+      await session.sendText("SHUTDOWN_PENDING_REQUEST_392");
+      await waitForCondition(() => requestHeld, "held shutdown request");
+      if (inject) writeFileSync(arm, "armed");
+      await session.sendText("/quit");
+      await session.waitForPane(() => session!.paneStatus().dead, TIMEOUT);
+      const output = await session.captureFullScrollback();
+      const stderr = readFileSync(stderrPath, "utf8");
+      expect(existsSync(receipt)).toBe(inject);
+      if (inject) {
+        expect(readFileSync(receipt, "utf8")).toContain(`target=${eventPath}`);
+        expect(readFileSync(tracePath, "utf8")).toContain("shutdown finished prompt persistence failed");
+        expect(session.paneStatus().status).toBe(1);
+        expect(output + stderr).toMatch(/save.*fail|fail.*sav|could not.*sav|unable to.*sav/i);
+      } else { expect(session.paneStatus().status).toBe(0); expect(stderr).toBe(""); }
+      expect(readFileSync(eventPath).subarray(0, saved.length).equals(saved)).toBe(true);
+      const resumed = await runFx(["ask", "--json", "--resume-id", id, "Continue without repeating work."], {
+        cwd: workspace, env, timeoutMs: TIMEOUT });
+      expect(resumed.code).toBe(0); expect(resumed.stderr).toBe("");
+      expect(JSON.parse(resumed.stdout).session_id).toBe(id);
+      expect(gateway.requests.at(-1)!.body).toContain("SHUTDOWN_SAVED_FACT_281");
+    } finally { held.dispose(); }
+  }, TIMEOUT * 3);
+
   test(
     "Ctrl-C clears the composer before cancelling an active response",
     async () => {

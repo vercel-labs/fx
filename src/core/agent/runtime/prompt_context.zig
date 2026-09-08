@@ -4,6 +4,7 @@ const token_estimate = @import("../../shared/token_estimate.zig");
 const types = @import("../../shared/types.zig");
 const session_runtime = @import("../../session/session.zig");
 const stream_provider = @import("../stream_provider.zig");
+const model_provider = @import("../../config/model_provider.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
@@ -118,7 +119,9 @@ pub const RetainedContext = struct {
 };
 
 /// Selects complete execution steps. Payloads are measured, never shortened.
-pub fn selectRecentContext(history: []const HistoryTurn, target: usize, input_capacity: ?usize) RetainedContext {
+pub fn selectRecentContext(history: []const HistoryTurn, target: usize, input_capacity: ?usize, options: struct {
+    provider: ?model_provider.ProviderSelection = null,
+}) RetainedContext {
     var raw_count = session_runtime.rawHistoryTurnCount(history);
     var selected = types.ContextHistoryCut{ .turns = raw_count };
     var total: usize = 0;
@@ -145,7 +148,12 @@ pub fn selectRecentContext(history: []const HistoryTurn, target: usize, input_ca
             .interrupted => |entry| entry.execution,
             .compacted_summary => unreachable,
         };
-        var base = textTokens(user) +| textTokens(reply) +| 8;
+        const replay = switch (turn) {
+            .assistant => |entry| entry.provider_replay,
+            .interrupted => null,
+            .compacted_summary => unreachable,
+        };
+        var base = textTokens(user) +| textTokens(reply) +| replay_tokens(replay, options.provider) +| 8;
         var steering_index = execution.steering.len;
         var step_index = execution.tool_steps.len;
         if (step_index == 0) {
@@ -165,7 +173,7 @@ pub fn selectRecentContext(history: []const HistoryTurn, target: usize, input_ca
         }
         while (step_index > 0) {
             step_index -= 1;
-            var cost = base +| executionStepTokens(execution.tool_steps[step_index]);
+            var cost = base +| executionStepTokens(execution.tool_steps[step_index], options.provider);
             var next_steering = steering_index;
             while (next_steering > 0 and execution.steering[next_steering - 1].after_tool_step_count >= step_index) {
                 next_steering -= 1;
@@ -197,8 +205,14 @@ fn textTokens(text: []const u8) usize {
     return @intCast(@min(estimator.estimate(), std.math.maxInt(usize)));
 }
 
-fn executionStepTokens(step: types.ToolExecutionStep) usize {
-    var total: usize = 8;
+fn replay_tokens(replay: ?types.ProviderReplay, provider: ?model_provider.ProviderSelection) usize {
+    const value = replay orelse return 0;
+    if (provider) |selection| if (!value.matches(selection)) return 0;
+    return textTokens(value.parts_json);
+}
+
+fn executionStepTokens(step: types.ToolExecutionStep, provider: ?model_provider.ProviderSelection) usize {
+    var total: usize = 8 +| replay_tokens(step.provider_replay, provider);
     if (step.assistant) |text| total +|= textTokens(text);
     for (step.tool_calls) |call| {
         total +|= textTokens(call.id) +| textTokens(call.name) +| textTokens(call.arguments_json) +| 8;
@@ -232,6 +246,7 @@ pub fn validateCompactionHandoff(
 
 pub const RequestCost = struct {
     serialized_bytes: usize,
+    /// Uncalibrated serialization estimate; non-image usage may replace it.
     text_tokens: usize,
     /// Null means no image parts. Otherwise visual cost needs applicable usage.
     image_identity: ?[32]u8 = null,
@@ -354,7 +369,10 @@ pub fn calibrateProviderRequest(
     else
         multiplyDivideCeilSaturating(cost.serialized_bytes, calibration.exact_input_tokens, calibration.request.serialized_bytes);
     var result = cost;
-    result.estimated_input_tokens = @max(cost.text_tokens, calibrated_tokens);
+    result.estimated_input_tokens = if (cost.image_identity != null)
+        @max(cost.text_tokens, calibrated_tokens)
+    else
+        @max(1, calibrated_tokens);
     return result;
 }
 
@@ -638,6 +656,45 @@ test "provider request measurement learns the prior exact token density" {
     try std.testing.expect(calibrated.estimated_input_tokens >= current.estimated_input_tokens);
 }
 
+test "provider usage corrects a serialized estimate downward" {
+    const cost = RequestCost{ .serialized_bytes = 34_210, .text_tokens = 8_892, .estimated_input_tokens = 8_892 };
+    const calibrated = calibrateProviderRequest(cost, .{ .request = cost, .exact_input_tokens = 6_030 });
+    try std.testing.expectEqual(@as(usize, 6_030), calibrated.estimated_input_tokens);
+    try std.testing.expectEqual(cost.text_tokens, calibrated.text_tokens);
+}
+
+test "retained context budgets provider replay on completed exchanges" {
+    const replay = types.ProviderReplay{ .source = .{ .provider = .gateway, .model = "fixture/model" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"\",\"providerOptions\":{\"openai\":{\"reasoningEncryptedContent\":\"" ++ ("r" ** 80_000) ++ "\"}}}]" };
+    var steps = [_]types.ToolExecutionStep{
+        .{ .assistant = @constCast("one"), .provider_replay = replay },
+        .{ .assistant = @constCast("two"), .provider_replay = replay },
+        .{ .assistant = @constCast("three"), .provider_replay = replay },
+    };
+    const history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("continue") },
+        .assistant = @constCast(""),
+        .execution = .{ .tool_steps = &steps },
+    } }};
+    const selected = selectRecentContext(&history, 5_990, 119_808, .{});
+    try std.testing.expectEqual(@as(usize, 2), selected.cut.tool_steps);
+    try std.testing.expect(selected.newest_exchange_tokens >= 20_000);
+    const changed_model = selectRecentContext(&history, 5_990, 119_808, .{ .provider = .{ .provider = .gateway, .model = "fixture/other" } });
+    try std.testing.expectEqual(@as(usize, 1), changed_model.cut.tool_steps);
+    try std.testing.expect(changed_model.newest_exchange_tokens < 100);
+}
+
+test "retained context budgets replay on standalone assistant replies" {
+    const turn = types.AssistantHistoryTurn{
+        .user = .{ .text = @constCast("continue") },
+        .assistant = @constCast("small reply"),
+        .provider_replay = .{ .source = .{ .provider = .gateway, .model = "fixture/model" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"\",\"providerOptions\":{\"openai\":{\"reasoningEncryptedContent\":\"" ++ ("r" ** 80_000) ++ "\"}}}]" },
+    };
+    const history = [_]HistoryTurn{ .{ .assistant = turn }, .{ .assistant = turn }, .{ .assistant = turn } };
+    const selected = selectRecentContext(&history, 5_990, 119_808, .{});
+    try std.testing.expectEqual(@as(usize, 2), selected.cut.turns);
+    try std.testing.expect(selected.newest_exchange_tokens >= 20_000);
+}
+
 fn measurement_test_request(with_images: bool) stream_provider.RequestData {
     return .{
         .model = "fixture/model",
@@ -868,13 +925,13 @@ test "retained context selects whole parallel tool exchanges without shortening 
         .{ .assistant = .{ .user = .{ .text = @constCast("old request") }, .assistant = @constCast("old answer") } },
         .{ .assistant = .{ .user = .{ .text = @constCast("current request") }, .assistant = @constCast(""), .execution = .{ .tool_steps = @constCast(&steps) } } },
     };
-    const selected = selectRecentContext(&history, 5000, null);
+    const selected = selectRecentContext(&history, 5000, null, .{});
     try std.testing.expectEqual(@as(usize, 1), selected.cut.turns);
     try std.testing.expectEqual(@as(usize, 1), selected.cut.tool_steps);
     try std.testing.expect(selected.newest_exchange_tokens > 5000);
     try std.testing.expectEqualStrings(body, results[0].output);
     try std.testing.expectEqualStrings(body, results[1].output);
-    const over_capacity = selectRecentContext(&history, 5000, 10_000);
+    const over_capacity = selectRecentContext(&history, 5000, 10_000, .{});
     try std.testing.expectEqual(@as(usize, 2), over_capacity.cut.turns);
     try std.testing.expectEqual(@as(usize, 0), over_capacity.cut.tool_steps);
     try std.testing.expectEqual(@as(usize, 0), over_capacity.estimated_tokens);

@@ -10,6 +10,8 @@ import { fileURLToPath } from "node:url";
 import { serializeError } from "./package-report.mjs";
 
 const input = process.argv[2];
+const next15 = process.argv.includes("--next15");
+const webpack = next15 || process.argv.includes("--webpack");
 assert.ok(input, "provide a published libfx version or local tarball");
 const projectId = process.env.LIBFX_VERCEL_PROJECT_ID;
 const orgId = process.env.LIBFX_VERCEL_ORG_ID;
@@ -59,6 +61,8 @@ try {
     assert.match(input, /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/, "pin an immutable version, not a tag");
     manifest.dependencies.libfx = input;
   }
+  if (next15) manifest.dependencies.next = "15.5.25";
+  if (webpack && !next15) manifest.scripts.build = "next build --webpack";
   await writeFile(resolve(app, "package.json"), JSON.stringify(manifest, null, 2));
   await run(process.env.PNPM_BIN || "pnpm", ["install", "--lockfile-only", "--no-frozen-lockfile", "--ignore-scripts"], "prepare");
   await mkdir(resolve(app, ".vercel"));
@@ -112,7 +116,7 @@ try {
     catch (error) { failure = failure ? new AggregateError([failure, error], "Verification and cleanup failed") : error; }
   }
   await writeFile(resolve(directory, "results.json"), redact(JSON.stringify({
-    input, deployment, results,
+    input, next15, bundler: webpack ? "webpack" : "turbopack", deployment, results,
     status: failure ? "failed" : "passed",
     error: serializeError(failure),
   }, null, 2)));

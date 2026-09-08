@@ -3383,6 +3383,145 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
+  test("legacy tool projection preserves surviving calls and replay through saved resume", async () => {
+    for (const { tool, input } of [
+      { tool: "terminal", input: { action: "read", session_id: "missing" } },
+      { tool: "terminal", input: { action: "exec" } },
+      { tool: "subagent", input: { command: { inspect: { id: "missing" } } } },
+    ] as const) {
+      for (const removedFirst of [false, true]) {
+        for (const metadata of [false, true]) {
+          const root = createFixtureRoot("legacy-projection");
+          const tracePath = join(root.root, "projection.trace");
+          writeFileSync(join(root.workspace, "notes.txt"), "LEGACY_READ_RESULT\n");
+          const calls = [
+            {
+              type: "tool-call", toolCallId: "removed_call", toolName: tool,
+              input,
+              ...(metadata ? { providerMetadata: { vertex: { thoughtSignature: "removed-signature" } } } : {}),
+            },
+            {
+              type: "tool-call", toolCallId: "retained_call", toolName: "read_file", input: { path: "notes.txt" },
+              ...(metadata ? { providerMetadata: { vertex: { thoughtSignature: "retained-signature" } } } : {}),
+            },
+          ];
+          if (!removedFirst) calls.reverse();
+          const responses = [
+            fakeGatewaySse([
+              { type: "reasoning-start", id: "reasoning" },
+              { type: "reasoning-delta", id: "reasoning", delta: "Inspect the fixture." },
+              { type: "reasoning-end", id: "reasoning", ...(metadata ? { providerMetadata: { vertex: { thoughtSignature: "reasoning-signature" } } } : {}) },
+              { type: "text-delta", id: "intro", delta: "I will inspect the notes." },
+              ...calls,
+              { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+            ]),
+            fakeGatewayFinalText("The notes were read."),
+            fakeGatewayFinalText("The saved result remains available."),
+          ];
+          const gateway = startGateway(() => responses.shift() ?? new Response("unexpected request", { status: 500 }));
+          try {
+            const first = await runFx(["ask", "--json", "--auto", "Please read notes.txt and explain the result."], {
+              cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
+            });
+            const result = parseAskJson(first.stdout);
+            expect(first.code).toBe(0);
+            expect(first.stderr).toContain("Reading notes.txt");
+            expect(result.final_output).toBe("The notes were read.");
+            expect(result.tool_calls.filter((call) => call.name === "read_file")).toEqual([{ name: "read_file", status: "success" }]);
+            expect(gateway.requestCount()).toBe(2);
+            const eventsPath = join(root.home, ".fx", "sessions", result.session_id, "events.jsonl");
+            const originalEvents = readFileSync(eventsPath, "utf8");
+            expect(originalEvents).toContain("removed_call");
+            if (metadata) expect(originalEvents).toContain("removed-signature");
+            const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", result.session_id, "Confirm the saved result without running tools."], {
+              cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
+            });
+            expect(resumed.code).toBe(0);
+            expect(resumed.stderr).toBe("");
+            expect(parseAskJson(resumed.stdout).tool_calls).toEqual([]);
+            expect(gateway.requestCount()).toBe(3);
+            expect(readFileSync(eventsPath, "utf8").startsWith(originalEvents)).toBe(true);
+            for (const request of gateway.requests.slice(1)) {
+              const prompt = gatewayRequest(request.body).prompt;
+              const callIndex = prompt.findIndex((message) => Array.isArray(message.content) && message.content.some((part) => part.type === "tool-call" && part.toolCallId === "retained_call"));
+              expect(callIndex).toBeGreaterThanOrEqual(0);
+              expect(prompt[callIndex + 1].role).toBe("tool");
+              expect(JSON.stringify(prompt[callIndex + 1].content)).toContain("retained_call");
+              expect(request.body).toContain("LEGACY_READ_RESULT");
+              expect(request.body).toContain("I will inspect the notes.");
+              expect(request.body).not.toContain('"toolCallId":"removed_call"');
+              expect(request.body).not.toContain("removed-signature");
+              if (metadata) {
+                expect(request.body).toContain("retained-signature");
+                expect(request.body).toContain("reasoning-signature");
+              }
+            }
+          } finally {
+            gateway.stop();
+            rmSync(root.root, { recursive: true, force: true });
+          }
+        }
+      }
+    }
+  }, 60_000);
+
+  test("legacy tool projection keeps reused identities scoped across saved turns", async () => {
+    const root = createFixtureRoot("legacy-reused-id");
+    const tracePath = join(root.root, "reused.trace");
+    const callResponse = (valid: boolean) => fakeGatewaySse([
+      {
+        type: "tool-call", toolCallId: "reused", toolName: "terminal",
+        input: valid ? { action: "exec", command: ":" } : { action: "exec" },
+        providerMetadata: { vertex: { thoughtSignature: valid ? "first-call-signature" : "second-call-signature" } },
+      },
+      { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+    ]);
+    const responses = [
+      callResponse(true), fakeGatewayFinalText("First turn stored."),
+      callResponse(false), fakeGatewayFinalText("Second turn stored."),
+      fakeGatewayFinalText("Both stored results remain available."),
+    ];
+    const gateway = startGateway(() => responses.shift() ?? new Response("unexpected request", { status: 500 }));
+    try {
+      const first = await runFx(["ask", "--json", "--auto", "Exercise the first fixture."], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
+      });
+      expect(first.code).toBe(0);
+      const sessionId = parseAskJson(first.stdout).session_id;
+      const eventsPath = join(root.home, ".fx", "sessions", sessionId, "events.jsonl");
+      const originalEvents = readFileSync(eventsPath, "utf8");
+      const second = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "Exercise the second fixture."], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
+      });
+      expect(second.code).toBe(0);
+      expect(parseAskJson(second.stdout).final_output).toBe("Second turn stored.");
+      expect(gateway.requestCount()).toBe(4);
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "Confirm the stored results without running tools."], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
+      });
+      expect(resumed.code).toBe(0);
+      expect(resumed.stderr).toBe("");
+      expect(parseAskJson(resumed.stdout).tool_calls).toEqual([]);
+      expect(gateway.requestCount()).toBe(5);
+      expect(readFileSync(eventsPath, "utf8").startsWith(originalEvents)).toBe(true);
+      for (const request of gateway.requests.slice(3)) {
+        const parts = gatewayRequest(request.body).prompt.flatMap((message) => Array.isArray(message.content) ? message.content : []);
+        const calls = parts.filter((part) => part.type === "tool-call" && part.toolCallId === "reused");
+        const results = parts.filter((part) => part.type === "tool-result" && part.toolCallId === "reused");
+        expect(calls).toHaveLength(1);
+        expect(calls[0].toolName).toBe("shell");
+        expect(results).toHaveLength(1);
+        expect(results[0].toolName).toBe("shell");
+        expect(request.body).toContain("first-call-signature");
+        expect(request.body).not.toContain("second-call-signature");
+        expect(request.body).toContain("Unsupported tool: terminal");
+      }
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test("saved malformed recovery resumes without re-executing the historical call", async () => {
     const root = createFixtureRoot("malformed-arguments-resume");
     const firstTracePath = join(root.root, "first-trace.log");
@@ -5161,6 +5300,82 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     },
     60_000,
   );
+
+  test.skipIf(!tmuxAvailable())("reasoning replay survives automatic and manual compaction and cold resume", async () => {
+    const root = createFixtureRoot("reasoning-context-budget");
+    const tracePath = join(root.root, "trace.log");
+    const stderrPath = join(root.root, "stderr.log");
+    writeFileSync(join(root.workspace, "sentinel.txt"), "REPLAY_RESULT_SENTINEL\n");
+    let ordinary = 0;
+    let summaries = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      const request = JSON.parse(body);
+      if (request.tools.length === 0) {
+        summaries++;
+        expect(body).not.toContain("LARGE_REASONING_");
+        expect(body).not.toContain("RECENT_REASONING_SIGNATURE");
+        expect(body).toContain("REPLAY_RESULT_SENTINEL");
+        return fakeGatewayFinalText("The prior reads completed. Preserve REPLAY_RESULT_SENTINEL and continue without repeating completed reads.");
+      }
+      ordinary++;
+      if (ordinary === 6) {
+        expect(body).toContain("context_handoff");
+        expect(body).toContain("LARGE_REASONING_5");
+        expect(body).not.toContain("LARGE_REASONING_1");
+      }
+      if (ordinary <= 6) return fakeGatewaySse([
+        { type: "reasoning-start", id: `reasoning-${ordinary}` },
+        { type: "reasoning-end", id: `reasoning-${ordinary}`, providerMetadata: { openai: { reasoningEncryptedContent: `LARGE_REASONING_${ordinary}` + "a".repeat(80_000) } } },
+        { type: "tool-call", toolCallId: `read-${ordinary}`, toolName: "read_file", input: { path: "sentinel.txt" } },
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+      ]);
+      if (ordinary === 7) return fakeGatewayFinalText("REPLAY_TURN_DONE");
+      if (ordinary === 8) return fakeGatewaySse([
+        { type: "reasoning-start", id: "recent-reasoning" },
+        { type: "reasoning-end", id: "recent-reasoning", providerMetadata: { openai: { reasoningEncryptedContent: "RECENT_REASONING_SIGNATURE" } } },
+        { type: "text-delta", id: "recent-answer", delta: "RECENT_TURN_DONE" },
+        { type: "finish", finishReason: { unified: "stop", raw: "stop" } },
+      ]);
+      expect(body).toContain("RECENT_REASONING_SIGNATURE");
+      expect(body).toContain("REPLAY_RESULT_SENTINEL");
+      expect(body).not.toContain("LARGE_REASONING_");
+      return fakeGatewayFinalText("COLD_REPLAY_DONE");
+    }, { models: [{ id: MODEL, type: "language", tags: ["tool-use", "reasoning"], context_window: 128_000, max_tokens: 8192 }] });
+    const env = { ...fixtureEnv(root, gateway, tracePath), FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_TRACE_SCOPES: "agent,session,context_compaction" };
+    let tui: TmuxSession | null = null;
+    try {
+      tui = await TmuxSession.create({ cwd: root.workspace, env, stderrPath, isolated: true });
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Read sentinel.txt six times, then finish.");
+      const automatic = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("REPLAY_TURN_DONE") || text.includes("request failed:")), 30_000);
+      expect(automatic).toContain("REPLAY_TURN_DONE");
+      expect(automatic).not.toContain("request failed:");
+      expect(summaries).toBe(1);
+      await tui.sendText("Remember the result and acknowledge this short follow-up.");
+      await tui.waitForText("RECENT_TURN_DONE", 15_000);
+      await tui.waitForComposer(15_000);
+      await tui.sendText("/compact");
+      await tui.waitForPane((text) => hasEmptyComposer(text) && summaries === 2 && (text.includes("Context compacted.") || text.includes("request failed:")), 20_000);
+      expect(readFileSync(tracePath, "utf8")).not.toContain("ContextCapacityExceeded");
+      await tui.sendText("/quit");
+      expect(await tui.waitForSessionEnd(15_000)).toBe(true);
+      tui = null;
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      const latest = await runFx(["session", "last", "--json"], { cwd: root.workspace, env });
+      expect(latest.code).toBe(0);
+      const id = JSON.parse(latest.stdout).id;
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", id, "Continue with the saved result."], { cwd: root.workspace, env, timeoutMs: 30_000 });
+      expect(resumed.code, resumed.stderr || resumed.stdout).toBe(0);
+      expect(JSON.parse(resumed.stdout).final_output).toBe("COLD_REPLAY_DONE");
+      expect(ordinary).toBe(9);
+      expect(summaries).toBe(2);
+      expect(readFileSync(join(root.workspace, "sentinel.txt"), "utf8")).toBe("REPLAY_RESULT_SENTINEL\n");
+    } finally {
+      await tui?.kill();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 100_000);
 
   for (const trigger of ["automatic", "manual"] as const) {
     test.skipIf(!tmuxAvailable())(

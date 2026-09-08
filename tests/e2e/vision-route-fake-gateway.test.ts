@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import {
   copyFileSync,
@@ -18,7 +20,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
-import { hasEmptyComposer, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import { fakeGatewaySse, hasEmptyComposer, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
 const TIMEOUT = 15_000;
 const GLM_MODEL = "zai/glm-5.2-fast";
@@ -1191,13 +1193,22 @@ describe("Vision route fake Gateway", () => {
     TIMEOUT,
   );
 
-  test(
-    "saved unadvertised native Vision rejection recovers and is filtered after resume",
-    async () => {
+  test.each(["plain", "prose-replay", "mixed-replay"] as const)(
+    "saved unadvertised native Vision rejection recovers and is filtered after resume (%s)",
+    async (shape) => {
       const root = createIsolatedRoot();
       const fixture = createScopedImageFixture(root);
+      if (shape === "mixed-replay") writeFileSync(join(root.workspace, "notes.txt"), "VISION_READ_SENTINEL\n");
       const gateway = startImageGateway([
-        sseToolCall("vision", { image_ids: [1], focus: "inspect" }, "native_vision"),
+        shape === "plain" ? sseToolCall("vision", { image_ids: [1], focus: "inspect" }, "native_vision") : fakeGatewaySse([
+          { type: "reasoning-start", id: "reasoning" },
+          { type: "reasoning-delta", id: "reasoning", delta: "Inspect the available evidence." },
+          { type: "reasoning-end", id: "reasoning", providerMetadata: { vertex: { thoughtSignature: "retained-reasoning-signature" } } },
+          ...(shape === "prose-replay" ? [{ type: "text-delta", id: "intro", delta: "I will inspect the image." }] : []),
+          { type: "tool-call", toolCallId: "native_vision", toolName: "vision", input: { image_ids: [1], focus: "inspect" }, providerMetadata: { vertex: { thoughtSignature: "removed-vision-signature" } } },
+          ...(shape === "mixed-replay" ? [{ type: "tool-call", toolCallId: "retained_read", toolName: "read_file", input: { path: "notes.txt" }, providerMetadata: { vertex: { thoughtSignature: "retained-read-signature" } } }] : []),
+          { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+        ]),
         sseText("Gemini recovered after rejected Vision"),
         sseText("Gemini continued without historical Vision evidence"),
       ]);
@@ -1254,6 +1265,9 @@ describe("Vision route fake Gateway", () => {
         });
         expect(rejectionOutput as string).not.toContain(fixture.imagePath);
         expect(filePartCount(recoveryRequest.body)).toBe(1);
+        const eventsPath = join(root.home, ".fx", "sessions", firstJson.session_id, "events.jsonl");
+        const originalEvents = readFileSync(eventsPath, "utf8");
+        if (shape !== "plain") expect(originalEvents).toContain("removed-vision-signature");
 
         const resumed = await runFx(
           [
@@ -1286,6 +1300,17 @@ describe("Vision route fake Gateway", () => {
         expect(resumedRequest.body).not.toContain('"toolName":"vision"');
         expect(resumedRequest.body).not.toContain("native_vision");
         expect(resumedRequest.body).not.toContain("Vision is unavailable for this request.");
+        expect(resumedRequest.body).not.toContain("removed-vision-signature");
+        if (shape !== "plain") expect(resumedRequest.body).toContain("retained-reasoning-signature");
+        if (shape === "prose-replay") expect(resumedRequest.body).toContain("I will inspect the image.");
+        if (shape === "mixed-replay") {
+          expect(resumedRequest.body).toContain("retained-read-signature");
+          expect(resumedRequest.body).toContain("VISION_READ_SENTINEL");
+          const parts = promptParts(resumedRequest.body);
+          expect(parts.filter((part) => part.type === "tool-call")).toHaveLength(1);
+          expect(parts.filter((part) => part.type === "tool-result")).toHaveLength(1);
+        }
+        expect(readFileSync(eventsPath, "utf8").startsWith(originalEvents)).toBe(true);
         for (const request of gateway.chatRequests) {
           expect(request.headers.get("ai-language-model-id")).toBe(GEMINI_MODEL);
           expect(request.body).not.toContain(fixture.imagePath);
@@ -3099,3 +3124,119 @@ describe("Vision route fake Gateway", () => {
     30_000,
   );
 });
+
+for (const sourceChange of ["removed", "changed", "saved snapshot missing", "saved snapshot corrupt"] as const) {
+  test(`recovery preserves captured image identity when ${sourceChange}`, async () => {
+    const root = createIsolatedRoot();
+    const input = join(root.workspace, "input.png");
+    const original = writeMarkedImage(input, "ORIGINAL_RECOVERY_INPUT");
+    const digest = createHash("sha256").update(Buffer.from(original, "base64")).digest("hex");
+    const gateway = startImageGateway([
+      sseText("INVALID_FINAL_WITHOUT_VISION"),
+      sseToolCall("vision", { image_ids: [1], focus: "describe" }, "recover_vision"),
+      sseText(VISION_RESULT),
+      sseText("RECOVERY_IMAGE_COMPLETE"),
+    ]);
+    const options = { cwd: root.workspace, env: fakeGatewayEnv(root, gateway, GLM_MODEL), timeoutMs: TIMEOUT };
+    try {
+      const failed = await runFx(["ask", "--json", "--auto", "--image", input, "Describe the saved image."], options);
+      expect(failed.code).toBe(1);
+      expect(failed.stdout).toContain("RequiredVisionToolCallMissing");
+      const sessions = join(root.home, ".fx", "sessions");
+      const id = readdirSync(sessions).find(name => existsSync(join(sessions, name, "recovery.json")))!;
+      expect(id).toBeDefined();
+      const checkpointPath = join(sessions, id, "recovery.json");
+      const checkpointBytes = readFileSync(checkpointPath);
+      const image = JSON.parse(checkpointBytes.toString()).checkpoint.user.images[0];
+      const snapshot = join(sessions, id, image.snapshot_path);
+      expect(image.id).toBe(1);
+      expect(image.snapshot_sha256).toBe(digest);
+      expect(readFileSync(snapshot).toString("base64")).toBe(original);
+      if (sourceChange === "removed") rmSync(input);
+      else if (sourceChange === "changed") writeMarkedImage(input, "REPLACEMENT_MUST_NOT_BE_USED");
+      else if (sourceChange === "saved snapshot missing") rmSync(snapshot);
+      else writeFileSync(snapshot, "corrupted saved bytes");
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", id, "--continue-recovery"], options);
+      if (sourceChange.startsWith("saved snapshot")) {
+        expect(resumed.code).toBe(1);
+        expect(resumed.stdout).toContain(sourceChange.endsWith("missing") ? "MissingImageSnapshot" : "ImageSnapshotCorrupt");
+        expect(gateway.chatRequests).toHaveLength(1);
+        expect(readFileSync(checkpointPath).equals(checkpointBytes)).toBe(true);
+        return;
+      }
+      expect(parseFxJson(resumed).output).toContain("RECOVERY_IMAGE_COMPLETE");
+      expect(gateway.chatRequests).toHaveLength(4);
+      const parts = nativeFileParts(gateway.chatRequests[2]!.body);
+      expect(parts).toHaveLength(1);
+      expect(createHash("sha256").update(Buffer.from(parts[0]!.data, "base64")).digest("hex")).toBe(digest);
+      const history = readFileSync(join(sessions, id, "events.jsonl"), "utf8");
+      expect(history).toContain(digest);
+      expect(readFileSync(snapshot).toString("base64")).toBe(original);
+      expect(existsSync(checkpointPath)).toBe(false);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT * 2);
+}
+
+test.skipIf(!tmuxAvailable())("TUI recovery retains images through failure and cold restart", async () => {
+  const root = createIsolatedRoot();
+  const input = join(root.workspace, "input.png");
+  const original = writeMarkedImage(input, "TUI_RECOVERY_INPUT");
+  const gateway = startImageGateway([
+    sseText("INVALID_FINAL_WITHOUT_VISION"),
+    sseToolCall("vision", { image_ids: [1], focus: "describe" }, "recover_vision"),
+    sseText(VISION_RESULT),
+    sseText("TUI_RECOVERY_IMAGE_COMPLETE"),
+    sseToolCall("vision", { image_ids: [2], focus: "describe new image" }, "new_vision"),
+    sseText(visionResult(2, "second image")),
+    sseText("TUI_NEW_IMAGE_COMPLETE"),
+  ]);
+  let session: TmuxSession | null = null;
+  const env = fakeGatewayEnv(root, gateway, GLM_MODEL);
+  try {
+    session = await TmuxSession.create({ cmd: FX_BIN, cwd: root.workspace, env, isolated: true, remainOnExit: true });
+    await session.waitForStableComposer(TIMEOUT);
+    await session.sendText(`/image ${input}`);
+    await session.waitForText("attached image:", TIMEOUT);
+    await session.sendText("Describe this image.");
+    await session.waitForText("RequiredVisionToolCallMissing", TIMEOUT);
+    await session.waitForStableComposer(TIMEOUT);
+    const sessions = join(root.home, ".fx", "sessions");
+    const id = readdirSync(sessions).find(name => existsSync(join(sessions, name, "recovery.json")))!;
+    const checkpoint = JSON.parse(readFileSync(join(sessions, id, "recovery.json"), "utf8")).checkpoint;
+    const snapshot = join(sessions, id, checkpoint.user.images[0].snapshot_path);
+    expect(readFileSync(snapshot).toString("base64")).toBe(original);
+    await session.sendText("/quit");
+    await session.waitForPane(() => session!.paneStatus().dead, TIMEOUT);
+    expect(session.paneStatus().status).toBe(0);
+    await session.kill();
+    session = null;
+    rmSync(input);
+    session = await TmuxSession.create({ cmd: `${FX_BIN} --resume ${id}`, cwd: root.workspace, env, isolated: true, remainOnExit: true });
+    await session.waitForStableComposer(TIMEOUT);
+    await session.sendText("/continue");
+    await session.waitForText("TUI_RECOVERY_IMAGE_COMPLETE", TIMEOUT);
+    await session.waitForStableComposer(TIMEOUT);
+    expect(nativeFileParts(gateway.chatRequests[2]!.body)[0]!.data).toBe(original);
+    writeMarkedImage(input, "NEW_IMAGE_AFTER_RECOVERY");
+    await session.sendText(`/image ${input}`);
+    await session.waitForText("attached image:", TIMEOUT);
+    await session.sendText("Describe the new image.");
+    await session.waitForText("TUI_NEW_IMAGE_COMPLETE", TIMEOUT);
+    await session.waitForStableComposer(TIMEOUT);
+    const scrollback = await session.captureFullScrollback();
+    expect(scrollback).not.toContain("ImageSnapshotPathUnsafe");
+    expect(scrollback).not.toContain("DuplicateImageId");
+    expect(gateway.chatRequests).toHaveLength(7);
+    await session.sendText("/quit");
+    await session.waitForPane(() => session!.paneStatus().dead, TIMEOUT);
+    expect(session.paneStatus().status).toBe(0);
+    expect(readFileSync(snapshot).toString("base64")).toBe(original);
+  } finally {
+    await session?.kill();
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);

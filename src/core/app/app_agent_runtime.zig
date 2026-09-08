@@ -795,6 +795,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn appendStaticContextMessage(
             app: *App,
             arena: Allocator,
+            project_context: ?[]const u8,
             messages: *std.ArrayList(ChatMessage),
             ignored_list_entries: []const []const u8,
             max_list_entries: usize,
@@ -814,7 +815,7 @@ pub fn Runtime(comptime App: type) type {
             _ = gateway_retry_count;
             _ = gateway_chat_url;
             try app.contextRegistry().appendDefaultStatic(.{
-                .project_context = modelVisibleProjectContext(app),
+                .project_context = project_context orelse modelVisibleProjectContext(app),
             }, arena, messages);
             var snapshot = if (comptime @hasDecl(App, "snapshotMcpModelCatalog"))
                 try app.snapshotMcpModelCatalog(
@@ -950,7 +951,15 @@ pub fn Runtime(comptime App: type) type {
             defer if (fresh_history) |*snapshot| snapshot.deinit(std.heap.c_allocator);
             var snapshot_ownership = worker_runtime.ActivePromptSnapshotOwnership.init(job.images);
             app.worker.beginActivePromptSnapshots(&snapshot_ownership);
+            if (job.recovery_checkpoint != null) {
+                app.worker.preservePromptSnapshots(job.turn_id, job.images);
+            }
             defer app.worker.endActivePromptSnapshots(&snapshot_ownership);
+            {
+                app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+                defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+                if (app.session_persistence.writable) |*loaded| try loaded.requireWritable();
+            }
             if (job.recovery_checkpoint == null) {
                 if (try app_session_runtime.Runtime(App).snapshotFreshPromptBoundary(app, std.heap.c_allocator)) |value| {
                     var checkpoint = value;
@@ -1085,66 +1094,77 @@ pub fn Runtime(comptime App: type) type {
                 .grants = &.{},
                 .agent_settings = app.worker.effectiveAgentTurnSettings(),
             }, .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics }, &.{}, gateway_retry_count, "", &tool_projection, null);
-            var continuation = try agent_runtime.prepareManualCompactionContinuation(
+            const base_continuation = try agent_runtime.prepareManualCompactionContinuation(
                 arena,
                 &deps,
                 config,
                 job.model,
                 capabilities,
             );
-            const window = try agent_runtime.prepareRetainedCompactionWindow(arena, job.history, null, capabilities, source_tokens);
-            const continuation_messages = try arena.alloc(ChatMessage, continuation.request.messages.len + window.retained_messages.len);
-            @memcpy(continuation_messages[0..continuation.request.messages.len], continuation.request.messages);
-            @memcpy(continuation_messages[continuation.request.messages.len..], window.retained_messages);
-            continuation.request.messages = continuation_messages;
-            var compaction_count: usize = 0;
-            for (job.history) |turn| switch (turn) {
-                .compacted_summary => |summary| {
-                    compaction_count = @max(
-                        compaction_count,
-                        summary.compaction_count,
-                    );
-                },
-                else => {},
-            };
-            const transaction = agent_runtime.compactContextTransaction(arena, &deps, .{
-                .trigger = .manual,
-                .provider = job.provider,
-                .working_capabilities = capabilities,
-                .request_tokens = source_tokens,
-                .source_tokens = runtime_prompt_context.estimateCompactionSourceTokens(window.source),
-                .continuation = continuation,
-                .retained_from = window.cut,
-                .newest_exchange_tokens = window.newest_exchange_tokens,
-                .source_messages = window.source,
-                .uncertain_source_message_count = if (uncertain_history_count > 0) window.source.len else 0,
-                .result_storage = result_storage,
-                .api_key = job.api_key,
-                .credential_source = job.credential_source,
-                .account_id = job.account_id,
-                .gateway_team = job.gateway_team,
-                .session_id = app_session_runtime.Runtime(App).activeSessionId(app),
-                .retry_count = gateway_retry_count,
-                .cancel_flag = &app.worker.worker_cancel_requested,
-                .trace_ctx = .{ .turn_id = job.turn_id },
-                .removed_turn_count = window.cut.turns,
-                .compaction_count = compaction_count + 1,
-            }) catch |err| {
-                if (err == error.Cancelled and
-                    app.worker.worker_cancel_requested.load(.seq_cst))
-                {
+            var retention_target = runtime_prompt_context.recentContextTarget(capabilities, source_tokens);
+            while (true) {
+                if (app.worker.worker_cancel_requested.load(.seq_cst)) return;
+                var continuation = base_continuation;
+                const window = try agent_runtime.prepareRetainedCompactionWindow(arena, job.history, null, capabilities, source_tokens, deps.agent_stream_provider, .{ .provider = job.provider, .model = job.model }, .{ .target = retention_target });
+                const continuation_messages = try arena.alloc(ChatMessage, continuation.request.messages.len + window.retained_messages.len);
+                @memcpy(continuation_messages[0..continuation.request.messages.len], continuation.request.messages);
+                @memcpy(continuation_messages[continuation.request.messages.len..], window.retained_messages);
+                continuation.request.messages = continuation_messages;
+                const refine = window.refine_budget(arena, deps.agent_stream_provider, continuation, capabilities, source_tokens, &retention_target) catch |err| {
+                    if (err == error.Cancelled and app.worker.worker_cancel_requested.load(.seq_cst)) return;
+                    return err;
+                };
+                if (refine) continue;
+                var compaction_count: usize = 0;
+                for (job.history) |turn| switch (turn) {
+                    .compacted_summary => |summary| {
+                        compaction_count = @max(
+                            compaction_count,
+                            summary.compaction_count,
+                        );
+                    },
+                    else => {},
+                };
+                const transaction = agent_runtime.compactContextTransaction(arena, &deps, .{
+                    .trigger = .manual,
+                    .provider = job.provider,
+                    .working_capabilities = capabilities,
+                    .request_tokens = source_tokens,
+                    .source_tokens = runtime_prompt_context.estimateCompactionSourceTokens(window.source),
+                    .continuation = continuation,
+                    .retained_from = window.cut,
+                    .newest_exchange_tokens = window.newest_exchange_tokens,
+                    .source_messages = window.source,
+                    .uncertain_source_message_count = if (uncertain_history_count > 0) window.source.len else 0,
+                    .result_storage = result_storage,
+                    .api_key = job.api_key,
+                    .credential_source = job.credential_source,
+                    .account_id = job.account_id,
+                    .gateway_team = job.gateway_team,
+                    .session_id = app_session_runtime.Runtime(App).activeSessionId(app),
+                    .retry_count = gateway_retry_count,
+                    .cancel_flag = &app.worker.worker_cancel_requested,
+                    .trace_ctx = .{ .turn_id = job.turn_id },
+                    .removed_turn_count = window.cut.turns,
+                    .compaction_count = compaction_count + 1,
+                }) catch |err| {
+                    if (err == error.Cancelled and
+                        app.worker.worker_cancel_requested.load(.seq_cst))
+                    {
+                        return;
+                    }
+                    return err;
+                };
+                _ = transaction orelse {
+                    try app_worker_runtime.Runtime(App).pushSemanticNotice(app, .{
+                        .topic = "context",
+                        .tone = .neutral,
+                        .body = "No context to compact.",
+                    });
                     return;
-                }
-                return err;
-            };
-            _ = transaction orelse {
-                try app_worker_runtime.Runtime(App).pushSemanticNotice(app, .{
-                    .topic = "context",
-                    .tone = .neutral,
-                    .body = "No context to compact.",
-                });
+                };
                 return;
-            };
+            }
         }
 
         fn lifecycleContext(app: *App) agent_runtime.LifecycleContext {
@@ -2082,7 +2102,7 @@ test "app prompt projection configures web search then blocks native execution" 
     const arena = arena_state.allocator();
     var messages: std.ArrayList(ChatMessage) = .empty;
     defer messages.deinit(arena);
-    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, null, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     try app.appendRuntimeContextMessage(arena, &messages);
 
     try std.testing.expectEqualStrings("stale-key", app.web_search_runtime.api_key);
@@ -2555,7 +2575,7 @@ test "app agent runtime appends static and transient context through configured 
     defer messages.deinit(arena);
     app.permission_engine.mode = .auto;
 
-    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, null, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     try Runtime(FakeApp).appendTransientRuntimeContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
 
     try std.testing.expectEqual(@as(usize, 3), messages.items.len);
@@ -2580,7 +2600,7 @@ test "app agent runtime prefers active queued project context snapshot" {
     var messages: std.ArrayList(ChatMessage) = .empty;
     defer messages.deinit(arena);
 
-    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, null, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
 
     try std.testing.expectEqual(@as(usize, 2), messages.items.len);
     try std.testing.expectEqualStrings("provider static:queued project context", messages.items[0].content.?);
@@ -3190,40 +3210,76 @@ test "subagent tool context uses immutable admission authority" {
     );
 }
 
-test "app agent runtime discards queued snapshots when tool projection preflight fails" {
+test "app agent runtime settles queued snapshot ownership when prompt admission fails" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    {
-        var file = try tmp.dir.createFile(std.testing.io, "queued-snapshot.bin", .{});
-        defer file.close(std.testing.io);
-        try file.writeStreamingAll(std.testing.io, "\x89PNG\r\n\x1a\nqueued");
+    const Admission = enum { projection_failure, invalid_writer, uncertain_checkpoint };
+    for ([_]Admission{ .projection_failure, .invalid_writer, .uncertain_checkpoint }) |admission| {
+        const invalid_writer = admission != .projection_failure;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        {
+            var file = try tmp.dir.createFile(std.testing.io, "queued-snapshot.bin", .{});
+            defer file.close(std.testing.io);
+            try file.writeStreamingAll(std.testing.io, "\x89PNG\r\n\x1a\nqueued");
+        }
+        const snapshot_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "queued-snapshot.bin");
+        defer alloc.free(snapshot_path);
+
+        var app = try FakeApp.init(alloc);
+        defer app.deinit();
+        app.snapshot_tools_error = error.TestExpectedEqual;
+        const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(root);
+        defer app.session_persistence.deinit(alloc);
+        if (invalid_writer) {
+            app.session_persistence.store = try @import("../session/session_store.zig").Store.initFromHome(alloc, root, root);
+            app.session_persistence.writable = try app.session_persistence.store.?.startWritableSession(alloc, .{
+                .id = @constCast("rejected-images"),
+                .origin_workspace_root = @constCast(root),
+                .workspace_root = @constCast(root),
+                .created_at_ms = 1,
+                .updated_at_ms = 1,
+                .conversation_language = .literal("en"),
+                .history = &.{},
+                .total_input_tokens = 0,
+                .total_output_tokens = 0,
+                .preferences = .{ .model = @constCast("test-model"), .effort = .auto, .fast_mode = false },
+            });
+            app.session_persistence.writable.?.conversation_writer.failure = error.SessionCommitFailed;
+        }
+
+        var job = try makeQueuedPrompt(alloc);
+        defer worker_runtime.freeQueuedPrompt(alloc, job);
+        job.images = try types.dupeImageAttachmentSlice(alloc, &.{.{
+            .id = 1,
+            .path = @constCast("/tmp/source.png"),
+            .media_type = @constCast("image/png"),
+            .snapshot_path = snapshot_path,
+            .snapshot_sha256 = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        }});
+
+        if (admission == .uncertain_checkpoint) {
+            app.worker.active_turn_id = 41;
+            app.worker.preservePromptSnapshots(41, job.images);
+            app.session_persistence.writable.?.conversation_writer.failure = error.SessionPersistenceUncertain;
+        }
+        try std.testing.expectError(
+            switch (admission) {
+                .projection_failure => error.TestExpectedEqual,
+                .invalid_writer => error.SessionCommitFailed,
+                .uncertain_checkpoint => error.SessionPersistenceUncertain,
+            },
+            Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url),
+        );
+        if (admission == .uncertain_checkpoint) {
+            try std.Io.Dir.accessAbsolute(std.testing.io, snapshot_path, .{});
+        } else {
+            try std.testing.expectError(
+                error.FileNotFound,
+                std.Io.Dir.accessAbsolute(std.testing.io, snapshot_path, .{}),
+            );
+        }
     }
-    const snapshot_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "queued-snapshot.bin");
-    defer alloc.free(snapshot_path);
-
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-    app.snapshot_tools_error = error.TestExpectedEqual;
-
-    var job = try makeQueuedPrompt(alloc);
-    defer worker_runtime.freeQueuedPrompt(alloc, job);
-    job.images = try types.dupeImageAttachmentSlice(alloc, &.{.{
-        .id = 1,
-        .path = @constCast("/tmp/source.png"),
-        .media_type = @constCast("image/png"),
-        .snapshot_path = snapshot_path,
-        .snapshot_sha256 = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-    }});
-
-    try std.testing.expectError(
-        error.TestExpectedEqual,
-        Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url),
-    );
-    try std.testing.expectError(
-        error.FileNotFound,
-        std.Io.Dir.accessAbsolute(std.testing.io, snapshot_path, .{}),
-    );
 }
 
 test "app agent runtime discards every snapshot in a failed multi-image preflight" {

@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { createWriteStream } from "node:fs";
-import { cp, mkdir, mkdtemp, readFile, rename, writeFile } from "node:fs/promises";
+import { access, cp, mkdir, mkdtemp, readFile, rename, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -13,6 +13,9 @@ import { fileURLToPath } from "node:url";
 import { serializeError } from "./package-report.mjs";
 
 const tarball = resolve(process.argv[2]);
+const next15 = process.argv.includes("--next15");
+const webpack = next15 || process.argv.includes("--webpack");
+const bundlerArgs = webpack && !next15 ? ["--webpack"] : [];
 const artifactRoot = process.env.LIBFX_TEST_ARTIFACT_ROOT || tmpdir();
 await mkdir(artifactRoot, { recursive: true });
 const root = await mkdtemp(resolve(artifactRoot, "libfx-next-"));
@@ -43,7 +46,9 @@ async function start(cwd, args, name) {
   const port = reservation.address().port;
   await new Promise((resolveClose) => reservation.close(resolveClose));
   const log = createWriteStream(resolve(root, `${name}.log`));
-  const child = spawn(process.execPath, ["--no-experimental-require-module", ...args, ...(name === "standalone" ? [] : ["--hostname", "127.0.0.1", "--port", String(port)])], {
+  // Next 16 dev forwards flags through NODE_OPTIONS, which rejects the JSPI flag.
+  const jspiArgs = name === "start" || (name === "dev" && next15) ? ["--experimental-wasm-jspi"] : [];
+  const child = spawn(process.execPath, [...jspiArgs, "--no-experimental-require-module", ...args, ...(name === "standalone" ? [] : ["--hostname", "127.0.0.1", "--port", String(port)])], {
     cwd, env: { ...env, HOSTNAME: "127.0.0.1", PORT: String(port) }, detached: true, stdio: ["ignore", "pipe", "pipe"],
   });
   child.stdout.pipe(log, { end: false });
@@ -89,6 +94,19 @@ async function exercise(server, stage) {
       console.log(`${stage}/${backend}/${scenario} passed`);
     }
   }
+  // Next's standalone tracer excludes .wasm assets; native selection above must not rely on that fallback.
+  if (stage === "start" || (stage === "dev" && next15)) {
+    const response = await fetch(`${server.url}/api/fx?backend=wasm&scenario=startup`, {
+      headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(60_000),
+    });
+    const result = await response.json();
+    assert.equal(response.status, 200, JSON.stringify(result));
+    assert.equal(result.ok, true);
+    assert.equal(result.probe.backend, "wasm-jspi");
+    assert.ok(result.checkpointBytes > 48);
+    results.push({ stage, backend: "wasm", status: response.status, ...result });
+    console.log(`${stage}/wasm/default asset startup passed`);
+  }
   const concurrent = await Promise.all(Array.from({ length: 8 }, async () => {
     const response = await fetch(`${server.url}/api/fx?backend=native`, {
       headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(60_000),
@@ -101,34 +119,53 @@ async function exercise(server, stage) {
   console.log(`${stage}/eight concurrent tool turns passed`);
 }
 
+async function assertBundledNativeAssets(buildDir) {
+  if (!webpack) return;
+  const routeDir = resolve(buildDir, "server/app/api/fx");
+  const trace = JSON.parse(await readFile(resolve(routeDir, "route.js.nft.json"), "utf8"));
+  for (const platform of ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64"]) {
+    const file = trace.files.find((path) => path.includes(`/static/media/libfx.${platform}.`) && path.endsWith(".node"));
+    assert.ok(file, `webpack must trace the emitted ${platform} addon, not externalize libfx`);
+    await access(resolve(routeDir, file));
+  }
+}
+
 try {
   await cp(fixture, app, { recursive: true, filter: (path) => !["node_modules", ".next"].includes(path.split("/").at(-1)) });
   await cp(tarball, resolve(app, "libfx.tgz"));
   const manifest = JSON.parse(await readFile(resolve(app, "package.json"), "utf8"));
   manifest.dependencies.libfx = "file:./libfx.tgz";
+  if (next15) manifest.dependencies.next = "15.5.25";
   await writeFile(resolve(app, "package.json"), JSON.stringify(manifest, null, 2));
   await run(process.env.PNPM_BIN || "pnpm", ["install", "--no-frozen-lockfile", "--ignore-scripts"], app, "install");
   const require = createRequire(resolve(app, "package.json"));
-  await run(process.execPath, [
-    fileURLToPath(new URL("./test-node-tracing.mjs", import.meta.url)),
-    dirname(require.resolve("libfx")),
-    require.resolve("next/dist/compiled/@vercel/nft"),
-  ], app, "node-tracing");
+  if (!next15) {
+    await run(process.execPath, [
+      fileURLToPath(new URL("./test-node-tracing.mjs", import.meta.url)),
+      dirname(require.resolve("libfx")),
+      require.resolve("next/dist/compiled/@vercel/nft"),
+    ], app, "node-tracing");
+  }
   const next = resolve(app, "node_modules/next/dist/bin/next");
-  const dev = await start(app, [next, "dev"], "dev");
+  const dev = await start(app, [next, "dev", ...bundlerArgs], "dev");
   await exercise(dev, "dev");
   await stop(dev);
-  await run(process.execPath, ["--no-experimental-require-module", next, "build"], app, "build");
+  await run(process.execPath, ["--no-experimental-require-module", next, "build", ...bundlerArgs], app, "build");
+  await assertBundledNativeAssets(resolve(app, ".next"));
   const production = await start(app, [next, "start"], "start");
   await exercise(production, "start");
   await stop(production);
 
-  await writeFile(resolve(app, "next.config.mjs"), 'export default { output: "standalone" };\n');
-  await run(process.execPath, ["--no-experimental-require-module", next, "build"], app, "standalone-build");
+  const distDir = "build-output";
+  await writeFile(resolve(app, "next.config.mjs"), `export default ${JSON.stringify({
+    output: "standalone", distDir, assetPrefix: "https://cdn.example.test/assets",
+  })};\n`);
+  await run(process.execPath, ["--no-experimental-require-module", next, "build", ...bundlerArgs], app, "standalone-build");
+  await assertBundledNativeAssets(resolve(app, distDir));
   const isolated = resolve(root, "isolated");
-  await cp(resolve(app, ".next/standalone"), isolated, { recursive: true, verbatimSymlinks: true });
-  await mkdir(resolve(isolated, ".next"), { recursive: true });
-  await cp(resolve(app, ".next/static"), resolve(isolated, ".next/static"), { recursive: true });
+  await cp(resolve(app, distDir, "standalone"), isolated, { recursive: true, verbatimSymlinks: true });
+  await mkdir(resolve(isolated, distDir), { recursive: true });
+  await cp(resolve(app, distDir, "static"), resolve(isolated, distDir, "static"), { recursive: true });
   await rename(app, resolve(root, "source-unavailable"));
   const standalone = await start(isolated, [resolve(isolated, "server.js")], "standalone");
   await exercise(standalone, "standalone");
@@ -141,7 +178,7 @@ try {
     catch (error) { failure = failure ? new AggregateError([failure, error], "Verification and cleanup failed") : error; }
   }
   await writeFile(resolve(root, "results.json"), JSON.stringify({
-    node: process.version, tarball, results,
+    node: process.version, next15, bundler: webpack ? "webpack" : "turbopack", tarball, results,
     status: failure ? "failed" : "passed",
     error: serializeError(failure),
   }, null, 2));

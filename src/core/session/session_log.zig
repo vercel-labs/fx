@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
@@ -118,9 +119,15 @@ pub const ConversationWriter = struct {
     latest_checkpoint_coverage: u64 = 0,
     turn_open: bool = false,
     pending_tool_calls: std.ArrayList(session_event.PendingToolCall) = .empty,
+    failure: ?error{ SessionWriterChanged, SessionPersistenceUncertain, SessionCommitFailed } = null,
+    test_sync_ops: if (builtin.is_test) io_mod.DurableOps else void = if (builtin.is_test) .{} else {},
 
     /// Takes ownership of `file` only on success.
     pub fn init(alloc: Allocator, file: std.Io.File) !ConversationWriter {
+        return initWithReplayScan(alloc, file, null);
+    }
+
+    fn initWithReplayScan(alloc: Allocator, file: std.Io.File, replay_scan: ?*ConversationReplayScan) !ConversationWriter {
         const length = try file.length(io_mod.getIo());
         var writer = ConversationWriter{ .alloc = alloc, .file = file };
         errdefer {
@@ -131,8 +138,10 @@ pub const ConversationWriter = struct {
         var open_turn_offset: ?u64 = null;
         var open_turn_prior_seq: u64 = 0;
         var checkpointed_turn = false;
+        var buffer: [8192]u8 = undefined;
+        var reader = file.reader(io_mod.getIo(), &buffer);
         while (offset < length) {
-            const line = session_replay.readLineAt(alloc, file, offset, length) catch |err| switch (err) {
+            const line = session_replay.readBufferedLine(alloc, &reader, length, null) catch |err| switch (err) {
                 error.TruncatedEventFrame => {
                     try file.setLength(io_mod.getIo(), offset);
                     try file.sync(io_mod.getIo());
@@ -170,6 +179,7 @@ pub const ConversationWriter = struct {
                 },
             }
             try writer.applyReplayedEvent(decoded.value.seq, decoded.value.event);
+            if (replay_scan) |scan| try scan.observe(offset, decoded.value.seq, decoded.value.event);
             offset = line.next_offset;
             writer.committed_bytes = offset;
         }
@@ -185,6 +195,10 @@ pub const ConversationWriter = struct {
             writer.committed_bytes = truncate_from;
             writer.last_seq = open_turn_prior_seq;
             writer.turn_open = checkpointed_turn;
+            if (replay_scan) |scan| {
+                scan.last_seq = writer.last_seq;
+                if (!writer.turn_open) scan.active_user_offset = null;
+            }
         }
         return writer;
     }
@@ -205,6 +219,7 @@ pub const ConversationWriter = struct {
         timestamp_ms: i64,
         event: session_event.ConversationEvent,
     ) !u64 {
+        if (self.failure) |err| return err;
         const seq = std.math.add(u64, self.last_seq, 1) catch
             return error.ConversationSequenceOverflow;
         const envelope = session_event.ConversationEnvelope{
@@ -243,14 +258,7 @@ pub const ConversationWriter = struct {
 
         const frame = try session_event.encodeConversationFrame(alloc, envelope);
         defer alloc.free(frame);
-        if (try self.file.length(io_mod.getIo()) != self.committed_bytes) {
-            try self.file.setLength(io_mod.getIo(), self.committed_bytes);
-            try self.file.sync(io_mod.getIo());
-        }
-        try self.file.writePositionalAll(io_mod.getIo(), frame, self.committed_bytes);
-        try self.file.sync(io_mod.getIo());
-        self.committed_bytes = std.math.add(u64, self.committed_bytes, frame.len) catch
-            return error.ConversationSizeOverflow;
+        try self.writePrepared(frame);
         self.last_seq = seq;
         self.turn_open = turn_open;
 
@@ -385,8 +393,10 @@ pub const ConversationWriter = struct {
     fn scanContext(self: *const ConversationWriter, alloc: Allocator, progress: *ConversationProgress, cut: ?types.ContextHistoryCut) !void {
         progress.coverage = self.latest_checkpoint_coverage;
         var offset: u64 = 0;
+        var buffer: [8192]u8 = undefined;
+        var reader = self.file.reader(io_mod.getIo(), &buffer);
         while (offset < self.committed_bytes) {
-            const line = try session_replay.readLineAt(alloc, self.file, offset, self.committed_bytes) orelse break;
+            const line = try session_replay.readBufferedLine(alloc, &reader, self.committed_bytes, null) orelse break;
             defer alloc.free(line.bytes);
             var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
             defer decoded.deinit();
@@ -431,6 +441,7 @@ pub const ConversationWriter = struct {
         timestamp_ms: i64,
         events: []const session_event.ConversationEvent,
     ) !void {
+        if (self.failure) |err| return err;
         if (events.len == 0) return;
         if (self.pending_tool_calls.items.len != 0) return error.UnresolvedToolCall;
 
@@ -479,24 +490,48 @@ pub const ConversationWriter = struct {
             try out.writer.writeAll(frame);
         }
         if (pending.items.len != 0) return error.UnresolvedToolCall;
-        if (try self.file.length(io_mod.getIo()) != self.committed_bytes) {
-            try self.file.setLength(io_mod.getIo(), self.committed_bytes);
-            try self.file.sync(io_mod.getIo());
-        }
-        try self.file.writePositionalAll(
-            io_mod.getIo(),
-            out.written(),
-            self.committed_bytes,
-        );
-        try self.file.sync(io_mod.getIo());
-        self.committed_bytes = std.math.add(
-            u64,
-            self.committed_bytes,
-            out.written().len,
-        ) catch return error.ConversationSizeOverflow;
+        try self.writePrepared(out.written());
         self.last_seq = seq;
         self.latest_checkpoint_coverage = checkpoint_coverage;
         self.turn_open = turn_open;
+    }
+
+    fn writePrepared(self: *ConversationWriter, bytes: []const u8) !void {
+        if (self.failure) |err| return err;
+        const next_bytes = std.math.add(u64, self.committed_bytes, bytes.len) catch
+            return error.ConversationSizeOverflow;
+        if (try self.file.length(io_mod.getIo()) != self.committed_bytes) {
+            self.failure = error.SessionWriterChanged;
+            debug_trace.logf("session", "conversation writer changed outside ownership offset={d}", .{self.committed_bytes});
+            return error.SessionWriterChanged;
+        }
+        self.file.writePositionalAll(io_mod.getIo(), bytes, self.committed_bytes) catch |err| {
+            return self.rollbackAppend(err);
+        };
+        self.syncAppend() catch |err| return self.rollbackAppend(err);
+        self.committed_bytes = next_bytes;
+    }
+
+    fn syncAppend(self: *ConversationWriter) !void {
+        if (comptime builtin.is_test) {
+            return self.test_sync_ops.sync_file(self.test_sync_ops.ctx, self.file);
+        }
+        try self.file.sync(io_mod.getIo());
+    }
+
+    fn rollbackAppend(self: *ConversationWriter, original: anyerror) anyerror {
+        self.failure = error.SessionPersistenceUncertain;
+        self.file.setLength(io_mod.getIo(), self.committed_bytes) catch |err| {
+            debug_trace.logf("session", "conversation append rollback failed offset={d} append_err={s} rollback_err={s}", .{ self.committed_bytes, @errorName(original), @errorName(err) });
+            return error.SessionPersistenceUncertain;
+        };
+        self.syncAppend() catch |err| {
+            debug_trace.logf("session", "conversation append rollback sync failed offset={d} append_err={s} rollback_err={s}", .{ self.committed_bytes, @errorName(original), @errorName(err) });
+            return error.SessionPersistenceUncertain;
+        };
+        self.failure = null;
+        debug_trace.logf("session", "conversation append rolled back offset={d} err={s}", .{ self.committed_bytes, @errorName(original) });
+        return original;
     }
 
     fn clearPendingToolCalls(self: *ConversationWriter) void {
@@ -741,7 +776,7 @@ fn loadConversationStateIfPresent(
     dir: *io_mod.VerifiedDir,
     expected_session_id: []const u8,
 ) !?session_codec.DurableSessionState {
-    return load_conversation_state_at_boundary(alloc, dir, expected_session_id, null);
+    return load_conversation_state_at_boundary(alloc, dir, expected_session_id, null, null);
 }
 
 fn load_conversation_state_at_boundary(
@@ -749,6 +784,7 @@ fn load_conversation_state_at_boundary(
     dir: *io_mod.VerifiedDir,
     expected_session_id: []const u8,
     recovery: ?ConversationRecoveryBoundary,
+    replay_window: ?ConversationReplayWindow,
 ) !?session_codec.DurableSessionState {
     const metadata_bytes = readManagedFileAlloc(
         alloc,
@@ -786,7 +822,7 @@ fn load_conversation_state_at_boundary(
     var open_work_id: ?[]u8 = null;
     defer if (open_work_id) |work_id| alloc.free(work_id);
     const length = if (recovery) |boundary| boundary.bytes else try event_file.length(io_mod.getIo());
-    const history = try replayConversationHistory(alloc, event_file, length, &conversation_seq, &open_work_id);
+    const history = try replayConversationHistory(alloc, event_file, length, &conversation_seq, &open_work_id, replay_window);
     errdefer session.freeHistoryTurnSlice(alloc, history);
     if (recovery == null) try restoreContextResultBodies(alloc, dir, history);
     const latest_work_id = if (recovery != null and recovery.?.turn_open and open_work_id != null)
@@ -798,10 +834,11 @@ fn load_conversation_state_at_boundary(
     else
         null;
     errdefer if (last_work_id) |work_id| alloc.free(work_id);
-    var usage = try session_usage_sidecar.load(
+    var usage: ?session_usage.Snapshot = try session_usage_sidecar.loadConversation(
         alloc,
         dir,
         expected_session_id,
+        metadata.value.updated_at_ms,
     );
     errdefer if (usage) |*snapshot| snapshot.deinit(alloc);
     var permission_state = try loadConversationPermissionState(alloc, dir);
@@ -881,12 +918,31 @@ pub const ConversationRecoveryBoundary = struct {
     turn_open: bool = false,
 };
 
+fn find_conversation_recovery_boundary(alloc: Allocator, dir: *io_mod.VerifiedDir) !ConversationRecoveryBoundary {
+    const scan = try scan_conversation_recovery(alloc, dir);
+    if (scan.complete) return error.SessionRecoveryNotNeeded;
+    return scan.boundary;
+}
+
+const ConversationRecovery = struct {
+    boundary: ConversationRecoveryBoundary,
+    usage_incomplete: bool,
+};
+
+pub fn classify_conversation_recovery(alloc: Allocator, dir: *io_mod.VerifiedDir, session_id: []const u8) !ConversationRecovery {
+    const scan = try scan_conversation_recovery(alloc, dir);
+    const usage_incomplete = try session_usage_sidecar.has_recoverable_corruption(alloc, dir, session_id);
+    if (scan.complete and !usage_incomplete) return error.SessionRecoveryNotNeeded;
+    return .{ .boundary = scan.boundary, .usage_incomplete = usage_incomplete };
+}
+
 /// Reads only. The existing transition validator remains the record authority.
-pub fn find_conversation_recovery_boundary(
+fn scan_conversation_recovery(
     alloc: Allocator,
     dir: *io_mod.VerifiedDir,
-) !ConversationRecoveryBoundary {
-    var reader = try ConversationHistoryReader.init(alloc, dir);
+) !struct { boundary: ConversationRecoveryBoundary, complete: bool } {
+    var history_buffer: [8192]u8 = undefined;
+    var reader = try ConversationHistoryReader.init(alloc, dir, &history_buffer);
     defer reader.deinit();
     const file = reader.file;
     const length = reader.length;
@@ -898,11 +954,14 @@ pub fn find_conversation_recovery_boundary(
     }
     var boundary: ConversationRecoveryBoundary = .{};
     var offset: u64 = 0;
-    var coverage_offset: u64 = 0;
     var coverage_seq: u64 = 0;
     var coverage_progress: ConversationProgress = .{};
+    var buffer: [8192]u8 = undefined;
+    var lines = file.reader(io_mod.getIo(), &buffer);
+    var coverage_buffer: [8192]u8 = undefined;
+    var coverage_lines = file.reader(io_mod.getIo(), &coverage_buffer);
     scan: while (offset < length) {
-        const line = session_replay.readLineAt(alloc, file, offset, length) catch |err| switch (err) {
+        const line = session_replay.readBufferedLine(alloc, &lines, length, null) catch |err| switch (err) {
             error.TruncatedEventFrame, error.EventFrameTooLarge => break,
             else => return err,
         } orelse break;
@@ -921,14 +980,13 @@ pub fn find_conversation_recovery_boundary(
             const coverage = decoded.value.event.context_checkpoint.covers_through_seq;
             // Coverage is monotone, so historical cuts need only one extra scan.
             while (coverage_seq < coverage) {
-                const covered = (try session_replay.readLineAt(alloc, file, coverage_offset, offset)) orelse
+                const covered = (try session_replay.readBufferedLine(alloc, &coverage_lines, offset, null)) orelse
                     return error.SessionRecoveryBoundaryInvalid;
                 defer alloc.free(covered.bytes);
                 var frame = try session_event.decodeConversationFrame(alloc, covered.bytes);
                 defer frame.deinit();
                 try coverage_progress.observe(frame.value.seq, frame.value.event, null);
                 coverage_seq = frame.value.seq;
-                coverage_offset = covered.next_offset;
             }
             if (coverage_progress.pending != 0) break :scan;
         }
@@ -954,10 +1012,10 @@ pub fn find_conversation_recovery_boundary(
             };
         }
     }
-    if (offset == length and boundary.bytes == length) return error.SessionRecoveryNotNeeded;
-    if (boundary.bytes == 0) return error.SessionRecoveryBoundaryInvalid;
+    const complete = offset == length and boundary.bytes == length;
+    if (!complete and boundary.bytes == 0) return error.SessionRecoveryBoundaryInvalid;
     debug_trace.logf("session", "event=conversation_recovery_boundary source_bytes={d} retained_bytes={d} through_seq={d}", .{ length, boundary.bytes, boundary.seq });
-    return boundary;
+    return .{ .boundary = boundary, .complete = complete };
 }
 
 /// Caller owns the returned complete archive, with a checkpointed open turn
@@ -968,7 +1026,7 @@ pub fn load_conversation_recovery_state(
     session_id: []const u8,
     boundary: ConversationRecoveryBoundary,
 ) !session_codec.DurableSessionState {
-    const loaded = load_conversation_state_at_boundary(alloc, dir, session_id, boundary) catch |err| switch (err) {
+    const loaded = load_conversation_state_at_boundary(alloc, dir, session_id, boundary, null) catch |err| switch (err) {
         error.InvalidSessionMetadata, error.InvalidSessionFormat => return error.SessionRecoveryBoundaryInvalid,
         else => return err,
     };
@@ -1172,7 +1230,8 @@ fn openConversationWritableSession(
     writable: *WritableSessionDir,
 ) !LoadedWritableSession {
     var event_file = try openManagedFile(&writable.dir, events_file, .read_write);
-    var conversation_writer = ConversationWriter.init(alloc, event_file) catch |err| {
+    var replay_scan: ConversationReplayScan = .{};
+    var conversation_writer = ConversationWriter.initWithReplayScan(alloc, event_file, &replay_scan) catch |err| {
         event_file.close(io_mod.getIo());
         return err;
     };
@@ -1185,15 +1244,21 @@ fn openConversationWritableSession(
         );
         defer if (recovery) |*checkpoint| checkpoint.deinit(alloc);
         if (recovery == null) {
-            _ = try conversation_writer.append(alloc, io_mod.milliTimestamp(), .{
+            const interrupted: session_event.ConversationEvent = .{
                 .interrupted = .{ .reason = .failed },
-            });
+            };
+            const offset = conversation_writer.committed_bytes;
+            _ = try conversation_writer.append(alloc, io_mod.milliTimestamp(), interrupted);
+            try replay_scan.observe(offset, conversation_writer.last_seq, interrupted);
         }
     }
-    var state = (try loadConversationStateIfPresent(
+    const replay_window = try replay_scan.finish(alloc, event_file, conversation_writer.committed_bytes);
+    var state = (try load_conversation_state_at_boundary(
         alloc,
         &writable.dir,
         writable.session_id,
+        null,
+        replay_window,
     )) orelse return error.InvalidSessionMetadata;
     errdefer state.deinit(alloc);
     const active_id = try alloc.dupe(u8, writable.session_id);
@@ -1222,8 +1287,9 @@ fn replayConversationHistory(
     length: u64,
     conversation_seq: *u64,
     open_work_id: *?[]u8,
+    replay_window: ?ConversationReplayWindow,
 ) ![]session.HistoryTurn {
-    const window = try findConversationReplayWindow(alloc, file, length);
+    const window = replay_window orelse try findConversationReplayWindow(alloc, file, length);
     conversation_seq.* = window.last_complete_seq;
     var offset = window.offset;
     var history: std.ArrayList(session.HistoryTurn) = .empty;
@@ -1258,9 +1324,11 @@ fn replayConversationHistory(
         try turn.begin(decoded.value.event.user);
     }
     var checkpoint_turn_open = window.active_user_offset != null;
-
+    var buffer: [8192]u8 = undefined;
+    var reader = file.reader(io_mod.getIo(), &buffer);
+    reader.pos = offset;
     while (offset < length) {
-        const line = session_replay.readLineAt(alloc, file, offset, length) catch |err| switch (err) {
+        const line = session_replay.readBufferedLine(alloc, &reader, length, null) catch |err| switch (err) {
             error.TruncatedEventFrame => break,
             else => return err,
         } orelse break;
@@ -1310,17 +1378,20 @@ fn replayConversationHistory(
 pub const ConversationHistoryReader = struct {
     alloc: Allocator,
     file: std.Io.File,
+    reader: std.Io.File.Reader,
     length: u64,
     offset: u64 = 0,
     builder: ConversationTurnBuilder,
 
-    pub fn init(alloc: Allocator, dir: *io_mod.VerifiedDir) !ConversationHistoryReader {
+    /// Borrows buffer until deinit; owns the opened file and current turn.
+    pub fn init(alloc: Allocator, dir: *io_mod.VerifiedDir, buffer: []u8) !ConversationHistoryReader {
         var file = try openManagedFile(dir, events_file, .read_only);
         errdefer file.close(io_mod.getIo());
         return .{
             .alloc = alloc,
             .file = file,
             .length = try file.length(io_mod.getIo()),
+            .reader = file.reader(io_mod.getIo(), buffer),
             .builder = ConversationTurnBuilder.init(alloc),
         };
     }
@@ -1333,7 +1404,7 @@ pub const ConversationHistoryReader = struct {
 
     pub fn next(self: *ConversationHistoryReader) !?session.HistoryTurn {
         while (self.offset < self.length) {
-            const line = session_replay.readLineAt(self.alloc, self.file, self.offset, self.length) catch |err| switch (err) {
+            const line = session_replay.readBufferedLine(self.alloc, &self.reader, self.length, null) catch |err| switch (err) {
                 error.TruncatedEventFrame => return null,
                 else => return err,
             } orelse return null;
@@ -1385,7 +1456,8 @@ pub fn loadConversationHistoryRange(
     end: usize,
 ) ![]session.HistoryTurn {
     if (start > end) return error.InvalidHistoryPageCursor;
-    var reader = try ConversationHistoryReader.init(alloc, dir);
+    var buffer: [8192]u8 = undefined;
+    var reader = try ConversationHistoryReader.init(alloc, dir, &buffer);
     defer reader.deinit();
     var turns: std.ArrayList(session.HistoryTurn) = .empty;
     errdefer {
@@ -1431,8 +1503,10 @@ fn load_conversation_archive_from_file(
     defer builder.deinit();
     var raw_turn_count: usize = 0;
     var compaction_count: usize = 0;
+    var buffer: [8192]u8 = undefined;
+    var reader = file.reader(io_mod.getIo(), &buffer);
     while (offset < length) {
-        const line = session_replay.readLineAt(alloc, file, offset, length) catch |err| switch (err) {
+        const line = session_replay.readBufferedLine(alloc, &reader, length, null) catch |err| switch (err) {
             error.TruncatedEventFrame => break,
             else => return err,
         } orelse break;
@@ -1502,89 +1576,94 @@ const ConversationReplayWindow = struct {
     coverage: u64 = 0,
 };
 
-fn findConversationReplayWindow(
-    alloc: Allocator,
-    file: std.Io.File,
-    length: u64,
-) !ConversationReplayWindow {
-    var window: ConversationReplayWindow = .{};
-    var offset: u64 = 0;
-    var turn_count: usize = 0;
-    var last_seq: u64 = 0;
-    var compaction_count: usize = 0;
-    var last_complete_seq: u64 = 0;
-    var active_user_offset: ?u64 = null;
-    while (offset < length) {
-        const line = session_replay.readLineAt(alloc, file, offset, length) catch |err| switch (err) {
-            error.TruncatedEventFrame => break,
-            else => return err,
-        } orelse break;
-        defer alloc.free(line.bytes);
-        var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
-        defer decoded.deinit();
-        const expected_seq = std.math.add(u64, last_seq, 1) catch
-            return error.InvalidConversationFrame;
-        if (decoded.value.seq != expected_seq) return error.InvalidConversationFrame;
-        last_seq = decoded.value.seq;
-        switch (decoded.value.event) {
+const ConversationReplayScan = struct {
+    window: ConversationReplayWindow = .{},
+    turn_count: usize = 0,
+    last_seq: u64 = 0,
+    active_user_offset: ?u64 = null,
+
+    fn observe(self: *ConversationReplayScan, offset: u64, seq: u64, event: session_event.ConversationEvent) !void {
+        const expected_seq = std.math.add(u64, self.last_seq, 1) catch return error.InvalidConversationFrame;
+        if (seq != expected_seq) return error.InvalidConversationFrame;
+        self.last_seq = seq;
+        switch (event) {
             .user => {
-                if (active_user_offset != null) return error.InvalidConversationFrame;
-                active_user_offset = offset;
+                if (self.active_user_offset != null) return error.InvalidConversationFrame;
+                self.active_user_offset = offset;
             },
             .turn_completed, .interrupted => {
-                if (active_user_offset == null) return error.InvalidConversationFrame;
-                active_user_offset = null;
-                turn_count = std.math.add(usize, turn_count, 1) catch
-                    return error.InvalidConversationFrame;
-                last_complete_seq = decoded.value.seq;
+                if (self.active_user_offset == null) return error.InvalidConversationFrame;
+                self.active_user_offset = null;
+                self.turn_count = std.math.add(usize, self.turn_count, 1) catch return error.InvalidConversationFrame;
+                self.window.last_complete_seq = seq;
             },
             .context_checkpoint => |checkpoint| {
-                last_complete_seq = decoded.value.seq;
-                compaction_count = std.math.add(
-                    usize,
-                    compaction_count,
-                    1,
-                ) catch return error.InvalidConversationFrame;
-                window = .{
+                self.window = .{
                     .offset = offset,
-                    .prior_turn_count = turn_count,
-                    .compaction_count = compaction_count,
-                    .active_user_offset = active_user_offset,
+                    .prior_turn_count = self.turn_count,
+                    .compaction_count = std.math.add(usize, self.window.compaction_count, 1) catch return error.InvalidConversationFrame,
+                    .last_complete_seq = seq,
+                    .active_user_offset = self.active_user_offset,
                     .checkpoint_offset = offset,
                     .coverage = checkpoint.covers_through_seq,
                 };
             },
             else => {},
         }
+    }
+
+    fn finish(self: *const ConversationReplayScan, alloc: Allocator, file: std.Io.File, length: u64) !ConversationReplayWindow {
+        var window = self.window;
+        // Coverage can precede the checkpoint: retain the recent exchanges
+        // between those boundaries rather than replaying only after the record.
+        if (window.checkpoint_offset != null) {
+            window.offset = 0;
+            window.active_user_offset = null;
+            window.prior_turn_count = 0;
+            var buffer: [8192]u8 = undefined;
+            var reader = file.reader(io_mod.getIo(), &buffer);
+            while (window.offset < length) {
+                const line = try session_replay.readBufferedLine(alloc, &reader, length, null) orelse break;
+                defer alloc.free(line.bytes);
+                var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
+                defer decoded.deinit();
+                if (decoded.value.seq > window.coverage) break;
+                switch (decoded.value.event) {
+                    .user => window.active_user_offset = window.offset,
+                    .turn_completed, .interrupted => {
+                        window.active_user_offset = null;
+                        window.prior_turn_count += 1;
+                    },
+                    else => {},
+                }
+                window.offset = line.next_offset;
+            }
+        }
+        return window;
+    }
+};
+
+fn findConversationReplayWindow(
+    alloc: Allocator,
+    file: std.Io.File,
+    length: u64,
+) !ConversationReplayWindow {
+    var scan: ConversationReplayScan = .{};
+    var offset: u64 = 0;
+    var buffer: [8192]u8 = undefined;
+    var reader = file.reader(io_mod.getIo(), &buffer);
+    while (offset < length) {
+        const line = session_replay.readBufferedLine(alloc, &reader, length, null) catch |err| switch (err) {
+            error.TruncatedEventFrame => break,
+            else => return err,
+        } orelse break;
+        defer alloc.free(line.bytes);
+        var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
+        defer decoded.deinit();
+        try scan.observe(offset, decoded.value.seq, decoded.value.event);
         offset = line.next_offset;
     }
-    window.last_complete_seq = last_complete_seq;
-    // Coverage is the summarized prefix. Recent exchanges can precede the
-    // checkpoint record and must be replayed after its summary, unchanged.
-    if (window.checkpoint_offset != null) {
-        offset = 0;
-        window.offset = 0;
-        window.active_user_offset = null;
-        window.prior_turn_count = 0;
-        while (offset < length) {
-            const line = try session_replay.readLineAt(alloc, file, offset, length) orelse break;
-            defer alloc.free(line.bytes);
-            var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
-            defer decoded.deinit();
-            if (decoded.value.seq > window.coverage) break;
-            switch (decoded.value.event) {
-                .user => window.active_user_offset = offset,
-                .turn_completed, .interrupted => {
-                    window.active_user_offset = null;
-                    window.prior_turn_count += 1;
-                },
-                else => {},
-            }
-            offset = line.next_offset;
-            window.offset = offset;
-        }
-    }
-    return window;
+    return scan.finish(alloc, file, length);
 }
 
 const ConversationTurnBuilder = struct {
@@ -2323,7 +2402,6 @@ pub fn recoverInterruptedLegacyImport(
 }
 
 pub const Boundary = enum {
-    latest_barrier_contended,
     latest_barrier_completed,
 };
 
@@ -2389,25 +2467,16 @@ pub const WritableSessionDir = struct {
         self.* = undefined;
     }
 
-    pub fn isParked(self: *const WritableSessionDir) bool {
+    fn isParked(self: *const WritableSessionDir) bool {
         return self.writer_lock == null;
     }
 
-    /// Release `session.lock` while keeping the session directory open for a
-    /// later `unpark` in the same process (idle job-control suspend).
+    /// Release `session.lock`. The loaded session must be retired before
+    /// acquiring another writer, since its state may no longer match storage.
     pub fn park(self: *WritableSessionDir) void {
         const lock = &(self.writer_lock orelse return);
         lock.release();
         self.writer_lock = null;
-    }
-
-    /// Reacquire `session.lock` after `park`. Fails with `SessionBusy` when
-    /// another process already owns the writer lock.
-    pub fn unpark(self: *WritableSessionDir) !void {
-        if (self.writer_lock != null) return;
-        self.writer_lock = acquireLock(&self.dir, session_lock_file, true) catch |err| {
-            return mapSessionLockError(err);
-        };
     }
 
     pub fn eventLogLengthForTest(self: *WritableSessionDir) !u64 {
@@ -2441,6 +2510,19 @@ pub const LoadedWritableSession = struct {
     external_prompt_origin: ExternalPromptOrigin = .root,
     external_root_user_messages: [][]u8 = &.{},
     external_root_user_evidence_complete: bool = false,
+
+    pub fn requireWritable(self: *const LoadedWritableSession) !void {
+        if (self.log.isParked()) return error.SessionWriterParked;
+        if (self.conversation_writer.failure) |err| return err;
+    }
+
+    fn recordWriteFailure(self: *LoadedWritableSession, err: anyerror) anyerror {
+        if (err == error.DurableReplacePostRenameFailed) {
+            self.conversation_writer.failure = error.SessionPersistenceUncertain;
+            return error.SessionPersistenceUncertain;
+        }
+        return err;
+    }
 
     pub fn deinit(self: *LoadedWritableSession, alloc: Allocator) void {
         self.conversation_writer.deinit();
@@ -2484,6 +2566,7 @@ pub const LoadedWritableSession = struct {
         alloc: Allocator,
         turn: *session.HistoryTurn,
     ) !void {
+        try self.requireWritable();
         try externalizeConversationTurnResults(
             alloc,
             turn,
@@ -2496,6 +2579,7 @@ pub const LoadedWritableSession = struct {
         alloc: Allocator,
         title: []const u8,
     ) !bool {
+        try self.requireWritable();
         const bytes = try readManagedFileAlloc(
             alloc,
             &self.log.dir,
@@ -2520,12 +2604,12 @@ pub const LoadedWritableSession = struct {
             .subagent_child = metadata.value.subagent_child,
         });
         defer alloc.free(encoded);
-        try io_mod.durableReplaceVerified(
+        io_mod.durableReplaceVerified(
             alloc,
             &self.log.dir,
             manifest_file,
             encoded,
-        );
+        ) catch |err| return self.recordWriteFailure(err);
         return true;
     }
 
@@ -2554,7 +2638,8 @@ pub const LoadedWritableSession = struct {
         event: SessionUpdate,
         timestamp_ms: i64,
     ) !CommitPosition {
-        return switch (event) {
+        try self.requireWritable();
+        const result = switch (event) {
             .history_turn_committed => self.appendConversationHistoryEvent(
                 alloc,
                 event,
@@ -2576,6 +2661,7 @@ pub const LoadedWritableSession = struct {
                 timestamp_ms,
             ),
         };
+        return result catch |err| self.recordWriteFailure(err);
     }
 
     pub fn commitContextCompaction(
@@ -2586,6 +2672,7 @@ pub const LoadedWritableSession = struct {
         retained_from: ?types.ContextHistoryCut,
         timestamp_ms: i64,
     ) !CommitPosition {
+        try self.requireWritable();
         var prepared: ?session.HistoryTurn = if (active_prefix) |prefix|
             try session.dupeHistoryTurn(alloc, .{ .assistant = prefix })
         else
@@ -2600,6 +2687,7 @@ pub const LoadedWritableSession = struct {
             retained_from,
         );
         if (prepared) |turn| self.writeFirstConversationTitle(alloc, turn);
+        if (self.conversation_writer.failure) |err| return err;
         return self.finishConversationCommit(alloc, timestamp_ms);
     }
 
@@ -2613,7 +2701,7 @@ pub const LoadedWritableSession = struct {
             .history_turn_committed => |value| value,
             else => return error.InvalidConversationEvent,
         };
-        const work_id = if (payload.work_id) |value|
+        var work_id = if (payload.work_id) |value|
             try alloc.dupe(u8, value)
         else
             null;
@@ -2624,14 +2712,26 @@ pub const LoadedWritableSession = struct {
             payload.turn,
         );
         self.writeFirstConversationTitle(alloc, payload.turn);
+        if (self.conversation_writer.failure) |err| return err;
         if (work_id) |value| {
             if (self.state.last_subagent_work_id) |old| alloc.free(old);
             self.state.last_subagent_work_id = value;
+            work_id = null;
         }
+        const language_changed = !std.mem.eql(u8, self.state.conversation_language.view(), payload.conversation_language.view());
         self.state.conversation_language = payload.conversation_language;
         self.state.total_input_tokens = payload.total_input_tokens;
         self.state.total_output_tokens = payload.total_output_tokens;
-        return self.finishConversationCommit(alloc, timestamp_ms);
+        const position = self.finishConversationCommit(alloc, timestamp_ms);
+        if (language_changed) {
+            writeConversationMetadata(alloc, &self.log.dir, self.state) catch |err| {
+                self.conversation_writer.failure = error.SessionPersistenceUncertain;
+                debug_trace.logf("session", "history committed but language metadata failed session={s} err={s}", .{ self.active_id, @errorName(err) });
+                return error.SessionPersistenceUncertain;
+            };
+        }
+        if (self.conversation_writer.failure) |err| return err;
+        return position;
     }
 
     fn writeFirstConversationTitle(self: *LoadedWritableSession, alloc: Allocator, turn: session.HistoryTurn) void {
@@ -2790,16 +2890,17 @@ pub const LoadedWritableSession = struct {
         permission_state: session_permission_state.State,
         timestamp_ms: i64,
     ) !void {
+        try self.requireWritable();
         var next = try session_permission_state.dupe(alloc, permission_state);
         errdefer next.deinit(alloc);
         const bytes = try session_codec.encodePermissionState(alloc, next);
         defer alloc.free(bytes);
-        try io_mod.durableReplaceVerified(
+        io_mod.durableReplaceVerified(
             alloc,
             &self.log.dir,
             permission_state_file,
             bytes,
-        );
+        ) catch |err| return self.recordWriteFailure(err);
         self.state.permission_state.deinit(alloc);
         self.state.permission_state = next;
         self.state.updated_at_ms = timestamp_ms;
@@ -3268,14 +3369,11 @@ pub const Root = struct {
             session_id,
             options.session_lock_deadline_ms,
         );
+        errdefer writable.deinit(alloc);
         if (!try hasConversationMetadata(alloc, &writable.dir)) {
-            writable.deinit(alloc);
             return error.SessionMigrationRequired;
         }
-        return openConversationWritableSession(alloc, &writable) catch |err| {
-            writable.deinit(alloc);
-            return err;
-        };
+        return openConversationWritableSession(alloc, &writable);
     }
 
     pub fn loadReadOnly(
@@ -3816,6 +3914,187 @@ test "conversation writer appends one durable line per event" {
     try std.testing.expect(std.mem.find(u8, bytes, "state_replacement") == null);
 }
 
+test "conversation writer preserves a suffix written outside its ownership" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |checkpoint| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const file = try tmp.dir.createFile(std.testing.io, "events.jsonl", .{ .read = true });
+        var writer = try ConversationWriter.init(alloc, file);
+        defer writer.deinit();
+        try writer.appendHistoryTurn(alloc, 1, .{ .assistant = .{
+            .user = .{ .text = @constCast("accepted request") },
+            .assistant = @constCast("accepted answer"),
+        } });
+        const external = try session_event.encodeConversationFrame(alloc, .{
+            .seq = writer.last_seq + 1,
+            .timestamp_ms = 2,
+            .event = .{ .context_checkpoint = .{
+                .covers_through_seq = writer.last_seq,
+                .summary = "another writer's accepted context",
+            } },
+        });
+        defer alloc.free(external);
+        try file.writePositionalAll(std.testing.io, external, writer.committed_bytes);
+        try file.sync(std.testing.io);
+        const before = try alloc.alloc(u8, @intCast(try file.length(std.testing.io)));
+        defer alloc.free(before);
+        try std.testing.expectEqual(before.len, try file.readPositionalAll(std.testing.io, before, 0));
+        const turn: types.HistoryTurn = if (checkpoint)
+            .{ .compacted_summary = .{ .summary = @constCast("stale checkpoint"), .removed_turn_count = 1, .compaction_count = 1 } }
+        else
+            .{ .assistant = .{ .user = .{ .text = @constCast("stale request") }, .assistant = @constCast("stale answer") } };
+        try std.testing.expectError(error.SessionWriterChanged, writer.appendHistoryTurn(alloc, 3, turn));
+        try std.testing.expectEqual(before.len, try file.length(std.testing.io));
+        const after = try alloc.alloc(u8, before.len);
+        defer alloc.free(after);
+        try std.testing.expectEqual(after.len, try file.readPositionalAll(std.testing.io, after, 0));
+        try std.testing.expectEqualSlices(u8, before, after);
+    }
+}
+
+test "conversation writer rolls back failed sync and refuses uncertain continuation" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |checkpoint| {
+        for ([_]bool{ false, true }) |fail_rollback| {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const file = try tmp.dir.createFile(std.testing.io, "events.jsonl", .{ .read = true });
+            var writer = try ConversationWriter.init(alloc, file);
+            defer writer.deinit();
+            try writer.appendHistoryTurn(alloc, 10, .{ .assistant = .{
+                .user = .{ .text = @constCast("accepted request") },
+                .assistant = @constCast("accepted answer"),
+            } });
+            const prior = try writer.readAllForTest(alloc);
+            defer alloc.free(prior);
+            const SyncFault = struct {
+                calls: usize = 0,
+                fail_rollback: bool,
+
+                fn sync(ctx: ?*anyopaque, target: std.Io.File) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ctx.?));
+                    self.calls += 1;
+                    if (self.calls == 1 or (self.fail_rollback and self.calls == 2)) return error.InjectedSyncFailure;
+                    try target.sync(std.testing.io);
+                }
+            };
+            var fault = SyncFault{ .fail_rollback = fail_rollback };
+            writer.test_sync_ops = .{ .ctx = &fault, .sync_file = SyncFault.sync };
+            const turn: types.HistoryTurn = if (checkpoint)
+                .{ .compacted_summary = .{ .summary = @constCast("failed summary"), .removed_turn_count = 1, .compaction_count = 1 } }
+            else
+                .{ .assistant = .{ .user = .{ .text = @constCast("failed request") }, .assistant = @constCast("failed answer") } };
+            try std.testing.expectError(
+                if (fail_rollback) error.SessionPersistenceUncertain else error.InjectedSyncFailure,
+                writer.appendHistoryTurn(alloc, 11, turn),
+            );
+            try std.testing.expectEqual(@as(usize, 2), fault.calls);
+            try std.testing.expectEqual(prior.len, try file.length(std.testing.io));
+            try std.testing.expectEqual(@as(u64, 3), writer.last_seq);
+            const after = try writer.readAllForTest(alloc);
+            defer alloc.free(after);
+            try std.testing.expectEqualSlices(u8, prior, after);
+            if (fail_rollback) {
+                try std.testing.expectError(error.SessionPersistenceUncertain, writer.appendHistoryTurn(alloc, 12, turn));
+                try std.testing.expectEqual(@as(usize, 2), fault.calls);
+            } else {
+                try writer.appendHistoryTurn(alloc, 12, turn);
+                try std.testing.expect(writer.committed_bytes > prior.len);
+            }
+        }
+    }
+}
+
+test "parked session refuses history and control mutations" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "parked-writes", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    loaded.log.park();
+    try std.testing.expectError(error.SessionWriterParked, loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+        .conversation_language = initial.conversation_language,
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+        .turn = .{ .assistant = .{ .user = .{ .text = @constCast("request") }, .assistant = @constCast("answer") } },
+    } }, 2));
+    try std.testing.expectError(error.SessionWriterParked, loaded.appendEvent(alloc, .{ .preferences_changed = .{ .fast_mode = true } }, 2));
+    try std.testing.expectError(error.SessionWriterParked, loaded.commitContextCompaction(alloc, .{ .summary = @constCast("summary"), .removed_turn_count = 1, .compaction_count = 1 }, null, null, 2));
+}
+
+test "writable resume releases ownership when metadata allocation fails" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "resume-allocation", 10);
+    defer initial.deinit(alloc);
+    var started = try temp.root.startConversationSession(alloc, initial, .{});
+    started.deinit(alloc);
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 1 });
+    try std.testing.expectError(error.OutOfMemory, temp.root.resumeForWrite(failing.allocator(), initial.id, .{ .session_lock_deadline_ms = 0 }));
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{ .session_lock_deadline_ms = 0 });
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqualStrings(initial.id, resumed.active_id);
+}
+
+test "committed conversation language survives reopening" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "language-roundtrip", 10);
+    defer initial.deinit(alloc);
+    {
+        var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+            .conversation_language = .literal("fr"),
+            .total_input_tokens = 0,
+            .total_output_tokens = 0,
+            .turn = .{ .assistant = .{ .user = .{ .text = @constCast("Bonjour") }, .assistant = @constCast("Salut") } },
+        } }, 20);
+    }
+    var restored = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer restored.deinit(alloc);
+    try std.testing.expectEqualStrings("fr", restored.conversation_language.view());
+    try std.testing.expectEqual(@as(usize, 1), restored.history.len);
+}
+
+test "conversation load retains history and qualifies missing or corrupt accounting" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |missing| {
+        var temp = try TempRoot.init(alloc);
+        defer temp.deinit(alloc);
+        var initial = try testState(alloc, "accounting-recovery", 10);
+        defer initial.deinit(alloc);
+        initial.history = try alloc.alloc(session.HistoryTurn, 1);
+        initial.history[0] = try session.makeAssistantTurn(alloc, "saved request", "saved answer");
+        var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+        loaded.deinit(alloc);
+        var dir = try openSessionDir(&temp.root.sessions.?, initial.id, .read_only);
+        defer dir.close();
+        if (missing) {
+            try dir.dir.deleteFile(std.testing.io, session_usage_sidecar.sidecar_file);
+        } else {
+            try io_mod.durableReplaceVerified(alloc, &dir, session_usage_sidecar.sidecar_file, "{broken accounting");
+        }
+        var restored = try temp.root.loadReadOnly(alloc, initial.id, .{});
+        defer restored.deinit(alloc);
+        try std.testing.expectEqualStrings("saved answer", restored.history[0].assistant.assistant);
+        try std.testing.expect(restored.usage != null);
+        try std.testing.expectEqual(session_usage.Availability.incomplete, restored.usage.?.billing);
+        try std.testing.expectEqual(@as(usize, 1), restored.usage.?.incidents.len);
+        if (!missing) {
+            const retained = try readManagedFileAlloc(alloc, &dir, session_usage_sidecar.sidecar_file, 1024);
+            defer alloc.free(retained);
+            try std.testing.expectEqualStrings("{broken accounting", retained);
+        }
+    }
+}
+
 test "conversation writer repairs only a partial final record and continues" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4320,6 +4599,9 @@ test "legacy import preserves published events and active recovery after metadat
     defer temp.deinit(alloc);
     var initial = try testState(alloc, "legacy-metadata-sync-failure", 10);
     defer initial.deinit(alloc);
+    var legacy_usage = session_usage.Usage.initLegacy();
+    defer legacy_usage.deinit(alloc);
+    initial.usage = try legacy_usage.snapshot(alloc);
     const history = try alloc.alloc(session.HistoryTurn, 1);
     history[0] = try session.makeAssistantTurn(alloc, "saved request", "saved answer");
     initial.history = history;
@@ -4364,6 +4646,7 @@ test "legacy import preserves published events and active recovery after metadat
     try std.testing.expectEqual(@as(usize, 1), resumed.state.history.len);
     try std.testing.expectEqualStrings("saved answer", resumed.state.history[0].assistant.assistant);
     try std.testing.expectEqual(@as(u64, 7), resumed.state.recovery_checkpoint.?.turn_id);
+    try std.testing.expectEqual(session_usage.Availability.legacy, resumed.state.usage.?.billing);
 }
 
 test "conversation storage creates only metadata and event log" {
@@ -5636,4 +5919,26 @@ test "cache-free resume loads only the latest checkpoint and suffix" {
     const bytes = try io_mod.readFileToEnd(alloc, &event_file, 1024 * 1024);
     defer alloc.free(bytes);
     try std.testing.expect(std.mem.find(u8, bytes, "old question") != null);
+}
+
+test "language metadata failure retains ownership of the committed work identity" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "language-work-failure", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    loaded.freshly_started = false;
+    try loaded.log.dir.dir.deleteFile(std.testing.io, "session.json");
+    try loaded.log.dir.dir.createDir(std.testing.io, "session.json", private_dir_permissions);
+    try std.testing.expectError(error.SessionPersistenceUncertain, loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+        .work_id = @constCast("committed-work"),
+        .conversation_language = .literal("fr"),
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+        .turn = .{ .assistant = .{ .user = .{ .text = @constCast("Bonjour") }, .assistant = @constCast("Salut") } },
+    } }, 20));
+    try std.testing.expectEqualStrings("committed-work", loaded.state.last_subagent_work_id.?);
+    try std.testing.expectError(error.SessionPersistenceUncertain, loaded.requireWritable());
 }

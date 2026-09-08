@@ -497,10 +497,10 @@ fn appendRuntimeContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayL
     }, arena, messages);
 }
 
-fn appendStaticContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayList(types.ChatMessage)) !void {
+fn appendStaticContext(raw: *anyopaque, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(types.ChatMessage)) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
     try context.config.context_registry.appendDefaultStatic(.{
-        .project_context = context.config.project_context,
+        .project_context = project_context orelse context.config.project_context,
     }, arena, messages);
     var snapshot = try snapshotModelCatalogForView(
         arena,

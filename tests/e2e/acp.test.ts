@@ -5257,6 +5257,52 @@ describe("acp: model-independent", () => {
     TIMEOUT,
   );
 
+  for (const continueSaved of [true, false]) test(`ACP recovery retains image snapshots through provider failure and reload: ${continueSaved ? "continue" : "new image"}`, async () => {
+    const root = createIsolatedRoot("fx-acp-checkpoint-image-");
+    const imageData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9WlXYX0AAAAASUVORK5CYII=";
+    const gateway = startFakeGateway([
+      finalText("INVALID_FINAL_WITHOUT_VISION"),
+      fakeGatewayToolCall("recover_vision", "vision", { image_ids: [continueSaved ? 1 : 2], focus: "describe" }),
+      finalText(JSON.stringify({ images: [{ image_id: continueSaved ? 1 : 2, status: "ok", summary: "small fixture", visible_text: [], details: [] }] })),
+      finalText("ACP_RECOVERY_IMAGE_COMPLETE"),
+    ]);
+    try {
+      client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+      const sessionId = await startCodeSession(client);
+      const failed = await runPromptBlocks(client, [
+        { type: "text", text: "Describe the image." },
+        { type: "image", data: imageData, mimeType: "image/png" },
+      ], TIMEOUT);
+      expect(JSON.stringify(failed)).toContain("RequiredVisionToolCallMissing");
+      const source = join(root.home, ".fx", "sessions", sessionId);
+      const checkpoint = JSON.parse(readFileSync(join(source, "recovery.json"), "utf8")).checkpoint;
+      const snapshot = join(source, checkpoint.user.images[0].snapshot_path);
+      expect(readFileSync(snapshot).toString("base64")).toBe(imageData);
+      await client.close();
+      client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+      await client.request("initialize", { protocolVersion: 1 }, 10);
+      client.send({ jsonrpc: "2.0", id: 11, method: "session/load", params: { sessionId, cwd: root.workspace, mcpServers: [] } });
+      expect((await readResponse(client, 11)).error).toBeUndefined();
+      const resumed = continueSaved
+        ? await continueRecovery(client, TIMEOUT, sessionId)
+        : await runPromptBlocks(client, [
+          { type: "text", text: "Describe this new image instead." },
+          { type: "image", data: imageData, mimeType: "image/png" },
+        ], TIMEOUT);
+      expect(resumed.promptResult.error).toBeUndefined();
+      expect(resumed.promptResult.result.stopReason).toBe("end_turn");
+      expect(gateway.requests).toHaveLength(4);
+      expect(gateway.requests[2]!.body).toContain(imageData);
+      expect(readFileSync(snapshot).toString("base64")).toBe(imageData);
+      expect(existsSync(join(source, "recovery.json"))).toBe(false);
+      expect(client.stderr).toBe("");
+    } finally {
+      await client?.close();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT * 2);
+
   test(
     "image prompt reaches the Gateway and replays from saved history",
     async () => {

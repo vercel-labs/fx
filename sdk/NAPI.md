@@ -281,7 +281,11 @@ when qualification fails, and report success only after cleanup succeeds.
 
 Live Vercel qualification is a separate release check. Run
 `node sdk/tests/test-vercel-package.mjs <tarball>` before publication, then run
-the same command with the immutable npm version afterward. Set
+the same command with the immutable npm version afterward. Repeat both checks
+with `--webpack` for Next.js 16 webpack and `--next15` for Next.js 15 webpack;
+the default is Next.js 16 Turbopack. The local `test-next-package.mjs` harness
+accepts the same selectors and verifies emitted native assets in the route
+trace before exercising production and relocated standalone output. Set
 `LIBFX_VERCEL_PROJECT_ID`, `LIBFX_VERCEL_ORG_ID`, and `AI_GATEWAY_API_KEY` in
 the environment. The harness uses the local Vercel CLI login, or
 `LIBFX_VERCEL_TOKEN` when supplied; npm publication does not require a Vercel

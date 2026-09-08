@@ -5922,3 +5922,23 @@ fn deinitMessages(alloc: Allocator, messages: *std.ArrayList(message.Message)) v
     for (messages.items) |*msg| msg.deinit(alloc);
     messages.deinit(alloc);
 }
+
+test "image catalog merges a retained recovery image and rejects changed identity" {
+    const alloc = std.testing.allocator;
+    var images = [_]ImageAttachment{.{
+        .id = 7,
+        .path = @constCast("/missing/original.png"),
+        .media_type = @constCast("image/png"),
+        .snapshot_path = @constCast("/session/images/saved.bin"),
+        .snapshot_sha256 = @constCast("a" ** 64),
+    }};
+    const turn: HistoryTurn = .{ .interrupted = .{ .user = .{ .text = @constCast("recover"), .images = &images } } };
+    const catalog = try collect_image_catalog(alloc, &.{turn}, &.{});
+    defer core_types.freeImageAttachmentSlice(alloc, catalog);
+    const merged = try merge_image_catalog_history_turn(alloc, catalog, turn);
+    defer core_types.freeImageAttachmentSlice(alloc, merged);
+    try std.testing.expectEqual(@as(usize, 1), merged.len);
+    try std.testing.expectEqual(@as(usize, 7), merged[0].id);
+    images[0].snapshot_sha256 = @constCast("b" ** 64);
+    try std.testing.expectError(error.StaleImageCatalog, merge_image_catalog_history_turn(alloc, catalog, turn));
+}

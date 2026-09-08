@@ -205,6 +205,7 @@ pub const SessionRecoveryResult = struct {
     recovered_session_id: []u8,
     history_len: usize,
     status: SessionRecoveryStatus = .recovered,
+    usage_incomplete: bool = false,
 
     pub fn deinit(self: *SessionRecoveryResult, alloc: Allocator) void {
         alloc.free(self.source_session_id);

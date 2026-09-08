@@ -268,6 +268,16 @@ test "full diff formatter renders unchanged review elisions" {
 
 pub fn Bindings(comptime App: type) type {
     return struct {
+        pub fn finishPromptPresentation(app: *App, finished: types.FinishedPrompt) !assistant_pacer.FinishResult {
+            try app_session_runtime.Runtime(App).appendFinishedPrompt(app, finished);
+            if (finished.summary) |summary| {
+                _ = app.shell.appendTurnSummaryEntry(app.alloc, summary) catch |err| {
+                    return .{ .presentation_failed = err };
+                };
+            }
+            return .committed;
+        }
+
         pub fn agentRuntimeDeps(app: *App) agent_runtime.AgentRuntimeDeps {
             var deps: agent_runtime.AgentRuntimeDeps = .{
                 .ctx = @ptrCast(app),
@@ -684,10 +694,10 @@ pub fn Bindings(comptime App: type) type {
             return result;
         }
 
-        fn agentAppendStaticContext(ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
+        fn agentAppendStaticContext(ctx: *anyopaque, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(ChatMessage)) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime @hasDecl(App, "appendStaticContextMessage")) {
-                try app.appendStaticContextMessage(arena, messages);
+                try app.appendStaticContextMessage(arena, project_context, messages);
             }
         }
 
@@ -1301,10 +1311,10 @@ pub fn Bindings(comptime App: type) type {
             return app.worker.prepareFreshPrompt(std.heap.c_allocator, value);
         }
 
-        fn workerBridgeAppendHistoryTurn(ctx: *anyopaque, finished: types.FinishedPrompt) !void {
+        fn workerBridgeAppendHistoryTurn(ctx: *anyopaque, finished: types.FinishedPrompt) !app_worker_runtime.HistoryDelivery {
             const app: *App = @ptrCast(@alignCast(ctx));
-            if (try app.pacer.deferFinish(app.alloc, finished)) return;
-            try appendHistoryTurn(app, finished);
+            if (try app.pacer.deferFinish(app.alloc, finished)) return .retained;
+            return .{ .settled = try appendHistoryTurn(app, finished) };
         }
 
         fn workerBridgeSessionGrant(ctx: *anyopaque, grant: types.PermissionGrant) !void {
@@ -1317,17 +1327,21 @@ pub fn Bindings(comptime App: type) type {
             try app.writeDomainNotice(notice, true);
         }
 
-        fn appendHistoryTurn(app: *App, finished: types.FinishedPrompt) !void {
+        fn appendHistoryTurn(app: *App, finished: types.FinishedPrompt) !assistant_pacer.FinishResult {
+            if (comptime @hasDecl(App, "finishPromptPresentation")) {
+                return app.finishPromptPresentation(finished);
+            }
             if (comptime @hasDecl(App, "appendFinishedPrompt")) {
                 try app.appendFinishedPrompt(finished);
-                return;
+                return .committed;
             }
             if (comptime @hasDecl(App, "appendHistoryTurn")) {
                 try app.appendHistoryTurn(finished.turn);
                 if (finished.snapshot_file_ownership) |ownership| ownership.transfer();
-                return;
+                return .committed;
             }
             try app_session_runtime.Runtime(App).appendFinishedPrompt(app, finished);
+            return .committed;
         }
     };
 }
@@ -2453,7 +2467,7 @@ test "worker bridge deps forward UI operations" {
     try deps.diff_block(deps.ctx, .{
         .preview = try std.heap.c_allocator.dupe(u8, "diff preview"),
     });
-    try deps.append_history_turn(deps.ctx, .{ .turn = .{ .compacted_summary = .{
+    _ = try deps.append_history_turn(deps.ctx, .{ .turn = .{ .compacted_summary = .{
         .summary = @constCast("summary"),
         .removed_turn_count = 1,
         .compaction_count = 1,
@@ -2553,7 +2567,7 @@ test "worker bridge history append fallback updates runtime history" {
     const turn = try session_runtime.makeAssistantTurn(alloc, "persist me", "saved");
     defer session_runtime.freeHistoryTurn(alloc, turn);
 
-    try deps.append_history_turn(deps.ctx, .{ .turn = turn });
+    _ = try deps.append_history_turn(deps.ctx, .{ .turn = turn });
 
     try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
     try std.testing.expectEqualStrings(

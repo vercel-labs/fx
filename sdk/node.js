@@ -42,6 +42,16 @@ const backendReasonCodes = {
   wasmLoad: "LIBFX_WASM_LOAD_FAILED",
 };
 
+function bundledAssetUrl(asset) {
+  if (asset.protocol !== "" || typeof asset.href !== "string" ||
+      typeof __webpack_base_uri__ === "undefined" || typeof __webpack_public_path__ !== "string" ||
+      !asset.href.startsWith(__webpack_public_path__)) {
+    throw new TypeError("Bundled asset URL has no filesystem mapping");
+  }
+  // Webpack's relative URL is a public asset address, not a Node URL instance.
+  return new URL(asset.href.slice(__webpack_public_path__.length), __webpack_base_uri__);
+}
+
 function jspiFallbackError(surface, nativeError) {
   const nativeDetail = nativeError ? ` Native loading failed: ${nativeError.message}.` : " No compatible native addon was found.";
   const error = new Error(
@@ -57,6 +67,7 @@ function jspiFallbackError(surface, nativeError) {
 async function loadNativeCandidate(candidate) {
   if (candidate == null) return null;
   if (candidate instanceof URL) {
+    if (candidate.protocol === "") candidate = bundledAssetUrl(candidate);
     if (candidate.protocol === "file:" && candidate.pathname.endsWith(".node")) {
       // Bundlers trace the asset URL; Node must load the native file at runtime.
       return Reflect.apply(nodeRequire, undefined, [fileURLToPath(candidate)]);
@@ -78,19 +89,27 @@ async function loadNativeCandidate(candidate) {
 function defaultNativeCandidate() {
   // Local path bindings let deployment tracers retain these assets in the generated CommonJS entry.
   if (process.platform === "linux" && process.arch === "x64") {
-    const path = fileURLToPath(new URL("./libfx.linux-x64.node", import.meta.url));
+    const asset = new URL("./libfx.linux-x64.node", import.meta.url);
+    if (asset.protocol === "") return fileURLToPath(bundledAssetUrl(asset));
+    const path = fileURLToPath(asset);
     return path;
   }
   if (process.platform === "linux" && process.arch === "arm64") {
-    const path = fileURLToPath(new URL("./libfx.linux-arm64.node", import.meta.url));
+    const asset = new URL("./libfx.linux-arm64.node", import.meta.url);
+    if (asset.protocol === "") return fileURLToPath(bundledAssetUrl(asset));
+    const path = fileURLToPath(asset);
     return path;
   }
   if (process.platform === "darwin" && process.arch === "x64") {
-    const path = fileURLToPath(new URL("./libfx.darwin-x64.node", import.meta.url));
+    const asset = new URL("./libfx.darwin-x64.node", import.meta.url);
+    if (asset.protocol === "") return fileURLToPath(bundledAssetUrl(asset));
+    const path = fileURLToPath(asset);
     return path;
   }
   if (process.platform === "darwin" && process.arch === "arm64") {
-    const path = fileURLToPath(new URL("./libfx.darwin-arm64.node", import.meta.url));
+    const asset = new URL("./libfx.darwin-arm64.node", import.meta.url);
+    if (asset.protocol === "") return fileURLToPath(bundledAssetUrl(asset));
+    const path = fileURLToPath(asset);
     return path;
   }
   return null;
@@ -115,7 +134,10 @@ function missingArtifact(error) {
 }
 
 function nativeCandidateFilePath(candidate) {
-  if (candidate instanceof URL) return candidate.protocol === "file:" ? fileURLToPath(candidate) : null;
+  if (candidate instanceof URL) {
+    if (candidate.protocol === "") candidate = bundledAssetUrl(candidate);
+    return candidate.protocol === "file:" ? fileURLToPath(candidate) : null;
+  }
   if (typeof candidate !== "string") return null;
   if (candidate.startsWith("file:")) return fileURLToPath(new URL(candidate));
   return URL.canParse(candidate) ? null : resolve(candidate);
@@ -196,7 +218,10 @@ function wasmInput(input) {
 }
 
 function wasmFilePath(input) {
-  if (input instanceof URL && input.protocol === "file:") return fileURLToPath(input);
+  if (input instanceof URL) {
+    if (input.protocol === "") input = bundledAssetUrl(input);
+    if (input.protocol === "file:") return fileURLToPath(input);
+  }
   if (typeof input === "string" && !URL.canParse(input)) return resolve(input);
   return null;
 }

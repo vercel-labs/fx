@@ -2872,7 +2872,12 @@ fn writeLookupFailure(
         error.SessionNotFound => {
             try writeStderr(deps, "fx session: record not found\n");
         },
-        error.InvalidSessionFormat => {
+        error.InvalidSessionFormat,
+        error.InvalidPermissionState,
+        error.PermissionStateTooLarge,
+        error.InvalidRecoveryCheckpoint,
+        error.InvalidUsageSidecar,
+        => {
             try writeStderr(
                 deps,
                 "fx session: record is corrupt; run `fx doctor` for recovery guidance\n",
@@ -3048,7 +3053,12 @@ fn lookupFailureMessage(err: anyerror) ?[]const u8 {
         error.NoSavedSessions => "no saved sessions for this workspace",
         error.NoReadableSessions => "saved sessions are unreadable; run `fx doctor` for recovery guidance",
         error.SessionNotFound => "record not found",
-        error.InvalidSessionFormat => "record is corrupt; run `fx doctor` for recovery guidance",
+        error.InvalidSessionFormat,
+        error.InvalidPermissionState,
+        error.PermissionStateTooLarge,
+        error.InvalidRecoveryCheckpoint,
+        error.InvalidUsageSidecar,
+        => "record is corrupt; run `fx doctor` for recovery guidance",
         error.UnsupportedSessionSchema => "record uses an unsupported session version",
         error.InvalidSessionId => "invalid session id",
         error.LegacySessionTooLarge => "legacy session is too large for automatic loading; run `fx session migrate <id> --allow-large`",
@@ -3131,6 +3141,32 @@ test "session detail failures separate corruption from unsupported schema" {
         "fx session: session future-session uses an unsupported session version\n",
         unsupported_text.stderr.written(),
     );
+}
+
+test "session lookup failures preserve supporting-state errors in the requested format" {
+    const cases = [_]struct { err: anyerror, code: []const u8 }{
+        .{ .err = error.InvalidPermissionState, .code = "InvalidPermissionState" },
+        .{ .err = error.PermissionStateTooLarge, .code = "PermissionStateTooLarge" },
+        .{ .err = error.InvalidRecoveryCheckpoint, .code = "InvalidRecoveryCheckpoint" },
+        .{ .err = error.InvalidUsageSidecar, .code = "InvalidUsageSidecar" },
+    };
+    for (cases) |case| {
+        for ([_]output_contracts.OutputFormat{ .text, .json }) |format| {
+            var output = CaptureOutput.init(std.testing.allocator);
+            defer output.deinit();
+            try writeLookupFailure(std.testing.allocator, output.deps(), "session", case.err, format);
+            const body = if (format == .json) output.stdout.written() else output.stderr.written();
+            const unused = if (format == .json) output.stderr.written() else output.stdout.written();
+            try std.testing.expectEqual(@as(usize, 0), unused.len);
+            try std.testing.expect(std.mem.find(u8, body, "fx doctor") != null);
+            try std.testing.expect(std.mem.find(u8, body, "resume it normally") == null);
+            if (format == .json) {
+                var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+                defer parsed.deinit();
+                try std.testing.expectEqualStrings(case.code, parsed.value.object.get("code").?.string);
+            }
+        }
+    }
 }
 
 test "session recovery boundary failures keep stable text and json guidance" {

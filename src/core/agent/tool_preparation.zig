@@ -7,6 +7,9 @@ const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const tool_admission = @import("../tooling/tool_admission.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
+const pathing = @import("../workspace/pathing.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
+const tool_args = @import("../tooling/tool_args.zig");
 
 const Allocator = std.mem.Allocator;
 const ToolCall = types.ToolCall;
@@ -478,6 +481,139 @@ fn freeApplicableTargets(alloc: Allocator, targets: []context_contract.Applicabl
     if (targets.len > 0) alloc.free(targets);
 }
 
+/// Owns only freshly resolved discovery hints, never delivery or permission state.
+pub const RetainedContextTargets = struct {
+    items: []context_contract.ApplicableTarget,
+
+    pub fn deinit(self: *RetainedContextTargets, alloc: Allocator) void {
+        freeApplicableTargets(alloc, self.items);
+        self.* = undefined;
+    }
+};
+
+pub fn retainedContextTargets(
+    alloc: Allocator,
+    history: []const types.HistoryTurn,
+    recovery_execution: ?types.ExecutionMemory,
+    workspace_root: []const u8,
+    registry: tool_dispatch.Registry,
+    cancel_flag: ?*std.atomic.Value(bool),
+) (Allocator.Error || error{Cancelled})!RetainedContextTargets {
+    var collector = RetainedTargetCollector{
+        .alloc = alloc,
+        .workspace_root = workspace_root,
+        .registry = registry,
+        .cancel_flag = cancel_flag,
+    };
+    errdefer {
+        for (collector.targets.items) |target| alloc.free(@constCast(target.path));
+        collector.targets.deinit(alloc);
+    }
+    try checkCancellation(cancel_flag);
+    if (recovery_execution) |execution| try collector.collect(execution);
+    var index = history.len;
+    const first = history.len - @min(history.len, 128);
+    while (index > first and !collector.full()) {
+        index -= 1;
+        const execution = switch (history[index]) {
+            .assistant => |turn| turn.execution,
+            .interrupted => |turn| turn.execution,
+            .compacted_summary => continue,
+        };
+        try collector.collect(execution);
+    }
+    if (index > 0 or collector.full()) {
+        debug_trace.logf("context", "retained_targets_bounded targets={d} steps={d} calls={d}", .{ collector.targets.items.len, collector.steps, collector.calls });
+    }
+    return .{ .items = try collector.targets.toOwnedSlice(alloc) };
+}
+
+const RetainedTargetCollector = struct {
+    alloc: Allocator,
+    workspace_root: []const u8,
+    registry: tool_dispatch.Registry,
+    cancel_flag: ?*std.atomic.Value(bool),
+    targets: std.ArrayList(context_contract.ApplicableTarget) = .empty,
+    steps: usize = 0,
+    calls: usize = 0,
+
+    fn full(self: *const RetainedTargetCollector) bool {
+        return self.targets.items.len == 32 or self.steps == 128 or self.calls == 128;
+    }
+
+    fn collect(self: *RetainedTargetCollector, execution: types.ExecutionMemory) (Allocator.Error || error{Cancelled})!void {
+        var step_index = execution.tool_steps.len;
+        while (step_index > 0 and !self.full()) {
+            step_index -= 1;
+            self.steps += 1;
+            const calls = execution.tool_steps[step_index].tool_calls;
+            var call_index = calls.len;
+            while (call_index > 0 and self.calls < 128 and self.targets.items.len < 32) {
+                call_index -= 1;
+                self.calls += 1;
+                try checkCancellation(self.cancel_flag);
+                try self.collectCall(calls[call_index]);
+            }
+        }
+    }
+
+    fn collectCall(self: *RetainedTargetCollector, call: ToolCall) Allocator.Error!void {
+        if (call.provenance == .provider_executed or call.argument_integrity != .valid or call.arguments_json.len > 64 * 1024) return;
+        const tool = self.registry.lookup(call.name) orelse return;
+        const is_directory = switch (tool.executor_kind) {
+            .glob_files, .grep_files, .terminal, .run_command => true,
+            .read_file, .write_file, .edit_file => false,
+            else => return,
+        };
+        var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, call.arguments_json, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return,
+        };
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+        var args = parsed.value.object;
+        const is_command = tool.executor_kind == .terminal or tool.executor_kind == .run_command;
+        if (tool.executor_kind == .terminal) {
+            if (args.get("request")) |request| {
+                if (request != .object) return;
+                args = request.object;
+            }
+            const expected_action = tool.captured_command_action orelse return;
+            const action = tool_args.optionalStringArg(args, "action") orelse return;
+            if (!std.mem.eql(u8, action, expected_action)) return;
+        }
+        const field = if (is_command) "cwd" else "path";
+        const raw_path = if (args.get(field)) |value| switch (value) {
+            .string => if (tool_args.isNullPlaceholderText(value.string) and is_directory) "." else value.string,
+            .null => if (is_directory) "." else return,
+            else => return,
+        } else if (is_directory) "." else return;
+        var path_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer path_arena.deinit();
+        const resolved = (if (is_directory)
+            pathing.resolveWorkspaceOrExternalPath(path_arena.allocator(), self.workspace_root, raw_path)
+        else
+            pathing.resolveWorkspaceOrExternalCreatePath(path_arena.allocator(), self.workspace_root, raw_path)) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                debug_trace.logf("context", "retained_target_skipped reason={s}", .{@errorName(err)});
+                return;
+            },
+        };
+        if (!pathing.pathInside(self.workspace_root, resolved)) {
+            debug_trace.logf("context", "retained_target_skipped reason=outside_primary_workspace", .{});
+            return;
+        }
+        const directory = if (is_directory) resolved else std.fs.path.dirname(resolved) orelse return;
+        for (self.targets.items) |target| {
+            if (std.mem.eql(u8, target.path, directory)) return;
+        }
+        const owned = try self.alloc.dupe(u8, directory);
+        errdefer self.alloc.free(owned);
+        try self.targets.append(self.alloc, .{ .path = owned, .kind = .directory });
+    }
+};
+
 fn testNoClassification(_: ?*anyopaque, _: Allocator, _: ToolCall) anyerror!?CallbackTerminal {
     return null;
 }
@@ -487,6 +623,57 @@ const test_classifiers: Classifiers = .{
     .validation = testNoClassification,
     .availability = testNoClassification,
 };
+
+fn checkRetainedTargetsAllocations(alloc: Allocator, history: []const types.HistoryTurn, workspace: []const u8, registry: tool_dispatch.Registry) !void {
+    var targets = try retainedContextTargets(alloc, history, null, workspace, registry, null);
+    defer targets.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), targets.items.len);
+}
+
+test "retained context targets use bounded typed history without executing calls" {
+    const alloc = std.testing.allocator;
+    const tools = @import("../../builtins/tools.zig");
+    const registry = tool_dispatch.Registry{ .tools = &.{ tools.read_file, tools.write_file, tools.grep_files, tools.shell } };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "nested");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const calls = [_]ToolCall{
+        .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"nested/missing.txt\"}" },
+        .{ .id = "write", .name = "write_file", .arguments_json = "{\"path\":\"nested/new.txt\"}" },
+        .{ .id = "search", .name = "grep_files", .arguments_json = "{\"query\":\"not a path\"}" },
+        .{ .id = "shell", .name = "shell", .arguments_json = "{\"request\":{\"action\":\"run\",\"command\":\"never execute\",\"cwd\":\"nested\"}}" },
+        .{ .id = "bad", .name = "shell", .arguments_json = "[]" },
+        .{ .id = "external", .name = "read_file", .arguments_json = "{\"path\":\"/tmp/outside.txt\"}" },
+    };
+    const steps = [_]types.ToolExecutionStep{.{ .tool_calls = @constCast(&calls) }};
+    const history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("inspect") },
+        .assistant = @constCast(""),
+        .execution = .{ .tool_steps = @constCast(&steps) },
+    } }};
+    try checkRetainedTargetsAllocations(alloc, &history, workspace, registry);
+    try std.testing.checkAllAllocationFailures(alloc, checkRetainedTargetsAllocations, .{ &history, workspace, registry });
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, retainedContextTargets(alloc, &history, null, workspace, registry, &cancelled));
+
+    var duplicates = try retainedContextTargets(alloc, &history, history[0].assistant.execution, workspace, registry, null);
+    defer duplicates.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), duplicates.items.len);
+}
+
+test "retained context target call budget prevents old target reads" {
+    const alloc = std.testing.allocator;
+    const tools = @import("../../builtins/tools.zig");
+    const registry = tool_dispatch.Registry{ .tools = &.{tools.read_file} };
+    var calls: [129]ToolCall = @splat(.{ .id = "unknown", .name = "unknown", .arguments_json = "{}" });
+    calls[0] = .{ .id = "old", .name = "read_file", .arguments_json = "{\"path\":\"old.txt\"}" };
+    const steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls }};
+    var targets = try retainedContextTargets(alloc, &.{}, .{ .tool_steps = @constCast(&steps) }, "/tmp", registry, null);
+    defer targets.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), targets.items.len);
+}
 
 test "advertised dynamic calls stay opaque while unsupported calls are terminal" {
     const alloc = std.testing.allocator;

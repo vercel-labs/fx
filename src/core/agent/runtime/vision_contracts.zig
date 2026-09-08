@@ -1,4 +1,6 @@
 const std = @import("std");
+const stream_provider = @import("../stream_provider.zig");
+const model_provider = @import("../../config/model_provider.zig");
 const image_attachments = @import("../../images/image_attachments.zig");
 const types = @import("../../shared/types.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
@@ -486,11 +488,14 @@ pub noinline fn project_text_only_messages(
 /// Produces arena-scoped native-route messages with raw images. Retains only
 /// root-turn Vision calls followed by contiguous structured route rejections.
 /// Canonical history is unchanged.
+/// Borrows source data; projected messages, call slices, and replay live in the request arena.
 pub noinline fn project_native_messages(
     alloc: Allocator,
     messages: []const types.ChatMessage,
     current_user_message_index: usize,
-) Allocator.Error![]const types.ChatMessage {
+    provider: stream_provider.Provider,
+    selection: model_provider.ProviderSelection,
+) ![]const types.ChatMessage {
     std.debug.assert(current_user_message_index < messages.len);
     std.debug.assert(messages[current_user_message_index].role == .user);
 
@@ -515,6 +520,9 @@ pub noinline fn project_native_messages(
     var filtered_call_slices: std.ArrayList([]types.ToolCall) = .empty;
     defer filtered_call_slices.deinit(alloc);
     errdefer for (filtered_call_slices.items) |calls| alloc.free(calls);
+    var selected_replay_buffers: std.ArrayList([]const u8) = .empty;
+    defer selected_replay_buffers.deinit(alloc);
+    errdefer for (selected_replay_buffers.items) |buffer| alloc.free(buffer);
 
     for (messages, 0..) |chat_message, message_index| {
         if (chat_message.role == .tool and
@@ -566,6 +574,26 @@ pub noinline fn project_native_messages(
                     retained_index += 1;
                 }
                 projected_message.tool_calls = retained;
+            }
+            if (chat_message.provider_replay) |replay| {
+                if (replay.matches(selection)) {
+                    const selected = try provider.projectReplay(
+                        alloc,
+                        replay,
+                        projected_message.tool_calls,
+                        if (projected_message.content) |content| content.len > 0 else false,
+                        true,
+                    );
+                    if (selected) |value| {
+                        if (value.parts_json.ptr != replay.parts_json.ptr) {
+                            selected_replay_buffers.append(alloc, value.parts_json) catch |err| {
+                                alloc.free(value.parts_json);
+                                return err;
+                            };
+                        }
+                    }
+                    projected_message.provider_replay = selected;
+                }
             }
         }
         try projected.append(alloc, projected_message);
@@ -1515,7 +1543,13 @@ test "native message projection retains only the current turn structured rejecti
         .{ .role = .assistant, .content = "later answer" },
     };
 
-    const immediate = try project_native_messages(arena, messages[0..8], 4);
+    const immediate = try project_native_messages(
+        arena,
+        messages[0..8],
+        4,
+        stream_provider.unavailable_provider,
+        .{ .provider = .gateway, .model = "test" },
+    );
     try std.testing.expectEqual(@as(usize, 7), immediate.len);
     try std.testing.expectEqual(@as(usize, 1), immediate[0].images.len);
     try std.testing.expectEqual(@as(usize, 1), immediate[1].tool_calls.len);
@@ -1527,7 +1561,13 @@ test "native message projection retains only the current turn structured rejecti
     try std.testing.expectEqualStrings("reused-call-id", immediate[5].tool_call_id.?);
     try std.testing.expectEqualStrings(rejection, immediate[5].content.?);
 
-    const later = try project_native_messages(arena, &messages, 8);
+    const later = try project_native_messages(
+        arena,
+        &messages,
+        8,
+        stream_provider.unavailable_provider,
+        .{ .provider = .gateway, .model = "test" },
+    );
     try std.testing.expectEqual(@as(usize, 7), later.len);
     try std.testing.expectEqual(@as(usize, 1), later[0].images.len);
     try std.testing.expectEqualStrings("read_file", later[1].tool_calls[0].name);
@@ -1564,6 +1604,8 @@ test "native message projection retains only the current turn structured rejecti
         arena,
         &success_then_rejection_messages,
         0,
+        stream_provider.unavailable_provider,
+        .{ .provider = .gateway, .model = "test" },
     );
     try std.testing.expectEqual(@as(usize, 7), success_then_rejection.len);
     try std.testing.expectEqual(@as(usize, 1), success_then_rejection[1].tool_calls.len);
@@ -1591,6 +1633,8 @@ test "native message projection retains only the current turn structured rejecti
         arena,
         &rejection_then_success_messages,
         0,
+        stream_provider.unavailable_provider,
+        .{ .provider = .gateway, .model = "test" },
     );
     try std.testing.expectEqual(@as(usize, 4), rejection_then_success.len);
     try std.testing.expectEqualStrings("rejection-then-success", rejection_then_success[1].tool_calls[0].id);
@@ -1630,7 +1674,13 @@ test "native message projection rejects reversed and unmatched Vision evidence" 
         .{ .role = .assistant, .content = "finished" },
     };
 
-    const projected = try project_native_messages(arena, &messages, 0);
+    const projected = try project_native_messages(
+        arena,
+        &messages,
+        0,
+        stream_provider.unavailable_provider,
+        .{ .provider = .gateway, .model = "test" },
+    );
     try std.testing.expectEqual(@as(usize, 5), projected.len);
     try std.testing.expectEqualStrings("reject malformed evidence", projected[0].content.?);
     try std.testing.expectEqualStrings("before-call separator", projected[1].content.?);
@@ -1642,6 +1692,88 @@ test "native message projection rejects reversed and unmatched Vision evidence" 
         for (chat_message.tool_calls) |call| {
             try std.testing.expect(!std.mem.eql(u8, call.name, "vision"));
         }
+    }
+}
+
+fn check_native_replay_projection_allocations(alloc: Allocator) !void {
+    const Probe = struct {
+        const selected = "[{\"type\":\"tool-call\",\"toolCallId\":\"read\"}]";
+
+        fn project(arena: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
+            const source = replay orelse return error.TestUnexpectedResult;
+            if (std.mem.eql(u8, source.parts_json, "invalid")) return error.InvalidProviderState;
+            try std.testing.expect(text and reasoning);
+            try std.testing.expectEqual(@as(usize, 1), calls.len);
+            try std.testing.expectEqualStrings("read", calls[0].id);
+            if (source.source.provider == .codex) return source;
+            return .{ .source = source.source, .parts_json = try arena.dupe(u8, selected) };
+        }
+    };
+    const provider = stream_provider.Provider{
+        .stream_fn = stream_provider.unavailable_provider.stream_fn,
+        .project_replay_fn = Probe.project,
+    };
+    const original = "[{\"type\":\"tool-call\",\"toolCallId\":\"vision\"},{\"type\":\"tool-call\",\"toolCallId\":\"read\"}]";
+    const calls = [_]types.ToolCall{
+        .{ .id = "vision", .name = "vision", .arguments_json = "{}" },
+        .{ .id = "read", .name = "read_file", .arguments_json = "{}" },
+    };
+    for ([_]model_provider.ProviderId{ .gateway, .codex }) |provider_id| {
+        const selection = model_provider.ProviderSelection{ .provider = provider_id, .model = "fixture-model" };
+        const source_parts = if (provider_id == .gateway) original else "[{\"type\":\"reasoning\",\"encrypted_content\":\"retained\"}]";
+        const messages = [_]types.ChatMessage{
+            .{ .role = .assistant, .content = "original", .tool_calls = &calls, .provider_replay = .{ .source = selection, .parts_json = source_parts } },
+            .{ .role = .tool, .tool_call_id = "vision", .tool_name = "vision", .content = "old result" },
+            .{ .role = .tool, .tool_call_id = "read", .tool_name = "read_file", .content = "retained result" },
+            .{ .role = .user, .content = "continue" },
+        };
+        const projected = try project_native_messages(alloc, &messages, 3, provider, selection);
+        defer {
+            const replay = projected[0].provider_replay.?;
+            if (replay.parts_json.ptr != source_parts.ptr) alloc.free(replay.parts_json);
+            alloc.free(projected[0].tool_calls);
+            alloc.free(projected);
+        }
+        try std.testing.expectEqual(@as(usize, 3), projected.len);
+        try std.testing.expectEqualStrings(if (provider_id == .gateway) Probe.selected else source_parts, projected[0].provider_replay.?.parts_json);
+        try std.testing.expectEqualStrings("read", projected[1].tool_call_id.?);
+        try std.testing.expectEqualStrings("retained result", projected[1].content.?);
+        try std.testing.expectEqualStrings(source_parts, messages[0].provider_replay.?.parts_json);
+        try std.testing.expectEqual(@as(usize, 2), messages[0].tool_calls.len);
+
+        var invalid_tail = messages;
+        invalid_tail[0].provider_replay.?.parts_json = "invalid";
+        const combined = messages ++ invalid_tail;
+        const unexpected = project_native_messages(alloc, &combined, combined.len - 1, provider, selection) catch |err| switch (err) {
+            error.InvalidProviderState => continue,
+            else => return err,
+        };
+        alloc.free(unexpected);
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "native message projection preserves selected replay and releases failed allocations" {
+    try check_native_replay_projection_allocations(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_native_replay_projection_allocations, .{});
+}
+
+test "native message projection leaves mismatched replay to the provider adapter" {
+    const source = model_provider.ProviderSelection{ .provider = .gateway, .model = "original-model" };
+    for ([_]model_provider.ProviderSelection{
+        .{ .provider = .gateway, .model = "different-model" },
+        .{ .provider = .codex, .model = "original-model" },
+    }) |selection| {
+        const messages = [_]types.ChatMessage{
+            .{ .role = .assistant, .content = "retained prose", .tool_calls = &.{.{ .id = "vision", .name = "vision", .arguments_json = "{}" }}, .provider_replay = .{ .source = source, .parts_json = "provider-owned" } },
+            .{ .role = .tool, .tool_call_id = "vision", .tool_name = "vision", .content = "old result" },
+            .{ .role = .user, .content = "continue" },
+        };
+        const projected = try project_native_messages(std.testing.allocator, &messages, 2, stream_provider.unavailable_provider, selection);
+        defer std.testing.allocator.free(projected);
+        try std.testing.expectEqual(@as(usize, 2), projected.len);
+        try std.testing.expectEqual(@as(usize, 0), projected[0].tool_calls.len);
+        try std.testing.expect(projected[0].provider_replay.?.parts_json.ptr == messages[0].provider_replay.?.parts_json.ptr);
     }
 }
 

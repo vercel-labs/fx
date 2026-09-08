@@ -61,6 +61,12 @@ fn unavailableFreshPrompt(_: *anyopaque, _: worker_runtime.FreshPromptPreparatio
 }
 fn discardCredentialRefresh(_: *anyopaque, _: credentials.Credential) !void {}
 
+/// A retained delivery owns its own payload; a settled delivery acknowledges history.
+pub const HistoryDelivery = union(enum) {
+    retained,
+    settled: assistant_pacer.FinishResult,
+};
+
 pub const WorkerEventHandlers = struct {
     ctx: *anyopaque,
     tool_lifecycle: activity_runtime.LifecyclePresenter,
@@ -79,7 +85,7 @@ pub const WorkerEventHandlers = struct {
     diff_block: *const fn (*anyopaque, diff_mod.DiffEntryPayload) anyerror!void,
     context_compaction: worker_runtime.ContextCompactionHandler = discardContextCompaction,
     prepare_fresh_prompt: worker_runtime.FreshPromptHandler = unavailableFreshPrompt,
-    append_history_turn: *const fn (*anyopaque, types.FinishedPrompt) anyerror!void,
+    append_history_turn: *const fn (*anyopaque, types.FinishedPrompt) anyerror!HistoryDelivery,
     session_grant: *const fn (*anyopaque, types.PermissionGrant) anyerror!void,
     error_text: *const fn (*anyopaque, types.SemanticNotice) anyerror!void,
 };
@@ -202,6 +208,7 @@ test "shutdown settles queued and pacer-owned finishes exactly once" {
             .assistant = @constCast("later answer"),
         } } } });
         app.worker.requestShutdown();
+        app_session_runtime.Runtime(ShutdownApp).recordShutdownFailure(&app, error.PreviousSessionSaveFailed);
         try std.testing.expectEqual(@as(usize, 0), app.session.historyLen());
         try std.testing.expect(app.session_persistence.writable.?.state.recovery_checkpoint != null);
 
@@ -264,6 +271,7 @@ const DetachedWorkerEventBatch = struct {
 
     fn deinit(self: *DetachedWorkerEventBatch) void {
         while (self.next_unvisited < self.events.items.len) : (self.next_unvisited += 1) {
+            debug_trace.logf("worker", "undelivered worker event discarded kind={s}", .{@tagName(self.events.items[self.next_unvisited])});
             worker_runtime.freeWorkerEvent(self.alloc, self.events.items[self.next_unvisited]);
         }
         self.events.deinit(self.alloc);
@@ -271,7 +279,7 @@ const DetachedWorkerEventBatch = struct {
     }
 };
 
-fn batchContainsInterruptedClosure(
+fn batchContainsTerminalClosure(
     events: []const WorkerEvent,
     id: types.ToolLifecycleId,
 ) bool {
@@ -282,12 +290,11 @@ fn batchContainsInterruptedClosure(
         };
         switch (lifecycle) {
             .terminal => |terminal| {
-                if (terminal.outcome.kind == .cancelled and
-                    terminal.id.turn_id == id.turn_id and
+                if (terminal.id.turn_id == id.turn_id and
                     std.mem.eql(u8, terminal.id.call_id, id.call_id)) return true;
             },
             .turn_finished => |finished| {
-                if (finished.outcome == .interrupted and finished.turn_id == id.turn_id) return true;
+                if (finished.turn_id == id.turn_id) return true;
             },
             .provisional, .authoritative_started, .progress => {},
         }
@@ -295,22 +302,30 @@ fn batchContainsInterruptedClosure(
     return false;
 }
 
-fn batchSegmentEndsInterrupted(events: []const WorkerEvent) bool {
-    for (events, 0..) |event, index| {
+fn batchSegmentIsInterrupted(events: []const WorkerEvent, cancelled_turn_id: ?u64) bool {
+    var turn_id: ?u64 = null;
+    scan: for (events, 0..) |event, index| {
         if (index > 0) switch (event) {
-            .begin_prompt, .begin_prompt_with_skill_bindings, .begin_presented_prompt => return false,
+            .begin_prompt, .begin_prompt_with_skill_bindings, .begin_presented_prompt => break :scan,
             else => {},
         };
-        const lifecycle = switch (event) {
-            .tool_lifecycle => |value| value,
-            else => continue,
-        };
-        switch (lifecycle) {
-            .turn_finished => |finished| if (finished.outcome == .interrupted) return true,
-            .provisional, .authoritative_started, .progress, .terminal => {},
+        switch (event) {
+            .begin_presented_prompt => |id| turn_id = id,
+            .turn_phase_update => |phase| turn_id = phase.turn_id,
+            .tool_lifecycle => |lifecycle| {
+                turn_id = switch (lifecycle) {
+                    .turn_finished => |finished| return finished.outcome == .interrupted,
+                    .provisional => |value| value.id.turn_id,
+                    .authoritative_started => |value| value.id.turn_id,
+                    .progress => |value| value.id.turn_id,
+                    .terminal => |value| value.id.turn_id,
+                };
+            },
+            else => {},
         }
     }
-    return false;
+    const cancelled = cancelled_turn_id orelse return false;
+    return turn_id == null or turn_id.? == cancelled;
 }
 
 pub fn Runtime(comptime App: type) type {
@@ -320,7 +335,7 @@ pub fn Runtime(comptime App: type) type {
             id: types.ToolLifecycleId,
             batch_events: []const WorkerEvent,
         ) CancelledEventAdmission {
-            if (batchContainsInterruptedClosure(batch_events, id)) return .admit;
+            if (batchContainsTerminalClosure(batch_events, id)) return .admit;
             if (id.turn_id <= presenter.snapshot().finalized_turn_watermark) return .drop;
             return .defer_until_closure;
         }
@@ -387,12 +402,7 @@ pub fn Runtime(comptime App: type) type {
         /// After the worker joins, persist finished turns without presenting output
         /// or admitting work. The pacer owns the finish preceding queued events.
         pub fn settleFinishedPromptsForShutdown(app: *App) !void {
-            if (app.pacer.deferred_turn) |finished| {
-                app.pacer.deferred_turn = null;
-                app.pacer.deferred_started_ns = null;
-                defer types.freeFinishedPrompt(app.alloc, finished);
-                try app_session_runtime.Runtime(App).appendFinishedPrompt(app, finished);
-            }
+            try settleDeferredFinish(app);
 
             var batch = DetachedWorkerEventBatch.init(
                 std.heap.c_allocator,
@@ -402,8 +412,49 @@ pub fn Runtime(comptime App: type) type {
             while (batch.claim()) |event| {
                 defer worker_runtime.freeWorkerEvent(batch.alloc, event);
                 switch (event) {
-                    .finish_prompt => |finished| try app_session_runtime.Runtime(App).appendFinishedPrompt(app, finished),
+                    .finish_prompt => |finished| try persistFinishedPrompt(app, finished),
                     else => debug_trace.logf("worker", "shutdown worker event dropped kind={s}", .{@tagName(event)}),
+                }
+            }
+        }
+
+        fn persistFinishedPrompt(app: *App, finished: types.FinishedPrompt) !void {
+            errdefer |err| app_session_runtime.Runtime(App).recordFailedHistoryDelivery(app, err);
+            if (comptime @hasField(App, "session")) {
+                try app_session_runtime.Runtime(App).appendFinishedPrompt(app, finished);
+            } else {
+                try app.appendFinishedPrompt(finished);
+            }
+        }
+
+        fn settleDeferredFinish(app: *App) !void {
+            if (comptime !@hasField(@TypeOf(app.pacer), "deferred_turn")) return;
+            if (app.pacer.deferred_turn) |finished| {
+                app.pacer.deferred_turn = null;
+                app.pacer.deferred_started_ns = null;
+                defer types.freeFinishedPrompt(app.alloc, finished);
+                try persistFinishedPrompt(app, finished);
+            }
+        }
+
+        fn preserveFinishedAfterDrainFailure(app: *App, batch: *DetachedWorkerEventBatch, may_persist: bool) void {
+            var can_persist = may_persist;
+            if (can_persist) settleDeferredFinish(app) catch {
+                can_persist = false;
+            };
+            while (batch.claim()) |event| {
+                defer worker_runtime.freeWorkerEvent(batch.alloc, event);
+                switch (event) {
+                    .finish_prompt => |finished| {
+                        if (can_persist) {
+                            persistFinishedPrompt(app, finished) catch {
+                                can_persist = false;
+                            };
+                        } else {
+                            debug_trace.logf("worker", "finished turn not persisted after earlier save failure", .{});
+                        }
+                    },
+                    else => debug_trace.logf("worker", "presentation failure discarded worker event kind={s}", .{@tagName(event)}),
                 }
             }
         }
@@ -821,15 +872,16 @@ pub fn Runtime(comptime App: type) type {
             };
             defer batch.deinit();
 
-            const cancel_requested = taken.cancel_requested;
-            var interrupted_segment = cancel_requested or batchSegmentEndsInterrupted(batch.events.items);
+            var can_persist_finished = true;
+            errdefer preserveFinishedAfterDrainFailure(app, &batch, can_persist_finished);
+
+            var interrupted_segment = batchSegmentIsInterrupted(batch.events.items, taken.cancelled_turn_id);
             var first_event = true;
 
             events: while (batch.claim()) |event| {
                 if (!first_event) switch (event) {
                     .begin_prompt, .begin_prompt_with_skill_bindings, .begin_presented_prompt => {
-                        interrupted_segment = cancel_requested or
-                            batchSegmentEndsInterrupted(batch.claimedAndRemaining());
+                        interrupted_segment = batchSegmentIsInterrupted(batch.claimedAndRemaining(), taken.cancelled_turn_id);
                     },
                     else => {},
                 };
@@ -1076,10 +1128,27 @@ pub fn Runtime(comptime App: type) type {
                         try applyToolLifecycle(app, handlers.tool_lifecycle, lifecycle);
                     },
                     .finish_prompt => |finished| {
+                        var accepted = false;
+                        errdefer if (!accepted) {
+                            settleDeferredFinish(app) catch {
+                                can_persist_finished = false;
+                            };
+                            if (can_persist_finished) persistFinishedPrompt(app, finished) catch {
+                                can_persist_finished = false;
+                            };
+                        };
                         try flushPendingCommandOutputAtTurnBoundary(app, handlers);
                         resetStream(app, false);
                         app.shell.render_requests.request(.footer);
-                        try handlers.append_history_turn(handlers.ctx, finished);
+                        const delivery = try handlers.append_history_turn(handlers.ctx, finished);
+                        accepted = true;
+                        switch (delivery) {
+                            .retained => {},
+                            .settled => |result| switch (result) {
+                                .committed => {},
+                                .presentation_failed => |err| return err,
+                            },
+                        }
                     },
                     .session_grant => |grant| {
                         try handlers.session_grant(handlers.ctx, grant);
@@ -1384,7 +1453,7 @@ const FakeWorker = struct {
         const cancel_requested = self.worker_cancel_requested.load(.seq_cst);
         return .{
             .events = self.takeEvents(),
-            .cancel_requested = cancel_requested,
+            .cancelled_turn_id = if (cancel_requested and self.active_turn_id != 0) self.active_turn_id else null,
         };
     }
 
@@ -1767,12 +1836,16 @@ const FakeApp = struct {
     attention_count: usize = 0,
     last_attention_turn_id: u64 = 0,
     last_attention_kind: ?@import("../hooks/hooks.zig").AttentionKind = null,
+    persisted_finishes: std.ArrayList(types.FinishedPrompt) = .empty,
+    finish_persistence_error: ?anyerror = null,
 
     fn init(alloc: std.mem.Allocator) FakeApp {
         return .{ .alloc = alloc };
     }
 
     fn deinit(self: *FakeApp) void {
+        for (self.persisted_finishes.items) |finished| types.freeFinishedPrompt(self.alloc, finished);
+        self.persisted_finishes.deinit(self.alloc);
         self.session_persistence.deinit(self.alloc);
         self.worker.deinit();
         self.approval_prompt.deinit(self.alloc);
@@ -1784,6 +1857,14 @@ const FakeApp = struct {
 
     fn pacerCallbacks(self: *FakeApp) void {
         _ = self;
+    }
+
+    pub fn appendFinishedPrompt(self: *FakeApp, finished: types.FinishedPrompt) !void {
+        if (self.finish_persistence_error) |err| return err;
+        const owned = try types.dupeFinishedPrompt(self.alloc, finished);
+        errdefer types.freeFinishedPrompt(self.alloc, owned);
+        try self.persisted_finishes.append(self.alloc, owned);
+        if (finished.snapshot_file_ownership) |ownership| ownership.transfer();
     }
 
     fn writeTranscript(self: *FakeApp, text: []const u8, record: bool) !void {
@@ -1860,7 +1941,9 @@ const NoopBridge = struct {
     fn diff(_: *anyopaque, payload: @import("../output/diff.zig").DiffEntryPayload) !void {
         @import("../output/diff.zig").freeDiffEntryPayload(std.heap.c_allocator, payload);
     }
-    fn history(_: *anyopaque, _: types.FinishedPrompt) !void {}
+    fn history(_: *anyopaque, _: types.FinishedPrompt) !HistoryDelivery {
+        return .{ .settled = .committed };
+    }
     fn grant(_: *anyopaque, _: types.PermissionGrant) !void {}
     fn err(_: *anyopaque, _: types.SemanticNotice) !void {}
 
@@ -2024,11 +2107,12 @@ const PacedTranscriptBridge = struct {
         self.notice_count += 1;
     }
 
-    fn appendHistoryTurn(raw: *anyopaque, finished: types.FinishedPrompt) !void {
+    fn appendHistoryTurn(raw: *anyopaque, finished: types.FinishedPrompt) !HistoryDelivery {
         const self: *PacedTranscriptBridge = @ptrCast(@alignCast(raw));
         self.history_count += 1;
-        if (try self.pacer.deferFinish(self.app.alloc, finished)) return;
+        if (try self.pacer.deferFinish(self.app.alloc, finished)) return .retained;
         self.finish_count += 1;
+        return .{ .settled = .committed };
     }
 
     fn emit(raw: *anyopaque, text: []const u8) !void {
@@ -2040,10 +2124,11 @@ const PacedTranscriptBridge = struct {
         );
     }
 
-    fn finish(raw: *anyopaque, _: types.FinishedPrompt) !void {
+    fn finish(raw: *anyopaque, _: types.FinishedPrompt) !assistant_pacer.FinishResult {
         const self: *PacedTranscriptBridge = @ptrCast(@alignCast(raw));
         self.finish_count += 1;
         self.record('F');
+        return .committed;
     }
 };
 
@@ -2624,11 +2709,12 @@ test "core.app_worker_runtime summary append clears recovered route status witho
     } } });
 
     const Capture = struct {
-        fn history(ctx: *anyopaque, finished: types.FinishedPrompt) !void {
+        fn history(ctx: *anyopaque, finished: types.FinishedPrompt) !HistoryDelivery {
             const inner: *FakeApp = @ptrCast(@alignCast(ctx));
             if (finished.summary) |summary| {
                 _ = try inner.shell.lifecycle.appendTurnSummaryEntry(inner.alloc, summary);
             }
+            return .{ .settled = .committed };
         }
     };
     var handlers = NoopBridge.handlers(&app);
@@ -3278,9 +3364,10 @@ test "core.app_worker_runtime cancellation suppresses payloads but retains turn 
             self.text_count += 1;
         }
 
-        fn history(raw: *anyopaque, _: types.FinishedPrompt) !void {
+        fn history(raw: *anyopaque, _: types.FinishedPrompt) !HistoryDelivery {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.history_count += 1;
+            return .{ .settled = .committed };
         }
     };
     var capture = Capture{};
@@ -3977,13 +4064,14 @@ test "core.app_worker_runtime split batches finalize lifecycle before history" {
         history_count: usize = 0,
         saw_finalized_fence: bool = false,
 
-        fn history(raw: *anyopaque, _: types.FinishedPrompt) !void {
+        fn history(raw: *anyopaque, _: types.FinishedPrompt) !HistoryDelivery {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.history_count += 1;
             self.saw_finalized_fence =
                 self.app.shell.finalizedToolTurnWatermark() == 1 and
                 self.app.shell.toolActivityRecordCount() == 0 and
                 self.app.shell.lifecyclePinCount() == 0;
+            return .{ .settled = .committed };
         }
     };
     var capture = Capture{ .app = &app };
@@ -4070,6 +4158,54 @@ test "core.app_worker_runtime reducer error settles batch and skips suffix" {
     const record = app.shell.toolActivityRecord(.{ .turn_id = 1, .call_id = "call" }).?;
     try std.testing.expectEqual(activity_runtime.ToolLifecyclePhase.authoritative, record.phase);
     try std.testing.expectEqual(@as(usize, 1), app.shell.lifecyclePinCount());
+}
+
+test "core.app_worker_runtime cancellation leaves an earlier completed segment drainable" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    app.worker.processing = true;
+    app.worker.active_turn_id = 2;
+    app.worker.worker_cancel_requested.store(true, .seq_cst);
+    try queueToolStart(&app, 1, "completed-call", "read_file");
+    try queueToolTerminal(&app, 1, "completed-call", .completed, "Read");
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{ .text = @constCast("earlier completed answer") } });
+    try queueTurnFinished(&app, 1, .completed);
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .begin_prompt = .{ .text = @constCast("later request") } });
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .turn_phase_update = .{ .turn_id = 2, .step_id = 1, .phase = .thinking } });
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{ .text = @constCast("cancelled later answer") } });
+    try queueTurnFinished(&app, 2, .interrupted);
+    const Capture = struct {
+        fn text(raw: *anyopaque, bytes: []const u8) !void {
+            const target: *FakeApp = @ptrCast(@alignCast(raw));
+            try target.transcript.appendSlice(target.alloc, bytes);
+        }
+    };
+    var handlers = NoopBridge.handlers(&app);
+    handlers.ctx = &app;
+    handlers.append_text = Capture.text;
+    try Runtime(FakeApp).tick(&app, handlers);
+    try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "earlier completed answer") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "cancelled later answer") == null);
+}
+
+test "core.app_worker_runtime reducer failure preserves a completed turn in the suffix" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    app.worker.processing = true;
+    try queueToolStart(&app, 1, "call", "read_file");
+    try queueLifecycle(&app, .{ .progress = .{
+        .id = .{ .turn_id = 1, .call_id = "call" },
+        .text = "Reading",
+    } });
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = .{ .assistant = .{
+        .user = .{ .text = @constCast("accepted request") },
+        .assistant = @constCast("completed answer"),
+    } } } });
+    app.shell.fail_next_update = true;
+    try std.testing.expectError(error.InjectedTranscriptUpdateFailure, tickNoop(&app));
+    try std.testing.expectEqual(@as(usize, 1), app.persisted_finishes.items.len);
+    try std.testing.expectEqualStrings("completed answer", app.persisted_finishes.items[0].turn.assistant.assistant);
 }
 
 test "core.app_worker_runtime failed turn terminalizes tool lifecycle before error text" {
@@ -4322,7 +4458,9 @@ test "core.app_worker_runtime drains diff block through bridge handler" {
             self.payload = payload;
             try self.preview_buf.appendSlice(std.testing.allocator, payload.preview);
         }
-        fn history(_: *anyopaque, _: types.FinishedPrompt) !void {}
+        fn history(_: *anyopaque, _: types.FinishedPrompt) !HistoryDelivery {
+            return .{ .settled = .committed };
+        }
         fn grant(_: *anyopaque, _: types.PermissionGrant) !void {}
         fn err(_: *anyopaque, _: types.SemanticNotice) !void {}
     };
@@ -4740,7 +4878,9 @@ test "core.app_worker_runtime cancelled drain skips diff block" {
             defer @import("../output/diff.zig").freeDiffEntryPayload(std.heap.c_allocator, payload);
             self.diff_count += 1;
         }
-        fn history(_: *anyopaque, _: types.FinishedPrompt) !void {}
+        fn history(_: *anyopaque, _: types.FinishedPrompt) !HistoryDelivery {
+            return .{ .settled = .committed };
+        }
         fn grant(_: *anyopaque, _: types.PermissionGrant) !void {}
         fn err(_: *anyopaque, _: types.SemanticNotice) !void {}
     };
@@ -4763,4 +4903,61 @@ test "core.app_worker_runtime cancelled drain skips diff block" {
     });
 
     try std.testing.expectEqual(@as(usize, 0), capture.diff_count);
+}
+
+test "worker finish delivery separates unaccepted work from committed presentation failure" {
+    for ([_]bool{ false, true }) |committed| {
+        var app = FakeApp.init(std.testing.allocator);
+        defer app.deinit();
+        app.worker.processing = true;
+        const Capture = struct {
+            app: *FakeApp,
+            committed: bool,
+            fn history(raw: *anyopaque, finished: types.FinishedPrompt) !HistoryDelivery {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (!self.committed) return error.InjectedDeliveryFailure;
+                try self.app.appendFinishedPrompt(finished);
+                return .{ .settled = .{ .presentation_failed = error.InjectedDeliveryFailure } };
+            }
+        };
+        var capture = Capture{ .app = &app, .committed = committed };
+        var handlers = NoopBridge.handlers(&app);
+        handlers.ctx = &capture;
+        handlers.append_history_turn = Capture.history;
+        for ([_][]const u8{ "first answer", "second answer" }) |answer| {
+            try app.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = .{ .assistant = .{
+                .user = .{ .text = @constCast("request") },
+                .assistant = @constCast(answer),
+            } } } });
+        }
+        try std.testing.expectError(error.InjectedDeliveryFailure, Runtime(FakeApp).tick(&app, handlers));
+        try std.testing.expectEqual(@as(usize, 2), app.persisted_finishes.items.len);
+        try std.testing.expectEqualStrings("first answer", app.persisted_finishes.items[0].turn.assistant.assistant);
+        try std.testing.expectEqualStrings("second answer", app.persisted_finishes.items[1].turn.assistant.assistant);
+        try std.testing.expectEqual(@as(?anyerror, null), app.session_persistence.shutdown_failure);
+    }
+}
+
+test "unaccepted worker finish records save failure and stops the detached suffix" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    app.worker.processing = true;
+    app.finish_persistence_error = error.InputOutput;
+    const Capture = struct {
+        fn history(_: *anyopaque, _: types.FinishedPrompt) !HistoryDelivery {
+            return error.InjectedDeliveryFailure;
+        }
+    };
+    var handlers = NoopBridge.handlers(&app);
+    handlers.append_history_turn = Capture.history;
+    for (0..2) |_| {
+        try app.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = .{ .assistant = .{
+            .user = .{ .text = @constCast("request") },
+            .assistant = @constCast("answer"),
+        } } } });
+    }
+    try std.testing.expectError(error.InjectedDeliveryFailure, Runtime(FakeApp).tick(&app, handlers));
+    try std.testing.expectEqual(@as(?anyerror, error.InputOutput), app.session_persistence.shutdown_failure);
+    try std.testing.expectEqual(@as(usize, 0), app.persisted_finishes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
 }

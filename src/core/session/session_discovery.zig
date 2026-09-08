@@ -73,6 +73,7 @@ pub const WritableCandidate = struct {
     updated_at_ms: i64,
     storage: CandidateStorage,
     projection_state: ProjectionState,
+    subagent_child: ?bool = null,
 
     pub fn deinit(self: *WritableCandidate, alloc: Allocator) void {
         alloc.free(self.id);
@@ -330,19 +331,10 @@ fn classifyConversationCandidate(
         var event_file = try openSessionFile(session_dir, "events.jsonl", .read_only);
         defer event_file.close(io_mod.getIo());
         var offset: u64 = 0;
+        var buffer: [8192]u8 = undefined;
+        var reader = event_file.reader(io_mod.getIo(), &buffer);
         while (offset < event_stat.size) {
-            const read = if (cancelled) |stop| session_replay.readLineAtCancellable(
-                alloc,
-                event_file,
-                offset,
-                event_stat.size,
-                stop,
-            ) else session_replay.readLineAt(
-                alloc,
-                event_file,
-                offset,
-                event_stat.size,
-            );
+            const read = session_replay.readBufferedLine(alloc, &reader, event_stat.size, cancelled);
             const line = read catch |err| switch (err) {
                 error.TruncatedEventFrame => break,
                 else => return err,
@@ -416,8 +408,10 @@ pub fn writable_conversation_candidate(
         defer file.close(io_mod.getIo());
         const stat = try file.stat(io_mod.getIo());
         var offset: u64 = 0;
+        var buffer: [8192]u8 = undefined;
+        var reader = file.reader(io_mod.getIo(), &buffer);
         while (offset < stat.size) {
-            const line = session_replay.readLineAt(alloc, file, offset, stat.size) catch |err| switch (err) {
+            const line = session_replay.readBufferedLine(alloc, &reader, stat.size, null) catch |err| switch (err) {
                 error.TruncatedEventFrame => break,
                 else => return err,
             } orelse break;
@@ -437,7 +431,9 @@ pub fn writable_conversation_candidate(
             offset = line.next_offset;
         }
     }
-    return dupeWritableCandidate(alloc, metadata.id, metadata.workspace_root, updated_at_ms, .conversation, .current);
+    var candidate = try dupeWritableCandidate(alloc, metadata.id, metadata.workspace_root, updated_at_ms, .conversation, .current);
+    candidate.subagent_child = metadata.subagent_child;
+    return candidate;
 }
 
 /// Identifies a fenced candidate without recovering it. Caller owns the candidate.
@@ -447,7 +443,12 @@ pub fn fenced_legacy_writable_candidate(
     session_id: []const u8,
     fallback_workspace: []const u8,
 ) !WritableCandidate {
-    const name: []const u8 = if (try entryExistsRelative(session_dir, "session.legacy.json")) "session.legacy.json" else "session.json";
+    const name: []const u8 = if (try entryExistsRelative(session_dir, "session.legacy.json"))
+        "session.legacy.json"
+    else if (try entryExistsRelative(session_dir, "session.json"))
+        "session.json"
+    else
+        return error.SessionAuthorityBoundaryUnavailable;
     const path_stat = try session_dir.dir.statFile(io_mod.getIo(), name, .{ .follow_symlinks = false });
     if (path_stat.kind != .file or path_stat.nlink != 1) return error.SessionPathUnsafe;
     var file = try openSessionFile(session_dir, name, .read_only);

@@ -942,9 +942,9 @@ pub const FakeAgentRuntimeDeps = struct {
         }
     }
 
-    fn appendStaticContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
+    fn appendStaticContext(raw: *anyopaque, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(ChatMessage)) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        if (self.static_context_text) |text| {
+        if (project_context orelse self.static_context_text) |text| {
             try messages.append(arena, .{ .role = .system, .content = try arena.dupe(u8, text) });
         }
     }

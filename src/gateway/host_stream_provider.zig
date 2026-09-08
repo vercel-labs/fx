@@ -2,6 +2,7 @@ const std = @import("std");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
 const gateway_client = @import("client.zig");
+const vercel_protocol = @import("vercel_protocol.zig");
 const credential_authority = @import("../core/auth/credential_authority.zig");
 
 const Allocator = std.mem.Allocator;
@@ -55,6 +56,7 @@ pub fn provider(context: *ProviderContext) stream_provider.Provider {
         .context = context,
         .stream_fn = stream,
         .build_request_fn = buildRequest,
+        .project_replay_fn = vercel_protocol.selectReplayParts,
     };
 }
 
@@ -64,6 +66,54 @@ pub fn initContext(
     transport: Transport,
 ) ProviderContext {
     return .{ .build_fn = build_fn, .endpoint = endpoint, .transport = transport };
+}
+
+test "host provider selects replay without changing canonical input" {
+    const Unused = struct {
+        fn build(_: Allocator, _: stream_provider.RequestData) ![]u8 {
+            return error.UnexpectedRequest;
+        }
+        fn open(_: ?*anyopaque, _: []const u8, _: []const u8, _: []const u8, _: []const u8) !i32 {
+            return error.UnexpectedRequest;
+        }
+        fn status(_: ?*anyopaque, _: i32, _: *u16) i32 {
+            return -1;
+        }
+        fn next(_: ?*anyopaque, _: i32, _: []u8) i32 {
+            return -1;
+        }
+        fn close(_: ?*anyopaque, _: i32) void {}
+    };
+    const types = @import("../core/shared/types.zig");
+    const alloc = std.testing.allocator;
+    var context = initContext(Unused.build, .{ .fixed = "https://example.invalid" }, .{
+        .context = null,
+        .open_fn = Unused.open,
+        .status_fn = Unused.status,
+        .next_fn = Unused.next,
+        .close_fn = Unused.close,
+    });
+    const adapter = provider(&context);
+    const parts = "[{\"type\":\"reasoning\",\"text\":\"retained\"},{\"type\":\"tool-call\",\"toolCallId\":\"read\"},{\"type\":\"text\",\"offset\":0,\"length\":6}]";
+    const replay = types.ProviderReplay{
+        .source = .{ .provider = .gateway, .model = "fixture-model" },
+        .parts_json = parts,
+    };
+    const calls = [_]types.ToolCall{.{ .id = "read", .name = "read_file", .arguments_json = "{}" }};
+    const unchanged = (try adapter.projectReplay(alloc, replay, &calls, true, true)).?;
+    try std.testing.expect(unchanged.parts_json.ptr == parts.ptr);
+
+    const selected = (try adapter.projectReplay(alloc, replay, &calls, false, true)).?;
+    defer alloc.free(selected.parts_json);
+    try std.testing.expectEqualStrings("[{\"type\":\"reasoning\",\"text\":\"retained\"},{\"type\":\"tool-call\",\"toolCallId\":\"read\"}]", selected.parts_json);
+    try std.testing.expectEqualStrings(parts, replay.parts_json);
+    try std.testing.expect(selected.matches(replay.source));
+    try std.testing.expectEqual(@as(?types.ProviderReplay, null), try adapter.projectReplay(alloc, replay, &.{}, false, false));
+    try std.testing.expectEqual(@as(?types.ProviderReplay, null), try adapter.projectReplay(alloc, null, &.{}, true, true));
+    try std.testing.expectError(error.InvalidProviderState, adapter.projectReplay(alloc, .{
+        .source = replay.source,
+        .parts_json = "{}",
+    }, &.{}, false, true));
 }
 
 fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequest) anyerror!stream_provider.Result {

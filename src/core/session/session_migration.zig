@@ -222,6 +222,9 @@ pub fn loadSchemaV3ReadOnly(
     {
         return error.InvalidSessionFormat;
     }
+    if (replayed.state.usage) |usage| if (usage.billing == .legacy) {
+        @import("../shared/debug_trace.zig").logf("session", "legacy usage unavailable session_id={s} source_schema=3", .{session_id});
+    };
     if (try replayed.state.archive_legacy_recovery(alloc)) {
         @import("../shared/debug_trace.zig").logf("session", "legacy recovery archived session_id={s} reason=unverifiable_route_authority", .{session_id});
     }

@@ -525,7 +525,17 @@ pub fn encodeState(state: DurableSessionState, writer: *std.Io.Writer) !EncodeSu
 }
 
 pub fn decodeState(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimits) !DurableSessionState {
-    return decodeStateImpl(alloc, source, limits) catch |err| switch (err) {
+    return decodeStateWithUsageContract(alloc, source, limits, false);
+}
+
+/// Reads an old persisted state without requiring modern cache-token totals.
+/// Caller owns the state; all non-usage validation remains unchanged.
+pub fn decodeLegacyState(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimits) !DurableSessionState {
+    return decodeStateWithUsageContract(alloc, source, limits, true);
+}
+
+fn decodeStateWithUsageContract(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimits, legacy_usage: bool) !DurableSessionState {
+    return decodeStateImpl(alloc, source, limits, legacy_usage) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidDurableField => return error.InvalidDurableField,
         error.InvalidDurableBytes => return error.InvalidDurableBytes,
@@ -1047,7 +1057,7 @@ pub fn writeRecoveryCheckpoint(writer: *std.Io.Writer, checkpoint: RecoveryCheck
     });
 }
 
-fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimits) !DurableSessionState {
+fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimits, legacy_usage: bool) !DurableSessionState {
     var json_reader = std.json.Reader.init(alloc, source);
     defer json_reader.deinit();
 
@@ -1117,6 +1127,7 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
     errdefer permission_state.deinit(alloc);
     var permission_state_seen = false;
     var usage: ?session_usage.Snapshot = null;
+    errdefer if (usage) |*snapshot| snapshot.deinit(alloc);
     var usage_seen = false;
     var last_subagent_work_id: ?[]u8 = null;
     errdefer if (last_subagent_work_id) |work_id| alloc.free(work_id);
@@ -1162,7 +1173,10 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
                 .allocate = .alloc_always,
                 .parse_numbers = false,
             });
-            usage = try session_usage.parseSnapshotValue(alloc, value);
+            usage = if (legacy_usage)
+                try session_usage.parseLegacySnapshotValue(alloc, value)
+            else
+                try session_usage.parseSnapshotValue(alloc, value);
             usage_seen = true;
         } else if (std.mem.eql(u8, key, "last_subagent_work_id")) {
             if (last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) return error.InvalidSessionFormat;
@@ -1184,7 +1198,6 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
             recovery_checkpoint = try parseRecoveryCheckpoint(alloc, value);
         } else return error.InvalidSessionFormat;
     }
-    errdefer if (usage) |*snapshot| snapshot.deinit(alloc);
     try expectToken(try json_reader.next(), .object_end);
     try expectToken(try json_reader.next(), .end_of_document);
 
@@ -4471,6 +4484,31 @@ test "permission state schema two round trips before activation" {
     try std.testing.expectEqual(session_permission_state.schema_version, decoded.version);
     try std.testing.expectEqual(@as(usize, 1), decoded.rules.items.len);
     try std.testing.expectEqual(session_permission_state.StateDecision.deny, session_permission_state.decide(decoded, key));
+}
+
+test "durable state usage remains strict and releases partial allocations" {
+    const alloc = std.testing.allocator;
+    const state_json =
+        \\{"id":"usage-state","origin_workspace_root":"/workspace","workspace_root":"/workspace","created_at_ms":1,"updated_at_ms":2,
+        \\"conversation_language":"en","preferences":{"model":"test/model","effort":"auto","fast_mode":false},"history":[],"total_input_tokens":0,"total_output_tokens":0,
+        \\"usage":{"billing":"complete","api_duration_complete":true,"wall_duration_complete":true,"code_complete":true,"next_sequence":2,"settled_through_sequence":1,
+        \\"api_duration_ms":10,"wall_duration_ms":20,"total_cost":1,"input_tokens":10,"output_tokens":3,"cache_read_tokens":2,"cache_write_tokens":0,"billable_web_search_calls":0,"lines_added":0,"lines_removed":0,
+        \\"models":[{"model":"test/model","first_sequence":1,"total_cost":1,"input_tokens":10,"output_tokens":3,"cache_read_tokens":2,"cache_write_tokens":0,"billable_web_search_calls":0}],"pending":[]},
+        \\"last_subagent_work_id":"legacy-work"}
+    ;
+    try std.testing.checkAllAllocationFailures(alloc, struct {
+        fn check(a: Allocator, bytes: []const u8) !void {
+            var source = std.Io.Reader.fixed(bytes);
+            var decoded = try decodeState(a, &source, .{});
+            defer decoded.deinit(a);
+            try std.testing.expectEqual(@as(u64, 10), decoded.usage.?.input_tokens);
+            try std.testing.expectEqualStrings("legacy-work", decoded.last_subagent_work_id.?);
+        }
+    }.check, .{state_json});
+    const incompatible = try std.mem.replaceOwned(u8, alloc, state_json, "\"cache_read_tokens\":2", "\"cache_read_tokens\":11");
+    defer alloc.free(incompatible);
+    var strict_source = std.Io.Reader.fixed(incompatible);
+    try std.testing.expectError(error.InvalidSessionFormat, decodeState(alloc, &strict_source, .{}));
 }
 
 test "durable session optional fields handle fuzzed ownership paths" {

@@ -4870,6 +4870,78 @@ test("native final snapshots preserve completed items and reject conflicting kin
   }
 }, 60_000);
 
+test("native discarded prose keeps tool continuation and saved resume valid", async () => {
+  for (const provider of ["codex", "grok"] as const) for (const mismatch of [false, true]) for (const multiple of [false, true]) {
+    const profile = mkdtempSync(join(tmpdir(), "fx-discarded-prose-"));
+    const gateway = startFakeGateway([]);
+    const model = "fixture-model";
+    const prose = mismatch ? "我会先检查锁文件和依赖清单。" : "I will read the notes next.";
+    const reasoning = { type: "reasoning", id: "rs_filtered", summary: [], encrypted_content: "RETAINED_REASONING" };
+    const message = (id: string, text: string, phase?: string) => ({ type: "message", id, role: "assistant", status: "completed", ...(phase ? { phase } : {}), content: [{ type: "output_text", text, annotations: [] }] });
+    const messages = multiple ? [message("msg_first", prose), message("msg_second", prose)] : [message("msg_first", prose, "commentary")];
+    const call = { type: "function_call", id: "fc_filtered", call_id: "call_filtered", name: "read_file", arguments: JSON.stringify({ path: "notes.txt" }) };
+    const toolIndex = messages.length + 1;
+    const answer = (text: string) => fakeGatewaySse([
+      { type: "response.output_item.done", output_index: 0, item: message("msg_answer", text) },
+      { type: "response.completed", response: { status: "completed", output: null } },
+    ]);
+    const responses = [fakeGatewaySse([
+      { type: "response.output_item.done", output_index: 0, item: reasoning },
+      ...messages.map((item, index) => ({ type: "response.output_item.done", output_index: index + 1, item })),
+      { type: "response.output_item.added", output_index: toolIndex, item: { ...call, arguments: "" } },
+      { type: "response.function_call_arguments.done", output_index: toolIndex, item_id: call.id, arguments: call.arguments },
+      { type: "response.output_item.done", output_index: toolIndex, item: call },
+      { type: "response.completed", response: { status: "completed", output: [reasoning, ...messages, call] } },
+    ]), answer("The notes were checked."), answer("The saved session remains usable.")];
+    const direct = provider === "codex" ? startFakeCodexToolLoop({ model, responses }) : startFakeGrokToolLoop({ model, responses });
+    try {
+      if (provider === "codex") writeSeededChatGptLogin(profile, direct.accessToken);
+      else writeSeededGrokLogin(profile, direct.accessToken);
+      writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
+      writeFileSync(join(profile, "notes.txt"), "FILTERED_READ_RESULT\n");
+      const tracePath = join(profile, "trace.log");
+      const env = {
+        HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
+        FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "agent,gateway,tool",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_E2E_GATEWAY_MODELS_URL: gateway.baseUrl + "/coding-agent/v1/models",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl, FX_E2E_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
+        FX_E2E_XAI_GROK_RESPONSES_URL: direct.responsesUrl, FX_E2E_XAI_GROK_MODELS_URL: direct.modelsUrl,
+        FX_E2E_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+      };
+      const first = await runFx(["ask", "--json", "--auto", "Please read the notes.txt file and explain the result."], { cwd: profile, env, timeoutMs: TIMEOUT });
+      expect(first.code, provider + "/" + mismatch + "/" + multiple + ": " + first.stdout + first.stderr).toBe(0);
+      expect(first.signal).toBeNull();
+      const result = JSON.parse(first.stdout);
+      expect(result.tool_calls).toEqual([{ name: "read_file", status: "success" }]);
+      expect(result.output).toBe(mismatch ? "The notes were checked." : messages.map(() => prose).join("\n\n") + "\n\nThe notes were checked.");
+      expect(direct.bodies).toHaveLength(2);
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace.includes("prose_discarded=true")).toBe(mismatch);
+      const detail = await runFx(["session", "--json", "--id", result.session_id], { cwd: profile, env });
+      expect(detail.code).toBe(0);
+      expect(JSON.parse(detail.stdout).history).toHaveLength(1);
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", result.session_id, "Please confirm the saved result without tools."], { cwd: profile, env, timeoutMs: TIMEOUT });
+      expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
+      expect(resumed.stderr).toBe("");
+      expect(JSON.parse(resumed.stdout).tool_calls).toEqual([]);
+      expect(JSON.parse(resumed.stdout).output).toBe("The saved session remains usable.");
+      expect(direct.bodies).toHaveLength(3);
+      for (const body of direct.bodies.slice(1)) {
+        const input = JSON.parse(body).input;
+        expect(input.filter((item: { type?: string }) => item.type === "reasoning")).toEqual([reasoning]);
+        expect(input.filter((item: { type?: string }) => item.type === "function_call").map((item: { call_id: string }) => item.call_id)).toEqual([call.call_id]);
+        expect(input.filter((item: { type?: string }) => item.type === "function_call_output")).toHaveLength(1);
+        expect(body).toContain("FILTERED_READ_RESULT");
+        if (mismatch) expect(body).not.toContain(prose);
+      }
+      expect(gateway.requests).toHaveLength(0);
+    } finally {
+      direct.stop(); gateway.stop();
+      rmSync(profile, { recursive: true, force: true });
+    }
+  }
+}, 60_000);
+
 test("native terminal outcomes preserve recovery and incomplete warnings", async () => {
   for (const provider of ["gateway", "codex", "grok"] as const) for (const mode of ["transient", "partial", "tool", "rejected", "rejected-partial", "length", "length-with-status"]) {
     const native = provider !== "gateway";

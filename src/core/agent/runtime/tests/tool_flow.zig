@@ -262,6 +262,7 @@ const ApplicableContextDelta = struct {
         _: std.mem.Allocator,
         _: context_contract.InitialContextInput,
     ) context_contract.ProviderError!context_contract.ProviderContext {
+        if (cancel_flag) |flag| flag.store(true, .seq_cst);
         return .{};
     }
 
@@ -3169,6 +3170,139 @@ test "modern cancellation during later context selection stops before context or
     try std.testing.expectEqualStrings("candidate_read", interrupted.tool_call.?.id);
     try std.testing.expectEqual(@as(usize, 1), hooks.finalization_count);
     try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
+}
+
+test "retained project context cancellation preserves an interrupted turn" {
+    const alloc = std.testing.allocator;
+    defer ApplicableContextDelta.reset("", null);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const calls = [_]ToolCall{toolCall("prior_read", "read_file", "{\"path\":\"prior.txt\"}")};
+    const steps = [_]types.ToolExecutionStep{.{ .tool_calls = @constCast(&calls) }};
+    const history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("prior") },
+        .assistant = @constCast("prior result"),
+        .execution = .{ .tool_steps = @constCast(&steps) },
+    } }};
+    var gateway = FakeGateway.init(alloc, &.{});
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.context_enabled = true;
+    hooks.context_registry = ApplicableContextDelta.registry;
+    var fixture = PromptFixture{ .workspace_root = workspace };
+    var job = fixture.job();
+    job.history = @constCast(&history);
+    ApplicableContextDelta.reset("", &fixture.cancel_flag);
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+    try std.testing.expect(fixture.cancel_flag.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 0), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .interrupted);
+}
+
+test "retained project context leaves empty history host context unchanged" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "Final" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.context_enabled = true;
+    hooks.static_context_text = "HOST_ONLY_CONTEXT";
+    var fixture = PromptFixture{};
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+    try expectBodyContains(&gateway, 0, "HOST_ONLY_CONTEXT");
+}
+
+test "retained project context refreshes queued rules before a repeated shell call" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "nested");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "nested/AGENTS.md", .data = "RETAINED_OLD_RULE" });
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const nested = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "nested");
+    defer alloc.free(nested);
+    const registry = context_contract.Registry{ .default_provider = builtin_context.provider };
+    const calls = [_]ToolCall{toolCall("scoped_shell", "shell", "{\"action\":\"run\",\"command\":\"pwd\",\"cwd\":\"nested\"}")};
+    const completions = [_]FakeCompletion{ .{ .tool_calls = &calls }, .{ .content = "Final" } };
+    var first_gateway = FakeGateway.init(alloc, &completions);
+    defer first_gateway.deinit();
+    var first_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer first_hooks.deinit();
+    first_hooks.context_enabled = true;
+    first_hooks.context_registry = registry;
+    var fixture = PromptFixture{ .workspace_root = workspace };
+    try runFakePrompt(&first_gateway, &first_hooks, fixture.config(), fixture.job());
+    try std.testing.expectEqual(@as(usize, 0), first_hooks.executed_names.items.len);
+    try expectBodyContains(&first_gateway, 1, types.context_deferred_tool_result_output);
+
+    var queued_snapshot = try registry.gatherDefaultSnapshot(alloc, .{
+        .workspace_root = workspace,
+        .targets = &.{.{ .path = nested, .kind = .directory }},
+    });
+    defer queued_snapshot.deinit(alloc);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "nested/AGENTS.md", .data = "RETAINED_CURRENT_RULE" });
+    var job = fixture.job();
+    job.history = first_hooks.history_turns.items;
+    job.context_snapshot = queued_snapshot;
+    var second_gateway = FakeGateway.init(alloc, &completions);
+    defer second_gateway.deinit();
+    var second_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer second_hooks.deinit();
+    second_hooks.context_enabled = true;
+    second_hooks.context_registry = registry;
+    second_hooks.static_context_text = queued_snapshot.modelVisibleBytes();
+    try runFakePrompt(&second_gateway, &second_hooks, fixture.config(), job);
+    try expectBodyContains(&second_gateway, 0, "RETAINED_CURRENT_RULE");
+    try expectBodyNotContains(&second_gateway, 0, "RETAINED_OLD_RULE");
+    try std.testing.expectEqual(@as(usize, 1), second_hooks.executed_names.items.len);
+    try std.testing.expectEqual(@as(usize, 1), second_hooks.permission_names.items.len);
+    try std.testing.expectEqual(@as(usize, 2), second_gateway.request_bodies.items.len);
+
+    const bare_final = [_]FakeCompletion{.{ .content = "Core context delivered" }};
+    var bare_gateway = FakeGateway.init(alloc, &bare_final);
+    defer bare_gateway.deinit();
+    var bare_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer bare_hooks.deinit();
+    bare_hooks.context_enabled = true;
+    bare_hooks.context_registry = registry;
+    var bare_deps = bare_hooks.deps();
+    bare_deps.append_static_context = null;
+    bare_deps.agent_stream_provider = bare_gateway.provider();
+    var agent: @import("../agent.zig").Agent = .{};
+    defer agent.deinit(alloc);
+    try agent.restoreHistory(alloc, job.history);
+    try runtime_orchestrator.processAgentPrompt(&agent, &bare_deps, null, testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, workspace), fixture.config(), job);
+    try expectBodyContains(&bare_gateway, 0, "RETAINED_CURRENT_RULE");
+
+    try tmp.dir.deleteFile(std.testing.io, "nested/AGENTS.md");
+    const final = [_]FakeCompletion{.{ .content = "No stale rule" }};
+    var deleted_gateway = FakeGateway.init(alloc, &final);
+    defer deleted_gateway.deinit();
+    var deleted_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer deleted_hooks.deinit();
+    deleted_hooks.context_enabled = true;
+    deleted_hooks.context_registry = registry;
+    deleted_hooks.static_context_text = queued_snapshot.modelVisibleBytes();
+    try runFakePrompt(&deleted_gateway, &deleted_hooks, fixture.config(), job);
+    try expectBodyNotContains(&deleted_gateway, 0, "RETAINED_OLD_RULE");
+    try expectBodyNotContains(&deleted_gateway, 0, "RETAINED_CURRENT_RULE");
+
+    var disabled_gateway = FakeGateway.init(alloc, &final);
+    defer disabled_gateway.deinit();
+    var disabled_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer disabled_hooks.deinit();
+    disabled_hooks.static_context_text = "HOST_CONTEXT_UNCHANGED";
+    try runFakePrompt(&disabled_gateway, &disabled_hooks, fixture.config(), job);
+    try expectBodyContains(&disabled_gateway, 0, "HOST_CONTEXT_UNCHANGED");
+    try expectBodyNotContains(&disabled_gateway, 0, "RETAINED_OLD_RULE");
 }
 
 test "modern context delta defers effectful call exactly once" {

@@ -1044,7 +1044,7 @@ fn reduceReplacement(
     );
     defer chunk_reader.deinit();
 
-    var decoded = session_codec.decodeState(alloc, &chunk_reader.interface, .{}) catch |err| {
+    var decoded = session_codec.decodeLegacyState(alloc, &chunk_reader.interface, .{}) catch |err| {
         if (chunk_reader.truncated) return .{ .state = null };
         if (chunk_reader.failure) |failure| return failure;
         return err;
@@ -1670,7 +1670,7 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
                 owned.deinit(alloc);
             }
             var usage = if (object.get("usage")) |usage_value|
-                session_usage.parseSnapshotValue(alloc, usage_value) catch |err| switch (err) {
+                session_usage.parseLegacySnapshotValue(alloc, usage_value) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => return error.InvalidEventFrame,
                 }
@@ -1765,7 +1765,7 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
         },
         .usage_checkpointed => blk: {
             const object = try exactObject(value, &.{"usage"});
-            var usage = session_usage.parseSnapshotValue(
+            var usage = session_usage.parseLegacySnapshotValue(
                 alloc,
                 object.get("usage") orelse return error.InvalidEventFrame,
             ) catch |err| switch (err) {
@@ -2864,6 +2864,94 @@ test "history provenance replay frees every partial allocation" {
         checkHistoryProvenanceReplayAllocationFailures,
         .{},
     );
+}
+
+test "legacy cache accounting remains readable without invented totals" {
+    const alloc = std.testing.allocator;
+    const frame = "{\"schema_version\":1,\"log_generation\":\"01010101010101010101010101010101\",\"seq\":2," ++
+        "\"event_id\":\"02020202020202020202020202020202\",\"timestamp_ms\":20,\"kind\":\"usage_checkpointed\",\"payload\":{\"usage\":{" ++
+        "\"billing\":\"complete\",\"api_duration_complete\":true,\"wall_duration_complete\":true,\"code_complete\":true,\"next_sequence\":2,\"settled_through_sequence\":1," ++
+        "\"api_duration_ms\":10,\"wall_duration_ms\":20,\"total_cost\":1,\"input_tokens\":1,\"output_tokens\":3,\"cache_read_tokens\":2,\"cache_write_tokens\":0,\"billable_web_search_calls\":0,\"lines_added\":0,\"lines_removed\":0," ++
+        "\"models\":[{\"model\":\"test/model\",\"first_sequence\":1,\"total_cost\":1,\"input_tokens\":1,\"output_tokens\":3,\"cache_read_tokens\":2,\"cache_write_tokens\":0,\"billable_web_search_calls\":0}],\"pending\":[]}}}\n";
+    var decoded = try decodeFrame(alloc, frame);
+    defer decoded.deinit(alloc);
+    const usage = decoded.event.usage_checkpointed.usage;
+    try session_usage.validateSnapshot(usage);
+    try std.testing.expectEqual(session_usage.Availability.legacy, usage.billing);
+    try std.testing.expectEqual(@as(usize, 0), usage.models.len);
+    try std.testing.expectEqual(@as(usize, 0), usage.pending.len);
+    try std.testing.expect(!usage.api_duration_complete);
+    try std.testing.expectEqual(@as(u64, 2), decoded.seq);
+}
+
+test "legacy usage replacement retains framing and checksum validation" {
+    const alloc = std.testing.allocator;
+    const usage_json = "{\"billing\":\"complete\",\"api_duration_complete\":true,\"wall_duration_complete\":true,\"code_complete\":true,\"next_sequence\":2,\"settled_through_sequence\":1," ++
+        "\"api_duration_ms\":0,\"wall_duration_ms\":0,\"total_cost\":0,\"input_tokens\":1,\"output_tokens\":0,\"cache_read_tokens\":2,\"cache_write_tokens\":0,\"billable_web_search_calls\":0,\"lines_added\":0,\"lines_removed\":0," ++
+        "\"models\":[{\"model\":\"test/model\",\"first_sequence\":1,\"total_cost\":0,\"input_tokens\":1,\"output_tokens\":0,\"cache_read_tokens\":2,\"cache_write_tokens\":0,\"billable_web_search_calls\":0}],\"pending\":[]}";
+    const common = "\"id\":\"legacy-replacement\",\"origin_workspace_root\":\"/workspace\",\"workspace_root\":\"/workspace\",\"created_at_ms\":1,\"updated_at_ms\":2,\"conversation_language\":\"en\",\"preferences\":{\"model\":\"test/model\",\"effort\":\"auto\",\"fast_mode\":false}";
+    const state_json = "{" ++ common ++ ",\"history\":[],\"total_input_tokens\":7,\"total_output_tokens\":3,\"usage\":" ++ usage_json ++ "}";
+    const started = "{\"schema_version\":1,\"log_generation\":\"01010101010101010101010101010101\",\"seq\":1,\"event_id\":\"01010101010101010101010101010101\",\"timestamp_ms\":1,\"kind\":\"session_started\",\"payload\":{" ++
+        "\"id\":\"legacy-replacement\",\"created_at_ms\":1,\"origin_workspace_root\":\"/workspace\",\"workspace_root\":\"/workspace\",\"conversation_language\":\"en\",\"preferences\":{\"model\":\"test/model\",\"effort\":\"auto\",\"fast_mode\":false},\"usage\":" ++ usage_json ++ "}}\n";
+    const replacement_id = [_]u8{9} ** 16;
+    const digest = sha256(state_json);
+    for ([_]bool{ false, true }) |corrupt| {
+        var declared_digest = digest;
+        if (corrupt) declared_digest[0] ^= 1;
+        const transaction = [_]Event{
+            .{ .state_replacement_started = .{ .replacement_id = replacement_id, .reason = .compaction, .encoded_bytes = state_json.len, .sha256 = declared_digest, .chunk_count = 1 } },
+            .{ .state_replacement_chunk = .{ .replacement_id = replacement_id, .chunk_index = 0, .raw_bytes = state_json.len, .chunk_sha256 = digest, .bytes = @constCast(state_json) } },
+            .{ .state_replacement_committed = .{ .replacement_id = replacement_id, .encoded_bytes = state_json.len, .sha256 = declared_digest, .chunk_count = 1 } },
+        };
+        var log: std.Io.Writer.Allocating = .init(alloc);
+        defer log.deinit();
+        try log.writer.writeAll(started);
+        for (transaction, 2..) |event, seq| {
+            const frame = try encodeLegacyFixtureFrame(alloc, .{
+                .log_generation = [_]u8{1} ** 16,
+                .seq = seq,
+                .event_id = [_]u8{@intCast(seq)} ** 16,
+                .timestamp_ms = 2,
+                .event = event,
+            });
+            defer alloc.free(frame);
+            try log.writer.writeAll(frame);
+        }
+        var source = std.Io.Reader.fixed(log.written());
+        if (corrupt) {
+            try std.testing.expectError(error.InvalidReplacement, reduceJsonl(alloc, &source, null));
+        } else {
+            var reduced = try reduceJsonl(alloc, &source, null);
+            defer reduced.deinit(alloc);
+            try std.testing.expectEqualStrings("legacy-replacement", reduced.state.id);
+            try std.testing.expectEqual(@as(u64, 4), reduced.through.?.seq);
+            try std.testing.expectEqual(log.written().len, reduced.bytes_consumed);
+            try std.testing.expectEqual(@as(u64, 7), reduced.state.total_input_tokens);
+            try std.testing.expectEqual(session_usage.Availability.legacy, reduced.state.usage.?.billing);
+            try std.testing.expect(reduced.truncate_from == null);
+
+            var known = session_usage.Usage.initFresh();
+            defer known.deinit(alloc);
+            try known.recordCommittedLines(6, 2);
+            var snapshot = try known.snapshot(alloc);
+            defer snapshot.deinit(alloc);
+            const later_frame = try encodeLegacyFixtureFrame(alloc, .{
+                .log_generation = [_]u8{1} ** 16,
+                .seq = 5,
+                .event_id = [_]u8{5} ** 16,
+                .timestamp_ms = 3,
+                .event = .{ .usage_checkpointed = .{ .usage = snapshot } },
+            });
+            defer alloc.free(later_frame);
+            try log.writer.writeAll(later_frame);
+            var later_source = std.Io.Reader.fixed(log.written());
+            var later = try reduceJsonl(alloc, &later_source, null);
+            defer later.deinit(alloc);
+            try std.testing.expectEqual(session_usage.Availability.complete, later.state.usage.?.billing);
+            try std.testing.expectEqual(@as(u64, 6), later.state.usage.?.lines_added);
+            try std.testing.expectEqual(@as(u64, 5), later.through.?.seq);
+        }
+    }
 }
 
 test "usage checkpoint event decodes a cumulative snapshot" {

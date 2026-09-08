@@ -48,6 +48,15 @@ pub const Owner = struct {
     slots: std.ArrayList(*Slot) = .empty,
     closed: bool = false,
 
+    pub fn hasRunningWork(self: *Owner) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.slots.items) |slot| {
+            if (slot.completion == .running) return true;
+        }
+        return false;
+    }
+
     pub fn start(self: *Owner, child_id: []const u8) StartError!StartResult {
         while (true) {
             const finished = blk: {

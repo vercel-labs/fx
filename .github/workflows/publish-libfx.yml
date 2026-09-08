@@ -297,6 +297,7 @@ jobs:
 
       - name: Test installed package and diagnostics
         run: |
+          node --experimental-wasm-jspi sdk/tests/test-node-bundled-assets.mjs
           node --experimental-wasm-jspi sdk/tests/test-node-async-assets.mjs sdk/dist/libfx
           node sdk/tests/test-packed-example.mjs libfx-package.tgz native esm
           node --no-experimental-require-module sdk/tests/test-packed-example.mjs libfx-package.tgz native cjs
@@ -314,7 +315,10 @@ jobs:
       - name: Test Next development, production and isolated output
         env:
           LIBFX_TEST_ARTIFACT_ROOT: ${{ runner.temp }}/libfx-package-evidence
-        run: node sdk/tests/test-next-package.mjs libfx-package.tgz
+        run: |
+          node sdk/tests/test-next-package.mjs libfx-package.tgz
+          node sdk/tests/test-next-package.mjs libfx-package.tgz --webpack
+          node sdk/tests/test-next-package.mjs libfx-package.tgz --next15
 
       - name: Retain package qualification evidence
         if: always()
@@ -415,6 +419,8 @@ jobs:
           node --experimental-wasm-jspi sdk/tests/test-packed-example.mjs libfx-registry.tgz wasm esm
           node --experimental-wasm-jspi --no-experimental-require-module sdk/tests/test-packed-example.mjs libfx-registry.tgz wasm cjs
           node sdk/tests/test-next-package.mjs libfx-registry.tgz
+          node sdk/tests/test-next-package.mjs libfx-registry.tgz --webpack
+          node sdk/tests/test-next-package.mjs libfx-registry.tgz --next15
       - name: Retain registry qualification evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

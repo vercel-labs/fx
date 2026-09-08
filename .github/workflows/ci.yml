@@ -189,12 +189,27 @@ jobs:
               node sdk/tests/test-host-tool-cancel.mjs native
             '
 
+      - name: Build foreign addons for package qualification
+        run: |
+          mkdir -p native-addons
+          cp zig-out/lib/libfx.node native-addons/libfx.linux-x64.node
+          prefix="$(mktemp -d "$RUNNER_TEMP/libfx-linux-arm64.XXXXXX")"
+          zig build libfx-napi -Dnapi-surface=core -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-gnu.2.34 -Dcpu=baseline --prefix "$prefix"
+          cp "$prefix/lib/libfx.node" native-addons/libfx.linux-arm64.node
+          prefix="$(mktemp -d "$RUNNER_TEMP/libfx-darwin-x64.XXXXXX")"
+          zig build libfx-napi -Dnapi-surface=core -Doptimize=ReleaseSafe -Dtarget=x86_64-macos -Dcpu=baseline --prefix "$prefix"
+          cp "$prefix/lib/libfx.node" native-addons/libfx.darwin-x64.node
+          prefix="$(mktemp -d "$RUNNER_TEMP/libfx-darwin-arm64.XXXXXX")"
+          zig build libfx-napi -Dnapi-surface=core -Doptimize=ReleaseSafe -Dtarget=aarch64-macos -Dcpu=baseline --prefix "$prefix"
+          cp "$prefix/lib/libfx.node" native-addons/libfx.darwin-arm64.node
+
       - name: Test Node package and backend diagnostics
         run: |
           node --experimental-wasm-jspi sdk/tests/test-backend-info.mjs
+          node --experimental-wasm-jspi sdk/tests/test-node-bundled-assets.mjs
           node sdk/tests/test-node-package.mjs
           node sdk/tests/test-term-demo-package.mjs
-          node sdk/scripts/package-libfx.mjs sdk/dist/libfx
+          node sdk/scripts/package-libfx.mjs sdk/dist/libfx native-addons/libfx.linux-x64.node native-addons/libfx.linux-arm64.node native-addons/libfx.darwin-x64.node native-addons/libfx.darwin-arm64.node
           node --experimental-wasm-jspi sdk/tests/test-node-async-assets.mjs sdk/dist/libfx
           npm pack ./sdk/dist/libfx --ignore-scripts --json > /tmp/libfx-pack.json
           mv "$(node -p 'require("/tmp/libfx-pack.json")[0].filename')" /tmp/libfx-package.tgz
@@ -215,7 +230,10 @@ jobs:
       - name: Test installed package through Next
         env:
           LIBFX_TEST_ARTIFACT_ROOT: ${{ runner.temp }}/libfx-package-evidence
-        run: node sdk/tests/test-next-package.mjs /tmp/libfx-package.tgz
+        run: |
+          node sdk/tests/test-next-package.mjs /tmp/libfx-package.tgz
+          node sdk/tests/test-next-package.mjs /tmp/libfx-package.tgz --webpack
+          node sdk/tests/test-next-package.mjs /tmp/libfx-package.tgz --next15
 
       - name: Retain package qualification evidence
         if: always()

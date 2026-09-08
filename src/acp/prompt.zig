@@ -38,7 +38,6 @@ const session_usage = @import("../core/session/session_usage.zig");
 const subagent_agent_adapter = @import("../core/subagent/agent_adapter.zig");
 const subagent_domain = @import("../core/subagent/domain.zig");
 const subagent_execution = @import("../core/subagent/execution.zig");
-const subagent_resume_admission = @import("../core/subagent/resume_admission.zig");
 const usage_recovery = @import("../core/session/usage_recovery.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
 const skill_invocation = @import("../core/skills/skill_invocation.zig");
@@ -154,7 +153,6 @@ const AcpContext = struct {
     /// session/set_mode changes never mutate a running turn.
     captured_mode: ?[]const u8 = null,
     captured_permission_mode: ?PermissionMode = null,
-    retain_external_root_user_turn: bool = false,
     current_prompt_input: ?*ParsedPromptInput = null,
 
     fn deinitPublishedToolCalls(self: *AcpContext) void {
@@ -644,6 +642,11 @@ pub fn handlePrompt(
     const session = if (state.active_session) |*active| active else return .{
         .rpc_error = no_active_session_rpc_error,
     };
+    {
+        session.session_write_mutex.lockUncancelable(io_mod.getIo());
+        defer session.session_write_mutex.unlock(io_mod.getIo());
+        if (session.writable) |*loaded| try loaded.requireWritable();
+    }
     if (!try server.selectCredentialForProvider(state, session.provider)) {
         return .{ .rpc_error = .{
             .code = ErrorCode.invalid_request,
@@ -663,8 +666,15 @@ pub fn handlePrompt(
         },
     };
 
-    const prior_image_catalog = try session.session_rt.snapshotImageCatalog(alloc, &.{});
+    var prior_image_catalog = try session.session_rt.snapshotImageCatalog(alloc, &.{});
     defer types.freeImageAttachmentSlice(alloc, prior_image_catalog);
+    if (session.writable) |writable| {
+        if (writable.state.recovery_checkpoint) |checkpoint| {
+            const merged = try session_runtime.merge_image_catalog_history_turn(alloc, prior_image_catalog, checkpoint.interruptedTurn());
+            types.freeImageAttachmentSlice(alloc, prior_image_catalog);
+            prior_image_catalog = merged;
+        }
+    }
     const next_image_id = (try image_attachments.calculate_next_image_id(prior_image_catalog)).next_id;
     var prompt_input = parsePromptInputWithFirstImageId(alloc, params, next_image_id) catch |err|
         return promptInputFailure(err);
@@ -743,7 +753,7 @@ pub fn handlePrompt(
         if (writable.conversation_writer.turn_open) {
             const checkpoint = writable.state.recovery_checkpoint orelse
                 return error.InvalidRecoveryCheckpoint;
-            try persistAcpHistoryTurn(alloc, session, checkpoint.interruptedTurn(), false, null);
+            try persistAcpHistoryTurn(alloc, session, checkpoint.interruptedTurn(), null);
         }
     }
 
@@ -779,8 +789,11 @@ pub fn handlePrompt(
     defer alloc.free(root_user_intent_context);
 
     const current_images = if (recovery_checkpoint) |checkpoint| checkpoint.user.images else prompt_input.images;
-    const authorized_image_catalog = try session.session_rt.snapshotImageCatalog(alloc, current_images);
-    defer types.freeImageAttachmentSlice(alloc, authorized_image_catalog);
+    const authorized_image_catalog = if (recovery_checkpoint != null)
+        prior_image_catalog
+    else
+        try session.session_rt.snapshotImageCatalog(alloc, current_images);
+    defer if (recovery_checkpoint == null) types.freeImageAttachmentSlice(alloc, authorized_image_catalog);
 
     const job: worker_runtime.QueuedPrompt = .{
         .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else 0,
@@ -838,7 +851,6 @@ pub fn handlePrompt(
             recovery_checkpoint == null
     else
         false;
-    ctx.retain_external_root_user_turn = current_prompt_is_root_authority;
     var agent_config = buildAgentConfig(state, session, .{
         .skill_catalog = .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
         .host_instructions = host_instructions,
@@ -1468,10 +1480,10 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
     }, arena, messages);
 }
 
-fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
+fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(ChatMessage)) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     try ctx.state.cfg.context_registry.appendDefaultStatic(.{
-        .project_context = ctx.modelVisibleProjectContext(),
+        .project_context = project_context orelse ctx.modelVisibleProjectContext(),
     }, arena, messages);
     if (ctx.state.cfg.minimal_kernel) return;
     const active_session = if (ctx.state.active_session) |*session| session else null;
@@ -1935,7 +1947,6 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
             ctx.alloc,
             session,
             turn,
-            ctx.retain_external_root_user_turn,
             ctx.current_prompt_input,
         );
     }
@@ -1945,7 +1956,6 @@ fn persistAcpHistoryTurn(
     alloc: Allocator,
     session: *server.ActiveSessionState,
     turn: HistoryTurn,
-    prompt_is_root_authority: bool,
     current_prompt_input: ?*ParsedPromptInput,
 ) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
@@ -1967,14 +1977,7 @@ fn persistAcpHistoryTurn(
         return;
     };
     try writable.prepareHistoryTurnForCommit(alloc, &prepared);
-    try subagent_resume_admission.retainExternalRootUserTurn(
-        session.store,
-        alloc,
-        writable,
-        prepared,
-        prompt_is_root_authority,
-    );
-    _ = try writable.appendEvent(
+    _ = writable.appendEvent(
         alloc,
         .{ .history_turn_committed = .{
             .conversation_language = session.session_rt.languageSnapshot(),
@@ -1983,7 +1986,12 @@ fn persistAcpHistoryTurn(
             .turn = prepared,
         } },
         io_mod.milliTimestamp(),
-    );
+    ) catch |err| {
+        if (err == error.SessionPersistenceUncertain) {
+            if (current_prompt_input) |input| input.retainImageSnapshots();
+        }
+        return err;
+    };
     session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
     prepared_owned = false;
     if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
@@ -2003,7 +2011,12 @@ fn commitContextCompaction(
     var prepared_owned = true;
     defer if (prepared_owned) types.freeHistoryTurnSlice(ctx.alloc, prepared);
     if (session.writable) |*writable| {
-        _ = try writable.commitContextCompaction(ctx.alloc, summary, active_prefix, retained_from, io_mod.milliTimestamp());
+        _ = writable.commitContextCompaction(ctx.alloc, summary, active_prefix, retained_from, io_mod.milliTimestamp()) catch |err| {
+            if (err == error.SessionPersistenceUncertain and active_prefix != null) {
+                if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
+            }
+            return err;
+        };
         if (active_prefix != null) {
             if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
         }
@@ -2051,6 +2064,9 @@ fn setRecoveryCheckpoint(
     checkpoint: session_codec.RecoveryCheckpoint,
 ) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    errdefer |err| if (err == error.SessionPersistenceUncertain) {
+        if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
+    };
     const session = if (ctx.state.active_session) |*value| value else return error.SessionPersistenceUnavailable;
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
@@ -2061,6 +2077,7 @@ fn setRecoveryCheckpoint(
         .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } },
         now_ms,
     );
+    if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
 }
 
 /// Stores grants on the active ACP session without persisting them.
@@ -4085,7 +4102,7 @@ test "ACP registry callbacks preserve snapshot bytes before transient context" {
     defer messages.deinit(arena);
     try messages.append(arena, .{ .role = .system, .content = "base system" });
 
-    try deps.append_static_context.?(deps.ctx, arena, &messages);
+    try deps.append_static_context.?(deps.ctx, arena, null, &messages);
     try deps.append_runtime_context(deps.ctx, arena, &messages);
 
     try std.testing.expectEqual(@as(usize, 4), messages.items.len);
@@ -4263,7 +4280,7 @@ test "ACP prompt projection configures web search then blocks native execution" 
     defer messages.deinit(arena);
     const deps = agentRuntimeDeps(&ctx);
     const append_static = deps.append_static_context orelse return error.TestExpectedEqual;
-    try append_static(deps.ctx, arena, &messages);
+    try append_static(deps.ctx, arena, null, &messages);
     try deps.append_runtime_context(deps.ctx, arena, &messages);
 
     try std.testing.expectEqualStrings("stale-key", state.web_search_runtime.api_key);

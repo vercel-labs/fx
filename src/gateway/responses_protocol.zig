@@ -33,6 +33,7 @@ pub fn selectReplayParts(alloc: std.mem.Allocator, replay: ?types.ProviderReplay
         count += 1;
     }
     if (count == 0) return null;
+    if (count == parsed.value.array.items.len) return source;
     out.writer.writeByte(']') catch return error.OutOfMemory;
     return .{ .source = source.source, .parts_json = try out.toOwnedSlice() };
 }
@@ -301,6 +302,16 @@ test "Responses replay filtering cleans up allocation failures" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+test "Responses unchanged replay projection borrows reasoning state" {
+    const source: types.ProviderReplay = .{
+        .source = .{ .provider = .codex, .model = "fixture-model" },
+        .parts_json = "[ {\"type\":\"reasoning\",\"encrypted_content\":\"kept\"} ]",
+    };
+    const selected = (try selectReplayParts(std.testing.allocator, source, &.{}, false, true)).?;
+    try std.testing.expectEqual(source.parts_json.ptr, selected.parts_json.ptr);
+    try std.testing.expectEqualStrings(source.parts_json, selected.parts_json);
 }
 
 test "Responses request preserves assistant commentary phase" {

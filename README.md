@@ -119,7 +119,11 @@ Repeated continuation reuses validated summaries of unchanged older sessions ins
 
 Older sessions that saved Vercel connection settings can be opened through `-r`, `/resume`, `-c`, or an exact ID. Migration preserves their model settings and keeps unfinished responses as interrupted history, without replaying old requests or restoring saved credential references.
 
-If a saved conversation is damaged, run `fx session recover <id>` to copy its validated prefix into a new session. Recovery preserves checkpoint boundaries and referenced result files, leaves the original unchanged, and prints the new session ID. Records after the damaged boundary are not included, and recovery does not rerun commands. Healthy conversations can be resumed without recovery.
+If a saved conversation is damaged, run `fx session recover <id>` to copy its validated prefix into a new session. Recovery preserves checkpoint boundaries and referenced result files, leaves the original unchanged, and prints the new session ID. Records after the damaged boundary are not included, and recovery does not rerun commands. If only accounting is corrupt, recovery keeps the conversation and marks historical usage as incomplete in the copy; the original accounting file remains unchanged. Healthy conversations can be resumed without recovery. Paused requests retain their captured images across errors and restarts. Continuing uses those saved images even if the original files move or change; missing or corrupted saved images produce a recovery error.
+
+A saved session has one writer until it closes. Suspending it with Ctrl+Z keeps its lock, so another process trying to resume the same session gets `SessionBusy`. Foregrounding preserves the current conversation and draft without reloading them.
+
+Recovery only reports that no repair is needed after confirming the saved session can be loaded. If a final session save fails during interactive shutdown, fx reports the failure and exits with a nonzero status after cleanup, without a successful resume hint or automatic upgrade relaunch.
 
 New sessions appear in resume selection only after their initial files are ready. Incomplete creation folders left by older builds do not block healthy conversations from resuming with `-c`; those folders remain available for diagnosis and are not deleted.
 
@@ -131,13 +135,15 @@ Run `/trace` to create a private Markdown diagnostic with logs, session context,
 
 fx automatically summarizes a long session into a fresh context window when the active model request reaches 80% of its usable input capacity, then continues the same turn. Run `/compact` to create the same durable handoff immediately and wait for your next prompt. Manual compaction refreshes the selected login when needed; Ctrl+C cancels preparation. If authentication fails, the chat stays open and unchanged so you can reconnect and retry `/compact`.
 
+Context estimates adjust to observed provider usage, including when a local estimate is too high. Compaction budgets the recent reasoning history it keeps and can retain fewer complete exchanges when needed to leave room for the summary.
+
 Compaction handoffs remain internal context for the model. Resuming a session and opening its full transcript show the conversation and tool activity, not internal summaries or operation ledgers.
 
 Saved conversations preserve original assistant replies and compatible provider continuation data. Display formatting does not rewrite saved text, and hook-driven continuation keeps earlier replies separate from the final response.
 
 In saved sessions, oversized `read_tool_result` responses keep a complete terminal-safe backing copy even when the inline response is clipped. Compaction and later retrieval preserve that copy without masking the explicitly requested text again.
 
-Resuming an older session upgrades its saved permissions and skips empty legacy file-change entries while keeping the conversation and tool results. Cancelled tools remain recorded as failures and do not prevent later compaction. If the model returns an empty compaction summary, fx retries the summary once without repeating tools. Cancellation or another failed summary leaves the previous context intact.
+Resuming an older session upgrades its saved permissions and skips empty legacy file-change entries while keeping the conversation and tool results. Historical cache-token accounting no longer prevents an otherwise valid older session from resuming; incompatible usage totals are marked unavailable. Cancelled tools remain recorded as failures and do not prevent later compaction. If the model returns an empty compaction summary, fx retries the summary once without repeating tools. Cancellation or another failed summary leaves the previous context intact.
 
 Use `fx ask` for a single request:
 

@@ -202,7 +202,7 @@ pub const AgentRuntimeDeps = struct {
     prepare_parent_turn_context: ?*const fn (ctx: *anyopaque, arena: Allocator) anyerror!?PreparedParentTurnContext = null,
     acknowledge_parent_turn_context: ?*const fn (ctx: *anyopaque, arena: Allocator, acknowledgements: []const ParentTurnDeliveryAck) void = null,
     append_runtime_context: *const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void,
-    append_static_context: ?*const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void = null,
+    append_static_context: ?*const fn (ctx: *anyopaque, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(ChatMessage)) anyerror!void = null,
     validate_tool_call: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall) anyerror!ToolCallValidationResult = null,
     snapshot_mcp_definition: ?*const fn (*anyopaque, Allocator, []const u8, types.McpToolBinding) anyerror!@import("../../tooling/tool_mcp_runtime.zig").DefinitionSnapshot = null,
     prepare_skill_call: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, locations: ?*const skill_contract.Locations) anyerror!skill_contract.CallPreparation = null,

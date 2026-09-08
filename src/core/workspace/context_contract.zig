@@ -130,6 +130,8 @@ pub const InitialContextInput = struct {
     targets: []const ApplicableTarget = &.{},
     omissions: []const ContextOmissionInput = &.{},
     omission_summary: ?ContextOmissionSummary = null,
+    /// Internal request reconstruction only; ordinary gathers retain their work limits.
+    bounded_reconstruction: bool = false,
     context_limits: context_limits.Values = .{},
 };
 

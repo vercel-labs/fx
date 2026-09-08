@@ -670,3 +670,61 @@ test "selected MCP schemas replace old definitions without duplicate names" {
     try std.testing.expect(properties.contains("new_value"));
     try std.testing.expect(!properties.contains("old_value"));
 }
+
+test "invalid writer at provider completion prevents delivery of executable tool calls" {
+    const Sink = struct {
+        calls: usize = 0,
+        fn persist(raw: *anyopaque, _: session_usage.Snapshot) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == 2) return error.SessionPersistenceUncertain;
+        }
+    };
+    const Provider = struct {
+        fn stream(_: ?*anyopaque, alloc: Allocator, request: agent_stream_provider.ModelRequest) !agent_stream_provider.Result {
+            try request.admission.admit();
+            return .{ .completed = .{
+                .completion = .{ .tool_calls = try types.dupeToolCallSlice(alloc, &.{.{
+                    .id = "unsaved-tool",
+                    .name = "read_file",
+                    .arguments_json = "{}",
+                }}), .finish_reason = .tool_calls },
+                .ownership = .owned,
+            } };
+        }
+        fn event(_: *anyopaque, _: agent_stream_provider.Event) void {}
+    };
+    const alloc = std.testing.allocator;
+    var sink = Sink{};
+    var usage = session_usage.Usage.initFresh();
+    defer usage.deinit(alloc);
+    usage.configureCheckpointSink(.{ .context = &sink, .allocator = alloc, .persist = Sink.persist });
+    var cancel = std.atomic.Value(bool).init(false);
+    var delivery = DeliveryCertainty.init();
+    var evidence: AttemptEvidence = .{};
+    var callback_ctx: u8 = 0;
+    try std.testing.expectError(error.SessionPersistenceUncertain, streamModelCompletion(
+        .{ .stream_fn = Provider.stream },
+        alloc,
+        .{
+            .credential = .{ .direct = .{ .secret_bytes = "test-key" } },
+            .model = "test/model",
+            .retry_count = 1,
+            .messages = &.{},
+            .tool_choice = .auto,
+            .provider_options = .{},
+            .trace_ctx = .{},
+            .content_capture_limit = null,
+            .delivery = &delivery,
+            .attempt_evidence = &evidence,
+            .events = .{ .context = &callback_ctx, .emit_fn = Provider.event },
+            .cancel_flag = &cancel,
+        },
+        &usage,
+        alloc,
+    ));
+    try std.testing.expectEqual(@as(usize, 2), sink.calls);
+    try std.testing.expect(evidence.provider_admitted);
+    try std.testing.expect(usage.checkpoint_mutex.tryLock());
+    usage.checkpoint_mutex.unlock(io_mod.getIo());
+}

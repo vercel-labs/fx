@@ -3,7 +3,6 @@ const domain = @import("domain.zig");
 const io_mod = @import("../shared/io.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const session_store = @import("../session/session_store.zig");
-const session_discovery = @import("../session/session_discovery.zig");
 const types = @import("../shared/types.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
@@ -514,20 +513,23 @@ pub fn isManagedChildSession(
 }
 
 /// Reuses discovery's validated identity while retaining all child-marker checks.
-pub fn isListedManagedChildSession(
+pub fn isDiscoveredManagedChildSession(
     sessions: session_store.Store,
     alloc: Allocator,
-    candidate: *const session_discovery.ReadOnlyCandidate,
+    session_id: []const u8,
+    subagent_child: ?bool,
 ) !bool {
-    if (candidate.subagent_child == true) return true;
-    var capability = sessions.openListedChildCapabilityReadOnly(alloc, candidate.summary.id) catch |err| switch (err) {
+    if (subagent_child == true) return true;
+    var capability = sessions.openListedSubagentControlReadOnly(alloc, session_id) catch |err| switch (err) {
         error.SessionNotFound => return false,
         else => return err,
     };
-    defer capability.deinit();
-    if (try capabilityHasManagedChildMarker(alloc, &capability)) return true;
-    if (candidate.subagent_child) |identity| return identity;
-    return sessions.loadSubagentChildIdentity(alloc, candidate.summary.id) catch |err| switch (err) {
+    defer if (capability) |*value| value.deinit();
+    if (capability) |*value| {
+        if (try capabilityHasManagedChildMarker(alloc, value)) return true;
+    }
+    if (subagent_child) |identity| return identity;
+    return sessions.loadSubagentChildIdentity(alloc, session_id) catch |err| switch (err) {
         error.SessionNotFound => false,
         else => return err,
     };

@@ -8,7 +8,13 @@ const HistoryTurn = types.HistoryTurn;
 const FinishedPrompt = types.FinishedPrompt;
 
 pub const EmitFn = *const fn (*anyopaque, []const u8) anyerror!void;
-pub const FinishFn = *const fn (*anyopaque, FinishedPrompt) anyerror!void;
+pub const FinishResult = union(enum) {
+    committed,
+    presentation_failed: anyerror,
+};
+
+// A result acknowledges history. An error retains the finish for settlement.
+pub const FinishFn = *const fn (*anyopaque, FinishedPrompt) anyerror!FinishResult;
 
 pub const DeferredFinishCommit = enum {
     uncommitted,
@@ -211,7 +217,8 @@ pub const AssistantPacer = struct {
             self.deferred_started_ns = now_ns;
         }
 
-        if (try self.emitPendingBlock(cb) == .drained) {
+        if (try self.emitPendingBlock(cb) == .drained or self.deferred_turn != null) {
+            if (self.pending.items.len > 0) try self.neutralizeIncompleteTail(cb);
             try self.fireDeferredFinish(alloc, now_ns, cb);
         }
     }
@@ -272,9 +279,7 @@ pub const AssistantPacer = struct {
 
     fn fireDeferredFinish(self: *AssistantPacer, alloc: Allocator, now_ns: i128, cb: TickCallbacks) !void {
         if (self.deferred_turn) |finished| {
-            self.deferred_turn = null;
             const started_ns = self.deferred_started_ns;
-            self.deferred_started_ns = null;
             var callback_finished = finished;
             if (callback_finished.summary) |*summary| {
                 const started = started_ns orelse now_ns;
@@ -282,8 +287,14 @@ pub const AssistantPacer = struct {
                     summary.turn_duration_ms += @intCast(@divFloor(now_ns - started, std.time.ns_per_ms));
                 }
             }
-            defer types.freeFinishedPrompt(alloc, callback_finished);
-            try cb.finish_fn(cb.finish_ctx, callback_finished);
+            const result = try cb.finish_fn(cb.finish_ctx, callback_finished);
+            self.deferred_turn = null;
+            self.deferred_started_ns = null;
+            types.freeFinishedPrompt(alloc, finished);
+            switch (result) {
+                .committed => {},
+                .presentation_failed => |err| return err,
+            }
         }
     }
 
@@ -376,10 +387,11 @@ const TestCapture = struct {
         try self.emitted.appendSlice(std.testing.allocator, text);
     }
 
-    fn finish(ctx: *anyopaque, finished: FinishedPrompt) anyerror!void {
+    fn finish(ctx: *anyopaque, finished: FinishedPrompt) anyerror!FinishResult {
         const self: *TestCapture = @ptrCast(@alignCast(ctx));
         self.finish_count += 1;
         self.finish_summary = finished.summary;
+        return .committed;
     }
 
     fn callbacks(self: *TestCapture) TickCallbacks {
@@ -568,7 +580,9 @@ test "presentation boundary preserves callback errors and pending bytes" {
             return error.InjectedEmitFailure;
         }
 
-        fn finish(_: *anyopaque, _: FinishedPrompt) anyerror!void {}
+        fn finish(_: *anyopaque, _: FinishedPrompt) anyerror!FinishResult {
+            return .committed;
+        }
     };
     var ctx: u8 = 0;
     const callbacks: TickCallbacks = .{
@@ -583,6 +597,66 @@ test "presentation boundary preserves callback errors and pending bytes" {
         pacer.flushPresentationAtBoundary(alloc, 0, callbacks),
     );
     try std.testing.expectEqualStrings("\x1b[1", pacer.pending.items);
+}
+
+test "deferred finish retains unacknowledged history without retrying committed presentation" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |committed| {
+        var pacer = AssistantPacer{};
+        defer pacer.deinit(alloc);
+        var cap = TestCapture{};
+        defer cap.deinit();
+        const Finish = struct {
+            committed: bool,
+            fail: bool = true,
+            commits: usize = 0,
+
+            fn run(raw: *anyopaque, _: FinishedPrompt) !FinishResult {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.fail and !self.committed) return error.InjectedPersistenceFailure;
+                self.commits += 1;
+                if (self.fail) return .{ .presentation_failed = error.InjectedPresentationFailure };
+                return .committed;
+            }
+        };
+        var finish = Finish{ .committed = committed };
+        var callbacks = cap.callbacks();
+        callbacks.finish_ctx = &finish;
+        callbacks.finish_fn = Finish.run;
+        try pacer.enqueue(alloc, "tail");
+        const turn = try makeAssistantTurn(alloc);
+        defer types.freeHistoryTurn(alloc, turn);
+        try std.testing.expect(try pacer.deferFinish(alloc, .{ .turn = turn }));
+        try std.testing.expectError(
+            if (committed) error.InjectedPresentationFailure else error.InjectedPersistenceFailure,
+            pacer.tick(alloc, 0, callbacks),
+        );
+        try std.testing.expectEqual(!committed, pacer.deferred_turn != null);
+        finish.fail = false;
+        try pacer.tick(alloc, 1, callbacks);
+        try std.testing.expectEqual(@as(usize, 1), finish.commits);
+        try std.testing.expect(!pacer.hasPending());
+    }
+}
+
+test "finished presentation closes an incomplete text tail" {
+    const alloc = std.testing.allocator;
+    var pacer = AssistantPacer{};
+    defer pacer.deinit(alloc);
+    var cap = TestCapture{};
+    defer cap.deinit();
+    try pacer.enqueue(alloc, "body \xe2\x82");
+    try pacer.tick(alloc, 0, cap.callbacks());
+    try std.testing.expect(pacer.hasPending());
+    const turn = try makeAssistantTurn(alloc);
+    defer types.freeHistoryTurn(alloc, turn);
+    try std.testing.expect(try pacer.deferFinish(alloc, .{ .turn = turn }));
+    try pacer.tick(alloc, 1, cap.callbacks());
+    try std.testing.expectEqual(@as(usize, 1), cap.finish_count);
+    try std.testing.expect(!pacer.hasPending());
+    try std.testing.expect(std.unicode.utf8ValidateSlice(cap.emitted.items));
+    try pacer.tick(alloc, 2, cap.callbacks());
+    try std.testing.expectEqual(@as(usize, 1), cap.finish_count);
 }
 
 test "deferFinish defers and fires when buffer drains" {

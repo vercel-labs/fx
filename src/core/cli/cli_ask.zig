@@ -599,7 +599,6 @@ const AskContext = struct {
     image_snapshot_temp_dir: ?[]u8 = null,
     prompt_snapshot_committed: bool = false,
     last_recovery_status: ?types.RouteRecoveryStatus = null,
-    retain_external_root_user_turn: bool = false,
 
     fn init(alloc: Allocator, cfg: Config, deps: RunDeps, workspace_root: []const u8) AskContext {
         const lifecycle_runtime = hooks.Runtime.init(alloc);
@@ -1642,10 +1641,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             options.images,
     );
     defer types.freeImageAttachmentSlice(alloc, current_images);
-    defer if (options.save_session and !ctx.prompt_snapshot_committed) {
+    defer if (recovery_checkpoint == null and options.save_session and !ctx.prompt_snapshot_committed) {
         image_attachments.deleteUnreferencedImageSnapshots(current_images, restored_image_catalog);
     };
-    if (current_images.len > 0) {
+    if (recovery_checkpoint == null and current_images.len > 0) {
         try ctx.checkCancellation();
         _ = std.math.add(
             usize,
@@ -1657,7 +1656,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         try ctx.checkCancellation();
     }
 
-    const authorized_image_catalog = try ctx.session.snapshotImageCatalog(alloc, current_images);
+    const authorized_image_catalog = if (recovery_checkpoint) |checkpoint|
+        try session_runtime.merge_image_catalog_history_turn(alloc, restored_image_catalog, checkpoint.interruptedTurn())
+    else
+        try ctx.session.snapshotImageCatalog(alloc, current_images);
     defer types.freeImageAttachmentSlice(alloc, authorized_image_catalog);
 
     try ctx.checkCancellation();
@@ -1785,7 +1787,6 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             recovery_checkpoint == null
     else
         false;
-    ctx.retain_external_root_user_turn = current_prompt_is_root_authority;
     options.deps.process_queued_prompt(&ctx.session.agent, &deps, semantic_presentation, ctx.lifecycleContext(), .{
         .system_prompt = cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = cfg.prompt_policy.modelPromptOverlay(ctx.model),
@@ -2156,10 +2157,10 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
     }, arena, messages);
 }
 
-fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
+fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(ChatMessage)) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     try ctx.deps.context_registry.appendDefaultStatic(.{
-        .project_context = ctx.modelVisibleProjectContext(),
+        .project_context = project_context orelse ctx.modelVisibleProjectContext(),
     }, arena, messages);
     var snapshot = if (ctx.mcp) |mcp|
         try mcp.snapshotModelCatalog(arena, ctx.permission_rules, true)
@@ -2854,15 +2855,7 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
         return;
     };
     try writable.prepareHistoryTurnForCommit(ctx.alloc, &prepared);
-    try subagent_resume_admission.retainExternalRootUserTurn(
-        ctx.store,
-        ctx.alloc,
-        writable,
-        prepared,
-        ctx.retain_external_root_user_turn,
-    );
-
-    _ = try writable.appendEvent(
+    _ = writable.appendEvent(
         ctx.alloc,
         .{ .history_turn_committed = .{
             .conversation_language = ctx.session.languageSnapshot(),
@@ -2871,7 +2864,10 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
             .turn = prepared,
         } },
         io_mod.milliTimestamp(),
-    );
+    ) catch |err| {
+        if (err == error.SessionPersistenceUncertain) ctx.prompt_snapshot_committed = true;
+        return err;
+    };
     ctx.session.commitPreparedHistoryEntry(ctx.alloc, prepared);
     prepared_owned = false;
     ctx.prompt_snapshot_committed = true;
@@ -2889,7 +2885,10 @@ fn commitContextCompaction(
     const prepared = try session_runtime.prepareCompactedHistory(ctx.alloc, ctx.session.agent.history.items, summary, retained_from orelse .{ .turns = session_runtime.rawHistoryTurnCount(ctx.session.agent.history.items) });
     errdefer types.freeHistoryTurnSlice(ctx.alloc, prepared);
     if (ctx.writable) |*writable| {
-        _ = try writable.commitContextCompaction(ctx.alloc, summary, active_prefix, retained_from, io_mod.milliTimestamp());
+        _ = writable.commitContextCompaction(ctx.alloc, summary, active_prefix, retained_from, io_mod.milliTimestamp()) catch |err| {
+            if (err == error.SessionPersistenceUncertain and active_prefix != null) ctx.prompt_snapshot_committed = true;
+            return err;
+        };
         if (active_prefix != null) ctx.prompt_snapshot_committed = true;
     }
     ctx.session.commitCompactedHistory(ctx.alloc, prepared);
@@ -2900,6 +2899,9 @@ fn setRecoveryCheckpoint(
     checkpoint: session_codec.RecoveryCheckpoint,
 ) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    errdefer |err| if (err == error.SessionPersistenceUncertain) {
+        ctx.prompt_snapshot_committed = true;
+    };
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
     const writable = if (ctx.writable) |*value| value else return error.SessionPersistenceUnavailable;
@@ -2909,6 +2911,7 @@ fn setRecoveryCheckpoint(
         .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } },
         now_ms,
     );
+    ctx.prompt_snapshot_committed = true;
 }
 
 fn flushAskSessionUsage(
@@ -4644,7 +4647,7 @@ const TestContextRegistryFixture = struct {
         defer messages.deinit(arena);
 
         const append_static = deps.append_static_context orelse return error.TestExpectedEqual;
-        try append_static(deps.ctx, arena, &messages);
+        try append_static(deps.ctx, arena, null, &messages);
         try deps.append_runtime_context(deps.ctx, arena, &messages);
         try std.testing.expectEqual(
             ctx.permission_mode,
@@ -4975,7 +4978,7 @@ test "CLI prompt projection configures web search then blocks native execution" 
     defer messages.deinit(arena);
     const deps = agentRuntimeDeps(&ctx);
     const append_static = deps.append_static_context orelse return error.TestExpectedEqual;
-    try append_static(deps.ctx, arena, &messages);
+    try append_static(deps.ctx, arena, null, &messages);
     try deps.append_runtime_context(deps.ctx, arena, &messages);
 
     try std.testing.expectEqualStrings("stale-key", ctx.web_search_runtime.api_key);
@@ -8630,15 +8633,18 @@ test "json run with missing API key prints diagnostic then final object" {
     );
 }
 
-test "ordinary resumed ask preserves its user after a retained mid-turn checkpoint" {
+test "resumed ask preserves user and image identity after a retained mid-turn checkpoint" {
     const Process = struct {
         fn run(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, _: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
             if (job.recovery_checkpoint) |checkpoint| {
                 try std.testing.expectEqual(@as(u64, 7), checkpoint.turn_id);
                 try std.testing.expectEqualStrings("original request", job.prompt);
+                try std.testing.expectEqual(@as(usize, 7), job.images[0].id);
+                try std.testing.expectEqual(@as(usize, 1), job.authorized_image_catalog.len);
+                try std.testing.expectEqualStrings(job.images[0].snapshot_sha256.?, job.authorized_image_catalog[0].snapshot_sha256.?);
             }
             try deps.propagate_history_turn(deps.ctx, .{ .assistant = .{
-                .user = .{ .text = job.prompt },
+                .user = .{ .text = job.prompt, .images = job.images },
                 .assistant = @constCast("new answer"),
             } });
             try testPushAssistantText(deps, "new answer");
@@ -8662,7 +8668,17 @@ test "ordinary resumed ask preserves its user after a retained mid-turn checkpoi
         defer store.deinit(alloc);
         var state = try testAskDurableState(alloc, "/tmp/fx-test", session_id);
         defer state.deinit(alloc);
-        const old_user = types.UserTurn{ .text = @constCast("original request") };
+        var images = [_]ImageAttachment{.{
+            .id = 7,
+            .path = @constCast("/missing/original.png"),
+            .media_type = @constCast("image/png"),
+            .snapshot_path = @constCast("images/image-7-aaaaaaaaaaaaaaaa.bin"),
+            .snapshot_sha256 = @constCast("a" ** 64),
+        }};
+        const old_user = types.UserTurn{
+            .text = @constCast("original request"),
+            .images = if (case.continue_recovery) &images else &.{},
+        };
         {
             var writable = try store.startWritableSession(alloc, state);
             defer writable.deinit(alloc);

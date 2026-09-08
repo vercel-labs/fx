@@ -105,7 +105,7 @@ const CatalogWorker = struct {
             if (is_active and !candidate.summary.hasResumableContent()) continue;
             if (self.read.cancelled.load(.acquire)) return error.Cancelled;
             var cacheable = candidate.storage == .conversation;
-            const managed = if (!candidate.summary.hasResumableContent()) true else child_state.isListedManagedChildSession(self.read.store, self.alloc, &candidate) catch |err| switch (err) {
+            const managed = if (!candidate.summary.hasResumableContent()) true else child_state.isDiscoveredManagedChildSession(self.read.store, self.alloc, candidate.summary.id, candidate.subagent_child) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => blk: {
                     cacheable = false;
@@ -402,36 +402,6 @@ pub fn resumeForExternalPrompt(
     try ensureExternalMarkerAllowed(store, alloc, loaded.active_id);
     try ensureLoadedExternalPromptAllowed(&loaded);
     return loaded;
-}
-
-/// Direct child prompts no longer exist. Parent-owned child execution resumes
-/// child history internally, so an externally resumed ordinary session has no
-/// subagent root-user evidence to retain.
-pub fn retainExternalRootUserTurn(
-    _: ?session_store.Store,
-    _: Allocator,
-    _: *session_store.LoadedWritableSession,
-    _: session.HistoryTurn,
-    _: bool,
-) !void {}
-
-fn ensureExternalPromptAllowed(
-    store: session_store.Store,
-    alloc: Allocator,
-    session_id: []const u8,
-) !void {
-    const managed = child_state.isManagedChildSession(
-        store,
-        alloc,
-        session_id,
-    ) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.SessionNotFound,
-        error.SessionStoreUnavailable,
-        => return,
-        else => return err,
-    };
-    if (managed) return error.OneOffSessionNotResumable;
 }
 
 fn isVisibleSession(
