@@ -62,6 +62,10 @@ jobs:
           fi
 
           git log "${PREV_TAG}..HEAD" --oneline > /tmp/log.txt
+          git show "${PREV_TAG}:CHANGELOG.md" > /tmp/previous-changelog-full.md 2>/dev/null || true
+          head -n 600 /tmp/previous-changelog-full.md > /tmp/previous-changelog.md
+          git show "${PREV_TAG}:README.md" > /tmp/previous-readme-full.md 2>/dev/null || true
+          head -n 600 /tmp/previous-readme-full.md > /tmp/previous-readme.md
           echo "Diff: ${DIFF_SIZE} bytes, $(wc -l < /tmp/diff.txt) lines"
           echo "Commits: $(wc -l < /tmp/log.txt)"
 
@@ -79,15 +83,26 @@ jobs:
 
           Rules:
           - Base your changelog ONLY on what the diff actually shows. Do not trust commit messages or PR descriptions as authoritative — they go stale. The diff is the source of truth.
+          - Treat added code carefully: it may replace, move, expose, or harden behavior that already existed. Do not describe surrounding context or a rewritten implementation as a newly introduced capability.
+          - Use New Features only when the diff proves users can now do something they could not do at the previous tag. If the capability already existed and this release makes it faster, safer, clearer, broader, or more reliable, classify only that delta as an Improvement or Bug Fix.
+          - Compare every proposed note with the previous release's changelog and README. Never announce a previously published or documented capability as new. Mention it again only when the current diff directly proves a distinct user-visible improvement or fix, and describe only that new delta.
+          - Before writing the final answer, silently verify each bullet: identify the changed lines that support it, decide whether the behavior existed at the previous tag, and remove or reclassify any claim you cannot prove.
           - Write public, user-facing product notes. Describe observable behavior and outcomes, not how the work was implemented or delivered.
           - Always spell the product name fx. Preserve different casing only for exact code identifiers such as FX_MODEL.
           - Group changes under ### Breaking Changes, ### New Features, ### Improvements, ### Bug Fixes, and ### Security as appropriate. Omit empty sections.
-          - Bold a short feature or fix name, then describe the user-visible change after a colon.
+          - Bold a short feature or fix name, then describe the user-visible change after a colon in one concise, concrete sentence.
           - Do not include pull request or issue numbers, links to trackers, commit hashes, contributor names, author attribution, or a Contributors section.
           - Do not include internal details such as repository moves, website or marketing work, CDN layout, CI workflows, tests or fixtures, branch history, or implementation-only refactors. Translate relevant work into its public user outcome or omit it.
           - Do not force every commit into the changelog. Omit changes without a public user outcome.
           - Output ONLY the changelog body (the content that goes between the release markers). Do not include the ## version heading, do not include the <!-- release:start/end --> markers, do not include any preamble or explanation.
           - Do not use emojis.
+
+          Style reference (format and specificity only — never reuse these facts unless the current diff independently supports a new delta):
+          ### Improvements
+          - **Command discovery:** Rank exact, prefix, and substring slash-command matches and highlight the selected help description
+
+          ### Bug Fixes
+          - **Web redirects:** Follow HTTP 303 redirects in `web_fetch`
           SYSPROMPT
 
           cat > /tmp/user-header.txt <<USERHEADER
@@ -99,6 +114,8 @@ jobs:
             --rawfile user_header /tmp/user-header.txt \
             --rawfile diff_stat /tmp/diff-stat.txt \
             --rawfile src_diff /tmp/diff.txt \
+            --rawfile previous_changelog /tmp/previous-changelog.md \
+            --rawfile previous_readme /tmp/previous-readme.md \
             --rawfile commit_log /tmp/log.txt \
             '{
               prompt: [
@@ -108,6 +125,8 @@ jobs:
                   text: (
                     $user_header + "\n\n## Diff stat (file-level summary)\n" + $diff_stat
                     + "\n\n## Source diff (src/ changes — the ground truth)\n" + $src_diff
+                    + "\n\n## Previously published changelog (deduplication and classification context only)\n" + $previous_changelog
+                    + "\n\n## Previous release README (existing public capability context only)\n" + $previous_readme
                     + "\n\n## Commit log (supplementary context only — do not trust these as authoritative)\n" + $commit_log
                   )
                 }]}
@@ -168,6 +187,7 @@ jobs:
           from pathlib import Path
 
           body = Path("/tmp/changelog-body.md").read_text()
+          previous = Path("/tmp/previous-changelog.md").read_text()
           forbidden = {
               "contributor attribution": r"(?im)^###\s+contributors\b|\bcontributors?\b|\bauthors?\b",
               "tracker references": r"(?i)#[0-9]+\b|\bPRs?\s*#?[0-9]+\b|\bpull requests?\b|github\.com/[^\s)]+/(?:pull|issues|commit)/",
@@ -192,6 +212,30 @@ jobs:
           bullets = re.findall(r"(?m)^- .+$", body)
           if not bullets or any(not re.match(r"^- \*\*[^*]+:\*\* \S", bullet) for bullet in bullets):
               errors.append("release bullets must use '- **Name:** Description'")
+
+          normalize = lambda value: re.sub(r"\s+", " ", value.strip()).casefold()
+          previous_bullets = {
+              normalize(bullet)
+              for bullet in re.findall(r"(?m)^- .+$", previous)
+          }
+          if any(normalize(bullet) in previous_bullets for bullet in bullets):
+              errors.append("release notes repeat a previously published bullet")
+
+          new_features = re.search(
+              r"(?ms)^### New Features\s*$\n(.*?)(?=^### |\Z)",
+              body,
+          )
+          previous_titles = {
+              normalize(title)
+              for title in re.findall(r"(?m)^- \*\*([^*]+):\*\*", previous)
+          }
+          if new_features:
+              new_feature_titles = {
+                  normalize(title)
+                  for title in re.findall(r"(?m)^- \*\*([^*]+):\*\*", new_features.group(1))
+              }
+              if new_feature_titles & previous_titles:
+                  errors.append("New Features repeats a previously published feature name")
 
           if errors:
               for error in errors:
