@@ -2620,6 +2620,34 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
   );
 
   test(
+    "question freeform rejects an empty answer and stays focused",
+    async () => {
+      const ctx = await openQuestionPrompt("question freeform required answer");
+
+      await ctx.session.sendLiteralText("3");
+      await waitForQuestionPane(ctx.session, "question freeform empty selected", (value) =>
+        hasQuestionSelection(value, 3, ""),
+      );
+
+      await ctx.session.sendKeys("Enter");
+      await ctx.session.sendLiteralText("required answer");
+      await waitForQuestionPane(ctx.session, "question freeform remained focused", (value) =>
+        hasQuestionSelection(value, 3, "required answer"),
+      );
+      expect(ctx.gateway.requests).toHaveLength(1);
+
+      await ctx.session.sendKeys("Enter");
+      await ctx.session.waitForText("question freeform required answer handled", TIMEOUT);
+      expect(ctx.gateway.requests).toHaveLength(2);
+      expect(
+        requestContainsExactString(ctx.gateway.requests[1]?.body ?? "", "required answer"),
+      ).toBe(true);
+      await assertProcessAliveAndClean(ctx);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "long question content wraps onto aligned continuation rows",
     async () => {
       const finalMarker = "long question answer handled";
