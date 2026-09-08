@@ -32,6 +32,9 @@ var state: State = .{};
 var next_turn_id = std.atomic.Value(u64).init(1);
 var next_step_id = std.atomic.Value(u64).init(1);
 var next_subagent_id = std.atomic.Value(u64).init(1);
+var next_turn_id_wasi: u64 = 1;
+var next_step_id_wasi: u64 = 1;
+var next_subagent_id_wasi: u64 = 1;
 
 pub fn configureFromEnv(alloc: Allocator, workspace_root: []const u8) void {
     const options = loadOptionsFromEnv(alloc, workspace_root) catch return;
@@ -60,17 +63,29 @@ pub fn activeLogPath() ?[]const u8 {
 }
 
 pub fn nextTurnId() u64 {
-    if (comptime @import("builtin").os.tag == .wasi) return 1;
+    if (comptime @import("builtin").os.tag == .wasi) {
+        const id = next_turn_id_wasi;
+        next_turn_id_wasi += 1;
+        return id;
+    }
     return next_turn_id.fetchAdd(1, .seq_cst);
 }
 
 pub fn nextStepId() u64 {
-    if (comptime @import("builtin").os.tag == .wasi) return 1;
+    if (comptime @import("builtin").os.tag == .wasi) {
+        const id = next_step_id_wasi;
+        next_step_id_wasi += 1;
+        return id;
+    }
     return next_step_id.fetchAdd(1, .seq_cst);
 }
 
 pub fn nextSubagentId() u64 {
-    if (comptime @import("builtin").os.tag == .wasi) return 1;
+    if (comptime @import("builtin").os.tag == .wasi) {
+        const id = next_subagent_id_wasi;
+        next_subagent_id_wasi += 1;
+        return id;
+    }
     return next_subagent_id.fetchAdd(1, .seq_cst);
 }
 
@@ -317,6 +332,9 @@ pub fn resetForTest() void {
     next_turn_id.store(1, .seq_cst);
     next_step_id.store(1, .seq_cst);
     next_subagent_id.store(1, .seq_cst);
+    next_turn_id_wasi = 1;
+    next_step_id_wasi = 1;
+    next_subagent_id_wasi = 1;
 }
 
 pub fn configureForTest(alloc: Allocator, path: []const u8) !void {
