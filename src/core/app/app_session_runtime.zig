@@ -2222,13 +2222,18 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn commitGoalState(app: *App) !void {
             if (comptime !@hasField(App, "session_persistence")) return;
+            commitJsHostSnapshot(app, "goal");
+            if (comptime runtime_profile.allows(App, .js_host_sessions)) return;
             if (app.session_persistence.writable == null) {
                 try beginFreshPersistedSession(app);
             }
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-            const loaded = if (app.session_persistence.writable) |*value| value else return;
-            try commitCurrentStateReplacementStrict(app, loaded, .compaction, .{}, false);
+            const loaded = if (app.session_persistence.writable) |*value|
+                value
+            else
+                return error.SessionPersistenceUnavailable;
+            try loaded.persistGoalState(app.alloc, app.goal, io_mod.milliTimestamp());
         }
 
         pub fn persistUsageCheckpoint(

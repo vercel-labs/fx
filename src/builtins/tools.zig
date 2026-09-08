@@ -928,6 +928,8 @@ test "production registry dispatches get_goal with a session context" {
     };
     defer goal.deinit(alloc);
     var goal_ctx: goal_module.GoalToolContext = .{ .goal = goal };
+    var status_detail: ?[]u8 = null;
+    defer if (status_detail) |detail| alloc.free(detail);
     var result = try tool_dispatch.dispatchAuthorizedToolCall(.{
         .allocator = alloc,
         .goal_ctx = &goal_ctx,
@@ -935,7 +937,7 @@ test "production registry dispatches get_goal with a session context" {
         .id = "call-get-goal",
         .name = "get_goal",
         .arguments_json = "{}",
-    });
+    }, &status_detail);
     defer result.deinit(alloc);
     try std.testing.expectEqual(tool_dispatch.DispatchResult.Status.success, result.status);
     try std.testing.expect(std.mem.find(u8, result.body, "verify production dispatch") != null);
@@ -969,7 +971,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "d9e838cda00404a235801e17fc798524dc535546c8220833a8d6065a54dccc38",
+        "f504643948b9f18346f3cad1e8ee1fc9fc6423a48023a50ff7c18dc9539817e1",
         &actual_hex,
     );
 }

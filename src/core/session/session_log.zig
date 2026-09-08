@@ -16,6 +16,7 @@ const result_store = @import("result_store.zig");
 const session_usage = @import("session_usage.zig");
 const session_usage_sidecar = @import("session_usage_sidecar.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
+const goal_store = @import("../goal/goal_store.zig");
 
 const Allocator = std.mem.Allocator;
 const Identifier = session_event.Identifier;
@@ -29,6 +30,7 @@ const publication_intent_file = "commit.pending.json";
 const manifest_file = "session.json";
 const permission_state_file = "permissions.json";
 const recovery_checkpoint_file = "recovery.json";
+const goal_state_file = "goal.json";
 const conversation_migration_temp_file = "events.v4.tmp";
 const conversation_migration_backup_file = "events.v3.backup";
 const checkpoint_file = "checkpoint.json";
@@ -686,6 +688,7 @@ fn writeConversationControlState(
         try session_usage_sidecar.write(alloc, dir, state.id, usage);
     }
     try writeConversationRecoveryState(alloc, dir, state.recovery_checkpoint, conversation_seq);
+    try writeConversationGoalState(alloc, dir, state.id, state.goal);
 }
 
 fn writeConversationRecoveryState(
@@ -719,6 +722,64 @@ fn writeConversationRecoveryState(
         };
         try io_mod.syncVerifiedDir(dir.dir);
     }
+}
+
+fn writeConversationGoalState(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+    goal: ?goal_store.Goal,
+) !void {
+    if (goal) |value| {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.writeAll("{\"session_id\":");
+        try std.json.Stringify.value(session_id, .{}, &out.writer);
+        try out.writer.writeAll(",\"goal\":");
+        try goal_store.writeJson(&out.writer, value);
+        try out.writer.writeByte('}');
+        try io_mod.durableReplaceVerified(alloc, dir, goal_state_file, out.written());
+    } else {
+        dir.dir.deleteFile(io_mod.getIo(), goal_state_file) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        try io_mod.syncVerifiedDir(dir.dir);
+    }
+}
+
+fn loadConversationGoalState(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    expected_session_id: []const u8,
+) !?goal_store.Goal {
+    const bytes = readManagedFileAlloc(
+        alloc,
+        dir,
+        goal_state_file,
+        session_codec.max_session_metadata_bytes,
+    ) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer alloc.free(bytes);
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{
+        .max_value_len = session_codec.max_session_metadata_bytes,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidSessionFormat,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object or parsed.value.object.count() != 2) return error.InvalidSessionFormat;
+    const session_id = parsed.value.object.get("session_id") orelse return error.InvalidSessionFormat;
+    if (session_id != .string or !std.mem.eql(u8, session_id.string, expected_session_id)) {
+        return error.InvalidSessionFormat;
+    }
+    const goal = parsed.value.object.get("goal") orelse return error.InvalidSessionFormat;
+    return goal_store.fromJson(alloc, goal) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidSessionFormat,
+    };
 }
 
 fn loadConversationPermissionState(
@@ -843,6 +904,8 @@ fn load_conversation_state_at_boundary(
     errdefer if (usage) |*snapshot| snapshot.deinit(alloc);
     var permission_state = try loadConversationPermissionState(alloc, dir);
     errdefer permission_state.deinit(alloc);
+    var goal = try loadConversationGoalState(alloc, dir, expected_session_id);
+    errdefer if (goal) |*value| value.deinit(alloc);
     var recovery_checkpoint = if (recovery == null)
         try loadConversationRecoveryCheckpoint(alloc, dir, conversation_seq)
     else
@@ -890,6 +953,7 @@ fn load_conversation_state_at_boundary(
         .last_subagent_work_id = last_work_id,
         .usage = usage,
         .recovery_checkpoint = recovery_checkpoint,
+        .goal = goal,
         .subagent_child = metadata.value.subagent_child,
     };
 }
@@ -2514,6 +2578,27 @@ pub const LoadedWritableSession = struct {
     pub fn requireWritable(self: *const LoadedWritableSession) !void {
         if (self.log.isParked()) return error.SessionWriterParked;
         if (self.conversation_writer.failure) |err| return err;
+    }
+
+    pub fn persistGoalState(
+        self: *LoadedWritableSession,
+        alloc: Allocator,
+        goal: ?goal_store.Goal,
+        timestamp_ms: i64,
+    ) !void {
+        try self.requireWritable();
+        const copy = if (goal) |value| try value.dupe(alloc) else null;
+        errdefer if (copy) |value| {
+            var owned = value;
+            owned.deinit(alloc);
+        };
+        writeConversationGoalState(alloc, &self.log.dir, self.state.id, goal) catch |err| {
+            return self.recordWriteFailure(err);
+        };
+        if (self.state.goal) |*old| old.deinit(alloc);
+        self.state.goal = copy;
+        self.state.updated_at_ms = timestamp_ms;
+        self.freshly_started = false;
     }
 
     fn recordWriteFailure(self: *LoadedWritableSession, err: anyerror) anyerror {
