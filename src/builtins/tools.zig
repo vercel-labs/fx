@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_builtin = @import("builtin");
 const builtin_gateway = @import("gateway.zig");
 const terminal_contracts = @import("../core/terminal/contracts.zig");
 const managed_execution_contract = @import("../core/execution/managed_execution_contract.zig");
@@ -931,6 +932,8 @@ test "production registry dispatches get_goal with a session context" {
     };
     defer goal.deinit(alloc);
     var goal_ctx: goal_module.GoalToolContext = .{ .goal = goal };
+    var status_detail: ?[]u8 = null;
+    defer if (status_detail) |detail| alloc.free(detail);
     var result = try tool_dispatch.dispatchAuthorizedToolCall(.{
         .allocator = alloc,
         .goal_ctx = &goal_ctx,
@@ -938,7 +941,7 @@ test "production registry dispatches get_goal with a session context" {
         .id = "call-get-goal",
         .name = "get_goal",
         .arguments_json = "{}",
-    });
+    }, &status_detail);
     defer result.deinit(alloc);
     try std.testing.expectEqual(tool_dispatch.DispatchResult.Status.success, result.status);
     try std.testing.expect(std.mem.find(u8, result.body, "verify production dispatch") != null);
@@ -972,7 +975,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "d9e838cda00404a235801e17fc798524dc535546c8220833a8d6065a54dccc38",
+        "b8233f5fdd5ee8e4e3a24412c4e2fc8c44e3a7bf46334449c5305504ae558c2b",
         &actual_hex,
     );
 }

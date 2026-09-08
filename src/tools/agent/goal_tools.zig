@@ -281,6 +281,8 @@ test "registered goal tools mutate and read one session context" {
         .on_mutation = MutationSink.commit,
     };
     const registry: tool_dispatch.Registry = .{ .tools = &.{ create_goal, get_goal } };
+    var create_status_detail: ?[]u8 = null;
+    defer if (create_status_detail) |detail| alloc.free(detail);
     var created = try tool_dispatch.dispatchAuthorizedToolCall(.{
         .allocator = alloc,
         .goal_ctx = &goal_ctx,
@@ -288,11 +290,13 @@ test "registered goal tools mutate and read one session context" {
         .id = "call-create",
         .name = "create_goal",
         .arguments_json = "{\"objective\":\"ship it\",\"token_budget\":500}",
-    });
+    }, &create_status_detail);
     defer created.deinit(alloc);
     try std.testing.expectEqual(tool_dispatch.DispatchResult.Status.success, created.status);
     goal_ctx.goal = sink.goal;
 
+    var read_status_detail: ?[]u8 = null;
+    defer if (read_status_detail) |detail| alloc.free(detail);
     var read = try tool_dispatch.dispatchAuthorizedToolCall(.{
         .allocator = alloc,
         .goal_ctx = &goal_ctx,
@@ -300,7 +304,7 @@ test "registered goal tools mutate and read one session context" {
         .id = "call-get",
         .name = "get_goal",
         .arguments_json = "{}",
-    });
+    }, &read_status_detail);
     defer read.deinit(alloc);
     try std.testing.expectEqual(tool_dispatch.DispatchResult.Status.success, read.status);
     try std.testing.expect(std.mem.find(u8, read.body, "ship it") != null);

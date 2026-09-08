@@ -88,7 +88,6 @@ async function launchNoKeyAndWait(record = false): Promise<{
 
 describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
   test(
-<<<<<<< HEAD
     "/compact with no eligible context leaves no transcript notice",
     async () => {
       const launched = await launchNoKeyAndWait(true);
