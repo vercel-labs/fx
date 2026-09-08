@@ -1412,7 +1412,7 @@ pub const WorkerRuntime = struct {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         return !self.worker_processing and
-            self.queued_prompt_count == 0 and
+            self.queuedWorkCountLocked() == 0 and
             self.worker_events.items.len == 0;
     }
 
