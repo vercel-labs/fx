@@ -175,10 +175,10 @@ pub fn CompletionRuntime(comptime App: type) type {
             app.input_runtime.vertical_navigation.reset();
             if (try routeNonSlashPickerMove(app, delta)) {
                 return;
+            } else if (app.input_runtime.composer_history.activeIndex() != null) {
+                try navigatePromptHistory(app, delta);
             } else if (!routeSlashCompletionMove(app, delta)) {
-                if (app.input_runtime.composer_history.activeIndex() != null) {
-                    try navigatePromptHistory(app, delta);
-                } else if (direction == .up and app.input_runtime.edit_state.cursor > 0) {
+                if (direction == .up and app.input_runtime.edit_state.cursor > 0) {
                     _ = horizontal_navigation.move(
                         .draft_start,
                         &app.input_runtime.edit_state,
@@ -244,7 +244,10 @@ pub fn CompletionRuntime(comptime App: type) type {
                 app.shell.layout.content_bottom,
                 true,
             );
-            const visible_slash_count = if (capped.input_extra == 0) visibleSlashCompletionCount(app) else 0;
+            const visible_slash_count = if (app.input_runtime.composer_history.activeIndex() == null and capped.input_extra == 0)
+                visibleSlashCompletionCount(app)
+            else
+                0;
             if (visible_slash_count > 0) {
                 app.input_runtime.vertical_navigation.reset();
                 navigateSlashCompletion(app, picker_delta, visible_slash_count);
