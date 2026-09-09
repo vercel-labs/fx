@@ -1101,6 +1101,39 @@ describe("acp: model-independent", () => {
   });
 
   test(
+    "active ACP session exits cleanly on stdin EOF",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-session-eof-");
+      const gateway = startFakeGateway([]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        const initialized = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
+        expect(initialized.error).toBeUndefined();
+        const created = await client.request("session/new", { mcpServers: [] }, 2) as any;
+        expect(created.error).toBeUndefined();
+        expect(typeof created.result.sessionId).toBe("string");
+        expect(created.result.sessionId.length).toBeGreaterThan(0);
+        await client.readLine(); // consume session/update notification
+
+        const exited = client.waitForExit(5_000);
+        client.endStdin();
+        expect(await exited).toBe(0);
+        expect(client.closed).toBe(true);
+        expect(client.stderr).toBe("");
+        expect(gateway.requests).toHaveLength(0);
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "host-managed ACP sessions stream without local credentials",
     async () => {
       const root = createIsolatedRoot("fx-acp-host-managed-");

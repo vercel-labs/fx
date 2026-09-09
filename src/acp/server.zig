@@ -297,7 +297,6 @@ pub const ServerState = struct {
 
     pub fn deinit(self: *ServerState) void {
         reapActivePrompt(self, true);
-        self.managed_executions.deinit();
         self.terminal_client.deinit();
         closeActiveSession(self) catch |err| {
             debug_trace.logf(
@@ -306,6 +305,7 @@ pub const ServerState = struct {
                 .{@errorName(err)},
             );
         };
+        self.managed_executions.deinit();
         self.workspace_access.deinit(self.alloc);
         if (self.workspace_root.len > 0) self.alloc.free(self.workspace_root);
         if (self.api_key.len > 0) secret.zeroAndFree(self.alloc, self.api_key);
@@ -565,7 +565,7 @@ pub fn releaseActiveSession(state: *ServerState) !void {
         active.session_rt.usage.configurePublicationSink(null);
         active.session_rt.usage.configureCheckpointSink(null);
     }
-    destroyActiveSession(state);
+    try destroyActiveSession(state);
 }
 
 fn closeActiveSession(state: *ServerState) !void {
@@ -575,33 +575,38 @@ fn closeActiveSession(state: *ServerState) !void {
         active.session_rt.usage.cancelReconciliation();
         active.session_rt.usage.finishProfilePublicationsBeforeShutdown();
         flushActiveSessionUsage(state) catch |err| {
-            destroyActiveSession(state);
+            destroyActiveSession(state) catch |cleanup_err| {
+                debug_trace.logf("session", "ACP session cleanup failed after usage flush error err={s}", .{@errorName(cleanup_err)});
+            };
             return err;
         };
         active.session_rt.usage.configurePublicationSink(null);
         active.session_rt.usage.configureCheckpointSink(null);
     }
-    destroyActiveSession(state);
+    try destroyActiveSession(state);
 }
 
-fn destroyActiveSession(state: *ServerState) void {
+fn destroyActiveSession(state: *ServerState) !void {
     const active = if (state.active_session) |*session| session else return;
-    state.alloc.free(active.session_id);
-    state.alloc.free(active.model);
-    types.freePermissionGrantSlice(state.alloc, active.session_grants);
-    if (comptime !host_target.is_wasm) {
-        if (active.mcp) |runtime| {
-            runtime.retireAndWait();
-            runtime.deinit();
-            state.alloc.destroy(runtime);
+    defer {
+        state.alloc.free(active.session_id);
+        state.alloc.free(active.model);
+        types.freePermissionGrantSlice(state.alloc, active.session_grants);
+        if (comptime !host_target.is_wasm) {
+            if (active.mcp) |runtime| {
+                runtime.retireAndWait();
+                runtime.deinit();
+                state.alloc.destroy(runtime);
+            }
         }
+        active.session_rt.deinit(state.alloc);
+        if (active.writable) |*writable| writable.deinit(state.alloc);
+        if (active.store) |*store| store.deinit(state.alloc);
+        if (active.wasm_state) |*wasm_state| wasm_state.deinit(state.alloc);
+        if (active.wasm_revision) |revision| state.alloc.free(revision);
+        state.active_session = null;
     }
-    active.session_rt.deinit(state.alloc);
-    if (active.writable) |*writable| writable.deinit(state.alloc);
-    if (active.store) |*store| store.deinit(state.alloc);
-    if (active.wasm_state) |*wasm_state| wasm_state.deinit(state.alloc);
-    if (active.wasm_revision) |revision| state.alloc.free(revision);
-    state.active_session = null;
+    try state.managed_executions.resetSession();
 }
 
 pub fn enableSubagentHost(state: *ServerState) void {
@@ -2925,6 +2930,83 @@ test "ACP rejects refreshed Codex tokens for another account" {
         null,
     ));
     try std.testing.expectEqualStrings("stale-token", state.api_key);
+}
+
+test "ACP session retirement propagates helper cleanup failure and releases the active session" {
+    const builtin = @import("builtin");
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    for ([_]enum { release, replace, close, close_flush_failure }{ .release, .replace, .close, .close_flush_failure }) |action| {
+        var state = ServerState{
+            .alloc = alloc,
+            .cfg = undefined,
+            .writer = undefined,
+            .managed_executions = managed_execution.Runtime.init(alloc),
+        };
+        defer state.managed_executions.deinit();
+        const session_id = try alloc.dupe(u8, "cleanup-session");
+        const model = alloc.dupe(u8, "old-model") catch |err| {
+            alloc.free(session_id);
+            return err;
+        };
+        state.active_session = .{
+            .session_id = session_id,
+            .model = model,
+            .mode = "default",
+            .workspace_root = "/tmp/workspace",
+            .api_key = "",
+            .agent_step_limit = 0,
+            .max_tool_result_bytes = 4096,
+            .fast_mode = false,
+            .effort = .auto,
+            .first_call_tool_choice = .auto,
+            .permission_mode = .ask,
+            .permission_rules = .{},
+            .session_rt = .{ .max_history_turns = 8 },
+            .cancel_flag = .init(false),
+            .pending_prompt_id = null,
+        };
+        defer destroyActiveSession(&state) catch {};
+        try state.active_session.?.session_rt.appendAssistantHistoryTurn(alloc, "old question", "old answer");
+        try state.active_session.?.retainGrant(alloc, "read_file", "/tmp/workspace/file");
+        state.active_session.?.wasm_revision = try alloc.dupe(u8, "owned-revision");
+
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        if (action == .close_flush_failure) {
+            const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+            defer alloc.free(home);
+            var store = try session_store.Store.initFromHome(alloc, home, "/tmp/workspace");
+            defer store.deinit(alloc);
+            var durable = try acpModelTestState(alloc, "cleanup-session", "/tmp/workspace");
+            defer durable.deinit(alloc);
+            state.active_session.?.writable = try store.startWritableSession(alloc, durable);
+            const usage = &state.active_session.?.session_rt.usage;
+            const sequence = try usage.reserveInvocation();
+            try usage.finishObservedInvocation(alloc, sequence, 1, .observed_generation, "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV", "https://ai-gateway.vercel.sh", null);
+            // Dirty usage without an attached store takes the existing flush
+            // error channel; cleanup must not replace that original error.
+            try std.testing.expectError(error.SessionPersistenceUnavailable, flushActiveSessionUsage(&state));
+        }
+        state.managed_executions.helpers.cleanup = .incomplete;
+        var id_buffer: [64]u8 = undefined;
+        _ = try state.managed_executions.generatedId(&id_buffer);
+        const expected_error = if (action == .close_flush_failure)
+            error.SessionPersistenceUnavailable
+        else
+            error.SessionHelperCleanupIncomplete;
+        var request = try jsonrpc.parseMessage(alloc, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"libfx/new\"}");
+        defer jsonrpc.freeMessage(alloc, &request);
+        try std.testing.expectError(expected_error, switch (action) {
+            .release => releaseActiveSession(&state),
+            .replace => sessions.handleNewLibfxSession(&state, alloc, &request),
+            .close, .close_flush_failure => closeActiveSession(&state),
+        });
+        try std.testing.expect(state.active_session == null);
+        try std.testing.expectEqualStrings("shell-2", try state.managed_executions.generatedId(&id_buffer));
+        try std.testing.expect(!state.managed_executions.shutting_down);
+        try state.managed_executions.resetSession();
+    }
 }
 
 test "ACP usage flush preserves snapshot ownership on allocation failure" {

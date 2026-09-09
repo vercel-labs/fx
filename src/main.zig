@@ -4133,6 +4133,7 @@ test {
     _ = @import("core/config/model_provider.zig");
     _ = provider_runtime;
     _ = @import("acp/prompt.zig");
+    _ = acp_server;
     _ = @import("core/output/activity_status.zig");
     _ = @import("core/agent/agent_runtime.zig");
     _ = @import("core/agent/execution_memory.zig");
@@ -4241,6 +4242,9 @@ test {
     _ = @import("core/execution/managed_execution_contract.zig");
     _ = @import("core/execution/managed_execution.zig");
     _ = @import("core/execution/process_tree.zig");
+    _ = @import("core/execution/command_runner.zig");
+    _ = @import("core/execution/session_helpers.zig");
+    _ = @import("core/execution/scope_memory.zig");
     _ = @import("core/config/prompt_policy.zig");
     _ = @import("core/workspace/record_tape.zig");
     _ = @import("core/session/session.zig");

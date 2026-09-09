@@ -97,6 +97,39 @@ describe("tui: direct-write audit", () => {
   test("accepts owned forms and rejects unowned acquisition or writes", () => {
     const fixtures: Fixture[] = [
       {
+        name: "captured helper stream closure",
+        path: "src/core/execution/command_runner.zig",
+        accepted: true,
+        source: `fn superviseSessionHelpers() void {
+          std.Io.File.stdout().close(io);
+          std.Io.File.stderr().close(io);
+        }`,
+      },
+      {
+        name: "unowned helper stream write",
+        path: "src/core/execution/command_runner.zig",
+        accepted: false,
+        source: `fn superviseSessionHelpers() void {
+          std.Io.File.stderr().writeStreamingAll(io, "unframed");
+        }`,
+      },
+      {
+        name: "helper retirement failure diagnostic",
+        path: "src/core/execution/managed_execution.zig",
+        accepted: true,
+        source: `fn deinitWithOutcome() void {
+          std.Io.File.stderr().writeStreamingAll(io, "cleanup incomplete");
+        }`,
+      },
+      {
+        name: "unowned execution diagnostic",
+        path: "src/core/execution/managed_execution.zig",
+        accepted: false,
+        source: `fn workerMain() void {
+          std.Io.File.stderr().writeStreamingAll(io, "unframed");
+        }`,
+      },
+      {
         name: "terminal probe",
         path: "src/ui/shell_runtime.zig",
         accepted: true,

@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -7,6 +8,7 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -26,9 +28,33 @@ const sessions: TmuxSession[] = [];
 const roots: string[] = [];
 const homes: string[] = [];
 const gateways: Array<ReturnType<typeof startFakeGateway>> = [];
+const helperCleanups: Array<{
+  pidPath: string;
+  scriptPath: string;
+  helper?: HelperProcessIdentity;
+  supervisor?: HelperProcessIdentity;
+}> = [];
 
 afterEach(async () => {
+  const cleanups = helperCleanups.splice(0);
+  // Rescue only after the test has recorded its outcome, never to satisfy /quit.
+  for (const cleanup of cleanups) {
+    try {
+      if (cleanup.supervisor) signalHelperProcess(cleanup.supervisor, "SIGCONT", true);
+    } catch (error) {
+      console.error("Supervisor teardown resume failed:", error);
+    }
+  }
   for (const session of sessions.splice(0)) await session.kill();
+  for (const cleanup of cleanups) {
+    try {
+      // An early assertion can fail before the test reads the helper PID.
+      const identity = cleanup.helper ?? captureSessionHelper(cleanup);
+      if (identity) signalHelperProcess(identity, "SIGKILL");
+    } catch (error) {
+      console.error("Session helper teardown failed:", error);
+    }
+  }
   for (const home of homes.splice(0)) await cleanupTerminalHost(home);
   for (const gateway of gateways.splice(0)) gateway.stop();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -307,6 +333,591 @@ test.skipIf(!tmuxAvailable())(
   },
   TIMEOUT,
 );
+
+function createSessionHelper(fixture: ReturnType<typeof createFixture>) {
+  const scriptPath = join(fixture.workspace, "helper.py");
+  const pidPath = join(fixture.workspace, "helper.pid");
+  const cleanup: (typeof helperCleanups)[number] = { pidPath, scriptPath };
+  helperCleanups.push(cleanup);
+  writeFileSync(scriptPath, `import os
+import pathlib
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+root = pathlib.Path(__file__).parent
+pid_path = root / "helper.pid"
+socket_path = str(root / "helper.sock")
+mode = sys.argv[1]
+signal.alarm(60)
+if mode == "serve":
+    assert os.getsid(0) == os.getpid()
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+        server.bind(socket_path)
+        server.listen(4)
+        pending = root / "helper.pid.tmp"
+        pending.write_text(str(os.getpid()))
+        pending.replace(pid_path)
+        while True:
+            connection, _ = server.accept()
+            with connection:
+                connection.sendall(("HELPER_REPLY:" + str(os.getpid())).encode())
+elif mode == "probe":
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(3)
+        client.connect(socket_path)
+        reply = client.recv(128).decode()
+    assert reply == "HELPER_REPLY:" + pid_path.read_text(), reply
+    print(reply, flush=True)
+else:
+    subprocess.Popen(
+        [sys.executable, __file__, "serve"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 5
+    while not pid_path.exists():
+        if time.monotonic() >= deadline:
+            raise RuntimeError("helper did not become ready")
+        time.sleep(0.01)
+    print("HELPER_STARTED:" + pid_path.read_text(), flush=True)
+    if mode == "hold":
+        signal.pause()
+`);
+  return {
+    pidPath,
+    cleanup,
+    command: (mode: "start" | "probe" | "hold") =>
+      `python3 ${JSON.stringify(scriptPath)} ${mode}`,
+  };
+}
+
+function helperPid(path: string): number {
+  const pid = Number(readFileSync(path, "utf8"));
+  expect(Number.isSafeInteger(pid) && pid > 0).toBe(true);
+  const cleanup = helperCleanups.find((entry) => entry.pidPath === path);
+  if (cleanup && !cleanup.helper) cleanup.helper = captureSessionHelper(cleanup);
+  return pid;
+}
+
+async function expectHelperExited(pid: number, pidPath: string): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      expect((error as NodeJS.ErrnoException).code).toBe("ESRCH");
+      return;
+    }
+    await Bun.sleep(25);
+  }
+  throw new Error(`Session helper ${pid} (${pidPath}) survived cleanup`);
+}
+
+type HelperProcessIdentity = {
+  pid: number;
+  ppid: number;
+  start: string;
+  state: string;
+  command: string;
+  supervisorRootPid?: number;
+};
+
+function helperProcessSnapshot(pid?: number): HelperProcessIdentity[] {
+  let output: string;
+  try {
+    output = execFileSync("ps", [
+      "-ww",
+      ...(pid === undefined ? ["-A"] : ["-p", String(pid)]),
+      "-o", "pid=,ppid=,lstart=,stat=,command=",
+    ], {
+      encoding: "utf8",
+      env: { ...process.env, LC_ALL: "C" },
+      timeout: 1_000,
+      maxBuffer: 16 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (error) {
+    const failure = error as { status?: number; stdout?: string; stderr?: string };
+    if (pid !== undefined && failure.status === 1 &&
+        !failure.stdout?.trim() && !failure.stderr?.trim()) return [];
+    throw error;
+  }
+  return output.split("\n").filter((line) => line.trim()).map((line) => {
+    const match = /^\s*(\d+)\s+(\d+)\s+(\S+\s+\S+\s+\d+\s+\S+\s+\d+)\s+(\S+)\s+(.*)$/.exec(line);
+    if (!match) throw new Error(`Unrecognized helper process identity: ${line}`);
+    return {
+      pid: Number(match[1]),
+      ppid: Number(match[2]),
+      start: match[3]!.replace(/\s+/g, " "),
+      state: match[4]!,
+      command: match[5]!,
+    };
+  });
+}
+
+function captureSessionHelper(
+  cleanup: (typeof helperCleanups)[number],
+): HelperProcessIdentity | undefined {
+  if (!existsSync(cleanup.pidPath)) return undefined;
+  const pid = Number(readFileSync(cleanup.pidPath, "utf8"));
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    throw new Error(`Invalid session helper PID in ${cleanup.pidPath}`);
+  }
+  const identity = helperProcessSnapshot(pid)[0];
+  if (!identity || identity.state.includes("Z")) return undefined;
+  // Prove this fixture's serve process before adopting a PID-file candidate.
+  const command = /^(?:\S*\/)?[Pp]ython(?:\d+(?:\.\d+)*)? (.+) serve$/.exec(identity.command);
+  if (command?.[1] !== cleanup.scriptPath) {
+    throw new Error(`Refusing unowned session helper PID ${pid} from ${cleanup.pidPath}`);
+  }
+  return identity;
+}
+
+function sameHelperProcess(identity: HelperProcessIdentity): HelperProcessIdentity | undefined {
+  const current = helperProcessSnapshot(identity.pid)[0];
+  return current?.pid === identity.pid && current.start === identity.start &&
+      current.command === identity.command
+    ? current
+    : undefined;
+}
+
+function isHelperSupervisor(identity: HelperProcessIdentity, rootPid: number): boolean {
+  if (identity.ppid !== rootPid) return false;
+  const privateCommand = " __fx_helper_session__ ";
+  if (!identity.command.startsWith(`${FX_BIN}${privateCommand}`) &&
+      !(process.platform === "linux" &&
+        identity.command.startsWith(`/proc/self/exe${privateCommand}`))) return false;
+  if (process.platform !== "linux") return true;
+  // argv[0] is spoofable; procfs must identify this checkout's actual executable.
+  try {
+    const actual = statSync(`/proc/${identity.pid}/exe`, { bigint: true });
+    const expected = statSync(FX_BIN, { bigint: true });
+    return actual.dev === expected.dev && actual.ino === expected.ino;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+function signalHelperProcess(
+  identity: HelperProcessIdentity,
+  signal: "SIGKILL" | "SIGSTOP" | "SIGCONT",
+  stoppedOnly = false,
+): boolean {
+  // Re-read PID, start time and full command immediately before each signal.
+  const current = sameHelperProcess(identity);
+  if (!current || current.state.includes("Z") ||
+      (stoppedOnly && !current.state.includes("T"))) return false;
+  if (identity.supervisorRootPid !== undefined &&
+      !isHelperSupervisor(current, identity.supervisorRootPid)) return false;
+  process.kill(current.pid, signal);
+  return true;
+}
+
+async function waitForHelperSupervisor(
+  identity: HelperProcessIdentity,
+  stopped: boolean,
+): Promise<void> {
+  const deadline = performance.now() + 5_000;
+  while (performance.now() < deadline) {
+    const current = sameHelperProcess(identity);
+    if (stopped ? current?.state.includes("T") : !current) return;
+    await Bun.sleep(25);
+  }
+  throw new Error(`Supervisor ${identity.pid} did not become ${stopped ? "stopped" : "absent"}`);
+}
+
+for (const signal of ["SIGKILL", "SIGSTOP"] as const) {
+  test.skipIf(!tmuxAvailable())(
+    `captured shell retained supervisor ${signal} settles without harness rescue`,
+    async () => {
+      const fixture = createFixture(`fx-shell-supervisor-${signal.toLowerCase()}-`);
+      const helper = createSessionHelper(fixture);
+      const { cleanup } = helper;
+      const fxPidPath = join(fixture.workspace, "fx.pid");
+      const wrapperPath = join(fixture.workspace, "launch-fx.sh");
+      writeFileSync(wrapperPath, 'printf "%s" "$$" > "$1"\nexec "$2"\n');
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("helper_before_supervisor_fault", "shell", {
+          request: {
+            action: "run",
+            command: helper.command("start"),
+            profile: "clean",
+            yield_time_ms: 30_000,
+          },
+        }),
+        () => {
+          helperPid(helper.pidPath);
+          const identity = cleanup.helper;
+          expect(identity?.command).toEndWith(`${join(fixture.workspace, "helper.py")} serve`);
+          return fakeGatewayFinalText("SESSION_HELPER_FAULT_BOUNDARY");
+        },
+        fakeGatewayToolCall("shell_after_supervisor_fault", "shell", {
+          request: {
+            action: "run",
+            command: "printf SHELL_AFTER_SUPERVISOR_FAULT",
+            profile: "clean",
+            yield_time_ms: 30_000,
+          },
+        }),
+        fakeGatewayFinalText("SESSION_HELPER_FAULT_FOLLOW_UP_OK"),
+      ]);
+      gateways.push(gateway);
+      const active = await launch(
+        fixture,
+        gateway,
+        `/bin/sh ${[wrapperPath, fxPidPath, FX_BIN].map((path) => JSON.stringify(path)).join(" ")}`,
+      );
+      await active.sendText("Start the redirected helper and finish the shell call.");
+      await active.waitForText("SESSION_HELPER_FAULT_BOUNDARY", TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      expect(gateway.requests).toHaveLength(2);
+      const pid = helperPid(helper.pidPath);
+      const started = toolResultEnvelope(gateway.requests[1]!.body, "helper_before_supervisor_fault");
+      expect(started).toContain('\\"state\\":\\"completed\\"');
+      expect(started).toContain('\\"exit_code\\":0');
+      expect(started).toContain(`HELPER_STARTED:${pid}`);
+      expect(cleanup.helper?.pid).toBe(pid);
+      expect(cleanup.helper?.command).toEndWith(`${join(fixture.workspace, "helper.py")} serve`);
+      expect(sameHelperProcess(cleanup.helper!)).toBeDefined();
+
+      const fx = helperProcessSnapshot(helperPid(fxPidPath))[0]!;
+      expect(fx).toBeDefined();
+      expect(fx.command).toBe(FX_BIN);
+      const supervisors = helperProcessSnapshot().filter((candidate) =>
+        isHelperSupervisor(candidate, fx.pid)
+      );
+      expect(supervisors).toHaveLength(1);
+      const supervisor = { ...supervisors[0]!, supervisorRootPid: fx.pid };
+      cleanup.supervisor = supervisor;
+      expect(supervisor.pid).not.toBe(pid);
+      expect(supervisor.pid).not.toBe(fx.pid);
+      expect(sameHelperProcess(fx)).toBeDefined();
+      expect(sameHelperProcess(supervisor)?.ppid).toBe(fx.pid);
+      expect(signalHelperProcess(supervisor, signal)).toBe(true);
+      await waitForHelperSupervisor(supervisor, signal === "SIGSTOP");
+
+      if (signal === "SIGKILL") {
+        // Only after supervisor death: the same fx must execute a later tool call.
+        expect(sameHelperProcess(fx)).toBeDefined();
+        await active.sendText("Run a fresh shell command after the supervisor fault.");
+        await active.waitForText("SESSION_HELPER_FAULT_FOLLOW_UP_OK", TIMEOUT);
+        await active.waitForComposer(TIMEOUT);
+        expect(gateway.requests).toHaveLength(4);
+        const result = toolResultEnvelope(gateway.requests[3]!.body, "shell_after_supervisor_fault");
+        expect(result).toContain('\\"state\\":\\"completed\\"');
+        expect(result).toContain('\\"exit_code\\":0');
+        expect(result).toContain("SHELL_AFTER_SUPERVISOR_FAULT");
+        expect(toolResultEnvelope(gateway.requests[3]!.body, "helper_before_supervisor_fault")).toBe(started);
+        expect(await active.captureFullScrollback()).toContain("SESSION_HELPER_FAULT_FOLLOW_UP_OK");
+        expect(sameHelperProcess(fx)).toBeDefined();
+      } else {
+        expect(sameHelperProcess(supervisor)?.state).toContain("T");
+        expect(sameHelperProcess(cleanup.helper!)).toBeDefined();
+      }
+
+      // No fixture signal or tmux kill may contribute to these success oracles.
+      await active.sendLiteral("/quit");
+      const quitStarted = performance.now();
+      await active.sendKeys("Enter");
+      expect(await active.waitForSessionEnd(Math.max(1, 5_000 - (performance.now() - quitStarted)))).toBe(true);
+      expect(performance.now() - quitStarted).toBeLessThan(5_000);
+      expect(active.paneStatus()).toEqual({ dead: true, status: 0 });
+      await expectHelperExited(pid, helper.pidPath);
+      expect(sameHelperProcess(supervisor)).toBeUndefined();
+      expect(sameHelperProcess(fx)).toBeUndefined();
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+}
+
+test.skipIf(!tmuxAvailable())(
+  "captured shell session helper survives natural exit across turns and dies on quit",
+  async () => {
+    const fixture = createFixture("fx-shell-helper-");
+    const helper = createSessionHelper(fixture);
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("helper_start", "shell", {
+        request: {
+          action: "run",
+          command: helper.command("start"),
+          profile: "clean",
+          yield_time_ms: 30_000,
+        },
+      }),
+      fakeGatewayFinalText("SESSION_HELPER_STARTED"),
+      fakeGatewayToolCall("helper_probe", "shell", {
+        request: {
+          action: "run",
+          command: helper.command("probe"),
+          profile: "clean",
+          yield_time_ms: 30_000,
+        },
+      }),
+      fakeGatewayFinalText("SESSION_HELPER_RESPONDED"),
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway);
+    await active.sendText("Start the redirected session helper and finish this turn.");
+    await active.waitForText("SESSION_HELPER_STARTED", TIMEOUT);
+    expect(gateway.requests).toHaveLength(2);
+    const pid = helperPid(helper.pidPath);
+    const started = toolResultEnvelope(gateway.requests[1]!.body, "helper_start");
+    expect(started).toContain('\\"state\\":\\"completed\\"');
+    expect(started).toContain('\\"exit_code\\":0');
+    expect(started).toContain(`HELPER_STARTED:${pid}`);
+    process.kill(pid, 0);
+
+    await active.sendText("Ask the same helper to respond from a new captured shell call.");
+    await active.waitForText("SESSION_HELPER_RESPONDED", TIMEOUT);
+    expect(gateway.requests).toHaveLength(4);
+    const probed = toolResultEnvelope(gateway.requests[3]!.body, "helper_probe");
+    expect(probed).toContain('\\"state\\":\\"completed\\"');
+    expect(probed).toContain('\\"exit_code\\":0');
+    expect(probed).toContain(`HELPER_REPLY:${pid}`);
+    expect(helperPid(helper.pidPath)).toBe(pid);
+    process.kill(pid, 0);
+    const scrollback = await active.captureFullScrollback();
+    expect(scrollback).toContain("SESSION_HELPER_STARTED");
+    expect(scrollback).toContain("SESSION_HELPER_RESPONDED");
+
+    await active.sendText("/quit");
+    expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+    await expectHelperExited(pid, helper.pidPath);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "captured shell session helper dies on clear and the replacement session runs shell work",
+  async () => {
+    const fixture = createFixture("fx-shell-helper-clear-");
+    const helper = createSessionHelper(fixture);
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("helper_before_clear", "shell", {
+        request: {
+          action: "run",
+          command: helper.command("start"),
+          profile: "clean",
+          yield_time_ms: 30_000,
+        },
+      }),
+      fakeGatewayFinalText("SESSION_HELPER_BEFORE_CLEAR"),
+      fakeGatewayToolCall("helper_after_clear", "shell", {
+        request: {
+          action: "run",
+          command: "printf SHELL_AFTER_SESSION_CLEAR",
+          profile: "clean",
+          yield_time_ms: 30_000,
+        },
+      }),
+      fakeGatewayFinalText("SESSION_HELPER_CLEAR_OK"),
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway);
+    await active.sendText("Start a redirected helper in this session.");
+    await active.waitForText("SESSION_HELPER_BEFORE_CLEAR", TIMEOUT);
+    expect(gateway.requests).toHaveLength(2);
+    const pid = helperPid(helper.pidPath);
+    const started = toolResultEnvelope(gateway.requests[1]!.body, "helper_before_clear");
+    expect(started).toContain('\\"state\\":\\"completed\\"');
+    expect(started).toContain('\\"exit_code\\":0');
+    expect(started).toContain(`HELPER_STARTED:${pid}`);
+    process.kill(pid, 0);
+
+    await active.sendText("/clear");
+    await expectHelperExited(pid, helper.pidPath);
+    await active.waitForComposer(TIMEOUT);
+    expect(active.isPaneAlive()).toBe(true);
+    await active.sendText("Run a fresh shell command in the replacement session.");
+    await active.waitForText("SESSION_HELPER_CLEAR_OK", TIMEOUT);
+    expect(gateway.requests).toHaveLength(4);
+    expect(gateway.requests[2]!.body).not.toContain("SESSION_HELPER_BEFORE_CLEAR");
+    const result = toolResultEnvelope(gateway.requests[3]!.body, "helper_after_clear");
+    expect(result).toContain('\\"state\\":\\"completed\\"');
+    expect(result).toContain('\\"exit_code\\":0');
+    expect(result).toContain("SHELL_AFTER_SESSION_CLEAR");
+    expect(await active.captureFullScrollback()).toContain("SESSION_HELPER_CLEAR_OK");
+    await active.sendText("/quit");
+    expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "captured shell session helper dies after unexpected fx process death",
+  async () => {
+    const fixture = createFixture("fx-shell-helper-death-");
+    const helper = createSessionHelper(fixture);
+    const fxPidPath = join(fixture.workspace, "fx.pid");
+    const wrapperPath = join(fixture.workspace, "launch-fx.sh");
+    writeFileSync(wrapperPath, 'printf "%s" "$$" > "$1"\nexec "$2"\n');
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("helper_before_death", "shell", {
+        request: {
+          action: "run",
+          command: helper.command("start"),
+          profile: "clean",
+          yield_time_ms: 30_000,
+        },
+      }),
+      fakeGatewayFinalText("SESSION_HELPER_BEFORE_DEATH"),
+    ]);
+    gateways.push(gateway);
+    const active = await launch(
+      fixture,
+      gateway,
+      `/bin/sh ${[wrapperPath, fxPidPath, FX_BIN].map((path) => JSON.stringify(path)).join(" ")}`,
+    );
+    await active.sendText("Start a redirected helper and finish the shell call.");
+    await active.waitForText("SESSION_HELPER_BEFORE_DEATH", TIMEOUT);
+    expect(gateway.requests).toHaveLength(2);
+    const pid = helperPid(helper.pidPath);
+    const fxPid = helperPid(fxPidPath);
+    expect(fxPid).not.toBe(pid);
+    const started = toolResultEnvelope(gateway.requests[1]!.body, "helper_before_death");
+    expect(started).toContain('\\"state\\":\\"completed\\"');
+    expect(started).toContain('\\"exit_code\\":0');
+    expect(started).toContain(`HELPER_STARTED:${pid}`);
+    process.kill(pid, 0);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+
+    // Kill only fx, not its process group or tmux host, before any fixture cleanup.
+    process.kill(fxPid, "SIGKILL");
+    await expectHelperExited(pid, helper.pidPath);
+    expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+    expect(() => process.kill(fxPid, 0)).toThrow();
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "captured shell session helper is cleaned when Ctrl-C cancels the initial run",
+  async () => {
+    const fixture = createFixture("fx-shell-helper-cancel-");
+    const helper = createSessionHelper(fixture);
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("helper_cancel_run", "shell", {
+        request: {
+          action: "run",
+          command: helper.command("hold"),
+          profile: "clean",
+          yield_time_ms: 30_000,
+        },
+      }),
+      fakeGatewayToolCall("helper_after_cancel", "shell", {
+        request: {
+          action: "run",
+          command: "printf SHELL_AFTER_CTRL_C",
+          profile: "clean",
+          yield_time_ms: 30_000,
+        },
+      }),
+      fakeGatewayFinalText("SESSION_HELPER_CTRL_C_OK"),
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway);
+    await active.sendText("Start the helper and wait for the captured command.");
+    await waitForFile(helper.pidPath);
+    const pid = helperPid(helper.pidPath);
+    process.kill(pid, 0);
+    await active.waitForComposer(TIMEOUT);
+    expect(gateway.requests).toHaveLength(1);
+
+    await active.sendKeys("C-c");
+    await active.waitForText("What can fx do differently?", TIMEOUT);
+    await expectHelperExited(pid, helper.pidPath);
+    expect(active.isPaneAlive()).toBe(true);
+    expect(gateway.requests).toHaveLength(1);
+    await active.sendText("Run a fresh shell command after cancellation.");
+    await active.waitForText("SESSION_HELPER_CTRL_C_OK", TIMEOUT);
+    expect(gateway.requests).toHaveLength(3);
+    expect(gateway.requests[1]!.body).toContain("<turn_aborted>");
+    const result = toolResultEnvelope(gateway.requests[2]!.body, "helper_after_cancel");
+    expect(result).toContain('\\"state\\":\\"completed\\"');
+    expect(result).toContain('\\"exit_code\\":0');
+    expect(result).toContain("SHELL_AFTER_CTRL_C");
+    const scrollback = await active.captureFullScrollback();
+    expect(scrollback).toContain("What can fx do differently?");
+    expect(scrollback).toContain("SESSION_HELPER_CTRL_C_OK");
+    await active.sendText("/quit");
+    expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT,
+);
+
+for (const ending of ["timeout", "stop"] as const) {
+  test.skipIf(!tmuxAvailable())(
+    `captured shell session helper is cleaned on ${ending} before later work`,
+    async () => {
+      const fixture = createFixture(`fx-shell-helper-${ending}-`);
+      const helper = createSessionHelper(fixture);
+      let pid = 0;
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("helper_hold", "shell", {
+          request: {
+            action: "run",
+            command: helper.command("hold"),
+            profile: "clean",
+            yield_time_ms: 0,
+            ...(ending === "timeout" ? { timeout_ms: 8_000 } : {}),
+          },
+        }),
+        async (body) => {
+          const sessionId = findSessionId(JSON.parse(body));
+          if (!sessionId) return new Response("missing session id", { status: 500 });
+          await waitForFile(helper.pidPath);
+          pid = helperPid(helper.pidPath);
+          process.kill(pid, 0);
+          return fakeGatewayToolCall("helper_end", "shell", {
+            request: ending === "timeout"
+              ? { action: "interact", session_id: sessionId, yield_time_ms: 30_000 }
+              : { action: "stop", session_id: sessionId, force: true },
+          });
+        },
+        async () => {
+          await expectHelperExited(pid, helper.pidPath);
+          return fakeGatewayToolCall("helper_follow_up", "shell", {
+            request: {
+              action: "run",
+              command: "printf HELPER_CLEANUP_FOLLOW_UP",
+              profile: "clean",
+              yield_time_ms: 30_000,
+            },
+          });
+        },
+        fakeGatewayFinalText("SESSION_HELPER_CLEANUP_OK"),
+      ]);
+      gateways.push(gateway);
+      const active = await launch(fixture, gateway);
+      await active.sendText(`Start the helper, ${ending} its captured command, then run later work.`);
+      await active.waitForText("SESSION_HELPER_CLEANUP_OK", TIMEOUT);
+      expect(gateway.requests).toHaveLength(4);
+      const ended = toolResultEnvelope(gateway.requests[2]!.body, "helper_end");
+      expect(ended).toContain('\\"termination_indeterminate\\":false');
+      if (ending === "timeout") {
+        expect(ended).toContain('\\"error\\":\\"TimeoutExpired\\"');
+      } else {
+        expect(ended).toContain('\\"state\\":\\"stopped\\"');
+      }
+      const followUp = toolResultEnvelope(gateway.requests[3]!.body, "helper_follow_up");
+      expect(followUp).toContain('\\"exit_code\\":0');
+      expect(followUp).toContain("HELPER_CLEANUP_FOLLOW_UP");
+      expect(active.isPaneAlive()).toBe(true);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+}
 
 test.skipIf(!tmuxAvailable())(
   "force stop settles a stubborn captured command and permits later work",

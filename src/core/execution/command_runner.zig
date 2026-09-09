@@ -4,6 +4,8 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const command_contract = @import("command_contract.zig");
 const command_environment = @import("command_environment.zig");
 const process_tree = @import("process_tree.zig");
+const session_helpers = @import("session_helpers.zig");
+const scope_memory = @import("scope_memory.zig");
 const io_mod = @import("../shared/io.zig");
 const self_exe = @import("../shared/self_exe.zig");
 const config_runtime = @import("../config/config_runtime.zig");
@@ -23,6 +25,9 @@ pub const CommandExecutionResult = command_contract.RunCommandResult;
 /// must remain valid for the duration of executeCommand.
 pub const Config = struct {
     max_command_output_bytes: usize,
+    /// Borrowed handoff lease; the worker settles it when publishing completion.
+    /// The worker must finish the lease after every return, including failures.
+    helper_lease: ?*session_helpers.Lease = null,
     cancel_flag: ?*std.atomic.Value(bool) = null,
     force_cancel_flag: ?*std.atomic.Value(bool) = null,
     output_chunk_lifecycle_id: ?types.ToolLifecycleId = null,
@@ -56,6 +61,8 @@ const supports_foreground_session = builtin.link_libc and
     builtin.os.tag != .windows and
     builtin.os.tag != .wasi;
 const foreground_session_token = "__fx_foreground_session__";
+const helper_session_token = "__fx_helper_session__";
+const helper_target_token = "__fx_helper_target__";
 const foreground_session_ready_byte: u8 = 0x1e;
 const foreground_session_release_byte: u8 = 0x06;
 const foreground_session_setup_timeout_ms: i64 = 5000;
@@ -96,7 +103,9 @@ const script_from_stdin_launcher =
 
 pub fn isForegroundSessionInvocation(args: []const [:0]const u8) bool {
     if (comptime !supports_foreground_session) return false;
-    return args.len > 0 and std.mem.eql(u8, args[0], foreground_session_token);
+    return args.len > 0 and (std.mem.eql(u8, args[0], foreground_session_token) or
+        std.mem.eql(u8, args[0], helper_session_token) or
+        std.mem.eql(u8, args[0], helper_target_token));
 }
 
 fn readForegroundSessionInputExact(buffer: []u8) !void {
@@ -115,13 +124,44 @@ fn readForegroundSessionInputExact(buffer: []u8) !void {
     }
 }
 
+fn runHelperTargetBootstrap(args: []const [:0]const u8) !void {
+    if (args.len == 0) return error.InvalidForegroundSessionInvocation;
+    var control: [foreground_session_failure_nonce_hex_bytes + 1]u8 = undefined;
+    try readForegroundSessionInputExact(&control);
+    if (control[foreground_session_failure_nonce_hex_bytes] != foreground_session_release_byte)
+        return error.InvalidForegroundSessionRelease;
+    // The trusted bootstrap cannot run shell startup files before its identity
+    // has been committed to the scope. exec preserves that process identity.
+    const err = std.process.replace(io_mod.getIo(), .{ .argv = args });
+    writeForegroundSessionReplaceFailure(control[0..foreground_session_failure_nonce_hex_bytes], err);
+    std.process.exit(foreground_session_replace_failure_exit_code);
+}
+
+fn receiveScopeMapping() !scope_memory.Mapping {
+    const io = io_mod.getIo();
+    const deadline = std.Io.Clock.awake.now(io).nanoseconds + foreground_session_setup_timeout_ms * std.time.ns_per_ms;
+    while (true) {
+        return scope_memory.Mapping.receive(std.Io.File.stdin()) catch |err| switch (err) {
+            error.WouldBlock => {
+                if (std.Io.Clock.awake.now(io).nanoseconds >= deadline) return error.ForegroundSessionSetupTimedOut;
+                io_mod.sleep(std.time.ns_per_ms);
+                continue;
+            },
+            else => return err,
+        };
+    }
+}
+
 pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
     if (comptime !supports_foreground_session) {
         return error.OperationUnsupported;
     }
-    if (!isForegroundSessionInvocation(args) or args.len < 3) {
-        return error.InvalidForegroundSessionInvocation;
-    }
+    if (!isForegroundSessionInvocation(args)) return error.InvalidForegroundSessionInvocation;
+    if (std.mem.eql(u8, args[0], helper_target_token)) return runHelperTargetBootstrap(args[1..]);
+    if (args.len < 3) return error.InvalidForegroundSessionInvocation;
+    const retain_helpers = std.mem.eql(u8, args[0], helper_session_token);
+    debug_trace.configureFromEnv(std.heap.page_allocator, ".");
+    defer debug_trace.shutdown();
     const deadline_ms = if (std.mem.eql(u8, args[1], "none"))
         null
     else
@@ -135,31 +175,26 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
         &.{foreground_session_ready_byte},
     );
 
+    var scope_mapping: ?scope_memory.Mapping = if (retain_helpers) try receiveScopeMapping() else null;
+    defer if (scope_mapping) |*mapping| mapping.deinit();
     var control: [foreground_session_control_bytes]u8 = undefined;
     try readForegroundSessionInputExact(&control);
     const failure_nonce = control[0..foreground_session_failure_nonce_hex_bytes];
     if (control[foreground_session_release_index] != foreground_session_release_byte) {
         return error.InvalidForegroundSessionRelease;
     }
+    errdefer |err| if (retain_helpers) exitForegroundSessionFailure(true, failure_nonce, err);
     const script_len = std.math.cast(usize, std.mem.readInt(
         u64,
         control[foreground_session_script_length_index..][0..foreground_session_script_length_bytes],
         .little,
-    )) orelse {
-        writeForegroundSessionReplaceFailure(
-            failure_nonce,
-            error.InvalidForegroundSessionScriptLength,
-        );
-        std.process.exit(foreground_session_replace_failure_exit_code);
-    };
+    )) orelse exitForegroundSessionFailure(retain_helpers, failure_nonce, error.InvalidForegroundSessionScriptLength);
     const script = std.heap.page_allocator.alloc(u8, script_len) catch |err| {
-        writeForegroundSessionReplaceFailure(failure_nonce, err);
-        std.process.exit(foreground_session_replace_failure_exit_code);
+        exitForegroundSessionFailure(retain_helpers, failure_nonce, err);
     };
     defer std.heap.page_allocator.free(script);
     readForegroundSessionInputExact(script) catch |err| {
-        writeForegroundSessionReplaceFailure(failure_nonce, err);
-        std.process.exit(foreground_session_replace_failure_exit_code);
+        exitForegroundSessionFailure(retain_helpers, failure_nonce, err);
     };
 
     @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_request).* =
@@ -175,55 +210,73 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
         _ = try std.posix.prctl(.SET_CHILD_SUBREAPER, .{@as(usize, 1)});
     }
     var process_witness: ?process_tree.DarwinProcessWitness =
-        if (comptime builtin.os.tag == .macos)
-            try .init()
-        else
-            null;
+        if (builtin.os.tag == .macos and !retain_helpers) try .init() else null;
     defer if (process_witness) |*witness| witness.deinit();
+    const active_witness: ?*process_tree.DarwinProcessWitness = if (scope_mapping) |*mapping|
+        if (mapping.witness) |*witness| witness else null
+    else if (process_witness) |*witness| witness else null;
+    var descendants = if (scope_mapping) |*mapping|
+        try process_tree.Tracker.initShared(std.heap.page_allocator, mapping.state)
+    else
+        try process_tree.Tracker.init(std.heap.page_allocator);
+    defer descendants.deinit();
+    if (active_witness) |witness| descendants.bindProcessWitness(witness);
+    var target_argv: std.ArrayList([]const u8) = .empty;
+    defer target_argv.deinit(std.heap.page_allocator);
+    const target_executable = if (retain_helpers) try self_exe.pathForReexec(std.heap.page_allocator) else null;
+    defer if (target_executable) |path| std.heap.page_allocator.free(path);
+    if (target_executable) |path| {
+        try target_argv.appendSlice(std.heap.page_allocator, &.{ path, helper_target_token });
+        for (args[2..]) |arg| try target_argv.append(std.heap.page_allocator, arg);
+    }
     const spawn_options: std.process.SpawnOptions = .{
-        .argv = args[2..],
+        .argv = if (retain_helpers) target_argv.items else args[2..],
         .stdin = .pipe,
         .stdout = .inherit,
         .stderr = .inherit,
-        .start_suspended = builtin.os.tag == .macos,
+        .start_suspended = builtin.os.tag == .macos and !retain_helpers,
     };
     var target = (if (comptime builtin.os.tag == .macos)
         darwin_process_spawn.spawn_inheriting_fd(
             zio,
             spawn_options,
-            process_witness.?.childFd(),
+            active_witness.?.childFd(),
         )
     else
         std.process.spawn(zio, spawn_options)) catch |err| {
-        writeForegroundSessionReplaceFailure(failure_nonce, err);
-        std.process.exit(foreground_session_replace_failure_exit_code);
+        exitForegroundSessionFailure(retain_helpers, failure_nonce, err);
     };
-    if (process_witness) |*witness| witness.closeChildCopy();
+    if (active_witness) |witness| witness.closeChildCopy();
     var target_input = target.stdin orelse {
         target.kill(zio);
-        writeForegroundSessionReplaceFailure(
-            failure_nonce,
-            error.ForegroundTargetInputMissing,
-        );
-        std.process.exit(foreground_session_replace_failure_exit_code);
+        exitForegroundSessionFailure(retain_helpers, failure_nonce, error.ForegroundTargetInputMissing);
     };
     target.stdin = null;
+    if (retain_helpers) {
+        releaseHelperTarget(&descendants, target.id.?, target_input, failure_nonce) catch |err| {
+            target_input.close(zio);
+            target.kill(zio);
+            exitForegroundSessionFailure(retain_helpers, failure_nonce, err);
+        };
+    }
     target_input.writeStreamingAll(zio, script) catch |err| {
         target_input.close(zio);
         target.kill(zio);
-        writeForegroundSessionReplaceFailure(failure_nonce, err);
-        std.process.exit(foreground_session_replace_failure_exit_code);
+        exitForegroundSessionFailure(retain_helpers, failure_nonce, err);
     };
     target_input.close(zio);
     const term = waitForForegroundTarget(
         &target,
-        if (process_witness) |*witness| witness else null,
+        &descendants,
         deadline_ms,
+        retain_helpers,
     ) catch |err| {
         target.kill(zio);
-        writeForegroundSessionReplaceFailure(failure_nonce, err);
-        std.process.exit(foreground_session_replace_failure_exit_code);
+        exitForegroundSessionFailure(retain_helpers, failure_nonce, err);
     };
+    if (std.mem.eql(u8, args[0], helper_session_token)) {
+        writeHelperCompletion(term) catch {};
+    }
     exitForegroundSessionSupervisor(term);
 }
 
@@ -354,20 +407,24 @@ const ChildWaiter = struct {
     }
 };
 
+fn releaseHelperTarget(descendants: *process_tree.Tracker, target_pid: std.posix.pid_t, input: std.Io.File, failure_nonce: []const u8) !void {
+    try descendants.refresh(target_pid);
+    try input.writeStreamingAll(io_mod.getIo(), failure_nonce);
+    try input.writeStreamingAll(io_mod.getIo(), &.{foreground_session_release_byte});
+}
+
 fn waitForForegroundTarget(
     target: *std.process.Child,
-    process_witness: ?*const process_tree.DarwinProcessWitness,
+    descendants: *process_tree.Tracker,
     deadline_ms: ?i64,
+    retain_helpers: bool,
 ) !std.process.Child.Term {
     const target_pid = target.id orelse return error.ForegroundTargetMissing;
-    var descendants = try process_tree.Tracker.init(std.heap.page_allocator);
-    defer descendants.deinit();
-    if (process_witness) |witness| {
-        descendants.bindProcessWitness(witness);
-    }
     if (comptime builtin.os.tag == .macos) {
-        try descendants.refresh(target_pid);
-        try std.posix.kill(target_pid, std.posix.SIG.CONT);
+        if (!retain_helpers) {
+            try descendants.refresh(target_pid);
+            try std.posix.kill(target_pid, std.posix.SIG.CONT);
+        }
     }
     var waiter = ChildWaiter.init(target);
     try waiter.start();
@@ -381,11 +438,7 @@ fn waitForForegroundTarget(
         const now_ms = io_mod.milliTimestamp();
         if (owner_alive and !foregroundSessionOwnerAlive()) {
             owner_alive = false;
-            debug_trace.logf(
-                "core",
-                "captured command owner liveness closed; forcing process tree cleanup",
-                .{},
-            );
+            debug_trace.logf("core", "captured command owner liveness closed; forcing process tree cleanup", .{});
         }
         const request = foregroundRequestAtDeadline(
             foregroundSessionTerminationRequest(),
@@ -397,50 +450,96 @@ fn waitForForegroundTarget(
             @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_request).* =
                 @intFromEnum(ForegroundSessionTerminationRequest.force);
         }
-        try refreshForegroundTargetTree(&descendants, target_pid);
-        advanceForegroundTargetTermination(
-            &descendants,
-            request,
-            now_ms,
-            &termination_started_ms,
-            &forced,
-        );
+        try refreshForegroundTargetTree(descendants, target_pid);
+        advanceForegroundTargetTermination(descendants, request, now_ms, &termination_started_ms, &forced);
 
         if (waiter.isReady()) {
             wait_pending = false;
             const term = try waiter.awaitReady();
-            try refreshForegroundTargetTree(&descendants, target_pid);
+            try refreshForegroundTargetTree(descendants, target_pid);
             advanceForegroundTargetTermination(
-                &descendants,
+                descendants,
                 foregroundSessionTerminationRequest(),
                 io_mod.milliTimestamp(),
                 &termination_started_ms,
                 &forced,
             );
             if (termination_started_ms) |started_ms| {
-                try waitForForegroundTargetDescendants(
-                    &descendants,
-                    target_pid,
-                    started_ms,
-                    &forced,
-                );
+                try waitForForegroundTargetDescendants(descendants, target_pid, started_ms, &forced);
                 return term;
             }
-            const count = try cleanupCompletedForegroundTarget(
-                &descendants,
-                target_pid,
-            );
+            if (retain_helpers and term == .exited) {
+                try superviseSessionHelpers(descendants, target_pid, term);
+                exitForegroundSessionSupervisor(term);
+            }
+            const count = try cleanupCompletedForegroundTarget(descendants, target_pid);
             if (count > 0) {
-                debug_trace.logf(
-                    "core",
-                    "captured command target completed; tracked descendants terminated count={d}",
-                    .{count},
-                );
+                debug_trace.logf("core", "captured command target completed; tracked descendants terminated count={d}", .{count});
             }
             return term;
         }
         io_mod.sleep(std.time.ns_per_ms);
     }
+}
+
+fn writeHelperCompletion(term: std.process.Child.Term) !void {
+    var frame: [5]u8 = @splat(0);
+    const value: u32 = switch (term) {
+        .exited => |code| blk: {
+            frame[0] = 0;
+            break :blk code;
+        },
+        .signal => |signal| blk: {
+            frame[0] = 1;
+            break :blk @intCast(@intFromEnum(signal));
+        },
+        .stopped, .unknown => blk: {
+            frame[0] = 2;
+            break :blk 0;
+        },
+    };
+    std.mem.writeInt(u32, frame[1..5], value, .little);
+    try std.Io.File.stdin().writeStreamingAll(io_mod.getIo(), &frame);
+}
+
+fn superviseSessionHelpers(
+    descendants: *process_tree.Tracker,
+    target_pid: std.posix.pid_t,
+    term: std.process.Child.Term,
+) !void {
+    // The shell never inherits this channel. Its result is separate from both
+    // untrusted output and the lifetime of the retained supervisor.
+    writeHelperCompletion(term) catch |err| {
+        _ = try cleanupCompletedForegroundTarget(descendants, target_pid);
+        return err;
+    };
+    std.Io.File.stdout().close(io_mod.getIo());
+    std.Io.File.stderr().close(io_mod.getIo());
+    errdefer _ = cleanupCompletedForegroundTarget(descendants, target_pid) catch descendants.signalAll(std.posix.SIG.KILL);
+    var empty_scans: u8 = 0;
+    while (foregroundSessionOwnerAlive() and foregroundSessionTerminationRequest() == .none) {
+        if (comptime builtin.os.tag == .linux) {
+            // The target waiter has joined; only adopted descendants remain.
+            while (true) {
+                var status: c_int = 0;
+                const pid = std.c.waitpid(-1, &status, std.c.W.NOHANG);
+                if (pid > 0) continue;
+                if (pid == -1 and std.posix.errno(pid) == .INTR) continue;
+                break;
+            }
+        }
+        try refreshForegroundTargetTree(descendants, target_pid);
+        descendants.pruneExited();
+        if (descendants.anyAlive()) {
+            empty_scans = 0;
+        } else {
+            empty_scans += 1;
+            if (empty_scans >= 2) return;
+        }
+        io_mod.sleep(50 * std.time.ns_per_ms);
+    }
+    const count = try cleanupCompletedForegroundTarget(descendants, target_pid);
+    debug_trace.logf("core", "session helper scope closed; descendants terminated count={d}", .{count});
 }
 
 fn cleanupCompletedForegroundTarget(
@@ -563,17 +662,35 @@ fn forceKillForegroundTargetDescendants(
     );
 }
 
-fn writeForegroundSessionReplaceFailure(
-    nonce: []const u8,
-    err: anyerror,
-) void {
+fn exitForegroundSessionFailure(retain_helpers: bool, nonce: []const u8, err: anyerror) noreturn {
+    debug_trace.logf("core", "foreground supervisor failed helper_mode={any} err={s}", .{ retain_helpers, @errorName(err) });
+    writeForegroundSessionSupervisorFailure(
+        if (retain_helpers) std.Io.File.stdin() else null,
+        std.Io.File.stderr(),
+        nonce,
+        err,
+    );
+    std.process.exit(foreground_session_replace_failure_exit_code);
+}
+
+fn writeForegroundSessionSupervisorFailure(control: ?std.Io.File, stderr: std.Io.File, nonce: []const u8, err: anyerror) void {
+    writeForegroundSessionReplaceFailureTo(stderr, nonce, err);
+    // Kind 3 carries no target status; its four payload bytes are reserved zero.
+    if (control) |file| file.writeStreamingAll(io_mod.getIo(), &.{ 3, 0, 0, 0, 0 }) catch {};
+}
+
+fn writeForegroundSessionReplaceFailure(nonce: []const u8, err: anyerror) void {
+    writeForegroundSessionReplaceFailureTo(std.Io.File.stderr(), nonce, err);
+}
+
+fn writeForegroundSessionReplaceFailureTo(file: std.Io.File, nonce: []const u8, err: anyerror) void {
     var buffer: [256]u8 = undefined;
     const message = std.fmt.bufPrint(
         &buffer,
         foreground_session_replace_failure_prefix ++ "{s}:{s}\n",
         .{ nonce, @errorName(err) },
     ) catch foreground_session_replace_failure_prefix ++ "unknown\n";
-    std.Io.File.stderr().writeStreamingAll(io_mod.getIo(), message) catch {};
+    file.writeStreamingAll(io_mod.getIo(), message) catch {};
 }
 
 fn exitForegroundSessionSupervisor(term: std.process.Child.Term) noreturn {
@@ -1111,6 +1228,7 @@ fn executeProcessWithInput(
         null,
         process_group_id,
         .process_group,
+        null,
     );
     const duration_ms = elapsedMs(started_ms, io_mod.milliTimestamp());
 
@@ -1176,9 +1294,18 @@ fn executeProcessWithDetachedSession(
     );
     failure_marker[failure_marker.len - 1] = ':';
 
+    if (cfg.helper_lease) |lease| try lease.reserve();
+    var retained = false;
+    const control_pair = if (cfg.helper_lease != null) try session_helpers.openControlPair() else null;
+    var child_control_closed = false;
+    defer if (control_pair) |pair| {
+        if (!child_control_closed) pair[1].close(io_mod.getIo());
+        if (!retained) pair[0].close(io_mod.getIo());
+    };
+
     var helper_argv: std.ArrayList([]const u8) = .empty;
     try helper_argv.append(scratch, executable);
-    try helper_argv.append(scratch, foreground_session_token);
+    try helper_argv.append(scratch, if (control_pair != null) helper_session_token else foreground_session_token);
     const deadline_ms = ExecutionControl.init(cfg).deadlineMs();
     const supervisor_deadline_ms = foreground_supervisor_fallback_deadline_ms(deadline_ms);
     const deadline_text = if (supervisor_deadline_ms) |value|
@@ -1191,11 +1318,15 @@ fn executeProcessWithDetachedSession(
     const started_ms = io_mod.milliTimestamp();
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = helper_argv.items,
-        .stdin = .pipe,
+        .stdin = if (control_pair) |pair| .{ .file = pair[1] } else .pipe,
         .stdout = .pipe,
         .stderr = .pipe,
         .cwd = .{ .path = cwd },
     });
+    if (control_pair) |pair| {
+        pair[1].close(io_mod.getIo());
+        child_control_closed = true;
+    }
 
     var output = OutputCollector.init(scratch, cfg);
     defer output.deinit();
@@ -1203,16 +1334,35 @@ fn executeProcessWithDetachedSession(
     var phase: ForegroundSessionPhase = .pre_ready;
     var child_needs_cleanup = true;
     errdefer if (child_needs_cleanup) {
-        cleanupForegroundSessionChild(&child, phase);
+        if (cfg.helper_lease) |lease| {
+            _ = lease.retireBorrowed(&child, control_pair.?[0]);
+        } else {
+            cleanupForegroundSessionChild(&child, phase);
+        }
     };
 
     try waitForForegroundSessionReady(&child, cfg);
     phase = .group_ready;
     try ExecutionControl.init(cfg).check();
 
-    const script_write = child.stdin orelse return error.SpawnFailed;
+    const script_write = if (control_pair) |pair| pair[0] else child.stdin orelse return error.SpawnFailed;
     child.stdin = null;
-    defer script_write.close(io_mod.getIo());
+    defer if (control_pair == null) script_write.close(io_mod.getIo());
+    if (cfg.helper_lease) |lease| {
+        const deadline = std.Io.Clock.awake.now(io_mod.getIo()).nanoseconds + foreground_session_setup_timeout_ms * std.time.ns_per_ms;
+        while (true) {
+            try ExecutionControl.init(cfg).check();
+            lease.mapping().send(script_write) catch |err| switch (err) {
+                error.WouldBlock => {
+                    if (std.Io.Clock.awake.now(io_mod.getIo()).nanoseconds >= deadline) return error.ForegroundSessionSetupTimedOut;
+                    io_mod.sleep(std.time.ns_per_ms);
+                    continue;
+                },
+                else => return err,
+            };
+            break;
+        }
+    }
 
     var script_length: [foreground_session_script_length_bytes]u8 = undefined;
     std.mem.writeInt(u64, &script_length, @intCast(script.len), .little);
@@ -1225,6 +1375,7 @@ fn executeProcessWithDetachedSession(
     try script_write.writeStreamingAll(io_mod.getIo(), script);
 
     var launch_failure_probe = ForegroundLaunchFailureProbe.init(&failure_marker);
+    var completion = if (cfg.helper_lease) |lease| HelperCompletion{ .control = script_write, .lease = lease } else null;
     const process_group_id = child.id;
     child_needs_cleanup = false;
     var collected = try collectSpawnedProcess(
@@ -1235,6 +1386,7 @@ fn executeProcessWithDetachedSession(
         &launch_failure_probe,
         process_group_id,
         .foreground_supervisor,
+        if (completion) |*value| value else null,
     );
     collected.source = reconcileForegroundTerminationSource(
         collected.source,
@@ -1243,6 +1395,23 @@ fn executeProcessWithDetachedSession(
     );
     const duration_ms = elapsedMs(started_ms, io_mod.milliTimestamp());
 
+    if (cfg.helper_lease) |lease| {
+        if (child.id != null and collected.source == .natural and collected.status == .exit_code and
+            !cancelRequested(cfg.cancel_flag))
+        {
+            lease.retain(child, script_write);
+            retained = true;
+        } else {
+            _ = lease.retireBorrowed(&child, script_write);
+        }
+    }
+    if (completion) |value| {
+        if (value.outcome) |outcome| {
+            if (outcome == .supervisor_failure) {
+                return authenticatedForegroundFailure(launch_failure_probe) orelse error.ForegroundSessionSupervisorFailed;
+            }
+        }
+    }
     if (foregroundSessionReplacementError(
         collected.status,
         launch_failure_probe,
@@ -1348,6 +1517,10 @@ fn foregroundSessionReplacementError(
         .exit_code => |code| if (code != foreground_session_replace_failure_exit_code) return null,
         else => return null,
     }
+    return authenticatedForegroundFailure(probe);
+}
+
+fn authenticatedForegroundFailure(probe: ForegroundLaunchFailureProbe) ?(std.process.ReplaceError || error{CommandLaunchFailed}) {
     if (probe.status != .failed) return null;
     return probe.replacement_error orelse error.CommandLaunchFailed;
 }
@@ -1393,6 +1566,7 @@ fn executeProcessWithScriptUnisolated(
         null,
         process_group_id,
         .process_group,
+        null,
     );
     const duration_ms = elapsedMs(started_ms, io_mod.milliTimestamp());
 
@@ -2221,7 +2395,53 @@ fn parseReplaceError(name: []const u8) ?std.process.ReplaceError {
     return null;
 }
 
+const HelperCompletion = struct {
+    control: std.Io.File,
+    lease: *session_helpers.Lease,
+    frame: [5]u8 = undefined,
+    received: usize = 0,
+    outcome: ?Outcome = null,
+
+    const Outcome = union(enum) {
+        target: command_contract.CommandStatus,
+        supervisor_failure,
+    };
+
+    fn observe(self: *HelperCompletion) ?Outcome {
+        if (self.outcome) |outcome| return outcome;
+        var fds = [_]std.posix.pollfd{.{ .fd = self.control.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&fds, 0) catch {
+            self.outcome = .{ .target = .indeterminate };
+            return self.outcome;
+        };
+        if (ready == 0) return null;
+        const count = self.control.readStreaming(io_mod.getIo(), &.{self.frame[self.received..]}) catch |err| switch (err) {
+            error.EndOfStream => 0,
+            else => {
+                self.outcome = .{ .target = .indeterminate };
+                return self.outcome;
+            },
+        };
+        if (count == 0) {
+            debug_trace.logf("core", "command termination indeterminate boundary=helper_completion bytes={d}", .{self.received});
+            self.outcome = .{ .target = .indeterminate };
+            return self.outcome;
+        }
+        self.received += count;
+        if (self.received != self.frame.len) return null;
+        const value = std.mem.readInt(u32, self.frame[1..5], .little);
+        self.outcome = switch (self.frame[0]) {
+            0 => .{ .target = if (value <= 255) .{ .exit_code = value } else .indeterminate },
+            1 => .{ .target = .{ .signal = value } },
+            3 => if (value == 0) .supervisor_failure else .{ .target = .indeterminate },
+            else => .{ .target = .indeterminate },
+        };
+        return self.outcome;
+    }
+};
+
 const ProcessObserver = struct {
+    completion: ?*HelperCompletion = null,
     waiter: ChildWaiter,
     process_id: std.process.Child.Id,
     stdout: std.Io.File,
@@ -2256,11 +2476,19 @@ const ProcessObserver = struct {
     }
 
     fn start(self: *ProcessObserver) !void {
+        if (self.completion != null) return;
         if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
         try self.waiter.start();
     }
 
     fn observe(self: *ProcessObserver) ?command_contract.CommandStatus {
+        if (self.completion) |completion| {
+            const outcome = completion.observe() orelse return null;
+            return switch (outcome) {
+                .target => |status| project_observed_status(status, "helper_completion", @tagName(status)),
+                .supervisor_failure => .indeterminate,
+            };
+        }
         if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return null;
         if (!self.waiter.isReady()) return null;
         const term = self.waiter.awaitReady() catch |err| {
@@ -2273,6 +2501,12 @@ const ProcessObserver = struct {
         self: *ProcessObserver,
         source: TerminationSource,
     ) !command_contract.CommandStatus {
+        if (self.completion != null) {
+            while (true) {
+                if (self.observe()) |status| return status;
+                io_mod.sleep(std.time.ns_per_ms);
+            }
+        }
         if (comptime builtin.os.tag != .windows and builtin.os.tag != .wasi) {
             self.waiter.awaitDiscard();
             return self.observe().?;
@@ -2296,6 +2530,14 @@ const ProcessObserver = struct {
     fn statusFromTerm(
         term: std.process.Child.Term,
     ) command_contract.CommandStatus {
+        return project_observed_status(commandStatusFromTerm(term), "child_term", @tagName(std.meta.activeTag(term)));
+    }
+
+    fn project_observed_status(
+        status: command_contract.CommandStatus,
+        boundary: []const u8,
+        term_tag: []const u8,
+    ) command_contract.CommandStatus {
         if (io_mod.getenv("FX_COMMAND_TEST_INDETERMINATE_AFTER_EXIT") != null) {
             debug_trace.logf(
                 "core",
@@ -2304,12 +2546,11 @@ const ProcessObserver = struct {
             );
             return .indeterminate;
         }
-        const status = commandStatusFromTerm(term);
         switch (status) {
             .indeterminate => debug_trace.logf(
                 "core",
-                "command termination became indeterminate boundary=child_term term={s}",
-                .{@tagName(std.meta.activeTag(term))},
+                "command termination became indeterminate boundary={s} term={s}",
+                .{ boundary, term_tag },
             ),
             .exit_code, .signal, .finished => {},
         }
@@ -2346,6 +2587,10 @@ const ProcessObserver = struct {
     }
 
     fn abort(self: *ProcessObserver, process_group_id: ?std.posix.pid_t) void {
+        if (self.completion) |completion| {
+            _ = completion.lease.retireBorrowed(self.waiter.child, completion.control);
+            return;
+        }
         if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
             cleanupChild(self.waiter.child);
             return;
@@ -2405,6 +2650,7 @@ fn collectOutput(
     var force_kill_sent = false;
     var streams_finished = false;
     var output_incomplete = false;
+    var helper_drain_started_ms: ?i64 = null;
 
     while (true) {
         try updateTerminationSignal(
@@ -2420,15 +2666,16 @@ fn collectOutput(
         if (leader_status.* == null) {
             if (observer.observe()) |status| {
                 leader_status.* = status;
+                if (observer.completion != null) helper_drain_started_ms = io_mod.milliTimestamp();
                 if (process_group_id) |pid| {
-                    if (source.* == .natural) {
+                    if (source.* == .natural and observer.completion == null) {
                         terminateRemainingProcessGroup(pid);
                         debug_trace.logf(
                             "core",
                             "captured command leader completed; remaining process group terminated",
                             .{},
                         );
-                    } else {
+                    } else if (source.* != .natural) {
                         debug_trace.logf(
                             "core",
                             "captured command leader completed during {s}; termination cleanup continuing",
@@ -2440,6 +2687,12 @@ fn collectOutput(
         }
 
         const now_ms = io_mod.milliTimestamp();
+        if (helper_drain_started_ms) |started| {
+            if (!streams_finished and now_ms - started >= foreground_target_cleanup_wait_ms) {
+                recordOutputDrainFailure(&output_incomplete, "helper_retained_output_pipe", error.Timeout);
+                break;
+            }
+        }
         if (termination_settle_expired(
             signal_started_ms,
             force_kill_sent,
@@ -2592,13 +2845,13 @@ fn waitForCollectedProcess(
 ) !command_contract.CommandStatus {
     if (leader_status) |status| {
         if (comptime builtin.os.tag != .windows and builtin.os.tag != .wasi) {
-            observer.waiter.awaitDiscard();
+            if (observer.completion == null) observer.waiter.awaitDiscard();
         }
         return status;
     }
     const status = try observer.awaitTermination(source);
     if (process_group_id) |pid| {
-        terminateRemainingProcessGroup(pid);
+        if (observer.completion == null) terminateRemainingProcessGroup(pid);
     }
     return status;
 }
@@ -2617,12 +2870,14 @@ fn collectSpawnedProcess(
     launch_failure_probe: ?*ForegroundLaunchFailureProbe,
     process_group_id: ?std.posix.pid_t,
     termination_protocol: TerminationProtocol,
+    completion: ?*HelperCompletion,
 ) !CollectedTermination {
     var observer = ProcessObserver.init(child) catch |err| {
         cleanupChild(child);
         return err;
     };
     defer observer.deinit();
+    observer.completion = completion;
     observer.start() catch |err| {
         debug_trace.logf(
             "core",
@@ -3198,19 +3453,26 @@ test "target cannot recover replacement nonce from supervisor" {
         .{token_probe},
     );
     defer std.testing.allocator.free(command);
-    const result = try executeCommand(.{
-        .max_command_output_bytes = 4096,
-    }, std.testing.allocator, command, "/tmp");
-    defer std.testing.allocator.free(result.output);
+    for ([_]bool{ false, true }) |retain_helpers| {
+        var owner = session_helpers.Owner.init(std.testing.allocator);
+        defer _ = owner.clear();
+        var lease = session_helpers.Lease{ .owner = &owner };
+        defer _ = lease.finish(false);
+        const result = try executeCommand(.{
+            .max_command_output_bytes = 4096,
+            .helper_lease = if (retain_helpers) &lease else null,
+        }, std.testing.allocator, command, "/tmp");
+        defer std.testing.allocator.free(result.output);
 
-    const foreground = result.command_result.?;
-    try std.testing.expectEqual(@as(?i64, 125), foreground.exit_code);
-    try std.testing.expect(std.mem.find(
-        u8,
-        result.output,
-        foreground_session_replace_failure_prefix,
-    ) != null);
-    try std.testing.expect(std.mem.find(u8, result.output, "FileNotFound") != null);
+        const foreground = result.command_result.?;
+        try std.testing.expectEqual(@as(?i64, 125), foreground.exit_code);
+        try std.testing.expect(std.mem.find(
+            u8,
+            result.output,
+            foreground_session_replace_failure_prefix,
+        ) != null);
+        try std.testing.expect(std.mem.find(u8, result.output, "FileNotFound") != null);
+    }
 }
 
 test "invalid readiness directly kills and reaps helper pid" {
@@ -3331,22 +3593,28 @@ test "foreground session setup has a bounded internal ceiling" {
 test "detached session preserves replacement failure with a zero output budget" {
     if (comptime !supports_foreground_session) return;
 
-    var scratch_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer scratch_state.deinit();
     const argv = [_][]const u8{"/definitely/missing/fx-command-target"};
-
-    try std.testing.expectError(
-        error.FileNotFound,
-        executeProcessWithDetachedSession(
-            scratch_state.allocator(),
-            .{
-                .max_command_output_bytes = 0,
-            },
-            &argv,
-            "/tmp",
-            "",
-        ),
-    );
+    for ([_]bool{ false, true }) |retain_helpers| {
+        var scratch_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer scratch_state.deinit();
+        var owner = session_helpers.Owner.init(std.testing.allocator);
+        defer _ = owner.clear();
+        var lease = session_helpers.Lease{ .owner = &owner };
+        defer _ = lease.finish(false);
+        try std.testing.expectError(
+            error.FileNotFound,
+            executeProcessWithDetachedSession(
+                scratch_state.allocator(),
+                .{
+                    .max_command_output_bytes = 0,
+                    .helper_lease = if (retain_helpers) &lease else null,
+                },
+                &argv,
+                "/tmp",
+                "",
+            ),
+        );
+    }
 }
 
 test "raw process execution transports long scripts without exposing stdin" {
@@ -4637,6 +4905,173 @@ fn expectProcessGone(pid: std.posix.pid_t) !void {
         }
         io_mod.sleep(10 * std.time.ns_per_ms);
     }
+}
+
+test "session helper completion EOF never substitutes supervisor status" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    var owner = session_helpers.Owner.init(std.testing.allocator);
+    defer _ = owner.clear();
+    var lease = session_helpers.Lease{ .owner = &owner };
+    for ([_][]const u8{ &.{}, &.{ 0, 7 }, &.{ 0, 7, 0, 0, 0 } }) |bytes| {
+        const pair = try session_helpers.openControlPair();
+        defer for (pair) |file| file.close(io_mod.getIo());
+        if (bytes.len != 0) try pair[1].writeStreamingAll(io_mod.getIo(), bytes);
+        try std.testing.expectEqual(@as(c_int, 0), std.c.shutdown(pair[1].handle, std.c.SHUT.WR));
+        var completion = HelperCompletion{ .control = pair[0], .lease = &lease };
+        const outcome = completion.observe() orelse completion.observe().?;
+        try std.testing.expect(outcome == .target);
+        if (bytes.len == 5) {
+            try std.testing.expectEqual(@as(i64, 7), outcome.target.exit_code);
+        } else {
+            try std.testing.expect(outcome.target == .indeterminate);
+        }
+        try std.testing.expectEqualDeep(outcome, completion.observe().?);
+    }
+}
+
+test "session helper supervisor failure frame preserves authenticated error with zero output budget" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = io_mod.getIo();
+    const control = try session_helpers.openControlPair();
+    defer for (control) |file| file.close(io);
+    const stderr = try session_helpers.openControlPair();
+    defer for (stderr) |file| file.close(io);
+    var owner = session_helpers.Owner.init(alloc);
+    defer _ = owner.clear();
+    var lease = session_helpers.Lease{ .owner = &owner };
+    var completion = HelperCompletion{ .control = control[0], .lease = &lease };
+    const nonce = foreground_session_test_nonce;
+    const marker = foreground_session_replace_failure_prefix ++ nonce ++ ":";
+    var probe = ForegroundLaunchFailureProbe.init(marker);
+    const cfg: Config = .{ .max_command_output_bytes = 0 };
+    var output = OutputCollector.init(alloc, cfg);
+    defer output.deinit();
+    var emitter: OutputChunkEmitter = .{};
+    defer emitter.deinit(alloc);
+
+    writeForegroundSessionSupervisorFailure(control[1], stderr[1], nonce, error.ProcessFdQuotaExceeded);
+    var buffer: [256]u8 = undefined;
+    const length = try stderr[0].readStreaming(io, &.{&buffer});
+    try probe.append(alloc, &emitter, &output, buffer[0..length], cfg);
+    try probe.flush(alloc, &emitter, &output, cfg);
+    const outcome = completion.observe() orelse return error.TestExpectedCompletion;
+    try std.testing.expect(outcome == .supervisor_failure);
+    try std.testing.expectEqualDeep(outcome, completion.observe().?);
+    try std.testing.expectEqual(error.ProcessFdQuotaExceeded, authenticatedForegroundFailure(probe).?);
+    try std.testing.expectEqual(@as(usize, 0), output.totalBytes());
+    try std.testing.expect(foregroundSessionReplacementError(.indeterminate, probe) == null);
+    try std.testing.expect(foregroundSessionReplacementError(.{ .exit_code = 0 }, probe) == null);
+    try std.testing.expectEqual(error.ProcessFdQuotaExceeded, foregroundSessionReplacementError(.{ .exit_code = 125 }, probe).?);
+    try std.testing.expect(authenticatedForegroundFailure(ForegroundLaunchFailureProbe.init(marker)) == null);
+}
+
+test "session helper supervisor failure frame rejects partial and reserved payload" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    var owner = session_helpers.Owner.init(std.testing.allocator);
+    defer _ = owner.clear();
+    var lease = session_helpers.Lease{ .owner = &owner };
+    for ([_][]const u8{ &.{3}, &.{ 3, 0, 0, 0 }, &.{ 3, 1, 0, 0, 0 } }) |bytes| {
+        const pair = try session_helpers.openControlPair();
+        defer for (pair) |file| file.close(io_mod.getIo());
+        try pair[1].writeStreamingAll(io_mod.getIo(), bytes);
+        try std.testing.expectEqual(@as(c_int, 0), std.c.shutdown(pair[1].handle, std.c.SHUT.WR));
+        var completion = HelperCompletion{ .control = pair[0], .lease = &lease };
+        const outcome = completion.observe() orelse completion.observe().?;
+        try std.testing.expectEqualDeep(HelperCompletion.Outcome{ .target = .indeterminate }, outcome);
+    }
+}
+
+test "session helper supervisor death before completion leaves target status indeterminate" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var owner = session_helpers.Owner.init(alloc);
+    defer _ = owner.clear();
+    var lease = session_helpers.Lease{ .owner = &owner };
+    defer _ = lease.finish(false);
+    const result = try executeCommand(.{
+        .helper_lease = &lease,
+        .max_command_output_bytes = 1024,
+    }, alloc, "kill -KILL \"$PPID\"; exec sleep 30", "/tmp");
+    defer alloc.free(result.output);
+    const observed = result.command_result.?;
+    try std.testing.expect(observed.termination_indeterminate);
+    try std.testing.expect(observed.exit_code == null and observed.signal == null);
+    try std.testing.expect(lease.slot != null);
+    const root = lease.mapping().state.rootPid();
+    try std.testing.expect(root != null);
+    try std.testing.expect(!try process_tree.processIsAlive(alloc, root.?));
+}
+
+test "session helper lease preserves nonzero completion beyond command deadline" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return;
+    const alloc = std.testing.allocator;
+    var owner = session_helpers.Owner.init(alloc);
+    defer _ = owner.clear();
+    var lease = session_helpers.Lease{ .owner = &owner };
+    defer _ = lease.finish(false);
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .helper_lease = &lease,
+        .timeout_ms = 1000,
+    }, alloc, "sleep 30 >/dev/null 2>&1 & printf '%s' \"$!\"; exit 7", "/tmp");
+    defer alloc.free(result.output);
+    try std.testing.expectEqual(@as(?i64, 7), result.command_result.?.exit_code);
+    const pending = lease.pending orelse return error.TestUnexpectedResult;
+    var tree = try process_tree.Tracker.init(alloc);
+    defer tree.deinit();
+    try tree.refresh(pending.child.id.?);
+    try std.testing.expect(tree.anyAlive());
+    try std.testing.expectEqual(session_helpers.CleanupOutcome.clean, lease.finish(true));
+    io_mod.sleep(1200 * std.time.ns_per_ms);
+    try tree.refresh(pending.child.id.?);
+    try std.testing.expect(tree.anyAlive());
+    try std.testing.expectEqual(session_helpers.CleanupOutcome.clean, owner.clear());
+    try std.testing.expect(!tree.anyAlive());
+    try tree.refresh(pending.child.id.?);
+    tree.pruneExited();
+    if (comptime builtin.os.tag == .linux) {
+        try std.testing.expectEqual(@as(usize, 0), tree.processes.items.len);
+    }
+}
+
+test "session helper handoff rejected by cancellation cleans descendants" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return;
+    const alloc = std.testing.allocator;
+    var owner = session_helpers.Owner.init(alloc);
+    defer _ = owner.clear();
+    var lease = session_helpers.Lease{ .owner = &owner };
+    defer _ = lease.finish(false);
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .helper_lease = &lease,
+    }, alloc, "sleep 30 >/dev/null 2>&1 & printf 'started'", "/tmp");
+    defer alloc.free(result.output);
+    var tree = try process_tree.Tracker.init(alloc);
+    defer tree.deinit();
+    try tree.refresh(lease.pending.?.child.id.?);
+    try std.testing.expect(tree.anyAlive());
+    try std.testing.expectEqual(session_helpers.CleanupOutcome.clean, lease.finish(false));
+    try std.testing.expect(!tree.anyAlive());
+    try std.testing.expect(lease.slot == null);
+}
+
+test "session helper inherited output pipes settle without hanging" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return;
+    const alloc = std.testing.allocator;
+    var owner = session_helpers.Owner.init(alloc);
+    defer _ = owner.clear();
+    var lease = session_helpers.Lease{ .owner = &owner };
+    defer _ = lease.finish(false);
+    const started = io_mod.milliTimestamp();
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .helper_lease = &lease,
+    }, alloc, "sleep 30 & printf 'started'", "/tmp");
+    defer alloc.free(result.output);
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
+    try std.testing.expect(result.command_result.?.output_incomplete);
+    try std.testing.expect(io_mod.milliTimestamp() - started < 5000);
 }
 
 test "natural command completion terminates background child inheriting pipes" {

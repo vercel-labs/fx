@@ -82,6 +82,8 @@ Use `/resume` to choose a saved conversation. The picker shares its catalog acro
 
 Tool calls are expanded by default. Enable `Collapse tool calls` in `/settings`, or set `"collapse_tool_calls": true` in `~/.fx/settings.json`, to show one summary per tool-call group in the main transcript. Individual calls remain available in the full transcript with Ctrl+O. Follow-up activity for captured shell commands shows the original command, such as `Observed zig build`, while tool results keep the same execution handle.
 
+Captured shell calls keep detached helper daemons, such as browser automation helpers, alive across calls in the active session. Helpers must redirect their standard streams; capture ends with the launching command, and inherited output pipes are closed after a bounded drain. Cancelling or timing out the launching command still terminates its descendants. Ending or replacing the session cleans up helpers that fx owns and can identify; they are not restored when a session is resumed. If cleanup cannot be verified, fx reports it instead of treating the session as clean. This does not change command permissions or the separate managed TTY lifetime.
+
 When a tool targets a directory with additional project instructions, fx shows `Reading project instructions before continuing:` before the agent decides whether to retry. This refresh does not add a failure or “command not run” count to the tool summary.
 
 While fx is working, Ctrl+C clears a nonempty composer without interrupting the turn. Press Ctrl+C again with an empty composer to cancel the active work.

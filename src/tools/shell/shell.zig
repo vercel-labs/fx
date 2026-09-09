@@ -1328,7 +1328,7 @@ fn finishPrepared(
     handoffPreparedDelivery(ctx, runtime, prepared.reservation_id) catch {
         return .{ .failure = try ctx.allocator.dupe(u8, "shell result commit failed") };
     };
-    const failed = switch (action) {
+    const failed = helper_cleanup_failed(prepared.snapshot.error_name) or switch (action) {
         .command => snapshotFailed(prepared.snapshot),
         .stop => stop_result_failed(prepared.snapshot.state),
     };
@@ -1359,7 +1359,8 @@ fn publishSnapshotMetadata(
             .termination_indeterminate = false,
         };
     const timed_out = if (snapshot.error_name) |name|
-        std.mem.eql(u8, name, "TimeoutExpired")
+        std.mem.eql(u8, name, "TimeoutExpired") or
+            std.mem.eql(u8, name, "TimeoutExpired: SessionHelperCleanupIncomplete")
     else
         false;
     var memory = types.ToolResultMemory{
@@ -1624,6 +1625,12 @@ fn snapshotStateName(state: managed_execution.SnapshotState) []const u8 {
         .stopped => "stopped",
         .lost => "lost",
     };
+}
+
+fn helper_cleanup_failed(error_name: ?[]const u8) bool {
+    const name = error_name orelse return false;
+    return std.mem.eql(u8, name, "SessionHelperCleanupIncomplete") or
+        std.mem.endsWith(u8, name, ": SessionHelperCleanupIncomplete");
 }
 
 fn snapshotFailed(snapshot: managed_execution.Snapshot) bool {
@@ -2209,6 +2216,38 @@ test "stopped execution is a successful shell observation without command failur
         try std.testing.expect(memory != null);
         try std.testing.expect(memory.?.command_process_presentation == null);
     }
+}
+
+test "helper cleanup failure preserves observed status and timeout metadata" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "SessionHelperCleanupIncomplete", "TimeoutExpired: SessionHelperCleanupIncomplete", "ProcessFdQuotaExceeded: SessionHelperCleanupIncomplete" }) |name| {
+        const snapshot = managed_execution.Snapshot{
+            .execution_id = @constCast("shell-cleanup-incomplete"),
+            .command = @constCast("helper-command"),
+            .cwd = @constCast("/tmp"),
+            .retained = true,
+            .state = .{ .stopped = .{ .exit_code = 0 } },
+            .output_delta = @constCast(""),
+            .output_truncated = false,
+            .error_name = @constCast(name),
+        };
+        try std.testing.expect(helper_cleanup_failed(snapshot.error_name));
+        const body = try formatSnapshot(alloc, snapshot, null);
+        defer alloc.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("stopped", parsed.value.object.get("state").?.string);
+        try std.testing.expectEqual(@as(i64, 0), parsed.value.object.get("exit_code").?.integer);
+        try std.testing.expectEqualStrings(name, parsed.value.object.get("error").?.string);
+        var metadata: ?[]const u8 = null;
+        defer if (metadata) |value| alloc.free(value);
+        try publishSnapshotMetadata(.{ .allocator = alloc, .command_result_json_sink = &metadata }, snapshot);
+        var decoded = try std.json.parseFromSlice(std.json.Value, alloc, metadata.?, .{});
+        defer decoded.deinit();
+        try std.testing.expectEqual(std.mem.startsWith(u8, name, "TimeoutExpired"), decoded.value.object.get("timed_out").?.bool);
+    }
+    try std.testing.expect(!helper_cleanup_failed(null));
+    try std.testing.expect(!helper_cleanup_failed("TimeoutExpired"));
 }
 
 test "lost shell snapshot preserves indeterminate execution guidance" {

@@ -269,7 +269,17 @@ describe.skipIf(!tmuxAvailable())("tui: active session transitions", () => {
 
         await session.sendText("start an active turn");
         await session.waitForText("Thinking", 10_000);
+        const requestDeadline = Date.now() + 10_000;
+        while (gateway.requests.length === 0 && Date.now() < requestDeadline) {
+          await Bun.sleep(10);
+        }
+        expect(gateway.requests).toHaveLength(1);
+        expect(gateway.requests[0]!.body).toContain("start an active turn");
         await session.sendText("/clear");
+        await session.waitForPane(
+          (pane) => !pane.includes("start an active turn") && !pane.includes("Thinking"),
+          10_000,
+        );
         await session.waitForComposer(10_000);
 
         await session.sendText("complete the follow-up");
