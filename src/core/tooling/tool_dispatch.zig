@@ -32,6 +32,7 @@ const terminal_client_runtime = @import("../terminal/client.zig");
 const terminal_contracts = @import("../terminal/contracts.zig");
 const tool_args = @import("tool_args.zig");
 const result_commit = @import("result_commit.zig");
+const goal_module = @import("../goal/goal.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -325,6 +326,8 @@ pub const DispatchContext = struct {
     command_result_json_sink: ?*?[]const u8 = null,
     turn_control_sink: ?*?TurnControl = null,
     result_commit_sink: ?*?result_commit.Token = null,
+    /// Per-session goal context for the goal tools. Borrowed from the host.
+    goal_ctx: ?*goal_module.GoalToolContext = null,
 };
 
 /// Function pointer used by ask_user_question to request live user answers.
@@ -448,6 +451,9 @@ pub const ExecutorKind = enum {
     ask_user_question,
     vision,
     host,
+    get_goal,
+    create_goal,
+    update_goal,
 };
 
 pub const ApprovalPolicy = enum {
