@@ -81,6 +81,87 @@ async function launchNoKeyAndWait(): Promise<{
 
 describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
   test(
+    "/loop schedules, lists, stops, and clears tasks for a new session",
+    async () => {
+      const launched = await launchNoKeyAndWait();
+      session = launched.terminal;
+
+      await session.sendText("/loop 5m check the deploy");
+      const scheduled = await session.waitForText("every 5 minutes", 5_000);
+      const id = scheduled.match(/Scheduled task ([0-9a-f]{12})/)?.[1];
+      expect(id).toBeDefined();
+
+      await session.sendText("/loop list");
+      const listed = await session.waitForText("check the deploy", 5_000);
+      expect(listed).toContain(id!);
+
+      await session.sendText(`/loop stop ${id}`);
+      const stopped = await session.waitForText(`Stopped scheduled task ${id}.`, 5_000);
+      expect(stopped).toContain(`Stopped scheduled task ${id}.`);
+
+      await session.sendText("/loop 5m task from the old session");
+      await session.waitForText("every 5 minutes", 5_000);
+      await session.sendText("/new");
+      await session.waitForComposer(5_000);
+      await session.sendText("/loop list");
+      const resetList = await session.waitForText("No scheduled tasks.", 5_000);
+      expect(resetList).not.toContain("task from the old session");
+
+      expect(session.paneStatus()).toEqual({ dead: false, status: null });
+      expect(readFileSync(launched.stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "/loop admits a due prompt through the real worker and fake Gateway",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-loop-execution-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(home);
+      mkdirSync(workspace);
+      tempDirs.push(root);
+      gateway = startFakeGateway([
+        fakeGatewayFinalText("LOOP_E2E_EXECUTION_OK"),
+      ]);
+      session = await TmuxSession.create({
+        cwd: workspace,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "loop-e2e-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_E2E_LOOP_INTERVAL_SECS: "2",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_PERMISSION_MODE: "yolo",
+        },
+      });
+      await session.waitForComposer(10_000);
+
+      const prompt = "LOOP_E2E_SCHEDULED_PROMPT";
+      await session.sendText(`/loop once 1m ${prompt}`);
+      await session.waitForText("Scheduled task", 5_000);
+      expect(gateway.requests).toHaveLength(0);
+
+      await session.waitForText("LOOP_E2E_EXECUTION_OK", 10_000);
+      expect(gateway.requests).toHaveLength(1);
+      expect(gateway.requests[0]!.body).toContain(prompt);
+      await session.sendText("/loop list");
+      await session.waitForText("No scheduled tasks.", 5_000);
+      expect(session.paneStatus()).toEqual({ dead: false, status: null });
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test(
     "/undo reports the exact empty state",
     async () => {
       session = await launchAndWait();

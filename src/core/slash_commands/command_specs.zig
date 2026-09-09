@@ -46,6 +46,7 @@ pub const SlashKind = enum {
     logout,
     provider,
     status,
+    loop,
     image,
     images,
     model,
@@ -166,6 +167,16 @@ pub const SlashSpec = struct {
     has_args: bool = false,
     accepts_payload: bool = false,
     requires_prompt_credential: bool = false,
+};
+
+pub const loop_spec: SlashSpec = .{
+    .kind = .loop,
+    .command = "/loop",
+    .help_entry = "/loop [list|stop <id>|[once] [5m|2h|1d] <prompt>]",
+    .completion_description = "run a prompt repeatedly on a schedule",
+    .presentation_category = .agents,
+    .has_args = true,
+    .accepts_payload = true,
 };
 
 pub const SlashRegistry = mod_registry.CommandRegistry(SlashSpec);
@@ -1798,7 +1809,7 @@ test "slash completion categories follow canonical entries" {
 test "help catalog groups visible commands and searches all command metadata" {
     const registry = testSlashRegistry();
 
-    try std.testing.expectEqual(@as(usize, 35), helpCatalogCount(registry, ""));
+    try std.testing.expectEqual(@as(usize, 36), helpCatalogCount(registry, ""));
     try std.testing.expectEqualStrings("/help", helpCatalogSpecAt(registry, "", 0).?.command);
     try std.testing.expectEqual(@as(usize, 5), helpCatalogCategoryCount(registry, "", .general));
     try std.testing.expectEqual(@as(usize, 3), helpCatalogCount(registry, "appearance"));

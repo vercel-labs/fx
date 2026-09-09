@@ -88,6 +88,8 @@ While fx is working, Ctrl+C clears a nonempty composer without interrupting the 
 
 Ctrl+L clears the inline display while keeping the conversation available in Ctrl+O. It preserves your draft and conversation context; `/clear` starts a fresh conversation instead.
 
+Use `/loop 5m check the deploy` to run a prompt repeatedly while the interactive session remains open. `/loop` or `/loop list` shows scheduled tasks, `/loop stop <id>` cancels one, and `/loop once 2h <prompt>` schedules a one-time prompt. Recurring tasks expire after seven days and wait for active or queued agent work to finish before starting another iteration.
+
 The status line hides the workspace path and Git branch by default. Enable the `Status line workspace` option in `/settings`, run `/statusline workspace`, or set it in `~/.fx/settings.json`:
 
 ```json

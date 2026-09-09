@@ -17,6 +17,7 @@ pub const ParsedCommand = union(enum) {
     logout: []const u8,
     provider,
     status,
+    loop: []const u8,
     image: []const u8,
     images: []const u8,
     model: []const u8,
@@ -56,6 +57,7 @@ pub const CommandHandlers = struct {
     logout: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     provider: *const fn (ctx: *anyopaque) anyerror!void,
     show_status: *const fn (ctx: *anyopaque) anyerror!void,
+    handle_loop: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     attach_image: *const fn (ctx: *anyopaque, path: []const u8) anyerror!void,
     manage_images: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_model: *const fn (ctx: *anyopaque, query: []const u8) anyerror!void,
@@ -101,6 +103,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .logout => .{ .logout = payload },
         .provider => .provider,
         .status => .status,
+        .loop => .{ .loop = payload },
         .images => .{ .images = payload },
         .image => .{ .image = payload },
         .model => .{ .model = payload },
@@ -154,6 +157,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .logout => |rest| try handlers.logout(handlers.ctx, rest),
         .provider => try handlers.provider(handlers.ctx),
         .status => try handlers.show_status(handlers.ctx),
+        .loop => |rest| try handlers.handle_loop(handlers.ctx, rest),
         .image => |path| try handlers.attach_image(handlers.ctx, path),
         .images => |rest| try handlers.manage_images(handlers.ctx, rest),
         .model => |query| try handlers.handle_model(handlers.ctx, query),
@@ -184,6 +188,14 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
 fn testSlashRegistry() SlashRegistry {
     const builtin_commands = @import("../../builtins/commands.zig");
     return builtin_commands.slash_registry;
+}
+
+test "parse extracts loop command payload" {
+    const parsed = parse(testSlashRegistry(), "/loop 5m check deploy");
+    switch (parsed) {
+        .loop => |payload| try std.testing.expectEqualStrings("5m check deploy", payload),
+        else => return error.TestExpectedLoopCommand,
+    }
 }
 
 test "parse extracts model command payload" {
@@ -470,6 +482,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .logout = unexpectedPayload,
         .provider = unexpectedNoPayload,
         .show_status = unexpectedNoPayload,
+        .handle_loop = unexpectedPayload,
         .attach_image = unexpectedPayload,
         .manage_images = unexpectedPayload,
         .handle_model = unexpectedPayload,
