@@ -1,4 +1,6 @@
 const std = @import("std");
+const journal_runtime = @import("../agent/runtime/journal_runtime.zig");
+const execution_journal = @import("../session/execution_journal.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const skill_invocation = @import("../skills/skill_invocation.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
@@ -67,6 +69,7 @@ const Context = struct {
     input_tokens: u64 = 0,
     output_tokens: u64 = 0,
     turn_outcome: ?types.TurnPresentationOutcome = null,
+    journal: ?*journal_runtime.Runtime = null,
     refreshed_credential: ?credentials.Credential = null,
 
     fn toolContext(self: *Context) tool_runtime.Context {
@@ -176,14 +179,10 @@ pub fn run(
         routed_config.tool_context.web_search_backend = null;
         routed_config.tool_context.web_search_runtime_ready = false;
     }
-    const trace_context = debug_trace.TraceContext{
+    var trace_context = debug_trace.TraceContext{
         .turn_id = debug_trace.nextTurnId(),
         .subagent_id = debug_trace.nextSubagentId(),
     };
-    if (!turn.workerRuntime().beginDirectProcessing(trace_context.turn_id)) {
-        return error.ProviderFailed;
-    }
-    defer turn.workerRuntime().finishProcessing();
     var context = Context{
         .config = routed_config,
         .turn = turn,
@@ -197,6 +196,47 @@ pub fn run(
         turn.setFailureDiagnostic("recovery_admission_failed", @errorName(err));
         return error.ProviderFailed;
     };
+    var journal: journal_runtime.Runtime = undefined;
+    var journal_creation: [16]u8 = undefined;
+    io_mod.getIo().random(&journal_creation);
+    const creation_id = std.fmt.bytesToHex(journal_creation, .lower);
+    if (turn.loaded.journalState()) |records| {
+        const work_id = turn.active_work_id orelse return error.ProviderFailed;
+        if (records.request(work_id)) |index| if (records.outcome(index)) |recorded| {
+            const input = journal_runtime.readUser(turn.alloc, records, index) catch return error.ProviderFailed;
+            defer types.freeUserTurn(turn.alloc, input);
+            if (!std.mem.eql(u8, input.text, message.content) or input.images.len != 0 or
+                !std.mem.eql(u8, input.work_id orelse "", work_id))
+            {
+                turn.setFailureDiagnostic("journal_request_conflict", "Work identity is already bound to different input");
+                return error.ProviderFailed;
+            }
+            const result = execution_journal.object(recorded, "result") catch return error.ProviderFailed;
+            if (execution_journal.boolean(result, "ok") catch false) {
+                turn.committed = true;
+                return .completed;
+            }
+            turn.setFailureDiagnostic("recorded_child_failure", execution_journal.string(result, "reason") catch "unavailable");
+            return error.ProviderFailed;
+        };
+        journal = .{
+            .state = records,
+            .sink = turn.loaded.journalSink().?,
+            .alloc = turn.alloc,
+            .namespace = turn.loaded.active_id,
+            .creation_id = &creation_id,
+            .request_id = work_id,
+            .work_id = work_id,
+            .resuming = records.pending() != .idle,
+        };
+        if (journal.resuming) {
+            journal.turn = records.request(work_id) orelse return error.ProviderFailed;
+            trace_context.turn_id = journal.runtimeTurnId() catch return error.ProviderFailed;
+        }
+        context.journal = &journal;
+    }
+    if (!turn.workerRuntime().beginDirectProcessing(trace_context.turn_id)) return error.ProviderFailed;
+    defer turn.workerRuntime().finishProcessing();
     const history = turn.sessionRuntime().snapshotHistory(arena) catch return error.OutOfMemory;
     const prompt = worker_runtime.QueuedPrompt{
         .turn_id = trace_context.turn_id,
@@ -376,6 +416,7 @@ fn withoutSubagentFunctions(
 fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
     return .{
         .ctx = context,
+        .journal = context.journal,
         .agent_stream_provider = context.config.tool_context.agent_stream_provider,
         .tool_registry = context.config.tool_context.tool_registry,
         .context_registry = context.config.context_registry,
@@ -401,9 +442,9 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .publish_committed_file_handoff = publishCommittedFileHandoff,
         .propagate_history_turn = propagateHistoryTurn,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
-        .recovery_checkpoint = .{
+        .recovery_checkpoint = if (context.journal == null) .{
             .set = setRecoveryCheckpoint,
-        },
+        } else null,
         .propagate_grant = discardGrant,
         .push_event = pushLiveEvent,
         .push_text = pushLiveText,

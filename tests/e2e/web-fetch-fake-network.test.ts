@@ -377,7 +377,7 @@ describe("web_fetch Gateway fixture", () => {
         expectNoFetchProgress(result.stderr);
 
         const sessionEvents = readFileSync(
-          join(root.home, ".fx", "sessions", json.session_id, "events.jsonl"),
+          join(root.home, ".fx", "sessions", json.session_id, "execution.journal"),
           "utf8",
         );
         expect(sessionEvents).toContain("web_fetch");

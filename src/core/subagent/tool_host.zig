@@ -433,7 +433,7 @@ pub const Runtime = struct {
             defaults,
         );
         defer state.deinit(alloc);
-        if (self.sessions.startWritableSession(alloc, state)) |writable_value| {
+        if (self.sessions.startJournalSession(alloc, state, .{})) |writable_value| {
             var writable = writable_value;
             writable.log.park();
             writable.deinit(alloc);

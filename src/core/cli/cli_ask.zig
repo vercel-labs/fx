@@ -2,6 +2,9 @@ const std = @import("std");
 const std_builtin = @import("builtin");
 const command_admission = @import("../permissions/command_admission.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
+const journal_runtime = @import("../agent/runtime/journal_runtime.zig");
+const execution_journal = @import("../session/execution_journal.zig");
+const journal_codec = @import("../session/execution_journal_codec.zig");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
 const app_runtime_setup = @import("../app/app_runtime_setup.zig");
@@ -855,12 +858,12 @@ const AskContext = struct {
                 self.alloc,
                 target,
                 self.workspace_root,
-                .{ .seed_preferences = seed_preferences },
+                .{ .seed_preferences = seed_preferences, .execution_journal = true },
             )
         else blk: {
             var state = try freshAskState(self, seed_preferences);
             defer state.deinit(self.alloc);
-            break :blk try store.startWritableSession(self.alloc, state);
+            break :blk try store.startJournalSession(self.alloc, state, .{});
         };
         var writable_owned = true;
         errdefer if (writable_owned) writable.deinit(self.alloc);
@@ -1543,9 +1546,50 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
     }
 
+    var journal: ?journal_runtime.Runtime = null;
+    var journal_nonce: [16]u8 = undefined;
+    io_mod.getIo().random(&journal_nonce);
+    const journal_creation = std.fmt.bytesToHex(journal_nonce, .lower);
+    var journal_user: ?types.UserTurn = null;
+    defer if (journal_user) |user| types.freeUserTurn(alloc, user);
+    if (ctx.writable) |*writable| {
+        if (writable.journalState()) |records| {
+            journal = .{
+                .state = records,
+                .sink = .{ .context = &ctx, .append_fn = appendJournalEntry, .guard = .{ .enter = enterJournalMutation, .leave = leaveJournalMutation } },
+                .alloc = ctx.alloc,
+                .namespace = writable.active_id,
+                .creation_id = &journal_creation,
+                .request_id = &journal_creation,
+                .resuming = options.continue_recovery,
+            };
+            if (options.continue_recovery) {
+                const turn = switch (records.pending()) {
+                    .idle => return failPromptRunResult(error.NoPendingRecovery),
+                    .model, .ending => |index| index,
+                    .tool => |position| position.turn,
+                };
+                journal.?.turn = turn;
+                journal.?.request_id = try execution_journal.string(records.start(turn), "requestId");
+                journal_user = try journal.?.user(alloc);
+                var input_history = [_]HistoryTurn{.{ .assistant = .{
+                    .user = journal_user.?,
+                    .assistant = @constCast(""),
+                } }};
+                try session_store.resolveSessionSnapshotLocators(alloc, &input_history, null, ctx.store.?.sessions_dir, writable.active_id);
+                const resumed_prompt = try alloc.dupe(u8, journal_user.?.text);
+                alloc.free(owned_prompt);
+                owned_prompt = resumed_prompt;
+                ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
+            } else if (records.pending() != .idle) return error.PendingTurnError;
+        }
+    }
+
     var recovery_checkpoint: ?session_codec.RecoveryCheckpoint = null;
     defer if (recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
-    if (options.continue_recovery) {
+    if (journal != null) {
+        // The journal owns pending execution; do not create a second checkpoint.
+    } else if (options.continue_recovery) {
         const writable = if (ctx.writable) |*value| value else return failPromptRunResult(error.RecoverySessionUnavailable);
         const checkpoint = writable.state.recovery_checkpoint orelse
             return failPromptRunResult(error.NoPendingRecovery);
@@ -1554,7 +1598,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         owned_prompt = try alloc.dupe(u8, recovery_checkpoint.?.user.text);
         ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
     } else if (ctx.writable) |*writable| {
-        if (writable.conversation_writer.turn_open) {
+        if (writable.hasPendingTurn()) {
             const checkpoint = writable.state.recovery_checkpoint orelse
                 return error.InvalidRecoveryCheckpoint;
             const prompt_snapshot_committed = ctx.prompt_snapshot_committed;
@@ -1631,16 +1675,18 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
 
     const current_images = try types.dupeImageAttachmentSlice(
         alloc,
-        if (recovery_checkpoint) |checkpoint|
+        if (journal_user) |user|
+            user.images
+        else if (recovery_checkpoint) |checkpoint|
             checkpoint.user.images
         else
             options.images,
     );
     defer types.freeImageAttachmentSlice(alloc, current_images);
-    defer if (recovery_checkpoint == null and options.save_session and !ctx.prompt_snapshot_committed) {
+    defer if (journal_user == null and recovery_checkpoint == null and options.save_session and !ctx.prompt_snapshot_committed) {
         image_attachments.deleteUnreferencedImageSnapshots(current_images, restored_image_catalog);
     };
-    if (recovery_checkpoint == null and current_images.len > 0) {
+    if (journal_user == null and recovery_checkpoint == null and current_images.len > 0) {
         try ctx.checkCancellation();
         _ = std.math.add(
             usize,
@@ -1748,7 +1794,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         ctx.session.agent.history.items,
     );
     defer alloc.free(root_user_intent_context);
-    ctx.active_turn_id = if (recovery_checkpoint) |checkpoint|
+    ctx.active_turn_id = if (journal_user != null)
+        try journal.?.runtimeTurnId()
+    else if (recovery_checkpoint) |checkpoint|
         checkpoint.turn_id
     else
         debug_trace.nextTurnId();
@@ -1775,12 +1823,16 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .recovery_checkpoint = recovery_checkpoint,
     };
 
-    const deps = agentRuntimeDeps(&ctx);
+    var deps = agentRuntimeDeps(&ctx);
+    if (journal) |*runtime| {
+        deps.journal = runtime;
+        deps.recovery_checkpoint = null;
+    }
     const semantic_presentation = if (ctx.presenter) |value| value.semanticSink() else null;
     try ctx.checkCancellation();
     const current_prompt_is_root_authority = if (ctx.writable) |writable|
         writable.external_prompt_origin == .persistent_child and
-            recovery_checkpoint == null
+            recovery_checkpoint == null and journal_user == null
     else
         false;
     options.deps.process_queued_prompt(&ctx.session.agent, &deps, semantic_presentation, ctx.lifecycleContext(), .{
@@ -1846,6 +1898,20 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     if (ctx.presenter) |value| try value.finish();
 
     var result = try takePromptRunResult(&ctx, alloc);
+    errdefer result.deinit(alloc);
+    if (journal) |*runtime| {
+        if (runtime.resuming and result.exit_code == 0 and result.recovery == null and runtime.state.pending() == .idle) {
+            if (try runtime.latestContext()) |context| {
+                var metadata = try journal_runtime.parseRecoveryMetadata(alloc, context);
+                defer metadata.deinit(alloc);
+                result.recovery = .{
+                    .kind = .auto_recovered,
+                    .succeeded_attempt = metadata.consumed_provider_attempts,
+                    .attempt_limit = metadata.max_provider_attempts,
+                };
+            }
+        }
+    }
     finalizeFreshAuthSession(&ctx, &result);
     return result;
 }
@@ -2869,6 +2935,26 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
     ctx.prompt_snapshot_committed = true;
 }
 
+fn enterJournalMutation(raw_ctx: *anyopaque) void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
+}
+
+fn leaveJournalMutation(raw_ctx: *anyopaque) void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.session_write_mutex.unlock(io_mod.getIo());
+}
+
+fn appendJournalEntry(raw_ctx: *anyopaque, entry: journal_codec.Entry) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    const writable = if (ctx.writable) |*value| value else return error.SessionPersistenceUnavailable;
+    const sink = writable.journalSink() orelse return error.JournalWriterRequired;
+    // An uncertain append may reference captured input artifacts. Retain them
+    // until a fresh owner has read the authoritative journal.
+    ctx.prompt_snapshot_committed = true;
+    try sink.append_fn(sink.context, entry);
+}
+
 fn commitContextCompaction(
     raw_ctx: *anyopaque,
     summary: types.CompactedSummaryHistoryTurn,
@@ -3199,13 +3285,15 @@ fn pushContextNotice(raw_ctx: *anyopaque, text: []const u8) !void {
 fn pushRouteRecoveryStatus(raw_ctx: *anyopaque, status: types.RouteRecoveryStatus) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     ctx.last_recovery_status = status;
-    const terminal = status.kind == .terminal_provider_error;
+    const terminal = status.is_paused();
     const json_progress = switch (status.kind) {
         .auto_retry,
         .auto_recovered,
         .manual_retry_without_fast,
         .manual_recovered_without_fast,
         .terminal_provider_error,
+        .suspended,
+        .tool_state_uncertain,
         => true,
         .unsafe_assistant_output,
         .unsafe_tool_start,
@@ -3859,7 +3947,7 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
         var label_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
         try out.writer.writeAll(",\"recovery\":{\"state\":");
         try std.json.Stringify.value(
-            if (recovery.kind == .terminal_provider_error) "paused" else if (recovery.isRecovered()) "recovered" else "active",
+            if (recovery.is_paused()) "paused" else if (recovery.isRecovered()) "recovered" else "active",
             .{},
             &out.writer,
         );
@@ -4349,6 +4437,15 @@ fn testProcessQueuedPromptUnauthorizedThenHistory(agent: *agent_runtime.Agent, d
     const ctx: *AskContext = @ptrCast(@alignCast(deps.ctx));
     const turn = try session_runtime.makeAssistantTurn(ctx.alloc, job.prompt, "retained response");
     defer types.freeHistoryTurn(ctx.alloc, turn);
+    if (deps.journal) |journal| {
+        _ = try journal.begin(turn.assistant.user, job.model, 1, false);
+        var key = try journal.generation();
+        defer key.deinit(ctx.alloc);
+        _ = try journal.recordDecision(.{ .content = turn.assistant.assistant }, &.{}, &.{}, key, true, null, null);
+        const result = try std.json.parseFromSlice(std.json.Value, ctx.alloc, "{\"ok\":true,\"stopReason\":\"stop\"}", .{});
+        defer result.deinit();
+        try journal.finish(result.value, turn);
+    }
     try deps.propagate_history_turn(deps.ctx, turn);
 }
 
@@ -7485,6 +7582,8 @@ test "saved ask settles profile publication before persistence teardown" {
     try std.testing.expectEqual(@as(usize, 1), pending.pending.len);
     try std.testing.expectEqual(@as(usize, 1), pending.publication_backlog.len);
 
+    const session_id = try alloc.dupe(u8, ctx.writable.?.active_id);
+    defer alloc.free(session_id);
     publication.allow_generation = true;
     ctx.deinit();
     ctx_live = false;
@@ -7492,10 +7591,9 @@ test "saved ask settles profile publication before persistence teardown" {
 
     var store = try session_store.Store.initFromHome(alloc, home, workspace);
     defer store.deinit(alloc);
-    var resumed = try store.resumeTargetForWrite(
+    var resumed = try store.resumeJournalForWrite(
         alloc,
-        .last,
-        workspace,
+        session_id,
         .{},
     );
     defer resumed.deinit(alloc);
@@ -7807,6 +7905,25 @@ test "render final JSON includes the latest terminal recovery diagnostic" {
         "⚠ Provider unavailable · HTTP 503 · no_available_providers: No providers are currently available · recovery paused after 2/2 attempts",
         recovery.get("message").?.string,
     );
+}
+
+test "render final JSON keeps suspension status paused" {
+    const alloc = std.testing.allocator;
+    for ([_]types.RouteRecoveryStatus.Kind{ .suspended, .tool_state_uncertain }) |kind| {
+        const result = PromptRunResult{
+            .exit_code = 1,
+            .assistant_output = try alloc.dupe(u8, ""),
+            .recovery = .{ .kind = kind },
+        };
+        defer result.deinit(alloc);
+        const json = try renderFinalJsonResult(alloc, result);
+        defer alloc.free(json);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+        defer parsed.deinit();
+        const recovery = parsed.value.object.get("recovery").?.object;
+        try std.testing.expectEqualStrings("paused", recovery.get("state").?.string);
+        try std.testing.expectEqualStrings(@tagName(kind), recovery.get("kind").?.string);
+    }
 }
 
 test "cli json records built in web_search completion" {
@@ -8628,20 +8745,33 @@ test "json run with missing API key prints diagnostic then final object" {
     );
 }
 
-test "resumed ask preserves user and image identity after a retained mid-turn checkpoint" {
+test "resumed ask preserves journal input and rejects implicit replacement" {
     const Process = struct {
+        var calls: usize = 0;
         fn run(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, _: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
-            if (job.recovery_checkpoint) |checkpoint| {
-                try std.testing.expectEqual(@as(u64, 7), checkpoint.turn_id);
-                try std.testing.expectEqualStrings("original request", job.prompt);
-                try std.testing.expectEqual(@as(usize, 7), job.images[0].id);
-                try std.testing.expectEqual(@as(usize, 1), job.authorized_image_catalog.len);
-                try std.testing.expectEqualStrings(job.images[0].snapshot_sha256.?, job.authorized_image_catalog[0].snapshot_sha256.?);
-            }
-            try deps.propagate_history_turn(deps.ctx, .{ .assistant = .{
+            calls += 1;
+            const ctx: *AskContext = @ptrCast(@alignCast(deps.ctx));
+            const journal = deps.journal orelse return error.TestExpectedJournal;
+            try std.testing.expectEqual(@as(u64, 7), try journal.runtimeTurnId());
+            try std.testing.expectEqualStrings("original request", job.prompt);
+            try std.testing.expectEqual(@as(usize, 7), job.images[0].id);
+            try std.testing.expectEqual(@as(usize, 1), job.authorized_image_catalog.len);
+            try std.testing.expectEqualStrings(job.images[0].snapshot_sha256.?, job.authorized_image_catalog[0].snapshot_sha256.?);
+            var image = try image_attachments.loadVerifiedSnapshot(ctx.alloc, job.images[0], .{});
+            defer image.deinit(ctx.alloc);
+            try std.testing.expectEqualStrings("\x89PNG\r\n\x1a\noriginal-image", image.bytes);
+            const turn: HistoryTurn = .{ .assistant = .{
                 .user = .{ .text = job.prompt, .images = job.images },
                 .assistant = @constCast("new answer"),
-            } });
+            } };
+            _ = try journal.begin(turn.assistant.user, job.model, 7, true);
+            var key = try journal.generation();
+            defer key.deinit(ctx.alloc);
+            _ = try journal.recordDecision(.{ .content = "new answer" }, &.{}, &.{}, key, true, null, null);
+            const result = try std.json.parseFromSlice(std.json.Value, ctx.alloc, "{\"ok\":true,\"stopReason\":\"stop\"}", .{});
+            defer result.deinit();
+            try journal.finish(result.value, turn);
+            try deps.propagate_history_turn(deps.ctx, turn);
             try testPushAssistantText(deps, "new answer");
         }
     };
@@ -8652,6 +8782,7 @@ test "resumed ask preserves user and image identity after a retained mid-turn ch
         .{ .prompt = "original request", .continue_recovery = true },
     };
     for (cases) |case| {
+        Process.calls = 0;
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
@@ -8663,39 +8794,33 @@ test "resumed ask preserves user and image identity after a retained mid-turn ch
         defer store.deinit(alloc);
         var state = try testAskDurableState(alloc, "/tmp/fx-test", session_id);
         defer state.deinit(alloc);
-        var images = [_]ImageAttachment{.{
-            .id = 7,
-            .path = @constCast("/missing/original.png"),
-            .media_type = @constCast("image/png"),
-            .snapshot_path = @constCast("images/image-7-aaaaaaaaaaaaaaaa.bin"),
-            .snapshot_sha256 = @constCast("a" ** 64),
-        }};
-        const old_user = types.UserTurn{
-            .text = @constCast("original request"),
-            .images = if (case.continue_recovery) &images else &.{},
-        };
+        var image: ?ImageAttachment = null;
+        defer if (image) |value| types.freeImageAttachment(alloc, value);
+        var images: [1]ImageAttachment = undefined;
+        var original_seq: u64 = 0;
         {
-            var writable = try store.startWritableSession(alloc, state);
+            var writable = try store.startJournalSession(alloc, state, .{});
             defer writable.deinit(alloc);
-            _ = try writable.commitContextCompaction(alloc, .{
-                .summary = @constCast("<context_handoff>Earlier work completed.</context_handoff>"),
-                .removed_turn_count = 0,
-                .compaction_count = 1,
-            }, .{ .user = old_user, .assistant = @constCast("") }, null, 10);
-            _ = try writable.appendEvent(alloc, .{ .recovery_checkpoint_set = .{ .checkpoint = .{
-                .turn_id = 7,
-                .user = old_user,
-                .assistant_source = @constCast("old partial answer"),
-                .cause = .network_interrupted,
-                .action = .paused,
-                .authority = .{ .provider = .gateway, .model = @constCast("model") },
-                .requested_fast_mode = false,
-                .fast_mode = false,
-                .max_provider_attempts = 3,
-                .consumed_provider_attempts = 1,
-            } } }, 20);
+            if (case.continue_recovery) {
+                const directory = try std.fs.path.join(alloc, &.{ store.sessions_dir, session_id, "images" });
+                defer alloc.free(directory);
+                image = try image_attachments.captureInlineImageBytes(alloc, 7, "image/png", "\x89PNG\r\n\x1a\noriginal-image", directory);
+                images[0] = image.?;
+            }
+            var journal: journal_runtime.Runtime = .{
+                .state = writable.journalState().?,
+                .sink = writable.journalSink().?,
+                .alloc = alloc,
+                .namespace = writable.active_id,
+                .creation_id = "old-runtime",
+                .request_id = "original-request",
+            };
+            _ = try journal.begin(.{ .text = @constCast("original request"), .images = if (case.continue_recovery) &images else &.{} }, state.preferences.model, 7, false);
+            var key = try journal.generation();
+            defer key.deinit(alloc);
+            _ = try journal.recordDecision(.{ .content = "old partial answer" }, &.{}, &.{}, key, false, null, null);
+            original_seq = writable.journalState().?.last_seq;
         }
-
         var stdout_capture: TestCapture = .{};
         defer stdout_capture.deinit(alloc);
         var stderr_capture: TestCapture = .{};
@@ -8707,19 +8832,25 @@ test "resumed ask preserves user and image identity after a retained mid-turn ch
             &.{ "--json", "--resume-id", session_id, "--continue-recovery" }
         else
             &.{ "--json", "--resume-id", session_id, case.prompt };
-        try std.testing.expectEqual(@as(u8, 0), try runWithDeps(alloc, args, testConfig(), deps));
-
+        const code = try runWithDeps(alloc, args, testConfig(), deps);
+        if (!case.continue_recovery) {
+            try std.testing.expectEqual(@as(u8, 1), code);
+            try std.testing.expectEqual(@as(usize, 0), Process.calls);
+            try std.testing.expect(std.mem.find(u8, stdout_capture.bytes.items, "PendingTurnError") != null);
+            var reopened = try store.resumeJournalForWrite(alloc, session_id, .{});
+            defer reopened.deinit(alloc);
+            try std.testing.expect(reopened.hasPendingTurn());
+            try std.testing.expectEqual(original_seq, reopened.journalState().?.last_seq);
+            continue;
+        }
+        try std.testing.expectEqual(@as(u8, 0), code);
+        try std.testing.expectEqual(@as(usize, 1), Process.calls);
         var restored = try store.loadReadOnly(alloc, session_id);
         defer restored.deinit(alloc);
-        try std.testing.expectEqual(@as(usize, if (case.continue_recovery) 2 else 3), restored.history.len);
-        if (!case.continue_recovery) {
-            try std.testing.expect(restored.history[1] == .interrupted);
-            try std.testing.expectEqualStrings("original request", restored.history[1].interrupted.user.text);
-            try std.testing.expectEqualStrings("old partial answer", restored.history[1].interrupted.assistant.?);
-        }
         const last = restored.history[restored.history.len - 1].assistant;
-        try std.testing.expectEqualStrings(case.prompt, last.user.text);
+        try std.testing.expectEqualStrings("original request", last.user.text);
         try std.testing.expectEqualStrings("new answer", last.assistant);
+        try std.testing.expectEqual(@as(usize, 7), last.user.images[0].id);
         try std.testing.expect(restored.recovery_checkpoint == null);
     }
 }

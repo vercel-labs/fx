@@ -32,7 +32,7 @@ pub fn writeModelRecoveryInfoUpdate(
     try writeJsonStr(
         if (recovery.isRecovered())
             "recovered"
-        else if (recovery.kind == .terminal_provider_error)
+        else if (recovery.is_paused())
             "paused"
         else
             "active",
@@ -74,6 +74,8 @@ pub const StopReason = enum {
     max_model_turns,
     refused,
     cancelled,
+    /// libfx extension only; standard ACP retains its existing stop reasons.
+    paused,
 
     pub fn jsonString(self: StopReason) []const u8 {
         return switch (self) {
@@ -82,6 +84,7 @@ pub const StopReason = enum {
             .max_model_turns => "max_model_turns",
             .refused => "refused",
             .cancelled => "cancelled",
+            .paused => "paused",
         };
     }
 };
@@ -227,6 +230,10 @@ pub fn writeToolCallUpdateWithCommandResult(
 }
 
 pub fn writeInitializeResponse(w: *std.Io.Writer, image_prompts: bool) !void {
+    return writeInitializeResponseWithJournal(w, image_prompts, false);
+}
+
+pub fn writeInitializeResponseWithJournal(w: *std.Io.Writer, image_prompts: bool, journal: bool) !void {
     try w.writeAll("{\"protocolVersion\":");
     try w.print("{d}", .{protocol_version});
     try w.writeAll(",\"agentCapabilities\":{");
@@ -237,7 +244,9 @@ pub fn writeInitializeResponse(w: *std.Io.Writer, image_prompts: bool) !void {
     try w.writeAll("},\"agentInfo\":{\"name\":\"fx\",\"title\":\"fx\",\"version\":");
     try writeJsonStr(build_options.app_version, w);
     try w.writeAll("},");
-    try w.writeAll("\"authMethods\":[]}");
+    try w.writeAll("\"authMethods\":[]");
+    if (journal) try w.writeAll(",\"_meta\":{\"libfxJournalVersion\":1}");
+    try w.writeByte('}');
 }
 
 pub fn writePromptResponse(w: *std.Io.Writer, reason: StopReason) !void {
@@ -492,6 +501,20 @@ test "model recovery info update is structured and clearable" {
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"state\":\"recovered\"") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"attempt\":5") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "ConnectionResetByPeer") == null);
+
+    for ([_]core_types.RouteRecoveryStatus.Kind{ .suspended, .tool_state_uncertain }) |kind| {
+        out.writer.end = 0;
+        try writeModelRecoveryInfoUpdate(&out.writer, .{
+            .kind = kind,
+            .action = .paused,
+            .required_action = if (kind == .suspended) .continue_later else .inspect_uncertain_tool,
+        }, true);
+        const json = out.writer.buffered();
+        try std.testing.expect(std.mem.find(u8, json, "\"state\":\"paused\"") != null);
+        try std.testing.expect(std.mem.find(u8, json, "\"attempt") == null);
+        try std.testing.expect(std.mem.find(u8, json, "Mac woke") == null);
+        try std.testing.expect(std.mem.find(u8, json, "connection") == null);
+    }
 
     out.writer.end = 0;
     try writeModelRecoveryInfoUpdate(&out.writer, null, false);

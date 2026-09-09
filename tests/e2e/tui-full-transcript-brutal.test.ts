@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { decodeNativeJournal } from "./journal/storage";
 import { execFileSync } from "node:child_process";
 import {
   chmodSync,
@@ -138,6 +139,15 @@ function committedAssistantOccurrences(home: string, assistant: string): number 
   let count = 0;
   for (const entry of readdirSync(sessionsRoot, { withFileTypes: true })) {
     if (!entry.isDirectory() || entry.name === "latest") continue;
+    const journalPath = join(sessionsRoot, entry.name, "execution.journal");
+    if (existsSync(journalPath)) {
+      for (const record of decodeNativeJournal(readFileSync(journalPath))) {
+        if (record.kind !== "turn_end") continue;
+        const body = JSON.parse(Buffer.from(record.bytes).toString("utf8"));
+        if (body.history?.kind === "assistant" && body.history.assistant === assistant) count++;
+      }
+      continue;
+    }
     const eventsPath = join(sessionsRoot, entry.name, "events.jsonl");
     if (!existsSync(eventsPath)) continue;
     for (const line of readFileSync(eventsPath, "utf8").split("\n")) {

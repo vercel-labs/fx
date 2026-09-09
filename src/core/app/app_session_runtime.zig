@@ -1,5 +1,6 @@
 const std = @import("std");
 const worker_runtime = @import("../agent/worker_runtime.zig");
+const restart_handoff = @import("../session/restart_handoff.zig");
 const auto_classifier_context = @import("../permissions/auto_classifier_context.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
@@ -25,6 +26,8 @@ const io_mod = @import("../shared/io.zig");
 const list_window = @import("../shared/list_window.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const session_runtime = @import("../session/session.zig");
+const journal_runtime = @import("../agent/runtime/journal_runtime.zig");
+const execution_journal = @import("../session/execution_journal.zig");
 const session_catalog = @import("../session/session_catalog.zig");
 const session_codec = @import("../session/session_codec.zig");
 const js_host_session_store = @import("../session/js_host_session_store.zig");
@@ -261,6 +264,7 @@ const UpgradeNotice = struct {
 };
 
 const ResumeNotice = union(enum) {
+    restart,
     session,
     upgrade: UpgradeNotice,
 };
@@ -353,9 +357,11 @@ test "resume handoff policy requires requested durable non-pristine state" {
 /// Owns `session_id`; callers must release it with `deinit`.
 pub const ResumeHandoff = struct {
     session_id: []u8,
+    upgrade_capability: ?std.Io.File = null,
 
     pub fn deinit(self: *ResumeHandoff, alloc: Allocator) void {
         alloc.free(self.session_id);
+        if (self.upgrade_capability) |file| file.close(io_mod.getIo());
         self.* = undefined;
     }
 };
@@ -1127,10 +1133,12 @@ test "open session keeps exclusive writer ownership until close" {
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
-    try Runtime(TestApp).appendHistoryTurn(&app, .{ .assistant = .{
+    const initial: types.HistoryTurn = .{ .assistant = .{
         .user = .{ .text = @constCast("original") },
         .assistant = @constCast("original answer"),
-    } });
+    } };
+    try acknowledgeTestHistory(&app, initial);
+    try Runtime(TestApp).appendHistoryTurn(&app, initial);
     const id = try alloc.dupe(u8, app.session_persistence.writable.?.active_id);
     defer alloc.free(id);
     try app.input_runtime.edit_state.input.appendSlice(alloc, "local unfinished draft");
@@ -1303,9 +1311,10 @@ pub fn Runtime(comptime App: type) type {
 
             var state = try freshState(app, preferences);
             defer state.deinit(app.alloc);
-            app.session_persistence.writable = store.startWritableSession(
+            app.session_persistence.writable = store.startJournalSession(
                 app.alloc,
                 state,
+                .{},
             ) catch |err| {
                 try warnNonDurable(app, "session creation failed", err);
                 return;
@@ -1738,6 +1747,7 @@ pub fn Runtime(comptime App: type) type {
                 .{
                     .seed_preferences = app.session_persistence.workspace_preferences,
                     .log = log_options,
+                    .execution_journal = true,
                 },
             );
         }
@@ -1753,6 +1763,16 @@ pub fn Runtime(comptime App: type) type {
             var display = try readNativeResumeDisplay(app, loaded);
             defer display.deinit(app.alloc);
 
+            var handoff_error: ?anyerror = null;
+            const consumed = restart_handoff.consume(app.alloc, loaded, notice == .upgrade, app.workspace_root) catch |err| failed: {
+                if (err == error.SessionPersistenceUncertain) return err;
+                handoff_error = err;
+                break :failed null;
+            };
+            if (comptime @hasField(App, "upgrade_handoff")) {
+                app.upgrade_handoff.continuation = if (consumed) |handoff| handoff.continuation else null;
+            }
+
             closeWritableSession(app);
             app.session_persistence.writable = loaded.*;
             loaded_owned = false;
@@ -1762,9 +1782,18 @@ pub fn Runtime(comptime App: type) type {
                 app.session_persistence.writable = null;
             }
             const active = &app.session_persistence.writable.?;
-            try hydrateResumedSession(app, active.state, display.title, notice);
+            const resume_notice: ResumeNotice = if (consumed != null and consumed.?.reason == .restart) .restart else notice;
+            try hydrateResumedSession(app, active.state, display.title, resume_notice);
+            if (comptime @hasField(App, "next_image_id")) {
+                if (active.journalState()) |records| app.next_image_id = try journal_runtime.nextImageId(app.alloc, records, app.next_image_id);
+            }
             active.releaseHydrationHistory(app.alloc);
             enableSessionStores(app);
+            if (handoff_error) |err| {
+                const body = try std.fmt.allocPrint(app.alloc, "automatic continuation blocked: {s}; the saved session remains paused", .{@errorName(err)});
+                defer app.alloc.free(body);
+                try app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = body }, true);
+            }
         }
 
         fn hydrateResumedSession(
@@ -2172,7 +2201,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn appendHistoryTurn(app: *App, turn: types.HistoryTurn) !void {
-            _ = try appendHistoryTurnWithPendingPresentation(app, turn, .strict, null);
+            _ = try appendHistoryTurnWithPendingPresentation(app, turn, .strict, null, null);
         }
 
         pub fn appendFinishedPrompt(
@@ -2180,14 +2209,17 @@ pub fn Runtime(comptime App: type) type {
             finished: types.FinishedPrompt,
         ) !void {
             var turn = finished.turn;
-            if (finished.summary) |summary| {
-                types.setHistoryTurnSummary(&turn, summary);
+            // Rendering may extend the displayed duration after the journal
+            // has acknowledged the canonical turn summary.
+            if (finished.journal_turn == null) {
+                if (finished.summary) |summary| types.setHistoryTurnSummary(&turn, summary);
             }
             _ = try appendHistoryTurnWithPendingPresentation(
                 app,
                 turn,
                 .strict,
                 finished.snapshot_file_ownership,
+                finished.journal_turn,
             );
         }
 
@@ -2270,11 +2302,51 @@ pub fn Runtime(comptime App: type) type {
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
             const loaded = if (app.session_persistence.writable) |*value| value else return null;
+            if (loaded.journalState()) |records| {
+                const index = switch (records.pending()) {
+                    .idle => return null,
+                    .model, .ending => |turn| turn,
+                    .tool => |position| position.turn,
+                };
+                const runtime: journal_runtime.Runtime = .{
+                    .state = records,
+                    .sink = loaded.journalSink().?,
+                    .alloc = alloc,
+                    .namespace = loaded.active_id,
+                    .creation_id = "queue",
+                    .request_id = try execution_journal.string(records.start(index), "requestId"),
+                    .turn = index,
+                };
+                const user = try runtime.user(alloc);
+                defer types.freeUserTurn(alloc, user);
+                // This is only the existing queue's input carrier. Execution
+                // restores authority and budgets from the journal itself.
+                const carrier: session_codec.RecoveryCheckpoint = .{
+                    .turn_id = try runtime.runtimeTurnId(),
+                    .user = user,
+                    .assistant_source = @constCast(""),
+                    .cause = .suspended,
+                    .action = .paused,
+                    .authority = .{ .provider = loaded.state.preferences.provider, .model = @constCast(try runtime.model()) },
+                    .requested_fast_mode = loaded.state.preferences.fast_mode,
+                    .fast_mode = loaded.state.preferences.fast_mode,
+                    .max_provider_attempts = 1,
+                    .consumed_provider_attempts = 0,
+                };
+                var owned = try carrier.dupe(alloc);
+                errdefer owned.deinit(alloc);
+                const store = app.session_persistence.store orelse return error.SessionPersistenceUnavailable;
+                try session_store.resolveSessionSnapshotLocators(alloc, &.{}, &owned, store.sessions_dir, loaded.active_id);
+                return owned;
+            }
             const checkpoint = loaded.state.recovery_checkpoint orelse return null;
             return try checkpoint.dupe(alloc);
         }
 
         pub fn continuePausedRecovery(app: *App) !bool {
+            const hold = comptime @hasField(App, "worker") and @hasDecl(@TypeOf(app.worker), "tryHoldTurnStart");
+            if (hold and !app.worker.tryHoldTurnStart()) return error.RecoveryBusy;
+            defer if (hold) app.worker.releaseTurnStartHold();
             var checkpoint = (try snapshotRecoveryCheckpoint(
                 app,
                 std.heap.c_allocator,
@@ -2285,11 +2357,26 @@ pub fn Runtime(comptime App: type) type {
             return app.queueRecoveryCheckpoint(&checkpoint);
         }
 
+        pub fn continuePlannedUpgrade(app: *App) !bool {
+            const expected = app.upgrade_handoff.continuation orelse return false;
+            app.upgrade_handoff.continuation = null;
+            if (!app.worker.upgradeQuiescent() or app.question_prompt.isActive() or app.approval_prompt.isActive())
+                return error.UpgradeContinuationBusy;
+            {
+                app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+                defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+                const loaded = if (app.session_persistence.writable) |*value| value else return error.SessionPersistenceUnavailable;
+                if (!std.meta.eql(expected, try restart_handoff.boundary(loaded))) return error.InvalidUpgradeHandoff;
+            }
+            return continuePausedRecovery(app);
+        }
+
         pub fn snapshotFreshPromptBoundary(app: *App, alloc: Allocator) !?session_codec.RecoveryCheckpoint {
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
             const loaded = if (app.session_persistence.writable) |*value| value else return null;
-            if (!loaded.conversation_writer.turn_open) return null;
+            if (!loaded.hasPendingTurn()) return null;
+            if (loaded.journalState() != null) return error.PendingTurnError;
             const value = loaded.state.recovery_checkpoint orelse return error.InvalidRecoveryCheckpoint;
             return try value.dupe(alloc);
         }
@@ -2300,7 +2387,7 @@ pub fn Runtime(comptime App: type) type {
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
             if (app.session_persistence.writable) |*loaded| {
-                if (!loaded.conversation_writer.turn_open and current.prior_turn != null) {
+                if (!loaded.hasPendingTurn() and current.prior_turn != null) {
                     debug_trace.logf("session", "event=fresh_prompt_prior_already_finished turn_id={d}; skipping interrupted closure", .{request.turn_id});
                     current.prior_turn = null;
                 }
@@ -2338,6 +2425,7 @@ pub fn Runtime(comptime App: type) type {
                 turn,
                 .visual_epoch,
                 null,
+                null,
             );
         }
 
@@ -2350,6 +2438,7 @@ pub fn Runtime(comptime App: type) type {
                 finished.turn,
                 .visual_epoch,
                 finished.snapshot_file_ownership,
+                finished.journal_turn,
             );
         }
 
@@ -2363,21 +2452,22 @@ pub fn Runtime(comptime App: type) type {
             turn: types.HistoryTurn,
             mode: AppendHistoryMode,
             snapshot_file_ownership: ?types.SnapshotFileOwnership,
+            journal_turn: ?types.JournalTurnReference,
         ) !HistoryAppendOutcome {
             if (comptime !@hasField(App, "session_persistence")) {
-                return appendHistoryTurnWithOutcome(app, turn, mode, snapshot_file_ownership);
+                return appendHistoryTurnWithOutcome(app, turn, mode, snapshot_file_ownership, journal_turn);
             }
             const interrupted = switch (turn) {
                 .interrupted => |entry| entry,
-                else => return appendHistoryTurnWithOutcome(app, turn, mode, snapshot_file_ownership),
+                else => return appendHistoryTurnWithOutcome(app, turn, mode, snapshot_file_ownership, journal_turn),
             };
             var pending = app.session_persistence.pending_cancelled_command orelse {
-                return appendHistoryTurnWithOutcome(app, turn, mode, snapshot_file_ownership);
+                return appendHistoryTurnWithOutcome(app, turn, mode, snapshot_file_ownership, journal_turn);
             };
             app.session_persistence.pending_cancelled_command = null;
             const call = interrupted.tool_call orelse {
                 pending.discard(app.alloc);
-                return appendHistoryTurnWithOutcome(app, turn, mode, snapshot_file_ownership);
+                return appendHistoryTurnWithOutcome(app, turn, mode, snapshot_file_ownership, journal_turn);
             };
             const is_command = try captured_command.isToolCall(
                 app.alloc,
@@ -2388,7 +2478,7 @@ pub fn Runtime(comptime App: type) type {
                 !std.mem.eql(u8, call.id, pending.lifecycle_id.call_id))
             {
                 pending.discard(app.alloc);
-                return appendHistoryTurnWithOutcome(app, turn, mode, snapshot_file_ownership);
+                return appendHistoryTurnWithOutcome(app, turn, mode, snapshot_file_ownership, journal_turn);
             }
             defer pending.discard(app.alloc);
 
@@ -2405,6 +2495,7 @@ pub fn Runtime(comptime App: type) type {
                     .{ .interrupted = enriched_interrupted },
                     mode,
                     snapshot_file_ownership,
+                    journal_turn,
                 );
             }
 
@@ -2413,7 +2504,7 @@ pub fn Runtime(comptime App: type) type {
                 .command_artifact_handle = pending.command_artifact_handle,
             };
             const enriched: types.HistoryTurn = .{ .interrupted = enriched_interrupted };
-            return appendHistoryTurnWithOutcome(app, enriched, mode, snapshot_file_ownership);
+            return appendHistoryTurnWithOutcome(app, enriched, mode, snapshot_file_ownership, journal_turn);
         }
 
         fn ensurePendingCancelledCommand(
@@ -2474,6 +2565,7 @@ pub fn Runtime(comptime App: type) type {
             turn: types.HistoryTurn,
             mode: AppendHistoryMode,
             snapshot_file_ownership: ?types.SnapshotFileOwnership,
+            journal_turn: ?types.JournalTurnReference,
         ) !HistoryAppendOutcome {
             var prepared = (if (comptime @hasDecl(@TypeOf(app.session), "prepareHistoryEntry"))
                 app.session.prepareHistoryEntry(app.alloc, turn)
@@ -2519,15 +2611,16 @@ pub fn Runtime(comptime App: type) type {
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
             const first_work = app.session_persistence.remember_fresh_session and !hasDurableUserWork(loaded);
             try loaded.prepareHistoryTurnForCommit(app.alloc, &prepared);
-            _ = loaded.appendEvent(
+            _ = loaded.appendHistoryProjection(
                 app.alloc,
-                .{ .history_turn_committed = .{
+                .{
                     .conversation_language = app.session.languageSnapshot(),
                     .total_input_tokens = app.total_input_tokens,
                     .total_output_tokens = app.total_output_tokens,
                     .turn = prepared,
-                } },
+                },
                 io_mod.milliTimestamp(),
+                journal_turn,
             ) catch |err| {
                 if (err == error.SessionPersistenceUncertain) {
                     if (snapshot_file_ownership) |ownership| ownership.transfer();
@@ -2816,9 +2909,7 @@ pub fn Runtime(comptime App: type) type {
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
             if (app.session_persistence.writable) |*loaded| {
                 // A missing finished turn cannot be followed by another saved turn.
-                if (loaded.conversation_writer.failure == null) {
-                    loaded.conversation_writer.failure = error.SessionCommitFailed;
-                }
+                loaded.markCommitFailed();
             }
         }
 
@@ -2835,6 +2926,24 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn prepareResumeHandoff(app: *App) !void {
+            if (app.session_persistence.subagent_host) |host| {
+                host.managed.mutex.lockUncancelable(io_mod.getIo());
+                defer host.managed.mutex.unlock(io_mod.getIo());
+                for (host.managed.slots.items) |slot| {
+                    if (slot.completion != .published) return error.UpgradeNeedsToolIntervention;
+                }
+            }
+            if (comptime @hasField(App, "managed_executions")) {
+                const executions = try app.managed_executions.list(app.alloc);
+                defer {
+                    for (executions) |*execution| execution.deinit(app.alloc);
+                    app.alloc.free(executions);
+                }
+                for (executions) |execution| switch (execution.state) {
+                    .running, .lost => return error.UpgradeNeedsToolIntervention,
+                    .completed, .stopped => {},
+                };
+            }
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
             const loaded = if (app.session_persistence.writable) |*value|
@@ -2842,6 +2951,29 @@ pub fn Runtime(comptime App: type) type {
             else
                 return error.SessionPersistenceUnavailable;
             try settleDurableState(app, loaded);
+            _ = try plannedUpgradeContinuation(app, loaded);
+        }
+
+        fn plannedUpgradeContinuation(app: *App, loaded: *session_store.LoadedWritableSession) !bool {
+            const current = try restart_handoff.boundary(loaded);
+            if (comptime @hasField(@TypeOf(app.worker), "upgrade_turn_id")) {
+                if (!app.worker.upgradeQuiescent()) return error.UpgradeCleanupPending;
+                const turn_id = app.worker.upgrade_turn_id;
+                if (turn_id != 0) {
+                    const finished = app.worker.upgrade_terminal orelse return error.UpgradeTurnNotSettled;
+                    if (finished.turn_id != turn_id) return error.UpgradeTurnNotSettled;
+                    switch (finished.outcome) {
+                        .paused => {
+                            if (current.turn_id != turn_id) return error.InvalidUpgradeHandoff;
+                            return true;
+                        },
+                        .completed => if (current.turn_id != 0) return error.InvalidUpgradeHandoff,
+                        .failed, .interrupted => return error.UpgradeTurnNotSettled,
+                    }
+                }
+            }
+            if (current.turn_id != 0) return error.UpgradeTurnNotSettled;
+            return false;
         }
 
         pub fn suspendToJobControl(app: *App, footer_rows: u16) !void {
@@ -3340,6 +3472,11 @@ pub fn Runtime(comptime App: type) type {
         ) !void {
             try setCachedSessionTitle(app, display_title);
             switch (notice) {
+                .restart => try sink.appendNotice(.{
+                    .topic = "session restarted",
+                    .tone = .neutral,
+                    .body = display_title,
+                }),
                 .session => try sink.appendNotice(.{
                     .topic = "session resumed",
                     .tone = .neutral,
@@ -3365,6 +3502,32 @@ pub fn Runtime(comptime App: type) type {
             sink: anytype,
             state: session_codec.DurableSessionState,
         ) !void {
+            if (comptime runtime_profile.allows(App, .durable_sessions)) {
+                if (app.session_persistence.writable) |*loaded| {
+                    if (loaded.journalState()) |records| {
+                        const pending = (try journal_runtime.pendingHistory(app.alloc, records)) orelse return;
+                        defer types.freeHistoryTurn(app.alloc, pending);
+                        const entry = pending.interrupted;
+                        try sink.appendUserTurn(entry.user, app.session.historyLen() != 0);
+                        try writeExecutionHistoryToSink(app, sink, entry.execution);
+                        if (entry.assistant) |assistant| {
+                            if (assistant.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, assistant);
+                        }
+                        if (comptime @hasField(App, "upgrade_handoff")) {
+                            if (app.upgrade_handoff.continuation != null) return;
+                        }
+                        try sink.appendNotice(.{
+                            .topic = "recovery",
+                            .tone = .warning,
+                            .body = if (records.pending() == .tool)
+                                "Turn paused with an unconfirmed tool result. Inspect the tool effect before continuing."
+                            else
+                                "Turn paused. Run /continue to resume the preserved turn.",
+                        });
+                        return;
+                    }
+                }
+            }
             const checkpoint = state.recovery_checkpoint orelse return;
             var has_prior_turns = false;
             for (state.history) |turn| switch (turn) {
@@ -4205,7 +4368,21 @@ pub fn Runtime(comptime App: type) type {
                     );
                     break :blk null;
                 };
-                break :blk .{ .session_id = session_id };
+                var capability: ?std.Io.File = null;
+                if (handoff_intent == .upgrade_requested) {
+                    const continuing = plannedUpgradeContinuation(app, loaded) catch |err| {
+                        app.alloc.free(session_id);
+                        recordShutdownFailure(app, err);
+                        break :blk null;
+                    };
+                    const reason = if (comptime @hasField(App, "upgrade_handoff")) app.upgrade_handoff.reason else .upgrade;
+                    capability = restart_handoff.publish(app.alloc, loaded, continuing, reason) catch |err| {
+                        app.alloc.free(session_id);
+                        recordShutdownFailure(app, err);
+                        break :blk null;
+                    };
+                }
+                break :blk .{ .session_id = session_id, .upgrade_capability = capability };
             } else null;
             if (comptime @hasDecl(
                 @TypeOf(app.session),
@@ -4613,7 +4790,26 @@ pub fn Runtime(comptime App: type) type {
         };
 
         fn hasDurableUserWork(loaded: *const session_store.LoadedWritableSession) bool {
-            return loaded.conversation_writer.last_seq != 0 or loaded.state.recovery_checkpoint != null;
+            return loaded.state.recovery_checkpoint != null or switch (loaded.writer) {
+                .conversation => |writer| writer.last_seq != 0,
+                .journal => |*writer| writer.execution.turns.items.len != 0 or loaded.state.history.len != 0,
+            };
+        }
+
+        /// Called by the worker after an acknowledged turn-start record is adopted.
+        pub fn rememberJournalAdmission(app: *App) void {
+            var failure: ?RememberFailure = null;
+            {
+                app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+                defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+                if (!app.session_persistence.remember_fresh_session) return;
+                const loaded = if (app.session_persistence.writable) |*value| value else return;
+                const journal = loaded.journalState() orelse return;
+                if (journal.turns.items.len == 0) return;
+                app.session_persistence.remember_fresh_session = false;
+                failure = rememberSession(app, loaded.active_id);
+            }
+            if (failure) |value| reportRememberFailure(app, value, true);
         }
 
         fn rememberSession(app: *App, id: []const u8) ?RememberFailure {
@@ -5599,6 +5795,50 @@ test "js-host preference changes snapshot the updated session preferences" {
     try std.testing.expect(fake.committed_state.?.preferences.fast_mode);
 }
 
+test "cold journal resume reserves image identities from failed turns without history" {
+    const alloc = std.testing.allocator;
+    var records: execution_journal.State = .{};
+    defer records.deinit(alloc);
+    var runtime: journal_runtime.Runtime = .{
+        .state = &records,
+        .alloc = alloc,
+        .namespace = "images",
+        .creation_id = "create",
+        .request_id = "failed-image",
+        .sink = .{ .context = &records, .append_fn = struct {
+            fn append(_: *anyopaque, _: execution_journal.Entry) !void {}
+        }.append },
+    };
+    var images = [_]types.ImageAttachment{.{ .id = 41, .path = @constCast("/not-read.png"), .media_type = @constCast("image/png") }};
+    _ = try runtime.begin(.{ .text = @constCast("image input"), .images = &images }, "model", 1, false);
+    try std.testing.expectEqual(@as(usize, 42), try journal_runtime.nextImageId(alloc, &records, 1));
+    var result = try std.json.parseFromSlice(std.json.Value, alloc, "{\"ok\":false,\"reason\":\"provider_error\",\"retryable\":false,\"message\":\"rejected\"}", .{});
+    defer result.deinit();
+    try runtime.finish(result.value, null);
+    try std.testing.expect(records.pending() == .idle);
+    try std.testing.expectEqual(@as(usize, 42), try journal_runtime.nextImageId(alloc, &records, 1));
+    try std.testing.expectEqual(@as(usize, 100), try journal_runtime.nextImageId(alloc, &records, 100));
+    images[0].id = 99;
+    var genesis = try @import("../session/execution_journal_genesis.zig").encode(alloc, .{
+        .id = @constCast("imported"),
+        .origin_workspace_root = @constCast("/workspace"),
+        .workspace_root = @constCast("/workspace"),
+        .created_at_ms = 1,
+        .updated_at_ms = 2,
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+        .conversation_language = .literal("en"),
+        .preferences = .{ .model = @constCast("model"), .effort = .auto, .fast_mode = false },
+        .history = @constCast(&[_]types.HistoryTurn{.{ .assistant = .{ .user = .{ .text = @constCast("old image"), .images = &images }, .assistant = @constCast("saved") } }}),
+    });
+    defer genesis.deinit(alloc);
+    var imported: execution_journal.State = .{};
+    defer imported.deinit(alloc);
+    try imported.restore(alloc, genesis.entry.seq, "checkpoint", genesis.entry.bytes, &genesis.entry.hash);
+    // The current model view may have compacted every imported image away.
+    try std.testing.expectEqual(@as(usize, 100), try journal_runtime.nextImageId(alloc, &imported, 1));
+}
+
 test "cold resume image id rebase rejects overflow before admission" {
     var images = [_]types.ImageAttachment{.{
         .id = std.math.maxInt(usize),
@@ -5677,6 +5917,69 @@ fn configureTestPreferences(app: *TestApp) !void {
         true,
         true,
     );
+}
+
+// Exercise host callbacks only after the real journal has acknowledged the
+// fixture's selected decisions, results, and terminal history.
+fn acknowledgeTestHistory(app: *TestApp, turn: types.HistoryTurn) !void {
+    const user = switch (turn) {
+        .assistant => |value| value.user,
+        .interrupted => |value| value.user,
+        .compacted_summary => return error.TestExpectedExecutionTurn,
+    };
+    const memory = if (turn == .assistant) turn.assistant.execution else turn.interrupted.execution;
+    try std.testing.expect(memory.steering.len == 0);
+    const loaded = if (app.session_persistence.writable) |*value| value else return;
+    const state = loaded.journalState() orelse return;
+    const request_id = try std.fmt.allocPrint(app.alloc, "fixture-{d}", .{state.turns.items.len + 1});
+    defer app.alloc.free(request_id);
+    var journal: journal_runtime.Runtime = .{
+        .state = state,
+        .sink = loaded.journalSink().?,
+        .alloc = app.alloc,
+        .namespace = loaded.active_id,
+        .creation_id = "fixture",
+        .request_id = request_id,
+    };
+    const runtime_turn_id = if (turn == .interrupted and app.session_persistence.pending_cancelled_command != null)
+        app.session_persistence.pending_cancelled_command.?.lifecycle_id.turn_id
+    else
+        state.turns.items.len + 1;
+    _ = try journal.begin(user, loaded.state.preferences.model, runtime_turn_id, false);
+    for (memory.tool_steps) |step| {
+        var key = try journal.generation();
+        defer key.deinit(app.alloc);
+        const replay = try app.alloc.alloc(execution_journal.Replay, step.tool_calls.len);
+        defer app.alloc.free(replay);
+        @memset(replay, .blocked);
+        const index = try journal.recordDecision(.{ .content = step.assistant }, step.tool_calls, replay, key, false, null, step.provider_replay);
+        for (step.tool_results, 0..) |result, call| try journal.recordResult(index, call, result);
+    }
+    var encoded: std.Io.Writer.Allocating = .init(app.alloc);
+    defer encoded.deinit();
+    if (turn == .assistant) {
+        var key = try journal.generation();
+        defer key.deinit(app.alloc);
+        _ = try journal.recordDecision(.{ .content = turn.assistant.assistant }, &.{}, &.{}, key, true, null, turn.assistant.provider_replay);
+        try encoded.writer.writeAll("{\"ok\":true,\"stopReason\":\"stop\"}");
+    } else {
+        if (turn.interrupted.tool_call) |call| {
+            var key = try journal.generation();
+            defer key.deinit(app.alloc);
+            _ = try journal.recordDecision(.{ .content = turn.interrupted.assistant }, &.{call}, &.{.blocked}, key, false, null, null);
+        }
+        try encoded.writer.writeAll("{\"ok\":false,\"reason\":\"cancelled\",\"retryable\":false,\"message\":\"Cancelled\"");
+        var pending = try journal_runtime.pendingTool(app.alloc, state);
+        defer if (pending) |*value| value.deinit();
+        if (pending) |value| {
+            try encoded.writer.writeAll(",\"pendingTool\":");
+            try std.json.Stringify.value(.{ .callId = value.tool.callId, .name = value.tool.name, .input = value.tool.input }, .{}, &encoded.writer);
+        }
+        try encoded.writer.writeByte('}');
+    }
+    const result = try std.json.parseFromSlice(std.json.Value, app.alloc, encoded.written(), .{});
+    defer result.deinit();
+    try journal.finish(result.value, turn);
 }
 
 fn writeSessionFixture(
@@ -5840,6 +6143,62 @@ test "upgrade resume handoff owns a validated pristine session" {
     try std.testing.expectEqualStrings(expected_id, handoff.session_id);
 }
 
+test "journal handoff consumption is one use and ordinary reopen cannot continue" {
+    const alloc = std.testing.allocator;
+    for ([_]enum { planned, ordinary, stale_position, wrong_workspace, old_version }{ .planned, .ordinary, .stale_position, .wrong_workspace, .old_version }) |mode| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const paths = try testPaths(alloc, &tmp);
+        defer alloc.free(paths.home);
+        defer alloc.free(paths.workspace);
+        const home = try TestHome.install(alloc, paths.home);
+        defer home.deinit();
+        var app = try TestApp.init(alloc, paths.workspace);
+        defer app.deinit();
+        try configureTestPreferences(&app);
+        try Runtime(TestApp).initializePersistence(&app, true);
+        try Runtime(TestApp).beginFreshPersistedSession(&app);
+        const loaded = &app.session_persistence.writable.?;
+        var capability: ?std.Io.File = try restart_handoff.publish(alloc, loaded, false, .restart);
+        defer if (capability) |file| file.close(io_mod.getIo());
+        const before = loaded.position;
+        if (mode == .stale_position or mode == .old_version) {
+            var file = try io_mod.openExistingRegularFile(loaded.log.dir.dir, "upgrade-handoff.json", .read_only);
+            defer file.close(io_mod.getIo());
+            const bytes = try io_mod.readFileToEnd(alloc, &file, 16 * 1024);
+            defer alloc.free(bytes);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+            defer parsed.deinit();
+            if (mode == .old_version) {
+                parsed.value.object.getPtr("version").?.integer = 2;
+            } else {
+                parsed.value.object.getPtr("boundary").?.object.getPtr("seq").?.integer += 1;
+            }
+            const changed = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+            defer alloc.free(changed);
+            try io_mod.durableReplaceVerified(alloc, &loaded.log.dir, "upgrade-handoff.json", changed);
+        }
+        if (mode == .old_version) {
+            try std.testing.expectError(error.InvalidUpgradeHandoff, restart_handoff.consume(alloc, loaded, true, paths.workspace));
+        } else if (mode == .ordinary) {
+            try std.testing.expect(try restart_handoff.consume(alloc, loaded, false, paths.workspace) == null);
+        } else {
+            // These records authenticate the inherited descriptor, so consume
+            // takes ownership even when the later boundary check rejects them.
+            capability = null;
+            if (mode == .stale_position or mode == .wrong_workspace) {
+                try std.testing.expectError(error.InvalidUpgradeHandoff, restart_handoff.consume(alloc, loaded, true, if (mode == .wrong_workspace) "/other" else paths.workspace));
+            } else {
+                const consumed = (try restart_handoff.consume(alloc, loaded, true, paths.workspace)).?;
+                try std.testing.expectEqual(restart_handoff.Reason.restart, consumed.reason);
+                try std.testing.expect(consumed.continuation == null);
+            }
+        }
+        try std.testing.expectEqual(before, loaded.position);
+        if (mode != .old_version) try std.testing.expect(try restart_handoff.consume(alloc, loaded, true, paths.workspace) == null);
+    }
+}
+
 test "resume handoff owns the exact non-pristine session id" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -5858,6 +6217,7 @@ test "resume handoff owns the exact non-pristine session id" {
     try Runtime(TestApp).beginFreshPersistedSession(&app);
     const turn = try session_runtime.makeAssistantTurn(alloc, "question", "answer");
     defer session_runtime.freeHistoryTurn(alloc, turn);
+    try acknowledgeTestHistory(&app, turn);
     try Runtime(TestApp).appendHistoryTurn(&app, turn);
     const expected_id = try alloc.dupe(
         u8,
@@ -5892,6 +6252,7 @@ test "resume handoff requires no derived cache write" {
     try Runtime(TestApp).beginFreshPersistedSession(&app);
     const turn = try session_runtime.makeAssistantTurn(alloc, "question", "answer");
     defer session_runtime.freeHistoryTurn(alloc, turn);
+    try acknowledgeTestHistory(&app, turn);
     try Runtime(TestApp).appendHistoryTurn(&app, turn);
     const expected_id = try alloc.dupe(
         u8,
@@ -5931,6 +6292,7 @@ test "resume handoff suppresses session id allocation failure" {
     try Runtime(TestApp).beginFreshPersistedSession(&app);
     const turn = try session_runtime.makeAssistantTurn(alloc, "question", "answer");
     defer session_runtime.freeHistoryTurn(alloc, turn);
+    try acknowledgeTestHistory(&app, turn);
     try Runtime(TestApp).appendHistoryTurn(&app, turn);
     Runtime(TestApp).requestResumeHandoff(&app);
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
@@ -6979,13 +7341,12 @@ test "upgrade resume restores active session with the installed version notice" 
         .tool_calls = calls[0..],
         .tool_results = results[0..],
     }};
-    var resumed_images = [_]types.ImageAttachment{.{
-        .id = 41,
-        .path = @constCast("/tmp/resumed.png"),
-        .media_type = @constCast("image/png"),
-        .snapshot_path = @constCast("images/image-41-0123456789abcdef.bin"),
-        .snapshot_sha256 = @constCast("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
-    }};
+    const image = try image_attachments.captureInlineImageBytes(alloc, 41, "image/png", "\x89PNG\r\n\x1a\nresume-image", paths.workspace);
+    defer types.freeImageAttachment(alloc, image);
+    const image_locator = try std.fmt.allocPrint(alloc, "images/image-41-{s}.bin", .{image.snapshot_sha256.?[0..16]});
+    defer alloc.free(image_locator);
+    var resumed_images = [_]types.ImageAttachment{image};
+    resumed_images[0].snapshot_path = image_locator;
     const history = [_]types.HistoryTurn{
         .{ .compacted_summary = .{
             .summary = @constCast("<context_handoff>older context</context_handoff>"),
@@ -7014,6 +7375,17 @@ test "upgrade resume restores active session with the installed version notice" 
         &history,
         2,
     );
+    const image_dir = try std.fs.path.join(alloc, &.{ app.session_persistence.store.?.sessions_dir, "session-1", "images" });
+    defer alloc.free(image_dir);
+    const saved_image = try image_attachments.copyVerifiedImageAttachmentToDir(alloc, image, 41, image_dir);
+    defer types.freeImageAttachment(alloc, saved_image);
+    {
+        var fixture = try app.session_persistence.store.?.resumeForWrite(alloc, "session-1");
+        defer fixture.deinit(alloc);
+        const capability = try fixture.childCapability();
+        var artifact = try capability.atomicReplace(alloc, .tool_results, "result-read-file.txt", "file contents");
+        artifact.deinit(alloc);
+    }
     app.requested_resume = .{ .id = try alloc.dupe(u8, "session-1") };
     app.total_web_search_requests = 99;
 
@@ -7075,7 +7447,7 @@ test "upgrade resume restores active session with the installed version notice" 
     try std.testing.expect(!app.fast_mode);
 }
 
-test "resumed recovery checkpoint replays its unfinished turn once" {
+test "resumed journal replays its unfinished turn once" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7105,9 +7477,10 @@ test "resumed recovery checkpoint replays its unfinished turn once" {
         0,
     );
     {
-        var writable = try app.session_persistence.store.?.resumeForWrite(
+        var writable = try app.session_persistence.store.?.resumeJournalForWrite(
             alloc,
             "paused-recovery",
+            .{},
         );
         defer writable.deinit(alloc);
         const checkpoint = session_codec.RecoveryCheckpoint{
@@ -7122,11 +7495,23 @@ test "resumed recovery checkpoint replays its unfinished turn once" {
             .max_provider_attempts = 10,
             .consumed_provider_attempts = 2,
         };
-        _ = try writable.appendEvent(
-            alloc,
-            .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } },
-            789,
-        );
+        var context: std.Io.Writer.Allocating = .init(alloc);
+        defer context.deinit();
+        try context.writer.writeAll("{\"recovery\":");
+        try session_codec.writeRecoveryCheckpoint(&context.writer, checkpoint);
+        try context.writer.writeAll(",\"preparations\":[]}");
+        var journal: journal_runtime.Runtime = .{
+            .state = writable.journalState().?,
+            .sink = writable.journalSink().?,
+            .alloc = alloc,
+            .namespace = writable.active_id,
+            .creation_id = "recovery-fixture",
+            .request_id = "unfinished-request",
+        };
+        _ = try journal.begin(checkpoint.user, checkpoint.authority.model, checkpoint.turn_id, false);
+        var key = try journal.generation();
+        defer key.deinit(alloc);
+        _ = try journal.recordDecision(.{ .content = checkpoint.assistant_source }, &.{}, &.{}, key, false, context.written(), null);
     }
 
     app.requested_resume = .{ .id = try alloc.dupe(u8, "paused-recovery") };
@@ -7140,7 +7525,14 @@ test "resumed recovery checkpoint replays its unfinished turn once" {
         app.assistant_text.items,
     );
     try std.testing.expectEqual(@as(usize, 2), app.notices.items.len);
-    try std.testing.expect(std.mem.find(u8, app.notices.items[1], "attempt 2/10") != null);
+    try std.testing.expect(std.mem.find(u8, app.notices.items[1], "Run /continue") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Cancelled") == null);
+    const records = app.session_persistence.writable.?.journalState().?;
+    const context = try execution_journal.object(records.latestContextRecord(0).?, "executionContext");
+    var saved = try session_codec.parseRecoveryCheckpoint(alloc, try execution_journal.object(context, "recovery"));
+    defer saved.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), saved.consumed_provider_attempts);
+    try std.testing.expectEqual(@as(usize, 10), saved.max_provider_attempts);
 }
 
 test "resumeRequestedSession releases the writer when the startup replay anchor fails" {
@@ -7189,9 +7581,10 @@ test "resumeRequestedSession releases the writer when the startup replay anchor 
     try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
 
-    var reopened = try app.session_persistence.store.?.resumeForWrite(
+    var reopened = try app.session_persistence.store.?.resumeJournalForWrite(
         alloc,
         "anchor-failure",
+        .{},
     );
     reopened.deinit(alloc);
 }
@@ -7622,9 +8015,10 @@ test "resumeRequestedSession cleans final owner after post-transfer failure" {
     try std.testing.expect(app.requested_resume == null);
     try std.testing.expect(app.session_persistence.writable == null);
 
-    var reopened = try app.session_persistence.store.?.resumeForWrite(
+    var reopened = try app.session_persistence.store.?.resumeJournalForWrite(
         alloc,
         "session-1",
+        .{},
     );
     defer reopened.deinit(alloc);
     try std.testing.expectEqualStrings("session-1", reopened.active_id);
@@ -7663,9 +8057,33 @@ test "resumeRequestedSession replays active-tool interruption with live cancella
         alloc,
         app.session_persistence.store.?,
         "session-1",
-        &history,
+        &.{},
         0,
     );
+    {
+        var writable = try app.session_persistence.store.?.resumeJournalForWrite(alloc, "session-1", .{});
+        defer writable.deinit(alloc);
+        var journal: journal_runtime.Runtime = .{
+            .state = writable.journalState().?,
+            .sink = writable.journalSink().?,
+            .alloc = alloc,
+            .namespace = writable.active_id,
+            .creation_id = "cancelled-fixture",
+            .request_id = "cancelled-request",
+        };
+        _ = try journal.begin(history[0].interrupted.user, writable.state.preferences.model, 1, false);
+        var key = try journal.generation();
+        defer key.deinit(alloc);
+        _ = try journal.recordDecision(.{}, &.{history[0].interrupted.tool_call.?}, &.{.blocked}, key, false, null, null);
+        const cancelled = (try journal.abandon()).?;
+        defer types.freeHistoryTurn(alloc, cancelled);
+        _ = try writable.appendEvent(alloc, .{ .history_turn_committed = .{
+            .conversation_language = writable.state.conversation_language,
+            .total_input_tokens = writable.state.total_input_tokens,
+            .total_output_tokens = writable.state.total_output_tokens,
+            .turn = cancelled,
+        } }, 789);
+    }
     app.requested_resume = .{ .id = try alloc.dupe(u8, "session-1") };
 
     try Runtime(TestApp).resumeRequestedSession(&app);
@@ -7770,7 +8188,7 @@ test "cancelled command presentation survives a persisted session restart" {
             true,
         );
 
-        try Runtime(TestApp).appendHistoryTurn(&app, .{ .interrupted = .{
+        const turn: types.HistoryTurn = .{ .interrupted = .{
             .user = .{ .text = @constCast("run the slow command") },
             .assistant = @constCast("I started it."),
             .tool_call = .{
@@ -7780,8 +8198,11 @@ test "cancelled command presentation survives a persisted session restart" {
             },
             .cancelled_command = .{
                 .output_replay = .{ .available = descriptor },
+                .command_artifact_handle = "fx-command-cancelled.log",
             },
-        } });
+        } };
+        try acknowledgeTestHistory(&app, turn);
+        try Runtime(TestApp).appendHistoryTurn(&app, turn);
         session_id = try alloc.dupe(u8, app.session_persistence.writable.?.active_id);
         Runtime(TestApp).finalizePersistence(&app);
     }
@@ -7905,7 +8326,7 @@ fn expectAuthoritativeCancelledReplayIsSoleArtifact() !void {
         true,
     );
 
-    try Runtime(TestApp).appendHistoryTurn(&app, .{ .interrupted = .{
+    const turn: types.HistoryTurn = .{ .interrupted = .{
         .user = .{ .text = @constCast("cancel") },
         .tool_call = .{
             .id = "authoritative-cancelled-command",
@@ -7914,8 +8335,11 @@ fn expectAuthoritativeCancelledReplayIsSoleArtifact() !void {
         },
         .cancelled_command = .{
             .output_replay = .{ .available = descriptor },
+            .command_artifact_handle = "fx-command-cancelled.log",
         },
-    } });
+    } };
+    try acknowledgeTestHistory(&app, turn);
+    try Runtime(TestApp).appendHistoryTurn(&app, turn);
     published = true;
 
     const history = try app.session.snapshotHistory(alloc);
@@ -8242,6 +8666,7 @@ test "appendHistoryTurn commits conversation without copying runtime counters" {
     const turn = try session_runtime.makeAssistantTurn(alloc, "question", "answer");
     defer session_runtime.freeHistoryTurn(alloc, turn);
 
+    try acknowledgeTestHistory(&app, turn);
     try Runtime(TestApp).appendHistoryTurn(&app, turn);
 
     var loaded = try app.session_persistence.store.?.loadReadOnly(
@@ -8272,37 +8697,42 @@ test "fresh TUI prompt preparation preserves equal user text as distinct turns" 
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
+    const loaded = &app.session_persistence.writable.?;
+    var journal: journal_runtime.Runtime = .{
+        .state = loaded.journalState().?,
+        .sink = loaded.journalSink().?,
+        .alloc = alloc,
+        .namespace = loaded.active_id,
+        .creation_id = "old-runtime",
+        .request_id = "old-request",
+    };
+    const user: types.UserTurn = .{ .text = @constCast("same prompt") };
+    _ = try journal.begin(user, loaded.state.preferences.model, 41, false);
+    var key = try journal.generation();
+    defer key.deinit(alloc);
+    _ = try journal.recordDecision(.{ .content = "partial old response" }, &.{}, &.{}, key, false, null, null);
     try Runtime(TestApp).commitContextCompaction(&app, .{
         .summary = @constCast("<context_handoff>unfinished request</context_handoff>"),
         .removed_turn_count = 0,
         .compaction_count = 1,
-    }, .{ .user = .{ .text = @constCast("same prompt") }, .assistant = @constCast("") }, null);
-    const checkpoint: session_codec.RecoveryCheckpoint = .{
-        .turn_id = 41,
-        .user = .{ .text = @constCast("same prompt") },
-        .assistant_source = @constCast("partial old response"),
-        .cause = .response_interrupted,
-        .action = .continuing_response,
-        .authority = .{ .provider = .gateway, .model = @constCast("saved/model") },
-        .requested_fast_mode = false,
-        .fast_mode = false,
-        .max_provider_attempts = 10,
-        .consumed_provider_attempts = 2,
-    };
-    try Runtime(TestApp).setRecoveryCheckpoint(&app, checkpoint);
+    }, .{ .user = user, .assistant = @constCast("") }, null);
+    const abandoned = (try journal.abandon()).?;
+    defer types.freeHistoryTurn(alloc, abandoned);
     var prepared = try Runtime(TestApp).prepareFreshPrompt(&app, .{
         .user = .{ .text = @constCast("same prompt") },
-        .prior_turn = checkpoint.interruptedTurn(),
+        .prior_turn = abandoned,
     });
     defer prepared.deinit(std.heap.c_allocator);
     try std.testing.expectEqual(@as(usize, 2), prepared.history.len);
-    try std.testing.expect(!app.session_persistence.writable.?.conversation_writer.turn_open);
+    try std.testing.expect(!loaded.hasPendingTurn());
     try std.testing.expect(app.session_persistence.writable.?.state.recovery_checkpoint == null);
     try std.testing.expectEqual(@as(usize, 2), app.session.historyLen());
-    try Runtime(TestApp).appendHistoryTurn(&app, .{ .assistant = .{
-        .user = .{ .text = @constCast("same prompt") },
-        .assistant = @constCast("new answer"),
-    } });
+    const next: types.HistoryTurn = .{ .assistant = .{ .user = user, .assistant = @constCast("new answer") } };
+    try acknowledgeTestHistory(&app, next);
+    try Runtime(TestApp).appendHistoryTurn(&app, next);
+    try std.testing.expectEqual(@as(usize, 2), loaded.journalState().?.turns.items.len);
+    try std.testing.expect(!std.mem.eql(u8, try execution_journal.string(loaded.journalState().?.start(0), "requestId"), try execution_journal.string(loaded.journalState().?.start(1), "requestId")));
+
     var page = try app.session_persistence.store.?.loadHistoryPage(alloc, app.session_persistence.writable.?.active_id, null, 10);
     defer page.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), page.turns.len);
@@ -8328,26 +8758,35 @@ test "context checkpoint persists before releasing summarized model memory" {
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
-    const session_id = app.session_persistence.writable.?.active_id;
+    const session_id = try alloc.dupe(u8, app.session_persistence.writable.?.active_id);
+    defer alloc.free(session_id);
 
     const first = try session_runtime.makeAssistantTurn(alloc, "first", "one");
     defer session_runtime.freeHistoryTurn(alloc, first);
     const second = try session_runtime.makeAssistantTurn(alloc, "second", "two");
     defer session_runtime.freeHistoryTurn(alloc, second);
+    try acknowledgeTestHistory(&app, first);
     try Runtime(TestApp).appendHistoryTurn(&app, first);
+    try acknowledgeTestHistory(&app, second);
     try Runtime(TestApp).appendHistoryTurn(&app, second);
+    var prior_page = try app.session_persistence.store.?.loadHistoryPage(alloc, session_id, null, 1);
+    defer prior_page.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), prior_page.history_len);
+    try std.testing.expectEqualStrings("second", prior_page.turns[0].assistant.user.text);
     const summary: types.CompactedSummaryHistoryTurn = .{
         .summary = @constCast("<context_handoff>both turns</context_handoff>"),
         .removed_turn_count = 2,
         .compaction_count = 1,
     };
-    const writer = &app.session_persistence.writable.?.conversation_writer;
-    const saved_seq = writer.last_seq;
-    const saved_bytes = writer.committed_bytes;
-    writer.last_seq = std.math.maxInt(u64);
-    try std.testing.expectError(error.ConversationSequenceOverflow, Runtime(TestApp).commitContextCompaction(&app, summary, null, null));
-    writer.last_seq = saved_seq;
-    try std.testing.expectEqual(saved_bytes, writer.committed_bytes);
+    const loaded = &app.session_persistence.writable.?;
+    const records = loaded.journalState().?;
+    const saved_limit = records.limits.records;
+    const saved_position = loaded.position;
+    records.limits.records = records.records.items.len;
+    try std.testing.expectError(error.JournalCapacityExceeded, Runtime(TestApp).commitContextCompaction(&app, summary, null, null));
+    records.limits.records = saved_limit;
+    try std.testing.expectEqual(saved_position, loaded.position);
+    try std.testing.expect(!records.blocked);
     try std.testing.expectEqual(@as(usize, 2), app.session.historyLen());
     try Runtime(TestApp).commitContextCompaction(&app, summary, null, null);
 
@@ -8356,11 +8795,13 @@ test "context checkpoint persists before releasing summarized model memory" {
         @as(usize, 0),
         app.session_persistence.writable.?.state.history.len,
     );
-    var root = app.session_persistence.store.?.canonical_root;
-    var resumed = try root.loadReadOnly(alloc, session_id, .{});
+    Runtime(TestApp).closeWritableSession(&app);
+    var resumed = try app.session_persistence.store.?.resumeJournalForWrite(alloc, session_id, .{});
     defer resumed.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), resumed.history.len);
-    try std.testing.expect(resumed.history[0] == .compacted_summary);
+    const restored = try journal_runtime.restoreHistory(alloc, resumed.journalState().?);
+    defer types.freeHistoryTurnSlice(alloc, restored);
+    try std.testing.expectEqual(@as(usize, 1), restored.len);
+    try std.testing.expect(restored[0] == .compacted_summary);
     var page = try app.session_persistence.store.?.loadHistoryPage(
         alloc,
         session_id,
@@ -8371,9 +8812,15 @@ test "context checkpoint persists before releasing summarized model memory" {
     try std.testing.expectEqual(@as(usize, 2), page.turns.len);
     try std.testing.expectEqualStrings("first", page.turns[0].assistant.user.text);
     try std.testing.expectEqualStrings("second", page.turns[1].assistant.user.text);
+    try std.testing.expectEqual(@as(usize, 2), page.history_len);
+    var continued = try app.session_persistence.store.?.loadHistoryPage(alloc, session_id, prior_page.next_cursor.?, 1);
+    defer continued.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), continued.turns.len);
+    try std.testing.expectEqualStrings("first", continued.turns[0].assistant.user.text);
+    try std.testing.expect(continued.next_cursor == null);
 }
 
-test "handle-free conversation result is externalized before live commit" {
+test "inline journal result remains complete through the live history callback" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8407,11 +8854,13 @@ test "handle-free conversation result is externalized before live commit" {
         .tool_results = &results,
     }};
 
-    try Runtime(TestApp).appendHistoryTurn(&app, .{ .assistant = .{
+    const turn: types.HistoryTurn = .{ .assistant = .{
         .user = .{ .text = @constCast("run it") },
         .assistant = @constCast("done"),
         .execution = .{ .tool_steps = &steps },
-    } });
+    } };
+    try acknowledgeTestHistory(&app, turn);
+    try Runtime(TestApp).appendHistoryTurn(&app, turn);
     try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
     try std.testing.expectEqual(
         @as(usize, 0),
@@ -8426,24 +8875,14 @@ test "handle-free conversation result is externalized before live commit" {
     defer reloaded.deinit(alloc);
     const stored_result = reloaded.history[0].assistant.execution
         .tool_steps[0].tool_results[0];
-    try std.testing.expect(live_result.output_handle != null);
-    try std.testing.expectEqualStrings(
-        live_result.output_handle.?,
-        stored_result.output_handle.?,
-    );
-    const capability = try app.session_persistence.writable.?.childCapability();
-    const stored = try result_store.readByRangeManaged(
-        alloc,
-        capability,
-        live_result.output_handle.?,
-        0,
-        64,
-    );
-    defer alloc.free(stored);
-    try std.testing.expect(std.mem.find(u8, stored, "done") != null);
+    try std.testing.expect(live_result.output_handle == null);
+    try std.testing.expect(stored_result.output_handle == null);
+    try std.testing.expectEqualStrings("done", live_result.output);
+    try std.testing.expectEqualStrings(live_result.output, stored_result.output);
+    try std.testing.expectEqual(@as(usize, 4), stored_result.stored_output_bytes);
 }
 
-test "completed conversation turn clears its recovery file" {
+test "completed journal turn clears pending execution without a recovery sidecar" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8459,23 +8898,27 @@ test "completed conversation turn clears its recovery file" {
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
-    try Runtime(TestApp).setRecoveryCheckpoint(&app, .{
-        .turn_id = 1,
-        .user = .{ .text = @constCast("prompt") },
-        .assistant_source = @constCast("partial"),
-        .cause = .network_interrupted,
-        .action = .retrying_request,
-        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
-        .requested_fast_mode = false,
-        .fast_mode = false,
-        .max_provider_attempts = 3,
-        .consumed_provider_attempts = 1,
-    });
-    try std.testing.expect(
-        app.session_persistence.writable.?.state.recovery_checkpoint != null,
-    );
+    const loaded = &app.session_persistence.writable.?;
+    var journal: journal_runtime.Runtime = .{
+        .state = loaded.journalState().?,
+        .sink = loaded.journalSink().?,
+        .alloc = alloc,
+        .namespace = loaded.active_id,
+        .creation_id = "completion-fixture",
+        .request_id = "completed-request",
+    };
     const turn = try session_runtime.makeAssistantTurn(alloc, "prompt", "done");
     defer session_runtime.freeHistoryTurn(alloc, turn);
+    _ = try journal.begin(turn.assistant.user, loaded.state.preferences.model, 1, false);
+    try std.testing.expect(loaded.hasPendingTurn());
+    try std.testing.expect(loaded.state.recovery_checkpoint == null);
+    var key = try journal.generation();
+    defer key.deinit(alloc);
+    _ = try journal.recordDecision(.{ .content = "done" }, &.{}, &.{}, key, true, null, null);
+    const result = try std.json.parseFromSlice(std.json.Value, alloc, "{\"ok\":true,\"stopReason\":\"stop\"}", .{});
+    defer result.deinit();
+    try journal.finish(result.value, turn);
+    try std.testing.expect(!loaded.hasPendingTurn());
     try Runtime(TestApp).appendHistoryTurn(&app, turn);
     try std.testing.expectError(
         error.FileNotFound,
@@ -8615,6 +9058,7 @@ test "appendHistoryTurn preserves canonical turns above the context limit" {
     for (users, assistants) |user, assistant| {
         const turn = try session_runtime.makeAssistantTurn(alloc, user, assistant);
         defer session_runtime.freeHistoryTurn(alloc, turn);
+        try acknowledgeTestHistory(&app, turn);
         try Runtime(TestApp).appendHistoryTurn(&app, turn);
     }
 
@@ -9562,6 +10006,7 @@ test "renameActiveSession persists the title only in session metadata" {
     try Runtime(TestApp).beginFreshPersistedSession(&app);
     Runtime(TestApp).enableSessionStores(&app);
 
+    const journal_position = app.session_persistence.writable.?.position.through_seq;
     try Runtime(TestApp).renameActiveSession(&app, "  deploy pipeline fix  ");
 
     // Cached for the footer without re-reading the sidecar.
@@ -9578,21 +10023,10 @@ test "renameActiveSession persists the title only in session metadata" {
         .{ .preferences_changed = .{ .fast_mode = true } },
         loaded.state.updated_at_ms + 1,
     );
-    var metadata_file = try loaded.log.dir.dir.openFile(
-        std.testing.io,
-        "session.json",
-        .{},
-    );
-    defer metadata_file.close(std.testing.io);
-    const metadata_bytes = try io_mod.readFileToEnd(
-        alloc,
-        &metadata_file,
-        session_codec.max_session_metadata_bytes,
-    );
-    defer alloc.free(metadata_bytes);
-    var metadata = try session_codec.decodeSessionMetadata(alloc, metadata_bytes);
+    var metadata = try loaded.writer.journal.owner.readMetadata();
     defer metadata.deinit();
     try std.testing.expectEqualStrings("deploy pipeline fix", metadata.value.title.?);
+    try std.testing.expectEqual(journal_position, loaded.position.through_seq);
     try std.testing.expectError(
         error.FileNotFound,
         loaded.log.dir.dir.statFile(std.testing.io, "display.json", .{}),
@@ -9835,6 +10269,62 @@ test "terminal title ignores long session and model context" {
     try std.testing.expectEqualStrings("v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
 }
 
+test "queued journal finish validates its own turn while a later turn is running" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |checkpoint_first| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const paths = try testPaths(alloc, &tmp);
+        defer alloc.free(paths.home);
+        defer alloc.free(paths.workspace);
+        const home = try TestHome.install(alloc, paths.home);
+        defer home.deinit();
+        var app = try TestApp.init(alloc, paths.workspace);
+        defer app.deinit();
+        try configureTestPreferences(&app);
+        try Runtime(TestApp).initializePersistence(&app, true);
+        try Runtime(TestApp).beginFreshPersistedSession(&app);
+        var first = try session_runtime.makeAssistantTurn(alloc, "first", "saved answer");
+        defer types.freeHistoryTurn(alloc, first);
+        const saved_summary: types.TurnSummary = .{ .turn_duration_ms = 10, .thinking_duration_ms = 2, .token_progress = .{} };
+        types.setHistoryTurnSummary(&first, saved_summary);
+        try acknowledgeTestHistory(&app, first);
+        const loaded = &app.session_persistence.writable.?;
+        const reference: types.JournalTurnReference = .{
+            .namespace_hash = execution_journal.inputHash(loaded.active_id),
+            .turn_index = 0,
+        };
+        if (checkpoint_first) {
+            var checkpoint = try loaded.journalState().?.checkpoint(alloc, loaded.journalSink().?);
+            checkpoint.deinit(alloc);
+        }
+        var next: journal_runtime.Runtime = .{
+            .state = loaded.journalState().?,
+            .sink = loaded.journalSink().?,
+            .alloc = alloc,
+            .namespace = loaded.active_id,
+            .creation_id = "next",
+            .request_id = "next-request",
+        };
+        _ = try next.begin(.{ .text = @constCast("second") }, loaded.state.preferences.model, 2, false);
+        const position = loaded.position;
+        var foreign = reference;
+        foreign.namespace_hash[0] ^= 1;
+        try std.testing.expectError(error.JournalConflict, Runtime(TestApp).appendFinishedPrompt(&app, .{ .turn = first, .journal_turn = foreign }));
+        var unfinished = reference;
+        unfinished.turn_index = 1;
+        try std.testing.expectError(error.JournalControlRequired, Runtime(TestApp).appendFinishedPrompt(&app, .{ .turn = first, .journal_turn = unfinished }));
+        var presentation_summary = saved_summary;
+        presentation_summary.turn_duration_ms += 100;
+        try Runtime(TestApp).appendFinishedPrompt(&app, .{ .turn = first, .summary = presentation_summary, .journal_turn = reference });
+        try std.testing.expectEqual(position, loaded.position);
+        try std.testing.expect(loaded.hasPendingTurn());
+        try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
+        try std.testing.expectEqualStrings("saved answer", app.session.agent.history.items[0].assistant.assistant);
+        try std.testing.expectEqual(saved_summary, app.session.agent.history.items[0].assistant.execution.turn_summary.?);
+    }
+}
+
 test "failed history delivery rejects the current writer without poisoning a fresh session" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -9856,6 +10346,7 @@ test "failed history delivery rejects the current writer without poisoning a fre
     try std.testing.expectEqual(@as(usize, 0), app.session.historyLen());
     Runtime(TestApp).closeWritableSession(&app);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
+    try acknowledgeTestHistory(&app, turn);
     try Runtime(TestApp).appendHistoryTurn(&app, turn);
     try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
     try std.testing.expectEqual(@as(?anyerror, error.InputOutput), app.session_persistence.shutdown_failure);
@@ -9876,14 +10367,15 @@ test "uncertain finished history preserves snapshot files and rejects later writ
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
     const Fault = struct {
-        fn sync(_: ?*anyopaque, _: std.Io.File) !void {
+        fn sync(_: ?*anyopaque, _: std.Io.Dir) !void {
             return error.InputOutput;
         }
     };
-    app.session_persistence.writable.?.conversation_writer.test_sync_ops = .{ .sync_file = Fault.sync };
     var ownership = SnapshotOwnershipProbe{};
     const turn = try session_runtime.makeAssistantTurn(alloc, "request", "answer");
     defer session_runtime.freeHistoryTurn(alloc, turn);
+    try acknowledgeTestHistory(&app, turn);
+    app.session_persistence.writable.?.writer.journal.owner.writer.ops = .{ .sync_dir = Fault.sync };
     try std.testing.expectError(error.SessionPersistenceUncertain, Runtime(TestApp).appendFinishedPrompt(&app, .{
         .turn = turn,
         .snapshot_file_ownership = ownership.handle(),
@@ -9911,29 +10403,31 @@ test "remembered session follows first durable work and ignores later activity" 
     try Runtime(TestApp).beginFreshPersistedSession(&app);
     const store = app.session_persistence.store.?;
     try std.testing.expect((try store.readRememberedSessionId(alloc)) == null);
-    const checkpoint: session_codec.RecoveryCheckpoint = .{
-        .turn_id = 1,
-        .user = .{ .text = @constCast("pending prompt") },
-        .assistant_source = @constCast(""),
-        .cause = .network_interrupted,
-        .action = .retrying_request,
-        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
-        .requested_fast_mode = false,
-        .fast_mode = false,
-        .max_provider_attempts = 3,
-        .consumed_provider_attempts = 1,
+    Runtime(TestApp).rememberJournalAdmission(&app);
+    try std.testing.expect((try store.readRememberedSessionId(alloc)) == null);
+    const loaded = &app.session_persistence.writable.?;
+    var journal: journal_runtime.Runtime = .{
+        .state = loaded.journalState().?,
+        .sink = loaded.journalSink().?,
+        .alloc = alloc,
+        .namespace = loaded.active_id,
+        .creation_id = "remembered",
+        .request_id = "first-request",
     };
     _ = try app.session_persistence.writable.?.appendEvent(alloc, .{ .preferences_changed = .{ .fast_mode = true } }, io_mod.milliTimestamp());
     try std.testing.expect(!app.session_persistence.writable.?.freshly_started);
-    try Runtime(TestApp).setRecoveryCheckpoint(&app, checkpoint);
+    _ = try journal.begin(.{ .text = @constCast("pending prompt") }, loaded.state.preferences.model, 1, false);
+    Runtime(TestApp).rememberJournalAdmission(&app);
     const first = (try store.readRememberedSessionId(alloc)).?;
     defer alloc.free(first);
     try std.testing.expectEqualStrings(app.session_persistence.writable.?.active_id, first);
     try store.rememberSessionId(alloc, "other-selection");
-    try Runtime(TestApp).setRecoveryCheckpoint(&app, checkpoint);
+    Runtime(TestApp).rememberJournalAdmission(&app);
     const turn = try session_runtime.makeAssistantTurn(alloc, "pending prompt", "done");
     defer session_runtime.freeHistoryTurn(alloc, turn);
-    try Runtime(TestApp).appendHistoryTurn(&app, turn);
+    const abandoned = (try journal.abandon()).?;
+    defer types.freeHistoryTurn(alloc, abandoned);
+    try Runtime(TestApp).appendHistoryTurn(&app, abandoned);
     const retained = (try store.readRememberedSessionId(alloc)).?;
     defer alloc.free(retained);
     try std.testing.expectEqualStrings("other-selection", retained);
@@ -9942,6 +10436,8 @@ test "remembered session follows first durable work and ignores later activity" 
     defer alloc.free(empty);
     try std.testing.expectEqualStrings("other-selection", empty);
     _ = try app.session_persistence.writable.?.appendEvent(alloc, .{ .preferences_changed = .{ .fast_mode = true } }, io_mod.milliTimestamp());
+    try acknowledgeTestHistory(&app, turn);
+    Runtime(TestApp).rememberJournalAdmission(&app);
     try Runtime(TestApp).appendHistoryTurn(&app, turn);
     const next = (try store.readRememberedSessionId(alloc)).?;
     defer alloc.free(next);
@@ -9975,7 +10471,7 @@ test "remembered continuation consumes selection without republishing and preser
     app.requested_resume = .remembered;
     try Runtime(TestApp).resumeRequestedSession(&app);
     try std.testing.expectEqualStrings("remembered", app.session_persistence.writable.?.active_id);
-    try std.testing.expectError(error.SessionBusy, store.resumeTargetForWrite(alloc, .{ .id = "remembered" }, paths.workspace, .{ .log = .{ .session_lock_deadline_ms = 0 } }));
+    try std.testing.expectError(error.SessionBusy, store.resumeTargetForWrite(alloc, .{ .id = "remembered" }, paths.workspace, .{ .execution_journal = true, .log = .{ .session_lock_deadline_ms = 0 } }));
     try store.rememberSessionId(alloc, "newer-selection");
     // Reading a remembered target is not another publication; exact selection still is.
     const retained = (try store.readRememberedSessionId(alloc)).?;
@@ -10003,21 +10499,19 @@ test "remembered selection write failure leaves pending user work durable and wa
     try Runtime(TestApp).beginFreshPersistedSession(&app);
     var obstruction = try tmp.dir.createFile(io_mod.getIo(), "home/.fx/continue", .{});
     obstruction.close(io_mod.getIo());
-    try Runtime(TestApp).setRecoveryCheckpoint(&app, .{
-        .turn_id = 1,
-        .user = .{ .text = @constCast("saved pending request") },
-        .assistant_source = @constCast(""),
-        .cause = .network_interrupted,
-        .action = .retrying_request,
-        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
-        .requested_fast_mode = false,
-        .fast_mode = false,
-        .max_provider_attempts = 3,
-        .consumed_provider_attempts = 1,
-    });
     const loaded = &app.session_persistence.writable.?;
-    try std.testing.expect(loaded.state.recovery_checkpoint != null);
-    try std.testing.expect(loaded.conversation_writer.failure == null);
+    var journal: journal_runtime.Runtime = .{
+        .state = loaded.journalState().?,
+        .sink = loaded.journalSink().?,
+        .alloc = alloc,
+        .namespace = loaded.active_id,
+        .creation_id = "remembered",
+        .request_id = "pending-request",
+    };
+    _ = try journal.begin(.{ .text = @constCast("saved pending request") }, loaded.state.preferences.model, 1, false);
+    Runtime(TestApp).rememberJournalAdmission(&app);
+    try std.testing.expect(loaded.hasPendingTurn());
+    try std.testing.expect(!loaded.journalState().?.isBlocked());
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
     try std.testing.expect(std.mem.find(u8, app.notices.items[0], "Session saved, but could not remember") != null);
     try std.testing.expect(std.mem.find(u8, app.notices.items[0], loaded.active_id) != null);

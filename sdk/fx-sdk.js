@@ -1,5 +1,13 @@
 import { CoreOutput, maxCoreMessageBytes } from "./core-output.js";
 import { loadModule } from "./wasm-module.js";
+import {
+  decodeEntry, JournalConflict, PersistenceUncertain, PendingTurnError,
+  RequestConflict, RecoveryRequired, JournalCapacityExceeded, parseToolInput, maxJournalEntryBytes, normalizeTurnUsage,
+} from "./journal-codec.js";
+import { createProjection } from "./transcript.js";
+
+export { JournalConflict, PersistenceUncertain, PendingTurnError, RequestConflict, RecoveryRequired, JournalCapacityExceeded } from "./journal-codec.js";
+export { createProjection, readCheckpoint } from "./transcript.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -16,6 +24,7 @@ const maxModelCatalogEntries = 10_000;
 const streamReadsPerTaskYield = 32;
 const maxUnreadEventBytes = 1024 * 1024;
 const maxUnreadEvents = 256;
+const maxJournalAppendFrameBytes = 4 * Math.ceil(maxJournalEntryBytes / 3) + 2048;
 
 function boundedString(value, name, maxBytes, required) {
   if (value === undefined && !required) return undefined;
@@ -48,6 +57,19 @@ function normalizeAgentOptions(value) {
     throw new TypeError("createFxAgent() options must be an object");
   }
   const options = { ...value };
+  if (options.checkpoint !== undefined || options.onCheckpoint !== undefined) {
+    throw new TypeError("checkpoint and onCheckpoint were replaced by journal and onEntry; restore journal entries and acknowledge each entry after durable storage");
+  }
+  if ((options.journal !== undefined) !== (options.onEntry !== undefined)) {
+    throw new TypeError("journal and onEntry must be supplied together");
+  }
+  if (options.journal !== undefined) {
+    if (options.journal === null || (typeof options.journal[Symbol.iterator] !== "function" &&
+        typeof options.journal[Symbol.asyncIterator] !== "function")) {
+      throw new TypeError("journal must be an iterable or async iterable of journal entries");
+    }
+    if (typeof options.onEntry !== "function") throw new TypeError("onEntry must be a function");
+  }
   if (Object.hasOwn(options, "env")) {
     throw new TypeError("createFxAgent() does not accept env; pass apiKey and model directly");
   }
@@ -580,23 +602,38 @@ function createRuntime(options) {
   }
 
   let pendingHostToolResult = null;
-  function hostToolCall(namePtr, nameLen, argumentsPtr, argumentsLen, outputPtr, outputCap, statusPtr) {
+  let pendingHostToolRelease = null;
+  function hostToolCall(namePtr, nameLen, argumentsPtr, argumentsLen, outputPtr, outputCap, statusPtr, contextPtr, contextLen) {
     pendingHostToolResult = null;
+    pendingHostToolRelease = null;
     if (typeof options.hostToolExecutor !== "function") return -1;
     if (options.traceWasi) console.error("fx host tool call start");
     let input;
-    try { input = JSON.parse(text(argumentsPtr, argumentsLen)); } catch { return -1; }
-    return Promise.resolve(options.hostToolExecutor(text(namePtr, nameLen), input)).then((result) => {
-      if (options.traceWasi) console.error("fx host tool call settled", result.cancelled, result.isError);
-      if (result.cancelled) return -2;
+    let context;
+    try {
+      input = JSON.parse(text(argumentsPtr, argumentsLen));
+      if (contextLen !== undefined && contextLen !== 0) {
+        const value = checkedBytes(contextPtr, contextLen);
+        if (!value || contextLen > workspaceCommandLimit) return -1;
+        context = JSON.parse(strictDecoder.decode(value));
+      }
+    } catch { return -1; }
+    return Promise.resolve().then(() => options.hostToolExecutor(text(namePtr, nameLen), input, undefined, context)).then((result) => {
+      if (options.traceWasi) console.error("fx host tool call settled", result?.cancelled, result?.isError);
+      // Cancellation is safe only if the executor never entered. Unknown work
+      // after entry must poison the owner even if core takes an interrupt path.
+      if (result?.cancelled) return result.executionOutcome === "not_started" ? -2 : -5;
+      if (result?.executionOutcome !== "completed" || typeof result.content !== "string" || typeof result.isError !== "boolean") return -4;
       const output = encoder.encode(result.content);
       bytes(statusPtr, 1)[0] = (result.isError ? 1 : 0) + (result.rich ? 2 : 0);
       if (output.length > outputCap) {
         if (!result.rich || output.length > 8 * 1024 * 1024) return -3;
         pendingHostToolResult = output;
+        pendingHostToolRelease = result.releaseCompleted;
         return output.length;
       }
       bytes(outputPtr, output.length).set(output);
+      pendingHostToolRelease = result.releaseCompleted;
       return output.length;
     }).catch(() => -1);
   }
@@ -861,6 +898,7 @@ function createRuntime(options) {
 
   function abortHostEffects() {
     pendingHostToolResult = null;
+    pendingHostToolRelease = null;
     streams.forEach((state) => state.controller.abort(abortReason));
     httpRequests.forEach((controller) => controller.abort(abortReason));
     workspaceExecs.forEach((state) => state.abort(-3));
@@ -911,7 +949,14 @@ function createRuntime(options) {
     proc_exit(code) { if (options.traceWasi) console.error("wasi proc_exit", code); markExited(code); throw new WebAssembly.RuntimeError(`proc_exit(${code})`); },
   };
 
+  let queuedSuspension = false;
+  let suspensionFlag = 0;
   const fx = {
+    fx_libfx_bind_suspend(ptr) {
+      suspensionFlag = ptr;
+      if (ptr && queuedSuspension) bytes(ptr, 1)[0] = 1;
+      queuedSuspension = false;
+    },
     fx_term_poll_input: new WebAssembly.Suspending(termPollInput),
     fx_prompt_history_available() { return options.promptHistoryStore ? 1 : 0; },
     fx_workspace_available() { return workspace.present ? 1 : 0; },
@@ -922,6 +967,23 @@ function createRuntime(options) {
     fx_http_stream_next: new WebAssembly.Suspending(streamNext),
     fx_http_stream_close(handle) { const state = streams.get(handle); state?.controller.abort(abortReason); streams.delete(handle); },
     fx_http_request: new WebAssembly.Suspending(httpRequest),
+    fx_libfx_checkpoint_set: new WebAssembly.Suspending(async (ptr, len) => {
+      try {
+        const ack = await options.onCheckpoint?.(bytes(ptr, len).slice());
+        return ack?.durable === true ? 1 : 0;
+      } catch { return 0; }
+    }),
+    fx_libfx_journal_append: new WebAssembly.Suspending(async (ptr, len) => {
+      try {
+        const value = checkedBytes(ptr, len);
+        if (!value || len > maxJournalAppendFrameBytes) throw new JournalConflict("Invalid journal append frame");
+        await options.journalAppend(JSON.parse(strictDecoder.decode(value)));
+        return 1;
+      } catch (error) {
+        options.journalFailure?.(error);
+        return 0;
+      }
+    }),
     fx_host_tool_call: new WebAssembly.Suspending(hostToolCall),
     fx_host_tool_result_read(offset, ptr, cap) {
       if (!pendingHostToolResult || offset < 0 || offset > pendingHostToolResult.length) return -1;
@@ -929,7 +991,11 @@ function createRuntime(options) {
       bytes(ptr, chunk.length).set(chunk);
       return chunk.length;
     },
-    fx_host_tool_result_release() { pendingHostToolResult = null; },
+    fx_host_tool_result_release() {
+      pendingHostToolResult = null;
+      pendingHostToolRelease?.();
+      pendingHostToolRelease = null;
+    },
     fx_open_url: new WebAssembly.Suspending(openUrl),
     fx_oauth_session_load: new WebAssembly.Suspending(oauthSessionLoad),
     fx_oauth_session_commit: new WebAssembly.Suspending(oauthSessionCommit),
@@ -958,6 +1024,10 @@ function createRuntime(options) {
     write(data) { stdin.push(typeof data === "string" ? encoder.encode(data) : data); },
     wake() { stdin.wake(); },
     closeStdin() { stdin.close(); },
+    requestSuspend() {
+      if (suspensionFlag) bytes(suspensionFlag, 1)[0] = 1;
+      else queuedSuspension = true;
+    },
     abortHostEffects,
     abort(error) {
       aborted = true;
@@ -1127,7 +1197,9 @@ function normalizeHostTools(value) {
     try { schema = JSON.parse(JSON.stringify(inputSchema)); } catch {
       throw new TypeError(`tool ${name} inputSchema must be JSON-serializable`);
     }
-    descriptors.push({ name, description, inputSchema: schema });
+    const replay = tool.replay === undefined ? "blocked" : tool.replay;
+    if (replay !== "safe" && replay !== "blocked") throw new TypeError(`tool ${name} replay must be safe or blocked`);
+    descriptors.push({ name, description, inputSchema: schema, replay });
     executors.set(name, execute);
   }
   return { descriptors, executors };
@@ -1170,17 +1242,7 @@ function hostToolContent(value) {
   if (typeof value === "string") return { content: value, rich: false };
   if (value === undefined) return { content: "null", rich: false };
   const encoded = JSON.stringify(value);
-  return { content: encoded === undefined ? "null" : encoded, rich: false };
-}
-
-function checkpointBytes(value) {
-  if (value === undefined) return null;
-  if (value instanceof Uint8Array) return value.slice();
-  if (value instanceof ArrayBuffer) return new Uint8Array(value.slice(0));
-  if (ArrayBuffer.isView(value)) {
-    return new Uint8Array(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength));
-  }
-  throw new TypeError("checkpoint must be an ArrayBuffer or typed array");
+  return { content: encoded === undefined ? "null" : encoded, rich: false, isError: value?.isError === true };
 }
 
 function bytesToBase64(value) {
@@ -1198,17 +1260,229 @@ function base64ToBytes(value) {
   return bytes;
 }
 
+function wireJournalEntry(value) {
+  if (typeof value?.bytes !== "string" || value.bytes.length > 4 * Math.ceil(maxJournalEntryBytes / 3)) {
+    throw new JournalConflict("Invalid journal entry bytes");
+  }
+  let bytes;
+  try { bytes = base64ToBytes(value.bytes); } catch { throw new JournalConflict("Invalid journal entry base64"); }
+  if (bytesToBase64(bytes) !== value.bytes) throw new JournalConflict("Noncanonical journal entry base64");
+  return decodeEntry({ ...value, bytes });
+}
+
+function publicJournalEntry(entry) {
+  return Object.freeze({ seq: entry.seq, kind: entry.kind, bytes: entry.bytes.slice(), hash: entry.hash });
+}
+
+function coreRequestError(value) {
+  const message = String(value?.message ?? "fx request failed");
+  const classes = { JournalConflict, PersistenceUncertain, PendingTurnError, RequestConflict, RecoveryRequired, JournalCapacityExceeded };
+  const name = typeof value?.data?.code === "string" ? value.data.code
+    : typeof value?.code === "string" ? value.code : message.split(":", 1)[0];
+  const ErrorClass = Object.hasOwn(classes, name) ? classes[name] : Error;
+  return new ErrorClass(message);
+}
+
+function createTurnOutput(cancel, emit) {
+  const queue = [];
+  const readers = new Set();
+  let first = 0;
+  let next = 0;
+  let queuedBytes = 0;
+  let finished = false;
+  let terminalError;
+  let capacity;
+  let releaseCapacity;
+  let reportedPressure = false;
+  let epoch = 0;
+  function release() {
+    let consumed = next;
+    for (const reader of readers) consumed = Math.min(consumed, reader.cursor);
+    while (first < consumed) { queuedBytes -= queue.shift().size; first++; }
+    releaseCapacity?.();
+    releaseCapacity = null;
+    capacity = null;
+  }
+  function read(reader) {
+    if (reader.closed) return { done: true };
+    if (reader.cursor < next) {
+      const value = queue[reader.cursor++ - first].update;
+      release();
+      return { value, done: false };
+    }
+    if (terminalError) throw terminalError;
+    return finished ? { done: true } : null;
+  }
+  function wake() {
+    for (const reader of readers) {
+      while (reader.waiters.length) {
+        let result;
+        try { result = read(reader); } catch (error) {
+          reader.waiters.splice(0).forEach((waiter) => waiter.reject(error));
+          break;
+        }
+        if (result === null) break;
+        reader.waiters.shift().resolve(result);
+      }
+    }
+  }
+  return {
+    push(update, size, incomingEpoch = epoch) {
+      if (finished || !readers.size || incomingEpoch !== epoch) return;
+      if (queue.length && (queue.length >= maxUnreadEvents || size > maxUnreadEventBytes - queuedBytes)) {
+        if (!capacity) capacity = new Promise((resolve) => { releaseCapacity = resolve; });
+        const pendingCapacity = capacity;
+        if (!reportedPressure) {
+          reportedPressure = true;
+          emit("output.backpressure", { bufferedBytes: queuedBytes, bufferedEvents: queue.length });
+        }
+        return pendingCapacity.then(() => this.push(update, size, incomingEpoch));
+      }
+      queue.push({ update, size });
+      queuedBytes += size;
+      next++;
+      wake();
+    },
+    subscribe() {
+      if (readers.size >= maxUnreadEvents) throw new RangeError("Too many consumers attached to this turn");
+      const reader = { cursor: next, waiters: [], closed: false };
+      readers.add(reader);
+      const detach = () => {
+        reader.closed = true;
+        readers.delete(reader);
+        reader.waiters.splice(0).forEach((waiter) => waiter.resolve({ done: true }));
+        release();
+      };
+      return {
+        next() {
+          try {
+            const result = read(reader);
+            return result ? Promise.resolve(result) : new Promise((resolve, reject) => reader.waiters.push({ resolve, reject }));
+          } catch (error) { return Promise.reject(error); }
+        },
+        return() { detach(); cancel(); return Promise.resolve({ done: true }); },
+        [Symbol.asyncIterator]() { return this; },
+      };
+    },
+    discard() {
+      epoch++;
+      for (const reader of readers) reader.cursor = next;
+      release();
+    },
+    finish(error) {
+      finished = true;
+      terminalError = error;
+      releaseCapacity?.();
+      releaseCapacity = null;
+      capacity = null;
+      wake();
+    },
+  };
+}
+
 export async function createFxAgent(options = {}) {
   options = normalizeAgentOptions(options);
   const hostTools = normalizeHostTools(options.tools);
   const instructions = normalizeInstructions(options.instructions);
-  const initialCheckpoint = checkpointBytes(options.checkpoint);
+  const journalEnabled = options.journal !== undefined;
+  let projection = createProjection();
+  let journalFailure = null;
+  let journalTail = Promise.resolve();
+  let journalCallbacks = 0;
+  let journalStatus = { idle: true, lastSeq: 0, pendingTurn: null };
+  let durableCalls = [];
+  let durableMessageId = null;
+  let closePromise;
+  let closeRequested = false;
+  const hostExecutions = new Set();
+  const controlCallbacks = new Set();
   const pending = new Map();
   let nextId = 1;
   let sessionId = null;
   let activeTurn = null;
   let closing = false;
-  const isCurrentTurn = (turn) => turn && activeTurn === turn && !turn.cancelled && !closing;
+  const isCurrentTurn = (turn) => turn && activeTurn === turn && !turn.cancelled && !closing && !journalFailure;
+  const assertOpen = () => {
+    if (journalFailure) throw journalFailure;
+    if (closing || closeRequested) throw new Error("fx agent is closed");
+  };
+  const requireJournal = () => {
+    if (!journalEnabled) throw new TypeError("Durable recovery requires journal and onEntry");
+  };
+  function failJournal(error) {
+    if (!journalFailure) journalFailure = error instanceof JournalConflict || error instanceof PersistenceUncertain
+      ? error : new PersistenceUncertain(undefined, { cause: error });
+    return journalFailure;
+  }
+  function track(promise, collection) {
+    collection.add(promise);
+    const release = () => collection.delete(promise);
+    promise.then(release, release);
+    return promise;
+  }
+  function adoptJournalStatus(entry) {
+    const body = entry.body;
+    let pendingTurn = journalStatus.pendingTurn;
+    if (entry.kind === "turn_start") {
+      durableCalls = [];
+      durableMessageId = null;
+      pendingTurn = { turnId: body.turnId, requestId: body.requestId, lastSeq: entry.seq, awaiting: "model" };
+    } else if (entry.kind === "model_step" && body.phase !== "context") {
+      durableMessageId = body.messageId;
+      durableCalls = body.phase === "request" ? [] : body.calls.map((call) => ({
+        callId: call.callId, name: call.name, input: parseToolInput(call.argumentsJson), replay: call.replay,
+      }));
+    } else if (entry.kind === "tool_result") {
+      durableCalls = durableCalls.slice(1);
+    } else if (entry.kind === "turn_end" || entry.kind === "checkpoint") {
+      durableCalls = [];
+      durableMessageId = null;
+      pendingTurn = null;
+    }
+    if (pendingTurn) pendingTurn = {
+      ...pendingTurn, lastSeq: entry.seq,
+      awaiting: durableCalls.length ? { tool: durableCalls[0] } : "model",
+    };
+    journalStatus = { idle: !pendingTurn, lastSeq: entry.seq, pendingTurn };
+  }
+  function appendJournal(params) {
+    const operation = journalTail.then(async () => {
+      if (journalFailure) throw journalFailure;
+      requireJournal();
+      if (sessionId === null || params?.sessionId !== sessionId) throw new JournalConflict("Journal append targets a different session");
+      const entry = wireJournalEntry(params.entry);
+      const candidate = projection.preview(entry);
+      const isNew = entry.seq > journalStatus.lastSeq;
+      journalCallbacks++;
+      try {
+        await options.onEntry(publicJournalEntry(entry));
+      } catch (error) {
+        throw failJournal(new PersistenceUncertain(undefined, { cause: error }));
+      } finally {
+        journalCallbacks--;
+      }
+      projection = candidate.projection;
+      if (!isNew) return;
+      adoptJournalStatus(entry);
+      if (entry.kind === "turn_start") {
+        await activeTurn?.push({ journalEvent: {
+          type: "turn_start", turnId: entry.body.turnId, messageId: entry.body.userMessageId,
+          requestId: entry.body.requestId,
+        } });
+      } else if (entry.kind === "tool_result") {
+        await activeTurn?.push({ journalEvent: {
+          type: "tool_end", turnId: entry.body.turnId, messageId: durableMessageId,
+          callId: entry.body.callId, content: entry.body.content, isError: entry.body.isError,
+        } });
+      } else if (entry.kind === "turn_end") {
+        await activeTurn?.push({ journalEvent: {
+          type: "turn_end", turnId: entry.body.turnId, result: normalizeJournalResult(entry.body.result),
+        } });
+      }
+    }).catch((error) => { throw failJournal(error); });
+    journalTail = operation.catch(() => {});
+    return operation;
+  }
   const emit = (type, detail = {}) => {
     try { options.onEvent?.({ type, timestamp: performance.now(), ...detail }); } catch {}
   };
@@ -1225,6 +1499,7 @@ export async function createFxAgent(options = {}) {
       const attempt = activeTurn ? ++activeTurn.transportAttempts : attemptIndex + 1;
       emit("transport.start", { attempt, method, endpoint, model: options.model });
       try {
+        if (journalFailure) throw journalFailure;
         if (activeTurn?.cancelled) {
           runtime.abortHostEffects();
           throw new DOMException("Aborted", "AbortError");
@@ -1246,6 +1521,7 @@ export async function createFxAgent(options = {}) {
         const errorName = error instanceof Error ? error.name : "Error";
         const elapsedMs = performance.now() - startedAt;
         emit("transport.error", { attempt, elapsedMs, error: errorName });
+        if (journalFailure) throw journalFailure;
         if (init.signal?.aborted) throw new DOMException("Aborted", "AbortError");
         if (attemptIndex === 1) throw error;
         emit("transport.retry", {
@@ -1259,12 +1535,21 @@ export async function createFxAgent(options = {}) {
     }
     throw new Error("transport retry exhausted");
   };
-  const executeHostTool = async (name, input, requestedSessionId) => {
+  const executeHostTool = async (name, input, requestedSessionId, context) => {
+    if (journalFailure) throw journalFailure;
     const execute = hostTools.executors.get(name);
     const turn = requestedSessionId === undefined || requestedSessionId === sessionId
       ? activeTurn
       : null;
-    if (!isCurrentTurn(turn)) return { content: "", isError: true, cancelled: true };
+    if (!isCurrentTurn(turn)) return { content: "", isError: true, executionOutcome: "not_started", cancelled: true };
+    if (journalEnabled && (!context || typeof context.turnId !== "string" || !context.turnId ||
+        typeof context.callId !== "string" || !context.callId || typeof context.requestId !== "string" ||
+        !context.requestId || typeof context.recovering !== "boolean" ||
+        (turn.requestId !== undefined && turn.requestId !== context.requestId) ||
+        context.turnId !== journalStatus.pendingTurn?.turnId || context.callId !== durableCalls[0]?.callId ||
+        name !== durableCalls[0]?.name)) {
+      throw failJournal(new JournalConflict("Host tool context does not identify the active journal turn"));
+    }
     const controller = new AbortController();
     turn.toolControllers.add(controller);
     let onAbort;
@@ -1273,37 +1558,60 @@ export async function createFxAgent(options = {}) {
     let content = "";
     let rich = false;
     let isError = false;
+    // An exception (including result encoding failure) does not acknowledge the
+    // external effect. Only a successfully returned/encoded result is terminal.
+    let executionOutcome = "not_started";
     try {
       if (!execute) throw new Error(`unknown host tool: ${String(name)}`);
-      const execution = Promise.resolve().then(() => {
+      if (journalEnabled) await turn.push({ journalEvent: {
+        type: "tool_start", turnId: context.turnId, messageId: durableMessageId,
+        callId: context.callId, name, input,
+      } });
+      const execution = track(Promise.resolve().then(() => {
         if (controller.signal.aborted || !isCurrentTurn(turn)) return;
-        return execute(input, { signal: controller.signal });
-      });
+        executionOutcome = "uncertain";
+        turn.enteredToolControllers.add(controller);
+        return execute(input, { ...context, signal: controller.signal });
+      }), hostExecutions);
       const value = await Promise.race([execution, aborted]);
-      if (!controller.signal.aborted) {
-        const normalized = hostToolContent(value);
+      if (!controller.signal.aborted && isCurrentTurn(turn)) {
+        const normalized = journalEnabled && value && typeof value.content === "string" &&
+          (value.isError === undefined || typeof value.isError === "boolean")
+          ? { content: value.content, isError: value.isError === true, rich: false }
+          : hostToolContent(value);
         content = normalized.content;
         rich = normalized.rich;
         isError = normalized.isError === true;
+        executionOutcome = "completed";
       }
     } catch (error) {
+      if (error instanceof PersistenceUncertain || error instanceof JournalConflict) throw failJournal(error);
       isError = true;
-      if (error?.toolResult?.type === "libfx.tool-result") {
-        try {
+      content = "Host tool outcome is uncertain";
+      // Diagnostic getters/encoding can themselves throw. They must not prevent
+      // the uncertain outcome from reaching core or turn it into completion.
+      try {
+        if (error?.toolResult?.type === "libfx.tool-result") {
           const normalized = hostToolContent(error.toolResult);
           content = normalized.content;
           rich = normalized.rich;
-        } catch {
+        } else {
           content = error instanceof Error ? error.message : String(error);
         }
-      } else {
-        content = error instanceof Error ? error.message : String(error);
-      }
+      } catch {}
     } finally {
       controller.signal.removeEventListener("abort", onAbort);
       turn.toolControllers.delete(controller);
     }
-    return { content, isError, rich, cancelled: controller.signal.aborted || !isCurrentTurn(turn) };
+    return {
+      content, isError, rich, executionOutcome,
+      cancelled: controller.signal.aborted || !isCurrentTurn(turn),
+      // Keep entry evidence until the bridge has delivered a terminal result.
+      // Exceptions and lost/invalid replies retain it through turn settlement.
+      releaseCompleted() {
+        if (executionOutcome === "completed") turn.enteredToolControllers.delete(controller);
+      },
+    };
   };
   emit("runtime.start");
   const runtimeOptions = {
@@ -1312,6 +1620,8 @@ export async function createFxAgent(options = {}) {
     args: ["acp"],
     env: agentEnvironment(options),
     hostToolExecutor: executeHostTool,
+    journalAppend: appendJournal,
+    journalFailure: failJournal,
   };
   const runtime = options.runtimeFactory
     ? await options.runtimeFactory(runtimeOptions)
@@ -1320,7 +1630,9 @@ export async function createFxAgent(options = {}) {
   const send = (message) => {
     if (closing) throw new Error("fx agent is closing");
     emit("acp.send", { message });
-    runtime.write(`${JSON.stringify(message)}\n`);
+    const line = `${JSON.stringify(message)}\n`;
+    if (encoder.encode(line).length > 8 * 1024 * 1024) throw new RangeError("ACP request exceeds the 8 MiB frame limit");
+    runtime.write(line);
   };
   const request = (method, params = {}) => new Promise((resolve, reject) => {
     const id = nextId++;
@@ -1330,21 +1642,32 @@ export async function createFxAgent(options = {}) {
   runtime.exited.then((code) => {
     emit("runtime.exit", { code });
     closing = true;
-    const error = runtime.error ?? new Error(`fx-core exited with code ${code} before completing the ACP request`);
+    const error = journalFailure ?? runtime.error ?? new Error(`fx-core exited with code ${code} before completing the ACP request`);
     for (const waiter of pending.values()) waiter.reject(error);
     pending.clear();
   });
   runtime.setLineHandler((message, size) => {
     emit("acp.receive", { message });
     if (message.method === "session/update") {
-      if (message.params.sessionId === sessionId) return activeTurn?.push(message.params.update, size);
+      if (message.params?.sessionId === sessionId) return activeTurn?.push(message.params.update, size);
       return;
     }
-    void handleControlMessage(message).catch((error) => runtime.abort(error));
+    void track(handleControlMessage(message), controlCallbacks).catch((error) => runtime.abort(journalFailure ?? error));
   });
   async function handleControlMessage(message) {
+    if (message.method === "libfx/checkpoint_set") {
+      if (!closing) send({ jsonrpc: "2.0", id: message.id, result: { durable: false } });
+      return;
+    }
+    if (message.method === "libfx/journal_append") {
+      let durable = false;
+      try { await appendJournal(message.params); durable = true; } catch {}
+      if (!closing) send({ jsonrpc: "2.0", id: message.id, result: { durable } });
+      return;
+    }
     if (message.method === "session/request_permission") {
       const turn = activeTurn;
+      if (message.params?.sessionId !== sessionId) return;
       if (!isCurrentTurn(turn)) return;
       emit("permission.request", { request: message.params });
       if (!isCurrentTurn(turn)) return;
@@ -1357,39 +1680,69 @@ export async function createFxAgent(options = {}) {
       return;
     }
     if (message.method === "libfx/tool_call") {
-      const { content, isError, rich, cancelled } = await executeHostTool(
+      if (message.params?.sessionId !== sessionId) throw new JournalConflict("Host tool call targets a different session");
+      const { content, isError, rich, executionOutcome, cancelled, releaseCompleted } = await executeHostTool(
         message.params?.name,
         message.params?.input,
         message.params?.sessionId,
+        message.params?.context,
       );
       if (cancelled || closing) return;
-      const response = { jsonrpc: "2.0", id: message.id, result: { content, isError, ...(rich ? { contentType: "rich" } : {}) } };
+      const response = { jsonrpc: "2.0", id: message.id, result: { content, isError, executionOutcome, ...(rich ? { contentType: "rich" } : {}) } };
       if (encoder.encode(JSON.stringify(response)).length + 1 > 8 * 1024 * 1024) {
-        response.result = { content: "Host tool result exceeded the response frame limit", isError: true };
+        response.result = { content: "Host tool result exceeded the response frame limit", isError: true, executionOutcome: "uncertain" };
       }
       send(response);
+      if (response.result.executionOutcome === "completed") releaseCompleted?.();
       return;
     }
     const waiter = pending.get(message.id); if (!waiter) return; pending.delete(message.id);
-    if (message.error) waiter.reject(new Error(message.error.message)); else waiter.resolve(message.result);
+    if (message.error) waiter.reject(journalFailure ?? coreRequestError(message.error));
+    else if (journalFailure) waiter.reject(journalFailure);
+    else waiter.resolve(message.result);
   }
   try {
-    await request("initialize", {
+    const initialized = await request("initialize", {
       protocolVersion: 1,
       clientCapabilities: {
-        ...(hostTools.descriptors.length || instructions
-          ? { libfx: { tools: hostTools.descriptors, instructions } }
+        ...(hostTools.descriptors.length || instructions || journalEnabled
+          ? { libfx: { tools: hostTools.descriptors, instructions, ...(journalEnabled ? { journal: true } : {}) } }
           : {}),
       },
     });
+    if (journalEnabled && initialized?._meta?.libfxJournalVersion !== 1) {
+      throw new TypeError("The fx core does not support journal version 1; update the core and SDK together");
+    }
 
     const sessionResult = await request("libfx/new");
     sessionId = sessionResult.sessionId;
-    if (initialCheckpoint) {
-      await request("libfx/restore", {
-        sessionId,
-        checkpoint: bytesToBase64(initialCheckpoint),
-      });
+    if (typeof sessionId !== "string" || !sessionId) throw new Error("fx returned an invalid session identity");
+    if (journalEnabled) {
+      for await (const value of options.journal) {
+        const entry = decodeEntry(value);
+        const candidate = projection.preview(entry);
+        // Large entries keep the existing ACP input-frame bound. The core
+        // adopts only the fully received, hash- and payload-validated entry.
+        if (entry.bytes.length <= 4 * 1024 * 1024) {
+          await request("libfx/journal/restore", {
+            sessionId,
+            entry: { seq: entry.seq, kind: entry.kind, bytes: bytesToBase64(entry.bytes), hash: entry.hash },
+          });
+        } else {
+          await request("libfx/journal/restore_begin", {
+            sessionId, entry: { seq: entry.seq, kind: entry.kind, hash: entry.hash }, byteLength: entry.bytes.length,
+          });
+          for (let offset = 0; offset < entry.bytes.length; offset += 64 * 1024) {
+            await request("libfx/journal/restore_append", {
+              sessionId, offset, bytes: bytesToBase64(entry.bytes.subarray(offset, offset + 64 * 1024)),
+            });
+          }
+          await request("libfx/journal/restore_finish", { sessionId });
+        }
+        projection = candidate.projection;
+        if (entry.seq > journalStatus.lastSeq) adoptJournalStatus(entry);
+      }
+      journalStatus = await request("libfx/status", { sessionId });
     }
   } catch (error) {
     closing = true;
@@ -1401,42 +1754,116 @@ export async function createFxAgent(options = {}) {
 
   const agent = {
     prompt(input, promptOptions = {}) {
-      if (closing) throw new Error("fx agent is closed");
-      if (activeTurn) throw new Error("a prompt is already in progress for this session");
+      assertOpen();
+      if (journalEnabled) boundedString(promptOptions.requestId, "requestId", 1024, true);
+      if (activeTurn) {
+        if (!journalEnabled || promptOptions.requestId !== activeTurn.requestId) {
+          throw journalEnabled ? new PendingTurnError() : new Error("a prompt is already in progress for this session");
+        }
+        if (JSON.stringify(normalizePromptInput(input)) !== activeTurn.inputJson) throw new RequestConflict();
+        return normalizeTurn(activeTurn, promptOptions.signal);
+      }
       return normalizeTurn(startTurn(input, promptOptions));
     },
+    async suspend() {
+      assertOpen();
+      requireJournal();
+      const turn = activeTurn;
+      if (!turn) return null;
+      if (!turn.suspension) {
+        turn.suspending = true;
+        turn.suspension = (async () => {
+          if (runtime.requestSuspend) runtime.requestSuspend();
+          else await request("libfx/suspend", { sessionId });
+          try { await turn.result; } catch (error) {
+            if (!(error instanceof PendingTurnError) || !error.status) throw error;
+          }
+          return agent.status();
+        })();
+      }
+      return turn.suspension;
+    },
+    async status() {
+      assertOpen();
+      if (journalEnabled) {
+        if (activeTurn || journalCallbacks) return structuredClone(journalStatus);
+        journalStatus = await request("libfx/status", { sessionId });
+        return structuredClone(journalStatus);
+      }
+      if (activeTurn) return { state: activeTurn.cancelledWithEnteredTool ? "blocked" : activeTurn.suspending ? "suspending" : "running", canResume: false };
+      return request("libfx/status", { sessionId });
+    },
+    resume(promptOptions = {}) {
+      assertOpen();
+      requireJournal();
+      if (activeTurn) throw new PendingTurnError();
+      return normalizeTurn(startTurn([], promptOptions, "libfx/resume"));
+    },
+    async abandon() {
+      assertOpen();
+      requireJournal();
+      if (activeTurn) throw new PendingTurnError();
+      await request("libfx/abandon", { sessionId });
+    },
     async checkpoint() {
-      if (closing) throw new Error("fx agent is closed");
+      assertOpen();
+      requireJournal();
       if (activeTurn) throw new Error("cannot checkpoint while a prompt is active");
       const response = await request("libfx/checkpoint", { sessionId });
-      if (typeof response?.checkpoint !== "string") throw new Error("fx returned an invalid checkpoint");
-      return base64ToBytes(response.checkpoint);
+      const entry = wireJournalEntry(response?.entry);
+      if (entry.kind !== "checkpoint" || entry.seq !== journalStatus.lastSeq) {
+        throw failJournal(new JournalConflict("fx returned an unacknowledged checkpoint"));
+      }
+      projection.preview(entry);
+      return publicJournalEntry(entry);
     },
-    async close() {
-      if (closing) { await runtime.exited; return; }
-      const turn = activeTurn;
-      turn?.cancel();
-      if (turn) await turn.result.catch(() => {});
-      closing = true;
-      runtime.closeStdin();
-      await runtime.exited;
+    close() {
+      if (!closePromise) {
+        closeRequested = true;
+        closePromise = (async () => {
+          const turn = activeTurn;
+          if (!closing) turn?.cancel();
+          if (turn) await turn.result.catch(() => {});
+          await journalTail;
+          while (hostExecutions.size || controlCallbacks.size) {
+            await Promise.allSettled([...hostExecutions, ...controlCallbacks]);
+          }
+          if (!closing) {
+            closing = true;
+            runtime.closeStdin();
+          }
+          await runtime.exited;
+        })();
+      }
+      return closePromise;
     },
   };
   return agent;
 
-  function normalizeTurn(rawTurn) {
+  function normalizeTurn(rawTurn, signal) {
+    validateSignal(signal);
+    const source = rawTurn.subscribe();
+    let iteratorTaken = false;
+    const abort = () => rawTurn.cancel();
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) rawTurn.cancel();
     const toolNames = new Map();
     const started = new Set();
     const eventFor = (update) => {
+      if (journalEnabled) {
+        if (update.journalEvent) return structuredClone(update.journalEvent);
+        if (update.sessionUpdate === "libfx/journal_event") return structuredClone(update.event);
+      }
       if (update.sessionUpdate === "agent_message_chunk") {
         const delta = update.content?.text;
         if (!delta || delta.startsWith("[context]")) return null;
-        return { type: "text_delta", delta };
+        return { type: "text_delta", delta, ...(journalEnabled ? { key: update.journalKey, ordinal: update.journalOrdinal } : {}) };
       }
       if (update.sessionUpdate === "agent_thought_chunk") {
         const delta = update.content?.text;
-        return delta ? { type: "reasoning_delta", delta } : null;
+        return delta ? { type: "reasoning_delta", delta, ...(journalEnabled ? { key: update.journalKey, ordinal: update.journalOrdinal } : {}) } : null;
       }
+      if (journalEnabled) return null;
       if (update.sessionUpdate === "tool_call") {
         toolNames.set(update.toolCallId, update.name || update.toolName || update.title || "tool");
         if (started.has(update.toolCallId)) return null;
@@ -1460,24 +1887,26 @@ export async function createFxAgent(options = {}) {
       }
       return null;
     };
-    const result = rawTurn.result.then((value) => ({
-      stopReason: value.stopReason,
-      usage: normalizeTurnUsage(value.usage),
-    }));
+    const result = rawTurn.result.then((value) => journalEnabled
+      ? normalizeJournalResult(value.journalResult)
+      : { stopReason: value.stopReason, usage: normalizeTurnUsage(value.usage) })
+      .finally(() => signal?.removeEventListener("abort", abort));
     void result.catch(() => {});
     return {
       cancel() { rawTurn.cancel(); },
       [Symbol.asyncIterator]() {
+        if (iteratorTaken) throw new Error("a turn has only one event consumer");
+        iteratorTaken = true;
         const iterator = (async function* () {
-          for await (const update of rawTurn) {
+          for await (const update of source) {
             const event = eventFor(update);
             if (event) yield event;
           }
         })();
         return {
           next(value) { return iterator.next(value); },
-          return(value) { rawTurn.cancel(); return iterator.return(value); },
-          throw(error) { rawTurn.cancel(); return iterator.throw(error); },
+          return(value) { void source.return(); return iterator.return(value); },
+          throw(error) { void source.return(); return iterator.throw(error); },
           [Symbol.asyncIterator]() { return this; },
         };
       },
@@ -1485,106 +1914,141 @@ export async function createFxAgent(options = {}) {
     };
   }
 
-  function normalizeTurnUsage(usage) {
-    const result = {};
-    if (Number.isSafeInteger(usage?.inputTokens)) result.inputTokens = usage.inputTokens;
-    if (Number.isSafeInteger(usage?.outputTokens)) result.outputTokens = usage.outputTokens;
-    if (Number.isSafeInteger(usage?.cacheReadTokens)) result.cacheReadTokens = usage.cacheReadTokens;
-    if (Number.isSafeInteger(usage?.cacheWriteTokens)) result.cacheWriteTokens = usage.cacheWriteTokens;
-    if (Number.isSafeInteger(usage?.reasoningTokens)) result.reasoningTokens = usage.reasoningTokens;
-    return result;
+  function validateSignal(signal) {
+    if (signal !== undefined && (typeof signal?.addEventListener !== "function" || typeof signal?.removeEventListener !== "function")) {
+      throw new TypeError("prompt signal must be an AbortSignal");
+    }
   }
 
-  function startTurn(input, promptOptions) {
-    const prompt = normalizePromptInput(input);
+  function normalizeJournalResult(value) {
+    if (!value || typeof value.ok !== "boolean") throw failJournal(new JournalConflict("fx returned an invalid journal turn result"));
+    return { ...value, ...(value.usage === undefined ? {} : { usage: normalizeTurnUsage(value.usage) }) };
+  }
+
+  function startTurn(input, promptOptions, method = "session/prompt") {
+    const prompt = method === "libfx/resume" ? [] : normalizePromptInput(input);
+    const requestId = journalEnabled && method === "session/prompt"
+      ? boundedString(promptOptions.requestId, "requestId", 1024, true) : undefined;
     const signal = promptOptions.signal;
-    if (signal !== undefined && (typeof signal?.addEventListener !== "function" || typeof signal?.removeEventListener !== "function")) throw new TypeError("prompt signal must be an AbortSignal");
-    const queue = [];
-    const waiters = [];
-    let queuedBytes = 0;
-    let resumeOutput;
-    let iteratorTaken = false;
-    let terminalError;
-    let reportedPressure = false;
-    let discardedBytes = 0;
+    validateSignal(signal);
     const toolControllers = new Set();
     let finished = false;
     let cancelled = false;
+    let terminalError;
+    let discardedBytes = 0;
+    let generationKey;
+    let ordinal = 0;
+    const output = createTurnOutput(() => turn.cancel(), emit);
+    const firstSubscription = output.subscribe();
+    let subscribed = false;
     const turn = {
+      requestId: requestId ?? (journalEnabled ? journalStatus.pendingTurn?.requestId : undefined),
+      inputJson: JSON.stringify(prompt),
       push(update, size = encoder.encode(JSON.stringify(update)).length) {
-        if (cancelled || finished) { discardedBytes += size; return; }
-        if (size > maxCoreMessageBytes) throw new RangeError("core output message exceeds 64 MiB");
-        if (queue.length && (queue.length >= maxUnreadEvents || size > maxUnreadEventBytes - queuedBytes)) {
-          const capacity = new Promise((resolveCapacity) => { resumeOutput = resolveCapacity; });
-          if (!reportedPressure) {
-            reportedPressure = true;
-            emit("output.backpressure", { bufferedBytes: queuedBytes, bufferedEvents: queue.length });
-          }
-          return capacity.then(() => turn.push(update, size));
+        if (finished || (cancelled && !update.journalEvent && update.sessionUpdate !== "libfx/journal_event")) {
+          discardedBytes += size;
+          return;
         }
-        const waiter = waiters.shift();
-        if (waiter) waiter.resolve({ value: update, done: false });
-        else { queue.push({ update, size }); queuedBytes += size; }
+        if (size > maxCoreMessageBytes) throw new RangeError("core output message exceeds 64 MiB");
+        if (journalEnabled && update.sessionUpdate === "libfx/journal_generation") {
+          const key = update.key;
+          if (!key || [key.turnId, key.messageId, key.generationId].some((value) => typeof value !== "string" || !value) ||
+              key.turnId !== journalStatus.pendingTurn?.turnId) {
+            throw failJournal(new JournalConflict("Model generation does not identify the pending journal turn"));
+          }
+          generationKey = Object.freeze({ turnId: key.turnId, messageId: key.messageId, generationId: key.generationId });
+          ordinal = 0;
+          return;
+        }
+        if (journalEnabled && (update.sessionUpdate === "agent_message_chunk" || update.sessionUpdate === "agent_thought_chunk")) {
+          const delta = update.content?.text;
+          if (!delta || (update.sessionUpdate === "agent_message_chunk" && delta.startsWith("[context]"))) return;
+          if (!generationKey) throw failJournal(new JournalConflict("Text delta is missing its journal generation"));
+          update = { ...update, journalKey: generationKey, journalOrdinal: ++ordinal };
+          size = encoder.encode(JSON.stringify(update)).length;
+        }
+        return output.push(update, size);
+      },
+      subscribe() {
+        if (subscribed) return output.subscribe();
+        subscribed = true;
+        return firstSubscription;
       },
       toolControllers,
+      enteredToolControllers: new Set(),
+      cancelledWithEnteredTool: false,
       transportAttempts: 0,
       get cancelled() { return cancelled; },
       cancel() {
         if (finished || cancelled) return;
         cancelled = true;
-        resumeOutput?.();
-        resumeOutput = null;
-        send({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } });
-        for (const controller of toolControllers) controller.abort();
-        runtime.abortHostEffects();
-      },
-      [Symbol.asyncIterator]() {
-        if (iteratorTaken) throw new Error("a turn has only one event consumer");
-        iteratorTaken = true;
-        return {
-          next() {
-            if (queue.length) {
-              const { update, size } = queue.shift();
-              queuedBytes -= size;
-              resumeOutput?.();
-              resumeOutput = null;
-              return Promise.resolve({ value: update, done: false });
-            }
-            if (terminalError) return Promise.reject(terminalError);
-            if (finished) return Promise.resolve({ done: true });
-            return new Promise((resolve, reject) => waiters.push({ resolve, reject }));
-          },
-          return() { turn.cancel(); return Promise.resolve({ done: true }); },
-        };
+        output.discard();
+        turn.cancelledWithEnteredTool = turn.enteredToolControllers.size > 0;
+        try {
+          if (!closing) send({ jsonrpc: "2.0", method: "session/cancel", params: {
+            sessionId,
+            _meta: { fx: { hostToolExecution: turn.cancelledWithEnteredTool ? "uncertain" : "not_started" } },
+          } });
+        } finally {
+          for (const controller of toolControllers) controller.abort();
+          runtime.abortHostEffects();
+        }
       },
     };
     if (signal?.aborted) {
       finished = true;
-      turn.result = Promise.resolve({ stopReason: "cancelled" });
+      const error = journalEnabled ? new DOMException("Cancelled before admission", "AbortError") : undefined;
+      output.finish(error);
+      turn.result = error ? Promise.reject(error) : Promise.resolve({ stopReason: "cancelled" });
+      void turn.result.catch(() => {});
       return turn;
     }
     activeTurn = turn;
     const abort = () => turn.cancel();
     signal?.addEventListener("abort", abort, { once: true });
-    turn.result = request("session/prompt", { sessionId, prompt })
-      .then((response) => ({ stopReason: cancelled ? "cancelled" : response.stopReason, usage: response.usage }))
+    turn.result = request(method, { sessionId, prompt, ...(requestId === undefined ? {} : { requestId }) })
+      .then((response) => {
+        if (journalFailure) throw journalFailure;
+        if (journalEnabled) {
+          if (response.stopReason === "suspended" && response.journalStatus?.pendingTurn) {
+            journalStatus = response.journalStatus;
+            const error = new PendingTurnError("Turn suspended; explicitly resume or abandon the pending turn");
+            error.status = structuredClone(journalStatus);
+            error.pendingTurn = error.status.pendingTurn;
+            throw error;
+          }
+          normalizeJournalResult(response.journalResult);
+          if (!projection.requests().get(turn.requestId)?.complete ||
+              (response.journalReplay && response.requestId !== turn.requestId)) {
+            throw failJournal(new JournalConflict("fx returned a result without the request's durable turn end"));
+          }
+          return response;
+        }
+        if (turn.cancelledWithEnteredTool) throw new Error("HostToolOutcomeUncertain: cancellation interrupted an entered host executor");
+        return { stopReason: cancelled ? "cancelled" : response.stopReason, usage: response.usage };
+      })
       .catch((error) => {
-        if (error.message === "Cancelled") return { stopReason: "cancelled" };
+        if (journalFailure) error = journalFailure;
+        if (!journalEnabled) {
+          if (turn.cancelledWithEnteredTool && error.message === "Cancelled") error = new Error("HostToolOutcomeUncertain: cancellation interrupted an entered host executor");
+          if (error.message === "Cancelled") return { stopReason: "cancelled" };
+        }
         terminalError = error;
         throw error;
       })
-      .finally(() => {
+      .finally(async () => {
+        await journalTail;
+        // A cancelled host promise can outlive the bridge reply. Keep ownership
+        // until it settles; its external receipt remains the host's authority.
+        while (hostExecutions.size || controlCallbacks.size) {
+          await Promise.allSettled([...hostExecutions, ...controlCallbacks]);
+        }
         finished = true;
-        resumeOutput?.();
-        resumeOutput = null;
         signal?.removeEventListener("abort", abort);
         if (activeTurn === turn) activeTurn = null;
         toolControllers.clear();
         if (discardedBytes) emit("output.discarded", { reason: "cancelled", bytes: discardedBytes });
-        for (const waiter of waiters.splice(0)) {
-          if (terminalError) waiter.reject(terminalError);
-          else waiter.resolve({ done: true });
-        }
+        output.finish(terminalError);
       });
     if (signal?.aborted) turn.cancel();
     void turn.result.catch(() => {});

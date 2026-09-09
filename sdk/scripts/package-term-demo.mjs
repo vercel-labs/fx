@@ -12,14 +12,18 @@ const browserPath = resolve(repoRoot, "sdk/browser.js");
 const sdkPath = resolve(repoRoot, "sdk/fx-sdk.js");
 const coreOutputPath = resolve(repoRoot, "sdk/core-output.js");
 const wasmModulePath = resolve(repoRoot, "sdk/wasm-module.js");
+const journalCodecPath = resolve(repoRoot, "sdk/journal-codec.js");
+const transcriptPath = resolve(repoRoot, "sdk/transcript.js");
 const wasmPath = resolve(repoRoot, "zig-out/bin/fx-term.wasm");
 
-const [htmlSource, browserBytes, sdkSource, coreOutputBytes, wasmModuleBytes, wasmBytes] = await Promise.all([
+const [htmlSource, browserBytes, sdkSource, coreOutputBytes, wasmModuleBytes, journalCodecBytes, transcriptSource, wasmBytes] = await Promise.all([
   readFile(htmlPath, "utf8"),
   readFile(browserPath),
   readFile(sdkPath),
   readFile(coreOutputPath),
   readFile(wasmModulePath),
+  readFile(journalCodecPath),
+  readFile(transcriptPath),
   readFile(wasmPath),
 ]);
 
@@ -29,15 +33,23 @@ const coreOutputHash = digest(coreOutputBytes);
 const coreOutputName = `core-output.${coreOutputHash}.js`;
 const wasmModuleHash = digest(wasmModuleBytes);
 const wasmModuleName = `wasm-module.${wasmModuleHash}.js`;
+const journalCodecHash = digest(journalCodecBytes);
+const journalCodecName = `journal-codec.${journalCodecHash}.js`;
+const transcriptBytes = Buffer.from(transcriptSource.toString()
+  .replaceAll('from "./journal-codec.js";', `from "./${journalCodecName}";`));
+const transcriptHash = digest(transcriptBytes);
+const transcriptName = `transcript.${transcriptHash}.js`;
 const sdkBytes = Buffer.from(sdkSource.toString()
-  .replace('from "./core-output.js";', `from "./${coreOutputName}";`)
-  .replace('from "./wasm-module.js";', `from "./${wasmModuleName}";`));
+  .replaceAll('from "./core-output.js";', `from "./${coreOutputName}";`)
+  .replaceAll('from "./wasm-module.js";', `from "./${wasmModuleName}";`)
+  .replaceAll('from "./journal-codec.js";', `from "./${journalCodecName}";`)
+  .replaceAll('from "./transcript.js";', `from "./${transcriptName}";`));
 const sdkHash = digest(sdkBytes);
 const wasmHash = digest(wasmBytes);
 const sdkName = `fx-sdk.${sdkHash}.js`;
 const wasmName = `fx-term.${wasmHash}.wasm`;
 const packagedBrowser = Buffer.from(
-  browserBytes.toString().replace('from "./fx-sdk.js";', `from "./${sdkName}";`),
+  browserBytes.toString().replaceAll('from "./fx-sdk.js";', `from "./${sdkName}";`),
 );
 const browserHash = digest(packagedBrowser);
 const browserName = `browser.${browserHash}.js`;
@@ -85,6 +97,14 @@ const vercelConfig = {
       headers: [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }],
     },
     {
+      source: `/${journalCodecName}`,
+      headers: [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }],
+    },
+    {
+      source: `/${transcriptName}`,
+      headers: [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }],
+    },
+    {
       source: `/${wasmName}`,
       headers: [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }],
     },
@@ -100,6 +120,8 @@ await Promise.all([
   writeFile(resolve(outputDir, sdkName), sdkBytes),
   writeFile(resolve(outputDir, coreOutputName), coreOutputBytes),
   writeFile(resolve(outputDir, wasmModuleName), wasmModuleBytes),
+  writeFile(resolve(outputDir, journalCodecName), journalCodecBytes),
+  writeFile(resolve(outputDir, transcriptName), transcriptBytes),
   writeFile(resolve(outputDir, wasmName), wasmBytes),
   writeFile(resolve(outputDir, "vercel.json"), `${JSON.stringify(vercelConfig, null, 2)}\n`),
 ]);
@@ -110,6 +132,8 @@ const manifest = {
   sdk: { file: sdkName, sha256: sdkHash, bytes: sdkBytes.byteLength },
   coreOutput: { file: coreOutputName, sha256: coreOutputHash, bytes: coreOutputBytes.byteLength },
   wasmModule: { file: wasmModuleName, sha256: wasmModuleHash, bytes: wasmModuleBytes.byteLength },
+  journalCodec: { file: journalCodecName, sha256: journalCodecHash, bytes: journalCodecBytes.byteLength },
+  transcript: { file: transcriptName, sha256: transcriptHash, bytes: transcriptBytes.byteLength },
   wasm: { file: wasmName, sha256: wasmHash, integrity: integrity(wasmBytes), bytes: wasmBytes.byteLength },
 };
 await writeFile(resolve(outputDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
@@ -119,4 +143,6 @@ console.log(`  ${browserName}`);
 console.log(`  ${sdkName}`);
 console.log(`  ${coreOutputName}`);
 console.log(`  ${wasmModuleName}`);
+console.log(`  ${journalCodecName}`);
+console.log(`  ${transcriptName}`);
 console.log(`  ${wasmName}`);

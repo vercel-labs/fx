@@ -27,6 +27,17 @@ static int real_sync(int fd) {
 
 static int injected_sync(int fd) {
     const char *target = getenv("FX_TEST_SYNC_TARGET");
+    const char *target_file = getenv("FX_TEST_SYNC_TARGET_FILE");
+    char configured[PATH_MAX];
+    if (target_file) {
+        int source = open(target_file, O_RDONLY);
+        if (source < 0) return real_sync(fd);
+        ssize_t count = read(source, configured, sizeof(configured) - 1);
+        close(source);
+        if (count <= 0 || (size_t)count >= sizeof(configured) - 1) return real_sync(fd);
+        configured[count] = 0;
+        target = configured;
+    }
     const char *arm = getenv("FX_TEST_SYNC_ARM");
     const char *record = getenv("FX_TEST_SYNC_RECORD");
     const char *match = getenv("FX_TEST_SYNC_MATCH");
@@ -50,13 +61,23 @@ static int injected_sync(int fd) {
         ssize_t got = pread(fd, tail, count, state.st_size - count);
         if (got < 0) return real_sync(fd);
         tail[got] = 0;
-        if (!strstr(tail, match)) return real_sync(fd);
+        size_t match_bytes = strlen(match);
+        int found = 0;
+        for (size_t offset = 0; offset + match_bytes <= (size_t)got; offset++) {
+            if (!memcmp(tail + offset, match, match_bytes)) { found = 1; break; }
+        }
+        if (!found) return real_sync(fd);
     }
     int hit = atomic_fetch_add(&fired, 1) + 1;
     int log = open(record, O_WRONLY | O_CREAT | O_APPEND, 0600);
     if (log >= 0) {
         dprintf(log, "hit=%d target=%s\n", hit, actual);
         close(log);
+    }
+    const char *mode = getenv("FX_TEST_SYNC_MODE");
+    if (mode && !strcmp(mode, "hold")) {
+        while (!access(arm, F_OK)) usleep(10000);
+        return real_sync(fd);
     }
     errno = EIO;
     return -1;

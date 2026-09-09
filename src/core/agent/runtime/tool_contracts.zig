@@ -128,11 +128,20 @@ pub fn unavailableHostToolResult(alloc: Allocator) Allocator.Error!ToolExecution
     };
 }
 
+pub const PreparedToolBlockKind = enum {
+    malformed_arguments,
+    lifecycle_block,
+    lifecycle_failed_closed,
+    route_unavailable,
+    required_vision,
+};
+
 pub const ToolExecutionRequest = struct {
     skill_locations: ?*const skill_contract.Locations = null,
     call_allocator: Allocator,
     result_allocator: Allocator,
     call: ToolCall,
+    journal_context: ?types.JournalToolContext = null,
     authority: command_admission.ToolExecutionAuthority,
     credential: types.CredentialLease = .{ .direct = .{} },
     /// Action-scoped root mode sampled before permission admission. Direct

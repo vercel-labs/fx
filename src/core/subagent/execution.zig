@@ -1,4 +1,6 @@
 const std = @import("std");
+const execution_journal = @import("../session/execution_journal.zig");
+const journal_runtime = @import("../agent/runtime/journal_runtime.zig");
 const managed_execution = @import("../execution/managed_execution.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const permission_prompter = @import("../permissions/permission_prompter.zig");
@@ -69,7 +71,7 @@ test "child compaction preserves work identity and permits final commit" {
         .assistant = @constCast("child done"),
     } }, 10, 5, 3);
     try std.testing.expect(turn.committed);
-    const bytes = try writable.conversation_writer.readAllForTest(alloc);
+    const bytes = try writable.writer.conversation.readAllForTest(alloc);
     defer alloc.free(bytes);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "child request"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "work-checkpoint"));
@@ -130,7 +132,7 @@ test "child recovery admission distinguishes work identity from repeated prompt 
             defer if (recovery) |*checkpoint| checkpoint.deinit(alloc);
             try std.testing.expectEqual(same_work, recovery != null);
             try std.testing.expect(!turn.committed);
-            try std.testing.expectEqual(same_work, writable.conversation_writer.turn_open);
+            try std.testing.expectEqual(same_work, writable.writer.conversation.turn_open);
             try turn.commit(work_id, .{ .assistant = .{
                 .user = .{ .text = @constCast("same prompt") },
                 .assistant = @constCast("new answer"),
@@ -283,8 +285,37 @@ pub const TurnContext = struct {
         self: *TurnContext,
         alloc: Allocator,
     ) CommitError!?session_codec.RecoveryCheckpoint {
+        if (self.loaded.journalState()) |records| {
+            const prior = switch (records.pending()) {
+                .idle => return null,
+                .model, .ending => |index| index,
+                .tool => |position| position.turn,
+            };
+            const work_id = self.active_work_id orelse return error.InvalidWorkId;
+            const previous = execution_journal.string(records.start(prior), "requestId") catch return error.SessionCommitFailed;
+            if (!std.mem.eql(u8, previous, work_id)) {
+                // A new managed message replaces interrupted work explicitly;
+                // preserve the old results and uncertainty before admitting it.
+                var journal: journal_runtime.Runtime = .{
+                    .state = records,
+                    .sink = self.loaded.journalSink().?,
+                    .alloc = self.alloc,
+                    .namespace = self.loaded.active_id,
+                    .creation_id = "replace-child-work",
+                    .request_id = previous,
+                    .work_id = previous,
+                    .turn = prior,
+                };
+                const abandoned = journal.abandon() catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.SessionCommitFailed;
+                if (abandoned) |turn| {
+                    defer session.freeHistoryTurn(self.alloc, turn);
+                    try self.appendCommittedHistory(previous, turn, self.loaded.state.total_input_tokens, self.loaded.state.total_output_tokens, io_mod.milliTimestamp());
+                }
+            }
+            return null;
+        }
         const checkpoint = self.loaded.state.recovery_checkpoint orelse return null;
-        if (self.loaded.conversation_writer.turn_open) {
+        if (self.loaded.hasPendingTurn()) {
             const prior_work_id = checkpoint.user.work_id orelse return error.InvalidWorkId;
             const work_id = self.active_work_id orelse return error.InvalidWorkId;
             if (!std.mem.eql(u8, prior_work_id, work_id)) {

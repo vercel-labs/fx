@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createFxAgent, getBackendInfo } from "../node.js";
+import { createJournalStore } from "./fixtures/journal-store.mjs";
 
 const root = await mkdtemp(join(tmpdir(), "libfx bundled assets "));
 const media = join(root, "static", "media");
@@ -35,9 +36,15 @@ try {
     assert.ok(nativeAddon instanceof URL);
     assert.throws(() => fileURLToPath(nativeAddon), { code: "ERR_INVALID_ARG_TYPE" });
     assert.equal((await getBackendInfo({ backend: "native", nativeAddon })).backend, "native");
-    const agent = await createFxAgent({ backend: "native", nativeAddon, apiKey: "fixture-key" });
-    try { assert.ok((await agent.checkpoint()).length > 48); }
-    finally { await agent.close(); }
+    const store = createJournalStore();
+    let agent;
+    try {
+      agent = await createFxAgent({ backend: "native", nativeAddon, apiKey: "fixture-key", ...store.options() });
+      assert.ok((await agent.checkpoint()).bytes.length > 48);
+    } finally {
+      await agent?.close();
+      store.close();
+    }
     for (const [surface, artifact] of [["agent", "core"], ["terminal", "term"]]) {
       const wasm = relativeUrl(`${publicPath}static/media/fx-${artifact}.fixture.wasm`);
       const info = await getBackendInfo({ backend: "wasm", surface, wasm });

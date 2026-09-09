@@ -511,7 +511,13 @@ test "processQueuedPrompt persists interrupted turn with aborted tool output for
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
     var fixture = PromptFixture{};
-    hooks.exec_plans = &.{.{ .err = error.Cancelled }};
+    // This fixture represents a conclusive abort. An entered executor that
+    // only throws Cancelled has no result evidence and must remain uncertain.
+    hooks.exec_plans = &.{.{ .result = .{
+        .status = .failure,
+        .cancelled = true,
+        .model_output = "Tool execution aborted before producing a result.",
+    } }};
     hooks.cancel_on_execute = &fixture.cancel_flag;
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());

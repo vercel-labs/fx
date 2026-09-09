@@ -182,6 +182,7 @@ async function installedWorkerMain() {
   const { createRequire } = await import("node:module");
   const { createServer } = await import("node:http");
   const { readdir, readFile, writeFile } = await import("node:fs/promises");
+  const { appendFileSync } = await import("node:fs");
   const { performance } = await import("node:perf_hooks");
   const config = JSON.parse(process.argv[2]);
 
@@ -260,6 +261,16 @@ async function installedWorkerMain() {
   const cjs = createRequire(import.meta.url)("libfx");
   const exportNames = Object.keys(esm).sort();
   assert.deepEqual(Object.keys(cjs).sort(), exportNames, "ESM and CJS exports differ");
+  let journalCounter = 0;
+  const journalOptions = (checkpoint) => {
+    const path = `journal-${process.pid}-${journalCounter++}.jsonl`;
+    return {
+      journal: checkpoint ? [checkpoint] : [],
+      onEntry(entry) {
+        appendFileSync(path, JSON.stringify({ ...entry, bytes: Buffer.from(entry.bytes).toString("base64") }) + "\n", { flush: true });
+      },
+    };
+  };
 
   if (config.mode === "cjs-happy") {
     assert.equal(typeof cjs.createFxAgent, "function");
@@ -326,17 +337,24 @@ async function installedWorkerMain() {
       apiKey: "test-placeholder",
       checkpoint: new Uint8Array([1, 2, 3]),
     }));
-    assert.match(invalidCheckpoint.message, /Invalid or non-fresh libfx checkpoint/);
-    const recovery = await esm.createFxAgent({ backend: "native", apiKey: "test-placeholder" });
+    assert.match(invalidCheckpoint.message, /checkpoint and onCheckpoint were replaced/);
+    const invalidJournal = await expectedError(() => esm.createFxAgent({
+      backend: "native", apiKey: "test-placeholder", ...journalOptions(),
+      journal: [{ seq: 1, kind: "checkpoint", bytes: new Uint8Array([1, 2, 3]), hash: "0".repeat(64) }],
+    }));
+    assert.ok(invalidJournal instanceof esm.JournalConflict);
+    const recovery = await esm.createFxAgent({ backend: "native", apiKey: "test-placeholder", ...journalOptions() });
     const checkpoint = await recovery.checkpoint();
     await recovery.close();
-    assert.ok(checkpoint.length > 48);
+    assert.equal(checkpoint.kind, "checkpoint");
+    assert.ok(checkpoint.bytes.length > 48);
     console.log(JSON.stringify({
       mode: config.mode,
       invalidProbe: errorRecord(invalidProbe),
       invalidBackend: errorRecord(invalidBackend),
       invalidCheckpoint: errorRecord(invalidCheckpoint),
-      recoveryCheckpointBytes: checkpoint.length,
+      invalidJournal: errorRecord(invalidJournal),
+      recoveryCheckpointBytes: checkpoint.bytes.length,
     }));
     return;
   }
@@ -350,16 +368,17 @@ async function installedWorkerMain() {
     await writeFile(config.wasmPath, await readFile(config.restoreWasmPath));
     const second = await esm.getBackendInfo({ backend: "wasm" });
     assert.equal(second.backend, "wasm-jspi");
-    const recovery = await esm.createFxAgent({ backend: "wasm", apiKey: "test-placeholder" });
+    const recovery = await esm.createFxAgent({ backend: "wasm", apiKey: "test-placeholder", ...journalOptions() });
     const checkpoint = await recovery.checkpoint();
     await recovery.close();
-    assert.ok(checkpoint.length > 48);
+    assert.equal(checkpoint.kind, "checkpoint");
+    assert.ok(checkpoint.bytes.length > 48);
     console.log(JSON.stringify({
       mode: config.mode,
       first,
       factoryError: errorRecord(factoryError),
       second,
-      recoveryCheckpointBytes: checkpoint.length,
+      recoveryCheckpointBytes: checkpoint.bytes.length,
     }));
     return;
   }
@@ -494,7 +513,7 @@ async function installedWorkerMain() {
     home: process.cwd(),
     workspaceRoot: process.cwd(),
     tools,
-    ...(checkpoint ? { checkpoint } : {}),
+    ...journalOptions(checkpoint),
   });
   const lookupTool = (marker, mode, state) => ({
     name: "lookup",
@@ -509,7 +528,8 @@ async function installedWorkerMain() {
       state.callbacks += 1;
       assert.equal(signal.aborted, false);
       assert.equal(input.key, marker);
-      if (mode === "reject") throw new Error(`rejected:${marker}`);
+      if (mode === "uncertain") throw new Error(`uncertain:${marker}`);
+      if (mode === "reject") return { content: `rejected:${marker}`, isError: true };
       return `value:${marker}`;
     },
   });
@@ -531,8 +551,21 @@ async function installedWorkerMain() {
     let agent;
     try {
       agent = await esm.createFxAgent(baseOptions(backend, [lookupTool(marker, mode, state)]));
-      const observed = await withTimeout(consumeTurn(agent.prompt(`CALL ${marker}`)), 10_000, `tool workflow ${marker}`);
-      assert.equal(observed.result.stopReason, "end_turn");
+      const pending = consumeTurn(agent.prompt(`CALL ${marker}`, { requestId: `call-${marker}` }));
+      if (mode === "uncertain") {
+        await assert.rejects(withTimeout(pending, 10_000, `uncertain tool ${marker}`), esm.RecoveryRequired);
+        const status = await agent.status();
+        assert.equal(status.pendingTurn.awaiting.tool.name, "lookup");
+        assert.equal(state.callbacks, 1);
+        assert.equal(provider.markerRequestCounts.get(marker), 1, "uncertain effect must not reach a later provider step");
+        await agent.abandon();
+        const checkpoint = await agent.checkpoint();
+        const transcript = esm.createProjection([checkpoint]).transcript();
+        assert.ok(transcript.messages.some((message) => message.parts.some((part) => part.type === "tool_call" && part.status === "unknown")));
+        return { marker, latencyMs: performance.now() - started };
+      }
+      const observed = await withTimeout(pending, 10_000, `tool workflow ${marker}`);
+      assert.equal(observed.result.stopReason, "stop");
       assert.equal(observed.text, `done:${marker}`);
       assert.equal(state.callbacks, 1);
       assert.equal(observed.events.filter((event) => event.type === "tool_start").length, 1);
@@ -560,17 +593,19 @@ async function installedWorkerMain() {
     let restored;
     try {
       source = await esm.createFxAgent(baseOptions("native", tools));
-      const first = await consumeTurn(source.prompt(`CALL ${marker}`));
+      const first = await consumeTurn(source.prompt(`CALL ${marker}`, { requestId: `call-${marker}` }));
       assert.equal(first.text, `done:${marker}`);
       const checkpoint = await source.checkpoint();
-      assert.ok(checkpoint.length > 48);
+      assert.equal(checkpoint.kind, "checkpoint");
+      assert.ok(checkpoint.bytes.length > 48);
+      assert.match(JSON.stringify(esm.createProjection([checkpoint]).transcript()), new RegExp(`value:${marker}`));
       await source.close();
       source = null;
       restored = await esm.createFxAgent(baseOptions("native", tools, checkpoint));
-      const second = await consumeTurn(restored.prompt(`RESTORE ${marker}`));
+      const second = await consumeTurn(restored.prompt(`RESTORE ${marker}`, { requestId: `restore-${marker}` }));
       assert.equal(second.text, `restored:${marker}`);
       assert.equal(state.callbacks, 1);
-      const result = { marker, checkpointBytes: checkpoint.length, latencyMs: performance.now() - started };
+      const result = { marker, checkpointBytes: checkpoint.bytes.length, latencyMs: performance.now() - started };
       await restored.close();
       restored = null;
       return result;
@@ -583,6 +618,8 @@ async function installedWorkerMain() {
   };
   const runCancellationWorkflow = async () => {
     const marker = nextMarker("cancel");
+    const journalPath = `cancel-${marker}.jsonl`;
+    const persist = (entry) => appendFileSync(journalPath, JSON.stringify({ ...entry, bytes: Buffer.from(entry.bytes).toString("base64") }) + "\n", { flush: true });
     provider.markerModes.set(marker, "cancel");
     provider.uniqueMarkers += 1;
     let startResolve;
@@ -608,35 +645,58 @@ async function installedWorkerMain() {
     try {
       agent = await esm.createFxAgent({
         ...baseOptions("native", [waitTool]),
+        onEntry: persist,
         onEvent(event) { runtimeEvents.push(event); },
       });
-      const pending = consumeTurn(agent.prompt(`CALL ${marker}`, { signal: controller.signal }));
+      const pending = consumeTurn(agent.prompt(`CALL ${marker}`, { requestId: `call-${marker}`, signal: controller.signal }));
+      let resultSettled = false;
+      pending.then(() => { resultSettled = true; }, () => { resultSettled = true; });
       await withTimeout(toolStarted, 5_000, `cancel tool start ${marker}`);
       controller.abort();
-      const cancelled = await withTimeout(pending, 10_000, `cancelled turn ${marker}`);
-      assert.equal(cancelled.result.stopReason, "cancelled");
+      await delay(25);
+      assert.equal(resultSettled, false, "entered executor must retain result cleanup ownership");
+      assert.throws(() => agent.prompt(`RECOVER ${marker}`, { requestId: `early-${marker}` }), esm.PendingTurnError);
       assert.equal(callbacks, 1);
       assert.equal(signalAborted, true);
-      const recovery = await withTimeout(consumeTurn(agent.prompt(`RECOVER ${marker}`)), 10_000, `cancel recovery ${marker}`);
+      settle();
+      await assert.rejects(withTimeout(pending, 10_000, `cancelled turn ${marker}`), esm.RecoveryRequired);
+      const status = await agent.status();
+      assert.equal(status.pendingTurn.awaiting.tool.name, "wait");
+      assert.equal(provider.markerRequestCounts.get(marker), 1, "cancelled unknown effect must not reach another provider step");
+      await agent.abandon();
+      await assert.rejects(consumeTurn(agent.prompt(`RECOVER ${marker}`, { requestId: `still-fenced-${marker}` })), esm.RecoveryRequired);
+      await agent.close();
+      agent = null;
+      const journal = (await readFile(journalPath, "utf8")).trim().split("\n").map((line) => {
+        const entry = JSON.parse(line);
+        return { ...entry, bytes: new Uint8Array(Buffer.from(entry.bytes, "base64")) };
+      });
+      agent = await esm.createFxAgent({
+        ...baseOptions("native", [waitTool]), journal, onEntry: persist,
+        onEvent(event) { runtimeEvents.push(event); },
+      });
+      const recovery = await withTimeout(consumeTurn(agent.prompt(`RECOVER ${marker}`, { requestId: `recover-${marker}` })), 10_000, `cancel recovery ${marker}`);
       assert.equal(recovery.text, `recovered:${marker}`);
       const checkpointBeforeLate = await agent.checkpoint();
       const sendsBeforeLate = runtimeEvents.filter((event) => event.type === "acp.send").length;
-      settle();
       await delay(25);
       assert.equal(provider.lateResultSeen, false);
       assert.equal(runtimeEvents.filter((event) => event.type === "acp.send").length, sendsBeforeLate);
-      assert.deepEqual(await agent.checkpoint(), checkpointBeforeLate);
+      const repeatedCheckpoint = await agent.checkpoint();
+      assert.ok(repeatedCheckpoint.seq > checkpointBeforeLate.seq);
+      assert.deepEqual(esm.createProjection([repeatedCheckpoint]).transcript(), esm.createProjection([checkpointBeforeLate]).transcript());
       assert.doesNotMatch(JSON.stringify(runtimeEvents), /late-result:/);
       const afterLate = await withTimeout(
-        consumeTurn(agent.prompt(`AFTER_LATE ${marker}`)),
+        consumeTurn(agent.prompt(`AFTER_LATE ${marker}`, { requestId: `after-late-${marker}` })),
         10_000,
         `post-settlement turn ${marker}`,
       );
       assert.equal(afterLate.text, `after-late:${marker}`);
       assert.doesNotMatch(JSON.stringify(afterLate.events), /late-result:/);
       const checkpointAfterLate = await agent.checkpoint();
-      assert.equal(Buffer.from(checkpointAfterLate).includes(Buffer.from("late-result:")), false);
-      const result = { marker, checkpointBytes: checkpointAfterLate.length, latencyMs: performance.now() - started };
+      assert.equal(checkpointAfterLate.kind, "checkpoint");
+      assert.equal(Buffer.from(checkpointAfterLate.bytes).includes(Buffer.from("late-result:")), false);
+      const result = { marker, checkpointBytes: checkpointAfterLate.bytes.length, latencyMs: performance.now() - started };
       await agent.close();
       agent = null;
       return result;
@@ -656,10 +716,12 @@ async function installedWorkerMain() {
       apiKey: "test-placeholder",
       home: process.cwd(),
       workspaceRoot: process.cwd(),
+      ...journalOptions(),
     });
     try {
       const checkpoint = await agent.checkpoint();
-      assert.ok(checkpoint.length > 48);
+      assert.equal(checkpoint.kind, "checkpoint");
+      assert.ok(checkpoint.bytes.length > 48);
       return performance.now() - started;
     } finally {
       await agent.close();
@@ -674,6 +736,7 @@ async function installedWorkerMain() {
     isolationWorkflows: 0,
     restoreWorkflows: 0,
     rejectedWorkflows: 0,
+    uncertainWorkflows: 0,
     cancellationWorkflows: 0,
     mixedOperations: 0,
     laterSuccessfulInteractions: 0,
@@ -722,9 +785,10 @@ async function installedWorkerMain() {
           return "success";
         }
         if (selected < 11) {
-          const value = await runToolWorkflow({ mode: "reject", backend: selected % 2 ? "auto" : "native", label: "mixed_reject" });
+          const mode = selected === 9 ? "reject" : "uncertain";
+          const value = await runToolWorkflow({ mode, backend: selected % 2 ? "auto" : "native", label: `mixed_${mode}` });
           samples.rejectMs.push(value.latencyMs);
-          return "reject";
+          return mode;
         }
         if (selected === 11) {
           const value = await runCancellationWorkflow();
@@ -742,6 +806,7 @@ async function installedWorkerMain() {
       const outcomes = await Promise.all(wave);
       counts.mixedOperations += outcomes.length;
       counts.rejectedWorkflows += outcomes.filter((value) => value === "reject").length;
+      counts.uncertainWorkflows += outcomes.filter((value) => value === "uncertain").length;
       counts.cancellationWorkflows += outcomes.filter((value) => value === "cancel").length;
       counts.restoreWorkflows += outcomes.filter((value) => value === "restore").length;
       samples.mixedMs.push(performance.now() - waveStarted);
@@ -770,7 +835,7 @@ async function installedWorkerMain() {
   assert.equal(counts.toolWorkflows, config.toolWorkflows);
   assert.ok(counts.mixedDurationMs >= config.durationMs);
   assert.equal(counts.laterSuccessfulInteractions, 1);
-  assert.ok(counts.rejectedWorkflows > 0 && counts.cancellationWorkflows > 0 && counts.restoreWorkflows > 0);
+  assert.ok(counts.rejectedWorkflows > 0 && counts.uncertainWorkflows > 0 && counts.cancellationWorkflows > 0 && counts.restoreWorkflows > 0);
   const allMemory = [memory.start, memory.afterWarmup, ...memory.samples, memory.after];
   memory.peakRss = allMemory.reduce((current, sample) => sample.rss > current.rss ? sample : current);
   memory.peakHeapUsed = allMemory.reduce((current, sample) => sample.heapUsed > current.heapUsed ? sample : current);

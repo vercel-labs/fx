@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -9,6 +10,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
+import { decodeNativeJournal } from "./journal/storage";
 import {
   fakeGatewaySse,
   startFakeGateway,
@@ -50,14 +52,13 @@ function gatewayEnvironment(home: string) {
   };
 }
 
-function filesNamed(directory: string, name: string): string[] {
-  const files: string[] = [];
-  for (const entry of readdirSync(directory, { withFileTypes: true })) {
-    const path = join(directory, entry.name);
-    if (entry.isDirectory()) files.push(...filesNamed(path, name));
-    if (entry.isFile() && entry.name === name) files.push(path);
-  }
-  return files;
+function sessionFiles(home: string, name: string): string[] {
+  const directory = join(home, ".fx", "sessions");
+  if (!existsSync(directory)) return [];
+  return readdirSync(directory, { withFileTypes: true })
+    .filter(entry => entry.isDirectory())
+    .map(entry => join(directory, entry.name, name))
+    .filter(path => existsSync(path));
 }
 
 type UsageCheckpoint = {
@@ -74,14 +75,14 @@ function readUsageCheckpoint(path: string): UsageCheckpoint {
 }
 
 function latestUsageCheckpoint(home: string): UsageCheckpoint {
-  const paths = filesNamed(home, "usage-v2.json");
+  const paths = sessionFiles(home, "usage-v2.json");
   if (paths.length === 0) throw new Error("missing usage sidecar");
   return readUsageCheckpoint(paths[paths.length - 1]!);
 }
 
 function conversationTurnCount(home: string): number {
   let count = 0;
-  for (const path of filesNamed(home, "events.jsonl")) {
+  for (const path of sessionFiles(home, "events.jsonl")) {
     for (const line of readFileSync(path, "utf8").trim().split("\n")) {
       if (line.length === 0) continue;
       const event = JSON.parse(line).event;
@@ -89,6 +90,9 @@ function conversationTurnCount(home: string): number {
         count += 1;
       }
     }
+  }
+  for (const path of sessionFiles(home, "execution.journal")) {
+    count += decodeNativeJournal(readFileSync(path)).filter(entry => entry.kind === "turn_end").length;
   }
   return count;
 }
@@ -212,10 +216,7 @@ test(
     expect(exitCode).toBe(0);
     expect(gateway.generationRequests).toEqual([]);
     await waitForProfileUsage(home, GENERATION_ID);
-    const events = filesNamed(home, "events.jsonl")
-      .map((path) => readFileSync(path, "utf8"))
-      .join("\n");
-    expect(events).toContain('"turn_completed"');
+    expect(conversationTurnCount(home)).toBe(1);
     const usage = latestUsageCheckpoint(home);
     expect(usage.billing).toBe("complete");
     expect(usage.pending).toEqual([]);
@@ -461,7 +462,7 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
         expect(await fixture.exited).toBe(0);
         expect(gateway.generationRequests).toEqual([GENERATION_ID]);
 
-        const usageSidecars = filesNamed(home, "usage-v2.json");
+        const usageSidecars = sessionFiles(home, "usage-v2.json");
         expect(usageSidecars).toHaveLength(1);
         const beforeResume = readUsageCheckpoint(usageSidecars[0]!);
         expect(beforeResume.billing).toBe("pending");

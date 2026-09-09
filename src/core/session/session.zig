@@ -1,5 +1,6 @@
 const std = @import("std");
 const kernel_agent = @import("../agent/runtime/agent.zig");
+const execution_journal = @import("execution_journal.zig");
 const core_types = @import("../shared/types.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -1572,6 +1573,9 @@ pub const WebFetchArtifactState = union(enum) {
 };
 
 pub const SessionRuntime = struct {
+    /// Owned execution authority for journal-enabled SDK sessions only.
+    execution_journal: execution_journal.State = .{},
+    journal_execution_started: bool = false,
     agent: kernel_agent.Agent = .{},
     context_notice_hashes: std.AutoHashMapUnmanaged(u64, void) = .empty,
     context_notice_lock: std.Io.Mutex = .init,
@@ -1610,6 +1614,7 @@ pub const SessionRuntime = struct {
     }
 
     pub fn deinit(self: *SessionRuntime, alloc: Allocator) void {
+        self.execution_journal.deinit(alloc);
         self.clearWebFetchArtifacts();
         self.usage.configurePublicationSink(null);
         self.usage.configureCheckpointSink(null);
@@ -1653,6 +1658,8 @@ pub const SessionRuntime = struct {
     }
 
     pub fn reset(self: *SessionRuntime, alloc: Allocator) void {
+        self.execution_journal.deinit(alloc);
+        self.journal_execution_started = false;
         self.clearWebFetchArtifacts();
         self.usage.resetFresh(alloc);
         self.clearPermissionState(alloc);

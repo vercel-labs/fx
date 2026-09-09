@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { invalidJournalOptions } from "./fixtures/invalid-journal.mjs";
 import { strict as assert } from "node:assert";
 import { closeSync } from "node:fs";
 import { mkdtemp, writeFile } from "node:fs/promises";
@@ -146,10 +147,10 @@ try {
   await assert.rejects(
     createFxAgent({
       nativeAddon: realNativeAddon,
-      checkpoint: new Uint8Array([1, 2, 3]),
+      ...invalidJournalOptions(),
       apiKey: "loader-checkpoint-key",
     }),
-    (error) => error.message.includes("Invalid or non-fresh libfx checkpoint"),
+    (error) => error.message.includes("JournalConflict"),
   );
 } finally {
   Object.defineProperty(WebAssembly, "Suspending", { configurable: true, value: savedSuspending });

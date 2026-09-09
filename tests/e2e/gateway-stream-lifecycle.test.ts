@@ -1,4 +1,6 @@
-import { describe, expect, test } from "bun:test";
+import { beforeAll, describe, expect, test } from "bun:test";
+import { decodeNativeJournal } from "./journal/storage";
+import { createProjection } from "../../sdk/transcript.js";
 import { createServer, type Socket } from "node:net";
 import {
   chmodSync,
@@ -18,6 +20,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { ensureLegacyFixtureBinary, runLegacyFx } from "./legacy-session-fixture";
 import {
   AMBIGUOUS_CAPABILITY_CLAUSES,
   AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
@@ -651,6 +654,7 @@ async function waitForMcpServerReady(
 }
 
 describe("gateway stream lifecycle", () => {
+  beforeAll(ensureLegacyFixtureBinary, 600_000);
   test("skill context keeps complete scoped resources visible through saved tool results", async () => {
     const root = createFixtureRoot("complete-skill-resources");
     writeLargeSkillCatalog(root.workspace, 48);
@@ -698,10 +702,11 @@ describe("gateway stream lifecycle", () => {
           expect(toolResultOutput(body, "whole_reference")).toContain("REFERENCE_RESOURCE_TAIL");
           return fakeGatewayFinalText("Complete resources restored.");
         case 4:
-          expect(toolResultOutput(body, "whole_main")).toContain("unavailable");
-          expect(toolResultOutput(body, "whole_main")).not.toContain('complete="true"');
+          // The journal retains complete inline output even after its sidecar is removed.
+          expect(toolResultOutput(body, "whole_main")).toContain("MAIN_RESOURCE_TAIL");
+          expect(toolResultOutput(body, "whole_main")).toContain('complete="true"');
           expect(toolResultOutput(body, "whole_reference")).toContain("REFERENCE_RESOURCE_TAIL");
-          return fakeGatewayFinalText("Missing saved resource reported.");
+          return fakeGatewayFinalText("Saved resource retained.");
         default:
           return new Response("unexpected request", { status: 500 });
       }
@@ -3334,9 +3339,10 @@ describe("gateway stream lifecycle", () => {
         ".fx",
         "sessions",
         firstJson.session_id,
-        "events.jsonl",
+        "execution.journal",
       );
-      const eventsBeforeResume = readFileSync(eventsPath).byteLength;
+      const savedJournal = readFileSync(eventsPath);
+      const entriesBeforeResume = decodeNativeJournal(savedJournal).length;
 
       const resumed = await runFx(
         [
@@ -3373,16 +3379,11 @@ describe("gateway stream lifecycle", () => {
       expect(gateway.requests[2].body).toContain("REPLAY_TOOL_RESULT");
       expect(resumedJson.tool_calls).toEqual([]);
 
-      const appendedEvents = readFileSync(eventsPath)
-        .subarray(eventsBeforeResume)
-        .toString("utf8")
-        .trim()
-        .split("\n")
-        .filter(Boolean)
-        .map((line) => JSON.parse(line) as { event: Record<string, unknown> });
-      const appendedKinds = appendedEvents.map((event) => Object.keys(event.event)[0]);
-      expect(appendedKinds).toContain("turn_completed");
-      expect(appendedKinds).not.toContain("state_replacement_started");
+      const resumedJournal = readFileSync(eventsPath);
+      expect(resumedJournal.subarray(0, savedJournal.length)).toEqual(savedJournal);
+      const appendedKinds = decodeNativeJournal(resumedJournal).slice(entriesBeforeResume).map(entry => entry.kind);
+      expect(appendedKinds).toContain("turn_end");
+      expect(appendedKinds).not.toContain("checkpoint");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -3395,7 +3396,7 @@ describe("gateway stream lifecycle", () => {
       const replies = [fakeGatewayFinalText("Seed reply."), fakeGatewayFinalText("Resumed reply.")];
       const gateway = startGateway(() => replies.shift() ?? new Response("unexpected request", { status: 500 }));
       try {
-        const seeded = await runFx(["ask", "--json", "--auto", "Seed a conversation."], {
+        const seeded = await runLegacyFx(["ask", "--json", "--auto", "Seed a conversation."], {
           cwd: root.workspace,
           env: fixtureEnv(root, gateway, join(root.root, "seed.log")),
           timeoutMs: 15_000,
@@ -3519,7 +3520,7 @@ describe("gateway stream lifecycle", () => {
         ".fx",
         "sessions",
         firstJson.session_id,
-        "events.jsonl",
+        "execution.journal",
       );
 
       expect(first.code).toBe(0);
@@ -3612,10 +3613,10 @@ describe("gateway stream lifecycle", () => {
             expect(result.final_output).toBe("The notes were read.");
             expect(result.tool_calls.filter((call) => call.name === "read_file")).toEqual([{ name: "read_file", status: "success" }]);
             expect(gateway.requestCount()).toBe(2);
-            const eventsPath = join(root.home, ".fx", "sessions", result.session_id, "events.jsonl");
-            const originalEvents = readFileSync(eventsPath, "utf8");
-            expect(originalEvents).toContain("removed_call");
-            if (metadata) expect(originalEvents).toContain("removed-signature");
+            const eventsPath = join(root.home, ".fx", "sessions", result.session_id, "execution.journal");
+            const originalEvents = readFileSync(eventsPath);
+            expect(originalEvents.toString("utf8")).toContain("removed_call");
+            if (metadata) expect(originalEvents.toString("utf8")).toContain("removed-signature");
             const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", result.session_id, "Confirm the saved result without running tools."], {
               cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
             });
@@ -3623,7 +3624,7 @@ describe("gateway stream lifecycle", () => {
             expect(resumed.stderr).toBe("");
             expect(parseAskJson(resumed.stdout).tool_calls).toEqual([]);
             expect(gateway.requestCount()).toBe(3);
-            expect(readFileSync(eventsPath, "utf8").startsWith(originalEvents)).toBe(true);
+            expect(readFileSync(eventsPath).subarray(0, originalEvents.length)).toEqual(originalEvents);
             for (const request of gateway.requests.slice(1)) {
               const prompt = gatewayRequest(request.body).prompt;
               const callIndex = prompt.findIndex((message) => Array.isArray(message.content) && message.content.some((part) => part.type === "tool-call" && part.toolCallId === "retained_call"));
@@ -3671,8 +3672,8 @@ describe("gateway stream lifecycle", () => {
       });
       expect(first.code).toBe(0);
       const sessionId = parseAskJson(first.stdout).session_id;
-      const eventsPath = join(root.home, ".fx", "sessions", sessionId, "events.jsonl");
-      const originalEvents = readFileSync(eventsPath, "utf8");
+      const eventsPath = join(root.home, ".fx", "sessions", sessionId, "execution.journal");
+      const originalEvents = readFileSync(eventsPath);
       const second = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "Exercise the second fixture."], {
         cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
       });
@@ -3686,7 +3687,7 @@ describe("gateway stream lifecycle", () => {
       expect(resumed.stderr).toBe("");
       expect(parseAskJson(resumed.stdout).tool_calls).toEqual([]);
       expect(gateway.requestCount()).toBe(5);
-      expect(readFileSync(eventsPath, "utf8").startsWith(originalEvents)).toBe(true);
+      expect(readFileSync(eventsPath).subarray(0, originalEvents.length)).toEqual(originalEvents);
       for (const request of gateway.requests.slice(3)) {
         const parts = gatewayRequest(request.body).prompt.flatMap((message) => Array.isArray(message.content) ? message.content : []);
         const calls = parts.filter((part) => part.type === "tool-call" && part.toolCallId === "reused");
@@ -3749,7 +3750,7 @@ describe("gateway stream lifecycle", () => {
         ".fx",
         "sessions",
         firstJson.session_id,
-        "events.jsonl",
+        "execution.journal",
       );
 
       expect(first.code).toBe(0);
@@ -3759,11 +3760,14 @@ describe("gateway stream lifecycle", () => {
       expect(existsSync(sideEffectPath)).toBe(false);
       expect(existsSync(sessionPath)).toBe(true);
       expect(existsSync(eventsPath)).toBe(true);
-      const savedEvents = readFileSync(eventsPath, "utf8");
+      const records = decodeNativeJournal(readFileSync(eventsPath)).map(entry => JSON.parse(Buffer.from(entry.bytes).toString("utf8")));
+      const savedEvents = JSON.stringify(records);
       expect(savedEvents).toContain('"arguments_json":"{}"');
       expect(savedEvents).toContain("tool_execution_failed");
-      expect(savedEvents).not.toContain(malformedArguments);
-      expect(savedEvents).not.toContain("malformed_json");
+      const selected = records.find(record => record.kind === "model_step" && record.calls?.length).calls[0];
+      expect(selected.argumentsJson).toBe("{}");
+      expect(selected.argument_integrity).toBe("malformed_json");
+      expect(JSON.stringify(records.find(record => record.kind === "turn_end").history)).not.toContain("malformed_json");
 
       const resumed = await runFx(
         [
@@ -4205,7 +4209,7 @@ describe("gateway stream lifecycle", () => {
       });
       expect(json.tool_calls.filter((call) => call.name === "read_tool_result")).toHaveLength(2);
       expect(existsSync(join(sessionRoot, "tool-results", canonicalHandle))).toBe(true);
-      const sessionEvents = readFileSync(join(sessionRoot, "events.jsonl"), "utf8");
+      const sessionEvents = readFileSync(join(sessionRoot, "execution.journal"), "utf8");
       expect(sessionEvents).toContain(suffixlessHandle);
       expect(sessionEvents).toContain(canonicalHandle);
       expect(sessionEvents).toContain(needle);
@@ -4407,7 +4411,7 @@ describe("gateway stream lifecycle", () => {
         env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "agent,tool,permission" },
         timeoutMs: 15_000,
       });
-      expect(result.code).toBe(0);
+      expect(result.code, result.stdout + result.stderr).toBe(0);
       expect(gateway.requestCount()).toBe(2);
       expect(existsSync(marker)).toBe(false);
       const json = parseAskJson(result.stdout);
@@ -4417,6 +4421,11 @@ describe("gateway stream lifecycle", () => {
         cwd: root.workspace, env: { HOME: root.home },
       });
       expect(saved.code).toBe(0);
+      const journal = decodeNativeJournal(readFileSync(join(root.home, ".fx", "sessions", json.session_id, "execution.journal")));
+      const outcome = JSON.parse(Buffer.from(journal.at(-1)!.bytes).toString("utf8"));
+      expect(outcome.result).toMatchObject({ ok: true, stopReason: "tool_limit" });
+      const transcript = createProjection(journal).transcript();
+      expect(transcript.messages.flatMap(message => message.parts).filter(part => part.type === "tool_result")).toHaveLength(4);
       const history = JSON.parse(saved.stdout).history;
       const results = history.flatMap((turn: any) =>
         (turn.execution?.tool_steps ?? []).flatMap((step: any) => step.tool_results));
@@ -5662,7 +5671,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           expect(Buffer.byteLength(snapshot)).toBeGreaterThan(65536);
           expect(snapshot).toContain(token);
           expect(snapshot).toContain(tail);
-          expect(readFileSync(join(sessionDir, "events.jsonl"), "utf8")).toContain(snapshotHandle);
+          expect(readFileSync(join(sessionDir, "execution.journal"), "utf8")).toContain(snapshotHandle);
           const resumed = await runFx(["ask", "--json", "--resume-id", sessionId, "Recover the clipped tail from the saved retrieval without rerunning the command."], { cwd: root.workspace, env, timeoutMs: 30000 });
           expect(resumed.code).toBe(0);
           expect(resumed.stderr).toBe("Reading tool result\n");
@@ -5772,7 +5781,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(beforeResume.code).toBe(0);
         const sessionsRoot = join(root.home, ".fx", "sessions");
         const sessionFiles = readdirSync(join(sessionsRoot, sessionId));
-        expect(JSON.parse(readFileSync(join(sessionsRoot, sessionId, "session.json"), "utf8")).schema_version).toBe(4);
+        expect(JSON.parse(readFileSync(join(sessionsRoot, sessionId, "session.json"), "utf8")).schema_version).toBe(5);
         expect(sessionFiles).not.toContain("checkpoint.json");
         expect(sessionFiles).not.toContain("display.json");
         expect(sessionFiles).not.toContain("recovery.json");
@@ -5996,13 +6005,14 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           const sessionsRoot = join(root.home, ".fx", "sessions");
           const sessionId = readdirSync(sessionsRoot).find((id) => {
             const path = join(sessionsRoot, id, "session.json");
-            return existsSync(path) && !JSON.parse(readFileSync(path, "utf8")).subagent_child;
+            return existsSync(path) && !existsSync(join(sessionsRoot, id, "subagent", "owner.json"));
           });
           expect(sessionId).toBeString();
           const sessionDir = join(sessionsRoot, sessionId!);
-          const eventsPath = join(sessionDir, "events.jsonl");
-          const before = readFileSync(eventsPath, "utf8");
-          expect(before).toContain('"reason":"cancelled"');
+          const eventsPath = join(sessionDir, "execution.journal");
+          const before = readFileSync(eventsPath);
+          const prior = decodeNativeJournal(before).map(entry => JSON.parse(Buffer.from(entry.bytes).toString("utf8")));
+          expect(prior.find(entry => entry.kind === "turn_end").history.terminal_reason).toBe("cancelled");
           await tui.sendText("Read the follow-up file and briefly acknowledge it. Do not rerun the child.");
           const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("CANCEL_FOLLOWUP_COMPLETE") || text.includes("request failed:")), 20000);
           expect(pane).not.toContain("request failed:");
@@ -6015,9 +6025,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           }
           expect(compactions).toBe(1);
           expect(gateway.requests).toHaveLength(5);
-          const saved = readFileSync(eventsPath, "utf8");
-          expect(saved.startsWith(before)).toBe(true);
-          expect(saved.match(/"context_checkpoint":/g)).toHaveLength(1);
+          const saved = readFileSync(eventsPath);
+          expect(saved.subarray(0, before.length)).toEqual(before);
+          const records = decodeNativeJournal(saved).map(entry => JSON.parse(Buffer.from(entry.bytes).toString("utf8")));
+          expect(records.filter(entry => entry.kind === "model_step" && entry.phase === "context" && entry.summary?.kind === "compacted_summary")).toHaveLength(1);
           expect(readFileSync(join(sessionDir, "tool-results", diagnosticHandle), "utf8")).toBe("aborted by user");
           expect(await tui.captureFullScrollback()).not.toContain("IncompleteCompactionResult");
           await tui.sendText("/quit");
@@ -6029,10 +6040,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           await tui.sendText("Continue without repeating cancelled work.");
           await tui.waitForPane((text) => hasEmptyComposer(text) && text.includes("CANCEL_RESTART_COMPLETE"), 15000);
           expect(gateway.requests).toHaveLength(6);
-          const events = readFileSync(eventsPath, "utf8").trim().split("\n").map((line) => JSON.parse(line).event);
-          expect(events.filter((event) => event.tool_call?.call_id === "cancelled-history-child")).toHaveLength(1);
-          expect(events.filter((event) => event.tool_call?.call_id === "cancel-follow-up-read")).toHaveLength(1);
-          expect(events.some((event) => event.assistant?.text === "CANCEL_RESTART_COMPLETE")).toBe(true);
+          const events = decodeNativeJournal(readFileSync(eventsPath)).map(entry => JSON.parse(Buffer.from(entry.bytes).toString("utf8")));
+          const calls = events.filter(entry => entry.kind === "model_step" && entry.calls).flatMap(entry => entry.calls);
+          expect(calls.filter(call => call.providerId === "cancelled-history-child")).toHaveLength(1);
+          expect(calls.filter(call => call.providerId === "cancel-follow-up-read")).toHaveLength(1);
+          expect(events.some(entry => entry.kind === "turn_end" && entry.history?.assistant === "CANCEL_RESTART_COMPLETE")).toBe(true);
           await tui.sendText("/quit");
           await tui.waitForPane(() => paneExitMatches(tui!.paneStatus(), 0), 15000);
           expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -7049,8 +7061,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const id = parseAskJson(seeded.stdout).session_id;
       expect(id).not.toBe("");
       const directory = join(root.home, ".fx", "sessions", id);
-      const eventsPath = join(directory, "events.jsonl");
-      const originalEvents = readFileSync(eventsPath, "utf8");
+      const eventsPath = join(directory, "execution.journal");
+      const originalEvents = readFileSync(eventsPath);
       const childDirectory = join(directory, "subagent");
       mkdirSync(childDirectory, { recursive: true, mode: 0o700 });
       const registryPath = join(childDirectory, "children.json");
@@ -7066,10 +7078,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(result.final_output).toBe(replies[1]);
       expect(result.tool_calls).toEqual([]);
       expect(gateway.requests).toHaveLength(2);
-      const continuedEvents = readFileSync(eventsPath, "utf8");
-      expect(continuedEvents.startsWith(originalEvents)).toBe(true);
-      expect(continuedEvents).toContain(replies[1]);
-      expect(continuedEvents.trim().split("\n").map(line => JSON.parse(line)).filter(frame => frame.event.turn_completed)).toHaveLength(2);
+      const continuedEvents = readFileSync(eventsPath);
+      expect(continuedEvents.subarray(0, originalEvents.length)).toEqual(originalEvents);
+      const records = decodeNativeJournal(continuedEvents);
+      expect(JSON.stringify(createProjection(records).transcript())).toContain(replies[1]);
+      expect(records.filter(record => record.kind === "turn_end")).toHaveLength(2);
       expect(readFileSync(registryPath, "utf8")).toBe("[]");
       expect(readFileSync(tracePath, "utf8")).toContain("ask subagent host unavailable");
 
@@ -7237,7 +7250,13 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     let childRequests = 0;
     let childId = "";
     let registryPath = "";
-    let recoveryPath = "";
+    const targetFile = join(root.root, "sync-target");
+    const arm = join(root.root, "sync-armed");
+    const receipt = join(root.root, "sync-receipt");
+    const library = join(root.root, process.platform === "darwin" ? "sync-fault.dylib" : "sync-fault.so");
+    const flags = process.platform === "darwin" ? ["-dynamiclib"] : ["-shared", "-fPIC"];
+    const compiled = Bun.spawnSync(["cc", ...flags, "-O2", "-Wall", "-Wextra", join(import.meta.dirname, "fixtures", "session-sync-fault.c"), "-o", library, ...(process.platform === "darwin" ? [] : ["-ldl"])]);
+    expect(compiled.exitCode).toBe(0);
     let failureObserved = false;
     const scripted = startDynamicFakeGateway((body) => {
       if (hasCurrentToolResult(body, "followup")) {
@@ -7248,13 +7267,20 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(child.last_outcome).toBe("completed");
         expect(child.last_failure).toBeNull();
         expect(readFileSync(marker, "utf8")).toBe("EFFECT_ONCE\n");
+        const entries = decodeNativeJournal(readFileSync(join(root.home, ".fx", "sessions", childId, "execution.journal")))
+          .map(entry => JSON.parse(Buffer.from(entry.bytes).toString("utf8")));
+        const endings = entries.filter(entry => entry.kind === "turn_end");
+        expect(endings).toHaveLength(2);
+        expect(endings[0].result).toMatchObject({ ok: false, reason: "interrupted", pendingTool: { name: "read_file" } });
+        expect(endings[1].result.ok).toBe(true);
+        expect(endings[0].history.execution.tool_steps[0].tool_results[0].tool_call_id).toBe("child_effect");
         return fakeGatewayFinalText("SUBAGENT_FAILURE_REPORTED");
       }
       if (hasCurrentToolResult(body, "delegate")) {
         const result = JSON.parse(toolResultOutput(body, "delegate"));
         expect(result.ok).toBe(false);
         expect(result.error_code).toBe("child_failed");
-        expect(result.result).toContain("SessionCommitFailed");
+        expect(result.result).toContain("PersistenceUncertain");
         expect(result.result).toContain("agent_turn_failed");
         expect(result.result).toContain("Earlier tool calls may have completed");
         expect(childRequests).toBe(2);
@@ -7264,9 +7290,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         const child = registry.children.find((entry: { id: string }) => entry.id === childId);
         expect(child.phase).toBe("idle");
         expect(child.active).toBeNull();
-        expect(child.last_failure).toContain("SessionCommitFailed");
+        expect(child.last_failure).toContain("PersistenceUncertain");
         failureObserved = true;
-        rmSync(recoveryPath, { recursive: true });
+        expect(existsSync(receipt)).toBe(true);
+        rmSync(arm);
         return fakeGatewayToolCall("followup", "subagent", {
           request: { action: "message", agent: "reporter", message: nextTask },
         });
@@ -7281,9 +7308,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           expect(childId).toBeTruthy();
           const owner = JSON.parse(readFileSync(join(sessions, childId, "subagent", "owner.json"), "utf8"));
           registryPath = join(sessions, owner.parent_id, "subagent", "children.json");
-          recoveryPath = join(sessions, childId, "recovery.json");
-          if (existsSync(recoveryPath)) renameSync(recoveryPath, `${recoveryPath}.saved`);
-          mkdirSync(recoveryPath);
+          writeFileSync(targetFile, join(sessions, childId, "execution.journal"));
+          writeFileSync(arm, "armed");
           return fakeGatewayToolCall("read_effect", "read_file", { path: marker });
         }
         return fakeShellRun("child_effect", "printf 'EFFECT_ONCE\\n' >> effect.txt");
@@ -7295,17 +7321,19 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     try {
       const result = await runFx(["ask", "--json", "--auto", "Exercise a failed child and its next message."], {
         cwd: root.workspace,
-        env: { ...fixtureEnv(root, scripted, ""), FX_TRACE_LOG: undefined, FX_TRACE: undefined, FX_TRACE_SCOPES: undefined },
+        env: { ...fixtureEnv(root, scripted, ""), FX_TRACE_LOG: undefined, FX_TRACE: undefined, FX_TRACE_SCOPES: undefined,
+          [process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD"]: library,
+          FX_TEST_SYNC_TARGET_FILE: targetFile, FX_TEST_SYNC_ARM: arm, FX_TEST_SYNC_RECORD: receipt, FX_TEST_SYNC_MATCH: "read_effect" },
         timeoutMs: 15_000,
       });
       expect(result.code).toBe(0);
       expect(failureObserved).toBe(true);
       expect(parseAskJson(result.stdout).output).toContain("SUBAGENT_FAILURE_REPORTED");
-      const events = readFileSync(join(root.home, ".fx", "sessions", parseAskJson(result.stdout).session_id, "events.jsonl"), "utf8")
-        .trim().split("\n").map((line) => JSON.parse(line));
-      const persisted = events.find((entry) => entry.event.tool_result?.call_id === "delegate")?.event.tool_result;
+      const events = decodeNativeJournal(readFileSync(join(root.home, ".fx", "sessions", parseAskJson(result.stdout).session_id, "execution.journal")))
+        .map(entry => JSON.parse(Buffer.from(entry.bytes).toString("utf8")));
+      const persisted = events.find(entry => entry.kind === "tool_result" && entry.persisted.tool_call_id === "delegate")?.persisted;
       expect(persisted?.status).toBe("failure");
-      expect(persisted?.preview).toContain("agent_turn_failed: SessionCommitFailed");
+      expect(persisted?.output).toContain("agent_turn_failed: PersistenceUncertain");
       expect(scripted.requestCount()).toBe(6);
       expect(result.stderr).not.toContain("panic");
     } finally {
@@ -7510,7 +7538,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 15_000);
 
-  test("sibling subagents start before either terminal result is awaited", async () => {
+  for (const journaled of [true, false]) test(`sibling subagents preserve execution ordering with journal=${journaled}`, async () => {
     const root = createFixtureRoot("subagent-sibling-start-order");
     const tracePath = join(root.root, "trace.log");
     const firstTask = "Reply exactly SIBLING_FIRST_DONE.";
@@ -7539,6 +7567,14 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         return heldFirst;
       }
       if (childRequest && promptText(body).includes(secondTask)) {
+        if (journaled) {
+          const sessions = join(root.home, ".fx", "sessions");
+          const id = readdirSync(sessions).find(id => existsSync(join(sessions, id, "execution.journal")) && !existsSync(join(sessions, id, "subagent", "owner.json")))!;
+          const entries = decodeNativeJournal(readFileSync(join(sessions, id, "execution.journal")));
+          const last = entries.at(-1)!;
+          expect(last.kind).toBe("tool_result");
+          expect(JSON.parse(Buffer.from(last.bytes).toString("utf8")).persisted.tool_call_id).toBe("sibling_first");
+        }
         started.add("second");
         return heldSecond;
       }
@@ -7565,7 +7601,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
     });
 
-    const run = runFx(
+    const run = (journaled ? runFx : runLegacyFx)(
       ["ask", "--json", "--auto", "Delegate both independent sibling tasks."],
       {
         cwd: root.workspace,
@@ -7575,10 +7611,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     );
     let orderingError: Error | undefined;
     try {
+      if (journaled) {
+        const firstDeadline = Date.now() + 3_000;
+        while (!started.has("first") && Date.now() < firstDeadline) await Bun.sleep(10);
+        if (started.size !== 1 || !started.has("first")) orderingError = new Error(`expected only the first journaled child before release, observed=${JSON.stringify([...started])}`);
+        releaseFirst(fakeGatewayFinalText("SIBLING_FIRST_DONE"));
+      }
       const deadline = Date.now() + 3_000;
       while (started.size < 2 && Date.now() < deadline) await Bun.sleep(10);
       if (started.size !== 2) {
-        orderingError = new Error(
+        orderingError ??= new Error(
           `expected both sibling requests before release, observed=${JSON.stringify([...started])}`,
         );
       }
@@ -7597,6 +7639,61 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 20_000);
+
+  for (const recoveryCase of ["success", "changed input", "recorded failure"] as const) test(`child completion reconciles registry acknowledgement: ${recoveryCase}`, async () => {
+    const changedInput = recoveryCase === "changed input";
+    const failed = recoveryCase === "recorded failure";
+    const root = createFixtureRoot("child-journal-registry-recovery");
+    const task = "CHILD_REGISTRY_CAPTURE: write the effect once.";
+    const next = "Inspect the completed child after reopening.";
+    let childId = "", registryPath = "", activeRegistry = "";
+    const gateway = startDynamicFakeGateway(body => {
+      if (promptText(body).includes(next)) {
+        const registry = JSON.parse(readFileSync(registryPath, "utf8"));
+        const child = registry.children.find(entry => entry.id === childId);
+        expect(child.phase).toBe(changedInput ? "interrupted" : "idle");
+        expect(child.active).toBeNull();
+        expect(child.last_outcome).toBe(changedInput ? "interrupted" : failed ? "failed" : "completed");
+        if (failed) expect(child.last_failure).toContain("provider_error");
+        return fakeGatewayFinalText("OWNER_RECOVERY_OK");
+      }
+      if (hasCurrentToolResult(body, "delegate_saved_child")) {
+        expect(JSON.parse(toolResultOutput(body, "delegate_saved_child")).ok).toBe(!failed);
+        return fakeGatewayFinalText("PARENT_SAVED");
+      }
+      if (hasCurrentToolResult(body, "child_saved_effect")) return fakeGatewayFinalText("CHILD_SAVED");
+      if (promptText(body).includes(task)) {
+        const sessions = join(root.home, ".fx", "sessions");
+        childId = readdirSync(sessions).find(id => existsSync(join(sessions, id, "subagent", "owner.json")))!;
+        const owner = JSON.parse(readFileSync(join(sessions, childId, "subagent", "owner.json"), "utf8"));
+        registryPath = join(sessions, owner.parent_id, "subagent", "children.json");
+        activeRegistry = readFileSync(registryPath, "utf8");
+        if (failed) return new Response(JSON.stringify({ error: { message: "rejected" } }), { status: 401, headers: { "content-type": "application/json" } });
+        return fakeShellRun("child_saved_effect", "printf 'EFFECT_ONCE\\n' >> child-effect.txt");
+      }
+      return fakeGatewayToolCall("delegate_saved_child", "subagent", { request: { action: "message", agent: "saved-worker", message: task } });
+    }, { classifierDecision: "clear", models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    try {
+      const env = fixtureEnv(root, gateway, join(root.root, "trace.log"));
+      const first = await runFx(["ask", "--json", "--yolo", "Create one durable child result."], { cwd: root.workspace, env, timeoutMs: 30_000 });
+      expect(first.code, first.stdout + first.stderr).toBe(0);
+      expect(parseAskJson(first.stdout).output).toBe("PARENT_SAVED");
+      expect(gateway.requestCount()).toBe(failed ? 3 : 4);
+      const childPath = join(root.home, ".fx", "sessions", childId, "execution.journal");
+      const savedChild = readFileSync(childPath);
+      expect(decodeNativeJournal(savedChild).at(-1)!.kind).toBe("turn_end");
+      const interruptedRegistry = JSON.parse(activeRegistry);
+      if (changedInput) interruptedRegistry.children.find(entry => entry.id === childId).active.message = "Different child input";
+      writeFileSync(registryPath, JSON.stringify(interruptedRegistry));
+      const second = await runFx(["ask", "--json", "--auto", "--resume-id", parseAskJson(first.stdout).session_id, next], { cwd: root.workspace, env, timeoutMs: 30_000 });
+      expect(second.code, second.stdout + second.stderr).toBe(0);
+      expect(parseAskJson(second.stdout).output).toBe("OWNER_RECOVERY_OK");
+      expect(gateway.requestCount()).toBe(failed ? 4 : 5);
+      expect(readFileSync(childPath)).toEqual(savedChild);
+      if (failed) expect(existsSync(join(root.workspace, "child-effect.txt"))).toBe(false);
+      else expect(readFileSync(join(root.workspace, "child-effect.txt"), "utf8").match(/EFFECT_ONCE/g)).toHaveLength(1);
+    } finally { gateway.stop(); rmSync(root.root, { recursive: true, force: true }); }
+  }, 60_000);
 
   test("saved ask resume continues one chat-created persistent child", async () => {
     const root = createFixtureRoot("subagent-persistent-resume");
@@ -7743,7 +7840,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 30_000);
 
-  test("SIGKILL during persistent child work keeps parent recovery selectable", async () => {
+  test("SIGKILL preserves selectable parent and uncertain child work", async () => {
     const root = createFixtureRoot("subagent-persistent-sigkill-recovery");
     const tracePath = join(root.root, "trace.log");
     const startedPath = join(root.workspace, "child-command.started");
@@ -7856,29 +7953,30 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         sessions: Array<{ id: string }>;
       }).sessions.map((session) => session.id)).toEqual([parentId!]);
 
-      const resumed = await runFx(
-        [
-          "ask",
-          "--json",
-          "--auto",
-          "--resume-id",
-          parentId!,
-          resumePrompt,
-        ],
-        {
-          cwd: root.workspace,
-          env: fixtureEnv(root, gateway, tracePath),
-          timeoutMs: 15_000,
-        },
-      );
-      if (resumed.code !== 0) {
-        throw new Error(
-          `persistent child recovery failed: code=${resumed.code} signal=${resumed.signal}\nstdout=${resumed.stdout}\nstderr=${resumed.stderr}\ntrace=${existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "<missing>"}`,
-        );
-      }
-      expect(parseAskJson(resumed.stdout).output).toContain(
-        "PARENT_RECOVERY_COMPLETE",
-      );
+      const parentPath = join(sessionsRoot, parentId!, "execution.journal");
+      const childPath = join(sessionsRoot, childId!, "execution.journal");
+      const before = readFileSync(parentPath);
+      const childBefore = readFileSync(childPath);
+      const childEntries = decodeNativeJournal(childBefore).map(entry => JSON.parse(Buffer.from(entry.bytes).toString("utf8")));
+      const start = childEntries.find(entry => entry.kind === "turn_start");
+      expect(JSON.parse(start.inputJson).work_id).toBe(start.requestId);
+      expect(childEntries.filter(entry => entry.kind === "tool_result")).toHaveLength(0);
+      expect(childEntries.some(entry => entry.kind === "model_step" && entry.calls?.some(call => call.providerId === "persistent_sigkill_shell"))).toBe(true);
+      const count = gateway.requestCount();
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", parentId!, resumePrompt], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
+      });
+      expect(resumed.code).toBe(1);
+      expect(resumed.stdout).toContain("PendingTurnError");
+      const continued = await runFx(["ask", "--json", "--auto", "--resume-id", parentId!, "--continue-recovery"], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
+      });
+      expect(continued.code).toBe(1);
+      expect(continued.stdout).toContain("RecoveryRequired");
+      expect(gateway.requestCount()).toBe(count);
+      expect(readFileSync(parentPath)).toEqual(before);
+      expect(readFileSync(childPath)).toEqual(childBefore);
+      expect(existsSync(finishedPath)).toBe(false);
     } finally {
       if (first.exitCode === null) first.kill("SIGKILL");
       for (const pid of ownedPids) {

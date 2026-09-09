@@ -31,6 +31,11 @@ pub const Config = struct {
     /// Interactive hosts may request a durable "try later" pause separately
     /// from cancellation. Headless hosts leave this null.
     recovery_pause_flag: ?*std.atomic.Value(bool) = null,
+    /// Host-owned, level-triggered safe-boundary suspension. Never passed to a
+    /// provider or tool as cancellation. The current model response and selected
+    /// tool group settle normally; final text may finish. Clear before explicit
+    /// checkpoint resume. Requires a durable recovery_checkpoint effect to pause.
+    suspend_flag: ?*std.atomic.Value(bool) = null,
     gateway_chat_url: []const u8,
     advertised_tool_names: []const []const u8 = &.{},
     advertised_functions: []const model_tool_schema.FunctionSchema = &.{},
@@ -51,6 +56,9 @@ pub const Config = struct {
     workspace_root: []const u8 = "",
     access_scope: ?workspace_access.AccessScope = null,
     origin: TurnOrigin = .root,
+    /// Interactive cancellation may abandon an unknown outcome once the
+    /// executor has returned. Other hosts retain explicit recovery control.
+    journal_cancel_policy: enum { preserve, abandon } = .preserve,
     /// Root-user evidence inherited by a subagent turn. Unused for root turns.
     root_user_intent_context: []const u8 = "",
     /// Exact ordered root-user authority inherited by a child. The child task

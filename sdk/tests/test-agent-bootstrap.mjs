@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { invalidJournalOptions } from "./fixtures/invalid-journal.mjs";
 import { strict as assert } from "node:assert";
 import { spawnSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
@@ -41,9 +42,9 @@ if (!child) {
 
   for (let index = 0; index < attempts; index++) {
     await assert.rejects(
-      createFxAgent({ ...options, checkpoint: new Uint8Array([1, 2, 3]) }),
+      createFxAgent({ ...options, ...invalidJournalOptions() }),
       (error) => {
-        assert.match(error.message, /Invalid or non-fresh libfx checkpoint/);
+        assert.match(error.message, /JournalConflict/);
         return true;
       },
     );

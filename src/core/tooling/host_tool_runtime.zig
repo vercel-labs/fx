@@ -47,6 +47,10 @@ pub const Runtime = struct {
             const name_value = entry.object.get("name") orelse return error.InvalidHostTool;
             const description_value = entry.object.get("description") orelse return error.InvalidHostTool;
             const schema_value = entry.object.get("inputSchema") orelse return error.InvalidHostTool;
+            const replay: @import("../session/execution_journal.zig").Replay = if (entry.object.get("replay")) |replay_value| replay: {
+                if (replay_value != .string) return error.InvalidHostTool;
+                break :replay std.meta.stringToEnum(@import("../session/execution_journal.zig").Replay, replay_value.string) orelse return error.InvalidHostTool;
+            } else .blocked;
             if (name_value != .string or description_value != .string or schema_value != .object) {
                 return error.InvalidHostTool;
             }
@@ -89,6 +93,7 @@ pub const Runtime = struct {
                 .model_schema = .{ .name = name, .description = "" },
                 .model_visible = false,
                 .executor_kind = .host,
+                .journal_replay = replay,
                 .activity_kind = .command,
                 .action_label = "Running",
                 .completed_action_label = "Ran",

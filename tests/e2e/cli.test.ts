@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { decodeNativeJournal } from "./journal/storage";
 import { spawnSync } from "node:child_process";
 import { createServer } from "node:net";
 import {
@@ -4562,9 +4563,9 @@ describe("cli: ask success", () => {
         });
 
         const metadata = JSON.parse(readFileSync(join(sessionDir, "session.json"), "utf8"));
-        expect(metadata.schema_version).toBe(4);
+        expect(metadata.schema_version).toBe(5);
         expect(Object.hasOwn(metadata, "history")).toBe(false);
-        expect(existsSync(join(sessionDir, "authority.json"))).toBe(false);
+        expect(JSON.parse(readFileSync(join(sessionDir, "authority.json"), "utf8")).schema_version).toBe(2);
         expect(existsSync(join(sessionDir, "checkpoint.json"))).toBe(false);
         expect(existsSync(join(sessionDir, "events.v3.backup"))).toBe(false);
 
@@ -4578,25 +4579,12 @@ describe("cli: ask success", () => {
           session_id: sessionId,
           final_output: "LEGACY_RESTART_OK",
         });
-        const records = readFileSync(join(sessionDir, "events.jsonl"), "utf8")
-          .trim()
-          .split("\n")
-          .map((line) => JSON.parse(line));
-        const events = records.map((record) => Object.keys(record.event)[0]);
-        expect(events).toEqual([
-          "context_checkpoint",
-          "user",
-          "tool_call",
-          "tool_result",
-          "assistant",
-          "turn_completed",
-          "user",
-          "assistant",
-          "turn_completed",
-          "user",
-          "assistant",
-          "turn_completed",
-        ]);
+        const records = decodeNativeJournal(readFileSync(join(sessionDir, "execution.journal")));
+        expect(records.filter(record => record.kind === "checkpoint")).toHaveLength(1);
+        expect(records.filter(record => record.kind === "turn_start")).toHaveLength(2);
+        expect(records.filter(record => record.kind === "turn_end")).toHaveLength(2);
+        const base = JSON.parse(Buffer.from(records[0]!.bytes).toString("utf8")).nativeBase;
+        const original = JSON.parse(base.stateJson).history.find((turn: { user?: { text: string } }) => turn.user?.text === "LEGACY_ORIGINAL_REQUEST");
         expect(gateway.requests).toHaveLength(2);
         for (const request of gateway.requests) {
           expect(request.body).toContain(legacySummary);
@@ -4604,12 +4592,14 @@ describe("cli: ask success", () => {
           expect(request.body).toContain("LEGACY_ORIGINAL_ANSWER");
           expect(request.body).toContain(legacyOutput);
         }
-        const preserved = records.find((record) => record.event.tool_result)?.event.tool_result;
-        expect(preserved.call_id).toBe("legacy-read");
-        expect(preserved.completeness).not.toBe("complete");
-        expect(readFileSync(join(sessionDir, "tool-results", preserved.artifact_ref), "utf8")).toBe(legacyOutput);
-        const files = records.find((record) => record.event.turn_completed)?.event.turn_completed.files;
-        expect(files.map((file: { path: string }) => file.path)).toEqual(["past.txt"]);
+        const preserved = original.execution.tool_steps[0].tool_results[0];
+        expect(preserved.tool_call_id).toBe("legacy-read");
+        expect(preserved.truncated).toBe(legacy.history[1].execution.tool_steps[0].tool_results[0].truncated);
+        expect(preserved.output_bytes).toBe(legacyOutput.length);
+        expect(preserved.stored_output_bytes).toBe(legacyOutput.length);
+        expect(preserved.output).toBe(legacyOutput);
+        if (preserved.output_handle) expect(readFileSync(join(sessionDir, "tool-results", preserved.output_handle), "utf8")).toBe(legacyOutput);
+        expect(original.execution.files.map((file: { path: string }) => file.path)).toEqual(["past.txt"]);
       } finally {
         gateway.stop();
         rmSync(root, { recursive: true, force: true });

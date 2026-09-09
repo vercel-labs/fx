@@ -11,6 +11,7 @@
   "homepage": "https://github.com/vercel-labs/fx/tree/main/sdk#readme",
   "bugs": "https://github.com/vercel-labs/fx/issues",
   "scripts": {
+    "test:journal-bridge": "node tests/test-journal-bridge.mjs",
     "test:node-wasm": "node tests/test-node-wasm.mjs",
     "test:node-napi": "node tests/test-node-napi.mjs",
     "test:browser-wasm": "node tests/test-browser-wasm.mjs"
@@ -30,6 +31,10 @@
     },
     "./browser": "./browser.js",
     "./wasm": "./fx-sdk.js",
+    "./transcript": {
+      "import": "./transcript.js",
+      "require": "./transcript.cjs"
+    },
     "./mcp": "./mcp.js",
     "./skills": "./skills.js",
     "./skills/node": "./skills-node.js"
@@ -41,6 +46,9 @@
     "fx-sdk.js",
     "wasm-module.js",
     "core-output.js",
+    "journal-codec.js",
+    "transcript.js",
+    "transcript.cjs",
     "mcp.js",
     "skills.js",
     "skills-node.js",

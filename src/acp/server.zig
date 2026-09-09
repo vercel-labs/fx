@@ -41,6 +41,9 @@ const elicitation = @import("../core/mcp/elicitation.zig");
 const tool_mcp_runtime = @import("../core/tooling/tool_mcp_runtime.zig");
 const permissions = @import("../core/permissions/permissions.zig");
 const host_tool_runtime = @import("../core/tooling/host_tool_runtime.zig");
+const execution_journal = @import("../core/session/execution_journal.zig");
+const journal_codec = @import("../core/session/execution_journal_codec.zig");
+const journal_runtime = @import("../core/agent/runtime/journal_runtime.zig");
 const agent_checkpoint = @import("../core/agent/runtime/checkpoint.zig");
 
 const Allocator = std.mem.Allocator;
@@ -63,7 +66,15 @@ const AcpMethod = enum {
     session_set_mode,
     libfx_checkpoint,
     libfx_restore,
+    libfx_journal_restore,
+    libfx_journal_restore_begin,
+    libfx_journal_restore_append,
+    libfx_journal_restore_finish,
     libfx_new,
+    libfx_suspend,
+    libfx_status,
+    libfx_resume,
+    libfx_abandon,
     unknown,
 
     fn parse(method: []const u8) AcpMethod {
@@ -81,7 +92,15 @@ const AcpMethod = enum {
         if (std.mem.eql(u8, method, "session/set_mode")) return .session_set_mode;
         if (std.mem.eql(u8, method, "libfx/checkpoint")) return .libfx_checkpoint;
         if (std.mem.eql(u8, method, "libfx/restore")) return .libfx_restore;
+        if (std.mem.eql(u8, method, "libfx/journal/restore")) return .libfx_journal_restore;
+        if (std.mem.eql(u8, method, "libfx/journal/restore_begin")) return .libfx_journal_restore_begin;
+        if (std.mem.eql(u8, method, "libfx/journal/restore_append")) return .libfx_journal_restore_append;
+        if (std.mem.eql(u8, method, "libfx/journal/restore_finish")) return .libfx_journal_restore_finish;
         if (std.mem.eql(u8, method, "libfx/new")) return .libfx_new;
+        if (std.mem.eql(u8, method, "libfx/suspend")) return .libfx_suspend;
+        if (std.mem.eql(u8, method, "libfx/status")) return .libfx_status;
+        if (std.mem.eql(u8, method, "libfx/resume")) return .libfx_resume;
+        if (std.mem.eql(u8, method, "libfx/abandon")) return .libfx_abandon;
         return .unknown;
     }
 
@@ -96,6 +115,8 @@ const AcpMethod = enum {
             .session_resume,
             .session_close,
             .libfx_new,
+            .libfx_suspend,
+            .libfx_status,
             => false,
             .session_list,
             .session_remove,
@@ -103,14 +124,27 @@ const AcpMethod = enum {
             .session_set_config_option,
             .libfx_checkpoint,
             .libfx_restore,
+            .libfx_journal_restore,
+            .libfx_journal_restore_begin,
+            .libfx_journal_restore_append,
+            .libfx_journal_restore_finish,
+            .libfx_resume,
+            .libfx_abandon,
             .unknown,
             => true,
         };
     }
 
+    fn isJournalRestoreTransfer(self: AcpMethod) bool {
+        return switch (self) {
+            .libfx_journal_restore_begin, .libfx_journal_restore_append, .libfx_journal_restore_finish => true,
+            else => false,
+        };
+    }
+
     fn isLibfx(self: AcpMethod) bool {
         return switch (self) {
-            .libfx_checkpoint, .libfx_restore, .libfx_new => true,
+            .libfx_checkpoint, .libfx_restore, .libfx_journal_restore, .libfx_journal_restore_begin, .libfx_journal_restore_append, .libfx_journal_restore_finish, .libfx_new, .libfx_suspend, .libfx_status, .libfx_resume, .libfx_abandon => true,
             else => false,
         };
     }
@@ -136,6 +170,8 @@ pub const OutboundKind = enum {
     permission,
     elicitation,
     host_tool,
+    checkpoint,
+    journal_append,
 };
 
 pub const OutboundResponse = struct {
@@ -203,8 +239,15 @@ pub const ActiveSessionState = struct {
     /// profile or project configuration.
     session_grants: []types.PermissionGrant = &.{},
     session_rt: session_runtime.SessionRuntime,
+    /// Transport-only assembly, owned by this fresh ACP session until finish/close.
+    journal_restore_transfer: ?JournalRestoreTransfer = null,
     mcp: ?*mcp_runtime.McpRuntime = null,
     cancel_flag: std.atomic.Value(bool),
+    suspend_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    recovery_blocked: bool = false,
+    /// Sticky owner fence, independent of turn finalization and checkpoint I/O.
+    /// Cancellation after host executor entry cannot prove the external outcome.
+    host_tool_cancel_uncertain: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     pending_prompt_id: ?jsonrpc.RequestId,
 
     pub fn retainGrant(self: *ActiveSessionState, alloc: Allocator, tool_name: []const u8, target_path: []const u8) !void {
@@ -245,6 +288,8 @@ pub const ServerState = struct {
     cfg: Config,
     writer: jsonrpc.Writer,
     initialized: bool = false,
+    host_checkpoint: bool = false,
+    host_journal: bool = false,
     client_fs_read: bool = false,
     client_fs_write: bool = false,
     client_terminal: bool = false,
@@ -596,6 +641,10 @@ fn destroyActiveSession(state: *ServerState) void {
             state.alloc.destroy(runtime);
         }
     }
+    if (active.journal_restore_transfer) |*transfer| {
+        debug_trace.logf("journal", "dropped partial restore on close received={d} expected={d}", .{ transfer.received, transfer.bytes.len });
+        transfer.deinit(state.alloc);
+    }
     active.session_rt.deinit(state.alloc);
     if (active.writable) |*writable| writable.deinit(state.alloc);
     if (active.store) |*store| store.deinit(state.alloc);
@@ -764,6 +813,7 @@ pub fn runWithTransport(
         if (line_result == null) break;
         const line = switch (line_result.?) {
             .overflow => {
+                fencePartialJournalRestore(&state, "restore input frame exceeded limit");
                 state.writer.writeError(alloc, null, .{
                     .code = ErrorCode.request_frame_too_large,
                     .message = "Request frame too large",
@@ -775,6 +825,7 @@ pub fn runWithTransport(
         defer alloc.free(line);
 
         var msg = jsonrpc.parseMessage(alloc, line) catch |err| {
+            fencePartialJournalRestore(&state, "malformed restore input frame");
             const code = switch (err) {
                 error.ParseError => ErrorCode.parse_error,
                 else => ErrorCode.invalid_request,
@@ -1185,15 +1236,32 @@ pub fn cancelPermissionRequest(state: *ServerState, id: u64) void {
 fn dispatchNotification(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
     reapActivePrompt(state, false);
     if (!state.initialized) return;
-    switch (AcpMethod.parse(msg.method)) {
-        .request_cancel => handleRequestCancellation(state, alloc, msg.params_raw),
+    const method = AcpMethod.parse(msg.method);
+    if (method.isJournalRestoreTransfer()) {
+        fencePartialJournalRestore(state, "restore transfer requires request identity");
+        return;
+    }
+    switch (method) {
+        .request_cancel => {
+            fencePartialJournalRestore(state, "restore request cancelled");
+            handleRequestCancellation(state, alloc, msg.params_raw);
+        },
         .session_cancel => {
             if (notificationTargetsActiveSession(state, alloc, msg.params_raw)) {
+                fenceHostToolCancellation(state, alloc, msg.params_raw);
                 handleCancel(state, true);
             }
         },
         else => {},
     }
+}
+
+fn hostToolFenceBlocks(method: AcpMethod, journal_mode: bool) bool {
+    return switch (method) {
+        .session_prompt, .libfx_resume, .libfx_checkpoint, .libfx_restore, .libfx_journal_restore, .libfx_journal_restore_begin, .libfx_journal_restore_append, .libfx_journal_restore_finish, .libfx_suspend => true,
+        .libfx_abandon => !journal_mode,
+        else => false,
+    };
 }
 
 fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
@@ -1213,6 +1281,7 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
 
     if (method == .session_cancel) {
         if (!try requireActiveSessionTarget(state, alloc, msg)) return;
+        fenceHostToolCancellation(state, alloc, msg.params_raw);
         handleCancel(state, true);
         return state.writer.writeResponse(alloc, msg.id, "null");
     }
@@ -1224,11 +1293,36 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         });
     }
 
+    if (state.cfg.minimal_kernel) {
+        if (state.active_session) |*active| {
+            if (active.host_tool_cancel_uncertain.load(.seq_cst) and hostToolFenceBlocks(method, state.host_journal)) return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_request,
+                .message = if (state.host_journal)
+                    "RecoveryRequired: reconcile the external effect before creating a fresh owner"
+                else
+                    "HostToolOutcomeUncertain: reconcile the external effect before creating a fresh owner",
+            });
+        }
+    }
+
+    if (state.active_session) |*active| {
+        if (active.journal_restore_transfer != null and !method.isJournalRestoreTransfer() and method != .libfx_new and method != .session_close) {
+            failJournalRestore(state.alloc, active, "authority requested during partial restore");
+            return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_request, .message = "JournalConflict: partial journal restore cannot authorize execution" });
+        }
+    }
+
     if (method.waitsForActivePrompt() and state.active_prompt != null) {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
             .message = "Prompt already in progress",
         });
+    }
+
+    switch (method) {
+        .libfx_suspend, .libfx_status, .libfx_resume => return handleKernelControl(state, alloc, msg, method),
+        .libfx_abandon => return if (host_target.is_wasm) handleKernelControl(state, alloc, msg, method) else startPrompt(state, alloc, msg),
+        else => {},
     }
 
     if (comptime host_target.is_wasm) {
@@ -1242,6 +1336,8 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
             .session_set_mode => handleSetMode(state, alloc, msg),
             .libfx_checkpoint => handleKernelCheckpoint(state, alloc, msg),
             .libfx_restore => handleKernelRestore(state, alloc, msg),
+            .libfx_journal_restore => handleJournalRestore(state, alloc, msg),
+            .libfx_journal_restore_begin, .libfx_journal_restore_append, .libfx_journal_restore_finish => handleJournalRestoreTransfer(state, alloc, msg, method),
             .libfx_new => sessions.handleNewLibfxSession(state, alloc, msg),
             else => state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.method_not_found,
@@ -1259,13 +1355,19 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         .session_prompt => startPrompt(state, alloc, msg),
         .session_set_config_option => handleSetConfigOption(state, alloc, msg),
         .session_set_mode => handleSetMode(state, alloc, msg),
-        .libfx_checkpoint => handleKernelCheckpoint(state, alloc, msg),
+        .libfx_checkpoint => if (state.host_journal) startPrompt(state, alloc, msg) else handleKernelCheckpoint(state, alloc, msg),
         .libfx_restore => handleKernelRestore(state, alloc, msg),
+        .libfx_journal_restore => handleJournalRestore(state, alloc, msg),
+        .libfx_journal_restore_begin, .libfx_journal_restore_append, .libfx_journal_restore_finish => handleJournalRestoreTransfer(state, alloc, msg, method),
         .libfx_new => sessions.handleNewLibfxSession(state, alloc, msg),
         .initialize,
         .request_cancel,
         .session_cancel,
         .session_remove,
+        .libfx_suspend,
+        .libfx_status,
+        .libfx_resume,
+        .libfx_abandon,
         .unknown,
         => state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.method_not_found,
@@ -1311,7 +1413,53 @@ fn handleRequestCancellation(
     const active = state.active_prompt orelse return;
     const active_id = active.msg.id orelse return;
     if (!requestIdsEqual(active_id, requested)) return;
+    fenceHostToolCancellation(state, alloc, params);
     handleCancel(state, true);
+}
+
+fn hostToolCancellationUncertain(pending: bool, params: ?std.json.Value) bool {
+    const root = params orelse return pending;
+    if (root != .object) return pending;
+    const meta = root.object.get("_meta") orelse return pending;
+    if (meta != .object) return pending;
+    const fx = meta.object.get("fx") orelse return pending;
+    if (fx != .object) return pending;
+    const evidence = fx.object.get("hostToolExecution") orelse return pending;
+    if (evidence != .string) return pending;
+    // Only the host that owns the executor can prove it never entered. Missing
+    // evidence for an outstanding request is conservative, including old hosts.
+    if (std.mem.eql(u8, evidence.string, "not_started")) return false;
+    if (std.mem.eql(u8, evidence.string, "uncertain")) return true;
+    return pending;
+}
+
+fn fenceHostToolCancellation(state: *ServerState, alloc: Allocator, params: ?[]const u8) void {
+    if (!state.cfg.minimal_kernel) return;
+    const active = if (state.active_session) |*value| value else return;
+    state.outbound_mutex.lockUncancelable(io_mod.getIo());
+    var pending = state.pending_outbound.valueIterator();
+    var pending_host_tool = false;
+    while (pending.next()) |value| {
+        if (value.kind == .host_tool and value.response == null) pending_host_tool = true;
+    }
+    state.outbound_mutex.unlock(io_mod.getIo());
+    const parsed = if (params) |raw| std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch null else null;
+    defer if (parsed) |value| value.deinit();
+    if (hostToolCancellationUncertain(pending_host_tool, if (parsed) |value| value.value else null)) {
+        active.host_tool_cancel_uncertain.store(true, .seq_cst);
+    }
+}
+
+test "ACP host cancellation fence distinguishes entry evidence and defaults uncertain" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(hostToolCancellationUncertain(true, null));
+    try std.testing.expect(!hostToolCancellationUncertain(false, null));
+    const safe = try std.json.parseFromSlice(std.json.Value, alloc, "{\"_meta\":{\"fx\":{\"hostToolExecution\":\"not_started\"}}}", .{});
+    defer safe.deinit();
+    try std.testing.expect(!hostToolCancellationUncertain(true, safe.value));
+    const unknown = try std.json.parseFromSlice(std.json.Value, alloc, "{\"_meta\":{\"fx\":{\"hostToolExecution\":\"uncertain\"}}}", .{});
+    defer unknown.deinit();
+    try std.testing.expect(hostToolCancellationUncertain(false, unknown.value));
 }
 
 fn libfxSessionId(alloc: Allocator, msg: *const jsonrpc.Message) !std.json.Parsed(std.json.Value) {
@@ -1336,6 +1484,414 @@ fn activeLibfxSession(
     return active;
 }
 
+// WASM has no concurrent ACP reader while a prompt is on the JSPI stack.
+// The single-threaded host may only set this borrowed flag, never run policy.
+// A null binding releases it before the session can be destroyed.
+extern "fx" fn fx_libfx_bind_suspend(flag: ?*std.atomic.Value(bool)) void;
+extern "fx" fn fx_libfx_checkpoint_set(ptr: [*]const u8, len: usize) i32;
+
+extern "fx" fn fx_libfx_journal_append(ptr: [*]const u8, len: usize) i32;
+
+fn writeJournalEntry(writer: *std.Io.Writer, entry: execution_journal.Entry) !void {
+    try writer.print("{{\"seq\":{d},\"kind\":", .{entry.seq});
+    try writeJsonStr(@tagName(entry.kind), writer);
+    try writer.writeAll(",\"bytes\":\"");
+    try std.base64.standard.Encoder.encodeWriter(writer, entry.bytes);
+    try writer.writeAll("\",\"hash\":");
+    try writeJsonStr(&entry.hash, writer);
+    try writer.writeByte('}');
+}
+
+fn journalSession(state: *ServerState) !*ActiveSessionState {
+    if (!state.cfg.minimal_kernel or !state.host_journal) return error.SessionPersistenceUnavailable;
+    const active = if (state.active_session) |*session| session else return error.SessionPersistenceUnavailable;
+    if (active.writable != null or active.wasm_state != null) return error.JournalConflict;
+    return active;
+}
+
+pub fn nativeJournalSink(active: *ActiveSessionState) execution_journal.Sink {
+    return .{ .context = active, .append_fn = appendNativeJournalEntry, .guard = .{ .enter = enterNativeJournal, .leave = leaveNativeJournal } };
+}
+
+fn enterNativeJournal(raw: *anyopaque) void {
+    const active: *ActiveSessionState = @ptrCast(@alignCast(raw));
+    active.session_write_mutex.lockUncancelable(io_mod.getIo());
+}
+
+fn leaveNativeJournal(raw: *anyopaque) void {
+    const active: *ActiveSessionState = @ptrCast(@alignCast(raw));
+    active.session_write_mutex.unlock(io_mod.getIo());
+}
+
+fn appendNativeJournalEntry(raw: *anyopaque, entry: execution_journal.Entry) !void {
+    const active: *ActiveSessionState = @ptrCast(@alignCast(raw));
+    const writable = if (active.writable) |*value| value else return error.SessionPersistenceUnavailable;
+    const sink = writable.journalSink() orelse return error.SessionPersistenceUnavailable;
+    try sink.append_fn(sink.context, entry);
+}
+
+pub fn journalSink(state: *ServerState) execution_journal.Sink {
+    return .{ .context = state, .append_fn = appendJournalEntry };
+}
+
+fn appendJournalEntry(raw: *anyopaque, entry: execution_journal.Entry) !void {
+    const state: *ServerState = @ptrCast(@alignCast(raw));
+    const active = try journalSession(state);
+    const alloc = state.alloc;
+    var params: std.Io.Writer.Allocating = .init(alloc);
+    defer params.deinit();
+    try params.writer.writeAll("{\"sessionId\":");
+    try writeJsonStr(active.session_id, &params.writer);
+    try params.writer.writeAll(",\"entry\":");
+    try writeJournalEntry(&params.writer, entry);
+    try params.writer.writeByte('}');
+    if (comptime host_target.is_wasm) {
+        if (fx_libfx_journal_append(params.written().ptr, params.written().len) != 1) return error.PersistenceUncertain;
+        return;
+    }
+    const id = (try beginOutboundRequest(state, .journal_append)) orelse return error.PersistenceUncertain;
+    var awaiting = true;
+    defer if (awaiting) {
+        cancelOutboundRequest(state, id);
+        if (awaitOutboundResponse(state, id, .journal_append)) |owned| {
+            var abandoned = owned;
+            abandoned.deinit(alloc);
+        }
+    };
+    try state.writer.writeRequest(alloc, .{ .integer = @intCast(id) }, "libfx/journal_append", params.written());
+    var response = awaitOutboundResponse(state, id, .journal_append) orelse return error.PersistenceUncertain;
+    awaiting = false;
+    defer response.deinit(alloc);
+    if (response.cancelled or response.error_json != null) return error.PersistenceUncertain;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, response.result_json orelse return error.PersistenceUncertain, .{}) catch return error.PersistenceUncertain;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.PersistenceUncertain;
+    const durable = parsed.value.object.get("durable") orelse return error.PersistenceUncertain;
+    if (durable != .bool or !durable.bool) return error.PersistenceUncertain;
+}
+
+const writeJournalStatus = journal_runtime.writeStatus;
+
+const journal_direct_restore_bytes: usize = 4 * 1024 * 1024;
+const journal_restore_chunk_bytes: usize = 64 * 1024;
+
+/// One bounded, transport-owned entry. No bytes enter execution state until
+/// the complete envelope and typed payload pass restore validation.
+const JournalRestoreTransfer = struct {
+    seq: u64,
+    kind: execution_journal.Kind,
+    hash: [64]u8,
+    bytes: []u8,
+    received: usize = 0,
+
+    fn init(alloc: Allocator, seq: u64, kind_text: []const u8, hash: []const u8, byte_length: usize) !JournalRestoreTransfer {
+        if (byte_length == 0 or byte_length > journal_codec.max_entry_bytes) return error.EntryTooLarge;
+        if (seq == 0 or seq > 9_007_199_254_740_991) return error.InvalidSequence;
+        const kind = std.meta.stringToEnum(execution_journal.Kind, kind_text) orelse return error.InvalidKind;
+        if (hash.len != 64) return error.InvalidHash;
+        for (hash) |byte| if (!std.ascii.isDigit(byte) and (byte < 'a' or byte > 'f')) return error.InvalidHash;
+        return .{ .seq = seq, .kind = kind, .hash = hash[0..64].*, .bytes = try alloc.alloc(u8, byte_length) };
+    }
+
+    fn append(self: *JournalRestoreTransfer, offset: usize, encoded: []const u8) !void {
+        if (offset != self.received) return error.JournalConflict;
+        const count = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return error.InvalidJournalRecord;
+        if (count == 0 or count > journal_restore_chunk_bytes or count > self.bytes.len - self.received) return error.EntryTooLarge;
+        std.base64.standard.Decoder.decode(self.bytes[self.received..][0..count], encoded) catch return error.InvalidJournalRecord;
+        self.received += count;
+    }
+
+    fn complete(self: *const JournalRestoreTransfer) ![]const u8 {
+        if (self.received != self.bytes.len) return error.InvalidJournalRecord;
+        return self.bytes;
+    }
+
+    fn deinit(self: *JournalRestoreTransfer, alloc: Allocator) void {
+        alloc.free(self.bytes);
+        self.* = undefined;
+    }
+};
+
+fn fencePartialJournalRestore(state: *ServerState, reason: []const u8) void {
+    if (state.active_session) |*active| {
+        if (active.journal_restore_transfer != null) failJournalRestore(state.alloc, active, reason);
+    }
+}
+
+fn failJournalRestore(alloc: Allocator, active: *ActiveSessionState, reason: []const u8) void {
+    if (active.journal_restore_transfer) |*transfer| {
+        debug_trace.logf("journal", "dropped partial restore received={d} expected={d} reason={s}", .{ transfer.received, transfer.bytes.len, reason });
+        transfer.deinit(alloc);
+        active.journal_restore_transfer = null;
+    }
+    active.session_rt.execution_journal.block();
+}
+
+fn requireFreshJournalRestore(active: *const ActiveSessionState) !void {
+    try active.session_rt.execution_journal.ensureAvailable();
+    if (active.session_rt.journal_execution_started or !active.session_rt.agent.fresh) return error.JournalConflict;
+}
+
+const IncomingJournalValidator = struct {
+    alloc: Allocator,
+
+    fn validate(raw: *anyopaque, state: *const execution_journal.State, body: std.json.Value) !void {
+        const self: *IncomingJournalValidator = @ptrCast(@alignCast(raw));
+        journal_runtime.validateIncoming(self.alloc, state, body) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.JournalConflict;
+    }
+};
+
+fn restoreJournalBytes(alloc: Allocator, journal: *execution_journal.State, seq: u64, kind: []const u8, bytes: []const u8, hash: []const u8) !void {
+    var context = IncomingJournalValidator{ .alloc = alloc };
+    try journal.restoreValidated(alloc, seq, kind, bytes, hash, .{ .context = &context, .validate_fn = IncomingJournalValidator.validate });
+}
+
+fn handleJournalRestore(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Message) !void {
+    const active = try journalSession(state);
+    try requireFreshJournalRestore(active);
+    errdefer |err| failJournalRestore(state.alloc, active, @errorName(err));
+    if (active.journal_restore_transfer != null) return error.JournalConflict;
+    var parsed = try libfxSessionId(alloc, msg);
+    defer parsed.deinit();
+    if (activeLibfxSession(state, parsed.value) == null) return error.InvalidJournalRecord;
+    const wire = try execution_journal.object(parsed.value, "entry");
+    const seq = try execution_journal.field(wire, "seq", .integer);
+    if (seq.integer <= 0) return error.InvalidSequence;
+    const kind = try execution_journal.string(wire, "kind");
+    const encoded = try execution_journal.string(wire, "bytes");
+    const hash = try execution_journal.string(wire, "hash");
+    const size = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return error.InvalidJournalRecord;
+    if (size > journal_direct_restore_bytes) return error.EntryTooLarge;
+    const bytes = try alloc.alloc(u8, size);
+    defer alloc.free(bytes);
+    std.base64.standard.Decoder.decode(bytes, encoded) catch return error.InvalidJournalRecord;
+    try restoreJournalBytes(state.alloc, &active.session_rt.execution_journal, @intCast(seq.integer), kind, bytes, hash);
+    try state.writer.writeResponse(alloc, msg.id, "null");
+}
+
+fn handleJournalRestoreTransfer(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Message, method: AcpMethod) !void {
+    const active = try journalSession(state);
+    try requireFreshJournalRestore(active);
+    errdefer |err| failJournalRestore(state.alloc, active, @errorName(err));
+    var parsed = try libfxSessionId(alloc, msg);
+    defer parsed.deinit();
+    if (activeLibfxSession(state, parsed.value) == null) return error.InvalidJournalRecord;
+    switch (method) {
+        .libfx_journal_restore_begin => {
+            if (active.journal_restore_transfer != null) return error.JournalConflict;
+            const entry = try execution_journal.object(parsed.value, "entry");
+            const seq = try execution_journal.field(entry, "seq", .integer);
+            const length = try execution_journal.field(parsed.value, "byteLength", .integer);
+            if (seq.integer <= 0) return error.InvalidSequence;
+            const byte_length = std.math.cast(usize, length.integer) orelse return error.EntryTooLarge;
+            active.journal_restore_transfer = try JournalRestoreTransfer.init(state.alloc, @intCast(seq.integer), try execution_journal.string(entry, "kind"), try execution_journal.string(entry, "hash"), byte_length);
+        },
+        .libfx_journal_restore_append => {
+            const transfer = if (active.journal_restore_transfer) |*value| value else return error.JournalConflict;
+            const offset = try execution_journal.field(parsed.value, "offset", .integer);
+            const position = std.math.cast(usize, offset.integer) orelse return error.JournalConflict;
+            try transfer.append(position, try execution_journal.string(parsed.value, "bytes"));
+        },
+        .libfx_journal_restore_finish => {
+            const transfer = if (active.journal_restore_transfer) |*value| value else return error.JournalConflict;
+            const bytes = try transfer.complete();
+            try restoreJournalBytes(state.alloc, &active.session_rt.execution_journal, transfer.seq, @tagName(transfer.kind), bytes, &transfer.hash);
+            transfer.deinit(state.alloc);
+            active.journal_restore_transfer = null;
+        },
+        else => unreachable,
+    }
+    try state.writer.writeResponse(alloc, msg.id, "null");
+}
+
+pub fn validateJournalRestore(alloc: Allocator, journal: *execution_journal.State) !void {
+    try journal.ensureAvailable();
+    journal_runtime.validateRestoredState(alloc, journal) catch |err| {
+        journal.block();
+        return if (err == error.OutOfMemory) error.OutOfMemory else error.JournalConflict;
+    };
+}
+
+/// Recreated owners adopt canonical completed history once. Live owners retain
+/// their already-verified in-memory artifact bindings and incremental history.
+pub fn materializeJournalHistory(alloc: Allocator, runtime: *session_runtime.SessionRuntime) !void {
+    if (!runtime.agent.fresh) return;
+    const history = try journal_runtime.restoreHistory(alloc, &runtime.execution_journal);
+    defer types.freeHistoryTurnSlice(alloc, history);
+    try runtime.agent.restoreHistory(alloc, history);
+}
+
+fn handleJournalControl(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Message, method: AcpMethod) !void {
+    const active = try journalSession(state);
+    if (method == .libfx_suspend) {
+        if (state.active_prompt == null) try active.session_rt.execution_journal.ensureAvailable();
+        if (state.active_prompt != null) active.suspend_flag.store(true, .seq_cst);
+        return state.writer.writeResponse(alloc, msg.id, "null");
+    }
+    if (state.active_prompt != null) return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_request,
+        .message = "PendingTurnError: journal status is available after the active turn settles",
+    });
+    const journal = &active.session_rt.execution_journal;
+    try journal.ensureAvailable();
+    try validateJournalRestore(alloc, journal);
+    if (method == .libfx_status) {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try writeJournalStatus(&out.writer, alloc, journal);
+        return state.writer.writeResponse(alloc, msg.id, out.written());
+    }
+    if (method == .libfx_abandon) {
+        try abandonJournal(state, alloc);
+        return state.writer.writeResponse(alloc, msg.id, "null");
+    }
+    const pending = journal.pending();
+    const turn = switch (pending) {
+        .idle => return error.PendingTurnError,
+        .model, .ending => |index| index,
+        .tool => |position| position.turn,
+    };
+    if (pending == .tool) {
+        const position = pending.tool;
+        const call = (try execution_journal.array(journal.modelStep(turn, position.step), "calls"))[position.call];
+        if (!std.mem.eql(u8, try execution_journal.string(call, "replay"), "safe")) return error.RecoveryRequired;
+    }
+    var params: std.Io.Writer.Allocating = .init(alloc);
+    defer params.deinit();
+    try std.json.Stringify.value(.{
+        .sessionId = active.session_id,
+        .requestId = try execution_journal.string(journal.start(turn), "requestId"),
+        .prompt = .{},
+        ._meta = .{ .fx = .{ .continueRecovery = true } },
+    }, .{}, &params.writer);
+    var resumed = msg.*;
+    resumed.params_raw = params.written();
+    try startPrompt(state, alloc, &resumed);
+}
+
+fn abandonJournal(state: *ServerState, alloc: Allocator) !void {
+    const active = try journalSession(state);
+    const journal = &active.session_rt.execution_journal;
+    try validateJournalRestore(alloc, journal);
+    try materializeJournalHistory(state.alloc, &active.session_rt);
+    const turn = switch (journal.pending()) {
+        .idle => return,
+        .model, .ending => |index| index,
+        .tool => |position| position.turn,
+    };
+    const start = journal.start(turn);
+    var runtime: journal_runtime.Runtime = .{
+        .state = journal,
+        .sink = journalSink(state),
+        .alloc = state.alloc,
+        .namespace = try execution_journal.string(start, "namespace"),
+        .request_id = try execution_journal.string(start, "requestId"),
+        // Abandonment emits no generation; the recorded turn identifies this control.
+        .creation_id = try execution_journal.string(start, "turnId"),
+        .turn = turn,
+    };
+    try active.session_rt.agent.history.ensureUnusedCapacity(state.alloc, 1);
+    active.session_rt.journal_execution_started = true;
+    if (try runtime.abandon()) |history| active.session_rt.commitPreparedHistoryEntry(state.alloc, history);
+    active.suspend_flag.store(false, .seq_cst);
+}
+
+/// Success means the host acknowledged these exact snapshot bytes as durable.
+/// This adapts RecoveryCheckpointEffect, not the foundational append journal.
+pub fn persistKernelCheckpoint(state: *ServerState, alloc: Allocator, bytes: []const u8) !void {
+    if (!state.host_checkpoint or state.host_journal) return error.SessionPersistenceUnavailable;
+    if (comptime host_target.is_wasm) {
+        if (fx_libfx_checkpoint_set(bytes.ptr, bytes.len) != 1) return error.SuspensionCheckpointUncertain;
+        return;
+    }
+    const id = (try beginOutboundRequest(state, .checkpoint)) orelse return error.SessionPersistenceUnavailable;
+    defer cancelOutboundRequest(state, id);
+    const encoded = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
+    defer alloc.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, bytes);
+    var params: std.Io.Writer.Allocating = .init(alloc);
+    defer params.deinit();
+    try std.json.Stringify.value(.{ .sessionId = state.active_session.?.session_id, .checkpoint = encoded }, .{}, &params.writer);
+    try state.writer.writeRequest(alloc, .{ .integer = @intCast(id) }, "libfx/checkpoint_set", params.written());
+    var response = awaitOutboundResponse(state, id, .checkpoint) orelse return error.SuspensionCheckpointUncertain;
+    defer response.deinit(state.alloc);
+    if (response.cancelled or response.error_json != null) return error.SuspensionCheckpointUncertain;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.result_json orelse return error.SuspensionCheckpointUncertain, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.SuspensionCheckpointUncertain;
+    const durable = parsed.value.object.get("durable") orelse return error.SuspensionCheckpointUncertain;
+    if (durable != .bool or !durable.bool) return error.SuspensionCheckpointUncertain;
+}
+
+fn handleKernelControl(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Message, method: AcpMethod) !void {
+    if (!try requireActiveSessionTarget(state, alloc, msg)) return;
+    const active = &state.active_session.?;
+    if (state.host_journal) return handleJournalControl(state, alloc, msg, method);
+    if (method == .libfx_suspend) {
+        if (!state.host_checkpoint) return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = "Suspension requires a durable onCheckpoint host",
+        });
+        if (state.active_prompt != null) active.suspend_flag.store(true, .seq_cst);
+        return state.writer.writeResponse(alloc, msg.id, "null");
+    }
+    if (method == .libfx_status) {
+        // Never read worker-owned checkpoint memory while a prompt is running.
+        const running = state.active_prompt != null;
+        const pending = if (running) null else active.session_rt.agent.recovery_checkpoint;
+        const poisoned = active.host_tool_cancel_uncertain.load(.seq_cst);
+        const can_resume = !running and !poisoned and !active.recovery_blocked and if (pending) |value| agent_checkpoint.canResume(value) else false;
+        const status: []const u8 = if (poisoned) "blocked" else if (running)
+            (if (active.suspend_flag.load(.seq_cst)) "suspending" else "running")
+        else if (active.recovery_blocked) "blocked" else if (pending != null) (if (can_resume) "paused" else "blocked") else "idle";
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try std.json.Stringify.value(.{ .state = status, .canResume = can_resume }, .{}, &out.writer);
+        return state.writer.writeResponse(alloc, msg.id, out.written());
+    }
+    if (active.recovery_blocked) return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_request,
+        .message = "Checkpoint acknowledgement uncertain; reconcile durable storage before restoring a fresh agent",
+    });
+    if (active.session_rt.agent.recovery_checkpoint == null) return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_request,
+        .message = "No paused checkpoint",
+    });
+    if (method == .libfx_resume) {
+        var params: std.Io.Writer.Allocating = .init(alloc);
+        defer params.deinit();
+        try std.json.Stringify.value(.{ .sessionId = active.session_id, .prompt = .{}, ._meta = .{ .fx = .{ .continueRecovery = true } } }, .{}, &params.writer);
+        var resumed = msg.*;
+        resumed.params_raw = params.written();
+        return startPrompt(state, alloc, &resumed);
+    }
+    try abandonKernelCheckpoint(state, alloc);
+    return state.writer.writeResponse(alloc, msg.id, "null");
+}
+
+fn abandonKernelCheckpoint(state: *ServerState, alloc: Allocator) !void {
+    const active = &state.active_session.?;
+    if (active.recovery_blocked) return error.SuspensionCheckpointUncertain;
+    const pending = active.session_rt.agent.recovery_checkpoint orelse return error.NoPausedCheckpoint;
+    // Abandon retains the shared interrupted-turn evidence, never replays it.
+    const history = try alloc.alloc(types.HistoryTurn, active.session_rt.agent.history.items.len + 1);
+    defer alloc.free(history);
+    @memcpy(history[0 .. history.len - 1], active.session_rt.agent.history.items);
+    history[history.len - 1] = pending.interruptedTurn();
+    const bytes = try agent_checkpoint.encode(alloc, history, active.session_rt.agent.turn_usage);
+    defer alloc.free(bytes);
+    try active.session_rt.agent.history.ensureUnusedCapacity(alloc, 1);
+    const abandoned = try types.dupeHistoryTurn(alloc, pending.interruptedTurn());
+    errdefer types.freeHistoryTurn(alloc, abandoned);
+    persistKernelCheckpoint(state, alloc, bytes) catch |err| {
+        active.recovery_blocked = true;
+        return err;
+    };
+    active.session_rt.agent.history.appendAssumeCapacity(abandoned);
+    active.session_rt.agent.clearRecoveryCheckpoint(alloc);
+    active.suspend_flag.store(false, .seq_cst);
+}
+
 fn handleKernelCheckpoint(
     state: *ServerState,
     alloc: Allocator,
@@ -1351,6 +1907,23 @@ fn handleKernelCheckpoint(
             .code = ErrorCode.invalid_params,
             .message = "Unknown libfx session",
         });
+    if (state.host_journal) {
+        _ = try journalSession(state);
+        try validateJournalRestore(alloc, &active.session_rt.execution_journal);
+        active.session_rt.journal_execution_started = true;
+        var entry = try active.session_rt.execution_journal.checkpoint(alloc, journalSink(state));
+        defer entry.deinit(alloc);
+        var response: std.Io.Writer.Allocating = .init(alloc);
+        defer response.deinit();
+        try response.writer.writeAll("{\"entry\":");
+        try writeJournalEntry(&response.writer, entry.entry);
+        try response.writer.writeByte('}');
+        return state.writer.writeResponse(alloc, msg.id, response.written());
+    }
+    if (active.recovery_blocked) return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_request,
+        .message = "Checkpoint acknowledgement uncertain; reconcile durable storage",
+    });
     const bytes = active.session_rt.agent.checkpoint(alloc) catch
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
@@ -1383,6 +1956,10 @@ fn handleKernelRestore(
             .code = ErrorCode.invalid_params,
             .message = "Unknown libfx session",
         });
+    if (state.host_journal) return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_request,
+        .message = "Journal mode rejects legacy checkpoint restoration",
+    });
     const checkpoint = parsed.value.object.get("checkpoint") orelse
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
@@ -1433,7 +2010,11 @@ fn startPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Messag
     errdefer jsonrpc.freeMessage(alloc, &active.msg);
 
     session.cancel_flag.store(false, .seq_cst);
+    session.suspend_flag.store(false, .seq_cst);
     if (comptime host_target.is_wasm) {
+        comptime std.debug.assert(@sizeOf(std.atomic.Value(bool)) == 1);
+        fx_libfx_bind_suspend(if (state.cfg.minimal_kernel and (state.host_checkpoint or state.host_journal)) &session.suspend_flag else null);
+        defer fx_libfx_bind_suspend(null);
         promptWorkerMain(active);
         jsonrpc.freeMessage(active.alloc, &active.msg);
         active.alloc.destroy(active);
@@ -1519,6 +2100,26 @@ fn notificationTargetsActiveSession(
 }
 
 fn promptWorkerMain(active: *ActivePrompt) void {
+    if (AcpMethod.parse(active.msg.method) == .libfx_checkpoint and active.state.host_journal) {
+        handleKernelCheckpoint(active.state, active.alloc, &active.msg) catch |err| {
+            active.state.writer.writeError(active.alloc, active.msg.id, .{ .code = ErrorCode.invalid_request, .message = @errorName(err) }) catch {};
+        };
+        active.reapable.store(true, .seq_cst);
+        return;
+    }
+    if (AcpMethod.parse(active.msg.method) == .libfx_abandon) {
+        (if (active.state.host_journal) abandonJournal(active.state, active.alloc) else abandonKernelCheckpoint(active.state, active.alloc)) catch |err| {
+            active.reapable.store(true, .seq_cst);
+            active.state.writer.writeError(active.alloc, active.msg.id, .{
+                .code = ErrorCode.invalid_request,
+                .message = @errorName(err),
+            }) catch {};
+            return;
+        };
+        active.reapable.store(true, .seq_cst);
+        active.state.writer.writeResponse(active.alloc, active.msg.id, "null") catch {};
+        return;
+    }
     const outcome: prompt_handler.TerminalOutcome = prompt_handler.handlePrompt(
         active.state,
         active.alloc,
@@ -1537,7 +2138,33 @@ fn promptWorkerMain(active: *ActivePrompt) void {
 }
 
 fn publishPromptOutcome(active: *ActivePrompt, outcome: prompt_handler.TerminalOutcome) !void {
+    if (active.state.active_session) |*session| {
+        if (session.host_tool_cancel_uncertain.load(.seq_cst)) return active.state.writer.writeError(active.alloc, active.msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = if (active.state.host_journal)
+                "RecoveryRequired: cancellation interrupted an entered host executor"
+            else
+                "HostToolOutcomeUncertain: cancellation interrupted an entered host executor",
+        });
+    }
     switch (outcome) {
+        .journal_complete => |completed| {
+            const journal = &active.state.active_session.?.session_rt.execution_journal;
+            const result = try execution_journal.object(journal.outcome(completed.turn) orelse return error.InvalidJournalTransition, "result");
+            const request_id = try execution_journal.string(journal.start(completed.turn), "requestId");
+            var response: std.Io.Writer.Allocating = .init(active.alloc);
+            defer response.deinit();
+            try std.json.Stringify.value(.{ .stopReason = "end_turn", .journalResult = result, .journalReplay = completed.replay, .requestId = request_id }, .{}, &response.writer);
+            try active.state.writer.writeResponse(active.alloc, active.msg.id, response.written());
+        },
+        .journal_suspended => {
+            var response: std.Io.Writer.Allocating = .init(active.alloc);
+            defer response.deinit();
+            try response.writer.writeAll("{\"stopReason\":\"suspended\",\"journalStatus\":");
+            try writeJournalStatus(&response.writer, active.alloc, &active.state.active_session.?.session_rt.execution_journal);
+            try response.writer.writeByte('}');
+            try active.state.writer.writeResponse(active.alloc, active.msg.id, response.written());
+        },
         .stop_reason => |stop_reason| {
             var response: std.Io.Writer.Allocating = .init(active.alloc);
             defer response.deinit();
@@ -1593,6 +2220,8 @@ const InitializeRequest = struct {
     client_elicitation: elicitation.Capabilities = .{},
     host_tools: host_tool_runtime.Runtime = .{},
     host_instructions: []u8 = &.{},
+    host_checkpoint: bool = false,
+    host_journal: bool = false,
 
     fn deinit(self: *InitializeRequest, alloc: Allocator) void {
         self.host_tools.deinit();
@@ -1639,6 +2268,15 @@ fn parseInitializeRequest(
     if (allow_libfx) {
         if (capabilities.object.get("libfx")) |libfx| {
             if (libfx != .object) return error.InvalidInitializeParams;
+            if (libfx.object.get("checkpoint")) |capability| {
+                if (capability != .bool) return error.InvalidInitializeParams;
+                request.host_checkpoint = capability.bool;
+            }
+            if (libfx.object.get("journal")) |capability| {
+                if (capability != .bool) return error.InvalidInitializeParams;
+                request.host_journal = capability.bool;
+            }
+            if (request.host_journal and request.host_checkpoint) return error.InvalidInitializeParams;
             request.host_tools = try host_tool_runtime.Runtime.init(
                 alloc,
                 libfx.object.get("tools"),
@@ -1899,6 +2537,8 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.client_fs_write = request.client_fs_write;
     state.client_terminal = request.client_terminal;
     state.client_elicitation = request.client_elicitation;
+    state.host_checkpoint = request.host_checkpoint;
+    state.host_journal = request.host_journal;
     state.host_tools.deinit();
     state.host_tools = request.host_tools;
     request.host_tools = .{};
@@ -1913,12 +2553,13 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try acp_types.writeInitializeResponse(&out.writer, !host_target.is_wasm);
+    try acp_types.writeInitializeResponseWithJournal(&out.writer, !host_target.is_wasm, state.cfg.minimal_kernel);
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 }
 
 fn handleCancel(state: *ServerState, notify_client: bool) void {
     if (state.active_session) |*session| {
+        if (session.journal_restore_transfer != null) failJournalRestore(state.alloc, session, "restore cancelled");
         debug_trace.eventf("interrupt", "cancel_requested", .{}, "source=acp active_tool_known=false", .{});
         session.cancel_flag.store(true, .seq_cst);
     }
@@ -2434,6 +3075,20 @@ test "ACP method parser classifies request dispatch methods" {
     try std.testing.expect(AcpMethod.libfx_restore.isLibfx());
     try std.testing.expect(AcpMethod.libfx_new.isLibfx());
     try std.testing.expect(!AcpMethod.session_new.isLibfx());
+}
+
+test "ACP libfx suspension controls use active-turn gates" {
+    const controls = .{
+        .{ "libfx/suspend", AcpMethod.libfx_suspend, false },
+        .{ "libfx/status", AcpMethod.libfx_status, false },
+        .{ "libfx/resume", AcpMethod.libfx_resume, true },
+        .{ "libfx/abandon", AcpMethod.libfx_abandon, true },
+    };
+    inline for (controls) |control| {
+        try std.testing.expectEqual(control[1], AcpMethod.parse(control[0]));
+        try std.testing.expect(control[1].isLibfx());
+        try std.testing.expectEqual(control[2], control[1].waitsForActivePrompt());
+    }
 }
 
 test "ACP prompt gate policy keeps lifecycle interruption responsive" {
@@ -2990,4 +3645,201 @@ test "ACP usage flush preserves snapshot ownership on allocation failure" {
         failing.allocated_bytes,
         failing.freed_bytes,
     );
+}
+
+test "journal witness ACP capability is explicit and excludes legacy checkpoint authority" {
+    const alloc = std.testing.allocator;
+    var request = try parseInitializeRequest(alloc, "{\"protocolVersion\":1,\"clientCapabilities\":{\"libfx\":{\"journal\":true}}}", true);
+    defer request.deinit(alloc);
+    try std.testing.expect(request.host_journal);
+    try std.testing.expect(!request.host_checkpoint);
+    try std.testing.expectError(error.InvalidInitializeParams, parseInitializeRequest(alloc, "{\"protocolVersion\":1,\"clientCapabilities\":{\"libfx\":{\"journal\":true,\"checkpoint\":true}}}", true));
+    try std.testing.expectError(error.InvalidInitializeParams, parseInitializeRequest(alloc, "{\"protocolVersion\":1,\"clientCapabilities\":{\"libfx\":{\"journal\":\"true\"}}}", true));
+    try std.testing.expectEqual(AcpMethod.libfx_journal_restore, AcpMethod.parse("libfx/journal/restore"));
+}
+
+test "journal witness ACP wire entry preserves bytes and status never invents idle pending work" {
+    const alloc = std.testing.allocator;
+    var state: execution_journal.State = .{};
+    defer state.deinit(alloc);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeJournalStatus(&out.writer, alloc, &state);
+    try std.testing.expectEqualStrings("{\"idle\":true,\"lastSeq\":0}", out.written());
+    out.clearRetainingCapacity();
+    const payload = "{\"v\":1,\"kind\":\"turn_start\",\"namespace\":\"session\",\"turnId\":\"turn\",\"userMessageId\":\"user\",\"requestId\":\"request\",\"model\":\"fixture\",\"runtimeTurnId\":\"1\",\"inputJson\":\"{}\",\"inputHash\":\"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\"}";
+    const codec = @import("../core/session/execution_journal_codec.zig");
+    var entry = try codec.create(alloc, 1, .turn_start, payload);
+    defer entry.deinit(alloc);
+    try state.restore(alloc, entry.entry.seq, "turn_start", entry.entry.bytes, &entry.entry.hash);
+    try writeJournalStatus(&out.writer, alloc, &state);
+    const status = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+    defer status.deinit();
+    try std.testing.expect(!status.value.object.get("idle").?.bool);
+    try std.testing.expectEqualStrings("request", status.value.object.get("pendingTurn").?.object.get("requestId").?.string);
+    out.clearRetainingCapacity();
+    try writeJournalEntry(&out.writer, entry.entry);
+    const wire = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+    defer wire.deinit();
+    const encoded = wire.value.object.get("bytes").?.string;
+    const decoded = try alloc.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(encoded));
+    defer alloc.free(decoded);
+    try std.base64.standard.Decoder.decode(decoded, encoded);
+    try std.testing.expectEqualStrings(payload, decoded);
+    try std.testing.expectEqualStrings(&entry.entry.hash, wire.value.object.get("hash").?.string);
+    const malformed = "{\"v\":1,\"kind\":\"model_step\",\"turnId\":\"turn\",\"messageId\":\"message\",\"generationId\":\"generation\",\"final\":false,\"completion\":{},\"calls\":[{\"callId\":\"call\",\"providerId\":\"provider\",\"name\":\"effect\",\"argumentsJson\":\"{broken\",\"replay\":\"blocked\"}]}";
+    var decision = try codec.create(alloc, 2, .model_step, malformed);
+    defer decision.deinit(alloc);
+    try state.restore(alloc, 2, "model_step", malformed, &decision.entry.hash);
+    out.clearRetainingCapacity();
+    try writeJournalStatus(&out.writer, alloc, &state);
+    const pending_status = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+    defer pending_status.deinit();
+    const pending_tool = pending_status.value.object.get("pendingTurn").?.object.get("awaiting").?.object.get("tool").?;
+    try std.testing.expectEqualStrings("{broken", pending_tool.object.get("input").?.string);
+    try std.testing.expectEqualStrings("call", pending_tool.object.get("callId").?.string);
+    state.blocked = true;
+    try std.testing.expectError(error.PersistenceUncertain, writeJournalStatus(&out.writer, alloc, &state));
+}
+
+test "journal witness ACP executor uncertainty permits inspection and abandonment only" {
+    try std.testing.expect(!hostToolFenceBlocks(.libfx_status, true));
+    try std.testing.expect(!hostToolFenceBlocks(.libfx_abandon, true));
+    try std.testing.expect(hostToolFenceBlocks(.libfx_abandon, false));
+    for ([_]AcpMethod{ .session_prompt, .libfx_resume, .libfx_checkpoint, .libfx_restore, .libfx_journal_restore, .libfx_suspend }) |method| {
+        try std.testing.expect(hostToolFenceBlocks(method, true));
+        try std.testing.expect(hostToolFenceBlocks(method, false));
+    }
+    var journal: execution_journal.State = .{ .blocked = true };
+    defer journal.deinit(std.testing.allocator);
+    try std.testing.expectError(error.PersistenceUncertain, journal.ensureAvailable());
+    try std.testing.expectError(error.PersistenceUncertain, validateJournalRestore(std.testing.allocator, &journal));
+}
+
+test "journal witness ACP materialization preserves trusted live history" {
+    const alloc = std.testing.allocator;
+    var runtime: session_runtime.SessionRuntime = .{ .max_history_turns = 8 };
+    defer runtime.deinit(alloc);
+    try materializeJournalHistory(alloc, &runtime);
+    try std.testing.expect(!runtime.agent.fresh);
+    var history = try session_runtime.makeAssistantTurn(alloc, "image request", "image response");
+    defer types.freeHistoryTurn(alloc, history);
+    history.assistant.user.images = try session_runtime.dupeImageAttachmentSlice(alloc, &.{.{
+        .id = 1,
+        .path = @constCast("/trusted/session/images/image.bin"),
+        .media_type = @constCast("image/png"),
+        .snapshot_path = @constCast("/trusted/session/images/image.bin"),
+        .snapshot_sha256 = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    }});
+    try runtime.appendHistoryEntry(alloc, history);
+    try materializeJournalHistory(alloc, &runtime);
+    try materializeJournalHistory(alloc, &runtime);
+    try std.testing.expectEqual(@as(usize, 1), runtime.agent.history.items.len);
+    try std.testing.expectEqualStrings("/trusted/session/images/image.bin", runtime.agent.history.items[0].assistant.user.images[0].snapshot_path.?);
+}
+
+test "journal witness ACP restore transfer bounds offsets and partial cancellation" {
+    const alloc = std.testing.allocator;
+    const hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    try std.testing.expectError(error.EntryTooLarge, JournalRestoreTransfer.init(alloc, 1, "checkpoint", hash, journal_codec.max_entry_bytes + 1));
+    try std.testing.expectError(error.EntryTooLarge, JournalRestoreTransfer.init(alloc, 1, "checkpoint", hash, 0));
+    try std.testing.expectError(error.InvalidHash, JournalRestoreTransfer.init(alloc, 1, "checkpoint", "short", 4));
+    var transfer = try JournalRestoreTransfer.init(alloc, 1, "checkpoint", hash, 4);
+    defer transfer.deinit(alloc);
+    try transfer.append(0, "YWI=");
+    try std.testing.expectEqual(@as(usize, 2), transfer.received);
+    try std.testing.expectError(error.JournalConflict, transfer.append(0, "YWI="));
+    try std.testing.expectError(error.JournalConflict, transfer.append(3, "ZA=="));
+    try std.testing.expectError(error.InvalidJournalRecord, transfer.complete());
+    try std.testing.expectError(error.EntryTooLarge, transfer.append(2, "Y2Rl"));
+    try transfer.append(2, "Y2Q=");
+    try std.testing.expectEqualStrings("abcd", try transfer.complete());
+
+    var active = ActiveSessionState{
+        .session_id = @constCast("session"),
+        .model = @constCast("model"),
+        .mode = "code",
+        .workspace_root = "/tmp",
+        .api_key = "",
+        .agent_step_limit = 0,
+        .max_tool_result_bytes = 0,
+        .fast_mode = false,
+        .effort = .auto,
+        .first_call_tool_choice = .auto,
+        .permission_mode = .ask,
+        .permission_rules = .{},
+        .session_rt = .{ .max_history_turns = 0 },
+        .cancel_flag = std.atomic.Value(bool).init(false),
+        .pending_prompt_id = null,
+    };
+    defer active.session_rt.deinit(alloc);
+    defer if (active.journal_restore_transfer) |*pending| pending.deinit(alloc);
+    active.journal_restore_transfer = try JournalRestoreTransfer.init(alloc, 1, "checkpoint", hash, journal_codec.max_entry_bytes);
+    try std.testing.expectEqual(@as(usize, 32 * 1024 * 1024), active.journal_restore_transfer.?.bytes.len);
+    try active.journal_restore_transfer.?.append(0, "eA==");
+    const too_large = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(journal_restore_chunk_bytes + 1));
+    defer alloc.free(too_large);
+    @memset(too_large, 'A');
+    try std.testing.expectError(error.EntryTooLarge, active.journal_restore_transfer.?.append(1, too_large));
+    failJournalRestore(alloc, &active, "test interrupted transfer");
+    try std.testing.expect(active.journal_restore_transfer == null);
+    try std.testing.expectEqual(@as(u64, 0), active.session_rt.execution_journal.last_seq);
+    try std.testing.expectError(error.PersistenceUncertain, requireFreshJournalRestore(&active));
+}
+
+test "journal witness ACP direct and assembled restore validate before adoption and allow exact reappend" {
+    const alloc = std.testing.allocator;
+    var journal: execution_journal.State = .{};
+    defer journal.deinit(alloc);
+    const bad = "{\"v\":1,\"kind\":\"turn_start\",\"namespace\":\"s\",\"turnId\":\"t\",\"userMessageId\":\"u\",\"requestId\":\"r\",\"model\":\"fixture\",\"runtimeTurnId\":\"1\",\"inputJson\":\"{}\",\"inputHash\":\"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\"}";
+    const bad_hash = journal_codec.digest(1, .turn_start, bad);
+    try std.testing.expectError(error.JournalConflict, restoreJournalBytes(alloc, &journal, 1, "turn_start", bad, &bad_hash));
+    try std.testing.expectEqual(@as(u64, 0), journal.last_seq);
+    try std.testing.expectEqual(@as(usize, 0), journal.records.items.len);
+    try std.testing.expectEqual(@as(usize, 0), journal.requests.count());
+    const checkpoint = "{\"v\":1,\"kind\":\"checkpoint\",\"lastIncludedSeq\":0,\"records\":[]}";
+    const hash = journal_codec.digest(1, .checkpoint, checkpoint);
+    var transfer = try JournalRestoreTransfer.init(alloc, 1, "checkpoint", &hash, checkpoint.len);
+    defer transfer.deinit(alloc);
+    const encoded = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(checkpoint.len));
+    defer alloc.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, checkpoint);
+    try transfer.append(0, encoded);
+    try restoreJournalBytes(alloc, &journal, transfer.seq, @tagName(transfer.kind), try transfer.complete(), &transfer.hash);
+    try restoreJournalBytes(alloc, &journal, 1, "checkpoint", checkpoint, &hash);
+    try std.testing.expectEqual(@as(u64, 1), journal.last_seq);
+    try std.testing.expect(journal.pending() == .idle);
+    var wrong_hash = hash;
+    wrong_hash[0] = if (hash[0] == '0') '1' else '0';
+    try std.testing.expectError(error.InvalidHash, restoreJournalBytes(alloc, &journal, 1, "checkpoint", checkpoint, &wrong_hash));
+    try std.testing.expectEqual(@as(u64, 1), journal.last_seq);
+}
+
+test "journal witness ACP maximum journal output fits existing 64 MiB output limit" {
+    const alloc = std.testing.allocator;
+    const output_limit: usize = 64 * 1024 * 1024; // sdk/core-output.js and native output transport.
+    const encoded_bytes = std.base64.standard.Encoder.calcSize(journal_codec.max_entry_bytes);
+    try std.testing.expect(encoded_bytes + 2048 < output_limit);
+    const payload = try alloc.alloc(u8, journal_codec.max_entry_bytes);
+    defer alloc.free(payload);
+    @memset(payload, ' ');
+    var params: std.Io.Writer.Allocating = .init(alloc);
+    defer params.deinit();
+    try params.writer.writeAll("{\"sessionId\":\"abcdefghijkl\",\"entry\":");
+    try writeJournalEntry(&params.writer, .{ .seq = 9_007_199_254_740_991, .kind = .checkpoint, .bytes = payload, .hash = @splat('a') });
+    try params.writer.writeByte('}');
+    const Capture = struct {
+        bytes: usize = 0,
+        fn write(raw: ?*anyopaque, frame: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.bytes += frame.len;
+            try std.testing.expect(frame[frame.len - 1] == '\n');
+        }
+    };
+    var capture: Capture = .{};
+    var writer = jsonrpc.Writer.initCallback(&capture, Capture.write);
+    try writer.writeRequest(alloc, .{ .integer = std.math.maxInt(i64) }, "libfx/journal_append", params.written());
+    try std.testing.expect(capture.bytes > encoded_bytes);
+    try std.testing.expect(capture.bytes - encoded_bytes < 2048);
+    try std.testing.expect(capture.bytes < output_limit);
 }

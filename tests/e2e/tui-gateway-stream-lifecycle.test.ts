@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { stripVTControlCharacters } from "node:util";
 import {
   chmodSync,
   copyFileSync,
@@ -47,6 +48,7 @@ import {
 } from "./tmux-helpers";
 import { expectPermissionModeContext } from "./permission-mode-context";
 import { readTapeFrames, stdoutFrames } from "./render-lab/tape";
+import { decodeNativeJournal } from "./journal/storage";
 
 const MODEL = "openai/gpt-5.5";
 const GLM_MODEL = "zai/glm-5.2";
@@ -1245,7 +1247,7 @@ async function runCanonicalLifecycleFixture(
     reachedFinal = settled.matched;
     if (reachedFinal) {
       await session.sendText("/help");
-      const help = await waitForPaneOrDone(session, "Commands 35", donePath);
+      const help = await waitForPaneOrDone(session, "Commands 36", donePath);
       helpVisible = help.matched;
       requestCountAfterHelp = queuedGateway.requests.length;
       if (helpVisible) {
@@ -1343,6 +1345,8 @@ async function launchRouteRecoveryTui(
     model?: string;
     models?: FakeGatewayModel[];
     settings?: Record<string, unknown>;
+    permissionMode?: "auto" | "full-access";
+    record?: boolean;
   } = {},
 ) {
   root = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
@@ -1365,13 +1369,17 @@ async function launchRouteRecoveryTui(
     width: 72,
     height: 24,
     minimumHistoryLines: 200,
+    remainOnExit: options.record ?? false,
     stderrPath,
     env: {
       HOME: home,
+      FX_DEBUG_RECORD: options.record ? "1" : undefined,
+      FX_DEBUG_RECORD_SILENT_BANNER: options.record ? "1" : undefined,
+      FX_TRACE_LOG: options.record ? join(root, "trace.log") : process.env.FX_E2E_ROUTE_TRACE,
       AI_GATEWAY_API_KEY: "fake-route-recovery-key",
       VERCEL_OIDC_TOKEN: undefined,
       FX_AUTO_UPGRADE: "0",
-      FX_PERMISSION_MODE: "auto",
+      FX_PERMISSION_MODE: options.permissionMode ?? "auto",
       FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
       FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
       FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
@@ -1384,7 +1392,7 @@ async function launchRouteRecoveryTui(
 }
 
 describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
-  test("retry exhaustion settles a streamed tool start and permits a later prompt", async () => {
+  test("retry exhaustion preserves the pending journal and permits an explicit new session", async () => {
     const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
       "fx-tui-retry-settlement-",
       [
@@ -1405,10 +1413,23 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     expect(scrollback).toContain("Connection interrupted before");
     expect(scrollback).not.toContain("UnknownToolLifecycleIdentity");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
+    const sessionsRoot = join(root!, "home", ".fx", "sessions");
+    const pendingId = readdirSync(sessionsRoot).find(id => existsSync(join(sessionsRoot, id, "execution.journal")))!;
+    const pendingPath = join(sessionsRoot, pendingId, "execution.journal");
+    const before = readFileSync(pendingPath);
+    await session!.sendText("Confirm a later prompt is still usable.");
+    await session!.waitForText("PendingTurnError", TIMEOUT);
+    await session!.waitForStableComposer(TIMEOUT);
+    expect(queuedGateway.requests).toHaveLength(10);
+    expect(readFileSync(pendingPath)).toEqual(before);
+    await session!.sendText("/new");
+    await session!.waitForStableComposer(TIMEOUT);
     await session!.sendText("Confirm a later prompt is still usable.");
     await session!.waitForText("AFTER_NETWORK_RECOVERY", TIMEOUT);
     await session!.waitForStableComposer(TIMEOUT);
     expect(queuedGateway.requests).toHaveLength(11);
+    expect(queuedGateway.requests[10]!.body).not.toContain("Read the notes and continue after a connection failure.");
+    expect(readFileSync(pendingPath)).toEqual(before);
     await session!.sendText("/quit");
     expect(await session!.waitForSessionEnd(TIMEOUT)).toBe(true);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -1837,6 +1858,50 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     TIMEOUT * 2,
   );
 
+  test("turn summary appears after the response is painted before journal acknowledgement", async () => {
+    root = realpathSync(mkdtempSync(join(tmpdir(), "fx-summary-after-ack-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const arm = join(root, "hold");
+    const entered = join(root, "entered");
+    const target = join(root, "target");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(home); mkdirSync(workspace);
+    const shim = join(root, process.platform === "darwin" ? "sync.dylib" : "sync.so");
+    execFileSync("cc", [process.platform === "darwin" ? "-dynamiclib" : "-shared", "-fPIC", "-O2", "-std=c11",
+      join(REPO_ROOT, "tests/e2e/fixtures/session-sync-fault.c"), "-o", shim, ...(process.platform === "darwin" ? [] : ["-ldl"])], { stdio: "pipe" });
+    const finalText = "RESPONSE_PAINTED_BEFORE_DURABLE_END";
+    const queuedGateway = startFakeGateway([() => {
+      const sessions = join(home, ".fx", "sessions");
+      const ids = readdirSync(sessions).filter(id => existsSync(join(sessions, id, "execution.journal")));
+      expect(ids).toHaveLength(1);
+      writeFileSync(target, join(sessions, ids[0]!, "execution.journal"));
+      writeFileSync(arm, "");
+      return fakeGatewayFinalTextWithUsage(finalText, 10, 600);
+    }], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    gateway = queuedGateway;
+    session = await TmuxSession.create({ cwd: workspace, stderrPath, env: {
+      HOME: home, AI_GATEWAY_API_KEY: "fake-summary-key", FX_MODEL: MODEL, FX_AUTO_UPGRADE: "0",
+      FX_GATEWAY_BASE_URL: queuedGateway.baseUrl, FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+      FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+      [process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD"]: shim,
+      FX_TEST_SYNC_TARGET_FILE: target, FX_TEST_SYNC_ARM: arm, FX_TEST_SYNC_RECORD: entered,
+      FX_TEST_SYNC_MATCH: '"kind":"turn_end"', FX_TEST_SYNC_MODE: "hold",
+    } });
+    try {
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Show the saved summary.");
+      await waitForPath(entered);
+      await session.waitForText(finalText, TIMEOUT);
+      expect(TURN_SUMMARY_WITH_TOKENS.test(await session.captureFullScrollback())).toBe(false);
+      rmSync(arm);
+      const finished = await waitForScrollback(session, value => value.includes(finalText) && TURN_SUMMARY_WITH_TOKENS.test(value), "summary after acknowledged turn end");
+      expect(finished).toContain("↓600");
+      expect(queuedGateway.requests).toHaveLength(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally { rmSync(arm, { force: true }); }
+  }, TIMEOUT * 2);
+
   test(
     "agent-owned HTTP retry renders the final token counter without markers",
     async () => {
@@ -2134,6 +2199,230 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     },
     TIMEOUT,
   );
+
+  for (const boundary of ["model", "tool"] as const) {
+    test(
+      `planned restart during held ${boundary} resumes automatically without recovery labels`,
+      async () => {
+        const held: HoldState = { started: false, cancelled: false };
+        const continued: HoldState = { started: false, cancelled: false };
+        const prompt = "Run both marker commands exactly once.";
+        const holdingText = "Preparing the first marker command.";
+        const finalText = "PLANNED_RESTART_FINAL";
+        const beforeId = "before_planned_restart";
+        const afterId = "after_planned_restart";
+        const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+          `fx-tui-planned-restart-${boundary}-`,
+          [
+            () => heldGatewayResponse(held, [
+              { type: "text-delta", id: "before_text", delta: holdingText },
+            ], [
+              {
+                type: "tool-call",
+                toolCallId: beforeId,
+                toolName: "shell",
+                input: { request: { action: "run", command: "./settle-tool.sh", yield_time_ms: 30_000 } },
+              },
+              { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+            ]),
+            () => heldGatewayResponse(continued, [], [
+              {
+                type: "tool-call",
+                toolCallId: afterId,
+                toolName: "shell",
+                input: { request: { action: "run", command: "printf 'after\\n' >> executions.log", yield_time_ms: 30_000 } },
+              },
+              { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+            ]),
+            fakeGatewayFinalText(finalText),
+          ],
+          { permissionMode: "full-access", record: true },
+        );
+        const workspace = join(root!, "workspace");
+        const executionsPath = join(workspace, "executions.log");
+        const toolStartedPath = join(workspace, "tool-started");
+        const releaseToolPath = join(workspace, "release-tool");
+        const toolScript = join(workspace, "settle-tool.sh");
+        // The polling stays in the fixture script, not in rendered tool text:
+        // a real sleep diagnostic must not be mistaken for our release gate.
+        writeFileSync(toolScript, [
+          "#!/bin/sh",
+          "set -eu",
+          "printf 'before\\n' >> executions.log",
+          ": > tool-started",
+          "while [ ! -f release-tool ]; do sleep 0.01; done",
+          "printf 'settled\\n' >> executions.log",
+          "printf 'FIRST_TOOL_FINISHED\\n'",
+          "",
+        ].join("\n"));
+        chmodSync(toolScript, 0o755);
+        const recordingsRoot = join(root!, "home", ".fx", "recordings");
+        const tapes = () => readdirSync(recordingsRoot)
+          .filter((name) => name.endsWith(".fxtape"))
+          .sort()
+          .map((name) => join(recordingsRoot, name));
+
+        try {
+          await session!.sendText(prompt);
+          await waitForCondition(() => held.started, "held model response");
+          expect(tapes()).toHaveLength(1);
+          const originalTape = tapes()[0]!;
+          if (boundary === "tool") {
+            held.release!();
+            await waitForPath(toolStartedPath);
+          }
+
+          await session!.sendText("/restart");
+          await session!.waitForText("restart requested", TIMEOUT);
+          expect(queuedGateway.requests).toHaveLength(1);
+          expect(tapes()).toEqual([originalTape]);
+          expect(held.cancelled).toBe(false);
+          if (boundary === "model") {
+            expect(existsSync(toolStartedPath)).toBe(false);
+            held.release!();
+            await waitForPath(toolStartedPath);
+          }
+          // The requested handoff must settle the selected tool, not cancel it
+          // or send another model request while its result is still outstanding.
+          expect(readFileSync(executionsPath, "utf8")).toBe("before\n");
+          expect(queuedGateway.requests).toHaveLength(1);
+          expect(continued.started).toBe(false);
+          expect(tapes()).toEqual([originalTape]);
+          writeFileSync(releaseToolPath, "");
+
+          // No /continue, kill, or TmuxSession.create here: the product owns both
+          // relaunch and continuation. A second tape proves fresh initialization.
+          await waitForCondition(() => continued.started, "automatic restart continuation");
+          expect(tapes()).toHaveLength(2);
+          expect(tapes()).toContain(originalTape);
+          expect(held.cancelled).toBe(false);
+          expect(session!.isAlive()).toBe(true);
+          expect(session!.isPaneAlive()).toBe(true);
+          expect(readFileSync(executionsPath, "utf8")).toBe("before\nsettled\n");
+          expect(queuedGateway.requests).toHaveLength(2);
+          const sessionsPath = join(root!, "home", ".fx", "sessions");
+          const savedIds = readdirSync(sessionsPath).filter(id => existsSync(join(sessionsPath, id, "session.json")));
+          expect(savedIds).toHaveLength(1);
+          const savedPath = join(sessionsPath, savedIds[0]!);
+          expect(readFileSync(join(savedPath, "upgrade-handoff.json"), "utf8")).toBe("{}\n");
+          const resumedRequest = parseGatewayRequest(queuedGateway.requests[1]!.body);
+          expect(collectToolResultIds(resumedRequest)).toEqual([beforeId]);
+          expect(queuedGateway.requests[1]!.body).toContain(prompt);
+          expect(queuedGateway.requests[1]!.body).toContain("FIRST_TOOL_FINISHED");
+
+          continued.release!();
+          await session!.waitForText(finalText, TIMEOUT);
+          const scrollback = await waitForScrollback(
+            session!,
+            (text) => text.includes(finalText) && text.includes("Ran printf 'after"),
+            "completed tools retained across planned restart",
+          );
+          expect(scrollback).toContain("Session restarted");
+          const resumedScrollback = scrollback.slice(scrollback.lastIndexOf("Session restarted"));
+          // The restored group and the post-restart group remain distinct.
+          expect(resumedScrollback).toContain("settle-tool.sh");
+          expect(resumedScrollback).toContain("after");
+          expect(queuedGateway.requests).toHaveLength(3);
+          expect(collectToolResultIds(parseGatewayRequest(queuedGateway.requests[2]!.body)))
+            .toEqual([beforeId, afterId]);
+          expect(readFileSync(executionsPath, "utf8")).toBe("before\nsettled\nafter\n");
+          expect(scrollback.split(finalText).length - 1).toBe(1);
+          expect(continued.cancelled).toBe(false);
+          expect(session!.isPaneAlive()).toBe(true);
+          await session!.sendText("/quit");
+          await waitForCondition(() => {
+            const exit = session!.paneStatus();
+            return exit.dead && exit.status === 0;
+          }, "clean exit after planned restart");
+          expect(readFileSync(stderrPath, "utf8")).toBe("");
+          expect(tapes()).toHaveLength(2);
+          const journal = decodeNativeJournal(readFileSync(join(savedPath, "execution.journal")))
+            .map(entry => JSON.parse(Buffer.from(entry.bytes).toString("utf8")));
+          expect(journal.filter(entry => entry.kind === "turn_start")).toHaveLength(1);
+          expect(journal.filter(entry => entry.kind === "turn_end")).toHaveLength(1);
+          expect(journal.filter(entry => entry.kind === "tool_result")).toHaveLength(2);
+
+          const recorded = tapes().map((path) => Buffer.concat(
+            stdoutFrames(path).map((frame) => frame.payload),
+          ).toString("utf8"));
+          expect(recorded.every((stdout) => stdout.length > 0)).toBe(true);
+          const stdout = stripVTControlCharacters(recorded.join("\n"));
+          expect(stdout).toContain("restart requested");
+          expect(stdout).toContain(finalText);
+          // Assert on every stdout byte, not just the surviving pane/scrollback:
+          // transient status/footer redraws must not tell a false failure story.
+          for (const output of [...recorded, stdout, scrollback]) {
+            expect(output).not.toMatch(/\bsleep\b|\bnetwork\b|\battempts?\b|\brecovered\b|SystemResumed|recovery paused/i);
+          }
+        } finally {
+          // A failed assertion must not leave the fixture command waiting forever.
+          writeFileSync(releaseToolPath, "");
+          held.release?.();
+          continued.release?.();
+        }
+      },
+      TIMEOUT * 3,
+    );
+  }
+
+  for (const outcome of ["cancelled", "yielded"] as const) {
+    test(`planned restart preserves the session when a tool is ${outcome}`, async () => {
+      const held: HoldState = { started: false, cancelled: false };
+      const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(`fx-restart-${outcome}-`, [
+        () => heldGatewayResponse(held, [], [{
+          type: "tool-call", toolCallId: "held_restart_tool", toolName: "shell",
+          input: { request: { action: "run", command: "./held-tool.sh", yield_time_ms: outcome === "yielded" ? 1 : 30_000 } },
+        }, { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } }]),
+        fakeGatewayFinalText("EXPLICIT_RESTART_CONTINUATION"),
+      ], { permissionMode: "full-access", record: true });
+      const workspace = join(root!, "workspace");
+      const effect = join(workspace, "effect");
+      const release = join(workspace, "release");
+      const settled = join(workspace, "settled");
+      const script = join(workspace, "held-tool.sh");
+      writeFileSync(script, "#!/bin/sh\nset -eu\nprintf once > effect\nwhile [ ! -f release ]; do sleep 0.01; done\nprintf settled > settled\n");
+      chmodSync(script, 0o755);
+      try {
+        await session!.sendText("Run the held tool once.");
+        await waitForCondition(() => held.started, "held provider before restart");
+        if (outcome === "cancelled") {
+          held.release!();
+          await waitForPath(effect);
+        }
+        await session!.sendText("/restart");
+        await session!.waitForText("restart requested", TIMEOUT);
+        if (outcome === "cancelled") {
+          await session!.sendKeys("C-c");
+          await session!.waitForComposer(TIMEOUT);
+        } else {
+          held.release!();
+          await waitForPath(effect);
+          await session!.waitForText("UpgradeNeedsToolIntervention", TIMEOUT);
+          writeFileSync(release, "");
+          await waitForPath(settled);
+        }
+        const sessionsPath = join(root!, "home", ".fx", "sessions");
+        const ids = readdirSync(sessionsPath).filter(id => existsSync(join(sessionsPath, id, "session.json")));
+        expect(ids).toHaveLength(1);
+        expect(existsSync(join(sessionsPath, ids[0]!, "upgrade-handoff.json"))).toBe(false);
+        expect(readFileSync(effect, "utf8")).toBe("once");
+        expect(queuedGateway.requests).toHaveLength(1);
+        expect(readdirSync(join(root!, "home", ".fx", "recordings")).filter(name => name.endsWith(".fxtape"))).toHaveLength(1);
+        if (outcome === "cancelled") {
+          expect(existsSync(settled)).toBe(false);
+        } else {
+          await session!.sendText("/continue");
+          await session!.waitForText("EXPLICIT_RESTART_CONTINUATION", TIMEOUT);
+          expect(queuedGateway.requests).toHaveLength(2);
+          expect(readFileSync(effect, "utf8")).toBe("once");
+        }
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        writeFileSync(release, "");
+        held.release?.();
+      }
+    }, TIMEOUT * 2);
+  }
 
   test(
     "paused response resumes through slash continue without a second user turn",
@@ -2698,12 +2987,12 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         () =>
           existsSync(sessionsRoot) &&
           readdirSync(sessionsRoot).some((entry) =>
-            existsSync(join(sessionsRoot, entry, "events.jsonl")),
+            existsSync(join(sessionsRoot, entry, "execution.journal")),
           ),
         "session event log",
       );
       const sessionId = readdirSync(sessionsRoot).find((entry) =>
-        existsSync(join(sessionsRoot, entry, "events.jsonl")),
+        existsSync(join(sessionsRoot, entry, "execution.journal")),
       );
       if (!sessionId) throw new Error("session event log was not found");
 

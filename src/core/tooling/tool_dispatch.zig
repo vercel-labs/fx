@@ -178,11 +178,14 @@ pub const HostToolProviderFn = *const fn (
     []const u8,
     usize,
     ?*std.atomic.Value(bool),
+    ?core_types.JournalToolContext,
 ) DispatchError!ToolResult;
 
 pub const HostToolProvider = struct {
     context: *anyopaque,
     call_fn: HostToolProviderFn,
+    /// Borrowed identity for this invocation; never shared across calls.
+    journal_context: ?core_types.JournalToolContext = null,
 
     pub fn call(
         self: HostToolProvider,
@@ -199,6 +202,7 @@ pub const HostToolProvider = struct {
             arguments_json,
             max_result_bytes,
             cancel_flag,
+            self.journal_context,
         );
     }
 };
@@ -219,6 +223,9 @@ pub const DispatchError = std.json.ParseError(std.json.Scanner) || error{
     PathOutsideWorkspace,
     WorkspaceUnavailable,
     Cancelled,
+    /// The host may have executed the tool, but no valid terminal result was
+    /// acknowledged. Propagate as an executor error, never a failure result.
+    HostToolOutcomeUncertain,
 };
 
 /// Core-owned execution backend used by the registered run_command callback.
@@ -480,6 +487,7 @@ pub const PresentationFn = *const fn (std.json.ObjectMap) ?CallPresentation;
 
 /// Descriptor for a core tool's model-facing metadata and runtime callbacks.
 pub const Tool = struct {
+    journal_replay: @import("../session/execution_journal.zig").Replay = .blocked,
     name: []const u8,
     description: []const u8,
     model_schema: model_tool_schema.FunctionSchema,

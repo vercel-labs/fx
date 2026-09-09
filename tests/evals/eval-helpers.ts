@@ -463,17 +463,24 @@ function captureFxProcessState(): string {
   }
 }
 
-export async function runFx(
+type FxRunOptions = {
+  cwd?: string;
+  env?: Record<string, string | undefined>;
+  stdin?: string | Uint8Array;
+  timeoutMs?: number;
+};
+
+export function runFx(args: string[], opts: FxRunOptions = {}): Promise<FxRunResult> {
+  return runFxFixtureBinary(FX_BIN, args, opts);
+}
+
+export async function runFxFixtureBinary(
+  binary: string,
   args: string[],
-  opts: {
-    cwd?: string;
-    env?: Record<string, string | undefined>;
-    stdin?: string | Uint8Array;
-    timeoutMs?: number;
-  } = {},
+  opts: FxRunOptions = {},
 ): Promise<FxRunResult> {
-  if (!existsSync(FX_BIN)) {
-    throw new Error(`fx binary not found at ${FX_BIN}. Run 'zig build' first.`);
+  if (!existsSync(binary)) {
+    throw new Error(`fx binary not found at ${binary}. Build it before running tests.`);
   }
 
   const { cwd, timeoutMs = 15_000 } = opts;
@@ -493,7 +500,7 @@ export async function runFx(
         env[key] = value;
       }
     }
-    const child = nodeSpawn(FX_BIN, args, {
+    const child = nodeSpawn(binary, args, {
       env: providerVersionTestEnv(env),
       cwd: cwd ?? REPO_ROOT,
       stdio: ["pipe", "pipe", "pipe"],

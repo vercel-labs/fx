@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { invalidJournalOptions } from "./fixtures/invalid-journal.mjs";
+import { createJournalStore } from "./fixtures/journal-store.mjs";
 import { strict as assert } from "node:assert";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -161,15 +163,23 @@ try {
     Object.defineProperty(WebAssembly, "promising", { configurable: true, value: savedPromising });
   }
 
-  const nonlocalFallback = await createFxAgent({
-    backend: "auto",
-    nativeAddon: nonlocalAddon,
-    wasm: coreWasm,
-    apiKey: "nonlocal-fallback-key",
-  });
-  const nonlocalCheckpoint = await nonlocalFallback.checkpoint();
-  await nonlocalFallback.close();
-  assert.ok(nonlocalCheckpoint.length > 0, "auto mode must fall back after a nonlocal addon URL fails");
+  const fallbackStore = createJournalStore();
+  let nonlocalFallback;
+  try {
+    nonlocalFallback = await createFxAgent({
+      ...fallbackStore.options(),
+      backend: "auto",
+      nativeAddon: nonlocalAddon,
+      wasm: coreWasm,
+      apiKey: "nonlocal-fallback-key",
+    });
+    const checkpoint = await nonlocalFallback.checkpoint();
+    assert.ok(checkpoint.bytes.length > 0, "auto mode must fall back after a nonlocal addon URL fails");
+    assert.deepEqual(checkpoint, fallbackStore.read().at(-1));
+  } finally {
+    await nonlocalFallback?.close();
+    fallbackStore.close();
+  }
 
   const nonlocalWasmInfo = await getBackendInfo({ backend: "wasm", wasm: nonlocalWasm });
   assert.equal(nonlocalWasmInfo.backend, "unavailable");
@@ -201,10 +211,17 @@ try {
   await writeFile(replacedWasm, await readFile(coreWasm));
   const secondFileProbe = await getBackendInfo({ backend: "wasm", wasm: replacedWasm });
   assert.equal(secondFileProbe.backend, "wasm-jspi", "replaced Wasm file must be read again after compile failure");
-  const replacedAgent = await createFxAgent({ backend: "wasm", wasm: replacedWasm, apiKey: "probe-retry-key" });
-  const replacedCheckpoint = await replacedAgent.checkpoint();
-  await replacedAgent.close();
-  assert.ok(replacedCheckpoint.length > 0, "factory must reuse the valid replacement after the failed probe");
+  const replacementStore = createJournalStore();
+  let replacedAgent;
+  try {
+    replacedAgent = await createFxAgent({ ...replacementStore.options(), backend: "wasm", wasm: replacedWasm, apiKey: "probe-retry-key" });
+    const checkpoint = await replacedAgent.checkpoint();
+    assert.ok(checkpoint.bytes.length > 0, "factory must reuse the valid replacement after the failed probe");
+    assert.deepEqual(checkpoint, replacementStore.read().at(-1));
+  } finally {
+    await replacedAgent?.close();
+    replacementStore.close();
+  }
 
   const stableCompileDescriptor = Object.getOwnPropertyDescriptor(WebAssembly, "compile");
   const stableRealCompile = WebAssembly.compile.bind(WebAssembly);
@@ -224,9 +241,9 @@ try {
         backend: "wasm",
         wasm: stableWasm,
         apiKey: "stable-cache-key",
-        checkpoint: new Uint8Array([1, 2, 3]),
+        ...invalidJournalOptions(),
       }),
-      /Invalid or non-fresh libfx checkpoint/,
+      /JournalConflict/,
     );
     assert.equal((await getBackendInfo({ backend: "wasm", wasm: stableWasm })).backend, "wasm-jspi");
     const stableAgent = await createFxAgent({ backend: "wasm", wasm: stableWasm, apiKey: "stable-cache-key" });

@@ -455,7 +455,8 @@ fn cleanupCompletedForegroundTarget(
     {
         try refreshForegroundTargetTree(descendants, target_pid);
         signaled += descendants.signalAll(std.posix.SIG.KILL);
-        if (descendants.anyAlive()) {
+        const drained = reapForegroundDescendants();
+        if (descendants.anyAlive() or !drained) {
             empty_scans = 0;
         } else {
             empty_scans += 1;
@@ -465,6 +466,7 @@ fn cleanupCompletedForegroundTarget(
     }
     try refreshForegroundTargetTree(descendants, target_pid);
     signaled += descendants.signalAll(std.posix.SIG.KILL);
+    _ = reapForegroundDescendants();
     return signaled;
 }
 
@@ -512,9 +514,9 @@ fn advanceForegroundTargetTermination(
         .force => {
             if (termination_started_ms.* == null) termination_started_ms.* = now_ms;
             forced.* = true;
-            forceKillForegroundTargetDescendants(descendants);
         },
     }
+    if (forced.*) forceKillForegroundTargetDescendants(descendants);
 }
 
 fn waitForForegroundTargetDescendants(
@@ -536,7 +538,8 @@ fn waitForForegroundTargetDescendants(
         if (forced.*) {
             _ = descendants.signalAll(std.posix.SIG.KILL);
         }
-        if (descendants.anyAlive()) {
+        const drained = reapForegroundDescendants();
+        if (descendants.anyAlive() or !drained) {
             empty_scans = 0;
         } else {
             empty_scans += 1;
@@ -550,6 +553,30 @@ fn waitForForegroundTargetDescendants(
         }
         io_mod.sleep(std.time.ns_per_ms);
     }
+}
+
+// The Linux supervisor is a subreaper. After its target waiter finishes, it
+// owns reaping adopted descendants rather than leaving zombies for PID 1.
+fn reapForegroundDescendants() bool {
+    if (comptime builtin.os.tag == .linux) {
+        // Return to tracking and the cleanup deadline even if late forks keep
+        // producing children while this batch is reaped.
+        for (0..256) |_| {
+            const pid = std.c.waitpid(-1, null, std.c.W.NOHANG);
+            if (pid > 0) continue;
+            if (pid == 0) return true;
+            switch (std.posix.errno(pid)) {
+                .INTR => continue,
+                .CHILD => return true,
+                else => |err| {
+                    debug_trace.logf("core", "foreground descendant reap failed errno={s}", .{@tagName(err)});
+                    return false;
+                },
+            }
+        }
+        return false;
+    }
+    return true;
 }
 
 fn forceKillForegroundTargetDescendants(
@@ -3028,6 +3055,7 @@ fn expectProcessGoneWithinForTest(pid: std.posix.pid_t, timeout_ms: i64) !void {
         };
         io_mod.sleep(std.time.ns_per_ms);
     }
+    std.debug.print("process {d} remains present after {d}ms\n", .{ pid, timeout_ms });
     return error.TestUnexpectedResult;
 }
 
@@ -3100,8 +3128,8 @@ test "foreground session owner loss kills the target and descendant before delay
     defer alloc.free(quoted_effect);
     const target_script = try std.fmt.allocPrint(
         alloc,
-        "sleep 30 & child=$!; printf '%s %s' \"$$\" \"$child\" > {s}; sleep 3; printf FINISHED > {s}",
-        .{ quoted_pids, quoted_effect },
+        "sleep 30 & child=$!; printf '%s %s' \"$$\" \"$child\" > {s}.tmp; mv {s}.tmp {s}; sleep 3; printf FINISHED > {s}",
+        .{ quoted_pids, quoted_pids, quoted_pids, quoted_effect },
     );
     defer alloc.free(target_script);
 
@@ -3110,7 +3138,6 @@ test "foreground session owner loss kills the target and descendant before delay
     try expectForegroundSessionReadyForTest(&child);
 
     const owner_write = child.stdin orelse return error.TestUnexpectedResult;
-    child.stdin = null;
     try writeForegroundSessionFrameForTest(
         owner_write,
         foreground_session_release_byte,
@@ -3126,17 +3153,30 @@ test "foreground session owner loss kills the target and descendant before delay
     const pids_text = try readAbsoluteFile(alloc, pids_path, 128);
     defer alloc.free(pids_text);
     var pids = std.mem.tokenizeAny(u8, pids_text, " \r\n\t");
-    const target_pid = try std.fmt.parseInt(std.posix.pid_t, pids.next() orelse return error.TestUnexpectedResult, 10);
-    const descendant_pid = try std.fmt.parseInt(std.posix.pid_t, pids.next() orelse return error.TestUnexpectedResult, 10);
-    try std.testing.expect(pids.next() == null);
+    const target_text = pids.next();
+    const descendant_text = pids.next();
+    if (target_text == null or descendant_text == null) {
+        std.debug.print("owner-loss PID marker incomplete: '{s}'\n", .{pids_text});
+        return error.TestUnexpectedResult;
+    }
+    const target_pid = try std.fmt.parseInt(std.posix.pid_t, target_text.?, 10);
+    const descendant_pid = try std.fmt.parseInt(std.posix.pid_t, descendant_text.?, 10);
+    if (pids.next() != null) {
+        std.debug.print("owner-loss PID marker has extra data: '{s}'\n", .{pids_text});
+        return error.TestUnexpectedResult;
+    }
     defer signalProcess(target_pid, std.posix.SIG.KILL) catch {};
     defer signalProcess(descendant_pid, std.posix.SIG.KILL) catch {};
 
     owner_write.close(io_mod.getIo());
+    child.stdin = null;
     _ = try child.wait(io_mod.getIo());
     try expectProcessGoneWithinForTest(target_pid, 2_000);
     try expectProcessGoneWithinForTest(descendant_pid, 2_000);
-    try std.testing.expect(!absoluteFileExists(effect_path));
+    if (absoluteFileExists(effect_path)) {
+        std.debug.print("owner-loss delayed effect exists; target={d}, descendant={d}\n", .{ target_pid, descendant_pid });
+        return error.TestUnexpectedResult;
+    }
 }
 
 test "foreground session bootstrap EOF executes no target" {

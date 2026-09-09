@@ -525,14 +525,16 @@ describe("lean auto mode reliability", () => {
     async () => {
       const root = createIsolatedRoot();
       const tracePath = join(root.root, "trace.log");
+      let deliveredOutput = "";
       const gateway = startGateway(
         [
           cleanTtyCommandCall("printf 'TTY_REVIEWED_OK\\n'", "reviewed_clean_tty"),
           (body) => {
             const started = JSON.parse(
               toolResultText(body, "reviewed_clean_tty"),
-            ) as { session_id: string; state: string };
+            ) as { session_id: string; state: string; output_delta: string };
             expect(started.state).toBe("running");
+            deliveredOutput += started.output_delta;
             return fakeGatewayToolCall("wait_reviewed_clean_tty", "shell", {
               request: {
                 action: "interact",
@@ -542,9 +544,11 @@ describe("lean auto mode reliability", () => {
             });
           },
           (body) => {
-            expect(toolResultText(body, "wait_reviewed_clean_tty")).toContain(
-              "TTY_REVIEWED_OK",
-            );
+            const waited = JSON.parse(
+              toolResultText(body, "wait_reviewed_clean_tty"),
+            ) as { output_delta: string };
+            deliveredOutput += waited.output_delta;
+            expect(deliveredOutput).toContain("TTY_REVIEWED_OK");
             return fakeGatewayFinalText("reviewed clean TTY complete");
           },
         ],

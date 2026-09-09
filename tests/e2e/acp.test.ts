@@ -1,3 +1,4 @@
+import { decodeNativeJournal } from "./journal/storage";
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
 import {
@@ -1337,7 +1338,7 @@ describe("acp: model-independent", () => {
         expect(occurrenceCount(allUpdates, partialText)).toBe(2);
         expect(occurrenceCount(allUpdates, replacementText)).toBe(1);
         expect(gateway.requests[10]!.body).not.toContain(partialText);
-        expect(acpLatestPromptText(gateway.requests[10]!.body)).toContain("Restart that response");
+        expect(acpLatestPromptText(gateway.requests[10]!.body)).toBe("Preserve this ACP prompt through recovery.");
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
@@ -1861,7 +1862,7 @@ describe("acp: model-independent", () => {
         expect(occurrenceCount(restartedUpdates, partialText)).toBe(1);
         expect(occurrenceCount(restartedUpdates, replacementText)).toBe(1);
         expect(gateway.requests[11]!.body).not.toContain(partialText);
-        expect(acpLatestPromptText(gateway.requests[11]!.body)).toContain("Restart that response");
+        expect(acpPromptText(gateway.requests[11]!.body)).toContain("Preserve this ACP prompt across a process restart.");
 
         await client.close();
         client = await AcpClient.create({
@@ -5262,9 +5263,14 @@ describe("acp: model-independent", () => {
     const imageData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9WlXYX0AAAAASUVORK5CYII=";
     const gateway = startFakeGateway([
       finalText("INVALID_FINAL_WITHOUT_VISION"),
-      fakeGatewayToolCall("recover_vision", "vision", { image_ids: [continueSaved ? 1 : 2], focus: "describe" }),
-      finalText(JSON.stringify({ images: [{ image_id: continueSaved ? 1 : 2, status: "ok", summary: "small fixture", visible_text: [], details: [] }] })),
+      fakeGatewayToolCall("recover_vision", "vision", { image_ids: [1], focus: "describe" }),
+      finalText(JSON.stringify({ images: [{ image_id: 1, status: "ok", summary: "small fixture", visible_text: [], details: [] }] })),
       finalText("ACP_RECOVERY_IMAGE_COMPLETE"),
+      ...(!continueSaved ? [
+        fakeGatewayToolCall("next_vision", "vision", { image_ids: [2], focus: "describe new image" }),
+        finalText(JSON.stringify({ images: [{ image_id: 2, status: "ok", summary: "next fixture", visible_text: [], details: [] }] })),
+        finalText("ACP_NEXT_IMAGE_COMPLETE"),
+      ] : []),
     ]);
     try {
       client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
@@ -5275,26 +5281,43 @@ describe("acp: model-independent", () => {
       ], TIMEOUT);
       expect(JSON.stringify(failed)).toContain("RequiredVisionToolCallMissing");
       const source = join(root.home, ".fx", "sessions", sessionId);
-      const checkpoint = JSON.parse(readFileSync(join(source, "recovery.json"), "utf8")).checkpoint;
-      const snapshot = join(source, checkpoint.user.images[0].snapshot_path);
+      const journalPath = join(source, "execution.journal");
+      const before = readFileSync(journalPath);
+      const start = decodeNativeJournal(before).find(entry => entry.kind === "turn_start")!;
+      const input = JSON.parse(JSON.parse(Buffer.from(start.bytes).toString("utf8")).inputJson);
+      const snapshot = join(source, input.images[0].snapshot_path);
       expect(readFileSync(snapshot).toString("base64")).toBe(imageData);
       await client.close();
       client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
       await client.request("initialize", { protocolVersion: 1 }, 10);
       client.send({ jsonrpc: "2.0", id: 11, method: "session/load", params: { sessionId, cwd: root.workspace, mcpServers: [] } });
       expect((await readResponse(client, 11)).error).toBeUndefined();
-      const resumed = continueSaved
-        ? await continueRecovery(client, TIMEOUT, sessionId)
-        : await runPromptBlocks(client, [
+      if (!continueSaved) {
+        const rejected = await runPromptBlocks(client, [
           { type: "text", text: "Describe this new image instead." },
           { type: "image", data: imageData, mimeType: "image/png" },
         ], TIMEOUT);
+        expect(JSON.stringify(rejected.promptResult.error)).toContain("PendingTurnError");
+        expect(readFileSync(journalPath)).toEqual(before);
+        expect(gateway.requests).toHaveLength(1);
+      }
+      const resumed = await continueRecovery(client, TIMEOUT, sessionId);
       expect(resumed.promptResult.error).toBeUndefined();
       expect(resumed.promptResult.result.stopReason).toBe("end_turn");
       expect(gateway.requests).toHaveLength(4);
       expect(gateway.requests[2]!.body).toContain(imageData);
       expect(readFileSync(snapshot).toString("base64")).toBe(imageData);
       expect(existsSync(join(source, "recovery.json"))).toBe(false);
+      if (!continueSaved) {
+        const next = await runPromptBlocks(client, [
+          { type: "text", text: "Describe this new image now." },
+          { type: "image", data: imageData, mimeType: "image/png" },
+        ], TIMEOUT);
+        expect(next.promptResult.error).toBeUndefined();
+        expect(JSON.stringify(next.messages)).toContain("ACP_NEXT_IMAGE_COMPLETE");
+        expect(gateway.requests).toHaveLength(7);
+        expect(gateway.requests[5]!.body).toContain(imageData);
+      }
       expect(client.stderr).toBe("");
     } finally {
       await client?.close();
@@ -5596,8 +5619,16 @@ describe("acp: model-independent", () => {
         });
         expect(codex.requests).toHaveLength(0);
         expect(gateway.requests).toHaveLength(0);
-        const imageDir = join(root.home, ".fx", "sessions", sessionId, "images");
-        if (existsSync(imageDir)) expect(readdirSync(imageDir)).toEqual([]);
+        const directory = join(root.home, ".fx", "sessions", sessionId);
+        const entries = decodeNativeJournal(readFileSync(join(directory, "execution.journal")))
+          .map(entry => JSON.parse(Buffer.from(entry.bytes).toString("utf8")));
+        expect(entries.filter(entry => entry.kind === "turn_start")).toHaveLength(1);
+        expect(entries.at(-1)).toMatchObject({ kind: "turn_end", result: { ok: false }, history: null });
+        const savedInput = JSON.parse(entries.find(entry => entry.kind === "turn_start").inputJson);
+        expect(savedInput.images).toHaveLength(1);
+        const imageDir = join(directory, "images");
+        expect(readdirSync(imageDir)).toHaveLength(1);
+        expect(readFileSync(join(directory, savedInput.images[0].snapshot_path)).toString("base64")).toBe(imageData);
 
         const rejectedDetail = await runFx(["session", "--id", sessionId, "--json"], {
           cwd: root.workspace,
@@ -8906,6 +8937,8 @@ test.skipIf(!tmuxAvailable())(
       finalText("ACP_MIDDLE_VISIBLE_RESPONSE"),
       finalText("ACP_LATEST_VISIBLE_RESPONSE"),
       finalText("ACP_INTERNAL_HANDOFF: continue the task."),
+      fakeGatewayToolCall("acp-journal-read", "read_file", { path: "replay-effects.txt" }),
+      finalText("ACP_JOURNAL_CONTINUED"),
     ]);
     let tui: TmuxSession | null = null;
     let localClient: AcpClient | null = null;
@@ -8930,7 +8963,7 @@ test.skipIf(!tmuxAvailable())(
       const ids = readdirSync(join(root.home, ".fx", "sessions"), { withFileTypes: true })
         .filter((entry) => entry.isDirectory()).map((entry) => entry.name);
       expect(ids).toHaveLength(1);
-      const eventsPath = join(root.home, ".fx", "sessions", ids[0]!, "events.jsonl");
+      const eventsPath = join(root.home, ".fx", "sessions", ids[0]!, "execution.journal");
       const savedEvents = readFileSync(eventsPath);
       expect(readFileSync(join(root.workspace, "replay-effects.txt"), "utf8")).toBe("ACP_SAVED_TOOL_OUTPUT\n");
       expect(gateway.requests).toHaveLength(5);
@@ -8964,6 +8997,20 @@ test.skipIf(!tmuxAvailable())(
         expect(gateway.requests).toHaveLength(5);
         expect(localClient.stderr).toBe("");
       }
+      const continued = await runPrompt(localClient, "Read replay-effects.txt and continue this saved conversation.", TIMEOUT);
+      expect(continued.promptResult.error, JSON.stringify(continued.promptResult)).toBeUndefined();
+      expect(continued.promptResult.result.stopReason).toBe("end_turn");
+      expect(JSON.stringify(continued.messages)).toContain("ACP_JOURNAL_CONTINUED");
+      expect(gateway.requests).toHaveLength(7);
+      expect(gateway.requests[6]!.body).toContain("ACP_SAVED_TOOL_OUTPUT");
+      const appended = readFileSync(eventsPath);
+      expect(appended.subarray(0, savedEvents.length)).toEqual(savedEvents);
+      expect(appended.length).toBeGreaterThan(savedEvents.length);
+      await localClient.close(); localClient = null;
+      const inspected = await runFx(["session", "--id", ids[0]!, "--json"], { cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+      expect(inspected.code, inspected.stdout + inspected.stderr).toBe(0);
+      expect(inspected.stdout).toContain("ACP_JOURNAL_CONTINUED");
+      expect(readFileSync(join(root.workspace, "replay-effects.txt"), "utf8")).toBe("ACP_SAVED_TOOL_OUTPUT\n");
     } finally {
       await tui?.kill();
       await localClient?.close();

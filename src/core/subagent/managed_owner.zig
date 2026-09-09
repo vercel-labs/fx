@@ -1,4 +1,6 @@
 const std = @import("std");
+const journal_runtime = @import("../agent/runtime/journal_runtime.zig");
+const execution_journal = @import("../session/execution_journal.zig");
 const approval_registry = @import("approval_registry.zig");
 const authority = @import("authority.zig");
 const child_state = @import("child_state.zig");
@@ -124,6 +126,20 @@ pub const Owner = struct {
         var registry = try self.state_store.load(self.alloc);
         defer registry.deinit(self.alloc);
         const generation = registry.generation;
+        for (registry.children) |child| {
+            if (child.phase != .running and child.phase != .awaiting_approval) continue;
+            const active = child.active orelse continue;
+            var snapshot = (self.sessions.loadJournalReadOnly(self.alloc, child.id) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => continue,
+            }) orelse continue;
+            defer snapshot.deinit(self.alloc);
+            if (try recordedJournalWork(self.alloc, &snapshot.state, active.id, active.message)) |recorded| {
+                // The child committed before the registry acknowledgement was
+                // lost. Adopt that result without starting another worker.
+                try registry.finish(self.alloc, child.id, active.id, recorded.outcome, recorded.failure);
+            }
+        }
         registry.interruptActive(self.alloc);
         if (registry.generation != generation) try self.state_store.save(self.alloc, registry);
     }
@@ -237,6 +253,54 @@ pub const Owner = struct {
     }
 };
 
+const RecordedWork = struct { outcome: child_state.Outcome, failure: ?types.ModelFailureDiagnostic = null };
+
+fn recordedJournalWork(alloc: Allocator, records: *const execution_journal.State, work_id: []const u8, message: []const u8) !?RecordedWork {
+    if (records.pending() != .idle) return null;
+    const index = records.request(work_id) orelse return null;
+    const outcome = records.outcome(index) orelse return null;
+    const input = try journal_runtime.readUser(alloc, records, index);
+    defer types.freeUserTurn(alloc, input);
+    if (!std.mem.eql(u8, input.work_id orelse "", work_id) or !std.mem.eql(u8, input.text, message) or input.images.len != 0) return null;
+    const result = try execution_journal.object(outcome, "result");
+    if (try execution_journal.boolean(result, "ok")) return .{ .outcome = .completed };
+    const reason = try execution_journal.string(result, "reason");
+    if (std.mem.eql(u8, reason, "cancelled")) return .{ .outcome = .cancelled };
+    if (std.mem.eql(u8, reason, "interrupted")) return .{ .outcome = .interrupted };
+    return .{ .outcome = .failed, .failure = execution.failureDiagnosticValue("recorded_child_failure", reason) };
+}
+
+test "journal witness child completion recovery uses the outcome rather than visible assistant history" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |ok| {
+        var records: execution_journal.State = .{};
+        defer records.deinit(alloc);
+        var runtime: journal_runtime.Runtime = .{
+            .alloc = alloc,
+            .state = &records,
+            .namespace = "child",
+            .creation_id = "attempt",
+            .request_id = "work",
+            .work_id = "work",
+            .sink = .{ .context = &records, .append_fn = struct {
+                fn append(_: *anyopaque, _: execution_journal.Entry) !void {}
+            }.append },
+        };
+        _ = try runtime.begin(.{ .text = @constCast("task") }, "model", 1, false);
+        var key = try runtime.generation();
+        defer key.deinit(alloc);
+        _ = try runtime.recordDecision(.{ .content = "visible answer" }, &.{}, &.{}, key, true, null, null);
+        var result = try std.json.parseFromSlice(std.json.Value, alloc, if (ok) "{\"ok\":true,\"stopReason\":\"stop\"}" else "{\"ok\":false,\"reason\":\"provider_error\",\"retryable\":false,\"message\":\"failed\"}", .{});
+        defer result.deinit();
+        try runtime.finish(result.value, .{ .assistant = .{ .user = .{ .text = @constCast("task"), .work_id = @constCast("work") }, .assistant = @constCast("visible answer") } });
+        const recorded = (try recordedJournalWork(alloc, &records, "work", "task")).?;
+        try std.testing.expectEqual(if (ok) child_state.Outcome.completed else .failed, recorded.outcome);
+        try std.testing.expectEqual(!ok, recorded.failure != null);
+        try std.testing.expect(try recordedJournalWork(alloc, &records, "work", "different task") == null);
+        try std.testing.expect(try recordedJournalWork(alloc, &records, "different work", "task") == null);
+    }
+}
+
 fn destroySlot(owner: *Owner, slot: *Slot) void {
     if (slot.thread) |thread| thread.join();
     std.debug.assert(slot.route_refs == 0);
@@ -279,7 +343,7 @@ fn runOne(slot: *Slot) OneOutcome {
         owner.alloc,
         .{ .id = slot.child_id },
         owner.sessions.workspace_root,
-        .{},
+        .{ .execution_journal = true },
     ) catch |err| return failedOutcome(work_id, "session_resume", err);
     defer {
         loaded.log.park();

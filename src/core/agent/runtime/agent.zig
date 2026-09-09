@@ -10,9 +10,11 @@ pub const Agent = struct {
     history: std.ArrayList(types.HistoryTurn) = .empty,
     turn_usage: types.Usage = .{},
     fresh: bool = true,
+    recovery_checkpoint: ?@import("../../session/session_codec.zig").RecoveryCheckpoint = null,
 
     pub fn deinit(self: *Agent, alloc: Allocator) void {
         self.clearHistory(alloc);
+        self.clearRecoveryCheckpoint(alloc);
         self.history.deinit(alloc);
         self.* = undefined;
     }
@@ -23,7 +25,12 @@ pub const Agent = struct {
     }
 
     pub fn checkpoint(self: *const Agent, alloc: Allocator) checkpoint_codec.Error![]u8 {
-        return checkpoint_codec.encode(alloc, self.history.items, self.turn_usage);
+        return checkpoint_codec.encodeWithRecovery(alloc, self.history.items, self.turn_usage, self.recovery_checkpoint);
+    }
+
+    pub fn clearRecoveryCheckpoint(self: *Agent, alloc: Allocator) void {
+        if (self.recovery_checkpoint) |*pending| pending.deinit(alloc);
+        self.recovery_checkpoint = null;
     }
 
     pub fn restoreCheckpoint(
@@ -42,6 +49,8 @@ pub const Agent = struct {
         for (previous.items) |turn| types.freeHistoryTurn(alloc, turn);
         previous.deinit(alloc);
         self.turn_usage = decoded.usage;
+        self.recovery_checkpoint = decoded.recovery_checkpoint;
+        decoded.recovery_checkpoint = null;
         self.fresh = false;
     }
 

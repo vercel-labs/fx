@@ -19,6 +19,8 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { createProjection } from "../../sdk/transcript.js";
+import { decodeNativeJournal } from "./journal/storage";
 import {
   canonicalSubagentIdForStore,
   fakeGatewayPermissionDecision,
@@ -888,11 +890,10 @@ describe("effect-aware command permissions", () => {
       activeSession = null;
 
       const sessionId = sessionIdFromHome(root);
-      const events = readFileSync(
-        join(root.home, ".fx", "sessions", sessionId, "events.jsonl"),
-        "utf8",
-      );
-      expect(events).toContain(feedback);
+      const transcript = createProjection(decodeNativeJournal(readFileSync(
+        join(root.home, ".fx", "sessions", sessionId, "execution.journal"),
+      ))).transcript();
+      expect(JSON.stringify(transcript)).toContain(feedback);
 
       const cliResumeGateway = startFakeGateway([
         finalText("history feedback cli resume complete"),
@@ -2534,7 +2535,7 @@ describe("effect-aware command permissions", () => {
         env: gatewayEnv(root, gateway, {
           FX_PERMISSION_MODE: "auto",
           FX_TRACE_LOG: tracePath,
-          FX_TRACE_SCOPES: "permission,interrupt",
+          FX_TRACE_SCOPES: "permission,interrupt,session,worker,history",
         }),
         stderrPath,
         width: 120,
@@ -2560,7 +2561,9 @@ describe("effect-aware command permissions", () => {
       releaseClassifier(permissionDecision("clear"));
       expect(existsSync(marker)).toBe(false);
 
-      await activeSession.sendText("Confirm the next prompt works.");
+      await activeSession.sendText("Confirm the next prompt works.").catch(cause => {
+        throw new Error(`fx exited after review cancellation: ${readFileSync(stderrPath, "utf8")}\n${readFileSync(tracePath, "utf8")}`, { cause });
+      });
       const pane = await activeSession.waitForText(
         "follow-up after review cancellation",
         TIMEOUT,

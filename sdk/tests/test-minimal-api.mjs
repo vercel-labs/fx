@@ -41,7 +41,7 @@ try {
     gatewayChatUrl: `http://127.0.0.1:${port}/chat`,
     model: "minimal/model",
   });
-  assert.deepEqual(Object.keys(agent).sort(), ["checkpoint", "close", "prompt"]);
+  assert.deepEqual(Object.keys(agent).sort(), ["abandon", "checkpoint", "close", "prompt", "resume", "status", "suspend"]);
   const turn = agent.prompt("hello");
   let text = "";
   let reasoning = "";
@@ -57,8 +57,7 @@ try {
   });
   assert.equal(requestedAuthorization, "Bearer minimal-key");
   assert.equal(requestedModel, "minimal/model");
-  const checkpoint = await agent.checkpoint();
-  assert.ok(checkpoint instanceof Uint8Array);
+  await assert.rejects(agent.checkpoint(), /journal.*onEntry/);
   assert.equal(await agent.close(), undefined);
   assert.equal(await agent.close(), undefined);
   console.log("minimal libfx API passed");

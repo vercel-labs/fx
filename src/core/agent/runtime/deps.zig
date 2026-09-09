@@ -31,6 +31,13 @@ const ToolExecutionResult = tool_contracts.ToolExecutionResult;
 const TransportPublicationOutcome = tool_contracts.TransportPublicationOutcome;
 pub const LiveToolAuthority = tool_contracts.LiveToolAuthority;
 
+/// Borrows the checkpoint only for the callback. Success acknowledges durable
+/// storage of this exact replacement, including execution results. A queued write
+/// or an in-memory copy is not an acknowledgement. Errors may mean the write
+/// committed but its acknowledgement was lost: the caller must not send another
+/// request or replay tools. The host must establish the durable state before an
+/// explicit resume; never retry the original prompt as a substitute for resume.
+/// This is a checkpoint effect, not an onEntry journal or exactly-once executor.
 pub const RecoveryCheckpointEffect = struct {
     set: *const fn (ctx: *anyopaque, checkpoint: session_codec.RecoveryCheckpoint) anyerror!void,
 };
@@ -221,6 +228,8 @@ pub const AgentRuntimeDeps = struct {
     propagate_history_turn: *const fn (ctx: *anyopaque, turn: HistoryTurn) anyerror!void,
     commit_context_compaction: ?ContextCompactionCommitEffect = null,
     recovery_checkpoint: ?RecoveryCheckpointEffect = null,
+    journal: ?*@import("journal_runtime.zig").Runtime = null,
+    journal_generation: ?*const fn (ctx: *anyopaque, key: @import("journal_runtime.zig").GenerationKey) anyerror!void = null,
     propagate_grant: *const fn (ctx: *anyopaque, tool_name: []const u8, target_path: []const u8) anyerror!void,
     push_event: *const fn (ctx: *anyopaque, event: WorkerEvent) anyerror!void,
     push_text: *const fn (ctx: *anyopaque, emission: TextEmission) anyerror!void,

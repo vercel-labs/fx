@@ -31,7 +31,23 @@ try {
   const vercel = JSON.parse(await readFile(join(temp, "vercel.json"), "utf8"));
   const header = vercel.headers.find(({ source }) => source === `/${manifest.wasmModule.file}`);
   assert.deepEqual(header?.headers, [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }]);
-  console.log("terminal demo package passed: shared Wasm module is hashed, rewritten, and immutable");
+  for (const key of ["browser", "sdk", "coreOutput", "wasmModule", "journalCodec", "transcript"]) {
+    const asset = manifest[key];
+    const bytes = await readFile(join(temp, asset.file));
+    assert.equal(digest(bytes), asset.sha256);
+    assert.equal(bytes.byteLength, asset.bytes);
+    assert.deepEqual(vercel.headers.find(({ source }) => source === `/${asset.file}`)?.headers,
+      [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }]);
+    for (const [, path] of bytes.toString().matchAll(/from "\.\/([^"]+)"/g)) {
+      assert.match(path, /\.[a-f0-9]{64}\.js$/, `unhashed import in ${asset.file}: ${path}`);
+      assert.ok((await readFile(join(temp, path))).length, `missing import in ${asset.file}: ${path}`);
+    }
+  }
+  assert.ok(sdk.includes(`from "./${manifest.journalCodec.file}"`));
+  assert.ok(sdk.includes(`from "./${manifest.transcript.file}"`));
+  const transcript = await readFile(join(temp, manifest.transcript.file), "utf8");
+  assert.ok(transcript.includes(`from "./${manifest.journalCodec.file}"`));
+  console.log("terminal demo package passed: complete JavaScript dependency chain is hashed, rewritten, and immutable");
 } finally {
   await rm(temp, { recursive: true, force: true });
 }

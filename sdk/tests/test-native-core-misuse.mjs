@@ -153,7 +153,7 @@ const sendPrompt = (sessionId, text) => send("session/prompt", {
 
 try {
   assert.ok((await request("initialize", { protocolVersion: 1, clientCapabilities: {} })).result);
-  const created = await request("session/new");
+  const created = await request("libfx/new");
   const sessionId = created.result.sessionId;
 
   const firstPrompt = sendPrompt(sessionId, "first low-level prompt");

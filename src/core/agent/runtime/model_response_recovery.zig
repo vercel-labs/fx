@@ -10,6 +10,9 @@ pub const FailureCause = enum {
     provider_unavailable,
     rate_limited,
     system_resumed,
+    // Control-only checkpoint causes. Neither may authorize model recovery.
+    suspended,
+    tool_state_uncertain,
     authentication,
     request_limit_reached,
     content_filter,
@@ -25,12 +28,7 @@ pub const OutputEvidence = enum {
     partial,
 };
 
-pub const ToolEvidence = enum {
-    none,
-    proven_unexecuted,
-    confirmed,
-    uncertain,
-};
+pub const ToolEvidence = @import("suspension.zig").ToolEvidence;
 
 pub const AttemptState = struct {
     consumed: usize,
@@ -110,6 +108,14 @@ pub noinline fn decide(evidence: Evidence) Decision {
     if (evidence.cancelled) return .{ .strategy = .stop };
 
     switch (evidence.cause) {
+        .suspended => return .{
+            .strategy = .pause,
+            .required_action = .continue_later,
+        },
+        .tool_state_uncertain => return .{
+            .strategy = .pause,
+            .required_action = .inspect_uncertain_tool,
+        },
         .content_filter => return .{
             .strategy = .stop,
             .required_action = .change_request,
@@ -192,6 +198,25 @@ pub fn shouldDisableFastRoute(
     replay_safe: bool,
 ) bool {
     return fast_mode and cause == .provider_unavailable and replay_safe;
+}
+
+test "suspension control causes never authorize a model recovery attempt" {
+    for ([_]FailureCause{ .suspended, .tool_state_uncertain }) |cause| {
+        for ([_]Delivery{ .definitely_unsent, .possibly_sent }) |delivery| {
+            const result = decide(.{
+                .cause = cause,
+                .delivery = delivery,
+                .attempts = .{ .consumed = 0 },
+                .output = .partial,
+                .tool = .confirmed,
+            });
+            try std.testing.expectEqual(Strategy.pause, result.strategy);
+            try std.testing.expectEqual(if (cause == .suspended) RequiredAction.continue_later else .inspect_uncertain_tool, result.required_action);
+            try std.testing.expectEqual(@as(u64, 0), result.delay_ns);
+            try std.testing.expectEqual(RetryPacingState.idle, result.next_pacing);
+            try std.testing.expect(!result.reserve_provider_attempt);
+        }
+    }
 }
 
 test "model response recovery policy is deterministic and bounded" {

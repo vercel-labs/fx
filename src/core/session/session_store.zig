@@ -701,6 +701,15 @@ pub const Store = struct {
         return loaded;
     }
 
+    pub fn startJournalSession(self: Store, alloc: Allocator, state: session_codec.DurableSessionState, options: session_log.Options) !LoadedWritableSession {
+        var root = self.canonical_root;
+        var created = try root.startConversationSession(alloc, state, options);
+        created.deinit(alloc);
+        var loaded = try self.resumeJournalForWrite(alloc, state.id, .{ .seed_preferences = state.preferences, .log = options, .execution_journal = true });
+        loaded.freshly_started = state.history.len == 0;
+        return loaded;
+    }
+
     fn startRecoveryStagedSession(
         self: Store,
         alloc: Allocator,
@@ -1156,6 +1165,41 @@ pub const Store = struct {
         );
     }
 
+    /// Acquires the journal writer for an exact session without passing through
+    /// legacy tail repair. The caller supplies a fresh shared execution State.
+    pub fn acquireJournal(
+        self: Store,
+        alloc: Allocator,
+        session_id: []const u8,
+        state: *@import("execution_journal.zig").State,
+        options: ResumeOptions,
+    ) !*@import("execution_journal_store.zig").Session {
+        var root = self.canonical_root;
+        return @import("execution_journal_store.zig").Session.acquire(
+            alloc,
+            &root,
+            session_id,
+            .{ .context = self.ctx(), .legacy_preferences = options.seed_preferences },
+            state,
+            options.log.session_lock_deadline_ms,
+            .{},
+        );
+    }
+
+    pub fn resumeJournalForWrite(self: Store, alloc: Allocator, session_id: []const u8, options: ResumeOptions) !LoadedWritableSession {
+        var execution: @import("execution_journal.zig").State = .{};
+        errdefer execution.deinit(alloc);
+        const owner = try self.acquireJournal(alloc, session_id, &execution, options);
+        var owner_owned = true;
+        errdefer if (owner_owned) owner.deinit();
+        var loaded = try session_log.openJournalWritableSession(alloc, owner, &execution);
+        owner_owned = false;
+        errdefer loaded.deinit(alloc);
+        try resolveSessionSnapshotLocators(alloc, loaded.state.history, null, self.sessions_dir, session_id);
+        try self.attachWritableChildCapability(alloc, &loaded);
+        return loaded;
+    }
+
     /// Resumes a target (a specific id, or the latest) for writing under
     /// `workspace_root`, migrating legacy storage and recovering interrupted
     /// authority transitions as needed. Caller owns the returned session.
@@ -1203,7 +1247,7 @@ pub const Store = struct {
                 io_mod.milliTimestamp(),
             );
         }
-        try self.attachWritableChildCapability(alloc, &loaded);
+        if (loaded.child_capability == null) try self.attachWritableChildCapability(alloc, &loaded);
         return loaded;
     }
 
@@ -1258,6 +1302,15 @@ pub const Store = struct {
         return loaded;
     }
 
+    /// Returns an owned native journal snapshot without acquiring a writer or
+    /// repairing storage. Legacy sessions return null.
+    pub fn loadJournalReadOnly(self: Store, alloc: Allocator, session_id: []const u8) !?@import("execution_journal_store.zig").Snapshot {
+        try validateSessionId(session_id);
+        var dir = try self.openSessionDir(session_id);
+        defer dir.close();
+        return @import("execution_journal_store.zig").inspect(alloc, &dir, session_id);
+    }
+
     /// Loads a session's full durable state read-only. Caller owns the state.
     pub fn loadReadOnly(
         self: Store,
@@ -1265,13 +1318,18 @@ pub const Store = struct {
         session_id: []const u8,
     ) !session_codec.DurableSessionState {
         var detail = try self.loadReadOnlyDetail(alloc, session_id, .{});
+        if (detail.journal) |value| if (value.pending != null) {
+            detail.deinit(alloc);
+            return error.JournalReaderRequired;
+        };
         detail.summary.deinit(alloc);
+        if (detail.journal) |*value| value.deinit(alloc);
         const state = detail.state;
         detail.state = undefined;
         return state;
     }
 
-    /// Replays complete canonical conversation turns without retaining the archive.
+    /// Replays complete canonical conversation turns.
     /// The visitor borrows each turn only for the duration of append().
     pub fn visitConversationHistory(
         self: Store,
@@ -1282,6 +1340,15 @@ pub const Store = struct {
         try validateSessionId(session_id);
         var dir = try self.openSessionDir(session_id);
         defer dir.close();
+        if (try @import("execution_journal_store.zig").inspect(alloc, &dir, session_id)) |value| {
+            var snapshot = value;
+            defer snapshot.deinit(alloc);
+            const history = try @import("../agent/runtime/journal_runtime.zig").restoreArchiveHistory(alloc, &snapshot.state);
+            defer session.freeHistoryTurnSlice(alloc, history);
+            try resolveSessionSnapshotLocators(alloc, history, null, self.sessions_dir, session_id);
+            for (history) |turn| try visitor.append(turn);
+            return;
+        }
         var buffer: [8192]u8 = undefined;
         var reader = try session_log.ConversationHistoryReader.init(alloc, &dir, &buffer);
         defer reader.deinit();
@@ -1325,8 +1392,10 @@ pub const Store = struct {
         var session_dir = self.openSessionDir(session_id) catch |err|
             return mapHistoryPageLoadError(err);
         defer session_dir.close();
-        if (session_log.hasConversationMetadata(alloc, &session_dir) catch |err|
-            return mapHistoryPageLoadError(err))
+        var native_snapshot = @import("execution_journal_store.zig").inspect(alloc, &session_dir, session_id) catch |err| return mapHistoryPageLoadError(err);
+        defer if (native_snapshot) |*snapshot| snapshot.deinit(alloc);
+        if (native_snapshot == null and (session_log.hasConversationMetadata(alloc, &session_dir) catch |err|
+            return mapHistoryPageLoadError(err)))
         {
             var candidate = classifyReadOnlyCandidate(
                 alloc,
@@ -1390,24 +1459,37 @@ pub const Store = struct {
             if (!std.mem.eql(u8, value.session_id, session_id)) return error.InvalidHistoryPageCursor;
         }
 
-        var state = self.loadReadOnly(alloc, session_id) catch |err| return mapHistoryPageLoadError(err);
+        var state = if (native_snapshot) |*snapshot|
+            session_log.projectJournalState(alloc, &snapshot.state, snapshot.metadata.value, .archive) catch |err| return mapHistoryPageLoadError(err)
+        else
+            self.loadReadOnly(alloc, session_id) catch |err| return mapHistoryPageLoadError(err);
         defer state.deinit(alloc);
+        if (native_snapshot != null) resolveSessionSnapshotLocators(alloc, state.history, null, self.sessions_dir, session_id) catch |err| return mapHistoryPageLoadError(err);
+
+        var native_turns: std.ArrayList(session.HistoryTurn) = .empty;
+        defer native_turns.deinit(alloc);
+        const history = if (native_snapshot != null) visible: {
+            for (state.history) |turn| {
+                if (turn != .compacted_summary) try native_turns.append(alloc, turn);
+            }
+            break :visible native_turns.items;
+        } else state.history;
 
         const snapshot: HistoryPageCursor = if (position) |value| blk: {
-            if (value.history_len > state.history.len)
+            if (value.history_len > history.len)
                 return error.StaleHistoryPageCursor;
-            const digest = historyPrefixDigest(state.history[0..value.history_len]) catch return error.SessionStoreUnavailable;
+            const digest = historyPrefixDigest(history[0..value.history_len]) catch return error.SessionStoreUnavailable;
             if (!std.mem.eql(u8, &value.prefix_digest, &digest)) return error.StaleHistoryPageCursor;
             break :blk value;
         } else .{
             .session_id = state.id,
-            .history_len = state.history.len,
+            .history_len = history.len,
             .revision_ms = state.updated_at_ms,
-            .prefix_digest = historyPrefixDigest(state.history) catch return error.SessionStoreUnavailable,
-            .start = state.history.len,
+            .prefix_digest = historyPrefixDigest(history) catch return error.SessionStoreUnavailable,
+            .start = history.len,
         };
-        const window = selectHistoryPageWindow(state.history.len, snapshot.start, limit);
-        const turns = try duplicateHistoryPage(alloc, state.history[window.start..window.end]);
+        const window = selectHistoryPageWindow(history.len, snapshot.start, limit);
+        const turns = try duplicateHistoryPage(alloc, history[window.start..window.end]);
         errdefer session.freeHistoryTurnSlice(alloc, turns);
         const next_cursor = if (window.start > 0) blk: {
             var encoded: [512]u8 = undefined;
@@ -1622,6 +1704,19 @@ pub const Store = struct {
         return .{
             .name = name,
             .preferences = switch (candidate.storage) {
+                .execution_journal => preferences: {
+                    var snapshot = (@import("execution_journal_store.zig").inspect(alloc, &session_dir, session_id) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.SessionMetadataUnavailable) orelse return error.SessionMetadataUnavailable;
+                    defer snapshot.deinit(alloc);
+                    const metadata = snapshot.metadata.value;
+                    const provider = model_provider.parse(metadata.provider) orelse return error.SessionMetadataUnavailable;
+                    const effort = core_types.ReasoningEffort.parse(metadata.effort) orelse return error.SessionMetadataUnavailable;
+                    break :preferences .{
+                        .provider = provider,
+                        .model = try alloc.dupe(u8, metadata.model),
+                        .effort = effort,
+                        .fast_mode = metadata.fast_mode,
+                    };
+                },
                 .conversation => self.loadConversationPreferences(
                     alloc,
                     &session_dir,
@@ -1789,6 +1884,40 @@ pub const Store = struct {
         try validateSessionId(session_id);
         var session_dir = try self.openSessionDir(session_id);
         defer session_dir.close();
+        if (try @import("execution_journal_store.zig").inspect(alloc, &session_dir, session_id)) |value| {
+            var snapshot = value;
+            defer snapshot.deinit(alloc);
+            var state = try session_log.projectJournalState(alloc, &snapshot.state, snapshot.metadata.value, .archive);
+            errdefer state.deinit(alloc);
+            state.updated_at_ms = snapshot.updated_at_ms;
+            try session_log.loadJournalControls(alloc, &session_dir, &state);
+            try resolveSessionSnapshotLocators(alloc, state.history, null, self.sessions_dir, session_id);
+            const runtime = @import("../agent/runtime/journal_runtime.zig");
+            const pending = try runtime.pendingHistory(alloc, &snapshot.state);
+            errdefer if (pending) |turn| session.freeHistoryTurn(alloc, turn);
+            if (pending) |turn| {
+                var turns = [_]session.HistoryTurn{turn};
+                try resolveSessionSnapshotLocators(alloc, &turns, null, self.sessions_dir, session_id);
+            }
+            var status: std.Io.Writer.Allocating = .init(alloc);
+            defer status.deinit();
+            try runtime.writeStatus(&status.writer, alloc, &snapshot.state);
+            var summary = try summaryFromState(alloc, state);
+            errdefer summary.deinit(alloc);
+            summary.has_checkpoint = pending != null;
+            if (snapshot.metadata.value.title) |title| {
+                const copy = try alloc.dupe(u8, title);
+                if (summary.title) |old| alloc.free(old);
+                summary.title = copy;
+                summary.display_metadata_present = true;
+            }
+            return .{
+                .summary = summary,
+                .state = state,
+                .storage_format = .execution_journal,
+                .journal = .{ .status_json = try status.toOwnedSlice(), .pending = pending },
+            };
+        }
         if (try session_log.hasConversationMetadata(alloc, &session_dir)) {
             var state = if (classify_history_errors)
                 try session_log.loadConversationDetailState(alloc, &session_dir, session_id)
@@ -2705,6 +2834,10 @@ pub const Store = struct {
         options: ResumeOptions,
     ) !LoadedWritableSession {
         try validateSessionId(session_id);
+        if (options.execution_journal) {
+            const loaded = try self.resumeJournalForWrite(alloc, session_id, options);
+            return self.finishWorkspaceResume(alloc, loaded, workspace_root, allow_rebind);
+        }
         var session_dir = try self.openSessionDir(session_id);
         if (try session_log.legacyImportRecoveryNeeded(&session_dir)) {
             session_dir.close();
@@ -2786,7 +2919,7 @@ pub const Store = struct {
     ) !LoadedWritableSession {
         var loaded = loaded_value;
         errdefer loaded.deinit(alloc);
-        try resolveSessionSnapshotLocators(
+        if (loaded.writer != .journal) try resolveSessionSnapshotLocators(
             alloc,
             loaded.state.history,
             if (loaded.state.recovery_checkpoint) |*checkpoint| checkpoint else null,
@@ -2933,6 +3066,7 @@ pub const Store = struct {
                 continue;
             }
             const child_identity = candidate.subagent_child orelse switch (candidate.storage) {
+                .execution_journal => return error.InvalidSessionFormat,
                 .legacy_v1, .legacy_v2 => false,
                 .schema_v3, .conversation => null,
             };
@@ -3023,6 +3157,17 @@ pub const Store = struct {
     ) !?WritableCandidate {
         var session_dir = try self.openSessionDir(session_id);
         defer session_dir.close();
+        if (try @import("execution_journal_store.zig").inspect(alloc, &session_dir, session_id)) |value| {
+            var snapshot = value;
+            defer snapshot.deinit(alloc);
+            if (snapshot.metadata.value.subagent_child or !std.mem.eql(u8, snapshot.metadata.value.workspace_root, workspace_root)) return null;
+            var state = try session_log.projectJournalState(alloc, &snapshot.state, snapshot.metadata.value, .archive);
+            defer state.deinit(alloc);
+            if (state.history.len == 0 and snapshot.state.pending() == .idle and !try self.sessionHasManagedChildren(alloc, session_id)) return null;
+            var candidate = try dupeWritableCandidate(alloc, session_id, workspace_root, snapshot.updated_at_ms, .execution_journal, .current);
+            candidate.subagent_child = snapshot.metadata.value.subagent_child;
+            return candidate;
+        }
         if (scan.cache.rankingGeneration(session_id)) |generation| {
             const current = catalog_cache.rankingFingerprintForOpenSession(self.canonical_root.sessions.?.dir, session_id, session_dir.dir, generation) catch null;
             if (current) |stamp| if (try scan.cache.reuseRanking(alloc, session_id, stamp)) |value| {
@@ -4213,7 +4358,9 @@ fn canonicalSnapshotLeaf(image: session.ImageAttachment, stored: []const u8) ![]
     return leaf;
 }
 
-fn resolveSessionSnapshotLocators(
+/// Mutates borrowed history only. Roots must come from the owning StoreContext;
+/// callers must not substitute a path supplied by an image or journal record.
+pub fn resolveSessionSnapshotLocators(
     alloc: Allocator,
     history: []session.HistoryTurn,
     checkpoint: ?*session_codec.RecoveryCheckpoint,
@@ -4517,6 +4664,7 @@ test "session snapshot locator resolver rejects symlink leaves and directories" 
 }
 
 pub fn isPristineStartedSession(loaded: *const LoadedWritableSession) bool {
+    if (loaded.writer == .journal and loaded.writer.journal.execution.turns.items.len != 0) return false;
     return loaded.freshly_started and
         std.mem.eql(u8, loaded.active_id, loaded.state.id) and
         std.mem.eql(u8, loaded.log.session_id, loaded.state.id) and

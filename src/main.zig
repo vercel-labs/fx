@@ -555,6 +555,7 @@ const App = struct {
     managed_executions: managed_execution.Runtime = managed_execution.Runtime.init(std.heap.c_allocator),
     legacy_process_provider: process_provider.Provider = process_provider.unavailable_provider,
     upgrader: auto_upgrade.AutoUpgrade = .{},
+    upgrade_handoff: app_upgrade_runtime.State = .{},
     change_tracker: change_tracker_mod.ChangeTracker = .{},
     mcp: app_mcp_runtime.State = .{},
     skills: skill_runtime.Runtime = .{},

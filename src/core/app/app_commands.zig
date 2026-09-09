@@ -346,6 +346,7 @@ pub fn Handlers(comptime App: type) type {
                 .reset_session = commandResetSession,
                 .resume_session = commandResumeSession,
                 .continue_recovery = commandContinueRecovery,
+                .restart_session = commandRestartSession,
                 .show_help = commandShowHelp,
                 .login = commandLogin,
                 .logout = commandLogout,
@@ -634,6 +635,15 @@ pub fn Handlers(comptime App: type) type {
                 return;
             }
             try app_session_runtime.Runtime(App).openSessionPicker(app);
+        }
+
+        fn commandRestartSession(ctx: *anyopaque) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) {
+                try app.writeDomainNotice(.{ .topic = "session", .tone = .neutral, .body = "Restart is owned by the embedding host." }, true);
+                return;
+            }
+            try @import("app_upgrade_runtime.zig").Runtime(App).requestRestart(app);
         }
 
         fn commandContinueRecovery(ctx: *anyopaque) !void {

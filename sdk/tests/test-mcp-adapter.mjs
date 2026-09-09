@@ -7,6 +7,7 @@ import { resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { createFxAgent } from "../node.js";
+import { createJournalStore } from "./fixtures/journal-store.mjs";
 import { createMcpAdapter } from "../mcp.js";
 
 const imageError = process.argv[4] === "images-error";
@@ -136,8 +137,10 @@ const gateway = createServer((request, response) => {
 await new Promise((resolveListen) => gateway.listen(0, "127.0.0.1", resolveListen));
 
 let agent;
+const journalStore = createJournalStore();
 try {
   const options = {
+    ...journalStore.options(),
     backend,
     nativeAddon: resolve(scriptDir, "../../zig-out/lib/libfx.node"),
     ...(backend === "wasm" ? { wasm: await readFile(resolve(scriptDir, "../../zig-out/bin/fx-core.wasm")) } : {}),
@@ -149,18 +152,18 @@ try {
     model: "mcp/model",
   };
   agent = await createFxAgent(options);
-  const turn = agent.prompt("use MCP");
+  const turn = agent.prompt("use MCP", { requestId: "mcp-first" });
   let text = "";
   for await (const event of turn) if (event.type === "text_delta") text += event.delta;
   assert.equal(text, "done");
-  assert.equal((await turn.result).stopReason, "end_turn");
+  assert.equal((await turn.result).stopReason, "stop");
   if (imageMode) {
     const checkpoint = await agent.checkpoint();
     await agent.close();
-    agent = await createFxAgent({ ...options, checkpoint });
-    const resumed = agent.prompt("Describe that screenshot again");
+    agent = await createFxAgent({ ...options, journal: [checkpoint] });
+    const resumed = agent.prompt("Describe that screenshot again", { requestId: "mcp-next" });
     for await (const event of resumed) {}
-    assert.equal((await resumed.result).stopReason, "end_turn");
+    assert.equal((await resumed.result).stopReason, "stop");
     assert.equal(gatewayRequests, 3);
   }
   assert.equal(toolCalls, 1, "result transfer or restore must never repeat the MCP effect");
@@ -174,4 +177,5 @@ try {
   await adapter.close().catch(() => {});
   gateway.closeAllConnections();
   await new Promise((resolveClose) => gateway.close(resolveClose));
+  journalStore.close();
 }

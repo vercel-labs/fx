@@ -1691,7 +1691,9 @@ fn clone_record(alloc: Allocator, wire: RecordWire) Allocator.Error!Record {
     };
 }
 
-fn parse_record(alloc: Allocator, bytes: []const u8) !Record {
+/// Decodes a record without opening a terminal or admitting a control claim.
+/// Caller owns the returned Record and releases it with deinit.
+pub fn parse_record(alloc: Allocator, bytes: []const u8) !Record {
     var parsed = std.json.parseFromSlice(
         RecordWire,
         alloc,

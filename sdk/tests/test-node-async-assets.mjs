@@ -2,6 +2,8 @@
 import { strict as assert } from "node:assert";
 import { createRequire } from "node:module";
 import { readFile } from "node:fs/promises";
+import { appendFileSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { createServer } from "node:http";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -41,17 +43,29 @@ watchdog.unref();
 
 async function exercise(sdk, surface, options) {
   if (surface === "agent") {
-    const agent = await sdk.createFxAgent({ ...options, apiKey: "async-asset-key", model: "async/model", fetch: modelFetch });
+    const journalDir = mkdtempSync(join(tmpdir(), "fx-async-journal-"));
+    const journalPath = join(journalDir, "entries.jsonl");
+    let agent;
     try {
-      const turn = agent.prompt("hello");
+      agent = await sdk.createFxAgent({ ...options, apiKey: "async-asset-key", model: "async/model", fetch: modelFetch,
+        journal: [], onEntry(entry) {
+          appendFileSync(journalPath, JSON.stringify({ ...entry, bytes: Buffer.from(entry.bytes).toString("base64") }) + "\n", { flush: true });
+        },
+      });
+      const turn = agent.prompt("hello", { requestId: "async-asset-request" });
       let text = "";
       for await (const event of turn) if (event.type === "text_delta") text += event.delta;
       assert.equal(text, "async asset");
-      assert.equal((await turn.result).stopReason, "end_turn");
-      assert.ok((await agent.checkpoint()).length > 48);
+      assert.equal((await turn.result).stopReason, "stop");
+      const checkpoint = await agent.checkpoint();
+      assert.equal(checkpoint.kind, "checkpoint");
+      assert.ok(checkpoint.bytes.length > 48);
+      assert.match(JSON.stringify(sdk.createProjection([checkpoint]).transcript()), /async asset/);
+      const stored = JSON.parse(readFileSync(journalPath, "utf8").trim().split("\n").at(-1));
+      assert.equal(stored.hash, checkpoint.hash);
       agentTurns++;
     }
-    finally { await agent.close(); }
+    finally { await agent?.close(); rmSync(journalDir, { recursive: true, force: true }); }
     return;
   }
   const data = new Set();

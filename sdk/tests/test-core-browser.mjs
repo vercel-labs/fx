@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { readFile, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { extname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -16,9 +17,10 @@ const chromeCandidates = [
   "chromium",
 ].filter(Boolean);
 const chromeStartTimeoutMs = 15_000;
+const chromeProfile = await mkdtemp(resolve(tmpdir(), "libfx-browser-profile-"));
 
 async function stopChrome(process) {
-  if (process.exitCode !== null || process.signalCode !== null) return;
+  if (!process.pid || process.exitCode !== null || process.signalCode !== null) return;
   process.kill();
   await new Promise((resolveExit) => process.once("exit", resolveExit));
 }
@@ -50,6 +52,7 @@ for (const candidate of chromeCandidates) {
   try {
     const args = [
       "--headless=new",
+      `--user-data-dir=${chromeProfile}`,
       "--no-first-run",
       "--no-default-browser-check",
       "--disable-background-networking",
@@ -91,6 +94,7 @@ for (const candidate of chromeCandidates) {
 }
 if (!chrome) {
   server.close();
+  await rm(chromeProfile, { recursive: true, force: true });
   console.error(`Chrome could not be started: ${chromeLaunchError?.message || "no executable found"}`);
   process.exit(2);
 }
@@ -181,12 +185,12 @@ try {
     expect(modelChunks.filter((chunk) => chunk.trim()).length >= 2, "browser stream was buffered");
     expect(result.fetchCalls === 1, `expected one prompt fetch, got ${result.fetchCalls}`);
     expect(result.model === "sdk/chrome-model", `unexpected model ${result.model}`);
-    expect(JSON.stringify(result.api) === JSON.stringify(["checkpoint", "close", "prompt"]), `unexpected public API ${JSON.stringify(result.api)}`);
+    expect(JSON.stringify(result.api) === JSON.stringify(["abandon", "checkpoint", "close", "prompt", "resume", "status", "suspend"]), `unexpected public API ${JSON.stringify(result.api)}`);
   });
   await runCase("stalled cancellation", "transport=stall&autorun=wait&cancel-after=50", (result) => {
     expect(result.stopReason === "cancelled", `unexpected stop reason ${result.stopReason}`);
     expect(result.fetchAborted, "browser fetch did not receive abort");
-    expect(JSON.stringify(result.api) === JSON.stringify(["checkpoint", "close", "prompt"]), `unexpected public API ${JSON.stringify(result.api)}`);
+    expect(JSON.stringify(result.api) === JSON.stringify(["abandon", "checkpoint", "close", "prompt", "resume", "status", "suspend"]), `unexpected public API ${JSON.stringify(result.api)}`);
   });
   await runCase("host tool and skill", "transport=mock&autorun=use%20the%20tool&host-tool=1&host-skill=1&model=sdk%2Fchrome-model", (result) => {
     expect(result.stopReason === "end_turn", `unexpected stop reason ${result.stopReason}`);
@@ -230,4 +234,5 @@ try {
   socket.close();
   await stopChrome(chrome);
   server.close();
+  await rm(chromeProfile, { recursive: true, force: true });
 }

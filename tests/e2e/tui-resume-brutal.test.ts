@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { decodeNativeJournal } from "./journal/storage";
 import { execFileSync } from "node:child_process";
 import {
   chmodSync,
@@ -254,8 +255,8 @@ async function seedRealSession(paths: Paths, config: Config): Promise<IndexedSum
     TIMEOUT * 20);
     const savedSessionsRoot = join(paths.home, ".fx", "sessions");
     await session.waitForPane(() => readdirSync(savedSessionsRoot).some((id) => {
-      const path = join(savedSessionsRoot, id, "events.jsonl");
-      return existsSync(path) && readFileSync(path, "utf8").includes('"turn_completed"');
+      const path = join(savedSessionsRoot, id, "execution.journal");
+      return existsSync(path) && decodeNativeJournal(readFileSync(path)).some(entry => entry.kind === "turn_end");
     }), TIMEOUT);
     await session.sendText("/quit");
     expect(await session.waitForSessionEnd(TIMEOUT * 2)).toBe(true);
@@ -270,9 +271,10 @@ async function seedRealSession(paths: Paths, config: Config): Promise<IndexedSum
     .filter((entry) => entry.isDirectory())
     .map((entry) => entry.name);
   expect(sessionIds).toHaveLength(1);
-  const metadata = JSON.parse(
+  const manifest = JSON.parse(
     readFileSync(join(sessionsRoot, sessionIds[0]!, "session.json"), "utf8"),
-  ) as {
+  );
+  const metadata = manifest.metadata as {
     id: string;
     created_at_ms: number;
     updated_at_ms: number;
@@ -281,24 +283,21 @@ async function seedRealSession(paths: Paths, config: Config): Promise<IndexedSum
     conversation_language: string;
     title?: string | null;
   };
-  const events = readFileSync(
-    join(sessionsRoot, sessionIds[0]!, "events.jsonl"),
-    "utf8",
-  );
+  const events = decodeNativeJournal(readFileSync(
+    join(sessionsRoot, sessionIds[0]!, "execution.journal"),
+  ));
   const updatedAtMs = Math.max(
     metadata.updated_at_ms,
-    Math.floor(statSync(join(sessionsRoot, sessionIds[0]!, "events.jsonl")).mtimeMs),
+    Math.floor(statSync(join(sessionsRoot, sessionIds[0]!, "execution.journal")).mtimeMs),
   );
   const metadataPath = join(sessionsRoot, sessionIds[0]!, "session.json");
-  writeFileSync(metadataPath, JSON.stringify({ ...metadata, title: REAL_TITLE }));
+  writeFileSync(metadataPath, JSON.stringify({ ...manifest, metadata: { ...metadata, title: REAL_TITLE } }));
   chmodSync(metadataPath, 0o600);
   return {
     ...metadata,
     updated_at_ms: updatedAtMs,
     title: REAL_TITLE,
-    history_len: events.split("\n").filter((line) =>
-      line.includes('"turn_completed"') || line.includes('"interrupted"')
-    ).length,
+    history_len: events.filter(entry => entry.kind === "turn_end").length,
     display_metadata_present: metadata.title != null,
     preview: `${REAL_TITLE}\n50K chat and large tools`,
   };

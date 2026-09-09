@@ -509,6 +509,23 @@ pub const WorkerEventBatch = struct {
     cancelled_turn_id: ?u64,
 };
 
+test "upgrade suspension fences admission without cancelling active work" {
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    worker.worker_processing = true;
+    worker.active_turn_id = 42;
+    try std.testing.expect(worker.requestUpgradeSuspension());
+    try std.testing.expect(worker.turn_start_held);
+    try std.testing.expect(worker.worker_suspend_requested.load(.seq_cst));
+    try std.testing.expect(!worker.worker_cancel_requested.load(.seq_cst));
+    try std.testing.expect(!worker.upgradeQuiescent());
+    worker.finishProcessing();
+    try std.testing.expect(worker.upgradeQuiescent());
+    worker.releaseUpgradeSuspension();
+    try std.testing.expect(!worker.turn_start_held);
+    try std.testing.expect(!worker.worker_suspend_requested.load(.seq_cst));
+}
+
 pub const WorkerRuntime = struct {
     worker_mutex: std.Io.Mutex = .init,
     worker_cond: std.Io.Condition = .init,
@@ -538,6 +555,13 @@ pub const WorkerRuntime = struct {
     /// Guarded by `worker_mutex`; explicit cancellation clears this ownership.
     steering_cancel_turn_id: ?u64 = null,
     worker_recovery_pause_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Cooperative shared-core suspension; never cancels a provider or tool.
+    worker_suspend_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Mirrored from the native storage owner. Cancelling a handoff or a turn
+    /// cannot clear it; only installing an authoritatively reopened owner can.
+    persistence_uncertain: std.atomic.Value(bool) = .init(false),
+    upgrade_turn_id: u64 = 0,
+    upgrade_terminal: ?types.TurnFinished = null,
     worker_connectivity_wait_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Set under `worker_mutex` once the active turn publishes its terminal
     /// recovery pause. The turn may still be finalizing, but cannot perform
@@ -593,6 +617,40 @@ pub const WorkerRuntime = struct {
         self.worker_stop_requested = true;
         self.worker_cond.broadcast(io_mod.getIo());
         self.worker_mutex.unlock(io_mod.getIo());
+    }
+
+    pub fn requestUpgradeSuspension(self: *WorkerRuntime) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (self.persistence_uncertain.load(.seq_cst) or self.worker_stop_requested or self.finalization_failure != null or
+            self.queuedWorkCountLocked() != 0 or self.turn_start_held or
+            self.active_context_compaction or self.pending_permission_waiting or
+            self.pending_question_shared != null or
+            (self.worker_processing and self.worker_cancel_requested.load(.seq_cst))) return false;
+        self.turn_start_held = true;
+        self.upgrade_turn_id = self.active_turn_id;
+        if (self.upgrade_terminal == null or self.upgrade_terminal.?.turn_id != self.active_turn_id)
+            self.upgrade_terminal = null;
+        self.worker_suspend_requested.store(true, .seq_cst);
+        return true;
+    }
+
+    pub fn releaseUpgradeSuspension(self: *WorkerRuntime) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.worker_suspend_requested.store(false, .seq_cst);
+        self.turn_start_held = false;
+        self.worker_cond.broadcast(io_mod.getIo());
+    }
+
+    /// Processing clears after the turn's deferred cleanup. UI events must also
+    /// drain before the host can persist the handoff under storage ownership.
+    pub fn upgradeQuiescent(self: *WorkerRuntime) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        return !self.worker_processing and self.worker_events.items.len == 0 and
+            self.queuedWorkCountLocked() == 0 and !self.pending_permission_waiting and
+            self.pending_question_shared == null and self.finalization_failure == null;
     }
 
     pub fn requestShutdown(self: *WorkerRuntime) void {
@@ -748,7 +806,10 @@ pub const WorkerRuntime = struct {
                 self.recovery_continuation_ready = false;
             },
             .tool_lifecycle => |lifecycle| switch (lifecycle) {
-                .turn_finished => self.worker_connectivity_wait_active.store(false, .seq_cst),
+                .turn_finished => |finished| {
+                    self.worker_connectivity_wait_active.store(false, .seq_cst);
+                    self.upgrade_terminal = finished;
+                },
                 .provisional, .authoritative_started, .progress, .terminal => return,
             },
             else => return,
@@ -824,7 +885,8 @@ pub const WorkerRuntime = struct {
         defer self.worker_mutex.unlock(io_mod.getIo());
         if (self.finalization_failure != null) return error.TurnFinalizationDeliveryFailed;
         if (self.worker_stop_requested) return error.WorkerStopped;
-        if (self.worker_processing or self.queued_prompts.items.len > 0 or
+        if (self.persistence_uncertain.load(.seq_cst)) return error.SessionRecoveryUncertain;
+        if (self.worker_processing or self.turn_start_held or self.queued_prompts.items.len > 0 or
             self.queued_context_compaction != null)
         {
             return error.WorkerBusy;
@@ -899,6 +961,8 @@ pub const WorkerRuntime = struct {
         defer self.worker_mutex.unlock(io_mod.getIo());
         if (self.finalization_failure != null) return error.TurnFinalizationDeliveryFailed;
         if (self.worker_stop_requested) return error.WorkerStopped;
+        if (self.persistence_uncertain.load(.seq_cst)) return error.SessionRecoveryUncertain;
+        if (self.worker_suspend_requested.load(.seq_cst)) return error.UpgradeSuspensionPending;
         if (queued.recovery_checkpoint != null and
             !recoveryContinuationAdmission(
                 self.worker_processing,
@@ -1109,7 +1173,7 @@ pub const WorkerRuntime = struct {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
 
-        while ((self.queued_prompts.items.len == 0 or self.turn_start_held) and
+        while ((self.queued_prompts.items.len == 0 or self.turn_start_held or self.persistence_uncertain.load(.seq_cst)) and
             !self.worker_stop_requested)
         {
             self.worker_processing = false;
@@ -1125,7 +1189,7 @@ pub const WorkerRuntime = struct {
         defer self.worker_mutex.unlock(io_mod.getIo());
 
         while (((self.queued_prompts.items.len == 0 and
-            self.queued_context_compaction == null) or self.turn_start_held) and
+            self.queued_context_compaction == null) or self.turn_start_held or self.persistence_uncertain.load(.seq_cst)) and
             !self.worker_stop_requested)
         {
             self.worker_processing = false;
@@ -1163,7 +1227,7 @@ pub const WorkerRuntime = struct {
     }
 
     fn takeNextWorkLocked(self: *WorkerRuntime, alloc: std.mem.Allocator) !?WorkItem {
-        if (self.worker_stop_requested) return null;
+        if (self.worker_stop_requested or self.persistence_uncertain.load(.seq_cst)) return null;
         if (self.queued_context_compaction) |task| {
             self.queued_context_compaction = null;
             self.worker_cancel_requested.store(false, .seq_cst);
@@ -1188,7 +1252,7 @@ pub const WorkerRuntime = struct {
     }
 
     fn takeNextPromptLocked(self: *WorkerRuntime, alloc: std.mem.Allocator) !?QueuedPrompt {
-        if (self.worker_stop_requested or self.queued_prompts.items.len == 0) return null;
+        if (self.worker_stop_requested or self.persistence_uncertain.load(.seq_cst) or self.queued_prompts.items.len == 0) return null;
 
         const queued = self.queued_prompts.items[0];
         const transfer_history = self.queued_prompts.items.len == 1;
@@ -1289,7 +1353,7 @@ pub const WorkerRuntime = struct {
     pub fn beginDirectProcessing(self: *WorkerRuntime, turn_id: u64) bool {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
-        if (self.worker_processing or self.worker_stop_requested) return false;
+        if (self.worker_processing or self.worker_stop_requested or self.persistence_uncertain.load(.seq_cst)) return false;
         self.worker_cancel_requested.store(false, .seq_cst);
         self.worker_recovery_pause_requested.store(false, .seq_cst);
         self.worker_connectivity_wait_active.store(false, .seq_cst);
@@ -1947,6 +2011,9 @@ pub const WorkerRuntime = struct {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         std.debug.assert(self.active_prompt_snapshot_ownership == ownership);
+        // A lost checkpoint acknowledgement may already reference these files.
+        // Keep them until a new storage owner can authoritatively recover.
+        if (self.persistence_uncertain.load(.seq_cst)) _ = ownership.preserve();
         self.active_prompt_snapshot_ownership = null;
         ownership.deinit();
     }

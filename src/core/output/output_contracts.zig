@@ -1133,7 +1133,7 @@ pub const SessionDetailSnapshot = struct {
         try out.writer.print("language: {s}\n", .{state.conversation_language.view()});
         try out.writer.print("history_len: {d}\n", .{state.history.len});
 
-        if (state.history.len == 0) {
+        if (state.history.len == 0 and (self.detail.journal == null or self.detail.journal.?.pending == null)) {
             try out.writer.writeAll("\n(no history yet)\n");
             return try out.toOwnedSlice();
         }
@@ -1142,6 +1142,11 @@ pub const SessionDetailSnapshot = struct {
             try out.writer.print("\n[turn {d}]\n", .{i + 1});
             try writeSessionHistoryTurnText(&out.writer, turn);
         }
+
+        if (self.detail.journal) |journal| if (journal.pending) |pending| {
+            try out.writer.writeAll("\n[unfinished turn]\n");
+            try writeSessionHistoryTurnText(&out.writer, pending);
+        };
 
         return try out.toOwnedSlice();
     }
@@ -1163,7 +1168,14 @@ pub const SessionDetailSnapshot = struct {
             try writeSessionHistoryTurnJson(&out.writer, turn);
         }
 
-        try out.writer.writeAll("]}");
+        try out.writer.writeByte(']');
+        if (self.detail.journal) |journal| {
+            try out.writer.writeAll(",\"journal\":");
+            try out.writer.writeAll(journal.status_json);
+            try out.writer.writeAll(",\"pending_turn\":");
+            if (journal.pending) |pending| try writeSessionHistoryTurnJson(&out.writer, pending) else try out.writer.writeAll("null");
+        }
+        try out.writer.writeByte('}');
         return try out.toOwnedSlice();
     }
 };

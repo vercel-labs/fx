@@ -165,6 +165,14 @@ jobs:
       - name: Test native addon
         run: npm run --prefix sdk test:node-napi
 
+      - name: Test native journal recovery
+        env:
+          FX_JOURNAL_BACKENDS: native
+        run: |
+          node --test sdk/tests/journal/runtime.test.mjs sdk/tests/test-journal-bridge.mjs sdk/tests/test-transcript.mjs
+          node sdk/tests/test-journal-recovery.mjs native
+          node sdk/tests/test-journal-capacity.mjs native
+
       - name: Name native addon for package discovery
         shell: bash
         run: |
@@ -283,7 +291,7 @@ jobs:
             const names = new Set(report.files.map(({ path }) => path));
             const required = [
               "package.json", "README.md", "LICENSE", "browser.js", "node.js", "node.cjs", "fx-sdk.js", "wasm-module.js",
-              "core-output.js", "mcp.js", "skills.js", "skills-node.js",
+              "core-output.js", "journal-codec.js", "transcript.js", "transcript.cjs", "mcp.js", "skills.js", "skills-node.js",
               "fx-core.wasm", "fx-term.wasm",
               "libfx.linux-x64.node", "libfx.linux-arm64.node",
               "libfx.darwin-x64.node", "libfx.darwin-arm64.node",
@@ -295,10 +303,26 @@ jobs:
             console.log(`validated ${report.name}@${report.version}: ${report.files.length} files, ${report.size} bytes packed`);
           '
 
+      - name: Test Wasm journal recovery
+        env:
+          FX_JOURNAL_BACKENDS: wasm
+        run: |
+          node --experimental-wasm-jspi --test sdk/tests/journal/runtime.test.mjs sdk/tests/test-journal-bridge.mjs sdk/tests/test-transcript.mjs
+          node sdk/tests/test-journal-recovery.mjs wasm
+          node --experimental-wasm-jspi sdk/tests/test-journal-capacity.mjs wasm
+
       - name: Test installed package and diagnostics
         run: |
+          node sdk/tests/test-journal-recovery.mjs native wasm
+          node sdk/tests/test-journal-recovery.mjs wasm native
           node --experimental-wasm-jspi sdk/tests/test-node-bundled-assets.mjs
           node --experimental-wasm-jspi sdk/tests/test-node-async-assets.mjs sdk/dist/libfx
+          node --experimental-wasm-jspi sdk/tests/test-journal-large-result.mjs sdk/dist/libfx esm
+          node --experimental-wasm-jspi --no-experimental-require-module sdk/tests/test-journal-large-result.mjs sdk/dist/libfx cjs
+          node --experimental-wasm-jspi sdk/tests/test-journal-compaction.mjs native wasm sdk/dist/libfx esm
+          node --experimental-wasm-jspi --no-experimental-require-module sdk/tests/test-journal-compaction.mjs wasm native sdk/dist/libfx cjs
+          node --experimental-wasm-jspi sdk/tests/test-journal-large-input.mjs native wasm sdk/dist/libfx esm
+          node --experimental-wasm-jspi --no-experimental-require-module sdk/tests/test-journal-large-input.mjs wasm native sdk/dist/libfx cjs
           node sdk/tests/test-packed-example.mjs libfx-package.tgz native esm
           node --no-experimental-require-module sdk/tests/test-packed-example.mjs libfx-package.tgz native cjs
           node --experimental-wasm-jspi sdk/tests/test-packed-example.mjs libfx-package.tgz wasm esm

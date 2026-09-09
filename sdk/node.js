@@ -18,6 +18,10 @@ import {
 } from "./fx-sdk.js";
 
 export { encodeXtermKeyEvent, fxSdkApiVersion, listModels, supportsJspi, xtermAdapter };
+export {
+  createProjection, readCheckpoint, JournalConflict, PersistenceUncertain,
+  PendingTurnError, RequestConflict, RecoveryRequired, JournalCapacityExceeded,
+} from "./fx-sdk.js";
 export const libfxApiVersion = 2;
 const nativeCoreApiVersion = 3;
 

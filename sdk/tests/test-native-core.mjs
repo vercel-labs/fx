@@ -14,9 +14,9 @@ const agent = await createFxAgent({
   apiKey: "native-core-test-key",
   onEvent(event) { events.push(event); },
 });
-assert.deepEqual(Object.keys(agent).sort(), ["checkpoint", "close", "prompt"]);
-assert.ok((await agent.checkpoint()).length > 0);
+assert.deepEqual(Object.keys(agent).sort(), ["abandon", "checkpoint", "close", "prompt", "resume", "status", "suspend"]);
+await assert.rejects(agent.checkpoint(), /journal.*onEntry/);
 assert.equal(await agent.close(), undefined);
 assert.ok(events.some((event) => event.type === "runtime.ready"));
 assert.ok(events.some((event) => event.type === "acp.receive"));
-console.log("native core passed: minimal agent initialization, checkpoint, and graceful close");
+console.log("native core passed: minimal initialization, explicit persistence requirement, and graceful close");

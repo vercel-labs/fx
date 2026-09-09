@@ -42,13 +42,7 @@ const PreToolUseCheckpoint = struct {
     call: ToolCall,
 };
 
-pub const PreparedToolBlockKind = enum {
-    malformed_arguments,
-    lifecycle_block,
-    lifecycle_failed_closed,
-    route_unavailable,
-    required_vision,
-};
+pub const PreparedToolBlockKind = @import("tool_contracts.zig").PreparedToolBlockKind;
 
 pub const PreparedToolCall = union(enum) {
     provider_executed: ToolCall,

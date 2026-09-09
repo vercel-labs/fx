@@ -9,6 +9,17 @@ pub const ApplyOutcome = enum {
     not_ready,
     unavailable,
     relaunch_requested,
+    suspension_requested,
+};
+
+const restart_handoff = @import("../session/restart_handoff.zig");
+pub const RelaunchReason = restart_handoff.Reason;
+
+pub const State = struct {
+    pending: bool = false,
+    reason: RelaunchReason = .upgrade,
+    /// Set only after a durable handoff has been validated and consumed.
+    continuation: ?restart_handoff.Boundary = null,
 };
 
 const CurrentExecutablePathFn = *const fn (
@@ -27,9 +38,33 @@ pub fn Runtime(comptime App: type) type {
             _ = try applyReadyUpgradeWithDeps(app, .{});
         }
 
-        pub fn collectUpgradeFacts(app: *App) void {
-            if (!autoUpgradeEnabled(app)) return;
+        pub fn requestRestart(app: *App) !void {
+            _ = try requestRestartWithDeps(app, .{});
+        }
 
+        pub fn requestRestartWithDeps(app: *App, deps: Deps) !ApplyOutcome {
+            return requestRelaunchWithDeps(app, deps, .restart);
+        }
+
+        pub fn collectUpgradeFacts(app: *App) void {
+            if (comptime @hasField(App, "upgrade_handoff")) {
+                if (app.upgrade_handoff.pending and !boundaryPending(app)) {
+                    _ = requestRelaunchWithDeps(app, .{}, app.upgrade_handoff.reason) catch {
+                        app.upgrade_handoff = .{};
+                        app.worker.releaseUpgradeSuspension();
+                    };
+                }
+            }
+            if (comptime @hasField(App, "upgrade_handoff")) {
+                if (app.upgrade_handoff.continuation != null) {
+                    _ = @import("app_session_runtime.zig").Runtime(App).continuePlannedUpgrade(app) catch |err| {
+                        const body = std.fmt.allocPrint(app.alloc, "automatic continuation paused: {s}; use /continue after reviewing the saved session", .{@errorName(err)}) catch return;
+                        defer app.alloc.free(body);
+                        app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = body }, true) catch {};
+                    };
+                }
+            }
+            if (!autoUpgradeEnabled(app)) return;
             if (comptime @hasField(App, "upgrader")) {
                 if (comptime @hasDecl(@TypeOf(app.upgrader), "takeRenderDirty")) {
                     if (app.upgrader.takeRenderDirty()) requestFooterRender(app);
@@ -41,28 +76,76 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             deps: Deps,
         ) !ApplyOutcome {
+            return requestRelaunchWithDeps(app, deps, .upgrade);
+        }
+
+        fn requestRelaunchWithDeps(app: *App, deps: Deps, requested_reason: RelaunchReason) !ApplyOutcome {
+            const reason = if (comptime @hasField(App, "upgrade_handoff"))
+                if (app.upgrade_handoff.pending) app.upgrade_handoff.reason else requested_reason
+            else
+                requested_reason;
             if (upgradeUnavailableNotice(app)) |notice| {
+                if (comptime @hasField(App, "upgrade_handoff")) {
+                    if (app.upgrade_handoff.pending) {
+                        app.upgrade_handoff = .{};
+                        app.worker.releaseUpgradeSuspension();
+                    }
+                }
                 try writeUpgradeNotice(app, .neutral, notice);
                 return .unavailable;
             }
 
-            if (!autoUpgradeEnabled(app)) {
+            if (reason == .upgrade and !autoUpgradeEnabled(app)) {
                 try writeUpgradeNotice(app, .neutral, "auto-upgrade is disabled");
                 return .not_ready;
             }
 
             if (comptime @hasField(App, "upgrader")) {
-                if (app.upgrader.getState() != auto_upgrade.State.ready) {
+                if (reason == .upgrade and app.upgrader.getState() != auto_upgrade.State.ready) {
                     try writeUpgradeNotice(app, .neutral, "no installed upgrade is ready");
                     return .not_ready;
                 }
             }
 
+            if (comptime @hasField(App, "upgrade_handoff")) {
+                if (!app.upgrade_handoff.pending) {
+                    if (comptime @hasField(App, "session_persistence")) {
+                        if (app.session_persistence.writable == null) {
+                            try writeUpgradeNotice(app, .neutral, "upgrade requires a saved session; --no-save cannot hand off a response");
+                            return .unavailable;
+                        }
+                    }
+                    if (!app.worker.requestUpgradeSuspension()) {
+                        try writeUpgradeNotice(app, .neutral, "upgrade is unavailable while work admission or cleanup is pending");
+                        return .unavailable;
+                    }
+                    app.upgrade_handoff = .{ .pending = true, .reason = reason };
+                }
+                if (boundaryPending(app)) {
+                    try app.writeDomainNotice(.{
+                        .topic = if (reason == .restart) "session" else "upgrade",
+                        .tone = .neutral,
+                        .body = if (reason == .restart)
+                            "restart requested; waiting for a safe response boundary"
+                        else
+                            "upgrade requested; waiting for a safe response boundary",
+                    }, true);
+                    requestFooterRender(app);
+                    return .suspension_requested;
+                }
+            }
+            var relaunch_requested = false;
+            defer if (!relaunch_requested) {
+                if (comptime @hasField(App, "upgrade_handoff")) {
+                    app.upgrade_handoff = .{};
+                    app.worker.releaseUpgradeSuspension();
+                }
+            };
             app.prepareResumeHandoffForUpgrade() catch |err| {
                 const notice = try std.fmt.allocPrint(
                     app.alloc,
-                    "upgrade paused because this conversation is not safely resumable: {s}; run `fx doctor` for recovery guidance",
-                    .{@errorName(err)},
+                    "{s} paused because this conversation is not safely resumable: {s}; run `fx doctor` for recovery guidance",
+                    .{ @tagName(reason), @errorName(err) },
                 );
                 defer app.alloc.free(notice);
                 try writeUpgradeNotice(app, .@"error", notice);
@@ -76,7 +159,7 @@ pub fn Runtime(comptime App: type) type {
             ) catch |err| {
                 const notice = try std.fmt.allocPrint(
                     app.alloc,
-                    "upgrade installed, but the executable path could not be resolved: {s}; restart fx manually",
+                    "relaunch executable path could not be resolved: {s}; restart fx manually",
                     .{@errorName(err)},
                 );
                 defer app.alloc.free(notice);
@@ -87,7 +170,7 @@ pub fn Runtime(comptime App: type) type {
             app.requestUpgradeRelaunch(executable_path) catch |err| {
                 const notice = try std.fmt.allocPrint(
                     app.alloc,
-                    "upgrade installed, but relaunch could not be prepared: {s}; restart fx manually",
+                    "relaunch could not be prepared: {s}; restart fx manually",
                     .{@errorName(err)},
                 );
                 defer app.alloc.free(notice);
@@ -95,12 +178,26 @@ pub fn Runtime(comptime App: type) type {
                 return .unavailable;
             };
             app.requestResumeHandoffForUpgrade();
+            relaunch_requested = true;
             if (comptime @hasField(App, "should_exit")) app.should_exit = true;
             return .relaunch_requested;
         }
 
+        fn boundaryPending(app: *App) bool {
+            if (app.stream.active or !app.worker.upgradeQuiescent()) return true;
+            if (comptime @hasField(App, "pacer")) {
+                if (app.pacer.deferred_turn != null or app.pacer.hasPending()) return true;
+            }
+            return false;
+        }
+
         fn upgradeUnavailableNotice(app: *App) ?[]const u8 {
-            if (comptime @hasField(App, "stream")) {
+            if (comptime @hasField(@TypeOf(app.worker), "persistence_uncertain")) {
+                if (app.worker.persistence_uncertain.load(.seq_cst))
+                    return "session persistence is uncertain; close and reopen this exact session before continuing; no work was retried";
+            }
+            // Hosts without the shared suspension wiring retain the stream guard.
+            if (comptime @hasField(App, "stream") and !@hasField(App, "upgrade_handoff")) {
                 if (app.stream.active) return "upgrade is unavailable until the response finishes";
             }
             if (comptime @hasField(App, "worker")) {
@@ -109,6 +206,10 @@ pub fn Runtime(comptime App: type) type {
                         return "upgrade is unavailable while prompts are queued";
                     }
                 }
+            }
+            if (comptime @hasField(App, "submission")) {
+                if (app.submission.pending != null or app.submission.compaction_pending)
+                    return "upgrade is unavailable while prompt admission is pending";
             }
             if (comptime @hasField(App, "question_prompt")) {
                 if (app.question_prompt.isActive()) return "upgrade is unavailable while a question is open";

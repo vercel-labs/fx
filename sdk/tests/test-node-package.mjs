@@ -35,6 +35,8 @@ try {
   assert.deepEqual(manifest.exports["./node"], { import: "./node.js", require: "./node.cjs" });
   assert.equal(manifest.exports["./browser"], "./browser.js");
   assert.equal(manifest.exports["./wasm"], "./fx-sdk.js");
+  assert.deepEqual(manifest.exports["./transcript"], { import: "./transcript.js", require: "./transcript.cjs" });
+  for (const name of ["journal-codec.js", "transcript.js", "transcript.cjs"]) assert.ok((await readFile(join(packageDir, name))).length);
   assert.equal(manifest.exports["./mcp"], "./mcp.js");
   assert.equal(manifest.exports["./skills"], "./skills.js");
   assert.equal(manifest.exports["./skills/node"], "./skills-node.js");
@@ -56,6 +58,8 @@ try {
   await writeFile(join(consumerDir, "esm.mjs"), `
     import * as libfx from "libfx";
     import * as nodeEntry from "libfx/node";
+    import { appendFileSync, readFileSync } from "node:fs";
+    import { createProjection } from "libfx/transcript";
     const { createFxAgent, createFxTerminal, getBackendInfo } = libfx;
     if (JSON.stringify(Object.keys(libfx).sort()) !== JSON.stringify(Object.keys(nodeEntry).sort())) {
       throw new Error("root and Node subpath ESM exports differ");
@@ -64,15 +68,25 @@ try {
     if (typeof createFxAgent !== "function" || typeof createFxTerminal !== "function" || info.backend !== "native") {
       throw new Error(JSON.stringify(info));
     }
-    const agent = await createFxAgent({ backend: "native", apiKey: "package-test-key" });
+    const agent = await createFxAgent({ backend: "native", apiKey: "package-test-key", journal: [],
+      onEntry(entry) { appendFileSync("esm-journal.jsonl", JSON.stringify({ ...entry, bytes: Buffer.from(entry.bytes).toString("base64") }) + "\\n", { flush: true }); },
+    });
     const checkpoint = await agent.checkpoint();
     await agent.close();
-    if (!(checkpoint instanceof Uint8Array) || checkpoint.length === 0) throw new Error("empty checkpoint");
+    if (!(checkpoint.bytes instanceof Uint8Array) || checkpoint.bytes.length === 0 || checkpoint.kind !== "checkpoint") throw new Error("empty checkpoint");
+    const saved = JSON.parse(readFileSync("esm-journal.jsonl", "utf8"));
+    if (saved.hash !== checkpoint.hash || saved.bytes !== Buffer.from(checkpoint.bytes).toString("base64")) throw new Error("checkpoint was not acknowledged");
+    if (createProjection([checkpoint]).transcript().messages.length !== 0) throw new Error("fresh checkpoint has history");
+    for (const name of ["createProjection", "readCheckpoint", "JournalConflict", "PersistenceUncertain", "PendingTurnError", "RequestConflict", "RecoveryRequired"]) {
+      if (typeof libfx[name] !== "function") throw new Error("missing journal export: " + name);
+    }
     console.log(JSON.stringify(Object.keys(libfx).sort()));
   `);
   await writeFile(join(consumerDir, "cjs.cjs"), `
     const libfx = require("libfx");
     const nodeEntry = require("libfx/node");
+    const transcript = require("libfx/transcript");
+    const { appendFileSync, readFileSync } = require("node:fs");
     const { createFxAgent, createFxTerminal, getBackendInfo } = libfx;
     (async () => {
       if (JSON.stringify(Object.keys(libfx).sort()) !== JSON.stringify(Object.keys(nodeEntry).sort())) {
@@ -82,10 +96,17 @@ try {
       if (typeof createFxAgent !== "function" || typeof createFxTerminal !== "function" || info.backend !== "native") {
         throw new Error(JSON.stringify(info));
       }
-      const agent = await createFxAgent({ backend: "native", apiKey: "package-test-key" });
+      const agent = await createFxAgent({ backend: "native", apiKey: "package-test-key", journal: [],
+        onEntry(entry) { appendFileSync("cjs-journal.jsonl", JSON.stringify({ ...entry, bytes: Buffer.from(entry.bytes).toString("base64") }) + "\\n", { flush: true }); },
+      });
       const checkpoint = await agent.checkpoint();
       await agent.close();
-      if (!(checkpoint instanceof Uint8Array) || checkpoint.length === 0) throw new Error("empty checkpoint");
+      if (!(checkpoint.bytes instanceof Uint8Array) || checkpoint.bytes.length === 0 || checkpoint.kind !== "checkpoint") throw new Error("empty checkpoint");
+      const saved = JSON.parse(readFileSync("cjs-journal.jsonl", "utf8"));
+      if (saved.hash !== checkpoint.hash || saved.bytes !== Buffer.from(checkpoint.bytes).toString("base64")) throw new Error("checkpoint was not acknowledged");
+      if (libfx.createProjection([checkpoint]).transcript().messages.length !== 0) throw new Error("fresh checkpoint has history");
+      if (transcript.createProjection([checkpoint]).transcript().messages.length !== 0) throw new Error("CommonJS transcript subpath lost checkpoint behavior");
+      if (JSON.stringify(transcript.readCheckpoint(checkpoint.bytes)) !== JSON.stringify(libfx.readCheckpoint(checkpoint.bytes))) throw new Error("CommonJS transcript projection differs from root");
       console.log(JSON.stringify(Object.keys(libfx).sort()));
     })();
   `);

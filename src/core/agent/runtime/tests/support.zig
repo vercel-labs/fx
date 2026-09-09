@@ -212,6 +212,7 @@ pub const FakeCompletion = struct {
     billing: ?types.ProviderBilling = null,
     exact_usage_provider: ?model_provider.ProviderId = null,
     delivery_ambiguous: bool = false,
+    suspend_before_output: bool = false,
     pause_before_output: bool = false,
     cancel_before_output: bool = false,
     cancel_after_chunks: bool = false,
@@ -227,6 +228,7 @@ pub const FakeGateway = struct {
     request_api_keys: std.ArrayList([]u8) = .empty,
     request_session_ids: std.ArrayList(?[]u8) = .empty,
     admitted_requests: usize = 0,
+    suspend_flag: ?*std.atomic.Value(bool) = null,
     recovery_pause_flag: ?*std.atomic.Value(bool) = null,
     observe_request: ?*const fn (agent_stream_provider.ModelRequest) anyerror!void = null,
 
@@ -287,6 +289,10 @@ pub const FakeGateway = struct {
             return err;
         }
 
+        if (completion.suspend_before_output) {
+            if (self.suspend_flag) |flag| flag.store(true, .seq_cst);
+            try std.testing.expect(!request.cancel_flag.load(.seq_cst));
+        }
         if (completion.pause_before_output) {
             if (self.recovery_pause_flag) |flag| flag.store(true, .seq_cst);
             request.cancel_flag.store(true, .seq_cst);
@@ -664,6 +670,10 @@ pub const FakeAgentRuntimeDeps = struct {
     recovery_checkpoint_error: ?anyerror = null,
     recovery_checkpoint_error_at: ?usize = null,
     recovery_checkpoint_calls: usize = 0,
+    recovery_checkpoint_lose_pause_ack: bool = false,
+    recovery_checkpoint_pause_error: ?anyerror = null,
+    observe_recovery_checkpoint: ?*const fn (*FakeAgentRuntimeDeps, session_codec.RecoveryCheckpoint) anyerror!void = null,
+    suspend_on_execute: ?*std.atomic.Value(bool) = null,
     cancel_on_recovery_reservation: ?*std.atomic.Value(bool) = null,
     pause_on_auto_retry_status: bool = false,
     recovery_pause_flag: ?*std.atomic.Value(bool) = null,
@@ -812,6 +822,10 @@ pub const FakeAgentRuntimeDeps = struct {
     ) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         self.recovery_checkpoint_calls += 1;
+        if (self.observe_recovery_checkpoint) |observe| try observe(self, checkpoint);
+        if (checkpoint.action == .paused) {
+            if (self.recovery_checkpoint_pause_error) |err| return err;
+        }
         if (self.recovery_checkpoint_error) |err| {
             if (self.recovery_checkpoint_error_at == null or
                 self.recovery_checkpoint_error_at.? == self.recovery_checkpoint_calls)
@@ -823,6 +837,9 @@ pub const FakeAgentRuntimeDeps = struct {
             self.alloc,
             try checkpoint.dupe(self.alloc),
         );
+        if (self.recovery_checkpoint_lose_pause_ack and checkpoint.action == .paused) {
+            return error.TestDurableAckLost;
+        }
         if (checkpoint.outstanding_reservation) {
             if (self.cancel_on_recovery_reservation) |cancel_flag| {
                 cancel_flag.store(true, .seq_cst);
@@ -1389,6 +1406,7 @@ pub const FakeAgentRuntimeDeps = struct {
         if (self.tool_execution_override) |override| {
             return override.execute_fn(override.context, request);
         }
+        if (self.suspend_on_execute) |flag| flag.store(true, .seq_cst);
         const execute_delegate = self.execute_delegate;
         const call = request.call;
         var plan: FakeExecPlan = undefined;

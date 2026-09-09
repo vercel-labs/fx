@@ -1,3 +1,4 @@
+import { decodeNativeJournal } from "./journal/storage";
 import { afterEach, expect, test } from "bun:test";
 import { spawn as nodeSpawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -4762,7 +4763,7 @@ test("native reasoning snapshots survive tools and saved resume exactly once", a
       expect(result.output).toBe("REASONING_SNAPSHOT_OK");
       expect(first.stderr).toMatch(/^(?:● Reading\x1b\[0m\n)?Reading notes\.txt\n$/);
       expect(direct.bodies).toHaveLength(2);
-      const saved = readFileSync(join(profile, ".fx", "sessions", result.session_id, "events.jsonl"), "utf8");
+      const saved = readFileSync(join(profile, ".fx", "sessions", result.session_id, "execution.journal"), "utf8");
       expect(saved).toContain(signature);
       const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", result.session_id, "Continue without tools."], { cwd: profile, env, timeoutMs: TIMEOUT });
       expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
@@ -6481,9 +6482,9 @@ tmuxTest(
     expect(JSON.parse(gateway.requests[2].body).tools ?? []).toHaveLength(0);
     const sessionIds = readdirSync(join(home, ".fx", "sessions")).filter((id) => existsSync(join(home!, ".fx", "sessions", id, "session.json")));
     expect(sessionIds).toHaveLength(1);
-    const historyPath = join(home, ".fx", "sessions", sessionIds[0], "events.jsonl");
-    const records = readFileSync(historyPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
-    expect(records.filter((record) => record.event.context_checkpoint)).toHaveLength(1);
+    const historyPath = join(home, ".fx", "sessions", sessionIds[0], "execution.journal");
+    const records = decodeNativeJournal(readFileSync(historyPath)).map(entry => JSON.parse(Buffer.from(entry.bytes).toString("utf8")));
+    expect(records.filter(record => record.kind === "model_step" && record.phase === "context" && record.summary?.kind === "compacted_summary")).toHaveLength(1);
     await session.sendKeys("C-u");
     await session.sendText("Continue after the manual compaction.");
     await session.waitForText("COMPACT_AUTH_CONTINUED", TIMEOUT);
@@ -6524,8 +6525,8 @@ for (const outcome of ["failure", "cancel"] as const) {
     await session.waitForText("AUTH_BOUNDARY_SECOND_REPLY", TIMEOUT);
     const sessionIds = readdirSync(join(home, ".fx", "sessions")).filter((id) => existsSync(join(home!, ".fx", "sessions", id, "session.json")));
     expect(sessionIds).toHaveLength(1);
-    const historyPath = join(home, ".fx", "sessions", sessionIds[0], "events.jsonl");
-    const before = readFileSync(historyPath, "utf8");
+    const historyPath = join(home, ".fx", "sessions", sessionIds[0], "execution.journal");
+    const before = readFileSync(historyPath);
     expect(gateway.requests).toHaveLength(2);
     expect(gateway.requests[0].headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
     expect(oauth.requests.filter((request) => request.path === "/oauth/token")).toHaveLength(0);
@@ -6544,7 +6545,7 @@ for (const outcome of ["failure", "cancel"] as const) {
       expect(scrollback).not.toContain("Your prompt is saved.");
     }
     expect(await session.captureFullScrollback()).toContain("DRAFT_DURING_AUTH_BOUNDARY");
-    expect(readFileSync(historyPath, "utf8")).toBe(before);
+    expect(readFileSync(historyPath)).toEqual(before);
     expect(gateway.requests).toHaveLength(2);
     await session.sendKeys("C-u");
     await selectEnvKeyCredential(session);
@@ -6553,7 +6554,8 @@ for (const outcome of ["failure", "cancel"] as const) {
     await session.waitForText("AUTH_BOUNDARY_RECOVERED", TIMEOUT);
     expect(gateway.requests).toHaveLength(3);
     expect(gateway.requests[2].headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
-    expect(readFileSync(historyPath, "utf8")).not.toContain('"context_checkpoint"');
+    expect(decodeNativeJournal(readFileSync(historyPath)).map(entry => JSON.parse(Buffer.from(entry.bytes).toString("utf8")))
+      .filter(record => record.kind === "model_step" && record.phase === "context" && record.summary?.kind === "compacted_summary")).toHaveLength(0);
     await session.sendText("/quit");
     await session.waitForSessionEnd(TIMEOUT);
     expect(readFileSync(stderrPath, "utf8")).toBe("");

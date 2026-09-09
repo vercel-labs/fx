@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { decodeNativeJournal } from "./journal/storage";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
@@ -282,6 +283,11 @@ async function waitForPersistedSessionMarker(
     return readdirSync(sessionsDir, { withFileTypes: true })
       .filter((entry) => entry.name !== "latest" && entry.isDirectory())
       .some((entry) => {
+        const journalPath = join(sessionsDir, entry.name, "execution.journal");
+        if (existsSync(journalPath)) {
+          return decodeNativeJournal(readFileSync(journalPath)).some(record =>
+            record.kind === "turn_end" && Buffer.from(record.bytes).toString("utf8").includes(marker));
+        }
         const eventsPath = join(sessionsDir, entry.name, "events.jsonl");
         return existsSync(eventsPath) &&
           readFileSync(eventsPath, "utf8").includes(marker);
@@ -306,8 +312,8 @@ test.skipIf(!tmuxAvailable())("suspended sessions retain exclusive writer owners
     const seeded = await runFx(["ask", "--json", "Remember the original turn."], { cwd: workspace, env, timeoutMs: TIMEOUT });
     expect(seeded.code).toBe(0);
     const id = JSON.parse(seeded.stdout).session_id;
-    const events = join(home, ".fx", "sessions", id, "events.jsonl");
-    const accepted = readFileSync(events);
+    const journal = join(home, ".fx", "sessions", id, "execution.journal");
+    const accepted = readFileSync(journal);
     tui = await TmuxSession.create({
       cmd: "/bin/sh -i", cwd: workspace, isolated: true, remainOnExit: true, width: 110, height: 36,
       env: { ...env, PS1: "SESSION_SHELL> " },
@@ -324,14 +330,14 @@ test.skipIf(!tmuxAvailable())("suspended sessions retain exclusive writer owners
     expect(other.code).toBe(1);
     expect(JSON.parse(other.stdout).error).toBe("SessionBusy");
     expect(gateway.requests).toHaveLength(1);
-    expect(readFileSync(events)).toEqual(accepted);
+    expect(readFileSync(journal)).toEqual(accepted);
     await tui.sendText(`fg; printf '%s' "$?" > ${shellQuote(exitPath)}`);
     await tui.waitForPane(pane => (pane.split("\n").filter(line => /^\s*┃/.test(line)).at(-1) ?? "").includes("DRAFT_SURVIVES_SUSPENSION"), TIMEOUT);
     await tui.sendKeys("Enter");
     await tui.waitForText("AFTER_FOREGROUND_TURN", TIMEOUT);
     await tui.waitForStableComposer(TIMEOUT);
     expect(gateway.requests.at(-1)?.body).toContain("DRAFT_SURVIVES_SUSPENSION");
-    expect(readFileSync(events).subarray(0, accepted.length).equals(accepted)).toBe(true);
+    expect(readFileSync(journal).subarray(0, accepted.length).equals(accepted)).toBe(true);
     expect(await tui.captureFullScrollback()).not.toContain("InvalidTranscriptTransition");
     await tui.sendText("/quit");
     await tui.waitForPane(() => existsSync(exitPath), TIMEOUT);
@@ -365,6 +371,17 @@ async function waitForSessionPickerClosed(session: TmuxSession): Promise<string>
       const plain = stripAnsi(pane);
       return hasEmptyComposer(plain) &&
         !plain.includes("Sessions");
+    },
+    TIMEOUT,
+  );
+}
+
+async function waitForSessionPickerEntries(session: TmuxSession): Promise<string> {
+  await waitForSessionPicker(session);
+  return session.waitForPane(
+    (pane) => {
+      const plain = stripAnsi(pane);
+      return /\bSessions [1-9]\d*\b/.test(plain) && !plain.includes("Loading sessions");
     },
     TIMEOUT,
   );
@@ -838,7 +855,7 @@ test.skipIf(!tmuxAvailable())(
         await active.waitForComposer(TIMEOUT);
         if (mode === "picker") {
           await active.sendText("/resume");
-          await waitForSessionPicker(active);
+          await waitForSessionPickerEntries(active);
           await active.sendKeys("Enter");
         }
         const resumed = await waitForScrollback(active, "RECENT_VISIBLE_REPLY");
@@ -865,9 +882,10 @@ test.skipIf(!tmuxAvailable())(
         expect(gateway.requests).toHaveLength(index + 1);
         expect(gateway.requests[index]!.body).toContain("INTERNAL_SUMMARY_ONLY");
         expect(gateway.requests[index]!.body).toContain("INTERNAL_CALL_506");
-        const events = readFileSync(join(sessionDir, "events.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
-        expect(events.filter((event) => event.event.context_checkpoint).map((event) => event.event.context_checkpoint.summary)).toEqual([summary]);
-        expect(JSON.parse(readFileSync(join(sessionDir, "session.json"), "utf8")).schema_version).toBe(4);
+        const entries = decodeNativeJournal(readFileSync(join(sessionDir, "execution.journal")));
+        const base = JSON.parse(Buffer.from(entries[0]!.bytes).toString("utf8")).nativeBase;
+        expect(JSON.parse(base.contextJson).history.filter((turn: { kind: string }) => turn.kind === "compacted_summary").map((turn: { summary: string }) => turn.summary)).toEqual([summary]);
+        expect(JSON.parse(readFileSync(join(sessionDir, "session.json"), "utf8")).schema_version).toBe(5);
         const replay = await runFx(["replay", tapePath, "--frames"], { cwd: workspace, env: { HOME: home } });
         expect(replay.code).toBe(0);
         expect(replay.stderr).toBe("");
@@ -3257,7 +3275,7 @@ test.skipIf(!tmuxAvailable())(
             previousEnd = start + text.length;
           }
           const events = readFileSync(
-            join(home, ".fx", "sessions", sessionIdFromHome(home), "events.jsonl"), "utf8",
+            join(home, ".fx", "sessions", sessionIdFromHome(home), "execution.journal"), "utf8",
           );
           expect(events).toContain("ROW28 ALPHA28_abcdefghijklmnopqrstuvwxyz0123456789");
 
@@ -4659,7 +4677,7 @@ test.skipIf(!tmuxAvailable())(
 
       await seedTransientDraft("STALE_SESSION_DRAFT_RESUME");
       await active.sendText("/resume");
-      await waitForSessionPicker(active);
+      await waitForSessionPickerEntries(active);
       await active.sendKeys("Enter");
       await waitForSessionPickerClosed(active);
       await proveReset("SESSION_INPUT_RESET_RESUME_OK", 2);
@@ -5547,7 +5565,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendHexBytes(["1b", "5b", "31", "31", "34", "3b", "39", "75"]);
-      await waitForSessionPicker(active);
+      await waitForSessionPickerEntries(active);
       await active.sendKeys("Enter");
       const pickerResumed = await waitForScrollback(active, flagFollowUp);
       expectCompactQuestion(pickerResumed);
@@ -5651,7 +5669,7 @@ test.skipIf(!tmuxAvailable())(
 
       const sessionId = sessionIdFromHome(home);
       const eventsJsonl = readFileSync(
-        join(home, ".fx", "sessions", sessionId, "events.jsonl"),
+        join(home, ".fx", "sessions", sessionId, "execution.journal"),
         "utf8",
       );
       expect(eventsJsonl).toContain("committed_file_presentation");
@@ -5887,7 +5905,7 @@ printf '${stdoutTail2}\\n'
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("/resume");
-      await waitForSessionPicker(active);
+      await waitForSessionPickerEntries(active);
       await active.sendKeys("Enter");
       await active.waitForPane((pane) => pane.includes("Ran ./resume-command-output.sh"), TIMEOUT);
       const pickerResumed = await active.capturePane();
@@ -5979,7 +5997,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("/resume");
-      await waitForSessionPicker(active);
+      await waitForSessionPickerEntries(active);
       const currentPicker = stripAnsi(await active.capturePane());
       expect(currentPicker).toContain("Sessions 1");
       expect(currentPicker).toContain("[Current workspace]");
@@ -6094,7 +6112,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("/resume");
-      const pane = stripAnsi(await waitForSessionPicker(active));
+      const pane = stripAnsi(await waitForSessionPickerEntries(active));
       expect(pane).toContain("Sessions 3");
       for (const suffix of ["alpha", "beta", "gamma"]) {
         expect(pane).toContain(suffix);
@@ -6178,7 +6196,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendHexBytes(["1b", "5b", "31", "31", "34", "3b", "39", "75"]);
-      await waitForSessionPicker(active);
+      await waitForSessionPickerEntries(active);
 
       let sessionEntries = visibleSessionPickerEntries(await active.capturePaneEscapes());
       expect(sessionEntries).toHaveLength(2);
@@ -6886,7 +6904,7 @@ test.skipIf(!tmuxAvailable())(
       expect(seed.code).toBe(0);
       const id = JSON.parse(seed.stdout).session_id;
       const sessions = join(home, ".fx", "sessions");
-      const eventsPath = join(sessions, id, "events.jsonl");
+      const eventsPath = join(sessions, id, "execution.journal");
       const before = readFileSync(eventsPath);
       const metadata = JSON.parse(readFileSync(join(sessions, id, "session.json"), "utf8"));
       const remnants: Array<[string, string]> = [];
@@ -6910,8 +6928,8 @@ test.skipIf(!tmuxAvailable())(
         await active.waitForStableComposer(TIMEOUT);
         await active.sendText("Continue the saved conversation without tools.");
         await active.waitForPane((pane) => pane.includes(reply) && hasEmptyComposer(pane), TIMEOUT);
-        const events = readFileSync(eventsPath, "utf8").trim().split("\n").map((line) => JSON.parse(line).event);
-        expect(events.filter((event) => event.assistant?.text === reply)).toHaveLength(1);
+        const events = decodeNativeJournal(readFileSync(eventsPath)).map(entry => JSON.parse(Buffer.from(entry.bytes).toString("utf8")));
+        expect(events.filter((event) => event.kind === "model_step" && event.completion?.content === reply)).toHaveLength(1);
         expect(readFileSync(eventsPath).subarray(0, before.length).equals(before)).toBe(true);
         expect(await active.captureFullScrollback()).not.toContain("FileNotFound");
         await active.sendText("/quit");
@@ -7112,7 +7130,7 @@ for (const inspectDetails of [false, true]) {
         await prompt("Read missing.txt once without retrying.");
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         const sessionId = sessionIdFromHome(home);
-        const eventsPath = join(home, ".fx", "sessions", sessionId, "events.jsonl");
+        const eventsPath = join(home, ".fx", "sessions", sessionId, "execution.journal");
         await active.kill();
         active = await TmuxSession.create({ cmd: `${FX_BIN} --resume-last`, cwd: workspace, env, stderrPath, isolated: true, remainOnExit: true, width: 88, height: 24 });
         await active.waitForComposer(TIMEOUT);
@@ -7137,11 +7155,11 @@ for (const inspectDetails of [false, true]) {
         expect(readFileSync(join(workspace, "receipt.txt"), "utf8")).toBe("RECEIVED\n");
         expect(readFileSync(join(workspace, "second.txt"), "utf8")).toBe("AFTER\n");
         expect(readFileSync(join(workspace, "ledger.txt"), "utf8")).toBe(ledger);
-        const events = readFileSync(eventsPath, "utf8").trim().split("\n").map(line => JSON.parse(line).event);
-        expect(events.filter(event => event.tool_result?.call_id === "write-second")).toHaveLength(1);
-        expect(events.find(event => event.tool_result?.call_id === "write-receipt").tool_result.committed_file_presentation.lifecycle_id)
+        const events = decodeNativeJournal(readFileSync(eventsPath)).map(entry => JSON.parse(Buffer.from(entry.bytes).toString("utf8")));
+        expect(events.filter(event => event.kind === "tool_result" && event.persisted.tool_call_id === "write-second")).toHaveLength(1);
+        expect(events.find(event => event.kind === "tool_result" && event.persisted.tool_call_id === "write-receipt").persisted.committed_file_presentation.lifecycle_id)
           .toEqual({ turn_id: 2, call_id: "write-receipt" });
-        expect(events.some(event => event.assistant?.text === savedReply)).toBe(true);
+        expect(events.some(event => event.kind === "model_step" && event.completion?.content === savedReply)).toBe(true);
         expect(gateway.requests).toHaveLength(9);
         expect(active.isPaneAlive()).toBe(true);
         expect(readFileSync(stderrPath, "utf8")).toBe("");

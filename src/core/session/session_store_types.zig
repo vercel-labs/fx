@@ -15,6 +15,7 @@ pub const automatic_legacy_max_bytes: u64 = 256 * 1024 * 1024;
 
 /// On-disk storage format a readable session was found in.
 pub const StorageFormat = enum {
+    execution_journal,
     conversation,
     schema_v3,
     legacy_v1,
@@ -24,6 +25,7 @@ pub const StorageFormat = enum {
 /// Storage format of a discovery candidate (kept distinct from `StorageFormat`
 /// so discovery and read APIs can evolve independently).
 pub const CandidateStorage = enum {
+    execution_journal,
     conversation,
     schema_v3,
     legacy_v1,
@@ -130,6 +132,7 @@ pub const ResumeTarget = union(enum) {
 /// Options controlling a resume. `log` is threaded into the canonical log layer;
 /// `seed_preferences` overrides the merged-config preferences on migration.
 pub const ResumeOptions = struct {
+    execution_journal: bool = false,
     allow_large_legacy: bool = false,
     seed_preferences: ?session_codec.DurableSessionPreferences = null,
     log: session_log.Options = .{},
@@ -145,14 +148,27 @@ pub const MigrationOptions = struct {
 /// A read-only load of a session: its summary, full durable state, and the
 /// format it was stored in. Owns both nested values.
 pub const ReadOnlyDetail = struct {
+    pub const Journal = struct {
+        status_json: []u8,
+        pending: ?session.HistoryTurn,
+
+        pub fn deinit(self: *Journal, alloc: Allocator) void {
+            alloc.free(self.status_json);
+            if (self.pending) |turn| session.freeHistoryTurn(alloc, turn);
+            self.* = undefined;
+        }
+    };
+
     summary: SessionSummary,
     state: session_codec.DurableSessionState,
     storage_format: StorageFormat,
+    journal: ?Journal = null,
 
     /// Frees the owned summary and state and poisons the value.
     pub fn deinit(self: *ReadOnlyDetail, alloc: Allocator) void {
         self.summary.deinit(alloc);
         self.state.deinit(alloc);
+        if (self.journal) |*value| value.deinit(alloc);
         self.* = undefined;
     }
 };

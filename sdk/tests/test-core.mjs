@@ -46,7 +46,7 @@ const agent = await createFxAgent({
   apiKey: "sdk-test-key",
   model: "sdk/core-model",
 });
-assert.deepEqual(Object.keys(agent).sort(), ["checkpoint", "close", "prompt"]);
+assert.deepEqual(Object.keys(agent).sort(), ["abandon", "checkpoint", "close", "prompt", "resume", "status", "suspend"]);
 
 const turn = agent.prompt([
   { type: "text", text: "say hello" },
@@ -65,6 +65,6 @@ assert.equal(fetchCalls, 1);
 assert.ok(requestedSessionId);
 assert.equal(requestedAuthorization, "Bearer sdk-test-key");
 assert.equal(requestedModel, "sdk/core-model");
-assert.ok((await agent.checkpoint()).length > 48);
+await assert.rejects(agent.checkpoint(), /journal.*onEntry/);
 assert.equal(await agent.close(), undefined);
 console.log("core SDK passed: minimal prompt, stream, usage, checkpoint, and close");

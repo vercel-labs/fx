@@ -559,7 +559,8 @@ pub fn freeTransientPersistedToolResult(
     }
 }
 
-fn appendPersistedPermissionFeedback(
+/// Appends an owned, redacted copy to the result's existing feedback.
+pub fn appendPersistedPermissionFeedback(
     alloc: Allocator,
     result: *types.PersistedToolResult,
     text: []const u8,

@@ -31,6 +31,8 @@ const files = [
   ["sdk/fx-sdk.js", "fx-sdk.js"],
   ["sdk/wasm-module.js", "wasm-module.js"],
   ["sdk/core-output.js", "core-output.js"],
+  ["sdk/journal-codec.js", "journal-codec.js"],
+  ["sdk/transcript.js", "transcript.js"],
   ["sdk/mcp.js", "mcp.js"],
   ["sdk/skills.js", "skills.js"],
   ["sdk/skills-node.js", "skills-node.js"],
@@ -79,6 +81,7 @@ await writeFile(resolve(outputDir, "package.json"), `${JSON.stringify(manifest, 
 
 console.log(`packaged ${manifest.name} in ${outputDir}`);
 console.log("  node.cjs");
+console.log("  transcript.cjs");
 for (const [, destination] of files) console.log(`  ${destination}`);
 for (const addon of nativeAddons) {
   console.log(`  ${requestedNativeAddons.length ? basename(addon) : localNativeName}`);

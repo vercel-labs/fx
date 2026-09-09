@@ -7,6 +7,7 @@ const execution_memory = @import("execution_memory.zig");
 const lifecycle_runtime = @import("lifecycle.zig");
 const telemetry = @import("telemetry.zig");
 const worker_runtime = @import("../worker_runtime.zig");
+const execution_journal = @import("../../session/execution_journal.zig");
 
 const Allocator = std.mem.Allocator;
 const AgentRuntimeDeps = deps_mod.AgentRuntimeDeps;
@@ -108,8 +109,9 @@ pub const TurnFinalizationGuard = struct {
         self: *TurnFinalizationGuard,
         outcome: types.TurnPresentationOutcome,
         disposition: ?types.ProviderCompletionDisposition,
-        finished_prompt: ?types.FinishedPrompt,
+        incoming_finished: ?types.FinishedPrompt,
     ) !void {
+        var finished_prompt = incoming_finished;
         if (self.state != .open) {
             if (finished_prompt) |finished| {
                 types.freeFinishedPrompt(std.heap.c_allocator, finished);
@@ -123,6 +125,43 @@ pub const TurnFinalizationGuard = struct {
         }
 
         self.cleanup_agent_terminal_leases();
+
+        if (self.deps.journal) |journal| {
+            if (outcome != .paused) {
+                if (finished_prompt) |*finished| {
+                    if (journal.work_id) |id| {
+                        @import("../../session/session.zig").copyWorkIdToTurn(std.heap.c_allocator, &finished.turn, id) catch |err| {
+                            self.state = .fatal;
+                            types.freeFinishedPrompt(std.heap.c_allocator, finished.*);
+                            return err;
+                        };
+                    }
+                    const index = journal.turn orelse {
+                        self.state = .fatal;
+                        types.freeFinishedPrompt(std.heap.c_allocator, finished.*);
+                        return error.InvalidJournalTransition;
+                    };
+                    finished.journal_turn = .{
+                        .namespace_hash = execution_journal.inputHash(try execution_journal.string(journal.state.start(index), "namespace")),
+                        .turn_index = index,
+                    };
+                }
+                finishJournal(journal, outcome, disposition, if (finished_prompt) |finished| finished.turn else null) catch |err| {
+                    self.state = .fatal;
+                    if (finished_prompt) |finished| types.freeFinishedPrompt(std.heap.c_allocator, finished);
+                    return err;
+                };
+                if (finished_prompt) |finished| {
+                    self.deps.propagate_history_turn(self.deps.ctx, finished.turn) catch |err| {
+                        debug_trace.logf("agent", "journal terminal cache update failed turn_id={d} seq={d} err={s}", .{ self.turn_id, journal.state.last_seq, @errorName(err) });
+                        journal.state.block();
+                        self.state = .fatal;
+                        types.freeFinishedPrompt(std.heap.c_allocator, finished);
+                        return err;
+                    };
+                }
+            }
+        }
 
         self.deps.finalize_turn(self.deps.ctx, self.turn_id, outcome, disposition) catch |err| {
             self.state = .fatal;
@@ -147,6 +186,53 @@ pub const TurnFinalizationGuard = struct {
         }
     }
 };
+
+fn finishJournal(journal: *@import("journal_runtime.zig").Runtime, outcome: types.TurnPresentationOutcome, disposition: ?types.ProviderCompletionDisposition, history: ?HistoryTurn) !void {
+    var arena: std.heap.ArenaAllocator = .init(journal.alloc);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var writer: std.Io.Writer.Allocating = .init(alloc);
+    const position = journal.state.pending();
+    if (outcome == .completed) {
+        var usage: types.Usage = .{};
+        for (0..journal.state.stepCount(journal.turn.?)) |step| {
+            const completion = try execution_journal.object(journal.state.modelStep(journal.turn.?, step), "completion");
+            const parsed = try std.json.parseFromValue(types.Usage, alloc, try execution_journal.object(completion, "usage"), .{});
+            inline for (@typeInfo(types.Usage).@"struct".fields) |field| {
+                if (@field(parsed.value, field.name)) |count| @field(usage, field.name) = try std.math.add(u64, @field(usage, field.name) orelse 0, count);
+            }
+        }
+        try std.json.Stringify.value(.{
+            .ok = true,
+            .stopReason = if (journal.state.canFinishToolLoop(journal.turn.?) and !journal.state.canFinishProviderResponse(journal.turn.?))
+                "tool_limit"
+            else if (disposition == .length_limited)
+                "length"
+            else
+                "stop",
+            .usage = usage,
+        }, .{}, &writer.writer);
+    } else {
+        try writer.writer.writeAll("{\"ok\":false,\"reason\":");
+        try std.json.Stringify.value(if (outcome == .interrupted) "cancelled" else "provider_error", .{}, &writer.writer);
+        try writer.writer.writeAll(",\"retryable\":false,\"message\":");
+        try std.json.Stringify.value(if (outcome == .interrupted) "The turn was cancelled." else "The turn could not complete.", .{}, &writer.writer);
+        if (position == .tool) {
+            const selected = position.tool;
+            const call = (try execution_journal.array(journal.state.modelStep(selected.turn, selected.step), "calls"))[selected.call];
+            const input = try std.json.parseFromSlice(std.json.Value, alloc, try execution_journal.string(call, "argumentsJson"), .{});
+            try writer.writer.writeAll(",\"pendingTool\":");
+            try std.json.Stringify.value(.{
+                .callId = try execution_journal.string(call, "callId"),
+                .name = try execution_journal.string(call, "name"),
+                .input = input.value,
+            }, .{}, &writer.writer);
+        }
+        try writer.writer.writeByte('}');
+    }
+    const result = try std.json.parseFromSlice(std.json.Value, alloc, writer.written(), .{});
+    try journal.finish(result.value, history);
+}
 
 pub const TerminalText = struct {
     history: []const u8,
@@ -202,9 +288,11 @@ pub fn finishAssistantTerminalWithExecution(
     );
 
     var propagation_error: ?anyerror = null;
-    deps.propagate_history_turn(deps.ctx, turn) catch |err| {
-        propagation_error = err;
-    };
+    if (deps.journal == null) {
+        deps.propagate_history_turn(deps.ctx, turn) catch |err| {
+            propagation_error = err;
+        };
+    }
     try finalization.finish(outcome, disposition, finished);
     finish_trace.finish(trace_outcome);
     if (propagation_error) |err| return err;

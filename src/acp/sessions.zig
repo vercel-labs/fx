@@ -7,6 +7,8 @@ const acp_types = @import("types.zig");
 const mcp_servers = @import("mcp_servers.zig");
 const server = @import("server.zig");
 const session_codec = @import("../core/session/session_codec.zig");
+const journal_runtime = @import("../core/agent/runtime/journal_runtime.zig");
+const execution_journal = @import("../core/session/execution_journal.zig");
 const session_display_metadata = @import("../core/session/session_display_metadata.zig");
 const session_store = @import("../core/session/session_store.zig");
 const legacy_background_migration = @import("../core/session/legacy_background_migration.zig");
@@ -230,7 +232,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
 
     var initial = try freshAcpState(state, alloc);
     defer initial.deinit(alloc);
-    var writable = store.startWritableSessionWithOptions(
+    var writable = store.startJournalSession(
         alloc,
         initial,
         .{},
@@ -609,6 +611,7 @@ fn handleRestoreSession(
         .{
             .seed_preferences = seed_preferences,
             .log = .{},
+            .execution_journal = true,
         },
     ) catch |err| return handleLoadFailure(state, alloc, msg, err);
     var writable_owned = true;
@@ -799,30 +802,69 @@ fn sendPendingRecoveryUpdate(
     session_id: []const u8,
     checkpoint: ?session_codec.RecoveryCheckpoint,
 ) !void {
+    if (state.active_session) |*active| if (active.writable) |*writable| if (writable.journalState()) |records| {
+        const pending = (try journal_runtime.pendingHistory(alloc, records)) orelse return;
+        defer types.freeHistoryTurn(alloc, pending);
+        var history = [_]types.HistoryTurn{pending};
+        try session_store.resolveSessionSnapshotLocators(alloc, &history, null, active.store.?.sessions_dir, session_id);
+        const turn = history[0].interrupted;
+        try sendUserHistoryTurn(state, alloc, session_id, turn.user);
+        try sendExecutionHistory(state, alloc, session_id, turn.execution);
+        if (turn.assistant) |text| if (text.len > 0) try sendAgentHistoryChunk(state, alloc, session_id, text);
+        const pending_index = switch (records.pending()) {
+            .idle => unreachable,
+            .model, .ending => |index| index,
+            .tool => |position| position.turn,
+        };
+        if (records.latestContextRecord(pending_index)) |record| {
+            const context = try execution_journal.object(record, "executionContext");
+            var metadata = try journal_runtime.parseRecoveryMetadata(alloc, context);
+            defer metadata.deinit(alloc);
+            if (metadata.assistant_source.len > 0 and !std.mem.eql(u8, metadata.assistant_source, turn.assistant orelse "")) {
+                try sendAgentHistoryChunk(state, alloc, session_id, metadata.assistant_source);
+            }
+        }
+        const uncertain = records.pending() == .tool;
+        return sendRecoveryInfo(state, alloc, session_id, .{
+            .kind = if (uncertain) .tool_state_uncertain else .suspended,
+            .cause = if (uncertain) .tool_state_uncertain else .suspended,
+            .action = .paused,
+            .required_action = if (uncertain) .inspect_uncertain_tool else .continue_later,
+        });
+    };
     const recovery = checkpoint orelse return;
     try sendUserHistoryTurn(state, alloc, session_id, recovery.user);
     try sendExecutionHistory(state, alloc, session_id, recovery.execution);
     if (recovery.assistant_source.len > 0) {
         try sendAgentHistoryChunk(state, alloc, session_id, recovery.assistant_source);
     }
+    const control_only = recovery.cause == .suspended or recovery.cause == .tool_state_uncertain;
     const attempt = recovery.consumed_provider_attempts +| @intFromBool(recovery.outstanding_reservation);
+    try sendRecoveryInfo(state, alloc, session_id, .{
+        .kind = switch (recovery.cause) {
+            .suspended => .suspended,
+            .tool_state_uncertain => .tool_state_uncertain,
+            else => .terminal_provider_error,
+        },
+        .failed_attempt = if (control_only) 0 else attempt,
+        .attempt_limit = if (control_only) 0 else recovery.max_provider_attempts,
+        .cause = recovery.cause,
+        .action = .paused,
+        .required_action = if (recovery.tool_state == .uncertain or recovery.cause == .tool_state_uncertain)
+            .inspect_uncertain_tool
+        else
+            .continue_later,
+        .diagnostic = if (control_only) null else types.ModelFailureDiagnostic.forCause(recovery.cause),
+    });
+}
+
+fn sendRecoveryInfo(state: *server.ServerState, alloc: Allocator, session_id: []const u8, status: types.RouteRecoveryStatus) !void {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"sessionId\":");
     try writeJsonStr(session_id, &out.writer);
     try out.writer.writeAll(",\"update\":");
-    try acp_types.writeModelRecoveryInfoUpdate(&out.writer, .{
-        .kind = .terminal_provider_error,
-        .failed_attempt = attempt,
-        .attempt_limit = recovery.max_provider_attempts,
-        .cause = recovery.cause,
-        .action = .paused,
-        .required_action = if (recovery.tool_state == .uncertain)
-            .inspect_uncertain_tool
-        else
-            .continue_later,
-        .diagnostic = types.ModelFailureDiagnostic.forCause(recovery.cause),
-    }, true);
+    try acp_types.writeModelRecoveryInfoUpdate(&out.writer, status, true);
     try out.writer.writeByte('}');
     try state.writer.writeNotification(
         alloc,
@@ -2056,6 +2098,24 @@ test "ACP new and loaded sessions provide a writable subagent host" {
         try std.testing.expect(state.subagent_store != null);
         try std.testing.expect(state.subagent_host != null);
 
+        var journal: journal_runtime.Runtime = .{
+            .state = new_writable.journalState().?,
+            .sink = new_writable.journalSink().?,
+            .alloc = arena,
+            .namespace = new_active.session_id,
+            .creation_id = "seed",
+            .request_id = "seed",
+        };
+        _ = try journal.begin(.{ .text = @constCast("remember this") }, new_active.model, 1, false);
+        var generation = try journal.generation();
+        defer generation.deinit(arena);
+        _ = try journal.recordDecision(.{ .content = "retained answer" }, &.{}, &.{}, generation, true, null, null);
+        var result = try std.json.parseFromSlice(std.json.Value, arena, "{\"ok\":true,\"stopReason\":\"stop\"}", .{});
+        defer result.deinit();
+        try journal.finish(result.value, .{ .assistant = .{
+            .user = .{ .text = @constCast("remember this") },
+            .assistant = @constCast("retained answer"),
+        } });
         _ = try new_writable.appendEvent(arena, .{ .history_turn_committed = .{
             .conversation_language = .literal("en"),
             .total_input_tokens = 0,

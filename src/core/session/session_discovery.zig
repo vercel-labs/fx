@@ -286,6 +286,24 @@ fn classifyReadOnlyCandidateWithCancellation(
     if (cancelled) |stop| {
         if (stop.load(.acquire)) return error.Cancelled;
     }
+    if (try @import("execution_journal_store.zig").inspect(alloc, session_dir, session_id)) |value| {
+        var snapshot = value;
+        defer snapshot.deinit(alloc);
+        var state = try session_log.projectJournalState(alloc, &snapshot.state, snapshot.metadata.value, .archive);
+        defer state.deinit(alloc);
+        state.updated_at_ms = snapshot.updated_at_ms;
+        var summary = try summaryFromState(alloc, state);
+        errdefer summary.deinit(alloc);
+        summary.has_checkpoint = snapshot.state.pending() != .idle;
+        if (snapshot.metadata.value.title) |title| {
+            const copy = try alloc.dupe(u8, title);
+            if (summary.title) |old| alloc.free(old);
+            summary.title = copy;
+            summary.display_metadata_present = true;
+        }
+        if (cancelled) |stop| if (stop.load(.acquire)) return error.Cancelled;
+        return .{ .summary = summary, .storage = .execution_journal, .projection_state = .current, .subagent_child = state.subagent_child };
+    }
     if (try session_log.readConversationMetadata(alloc, session_dir)) |value| {
         var metadata = value;
         defer metadata.deinit();

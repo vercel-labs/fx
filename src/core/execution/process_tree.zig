@@ -289,6 +289,14 @@ pub const Tracker = struct {
         comptime Effects: type,
     ) DeliverySummary {
         var summary: DeliverySummary = .{};
+        if (signal == std.posix.SIG.KILL) {
+            // A shell can continue after its waiting child dies. Stop the tree
+            // before killing children so forced cleanup cannot advance that shell.
+            var stopped: DeliverySummary = .{};
+            if (self.root) |root| self.signalTrackedProcessWith(root, .STOP, preserved_group, &stopped, Effects);
+            for (self.processes.items) |process| self.signalTrackedProcessWith(process, .STOP, preserved_group, &stopped, Effects);
+            summary.incomplete = stopped.incomplete;
+        }
         var index = self.processes.items.len;
         while (index > 0) {
             index -= 1;
@@ -719,6 +727,45 @@ test "macOS lineage identity matches only the same unique process" {
         .{ .linux_start_ticks = 42 },
         42,
     ));
+}
+
+test "forced tree cleanup stops every tracked process before killing children" {
+    const Event = struct { pid: std.posix.pid_t, signal: std.posix.SIG };
+    const Effects = struct {
+        var events: [6]Event = undefined;
+        var count: usize = 0;
+
+        fn capture(_: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
+            return .{ .identity = .{ .linux_start_ticks = @intCast(pid) }, .parent_pid = 1 };
+        }
+
+        fn processGroup(_: std.posix.pid_t) ProcessGroupState {
+            return .{ .found = 100 };
+        }
+
+        fn send(pid: std.posix.pid_t, signal: std.posix.SIG) std.posix.KillError!void {
+            if (count == events.len) return error.PermissionDenied;
+            events[count] = .{ .pid = pid, .signal = signal };
+            count += 1;
+        }
+    };
+    Effects.count = 0;
+    var tracker = Tracker{
+        .alloc = std.testing.allocator,
+        .root = .{ .pid = 10, .identity = .{ .linux_start_ticks = 10 } },
+    };
+    defer tracker.deinit();
+    for ([_]std.posix.pid_t{ 20, 30 }) |pid| {
+        try tracker.processes.append(std.testing.allocator, .{ .pid = pid, .identity = .{ .linux_start_ticks = @intCast(pid) } });
+    }
+    const result = tracker.signalProcessesWith(std.posix.SIG.KILL, null, Effects);
+    try std.testing.expectEqual(@as(usize, 3), result.delivered);
+    try std.testing.expect(!result.incomplete);
+    const expected = [_]Event{
+        .{ .pid = 10, .signal = .STOP }, .{ .pid = 20, .signal = .STOP }, .{ .pid = 30, .signal = .STOP },
+        .{ .pid = 30, .signal = .KILL }, .{ .pid = 20, .signal = .KILL }, .{ .pid = 10, .signal = .KILL },
+    };
+    try std.testing.expectEqualSlices(Event, &expected, Effects.events[0..Effects.count]);
 }
 
 test "checked signal delivery distinguishes vanished stale and failed targets" {

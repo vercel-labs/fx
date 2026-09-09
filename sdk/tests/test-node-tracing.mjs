@@ -19,6 +19,7 @@ async function exercise(sdk) {
   const { strict: assert } = await import("node:assert");
   const { createServer } = await import("node:http");
   const { mkdir } = await import("node:fs/promises");
+  const { appendFileSync, readFileSync } = await import("node:fs");
   const { resolve } = await import("node:path");
   const home = resolve("profile");
   await mkdir(home, { recursive: true });
@@ -46,6 +47,10 @@ async function exercise(sdk) {
       const agent = await sdk.createFxAgent({
         backend, home, workspaceRoot: process.cwd(), apiKey: "trace-key", model: "trace/model",
         gatewayChatUrl: `${origin}/chat`,
+        journal: [],
+        onEntry(entry) {
+          appendFileSync(`${backend}-journal.jsonl`, JSON.stringify({ ...entry, bytes: Buffer.from(entry.bytes).toString("base64") }) + "\n", { flush: true });
+        },
         fetch(input, init) {
           const url = init?.method === "GET" ? `${origin}/models` : String(input);
           assert.equal(new URL(url).origin, origin);
@@ -53,13 +58,18 @@ async function exercise(sdk) {
         },
       });
       try {
-        const turn = agent.prompt("hello");
+        const turn = agent.prompt("hello", { requestId: `trace-${backend}` });
         let text = "";
         for await (const event of turn) if (event.type === "text_delta") text += event.delta;
         assert.equal(text, "traced");
-        assert.equal((await turn.result).stopReason, "end_turn");
-        const checkpointBytes = (await agent.checkpoint()).length;
+        assert.equal((await turn.result).stopReason, "stop");
+        const checkpoint = await agent.checkpoint();
+        assert.equal(checkpoint.kind, "checkpoint");
+        const checkpointBytes = checkpoint.bytes.length;
         assert.ok(checkpointBytes > 48);
+        assert.match(JSON.stringify(sdk.createProjection([checkpoint]).transcript()), /traced/);
+        const stored = JSON.parse(readFileSync(`${backend}-journal.jsonl`, "utf8").trim().split("\n").at(-1));
+        assert.equal(stored.hash, checkpoint.hash);
         results.push({ backend, checkpointBytes });
       } finally { await agent.close(); }
     }

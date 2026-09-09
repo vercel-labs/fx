@@ -171,6 +171,26 @@ pub fn loadSchemaV3ReadOnly(
     session_dir: *io_mod.VerifiedDir,
     session_id: []const u8,
 ) !SchemaV3Import {
+    return loadSchemaV3ReadOnlyWithPendingPolicy(alloc, session_dir, session_id, .archive_legacy);
+}
+
+/// Journal conversion must see the original recovery evidence before any
+/// compatibility normalization. A pending checkpoint or uncommitted tail blocks
+/// conversion; neither the source bytes nor its recovery state are repaired.
+pub fn loadCompletedSchemaV3ForJournal(
+    alloc: Allocator,
+    session_dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+) !SchemaV3Import {
+    return loadSchemaV3ReadOnlyWithPendingPolicy(alloc, session_dir, session_id, .reject);
+}
+
+fn loadSchemaV3ReadOnlyWithPendingPolicy(
+    alloc: Allocator,
+    session_dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+    pending_policy: enum { archive_legacy, reject },
+) !SchemaV3Import {
     var events = try openSessionFile(session_dir, "events.jsonl", .read_only);
     defer events.close(io_mod.getIo());
     const generation = try session_replay.readFirstGeneration(alloc, events);
@@ -209,6 +229,8 @@ pub fn loadSchemaV3ReadOnly(
         try authority_module.objectString(object, "through_event_id"),
     );
     const committed_bytes = try authority_module.jsonU64(object, "through_event_log_bytes");
+    if (pending_policy == .reject and committed_bytes != try events.length(io_mod.getIo()))
+        return error.PendingTurnError;
     var replayed = try session_replay.replayCommittedPrefix(
         alloc,
         events,
@@ -225,7 +247,8 @@ pub fn loadSchemaV3ReadOnly(
     if (replayed.state.usage) |usage| if (usage.billing == .legacy) {
         @import("../shared/debug_trace.zig").logf("session", "legacy usage unavailable session_id={s} source_schema=3", .{session_id});
     };
-    if (try replayed.state.archive_legacy_recovery(alloc)) {
+    if (pending_policy == .reject and replayed.state.recovery_checkpoint != null) return error.PendingTurnError;
+    if (pending_policy == .archive_legacy and try replayed.state.archive_legacy_recovery(alloc)) {
         @import("../shared/debug_trace.zig").logf("session", "legacy recovery archived session_id={s} reason=unverifiable_route_authority", .{session_id});
     }
     const state = replayed.takeState();
@@ -388,6 +411,7 @@ test "schema v3 import archives legacy recovery with allocation failure cleanup"
     const watermark = try std.fmt.allocPrint(alloc, "{{\"schema_version\":1,\"session_id\":\"legacy-recovery\",\"log_generation\":\"01010101010101010101010101010101\",\"through_seq\":2,\"through_event_id\":\"02020202020202020202020202020202\",\"through_event_log_bytes\":{d}}}", .{events.len});
     defer alloc.free(watermark);
     try dir.dir.writeFile(std.testing.io, .{ .sub_path = "commit.01010101010101010101010101010101.json", .data = watermark });
+    try std.testing.expectError(error.PendingTurnError, loadCompletedSchemaV3ForJournal(alloc, &dir, "legacy-recovery"));
     try std.testing.checkAllAllocationFailures(alloc, struct {
         fn check(a: Allocator, source: *io_mod.VerifiedDir) !void {
             var imported = try loadSchemaV3ReadOnly(a, source, "legacy-recovery");

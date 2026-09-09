@@ -665,7 +665,9 @@ fn renderActive(writer: *std.Io.Writer, active: ActiveWork) !void {
     );
 }
 
-fn parseRegistry(alloc: Allocator, bytes: []const u8, parent_id: []const u8) !Registry {
+/// Decodes read-only registry evidence. Caller owns the returned Registry and
+/// releases it with deinit; parsing grants no child execution authority.
+pub fn parseRegistry(alloc: Allocator, bytes: []const u8, parent_id: []const u8) !Registry {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
     defer parsed.deinit();
     const root = try object(parsed.value);

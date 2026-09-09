@@ -107,32 +107,62 @@ async function exerciseCancellation(settlement, closeBeforeSettle) {
     const drain = (async () => { for await (const _event of turn) {} })();
     await withTimeout(toolStarted, "tool start");
     controller.abort();
-    const [result] = await withTimeout(Promise.all([turn.result, drain]), "cancelled turn and event stream");
-    assert.equal(result.stopReason, "cancelled");
+    const poisoned = settlement !== "before-start";
+    let turnSettled = false;
+    const observed = Promise.allSettled([turn.result, drain]).then((results) => {
+      turnSettled = true;
+      return results;
+    });
+    let closeSettled = false;
+    const closing = closeBeforeSettle ? agent.close().then(() => { closeSettled = true; }) : null;
+    if (settlement === "resolve" || settlement === "reject") {
+      await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+      assert.equal(turnSettled, false, "turn settled before its executor released resources");
+      assert.equal(closeSettled, false, "close settled before its executor released resources");
+      settleTool();
+    }
+    const [result, stream] = await withTimeout(observed, "cancelled turn and event stream");
+    if (closing) await withTimeout(closing, "close after tool settlement");
+    if (poisoned) {
+      assert.equal(result.status, "rejected");
+      assert.match(result.reason.message, /HostToolOutcomeUncertain/);
+      assert.equal(stream.status, "rejected");
+    } else {
+      assert.equal(result.status, "fulfilled");
+      assert.equal(result.value.stopReason, "cancelled");
+      assert.equal(stream.status, "fulfilled");
+    }
     assert.equal(toolCalls, settlement === "before-start" ? 0 : 1);
     assert.equal(toolSignalAborted, settlement !== "before-start");
     assert.equal(modelRequests, 1);
 
-    const followup = agent.prompt("continue after cancellation");
-    let text = "";
-    await withTimeout((async () => {
-      for await (const event of followup) if (event.type === "text_delta") text += event.delta;
-      assert.equal((await followup.result).stopReason, "end_turn");
-    })(), "follow-up prompt");
-    assert.equal(text, "recovered");
-    assert.equal(modelRequests, 2);
+    if (poisoned && !closing) {
+      assert.deepEqual(await agent.status(), { state: "blocked", canResume: false });
+      await assert.rejects(agent.prompt("continue after cancellation").result, /uncertain/i);
+      assert.throws(() => agent.resume(), /journal.*onEntry/);
+      await assert.rejects(agent.checkpoint(), /journal.*onEntry/);
+      assert.equal(modelRequests, 1);
+    } else if (!poisoned) {
+      const followup = agent.prompt("continue after cancellation");
+      let text = "";
+      await withTimeout((async () => {
+        for await (const event of followup) if (event.type === "text_delta") text += event.delta;
+        assert.equal((await followup.result).stopReason, "end_turn");
+      })(), "follow-up prompt");
+      assert.equal(text, "recovered");
+      assert.equal(modelRequests, 2);
+    }
     assert.ok(requestBodies.every((body) => !body.includes("late tool result") && !body.includes("late tool failure")));
 
-    if (closeBeforeSettle) await withTimeout(agent.close(), "close before tool settlement");
     const eventsBeforeSettle = events.length;
-    const checkpoint = closeBeforeSettle ? null : await agent.checkpoint();
+    if (!closing) await assert.rejects(agent.checkpoint(), /journal.*onEntry/);
     const sendsBeforeSettle = events.filter((event) => event.type === "acp.send").length;
     settleTool?.();
     await new Promise((resolveWait) => setTimeout(resolveWait, 25));
     assert.deepEqual(unhandledRejections, []);
     assert.equal(events.filter((event) => event.type === "acp.send").length, sendsBeforeSettle);
     if (closeBeforeSettle) assert.equal(events.length, eventsBeforeSettle);
-    else assert.deepEqual(await agent.checkpoint(), checkpoint);
+    else await assert.rejects(agent.checkpoint(), /journal.*onEntry/);
     await withTimeout(agent.close(), "close");
     console.log(`${backend} host tool cancellation passed: ${settlement}, closeBeforeSettle=${closeBeforeSettle}`);
   } finally {

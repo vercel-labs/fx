@@ -634,6 +634,29 @@ test "appendTurnSummaryEntry stores classified dim transcript row" {
     try std.testing.expectEqualStrings("\x1b[38;5;245m  2m 10s (↑10k ↓5k)\x1b[0m\n", rendered);
 }
 
+test "turn summary invalidates a previously rendered compact transcript" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{ .rows = 24, .cols = 80, .content_bottom = 20, .divider_top_row = 21, .input_row = 22, .divider_bottom_row = 23, .hint_row = 24 },
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    var metrics = Metrics{};
+    _ = try runtime.streamAssistantChunk(alloc, &metrics, "Completed response.\n");
+    var before = try runtime.cachedTranscriptSource(alloc);
+    defer before.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, before.bytes, "Completed response.") != null);
+    _ = try runtime.appendTurnSummaryEntry(alloc, .{
+        .turn_duration_ms = 2_000,
+        .token_progress = .{ .input_tokens = 8, .output_tokens = 600 },
+    });
+    var after = try runtime.cachedTranscriptSource(alloc);
+    defer after.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, after.bytes, "Completed response.") != null);
+    try std.testing.expect(std.mem.find(u8, after.bytes, "  2s (↑8 ↓600)") != null);
+    try std.testing.expect(std.mem.find(u8, before.bytes, "  2s (↑8 ↓600)") == null);
+}
+
 test "recovered route status is transient and final summary stays normal" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{
@@ -6103,6 +6126,7 @@ pub const TranscriptRuntime = struct {
             .turn_summary,
             if (summary.completed_at_ms > 0) summary.completed_at_ms else io_mod.milliTimestamp(),
         );
+        self.markTranscriptContentDirtyFrom(entry_id);
         if (self.worker_status.clear_recovered_route()) self.render_requests.request(.footer);
         return entry_id;
     }

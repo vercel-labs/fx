@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { strict as assert } from "node:assert";
 import { createServer } from "node:http";
+import { appendFileSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -32,7 +33,7 @@ if (process.argv[2] !== "--installed") {
     await rm(temp, { recursive: true, force: true });
   }
 } else {
-  const { createFxAgent, createFxTerminal, getBackendInfo } = format === "cjs" ? createRequire(import.meta.url)("libfx") : await import("libfx");
+  const { createFxAgent, createFxTerminal, getBackendInfo, createProjection } = format === "cjs" ? createRequire(import.meta.url)("libfx") : await import("libfx");
   const { createMcpAdapter } = await import("libfx/mcp");
   const { createSkillsAdapter } = await import("libfx/skills");
   assert.equal(typeof createMcpAdapter, "function");
@@ -94,17 +95,27 @@ if (process.argv[2] !== "--installed") {
     apiKey: "packed-key",
     gatewayChatUrl: `http://127.0.0.1:${server.address().port}/chat`,
     model: "packed/model",
+    journal: [],
+    onEntry(entry) {
+      appendFileSync("journal.jsonl", JSON.stringify({ ...entry, bytes: Buffer.from(entry.bytes).toString("base64") }) + "\n", { flush: true });
+    },
   });
   try {
-    assert.deepEqual(Object.keys(agent).sort(), ["checkpoint", "close", "prompt"]);
-    const turn = agent.prompt("hello");
+    assert.deepEqual(Object.keys(agent).sort(), ["abandon", "checkpoint", "close", "prompt", "resume", "status", "suspend"]);
+    const turn = agent.prompt("hello", { requestId: "packed-request" });
     let text = "";
     for await (const event of turn) if (event.type === "text_delta") text += event.delta;
     assert.equal(text, "packed");
-    assert.deepEqual(await turn.result, { stopReason: "end_turn", usage: { inputTokens: 1, outputTokens: 1 } });
+    assert.deepEqual(await turn.result, { ok: true, stopReason: "stop", usage: { inputTokens: 1, outputTokens: 1 } });
     assert.equal(requestedAuthorization, "Bearer packed-key");
     assert.equal(requestedModel, "packed/model");
-    assert.ok((await agent.checkpoint()).length > 48);
+    const checkpoint = await agent.checkpoint();
+    assert.equal(checkpoint.kind, "checkpoint");
+    assert.ok(checkpoint.bytes.length > 48);
+    const stored = readFileSync("journal.jsonl", "utf8").trim().split("\n").map(JSON.parse);
+    assert.equal(stored.at(-1).hash, checkpoint.hash);
+    assert.equal(stored.at(-1).bytes, Buffer.from(checkpoint.bytes).toString("base64"));
+    assert.match(JSON.stringify(createProjection([checkpoint]).transcript()), /packed/);
     await agent.close();
     console.log(`${format} ${backend} packed libfx example passed`);
   } finally {

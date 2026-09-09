@@ -13,6 +13,8 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { createProjection } from "../../sdk/transcript.js";
+import { decodeNativeJournal } from "./journal/storage";
 import { findFooterBlocks, readTrace } from "./tui-render-assertions";
 import {
   FAKE_GATEWAY_MODEL,
@@ -64,6 +66,66 @@ afterEach(async () => {
 });
 
 describe.skipIf(SKIP)("tui: interrupt recovery", () => {
+  test("journaled steering survives process death before the next response", async () => {
+    root = realpathSync(mkdtempSync(join(tmpdir(), "fx-steering-crash-")));
+    const home = join(root, "home"), workspace = join(root, "workspace");
+    mkdirSync(home); mkdirSync(workspace);
+    const first: HoldState = { started: false, cancelled: false, cancelCount: 0, released: false };
+    const second: HoldState = { started: false, cancelled: false, cancelCount: 0, released: false };
+    gateway = startFakeGateway([
+      () => heldUntilReleasedResponse(first, "SAVED_STEERING_PREFIX\n"),
+      () => heldUntilReleasedResponse(second, ""),
+      fakeGatewayFinalText("STEERING_RECOVERED_ONCE"),
+    ]);
+    const env = {
+      HOME: home, AI_GATEWAY_API_KEY: "steering-crash-key", VERCEL_OIDC_TOKEN: undefined,
+      FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1", FX_SOUND: "0", FX_AUTO_UPGRADE: "0",
+      FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: FAKE_GATEWAY_MODEL,
+    };
+    const pidPath = join(root, "owner.pid");
+    const stderrPath = join(root, "stderr.log");
+    const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+    const guidance = "STEERING_REQUIREMENT_438: preserve this update";
+    const launch = `printf '%s' $$ > ${quote(pidPath)}; exec ${quote(FX_BIN)}`;
+    session = await TmuxSession.create({
+      cmd: `/bin/sh -c ${quote(launch)}`,
+      cwd: workspace, env, stderrPath, isolated: true, remainOnExit: true,
+    });
+    await session.waitForStableComposer(TIMEOUT);
+    await session.sendText("Begin the original task and wait.");
+    await waitForCondition(() => first.started, "first response start");
+    await session.waitForText("Generating", TIMEOUT);
+    await session.sendText(guidance);
+    await waitForCondition(() => second.started, "request after steering acknowledgement");
+    const ids = readdirSync(join(home, ".fx", "sessions"), { withFileTypes: true }).filter(entry => entry.isDirectory()).map(entry => entry.name);
+    expect(ids).toHaveLength(1);
+    const id = ids[0]!;
+    const path = join(home, ".fx", "sessions", id, "execution.journal");
+    const saved = readFileSync(path);
+    expect(saved.toString()).toContain('"change":"steering"');
+    expect(saved.toString()).toContain(guidance);
+    expect(saved.toString()).toContain("SAVED_STEERING_PREFIX");
+    const transcript = JSON.stringify(createProjection(decodeNativeJournal(saved)).transcript());
+    expect(countOccurrences(transcript, guidance)).toBe(1);
+    expect(countOccurrences(transcript, "SAVED_STEERING_PREFIX")).toBe(1);
+    const pid = Number(readFileSync(pidPath, "utf8"));
+    expect(Number.isSafeInteger(pid) && pid > 1).toBe(true);
+    process.kill(pid, "SIGKILL");
+    await waitForCondition(() => session!.paneStatus().dead, "killed journal owner");
+    expect(gateway.requests).toHaveLength(2);
+    expect(readFileSync(path)).toEqual(saved);
+    const resumed = await runFx(["ask", "--json", "--resume-id", id, "--continue-recovery"], { cwd: workspace, env, timeoutMs: TIMEOUT });
+    expect(resumed, JSON.stringify(resumed)).toMatchObject({ code: 0, signal: null, timedOut: false });
+    expect(resumed.stdout).toContain("STEERING_RECOVERED_ONCE");
+    expect(gateway.requests).toHaveLength(3);
+    const prompt = JSON.stringify(JSON.parse(gateway.requests[2]!.body).prompt);
+    expect(countOccurrences(prompt, guidance)).toBe(1);
+    expect(countOccurrences(prompt, "SAVED_STEERING_PREFIX")).toBe(1);
+    expect(prompt).toContain("<user_steering>");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  }, TIMEOUT * 2);
+
   for (const inject of [false, true]) test(`quit reports final history persistence failure with fault=${inject}`, async () => {
     root = realpathSync(mkdtempSync(join(tmpdir(), "fx-shutdown-save-")));
     const home = join(root, "home"), workspace = join(root, "workspace");
@@ -89,7 +151,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       const seeded = await runFx(["ask", "--json", "Save the first fact."], { cwd: workspace, env, timeoutMs: TIMEOUT });
       expect(seeded.code).toBe(0); expect(seeded.stderr).toBe("");
       const id = JSON.parse(seeded.stdout).session_id;
-      const eventPath = join(home, ".fx", "sessions", id, "events.jsonl");
+      const eventPath = join(home, ".fx", "sessions", id, "execution.journal");
       const saved = readFileSync(eventPath);
       const stderrPath = join(root, "stderr.log"), tracePath = join(root, "trace.log");
       const arm = join(root, "armed"), receipt = join(root, "injected.txt");
@@ -245,7 +307,9 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       await session.waitForText("Thinking", TIMEOUT);
 
       session.sendKeysImmediate(["C-c", "o", "k", "Enter"]);
-      await waitForCondition(() => followUp.started, "follow-up request after tool completion");
+      await waitForCondition(() => followUp.started, "follow-up request after tool completion").catch(cause => {
+        throw new Error(`follow-up failed: ${readFileSync(stderrPath, "utf8")}\n${readTrace(tracePath)}`, { cause });
+      });
       await session.waitForText("Thinking", TIMEOUT);
       const activeGrid = await session.capturePaneGrid();
       expect(activeGrid.join("\n")).toContain("Read probe.txt");
@@ -374,7 +438,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       await waitForCondition(() => {
         eventsPath = readdirSync(sessionRoot, { withFileTypes: true })
           .filter((entry) => entry.isDirectory())
-          .map((entry) => join(sessionRoot, entry.name, "events.jsonl"))
+          .map((entry) => join(sessionRoot, entry.name, "execution.journal"))
           .find((path) => existsSync(path) && readFileSync(path, "utf8").includes(steeringText));
         return eventsPath !== undefined;
       }, "steering history persistence");
@@ -534,22 +598,20 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
         .filter((entry) => entry.isDirectory())
         .map((entry) => entry.name)
         .filter((id) => {
-          const path = join(sessionRoot, id, "events.jsonl");
+          const path = join(sessionRoot, id, "execution.journal");
           return existsSync(path) && readFileSync(path, "utf8").includes(
             "Stream a response that I will interrupt.",
           );
         });
       expect(sessionIds).toHaveLength(1);
       const events = readFileSync(
-        join(sessionRoot, sessionIds[0]!, "events.jsonl"),
+        join(sessionRoot, sessionIds[0]!, "execution.journal"),
         "utf8",
       );
-      const interruptedEvents = events
-        .trim()
-        .split("\n")
-        .filter(Boolean)
-        .map((line) => JSON.parse(line) as { event: Record<string, unknown> })
-        .filter((record) => record.event.interrupted !== undefined);
+      const interruptedEvents = decodeNativeJournal(readFileSync(join(sessionRoot, sessionIds[0]!, "execution.journal")))
+        .filter(entry => entry.kind === "turn_end")
+        .map(entry => JSON.parse(Buffer.from(entry.bytes).toString("utf8")))
+        .filter(record => record.history?.kind === "interrupted");
       expect(interruptedEvents).toHaveLength(1);
       for (const chunk of PARTIAL_CHUNKS) {
         expect(events).toContain(chunk.trim());

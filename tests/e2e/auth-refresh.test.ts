@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { decodeNativeJournal } from "./journal/storage";
 import {
   chmodSync,
   existsSync,
@@ -429,7 +430,7 @@ test(
 );
 
 test(
-  "saved API-key 401 discards only the new empty session and preserves resume last",
+  "saved API-key 401 retains its journal outcome and preserves resume last",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-auth-empty-session-e2e-")));
     const home = join(root, "home");
@@ -483,12 +484,24 @@ test(
       const rejectedJson = JSON.parse(rejected.stdout);
       expect(rejectedJson).toMatchObject({
         exit_code: 1,
-        session_id: "",
         steps: 0,
         tool_calls: [],
       });
       expect(rejectedJson.error).toBeUndefined();
-      expect(sessionIdsFromHome(home)).toEqual([seedSessionId]);
+      const rejectedId = rejectedJson.session_id as string;
+      expect(rejectedId.length).toBeGreaterThan(0);
+      expect(rejectedId).not.toBe(seedSessionId);
+      const expectedIds = [seedSessionId, rejectedId].sort();
+      expect(sessionIdsFromHome(home).sort()).toEqual(expectedIds);
+      const rejectedPath = join(home, ".fx", "sessions", rejectedId, "execution.journal");
+      const rejectedBytes = readFileSync(rejectedPath);
+      const records = decodeNativeJournal(rejectedBytes).map(entry => JSON.parse(Buffer.from(entry.bytes).toString("utf8")));
+      expect(records.filter(record => record.kind === "turn_start")).toHaveLength(1);
+      expect(JSON.parse(records.find(record => record.kind === "turn_start").inputJson).text).toBe("Reject this new saved session.");
+      expect(records.filter(record => record.kind === "tool_result")).toHaveLength(0);
+      const ended = records.filter(record => record.kind === "turn_end");
+      expect(ended).toHaveLength(1);
+      expect(ended[0]).toMatchObject({ history: null, result: { ok: false, reason: "provider_error", retryable: false } });
       expect(gateway.requests).toHaveLength(2);
 
       const sessionsResult = await runFx(
@@ -498,10 +511,10 @@ test(
       expect(sessionsResult.code).toBe(0);
       expect(sessionsResult.stderr).toBe("");
       const sessions = JSON.parse(sessionsResult.stdout);
-      expect(sessions.count).toBe(1);
-      expect(sessions.sessions).toHaveLength(1);
-      expect(sessions.sessions[0].id).toBe(seedSessionId);
-      expect(sessions.sessions[0].history_len).toBe(1);
+      expect(sessions.count).toBe(2);
+      expect(sessions.sessions).toHaveLength(2);
+      expect(sessions.sessions.find(session => session.id === seedSessionId).history_len).toBe(1);
+      expect(sessions.sessions.find(session => session.id === rejectedId).history_len).toBe(0);
       expect(gateway.requests).toHaveLength(2);
 
       const resumed = await runFx(
@@ -523,7 +536,8 @@ test(
       const resumedJson = JSON.parse(resumed.stdout);
       expect(resumedJson.session_id).toBe(seedSessionId);
       expect(resumedJson.output).toContain("RESUMED_SESSION_RESPONSE");
-      expect(sessionIdsFromHome(home)).toEqual([seedSessionId]);
+      expect(sessionIdsFromHome(home).sort()).toEqual(expectedIds);
+      expect(readFileSync(rejectedPath)).toEqual(rejectedBytes);
       expect(gateway.requests).toHaveLength(3);
 
       const detail = await runFx(

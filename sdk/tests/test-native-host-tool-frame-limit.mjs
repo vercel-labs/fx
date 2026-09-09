@@ -11,7 +11,7 @@ const addon = resolve(process.argv[2] || resolve(scriptDir, "../../zig-out/lib/l
 const home = await mkdtemp(join(tmpdir(), "fx-native-tool-frame-"));
 const rich = { type: "libfx.tool-result", text: '"'.repeat(3 * 1024 * 1024), images: [] };
 const content = JSON.stringify({ text: rich.text, images: rich.images });
-const encoded = JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content, isError: false, contentType: "rich" } });
+const encoded = JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content, isError: false, contentType: "rich", executionOutcome: "completed" } });
 assert.ok(Buffer.byteLength(content) < 8 * 1024 * 1024);
 assert.ok(Buffer.byteLength(encoded) + 1 > 8 * 1024 * 1024);
 const limitError = "Host tool result exceeded the response frame limit";
@@ -53,36 +53,24 @@ try {
         { type: "tool-call", toolCallId: "frame1", toolName: "escaped_result", input: {} },
         { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
       );
-      assert.ok(requests <= 3);
-      const payload = JSON.parse(Buffer.from(init.body).toString("utf8"));
-      const results = payload.prompt.flatMap((message) => message.content ?? [])
-        .filter((part) => part.type === "tool-result" && part.toolCallId === "frame1");
-      assert.equal(results.length, 1);
-      assert.deepEqual(results[0].output, { type: "error-text", value: limitError });
-      return sse(
-        { type: "text-delta", delta: requests === 2 ? "handled error" : "still usable" },
-        { type: "finish", finishReason: { unified: "stop", raw: "stop" } },
-      );
+      assert.fail("unacknowledged oversized result allowed another provider request");
     },
   });
   const first = agent.prompt("get escaped text");
   const events = [];
-  for await (const event of first) events.push(event);
-  assert.equal((await first.result).stopReason, "end_turn");
+  await assert.rejects(async () => { for await (const event of first) events.push(event); }, /SuspensionCheckpointUnavailable/);
+  await assert.rejects(first.result, /SuspensionCheckpointUnavailable/);
   assert.equal(events.filter((event) => event.type === "tool_end" && event.isError).length, 1);
-  assert.equal(events.filter((event) => event.type === "text_delta").map((event) => event.delta).join(""), "handled error");
-  assert.deepEqual(responses, [{ content: limitError, isError: true }]);
-
-  const followup = agent.prompt("continue without replaying the tool");
-  let text = "";
-  for await (const event of followup) if (event.type === "text_delta") text += event.delta;
-  assert.equal((await followup.result).stopReason, "end_turn");
-  assert.equal(text, "still usable");
-  assert.equal(requests, 3);
+  assert.deepEqual(responses, [{ content: limitError, isError: true, executionOutcome: "uncertain" }]);
+  assert.deepEqual(await agent.status(), { state: "blocked", canResume: false });
+  await assert.rejects(agent.prompt("continue without replaying the tool").result, /uncertain/i);
+  assert.throws(() => agent.resume(), /journal.*onEntry/);
+  await assert.rejects(agent.checkpoint(), /journal.*onEntry/);
+  assert.equal(requests, 1);
   assert.equal(executions, 1);
   assert.equal(responses.length, 1);
   assert.equal(exits, 0);
-  console.log("native tool frame limit passed: one tool error, model continuation, reusable agent, no replay");
+  console.log("native tool frame limit passed: uncertainty retained, missing-sink owner blocked, no further model request or replay");
 } finally {
   clearTimeout(timer);
   await agent?.close().catch(() => {});

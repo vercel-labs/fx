@@ -90,6 +90,21 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
 
+    // A focused entry point for the same recovery contract on every CI platform.
+    const journal_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/journal_tests.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+            .link_libc = true,
+        }),
+        .filters = &.{"journal witness"},
+    });
+    journal_tests.root_module.addImport("build_options", build_options.createModule());
+    const run_journal_tests = b.addRunArtifact(journal_tests);
+    const journal_test_step = b.step("test-journal", "Run focused journal crash/recovery acceptance witnesses");
+    journal_test_step.dependOn(&run_journal_tests.step);
+
     if (wasm_surface != .none) {
         addWasmArtifact(b, wasm_surface, git_commit, app_version, update_channel);
     }

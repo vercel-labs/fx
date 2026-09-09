@@ -11,6 +11,7 @@ pub const ParsedCommand = union(enum) {
     reset_session,
     resume_session,
     continue_recovery,
+    restart_session,
     rename_session: []const u8,
     help,
     login,
@@ -51,6 +52,7 @@ pub const CommandHandlers = struct {
     reset_session: *const fn (ctx: *anyopaque) anyerror!void,
     resume_session: *const fn (ctx: *anyopaque) anyerror!void,
     continue_recovery: *const fn (ctx: *anyopaque) anyerror!void,
+    restart_session: *const fn (ctx: *anyopaque) anyerror!void,
     show_help: *const fn (ctx: *anyopaque) anyerror!void,
     login: *const fn (ctx: *anyopaque) anyerror!void,
     logout: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
@@ -95,6 +97,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .reset_session => .reset_session,
         .resume_session => .resume_session,
         .continue_recovery => .continue_recovery,
+        .restart_session => .restart_session,
         .rename_session => .{ .rename_session = payload },
         .help => .help,
         .login => .login,
@@ -148,6 +151,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .reset_session => try handlers.reset_session(handlers.ctx),
         .resume_session => try handlers.resume_session(handlers.ctx),
         .continue_recovery => try handlers.continue_recovery(handlers.ctx),
+        .restart_session => try handlers.restart_session(handlers.ctx),
         .rename_session => |rest| try handlers.rename_session(handlers.ctx, rest),
         .help => try handlers.show_help(handlers.ctx),
         .login => try handlers.login(handlers.ctx),
@@ -238,6 +242,7 @@ test "parse recognizes interactive resume" {
 
 test "parse recognizes explicit recovery continuation" {
     try std.testing.expectEqual(ParsedCommand.continue_recovery, parse(testSlashRegistry(), "/continue"));
+    try std.testing.expectEqual(ParsedCommand.restart_session, parse(testSlashRegistry(), "/restart"));
 }
 
 test "parse recognizes logout" {
@@ -465,6 +470,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .reset_session = unexpectedNoPayload,
         .resume_session = unexpectedNoPayload,
         .continue_recovery = unexpectedNoPayload,
+        .restart_session = unexpectedNoPayload,
         .show_help = unexpectedNoPayload,
         .login = unexpectedNoPayload,
         .logout = unexpectedPayload,

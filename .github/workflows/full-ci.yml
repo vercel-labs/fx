@@ -53,6 +53,14 @@ jobs:
       - name: Build
         run: zig build -Doptimize=${{ matrix.optimize }}
 
+      - name: Run journal recovery tests
+        shell: bash
+        run: |
+          FX_JOURNAL_OLDER_EXE="$(bash scripts/legacy-session-fixture.sh)"
+          export FX_JOURNAL_OLDER_EXE
+          command -v lsof
+          zig build test-journal --summary all
+
       - name: Run unit tests
         run: zig build test -Doptimize=${{ matrix.optimize }}
 

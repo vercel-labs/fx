@@ -87,6 +87,14 @@ jobs:
       - name: Test Node + WASM
         run: npm run --prefix sdk test:node-wasm
 
+      - name: Test Wasm journal recovery
+        env:
+          FX_JOURNAL_BACKENDS: wasm
+        run: |
+          node --experimental-wasm-jspi --test sdk/tests/journal/runtime.test.mjs sdk/tests/test-journal-bridge.mjs sdk/tests/test-transcript.mjs
+          node sdk/tests/test-journal-recovery.mjs wasm
+          node --experimental-wasm-jspi sdk/tests/test-journal-capacity.mjs wasm
+
       - name: Test libfx Wasm integrations
         run: |
           node --experimental-wasm-jspi sdk/tests/test-host-tools.mjs wasm
@@ -115,6 +123,14 @@ jobs:
 
       - name: Test Node + N-API
         run: npm run --prefix sdk test:node-napi
+
+      - name: Test native journal recovery
+        env:
+          FX_JOURNAL_BACKENDS: native
+        run: |
+          node --test sdk/tests/journal/runtime.test.mjs sdk/tests/test-journal-bridge.mjs sdk/tests/test-transcript.mjs
+          node sdk/tests/test-journal-recovery.mjs native
+          node sdk/tests/test-journal-capacity.mjs native
 
       - name: Test minimal native integrations
         run: |
@@ -211,6 +227,12 @@ jobs:
           node sdk/tests/test-term-demo-package.mjs
           node sdk/scripts/package-libfx.mjs sdk/dist/libfx native-addons/libfx.linux-x64.node native-addons/libfx.linux-arm64.node native-addons/libfx.darwin-x64.node native-addons/libfx.darwin-arm64.node
           node --experimental-wasm-jspi sdk/tests/test-node-async-assets.mjs sdk/dist/libfx
+          node --experimental-wasm-jspi sdk/tests/test-journal-large-result.mjs sdk/dist/libfx esm
+          node --experimental-wasm-jspi --no-experimental-require-module sdk/tests/test-journal-large-result.mjs sdk/dist/libfx cjs
+          node --experimental-wasm-jspi sdk/tests/test-journal-compaction.mjs native wasm sdk/dist/libfx esm
+          node --experimental-wasm-jspi --no-experimental-require-module sdk/tests/test-journal-compaction.mjs wasm native sdk/dist/libfx cjs
+          node --experimental-wasm-jspi sdk/tests/test-journal-large-input.mjs native wasm sdk/dist/libfx esm
+          node --experimental-wasm-jspi --no-experimental-require-module sdk/tests/test-journal-large-input.mjs wasm native sdk/dist/libfx cjs
           npm pack ./sdk/dist/libfx --ignore-scripts --json > /tmp/libfx-pack.json
           mv "$(node -p 'require("/tmp/libfx-pack.json")[0].filename')" /tmp/libfx-package.tgz
           node sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz native esm

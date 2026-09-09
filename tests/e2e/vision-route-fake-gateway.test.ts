@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { decodeNativeJournal } from "./journal/storage";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
@@ -1265,7 +1266,7 @@ describe("Vision route fake Gateway", () => {
         });
         expect(rejectionOutput as string).not.toContain(fixture.imagePath);
         expect(filePartCount(recoveryRequest.body)).toBe(1);
-        const eventsPath = join(root.home, ".fx", "sessions", firstJson.session_id, "events.jsonl");
+        const eventsPath = join(root.home, ".fx", "sessions", firstJson.session_id, "execution.journal");
         const originalEvents = readFileSync(eventsPath, "utf8");
         if (shape !== "plain") expect(originalEvents).toContain("removed-vision-signature");
 
@@ -3008,7 +3009,7 @@ describe("Vision route fake Gateway", () => {
           .map((entry) => entry.name);
         expect(sessionIds).toHaveLength(1);
         const events = readFileSync(
-          join(sessionsRoot, sessionIds[0]!, "events.jsonl"),
+          join(sessionsRoot, sessionIds[0]!, "execution.journal"),
           "utf8",
         );
         expect(events).toContain(feedback);
@@ -3143,11 +3144,12 @@ for (const sourceChange of ["removed", "changed", "saved snapshot missing", "sav
       expect(failed.code).toBe(1);
       expect(failed.stdout).toContain("RequiredVisionToolCallMissing");
       const sessions = join(root.home, ".fx", "sessions");
-      const id = readdirSync(sessions).find(name => existsSync(join(sessions, name, "recovery.json")))!;
+      const id = readdirSync(sessions).find(name => existsSync(join(sessions, name, "execution.journal")))!;
       expect(id).toBeDefined();
-      const checkpointPath = join(sessions, id, "recovery.json");
+      const checkpointPath = join(sessions, id, "execution.journal");
       const checkpointBytes = readFileSync(checkpointPath);
-      const image = JSON.parse(checkpointBytes.toString()).checkpoint.user.images[0];
+      const start = decodeNativeJournal(checkpointBytes).find(entry => entry.kind === "turn_start")!;
+      const image = JSON.parse(JSON.parse(Buffer.from(start.bytes).toString("utf8")).inputJson).images[0];
       const snapshot = join(sessions, id, image.snapshot_path);
       expect(image.id).toBe(1);
       expect(image.snapshot_sha256).toBe(digest);
@@ -3169,10 +3171,11 @@ for (const sourceChange of ["removed", "changed", "saved snapshot missing", "sav
       const parts = nativeFileParts(gateway.chatRequests[2]!.body);
       expect(parts).toHaveLength(1);
       expect(createHash("sha256").update(Buffer.from(parts[0]!.data, "base64")).digest("hex")).toBe(digest);
-      const history = readFileSync(join(sessions, id, "events.jsonl"), "utf8");
+      const history = readFileSync(checkpointPath, "utf8");
       expect(history).toContain(digest);
       expect(readFileSync(snapshot).toString("base64")).toBe(original);
-      expect(existsSync(checkpointPath)).toBe(false);
+      expect(decodeNativeJournal(readFileSync(checkpointPath)).filter(entry => entry.kind === "turn_end")).toHaveLength(1);
+      expect(existsSync(join(sessions, id, "recovery.json"))).toBe(false);
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -3204,9 +3207,10 @@ test.skipIf(!tmuxAvailable())("TUI recovery retains images through failure and c
     await session.waitForText("RequiredVisionToolCallMissing", TIMEOUT);
     await session.waitForStableComposer(TIMEOUT);
     const sessions = join(root.home, ".fx", "sessions");
-    const id = readdirSync(sessions).find(name => existsSync(join(sessions, name, "recovery.json")))!;
-    const checkpoint = JSON.parse(readFileSync(join(sessions, id, "recovery.json"), "utf8")).checkpoint;
-    const snapshot = join(sessions, id, checkpoint.user.images[0].snapshot_path);
+    const id = readdirSync(sessions).find(name => existsSync(join(sessions, name, "execution.journal")))!;
+    const start = decodeNativeJournal(readFileSync(join(sessions, id, "execution.journal"))).find(entry => entry.kind === "turn_start")!;
+    const inputState = JSON.parse(JSON.parse(Buffer.from(start.bytes).toString("utf8")).inputJson);
+    const snapshot = join(sessions, id, inputState.images[0].snapshot_path);
     expect(readFileSync(snapshot).toString("base64")).toBe(original);
     await session.sendText("/quit");
     await session.waitForPane(() => session!.paneStatus().dead, TIMEOUT);

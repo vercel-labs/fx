@@ -1,4 +1,6 @@
-import { describe, expect, test } from "bun:test";
+import { beforeAll, describe, expect, test } from "bun:test";
+import "./journal/crash.test";
+import { decodeNativeJournal } from "./journal/storage";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
@@ -17,6 +19,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { ensureLegacyFixtureBinary, runLegacyFx } from "./legacy-session-fixture";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -128,7 +131,7 @@ test("latest resume preserves an unrelated pending authority directory", async (
     writeFileSync(join(orphan, "authority.pending.json"), "pending", { mode: 0o600 });
     writeFileSync(join(orphan, "events.jsonl"), "unidentified saved data\n", { mode: 0o600 });
     const resumed = await continueSession(fixture, gateway, id, true);
-    expect(resumed.code).toBe(0);
+    expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
     expect(resumed.stderr).toBe("");
     expect(JSON.parse(resumed.stdout).session_id).toBe(id);
     expect(gateway.requests.at(-1)?.body).toContain("SAVED_PARENT_CONTEXT");
@@ -149,11 +152,11 @@ test("resume keeps conversation history when accounting is damaged", async () =>
   try {
     const id = await createSavedSession(fixture, gateway);
     const dir = join(fixture.home, ".fx", "sessions", id);
-    const events = join(dir, "events.jsonl");
+    const events = join(dir, "execution.journal");
     const before = readFileSync(events);
     writeFileSync(join(dir, "usage-v2.json"), "{broken accounting", { mode: 0o600 });
     const resumed = await continueSession(fixture, gateway, id);
-    expect(resumed.code).toBe(0);
+    expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
     expect(resumed.stderr).toBe("");
     expect(JSON.parse(resumed.stdout).session_id).toBe(id);
     expect(gateway.requests.at(-1)?.body).toContain("ACCOUNTING_HISTORY_RETAINED");
@@ -178,13 +181,13 @@ test("conversation language survives an ordinary saved turn and resume", async (
     expect(seeded.code).toBe(0);
     const id = JSON.parse(seeded.stdout).session_id;
     const metadata = join(fixture.home, ".fx", "sessions", id, "session.json");
-    expect(JSON.parse(readFileSync(metadata, "utf8")).conversation_language).toBe("ja");
+    expect(JSON.parse(readFileSync(metadata, "utf8")).metadata.conversation_language).toBe("ja");
     const resumed = await runFx(["ask", "--json", "--resume-id", id, "👍"], {
       cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
     });
-    expect(resumed.code).toBe(0);
+    expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
     expect(resumed.stderr).toBe("");
-    expect(JSON.parse(readFileSync(metadata, "utf8")).conversation_language).toBe("ja");
+    expect(JSON.parse(readFileSync(metadata, "utf8")).metadata.conversation_language).toBe("ja");
   } finally {
     gateway.stop();
     rmSync(fixture.root, { recursive: true, force: true });
@@ -310,7 +313,61 @@ function legacyGatewayEnv(
   };
 }
 
+function nativeJournalRecords(source: string) {
+  return decodeNativeJournal(readFileSync(join(source, "execution.journal")))
+    .map(entry => JSON.parse(Buffer.from(entry.bytes).toString("utf8")));
+}
+
+function nativeHistory(source: string) {
+  const records = nativeJournalRecords(source);
+  expect(records.filter(record => record.kind === "checkpoint")).toHaveLength(1);
+  return [
+    ...JSON.parse(records[0].nativeBase.stateJson).history,
+    ...records.filter(record => record.kind === "turn_end" && record.history).map(record => record.history),
+  ];
+}
+
+async function expectPendingLegacyRefusal(fixture: ReturnType<typeof createFixture>, gateway: ReturnType<typeof startFakeGateway>, id: string) {
+  const source = join(fixture.home, ".fx", "sessions", id);
+  const before = savedFileHashes(source);
+  const requests = gateway.requests.length;
+  const classifiers = gateway.classifierRequests.length;
+  const refused = await continueSession(fixture, gateway, id);
+  expect(refused.timedOut).toBe(false);
+  expect(refused.code).toBe(1);
+  expect(refused.stdout + refused.stderr).toContain("PendingTurnError");
+  expect(savedFileHashes(source)).toEqual(before);
+  expect(gateway.requests).toHaveLength(requests);
+  expect(gateway.classifierRequests).toHaveLength(classifiers);
+}
+
 function expectLegacyArchive(source: string) {
+  if (existsSync(join(source, "execution.journal"))) {
+    const history = nativeHistory(source);
+    const partial = history.filter(turn => turn.kind === "interrupted" && turn.assistant === LEGACY_PARTIAL);
+    expect(partial).toHaveLength(1);
+    expect(partial[0].terminal_reason).toBe("failed");
+    const steps = partial[0].execution.tool_steps;
+    expect(steps).toHaveLength(1);
+    expect(steps[0].tool_calls).toHaveLength(1);
+    expect(steps[0].tool_calls[0]).toMatchObject({ id: LEGACY_TOOL_CALL_ID, name: "read_file",
+      arguments_json: JSON.stringify({ path: "synthetic-recorded-read.txt" }) });
+    expect(steps[0].tool_results).toHaveLength(1);
+    expect(steps[0].tool_results[0]).toMatchObject({ tool_call_id: LEGACY_TOOL_CALL_ID,
+      tool_name: "read_file", status: "success", output: LEGACY_TOOL_EVIDENCE,
+      truncated: true, output_bytes: Buffer.byteLength(LEGACY_TOOL_EVIDENCE),
+      stored_output_bytes: Buffer.byteLength(LEGACY_TOOL_EVIDENCE) });
+    const text = JSON.stringify(history);
+    expect(text.split(LEGACY_PARTIAL)).toHaveLength(2);
+    expect(text).toContain(LEGACY_ANSWER);
+    expect(text).not.toContain("route_identity");
+    expect(JSON.parse(readFileSync(join(source, "session.json"), "utf8"))).toMatchObject({
+      schema_version: 5, metadata: { provider: "gateway", model: FAKE_GATEWAY_MODEL, effort: "high", fast_mode: true },
+    });
+    expect(existsSync(join(source, "recovery.json"))).toBe(false);
+    return;
+  }
+
   const events = readFileSync(join(source, "events.jsonl"), "utf8");
   const records = events.trimEnd().split("\n").map(JSON.parse);
   const archived = records.filter((record) => record.event.interrupted?.partial_text === LEGACY_PARTIAL);
@@ -355,12 +412,25 @@ function expectLegacyRequest(request: { body: string; headers: Headers }) {
   expect(request.body).not.toContain("legacy-route.invalid");
 }
 
-describe("session recovery", () => {
+describe("legacy session recovery", () => {
+  beforeAll(ensureLegacyFixtureBinary, 600_000);
+
+  async function createLegacySavedSession(fixture: ReturnType<typeof createFixture>, gateway: ReturnType<typeof startFakeGateway>) {
+    const created = await runLegacyFx(["ask", "--json", "--auto", "Create the first saved turn."], {
+      cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
+    });
+    expect(created.code).toBe(0);
+    expect(created.stderr).toBe("");
+    const id = JSON.parse(created.stdout).session_id;
+    expect(JSON.parse(readFileSync(join(fixture.home, ".fx", "sessions", id, "session.json"), "utf8")).schema_version).toBe(4);
+    return id;
+  }
+
   test("unsupported accounting snapshot versions refuse recovery without changing the source", async () => {
     const fixture = createFixture("fx-session-future-usage-");
     const gateway = startFakeGateway([fakeGatewayFinalText("SAVED_ACCOUNTING_VERSION")]);
     try {
-      const id = await createSavedSession(fixture, gateway);
+      const id = await createLegacySavedSession(fixture, gateway);
       const sessions = join(fixture.home, ".fx", "sessions");
       const source = join(sessions, id);
       const usagePath = join(source, "usage-v2.json");
@@ -390,7 +460,7 @@ describe("session recovery", () => {
         fakeGatewayFinalText("ACCOUNTING_RECOVERY_CONTINUED"),
       ]);
       try {
-        const id = await createSavedSession(fixture, gateway);
+        const id = await createLegacySavedSession(fixture, gateway);
         const source = join(fixture.home, ".fx", "sessions", id);
         const committed = readFileSync(join(source, "events.jsonl"));
         writeFileSync(join(source, "usage-v2.json"), "{broken usage", { mode: 0o600 });
@@ -399,7 +469,7 @@ describe("session recovery", () => {
         const result = await runFx(["session", "recover", id, "--json"], {
           cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
         });
-        expect(result.code).toBe(0);
+        expect(result.code, result.stdout + result.stderr).toBe(0);
         expect(result.stderr).toBe("");
         const recovered = JSON.parse(result.stdout);
         expect(recovered).toMatchObject({ status: "recovered", usage_incomplete: true, source_id: id });
@@ -456,13 +526,13 @@ describe("session recovery", () => {
       writeFileSync(legacy.watermarkPath, JSON.stringify({ ...watermark, through_seq: 4,
         through_event_id: records.at(-1).event_id, through_event_log_bytes: Buffer.byteLength(events) }), { mode: 0o600 });
       const oldHashes = savedFileHashes(legacy.source);
-      const healthyId = await createSavedSession(fixture, gateway);
+      const healthyId = await createLegacySavedSession(fixture, gateway);
       const env = { ...legacyGatewayEnv(fixture, gateway), FX_SOUND: "0", FX_SKIP_ONBOARDING: "1" };
       const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
-      async function resume(args: string[], marker: string, label: string) {
+      async function resume(args: string[], marker: string, label: string, binary = FX_BIN) {
         const stderrPath = join(fixture.root, `${label}.stderr`);
         tui = await TmuxSession.create({
-          cmd: [FX_BIN, ...args].map(quote).join(" "), cwd: fixture.workspace,
+          cmd: [binary, ...args].map(quote).join(" "), cwd: fixture.workspace,
           isolated: true, remainOnExit: true, width: 110, height: 40, stderrPath,
           env: { ...env, FX_RECORD: join(fixture.root, `${label}.fxtape`) },
         });
@@ -482,12 +552,14 @@ describe("session recovery", () => {
       expect(gateway.requests).toHaveLength(1);
       expect(existsSync(join(fixture.home, ".fx", "sessions", healthyId))).toBe(true);
 
+      await expectPendingLegacyRefusal(fixture, gateway, legacy.id);
+      await resume(["--resume", legacy.id], LEGACY_ANSWER, "legacy-resolution", await ensureLegacyFixtureBinary());
       await resume(["--resume", legacy.id], LEGACY_ANSWER, "legacy");
       expectLegacyArchive(legacy.source);
-      const usage = JSON.parse(readFileSync(join(legacy.source, "usage-v2.json"), "utf8"));
-      expect(usage.session_id).toBe(legacy.id);
-      expect(usage.snapshot.billing).toBe("legacy");
-      expect(usage.snapshot.models).toEqual([]);
+      const base = JSON.parse(nativeJournalRecords(legacy.source)[0].nativeBase.stateJson);
+      expect(base.id).toBe(legacy.id);
+      expect(base.usage.billing).toBe("legacy");
+      expect(base.usage.models).toEqual([]);
       expect(gateway.requests).toHaveLength(1);
       const continued = await continueSession(fixture, gateway, legacy.id);
       expect(continued.code).toBe(0);
@@ -504,11 +576,11 @@ describe("session recovery", () => {
     }
   }, TIMEOUT * 3);
 
-  test("recovery no-op requires a loadable current conversation", async () => {
+  test("recovery no-op requires a loadable legacy v4 conversation", async () => {
     const fixture = createFixture("fx-session-current-healthy-");
     const gateway = startFakeGateway([fakeGatewayFinalText("SAVED_HEALTHY")]);
     try {
-      const id = await createSavedSession(fixture, gateway);
+      const id = await createLegacySavedSession(fixture, gateway);
       const source = join(fixture.home, ".fx", "sessions", id);
       const before = savedFileHashes(source);
       const result = await runFx(["session", "recover", id, "--json"], {
@@ -558,7 +630,7 @@ describe("session recovery", () => {
     { checkpointedTurn: false, missingUsage: false, fullCoverage: true, damagedUsage: false },
     { checkpointedTurn: false, missingUsage: false, fullCoverage: false, damagedUsage: true },
   ]) {
-    test(`current conversation recovery preserves exact checkpoints and artifacts with open=${checkpointedTurn} missing usage=${missingUsage} full coverage=${fullCoverage} damaged usage=${damagedUsage}`, async () => {
+    test(`legacy v4 conversation recovery preserves exact checkpoints and artifacts with open=${checkpointedTurn} missing usage=${missingUsage} full coverage=${fullCoverage} damaged usage=${damagedUsage}`, async () => {
       const fixture = createFixture("fx-session-current-copy-");
       const responses = [
         fakeShellRun("saved-effect", "printf 'ONCE_RECOVERY_731\\n' >> effect.log; printf 'RESULT_RECOVERY_982\\n'"),
@@ -566,7 +638,7 @@ describe("session recovery", () => {
       ];
       const gateway = startFakeGateway(responses);
       try {
-        const created = await runFx(["ask", "--json", "--full-access", "Save one command result."], {
+        const created = await runLegacyFx(["ask", "--json", "--full-access", "Save one command result."], {
           cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
         });
         expect(created.code).toBe(0);
@@ -646,10 +718,11 @@ describe("session recovery", () => {
           .filter((line) => line.includes("[tool] event=execution_start "));
         expect(executionStarts).toHaveLength(1);
         expect(executionStarts[0]).toContain("call_id=read-recovered name=read_tool_result");
-        const after = readFileSync(join(target, "events.jsonl"), "utf8").trimEnd().split("\n").map(JSON.parse);
-        const readResult = after.find((record) => record.event.tool_result?.call_id === "read-recovered").event.tool_result;
+        const after = nativeJournalRecords(target);
+        const readResult = after.find(record => record.kind === "tool_result" && record.persisted.tool_call_id === "read-recovered").persisted;
         expect(readResult.status).toBe("success");
-        expect(readFileSync(join(target, "tool-results", readResult.artifact_ref), "utf8")).toContain("RESULT_RECOVERY_982");
+        expect(readResult.output).toContain("RESULT_RECOVERY_982");
+        if (readResult.output_handle) expect(readFileSync(join(target, "tool-results", readResult.output_handle), "utf8")).toContain("RESULT_RECOVERY_982");
         expect(readFileSync(join(fixture.workspace, "effect.log"), "utf8")).toBe("ONCE_RECOVERY_731\n");
         expect(savedFileHashes(source)).toEqual(before);
         const inspected = await runFx(["session", "--id", result.recovered_id, "--json"], {
@@ -666,12 +739,12 @@ describe("session recovery", () => {
   }
 
   for (const tail of ["", "invalid tail\n"]) {
-    test(`current recovery excludes checkpoint splitting a call/result pair with tail=${tail.length > 0}`, async () => {
+    test(`legacy v4 recovery excludes checkpoint splitting a call/result pair with tail=${tail.length > 0}`, async () => {
       const fixture = createFixture("fx-session-current-cut-");
       const responses = [fakeShellRun("cut-call", "printf 'CUT_RESULT_619\\n'"), fakeGatewayFinalText("CUT_SAVED")];
       const gateway = startFakeGateway(responses);
       try {
-        const created = await runFx(["ask", "--json", "--full-access", "Save one result."], {
+        const created = await runLegacyFx(["ask", "--json", "--full-access", "Save one result."], {
           cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
         });
         expect(created.code).toBe(0);
@@ -715,14 +788,14 @@ describe("session recovery", () => {
   }
 
   for (const damage of ["metadata", "private-child", "private-marker", "first-record", "missing-result", "changed-result"] as const) {
-    test(`current conversation recovery refuses ${damage} without publishing a copy`, async () => {
+    test(`legacy v4 conversation recovery refuses ${damage} without publishing a copy`, async () => {
       const fixture = createFixture("fx-session-current-refusal-");
       const gateway = startFakeGateway([
         fakeShellRun("retained-result", "printf 'REQUIRED_RESULT_619\\n'"),
         fakeGatewayFinalText("RESULT_SAVED"),
       ]);
       try {
-        const created = await runFx(["ask", "--json", "--full-access", "Save a result."], {
+        const created = await runLegacyFx(["ask", "--json", "--full-access", "Save a result."], {
           cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
         });
         expect(created.code).toBe(0);
@@ -772,15 +845,16 @@ describe("session recovery", () => {
     }, TIMEOUT);
   }
 
-  test.skipIf(!tmuxAvailable())("resume picker discovers a checkpoint from an unfinished first turn", async () => {
+  test.skipIf(!tmuxAvailable())("resume picker preserves an unfinished legacy checkpoint until compatible recovery", async () => {
     const fixture = createFixture("fx-session-first-checkpoint-");
     const gateway = startFakeGateway([
       fakeGatewayFinalText("FIRST_TURN_SAVED"),
       fakeGatewayFinalText("CHECKPOINT_TURN_RECOVERED"),
+      fakeGatewayFinalText("CHECKPOINT_JOURNAL_CONTINUED"),
     ]);
     let tui: TmuxSession | null = null;
     try {
-      const sessionId = await createSavedSession(fixture, gateway);
+      const sessionId = await createLegacySavedSession(fixture, gateway);
       const eventsPath = join(fixture.home, ".fx", "sessions", sessionId, "events.jsonl");
       const checkpoint = [
         { user: { text: "unfinished first request", images: [], work_id: null } },
@@ -799,22 +873,39 @@ describe("session recovery", () => {
       expect(JSON.parse(listed.stdout).sessions[0]).not.toHaveProperty("has_checkpoint");
       expect(readFileSync(eventsPath, "utf8")).toBe(checkpoint);
 
+      await expectPendingLegacyRefusal(fixture, gateway, sessionId);
+      const before = savedFileHashes(join(fixture.home, ".fx", "sessions", sessionId));
       const stderrPath = join(fixture.root, "tui.stderr");
-      tui = await TmuxSession.create({ cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), stderrPath });
+      const tracePath = join(fixture.root, "picker.trace");
+      tui = await TmuxSession.create({ cwd: fixture.workspace, env: { ...gatewayEnv(fixture, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "session" }, stderrPath });
       await tui.waitForComposer(TIMEOUT);
       await tui.sendText("/resume");
       await tui.waitForText("Create the first saved turn.", TIMEOUT);
       expect(readFileSync(eventsPath, "utf8")).toBe(checkpoint);
+      await tui.sendLiteralText("Create the first saved turn.");
+      await tui.waitForPane(pane => /Sessions\s+1\b/.test(pane) && pane.includes("Create the first saved turn."), TIMEOUT);
       await tui.sendKeys("Enter");
-      await tui.waitForText("unfinished first request", TIMEOUT);
+      await tui.waitForPane(() => existsSync(tracePath) && readFileSync(tracePath, "utf8").includes("picker resume failed err=PendingTurnError"), TIMEOUT);
+      expect(savedFileHashes(join(fixture.home, ".fx", "sessions", sessionId))).toEqual(before);
+      expect(gateway.requests).toHaveLength(1);
+      await tui.sendKeys("Escape");
       await tui.waitForComposer(TIMEOUT);
-      await tui.sendText("Continue after checkpoint.");
-      await tui.waitForPane(() => readFileSync(eventsPath, "utf8").includes("CHECKPOINT_TURN_RECOVERED"), TIMEOUT);
       await tui.sendText("/quit");
       expect(await tui.waitForSessionEnd(TIMEOUT)).toBe(true);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
+      const resolved = await runLegacyFx(["ask", "--json", "--auto", "--resume-id", sessionId, "Continue after checkpoint."], {
+        cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
+      });
+      expect(resolved.code, resolved.stdout + resolved.stderr).toBe(0);
+      expect(resolved.stdout).toContain("CHECKPOINT_TURN_RECOVERED");
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.requests[1]!.body).toContain("FIRST_CHECKPOINT_FACT");
+      const continued = await continueSession(fixture, gateway, sessionId);
+      expect(continued.code, continued.stdout + continued.stderr).toBe(0);
+      expect(continued.stdout).toContain("CHECKPOINT_JOURNAL_CONTINUED");
+      expect(gateway.requests).toHaveLength(3);
+      expect(gateway.requests[2]!.body).toContain("FIRST_CHECKPOINT_FACT");
+      expect(gateway.requests[2]!.body).toContain("CHECKPOINT_TURN_RECOVERED");
     } finally {
       await tui?.kill();
       gateway.stop();
@@ -830,7 +921,7 @@ describe("session recovery", () => {
     ]);
     let tui: TmuxSession | null = null;
     try {
-      const id = await createSavedSession(fixture, gateway);
+      const id = await createLegacySavedSession(fixture, gateway);
       const sessions = join(fixture.home, ".fx", "sessions");
       const unpublished = join(sessions, "unpublished");
       mkdirSync(unpublished, { mode: 0o700 });
@@ -867,7 +958,7 @@ describe("session recovery", () => {
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.requests[1]!.body).toContain("LOCAL_HISTORY_KEPT");
-      expect(readFileSync(join(sessions, id, "events.jsonl"), "utf8")).toContain("CONTINUE_DISCOVERY_OK");
+      expect(JSON.stringify(nativeHistory(join(sessions, id)))).toContain("CONTINUE_DISCOVERY_OK");
       expect(savedFileHashes(foreign)).toEqual(foreignBefore);
       expect(savedFileHashes(fenced)).toEqual(fencedBefore);
     } finally {
@@ -883,7 +974,7 @@ describe("session recovery", () => {
     const gateway = startFakeGateway([fakeGatewayFinalText("LATEST_CACHE_HISTORY")]);
     let tui: TmuxSession | null = null;
     try {
-      const id = await createSavedSession(fixture, gateway);
+      const id = await createLegacySavedSession(fixture, gateway);
       const before = savedFileHashes(legacy.source);
       for (const iteration of [0, 1]) {
         const trace = join(fixture.root, `ranking-${iteration}.trace`);
@@ -917,7 +1008,7 @@ describe("session recovery", () => {
       const resumed = await runFx(["session", "--id", id, "--json"], {
         cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
       });
-      expect(resumed.code).toBe(0);
+      expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
       expect(resumed.stderr).toBe("");
       expect(resumed.stdout).toContain("LATEST_CACHE_HISTORY");
     } finally {
@@ -932,7 +1023,7 @@ describe("session recovery", () => {
     { version: 3, entry: "/resume" },
     { version: 4, entry: "--resume id" },
   ] as const) {
-    test.skipIf(!tmuxAvailable())(`legacy v${version} checkpoint resumes through ${entry} and survives close/reopen`, async () => {
+    test.skipIf(!tmuxAvailable())(`legacy v${version} pending checkpoint refuses conversion, resolves through ${entry}, and survives journal reopen`, async () => {
       const fixture = createFixture("fx-legacy-resume-flow-");
       const legacy = createLegacySession(fixture, version);
       const gateway = startFakeGateway([
@@ -956,11 +1047,14 @@ describe("session recovery", () => {
         const expectedSessionIds = [legacy.id];
         let blankSessionDir: string | null = null;
         expect(sessionEntries()).toEqual(expectedSessionIds);
+        await expectPendingLegacyRefusal(fixture, gateway, legacy.id);
         const initialArgs = entry === "/resume" ? [] : entry === "-r" ? ["-r"] : ["--resume", legacy.id];
-        for (const [index, args] of [initialArgs, ["-c"], ["--resume", legacy.id]].entries()) {
+        // The compatible older binary predates remembered selection. Select its
+        // migrated session in current fx before exercising -c.
+        for (const [index, args] of [initialArgs, ["--resume", legacy.id], ["-c"]].entries()) {
           const stderrPath = join(fixture.root, `legacy-${index}.stderr`);
           tui = await TmuxSession.create({
-            cmd: [FX_BIN, ...args].map((arg) => JSON.stringify(arg)).join(" "),
+            cmd: [index === 0 ? await ensureLegacyFixtureBinary() : FX_BIN, ...args].map((arg) => JSON.stringify(arg)).join(" "),
             cwd: fixture.workspace, env: legacyGatewayEnv(fixture, gateway), stderrPath,
           });
           if (index === 0 && entry !== "--resume id") {
@@ -1001,7 +1095,7 @@ describe("session recovery", () => {
             await tui.sendText(`Continue the migrated conversation after reopen ${index}.`);
             await tui.waitForText(reply, TIMEOUT);
             await tui.waitForComposer(TIMEOUT);
-            await tui.waitForPane(() => readFileSync(join(legacy.source, "events.jsonl"), "utf8").includes(reply), TIMEOUT);
+            await tui.waitForPane(() => JSON.stringify(nativeHistory(legacy.source)).includes(reply), TIMEOUT);
             expect(gateway.requests).toHaveLength(index);
             expectLegacyRequest(gateway.requests[index - 1]!);
             expectLegacyArchive(legacy.source);
@@ -1050,12 +1144,12 @@ describe("session recovery", () => {
       expect(savedFileHashes(legacy.source)).toEqual(before);
       expect(readdirSync(join(fixture.home, ".fx", "sessions"))).toEqual([legacy.id]);
       writeFileSync(legacy.watermarkPath, watermark);
-
+      await expectPendingLegacyRefusal(fixture, gateway, legacy.id);
       for (const [index, args] of [["--resume-id", legacy.id], ["--resume", "last"]].entries()) {
-        const result = await runFx(["ask", "--json", "--auto", ...args, "Continue the synthetic saved conversation."], {
+        const result = await (index === 0 ? runLegacyFx : runFx)(["ask", "--json", "--auto", ...args, "Continue the synthetic saved conversation."], {
           cwd: fixture.workspace, env: legacyGatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
         });
-        expect(result.code).toBe(0);
+        expect(result.code, result.stdout + result.stderr).toBe(0);
         expect(result.stderr).toBe("");
         expect(JSON.parse(result.stdout)).toMatchObject({
           session_id: legacy.id, model: FAKE_GATEWAY_MODEL, tool_calls: [],
@@ -1110,7 +1204,7 @@ describe("session recovery", () => {
         const result = await runFx(["ask", "--json", "--auto", "--resume-id", legacy.id, prompt], {
           cwd: fixture.workspace, env: legacyGatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
         });
-        expect(result.code).toBe(0);
+        expect(result.code, result.stdout + result.stderr).toBe(0);
         expect(result.stderr).toBe("");
         expect(JSON.parse(result.stdout)).toMatchObject({
           session_id: legacy.id, output: "SUPERSESSION_ASK_SAVED", tool_calls: [],
@@ -1122,13 +1216,14 @@ describe("session recovery", () => {
         expect(request).toContain(LEGACY_ANSWER);
         expect(request).not.toContain(LEGACY_PARTIAL);
         expect(request).not.toContain(LEGACY_TOOL_EVIDENCE);
-        const migrated = readFileSync(eventsPath, "utf8");
+        const migratedHistory = nativeHistory(legacy.source);
+        const migrated = JSON.stringify(migratedHistory);
         expect(migrated).toContain(LEGACY_ANSWER);
         expect(migrated).toContain("SUPERSESSION_ASK_SAVED");
         expect(migrated).not.toContain(LEGACY_PARTIAL);
         expect(migrated).not.toContain(LEGACY_TOOL_CALL_ID);
         expect(migrated).not.toContain(LEGACY_TOOL_EVIDENCE);
-        expect(migrated.trimEnd().split("\n").map(JSON.parse).filter((record) => record.event.interrupted))
+        expect(migratedHistory.filter(turn => turn.kind === "interrupted"))
           .toHaveLength(0);
         if (kind === "history_turn_committed") {
           expect(request).toContain(supersedingAnswer);
@@ -1152,7 +1247,7 @@ describe("session recovery", () => {
       const fixture = createFixture("fx-session-fifo-");
       const gateway = startFakeGateway([fakeGatewayFinalText("FIFO_SOURCE_SAVED")]);
       try {
-        const id = fenced ? "fenced-legacy-fifo" : await createSavedSession(fixture, gateway);
+        const id = fenced ? "fenced-legacy-fifo" : await createLegacySavedSession(fixture, gateway);
         const source = join(fixture.home, ".fx", "sessions", id);
         if (fenced) {
           mkdirSync(source, { recursive: true, mode: 0o700 });
@@ -1199,14 +1294,14 @@ describe("session recovery", () => {
     }, TIMEOUT);
   }
 
-  test("latest resume discovers and repairs a partial final JSONL record", async () => {
+  test("latest resume preserves a partial legacy record until explicit recovery", async () => {
     const fixture = createFixture("fx-session-partial-record-");
     const gateway = startFakeGateway([
       fakeGatewayFinalText("FIRST_TURN_SAVED"),
       fakeGatewayFinalText("PARTIAL_RECORD_RECOVERED"),
     ]);
     try {
-      const sessionId = await createSavedSession(fixture, gateway);
+      const sessionId = await createLegacySavedSession(fixture, gateway);
       const sessionDir = join(fixture.home, ".fx", "sessions", sessionId);
       const eventsPath = join(sessionDir, "events.jsonl");
       const committed = readFileSync(eventsPath, "utf8");
@@ -1223,28 +1318,31 @@ describe("session recovery", () => {
         .toContain(sessionId);
       expect(readFileSync(eventsPath, "utf8")).toBe(committed + '{"schema_version":1,"partial-tail"');
 
-      const resumed = await continueSession(fixture, gateway, sessionId, true);
-      expect(resumed.code).toBe(0);
+      const before = savedFileHashes(sessionDir);
+      const refused = await continueSession(fixture, gateway, sessionId, true);
+      expect(refused.code).toBe(1);
+      expect(refused.stdout + refused.stderr).toContain("TruncatedEventFrame");
+      expect(savedFileHashes(sessionDir)).toEqual(before);
+      expect(gateway.requests).toHaveLength(1);
+      const recovered = await runFx(["session", "recover", sessionId, "--json"], {
+        cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
+      });
+      expect(recovered.code, recovered.stdout + recovered.stderr).toBe(0);
+      const copyId = JSON.parse(recovered.stdout).recovered_id;
+      expect(copyId).not.toBe(sessionId);
+      const copy = join(fixture.home, ".fx", "sessions", copyId);
+      expect(readFileSync(join(copy, "events.jsonl"), "utf8")).toBe(committed);
+      const resumed = await continueSession(fixture, gateway, copyId);
+      expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
       expect(resumed.stderr).toBe("");
-      expect(JSON.parse(resumed.stdout).session_id).toBe(sessionId);
+      expect(JSON.parse(resumed.stdout).session_id).toBe(copyId);
       expect(JSON.parse(resumed.stdout).output).toBe("PARTIAL_RECORD_RECOVERED");
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.requests[1]!.body).not.toContain("partial-tail");
 
-      const repaired = readFileSync(eventsPath, "utf8");
-      expect(repaired.startsWith(committed)).toBe(true);
-      expect(repaired).not.toContain("partial-tail");
-      const files = readdirSync(sessionDir, { withFileTypes: true })
-        .filter((entry) => entry.isFile())
-        .map((entry) => entry.name)
-        .sort();
-      expect(files).toEqual([
-        "events.jsonl",
-        "permissions.json",
-        "session.json",
-        "session.lock",
-        "usage-v2.json",
-      ]);
+      expect(savedFileHashes(sessionDir)).toEqual(before);
+      expect(JSON.stringify(nativeHistory(copy))).toContain("PARTIAL_RECORD_RECOVERED");
+      expect(JSON.stringify(nativeHistory(copy))).not.toContain("partial-tail");
     } finally {
       gateway.stop();
       rmSync(fixture.root, { recursive: true, force: true });
@@ -1252,14 +1350,14 @@ describe("session recovery", () => {
   }, TIMEOUT);
 
   for (const partialNextRecord of [false, true]) {
-    test(`writable resume truncates an unfinished turn with partial next record=${partialNextRecord}`, async () => {
+    test(`journal conversion preserves an unfinished legacy turn with partial next record=${partialNextRecord}`, async () => {
       const fixture = createFixture("fx-session-unfinished-turn-");
       const gateway = startFakeGateway([
         fakeGatewayFinalText("FIRST_TURN_SAVED"),
         fakeGatewayFinalText("UNFINISHED_TURN_RECOVERED"),
       ]);
       try {
-        const sessionId = await createSavedSession(fixture, gateway);
+        const sessionId = await createLegacySavedSession(fixture, gateway);
         const eventsPath = join(
           fixture.home,
           ".fx",
@@ -1284,8 +1382,22 @@ describe("session recovery", () => {
         }) + "\n");
         if (partialNextRecord) appendFileSync(eventsPath, '{"schema_version":1,"event":');
 
-        const resumed = await continueSession(fixture, gateway, sessionId);
-        expect(resumed.code).toBe(0);
+        const before = savedFileHashes(join(fixture.home, ".fx", "sessions", sessionId));
+        const refused = await continueSession(fixture, gateway, sessionId);
+        expect(refused.code).toBe(1);
+        expect(refused.stdout + refused.stderr).toContain(partialNextRecord ? "TruncatedEventFrame" : "PendingTurnError");
+        expect(savedFileHashes(join(fixture.home, ".fx", "sessions", sessionId))).toEqual(before);
+        expect(gateway.requests).toHaveLength(1);
+        const inspected = await runFx(["session", "--id", sessionId, "--json"], {
+          cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
+        });
+        expect(inspected.code).toBe(0);
+        expect(inspected.stdout).toContain("FIRST_TURN_SAVED");
+        expect(savedFileHashes(join(fixture.home, ".fx", "sessions", sessionId))).toEqual(before);
+        const resumed = await runLegacyFx(["ask", "--json", "--auto", "--resume-id", sessionId, "Continue after recovery."], {
+          cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
+        });
+        expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
         expect(resumed.stderr).toBe("");
         expect(JSON.parse(resumed.stdout).output).toBe("UNFINISHED_TURN_RECOVERED");
         expect(gateway.requests).toHaveLength(2);
@@ -1308,7 +1420,7 @@ describe("session recovery", () => {
       fakeGatewayFinalText("FIRST_TURN_SAVED"),
     ]);
     try {
-      const sessionId = await createSavedSession(fixture, gateway);
+      const sessionId = await createLegacySavedSession(fixture, gateway);
       const eventsPath = join(
         fixture.home,
         ".fx",

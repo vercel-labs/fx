@@ -297,6 +297,10 @@ pub const ModelRecoveryCause = enum {
     provider_unavailable,
     rate_limited,
     system_resumed,
+    /// Intentional host handoff, not evidence of a model or transport failure.
+    suspended,
+    /// Tool effects cannot be safely replayed, independently of model health.
+    tool_state_uncertain,
     authentication,
     request_limit_reached,
 };
@@ -332,6 +336,8 @@ pub const ModelFailureDiagnostic = struct {
             .provider_unavailable => "provider_error",
             .rate_limited => "HTTP 429",
             .system_resumed => "SystemResumed",
+            .suspended => "Suspended at a safe boundary",
+            .tool_state_uncertain => "Tool effects are uncertain; inspect before continuing",
             .authentication => "AuthenticationExpired",
             .request_limit_reached => "ProviderRequestLimitReached",
         };
@@ -371,6 +377,8 @@ pub const RouteRecoveryStatus = struct {
         manual_retry_without_fast,
         manual_recovered_without_fast,
         terminal_provider_error,
+        suspended,
+        tool_state_uncertain,
         unsafe_assistant_output,
         unsafe_tool_start,
         content_filter,
@@ -393,13 +401,22 @@ pub const RouteRecoveryStatus = struct {
             .manual_recovered_without_fast,
             => .success,
             .terminal_provider_error,
+            .tool_state_uncertain,
             .unsafe_assistant_output,
             .unsafe_tool_start,
             .content_filter,
             => .danger,
             .auto_retry,
             .manual_retry_without_fast,
+            .suspended,
             => .warning,
+        };
+    }
+
+    pub fn is_paused(self: RouteRecoveryStatus) bool {
+        return switch (self.kind) {
+            .terminal_provider_error, .suspended, .tool_state_uncertain => true,
+            else => false,
         };
     }
 
@@ -430,6 +447,8 @@ pub const RouteRecoveryStatus = struct {
             .manual_retry_without_fast => self.manualRetryLabel(buf),
             .manual_recovered_without_fast => "✓ recovered · Fast disabled",
             .terminal_provider_error => self.pausedLabel(buf),
+            .suspended => "Suspended at a safe boundary · context preserved",
+            .tool_state_uncertain => "Tool state uncertain · inspect before continuing",
             .unsafe_assistant_output => self.fixedFailureLabel(
                 buf,
                 "Response interrupted",
@@ -481,6 +500,8 @@ pub const RouteRecoveryStatus = struct {
             .system_resumed => "Mac woke from sleep",
             .authentication => "Authentication refreshed",
             .request_limit_reached => "Provider request limit reached",
+            .suspended => return "Suspended at a safe boundary · context preserved",
+            .tool_state_uncertain => return "Tool state uncertain · inspect before continuing",
         };
         const action = switch (self.action orelse .retrying_request) {
             .retrying_request => "retrying request",
@@ -521,6 +542,9 @@ pub const RouteRecoveryStatus = struct {
 
     fn pausedLabel(self: RouteRecoveryStatus, buf: []u8) []const u8 {
         const cause = self.cause orelse return self.pausedCauseLabel(buf, "Provider unavailable");
+        if (cause == .suspended) return "Suspended at a safe boundary · context preserved";
+        if (cause == .tool_state_uncertain)
+            return "Tool state uncertain · inspect before continuing";
         if (cause == .rate_limited and self.failed_attempt < self.attempt_limit) {
             if (self.diagnostic) |diagnostic| {
                 return std.fmt.bufPrint(
@@ -585,7 +609,7 @@ pub const RouteRecoveryStatus = struct {
             .rate_limited => "Rate limited",
             .system_resumed => "Mac woke from sleep",
             .authentication => "Authentication expired",
-            .request_limit_reached => unreachable,
+            .suspended, .tool_state_uncertain, .request_limit_reached => unreachable,
         };
         return self.pausedCauseLabel(buf, name);
     }
@@ -609,6 +633,32 @@ pub const RouteRecoveryStatus = struct {
         ) catch "⚠ Model response recovery paused";
     }
 };
+
+test "suspension and uncertainty labels do not claim model failure recovery" {
+    for ([_]ModelRecoveryCause{ .suspended, .tool_state_uncertain }) |cause| {
+        const kind: RouteRecoveryStatus.Kind = if (cause == .suspended) .suspended else .tool_state_uncertain;
+        // A replay presenter may still carry legacy counters or diagnostics.
+        // None of those are evidence for a network claim on a control cause.
+        for ([_]RouteRecoveryStatus.Kind{ kind, .terminal_provider_error }) |status_kind| {
+            const status = RouteRecoveryStatus{
+                .kind = status_kind,
+                .cause = cause,
+                .action = .paused,
+                .failed_attempt = 4,
+                .attempt_limit = 10,
+                .delay_seconds = 3,
+                .diagnostic = ModelFailureDiagnostic.init("SystemResumed"),
+            };
+            var buffer: [RouteRecoveryStatus.label_max_bytes]u8 = undefined;
+            try std.testing.expectEqualStrings(if (cause == .suspended)
+                "Suspended at a safe boundary · context preserved"
+            else
+                "Tool state uncertain · inspect before continuing", status.label(&buffer));
+            try std.testing.expect(!status.isRecovered());
+        }
+        try std.testing.expectEqual(if (cause == .suspended) RouteRecoveryStatusTone.warning else .danger, (RouteRecoveryStatus{ .kind = kind }).tone());
+    }
+}
 
 test "route recovery reports the attempt owned by its state" {
     try std.testing.expectEqual(@as(usize, 3), (RouteRecoveryStatus{
@@ -733,6 +783,15 @@ pub const McpToolBinding = struct {
             self.authority_id == other.authority_id and
             std.mem.eql(u8, &self.definition_digest, &other.definition_digest);
     }
+};
+
+/// Recorded execution identity supplied to a host tool. It carries no authority;
+/// permissions are checked independently for every attempted invocation.
+pub const JournalToolContext = struct {
+    turnId: []const u8,
+    callId: []const u8,
+    requestId: []const u8,
+    recovering: bool,
 };
 
 pub const ToolCall = struct {
@@ -1942,6 +2001,13 @@ pub const SnapshotFileOwnership = struct {
     }
 };
 
+/// Identifies an acknowledged turn while its UI event waits in the queue.
+/// Journal checkpoints preserve the session-lifetime turn ordering.
+pub const JournalTurnReference = struct {
+    namespace_hash: [64]u8,
+    turn_index: usize,
+};
+
 pub const FinishedPrompt = struct {
     turn: HistoryTurn,
     /// Owned display-only text; never serialized as conversation history.
@@ -1950,6 +2016,7 @@ pub const FinishedPrompt = struct {
     terminal_projection: FinishedPromptProjection = .history_default,
     terminal_outcome: ?TurnPresentationOutcome = null,
     snapshot_file_ownership: ?SnapshotFileOwnership = null,
+    journal_turn: ?JournalTurnReference = null,
 };
 
 pub const PermissionMode = enum {
@@ -2326,6 +2393,7 @@ pub fn dupeFinishedPrompt(alloc: std.mem.Allocator, finished: FinishedPrompt) !F
         .terminal_projection = finished.terminal_projection,
         .terminal_outcome = finished.terminal_outcome,
         .snapshot_file_ownership = finished.snapshot_file_ownership,
+        .journal_turn = finished.journal_turn,
     };
 }
 

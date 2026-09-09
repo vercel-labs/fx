@@ -1,8 +1,9 @@
 # libfx
 
 `libfx` is the small fx agent kernel for JavaScript hosts. One agent is one
-in-memory conversation with three operations: `prompt`, `checkpoint`, and
-`close`.
+conversation with streaming prompts and optional host-owned execution journaling.
+Plain agents keep their history in memory. Journal agents expose explicit
+checkpoint, suspend, resume, and abandon controls.
 
 ```sh
 npm install libfx
@@ -33,7 +34,6 @@ for await (const event of turn) {
 }
 
 console.log(await turn.result); // { stopReason, usage }
-const checkpoint = await agent.checkpoint();
 await agent.close();
 ```
 
@@ -76,26 +76,204 @@ A turn has one event consumer. Breaking out of its iterator cancels the turn;
 message-decoding failures reject the result instead of returning success with
 missing text.
 
+SDK requests are limited to 8 MiB including their encoded request envelope.
 Native transport buffers at most 8 MiB of output bytes. Unread SDK events apply
 backpressure at 1 MiB of encoded messages or 256 events. One message can exceed
 that threshold when the queue is empty; an individual encoded ACP message is
 limited to 64 MiB on both backends. These are transport bounds, not a total
 answer-size limit or a bound on retained conversation history.
 
-Only one prompt may run at a time. `checkpoint()` is idle-only and returns
-opaque, bounded, versioned bytes. Restore them only when creating a fresh
-agent:
+Only one execution may run at a time. An already-aborted signal on a plain
+agent returns `cancelled` without a model request or a history change.
+
+### Journal API (development)
+
+The journal API described here is under qualification in this source tree.
+Existing releases that expose `checkpoint` and `onCheckpoint` retain their
+versioned API; do not apply these migration instructions to those releases.
+Native and Wasm cores must advertise journal version 1 before the SDK creates
+a durable session. An incompatible core is rejected.
+
+Supply both `journal`, an iterable or async iterable of entries, and
+`onEntry(entry)`, a callback whose resolution means the exact entry is durable.
+Each entry is `{ seq, kind, bytes: Uint8Array, hash }`. The core assigns its
+sequence, identities, and hash. Preserve them and the exact bytes.
+
+The following Node example uses a file that the application owns exclusively.
+The containing directory is synced when the file is created, and each append
+is synced before acknowledgement. A production host must enforce one writer
+and preserve the journal after an uncertain write.
 
 ```js
-const restored = await createFxAgent({ apiKey, model, checkpoint });
+import { open } from "node:fs/promises";
+import { createFxAgent } from "libfx";
+
+const file = await open("./conversation.journal", "a+");
+let agent;
+try {
+  const directory = await open(".", "r");
+  try { await directory.sync(); } finally { await directory.close(); }
+  const saved = await file.readFile("utf8");
+  const journal = saved.split("\n").filter(Boolean).map((line) => {
+    const entry = JSON.parse(line);
+    return { ...entry, bytes: new Uint8Array(Buffer.from(entry.bytes, "base64")) };
+  });
+  agent = await createFxAgent({
+    apiKey: process.env.AI_GATEWAY_API_KEY,
+    journal,
+    async onEntry(entry) {
+      await file.writeFile(JSON.stringify({
+        ...entry, bytes: Buffer.from(entry.bytes).toString("base64"),
+      }) + "\n");
+      await file.sync();
+    },
+  });
+  const turn = agent.prompt("Explain this project.", { requestId: "explain-project-1" });
+  for await (const event of turn) {
+    if (event.type === "text_delta") process.stdout.write(event.delta);
+  }
+  console.log(await turn.result);
+} finally {
+  try { await agent?.close(); } finally { await file.close(); }
+}
 ```
 
-An already-aborted prompt signal returns `cancelled` without a model request
-or a history change. The next prompt can run normally.
+Loading records validates and restores state without calling a model or a tool.
+The host must resupply credentials, instructions, tools, MCP clients, and skill
+records. Keep required rich-input and tool-output artifacts available alongside
+the journal. The journal contains sensitive conversation and execution data.
 
-The checkpoint contains conversation history and usage only. The host owns
-durable storage and must resupply models, credentials, instructions, tools,
-MCP clients, and skill records.
+The acknowledgement boundaries are `turn_start`, `model_step`, `tool_result`,
+`turn_end`, and `checkpoint`. A start precedes model admission; a complete model
+decision precedes tool effects; each tool result precedes dependent work; and a
+turn end precedes result resolution. No manual final checkpoint is needed to
+record a completed journal turn. `onEntry` must await durable storage, rather than
+queue a write or retain only an in-memory copy. It may call `status()` to inspect
+the last acknowledged position; it must not await another operation on the same
+agent. A rejected callback rejects the turn with `PersistenceUncertain`, retains
+the callback error as `cause`, and fences the instance. Close it and reconcile
+its authoritative storage before recreating an owner.
+
+`model_step` also carries provider reservations, context compaction, and accepted
+steering input. Reservations and compaction advance the durable sequence without
+creating an assistant message. Steering preserves its message identities and any
+interrupted response prefix before another model request. The transcript
+projection handles these records and identifies drafts retired by steering;
+compacting model context does not replace the saved conversation.
+
+Automatic compaction records the retained model context before continuing. A
+recreated owner restores that boundary and keeps the complete saved tool history.
+Before execution, the core can lower the model-facing tool output limit to keep
+enough journal space for the result and completion or abandonment of the turn.
+
+Tool permission feedback projects as user messages with stable call-scoped IDs.
+
+Journal prompts require a nonempty caller `requestId`. Retrying a completed ID
+with the same input returns recorded semantic output without new effects or
+storage callbacks. Retrying the current live ID attaches to its execution and
+future events. Changed input raises `RequestConflict`; a restored pending
+request raises `PendingTurnError` until the host explicitly resumes or abandons
+it. A different ID does not retry an earlier request. Retained request mappings
+are session-lived; this API has no request TTL or eviction setting. Provider
+context records refer to the original saved input rather than rewriting it at
+every model boundary. Existing records that contain the full input remain readable.
+
+Each attached handle has one consumer, sharing the bounded event buffer. A slow
+consumer backpressures all attached handles. Calling `cancel()` or leaving any
+handle's iterator cancels their shared execution. An already-aborted journal
+prompt rejects with `AbortError` before admission; it does not manufacture a
+completed turn.
+
+Journal `turn.result` resolves only after a durable turn end and executor/callback
+cleanup. Its result is `{ ok: true, stopReason, usage? }` for success, or
+`{ ok: false, reason, retryable, message, pendingTool? }` for a recorded failure.
+Successful stop reasons are `stop`, `length`, and `tool_limit`; failure reasons
+are `cancelled`, `interrupted`, `refused`, `provider_error`, and `timeout`.
+`JournalConflict`, `PersistenceUncertain`, `PendingTurnError`, `RequestConflict`,
+and `RecoveryRequired` are exported error classes with matching `name` and
+`code`. Storage failures are errors, never ordinary tool `isError` results.
+
+Journal event shapes preserve core identities:
+
+- `turn_start`: `turnId`, `messageId`.
+- `text_delta` and `reasoning_delta`: `key: { turnId, messageId, generationId }`,
+  `ordinal`, and `delta`.
+- `tool_start`: `turnId`, `messageId`, `callId`, `name`, and `input`.
+- `tool_end`: `turnId`, `messageId`, `callId`, `content`, and `isError`.
+- `turn_end`: `turnId` and `result`.
+
+Completed retry streams are semantic replay, not a reproduction of original
+network token chunks. Draft identities never authorize an effect or recovery.
+
+### Checkpoints, projection, and compatibility
+
+`await agent.checkpoint()` is idle-only. It appends a checkpoint through
+`onEntry` and returns the same acknowledged `JournalEntry` shape, with
+`Uint8Array` bytes. Restore from that checkpoint entry followed by every newer
+entry. Never prune records until the checkpoint itself is acknowledged and
+retains their transcript, outcomes, and request mappings. Keep receipts for
+pending or uncertain tools, including when a provider's ordinary lookup window
+has expired. Expiry does not establish that an effect never happened.
+
+Pure transcript inspection does not load native or Wasm code:
+
+```js
+import { createProjection, readCheckpoint } from "libfx/transcript";
+
+const projection = createProjection(journal);
+const transcript = projection.transcript();
+const recordedRequests = projection.requests(); // input hash, turn ID, completion, and recorded result
+const candidate = projection.preview(nextEntry);
+// After storing nextEntry, adopt candidate.projection and publish its delta.
+const checkpointTranscript = readCheckpoint(checkpointEntry.bytes);
+```
+
+Projection validates entry integrity and transitions. `preview()` leaves its
+source unchanged and returns the candidate projection, changed messages, and
+completed draft keys. `apply()` is for entries that are already durable.
+`readCheckpoint()` reads the versioned journal checkpoint body; it does not
+convert legacy SDK checkpoint bytes into executable journal state.
+
+| Options | Behavior |
+| --- | --- |
+| Both `journal` and `onEntry` | Journal restore and durable operations; prompts require `requestId`. |
+| Only one journal option, or an invalid callback/iterable | Rejected before execution. |
+| Neither option | Existing non-durable prompt, stream, tools, and close; durable operations reject. |
+| Non-undefined `checkpoint` or `onCheckpoint`, including mixed inputs | Actionable migration error; no automatic import or precedence rule. |
+
+Legacy checkpoint data must remain available to a compatible reader. This SDK
+API does not automatically migrate a legacy checkpoint or authorize recovery
+from it. Individual journal entries are bounded at 32 MiB; record and runtime
+capacity limits also apply. A capacity or storage error is not permission to
+truncate history or forget request identities.
+
+### Suspension and recovery
+
+- `suspend()` requests a safe boundary and waits for callbacks and entered
+  executors to settle. It resolves core status, or `null` if no turn is active.
+  It does not write `turn_end`. The suspended handle's `turn.result` rejects
+  `PendingTurnError` carrying `status` and `pendingTurn`. A turn that finishes
+  before suspension takes effect can resolve normally.
+- `status()` reports `idle`, `lastSeq`, and, when present, `pendingTurn` containing
+  `turnId`, `requestId`, `lastSeq`, and `awaiting`. The latter is `"model"` or
+  `{ tool: { callId, name, input, replay } }`. During a persistence callback,
+  status describes the previous durable position. Core admission still decides
+  whether an operation can proceed.
+- `resume({ signal? })` returns a continuation handle for the pending turn. It
+  may repeat an unrecorded model request and incur billing. Settled tool results
+  are retained. An unresolved tool resumes only under its recorded replay policy.
+- `abandon()` records an interrupted turn end without running pending tools.
+  The first unresolved selected tool remains `unknown`; later unexecuted calls
+  are `skipped`. Abandonment is not evidence that an external effect failed.
+- `close()` requests cancellation and waits for callbacks, tools, and turn-result
+  cleanup. It is idempotent and remains available after an error. It does not
+  replace suspension. A tool that ignores cancellation still must settle before
+  cleanup can finish.
+
+Keep the event consumer running while requesting suspension and handle
+`PendingTurnError` from both the stream and its result. Recreate the next owner
+from acknowledged journal entries, then choose recovery explicitly. Host
+adapters should default to abandonment; automatic resume is an opt-in policy.
 
 ## Models
 
@@ -136,11 +314,39 @@ const agent = await createFxAgent({
 });
 ```
 
-The JavaScript host is the authority for tool effects. The same descriptors,
-schemas, cancellation, results, and events are used by N-API and WebAssembly.
-Cancelling a prompt aborts its tools' signals and stops waiting for their
-callbacks. Late results and rejections are ignored. Tools remain responsible
-for stopping their own work when their signal is aborted.
+The JavaScript host owns tool effects; the core owns their execution order and
+recorded identities. Journal tools default to `replay: "blocked"`. Declare
+`replay: "safe"` only when the executor can recover its original authoritative
+outcome by the recorded call ID, checking that its tool and input match. A
+`recovering` flag does not replace that lookup. Journal tool context contains
+`signal`, `turnId`, `callId`, `requestId`, and `recovering`.
+
+Journal arguments use the same secret redaction as saved history. If redaction
+changes a call's input, that call is recorded with blocked replay even when its
+tool declares safe replay. A pending call requires reconciliation or abandonment;
+an already recorded result remains usable without executing the tool again.
+
+Cancellation aborts tool signals. The SDK retains an entered executor until its
+actual promise settles, including after cancellation or shutdown. Throwing,
+rejecting, invalid encoding, or losing a bridge reply does not prove that an
+external effect failed. In journal mode the core preserves the pending tool and
+rejects with `RecoveryRequired`; explicit recovery or abandonment is required.
+A storage acknowledgement cannot resolve this independent effect uncertainty.
+
+For a known terminal failure, return `{ content: "Known failure", isError: true }`
+in journal mode. This is an ordinary recorded result that the model can handle.
+Other objects remain JSON text, and typed results preserve media:
+
+```js
+return { type: "libfx.tool-result", text: "Known terminal failure", images: [], isError: true };
+```
+
+Plain non-durable agents retain their existing tool-event and result shapes.
+After cancellation interrupts an entered executor, their uncertainty guard
+rejects with `HostToolOutcomeUncertain` and blocks further work on that owner.
+Tools remain responsible for stopping or reconciling external work. None of
+these APIs makes arbitrary external effects exactly once.
+
 Instructions are limited to 64 KiB of UTF-8 text, including text assembled by
 the MCP and skills adapters. They are the complete host-owned system context:
 libfx adds no hidden base prompt, and omitting `instructions` sends no system
@@ -151,10 +357,12 @@ message.
 `libfx/mcp` accepts a host-owned MCP client. Transport, authentication,
 elicitation, and cleanup remain outside the kernel. The client uses the MCP
 TypeScript SDK v1 signature: `callTool(params, resultSchema?, options?)`, with
-cancellation passed in `options`. Tool text and structured data
-reach the model together. PNG, JPEG, GIF, and WebP tool images reach models that
+cancellation passed in `options`. Explicit MCP `isError: true` responses are
+returned terminal failures; rejected `callTool()` operations remain uncertain.
+Tool text and structured data reach the model together. PNG, JPEG, GIF, and WebP tool images reach models that
 advertise image input support; other models receive an explicit omission notice.
-Images are retained in checkpoints within the existing checkpoint size limit.
+Journal persistence must retain image data or required artifacts before acknowledging
+the records that reference them. Existing tool-result and journal bounds apply.
 Each image may contain up to 5 MiB of base64 data, with at most eight images and
 an 8 MiB result frame. Ordinary host tool objects remain JSON text. Resource and
 prompt options supply text instructions; non-text context has an omission notice.
@@ -306,7 +514,7 @@ export async function POST(request) {
 
 Use the application's normal authentication and request limits around the
 route. JavaScript tools and MCP clients remain host-owned and must be supplied
-when creating an agent, including after checkpoint restoration. The native
+when creating an agent, including after journal restoration. The native
 backend does not enable the CLI's built-in shell or filesystem tools.
 
 ## Interactive terminal

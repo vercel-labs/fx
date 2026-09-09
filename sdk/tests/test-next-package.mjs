@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { createWriteStream } from "node:fs";
-import { access, cp, mkdir, mkdtemp, readFile, rename, writeFile } from "node:fs/promises";
+import { access, cp, mkdir, mkdtemp, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -18,7 +18,7 @@ const webpack = next15 || process.argv.includes("--webpack");
 const bundlerArgs = webpack && !next15 ? ["--webpack"] : [];
 const artifactRoot = process.env.LIBFX_TEST_ARTIFACT_ROOT || tmpdir();
 await mkdir(artifactRoot, { recursive: true });
-const root = await mkdtemp(resolve(artifactRoot, "libfx-next-"));
+const root = await realpath(await mkdtemp(resolve(artifactRoot, "libfx-next-")));
 const app = resolve(root, "app");
 const fixture = fileURLToPath(new URL("./next/", import.meta.url));
 const token = randomUUID();
@@ -79,7 +79,7 @@ async function exercise(server, stage) {
   const unauthorized = await fetch(`${server.url}/api/fx`);
   assert.equal(unauthorized.status, 401);
   for (const backend of ["native", "auto"]) {
-    for (const scenario of ["host", "mcp", "error", "cancel", "resume"]) {
+    for (const scenario of ["host", "mcp", "error", "known-error", "cancel", "resume"]) {
       const response = await fetch(`${server.url}/api/fx?backend=${backend}&scenario=${scenario}`, {
         headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(60_000),
       });
@@ -137,7 +137,7 @@ try {
   manifest.dependencies.libfx = "file:./libfx.tgz";
   if (next15) manifest.dependencies.next = "15.5.25";
   await writeFile(resolve(app, "package.json"), JSON.stringify(manifest, null, 2));
-  await run(process.env.PNPM_BIN || "pnpm", ["install", "--no-frozen-lockfile", "--ignore-scripts"], app, "install");
+  await run(process.env.PNPM_BIN || "pnpm", ["install", "--ignore-workspace", "--no-frozen-lockfile", "--ignore-scripts"], app, "install");
   const require = createRequire(resolve(app, "package.json"));
   if (!next15) {
     await run(process.execPath, [

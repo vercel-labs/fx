@@ -74,10 +74,10 @@ export async function createMcpAdapter(client, options = {}) {
           type: "image", mimeType: item.mimeType, data: item.data,
         }));
         const rich = images.length ? { type: "libfx.tool-result", text, images } : null;
-        if (result?.isError) {
-          const error = new Error(text || `MCP tool ${tool.name} failed`);
-          if (rich) error.toolResult = rich;
-          throw error;
+        if (result?.isError === true) {
+          // A returned MCP error is a known terminal result. Only a rejected
+          // callTool transport/executor is uncertain to the agent core.
+          return { type: "libfx.tool-result", text: text || `MCP tool ${tool.name} failed`, images, isError: true };
         }
         return rich ?? text;
       },

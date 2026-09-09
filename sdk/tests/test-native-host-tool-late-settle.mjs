@@ -82,11 +82,19 @@ async function exerciseLateSettlement(closeBeforeSettle) {
     const turn = agent.prompt("wait", { signal: controller.signal });
     await toolStarted;
     controller.abort();
-    const result = await withTimeout(turn.result);
-    assert.equal(result.stopReason, "cancelled");
+    let resultSettled = false;
+    const result = assert.rejects(withTimeout(turn.result), /HostToolOutcomeUncertain/)
+      .then(() => { resultSettled = true; });
+    let closeSettled = false;
+    const closing = closeBeforeSettle ? agent.close().then(() => { closeSettled = true; }) : null;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 25));
     assert.equal(toolSignalAborted, true);
-
-    if (closeBeforeSettle) await agent.close();
+    assert.equal(resultSettled, false, "turn settled before the executor released its resources");
+    assert.equal(closeSettled, false, "close settled before the executor released its resources");
+    settleTool();
+    await result;
+    if (closing) await withTimeout(closing);
+    else assert.deepEqual(await agent.status(), { state: "blocked", canResume: false });
     const sendsBeforeSettle = events.filter((event) => event.type === "acp.send").length;
     settleTool();
     await new Promise((resolveWait) => setTimeout(resolveWait, 50));

@@ -332,7 +332,7 @@
         test.api = Object.keys(agent).sort();
         status.textContent = "ready";
         status.className = "ready";
-        append("agent.ready", "prompt · checkpoint · close", { tone: "lifecycle" });
+        append("agent.ready", "prompt · cancel · close", { tone: "lifecycle" });
         setState("ready");
         setActive(false);
         if (autorun) await runPrompt(autorun);

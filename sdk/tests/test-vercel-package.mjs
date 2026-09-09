@@ -98,7 +98,7 @@ try {
         assert.equal(result.toolCalls, 1);
         assert.ok(result.events.includes("tool_start") && result.events.includes("tool_end"));
         assert.ok(result.checkpointBytes > 48);
-        assert.equal(result.result.stopReason, "end_turn");
+        assert.equal(result.result.stopReason, "stop");
         if (scenario === "mcp") assert.equal(result.closedMcp, true);
         results.push({ round, backend, scenario, ...result });
         console.log(`Vercel round ${round + 1}/${backend}/${scenario} passed (${result.node}, glibc ${result.glibc})`);

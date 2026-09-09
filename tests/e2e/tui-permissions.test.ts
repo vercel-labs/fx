@@ -1,3 +1,4 @@
+import { decodeNativeJournal } from "./journal/storage";
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
@@ -934,10 +935,9 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       activeSession = null;
 
       const sessionId = sessionIdFromHome(root);
-      const events = readFileSync(
-        join(root.home, ".fx", "sessions", sessionId, "events.jsonl"),
-        "utf8",
-      );
+      const events = JSON.stringify(decodeNativeJournal(readFileSync(
+        join(root.home, ".fx", "sessions", sessionId, "execution.journal"),
+      )).map(entry => JSON.parse(Buffer.from(entry.bytes).toString("utf8"))));
       expect(events).toContain('"permission_feedback"');
       expect(events).toContain(feedback);
 

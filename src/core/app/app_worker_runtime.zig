@@ -220,7 +220,7 @@ test "shutdown settles queued and pacer-owned finishes exactly once" {
         try std.testing.expectEqual(@as(usize, 0), app.worker.worker_events.items.len);
         try std.testing.expect(app.pacer.deferred_turn == null);
         try std.testing.expect(app.session_persistence.writable.?.state.recovery_checkpoint == null);
-        try std.testing.expect(!app.session_persistence.writable.?.conversation_writer.turn_open);
+        try std.testing.expect(!app.session_persistence.writable.?.writer.conversation.turn_open);
         // Close the actual writer before reload so only durable state can pass.
         app.session_persistence.writable.?.deinit(alloc);
         app.session_persistence.writable = null;
