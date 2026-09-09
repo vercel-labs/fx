@@ -4516,11 +4516,18 @@ test "top-level MCP trust persists project approval without interactive startup"
     try std.testing.expectEqualStrings("fixture", choices.choices.approved[0]);
 }
 
-test "subcommand help detection stops at the option sentinel" {
+test "subcommand help detection stops at the option sentinel for every command" {
     const command_catalog = testCommandCatalog();
-    try std.testing.expectEqual(TopLevelKind.ask, topLevelHelpRequest(command_catalog, &.{ @constCast("ask"), @constCast("--help") }));
-    try std.testing.expectEqual(null, topLevelHelpRequest(command_catalog, &.{ @constCast("ask"), @constCast("--"), @constCast("--help") }));
-    try std.testing.expectEqual(null, topLevelHelpRequest(command_catalog, &.{ @constCast("ask"), @constCast("--"), @constCast("-h") }));
+    for (command_catalog.specs) |spec| {
+        if (spec.kind == .help) continue;
+        const token = try std.testing.allocator.dupeZ(u8, spec.token);
+        defer std.testing.allocator.free(token);
+
+        try std.testing.expectEqual(spec.kind, topLevelHelpRequest(command_catalog, &.{ token, @constCast("--help") }));
+        try std.testing.expectEqual(spec.kind, topLevelHelpRequest(command_catalog, &.{ token, @constCast("-h") }));
+        try std.testing.expectEqual(null, topLevelHelpRequest(command_catalog, &.{ token, @constCast("--"), @constCast("--help") }));
+        try std.testing.expectEqual(null, topLevelHelpRequest(command_catalog, &.{ token, @constCast("--"), @constCast("-h") }));
+    }
 }
 
 test "workspace launch modifiers preserve supported command help" {
