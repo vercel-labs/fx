@@ -257,7 +257,10 @@ fn runGitRawList(
     }
 }
 
-fn trustedGitExecutable() ?[]const u8 {
+/// The Git binary the workspace layer is willing to run, or null when none of
+/// the known-good absolute paths exist. Never falls back to a PATH lookup, so a
+/// `git` planted earlier on PATH cannot stand in for the real one.
+pub fn trustedGitExecutable() ?[]const u8 {
     const candidates = switch (builtin.os.tag) {
         .windows => &[_][]const u8{
             "C:\\Program Files\\Git\\cmd\\git.exe",
