@@ -1804,8 +1804,26 @@ pub const SessionRuntime = struct {
         self.unversioned_history_len = 0;
     }
 
+    /// Drops the trailing turns from the live conversation. The turns are gone
+    /// from this process; persisting the shorter history is the caller's job.
+    pub fn truncateHistory(
+        self: *SessionRuntime,
+        alloc: Allocator,
+        retained_turns: usize,
+    ) void {
+        std.debug.assert(retained_turns <= self.agent.history.items.len);
+        for (self.agent.history.items[retained_turns..]) |turn| freeHistoryTurn(alloc, turn);
+        self.agent.history.shrinkRetainingCapacity(retained_turns);
+        self.unversioned_history_len = @min(self.unversioned_history_len, retained_turns);
+    }
+
     pub fn historyLen(self: *const SessionRuntime) usize {
         return self.agent.history.items.len;
+    }
+
+    /// Borrows the live conversation, oldest turn first.
+    pub fn historyTurns(self: *const SessionRuntime) []const HistoryTurn {
+        return self.agent.history.items;
     }
 
     pub fn unversionedHistoryEnd(self: *const SessionRuntime) usize {

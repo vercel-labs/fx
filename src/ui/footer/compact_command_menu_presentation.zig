@@ -27,6 +27,7 @@ const ChoiceView = struct {
 
 pub fn desiredRowCount(projection: CompactCommandMenuProjection, width: u16) u16 {
     const count: usize = switch (projection) {
+        .turn_picker => |picker| turnPickerRowCount(picker),
         .statusline => settings_row_offset + settings_catalog.statuslineChoiceCount(),
         .usage => |usage| usageDesiredRowCount(usage, width),
         .workspace => |workspace| workspace_pinned_rows +
@@ -45,10 +46,91 @@ pub noinline fn composeCompactCommandMenuRow(
     const empty: std.ArrayList(u8) = .empty;
     if (width == 0 or row_index >= visible_rows) return empty;
     return switch (projection) {
+        .turn_picker => |picker| composeTurnPickerRow(alloc, picker, row_index, visible_rows, width),
         .statusline => composeSettingsRow(alloc, projection, row_index, visible_rows, width),
         .usage => |usage| composeUsageRow(alloc, usage, row_index, visible_rows, width),
         .workspace => |workspace| composeWorkspaceRow(alloc, workspace, row_index, visible_rows, width),
     };
+}
+
+fn turnPickerRowCount(picker: render_input.TurnPickerProjection) usize {
+    const total = picker.history_len + 1;
+    const shown = @min(total -| picker.window_start, picker.visible_rows);
+    const above: usize = if (picker.window_start > 0) 1 else 0;
+    const below: usize = if (picker.window_start + shown < total) 1 else 0;
+    return shown + above + below + 4;
+}
+
+fn composeTurnPickerRow(
+    alloc: Allocator,
+    picker: render_input.TurnPickerProjection,
+    row_index: u16,
+    visible_rows: u16,
+    width: u16,
+) !std.ArrayList(u8) {
+    const empty: std.ArrayList(u8) = .empty;
+    if (row_index == 0) return composeStyledRow(alloc, "Rewind", width, ui_render.selected_completion_style);
+    if (row_index == 1) return composeStyledRow(alloc, "Restore the conversation to the point before…", width, ui_render.dim_style);
+
+    const total = picker.history_len + 1;
+    const shown = @min(total -| picker.window_start, picker.visible_rows);
+    const row: usize = row_index;
+    var next: usize = 2;
+    if (picker.window_start > 0) {
+        if (row == next) return composeCountRow(alloc, "↑ {d} more above", picker.window_start, width);
+        next += 1;
+    }
+    if (row >= next and row < next + shown) {
+        const index = picker.window_start + (row - next);
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(alloc);
+        try out.appendSlice(alloc, if (index == picker.cursor) ui_render.selected_completion_style else ui_render.dim_style);
+        if (index == picker.history_len) {
+            try row_text.appendClipped(alloc, &out, "(current)", width);
+        } else {
+            const text = switch (picker.history[index]) {
+                .assistant => |turn| turn.user.text,
+                .interrupted => |turn| turn.user.text,
+                .compacted_summary => "[compacted summary]",
+            };
+            const line_end = std.mem.findAny(u8, text, "\r\n") orelse text.len;
+            try row_text.appendClipped(alloc, &out, text[0..line_end], width);
+        }
+        try out.appendSlice(alloc, ui_render.reset_style);
+        return out;
+    }
+    next += shown;
+    if (picker.window_start + shown < total and row == next) {
+        return composeCountRow(alloc, "↓ {d} more below", total - (picker.window_start + shown), width);
+    }
+    if (row_index != visible_rows - 2) return empty;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, ui_render.dim_style);
+    if (picker.cursor == picker.history_len) {
+        try row_text.appendClipped(alloc, &out, "No change.", width);
+    } else {
+        const effect = try std.fmt.allocPrint(
+            alloc,
+            "Drops {d} turns, keeps {d}. File changes are not reverted.",
+            .{ picker.history_len - picker.cursor, picker.cursor },
+        );
+        defer alloc.free(effect);
+        try row_text.appendClipped(alloc, &out, effect, width);
+    }
+    try out.appendSlice(alloc, ui_render.reset_style);
+    return out;
+}
+
+fn composeCountRow(alloc: Allocator, comptime fmt: []const u8, count: usize, width: u16) !std.ArrayList(u8) {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, ui_render.dim_style);
+    const text = try std.fmt.allocPrint(alloc, fmt, .{count});
+    defer alloc.free(text);
+    try row_text.appendClipped(alloc, &out, text, width);
+    try out.appendSlice(alloc, ui_render.reset_style);
+    return out;
 }
 
 fn composeSettingsRow(
@@ -61,7 +143,7 @@ fn composeSettingsRow(
     const empty: std.ArrayList(u8) = .empty;
     const statusline = switch (projection) {
         .statusline => |value| value,
-        .usage, .workspace => return empty,
+        .turn_picker, .usage, .workspace => return empty,
     };
     const choice_count = settings_catalog.statuslineChoiceCount();
     if (choice_count == 0) return empty;
@@ -101,7 +183,7 @@ fn choiceView(projection: CompactCommandMenuProjection, choice_index: usize) ?Ch
                 .selected = choice_index == statusline.selected_index % settings_catalog.statuslineChoiceCount(),
             };
         },
-        .usage, .workspace => null,
+        .turn_picker, .usage, .workspace => null,
     };
 }
 

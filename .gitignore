@@ -55,3 +55,7 @@ benchmarks/baseline.json
 .vibe/
 .windsurf/
 .zencoder/
+
+# Python bytecode caches from scripts/
+__pycache__/
+*.pyc
