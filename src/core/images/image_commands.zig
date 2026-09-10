@@ -1,4 +1,5 @@
 const std = @import("std");
+const clipboard_image_runtime = @import("clipboard_image_runtime.zig");
 const image_attachments = @import("image_attachments.zig");
 const types = @import("../shared/types.zig");
 const entity_spans = @import("../shared/entity_spans.zig");
@@ -84,21 +85,59 @@ pub fn Commands(comptime App: type) type {
         }
 
         pub fn attachClipboard(app: *App) !void {
-            var loaded = image_attachments.loadClipboardImageAttachment(app.alloc) catch |err| {
-                if (err == error.NoClipboardImage) {
-                    try app.writeDomainNotice(.{ .topic = "images", .tone = .neutral, .body = "no image found on clipboard" }, true);
-                } else if (err != error.Unsupported) {
-                    const line = try std.fmt.allocPrint(app.alloc, "failed to paste clipboard image: {s}", .{@errorName(err)});
-                    defer app.alloc.free(line);
-                    try app.writeDomainNotice(.{ .topic = "images", .tone = .@"error", .body = line }, true);
+            if (comptime @hasField(App, "clipboard_images")) {
+                switch (try app.clipboard_images.start(app.alloc)) {
+                    .started => try app.writeDomainNotice(.{
+                        .topic = "images",
+                        .tone = .neutral,
+                        .body = "reading image from clipboard; you can keep typing",
+                    }, true),
+                    .already_running => try app.writeDomainNotice(.{
+                        .topic = "images",
+                        .tone = .neutral,
+                        .body = "clipboard image attachment is already in progress",
+                    }, true),
+                    .unsupported => {},
                 }
-                return;
-            };
-            defer loaded.deinit(app.alloc);
-            switch (try insertImageAtCursor(App, app, loaded.takeAttachment(), .temporary)) {
-                .inserted => app.shell.render_requests.request(.footer),
-                .rejected => {},
-                .input_full => try writeInputFullNotice(app),
+            }
+        }
+
+        pub fn collectClipboardImage(app: *App) !void {
+            if (comptime @hasField(App, "clipboard_images")) {
+                var completion = app.clipboard_images.takeCompletion() orelse return;
+                defer completion.deinit(app.alloc);
+
+                switch (completion) {
+                    .loaded => |*loaded| switch (try insertImageAtCursor(
+                        App,
+                        app,
+                        loaded.takeAttachment(),
+                        .temporary,
+                    )) {
+                        .inserted => app.shell.render_requests.request(.footer),
+                        .rejected => {},
+                        .input_full => try writeInputFullNotice(app),
+                    },
+                    .no_image => try app.writeDomainNotice(.{
+                        .topic = "images",
+                        .tone = .neutral,
+                        .body = "no image found on clipboard",
+                    }, true),
+                    .failed => |err| {
+                        if (err == error.Cancelled) return;
+                        const line = try std.fmt.allocPrint(
+                            app.alloc,
+                            "failed to paste clipboard image: {s}",
+                            .{@errorName(err)},
+                        );
+                        defer app.alloc.free(line);
+                        try app.writeDomainNotice(.{
+                            .topic = "images",
+                            .tone = .@"error",
+                            .body = line,
+                        }, true);
+                    },
+                }
             }
         }
 
@@ -186,6 +225,7 @@ const FakeApp = struct {
     transcript: std.ArrayList(u8) = .empty,
     next_image_id_counter: usize = 1,
     input_runtime: FakeInput = .{},
+    clipboard_images: clipboard_image_runtime.Runtime = .{},
     shell: struct {
         render_requests: render_request.RenderRequestState = .{},
     } = .{},
@@ -195,6 +235,7 @@ const FakeApp = struct {
     snapshot_dir: ?[]const u8 = null,
 
     fn deinit(self: *FakeApp) void {
+        self.clipboard_images.deinit(self.alloc);
         self.clearPendingImages();
         self.pending_images.deinit(self.alloc);
         self.transcript.deinit(self.alloc);
