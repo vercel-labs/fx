@@ -374,6 +374,8 @@ pub fn Handlers(comptime App: type) type {
                 .rename_session = commandRenameSession,
                 .handle_notifications = commandHandleNotifications,
                 .handle_workspace = commandHandleWorkspace,
+                .handle_btw = commandBtw,
+                .handle_recap = commandRecap,
                 .show_version = commandShowVersion,
                 .unknown = commandUnknown,
             };
@@ -2027,6 +2029,34 @@ pub fn Handlers(comptime App: type) type {
         fn commandHandleNotifications(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try handleNotificationsCommand(app, rest);
+        }
+
+        fn commandBtw(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            const trimmed = std.mem.trim(u8, rest, " \t");
+            if (trimmed.len == 0) {
+                try app.writeDomainNotice(.{
+                    .topic = "side_question",
+                    .tone = .@"error",
+                    .body = "Usage: /btw <question>",
+                }, false);
+                return;
+            }
+            try app.requestSideQuestion(.btw, trimmed);
+        }
+
+        fn commandRecap(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            const trimmed = std.mem.trim(u8, rest, " \t");
+            if (trimmed.len > 0) {
+                try app.writeDomainNotice(.{
+                    .topic = "side_question",
+                    .tone = .@"error",
+                    .body = "Usage: /recap",
+                }, false);
+                return;
+            }
+            try app.requestSideQuestion(.recap, "");
         }
 
         fn commandHandleWorkspace(ctx: *anyopaque, rest: []const u8) !void {

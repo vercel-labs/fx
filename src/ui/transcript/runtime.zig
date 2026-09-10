@@ -606,6 +606,31 @@ test "formatTurnSummaryLine renders only total duration without token estimate" 
     try std.testing.expectEqualStrings("  1h 00m", line);
 }
 
+test "transient notice renders in prepared frame without canonical history and resets" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = .{
+        .rows = 24,
+        .cols = 80,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    } };
+    defer runtime.deinit(alloc);
+    _ = try runtime.appendRawTranscriptEntry(alloc, "CANONICAL\n");
+    const before_revision = runtime.full_transcript_content_revision;
+    try runtime.setTransientNotice(alloc, .{ .topic = "side_question", .tone = .neutral, .body = "SIDE_ONLY" });
+    try std.testing.expect(runtime.full_transcript_content_revision != before_revision);
+    var source = try runtime.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, source.bytes, "CANONICAL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source.bytes, "SIDE_ONLY") != null);
+    try std.testing.expectEqual(@as(usize, 1), runtime.entries.items.len);
+    runtime.clearTranscript(alloc);
+    try std.testing.expect(runtime.transient_notice == null);
+}
+
 test "appendTurnSummaryEntry stores classified dim transcript row" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{
@@ -4230,8 +4255,10 @@ pub const TranscriptRuntime = struct {
     /// subsequent ids remain unique within the session, which keeps
     /// debug traces unambiguous across transcript resets.
     next_entry_id: u32 = 1,
-    /// Cols at which the transcript byte buffer was last regenerated from
-    /// entries. A cache-origin proof is valid only at this width.
+    /// One compact-only notice rendered from core-owned UI state. It remains
+    /// outside `entries`, so side-question output never enters session
+    /// history, full-transcript replay, or model context.
+    transient_notice: ?types.SemanticNotice = null,
     /// Zero before the first prepared transcript frame.
     last_rendered_cols: u16 = 0,
     /// True only when the visible cache was rebuilt from an untrimmed,
@@ -4344,9 +4371,18 @@ pub const TranscriptRuntime = struct {
         self.command_output_blocks.deinit(alloc);
         for (self.entries.items) |*entry| entry.deinit(alloc);
         self.entries.deinit(alloc);
+        if (self.transient_notice) |notice| types.freeSemanticNotice(alloc, notice);
+        self.transient_notice = null;
         self.transcript_commit_state.deinit(alloc);
         self.footer_viewport.deinit(alloc);
         self.ui_observer.deinit(alloc);
+    }
+
+    pub fn setTransientNotice(self: *TranscriptRuntime, alloc: Allocator, notice: types.SemanticNotice) !void {
+        const owned = try types.dupeSemanticNotice(alloc, notice);
+        if (self.transient_notice) |previous| types.freeSemanticNotice(alloc, previous);
+        self.transient_notice = owned;
+        self.markTranscriptContentDirty();
     }
 
     fn releasePendingResumeSource(self: *TranscriptRuntime, alloc: Allocator) usize {
@@ -4695,6 +4731,8 @@ pub const TranscriptRuntime = struct {
         self.lifecycle_state.deinit(alloc);
         self.worker_status.reset();
         self.clearToolDetails(alloc);
+        if (self.transient_notice) |notice| types.freeSemanticNotice(alloc, notice);
+        self.transient_notice = null;
         return transcript_store.clearTranscript(self, alloc);
     }
 

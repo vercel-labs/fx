@@ -2375,6 +2375,19 @@ pub fn renderEntriesForPreparationInterruptible(
         .line_provenance = owned_provenance,
     };
 }
+pub fn appendTransientNoticeToPreparation(
+    alloc: Allocator,
+    out: *std.ArrayList(u8),
+    notice: types.SemanticNotice,
+    styles: Styles,
+    cols: u16,
+) !void {
+    if (notice.body.len == 0) return;
+    if (out.items.len > 0) try out.appendNTimes(alloc, '\n', blockSeparatorNewlineCount(.unknown_raw, blockKindForNoticeTone(notice.tone)));
+    const rendered = try renderSemanticNotice(alloc, notice, styles, cols);
+    defer alloc.free(rendered);
+    try out.appendSlice(alloc, rendered);
+}
 
 test "interruptible compact preparation checks inside one oversized assistant entry" {
     const alloc = std.testing.allocator;

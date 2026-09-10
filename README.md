@@ -229,6 +229,18 @@ zig build -Doptimize=ReleaseSafe
 
 Run the test suite with `zig build test`. See [CONTRIBUTING.md](CONTRIBUTING.md) for development and contribution guidelines.
 
+## Side Questions
+
+**`/btw <question>`** — Ask a non-interrupting side question. Runs a single model
+request with no tools, no history, and no agent loop. The main conversation
+remains unaffected while the answer appears inline.
+
+**`/recap`** — Request a read-only recap from the model without
+persisting into the session history or triggering compaction. Takes no argument.
+
+Both commands require an active credential and use the current provider and
+model.
+
 ## License
 
 [Apache-2.0](LICENSE)
