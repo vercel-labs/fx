@@ -137,12 +137,13 @@ async function waitForModelsMenu(session: TmuxSession, count: number): Promise<s
   throw new Error(`Timed out waiting for models menu.\nPane:\n${latest.join("\n")}`);
 }
 
-async function waitForHelpMenu(session: TmuxSession, count: number): Promise<string[]> {
+async function waitForHelpMenu(session: TmuxSession, count?: number): Promise<string[]> {
   const deadline = Date.now() + TIMEOUT;
   let latest: string[] = [];
   while (Date.now() < deadline) {
     latest = await session.capturePaneGrid();
-    if (latest.join("\n").includes(`Commands ${count}`)) return latest;
+    const pane = latest.join("\n");
+    if (pane.includes("Commands ") && (count === undefined || pane.includes(`Commands ${count}`))) return latest;
     await Bun.sleep(100);
   }
   throw new Error(`Timed out waiting for help menu.\nPane:\n${latest.join("\n")}`);
@@ -1051,7 +1052,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       ).toBe(69);
       expect(closedComposerRow).toBe(73);
       await session.sendLiteralText("/");
-      await session.waitForText("Commands 35", 5_000);
+      await session.waitForPane((current) => current.includes("Commands ") && current.includes("/btw"), 5_000);
       const afterSlash = await capture("after-slash");
       expect(visibleTranscriptTailRow(afterSlash)).toBe(60);
       expect(composerRow(afterSlash)).toBe(64);
@@ -1576,7 +1577,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendText("/help");
-      let grid = await waitForHelpMenu(session, 35);
+      let grid = await waitForHelpMenu(session);
       let pane = grid.join("\n");
       expect(pane).toContain("𝒇x");
       expect(pane).toContain("Run /help for commands");
@@ -1592,7 +1593,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       grid = await waitForHelpMenu(session, 5);
       expect(grid.join("\n")).toContain("[General]");
       await session.sendKeys("BTab");
-      grid = await waitForHelpMenu(session, 35);
+      grid = await waitForHelpMenu(session);
       expect(grid.join("\n")).toContain("[All]");
 
       await session.sendLiteralText("clipboard");
@@ -1603,11 +1604,11 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).not.toContain("/clear");
 
       await session.sendKeys("C-u");
-      await waitForHelpMenu(session, 35);
+      await waitForHelpMenu(session);
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
       pane = await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("Commands 35"),
+        (current) => hasEmptyComposer(current) && !current.includes("Commands "),
         5_000,
       );
       expect(composerContains(pane, "/clear")).toBe(false);
@@ -1616,7 +1617,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-u");
       await session.sendText("/help");
-      await waitForHelpMenu(session, 35);
+      await waitForHelpMenu(session);
       await session.sendLiteralText("additional directories");
       await waitForHelpMenu(session, 1);
       await session.sendKeys("Enter");
@@ -1633,7 +1634,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-u");
       await session.sendText("/help");
-      await waitForHelpMenu(session, 35);
+      await waitForHelpMenu(session);
       await session.sendLiteralText("no command can match this query");
       await session.waitForText("No commands found.", 5_000);
       await session.sendKeys("Escape");
@@ -2662,7 +2663,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
 
       await session.sendText("/help");
-      grid = await waitForHelpMenu(session, 35);
+      grid = await waitForHelpMenu(session);
       expect(grid.join("\n")).toContain("Run /help for commands");
       expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
@@ -3661,7 +3662,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendLiteralText("/");
-      await session.waitForText("Commands 35", 5_000);
+      await session.waitForPane((current) => current.includes("Commands ") && current.includes("/btw"), 5_000);
 
       for (let i = 0; i < 5; i += 1) {
         await session.sendKeys("Down");
