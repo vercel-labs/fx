@@ -4,6 +4,7 @@ const session = @import("session.zig");
 const session_codec = @import("session_codec.zig");
 const session_usage = @import("session_usage.zig");
 const types = @import("../shared/types.zig");
+const json_owned = @import("../shared/json_owned.zig");
 const model_provider = @import("../config/model_provider.zig");
 const context_limits = @import("../config/context_limits.zig");
 
@@ -96,6 +97,37 @@ pub const ConversationInterruption = struct {
             cancellation_origin: std.json.Value = .{ .string = "turn" },
         };
         const wire = try std.json.innerParse(Wire, alloc, source, options);
+        // The default enum decoder also accepts numeric tags, not just names.
+        if (wire.cancellation_origin != .string) return error.UnexpectedToken;
+        const origin = std.meta.stringToEnum(types.CancellationOrigin, wire.cancellation_origin.string) orelse
+            return error.InvalidEnumTag;
+        return .{
+            .reason = wire.reason,
+            .partial_text = wire.partial_text,
+            .command_replay_ref = wire.command_replay_ref,
+            .command_replay_bytes = wire.command_replay_bytes,
+            .command_artifact_ref = wire.command_artifact_ref,
+            .files = wire.files,
+            .turn_summary = wire.turn_summary,
+            .cancellation_origin = origin,
+        };
+    }
+
+    /// Mirror of `jsonParse` for the `std.json.Value`-first decode path in
+    /// `json_owned.parseOwned`; the static parser only honors the hook whose
+    /// input matches its source type.
+    pub fn jsonParseFromValue(alloc: Allocator, source: std.json.Value, options: std.json.ParseOptions) !ConversationInterruption {
+        const Wire = struct {
+            reason: session.InterruptedTerminalReason,
+            partial_text: ?[]const u8 = null,
+            command_replay_ref: ?[]const u8 = null,
+            command_replay_bytes: ?u64 = null,
+            command_artifact_ref: ?[]const u8 = null,
+            files: []const types.FileEvidence = &.{},
+            turn_summary: ?types.TurnSummary = null,
+            cancellation_origin: std.json.Value = .{ .string = "turn" },
+        };
+        const wire = try std.json.innerParseFromValue(Wire, alloc, source, options);
         // The default enum decoder also accepts numeric tags, not just names.
         if (wire.cancellation_origin != .string) return error.UnexpectedToken;
         const origin = std.meta.stringToEnum(types.CancellationOrigin, wire.cancellation_origin.string) orelse
@@ -422,8 +454,7 @@ pub fn decodeConversationFrame(
     if (bytes.len == 0 or bytes.len > event_frame_max_bytes or bytes[bytes.len - 1] != '\n') {
         return error.InvalidConversationFrame;
     }
-    var parsed = std.json.parseFromSlice(ConversationEnvelope, alloc, bytes, .{
-        .allocate = .alloc_always,
+    var parsed = json_owned.parseOwned(ConversationEnvelope, alloc, bytes, .{
         .max_value_len = event_frame_max_bytes,
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,

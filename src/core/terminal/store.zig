@@ -12,6 +12,7 @@ const profile_paths = @import("../shared/profile_paths.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
+const json_owned = @import("../shared/json_owned.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -1692,11 +1693,11 @@ fn clone_record(alloc: Allocator, wire: RecordWire) Allocator.Error!Record {
 }
 
 fn parse_record(alloc: Allocator, bytes: []const u8) !Record {
-    var parsed = std.json.parseFromSlice(
+    var parsed = json_owned.parseOwned(
         RecordWire,
         alloc,
         bytes,
-        .{ .allocate = .alloc_always },
+        .{},
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidTerminalRecord,
@@ -1822,11 +1823,11 @@ fn load_event(
         else => return err,
     };
     defer alloc.free(bytes);
-    var parsed = std.json.parseFromSlice(
+    var parsed = json_owned.parseOwned(
         EventWire,
         alloc,
         bytes,
-        .{ .allocate = .alloc_always },
+        .{},
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidDurableEvent,
@@ -5394,11 +5395,11 @@ fn load_owner_catalog_authority(
     defer file.deinit();
     const bytes = try file.readToEnd(alloc, max_record_bytes);
     defer alloc.free(bytes);
-    var parsed = std.json.parseFromSlice(
+    var parsed = json_owned.parseOwned(
         OwnerCatalogAuthorityWire,
         alloc,
         bytes,
-        .{ .allocate = .alloc_always },
+        .{},
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidAuthorityRecord,
@@ -5511,11 +5512,11 @@ fn load_authority(
     defer file.deinit();
     const bytes = try file.readToEnd(alloc, max_record_bytes);
     defer alloc.free(bytes);
-    var parsed = std.json.parseFromSlice(
+    var parsed = json_owned.parseOwned(
         AuthorityWire,
         alloc,
         bytes,
-        .{ .allocate = .alloc_always },
+        .{},
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidAuthorityRecord,
@@ -5620,11 +5621,11 @@ fn load_close_transaction(
     defer file.deinit();
     const bytes = try file.readToEnd(alloc, max_event_bytes);
     defer alloc.free(bytes);
-    var parsed = std.json.parseFromSlice(
+    var parsed = json_owned.parseOwned(
         CloseTransaction,
         alloc,
         bytes,
-        .{ .allocate = .alloc_always },
+        .{},
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidCloseTransaction,

@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const contracts = @import("contracts.zig");
 const host_capabilities = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
+const json_owned = @import("../shared/json_owned.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const process_identity = @import("../execution/process_identity.zig");
 const process_provider_mod = @import(
@@ -987,11 +988,11 @@ pub fn runLauncher(
         max_launcher_config_bytes,
     );
     defer alloc.free(bytes);
-    var parsed = try std.json.parseFromSlice(
+    var parsed = try json_owned.parseOwned(
         LauncherConfig,
         alloc,
         bytes,
-        .{ .allocate = .alloc_always },
+        .{},
     );
     defer parsed.deinit();
     try validateLauncherConfig(parsed.value);
@@ -1842,11 +1843,11 @@ fn loadManifest(alloc: Allocator, path: []const u8) !ManifestWire {
     defer file.close(io_mod.getIo());
     const bytes = try io_mod.readFileToEnd(alloc, &file, 4096);
     defer alloc.free(bytes);
-    var parsed = try std.json.parseFromSlice(
+    var parsed = try json_owned.parseOwned(
         ManifestWire,
         alloc,
         bytes,
-        .{ .allocate = .alloc_always },
+        .{},
     );
     defer parsed.deinit();
     if (parsed.value.schema_version != 1 or
@@ -1973,11 +1974,11 @@ fn loadShellIdentity(alloc: Allocator, path: []const u8) !ShellIdentity {
     defer file.close(io_mod.getIo());
     const bytes = try io_mod.readFileToEnd(alloc, &file, 4096);
     defer alloc.free(bytes);
-    var parsed = try std.json.parseFromSlice(
+    var parsed = try json_owned.parseOwned(
         ShellIdentityWire,
         alloc,
         bytes,
-        .{ .allocate = .alloc_always },
+        .{},
     );
     defer parsed.deinit();
     const pid = std.math.cast(std.posix.pid_t, parsed.value.pid) orelse

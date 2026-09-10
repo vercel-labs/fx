@@ -8,6 +8,7 @@ const native_session = @import("native_session.zig");
 const terminal_store = @import("store.zig");
 const host_capabilities = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
+const json_owned = @import("../shared/json_owned.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const process_provider_mod = @import(
@@ -1492,11 +1493,11 @@ pub fn identityEvidence(
         .limited(identity_max_bytes),
     ) catch return .unverifiable;
     defer alloc.free(bytes);
-    var parsed = std.json.parseFromSlice(
+    var parsed = json_owned.parseOwned(
         IdentityRecord,
         alloc,
         bytes,
-        .{ .allocate = .alloc_always },
+        .{},
     ) catch return .unverifiable;
     defer parsed.deinit();
     const token = process_identity.ProcessInstanceToken.parse(
