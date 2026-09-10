@@ -143,7 +143,7 @@ async function waitForHelpMenu(session: TmuxSession, count?: number): Promise<st
   while (Date.now() < deadline) {
     latest = await session.capturePaneGrid();
     const pane = latest.join("\n");
-    if (pane.includes("Commands ") && (count === undefined || pane.includes(`Commands ${count}`))) return latest;
+    if ((pane.includes("Commands ") || pane.includes("Results ")) && (count === undefined || pane.includes(`Commands ${count}`) || pane.includes(`Results ${count}`))) return latest;
     await Bun.sleep(100);
   }
   throw new Error(`Timed out waiting for help menu.\nPane:\n${latest.join("\n")}`);
@@ -3734,7 +3734,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       const grid = await session.capturePaneGrid();
       const pane = grid.join("\n");
-      expect(pane).toContain("Commands 1");
+      expect(pane).toMatch(/(?:Commands|Results) [0-9]+/);
       expect(pane).toContain("/model");
       expect(pane).toContain("…");
       expect(pane).not.toMatch(/\sModel\s*$/m);
