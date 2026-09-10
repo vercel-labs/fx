@@ -1,3 +1,5 @@
+const side_question_runtime = @import("core/app/side_question_runtime.zig");
+const side_question_commands = @import("core/app/side_question_commands.zig");
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
@@ -503,7 +505,23 @@ const App = struct {
     pub fn terminalTitle(self: *const Self) host.TerminalTitle {
         return ui_render.terminalTitleFor(&self.shell.stdout_file);
     }
+    pub fn requestSideQuestion(self: *App, kind: side_question_runtime.Kind, payload: []const u8) !void {
+        try side_question_commands.Runtime(App).requestSideQuestion(
+            self,
+            &self.side_question_runtime,
+            kind,
+            payload,
+        );
+    }
 
+    pub fn collectSideQuestionFacts(self: *App) !void {
+        try side_question_commands.Runtime(App).collectSideQuestionFacts(
+            self,
+            &self.side_question_runtime,
+        );
+    }
+
+    side_question_runtime: side_question_runtime.Runtime = side_question_runtime.Runtime.init(),
     alloc: Allocator,
     terminal: TerminalState = .{},
 
@@ -831,6 +849,7 @@ const App = struct {
     }
 
     fn deinitImpl(self: *App, capture_resume_handoff: bool) app_session_runtime.ShutdownOutcome {
+        self.side_question_runtime.deinit();
         self.auth.stopProviderPreparation();
         // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
@@ -2472,7 +2491,6 @@ const App = struct {
     pub fn writeDomainNotice(self: *App, notice: types.SemanticNotice, record: bool) !void {
         try self.shell.writeNotice(self.alloc, &self.metrics, notice, record);
     }
-
     pub fn submitDirectTerminal(self: *App, command: []const u8) !void {
         try app_terminal_runtime.Runtime(App).submitDirect(self, command);
     }
@@ -2891,8 +2909,8 @@ const App = struct {
 
     pub fn loopCollectFacts(ctx: *anyopaque) !void {
         const self: *App = @ptrCast(@alignCast(ctx));
+        try self.collectSideQuestionFacts();
         if (!try WorkerAppRuntime.authorizeInteractiveAdmission(self)) return;
-
         if (comptime !host_target.is_wasm) {
             if (self.file_index.joinThreadIfDone(std.heap.c_allocator)) {
                 self.shell.render_requests.request(.footer);

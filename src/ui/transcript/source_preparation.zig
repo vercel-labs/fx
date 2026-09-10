@@ -633,6 +633,20 @@ fn prepareTranscriptSourceInternal(
             line_provenance = try unattributedLineProvenance(alloc, bytes);
         }
     }
+    if (self.transient_notice) |notice| {
+        var with_transient: std.ArrayList(u8) = .empty;
+        errdefer with_transient.deinit(alloc);
+        try with_transient.appendSlice(alloc, bytes);
+        try transcript_blocks.appendTransientNoticeToPreparation(
+            alloc,
+            &with_transient,
+            notice,
+            self.command_output_render.styles,
+            self.layout.cols,
+        );
+        alloc.free(bytes);
+        bytes = try with_transient.toOwnedSlice(alloc);
+    }
 
     var replaceable_last_line = self.replaceable_last_line;
     var replaceable_start = self.replaceable_start;
