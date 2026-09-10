@@ -1590,7 +1590,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).toContain("Enter Open");
 
       await session.sendKeys("Tab");
-      grid = await waitForHelpMenu(session, 5);
+      grid = await waitForHelpMenu(session);
       expect(grid.join("\n")).toContain("[General]");
       await session.sendKeys("BTab");
       grid = await waitForHelpMenu(session);
