@@ -184,10 +184,25 @@ pub fn profileShell(
 
 const captured_zsh_user_prelude = "\\builtin trap - TERM; ";
 
+/// Whether the operator's shell may redefine the command words before running
+/// them. An approval granted by reading the command string is only honest if the
+/// words that were read are the words that run, so a caller holding such an
+/// approval asks for `as_parsed`.
+pub const WordResolution = enum { shell_defined, as_parsed };
+
 pub fn capturedInvocation(
     alloc: Allocator,
     environment_value: Environment,
     command: []const u8,
+) (ResolveError || Allocator.Error)!Invocation {
+    return capturedInvocationResolving(alloc, environment_value, command, .shell_defined);
+}
+
+pub fn capturedInvocationResolving(
+    alloc: Allocator,
+    environment_value: Environment,
+    command: []const u8,
+    words: WordResolution,
 ) (ResolveError || Allocator.Error)!Invocation {
     switch (environment_value) {
         .legacy, .workspace_clean => return error.UnsupportedShell,
@@ -197,10 +212,26 @@ pub fn capturedInvocation(
                 .clean_start = true,
             } });
             removeInteractiveFlag(&invocation);
+            if (words == .as_parsed and shellKind(path).? == .bash) {
+                appendBashAsParsedProtection(&invocation);
+            }
             invocation.setCommand(command);
             return invocation;
         },
         .user => |path| {
+            if (words == .as_parsed) {
+                var invocation = try resolve(null, .{ .executable = .{
+                    .path = path,
+                    .clean_start = true,
+                } });
+                removeInteractiveFlag(&invocation);
+                if (shellKind(path).? == .bash) {
+                    appendBashAsParsedProtection(&invocation);
+                }
+                invocation.setCommand(command);
+                return invocation;
+            }
+
             var invocation = try resolve(path, .user_login);
             if (std.mem.eql(u8, std.fs.path.basename(path), "bash")) {
                 removeInteractiveFlag(&invocation);
@@ -234,6 +265,13 @@ fn removeInteractiveFlag(invocation: *Invocation) void {
     std.debug.assert(invocation.len > 0);
     std.debug.assert(std.mem.eql(u8, invocation.values[invocation.len - 1], "-i"));
     invocation.len -= 1;
+}
+
+fn appendBashAsParsedProtection(invocation: *Invocation) void {
+    // Bash still reads BASH_ENV and imports exported functions in a
+    // non-interactive clean shell. Privileged mode suppresses those
+    // user-controlled command redefinition paths.
+    invocation.append("-p");
 }
 
 pub fn buildBootstrap(
@@ -462,6 +500,44 @@ test "captured profiles use exact non-PTY argv" {
     for (&expected_zsh_user, zsh_user.argv()) |expected, actual| {
         try std.testing.expectEqualStrings(expected, actual);
     }
+}
+
+test "as-parsed captured commands bypass Bash and zsh user definitions" {
+    const bash = try capturedInvocationResolving(
+        std.testing.allocator,
+        .{ .user = "/bin/bash" },
+        "git status",
+        .as_parsed,
+    );
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{ "/bin/bash", "--noprofile", "--norc", "-p", "-c", "git status" },
+        bash.argv(),
+    );
+
+    const zsh = try capturedInvocationResolving(
+        std.testing.allocator,
+        .{ .user = "/bin/zsh" },
+        "git status",
+        .as_parsed,
+    );
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{ "/bin/zsh", "-f", "-c", "git status" },
+        zsh.argv(),
+    );
+
+    const clean_bash = try capturedInvocationResolving(
+        std.testing.allocator,
+        .{ .clean = "/bin/bash" },
+        "npm install",
+        .as_parsed,
+    );
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{ "/bin/bash", "--noprofile", "--norc", "-p", "-c", "npm install" },
+        clean_bash.argv(),
+    );
 }
 
 test "captured invocation provider projection shell-quotes every argv word" {

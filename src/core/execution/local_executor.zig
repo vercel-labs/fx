@@ -61,12 +61,18 @@ pub fn executePreparedCommand(
         },
         .approved_shell => |shell| .{
             .route = .approved_shell,
-            .result = try command_runner.executeCommandInEnvironment(
+            .result = try command_runner.executeCommandInEnvironmentResolving(
                 cfg,
                 alloc,
                 shell.command_ctx.command,
                 shell.command_ctx.resolved_cwd,
                 shell.command_ctx.environment,
+                // An auto-mode approval comes from parsing the command text, and
+                // nothing else looked at it. Run the words that were parsed.
+                switch (shell.source) {
+                    .auto_mode => .as_parsed,
+                    else => .shell_defined,
+                },
             ),
         },
     };
