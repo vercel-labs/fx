@@ -313,14 +313,15 @@ fn serialize_capped(
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
+    const model_result = select_model_result(result);
     var full = std.Io.Writer.Allocating.init(arena);
-    try write_envelope(arena, &full.writer, server_name, tool_name, result);
+    try write_envelope(arena, &full.writer, server_name, tool_name, model_result);
     const full_output = full.writer.buffered();
     if (full_output.len <= max_tool_result_bytes) {
         return try alloc.dupe(u8, full_output);
     }
 
-    const combined = try collect_result_text(arena, result);
+    const combined = try collect_result_text(arena, model_result);
     const marker = try std.fmt.allocPrint(
         arena,
         "\n... [mcp tool result truncated for {s}/{s}: original {d} bytes; cap is {d} bytes]\n",
@@ -371,6 +372,26 @@ fn serialize_capped(
         );
     }
     return try alloc.dupe(u8, best);
+}
+
+/// Modern MCP servers can return the required `content` and the newer but optional
+/// `structuredContent`.
+///
+/// Its biggest advantage is that if the tool declares an `outputSchema`,
+/// `structuredContent` has to conform to it.
+///
+/// This function prefers keeping `structuredContent` if present, falling back to `content`.
+/// This avoids sending equivalent structured and unstructured results to the model and
+/// needlessly using additional input tokens.
+///
+/// Reference:
+/// https://modelcontextprotocol.io/specification/2026-07-28/server/tools#structured-content
+fn select_model_result(result: std.json.Value) std.json.Value {
+    if (result != .object) return result;
+    if (result.object.get("structuredContent")) |structured_content| {
+        if (structured_content != .null) return structured_content;
+    }
+    return result.object.get("content") orelse result;
 }
 
 fn write_envelope(
@@ -524,13 +545,62 @@ test "tool result extracts all content" {
         "server",
         parsed.value.object.get("server").?.string,
     );
-    const content = parsed.value.object.get("result").?.object.get("content").?.array.items;
+    const content = parsed.value.object.get("result").?.array.items;
     try std.testing.expectEqualStrings("hello ", content[0].object.get("text").?.string);
     try std.testing.expect(content[1].object.get("data") == null);
     try std.testing.expectEqual(@as(usize, 1), result.images.len);
     try std.testing.expectEqualStrings("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=", result.images[0].data);
     try std.testing.expectEqualStrings("image/png", result.images[0].mime_type);
     try std.testing.expectEqualStrings("world", content[2].object.get("text").?.string);
+}
+
+test "tool result prefers non-null structured content over compatibility content" {
+    const alloc = std.testing.allocator;
+    const response =
+        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"duplicate compatibility text"}],"structuredContent":{"answer":42,"source":"structured"},"isError":false}}
+    ;
+    var result = try extract(alloc, .{
+        .server_name = "server",
+        .tool_name = "mcp__server__tool",
+        .response = response,
+        .max_tool_result_bytes = tool_result_limits.default_max_tool_result_bytes,
+        .protocol = .modern,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "{\"server\":\"server\",\"tool\":\"mcp__server__tool\",\"result\":{\"answer\":42,\"source\":\"structured\"}}",
+        result.model_output,
+    );
+    try std.testing.expect(std.mem.find(u8, result.model_output, "duplicate compatibility text") == null);
+}
+
+test "tool result falls back to content when structured content is null or absent" {
+    const alloc = std.testing.allocator;
+    const cases = [_][]const u8{
+        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"null fallback"}],"structuredContent":null}}
+        ,
+        \\{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"absent fallback"}]}}
+        ,
+    };
+    const expected = [_][]const u8{ "null fallback", "absent fallback" };
+
+    for (cases, expected) |response, expected_text| {
+        var result = try extract(alloc, .{
+            .server_name = "server",
+            .tool_name = "mcp__server__tool",
+            .response = response,
+            .max_tool_result_bytes = tool_result_limits.default_max_tool_result_bytes,
+            .protocol = .modern,
+        });
+        defer result.deinit(alloc);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.model_output, .{});
+        defer parsed.deinit();
+        const content = parsed.value.object.get("result").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), content.len);
+        try std.testing.expectEqualStrings(expected_text, content[0].object.get("text").?.string);
+    }
 }
 
 test "tool result retains protocol error diagnostics" {
