@@ -84,6 +84,8 @@ const allowlist: AllowRule[] = [
   rule("benchmarks/activity_progress.zig", "main", /stdio_acquisition/, "benchmark_output", "benchmark report output"),
   rule("src/core/shell_command/command_effect.zig", "(?:expectDirect|expectNativePrintfEquivalent)", /debug_print/, "tests", "test diagnostics"),
   rule("src/core/app/app_worker_runtime.zig", "(?:printModelTrace|printLifecycleDrainTrace)", /debug_print/, "tests", "test diagnostics"),
+  rule("src/test_shard_runner.zig", "main", /debug_print/, "tests", "shard test runner pass/fail/skip reporting"),
+  rule("src/test_shard_runner.zig", "log", /debug_print/, "tests", "shard test runner captured std.log output"),
 ];
 
 function rule(
