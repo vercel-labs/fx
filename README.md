@@ -80,6 +80,9 @@ Type `@` to find workspace files. Use `@~`, `@.`, or `@..` to browse your home, 
 
 Selected filenames use quoting and escaping when needed for spaces, quotes, backslashes or special punctuation. For example, `@"./photo.png,"` refers to a filename ending in a comma, while manually typed or recalled `@./photo.png,` retains the image-plus-punctuation meaning. Quote or reselect an older ambiguous path before submitting it. Dollar signs inside an `@` path do not invoke skills.
 
+Commands run by fx receive `AI_AGENT=fx` in their environment. This lets
+development tools identify fx.
+
 Use `/resume` to choose a saved conversation. The picker shares its catalog across workspace views and reuses unchanged session summaries between launches. The first catalog build, or recovery from missing cache data, scans saved sessions automatically. Changed sessions are checked again, and closing the picker stops obsolete loading work.
 
 Tool calls are expanded by default. Enable `Collapse tool calls` in `/settings`, or set `"collapse_tool_calls": true` in `~/.fx/settings.json`, to show one summary per tool-call group in the main transcript. Individual calls remain available in the full transcript with Ctrl+O. Follow-up activity for captured shell commands shows the original command, such as `Observed zig build`, while tool results keep the same execution handle.

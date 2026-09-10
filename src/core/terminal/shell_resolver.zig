@@ -246,7 +246,7 @@ pub fn buildBootstrap(
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(alloc);
 
-    try output.appendSlice(alloc, "set +x; ");
+    try output.appendSlice(alloc, "set +x; export AI_AGENT=fx; ");
     if (command_path) |path| {
         try output.appendSlice(alloc, "fx_terminal_command=$(< ");
         try appendShellWord(&output, alloc, path);
@@ -525,7 +525,7 @@ test "bootstrap quotes private paths and separates command completion" {
     );
     defer std.testing.allocator.free(commandless);
     try std.testing.expectEqualStrings(
-        "set +x; '/tmp/fx'\"'\"'bin' '--fx-internal-terminal-control' " ++
+        "set +x; export AI_AGENT=fx; '/tmp/fx'\"'\"'bin' '--fx-internal-terminal-control' " ++
             "'/tmp/control' 'nonce' 'shell-ready' || exit 125\n",
         commandless,
     );
