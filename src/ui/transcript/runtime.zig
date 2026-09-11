@@ -334,6 +334,8 @@ fn recoveryAppendPrefixMatches(
         );
 }
 
+pub const FooterHistoryTransition = transcript_painter.FooterHistoryTransition;
+
 pub const TranscriptScrollFacts = struct {
     source_visual_offset: u32 = 0,
     target_visual_offset: u32 = 0,
@@ -343,6 +345,7 @@ pub const TranscriptScrollFacts = struct {
     planned_rows: u16 = 0,
     source_compatible: bool = false,
     geometry_rebase: bool = false,
+    footer_history_rewind: bool = false,
     recovery_rebase: bool = false,
     recovery_progress_compatible: bool = false,
     recovery_tracks_semantic_progress: bool = false,
@@ -7225,7 +7228,7 @@ pub const TranscriptRuntime = struct {
         self: *const TranscriptRuntime,
         prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
     ) TranscriptScrollFacts {
-        return self.planTranscriptScrollForFrame(prepared, false, false);
+        return self.planTranscriptScrollForFrame(prepared, .unchanged);
     }
 
     /// Selects the finality floor in flow bytes from the prepared paint's
@@ -7282,9 +7285,11 @@ pub const TranscriptRuntime = struct {
     pub fn planTranscriptScrollForFrame(
         self: *const TranscriptRuntime,
         prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
-        footer_reservation_changed: bool,
-        replay_displaced_footer_history: bool,
+        footer_history_transition: FooterHistoryTransition,
     ) TranscriptScrollFacts {
+        const footer_reservation_changed = footer_history_transition != .unchanged;
+        const replay_displaced_footer_history = footer_history_transition == .displaced;
+        const footer_history_rewind = footer_history_transition == .reclaimed;
         const target_offset = prepared.sourceVisualOffset();
         const target_total_visual_rows = prepared.sourceTotalVisualRows();
         if (self.terminal_reset_pending) {
@@ -7514,10 +7519,13 @@ pub const TranscriptRuntime = struct {
             else if (anchor.history_catchup_pending)
                 releasable_advance
             else
-                // Rows leaving the screen top are [visual..visual+scroll);
-                // the floor clamps that range, so the budget is measured
-                // from the committed viewport, not from history.
-                releasable_offset -| anchor.visual_offset
+                // Rows leaving the screen top are [visual..visual+scroll),
+                // but a reclaimed viewport may sit behind rows already in
+                // native history. Never release those rows a second time.
+                releasable_offset -| @max(
+                    anchor.visual_offset,
+                    anchor.history_visual_offset,
+                )
         else if (self.compatibleCommittedHistoryReplayRange(
             prepared,
             anchor,
@@ -7599,6 +7607,7 @@ pub const TranscriptRuntime = struct {
             .planned_rows = planned,
             .source_compatible = source_compatible,
             .geometry_rebase = geometry_rebase,
+            .footer_history_rewind = footer_history_rewind,
             .recovery_rebase = recovery_rebase,
             .finality_hold = finality_hold,
             .recovery_progress_compatible = !recovery_rebase,
@@ -7913,7 +7922,10 @@ pub const TranscriptRuntime = struct {
         if (self.fullTranscriptActive() or
             target.body_disposition != .paint or
             !stable_terminal_geometry or
-            self.resize_history_row_delta != null)
+            self.resize_history_row_delta != null or
+            scroll_facts.footer_history_rewind or
+            target.total_visual_rows < anchor.total_visual_rows or
+            anchor.visual_offset < anchor.history_visual_offset)
         {
             return null;
         }
@@ -8493,8 +8505,7 @@ pub const TranscriptRuntime = struct {
         alloc: Allocator,
         source: *const TranscriptPreparationSource,
         prepared: *transcript_painter.PreparedTranscriptSurfacePaint,
-        footer_reservation_changed: bool,
-        replay_displaced_footer_history: bool,
+        footer_history_transition: FooterHistoryTransition,
     ) !TranscriptScrollFacts {
         if (self.borrowsPendingResumeSource(source)) switch (self.transcript_commit_state) {
             .invalid => try transcript_painter.seedPreparedPresentationBoundary(
@@ -8521,8 +8532,7 @@ pub const TranscriptRuntime = struct {
         };
         return self.planTranscriptScrollForFrame(
             prepared,
-            footer_reservation_changed,
-            replay_displaced_footer_history,
+            footer_history_transition,
         );
     }
 
@@ -8652,15 +8662,13 @@ pub const TranscriptRuntime = struct {
         target_layout: render_engine.frame_layout.CommittedLayoutSnapshot,
         plan: *render_engine.paint_plan.PaintPlan,
         scroll_plan: render_engine.frame_scroll_plan.FrameScrollPlan,
-        footer_reservation_changed: bool,
-        replay_displaced_footer_history: bool,
+        footer_history_transition: FooterHistoryTransition,
     ) !TranscriptTransition {
         const scroll_facts = try self.prepareTranscriptScrollFactsForFrame(
             alloc,
             source,
             prepared,
-            footer_reservation_changed,
-            replay_displaced_footer_history,
+            footer_history_transition,
         );
         const destructive_invalidation = render_engine.frame_retention.transcriptAreaHasDestructiveInvalidation(
             self.committed_frame_layout.transcript_area,
@@ -10993,7 +11001,7 @@ pub const TranscriptRuntime = struct {
             metrics,
             source,
             area,
-            false,
+            .unchanged,
         );
     }
 
@@ -11003,7 +11011,7 @@ pub const TranscriptRuntime = struct {
         metrics: *Metrics,
         source: *const TranscriptPreparationSource,
         area: render_engine.frame_layout.FrameRect,
-        footer_reservation_changed: bool,
+        footer_history_transition: FooterHistoryTransition,
     ) !transcript_painter.PreparedTranscriptSurfacePaint {
         return transcript_painter.prepareTranscriptSurfacePaintFromSourceForFrame(
             self,
@@ -11011,7 +11019,7 @@ pub const TranscriptRuntime = struct {
             metrics,
             source,
             area,
-            footer_reservation_changed,
+            footer_history_transition,
         );
     }
 
@@ -11618,8 +11626,7 @@ fn resolveAndSealTranscriptTransitionForRuntimeTest(
         alloc,
         source,
         prepared,
-        false,
-        false,
+        .unchanged,
     );
     const destructive_invalidation = render_engine.frame_retention.transcriptAreaHasDestructiveInvalidation(
         runtime.committed_frame_layout.transcript_area,
@@ -12220,8 +12227,7 @@ test "pending tail projection seals against the complete frame layout" {
         alloc,
         source,
         &prepared,
-        false,
-        false,
+        .unchanged,
     );
     const scroll_plan = render_engine.frame_scroll_plan.merge(
         layout.rows,
@@ -12362,15 +12368,14 @@ test "history recovery preserves retained geometry and stages painted frames" {
             &metrics,
             &source,
             area,
-            repaint,
+            if (repaint) .displaced else .unchanged,
         );
         defer prepared.deinit(alloc);
         const facts = try runtime.prepareTranscriptScrollFactsForFrame(
             alloc,
             &source,
             &prepared,
-            repaint,
-            false,
+            if (repaint) .displaced else .unchanged,
         );
         const scroll = render_engine.frame_scroll_plan.merge(layout.rows, 1, 0, facts.planned_rows);
         if (repaint) {
