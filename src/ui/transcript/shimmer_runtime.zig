@@ -117,8 +117,16 @@ fn wrappedStaticActivityLabel(
             const marker = omissionMarker(@intCast(@min(available, std.math.maxInt(u16))));
             const content_width = available -| marker.len;
             if (preserve_trailing_context) {
-                const suffix = display_width.suffixByWidthIgnoringAnsi(remaining, content_width);
-                try appendStaticActivityLine(alloc, &out, prefix, continuation_indent_width, marker, first);
+                // Keep a recovery/action suffix, but also continue from the
+                // current wrap point so long mid-message URLs are not skipped.
+                const suffix = display_width.suffixByWidthIgnoringAnsi(remaining, content_width / 2);
+                const suffix_width = display_width.visibleWidthIgnoringAnsi(suffix);
+                const head_budget = content_width -| suffix_width;
+                var head = display_width.prefixByWidthIgnoringAnsi(remaining, head_budget);
+                const suffix_start = remaining.len - suffix.len;
+                if (head.len > suffix_start) head = remaining[0..suffix_start];
+                try appendStaticActivityLine(alloc, &out, prefix, continuation_indent_width, head, first);
+                try out.appendSlice(alloc, marker);
                 try out.appendSlice(alloc, suffix);
             } else {
                 var chunk = display_width.wrapCutIgnoringAnsi(remaining, content_width);
@@ -576,6 +584,52 @@ test "static status truncation preserves recovery action and attempt suffix" {
         try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 32);
     }
     try std.testing.expectEqual(@as(usize, 3), line_count);
+}
+
+test "static status truncation keeps url head when preserving trailing context" {
+    const label =
+        "⚠ API access denied · HTTP 403 · no_providers_available: Free tier users do not have access to this model. Visit https://vercel.com/d?to=%2F%5Bteam%5D%2F%7E%2Fai%3Fmodal%3Dtop-up for unrestricted access.";
+    const preview = try wrappedStaticActivityLabel(
+        std.testing.allocator,
+        label,
+        48,
+        3,
+        true,
+    );
+    defer preview.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, preview.bytes, "https://vercel.com/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, preview.bytes, "...") != null);
+    try std.testing.expect(std.mem.endsWith(u8, preview.bytes, "unrestricted access."));
+
+    var lines = std.mem.splitScalar(u8, preview.bytes, '\n');
+    var line_count: usize = 0;
+    var last: []const u8 = "";
+    while (lines.next()) |line| {
+        line_count += 1;
+        last = line;
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 48);
+    }
+    try std.testing.expectEqual(@as(usize, 3), line_count);
+    const trimmed = std.mem.trimLeft(u8, last, " ");
+    try std.testing.expect(!std.mem.startsWith(u8, trimmed, "..."));
+}
+
+test "static status wraps long gateway url without omission when rows allow" {
+    const label =
+        "⚠ API access denied · HTTP 403 · no_providers_available: Free tier users do not have access to this model. Visit https://vercel.com/d?to=%2F%5Bteam%5D%2F%7E%2Fai%3Fmodal%3Dtop-up for unrestricted access.";
+    const preview = try wrappedStaticActivityLabel(
+        std.testing.allocator,
+        label,
+        48,
+        8,
+        true,
+    );
+    defer preview.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, preview.bytes, "...") == null);
+    try std.testing.expect(std.mem.indexOf(u8, preview.bytes, "https://vercel.com/d?to=%2F%5Bteam%5D%2F%7E%2Fai%3Fmodal%3Dtop-up") != null);
+    try std.testing.expect(std.mem.endsWith(u8, preview.bytes, "unrestricted access."));
 }
 
 test "static status truncation preserves leading context for non-error statuses" {
