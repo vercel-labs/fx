@@ -711,9 +711,18 @@ describe("lean auto mode reliability", () => {
             });
           },
           (body) => {
-            expect(toolResultText(body, "wait_reviewed_clean_tty")).toContain(
-              "TTY_REVIEWED_OK",
-            );
+            const started = JSON.parse(
+              toolResultText(body, "reviewed_clean_tty"),
+            ) as { output_delta: string };
+            const completed = JSON.parse(
+              toolResultText(body, "wait_reviewed_clean_tty"),
+            ) as { state: string; exit_code: number | null; output_delta: string };
+            expect(completed.state).toBe("completed");
+            expect(completed.exit_code).toBe(0);
+            expect(typeof started.output_delta).toBe("string");
+            expect(typeof completed.output_delta).toBe("string");
+            const output = started.output_delta + completed.output_delta;
+            expect(output.match(/TTY_REVIEWED_OK/g) ?? []).toHaveLength(1);
             return fakeGatewayFinalText("reviewed clean TTY complete");
           },
         ],

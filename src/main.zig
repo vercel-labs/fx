@@ -610,6 +610,7 @@ const App = struct {
     ) !Self {
         var app = Self{
             .alloc = alloc,
+            .input_runtime = undefined,
             .auth = undefined,
             .usage_dashboard = undefined,
             .session_persistence = undefined,
@@ -624,6 +625,7 @@ const App = struct {
             else
                 shell_process_provider.provider,
         };
+        InputRuntime.initInto(&app.input_runtime);
         auth_runtime.Runtime.initIntoWithMode(
             &app.auth,
             app_api_key_validator,

@@ -102,10 +102,16 @@ pub const State = struct {
     prepared: ?Snapshot = null,
     presented: ?Snapshot = null,
 
+    pub fn initInto(storage: *State) void {
+        inline for (std.meta.fields(State)) |field| {
+            @field(storage.*, field.name) = field.defaultValue().?;
+        }
+    }
+
     pub fn deinit(self: *State, alloc: std.mem.Allocator) void {
         if (self.prepared) |*value| value.deinit(alloc);
         if (self.presented) |*value| value.deinit(alloc);
-        self.* = .{};
+        initInto(self);
     }
 
     pub fn invalidate(self: *State) void {
@@ -275,6 +281,25 @@ pub const State = struct {
         self.trusted = true;
     }
 };
+
+test "file completion deinit restores every defined field for reuse" {
+    var state: State = .{};
+    state.active = true;
+    state.indexed = false;
+    state.episode = 47;
+    state.next_revision = 81;
+    state.lookup_len = 3;
+    state.raw_len = 5;
+    state.trusted = true;
+    state.refresh_requested = true;
+    state.selection_missing = true;
+    state.deinit(std.testing.allocator);
+    inline for (std.meta.fields(State)) |field| {
+        if (comptime std.mem.eql(u8, field.name, "raw_query") or std.mem.eql(u8, field.name, "lookup_query")) continue;
+        try std.testing.expectEqualDeep(field.defaultValue().?, @field(state, field.name));
+    }
+    state.deinit(std.testing.allocator);
+}
 
 test "file picker prepared rows cannot replace presented identity before acknowledgement" {
     const alloc = std.testing.allocator;

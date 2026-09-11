@@ -53,6 +53,14 @@ pub const Runtime = struct {
     /// box. Holds the draft the composer is restored to when the picker closes.
     model_picker_draft: ?composer_stash.State = null,
 
+    pub fn initInto(storage: *Runtime) void {
+        picker_state.State.initInto(&storage.picker);
+        inline for (std.meta.fields(Runtime)) |field| {
+            if (comptime std.mem.eql(u8, field.name, "picker")) continue;
+            @field(storage.*, field.name) = field.defaultValue().?;
+        }
+    }
+
     pub fn deinit(self: *Runtime, alloc: Allocator) void {
         input_reset.resetPendingTextScalarWithTrace(&self.text_scalar, "shutdown");
         self.paste.deinit(alloc);
@@ -201,4 +209,18 @@ test "runtime owns product input state without terminal mechanics" {
     try std.testing.expectEqualStrings("draft", runtime.edit_state.input.items);
     try std.testing.expect(!@hasField(Runtime, "terminal_action_decoder"));
     try std.testing.expect(!@hasField(Runtime, "terminal_cursor_probe"));
+}
+
+test "input runtime initialization restores default picker and composer state" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{ .slash_menu_categories = false };
+    defer runtime.deinit(alloc);
+    runtime.picker.file_completion.active = true;
+    runtime.picker.file_completion.episode = 57;
+    Runtime.initInto(&runtime);
+    try std.testing.expect(runtime.slash_menu_categories);
+    try std.testing.expect(!runtime.picker.file_completion.active);
+    try std.testing.expectEqual(@as(u64, 1), runtime.picker.file_completion.episode);
+    try runtime.insertionState().insertSlice(alloc, "draft", .clear);
+    try std.testing.expectEqualStrings("draft", runtime.edit_state.input.items);
 }

@@ -119,12 +119,25 @@ pub const State = struct {
     file_completion_window_start: usize = 0,
     file_picker_episode_seen: bool = false,
 
+    pub fn initInto(storage: *State) void {
+        file_completion_state.State.initInto(&storage.file_completion);
+        storage.reset_fields();
+    }
+
     pub fn deinit(self: *State, alloc: Allocator) void {
         self.file_completion.deinit(alloc);
         self.model_picker_pending_model.deinit(alloc);
         self.provider_picker_pending_provider.deinit(alloc);
         self.provider_picker_pending_method.deinit(alloc);
-        self.* = .{};
+        self.reset_fields();
+    }
+
+    fn reset_fields(self: *State) void {
+        inline for (std.meta.fields(State)) |field| {
+            // The child's owner initializes or resets it before these fields.
+            if (comptime std.mem.eql(u8, field.name, "file_completion")) continue;
+            @field(self.*, field.name) = field.defaultValue().?;
+        }
     }
 
     pub fn resetInlinePickerEpisode(self: *State) void {
@@ -597,6 +610,33 @@ fn skipPickerSpaces(bytes: []const u8, start: usize) usize {
     var index = start;
     while (index < bytes.len and (bytes[index] == ' ' or bytes[index] == '\t')) : (index += 1) {}
     return index;
+}
+
+test "picker deinit releases owned text and restores declared defaults" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+    try state.model_picker_pending_model.appendSlice(alloc, "model");
+    try state.provider_picker_pending_provider.appendSlice(alloc, "provider");
+    try state.provider_picker_pending_method.appendSlice(alloc, "method");
+    state.model_picker_stage = .fast;
+    state.provider_picker_stage = .api_key;
+    state.slash_completion_index = 7;
+    state.inline_picker_suppression = .history_slash_recall_until_edit;
+    state.file_completion.active = true;
+    state.file_completion.episode = 51;
+    state.deinit(alloc);
+    inline for (std.meta.fields(State)) |field| {
+        if (comptime std.mem.eql(u8, field.name, "file_completion")) {
+            inline for (std.meta.fields(file_completion_state.State)) |child| {
+                if (comptime std.mem.eql(u8, child.name, "raw_query") or std.mem.eql(u8, child.name, "lookup_query")) continue;
+                try std.testing.expectEqualDeep(child.defaultValue().?, @field(state.file_completion, child.name));
+            }
+        } else {
+            try std.testing.expectEqualDeep(field.defaultValue().?, @field(state, field.name));
+        }
+    }
+    state.deinit(alloc);
 }
 
 test "picker state resolves model file skill and slash queries" {
