@@ -2,6 +2,7 @@ const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const message = @import("../shared/message.zig");
+const string_pool = @import("../shared/comptime_string_pool.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 
@@ -708,39 +709,42 @@ fn shouldRedactArgumentValue(key: []const u8) bool {
     return false;
 }
 
+const credential_key_strings = [_][]const u8{
+    "password",
+    "passwd",
+    "token",
+    "api_key",
+    "apikey",
+    "secret",
+    "secret_key",
+    "secretkey",
+    "client_secret",
+    "clientsecret",
+    "access_token",
+    "accesstoken",
+    "refresh_token",
+    "refreshtoken",
+    "auth_token",
+    "authtoken",
+    "id_token",
+    "idtoken",
+    "private_key",
+    "privatekey",
+    "access_key",
+    "accesskey",
+    "authorization",
+    "cookie",
+    "set_cookie",
+    "setcookie",
+    "credential",
+    "credentials",
+};
+const credential_keys_pool = string_pool.Interned(&credential_key_strings);
+const credential_keys = credential_keys_pool.all;
+
 fn isCredentialArgumentKey(key: []const u8) bool {
-    const exact = [_][]const u8{
-        "password",
-        "passwd",
-        "token",
-        "api_key",
-        "apikey",
-        "secret",
-        "secret_key",
-        "secretkey",
-        "client_secret",
-        "clientsecret",
-        "access_token",
-        "accesstoken",
-        "refresh_token",
-        "refreshtoken",
-        "auth_token",
-        "authtoken",
-        "id_token",
-        "idtoken",
-        "private_key",
-        "privatekey",
-        "access_key",
-        "accesskey",
-        "authorization",
-        "cookie",
-        "set_cookie",
-        "setcookie",
-        "credential",
-        "credentials",
-    };
-    for (exact) |candidate| {
-        if (std.ascii.eqlIgnoreCase(key, candidate)) return true;
+    for (credential_keys) |candidate| {
+        if (std.ascii.eqlIgnoreCase(key, candidate.get())) return true;
     }
     return false;
 }

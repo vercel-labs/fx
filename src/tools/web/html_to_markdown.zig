@@ -1,4 +1,5 @@
 const std = @import("std");
+const string_pool = @import("../../core/shared/comptime_string_pool.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -485,44 +486,58 @@ fn decodeNumericEntity(entity: []const u8) ?u21 {
     return value;
 }
 
+const entity_strings = [_][2][]const u8{
+    .{ "amp", "&" },
+    .{ "lt", "<" },
+    .{ "gt", ">" },
+    .{ "quot", "\"" },
+    .{ "apos", "'" },
+    .{ "nbsp", " " },
+    .{ "copy", "©" },
+    .{ "reg", "®" },
+    .{ "trade", "™" },
+    .{ "mdash", "—" },
+    .{ "ndash", "–" },
+    .{ "hellip", "…" },
+    .{ "lsquo", "‘" },
+    .{ "rsquo", "’" },
+    .{ "ldquo", "“" },
+    .{ "rdquo", "”" },
+    .{ "laquo", "«" },
+    .{ "raquo", "»" },
+    .{ "times", "×" },
+    .{ "divide", "÷" },
+    .{ "bull", "•" },
+    .{ "middot", "·" },
+    .{ "sect", "§" },
+    .{ "para", "¶" },
+    .{ "deg", "°" },
+    .{ "plusmn", "±" },
+    .{ "euro", "€" },
+    .{ "pound", "£" },
+    .{ "yen", "¥" },
+    .{ "cent", "¢" },
+};
+
+const entity_pool = string_pool.Interned(blk: {
+    var flat: []const []const u8 = &.{};
+    for (entity_strings) |pair| {
+        flat = flat ++ &[2][]const u8{ pair[0], pair[1] };
+    }
+    break :blk flat;
+});
+
+const entity_entries = blk: {
+    var out: [entity_strings.len]struct { entity_pool.Ref, entity_pool.Ref } = undefined;
+    for (entity_strings, 0..) |pair, i| {
+        out[i] = .{ entity_pool.ref(pair[0]), entity_pool.ref(pair[1]) };
+    }
+    break :blk out;
+};
+
 fn namedEntity(entity: []const u8) ?[]const u8 {
-    const entries = [_]struct {
-        name: []const u8,
-        value: []const u8,
-    }{
-        .{ .name = "amp", .value = "&" },
-        .{ .name = "lt", .value = "<" },
-        .{ .name = "gt", .value = ">" },
-        .{ .name = "quot", .value = "\"" },
-        .{ .name = "apos", .value = "'" },
-        .{ .name = "nbsp", .value = " " },
-        .{ .name = "copy", .value = "©" },
-        .{ .name = "reg", .value = "®" },
-        .{ .name = "trade", .value = "™" },
-        .{ .name = "mdash", .value = "—" },
-        .{ .name = "ndash", .value = "–" },
-        .{ .name = "hellip", .value = "…" },
-        .{ .name = "lsquo", .value = "‘" },
-        .{ .name = "rsquo", .value = "’" },
-        .{ .name = "ldquo", .value = "“" },
-        .{ .name = "rdquo", .value = "”" },
-        .{ .name = "laquo", .value = "«" },
-        .{ .name = "raquo", .value = "»" },
-        .{ .name = "times", .value = "×" },
-        .{ .name = "divide", .value = "÷" },
-        .{ .name = "bull", .value = "•" },
-        .{ .name = "middot", .value = "·" },
-        .{ .name = "sect", .value = "§" },
-        .{ .name = "para", .value = "¶" },
-        .{ .name = "deg", .value = "°" },
-        .{ .name = "plusmn", .value = "±" },
-        .{ .name = "euro", .value = "€" },
-        .{ .name = "pound", .value = "£" },
-        .{ .name = "yen", .value = "¥" },
-        .{ .name = "cent", .value = "¢" },
-    };
-    for (entries) |entry| {
-        if (std.mem.eql(u8, entity, entry.name)) return entry.value;
+    for (entity_entries) |entry| {
+        if (std.mem.eql(u8, entity, entry[0].get())) return entry[1].get();
     }
     return null;
 }

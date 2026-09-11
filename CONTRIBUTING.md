@@ -577,6 +577,14 @@ not rediscovered:
   `-no_data_in_code_info` to ld64, dropping ~31 KiB of debugger-only
   metadata that dyld does not read. `LC_UUID` is not droppable: modern dyld
   refuses to launch a binary without it.
+- Large static string tables (syntax-highlight profiles, slash-command
+  completions, credential redaction terms, entity maps, language signals)
+  intern their strings through `src/core/shared/comptime_string_pool.zig`.
+  Each entry stores a 4-byte (offset, length) pair into one shared blob
+  instead of a 16-byte slice, and the tables stay in natural literal form
+  as comptime-only inputs that never materialize. New static tables of
+  short strings should use the pool; strings over 255 bytes do not fit and
+  should stay slices. `pool.ref` is comptime-only.
 
 UPX-style executable packing is not viable on macOS arm64: the packed binary
 is killed at exec even after re-signing. It packs the Linux ELF correctly,
