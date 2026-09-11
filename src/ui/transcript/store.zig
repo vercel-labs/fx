@@ -3379,9 +3379,9 @@ pub fn replaceTrailingTranscriptLineSilent(self: anytype, alloc: Allocator, text
     }
     reconcileTranscriptAnchorAfterSourceChange(
         self,
-        true,
+        false,
         "replaceable_tail_replacement",
-        .strict,
+        .preserve_same_epoch,
     );
     return true;
 }
