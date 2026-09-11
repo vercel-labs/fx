@@ -4571,7 +4571,7 @@ pub const TranscriptRuntime = struct {
         alloc: Allocator,
         event: types.ToolLifecycleEvent,
     ) !?types.ToolActivityKind {
-        return self.applyToolLifecycleWithAnchorPolicy(alloc, event, false);
+        return self.applyToolLifecycleWithAnchorPolicy(alloc, event, true);
     }
 
     pub fn applyToolLifecyclePreservingNormalBufferAnchor(
@@ -7939,9 +7939,14 @@ pub const TranscriptRuntime = struct {
             !stable_terminal_geometry or
             self.resize_history_row_delta != null or
             scroll_facts.footer_history_rewind or
-            target.total_visual_rows < anchor.total_visual_rows or
             anchor.visual_offset < anchor.history_visual_offset)
         {
+            return null;
+        }
+        if (target.history_visual_offset >= target.total_visual_rows) {
+            // A contraction can remove every row at or beyond the native
+            // history floor. Staging at EOF cannot paint a projection, so
+            // keep the natural visible tail behind immutable history.
             return null;
         }
         if (target.visual_offset < target.history_visual_offset) {

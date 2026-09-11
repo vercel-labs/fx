@@ -7439,7 +7439,7 @@ test "recovery backward area movement stabilizes at acknowledged semantic endpoi
     try std.testing.expectEqual(@as(u16, 1), projection.cursor_col);
 }
 
-test "contracted transcript source reclaims the natural tail instead of an empty history floor" {
+test "contracted transcript source preserves the native history floor" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{
         .layout = transcriptTestLayout(80, 20, 16),
@@ -7476,6 +7476,7 @@ test "contracted transcript source reclaims the natural tail instead of an empty
     defer prepared.deinit(alloc);
     const line_rows = [_]u16{1} ** 150;
     try prepared.line_visual_rows.appendSlice(alloc, &line_rows);
+    try makeSyntheticPreparedRenderable(&prepared, alloc);
 
     var source = TranscriptPreparationSource{
         .bytes = try alloc.dupe(u8, "contracted-flow"),
@@ -7510,8 +7511,8 @@ test "contracted transcript source reclaims the natural tail instead of an empty
     );
 
     try std.testing.expectEqual(@as(u32, 134), facts.target_visual_offset);
-    try std.testing.expectEqual(@as(usize, 134), resolved.selection().start_line);
-    try std.testing.expectEqual(@as(u16, 16), resolved.occupiedTranscriptRows());
+    try std.testing.expectEqual(@as(usize, 136), resolved.selection().start_line);
+    try std.testing.expectEqual(@as(u16, 14), resolved.occupiedTranscriptRows());
     try std.testing.expect(resolved.bodyDisposition() == .paint);
 
     switch (runtime.transcript_commit_state) {
@@ -7552,6 +7553,60 @@ test "contracted transcript source reclaims the natural tail instead of an empty
     try std.testing.expect(growth_facts.source_compatible);
     try std.testing.expectEqual(@as(u32, 0), growth_facts.semantic_rows);
     try std.testing.expectEqual(@as(u16, 0), growth_facts.planned_rows);
+
+    var deep_selection = testSelectionInArea(104, 1, 16);
+    deep_selection.line_count = 120;
+    deep_selection.last_visible_row = 16;
+    var deep_prepared = transcript_painter.PreparedTranscriptSurfacePaint{
+        .bytes = try alloc.dupe(u8, "deeply-contracted-flow"),
+        .selection = deep_selection,
+        .cursor = .{
+            .cursor_row = 16,
+            .cursor_col = 1,
+            .replaceable_row = 16,
+        },
+    };
+    defer deep_prepared.deinit(alloc);
+    const deep_line_rows = [_]u16{1} ** 120;
+    try deep_prepared.line_visual_rows.appendSlice(alloc, &deep_line_rows);
+    try makeSyntheticPreparedRenderable(&deep_prepared, alloc);
+
+    var deep_source = TranscriptPreparationSource{
+        .bytes = try alloc.dupe(u8, "deeply-contracted-flow"),
+        .folded_summary_indices = &.{},
+        .preview = .{ .natural_visual_rows = 120 },
+        .tail_kind = null,
+        .tracked_entry_id = null,
+        .tracked_entry_start_line = null,
+        .replaceable_last_line = false,
+        .replaceable_start = 0,
+        .replaceable_row = 16,
+        .welcome_cut_line = null,
+        .welcome_boundary = null,
+        .cols = 80,
+    };
+    defer deep_source.deinit(alloc);
+    const deep_facts = try runtime.prepareTranscriptScrollFactsForFrame(
+        alloc,
+        &deep_source,
+        &deep_prepared,
+        .unchanged,
+    );
+    const deep_resolved = try runtime.resolveTranscriptTransitionTargetForFrame(
+        alloc,
+        &deep_source,
+        &deep_prepared,
+        runtime.committed_frame_layout,
+        render_engine.frame_scroll_plan.FrameScrollPlan.none(20, 1),
+        deep_facts,
+        false,
+        false,
+    );
+
+    try std.testing.expectEqual(@as(u32, 104), deep_facts.target_visual_offset);
+    try std.testing.expectEqual(@as(usize, 104), deep_resolved.selection().start_line);
+    try std.testing.expectEqual(@as(u16, 16), deep_resolved.occupiedTranscriptRows());
+    try std.testing.expect(deep_resolved.bodyDisposition() == .paint);
 }
 
 test "same-width backward footer candidate retains one coherent stable anchor" {
@@ -13912,7 +13967,7 @@ test "turn finished anchor preservation keeps a same-epoch retention rewrite" {
     );
 }
 
-test "turn finished anchor preservation falls back for strict mode or geometry blocker" {
+test "turn finished anchor preservation applies by default and falls back for geometry blocker" {
     const alloc = std.testing.allocator;
 
     {
@@ -13929,7 +13984,7 @@ test "turn finished anchor preservation falls back for strict mode or geometry b
         });
 
         try std.testing.expectEqual(
-            transcript_runtime.TranscriptCommitDiagnosticState.invalid,
+            transcript_runtime.TranscriptCommitDiagnosticState.stable,
             runtime.transcriptCommitDiagnostic().state,
         );
     }

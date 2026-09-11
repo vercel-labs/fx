@@ -7043,6 +7043,66 @@ test "replaceable line survives a replay_viewport pass" {
     );
 }
 
+test "mutable transcript contraction preserves the native history floor" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 40, 12, 4);
+    defer h.deinit();
+
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var approval = approval_prompt.ApprovalPrompt{};
+    defer approval.deinit(alloc);
+
+    try h.shell.initViewport(&h.metrics, 1);
+    _ = try h.shell.appendRawTranscriptEntry(
+        alloc,
+        "history 00\nhistory 01\nhistory 02\nhistory 03\n" ++
+            "history 04\nhistory 05\nhistory 06\nhistory 07\n",
+    );
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    _ = try h.shell.appendReplaceableTranscriptLine(
+        alloc,
+        &h.metrics,
+        "provisional lifecycle status that wraps onto a second visual row\n",
+    );
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+    try std.testing.expect(h.last_frame.committed_scroll_rows > 0);
+    const provisional = h.shell.transcriptCommitDiagnostic();
+
+    try std.testing.expect(
+        try h.shell.replaceTrailingTranscriptLine(alloc, &h.metrics, "settled status\n"),
+    );
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    const settled = h.shell.transcriptCommitDiagnostic();
+    try std.testing.expect(settled.total_visual_rows < provisional.total_visual_rows);
+    try std.testing.expectEqual(
+        provisional.history_visual_offset,
+        settled.history_visual_offset,
+    );
+    try std.testing.expectEqual(settled.history_visual_offset, settled.visual_offset);
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.committed_scroll_rows);
+
+    _ = try h.shell.appendRawTranscriptEntry(
+        alloc,
+        "assistant continuation remains visible\n",
+    );
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try countGridOccurrences(&h, "settled status"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try countGridOccurrences(&h, "assistant continuation remains visible"),
+    );
+}
+
 test "settled resize reanchors viewport_top_row at row one" {
     var h = try Harness.init(std.testing.allocator, 40, 24, 4);
     defer h.deinit();
