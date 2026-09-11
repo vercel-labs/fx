@@ -547,7 +547,7 @@ Linux (exact bytes vary by commit):
 
 | Target          | Stripped bytes | MiB    |
 | --------------- | -------------- | ------ |
-| aarch64-macos   | ~5,176,000     | 4.936  |
+| aarch64-macos   | ~5,226,000     | 4.984  |
 | aarch64-linux   | ~5,454,000     | 5.201  |
 | x86_64-linux    | ~6,915,000     | 6.595  |
 | x86_64-macos    | ~6,920,000     | 6.600  |
