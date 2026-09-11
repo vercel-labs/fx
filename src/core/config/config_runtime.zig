@@ -605,6 +605,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "provider",
         "codex_model",
         "grok_model",
+        "deepseek_model",
         "effort",
         "fast_mode",
         "fast_mode_model_bound",
@@ -1369,6 +1370,12 @@ fn parseProfileOnlyFields(
         if (model_value != .string) return error.InvalidGrokModelType;
         settings_store.validateModel(model_value.string) catch return error.InvalidGrokModelValue;
         try settings.models.putCopy(alloc, .grok, model_value.string);
+    }
+
+    if (root.object.get("deepseek_model")) |model_value| {
+        if (model_value != .string) return error.InvalidDeepSeekModelType;
+        settings_store.validateModel(model_value.string) catch return error.InvalidDeepSeekModelValue;
+        try settings.models.putCopy(alloc, .deepseek, model_value.string);
     }
 
     if (root.object.get("models")) |models_value| {

@@ -3426,6 +3426,7 @@ fn exactUsageOrigin(provider: model_provider.ProviderId) []const u8 {
         .gateway => "exact/gateway",
         .codex => "exact/codex",
         .grok => "exact/grok",
+        .deepseek => "exact/deepseek",
     };
 }
 

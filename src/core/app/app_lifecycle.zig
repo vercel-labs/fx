@@ -1151,6 +1151,7 @@ fn configuredProviderSelection(
         .gateway => default_model,
         .codex => return error.CodexModelNotSelected,
         .grok => return error.GrokModelNotSelected,
+        .deepseek => return error.DeepSeekModelNotSelected,
     };
     return .{ .provider = provider, .model = model };
 }

@@ -23,6 +23,7 @@ pub fn derive(
     switch (source) {
         .vercel_oidc_token,
         .ai_gateway_api_key,
+        .deepseek_api_key,
         .fx_login,
         .stored_key,
         .host_managed,

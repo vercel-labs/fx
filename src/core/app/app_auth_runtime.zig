@@ -170,6 +170,7 @@ pub fn Runtime(comptime App: type) type {
                         .gateway => credentials.missing_interactive_credential_message,
                         .codex => credentials.missing_chatgpt_interactive_credential_message,
                         .grok => credentials.missing_grok_interactive_credential_message,
+                        .deepseek => credentials.missing_deepseek_interactive_credential_message,
                     },
                 }, true),
                 .failed => |failure| {
@@ -193,7 +194,9 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .warning,
-                    .body = if (provider == .grok)
+                    .body = if (provider == .deepseek)
+                        credentials.missing_deepseek_interactive_credential_message
+                    else if (provider == .grok)
                         credentials.missing_grok_interactive_credential_message
                     else
                         credentials.missing_chatgpt_interactive_credential_message,
@@ -1214,14 +1217,14 @@ pub fn Runtime(comptime App: type) type {
                     switch (target) {
                         .codex => try beginCodexSignInForProviderSwitch(app),
                         .grok => try beginGrokSignInForProviderSwitch(app),
-                        .gateway => {},
+                        .gateway, .deepseek => {},
                     }
                 }
                 if (target == .gateway or !request.allow_login) {
                     try app.writeDomainNotice(.{
                         .topic = "provider",
                         .tone = .warning,
-                        .body = if (intent == .post_oauth) "Subscription sign-in completed, but its saved credential is unavailable. The current provider is unchanged." else if (target == .codex) "Run fx login codex, then try switching again." else if (target == .grok) "Run fx login grok, then try switching again." else credentials.missing_interactive_credential_message,
+                        .body = if (intent == .post_oauth) "Subscription sign-in completed, but its saved credential is unavailable. The current provider is unchanged." else if (target == .codex) "Run fx login codex, then try switching again." else if (target == .grok) "Run fx login grok, then try switching again." else if (target == .deepseek) "Set DEEPSEEK_API_KEY, then try switching again." else credentials.missing_interactive_credential_message,
                     }, true);
                 }
                 return false;
@@ -1822,6 +1825,7 @@ pub fn Runtime(comptime App: type) type {
                 .grok_subscription => try beginGrokSignIn(app),
                 .vercel_oidc_token,
                 .ai_gateway_api_key,
+                .deepseek_api_key,
                 .stored_key,
                 .host_managed,
                 => {},
@@ -2217,7 +2221,7 @@ test "interactive subscription sign-in rejects active and queued work before OAu
             switch (provider) {
                 .codex => try Runtime(BusySignInApp).beginChatGptSignIn(&app),
                 .grok => try Runtime(BusySignInApp).beginGrokSignIn(&app),
-                .gateway => unreachable,
+                .gateway, .deepseek => unreachable,
             }
 
             try std.testing.expectEqual(@as(usize, 0), app.auth.start_count);
