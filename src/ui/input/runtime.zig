@@ -2057,12 +2057,20 @@ test "input escape parser resolves unmodified kitty Backspace to a delete byte" 
     try expectEscapeAction("[127u", .{ .remapped_byte = 127 });
     // Modifier param is bitmask+1: ;1 = none, ;3 = Alt, ;9 = Super.
     try expectEscapeAction("[127;1u", .{ .remapped_byte = 127 });
+    try expectEscapeAction("[127;1:1u", .{ .remapped_byte = 127 });
+    try expectEscapeAction("[127;1:2u", .{ .remapped_byte = 127 });
+    try expectEscapeAction("[127;1:3u", .ignore);
     try expectEscapeAction("[127;3u", .delete_word_left);
+    try expectEscapeAction("[127;3:1u", .delete_word_left);
     try expectEscapeAction("[127;9u", .delete_to_line_start);
     try expectEscapeAction("[13u", .{ .remapped_byte = '\r' });
     try expectEscapeAction("[13;1u", .{ .remapped_byte = '\r' });
+    try expectEscapeAction("[13;1:1u", .{ .remapped_byte = '\r' });
+    try expectEscapeAction("[13;1:3u", .ignore);
     try expectEscapeAction("[9u", .{ .remapped_byte = '\t' });
     try expectEscapeAction("[9;1u", .{ .remapped_byte = '\t' });
+    try expectEscapeAction("[9;1:1u", .{ .remapped_byte = '\t' });
+    try expectEscapeAction("[9;1:3u", .ignore);
 }
 
 test "input escape parser resolves unmapped single-parameter CSI u to ignore" {
