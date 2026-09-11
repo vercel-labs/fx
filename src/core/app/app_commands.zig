@@ -556,6 +556,7 @@ pub fn Handlers(comptime App: type) type {
                     .tone = .neutral,
                     .body = "Opened https://fx.sh/feedback.",
                 }, true);
+                if (comptime @hasDecl(App, "play_max_interaction_sound")) app.play_max_interaction_sound(.click);
                 return;
             }
             try app.writeDomainNotice(.{
@@ -601,6 +602,9 @@ pub fn Handlers(comptime App: type) type {
                 .copy_failed, .unavailable => .@"error",
             };
             try finish_trace_notice(app, progress_entry_id, tone, body);
+            if (tone == .neutral) {
+                if (comptime @hasDecl(App, "playInteractionSound")) app.playInteractionSound();
+            }
         }
 
         fn commandQuit(ctx: *anyopaque) !void {
@@ -1252,6 +1256,12 @@ pub fn Handlers(comptime App: type) type {
                 .tone = .neutral,
                 .body = msg,
             }, true);
+            switch (result) {
+                .restored, .deleted => {
+                    if (comptime @hasDecl(App, "play_max_interaction_sound")) app.play_max_interaction_sound(.release);
+                },
+                .empty, .unavailable => {},
+            }
         }
 
         fn commandHandleMcp(ctx: *anyopaque, rest: []const u8) !void {
@@ -1918,6 +1928,7 @@ pub fn Handlers(comptime App: type) type {
                 .tone = .neutral,
                 .body = "Copied to clipboard.",
             }, true);
+            if (comptime @hasDecl(App, "play_max_interaction_sound")) app.play_max_interaction_sound(.release);
         }
 
         fn commandSubmitFeedback(ctx: *anyopaque) !void {

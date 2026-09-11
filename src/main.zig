@@ -27,6 +27,7 @@ const input_submit_runtime = @import("core/app/input_submit_runtime.zig");
 const core_input_runtime = @import("core/input/runtime.zig");
 const app_bootstrap_runtime = @import("core/app/app_bootstrap_runtime.zig");
 const app_notification_runtime = @import("core/app/app_notification_runtime.zig");
+const notification_contract = @import("core/notifications/notification_contract.zig");
 const app_permission_runtime = @import("core/app/app_permission_runtime.zig");
 const app_process_runtime = @import("core/app/app_process_runtime.zig");
 const managed_execution = @import("core/execution/managed_execution.zig");
@@ -768,6 +769,10 @@ const App = struct {
 
     pub fn playInteractionSound(self: *App) void {
         NotificationAppRuntime.playCue(self, .click);
+    }
+
+    pub fn play_max_interaction_sound(self: *App, cue: notification_contract.Cue) void {
+        NotificationAppRuntime.playMaxCue(self, cue);
     }
 
     pub fn playInputClearedSound(self: *App) void {
