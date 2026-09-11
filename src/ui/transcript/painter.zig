@@ -1304,6 +1304,7 @@ fn prepareTranscriptSurfacePaintWithOwnedSource(
         &source,
         true,
         false,
+        false,
         .apply,
         null,
     );
@@ -1330,6 +1331,7 @@ pub fn prepareTranscriptSurfacePaintFromSourceForArea(
         source,
         false,
         false,
+        false,
         .apply,
         null,
     );
@@ -1351,10 +1353,17 @@ pub fn preparePreselectedTranscriptSurfacePaintFromSourceForArea(
         source,
         false,
         false,
+        false,
         .skip,
         null,
     );
 }
+
+pub const FooterHistoryTransition = enum {
+    unchanged,
+    displaced,
+    reclaimed,
+};
 
 pub fn prepareTranscriptSurfacePaintFromSourceForFrame(
     self: anytype,
@@ -1362,7 +1371,7 @@ pub fn prepareTranscriptSurfacePaintFromSourceForFrame(
     metrics: *Metrics,
     source: *const TranscriptPreparationSource,
     area: render_engine.frame_layout.FrameRect,
-    allow_projection_rebase: bool,
+    footer_history_transition: FooterHistoryTransition,
 ) !PreparedTranscriptSurfacePaint {
     return prepareTranscriptSurfacePaintInternal(
         self,
@@ -1372,7 +1381,8 @@ pub fn prepareTranscriptSurfacePaintFromSourceForFrame(
         area,
         source,
         false,
-        allow_projection_rebase,
+        footer_history_transition != .unchanged,
+        footer_history_transition == .reclaimed,
         .apply,
         null,
     );
@@ -1393,6 +1403,7 @@ pub fn prepareIndexedFullTranscriptSurfacePaintForArea(
         0,
         area,
         source,
+        false,
         false,
         false,
         .skip,
@@ -1674,6 +1685,7 @@ fn prepareTranscriptSurfacePaintInternal(
     source: *const TranscriptPreparationSource,
     commit_runtime_state: bool,
     allow_projection_rebase: bool,
+    allow_history_rewind: bool,
     resize_history_policy: ResizeHistoryPolicy,
     forced_visual_offset: ?u32,
 ) !PreparedTranscriptSurfacePaint {
@@ -1971,7 +1983,8 @@ fn prepareTranscriptSurfacePaintInternal(
                     !repaint_required or
                     settled_history_reflow;
                 const next_offset = prepared.sourceVisualOffsetFor(viewport_selection_snapshot);
-                if (allow_projection_rebase and
+                if (!allow_history_rewind and
+                    allow_projection_rebase and
                     !stable.flow_unchanged and
                     self.committed_frame_layout.terminal_rows == self.layout.rows and
                     invalidation_allows_preservation and
@@ -2003,7 +2016,8 @@ fn prepareTranscriptSurfacePaintInternal(
                     prepared.projection_area.top = top_row;
                     viewport_selection_snapshot.top_row = top_row;
                 }
-                if (invalidation_allows_preservation and
+                if (!allow_history_rewind and
+                    invalidation_allows_preservation and
                     (!allow_projection_rebase or
                         exact_history_reflow or
                         settled_history_reflow))

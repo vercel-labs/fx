@@ -46,8 +46,7 @@ fn resolveAndSealTranscriptTransitionForTest(
         alloc,
         source,
         prepared,
-        false,
-        false,
+        .unchanged,
     );
     const destructive_invalidation = render_engine.frame_retention.transcriptAreaHasDestructiveInvalidation(
         runtime.committed_frame_layout.transcript_area,
@@ -490,7 +489,7 @@ test "unchanged transcript keeps stable projection during footer reflow" {
         &metrics,
         &source,
         .{ .top = 1, .bottom = 4 },
-        false,
+        .unchanged,
     );
     defer compact.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), compact.selection.start_line);
@@ -514,7 +513,7 @@ test "unchanged transcript keeps stable projection during footer reflow" {
         &metrics,
         &source,
         .{ .top = 1, .bottom = 6 },
-        true,
+        .displaced,
     );
     defer expanded.deinit(alloc);
 
@@ -637,7 +636,7 @@ test "child full transcript finalizer consumes one complete transition" {
         &source,
     );
     defer prepared.deinit(alloc);
-    const facts = runtime.planTranscriptScrollForFrame(&prepared, false, false);
+    const facts = runtime.planTranscriptScrollForFrame(&prepared, .unchanged);
     const scroll_plan = render_engine.frame_scroll_plan.merge(
         runtime.layout.rows,
         runtime.owned_top_row,
@@ -652,8 +651,7 @@ test "child full transcript finalizer consumes one complete transition" {
         render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan),
         &plan,
         scroll_plan,
-        false,
-        false,
+        .unchanged,
     );
     defer transition.deinit(alloc);
 
@@ -7441,6 +7439,121 @@ test "recovery backward area movement stabilizes at acknowledged semantic endpoi
     try std.testing.expectEqual(@as(u16, 1), projection.cursor_col);
 }
 
+test "contracted transcript source reclaims the natural tail instead of an empty history floor" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(80, 20, 16),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    var stable_selection = testSelectionInArea(136, 1, 16);
+    stable_selection.line_count = 152;
+    stable_selection.last_visible_row = 16;
+    try installStableAnchorForTest(
+        &runtime,
+        alloc,
+        "expanded-flow",
+        stable_selection,
+        136,
+        16,
+        1,
+        900,
+    );
+
+    var target_selection = testSelectionInArea(134, 1, 16);
+    target_selection.line_count = 150;
+    target_selection.last_visible_row = 16;
+    var prepared = transcript_painter.PreparedTranscriptSurfacePaint{
+        .bytes = try alloc.dupe(u8, "contracted-flow"),
+        .selection = target_selection,
+        .cursor = .{
+            .cursor_row = 16,
+            .cursor_col = 1,
+            .replaceable_row = 16,
+        },
+    };
+    defer prepared.deinit(alloc);
+    const line_rows = [_]u16{1} ** 150;
+    try prepared.line_visual_rows.appendSlice(alloc, &line_rows);
+
+    var source = TranscriptPreparationSource{
+        .bytes = try alloc.dupe(u8, "contracted-flow"),
+        .folded_summary_indices = &.{},
+        .preview = .{ .natural_visual_rows = 150 },
+        .tail_kind = null,
+        .tracked_entry_id = null,
+        .tracked_entry_start_line = null,
+        .replaceable_last_line = false,
+        .replaceable_start = 0,
+        .replaceable_row = 16,
+        .welcome_cut_line = null,
+        .welcome_boundary = null,
+        .cols = 80,
+    };
+    defer source.deinit(alloc);
+    const facts = try runtime.prepareTranscriptScrollFactsForFrame(
+        alloc,
+        &source,
+        &prepared,
+        .unchanged,
+    );
+    const resolved = try runtime.resolveTranscriptTransitionTargetForFrame(
+        alloc,
+        &source,
+        &prepared,
+        runtime.committed_frame_layout,
+        render_engine.frame_scroll_plan.FrameScrollPlan.none(20, 1),
+        facts,
+        false,
+        false,
+    );
+
+    try std.testing.expectEqual(@as(u32, 134), facts.target_visual_offset);
+    try std.testing.expectEqual(@as(usize, 134), resolved.selection().start_line);
+    try std.testing.expectEqual(@as(u16, 16), resolved.occupiedTranscriptRows());
+    try std.testing.expect(resolved.bodyDisposition() == .paint);
+
+    switch (runtime.transcript_commit_state) {
+        .stable => |*anchor| {
+            alloc.free(anchor.flow);
+            anchor.flow = try alloc.dupe(u8, "contracted-flow");
+            anchor.selection = target_selection;
+            anchor.visual_offset = 134;
+            anchor.history_visual_offset = 136;
+            anchor.total_visual_rows = 150;
+            anchor.cursor_row = 16;
+            anchor.cursor_col = 1;
+            anchor.occupied_last_row = 16;
+        },
+        .invalid, .recovering => return error.TestExpectedStableTranscript,
+    }
+
+    var growth_selection = target_selection;
+    growth_selection.start_line = 135;
+    growth_selection.line_count = 151;
+    var growth = transcript_painter.PreparedTranscriptSurfacePaint{
+        .bytes = try alloc.dupe(u8, "contracted-flow+"),
+        .selection = growth_selection,
+        .cursor = .{
+            .cursor_row = 16,
+            .cursor_col = 1,
+            .replaceable_row = 16,
+        },
+    };
+    defer growth.deinit(alloc);
+    const growth_line_rows = [_]u16{1} ** 151;
+    try growth.line_visual_rows.appendSlice(alloc, &growth_line_rows);
+
+    const growth_facts = runtime.planTranscriptScrollForFrame(
+        &growth,
+        .unchanged,
+    );
+    try std.testing.expect(growth_facts.source_compatible);
+    try std.testing.expectEqual(@as(u32, 0), growth_facts.semantic_rows);
+    try std.testing.expectEqual(@as(u16, 0), growth_facts.planned_rows);
+}
+
 test "same-width backward footer candidate retains one coherent stable anchor" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{
@@ -7521,8 +7634,7 @@ test "same-width backward footer candidate retains one coherent stable anchor" {
         alloc,
         &source,
         &prepared,
-        false,
-        false,
+        .unchanged,
     );
     const resolved = try runtime.resolveTranscriptTransitionTargetForFrame(
         alloc,

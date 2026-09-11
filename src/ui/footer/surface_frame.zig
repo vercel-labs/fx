@@ -892,15 +892,17 @@ pub const SurfaceFooterMeasurement = struct {
             self.footerReservedBaseRows() != shell.footer_reserved_base_rows;
     }
 
-    pub fn replaysDisplacedTranscriptHistory(
+    pub fn transcriptHistoryTransition(
         self: *const SurfaceFooterMeasurement,
         shell: *const TranscriptRuntime,
-    ) bool {
+    ) transcript_runtime.FooterHistoryTransition {
         const measured_rows = @as(u32, self.footer_extra) +
             @as(u32, self.footerReservedBaseRows());
         const committed_rows = @as(u32, shell.extra_input_rows) +
             @as(u32, shell.footer_reserved_base_rows);
-        return measured_rows > committed_rows;
+        if (measured_rows > committed_rows) return .displaced;
+        if (measured_rows < committed_rows) return .reclaimed;
+        return .unchanged;
     }
 
     pub fn frameInvalidationUpdate(self: *const SurfaceFooterMeasurement) surface_invalidation.FooterExtraUpdate {

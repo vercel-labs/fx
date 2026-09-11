@@ -1301,14 +1301,10 @@ pub fn Runtime(comptime App: type) type {
                     }
                 }
             }
-            const footer_reservation_changed = if (footer_measurement) |*measurement|
-                measurement.changesFooterReservation(presentation_shell)
+            const footer_history_transition = if (footer_measurement) |*measurement|
+                measurement.transcriptHistoryTransition(presentation_shell)
             else
-                false;
-            const replay_displaced_footer_history = if (footer_measurement) |*measurement|
-                measurement.replaysDisplacedTranscriptHistory(presentation_shell)
-            else
-                false;
+                .unchanged;
 
             var footer_frame: surface_frame.SurfaceFooterFrame = undefined;
             var footer_frame_initialized = false;
@@ -1368,8 +1364,7 @@ pub fn Runtime(comptime App: type) type {
                     .source = transcript_source,
                     .prepared_transcript = &prepared_transcript,
                     .resolved_target = &resolved_transcript_target,
-                    .footer_reservation_changed = footer_reservation_changed,
-                    .replay_displaced_footer_history = replay_displaced_footer_history,
+                    .footer_history_transition = footer_history_transition,
                     .footer_measurement = if (footer_measurement) |*measurement| measurement else null,
                     .fallback_footer_rows = if (footer_measurement == null)
                         footer_frame.paint.footer
@@ -2023,8 +2018,7 @@ fn FixedPointTranscriptContext(comptime App: type) type {
         source: ?*const transcript_runtime.TranscriptPreparationSource,
         prepared_transcript: *?transcript_painter.PreparedTranscriptSurfacePaint,
         resolved_target: *?transcript_runtime.TranscriptRuntime.ResolvedTranscriptTarget,
-        footer_reservation_changed: bool,
-        replay_displaced_footer_history: bool,
+        footer_history_transition: transcript_runtime.FooterHistoryTransition,
         footer_measurement: ?*const surface_frame.SurfaceFooterMeasurement,
         fallback_footer_rows: ?render_engine.footer_layout.FooterRows,
         activity_projection: activity_runtime.ActivityProjection,
@@ -2066,15 +2060,14 @@ fn FixedPointTranscriptContext(comptime App: type) type {
                 &self.app.metrics,
                 source,
                 canonical_area,
-                self.footer_reservation_changed,
+                self.footer_history_transition,
             );
             const prepared = &self.prepared_transcript.*.?;
             const scroll_facts = try self.presentation_shell.prepareTranscriptScrollFactsForFrame(
                 self.app.alloc,
                 source,
                 prepared,
-                self.footer_reservation_changed,
-                self.replay_displaced_footer_history,
+                self.footer_history_transition,
             );
             self.scroll_facts = scroll_facts;
             const canonical_occupied_rows = if (prepared.selection.last_visible_row >= canonical_area.top)

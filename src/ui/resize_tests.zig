@@ -265,9 +265,7 @@ pub const Harness = struct {
         self.shell.normalizeFrameInvalidations(&invalidations);
         var measurement = try surface_frame.measureSurfaceFooter(self.alloc, &self.shell, approval.projection(), ctx);
         defer measurement.deinit(self.alloc);
-        const footer_reservation_changed = measurement.changesFooterReservation(&self.shell);
-        const replay_displaced_footer_history =
-            measurement.replaysDisplacedTranscriptHistory(&self.shell);
+        const footer_history_transition = measurement.transcriptHistoryTransition(&self.shell);
         var prepared: ?transcript_painter.PreparedTranscriptSurfacePaint = null;
         defer if (prepared) |*paint| paint.deinit(self.alloc);
         var resolved_target: ?transcript_runtime.TranscriptRuntime.ResolvedTranscriptTarget = null;
@@ -294,8 +292,7 @@ pub const Harness = struct {
             &source,
             &prepared,
             &resolved_target,
-            footer_reservation_changed,
-            replay_displaced_footer_history,
+            footer_history_transition,
             invalidations,
         );
 
@@ -467,8 +464,7 @@ fn solveTestFrame(
     source: *const TranscriptPreparationSource,
     prepared: *?transcript_painter.PreparedTranscriptSurfacePaint,
     resolved_target: *?transcript_runtime.TranscriptRuntime.ResolvedTranscriptTarget,
-    footer_reservation_changed: bool,
-    replay_displaced_footer_history: bool,
+    footer_history_transition: transcript_runtime.FooterHistoryTransition,
     attempt_invalidations: render_engine.paint_plan.FrameInvalidationSet,
 ) !render_engine.frame_fixed_point.FramePlan {
     var ctx = TestFrameSolveContext{
@@ -478,8 +474,7 @@ fn solveTestFrame(
         .resolved_target = resolved_target,
         .measurement = measurement,
         .activity = activity,
-        .footer_reservation_changed = footer_reservation_changed,
-        .replay_displaced_footer_history = replay_displaced_footer_history,
+        .footer_history_transition = footer_history_transition,
         .attempt_invalidations = attempt_invalidations,
     };
     return render_engine.frame_fixed_point.solve(
@@ -505,8 +500,7 @@ const TestFrameSolveContext = struct {
     resolved_target: *?transcript_runtime.TranscriptRuntime.ResolvedTranscriptTarget,
     measurement: *const surface_frame.SurfaceFooterMeasurement,
     activity: render_engine.frame_layout.ActivityState,
-    footer_reservation_changed: bool,
-    replay_displaced_footer_history: bool,
+    footer_history_transition: transcript_runtime.FooterHistoryTransition,
     attempt_invalidations: render_engine.paint_plan.FrameInvalidationSet,
     scroll_facts: ?transcript_runtime.TranscriptScrollFacts = null,
 
@@ -528,14 +522,13 @@ const TestFrameSolveContext = struct {
                 &self.h.metrics,
                 self.source,
                 candidate.transcript_area,
-                self.footer_reservation_changed,
+                self.footer_history_transition,
             );
             const scroll_facts = try self.h.shell.prepareTranscriptScrollFactsForFrame(
                 self.h.alloc,
                 self.source,
                 &self.prepared.*.?,
-                self.footer_reservation_changed,
-                self.replay_displaced_footer_history,
+                self.footer_history_transition,
             );
             self.scroll_facts = scroll_facts;
             inline_advance_rows = scroll_facts.planned_rows;
@@ -836,8 +829,7 @@ fn resolveAndSealTranscriptTransitionForTest(
         alloc,
         source,
         prepared,
-        false,
-        false,
+        .unchanged,
     );
     const destructive_invalidation = render_engine.frame_retention.transcriptAreaHasDestructiveInvalidation(
         shell.committed_frame_layout.transcript_area,
@@ -3601,6 +3593,54 @@ test "question modal replays displaced transcript rows into history" {
     );
     try expectGridContains(&h, "question context 24");
     try expectGridContains(&h, "How should the inspection proceed?");
+
+    _ = try h.shell.appendRawTranscriptEntry(
+        alloc,
+        "selected answer\nworking response\nthird progress row\n",
+    );
+    question.discard(alloc, "answered");
+    ctx.question = null;
+    ctx.activity = .{ .turn_thinking = .{ .label = "Generating" } };
+    h.frame_redraw = true;
+    try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
+    try h.flush();
+
+    try std.testing.expectEqual(
+        h.shell.layout.rows,
+        h.shell.committed_frame_layout.footer_area.bottom,
+    );
+    try std.testing.expectEqual(
+        h.shell.committed_frame_layout.transcript_area.bottom,
+        h.shell.last_visible_transcript_last_row,
+    );
+    const anchor = h.shell.transcriptCommitDiagnostic();
+    try std.testing.expect(anchor.visual_offset < anchor.history_visual_offset);
+    const stable_visual_offset = anchor.visual_offset;
+    const stable_history_visual_offset = anchor.history_visual_offset;
+
+    for (0..4) |_| {
+        h.shell.render_requests.request(.footer);
+        try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
+        try h.flush();
+        try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
+        try std.testing.expectEqual(@as(u16, 0), h.last_frame.committed_scroll_rows);
+        try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
+        try std.testing.expectEqual(@as(usize, 0), h.last_frame.document_append_bytes);
+        try std.testing.expectEqual(
+            h.shell.layout.rows,
+            h.shell.committed_frame_layout.footer_area.bottom,
+        );
+        try std.testing.expectEqual(
+            h.shell.committed_frame_layout.transcript_area.bottom,
+            h.shell.last_visible_transcript_last_row,
+        );
+        const repeated_anchor = h.shell.transcriptCommitDiagnostic();
+        try std.testing.expectEqual(stable_visual_offset, repeated_anchor.visual_offset);
+        try std.testing.expectEqual(
+            stable_history_visual_offset,
+            repeated_anchor.history_visual_offset,
+        );
+    }
 }
 
 test "resized question cancellation keeps the idle footer bottom anchored" {
@@ -6148,12 +6188,11 @@ test "long transcript picker filtering keeps footer anchored and close releases 
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try std.testing.expect(h.shell.committed_frame_layout.footer_area.top < idle_footer_top);
+    try std.testing.expectEqual(idle_footer_top, h.shell.committed_frame_layout.footer_area.top);
     try std.testing.expectEqual(
-        h.shell.last_visible_transcript_last_row + 2,
-        h.shell.committed_frame_layout.footer_area.top,
+        h.shell.layout.rows,
+        h.shell.committed_frame_layout.footer_area.bottom,
     );
-    try std.testing.expect(h.shell.committed_frame_layout.footer_area.bottom < h.shell.layout.rows);
 
     h.shell.terminal_reset_pending = true;
     try h.shell.writeNotice(
@@ -6699,11 +6738,11 @@ test "footer reflow rebases a same-height transcript rewrite without history scr
         &h.metrics,
         &source,
         reduced_area,
-        true,
+        .displaced,
     );
     defer prepared.deinit(alloc);
 
-    const facts = h.shell.planTranscriptScrollForFrame(&prepared, true, true);
+    const facts = h.shell.planTranscriptScrollForFrame(&prepared, .displaced);
     try std.testing.expect(!facts.source_compatible);
     try std.testing.expect(facts.geometry_rebase);
     try std.testing.expectEqual(@as(u32, 0), facts.semantic_rows);
@@ -6739,13 +6778,12 @@ test "footer reflow replays an unchanged displaced prefix across a later rewrite
             &h.metrics,
             &source,
             reduced_area,
-            true,
+            .displaced,
         );
         defer compatible.deinit(alloc);
         const compatible_facts = h.shell.planTranscriptScrollForFrame(
             &compatible,
-            true,
-            true,
+            .displaced,
         );
         break :replay_boundary transcript_painter.preparedTranscriptFlowOffsetForVisualOffset(
             &compatible,
@@ -6767,11 +6805,11 @@ test "footer reflow replays an unchanged displaced prefix across a later rewrite
         &h.metrics,
         &source,
         reduced_area,
-        true,
+        .displaced,
     );
     defer prepared.deinit(alloc);
 
-    const facts = h.shell.planTranscriptScrollForFrame(&prepared, true, true);
+    const facts = h.shell.planTranscriptScrollForFrame(&prepared, .displaced);
     try std.testing.expect(!facts.source_compatible);
     try std.testing.expect(facts.geometry_rebase);
     try std.testing.expect(facts.semantic_rows > 0);
