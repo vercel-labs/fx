@@ -530,32 +530,49 @@ authoritative production pipeline.
 scripts/compact-release.sh                      # host platform only
 scripts/compact-release.sh --all                # all four native targets
 scripts/compact-release.sh --xz                 # also emit .xz artifacts
+scripts/compact-release.sh --mergefunc          # LLVM mergefunc pipeline (macOS)
 ```
 
-Reference sizes from the four native targets (exact bytes vary by commit):
+`--mergefunc` emits the whole-program bitcode (`zig build pgso-ir
+-Dpgso-artifact=fx -Doptimize=ReleaseSmall`), folds identical functions with
+LLVM's `mergefunc` pass, recompiles at `-Oz`, and links with ld64, whose
+cstring merge also dedups `__TEXT,__cstring` constants the Zig linker emits
+verbatim. It requires an LLVM toolchain with `opt` and `clang` (`brew install
+llvm`, or set `LLVM_DIR`). It only helps macOS targets: on Linux the `-Oz`
+recompile plus `zig cc` link costs more than the plain ReleaseSmall build, so
+those targets fall back to the plain path with a note.
+
+Reference sizes with `--mergefunc` on the macOS targets and plain builds on
+Linux (exact bytes vary by commit):
 
 | Target          | Stripped bytes | MiB    |
 | --------------- | -------------- | ------ |
-| aarch64-macos   | ~5,229,000     | 4.987  |
-| aarch64-linux   | ~5,377,000     | 5.127  |
-| x86_64-linux    | ~6,878,000     | 6.562  |
-| x86_64-macos    | ~7,003,000     | 6.682  |
+| aarch64-macos   | ~5,208,000     | 4.966  |
+| aarch64-linux   | ~5,454,000     | 5.201  |
+| x86_64-linux    | ~6,915,000     | 6.595  |
+| x86_64-macos    | ~6,920,000     | 6.600  |
 
 The post-link strip pass is required: the Zig Mach-O linker keeps local
 symbols for ReleaseSmall even with strip enabled (~770 KiB of `__LINKEDIT`
 on aarch64-macos), while ReleaseSafe emits a minimal linkedit segment.
 
 x86_64 text is roughly 1.4x the aarch64 equivalent for this codebase, so the
-compact surface only approaches 5 MiB on arm64. Two further levers exist:
+compact surface only approaches 5 MiB on arm64.
 
-- The LLVM size pipeline (emit bitcode via `zig build pgso-ir
-  -Dpgso-artifact=fx -Doptimize=ReleaseSmall`, run `opt -passes
-  default<Oz>,mergefunc,iroutliner`, then `llc` and link) trims roughly
-  15-35 KiB more per arm64 target but needs an external LLVM toolchain.
-- `std.json.static` parsing specializes one recursive-descent parser per
-  parsed type. The fx binary carries on the order of a hundred `innerParse`
-  clones (~150 KiB on x86_64). Funneling parse sites through a shared
-  `std.json.Value`-first helper is the largest known code-level cut.
+Two size levers are already applied in-tree and documented here so they are
+not rediscovered:
+
+- `std.json.static` parsing used to specialize one recursive-descent parser
+  per parsed type (115 `innerParse` clones, ~94 KiB). Concrete wire-type
+  parse sites now funnel through `src/core/shared/json_owned.zig`, which
+  shares the single `std.json.Value` parser and converts with
+  `parseFromValue`; all typed clones are gone. New parse sites for concrete
+  types should use `json_owned.parseOwned` unless they deliberately borrow
+  from the input buffer (see the image-measurement site in
+  `prompt_context.zig`).
+- Optimized builds select `std.debug.simple_panic` in `src/main.zig`, since
+  stripped binaries carry no symbols for the full panic handler's self-info
+  reader. Debug builds keep full stack traces.
 
 UPX-style executable packing is not viable on macOS arm64: the packed binary
 is killed at exec even after re-signing. It packs the Linux ELF correctly,
