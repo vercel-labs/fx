@@ -356,31 +356,38 @@ fn credentialReadyAt(
 }
 
 fn adoptServerCredential(state: *ServerState, credential: *credentials.Credential) void {
-    if (state.active_session) |*active| active.api_key = &.{};
-    if (state.api_key.len > 0) secret.zeroAndFree(state.alloc, state.api_key);
-    if (state.gateway_team) |team| state.alloc.free(team);
-    if (state.account_id) |account_id| state.alloc.free(account_id);
-
+    // Subagent children copy these fields under the same lock; swap first and
+    // free the previous values only after no child can still observe them.
+    state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+    const previous_api_key = state.api_key;
+    const previous_gateway_team = state.gateway_team;
+    const previous_account_id = state.account_id;
     state.api_key = credential.token;
-    credential.token = &.{};
     state.credential_source = credential.source;
     state.credential_refresh_after_ms = credential.refresh_after_ms;
     state.account_id = credential.account_id;
-    credential.account_id = null;
     state.gateway_team = if (credential.team_id) |team| team else credential.team_slug;
-    if (credential.team_id != null) {
-        credential.team_id = null;
-        if (credential.team_slug) |slug| state.alloc.free(slug);
-        credential.team_slug = null;
-    } else {
-        credential.team_slug = null;
-    }
     if (state.active_session) |*active| {
         active.api_key = state.api_key;
         active.credential_source = state.credential_source;
         active.credential_refresh_after_ms = state.credential_refresh_after_ms;
         active.account_id = state.account_id;
-        if (comptime !host_target.is_wasm) {
+    }
+    state.subagent_authority_mutex.unlock(io_mod.getIo());
+
+    credential.token = &.{};
+    credential.account_id = null;
+    if (credential.team_id != null) {
+        credential.team_id = null;
+        if (credential.team_slug) |slug| state.alloc.free(slug);
+    }
+    credential.team_slug = null;
+    if (previous_api_key.len > 0) secret.zeroAndFree(state.alloc, previous_api_key);
+    if (previous_gateway_team) |team| state.alloc.free(team);
+    if (previous_account_id) |account_id| state.alloc.free(account_id);
+
+    if (comptime !host_target.is_wasm) {
+        if (state.active_session) |*active| {
             if (state.credential_source == .chatgpt_subscription or state.credential_source == .grok_subscription) {
                 active.session_rt.usage.clearReconciliationCredential();
             }
@@ -2912,6 +2919,7 @@ test "ACP publishes an account-bound refreshed Codex token for later prompts" {
     const alloc = std.testing.allocator;
     var state: ServerState = undefined;
     state.alloc = alloc;
+    state.subagent_authority_mutex = .init;
     state.api_key = try alloc.dupe(u8, "stale-token");
     state.account_id = try alloc.dupe(u8, "acct-1");
     state.credential_source = .chatgpt_subscription;
@@ -2959,6 +2967,7 @@ test "ACP rejects refreshed Codex tokens for another account" {
     const alloc = std.testing.allocator;
     var state: ServerState = undefined;
     state.alloc = alloc;
+    state.subagent_authority_mutex = .init;
     state.api_key = try alloc.dupe(u8, "stale-token");
     state.account_id = try alloc.dupe(u8, "acct-1");
     state.credential_source = .chatgpt_subscription;

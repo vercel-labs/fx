@@ -4,6 +4,7 @@ const std_builtin = @import("builtin");
 const command_admission = @import("../core/permissions/command_admission.zig");
 const auth_runtime = @import("../core/auth/auth_runtime.zig");
 const credentials = @import("../core/auth/credentials.zig");
+const secret = @import("../core/auth/secret.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
@@ -154,6 +155,10 @@ const AcpContext = struct {
     /// session/set_mode changes never mutate a running turn.
     captured_mode: ?[]const u8 = null,
     captured_permission_mode: ?PermissionMode = null,
+    /// Set for subagent children: owned copies of the host credential. The
+    /// child tool context takes its credential fields from here instead of the
+    /// live session, and leaves the parent-owned web search configuration alone.
+    captured_host: ?*const ChildHostSnapshot = null,
     current_prompt_input: ?*ParsedPromptInput = null,
 
     fn deinitPublishedToolCalls(self: *AcpContext) void {
@@ -314,11 +319,18 @@ const AcpContext = struct {
     fn toolContext(self: *AcpContext) tool_runtime.Context {
         const session = if (self.state.active_session) |*active| active else unreachable;
         const provider_capabilities = self.state.cfg.provider_set.select(session.provider).capabilities;
-        if (provider_capabilities.fx_search) {
-            self.state.web_search_runtime.configure(.{
-                .api_key = session.api_key,
-                .credential_source = session.credential_source,
-                .gateway_team = self.state.gateway_team,
+        const api_key: []const u8 = if (self.captured_host) |captured| captured.api_key else session.api_key;
+        const credential_source = if (self.captured_host) |captured| captured.credential_source else session.credential_source;
+        const gateway_team: ?[]const u8 = if (self.captured_host) |captured| captured.gateway_team else self.state.gateway_team;
+        const account_id: ?[]const u8 = if (self.captured_host) |captured| captured.account_id else session.account_id;
+        // The parent configures the shared web search runtime on its own
+        // thread from the live session; children search with that
+        // configuration rather than racing it with a stale copy.
+        if (provider_capabilities.fx_search and self.captured_host == null) {
+            self.state.web_search_runtime.configure(self.alloc, .{
+                .api_key = api_key,
+                .credential_source = credential_source,
+                .gateway_team = gateway_team,
                 .worker_model = session.model,
                 .gateway_retry_count = self.state.cfg.gateway_retry_count,
                 .gateway_chat_url = self.state.cfg.gateway_chat_url,
@@ -336,15 +348,15 @@ const AcpContext = struct {
             .max_read_file_line_len = self.state.cfg.max_read_file_line_len,
             .max_command_output_bytes = self.state.cfg.max_command_output_bytes,
             .max_tool_result_bytes = session.max_tool_result_bytes,
-            .api_key = session.api_key,
+            .api_key = api_key,
             .agent_stream_provider = server.streamProviderFor(self.state, session.provider),
-            .credential_source = session.credential_source,
-            .account_id = session.account_id,
+            .credential_source = credential_source,
+            .account_id = account_id,
             .provider = session.provider,
             .provider_capabilities = provider_capabilities,
             .oauth_transport = self.state.cfg.gateway_provider.oauth_transport,
             .secret_store = self.state.cfg.secret_store,
-            .gateway_team = self.state.gateway_team,
+            .gateway_team = gateway_team,
             .model = session.model,
             .gateway_retry_count = self.state.cfg.gateway_retry_count,
             .gateway_chat_url = self.state.cfg.gateway_chat_url,
@@ -904,13 +916,19 @@ pub fn runSubagentChild(
     };
     const session_id = active.session_id;
     const captured_mode = active.mode;
+    var host_snapshot = ChildHostSnapshot.capture(alloc, state, active) catch {
+        state.subagent_authority_mutex.unlock(io_mod.getIo());
+        return error.OutOfMemory;
+    };
     state.subagent_authority_mutex.unlock(io_mod.getIo());
+    defer host_snapshot.deinit(alloc);
     var ctx = AcpContext{
         .alloc = alloc,
         .state = state,
         .session_id = session_id,
         .captured_mode = captured_mode,
         .captured_permission_mode = admission.permission_mode,
+        .captured_host = &host_snapshot,
     };
     defer ctx.deinitPublishedToolCalls();
     var child_projection = state.cfg.mode_registry.buildModelToolProjection(
@@ -938,10 +956,54 @@ pub fn runSubagentChild(
         .custom_tool_guidance = child_projection.custom_guidance,
         .context_registry = state.cfg.context_registry,
         .context_enabled = state.context_enabled,
-        .project_context = state.context_snapshot.modelVisibleBytes(),
+        .project_context = host_snapshot.project_context,
         .lifecycle_view = state.lifecycle_view,
     }, turn, message, admission, cancel);
 }
+
+/// Parent state a subagent child keeps reading after its own thread starts.
+/// The child can outlive the parent's cancelled turn, and the next prompt may
+/// replace the project context or rotate the credential, so the child owns
+/// copies taken under `subagent_authority_mutex`. The parent swaps those fields
+/// under the same lock before freeing the previous values. `AcpContext`
+/// consumes the snapshot through `captured_host` when building the child tool
+/// context.
+const ChildHostSnapshot = struct {
+    project_context: []u8,
+    api_key: []u8,
+    credential_source: ?types.CredentialSource,
+    gateway_team: ?[]u8,
+    account_id: ?[]u8,
+
+    fn capture(
+        alloc: Allocator,
+        state: *const server.ServerState,
+        active: *const server.ActiveSessionState,
+    ) Allocator.Error!ChildHostSnapshot {
+        const project_context = try alloc.dupe(u8, state.context_snapshot.modelVisibleBytes());
+        errdefer alloc.free(project_context);
+        const api_key = try alloc.dupe(u8, active.api_key);
+        errdefer secret.zeroAndFree(alloc, api_key);
+        const gateway_team = if (state.gateway_team) |team| try alloc.dupe(u8, team) else null;
+        errdefer if (gateway_team) |team| alloc.free(team);
+        const account_id = if (active.account_id) |id| try alloc.dupe(u8, id) else null;
+        return .{
+            .project_context = project_context,
+            .api_key = api_key,
+            .credential_source = active.credential_source,
+            .gateway_team = gateway_team,
+            .account_id = account_id,
+        };
+    }
+
+    fn deinit(self: *ChildHostSnapshot, alloc: Allocator) void {
+        alloc.free(self.project_context);
+        secret.zeroAndFree(alloc, self.api_key);
+        if (self.gateway_team) |team| alloc.free(team);
+        if (self.account_id) |id| alloc.free(id);
+        self.* = undefined;
+    }
+};
 
 fn refreshProjectContext(
     state: *server.ServerState,
@@ -950,10 +1012,12 @@ fn refreshProjectContext(
     omissions: []const context_contract.ContextOmissionInput,
     omission_summary: ?context_contract.ContextOmissionSummary,
 ) context_contract.ProviderError!void {
-    state.context_snapshot.deinit(alloc);
-    if (!state.context_enabled) return;
+    if (!state.context_enabled) {
+        replaceProjectContextSnapshot(state, alloc, .{});
+        return;
+    }
 
-    state.context_snapshot = state.cfg.context_registry.gatherDefaultSnapshot(alloc, .{
+    const next = state.cfg.context_registry.gatherDefaultSnapshot(alloc, .{
         .workspace_root = state.workspace_root,
         .access_scope = state.workspace_access.scope(state.workspace_root),
         .targets = targets,
@@ -962,8 +1026,25 @@ fn refreshProjectContext(
         .context_limits = state.context_limits,
     }) catch |err| {
         debug_trace.logf("context", "acp gather failed err={s}", .{@errorName(err)});
+        replaceProjectContextSnapshot(state, alloc, .{});
         return err;
     };
+    replaceProjectContextSnapshot(state, alloc, next);
+}
+
+/// Swaps the parent snapshot under the lock subagent children hold while they
+/// copy it (`ChildHostSnapshot.capture`), then frees the previous bytes once no
+/// child can still see them.
+fn replaceProjectContextSnapshot(
+    state: *server.ServerState,
+    alloc: Allocator,
+    next: context_contract.GatheredContextSnapshot,
+) void {
+    state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+    var previous = state.context_snapshot;
+    state.context_snapshot = next;
+    state.subagent_authority_mutex.unlock(io_mod.getIo());
+    previous.deinit(alloc);
 }
 
 const AgentConfigSections = struct {
@@ -3996,6 +4077,49 @@ test "ACP refreshes typed registry context and propagates enabled gathering erro
     try std.testing.expect(state.context_snapshot.contribution == null);
 }
 
+test "ACP subagent child owns its parent snapshot across later refreshes" {
+    const alloc = std.testing.allocator;
+    AcpContextRegistryFixture.reset();
+
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    const active = &state.active_session.?;
+    try refreshProjectContext(&state, alloc, &.{}, &.{}, null);
+
+    var snapshot = try ChildHostSnapshot.capture(alloc, &state, active);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqualStrings("ACP registry context 1", snapshot.project_context);
+    try std.testing.expect(snapshot.project_context.ptr != state.context_snapshot.modelVisibleBytes().ptr);
+    try std.testing.expectEqualStrings(active.api_key, snapshot.api_key);
+    try std.testing.expect(snapshot.api_key.ptr != active.api_key.ptr);
+    try std.testing.expectEqual(active.credential_source, snapshot.credential_source);
+    try std.testing.expect(snapshot.gateway_team == null);
+    try std.testing.expect(snapshot.account_id == null);
+
+    var child_ctx = AcpContext{
+        .alloc = alloc,
+        .state = &state,
+        .session_id = active.session_id,
+        .captured_host = &snapshot,
+    };
+    try std.testing.expect(state.web_search_runtime.owned == null);
+    const child_tool_context = child_ctx.toolContext();
+    try std.testing.expect(child_tool_context.api_key.ptr == snapshot.api_key.ptr);
+    try std.testing.expectEqual(snapshot.credential_source, child_tool_context.credential_source);
+    // The child must not reconfigure the parent-owned web search runtime.
+    try std.testing.expect(state.web_search_runtime.owned == null);
+
+    // A later prompt replaces the parent snapshot while the child still runs.
+    try refreshProjectContext(&state, alloc, &.{}, &.{}, null);
+    try std.testing.expectEqualStrings("ACP registry context 2", state.context_snapshot.modelVisibleBytes());
+    try std.testing.expectEqualStrings("ACP registry context 1", snapshot.project_context);
+
+    state.context_enabled = false;
+    try refreshProjectContext(&state, alloc, &.{}, &.{}, null);
+    try std.testing.expectEqualStrings("", state.context_snapshot.modelVisibleBytes());
+    try std.testing.expectEqualStrings("ACP registry context 1", snapshot.project_context);
+}
+
 test "ACP prompt propagates context provider errors before pending prompt state" {
     const alloc = std.testing.allocator;
     var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
@@ -4219,11 +4343,12 @@ test "ACP prompt projection configures web search then blocks native execution" 
     var provider = state.web_search_runtime.provider orelse return error.TestExpectedEqual;
     provider.context = @ptrCast(&provider_state);
     provider.execute_fn = FailingWebSearchProvider.execute;
+    state.web_search_runtime.deinit();
     state.web_search_runtime = web_search_runtime.Runtime.init(.{
         .provider = provider,
     });
 
-    state.web_search_runtime.configure(.{
+    state.web_search_runtime.configure(alloc, .{
         .api_key = "stale-key",
         .worker_model = "stale-model",
         .gateway_retry_count = 99,

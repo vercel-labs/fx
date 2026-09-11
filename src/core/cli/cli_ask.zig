@@ -952,7 +952,7 @@ const AskContext = struct {
     fn toolContext(self: *AskContext) tool_runtime.Context {
         const provider_capabilities = self.cfg.provider_set.select(self.provider).capabilities;
         if (provider_capabilities.fx_search) {
-            self.web_search_runtime.configure(.{
+            self.web_search_runtime.configure(self.alloc, .{
                 .api_key = self.api_key,
                 .credential_source = self.credential_source,
                 .gateway_team = self.gateway_team,
@@ -4956,11 +4956,12 @@ test "CLI prompt projection configures web search then blocks native execution" 
     var provider = ctx.web_search_runtime.provider orelse return error.TestExpectedEqual;
     provider.context = @ptrCast(&provider_state);
     provider.execute_fn = FailingWebSearchProvider.execute;
+    ctx.web_search_runtime.deinit();
     ctx.web_search_runtime = web_search_runtime.Runtime.init(.{
         .provider = provider,
     });
 
-    ctx.web_search_runtime.configure(.{
+    ctx.web_search_runtime.configure(alloc, .{
         .api_key = "stale-key",
         .worker_model = "stale-model",
         .gateway_retry_count = 99,

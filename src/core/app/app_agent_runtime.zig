@@ -303,7 +303,7 @@ pub fn Runtime(comptime App: type) type {
             }
             if (comptime @hasField(App, "web_search_runtime")) {
                 if (provider_capabilities.fx_search) {
-                    app.web_search_runtime.configure(.{
+                    app.web_search_runtime.configure(app.alloc, .{
                         .api_key = app.auth.apiKey() orelse "",
                         .credential_source = app.auth.credentialSource(),
                         .gateway_team = app.auth.gatewayTeam(),
@@ -778,7 +778,7 @@ pub fn Runtime(comptime App: type) type {
             ctx.gateway_team = credential.tenant();
             if (comptime @hasField(App, "web_search_runtime") and @hasField(App, "session")) {
                 if (ctx.provider_capabilities.fx_search) {
-                    app.web_search_runtime.configure(.{
+                    app.web_search_runtime.configure(app.alloc, .{
                         .api_key = credential_secret,
                         .credential_source = credential_source,
                         .gateway_team = credential.tenant(),
@@ -2095,11 +2095,12 @@ test "app prompt projection configures web search then blocks native execution" 
     var provider = app.web_search_runtime.provider orelse return error.TestExpectedEqual;
     provider.context = @ptrCast(&provider_state);
     provider.execute_fn = FailingWebSearchProvider.execute;
+    app.web_search_runtime.deinit();
     app.web_search_runtime = web_search_runtime.Runtime.init(.{
         .provider = provider,
     });
 
-    app.web_search_runtime.configure(.{
+    app.web_search_runtime.configure(alloc, .{
         .api_key = "stale-key",
         .worker_model = "stale-model",
         .gateway_retry_count = 99,
