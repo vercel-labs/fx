@@ -145,8 +145,12 @@ build_mergefunc() {
   fi
   "$llvm_dir/clang" -arch "$arch" -Oz -c "$prefix/fx.mf.bc" -o "$obj"
   mkdir -p "$(dirname "$bin_out")"
-  "$llvm_dir/clang" -arch "$arch" -Wl,-dead_strip -isysroot "$sdkroot" \
-    "$obj" "$crt" -lSystem -o "$bin_out"
+  # -no_function_starts and -no_data_in_code_info drop debugger-only
+  # metadata tables (~31 KiB); dyld does not need them. LC_UUID stays:
+  # modern dyld refuses to launch binaries without it.
+  "$llvm_dir/clang" -arch "$arch" -Wl,-dead_strip \
+    -Wl,-no_function_starts -Wl,-no_data_in_code_info \
+    -isysroot "$sdkroot" "$obj" "$crt" -lSystem -o "$bin_out"
 }
 
 strip_binary() {

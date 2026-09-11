@@ -547,7 +547,7 @@ Linux (exact bytes vary by commit):
 
 | Target          | Stripped bytes | MiB    |
 | --------------- | -------------- | ------ |
-| aarch64-macos   | ~5,208,000     | 4.966  |
+| aarch64-macos   | ~5,176,000     | 4.936  |
 | aarch64-linux   | ~5,454,000     | 5.201  |
 | x86_64-linux    | ~6,915,000     | 6.595  |
 | x86_64-macos    | ~6,920,000     | 6.600  |
@@ -573,6 +573,10 @@ not rediscovered:
 - Optimized builds select `std.debug.simple_panic` in `src/main.zig`, since
   stripped binaries carry no symbols for the full panic handler's self-info
   reader. Debug builds keep full stack traces.
+- The compact macOS link passes `-no_function_starts` and
+  `-no_data_in_code_info` to ld64, dropping ~31 KiB of debugger-only
+  metadata that dyld does not read. `LC_UUID` is not droppable: modern dyld
+  refuses to launch a binary without it.
 
 UPX-style executable packing is not viable on macOS arm64: the packed binary
 is killed at exec even after re-signing. It packs the Linux ELF correctly,
