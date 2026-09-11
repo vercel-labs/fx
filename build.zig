@@ -39,6 +39,12 @@ pub fn build(b: *std.Build) void {
         "Build a Node-API addon surface (core)",
     ) orelse .none;
 
+    const keep_symbols = b.option(
+        bool,
+        "keep-symbols",
+        "Keep symbol tables in optimized builds for size analysis",
+    ) orelse false;
+
     const git_commit = readGitCommit(b);
     const app_version = readAppVersion(b);
     const update_channel = b.option(UpdateChannel, "update-channel", "Build update channel (stable or dev)") orelse .stable;
@@ -61,7 +67,7 @@ pub fn build(b: *std.Build) void {
             .omit_frame_pointer = true,
             .unwind_tables = .none,
             .error_tracing = false,
-            .strip = optimize != .Debug,
+            .strip = optimize != .Debug and !keep_symbols,
         }),
     });
     exe.root_module.addImport("build_options", build_options.createModule());

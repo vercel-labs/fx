@@ -474,6 +474,7 @@ jobs:
           scripts=(
             benchmarks/startup.sh
             scripts/check-public-surface.sh
+            scripts/compact-release.sh
           )
           bash -n "${scripts[@]}"
           shellcheck "${scripts[@]}"

@@ -519,6 +519,50 @@ node benchmarks/libfx/bench-competitive.mjs --server /tmp/libfx-bench-server --p
 Build the SDK artifacts and install the pinned Pi package first, as shown in
 `.github/workflows/bench.yml`. Raw per-prompt samples remain in the output directory.
 
+## Compact Builds
+
+`scripts/compact-release.sh` builds stripped ReleaseSmall binaries per
+platform. It exists for size-sensitive distributions; the default product
+build remains ReleaseSafe and the macOS arm64 PGSO qualification remains the
+authoritative production pipeline.
+
+```bash
+scripts/compact-release.sh                      # host platform only
+scripts/compact-release.sh --all                # all four native targets
+scripts/compact-release.sh --xz                 # also emit .xz artifacts
+```
+
+Reference sizes from the four native targets (exact bytes vary by commit):
+
+| Target          | Stripped bytes | MiB    |
+| --------------- | -------------- | ------ |
+| aarch64-macos   | ~5,229,000     | 4.987  |
+| aarch64-linux   | ~5,377,000     | 5.127  |
+| x86_64-linux    | ~6,878,000     | 6.562  |
+| x86_64-macos    | ~7,003,000     | 6.682  |
+
+The post-link strip pass is required: the Zig Mach-O linker keeps local
+symbols for ReleaseSmall even with strip enabled (~770 KiB of `__LINKEDIT`
+on aarch64-macos), while ReleaseSafe emits a minimal linkedit segment.
+
+x86_64 text is roughly 1.4x the aarch64 equivalent for this codebase, so the
+compact surface only approaches 5 MiB on arm64. Two further levers exist:
+
+- The LLVM size pipeline (emit bitcode via `zig build pgso-ir
+  -Dpgso-artifact=fx -Doptimize=ReleaseSmall`, run `opt -passes
+  default<Oz>,mergefunc,iroutliner`, then `llc` and link) trims roughly
+  15-35 KiB more per arm64 target but needs an external LLVM toolchain.
+- `std.json.static` parsing specializes one recursive-descent parser per
+  parsed type. The fx binary carries on the order of a hundred `innerParse`
+  clones (~150 KiB on x86_64). Funneling parse sites through a shared
+  `std.json.Value`-first helper is the largest known code-level cut.
+
+UPX-style executable packing is not viable on macOS arm64: the packed binary
+is killed at exec even after re-signing. It packs the Linux ELF correctly,
+but decompression happens at every launch and the startup-latency budget in
+`bench.yml` would not survive it. Distributing `.xz` artifacts keeps every
+platform's download under 3 MiB without touching runtime behavior.
+
 ## Before Marking a PR Ready
 
 Minimum checklist:
