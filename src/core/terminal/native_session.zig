@@ -6,6 +6,7 @@ const shell_resolver = @import("shell_resolver.zig");
 const terminal_store = @import("store.zig");
 const tmux_session = @import("tmux_session.zig");
 const host_capabilities = @import("../hosts/host.zig");
+const json_owned = @import("../shared/json_owned.zig");
 const session_layout = @import("../session/session_layout.zig");
 const process_identity = @import("../execution/process_identity.zig");
 const managed_execution_contract = @import("../execution/managed_execution_contract.zig");
@@ -388,11 +389,11 @@ pub fn runLauncher(alloc: Allocator) !void {
     const config_bytes = try alloc.alloc(u8, config_len);
     defer alloc.free(config_bytes);
     try readExactFd(std.posix.STDIN_FILENO, config_bytes);
-    var parsed = try std.json.parseFromSlice(
+    var parsed = try json_owned.parseOwned(
         LauncherConfig,
         alloc,
         config_bytes,
-        .{ .allocate = .alloc_always },
+        .{},
     );
     defer parsed.deinit();
     if (parsed.value.argv.len == 0) return error.InvalidLauncherConfig;
