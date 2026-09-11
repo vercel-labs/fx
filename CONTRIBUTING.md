@@ -582,9 +582,13 @@ not rediscovered:
   intern their strings through `src/core/shared/comptime_string_pool.zig`.
   Each entry stores a 4-byte (offset, length) pair into one shared blob
   instead of a 16-byte slice, and the tables stay in natural literal form
-  as comptime-only inputs that never materialize. New static tables of
-  short strings should use the pool; strings over 255 bytes do not fit and
-  should stay slices. `pool.ref` is comptime-only.
+  as comptime-only inputs that never materialize. Measured: 16.6 KiB off
+  the plain ReleaseSmall build; on the compact pipeline the rebased-const
+  segment drops ~16 KiB of slice headers while blob and ref tables add
+  ~10 KiB back, and 16 KiB segment page alignment currently absorbs the
+  difference in file size. New static tables of short strings should use
+  the pool; strings over 255 bytes do not fit and should stay slices.
+  `pool.ref` is comptime-only.
 
 UPX-style executable packing is not viable on macOS arm64: the packed binary
 is killed at exec even after re-signing. It packs the Linux ELF correctly,
