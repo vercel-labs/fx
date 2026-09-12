@@ -521,6 +521,14 @@ Build the SDK artifacts and install the pinned Pi package first, as shown in
 
 ## Before Marking a PR Ready
 
+The [pager experiment](experiments/pager/README.md) builds offline from a fresh
+arm64 binary with `zig build -Doptimize=ReleaseSmall -Dmacho-headerpad=16384`.
+The optional build setting reserves space for additional Mach-O load commands;
+ordinary builds do not reserve it. All pager execution belongs inside a macOS
+VM. Host-side supervision cannot contain a kernel panic. Full CI runs only the
+experiment's static layout and contract tests; guest runtime evidence is also
+required when changing the pager.
+
 Minimum checklist:
 
 1. Run `zig fmt --check src/` and the focused tests for the changed path.
