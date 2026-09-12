@@ -432,7 +432,7 @@ pub fn Runtime(comptime App: type) type {
                 finished.*,
             )) {
                 .uncommitted => .uncommitted,
-                .committed, .committed_degraded => .committed,
+                .committed => .committed,
             };
         }
 

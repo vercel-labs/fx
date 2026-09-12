@@ -3891,7 +3891,6 @@ const McpCommandFakeApp = struct {
         published_healthy,
         published_degraded,
         retained,
-        completion_failed,
         begin_failed,
     };
 
@@ -3995,7 +3994,6 @@ const McpCommandFakeApp = struct {
                     "Required MCP server 'fixture' failed to start.",
                 ),
             } },
-            .completion_failed => .{ .failed = error.TestReloadFailed },
             .begin_failed => unreachable,
         };
     }

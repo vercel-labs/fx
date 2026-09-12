@@ -85,7 +85,6 @@ pub const ToolExecutionResult = struct {
     interactive_notice: ?types.SemanticNotice = null,
     context_notices: []const []const u8 = &.{},
     command_result_json: ?[]const u8 = null,
-    turn_control: ?tool_dispatch.TurnControl = null,
     web_search_completion: ?types.WebSearchCompletion = null,
     web_fetch_completion: ?types.WebFetchCompletion = null,
     inner_usage: ?types.ToolUsage = null,

@@ -121,10 +121,6 @@ pub const SelectedDynamicToolSinkFn = *const fn (
 
 pub const ContextNoticeSinkFn = *const fn (?*anyopaque, []const u8) error{OutOfMemory}!void;
 
-pub const TurnControl = enum {
-    return_to_user,
-};
-
 /// Erased, owned typed input decoded by a concrete tool.
 pub const ToolInput = struct {
     ptr: *anyopaque,

@@ -921,7 +921,6 @@ const DispatchMetadata = struct {
     web_fetch_completion: ?types.WebFetchCompletion = null,
     tool_result_memory: ?types.ToolResultMemory = null,
     command_result_json: ?[]const u8 = null,
-    turn_control: ?tool_dispatch.TurnControl = null,
 
     fn attach(self: *DispatchMetadata, ctx: *tool_dispatch.DispatchContext) void {
         ctx.model_content_kind_sink = &self.model_content_kind;
@@ -953,7 +952,6 @@ fn toolExecutionResultFromDispatch(
             .web_fetch_completion = metadata.web_fetch_completion,
             .tool_result_memory = memory,
             .command_result_json = metadata.command_result_json,
-            .turn_control = metadata.turn_control,
         },
         .failure => .{
             .status = .failure,
@@ -964,7 +962,6 @@ fn toolExecutionResultFromDispatch(
             .web_fetch_completion = metadata.web_fetch_completion,
             .tool_result_memory = memory,
             .command_result_json = metadata.command_result_json,
-            .turn_control = metadata.turn_control,
         },
     };
 }

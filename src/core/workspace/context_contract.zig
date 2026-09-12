@@ -437,13 +437,11 @@ pub const EntryPoint = enum {
 pub const DriftStatus = enum {
     intentional,
     temporary,
-    phase12_follow_up,
 
     fn label(self: DriftStatus) []const u8 {
         return switch (self) {
             .intentional => "intentional",
             .temporary => "temporary",
-            .phase12_follow_up => "phase12_follow_up",
         };
     }
 };

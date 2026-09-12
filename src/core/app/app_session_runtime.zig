@@ -245,7 +245,6 @@ pub const SessionPickerScope = session_catalog.Scope;
 pub const HistoryAppendOutcome = enum {
     uncommitted,
     committed,
-    committed_degraded,
 };
 
 pub const ResumeHandoffIntent = enum {
