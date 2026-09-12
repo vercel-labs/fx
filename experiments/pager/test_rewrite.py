@@ -1,9 +1,14 @@
 """Static parser/layout regression tests. Never execute generated Mach-O files."""
 import struct
+import subprocess
+import sys
+import tempfile
 import unittest
+from pathlib import Path
 
 from rewrite_macho import (PAGE, CHAINED, DYLD_INFO, DYSYMTAB, MAIN, SEGMENT,
                            SYMTAB, inspect, parse, rewrite, rewrite_opcodes, segment_command)
+from verify_guest import INSTALL_SCRIPT
 
 
 def fixture(chained=False, padding=True):
@@ -118,6 +123,22 @@ class RewriteTests(unittest.TestCase):
         for stream, bind in (([0x22,0x80],False),([0xD0],True),([0x40,65],True)):
             with self.assertRaises(ValueError):
                 rewrite_opcodes(bytearray(stream), {2:3}, bind)
+
+
+class GuestTransferTests(unittest.TestCase):
+    def test_replacement_preserves_previous_inode_contents(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory)/'signed executable'
+            target.write_bytes(b'old signed bytes')
+            inode = target.stat().st_ino
+            with target.open('rb') as previous:
+                subprocess.run([sys.executable, '-c', INSTALL_SCRIPT, str(target)],
+                               input=b'new signed bytes', check=True, capture_output=True)
+                self.assertEqual(previous.read(), b'old signed bytes')
+                self.assertNotEqual(target.stat().st_ino, inode)
+            self.assertEqual(target.read_bytes(), b'new signed bytes')
+            self.assertEqual(target.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(list(Path(directory).iterdir()), [target])
 
 
 if __name__ == '__main__':

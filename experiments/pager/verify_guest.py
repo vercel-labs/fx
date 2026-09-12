@@ -12,6 +12,20 @@ from rewrite_macho import parse
 
 ROOT = Path(__file__).resolve().parent
 
+# Keep the old inode intact: macOS may cache its executable signature.
+INSTALL_SCRIPT = '''import os, pathlib, sys, tempfile
+target = pathlib.Path(sys.argv[1])
+fd, temporary = tempfile.mkstemp(prefix=".pager-upload-", dir=target.parent)
+try:
+    with os.fdopen(fd, "wb") as output:
+        output.write(sys.stdin.buffer.read())
+    os.chmod(temporary, 0o755)
+    os.replace(temporary, target)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+'''
+
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
@@ -39,11 +53,12 @@ def main():
     checked('mkdir -p '+root+'/zig-out/bin')
     def upload(data, relative):
         target=shlex.quote(a.guest_root+'/'+relative)
-        r=remote('cat > '+target+' && chmod 755 '+target,data)
+        r=remote('python3 -c '+shlex.quote(INSTALL_SCRIPT)+' '+target,data)
         if r.returncode: raise RuntimeError(r.stderr.decode())
         actual=checked('/usr/bin/shasum -a 256 '+target).split()[0]
         if actual!=hashlib.sha256(data).hexdigest(): raise RuntimeError('guest artifact hash mismatch')
-    result=dict(model=model,os=checked('sw_vers'),boot_before=checked('sysctl -n kern.boottime'),checks=[],artifacts={})
+    result=dict(model=model,os=checked('sw_vers'),sip=checked('/usr/bin/csrutil status'),
+                boot_before=checked('sysctl -n kern.boottime'),checks=[],artifacts={})
     a.report.parent.mkdir(parents=True,exist_ok=True)
     def save(): a.report.write_text(json.dumps(result,indent=2)+'\n')
     def run_check(name,command,expected=0,contains=None,tui=False):

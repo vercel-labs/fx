@@ -106,7 +106,10 @@ verify rejected page checksums and rejected RW transitions exit cleanly.
 
 The host-side `verify_guest.py` automates transfer with hash verification,
 eager and demand CLI checks, a TUI interaction, concurrency, and injected
-failure checks. It requires an already running guest with a verified SSH key:
+failure checks. Uploads replace files atomically instead of overwriting signed
+executables in place, avoiding stale kernel signature caches as described in
+[Apple's update guidance](https://developer.apple.com/documentation/security/updating-mac-software).
+It requires an already running guest with a verified SSH key:
 
 ```sh
 python3 experiments/pager/verify_guest.py --ssh-host admin@GUEST_IP \
@@ -117,13 +120,15 @@ python3 experiments/pager/verify_guest.py --ssh-host admin@GUEST_IP \
 The build directory must contain `eager`, `demand`, `thread-demand`, and
 `write-demand` outputs. Build the last using the C fixture with
 `-DTEST_WRITE_FAULT=1`; it deliberately writes to a restored code page and
-must exit with code 88. The runner records guest OS, boot identity and binary
+must exit with code 88. The runner records guest OS, SIP status, boot identity and binary
 hashes alongside results. It never runs these binaries locally.
 
 ## Limits
 
 A guest pass does not establish host safety. Guest and host kernels can enforce
-different executable-memory policies. This experiment does not qualify
+different executable-memory policies. The initial CI-style guest image has SIP
+disabled; its results do not qualify execution with the host's security policy.
+This experiment does not qualify
 notarized distribution, arbitrary Mach-O files, signal-handler coexistence,
 post-start fork recovery, or production startup latency. It still owns SIGBUS
 and SIGSEGV for the process lifetime. Preserve original panic evidence and
