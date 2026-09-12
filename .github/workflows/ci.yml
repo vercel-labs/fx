@@ -35,6 +35,15 @@ jobs:
       - name: Validate PGSO corpus classification
         run: python3 -m scripts.pgso.corpus --manifest scripts/pgso/corpus.json --list
 
+      - name: Test release preparation and publication contracts
+        run: |
+          python3 -m unittest \
+            scripts.tests.test_release_candidate scripts.tests.test_release_delivery \
+            scripts.tests.test_release_publication scripts.tests.test_release_inputs \
+            scripts.tests.test_release_preparation scripts.tests.test_prepare_release_notes \
+            scripts.tests.test_libfx_build_workflow scripts.tests.test_release_examples \
+            scripts.tests.test_release_metadata scripts.tests.test_publish_prepared_sdk -q
+
       - name: Audit public surface
         run: ./scripts/check-public-surface.sh
 

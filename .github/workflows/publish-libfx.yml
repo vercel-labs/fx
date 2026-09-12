@@ -8,387 +8,291 @@ on:
   workflow_dispatch:
     inputs:
       channel:
-        description: npm channel to publish
+        description: Publication channel
         required: true
         type: choice
-        options:
-          - dev
-          - stable
+        options: [dev, stable]
+      prepared_run:
+        description: Successful Release preparation run (required for stable)
+        type: string
+        default: ""
 
 permissions:
   contents: read
 
-concurrency:
-  group: publish-libfx-${{ (github.event.workflow_run.name == 'Release' || inputs.channel == 'stable') && 'stable' || 'dev' }}
-  cancel-in-progress: false
+env:
+  FX_RELEASE_VERCEL_TEAM_ID: ${{ vars.FX_RELEASE_VERCEL_TEAM_ID }}
 
 jobs:
   metadata:
     if: >-
-      github.event_name == 'workflow_dispatch' ||
+      github.repository == 'vercel-labs/fx' && github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.event == 'push' &&
-       github.event.workflow_run.head_repository.full_name == github.repository)
-    runs-on: ubuntu-latest
+       (github.event.workflow_run.event == 'push' ||
+        (github.event.workflow_run.name == 'Release' && github.event.workflow_run.event == 'workflow_dispatch')) &&
+       github.event.workflow_run.head_repository.full_name == github.repository))
+    runs-on: ubuntu-24.04
     outputs:
       channel: ${{ steps.metadata.outputs.channel }}
       npm_tag: ${{ steps.metadata.outputs.npm_tag }}
       sha: ${{ steps.metadata.outputs.sha }}
-      should_publish: ${{ steps.metadata.outputs.should_publish }}
       version: ${{ steps.metadata.outputs.version }}
+      run_id: ${{ steps.metadata.outputs.run_id }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-          ref: ${{ github.event_name == 'workflow_dispatch' && 'main' || github.event.workflow_run.head_sha }}
-
-      - name: Resolve channel and version
+      - name: Resolve publication input
         id: metadata
         env:
           EVENT_NAME: ${{ github.event_name }}
           REQUESTED_CHANNEL: ${{ inputs.channel }}
+          REQUESTED_RUN: ${{ inputs.prepared_run }}
           WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
           WORKFLOW_SHA: ${{ github.event.workflow_run.head_sha }}
+          WORKFLOW_RUN: ${{ github.event.workflow_run.id }}
         run: |
           set -euo pipefail
-
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+          if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
             CHANNEL="$REQUESTED_CHANNEL"
-            SHA=$(git rev-parse HEAD)
+            SHA="$GITHUB_SHA"
+            RUN_ID="$REQUESTED_RUN"
           else
             SHA="$WORKFLOW_SHA"
-            if [ "$WORKFLOW_NAME" = "Release" ]; then
-              CHANNEL=stable
-            else
-              CHANNEL=dev
-            fi
+            RUN_ID="$WORKFLOW_RUN"
+            CHANNEL=dev
+            if [[ "$WORKFLOW_NAME" == Release ]]; then CHANNEL=stable; fi
           fi
-
-          BASE_VERSION=$(grep 'pub const version' src/main.zig | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          if ! [[ "$BASE_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "::error::src/main.zig version is not strict SemVer"
+          if ! [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::publication source must be a full commit SHA"
             exit 1
           fi
-          SHOULD_PUBLISH=true
-          if [ "$CHANNEL" = "stable" ]; then
-            TAG="v${BASE_VERSION}"
-            if git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}" 2>/dev/null; then
-              TAG_SHA=$(git rev-list -n 1 "$TAG")
-              if [ "$TAG_SHA" != "$SHA" ]; then
-                if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-                  echo "::error::Stable tag ${TAG} points to ${TAG_SHA}, not ${SHA}"
-                  exit 1
-                fi
-                echo "Release workflow did not publish ${SHA}; skipping libfx stable publish"
-                SHOULD_PUBLISH=false
-              fi
-            else
-              if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-                echo "::error::Stable tag ${TAG} does not exist"
-                exit 1
-              fi
-              echo "Release workflow did not create ${TAG}; skipping libfx stable publish"
-              SHOULD_PUBLISH=false
+          if [[ "$CHANNEL" == stable ]]; then
+            if ! [[ "$RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error::stable publication requires a preparation run ID"
+              exit 1
             fi
-            VERSION="$BASE_VERSION"
+            VERSION=""
             NPM_TAG=latest
-          else
-            SHORT_SHA=$(printf '%s' "$SHA" | cut -c1-12)
-            VERSION="${BASE_VERSION}-dev.${GITHUB_RUN_NUMBER}.g${SHORT_SHA}"
+          elif [[ "$CHANNEL" == dev ]]; then
+            BASE_VERSION=$(git show "$SHA:src/main.zig" | sed -n 's/^pub const version = "\([^"]*\)";$/\1/p')
+            if ! [[ "$BASE_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              echo "::error::source version must be strict SemVer"
+              exit 1
+            fi
+            VERSION="${BASE_VERSION}-dev.${GITHUB_RUN_NUMBER}.g${SHA:0:12}"
             NPM_TAG=dev
+            RUN_ID="$GITHUB_RUN_ID"
+          else
+            echo "::error::unknown publication channel"
+            exit 1
           fi
+          {
+            echo "channel=$CHANNEL"
+            echo "npm_tag=$NPM_TAG"
+            echo "sha=$SHA"
+            echo "version=$VERSION"
+            echo "run_id=$RUN_ID"
+          } >> "$GITHUB_OUTPUT"
 
-          echo "channel=${CHANNEL}" >> "$GITHUB_OUTPUT"
-          echo "npm_tag=${NPM_TAG}" >> "$GITHUB_OUTPUT"
-          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
-          echo "should_publish=${SHOULD_PUBLISH}" >> "$GITHUB_OUTPUT"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Publishing libfx@${VERSION} on the ${CHANNEL} channel (${NPM_TAG})"
-
-  native:
+  build:
     needs: metadata
-    if: needs.metadata.outputs.should_publish == 'true'
-    name: Native (${{ matrix.package_platform }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-24.04
-            package_platform: linux-x64
-            target_flags: -Dtarget=x86_64-linux-gnu.2.34 -Dcpu=baseline
-            runtime_image: public.ecr.aws/lambda/nodejs@sha256:2472f0273d8848d8b2aa6528f5526b8a514b70703596199efe5a4b84d3d59b0b
-          - runner: ubuntu-24.04-arm
-            package_platform: linux-arm64
-            target_flags: -Dtarget=aarch64-linux-gnu.2.34 -Dcpu=baseline
-            runtime_image: public.ecr.aws/lambda/nodejs@sha256:104527dd19c1907b4aaf328b5b3af1ac0c5db6bb9c76be8cb73fb295ec58b0fe
-          - runner: macos-15-intel
-            package_platform: darwin-x64
-          - runner: macos-15
-            package_platform: darwin-arm64
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ needs.metadata.outputs.sha }}
+    if: needs.metadata.outputs.channel == 'dev'
+    uses: ./.github/workflows/build-libfx.yml
+    with:
+      source_sha: ${{ needs.metadata.outputs.sha }}
+      version: ${{ needs.metadata.outputs.version }}
+      update_channel: dev
 
-      - name: Setup Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        with:
-          version: "0.16.0"
-
-      - name: Setup Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: "24"
-
-      - name: Build ReleaseSafe addon
-        run: zig build libfx-napi -Dnapi-surface=core -Doptimize=ReleaseSafe -Dupdate-channel=${{ needs.metadata.outputs.channel }} ${{ matrix.target_flags }}
-
-      - name: Check Linux ABI baseline
-        if: startsWith(matrix.package_platform, 'linux-')
-        run: |
-          python3 sdk/tests/test-linux-abi.py
-          python3 sdk/scripts/check-linux-abi.py zig-out/lib/libfx.node
-
-      - name: Test Linux addon on Amazon Linux 2023
-        if: startsWith(matrix.package_platform, 'linux-')
-        run: |
-          docker run --rm --network none --entrypoint /bin/bash \
-            --volume "$PWD:/workspace:ro" --workdir /workspace \
-            '${{ matrix.runtime_image }}' -euc '
-              node -e '\''const assert = require("node:assert/strict"); assert.equal(process.report.getReport().header.glibcVersionRuntime, "2.34");'\''
-              node sdk/tests/test-native-core-ready.mjs
-              node sdk/tests/test-host-tools.mjs native
-              node sdk/tests/test-host-tool-cancel.mjs native
-            '
-
-      - name: Test native addon
-        run: npm run --prefix sdk test:node-napi
-
-      - name: Name native addon for package discovery
-        shell: bash
-        run: |
-          mkdir -p native-addons
-          cp zig-out/lib/libfx.node native-addons/libfx.${{ matrix.package_platform }}.node
-
-      - name: Upload native addon
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: libfx-native-${{ matrix.package_platform }}
-          path: native-addons/libfx.${{ matrix.package_platform }}.node
-          if-no-files-found: error
-
-  wasm:
+  prepared:
+    name: Verify complete release before approval
     needs: metadata
-    if: needs.metadata.outputs.should_publish == 'true'
-    name: WebAssembly (ReleaseSmall)
+    if: needs.metadata.outputs.channel == 'stable'
     runs-on: ubuntu-24.04
+    environment: release-preparation
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    outputs:
+      eligible: ${{ steps.verify.outputs.eligible }}
+      version: ${{ steps.verify.outputs.version }}
+      source_sha: ${{ steps.verify.outputs.source_sha }}
+      website_sha: ${{ steps.verify.outputs.website_sha }}
+      artifact_id: ${{ steps.input.outputs.artifact_id }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ needs.metadata.outputs.sha }}
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+          fetch-depth: 0
+      - name: Locate the exact prepared artifact
+        id: input
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREPARED_RUN: ${{ needs.metadata.outputs.run_id }}
+        run: python3 -m scripts.release_inputs --run-id "$PREPARED_RUN"
+      - name: Download the immutable prepared artifact
+        if: steps.input.outputs.available == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          version: "0.16.0"
-
-      - name: Setup Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: "24"
-
-      - name: Build ReleaseSmall WebAssembly surfaces
-        run: |
-          zig build -Dwasm-surface=core -Doptimize=ReleaseSmall -Dupdate-channel=${{ needs.metadata.outputs.channel }}
-          zig build -Dwasm-surface=term -Doptimize=ReleaseSmall -Dupdate-channel=${{ needs.metadata.outputs.channel }}
-
-      - name: Install terminal test dependencies
-        run: npm ci --prefix sdk/node
-
-      - name: Test Node and WebAssembly
-        run: npm run --prefix sdk test:node-wasm
-
-      - name: Upload WebAssembly artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: libfx-wasm
-          path: |
-            zig-out/bin/fx-core.wasm
-            zig-out/bin/fx-term.wasm
-          if-no-files-found: error
-
-  package:
-    needs: [metadata, native, wasm]
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ needs.metadata.outputs.sha }}
-
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: "24.18.0"
-
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: "1.4.2"
-
-      - name: Install package test runner
-        run: npm install --global pnpm@11.1.1
-
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          pattern: libfx-native-*
-          path: native-addons
+          artifact-ids: ${{ steps.input.outputs.artifact_id }}
+          run-id: ${{ needs.metadata.outputs.run_id }}
+          github-token: ${{ github.token }}
           merge-multiple: true
-
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+          path: ${{ runner.temp }}/fx-release-prepared
+      - name: Create scoped website token
+        if: steps.input.outputs.available == 'true'
+        id: app
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
-          name: libfx-wasm
-          path: wasm-artifacts
-
-      - name: Assemble package
+          app-id: ${{ vars.FX_RELEASE_APP_ID }}
+          private-key: ${{ secrets.FX_RELEASE_APP_PRIVATE_KEY }}
+          owner: vercel-labs
+          repositories: fx-web
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: steps.input.outputs.available == 'true'
+        with:
+          node-version: "24"
+      - name: Install deployment verifier
+        if: steps.input.outputs.available == 'true'
+        run: npm install --global vercel@59.11.7
+      - name: Check source, artifacts, website and current channels
+        if: steps.input.outputs.available == 'true'
+        id: verify
         env:
-          LIBFX_VERSION: ${{ needs.metadata.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+          FX_WEB_GITHUB_TOKEN: ${{ steps.app.outputs.token }}
+          VERCEL_TOKEN: ${{ secrets.FX_WEB_VERCEL_TOKEN }}
+          PREPARED_RUN: ${{ needs.metadata.outputs.run_id }}
+          WORKFLOW_SHA: ${{ steps.input.outputs.workflow_sha }}
+          FX_EXAMPLE_VERCEL_TOKENS: ${{ secrets.FX_EXAMPLE_VERCEL_TOKENS }}
         run: |
-          set -euo pipefail
-          mkdir -p zig-out/bin zig-out/lib
-          cp wasm-artifacts/*.wasm zig-out/bin/
-          cp native-addons/libfx.linux-x64.node zig-out/lib/libfx.node
-          jq -e '
-            .name == "libfx" and
-            .type == "module" and
-            .scripts != null and
-            (.scripts | keys | all(startswith("test:"))) and
-            (.dependencies == null) and
-            (.devDependencies == null) and
-            (.optionalDependencies == null) and
-            (.peerDependencies == null) and
-            (.bin == null)
-          ' sdk/package.json >/dev/null
-
-          node sdk/scripts/package-libfx.mjs sdk/dist/libfx native-addons/*.node
-          jq --arg version "$LIBFX_VERSION" '.version = $version' \
-            sdk/dist/libfx/package.json > sdk/dist/libfx/package.json.tmp
-          mv sdk/dist/libfx/package.json.tmp sdk/dist/libfx/package.json
-          npm pack ./sdk/dist/libfx --ignore-scripts --json > /tmp/libfx-pack.json
-          mv "$(jq -r '.[0].filename' /tmp/libfx-pack.json)" libfx-package.tgz
-          sha256sum libfx-package.tgz > libfx-package.tgz.sha256
-
-      - name: Validate package archive
-        run: |
-          node -e '
-            const report = require("/tmp/libfx-pack.json")[0];
-            const names = new Set(report.files.map(({ path }) => path));
-            const required = [
-              "package.json", "README.md", "LICENSE", "browser.js", "node.js", "node.cjs", "fx-sdk.js", "wasm-module.js",
-              "core-output.js", "mcp.js", "skills.js", "skills-node.js",
-              "fx-core.wasm", "fx-term.wasm",
-              "libfx.linux-x64.node", "libfx.linux-arm64.node",
-              "libfx.darwin-x64.node", "libfx.darwin-arm64.node",
-            ];
-            if (names.size !== required.length) throw new Error(`unexpected package file count: ${names.size}`);
-            for (const name of required) {
-              if (!names.has(name)) throw new Error(`package is missing ${name}`);
-            }
-            console.log(`validated ${report.name}@${report.version}: ${report.files.length} files, ${report.size} bytes packed`);
-          '
-
-      - name: Test installed package and diagnostics
-        run: |
-          node --experimental-wasm-jspi sdk/tests/test-node-bundled-assets.mjs
-          node --experimental-wasm-jspi sdk/tests/test-node-async-assets.mjs sdk/dist/libfx
-          node sdk/tests/test-packed-example.mjs libfx-package.tgz native esm
-          node --no-experimental-require-module sdk/tests/test-packed-example.mjs libfx-package.tgz native cjs
-          node --experimental-wasm-jspi sdk/tests/test-packed-example.mjs libfx-package.tgz wasm esm
-          node --experimental-wasm-jspi --no-experimental-require-module sdk/tests/test-packed-example.mjs libfx-package.tgz wasm cjs
-          node --experimental-wasm-jspi sdk/tests/test-backend-info.mjs
-          node sdk/tests/test-term-demo-package.mjs
-
-      - name: Test package recovery and lifecycle boundaries
-        run: |
-          node sdk/tests/test-package-resilience.mjs --package libfx-package.tgz \
-            --cheap-cycles 100 --tool-workflows 20 --duration-ms 5000 --concurrency 4 \
-            --json-out "${{ runner.temp }}/libfx-package-evidence/resilience.json"
-
-      - name: Test Next development, production and isolated output
-        env:
-          LIBFX_TEST_ARTIFACT_ROOT: ${{ runner.temp }}/libfx-package-evidence
-        run: |
-          node sdk/tests/test-next-package.mjs libfx-package.tgz
-          node sdk/tests/test-next-package.mjs libfx-package.tgz --webpack
-          node sdk/tests/test-next-package.mjs libfx-package.tgz --next15
-
-      - name: Retain package qualification evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: libfx-package-evidence
-          path: |
-            ${{ runner.temp }}/libfx-package-evidence/resilience.json
-            ${{ runner.temp }}/libfx-package-evidence/libfx-next-*/*.log
-            ${{ runner.temp }}/libfx-package-evidence/libfx-next-*/results.json
-            ${{ runner.temp }}/libfx-package-evidence/libfx-trace-*/*.log
-            ${{ runner.temp }}/libfx-package-evidence/libfx-trace-*/results.json
-          if-no-files-found: ignore
-
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: libfx-package
-          path: |
-            libfx-package.tgz
-            libfx-package.tgz.sha256
-          if-no-files-found: error
+          python3 -m scripts.release_inputs --run-id "$PREPARED_RUN" \
+            --workflow-sha "$WORKFLOW_SHA" --artifacts "$RUNNER_TEMP/fx-release-prepared"
+          python3 -m scripts.release_summary "$RUNNER_TEMP/fx-release-prepared" >> "$GITHUB_STEP_SUMMARY"
 
   publish:
-    needs: [metadata, package]
+    name: Approve and publish verified artifacts
+    needs: [metadata, build, prepared]
+    if: >-
+      !cancelled() && needs.metadata.result == 'success' &&
+      ((needs.metadata.outputs.channel == 'dev' && needs.build.result == 'success') ||
+       (needs.metadata.outputs.channel == 'stable' && needs.prepared.outputs.eligible == 'true'))
     runs-on: ubuntu-24.04
     environment: npm
+    concurrency:
+      group: ${{ needs.metadata.outputs.channel == 'stable' && 'stable-release-publication' || 'publish-libfx-dev' }}
+      cancel-in-progress: false
     permissions:
-      contents: read
+      contents: write
+      actions: read
       id-token: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-          ref: ${{ needs.metadata.outputs.sha }}
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "24"
           registry-url: https://registry.npmjs.org
-      - name: Install OIDC-capable npm
-        run: npm install --global npm@11.15.0
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - name: Install trusted publisher and deployment CLI
+        run: npm install --global npm@11.15.0 vercel@59.11.7
+      - name: Download dev SDK
+        if: needs.metadata.outputs.channel == 'dev'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: libfx-package
-      - run: sha256sum --check libfx-package.tgz.sha256
-
+          path: ${{ runner.temp }}/fx-release-prepared
+      - name: Download approved release artifact by immutable ID
+        if: needs.metadata.outputs.channel == 'stable'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.prepared.outputs.artifact_id }}
+          run-id: ${{ needs.metadata.outputs.run_id }}
+          github-token: ${{ github.token }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/fx-release-prepared
+      - name: Create scoped website publication token
+        if: needs.metadata.outputs.channel == 'stable'
+        id: app
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.FX_RELEASE_APP_ID }}
+          private-key: ${{ secrets.FX_RELEASE_APP_PRIVATE_KEY }}
+          owner: vercel-labs
+          repositories: fx-web
+      - name: Recheck the approved snapshot before public writes
+        if: needs.metadata.outputs.channel == 'stable'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FX_WEB_GITHUB_TOKEN: ${{ steps.app.outputs.token }}
+          VERCEL_TOKEN: ${{ secrets.FX_WEB_VERCEL_TOKEN }}
+          SOURCE_SHA: ${{ needs.prepared.outputs.source_sha }}
+          PREPARED_RUN: ${{ needs.metadata.outputs.run_id }}
+          FX_EXAMPLE_VERCEL_TOKENS: ${{ secrets.FX_EXAMPLE_VERCEL_TOKENS }}
+        run: |
+          python3 -m scripts.release_inputs --run-id "$PREPARED_RUN" --assert-current
+          python3 -m scripts.release_publication verify --artifacts "$RUNNER_TEMP/fx-release-prepared" --source-sha "$SOURCE_SHA"
       - name: Confirm dev publish still targets main
         if: needs.metadata.outputs.channel == 'dev'
         env:
+          GH_TOKEN: ${{ github.token }}
           RELEASE_SHA: ${{ needs.metadata.outputs.sha }}
         run: |
           MAIN_SHA=$(git ls-remote origin refs/heads/main | cut -f1)
           if [ "$MAIN_SHA" != "$RELEASE_SHA" ]; then
-            echo "::error::main advanced to ${MAIN_SHA}; refusing to move the dev channel to stale ${RELEASE_SHA}"
+            echo "::error::main advanced; refusing a stale dev publication"
             exit 1
           fi
-
-      - name: Publish the verified archive with npm trusted publishing
+      - name: Publish and verify the prepared SDK archive
         env:
-          LIBFX_VERSION: ${{ needs.metadata.outputs.version }}
+          LIBFX_VERSION: ${{ needs.prepared.outputs.version || needs.metadata.outputs.version }}
           NPM_TAG: ${{ needs.metadata.outputs.npm_tag }}
         run: |
-          set -euo pipefail
-          if npm view "libfx@${LIBFX_VERSION}" version --registry=https://registry.npmjs.org/ >/dev/null 2>&1; then
-            echo "libfx@${LIBFX_VERSION} is already published; leaving ${NPM_TAG} unchanged"
-            exit 0
-          fi
-          npm publish ./libfx-package.tgz --ignore-scripts --access public --tag "$NPM_TAG" --provenance
+          (cd "$RUNNER_TEMP/fx-release-prepared" && sha256sum --check libfx-package.tgz.sha256)
+          python3 -m scripts.publish_prepared_sdk --archive "$RUNNER_TEMP/fx-release-prepared/libfx-package.tgz" \
+            --version "$LIBFX_VERSION" --tag "$NPM_TAG"
+      - name: Publish native artifacts and promote the prepared website
+        if: needs.metadata.outputs.channel == 'stable'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FX_WEB_GITHUB_TOKEN: ${{ steps.app.outputs.token }}
+          VERCEL_TOKEN: ${{ secrets.FX_WEB_VERCEL_TOKEN }}
+          BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
+          FX_EXAMPLE_VERCEL_TOKENS: ${{ secrets.FX_EXAMPLE_VERCEL_TOKENS }}
+          SOURCE_SHA: ${{ needs.prepared.outputs.source_sha }}
+        run: python3 -m scripts.release_publication publish --artifacts "$RUNNER_TEMP/fx-release-prepared" --source-sha "$SOURCE_SHA"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: needs.metadata.outputs.channel == 'stable'
+        with:
+          repository: vercel-labs/fx-web
+          ref: ${{ needs.prepared.outputs.website_sha }}
+          token: ${{ steps.app.outputs.token }}
+          path: verified-website
+      - uses: pnpm/action-setup@v4
+        if: needs.metadata.outputs.channel == 'stable'
+        with:
+          version: "11.1.1"
+          run_install: false
+      - name: Verify the live terminal, changelog and sizes
+        if: needs.metadata.outputs.channel == 'stable'
+        working-directory: verified-website/apps/marketing
+        run: |
+          pnpm install --frozen-lockfile
+          node scripts/verify-release-site.mjs https://fx.sh \
+            "$RUNNER_TEMP/fx-release-prepared/candidate.json" "$RUNNER_TEMP/fx-release-public-evidence"
+      - name: Retain publication verification
+        if: always() && needs.metadata.outputs.channel == 'stable'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fx-release-public-evidence
+          path: ${{ runner.temp }}/fx-release-public-evidence
+          if-no-files-found: ignore
+          overwrite: true
 
   verify-published:
     needs: [metadata, publish]
+    if: needs.metadata.outputs.channel == 'dev'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -431,4 +335,5 @@ jobs:
             ${{ runner.temp }}/libfx-registry-evidence/libfx-next-*/results.json
             ${{ runner.temp }}/libfx-registry-evidence/libfx-trace-*/*.log
             ${{ runner.temp }}/libfx-registry-evidence/libfx-trace-*/results.json
+          overwrite: true
           if-no-files-found: ignore

@@ -1,0 +1,306 @@
+name: Build libfx
+
+on:
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Full source commit SHA to build
+        required: true
+        type: string
+      version:
+        description: Stable SemVer or commit-addressed dev package version
+        required: true
+        type: string
+      update_channel:
+        description: Build channel (stable or dev), matching the package version
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_sha }}
+
+      - name: Validate build identity
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          LIBFX_VERSION: ${{ inputs.version }}
+          UPDATE_CHANNEL: ${{ inputs.update_channel }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || [ "$(git rev-parse HEAD)" != "$SOURCE_SHA" ]; then
+            echo "::error::source_sha must match the checked-out full commit SHA"
+            exit 1
+          fi
+
+          SEMVER='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+          BASE_VERSION=$(sed -n 's/^pub const version = "\([^"]*\)";$/\1/p' src/main.zig)
+          if ! [[ "$BASE_VERSION" =~ ^${SEMVER}$ ]]; then
+            echo "::error::src/main.zig version is not strict SemVer"
+            exit 1
+          fi
+          case "$UPDATE_CHANNEL" in
+            stable)
+              if [ "$LIBFX_VERSION" != "$BASE_VERSION" ]; then
+                echo "::error::stable version must match src/main.zig"
+                exit 1
+              fi
+              ;;
+            dev)
+              if ! [[ "$LIBFX_VERSION" =~ ^${SEMVER}-dev\.[1-9][0-9]*\.g[0-9a-f]{12}$ ]] ||
+                 ! [[ "$LIBFX_VERSION" == "$BASE_VERSION"-dev.*.g"${SOURCE_SHA:0:12}" ]]; then
+                echo "::error::dev version must match src/main.zig and the source commit"
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::update_channel must be stable or dev"
+              exit 1
+              ;;
+          esac
+
+  native:
+    needs: validate
+    name: Native (${{ matrix.package_platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            package_platform: linux-x64
+            target_flags: -Dtarget=x86_64-linux-gnu.2.34 -Dcpu=baseline
+            runtime_image: public.ecr.aws/lambda/nodejs@sha256:2472f0273d8848d8b2aa6528f5526b8a514b70703596199efe5a4b84d3d59b0b
+          - runner: ubuntu-24.04-arm
+            package_platform: linux-arm64
+            target_flags: -Dtarget=aarch64-linux-gnu.2.34 -Dcpu=baseline
+            runtime_image: public.ecr.aws/lambda/nodejs@sha256:104527dd19c1907b4aaf328b5b3af1ac0c5db6bb9c76be8cb73fb295ec58b0fe
+          - runner: macos-15-intel
+            package_platform: darwin-x64
+          - runner: macos-15
+            package_platform: darwin-arm64
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_sha }}
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: "0.16.0"
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+
+      - name: Build ReleaseSafe addon
+        run: zig build libfx-napi -Dnapi-surface=core -Doptimize=ReleaseSafe -Dupdate-channel=${{ inputs.update_channel }} ${{ matrix.target_flags }}
+
+      - name: Check Linux ABI baseline
+        if: startsWith(matrix.package_platform, 'linux-')
+        run: |
+          python3 sdk/tests/test-linux-abi.py
+          python3 sdk/scripts/check-linux-abi.py zig-out/lib/libfx.node
+
+      - name: Test Linux addon on Amazon Linux 2023
+        if: startsWith(matrix.package_platform, 'linux-')
+        run: |
+          docker run --rm --network none --entrypoint /bin/bash \
+            --volume "$PWD:/workspace:ro" --workdir /workspace \
+            '${{ matrix.runtime_image }}' -euc '
+              node -e '\''const assert = require("node:assert/strict"); assert.equal(process.report.getReport().header.glibcVersionRuntime, "2.34");'\''
+              node sdk/tests/test-native-core-ready.mjs
+              node sdk/tests/test-host-tools.mjs native
+              node sdk/tests/test-host-tool-cancel.mjs native
+            '
+
+      - name: Test native addon
+        run: npm run --prefix sdk test:node-napi
+
+      - name: Name native addon for package discovery
+        shell: bash
+        run: |
+          mkdir -p native-addons
+          cp zig-out/lib/libfx.node native-addons/libfx.${{ matrix.package_platform }}.node
+
+      - name: Upload native addon
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: libfx-native-${{ matrix.package_platform }}
+          path: native-addons/libfx.${{ matrix.package_platform }}.node
+          overwrite: true
+          if-no-files-found: error
+
+  wasm:
+    needs: validate
+    name: WebAssembly (ReleaseSmall)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_sha }}
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: "0.16.0"
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+
+      - name: Build ReleaseSmall WebAssembly surfaces
+        run: |
+          zig build -Dwasm-surface=core -Doptimize=ReleaseSmall -Dupdate-channel=${{ inputs.update_channel }}
+          zig build -Dwasm-surface=term -Doptimize=ReleaseSmall -Dupdate-channel=${{ inputs.update_channel }}
+
+      - name: Install terminal test dependencies
+        run: npm ci --prefix sdk/node
+
+      - name: Test Node and WebAssembly
+        run: npm run --prefix sdk test:node-wasm
+
+      - name: Upload WebAssembly artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: libfx-wasm
+          path: |
+            zig-out/bin/fx-core.wasm
+            zig-out/bin/fx-term.wasm
+          overwrite: true
+          if-no-files-found: error
+
+  package:
+    needs: [native, wasm]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_sha }}
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24.18.0"
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+
+      - name: Install package test runner
+        run: npm install --global pnpm@11.1.1
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: libfx-native-*
+          path: native-addons
+          merge-multiple: true
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: libfx-wasm
+          path: wasm-artifacts
+
+      - name: Assemble package
+        env:
+          LIBFX_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p zig-out/bin zig-out/lib
+          cp wasm-artifacts/*.wasm zig-out/bin/
+          cp native-addons/libfx.linux-x64.node zig-out/lib/libfx.node
+          jq -e '
+            .name == "libfx" and
+            .type == "module" and
+            .scripts != null and
+            (.scripts | keys | all(startswith("test:"))) and
+            (.dependencies == null) and
+            (.devDependencies == null) and
+            (.optionalDependencies == null) and
+            (.peerDependencies == null) and
+            (.bin == null)
+          ' sdk/package.json >/dev/null
+
+          node sdk/scripts/package-libfx.mjs sdk/dist/libfx native-addons/*.node
+          jq --arg version "$LIBFX_VERSION" '.version = $version' \
+            sdk/dist/libfx/package.json > sdk/dist/libfx/package.json.tmp
+          mv sdk/dist/libfx/package.json.tmp sdk/dist/libfx/package.json
+          npm pack ./sdk/dist/libfx --ignore-scripts --json > /tmp/libfx-pack.json
+          mv "$(jq -r '.[0].filename' /tmp/libfx-pack.json)" libfx-package.tgz
+          sha256sum libfx-package.tgz > libfx-package.tgz.sha256
+
+      - name: Validate package archive
+        run: |
+          # shellcheck disable=SC2016
+          node -e '
+            const report = require("/tmp/libfx-pack.json")[0];
+            const names = new Set(report.files.map(({ path }) => path));
+            const required = [
+              "package.json", "README.md", "LICENSE", "browser.js", "node.js", "node.cjs", "fx-sdk.js", "wasm-module.js",
+              "core-output.js", "mcp.js", "skills.js", "skills-node.js",
+              "fx-core.wasm", "fx-term.wasm",
+              "libfx.linux-x64.node", "libfx.linux-arm64.node",
+              "libfx.darwin-x64.node", "libfx.darwin-arm64.node",
+            ];
+            if (names.size !== required.length) throw new Error(`unexpected package file count: ${names.size}`);
+            for (const name of required) {
+              if (!names.has(name)) throw new Error(`package is missing ${name}`);
+            }
+            console.log(`validated ${report.name}@${report.version}: ${report.files.length} files, ${report.size} bytes packed`);
+          '
+
+      - name: Test installed package and diagnostics
+        run: |
+          node --experimental-wasm-jspi sdk/tests/test-node-bundled-assets.mjs
+          node --experimental-wasm-jspi sdk/tests/test-node-async-assets.mjs sdk/dist/libfx
+          node sdk/tests/test-packed-example.mjs libfx-package.tgz native esm
+          node --no-experimental-require-module sdk/tests/test-packed-example.mjs libfx-package.tgz native cjs
+          node --experimental-wasm-jspi sdk/tests/test-packed-example.mjs libfx-package.tgz wasm esm
+          node --experimental-wasm-jspi --no-experimental-require-module sdk/tests/test-packed-example.mjs libfx-package.tgz wasm cjs
+          node --experimental-wasm-jspi sdk/tests/test-backend-info.mjs
+          node sdk/tests/test-term-demo-package.mjs
+
+      - name: Test package recovery and lifecycle boundaries
+        run: |
+          node sdk/tests/test-package-resilience.mjs --package libfx-package.tgz \
+            --cheap-cycles 100 --tool-workflows 20 --duration-ms 5000 --concurrency 4 \
+            --json-out "${{ runner.temp }}/libfx-package-evidence/resilience.json"
+
+      - name: Test Next development, production and isolated output
+        env:
+          LIBFX_TEST_ARTIFACT_ROOT: ${{ runner.temp }}/libfx-package-evidence
+        run: |
+          node sdk/tests/test-next-package.mjs libfx-package.tgz
+          node sdk/tests/test-next-package.mjs libfx-package.tgz --webpack
+          node sdk/tests/test-next-package.mjs libfx-package.tgz --next15
+
+      - name: Retain package qualification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: libfx-package-evidence
+          path: |
+            ${{ runner.temp }}/libfx-package-evidence/resilience.json
+            ${{ runner.temp }}/libfx-package-evidence/libfx-next-*/*.log
+            ${{ runner.temp }}/libfx-package-evidence/libfx-next-*/results.json
+            ${{ runner.temp }}/libfx-package-evidence/libfx-trace-*/*.log
+            ${{ runner.temp }}/libfx-package-evidence/libfx-trace-*/results.json
+          overwrite: true
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: libfx-package
+          path: |
+            libfx-package.tgz
+            libfx-package.tgz.sha256
+          overwrite: true
+          if-no-files-found: error

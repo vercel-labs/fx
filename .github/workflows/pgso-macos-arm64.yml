@@ -2,6 +2,12 @@ name: macOS arm64 PGSO candidate
 
 on:
   workflow_call:
+    inputs:
+      source_sha:
+        description: Exact source commit for a coordinated release
+        required: false
+        type: string
+        default: ""
   workflow_dispatch:
   pull_request:
     paths:
@@ -38,6 +44,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+          ref: ${{ inputs.source_sha || github.sha }}
 
       - name: Require native arm64 host
         run: test "$(uname -m)" = arm64
@@ -109,6 +116,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+          ref: ${{ inputs.source_sha || github.sha }}
 
       - name: Require native arm64 host
         run: test "$(uname -m)" = arm64
@@ -166,6 +174,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+          ref: ${{ inputs.source_sha || github.sha }}
 
       - name: Require native arm64 host
         run: test "$(uname -m)" = arm64
@@ -244,6 +253,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+          ref: ${{ inputs.source_sha || github.sha }}
 
       - name: Require native arm64 host
         run: test "$(uname -m)" = arm64
@@ -305,6 +315,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+          ref: ${{ inputs.source_sha || github.sha }}
 
       - name: Require native arm64 host
         run: test "$(uname -m)" = arm64
@@ -361,6 +372,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+          ref: ${{ inputs.source_sha || github.sha }}
 
       - name: Require native arm64 host
         run: test "$(uname -m)" = arm64
@@ -415,6 +427,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+          ref: ${{ inputs.source_sha || github.sha }}
 
       - name: Require native arm64 host
         run: test "$(uname -m)" = arm64
