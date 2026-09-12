@@ -143,6 +143,8 @@ def _parse_profile(text: str) -> tuple[ProfileRecord, ...]:
     blocks = tuple(
         block for block in text[len(header) :].strip().split("\n\n") if block
     )
+    if blocks and blocks[0].startswith(":temporal_prof_traces\n"):
+        blocks = blocks[1:]
     records = tuple(_parse_record(block) for block in blocks)
     if not records:
         raise PgsoError("text instrumentation profile contains no functions")

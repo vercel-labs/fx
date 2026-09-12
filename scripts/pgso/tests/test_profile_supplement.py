@@ -30,6 +30,37 @@ def profile_text(*records: tuple[str, int, tuple[int, ...]]) -> str:
 
 
 class ProfileSupplementTests(unittest.TestCase):
+    def test_temporal_metadata_does_not_change_counter_projection(self) -> None:
+        production = profile_text(("fx;hot", 7, (10, 20)), ("fx;cold", 8, (1,)))
+        benchmark = profile_text(("bench;hot", 7, (4, 5)))
+        header = "# IR level Instrumentation Flag\n:ir\n"
+        temporal = header + (
+            ":temporal_prof_traces\n"
+            "# Num Temporal Profile Traces:\n1\n"
+            "# Temporal Profile Trace Stream Size:\n1\n"
+            "# Weight:\n1\n# Num Functions:\n2\nfx;hot\nfx;cold\n\n"
+        ) + production[len(header):]
+        expected = map_production_profile(
+            production, benchmark, source_module="fx", destination_module="bench",
+        )
+        actual = map_production_profile(
+            temporal, benchmark, source_module="fx", destination_module="bench",
+        )
+        self.assertEqual(expected, actual)
+        self.assertEqual(31, actual.total_counter_value)
+        self.assertNotIn(":temporal_prof_traces", actual.text)
+
+    def test_temporal_metadata_does_not_hide_invalid_function_records(self) -> None:
+        header = "# IR level Instrumentation Flag\n:ir\n"
+        metadata = ":temporal_prof_traces\n# Num Temporal Profile Traces:\n0\n\n"
+        for suffix in ("", "broken function record"):
+            with self.subTest(suffix=suffix), self.assertRaises(PgsoError):
+                map_production_profile(
+                    header + metadata + suffix,
+                    profile_text(("bench;hot", 7, (1,))),
+                    source_module="fx", destination_module="bench",
+                )
+
     def test_supplements_follow_the_production_cold_cutoff(self) -> None:
         self.assertEqual(600_000, PROFILE_SUMMARY_CUTOFF_COLD)
         self.assertEqual(2, SUPPLEMENT_COLD_THRESHOLD_MULTIPLIER)

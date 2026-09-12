@@ -164,16 +164,23 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
       mkdirSync(home);
       mkdirSync(workspace);
       tempDirs.push(root);
+      gateway = startFakeGateway([]);
 
       session = await TmuxSession.create({
         cwd: workspace,
         stderrPath,
+        isolated: true,
         width: 60,
         height: 12,
         minimumHistoryLines: 2000,
         env: {
           HOME: home,
           AI_GATEWAY_API_KEY: "status-compact-key",
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_SOUND: "0",
           FX_AUTO_UPGRADE: "0",
           FX_DISABLE_KEYCHAIN: "1",
           FX_PERMISSION_MODE: "auto",

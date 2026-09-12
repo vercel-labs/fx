@@ -6,23 +6,39 @@ The candidate is accepted only when it is no larger than **7.800 MiB**, has the 
 
 ## Toolchain and target
 
-The driver fails unless all of these match exactly:
+The driver requires:
 
 - macOS on an arm64 host
 - generic `aarch64-macos` output
 - Zig `0.16.0`
 - LLVM `21.1.8` tools and profile runtime from one configured LLVM root
+- the selected Xcode macOS SDK and native Apple linker with arm64 support
 - Bun `1.3.14`
 - Hyperfine `1.20.0`
 - the selected source commit, update channel, bitcode hash, corpus hash, and profile-generation flags
 
-The pipeline does not use the host CPU as the release target. The final candidate must match the control's architecture and minimum macOS version, contain a valid code signature, contain no profile sections or profile-runtime dependency, and produce no profile output when executed.
+The pipeline does not use the host CPU as the release target. The final candidate must match the control's architecture, minimum macOS version, SDK compatibility stamp, main-stack request, and dynamic-library dependency versions. It must contain a valid code signature, contain no profile sections or profile-runtime dependency, and produce no profile output when executed.
+
+Training records execution counts and first-use function timestamps in the same
+continuous profiles. Counter supplements preserve the temporal traces. The
+main PGSO executable uses LLVM's temporal function order through the native
+Apple linker; benchmark and other native release links keep their existing
+paths. Identical-code folding stays disabled. The function-starts table is
+omitted, matching the existing stripped Zig link. The exact optimized Zig
+runtime object and bundled system-library stub remain the link inputs; the
+selected Xcode SDK supplies re-export stubs. Compatibility and sysroot SDK
+versions are recorded separately. Build evidence retains input digests, every
+mapped or unmapped profile name, the full linker map, and verified ordered code
+counts. Empty or ambiguous mappings, an unapplied order, and truncated symbol
+output fail closed.
 
 ## Commands
 
 Every mutating command requires a fresh or empty output directory. State from separate runs is never merged implicitly.
 
 ```bash
+brew install llvm@21
+
 python3 -m scripts.pgso build \
   --llvm-bin "$(brew --prefix llvm@21)/bin" \
   --output-dir /tmp/fx-pgso-build

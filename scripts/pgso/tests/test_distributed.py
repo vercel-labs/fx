@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import unittest
+import json
+import tempfile
 
 import pathlib
 import dataclasses
 
 from scripts.pgso.corpus import Corpus, Scenario
 from scripts.pgso.distributed import (
+    _load_documents,
     aggregate_measurement_shards,
     aggregate_scenario_shards,
     matrix_payload,
@@ -17,6 +20,100 @@ from scripts.pgso.distributed import (
 )
 from scripts.pgso.model import BuildIdentity, PgsoError
 from scripts.pgso.pipeline import GENERATION_FLAGS
+
+
+class RetriedArtifactTests(unittest.TestCase):
+    def test_newest_attempt_replaces_old_failure_without_deleting_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            old = root / "pgso-heavy-sha-ui-attempt-9" / "manifest.json"
+            new = root / "pgso-heavy-sha-ui-attempt-10" / "manifest.json"
+            old.parent.mkdir()
+            new.parent.mkdir()
+            old.write_text('{"status":"failed"}')
+            new.write_text('{"status":"passed"}')
+            self.assertEqual(_load_documents(root), ({"status": "passed"},))
+            self.assertEqual(old.read_text(), '{"status":"failed"}')
+
+    def test_latest_failed_attempt_does_not_fall_back_to_old_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            for attempt, status in ((2, "passed"), (3, "failed")):
+                directory = root / f"pgso-heavy-sha-ui-attempt-{attempt}"
+                directory.mkdir()
+                (directory / "manifest.json").write_text(json.dumps({"status": status}))
+            self.assertEqual(_load_documents(root), ({"status": "failed"},))
+
+    def test_retry_selection_is_independent_for_each_shard(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            for shard, attempt in (("one", 1), ("one", 2), ("two", 1)):
+                directory = root / f"pgso-training-sha-{shard}-attempt-{attempt}"
+                directory.mkdir()
+                (directory / "manifest.json").write_text(json.dumps({"shard": shard, "attempt": attempt}))
+            self.assertEqual(_load_documents(root), (
+                {"shard": "one", "attempt": 2},
+                {"shard": "two", "attempt": 1},
+            ))
+
+    def test_missing_latest_manifest_is_not_replaced_by_old_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            old = root / "pgso-heavy-sha-ui-attempt-1"
+            old.mkdir()
+            (old / "manifest.json").write_text('{"status":"passed"}')
+            (root / "pgso-heavy-sha-ui-attempt-2").mkdir()
+            with self.assertRaises(PgsoError):
+                _load_documents(root)
+
+    def test_malformed_latest_manifest_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            for attempt, content in ((1, '{"status":"passed"}'), (2, "broken")):
+                directory = root / f"pgso-heavy-sha-ui-attempt-{attempt}"
+                directory.mkdir()
+                (directory / "manifest.json").write_text(content)
+            with self.assertRaises(PgsoError):
+                _load_documents(root)
+
+    def test_malformed_superseded_manifest_is_not_loaded(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            for attempt, content in ((1, "broken"), (2, '{"status":"passed"}')):
+                directory = root / f"pgso-heavy-sha-ui-attempt-{attempt}"
+                directory.mkdir()
+                (directory / "manifest.json").write_text(content)
+            self.assertEqual(_load_documents(root), ({"status": "passed"},))
+
+    def test_unsuffixed_local_layout_keeps_recursive_loading(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            (root / "local" / "nested").mkdir(parents=True)
+            (root / "logs").mkdir()
+            (root / "local" / "nested" / "manifest.json").write_text('{"status":"passed"}')
+            self.assertEqual(_load_documents(root), ({"status": "passed"},))
+
+    def test_invalid_or_ambiguous_attempts_fail(self) -> None:
+        for names in (("shard-attempt-0",), ("shard-attempt-1", "shard-attempt-01")):
+            with self.subTest(names=names), tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary)
+                for name in names:
+                    directory = root / name
+                    directory.mkdir()
+                    (directory / "manifest.json").write_text('{"status":"passed"}')
+                with self.assertRaises(PgsoError):
+                    _load_documents(root)
+
+    def test_latest_versioned_directory_link_is_not_followed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary) / "shards"
+            root.mkdir()
+            outside = pathlib.Path(temporary) / "outside"
+            outside.mkdir()
+            (outside / "manifest.json").write_text('{"status":"passed"}')
+            (root / "pgso-heavy-sha-ui-attempt-2").symlink_to(outside, target_is_directory=True)
+            with self.assertRaises(PgsoError):
+                _load_documents(root)
 
 
 def scenario(name: str, timeout_seconds: float) -> Scenario:

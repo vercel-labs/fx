@@ -466,6 +466,9 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
                 "version": candidate.version_output,
             },
             "warnings": 0,
+            "linker": json.loads(
+                (paths.logs / "candidate-layout.json").read_text(encoding="utf-8")
+            ),
         }
         supplement_evidence = profile_linked_benchmark_evidence(
             linked_benchmarks,
