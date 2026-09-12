@@ -1,9 +1,11 @@
 # Guest-only executable pager experiment
 
 This experiment stores whole arm64 code pages as independent zstd frames and
-restores them on first access. It is not a release format. Earlier versions
-caused two physical-host kernel panics on macOS 26.5.2, including one in
-ReportCrash. A watchdog, debugger, or external SSD does not isolate the kernel.
+restores them on first access. It is not a release format. Two physical-host
+kernel panics were recorded during earlier testing on macOS 26.5.2. One
+identified fx_pagerized directly; the other occurred in ReportCrash, whose
+connection to the experiment remains circumstantial. A watchdog, debugger,
+or external SSD does not isolate the kernel.
 Run experimental binaries only inside a disposable macOS VM.
 
 ## Ownership and contract
