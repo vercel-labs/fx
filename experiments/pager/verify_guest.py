@@ -18,7 +18,7 @@ def main():
     p.add_argument('--ssh-host', required=True, help='user@guest-address')
     p.add_argument('--key', type=Path, required=True)
     p.add_argument('--known-hosts', type=Path, required=True)
-    p.add_argument('--guest-root', default='/Users/admin/fx-pager')
+    p.add_argument('--guest-root', default='fx-pager')
     p.add_argument('--build-dir', type=Path, required=True, help='contains eager, demand and thread-demand directories')
     p.add_argument('--report', type=Path, required=True)
     a = p.parse_args()
