@@ -759,15 +759,10 @@ pub fn composeFooterFrame(
                 try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
             }
         } else if (input.picker_kind == .help and ctx.help_menu.active) {
+            const prepared = help_menu_presentation.prepareHelpMenu(&ctx.help_menu, shell.layout.cols, input.picker_rows);
             var menu_row_index: u16 = 0;
             while (menu_row_index < input.picker_rows) : (menu_row_index += 1) {
-                var menu_row = try help_menu_presentation.composeHelpMenuRow(
-                    alloc,
-                    ctx.help_menu,
-                    menu_row_index,
-                    shell.layout.cols,
-                    input.picker_rows,
-                );
+                var menu_row = try prepared.composeRow(alloc, menu_row_index);
                 try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
             }
         } else if (input.picker_kind == .sessions and ctx.session_menu.active) {

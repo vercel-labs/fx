@@ -31,43 +31,53 @@ const Layout = struct {
     row_count: u16 = 0,
 };
 
-pub fn menuRowCount(projection: HelpMenuProjection, width: u16, max_rows: u16) u16 {
-    return buildLayout(projection, width, max_rows).row_count;
+pub const PreparedHelpMenu = struct {
+    projection: *const HelpMenuProjection,
+    layout: Layout,
+    width: u16,
+    row_budget: u16,
+    description_column: usize,
+
+    pub noinline fn composeRow(self: PreparedHelpMenu, alloc: Allocator, row_index: u16) !std.ArrayList(u8) {
+        const empty: std.ArrayList(u8) = .empty;
+        if (self.width == 0 or row_index >= self.row_budget) return empty;
+        if (row_index < self.layout.body_start_row) {
+            if (row_index == 0) return composeHeaderRow(alloc, self.projection.*, self.width, self.layout.match_count);
+            return empty;
+        }
+        if (self.layout.match_count == 0) return composeEmptyRow(alloc, self.width);
+        return switch (bodyRowAt(self.projection.*, self.layout, row_index - self.layout.body_start_row)) {
+            .none => empty,
+            .item => |item| composeCommandRow(alloc, item.spec.*, item.selected, self.width, self.description_column),
+        };
+    }
+};
+
+/// Borrows the frame's projection; its registry and filter must remain stable.
+pub fn prepareHelpMenu(projection: *const HelpMenuProjection, width: u16, row_budget: u16) PreparedHelpMenu {
+    const layout = if (width == 0) Layout{} else buildLayout(projection.*, row_budget);
+    return .{
+        .projection = projection,
+        .layout = layout,
+        .width = width,
+        .row_budget = row_budget,
+        .description_column = if (layout.visible_items == 0) 0 else descriptionColumn(projection.*, width),
+    };
+}
+
+pub fn menuRowCount(projection: HelpMenuProjection, _: u16, max_rows: u16) u16 {
+    return buildLayout(projection, max_rows).row_count;
 }
 
 pub fn visibleNavigationItemsForBudget(
     projection: HelpMenuProjection,
-    width: u16,
+    _: u16,
     row_budget: u16,
 ) u16 {
-    return @max(buildLayout(projection, width, row_budget).visible_items, 1);
+    return @max(buildLayout(projection, row_budget).visible_items, 1);
 }
 
-pub fn composeHelpMenuRow(
-    alloc: Allocator,
-    projection: HelpMenuProjection,
-    row_index: u16,
-    width: u16,
-    row_count: u16,
-) !std.ArrayList(u8) {
-    const empty: std.ArrayList(u8) = .empty;
-    if (width == 0 or row_index >= row_count) return empty;
-
-    const layout = buildLayout(projection, width, row_count);
-    if (row_index < layout.body_start_row) {
-        if (row_index == 0) return composeHeaderRow(alloc, projection, width);
-        return empty;
-    }
-    if (layout.match_count == 0) return composeEmptyRow(alloc, width);
-
-    const description_col = descriptionColumn(projection, width);
-    return switch (bodyRowAt(projection, layout, row_index - layout.body_start_row)) {
-        .none => empty,
-        .item => |item| composeCommandRow(alloc, item.spec.*, item.selected, width, description_col),
-    };
-}
-
-fn buildLayout(projection: HelpMenuProjection, width: u16, max_rows: u16) Layout {
+fn buildLayout(projection: HelpMenuProjection, max_rows: u16) Layout {
     if (max_rows == 0) return .{};
     const match_count = projection.filteredItemCount();
     const selected = if (match_count == 0) 0 else projection.selected_index % match_count;
@@ -80,70 +90,33 @@ fn buildLayout(projection: HelpMenuProjection, width: u16, max_rows: u16) Layout
         };
     }
 
-    const body_budget = max_rows - body_start_row;
-    var first_item = @min(projection.window_start, match_count - 1);
-    if (selected < first_item) first_item = selected;
-    var body = measureBody(projection, width, first_item, body_budget);
-    while (selected >= first_item + body.visible_items and first_item < selected) {
-        first_item += 1;
-        body = measureBody(projection, width, first_item, body_budget);
-    }
-    if (body.visible_items == 0) {
-        first_item = selected;
-        body = measureBody(projection, width, first_item, body_budget);
-    }
+    const capacity = @min(max_rows - body_start_row, max_visible_items);
+    const first_item = @max(@min(projection.window_start, selected), selected -| (capacity - 1));
+    const visible_items: u16 = @intCast(@min(match_count - first_item, capacity));
     return .{
         .match_count = match_count,
         .selected = selected,
         .first_item = first_item,
-        .visible_items = body.visible_items,
+        .visible_items = visible_items,
         .body_start_row = body_start_row,
-        .row_count = body_start_row + body.rows,
+        .row_count = body_start_row + visible_items,
     };
 }
 
-const BodyMeasurement = struct {
-    visible_items: u16 = 0,
-    rows: u16 = 0,
-};
-
-fn measureBody(projection: HelpMenuProjection, width: u16, first_item: usize, row_budget: u16) BodyMeasurement {
-    var measurement: BodyMeasurement = .{};
-    _ = width;
-    var display_index = first_item;
-    while (projection.itemAt(display_index) != null) : (display_index += 1) {
-        const required: u16 = 1;
-        if (measurement.rows + required > row_budget) break;
-        measurement.rows += required;
-        measurement.visible_items += 1;
-        if (measurement.visible_items == max_visible_items) break;
-    }
-    return measurement;
-}
-
 fn bodyRowAt(projection: HelpMenuProjection, layout: Layout, target: u16) BodyRow {
-    var row: u16 = 0;
-    var offset: usize = 0;
-    while (offset < layout.visible_items) : (offset += 1) {
-        const display_index = layout.first_item + offset;
-        const spec = projection.itemAt(display_index) orelse return .none;
-        if (row == target) return .{ .item = .{
-            .spec = spec,
-            .selected = display_index == layout.selected,
-        } };
-        row += 1;
-    }
-    return .none;
+    if (target >= layout.visible_items) return .none;
+    const display_index = layout.first_item + target;
+    const spec = projection.itemAt(display_index) orelse return .none;
+    return .{ .item = .{ .spec = spec, .selected = display_index == layout.selected } };
 }
 
-fn composeHeaderRow(alloc: Allocator, projection: HelpMenuProjection, width: u16) !std.ArrayList(u8) {
+fn composeHeaderRow(alloc: Allocator, projection: HelpMenuProjection, width: u16, match_count: usize) !std.ArrayList(u8) {
     var wide: std.ArrayList(u8) = .empty;
     defer wide.deinit(alloc);
-    try appendHeaderTitle(alloc, &wide, projection.filteredItemCount());
+    try appendHeaderTitle(alloc, &wide, match_count);
     try wide.appendSlice(alloc, "  ");
     try appendCategoryTab(alloc, &wide, null, projection.category == null);
-    inline for (std.meta.fields(command_specs.SlashPresentationCategory)) |field| {
-        const category: command_specs.SlashPresentationCategory = @enumFromInt(field.value);
+    for (std.meta.tags(command_specs.SlashPresentationCategory)) |category| {
         try wide.appendSlice(alloc, "  ");
         try appendCategoryTab(alloc, &wide, category, projection.category == category);
     }
@@ -158,7 +131,7 @@ fn composeHeaderRow(alloc: Allocator, projection: HelpMenuProjection, width: u16
     var prefix_count = category_count - 1;
     while (prefix_count > 0) : (prefix_count -= 1) {
         packed_row.clearRetainingCapacity();
-        try appendHeaderTitle(alloc, &packed_row, projection.filteredItemCount());
+        try appendHeaderTitle(alloc, &packed_row, match_count);
         for (0..prefix_count) |index| {
             const category = helpCategoryAt(index);
             try packed_row.appendSlice(alloc, "  ");
@@ -179,7 +152,7 @@ fn composeHeaderRow(alloc: Allocator, projection: HelpMenuProjection, width: u16
 
     var compact: std.ArrayList(u8) = .empty;
     defer compact.deinit(alloc);
-    try appendHeaderTitle(alloc, &compact, projection.filteredItemCount());
+    try appendHeaderTitle(alloc, &compact, match_count);
     try compact.appendSlice(alloc, "  ");
     try appendCategoryTab(alloc, &compact, projection.category, true);
     if (display_width.visibleWidthIgnoringAnsi(compact.items) <= width) {
@@ -289,6 +262,68 @@ const help_menu_test_specs = [_]command_specs.SlashSpec{
 };
 const help_menu_test_registry = command_specs.SlashRegistry{ .commands = help_menu_test_specs[0..] };
 
+test "help menu preserves a partial end window with a larger row budget" {
+    const projection: HelpMenuProjection = .{
+        .active = true,
+        .registry = help_menu_test_registry,
+        .selected_index = 2,
+        .window_start = 2,
+    };
+    try std.testing.expectEqual(@as(u16, 3), menuRowCount(projection, 80, 22));
+    try std.testing.expectEqual(@as(u16, 1), visibleNavigationItemsForBudget(projection, 80, 22));
+    var row = try prepareHelpMenu(&projection, 80, 22).composeRow(std.testing.allocator, 2);
+    defer row.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, row.items, "/paste") != null);
+}
+
+test "help menu scrolls only far enough to reveal the selected command" {
+    var specs: [25]command_specs.SlashSpec = undefined;
+    var names: [25][8]u8 = undefined;
+    for (&specs, &names, 0..) |*spec, *buffer, index| {
+        const name = try std.fmt.bufPrint(buffer, "/c{d:0>2}", .{index});
+        spec.* = .{ .kind = .help, .command = name, .help_entry = name, .completion_description = "command", .presentation_category = .general };
+    }
+    const projection: HelpMenuProjection = .{ .active = true, .registry = .{ .commands = &specs }, .selected_index = 21 };
+    const prepared = prepareHelpMenu(&projection, 80, 8);
+    var first = try prepared.composeRow(std.testing.allocator, 2);
+    defer first.deinit(std.testing.allocator);
+    var last = try prepared.composeRow(std.testing.allocator, 7);
+    defer last.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, first.items, "/c16") != null);
+    try std.testing.expect(std.mem.find(u8, last.items, "/c21") != null);
+    try std.testing.expect(std.mem.find(u8, last.items, ui_render.selected_completion_style) != null);
+}
+
+test "prepared help menu preserves frame selection and tight row budgets" {
+    const alloc = std.testing.allocator;
+    var projection: HelpMenuProjection = .{
+        .active = true,
+        .registry = help_menu_test_registry,
+        .selected_index = 2,
+    };
+    const prepared = prepareHelpMenu(&projection, 40, 3);
+    projection.selected_index = 0;
+    var selected = try prepared.composeRow(alloc, 2);
+    defer selected.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, selected.items, "/paste") != null);
+    try std.testing.expect(std.mem.find(u8, selected.items, ui_render.selected_completion_style) != null);
+
+    var outside = try prepared.composeRow(alloc, 3);
+    defer outside.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), outside.items.len);
+
+    const next = prepareHelpMenu(&projection, 40, 1);
+    var first = try next.composeRow(alloc, 0);
+    defer first.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, first.items, "/help") != null);
+    try std.testing.expect(std.mem.find(u8, first.items, "Commands") == null);
+
+    const zero_width = prepareHelpMenu(&projection, 0, 3);
+    var empty = try zero_width.composeRow(alloc, 0);
+    defer empty.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), empty.items.len);
+}
+
 test "help menu places descriptions after the widest matching command" {
     const alloc = std.testing.allocator;
     const projection: render_input.HelpMenuProjection = .{
@@ -297,12 +332,13 @@ test "help menu places descriptions after the widest matching command" {
         .selected_index = 0,
     };
     const rows = menuRowCount(projection, 160, 20);
+    const prepared = prepareHelpMenu(&projection, 160, rows);
 
-    var header = try composeHelpMenuRow(alloc, projection, 0, 160, rows);
+    var header = try prepared.composeRow(alloc, 0);
     defer header.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, header.items, "Commands 3") != null);
 
-    var selected = try composeHelpMenuRow(alloc, projection, 2, 160, rows);
+    var selected = try prepared.composeRow(alloc, 2);
     defer selected.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, selected.items, "/help") != null);
     try std.testing.expect(std.mem.find(u8, selected.items, "●") == null);
@@ -322,7 +358,7 @@ test "help menu places descriptions after the widest matching command" {
     const narrow_rows = menuRowCount(projection, 22, 20);
     try std.testing.expectEqual(rows, narrow_rows);
     try std.testing.expectEqual(@as(usize, 13), descriptionColumn(projection, 22));
-    var narrow = try composeHelpMenuRow(alloc, projection, 2, 22, narrow_rows);
+    var narrow = try prepareHelpMenu(&projection, 22, narrow_rows).composeRow(alloc, 2);
     defer narrow.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, narrow.items, "/help") != null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(narrow.items) <= 22);
@@ -339,7 +375,7 @@ test "help menu keeps a four column gutter after command names" {
         .registry = .{ .commands = long_specs[0..] },
     };
     const rows = menuRowCount(projection, 160, 12);
-    var item = try composeHelpMenuRow(alloc, projection, 2, 160, rows);
+    var item = try prepareHelpMenu(&projection, 160, rows).composeRow(alloc, 2);
     defer item.deinit(alloc);
 
     const description_start = std.mem.find(u8, item.items, "choose permission behavior").?;
@@ -359,7 +395,7 @@ test "help menu search keeps headings non-selectable and reports empty results" 
     const rows = menuRowCount(projection, 80, 12);
     try std.testing.expectEqual(@as(u16, 3), rows);
 
-    var item = try composeHelpMenuRow(alloc, projection, 2, 80, rows);
+    var item = try prepareHelpMenu(&projection, 80, rows).composeRow(alloc, 2);
     defer item.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, item.items, "/paste") != null);
 
@@ -369,7 +405,7 @@ test "help menu search keeps headings non-selectable and reports empty results" 
         .query = "no command can match this query",
     };
     const empty_rows = menuRowCount(empty_projection, 80, 12);
-    var empty = try composeHelpMenuRow(alloc, empty_projection, empty_rows - 1, 80, empty_rows);
+    var empty = try prepareHelpMenu(&empty_projection, 80, empty_rows).composeRow(alloc, empty_rows - 1);
     defer empty.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, empty.items, "No commands found.") != null);
 }
@@ -382,12 +418,13 @@ test "help menu renders category tabs and flat commands through the VT" {
         .registry = help_menu_test_registry,
     };
     const rows = menuRowCount(projection, width, 8);
+    const prepared = prepareHelpMenu(&projection, width, rows);
 
     var grid = try vt_emulator.Grid.init(alloc, width, rows);
     defer grid.deinit();
     var row_index: u16 = 0;
     while (row_index < rows) : (row_index += 1) {
-        var row = try composeHelpMenuRow(alloc, projection, row_index, width, rows);
+        var row = try prepared.composeRow(alloc, row_index);
         defer row.deinit(alloc);
         var cursor_buf: [32]u8 = undefined;
         const cursor = try std.fmt.bufPrint(&cursor_buf, "\x1b[{d};1H", .{row_index + 1});
@@ -427,7 +464,7 @@ test "help menu packs more filters while preserving a far active filter in the V
         .active = true,
         .registry = registry,
     };
-    var all_row = try composeHelpMenuRow(alloc, all_projection, 0, width, 8);
+    var all_row = try prepareHelpMenu(&all_projection, width, 8).composeRow(alloc, 0);
     defer all_row.deinit(alloc);
     var all_grid = try vt_emulator.Grid.init(alloc, width, 1);
     defer all_grid.deinit();
@@ -445,7 +482,7 @@ test "help menu packs more filters while preserving a far active filter in the V
         .category = .product,
         .registry = registry,
     };
-    var product_row = try composeHelpMenuRow(alloc, product_projection, 0, width, 8);
+    var product_row = try prepareHelpMenu(&product_projection, width, 8).composeRow(alloc, 0);
     defer product_row.deinit(alloc);
     var product_grid = try vt_emulator.Grid.init(alloc, width, 1);
     defer product_grid.deinit();
