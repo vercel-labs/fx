@@ -233,6 +233,8 @@ zig build -Doptimize=ReleaseSafe
 
 Run the test suite with `zig build test`. See [CONTRIBUTING.md](CONTRIBUTING.md) for development and contribution guidelines.
 
+The optional [pager experiment](experiments/pager/README.md) explores compressed executable pages. Its binaries are restricted to macOS virtual machines and are not release artifacts.
+
 ## License
 
 [Apache-2.0](LICENSE)
