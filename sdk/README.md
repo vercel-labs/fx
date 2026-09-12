@@ -345,6 +345,85 @@ outcomes do not add transcript entries, including cancellation after resume.
 Stored snapshots retain cancellation-origin metadata; keep them opaque and
 resume with the same or a newer SDK build. Older snapshots remain readable.
 
+## Native fx with a browser UI
+
+Pass `remote` to `createFxTerminal()` to render a native fx process through the
+same xterm adapter. This mode does not load WebAssembly or start a browser agent.
+The native process owns model requests, tools, settings, and session state.
+
+```js
+import { createFxTerminal, xtermAdapter } from "libfx/browser";
+
+const runtime = await createFxTerminal({
+  terminal: xtermAdapter(term),
+  remote: {
+    url: connection.url,
+    sessionId: connection.sessionId,
+  },
+});
+await runtime.interactive;
+```
+
+The authenticated application backend provides `connection` after authorizing the
+user's existing sandbox session. Its URL points to the application WebSocket relay;
+the private sandbox capability stays on the server. See the [native backend example](https://github.com/vercel-labs/fx/tree/main/sdk/examples/remote-terminal)
+for a working WebSocket broker, PTY helper, and Vercel Sandbox startup integration.
+The example requires Node and Python in the sandbox; the SDK itself adds no
+transport dependency. Native fx must be installed at session startup. Reuse the
+broker for subsequent messages and browser connections.
+
+`interactive` means the transport has attached, not that native fx has completed
+startup. `abort()` detaches the view and resolves `exited` with 130; it does not
+kill the native session or cancel a turn. `interrupt()` explicitly sends Ctrl+C
+to the native terminal. `write()` accepts a string or `Uint8Array` up to 64 KiB.
+Terminal input, resize, fx commands, and pickers continue through native fx.
+Terminal editing therefore includes network latency; this mode does not perform
+speculative local echo or duplicate native command handling.
+
+An unexpected connection loss resolves `exited` with 255. Reconnect explicitly
+using a fresh runtime and the same terminal instance, session ID, and last
+rendered `runtime.cursor`. A fresh blank terminal needs cursor zero. The example
+retains bounded output history and rejects expired cursors rather than replay an
+incomplete screen. Input is never retried automatically. `remote.url` may also be
+an async function to obtain a freshly authorized URL for each attachment.
+
+Use `createFxView({ remote, onSnapshot })` for semantic HTML state instead of
+terminal output. It exposes the same attachment lifecycle plus `interact(action)`.
+Its `interactive` promise waits for the first native snapshot. Snapshots and
+actions come from native fx's interaction channel, not parsed ANSI.
+The optional `libfx/html` renderer consumes them:
+
+```js
+import { createFxView } from "libfx/browser";
+import { createFxHtmlView } from "libfx/html";
+
+let client;
+const view = createFxHtmlView({
+  container: document.querySelector("#fx"),
+  send(action) { client.interact(action); },
+});
+client = await createFxView({
+  remote: { url: connection.url, sessionId: connection.sessionId },
+  onSnapshot: view.render,
+});
+await client.interactive;
+```
+
+The HTML surface is experimental and requires the native interaction channel from
+this build. Its supported controls are defined by that channel; it does not make
+all terminal-only screens HTML-compatible. Use the terminal presentation for
+native interactions not yet projected into semantic snapshots. Neither rendering
+mode changes backend tool capabilities or permissions. Native process lifetime
+and sandbox billing remain the owning application's responsibility.
+
+Keep model and sandbox credentials on the server. The example includes
+`createTerminalRelay` with a server-owned authentication/session resolver, a
+separate browser Origin check, and bounded forwarding. The browser connects to
+this application backend; it never receives the private sandbox capability URL.
+Do not put private connection URLs in logs or analytics. The sandbox broker also
+validates an exact Origin and allows one writer at a time; Origin validation
+alone is not authentication.
+
 ## Security
 
 Treat `nativeAddon` and `gatewayChatUrl` as trusted host

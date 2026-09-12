@@ -1,3 +1,4 @@
+import { createRemoteTerminal } from "./remote-terminal.js";
 import { CoreOutput, maxCoreMessageBytes } from "./core-output.js";
 import { loadModule } from "./wasm-module.js";
 
@@ -282,6 +283,7 @@ function xtermSelectionOwnsShortcut(term, event) {
 }
 
 export function xtermAdapter(term) {
+  let pendingWrite = Promise.resolve();
   let keyDataHandler = null;
   if (typeof term.attachCustomKeyEventHandler === "function") {
     term.attachCustomKeyEventHandler((event) => {
@@ -293,7 +295,13 @@ export function xtermAdapter(term) {
     });
   }
   return {
-    write(bytes) { term.write(typeof bytes === "string" ? bytes : decoder.decode(bytes)); },
+    write(bytes) {
+      let complete;
+      const pending = new Promise((resolve) => { complete = resolve; });
+      term.write(bytes, complete);
+      pendingWrite = pending;
+    },
+    drain() { return pendingWrite; },
     onData(callback) { const disposable = term.onData(callback); return () => disposable.dispose(); },
     onKeyData(callback) {
       keyDataHandler = callback;
@@ -1102,6 +1110,7 @@ async function instantiate(options) {
 }
 
 export async function createFxTerminal(options) {
+  if (options?.remote) return createRemoteTerminal(options);
   if (!options?.terminal) throw new TypeError("terminal is required");
   const emit = (type, detail = {}) => {
     try { options.onEvent?.({ type, timestamp: performance.now(), ...detail }); } catch {}

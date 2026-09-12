@@ -223,6 +223,10 @@ try {
     expect(result.dataListeners === 0, `browser terminal leaked ${result.dataListeners} data listener(s)`);
     expect(result.resizeListeners === 0, `browser terminal leaked ${result.resizeListeners} resize listener(s)`);
     console.log("browser terminal startup and shutdown passed");
+    await command("Page.navigate", { url: `http://127.0.0.1:${port}/sdk/browser-test-html.html` }, sessionId);
+    const html = await waitFor("window.__fxHtmlResult", sessionId);
+    expect(html.ok, html.error || "HTML interaction renderer failed");
+    console.log("browser HTML interaction controls passed");
   } finally {
     await command("Target.closeTarget", { targetId });
   }

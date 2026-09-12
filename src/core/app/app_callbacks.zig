@@ -1075,7 +1075,9 @@ pub fn Bindings(comptime App: type) type {
             const app: *App = @ptrCast(@alignCast(ctx));
             switch (emission) {
                 .assistant_started => {},
-                .assistant_source => {},
+                .assistant_source => |text| {
+                    if (comptime @hasField(App, "interaction_host")) try app.interaction_host.appendSource(app.alloc, text);
+                },
                 .assistant_rendered => |text| try app_worker_runtime.Runtime(App).pushText(app, text),
                 .assistant_restarted => |text| try app_worker_runtime.Runtime(App).pushText(app, text),
                 .operational => |text| try app_worker_runtime.Runtime(App).pushText(app, text),

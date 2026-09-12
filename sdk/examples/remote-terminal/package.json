@@ -1,0 +1,11 @@
+{
+  "name": "libfx-native-terminal-backend-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test.mjs relay.test.mjs"
+  },
+  "dependencies": {
+    "ws": "8.21.3"
+  }
+}

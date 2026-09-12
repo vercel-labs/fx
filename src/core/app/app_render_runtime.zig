@@ -1,5 +1,6 @@
 const std = @import("std");
 const question_prompt = @import("../agent/question_prompt.zig");
+const interactive_model_projection = @import("interactive_model_projection.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const app_commands = @import("app_commands.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
@@ -515,10 +516,7 @@ pub fn Runtime(comptime App: type) type {
             };
         }
 
-        var model_completions_buf: [32][]const u8 = undefined;
-        var effort_picker_values_buf: [types.ReasoningEffort.max_options + 1]types.ReasoningEffort = undefined;
-        var effort_picker_labels_buf: [types.ReasoningEffort.max_options + 1][]const u8 = undefined;
-        var fast_picker_labels_buf: [2][]const u8 = undefined;
+        var model_picker_buffer: interactive_model_projection.Buffer = .{};
         var provider_picker_column: provider_picker_runtime.ColumnBuffer = .{};
         noinline fn footerContext(
             app: *App,
@@ -526,46 +524,9 @@ pub fn Runtime(comptime App: type) type {
             shimmer_pos: i16,
             steering: *const SteeringProjection,
         ) render_input.RenderContext {
-            const model_query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state);
+            const model_picker = interactive_model_projection.project(App, app, &model_picker_buffer);
+            const model_query = model_picker.query;
             const pending_model = if (app.input_runtime.picker.hasPendingModelPickerSelection()) app.input_runtime.picker.model_picker_pending_model.items else null;
-            var model_picker_stage: picker_state.ModelPickerStage = .model;
-            var picker_items: []const []const u8 = &.{};
-            var picker_index: usize = 0;
-            var picker_window_start: usize = 0;
-            var picker_anchor: usize = 0;
-
-            if (model_query) |picker_query| {
-                model_picker_stage = picker_query.stage;
-                picker_anchor = picker_query.token_start;
-                switch (picker_query.stage) {
-                    .model => {
-                        const count = input_completion_runtime.CompletionRuntime(App).modelPickerCompletions(app, picker_query.query, &model_completions_buf);
-                        picker_items = model_completions_buf[0..count];
-                        picker_index = input_completion_runtime.CompletionRuntime(App).modelPickerIndex(app, picker_items);
-                        picker_window_start = input_completion_runtime.CompletionRuntime(App).modelPickerWindowStart(app, count, picker_index);
-                    },
-                    .effort => {
-                        const target = if (app.input_runtime.picker.hasPendingModelPickerSelection()) app.input_runtime.picker.model_picker_pending_model.items else provider_runtime.model(app);
-                        const capabilities = model_capabilities.resolveForApp(App, app, target);
-                        const effort_count = model_capabilities.reasoningEffortOptionCount(capabilities);
-                        for (0..effort_count) |i| {
-                            effort_picker_values_buf[i] = model_capabilities.reasoningEffortAtIndex(capabilities, i);
-                            effort_picker_labels_buf[i] = effort_picker_values_buf[i].displayLabel();
-                        }
-                        const count = picker_state.filterCompletionLabels(picker_query.query, effort_picker_labels_buf[0..effort_count], effort_picker_labels_buf[0..]);
-                        picker_items = effort_picker_labels_buf[0..count];
-                        picker_index = app.input_runtime.picker.model_picker_effort_index;
-                        picker_window_start = app.input_runtime.picker.model_picker_effort_window_start;
-                    },
-                    .fast => {
-                        for (picker_state.model_picker_fast_options, 0..) |option, i| fast_picker_labels_buf[i] = option;
-                        const count = picker_state.filterCompletionLabels(picker_query.query, fast_picker_labels_buf[0..], fast_picker_labels_buf[0..]);
-                        picker_items = fast_picker_labels_buf[0..count];
-                        picker_index = app.input_runtime.picker.model_picker_fast_index;
-                        picker_window_start = app.input_runtime.picker.model_picker_fast_window_start;
-                    },
-                }
-            }
 
             const provider_query = if (model_query == null)
                 app.input_runtime.picker.activeProviderPickerQuery(&app.input_runtime.edit_state)
@@ -704,13 +665,13 @@ pub fn Runtime(comptime App: type) type {
                 .shimmer_pos = shimmer_pos,
                 .now_ms = now_ms,
                 .model_query_active = model_query != null,
-                .model_picker_stage = model_picker_stage,
-                .model_completions_loading = if (model_query != null and model_picker_stage == .model) app.isModelCacheLoading() else false,
-                .model_completions_failed = if (model_query != null and model_picker_stage == .model) app.isModelCacheFailed() else false,
-                .model_completions = picker_items,
-                .model_completion_index = picker_index,
-                .model_completion_window_start = picker_window_start,
-                .model_completion_anchor = picker_anchor,
+                .model_picker_stage = model_picker.stage,
+                .model_completions_loading = model_picker.loading,
+                .model_completions_failed = model_picker.failed,
+                .model_completions = model_picker.items,
+                .model_completion_index = model_picker.selected_index,
+                .model_completion_window_start = model_picker.window_start,
+                .model_completion_anchor = model_picker.anchor,
                 .provider_query_active = provider_query != null,
                 .provider_picker_stage = provider_stage,
                 .provider_picker_completions = provider_picker_items,
@@ -3460,11 +3421,11 @@ const CoordinatorTestApp = struct {
 
     pub fn writeDomainNotice(_: *CoordinatorTestApp, _: types.SemanticNotice, _: bool) !void {}
 
-    fn isModelCacheLoading(self: *CoordinatorTestApp) bool {
+    pub fn isModelCacheLoading(self: *CoordinatorTestApp) bool {
         return self.model_cache_loading;
     }
 
-    fn isModelCacheFailed(_: *CoordinatorTestApp) bool {
+    pub fn isModelCacheFailed(_: *CoordinatorTestApp) bool {
         return false;
     }
 

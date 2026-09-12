@@ -87,6 +87,13 @@ jobs:
       - name: Test Node + WASM
         run: npm run --prefix sdk test:node-wasm
 
+      - name: Test remote terminal and native interaction
+        run: |
+          node sdk/tests/test-remote-terminal.mjs
+          python3 sdk/tests/test-native-interaction.py
+          npm ci --prefix sdk/examples/remote-terminal
+          node --test sdk/examples/remote-terminal/test.mjs sdk/examples/remote-terminal/relay.test.mjs
+
       - name: Test libfx Wasm integrations
         run: |
           node --experimental-wasm-jspi sdk/tests/test-host-tools.mjs wasm

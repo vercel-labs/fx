@@ -11,15 +11,17 @@ const htmlPath = resolve(repoRoot, "sdk/term-demo.html");
 const browserPath = resolve(repoRoot, "sdk/browser.js");
 const sdkPath = resolve(repoRoot, "sdk/fx-sdk.js");
 const coreOutputPath = resolve(repoRoot, "sdk/core-output.js");
+const remoteTerminalPath = resolve(repoRoot, "sdk/remote-terminal.js");
 const wasmModulePath = resolve(repoRoot, "sdk/wasm-module.js");
 const wasmPath = resolve(repoRoot, "zig-out/bin/fx-term.wasm");
 
-const [htmlSource, browserBytes, sdkSource, coreOutputBytes, wasmModuleBytes, wasmBytes] = await Promise.all([
+const [htmlSource, browserBytes, sdkSource, coreOutputBytes, wasmModuleBytes, remoteTerminalBytes, wasmBytes] = await Promise.all([
   readFile(htmlPath, "utf8"),
   readFile(browserPath),
   readFile(sdkPath),
   readFile(coreOutputPath),
   readFile(wasmModulePath),
+  readFile(remoteTerminalPath),
   readFile(wasmPath),
 ]);
 
@@ -29,7 +31,10 @@ const coreOutputHash = digest(coreOutputBytes);
 const coreOutputName = `core-output.${coreOutputHash}.js`;
 const wasmModuleHash = digest(wasmModuleBytes);
 const wasmModuleName = `wasm-module.${wasmModuleHash}.js`;
+const remoteTerminalHash = digest(remoteTerminalBytes);
+const remoteTerminalName = `remote-terminal.${remoteTerminalHash}.js`;
 const sdkBytes = Buffer.from(sdkSource.toString()
+  .replace('from "./remote-terminal.js";', `from "./${remoteTerminalName}";`)
   .replace('from "./core-output.js";', `from "./${coreOutputName}";`)
   .replace('from "./wasm-module.js";', `from "./${wasmModuleName}";`));
 const sdkHash = digest(sdkBytes);
@@ -37,7 +42,9 @@ const wasmHash = digest(wasmBytes);
 const sdkName = `fx-sdk.${sdkHash}.js`;
 const wasmName = `fx-term.${wasmHash}.wasm`;
 const packagedBrowser = Buffer.from(
-  browserBytes.toString().replace('from "./fx-sdk.js";', `from "./${sdkName}";`),
+  browserBytes.toString()
+    .replace('from "./fx-sdk.js";', `from "./${sdkName}";`)
+    .replace('from "./remote-terminal.js";', `from "./${remoteTerminalName}";`),
 );
 const browserHash = digest(packagedBrowser);
 const browserName = `browser.${browserHash}.js`;
@@ -85,6 +92,10 @@ const vercelConfig = {
       headers: [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }],
     },
     {
+      source: `/${remoteTerminalName}`,
+      headers: [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }],
+    },
+    {
       source: `/${wasmName}`,
       headers: [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }],
     },
@@ -100,6 +111,7 @@ await Promise.all([
   writeFile(resolve(outputDir, sdkName), sdkBytes),
   writeFile(resolve(outputDir, coreOutputName), coreOutputBytes),
   writeFile(resolve(outputDir, wasmModuleName), wasmModuleBytes),
+  writeFile(resolve(outputDir, remoteTerminalName), remoteTerminalBytes),
   writeFile(resolve(outputDir, wasmName), wasmBytes),
   writeFile(resolve(outputDir, "vercel.json"), `${JSON.stringify(vercelConfig, null, 2)}\n`),
 ]);
@@ -109,6 +121,7 @@ const manifest = {
   browser: { file: browserName, sha256: digest(packagedBrowser), bytes: packagedBrowser.byteLength },
   sdk: { file: sdkName, sha256: sdkHash, bytes: sdkBytes.byteLength },
   coreOutput: { file: coreOutputName, sha256: coreOutputHash, bytes: coreOutputBytes.byteLength },
+  remoteTerminal: { file: remoteTerminalName, sha256: remoteTerminalHash, bytes: remoteTerminalBytes.byteLength },
   wasmModule: { file: wasmModuleName, sha256: wasmModuleHash, bytes: wasmModuleBytes.byteLength },
   wasm: { file: wasmName, sha256: wasmHash, integrity: integrity(wasmBytes), bytes: wasmBytes.byteLength },
 };

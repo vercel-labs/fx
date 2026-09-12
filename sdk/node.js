@@ -1,3 +1,4 @@
+export { createRemoteView as createFxView } from "./remote-terminal.js";
 import { access, readFile } from "node:fs/promises";
 import { closeSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -559,5 +560,6 @@ export async function createFxAgent(options = {}) {
 }
 
 export function createFxTerminal(options = {}) {
+  if (options.remote) return createWasmTerminal(options);
   return createWithFallback("terminal", "createFxTerminal", createWasmTerminal, defaultTermWasm, options);
 }

@@ -1685,7 +1685,7 @@ fn writeApprovalPlaceholder(writer: *std.Io.Writer, placeholder: []const u8) !vo
     }
 }
 
-fn approvalChoiceLabel(approval: ApprovalProjection, choice: u8) []const u8 {
+pub fn approvalChoiceLabel(approval: ApprovalProjection, choice: u8) []const u8 {
     if (approval.request.confirmation_only) return switch (choice) {
         0 => "1. Confirm",
         1 => "2. Cancel",

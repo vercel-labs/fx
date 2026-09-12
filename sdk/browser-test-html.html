@@ -1,0 +1,63 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>libfx HTML view test</title>
+<div id="view"></div>
+<script type="module">
+import { createFxHtmlView } from './html-view.js';
+const container = document.querySelector('#view');
+const actions = [];
+const assert = (condition, message) => { if (!condition) throw new Error(message); };
+try {
+  const view = createFxHtmlView({ container, send: (action) => actions.push(action) });
+  const base = {
+    type: 'snapshot', version: 1, revision: 1,
+    composer: { text: '', cursor: 0, protected: false },
+    model: { active: false, stage: 'model', items: [], selected_index: 0 },
+    commands: [{ command: '/model', description: 'Choose model', aliases: [], accepts_payload: true }],
+    permission: null, busy: false,
+    transcript: [{ role: 'assistant', text: '<img src=x onerror=alert(1)>' }],
+  };
+  view.render(base);
+  assert(!container.querySelector('img'), 'Transcript was interpreted as HTML');
+  assert(container.textContent.includes('<img'), 'Transcript text is missing');
+  const input = container.querySelector('textarea');
+  input.focus();
+  input.value = '/mo';
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  const command = container.querySelector('.fx-commands button');
+  assert(command.textContent.includes('/model'), 'Native command is missing');
+  command.click();
+  assert(actions.at(-1).text === '/model ', 'Command did not use native descriptor');
+  view.render({ ...base, revision: 2, composer: { ...base.composer, text: '/model ' }, model: { active: true, stage: 'model', items: ['alpha', 'beta'], selected_index: 0 } });
+  container.querySelectorAll('[role=option]')[1].click();
+  assert(actions.at(-1).revision === 2 && actions.at(-1).index === 1, 'Model action lost native revision or index');
+  view.render({ ...base, revision: 3, permission: { id: 77, label: 'Run build', explanation: 'Native explanation', choices: [{ id: 3, label: 'Native deny label' }] } });
+  container.querySelector('.fx-permission button').click();
+  assert(actions.at(-1).id === 77 && actions.at(-1).choice === 3, 'Permission identity changed');
+  assert(container.querySelector('.fx-permission button').textContent === 'Native deny label', 'Permission label was invented');
+  view.render({ ...base, revision: 4 });
+  input.value = 'draft';
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  input.value = 'draft newer';
+  view.render({ ...base, revision: 5, composer: { ...base.composer, text: 'old remote text' } });
+  assert(input.value === 'draft newer', 'Stale snapshot overwrote active draft');
+  input.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+  const before = actions.length;
+  input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', isComposing: true, bubbles: true }));
+  assert(actions.length === before, 'IME composition submitted a prompt');
+  input.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true }));
+  container.querySelector('form').requestSubmit();
+  assert(actions.at(-1).type === 'submit', 'Composer did not submit');
+  view.render({ ...base, revision: 6, composer: { ...base.composer, protected: true } });
+  assert(input.disabled && input.value === '', 'Protected input is visible');
+  view.render({ ...base, revision: 7, unsupported_screen: 'help' });
+  assert(input.disabled, 'Unsupported native screen accepted input');
+  [...container.querySelectorAll('button')].find(node => node.textContent === 'Close screen').click();
+  assert(actions.at(-1).type === 'dismiss', 'Screen dismissal incorrectly cancelled the agent');
+  view.dispose();
+  assert(container.children.length === 0, 'View was not disposed');
+  window.__fxHtmlResult = { ok: true, actions: actions.length };
+} catch (error) {
+  window.__fxHtmlResult = { ok: false, error: error.stack };
+}
+</script>

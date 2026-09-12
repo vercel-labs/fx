@@ -31,6 +31,7 @@
     "./browser": "./browser.js",
     "./wasm": "./fx-sdk.js",
     "./mcp": "./mcp.js",
+    "./html": "./html-view.js",
     "./skills": "./skills.js",
     "./skills/node": "./skills-node.js"
   },
@@ -41,6 +42,8 @@
     "fx-sdk.js",
     "wasm-module.js",
     "core-output.js",
+    "remote-terminal.js",
+    "html-view.js",
     "mcp.js",
     "skills.js",
     "skills-node.js",
