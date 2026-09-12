@@ -4,6 +4,7 @@ pub const mcp_auth_usage = "mcp auth NAME";
 const display_width = @import("../shared/display_width.zig");
 const list_window = @import("../shared/list_window.zig");
 const mod_registry = @import("../mods/registry.zig");
+const string_pool = @import("../shared/comptime_string_pool.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -682,63 +683,25 @@ pub fn slashCompletionHasArgs(registry: SlashRegistry, command: []const u8) bool
 }
 
 fn allowlistCompletionHasArgs(command: []const u8) bool {
-    const completions_with_more_args = [_][]const u8{
-        "/allowlist add",
-        "/allowlist remove",
-        "/allowlist reset",
-        "/allowlist view",
-        "/allowlist local",
-        "/allowlist user",
-        "/allowlist local add",
-        "/allowlist local remove",
-        "/allowlist local reset",
-        "/allowlist user add",
-        "/allowlist user remove",
-        "/allowlist user reset",
-        "/allowlist add command",
-        "/allowlist add tool",
-        "/allowlist add url",
-        "/allowlist add web-fetch-domain",
-        "/allowlist remove command",
-        "/allowlist remove tool",
-        "/allowlist remove url",
-        "/allowlist remove web-fetch-domain",
-        "/allowlist local add command",
-        "/allowlist local add tool",
-        "/allowlist local add url",
-        "/allowlist local add web-fetch-domain",
-        "/allowlist local remove command",
-        "/allowlist local remove tool",
-        "/allowlist local remove url",
-        "/allowlist local remove web-fetch-domain",
-        "/allowlist user add command",
-        "/allowlist user add tool",
-        "/allowlist user add url",
-        "/allowlist user add web-fetch-domain",
-        "/allowlist user remove command",
-        "/allowlist user remove tool",
-        "/allowlist user remove url",
-        "/allowlist user remove web-fetch-domain",
-    };
-    for (completions_with_more_args) |completion| {
-        if (std.mem.eql(u8, command, completion)) return true;
+    for (allowlist_more_args_completions) |completion| {
+        if (std.mem.eql(u8, command, completion.get())) return true;
     }
     return false;
 }
 
-const statusline_arg_completions = [_][]const u8{
+const statusline_completion_strings = [_][]const u8{
     "/statusline context",
     "/statusline session",
     "/statusline workspace",
 };
 
-const notifications_arg_completions = [_][]const u8{
+const notifications_completion_strings = [_][]const u8{
     "/sound on",
     "/sound off",
     "/sound max",
 };
 
-const permissions_arg_completions = [_][]const u8{
+const permissions_completion_strings = [_][]const u8{
     "/permissions ask",
     "/permissions auto",
     "/permissions remember",
@@ -747,14 +710,14 @@ const permissions_arg_completions = [_][]const u8{
     "/permissions reset",
 };
 
-const workspace_arg_completions = [_][]const u8{
+const workspace_completion_strings = [_][]const u8{
     "/workspace list",
     "/workspace add",
     "/workspace remove",
     "/workspace clear",
 };
 
-const allowlist_action_completions = [_][]const u8{
+const allowlist_action_completion_strings = [_][]const u8{
     "/allowlist view",
     "/allowlist add",
     "/allowlist remove",
@@ -763,7 +726,7 @@ const allowlist_action_completions = [_][]const u8{
     "/allowlist user",
 };
 
-const allowlist_view_completions = [_][]const u8{
+const allowlist_view_completion_strings = [_][]const u8{
     "/allowlist view effective",
     "/allowlist view local",
     "/allowlist view user",
@@ -775,21 +738,21 @@ const allowlist_scoped_action_suffixes = [_][]const u8{
     "reset",
 };
 
-const allowlist_add_kind_completions = [_][]const u8{
+const allowlist_add_kind_completion_strings = [_][]const u8{
     "/allowlist add command",
     "/allowlist add tool",
     "/allowlist add url",
     "/allowlist add web-fetch-domain",
 };
 
-const allowlist_remove_kind_completions = [_][]const u8{
+const allowlist_remove_kind_completion_strings = [_][]const u8{
     "/allowlist remove command",
     "/allowlist remove tool",
     "/allowlist remove url",
     "/allowlist remove web-fetch-domain",
 };
 
-const allowlist_reset_scope_completions = [_][]const u8{
+const allowlist_reset_scope_completion_strings = [_][]const u8{
     "/allowlist reset commands",
     "/allowlist reset tools",
     "/allowlist reset urls",
@@ -797,7 +760,7 @@ const allowlist_reset_scope_completions = [_][]const u8{
     "/allowlist reset all",
 };
 
-const allowlist_add_tool_completions = [_][]const u8{
+const allowlist_add_tool_completion_strings = [_][]const u8{
     "/allowlist add tool read_file",
     "/allowlist add tool write_file",
     "/allowlist add tool edit_file",
@@ -808,7 +771,7 @@ const allowlist_add_tool_completions = [_][]const u8{
     "/allowlist add tool subagent",
 };
 
-const allowlist_remove_tool_completions = [_][]const u8{
+const allowlist_remove_tool_completion_strings = [_][]const u8{
     "/allowlist remove tool read_file",
     "/allowlist remove tool write_file",
     "/allowlist remove tool edit_file",
@@ -817,6 +780,45 @@ const allowlist_remove_tool_completions = [_][]const u8{
     "/allowlist remove tool skill",
     "/allowlist remove tool install_skill",
     "/allowlist remove tool subagent",
+};
+
+const allowlist_more_args_strings = [_][]const u8{
+    "/allowlist add",
+    "/allowlist remove",
+    "/allowlist reset",
+    "/allowlist view",
+    "/allowlist local",
+    "/allowlist user",
+    "/allowlist local add",
+    "/allowlist local remove",
+    "/allowlist local reset",
+    "/allowlist user add",
+    "/allowlist user remove",
+    "/allowlist user reset",
+    "/allowlist add command",
+    "/allowlist add tool",
+    "/allowlist add url",
+    "/allowlist add web-fetch-domain",
+    "/allowlist remove command",
+    "/allowlist remove tool",
+    "/allowlist remove url",
+    "/allowlist remove web-fetch-domain",
+    "/allowlist local add command",
+    "/allowlist local add tool",
+    "/allowlist local add url",
+    "/allowlist local add web-fetch-domain",
+    "/allowlist local remove command",
+    "/allowlist local remove tool",
+    "/allowlist local remove url",
+    "/allowlist local remove web-fetch-domain",
+    "/allowlist user add command",
+    "/allowlist user add tool",
+    "/allowlist user add url",
+    "/allowlist user add web-fetch-domain",
+    "/allowlist user remove command",
+    "/allowlist user remove tool",
+    "/allowlist user remove url",
+    "/allowlist user remove web-fetch-domain",
 };
 
 fn scopedAllowlistCompletions(
@@ -834,18 +836,71 @@ fn scopedAllowlistCompletions(
     return result;
 }
 
-const allowlist_local_action_completions = scopedAllowlistCompletions("local", allowlist_scoped_action_suffixes);
-const allowlist_user_action_completions = scopedAllowlistCompletions("user", allowlist_scoped_action_suffixes);
-const allowlist_local_add_kind_completions = scopedAllowlistCompletions("local", allowlist_add_kind_completions);
-const allowlist_user_add_kind_completions = scopedAllowlistCompletions("user", allowlist_add_kind_completions);
-const allowlist_local_remove_kind_completions = scopedAllowlistCompletions("local", allowlist_remove_kind_completions);
-const allowlist_user_remove_kind_completions = scopedAllowlistCompletions("user", allowlist_remove_kind_completions);
-const allowlist_local_reset_scope_completions = scopedAllowlistCompletions("local", allowlist_reset_scope_completions);
-const allowlist_user_reset_scope_completions = scopedAllowlistCompletions("user", allowlist_reset_scope_completions);
-const allowlist_local_add_tool_completions = scopedAllowlistCompletions("local", allowlist_add_tool_completions);
-const allowlist_user_add_tool_completions = scopedAllowlistCompletions("user", allowlist_add_tool_completions);
-const allowlist_local_remove_tool_completions = scopedAllowlistCompletions("local", allowlist_remove_tool_completions);
-const allowlist_user_remove_tool_completions = scopedAllowlistCompletions("user", allowlist_remove_tool_completions);
+const allowlist_local_action_strings = scopedAllowlistCompletions("local", allowlist_scoped_action_suffixes);
+const allowlist_user_action_strings = scopedAllowlistCompletions("user", allowlist_scoped_action_suffixes);
+const allowlist_local_add_kind_strings = scopedAllowlistCompletions("local", allowlist_add_kind_completion_strings);
+const allowlist_user_add_kind_strings = scopedAllowlistCompletions("user", allowlist_add_kind_completion_strings);
+const allowlist_local_remove_kind_strings = scopedAllowlistCompletions("local", allowlist_remove_kind_completion_strings);
+const allowlist_user_remove_kind_strings = scopedAllowlistCompletions("user", allowlist_remove_kind_completion_strings);
+const allowlist_local_reset_scope_strings = scopedAllowlistCompletions("local", allowlist_reset_scope_completion_strings);
+const allowlist_user_reset_scope_strings = scopedAllowlistCompletions("user", allowlist_reset_scope_completion_strings);
+const allowlist_local_add_tool_strings = scopedAllowlistCompletions("local", allowlist_add_tool_completion_strings);
+const allowlist_user_add_tool_strings = scopedAllowlistCompletions("user", allowlist_add_tool_completion_strings);
+const allowlist_local_remove_tool_strings = scopedAllowlistCompletions("local", allowlist_remove_tool_completion_strings);
+const allowlist_user_remove_tool_strings = scopedAllowlistCompletions("user", allowlist_remove_tool_completion_strings);
+
+// Completion strings are interned into one comptime blob; the runtime
+// tables reference it with 4-byte (offset, length) pairs. The _strings
+// arrays above are comptime-only inputs and never materialize.
+const completion_pool = string_pool.Interned(&(statusline_completion_strings ++
+    notifications_completion_strings ++
+    permissions_completion_strings ++
+    workspace_completion_strings ++
+    allowlist_action_completion_strings ++
+    allowlist_view_completion_strings ++
+    allowlist_add_kind_completion_strings ++
+    allowlist_remove_kind_completion_strings ++
+    allowlist_reset_scope_completion_strings ++
+    allowlist_add_tool_completion_strings ++
+    allowlist_remove_tool_completion_strings ++
+    allowlist_more_args_strings ++
+    allowlist_local_action_strings ++
+    allowlist_user_action_strings ++
+    allowlist_local_add_kind_strings ++
+    allowlist_user_add_kind_strings ++
+    allowlist_local_remove_kind_strings ++
+    allowlist_user_remove_kind_strings ++
+    allowlist_local_reset_scope_strings ++
+    allowlist_user_reset_scope_strings ++
+    allowlist_local_add_tool_strings ++
+    allowlist_user_add_tool_strings ++
+    allowlist_local_remove_tool_strings ++
+    allowlist_user_remove_tool_strings));
+
+const statusline_arg_completions = completion_pool.List(statusline_completion_strings).items;
+const notifications_arg_completions = completion_pool.List(notifications_completion_strings).items;
+const permissions_arg_completions = completion_pool.List(permissions_completion_strings).items;
+const workspace_arg_completions = completion_pool.List(workspace_completion_strings).items;
+const allowlist_action_completions = completion_pool.List(allowlist_action_completion_strings).items;
+const allowlist_view_completions = completion_pool.List(allowlist_view_completion_strings).items;
+const allowlist_add_kind_completions = completion_pool.List(allowlist_add_kind_completion_strings).items;
+const allowlist_remove_kind_completions = completion_pool.List(allowlist_remove_kind_completion_strings).items;
+const allowlist_reset_scope_completions = completion_pool.List(allowlist_reset_scope_completion_strings).items;
+const allowlist_add_tool_completions = completion_pool.List(allowlist_add_tool_completion_strings).items;
+const allowlist_remove_tool_completions = completion_pool.List(allowlist_remove_tool_completion_strings).items;
+const allowlist_more_args_completions = completion_pool.List(allowlist_more_args_strings).items;
+const allowlist_local_action_completions = completion_pool.List(allowlist_local_action_strings).items;
+const allowlist_user_action_completions = completion_pool.List(allowlist_user_action_strings).items;
+const allowlist_local_add_kind_completions = completion_pool.List(allowlist_local_add_kind_strings).items;
+const allowlist_user_add_kind_completions = completion_pool.List(allowlist_user_add_kind_strings).items;
+const allowlist_local_remove_kind_completions = completion_pool.List(allowlist_local_remove_kind_strings).items;
+const allowlist_user_remove_kind_completions = completion_pool.List(allowlist_user_remove_kind_strings).items;
+const allowlist_local_reset_scope_completions = completion_pool.List(allowlist_local_reset_scope_strings).items;
+const allowlist_user_reset_scope_completions = completion_pool.List(allowlist_user_reset_scope_strings).items;
+const allowlist_local_add_tool_completions = completion_pool.List(allowlist_local_add_tool_strings).items;
+const allowlist_user_add_tool_completions = completion_pool.List(allowlist_user_add_tool_strings).items;
+const allowlist_local_remove_tool_completions = completion_pool.List(allowlist_local_remove_tool_strings).items;
+const allowlist_user_remove_tool_completions = completion_pool.List(allowlist_user_remove_tool_strings).items;
 
 fn argCompletionPrefix(prefix: []const u8, command: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, prefix, command)) return null;
@@ -883,10 +938,10 @@ pub fn workspaceArgCompletionPrefix(prefix: []const u8) ?[]const u8 {
     return argCompletionPrefix(prefix, "/workspace");
 }
 
-fn argCompletionCount(completions: []const []const u8, command_with_space_len: usize, query: []const u8) usize {
+fn argCompletionCount(completions: []const completion_pool.Ref, command_with_space_len: usize, query: []const u8) usize {
     var count: usize = 0;
     for (completions) |completion| {
-        if (argCompletionMatches(completion, command_with_space_len, query)) count += 1;
+        if (argCompletionMatches(completion.get(), command_with_space_len, query)) count += 1;
     }
     return count;
 }
@@ -912,11 +967,11 @@ fn allowlistArgCompletionCount(query: []const u8) usize {
     return argCompletionCount(state.completions, state.label_offset, state.query);
 }
 
-fn nthArgCompletion(completions: []const []const u8, command_with_space_len: usize, query: []const u8, n: usize) ?[]const u8 {
+fn nthArgCompletion(completions: []const completion_pool.Ref, command_with_space_len: usize, query: []const u8, n: usize) ?[]const u8 {
     var idx: usize = 0;
     for (completions) |completion| {
-        if (!argCompletionMatches(completion, command_with_space_len, query)) continue;
-        if (idx == n) return completion;
+        if (!argCompletionMatches(completion.get(), command_with_space_len, query)) continue;
+        if (idx == n) return completion.get();
         idx += 1;
     }
     return null;
@@ -1008,7 +1063,7 @@ fn argCompletionMatches(completion: []const u8, command_with_space_len: usize, q
 }
 
 const AllowlistArgCompletionState = struct {
-    completions: []const []const u8,
+    completions: []const completion_pool.Ref,
     label_offset: usize,
     query: []const u8,
 };

@@ -1,4 +1,5 @@
 const std = @import("std");
+const json_owned = @import("../core/shared/json_owned.zig");
 const versions = @import("../core/gateway/provider_versions.zig");
 const io_mod = @import("../core/shared/io.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
@@ -109,7 +110,7 @@ fn parseResponse(alloc: Allocator, provider: versions.Provider, body: []const u8
     if (body.len > max_response_bytes) return error.ProviderVersionResponseTooLarge;
     if (provider == .grok) return versions.Version.parse(body) orelse error.InvalidProviderVersion;
     const Release = struct { version: []const u8 };
-    const parsed = try std.json.parseFromSlice(Release, alloc, body, .{ .ignore_unknown_fields = true });
+    const parsed = try json_owned.parseOwned(Release, alloc, body, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     return versions.Version.parse(parsed.value.version) orelse error.InvalidProviderVersion;
 }

@@ -5,6 +5,14 @@ const io_mod = @import("core/shared/io.zig");
 
 pub const version = "0.0.9";
 
+/// Message-plus-trap panic handling keeps the DWARF/Mach-O self-info reader
+/// out of shipped binaries, whose symbols are stripped anyway. Debug builds
+/// keep full stack traces.
+pub const panic = if (builtin.mode == .Debug)
+    std.debug.FullPanic(std.debug.defaultPanic)
+else
+    std.debug.simple_panic;
+
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const provider_runtime = @import("core/app/provider_runtime.zig");
 const auth_runtime = @import("core/auth/auth_runtime.zig");

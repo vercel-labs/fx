@@ -746,19 +746,29 @@ fn loadConversationRecoveryCheckpoint(
         else => return err,
     };
     defer alloc.free(bytes);
-    var parsed = std.json.parseFromSlice(struct {
-        conversation_seq: u64,
-        checkpoint: std.json.Value,
-    }, alloc, bytes, .{
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{
         .max_value_len = session_codec.max_recovery_checkpoint_bytes,
     }) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return error.InvalidRecoveryCheckpoint,
     };
     defer parsed.deinit();
-    if (parsed.value.conversation_seq < conversation_seq) return null;
-    if (parsed.value.conversation_seq != conversation_seq) return error.InvalidRecoveryCheckpoint;
-    return session_codec.parseRecoveryCheckpoint(alloc, parsed.value.checkpoint) catch |err| switch (err) {
+    // Matches the strict two-field wire struct this frame used to decode as:
+    // unknown fields, missing fields, and non-integer seq are all rejected.
+    if (parsed.value != .object or parsed.value.object.count() != 2) {
+        return error.InvalidRecoveryCheckpoint;
+    }
+    const seq_value = parsed.value.object.get("conversation_seq") orelse
+        return error.InvalidRecoveryCheckpoint;
+    const frame_seq: u64 = switch (seq_value) {
+        .integer => |v| if (v >= 0) @intCast(v) else return error.InvalidRecoveryCheckpoint,
+        else => return error.InvalidRecoveryCheckpoint,
+    };
+    const checkpoint_value = parsed.value.object.get("checkpoint") orelse
+        return error.InvalidRecoveryCheckpoint;
+    if (frame_seq < conversation_seq) return null;
+    if (frame_seq != conversation_seq) return error.InvalidRecoveryCheckpoint;
+    return session_codec.parseRecoveryCheckpoint(alloc, checkpoint_value) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return error.InvalidRecoveryCheckpoint,
     };

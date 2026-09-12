@@ -1,5 +1,6 @@
 const std = @import("std");
 const language_script = @import("../../shared/language_script.zig");
+const string_pool = @import("../../shared/comptime_string_pool.zig");
 
 const minimum_letters: usize = 5;
 const minimum_unexpected_prose_letters: usize = 8;
@@ -77,36 +78,58 @@ fn clear_evidence(script: Script, letters: usize, dominant_letters: usize) Evide
     };
 }
 
+const signal_strings = [_][]const u8{
+    "answer in ",
+    "respond in ",
+    "reply in ",
+    "write in ",
+    "speak in ",
+    "translate",
+    " language",
+    "chinese",
+    "mandarin",
+    "cantonese",
+    "japanese",
+    "korean",
+    "russian",
+    "ukrainian",
+    "bulgarian",
+    "arabic",
+    "persian",
+    "farsi",
+    "urdu",
+    "hebrew",
+    "greek",
+    "hindi",
+    "marathi",
+    "nepali",
+    "thai",
+};
+const authority_word_strings = [_][]const u8{
+    "the",
+    "this",
+    "that",
+    "these",
+    "those",
+    "you",
+    "your",
+    "please",
+    "what",
+    "why",
+    "how",
+    "should",
+    "would",
+    "could",
+    "will",
+};
+
+const language_terms_pool = string_pool.Interned(&signal_strings ++ &authority_word_strings);
+const signals = language_terms_pool.List(signal_strings).items;
+const authority_words = language_terms_pool.List(authority_word_strings).items;
+
 fn may_request_language_switch(prompt: []const u8) bool {
-    const signals = [_][]const u8{
-        "answer in ",
-        "respond in ",
-        "reply in ",
-        "write in ",
-        "speak in ",
-        "translate",
-        " language",
-        "chinese",
-        "mandarin",
-        "cantonese",
-        "japanese",
-        "korean",
-        "russian",
-        "ukrainian",
-        "bulgarian",
-        "arabic",
-        "persian",
-        "farsi",
-        "urdu",
-        "hebrew",
-        "greek",
-        "hindi",
-        "marathi",
-        "nepali",
-        "thai",
-    };
     for (signals) |signal| {
-        if (contains_ignore_case(prompt, signal)) return true;
+        if (contains_ignore_case(prompt, signal.get())) return true;
     }
     return false;
 }
@@ -121,23 +144,6 @@ fn contains_ignore_case(haystack: []const u8, needle: []const u8) bool {
 }
 
 fn has_english_authority_signal(text: []const u8) bool {
-    const words = [_][]const u8{
-        "the",
-        "this",
-        "that",
-        "these",
-        "those",
-        "you",
-        "your",
-        "please",
-        "what",
-        "why",
-        "how",
-        "should",
-        "would",
-        "could",
-        "will",
-    };
     var start: usize = 0;
     while (start < text.len) {
         while (start < text.len and !std.ascii.isAlphabetic(text[start])) : (start += 1) {}
@@ -145,8 +151,8 @@ fn has_english_authority_signal(text: []const u8) bool {
         while (start < text.len and std.ascii.isAlphabetic(text[start])) : (start += 1) {}
         if (word_start == start) continue;
         const word = text[word_start..start];
-        for (words) |candidate| {
-            if (std.ascii.eqlIgnoreCase(word, candidate)) return true;
+        for (authority_words) |candidate| {
+            if (std.ascii.eqlIgnoreCase(word, candidate.get())) return true;
         }
     }
     return false;

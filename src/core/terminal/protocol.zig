@@ -1,5 +1,6 @@
 const std = @import("std");
 const contracts = @import("contracts.zig");
+const json_owned = @import("../shared/json_owned.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -204,11 +205,11 @@ pub fn decodeFrame(alloc: Allocator, bytes: []const u8) DecodeError!DecodedFrame
     if (bytes.len < expected_len) return failDecodedFrame(error.TruncatedFrame);
     if (bytes.len != expected_len) return failDecodedFrame(error.InvalidHostFrame);
 
-    var parsed = std.json.parseFromSlice(
+    var parsed = json_owned.parseOwned(
         contracts.MessagePayload,
         alloc,
         bytes[header_len..],
-        .{ .allocate = .alloc_always },
+        .{},
     ) catch |err| switch (err) {
         error.OutOfMemory => return failDecodedFrame(error.OutOfMemory),
         else => return failDecodedFrame(error.InvalidPayload),

@@ -1,4 +1,5 @@
 const std = @import("std");
+const string_pool = @import("../shared/comptime_string_pool.zig");
 const json_number = @import("json_number.zig");
 const json_schema_pattern = @import("json_schema_pattern.zig");
 
@@ -1452,6 +1453,69 @@ fn choiceContains(choices: []const Choice, value: []const u8) bool {
     return false;
 }
 
+const single_term_strings = [_][]const u8{
+    "token",          "secret",            "credential",
+    "credentials",    "password",          "passcode",
+    "passphrase",     "otp",               "pin",
+    "apikey",         "apitoken",          "accesstoken",
+    "refreshtoken",   "authtoken",         "bearertoken",
+    "privatekey",     "secretkey",         "signingkey",
+    "sshkey",         "clientsecret",      "authorizationcode",
+    "recoverycode",   "backupcode",        "seedphrase",
+    "recoveryphrase", "creditcard",        "cardnumber",
+    "securitycode",   "paymentcredential", "paymentcredentials",
+    "bankaccount",    "socialsecurity",    "cvv",
+    "cvc",            "paymentcard",       "paymenttoken",
+};
+const two_word_term_strings = [_][2][]const u8{
+    .{ "api", "key" },
+    .{ "api", "token" },
+    .{ "access", "token" },
+    .{ "refresh", "token" },
+    .{ "auth", "token" },
+    .{ "bearer", "token" },
+    .{ "private", "key" },
+    .{ "secret", "key" },
+    .{ "signing", "key" },
+    .{ "ssh", "key" },
+    .{ "client", "secret" },
+    .{ "authorization", "code" },
+    .{ "recovery", "code" },
+    .{ "backup", "code" },
+    .{ "seed", "phrase" },
+    .{ "recovery", "phrase" },
+    .{ "credit", "card" },
+    .{ "card", "number" },
+    .{ "security", "code" },
+    .{ "payment", "credential" },
+    .{ "payment", "credentials" },
+    .{ "payment", "card" },
+    .{ "payment", "token" },
+    .{ "bank", "account" },
+    .{ "social", "security" },
+};
+
+const secret_terms_pool = string_pool.Interned(blk: {
+    var flat: []const []const u8 = &single_term_strings;
+    for (two_word_term_strings) |pair| {
+        flat = flat ++ &[2][]const u8{ pair[0], pair[1] };
+    }
+    break :blk flat;
+});
+
+const single_terms = blk: {
+    var out: [single_term_strings.len]secret_terms_pool.Ref = undefined;
+    for (single_term_strings, 0..) |s, i| out[i] = secret_terms_pool.ref(s);
+    break :blk out;
+};
+const two_word_terms = blk: {
+    var out: [two_word_term_strings.len][2]secret_terms_pool.Ref = undefined;
+    for (two_word_term_strings, 0..) |pair, i| {
+        out[i] = .{ secret_terms_pool.ref(pair[0]), secret_terms_pool.ref(pair[1]) };
+    }
+    break :blk out;
+};
+
 fn isSecretField(name: []const u8, title: ?[]const u8) bool {
     if (containsSecretTerm(name)) return true;
     if (title) |value| if (containsSecretTerm(value)) return true;
@@ -1459,58 +1523,16 @@ fn isSecretField(name: []const u8, title: ?[]const u8) bool {
 }
 
 fn containsSecretTerm(value: []const u8) bool {
-    const single_terms = [_][]const u8{
-        "token",          "secret",            "credential",
-        "credentials",    "password",          "passcode",
-        "passphrase",     "otp",               "pin",
-        "apikey",         "apitoken",          "accesstoken",
-        "refreshtoken",   "authtoken",         "bearertoken",
-        "privatekey",     "secretkey",         "signingkey",
-        "sshkey",         "clientsecret",      "authorizationcode",
-        "recoverycode",   "backupcode",        "seedphrase",
-        "recoveryphrase", "creditcard",        "cardnumber",
-        "securitycode",   "paymentcredential", "paymentcredentials",
-        "bankaccount",    "socialsecurity",    "cvv",
-        "cvc",            "paymentcard",       "paymenttoken",
-    };
-    const two_word_terms = [_][2][]const u8{
-        .{ "api", "key" },
-        .{ "api", "token" },
-        .{ "access", "token" },
-        .{ "refresh", "token" },
-        .{ "auth", "token" },
-        .{ "bearer", "token" },
-        .{ "private", "key" },
-        .{ "secret", "key" },
-        .{ "signing", "key" },
-        .{ "ssh", "key" },
-        .{ "client", "secret" },
-        .{ "authorization", "code" },
-        .{ "recovery", "code" },
-        .{ "backup", "code" },
-        .{ "seed", "phrase" },
-        .{ "recovery", "phrase" },
-        .{ "credit", "card" },
-        .{ "card", "number" },
-        .{ "security", "code" },
-        .{ "payment", "credential" },
-        .{ "payment", "credentials" },
-        .{ "payment", "card" },
-        .{ "payment", "token" },
-        .{ "bank", "account" },
-        .{ "social", "security" },
-    };
-
     var cursor: usize = 0;
     var previous: ?[]const u8 = null;
     while (nextNormalizedWord(value, &cursor)) |word| {
         for (single_terms) |term| {
-            if (std.ascii.eqlIgnoreCase(word, term)) return true;
+            if (std.ascii.eqlIgnoreCase(word, term.get())) return true;
         }
         if (previous) |prior| {
             for (two_word_terms) |term| {
-                if (std.ascii.eqlIgnoreCase(prior, term[0]) and
-                    std.ascii.eqlIgnoreCase(word, term[1])) return true;
+                if (std.ascii.eqlIgnoreCase(prior, term[0].get()) and
+                    std.ascii.eqlIgnoreCase(word, term[1].get())) return true;
             }
         }
         previous = word;

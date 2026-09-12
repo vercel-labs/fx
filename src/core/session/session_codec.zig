@@ -4,6 +4,7 @@ const session = @import("session.zig");
 const session_usage = @import("session_usage.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const types = @import("../shared/types.zig");
+const json_owned = @import("../shared/json_owned.zig");
 const captured_command = @import("../tooling/captured_command.zig");
 const model_provider = @import("../config/model_provider.zig");
 const context_limits = @import("../config/context_limits.zig");
@@ -334,8 +335,7 @@ pub fn decodeSessionMetadata(
     if (bytes.len == 0 or bytes.len > max_session_metadata_bytes) {
         return error.SessionMetadataTooLarge;
     }
-    var parsed = std.json.parseFromSlice(SessionMetadata, alloc, bytes, .{
-        .allocate = .alloc_always,
+    var parsed = json_owned.parseOwned(SessionMetadata, alloc, bytes, .{
         .ignore_unknown_fields = false,
         .max_value_len = max_session_metadata_bytes,
     }) catch |err| switch (err) {
