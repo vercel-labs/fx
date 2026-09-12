@@ -169,7 +169,7 @@ pub const CapabilityResolver = struct {
     ) model_capabilities.ResolveError!void {
         const now = io_mod.milliTimestamp();
         const requested = model_catalog.AccessMetadata.init(input.access);
-        const access_changed = self.provider_id != provider.provider_id or
+        const access_changed = !std.meta.eql(self.provider_id, provider.provider_id) or
             self.requested_access == null or !std.meta.eql(self.requested_access.?, requested);
         const expired = if (provider.refresh_interval_ms) |interval|
             now < self.last_attempt_ms or now - self.last_attempt_ms >= interval

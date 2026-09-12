@@ -10,6 +10,8 @@ pub const Runtime = struct {
     alloc: Allocator,
     active_provider: model_provider.ProviderId = .gateway,
     model: std.ArrayList(u8) = .empty,
+    definitions: @import("../config/configured_provider.zig").Registry = .{},
+    model_requests_blocked: bool = false,
 
     pub fn init(alloc: Allocator) Self {
         return .{ .alloc = alloc };
@@ -17,6 +19,7 @@ pub const Runtime = struct {
 
     pub fn deinit(self: *Self) void {
         self.model.deinit(self.alloc);
+        self.definitions.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -38,8 +41,9 @@ pub const Runtime = struct {
         target_provider: model_provider.ProviderId,
         model_value: []const u8,
     ) !void {
+        const bound = try target_provider.bind(self.definitions);
         var owned = try self.alloc.dupe(u8, model_value);
-        self.adoptOwned(target_provider, &owned);
+        self.adoptOwned(bound, &owned);
     }
 
     /// Transfers `owned_model` into the runtime. All fallible preparation must

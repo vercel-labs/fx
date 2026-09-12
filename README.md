@@ -43,6 +43,51 @@ fx ask "explain the changes in this repository"
 
 Inside the shell, run `/help` to browse interactive commands.
 
+## Custom model connections
+
+The native CLI can use a user-configured OpenAI Chat Completions endpoint, including local servers and gateways such as Ollama and OpenRouter. Add named connections to `~/.fx/settings.json`; keep existing unrelated settings. For example:
+
+```json
+{
+  "provider": "local",
+  "providers": {
+    "local": {
+      "protocol": "openai-chat-completions",
+      "base_url": "http://localhost:11434/v1",
+      "auth": { "type": "none" }
+    },
+    "openrouter": {
+      "protocol": "openai-chat-completions",
+      "base_url": "https://openrouter.ai/api/v1",
+      "auth": { "type": "bearer", "env": "OPENROUTER_API_KEY" }
+    }
+  },
+  "models": {
+    "local": "qwen2.5:7b",
+    "openrouter": "openai/gpt-4.1"
+  }
+}
+```
+
+Use a model actually available on your server. `base_url` includes the API prefix, such as `/v1`; fx adds `/chat/completions`. Remote endpoints require HTTPS. Loopback HTTP is supported for local servers. Anonymous connections send no Authorization header; bearer connections read only their named environment variable, not a Gateway or subscription credential.
+
+```bash
+fx provider local
+fx ask "explain this repository"
+FX_PROVIDER=openrouter FX_MODEL=openai/gpt-4.1 fx ask "review this change"
+fx status --json
+```
+
+`fx provider` saves a preference. `FX_PROVIDER` and `FX_MODEL` affect the invocation without rewriting settings. User-owned workspace overrides can select a connection; committed project `.fx.json` cannot define or select model endpoints. The interactive sign-in picker remains for built-in providers. Configured connections are selected through the file or CLI and work in the interactive shell, `fx ask`, and native ACP.
+
+An explicit model does not require catalog discovery. `fx models` lists model IDs supplied in the connection's optional `model_metadata` object. Its per-model fields are `context_window`, `max_output_tokens`, `supports_tool_use`, and `supports_vision`. Set token limits to the server's actual configuration; without a known context window, automatic compaction cannot determine its threshold. Native image input is not yet implemented by this adapter, even if the backend supports it.
+
+Text and function-tool streaming are supported. Streams must include a finish reason followed by `[DONE]`; partial tool arguments never execute. Provider-specific reasoning/replay formats and the Responses API are not part of this adapter. The default `tool_choice_mode` is `omit` for servers with partial OpenAI compatibility; set it to `send` only when the server supports that field. Required tool outcomes are still validated locally.
+
+Automatic permission review uses the selected model on the same connection. An optional `reviewer_model` in that connection can select another model there. A model that cannot produce a valid review decision leaves the action unapproved; fx never silently uses a cloud reviewer or changes permission mode. Gateway-only search, credits and vision fallback are unavailable on custom connections. Token usage is reported when provided; unknown cost is not treated as zero.
+
+Saved custom sessions retain the connection name and a non-secret endpoint/authentication fingerprint. Changing or removing that connection prevents an implicit resume against a different destination. Existing history remains readable. Built-in sessions retain their existing provider representation; custom sessions require a build that supports configured connections. Invalid profile configuration fails model startup rather than falling back to Gateway. An unsafe profile directory still permits interactive inspection and local recovery, but model requests stay disabled until you repair the profile and restart fx.
+
 ## Embed fx
 
 fx builds as a native binary or WebAssembly. Applications embedding fx can provide network transport, session storage, configuration, permission handling, and terminal I/O.

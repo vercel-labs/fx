@@ -99,12 +99,22 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn ensurePromptCredential(app: *App) !bool {
+            if (comptime @hasField(App, "provider_selection")) {
+                if (app.provider_selection.model_requests_blocked) {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .@"error",
+                        .body = "Repair profile settings and restart fx before sending a message.",
+                    });
+                    return false;
+                }
+            }
             if (try rejectPendingPreparation(app)) return false;
             if (comptime provider_runtime.supported(App) and
                 @hasDecl(@TypeOf(app.auth), "selectForProvider"))
             {
                 const provider = provider_runtime.provider(app);
-                if (!model_provider.authorizesCredential(provider, app.auth.credentialSource())) {
+                if (provider == .configured or !model_provider.authorizesCredential(provider, app.auth.credentialSource())) {
                     const selection = selectProviderCredential(app, provider) catch |err| {
                         if (err == error.OutOfMemory) return err;
                         debug_trace.logf("auth", "prompt credential preference load failed err={s}", .{@errorName(err)});
@@ -129,7 +139,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn selectProviderCredential(app: *App, provider: model_provider.ProviderId) !auth_runtime.ProviderCredentialSelection {
-            if (hostManagesAuth(app) or model_provider.authorizesCredential(provider, app.auth.credentialSource())) return .unchanged;
+            if (hostManagesAuth(app) or (provider != .configured and model_provider.authorizesCredential(provider, app.auth.credentialSource()))) return .unchanged;
             var preferred: ?credentials.Source = null;
             if (provider == .gateway and !host_target.is_wasm) {
                 var settings = try config_runtime.loadMergedSettings(app.alloc, app.workspace_root);
@@ -142,7 +152,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn restoreSessionCredential(app: *App, previous_provider: model_provider.ProviderId) !void {
             // Hydration can run before App.init returns, so it must not start background tasks.
             const provider = provider_runtime.provider(app);
-            const provider_changed = previous_provider != provider;
+            const provider_changed = !previous_provider.same_authority(provider);
             if (provider_changed) {
                 app.auth.cancelPromptCredentialRefresh();
                 app.model_cache.resetForProviderChange();
@@ -170,6 +180,7 @@ pub fn Runtime(comptime App: type) type {
                         .gateway => credentials.missing_interactive_credential_message,
                         .codex => credentials.missing_chatgpt_interactive_credential_message,
                         .grok => credentials.missing_grok_interactive_credential_message,
+                        .configured => "Configured provider authentication is unavailable. Check settings.json and its environment variable.",
                     },
                 }, true),
                 .failed => |failure| {
@@ -193,7 +204,9 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .warning,
-                    .body = if (provider == .grok)
+                    .body = if (provider == .configured)
+                        "Configured provider authentication is unavailable. Check settings.json and its environment variable."
+                    else if (provider == .grok)
                         credentials.missing_grok_interactive_credential_message
                     else
                         credentials.missing_chatgpt_interactive_credential_message,
@@ -278,7 +291,7 @@ pub fn Runtime(comptime App: type) type {
                 .active_source = app.auth.credentialSource(),
                 .available_sources = provider_inventory,
             });
-            const hold_turn_start = logout_provider == selected_provider and logout_provider != .gateway;
+            const hold_turn_start = logout_provider.eql(selected_provider) and logout_provider != .gateway;
             if (hold_turn_start and (app.stream.active or !app.worker.tryHoldTurnStart())) {
                 try writeAuthNotice(app, .{
                     .topic = "auth",
@@ -354,7 +367,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn reconcileSubscriptionLogout(app: *App, removed: model_provider.ProviderId) !void {
             const selected = provider_runtime.provider(app);
-            if (selected != removed) return;
+            if (!selected.eql(removed)) return;
             const candidates = auth_transition.logoutFallbackProviders(.{
                 .requested = removed,
                 .selected = selected,
@@ -1092,7 +1105,7 @@ pub fn Runtime(comptime App: type) type {
                 .catalog_provider = catalog_provider,
                 .models_path = app.model_cache.models_path,
                 .preferred_source = if (target == .gateway) settings.credential_source else null,
-                .primary_model = if (intent == .post_oauth and provider_runtime.provider(app) == target) provider_runtime.model(app) else null,
+                .primary_model = if (intent == .post_oauth and provider_runtime.provider(app).eql(target)) provider_runtime.model(app) else null,
                 .preferred_model = if (intent == .post_oauth) settings.models.get(target) else io_mod.getenv("FX_MODEL") orelse settings.models.get(target),
             });
         }
@@ -1214,7 +1227,7 @@ pub fn Runtime(comptime App: type) type {
                     switch (target) {
                         .codex => try beginCodexSignInForProviderSwitch(app),
                         .grok => try beginGrokSignInForProviderSwitch(app),
-                        .gateway => {},
+                        .gateway, .configured => {},
                     }
                 }
                 if (target == .gateway or !request.allow_login) {
@@ -1824,6 +1837,7 @@ pub fn Runtime(comptime App: type) type {
                 .ai_gateway_api_key,
                 .stored_key,
                 .host_managed,
+                .configured,
                 => {},
             }
         }
@@ -2217,7 +2231,7 @@ test "interactive subscription sign-in rejects active and queued work before OAu
             switch (provider) {
                 .codex => try Runtime(BusySignInApp).beginChatGptSignIn(&app),
                 .grok => try Runtime(BusySignInApp).beginGrokSignIn(&app),
-                .gateway => unreachable,
+                .gateway, .configured => unreachable,
             }
 
             try std.testing.expectEqual(@as(usize, 0), app.auth.start_count);

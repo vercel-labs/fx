@@ -974,7 +974,7 @@ pub const Usage = struct {
             }
             if (std.mem.eql(u8, pending.id, id)) {
                 if (pending.sequence != sequence or
-                    pending.provider != provider or
+                    !pending.provider.same_authority(provider) or
                     !std.mem.eql(u8, pending.origin, origin) or
                     !optionalStringsEqual(pending.team, team) or
                     pending.credential_source != credential_source or
@@ -2168,7 +2168,7 @@ pub const Usage = struct {
                 generation.sequence != saved.sequence or
                 !std.mem.eql(u8, generation.origin, saved.origin) or
                 !optionalStringsEqual(generation.team, saved.team) or
-                generation.provider != saved.provider or
+                !generation.provider.same_authority(saved.provider) or
                 generation.credential_source != saved.credential_source or
                 !optionalCredentialIdentitiesEqual(generation.credential_identity, saved.credential_identity) or
                 !optionalStringsEqual(generation.account_id, saved.account_id) or
@@ -2251,7 +2251,7 @@ const ReconciliationAuthority = struct {
     credential_identity: ?credential_authority.Identity,
 
     fn eql(self: ReconciliationAuthority, other: ReconciliationAuthority) bool {
-        return self.provider == other.provider and
+        return self.provider.same_authority(other.provider) and
             optionalCredentialIdentitiesEqual(self.credential_identity, other.credential_identity);
     }
 };
@@ -2558,7 +2558,7 @@ pub fn billingProjectionEql(first: Snapshot, second: Snapshot) bool {
             left.sequence != right.sequence or
             !std.mem.eql(u8, left.origin, right.origin) or
             !optionalStringsEqual(left.team, right.team) or
-            left.provider != right.provider or
+            !left.provider.same_authority(right.provider) or
             left.credential_source != right.credential_source or
             !optionalCredentialIdentitiesEqual(left.credential_identity, right.credential_identity) or
             !optionalStringsEqual(left.account_id, right.account_id))
@@ -3167,7 +3167,7 @@ fn reconcilePendingBlocking(
 
         var retry_needed = false;
         for (current.pending) |pending| {
-            if (pending.provider != authority.provider or
+            if (!pending.provider.same_authority(authority.provider) or
                 !optionalCredentialIdentitiesEqual(
                     pending.credential_identity,
                     authority.credential_identity,
@@ -3411,7 +3411,8 @@ fn canonicalExactGenerationId(
     try validateExternalGenerationId(external_id);
     var digest: [Sha256.digest_length]u8 = undefined;
     var hash = Sha256.init(.{});
-    hash.update(@tagName(provider));
+    hash.update(provider.label());
+    if (provider == .configured) if (provider.configured.binding) |binding| hash.update(&binding);
     hash.update(&.{0});
     hash.update(external_id);
     hash.final(&digest);
@@ -3426,6 +3427,7 @@ fn exactUsageOrigin(provider: model_provider.ProviderId) []const u8 {
         .gateway => "exact/gateway",
         .codex => "exact/codex",
         .grok => "exact/grok",
+        .configured => "exact/configured",
     };
 }
 

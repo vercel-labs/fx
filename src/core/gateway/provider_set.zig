@@ -18,6 +18,7 @@ pub const Bundle = struct {
         grok,
     };
     pub const Capabilities = struct {
+        gateway_prompt_caching: bool = false,
         fx_search: bool = false,
         vision_fallback: bool = false,
     };
@@ -54,12 +55,20 @@ pub const Set = struct {
     gateway: Bundle,
     codex: Bundle,
     grok: Bundle,
+    definitions: []const @import("../config/configured_provider.zig").Definition = &.{},
+    configured_fn: ?*const fn (*const @import("../config/configured_provider.zig").Definition) Bundle = null,
 
     pub fn select(self: Set, provider: model_provider.ProviderId) Bundle {
         return switch (provider) {
             .gateway => self.gateway,
             .codex => self.codex,
             .grok => self.grok,
+            .configured => blk: {
+                const factory = self.configured_fn orelse break :blk .{};
+                const registry = @import("../config/configured_provider.zig").Registry{ .definitions = self.definitions };
+                const bound = provider.bind(registry) catch break :blk .{};
+                break :blk factory(registry.get(bound.label()).?);
+            },
         };
     }
 

@@ -47,7 +47,7 @@ pub fn parse_preferences(alloc: Allocator, value: std.json.Value) !DurableSessio
         if (!std.mem.eql(u8, try requireString(object, "connection_id"), "vercel")) return error.InvalidDurableField;
         break :blk .gateway;
     } else if (object.contains("provider"))
-        model_provider.parse(try requireString(object, "provider")) orelse return error.InvalidDurableField
+        model_provider.parse_saved(object.get("provider").?) catch return error.InvalidDurableField
     else
         .gateway;
     const model = try requireString(object, if (legacy) "model_id" else "model");
@@ -301,7 +301,7 @@ pub const SessionMetadata = struct {
     created_at_ms: i64,
     updated_at_ms: i64,
     conversation_language: []const u8,
-    provider: []const u8,
+    provider: model_provider.ProviderId,
     model: []const u8,
     effort: []const u8,
     fast_mode: bool,
@@ -405,7 +405,7 @@ fn validateSessionMetadata(metadata: SessionMetadata) !void {
         return error.InvalidSessionMetadata;
     }
     try validateConversationLanguageBytes(metadata.conversation_language);
-    if (model_provider.parse(metadata.provider) == null) return error.InvalidSessionMetadata;
+    if (metadata.provider == .configured and metadata.provider.configured.binding == null) return error.InvalidSessionMetadata;
     try validateModel(metadata.model);
     if (types.ReasoningEffort.parse(metadata.effort) == null) {
         return error.InvalidSessionMetadata;
@@ -875,7 +875,7 @@ fn writeState(writer: *std.Io.Writer, state: DurableSessionState) !void {
     try writer.print(",\"fast_mode\":{s},\"provider\":", .{
         if (state.preferences.fast_mode) "true" else "false",
     });
-    try writeJsonString(writer, @tagName(state.preferences.provider));
+    try std.json.Stringify.value(state.preferences.provider, .{}, writer);
     try writer.writeAll("},\"history\":[");
     for (state.history, 0..) |turn, i| {
         if (i > 0) try writer.writeByte(',');
@@ -1022,7 +1022,7 @@ pub fn writeRecoveryCheckpoint(writer: *std.Io.Writer, checkpoint: RecoveryCheck
     try writer.writeAll(",\"tool_state\":");
     try writeJsonString(writer, @tagName(checkpoint.tool_state));
     try writer.writeAll(",\"authority\":{\"provider\":");
-    try writeJsonString(writer, @tagName(checkpoint.authority.provider));
+    try std.json.Stringify.value(checkpoint.authority.provider, .{}, writer);
     try writer.writeAll(",\"model\":");
     try writeDurableBytes(writer, checkpoint.authority.model);
     try writer.writeAll(",\"credential_source\":");
@@ -1376,8 +1376,7 @@ fn parseTurnAuthority(alloc: Allocator, value: std.json.Value) !TurnAuthority {
         "credential_source",
         "credential_identity",
     });
-    const provider = model_provider.parse(try requireString(object, "provider")) orelse
-        return error.InvalidDurableField;
+    const provider = model_provider.parse_saved(object.get("provider").?) catch return error.InvalidDurableField;
     const model = try parseDurableBytes(alloc, object.get("model") orelse return error.InvalidSessionFormat);
     errdefer alloc.free(model);
     const credential_source = if (object.get("credential_source")) |source| switch (source) {
@@ -4749,7 +4748,7 @@ test "session metadata round trips without conversation or control state" {
         .created_at_ms = 10,
         .updated_at_ms = 20,
         .conversation_language = "en",
-        .provider = "gateway",
+        .provider = .gateway,
         .model = "openai/gpt-5.6",
         .effort = "high",
         .fast_mode = false,

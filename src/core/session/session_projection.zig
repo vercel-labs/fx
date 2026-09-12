@@ -304,7 +304,7 @@ fn durablePreferencesEqual(
     right: session_codec.DurableSessionPreferences,
 ) bool {
     return std.mem.eql(u8, left.model, right.model) and
-        left.provider == right.provider and
+        left.provider.same_authority(right.provider) and
         left.effort.eql(right.effort) and
         left.fast_mode == right.fast_mode;
 }
@@ -481,7 +481,7 @@ fn writePreferences(
     try writer.print(",\"fast_mode\":{s},\"provider\":", .{
         if (preferences.fast_mode) "true" else "false",
     });
-    try writeJsonString(writer, @tagName(preferences.provider));
+    try std.json.Stringify.value(preferences.provider, .{}, writer);
     try writer.writeByte('}');
 }
 

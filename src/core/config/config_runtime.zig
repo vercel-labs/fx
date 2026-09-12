@@ -10,6 +10,7 @@ const settings_store = @import("settings_store.zig");
 const project_config = @import("../mcp/project_config.zig");
 const model_provider = @import("model_provider.zig");
 const model_preferences = @import("model_preferences.zig");
+const configured_provider = @import("configured_provider.zig");
 const update_target = @import("../upgrade/update_target.zig");
 pub const context_limits = @import("context_limits.zig");
 
@@ -37,6 +38,7 @@ pub const Paths = struct {
 };
 
 pub const Settings = struct {
+    providers: ?configured_provider.Registry = null,
     models: model_preferences.Preferences = .{},
     provider: ?model_provider.ProviderId = null,
     permission_mode: ?types.PermissionMode = null,
@@ -68,6 +70,7 @@ pub const Settings = struct {
 
     pub fn deinit(self: *Settings, alloc: Allocator) void {
         self.models.deinit(alloc);
+        if (self.providers) |*providers| providers.deinit(alloc);
         self.permission_rules.deinit(alloc);
         self.* = .{};
     }
@@ -131,15 +134,28 @@ pub const ConfigSources = struct {
 };
 
 pub const ProviderModelSources = struct {
-    values: [std.meta.fields(model_provider.ProviderId).len]ConfigSource =
-        [_]ConfigSource{.compiled_default} ** std.meta.fields(model_provider.ProviderId).len,
+    const Entry = struct { provider: model_provider.NameKey, source: ConfigSource };
+    entries: [model_preferences.max_preferences]?Entry = @splat(null),
 
-    pub fn get(self: ProviderModelSources, provider: model_provider.ProviderId) ConfigSource {
-        return self.values[@intFromEnum(provider)];
+    pub fn get(self: *const ProviderModelSources, provider: model_provider.NameKey) ConfigSource {
+        for (self.entries) |entry| if (entry) |*value| {
+            if (value.provider.eqlName(provider.label())) return value.source;
+        };
+        return .compiled_default;
     }
 
-    pub fn set(self: *ProviderModelSources, provider: model_provider.ProviderId, source: ConfigSource) void {
-        self.values[@intFromEnum(provider)] = source;
+    pub fn set(self: *ProviderModelSources, provider: model_provider.NameKey, source: ConfigSource) !void {
+        for (&self.entries) |*entry| {
+            if (entry.*) |*value| {
+                if (!value.provider.eqlName(provider.label())) continue;
+                value.source = source;
+                return;
+            } else {
+                entry.* = .{ .provider = provider, .source = source };
+                return;
+            }
+        }
+        return error.TooManyModelPreferences;
     }
 };
 
@@ -239,6 +255,26 @@ pub fn discoverPaths(alloc: Allocator, workspace_root: []const u8) !Paths {
 
 pub fn discoverPathsFromHome(alloc: Allocator, home_dir: []const u8, workspace_root: []const u8) !Paths {
     return discoverPathsWithOptionalHome(alloc, home_dir, workspace_root);
+}
+
+fn resolve_provider_selection(settings: *Settings) !void {
+    if (io_mod.getenv("FX_PROVIDER")) |raw| {
+        settings.provider = model_provider.parse(raw) orelse return error.InvalidProviderValue;
+    }
+    if (settings.provider) |provider| settings.provider = try provider.bind(settings.providers orelse .{});
+}
+
+/// Reads only profile-global connection definitions. Caller owns the registry.
+pub fn loadConfiguredProviders(alloc: Allocator) !configured_provider.Registry {
+    var paths = try discoverPaths(alloc, ".");
+    defer paths.deinit(alloc);
+    const bytes = (try readOptionalUserSettingsFile(alloc, paths)) orelse return .{};
+    defer alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{ .duplicate_field_behavior = .@"error" });
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidSettingsShape;
+    const definitions = parsed.value.object.get("providers") orelse return .{};
+    return configured_provider.Registry.parse(alloc, definitions);
 }
 
 pub fn loadMergedSettings(alloc: Allocator, workspace_root: []const u8) !Settings {
@@ -503,16 +539,18 @@ fn loadMergedSettingsDetailedWithOptionalHome(
         }
     }
 
+    try resolve_provider_selection(&settings);
+    if (io_mod.getenv("FX_PROVIDER") != null) sources.provider = .process_override;
     if (io_mod.getenv("FX_MODEL")) |model_override| {
         if (std.mem.trim(u8, model_override, " \t\r\n").len > 0) {
-            sources.models.set(settings.provider orelse .gateway, .process_override);
+            try sources.models.set(model_provider.NameKey.fromProvider(settings.provider orelse .gateway), .process_override);
         }
     }
 
     return .{
         .settings = settings,
         .diagnostics = try diagnostics.toOwnedSlice(alloc),
-        .model_source = sources.models.get(settings.provider orelse .gateway),
+        .model_source = sources.models.get(model_provider.NameKey.fromProvider(settings.provider orelse .gateway)),
         .sources = sources,
         .permission_sources = permission_sources,
         .prompt_history_store_allowed = prompt_history_store_allowed,
@@ -605,6 +643,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "model",
         "models",
         "provider",
+        "providers",
         "codex_model",
         "grok_model",
         "effort",
@@ -650,10 +689,8 @@ fn appendIgnoredProjectProfileSettingDiagnostics(
     }
 }
 
-fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: ConfigSource) void {
-    inline for (std.meta.tags(model_provider.ProviderId)) |provider| {
-        if (settings.models.get(provider) != null) sources.models.set(provider, source);
-    }
+fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: ConfigSource) !void {
+    for (settings.models.entries.items) |entry| try sources.models.set(entry.provider, source);
     if (settings.provider != null) sources.provider = source;
     if (settings.permission_mode != null) sources.permission_mode = source;
     if (settings.effort != null) sources.effort = source;
@@ -698,7 +735,7 @@ fn mergeDetailedSettingsLayer(
     if (parseSettingsValueForLayer(
         alloc,
         value,
-        settings_layer,
+        if (source == .user_workspace) .profile_workspace else settings_layer,
         tolerate_non_object_user_containers,
         source != .user_workspace,
     )) |layer_settings| {
@@ -712,7 +749,7 @@ fn mergeDetailedSettingsLayer(
         if (source == .user_workspace) {
             incoming.update_channel = null;
         }
-        updateConfigSources(state.sources, incoming, source);
+        try updateConfigSources(state.sources, incoming, source);
         if (incoming.has_permission_rules) {
             switch (permission_source) {
                 .none => {},
@@ -727,9 +764,10 @@ fn mergeDetailedSettingsLayer(
                 },
             }
         }
-        mergeSettings(state.settings, &incoming, alloc);
+        try mergeSettings(state.settings, &incoming, alloc);
     } else |err| {
         if (err == error.OutOfMemory) return err;
+        if (diagnostic_layer == .user and value == .object and (value.object.contains("providers") or value.object.contains("provider") or state.settings.provider != null and state.settings.provider.? == .configured)) return err;
         if (diagnostic_layer == .user and err == error.InvalidModelValue) state.prompt_history_store_allowed.* = false;
         try state.diagnostics.append(alloc, .{
             .layer = diagnostic_layer,
@@ -1009,14 +1047,15 @@ pub fn loadMergedSettingsFromPaths(alloc: Allocator, paths: Paths) !Settings {
         var user_settings = try parseSettingsValueForLayer(alloc, parsed.value, .profile, false, true);
         defer user_settings.deinit(alloc);
         user_settings.context_limits.retag(.user_global);
-        mergeSettings(&settings, &user_settings, alloc);
+        try mergeSettings(&settings, &user_settings, alloc);
 
         try mergeWorkspaceOverridesFromValue(&settings, alloc, parsed.value, paths.workspace_root);
+        try resolve_provider_selection(&settings);
         return settings;
     }
 
     try mergeSettingsFile(&settings, alloc, paths.workspace_settings);
-
+    try resolve_provider_selection(&settings);
     return settings;
 }
 
@@ -1107,11 +1146,11 @@ fn mergeWorkspaceOverridesFromValue(target: *Settings, alloc: Allocator, root_va
     const override_val = workspaces_val.object.get(workspace_root) orelse return;
     if (override_val != .object) return;
 
-    var override_settings = try parseSettingsValueForLayer(alloc, override_val, .profile, true, false);
+    var override_settings = try parseSettingsValueForLayer(alloc, override_val, .profile_workspace, true, false);
     defer override_settings.deinit(alloc);
     override_settings.update_channel = null;
     override_settings.context_limits.retag(.user_workspace);
-    mergeSettings(target, &override_settings, alloc);
+    try mergeSettings(target, &override_settings, alloc);
 }
 
 fn mergeSettingsFile(target: *Settings, alloc: Allocator, path: []const u8) !void {
@@ -1120,7 +1159,7 @@ fn mergeSettingsFile(target: *Settings, alloc: Allocator, path: []const u8) !voi
 
     var parsed = try parseSettingsJsonForLayer(alloc, bytes, .project);
     defer parsed.deinit(alloc);
-    mergeSettings(target, &parsed, alloc);
+    try mergeSettings(target, &parsed, alloc);
 }
 
 fn readOptionalFile(alloc: Allocator, path: []const u8) !?[]u8 {
@@ -1160,6 +1199,7 @@ const JsonStringToken = struct {
 
 const SettingsLayer = enum {
     profile,
+    profile_workspace,
     project,
 };
 
@@ -1330,7 +1370,10 @@ fn parseSettingsValueForLayer(
     var settings = Settings{};
     errdefer settings.deinit(alloc);
 
-    if (layer == .profile) try parseProfileOnlyFields(
+    if (layer == .profile) {
+        if (root.object.get("providers")) |value| settings.providers = try configured_provider.Registry.parse(alloc, value);
+    }
+    if (layer != .project) try parseProfileOnlyFields(
         &settings,
         alloc,
         root,
@@ -1377,12 +1420,13 @@ fn parseProfileOnlyFields(
 
     if (root.object.get("models")) |models_value| {
         if (models_value != .object) return error.InvalidModelType;
-        inline for (std.meta.tags(model_provider.ProviderId)) |provider| {
-            if (models_value.object.get(@tagName(provider))) |model_value| {
-                if (model_value != .string) return error.InvalidModelType;
-                settings_store.validateModel(model_value.string) catch return error.InvalidModelValue;
-                try settings.models.putCopy(alloc, provider, model_value.string);
-            }
+        var iterator = models_value.object.iterator();
+        while (iterator.next()) |entry| {
+            const provider = model_provider.parse(entry.key_ptr.*) orelse return error.InvalidProviderValue;
+            const model_value = entry.value_ptr.*;
+            if (model_value != .string) return error.InvalidModelType;
+            settings_store.validateModel(model_value.string) catch return error.InvalidModelValue;
+            try settings.models.putCopy(alloc, provider, model_value.string);
         }
     }
 
@@ -1551,8 +1595,13 @@ fn parseProjectSafeFields(settings: *Settings, root: std.json.Value) !void {
     }
 }
 
-fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void {
-    target.models.mergeOwnedFrom(alloc, &incoming.models);
+fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void {
+    try target.models.mergeOwnedFrom(alloc, &incoming.models);
+    if (incoming.providers) |providers| {
+        if (target.providers) |*old| old.deinit(alloc);
+        target.providers = providers;
+        incoming.providers = null;
+    }
     if (incoming.provider) |value| target.provider = value;
     if (incoming.permission_mode) |value| target.permission_mode = value;
     if (incoming.credential_source) |value| target.credential_source = value;
@@ -2130,7 +2179,7 @@ test "max_tool_result_bytes parses resolves merges and serializes" {
 
     var second = try parseSettingsJson(std.testing.allocator, "{\"max_tool_result_bytes\":131072}");
     defer second.deinit(std.testing.allocator);
-    mergeSettings(&first, &second, std.testing.allocator);
+    try mergeSettings(&first, &second, std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 131072), first.max_tool_result_bytes.?);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"max_tool_result_bytes\":131072}", .{});
@@ -2171,7 +2220,7 @@ test "startup_scrollback parses merges rejects invalid type and round trips" {
 
     var second = try parseSettingsJson(std.testing.allocator, "{\"startup_scrollback\":false}");
     defer second.deinit(std.testing.allocator);
-    mergeSettings(&first, &second, std.testing.allocator);
+    try mergeSettings(&first, &second, std.testing.allocator);
     try std.testing.expectEqual(false, first.startup_scrollback.?);
 
     try std.testing.expectError(error.InvalidStartupScrollbackType, parseSettingsJson(std.testing.allocator, "{\"startup_scrollback\":\"off\"}"));
@@ -2194,7 +2243,7 @@ test "collapse tool calls parses merges and rejects invalid types" {
 
     var second = try parseSettingsJson(std.testing.allocator, "{\"collapse_tool_calls\":false}");
     defer second.deinit(std.testing.allocator);
-    mergeSettings(&first, &second, std.testing.allocator);
+    try mergeSettings(&first, &second, std.testing.allocator);
     try std.testing.expect(!first.collapse_tool_calls.?);
 
     try std.testing.expectError(
@@ -2214,7 +2263,7 @@ test "slash menu categories parses merges and rejects invalid types" {
 
     var second = try parseSettingsJson(std.testing.allocator, "{\"slash_menu_categories\":false}");
     defer second.deinit(std.testing.allocator);
-    mergeSettings(&first, &second, std.testing.allocator);
+    try mergeSettings(&first, &second, std.testing.allocator);
     try std.testing.expectEqual(false, first.slash_menu_categories.?);
 
     try std.testing.expectError(
@@ -2234,7 +2283,7 @@ test "first_call_tool_choice parses merges and round trips" {
 
     var second = try parseSettingsJson(std.testing.allocator, "{\"first_call_tool_choice\":\"auto\"}");
     defer second.deinit(std.testing.allocator);
-    mergeSettings(&first, &second, std.testing.allocator);
+    try mergeSettings(&first, &second, std.testing.allocator);
     try std.testing.expectEqual(types.ToolChoice.auto, first.first_call_tool_choice.?);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"first_call_tool_choice\":\"none\"}", .{});
@@ -3098,7 +3147,7 @@ test "global statusline fields parse and merge independently" {
     );
     defer incoming.deinit(std.testing.allocator);
 
-    mergeSettings(&target, &incoming, std.testing.allocator);
+    try mergeSettings(&target, &incoming, std.testing.allocator);
 
     try std.testing.expectEqual(true, target.statusline_context.?);
     try std.testing.expectEqual(true, target.statusline_session.?);
@@ -3231,7 +3280,7 @@ test "notification settings default off parse and merge by field" {
         "{\"notifications\":{\"attention_required\":true,\"max\":true}}",
     );
     defer workspace.deinit(std.testing.allocator);
-    mergeSettings(&global, &workspace, std.testing.allocator);
+    try mergeSettings(&global, &workspace, std.testing.allocator);
 
     try std.testing.expectEqual(true, global.notification_turn_end.?);
     try std.testing.expectEqual(true, global.notification_attention_required.?);
@@ -3387,7 +3436,7 @@ test "detailed settings expose target sources and permission views" {
     var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
     defer result.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(ConfigSource.user_workspace, result.sources.models.get(.gateway));
+    try std.testing.expectEqual(ConfigSource.user_workspace, result.sources.models.get(model_provider.NameKey.fromProvider(.gateway)));
     try std.testing.expectEqual(ConfigSource.user_workspace, result.sources.permission_mode);
     try std.testing.expectEqual(ConfigSource.compiled_default, result.sources.effort);
     try std.testing.expectEqual(ConfigSource.user_global, result.sources.fast_mode);
@@ -3429,7 +3478,7 @@ test "detailed settings report non-empty process model override as winning sourc
     var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
     defer result.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(ConfigSource.process_override, result.sources.models.get(.gateway));
+    try std.testing.expectEqual(ConfigSource.process_override, result.sources.models.get(model_provider.NameKey.fromProvider(.gateway)));
     try std.testing.expectEqual(ModelSource.process_override, result.model_source.?);
     try std.testing.expectEqualStrings("user/model", result.settings.models.get(.gateway).?);
 }

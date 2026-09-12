@@ -880,9 +880,9 @@ const App = struct {
         self.terminal_input_runtime.deinit(self.alloc);
         self.shell.deinit(self.alloc);
         self.pacer.deinit(self.alloc);
-        self.provider_selection.deinit();
         self.session_title.deinit(self.alloc);
         SessionAppRuntime.deinitPersistence(self);
+        self.provider_selection.deinit();
         if (self.requested_resume) |*target| {
             target.deinit(self.alloc);
             self.requested_resume = null;
@@ -1970,10 +1970,12 @@ const App = struct {
             .permission_reviewer;
     }
 
-    pub fn providerSet(_: *const App) provider_set.Set {
+    pub fn providerSet(self: *const App) provider_set.Set {
+        if (self.provider_selection.model_requests_blocked) return .{ .gateway = .{}, .codex = .{}, .grok = .{} };
         if (comptime host_target.is_wasm) {
             return provider_set.gateway_only(.{
                 .capabilities = .{
+                    .gateway_prompt_caching = true,
                     .vision_fallback = host_profile.tools,
                 },
                 .presentation = provider_catalog.find(.gateway),
@@ -1988,6 +1990,7 @@ const App = struct {
             });
         }
         var providers = builtin_providers.native;
+        providers.definitions = self.provider_selection.definitions.definitions;
         if (comptime !host_profile.tools) {
             providers.gateway.permission_reviewer = null;
             providers.codex.permission_reviewer = null;
@@ -2081,7 +2084,7 @@ const App = struct {
             if (comptime host_target.is_wasm)
                 js_host_model_catalog.provider
             else
-                self.providerSet().select(self.provider_selection.selection().provider).model_catalog orelse unreachable,
+                self.providerSet().select(self.provider_selection.selection().provider).model_catalog orelse return error.ModelCatalogUnavailable,
             builtin_gateway.models_path,
         );
     }
@@ -2098,7 +2101,7 @@ const App = struct {
             );
         } else {
             self.model_cache.startWarmup(
-                self.providerSet().select(self.provider_selection.selection().provider).model_catalog orelse unreachable,
+                self.providerSet().select(self.provider_selection.selection().provider).model_catalog orelse return,
                 self.auth.modelCatalogAccess(),
             );
         }
@@ -4174,6 +4177,8 @@ test "semantic code block preserves indentation on wrapped continuation rows" {
 test {
     _ = @import("napi_fetch_state.zig");
     _ = @import("core/config/model_provider.zig");
+    _ = @import("core/config/configured_provider.zig");
+    _ = @import("gateway/chat_completions_protocol.zig");
     _ = provider_runtime;
     _ = @import("acp/prompt.zig");
     _ = @import("core/output/activity_status.zig");
@@ -4257,6 +4262,8 @@ test {
     _ = @import("core/input/file_completion_state.zig");
     _ = @import("gateway/vercel_protocol.zig");
     _ = @import("core/gateway/provider_set.zig");
+    _ = @import("core/gateway/model_catalog.zig");
+    _ = @import("gateway/chat_completions.zig");
     _ = @import("core/github/git_context.zig");
     _ = @import("core/github/github_publish.zig");
     _ = @import("core/github/github_workflows.zig");

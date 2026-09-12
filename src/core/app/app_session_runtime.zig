@@ -4716,7 +4716,17 @@ pub fn Runtime(comptime App: type) type {
                 app.session_persistence.workspace_preferences,
                 preferences,
             );
-            try provider_runtime.replaceSelection(app, preferences.provider, preferences.model);
+            if (io_mod.getenv("FX_PROVIDER") != null) {
+                var settings = try config_runtime.loadMergedSettings(app.alloc, app.workspace_root);
+                defer settings.deinit(app.alloc);
+                const selected = settings.provider orelse return error.InvalidProviderValue;
+                const model = settings.models.get(selected) orelse fallback: {
+                    const seeded = app.session_persistence.workspace_preferences orelse return error.ConfiguredModelNotSelected;
+                    if (!seeded.provider.eql(selected)) return error.ConfiguredModelNotSelected;
+                    break :fallback seeded.model;
+                };
+                try provider_runtime.replaceSelection(app, selected, model);
+            } else try provider_runtime.replaceSelection(app, preferences.provider, preferences.model);
             if (app.session_persistence.process_model_override) |model| {
                 try provider_runtime.replaceModel(app, model);
             }
@@ -4840,7 +4850,7 @@ fn restoredFastModeModelBound(
 ) bool {
     if (!current_bound) return false;
     const current = configured orelse return false;
-    return current.provider == restored.provider and
+    return current.provider.same_authority(restored.provider) and
         std.mem.eql(u8, current.model, restored.model) and
         current.fast_mode == restored.fast_mode;
 }

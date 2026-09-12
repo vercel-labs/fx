@@ -145,7 +145,7 @@ pub fn run(
     routed_config.tool_context.agent_stream_provider = provider.agent_stream_or_unavailable();
     routed_config.tool_context.permission_reviewer_provider = provider.permission_reviewer;
     routed_config.tool_context.auto_classifier = auto_classifier.Classifier.disabled();
-    if (!model_provider.authorizesCredential(
+    if (admission.provider == .configured or !model_provider.authorizesCredential(
         admission.provider,
         config.tool_context.credential_source,
     )) {
@@ -390,6 +390,8 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .tool_registry = context.config.tool_context.tool_registry,
         .context_registry = context.config.context_registry,
         .context_enabled = context.config.context_enabled,
+        .available_model_capabilities = availableModelCapabilities,
+        .resolve_model_capabilities = resolveModelCapabilities,
         .finalize_turn = finalizeTurn,
         .take_steering_boundary = takeChildSteeringBoundary,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
@@ -430,6 +432,128 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .usage = &context.turn.sessionRuntime().usage,
         .usage_allocator = context.turn.alloc,
     };
+}
+
+fn availableModelCapabilities(raw: *anyopaque, model: []const u8) model_capabilities.Capabilities {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    const provider = context.config.provider_set.select(context.admission.provider);
+    if (provider.model_catalog) |catalog| {
+        if (catalog.lookupCapabilities(model)) |capabilities| return capabilities;
+    }
+    return model_capabilities.capabilitiesForModel(model);
+}
+
+fn resolveModelCapabilities(raw: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    if (context.cancel.load(.seq_cst)) return error.Cancelled;
+    return availableModelCapabilities(raw, model);
+}
+
+test "child runtime capability callbacks preserve fallback and child cancellation" {
+    const session_store = @import("../session/session_store.zig");
+    const catalog = @import("../gateway/model_catalog.zig");
+    const authority = @import("authority.zig");
+    const Fixture = struct {
+        fetches: usize = 0,
+        lookups: usize = 0,
+
+        fn resolve(_: ?*anyopaque, alloc: Allocator, _: []const u8) authority.HostResolveError!authority.HostAuthority {
+            return authority.HostAuthority.capture(alloc, &.{}, &.{}, .{}, &.{});
+        }
+        fn fetch(raw: ?*anyopaque, _: Allocator, _: catalog.FetchInput) Allocator.Error!catalog.ProviderResult {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.fetches += 1;
+            return .{ .failure = .{ .category = .runtime } };
+        }
+        fn lookup(raw: ?*anyopaque, model: []const u8) model_capabilities.Capabilities {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.lookups += 1;
+            return if (std.mem.eql(u8, model, "child-model")) .{ .context_window = 32768, .max_output_tokens = 512 } else .{};
+        }
+        fn output(_: *anyopaque, _: ?types.ToolLifecycleId, _: command_output_content.Stream, _: []const u8) anyerror!void {}
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    var store = try session_store.Store.initFromHome(alloc, root, root);
+    defer store.deinit(alloc);
+    var writable = try store.startWritableSession(alloc, .{
+        .id = @constCast("capability-parent"),
+        .origin_workspace_root = @constCast(root),
+        .workspace_root = @constCast(root),
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .conversation_language = @import("../session/session.zig").ConversationLanguage.literal("en"),
+        .history = &.{},
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+        .preferences = .{ .model = @constCast("parent-model"), .effort = .auto, .fast_mode = false },
+    });
+    defer writable.deinit(alloc);
+    const host = try tool_host.Runtime.create(alloc, &store, "capability-parent", .{ .resolve_fn = Fixture.resolve }, .{});
+    defer host.deinit();
+    var turn = try execution.TurnContext.init(alloc, &writable, 0);
+    defer turn.deinit();
+    var admission = try domain.captureAdmission(alloc, .{ .parent_id = "capability-parent", .source_id = "capability-parent", .model = "parent-model", .effort = .auto });
+    defer admission.deinit(alloc);
+    var fixture: Fixture = .{};
+    var cancel = std.atomic.Value(bool).init(false);
+    var parent_cancel = std.atomic.Value(bool).init(false);
+    const registry = context_contract.Registry{ .default_provider = context_contract.empty_provider };
+    var context = Context{
+        .config = .{
+            .host = host,
+            .tool_context = .{
+                .workspace_root = root,
+                .ignored_list_entries = &.{},
+                .max_list_entries = 100,
+                .max_read_file_bytes = 65536,
+                .max_read_file_lines = 400,
+                .max_read_file_line_len = 2000,
+                .max_command_output_bytes = 65536,
+                .api_key = "",
+                .model = "parent-model",
+                .provider = .grok,
+                .gateway_retry_count = 1,
+                .gateway_chat_url = "",
+                .agent_step_limit = 8,
+                .permission_mode = .ask,
+                .permission_grants = &.{},
+                .permission_rules = .{},
+                .worker = turn.workerRuntime(),
+                .session = turn.sessionRuntime(),
+                .context_registry = registry,
+                .output_chunk_ctx = &fixture,
+                .on_output_chunk = Fixture.output,
+                .cancel_flag = &parent_cancel,
+            },
+            .provider_set = .{ .gateway = .{ .model_catalog = .{ .context = &fixture, .fetch_fn = Fixture.fetch } }, .codex = .{}, .grok = .{} },
+            .system_prompt = "",
+            .context_registry = registry,
+            .context_enabled = false,
+        },
+        .turn = &turn,
+        .admission = admission,
+        .cancel = &cancel,
+        .subagent_id = 1,
+    };
+    const deps = runtimeDeps(&context);
+    const fallback = model_capabilities.capabilitiesForModel("legacy-fast");
+    try std.testing.expectEqualDeep(fallback, deps.available_model_capabilities(deps.ctx, "legacy-fast"));
+    try std.testing.expectEqualDeep(fallback, try deps.resolve_model_capabilities(deps.ctx, alloc, "legacy-fast"));
+    context.config.provider_set.gateway.model_catalog.?.lookup_capabilities_fn = Fixture.lookup;
+    const available = deps.available_model_capabilities(deps.ctx, "child-model");
+    try std.testing.expectEqual(@as(?u32, 512), available.max_output_tokens);
+    try std.testing.expectEqual(@as(?u32, 32768), available.context_window);
+    try std.testing.expectEqualDeep(available, try deps.resolve_model_capabilities(deps.ctx, alloc, "child-model"));
+    try std.testing.expectEqualDeep(model_capabilities.Capabilities{}, deps.available_model_capabilities(deps.ctx, "unknown-fast"));
+    const lookups = fixture.lookups;
+    cancel.store(true, .seq_cst);
+    try std.testing.expectError(error.Cancelled, deps.resolve_model_capabilities(deps.ctx, alloc, "child-model"));
+    try std.testing.expectEqual(lookups, fixture.lookups);
+    try std.testing.expectEqual(@as(usize, 0), fixture.fetches);
 }
 
 fn takeChildSteeringBoundary(

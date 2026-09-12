@@ -259,6 +259,9 @@ pub fn Runtime(comptime App: type) type {
             var selected_model = startup.takeSelectedModel();
             defer if (selected_model.len > 0) app.alloc.free(selected_model);
             if (comptime @hasField(App, "provider_selection")) {
+                app.provider_selection.model_requests_blocked = startup.model_requests_blocked;
+                app.provider_selection.definitions = startup.configured_providers;
+                startup.configured_providers = .{};
                 app.provider_selection.adoptOwned(startup.provider, &selected_model);
             } else {
                 try provider_runtime.replaceModel(app, selected_model);

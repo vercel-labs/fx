@@ -3643,7 +3643,7 @@ fn recoverySelectionChanged(
     selected_model: []const u8,
     selected_fast_mode: bool,
 ) bool {
-    return checkpoint.authority.provider != selected_provider or !std.mem.eql(
+    return !checkpoint.authority.provider.same_authority(selected_provider) or !std.mem.eql(
         u8,
         checkpoint.authority.model,
         selected_model,
@@ -5655,7 +5655,7 @@ pub fn prepareManualCompactionContinuation(
         0,
     );
     var provider_options = model_capabilities.resolveProviderOptionsForCapabilities(capabilities, config.effort, config.fast_mode);
-    provider_options.prompt_caching = true;
+    provider_options.prompt_caching = config.provider_capabilities.gateway_prompt_caching;
     return .{
         .request = .{
             .model = model,
@@ -6799,7 +6799,7 @@ fn processQueuedPromptLoop(
             const request_messages = try runtime_gateway_step.projectToolImageMessages(overlay_arena, materialized_messages, request_capabilities.image_input_support == .native, config.max_tool_result_bytes);
             last_gateway_message_count = gateway_instructions.items.len + request_messages.len;
             var provider_opts = model_capabilities.resolveProviderOptionsForCapabilities(request_capabilities, config.effort, route_fast_mode);
-            provider_opts.prompt_caching = true;
+            provider_opts.prompt_caching = config.provider_capabilities.gateway_prompt_caching;
             runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, route_fast_mode, config.effort, provider_opts);
             const tool_choice: types.ToolChoice = if (recovery_strategy == .reconcile_tool)
                 .none

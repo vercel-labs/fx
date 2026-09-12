@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { createConfiguredProviderFixture, completion as configuredCompletion } from "./fixtures/chat-completions";
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
 import {
   chmodSync,
@@ -843,6 +844,121 @@ class AcpClient {
     });
   }
 }
+
+test.each(["empty", "unrelated"])("configured provider ACP preserves explicit models with %s metadata", async metadata => {
+  const fixture = createConfiguredProviderFixture();
+  (fixture.settings.providers.local as any).model_metadata = {};
+  (fixture.settings.providers.remote as any).model_metadata = metadata === "empty" ? {} : { "other-model": { context_window: 32768, max_output_tokens: 2048 } };
+  fixture.save();
+  const client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+  try {
+    const initialized = await client.request("initialize", { protocolVersion: 1, clientCapabilities: {} }) as any;
+    expect(initialized.error).toBeUndefined();
+    const created = await client.request("session/new", { cwd: fixture.workspace, mcpServers: [] }) as any;
+    if (created.error) throw new Error(JSON.stringify(created));
+    const provider = created.result.configOptions.find((option: any) => option.id === "provider");
+    expect(provider.currentValue).toBe("local");
+    expect(provider.options.map((option: any) => option.value)).toContain("remote");
+    const switched = await client.request("session/set_config_option", { configId: "provider", value: "remote" }) as any;
+    if (switched.error) throw new Error(JSON.stringify(switched));
+    expect(switched.result.configOptions.find((option: any) => option.id === "provider").currentValue).toBe("remote");
+    expect(switched.result.configOptions.find((option: any) => option.id === "model").currentValue).toBe("remote-model");
+    const selected = await client.request("session/set_config_option", { configId: "model", value: "unlisted-model" }) as any;
+    if (selected.error) throw new Error(JSON.stringify(selected));
+    const prompted = await client.request("session/prompt", { prompt: [{ type: "text", text: "hello" }] }) as any;
+    if (prompted.error) throw new Error(JSON.stringify(prompted));
+    expect(fixture.requests).toHaveLength(1);
+    expect(fixture.requests[0].body.model).toBe("unlisted-model");
+    const loaded = await client.request("session/load", { sessionId: created.result.sessionId, cwd: fixture.workspace, mcpServers: [] }) as any;
+    if (loaded.error) throw new Error(JSON.stringify(loaded));
+    const current = loaded.result.configOptions.find((option: any) => option.id === "provider").currentValue;
+    expect(current).toBe("remote");
+    const roundTrip = await client.request("session/set_config_option", { configId: "provider", value: current }) as any;
+    expect(roundTrip.error).toBeUndefined();
+    expect(fixture.requests).toHaveLength(1);
+  } finally { await client.close(); fixture.close(); }
+}, 45000);
+
+test.each(["local", "remote"])("configured provider ACP loading %s stages credentials before canceling the active prompt", async targetProvider => {
+  const target = createConfiguredProviderFixture();
+  const fixture = createConfiguredProviderFixture(body => {
+    if (body.messages.some((message: any) => message.role === "user" && message.content === "hold this")) {
+      return new Response(new ReadableStream({ start(controller) {
+        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ id: "held", model: body.model, choices: [{ index: 0, delta: { content: "alpha pending" }, finish_reason: null }] })}\n\n`));
+      } }), { headers: { "content-type": "text/event-stream" } });
+    }
+    return configuredCompletion(body.model);
+  });
+  (fixture.settings.providers.local as any).auth = { type: "bearer", env: "FX_TEST_LOCAL_TOKEN" };
+  fixture.settings.providers.remote.base_url = target.settings.providers.local.base_url;
+  fixture.save();
+  const env = { ...fixture.env, FX_TEST_LOCAL_TOKEN: "alpha-token" };
+  let client: AcpClient | undefined;
+  try {
+    const saved = await runFx(["ask", "--json", "saved target"], { cwd: fixture.workspace, env: { ...env, FX_PROVIDER: targetProvider } });
+    if (saved.code !== 0) throw new Error(saved.stdout + saved.stderr);
+    const targetId = JSON.parse(saved.stdout).session_id;
+    fixture.requests.length = 0;
+    target.requests.length = 0;
+    client = await AcpClient.create({ cwd: fixture.workspace, env });
+    await client.request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+    const active = await client.request("session/new", { cwd: fixture.workspace, mcpServers: [] }) as any;
+    if (active.error) throw new Error(JSON.stringify(active));
+    client.send({ jsonrpc: "2.0", id: 900, method: "session/prompt", params: { prompt: [{ type: "text", text: "hold this" }] } });
+    await waitForCondition("active configured stream", () => client!.rawLines.some(line => line.includes("alpha pending")), 5000);
+    const definition = (fixture.settings.providers as any)[targetProvider];
+    const originalAuth = definition.auth;
+    definition.auth = { type: "bearer", env: "MISSING_PROVIDER_SLOT" };
+    fixture.save();
+    const rejected = await client.request("session/load", { sessionId: targetId, cwd: fixture.workspace, mcpServers: [] }, 901) as any;
+    expect(rejected.error).toBeDefined();
+    expect(client.rawLines.some(line => JSON.parse(line).id === 900)).toBe(false);
+    definition.auth = originalAuth;
+    fixture.save();
+    const loaded = await client.request("session/load", { sessionId: targetId, cwd: fixture.workspace, mcpServers: [] }, 902) as any;
+    if (loaded.error) throw new Error(JSON.stringify(loaded));
+    const messages = client.rawLines.map(line => JSON.parse(line));
+    const cancelledIndex = messages.findIndex(message => message.id === 900);
+    expect(cancelledIndex).toBeGreaterThanOrEqual(0);
+    expect(cancelledIndex).toBeLessThan(messages.findIndex(message => message.id === 902));
+    expect(messages[cancelledIndex].result.stopReason).toBe("cancelled");
+    const prompted = await client.request("session/prompt", { prompt: [{ type: "text", text: "after load" }] }) as any;
+    if (prompted.error) throw new Error(JSON.stringify(prompted));
+    expect(fixture.requests.every(request => request.authorization === `Bearer ${env.FX_TEST_LOCAL_TOKEN}`)).toBe(true);
+    expect(target.requests.every(request => request.authorization === `Bearer ${env.FX_TEST_PROVIDER_TOKEN}`)).toBe(true);
+    expect(targetProvider === "remote" ? target.requests.length : fixture.requests.length).toBe(targetProvider === "remote" ? 1 : 2);
+    expect(client.stderr).not.toContain("panic");
+    client.endStdin();
+    expect(await client.waitForExit()).toBe(0);
+  } finally { await client?.close(); fixture.close(); target.close(); }
+}, 45000);
+
+test("configured provider ACP prompts and switching preserve connection credentials", async () => {
+  const fixture = createConfiguredProviderFixture();
+  const client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+  try {
+    const initialized = await client.request("initialize", { protocolVersion: 1, clientCapabilities: {}, clientInfo: { name: "provider-test", version: "1" } }) as any;
+    expect(initialized.error).toBeUndefined();
+    const created = await client.request("session/new", { cwd: fixture.workspace, mcpServers: [] }) as any;
+    if (created.error) throw new Error(JSON.stringify(created));
+    const first = await client.request("session/prompt", { prompt: [{ type: "text", text: "hello local" }] }) as any;
+    if (first.error) throw new Error(JSON.stringify(first));
+    expect(fixture.requests).toHaveLength(1);
+    expect(fixture.requests[0].authorization).toBeNull();
+    const switched = await client.request("session/set_config_option", { configId: "provider", value: "remote" }) as any;
+    if (switched.error) throw new Error(JSON.stringify(switched));
+    const second = await client.request("session/prompt", { prompt: [{ type: "text", text: "hello remote" }] }) as any;
+    if (second.error) throw new Error(JSON.stringify(second));
+    expect(fixture.requests).toHaveLength(2);
+    expect(fixture.requests[1].authorization).toBe("Bearer own-provider-token");
+    expect(fixture.requests[1].body.model).toBe("remote-model");
+    client.endStdin();
+    await client.waitForExit();
+  } finally {
+    await client.close();
+    fixture.close();
+  }
+}, 45000);
 
 function createIsolatedRoot(prefix: string) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), prefix)));

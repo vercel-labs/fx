@@ -77,7 +77,7 @@ pub fn Runtime(comptime App: type) type {
                     for (slugs[0..count], 0..) |slug, i| {
                         column.labels[i] = slug;
                         const id = provider_catalog.parse(slug) orelse .gateway;
-                        column.annotations[i] = if (id == active_provider and
+                        column.annotations[i] = if (id.eql(active_provider) and
                             model_provider.authorizesCredential(id, app.auth.credentialSource())) "current" else "";
                     }
                 },
@@ -88,7 +88,7 @@ pub fn Runtime(comptime App: type) type {
                     const methods = provider_picker_catalog.providerMethods(provider);
                     for (methods, 0..) |method, i| {
                         column.labels[i] = provider_picker_catalog.methodSlug(method);
-                        const in_use = provider == active_provider and
+                        const in_use = provider.eql(active_provider) and
                             if (active_source) |source| provider_picker_catalog.methodMatchesSource(method, source) else false;
                         column.annotations[i] = if (in_use) "current" else "";
                     }
@@ -469,7 +469,7 @@ pub fn Runtime(comptime App: type) type {
             // switching after a failed selection would strand the provider
             // without the credential the user just asked it to use.
             if (try auth_rt.applySourceChoice(app, source)) {
-                if (provider_runtime.provider(app) != provider) {
+                if (!provider_runtime.provider(app).eql(provider)) {
                     try auth_rt.applyPickerChoice(app, .{ .provider = provider });
                 }
             }
@@ -483,7 +483,7 @@ pub fn Runtime(comptime App: type) type {
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             const auth_rt = app_auth_runtime.Runtime(App);
             if (try auth_rt.applyTeamChoice(app, index)) {
-                if (provider_runtime.provider(app) != provider) {
+                if (!provider_runtime.provider(app).eql(provider)) {
                     try auth_rt.applyPickerChoice(app, .{ .provider = provider });
                 }
             }

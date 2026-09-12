@@ -107,7 +107,7 @@ class PgsoPipelineTests(unittest.TestCase):
                 "-pgo-kind=pgo-instr-use-pipeline",
                 "-pgo-cold-func-opt=minsize",
                 "-profile-summary-cutoff-cold=600000",
-                "-passes=default<O2>,mergefunc,iroutliner",
+                "-passes=default<O2>,mergefunc",
             ),
             USE_FLAGS,
         )

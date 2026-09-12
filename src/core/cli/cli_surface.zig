@@ -699,6 +699,7 @@ fn runProviderLogin(alloc: Allocator, cfg: Config, provider: model_provider.Prov
         .gateway => try login_flow.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
         .codex => try chatgpt_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
         .grok => try grok_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
+        .configured => return error.ConfiguredProviderUsesEnvironmentAuth,
     }
 }
 
@@ -736,6 +737,26 @@ fn activateProviderSelectionFallible(
     };
     defer settings.deinit(alloc);
 
+    if (target == .configured) {
+        const bound = try target.bind(settings.providers orelse .{});
+        const selected_model = settings.models.get(bound) orelse return error.ConfiguredModelNotSelected;
+        var attempt = config_runtime.attemptUserPreferences(alloc, .{
+            .provider = bound,
+            .model_preference = .{ .provider = bound, .model = selected_model },
+        });
+        defer attempt.deinit(alloc);
+        switch (attempt) {
+            .failure => {
+                try writeProviderActivationError(alloc, deps, caller, "failed to save provider selection");
+                return false;
+            },
+            .outcome => {},
+        }
+        const message = try std.fmt.allocPrint(alloc, "Provider set to {s}.\n", .{bound.label()});
+        defer alloc.free(message);
+        if (caller == .provider_command) try writeStdout(deps, message);
+        return true;
+    }
     const preferred_source = exact_source orelse settings.credential_source;
     var prepared_credential = if (cfg.auth_mode == .host_managed)
         null
@@ -749,7 +770,7 @@ fn activateProviderSelectionFallible(
         );
     defer if (prepared_credential) |*credential| credential.deinit(alloc);
 
-    const already_selected = (settings.provider orelse .gateway) == target;
+    const already_selected = (settings.provider orelse @as(model_provider.ProviderId, .gateway)).eql(target);
     if (caller == .provider_command and already_selected and
         (cfg.auth_mode == .host_managed or prepared_credential != null))
     {
@@ -757,6 +778,7 @@ fn activateProviderSelectionFallible(
             .gateway => "Gateway is already selected.\n",
             .codex => "Codex is already selected.\n",
             .grok => "Grok is already selected.\n",
+            .configured => "Configured provider is already selected.\n",
         });
         return true;
     }
@@ -790,6 +812,7 @@ fn activateProviderSelectionFallible(
                 .codex => "Codex credential is unavailable",
                 .grok => "Grok credential is unavailable",
                 .gateway => "configure a Gateway credential first",
+                .configured => "configure the provider auth environment variable first",
             },
         );
         return false;
@@ -799,6 +822,7 @@ fn activateProviderSelectionFallible(
             .codex => "Codex model catalog is unavailable",
             .grok => "Grok model catalog is unavailable",
             .gateway => "Gateway model catalog is unavailable",
+            .configured => "Configured model catalog is unavailable",
         });
         return false;
     };
@@ -865,13 +889,14 @@ fn activateProviderSelectionFallible(
     if (performed_login) |provider| switch (provider) {
         .codex => try writeStdout(deps, "Signed in with Codex.\n"),
         .grok => try writeStdout(deps, "Signed in with Grok.\n"),
-        .gateway => unreachable,
+        .gateway, .configured => unreachable,
     };
     if (caller == .provider_command) {
         try writeStdout(deps, switch (target) {
             .gateway => "Provider set to Gateway.\n",
             .codex => "Provider set to Codex.\n",
             .grok => "Provider set to Grok.\n",
+            .configured => "Provider set to configured connection.\n",
         });
     }
     return true;
@@ -1016,6 +1041,7 @@ fn runNonInteractiveWithDeps(
                 .gateway => "Signed in to Vercel.\nAI Gateway access may still require billing or API setup for the selected account.\n",
                 .codex => "Signed in with Codex.\n",
                 .grok => "Signed in with Grok.\n",
+                .configured => "Configured providers use settings.json authentication.\n",
             });
             return .handled_success;
         },
@@ -1154,11 +1180,11 @@ fn runNonInteractiveWithDeps(
         },
         .provider => |rest| {
             if (rest.len != 1) {
-                try writeStderr(deps, "usage: fx provider <gateway|codex|grok>\n");
+                try writeStderr(deps, "usage: fx provider <name>\n");
                 return .handled_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {
-                try writeStderr(deps, "fx provider: expected gateway, codex, or grok\n");
+                try writeStderr(deps, "fx provider: expected gateway, codex, grok, or a configured name\n");
                 return .handled_failure;
             };
             return if (try activateProviderSelection(alloc, cfg, deps, target, .provider_command, null))
@@ -1211,6 +1237,7 @@ fn runNonInteractiveWithDeps(
                 .revision = cfg.revision,
             }, mcp_inspection.profile_diagnostic);
             snapshot.mcp = localMcpView(&mcp_inspection);
+            snapshot.provider_endpoint = startup.provider_endpoint;
             if (opts.format == .json) {
                 try writeStatusJsonLine(alloc, deps, snapshot);
                 return .handled_success;
@@ -1272,11 +1299,14 @@ fn runNonInteractiveWithDeps(
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
 
             const catalog_access = startup.modelCatalogAccess();
-            const catalog_provider = cfg.provider_set.select(startup.provider).cli_model_catalog orelse {
+            var available_providers = cfg.provider_set;
+            available_providers.definitions = startup.configured_providers.definitions;
+            const catalog_provider = available_providers.select(startup.provider).cli_model_catalog orelse {
                 try writeStderr(deps, switch (startup.provider) {
                     .gateway => "fx models: Gateway model catalog is unavailable\n",
                     .codex => "fx models: Codex model catalog is unavailable\n",
                     .grok => "fx models: Grok model catalog is unavailable\n",
+                    .configured => "fx models: Configured model catalog is unavailable\n",
                 });
                 return .handled_failure;
             };

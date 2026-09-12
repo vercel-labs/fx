@@ -2028,6 +2028,73 @@ pub fn spawnHttpCancelWatcherBounded(
     return spawn_gateway_cancel_watcher(done, cancel_flag, null, deadline, null, stream);
 }
 
+/// One shared concrete opener result so every backend reuses the same
+/// bounded-operation instantiation instead of specializing per file.
+pub const OpenedPost = struct {
+    request: ?std.http.Client.Request,
+
+    pub fn deinit(self: *OpenedPost, _: std.mem.Allocator) void {
+        if (self.request) |*request| request.deinit();
+        self.request = null;
+    }
+
+    pub fn take(self: *OpenedPost) std.http.Client.Request {
+        const request = self.request.?;
+        self.request = null;
+        return request;
+    }
+};
+
+pub const PostOperation = struct {
+    client: *std.http.Client,
+    uri: std.Uri,
+    authorization: ?[]const u8,
+    extra_headers: []const std.http.Header = &.{},
+
+    pub fn run(self: *PostOperation) !OpenedPost {
+        var headers: std.http.Client.Request.Headers = .{
+            .content_type = .{ .override = "application/json" },
+            .accept_encoding = .omit,
+            .user_agent = .{ .override = user_agent },
+        };
+        if (self.authorization) |value| headers.authorization = .{ .override = value };
+        return .{ .request = try self.client.request(.POST, self.uri, .{
+            .headers = headers,
+            .extra_headers = self.extra_headers,
+            .keep_alive = false,
+            .redirect_behavior = .unhandled,
+        }) };
+    }
+};
+
+pub fn openBoundedPost(
+    alloc: std.mem.Allocator,
+    cancel_flag: *std.atomic.Value(bool),
+    deadline: std.Io.Clock.Timestamp,
+    operation: *PostOperation,
+) !OpenedPost {
+    return runBoundedHttpOperation(OpenedPost, alloc, cancel_flag, deadline, operation);
+}
+
+pub const CancelWatch = struct {
+    done: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+
+    pub fn start(self: *CancelWatch, cancel: *std.atomic.Value(bool), deadline: ?std.Io.Clock.Timestamp, connection: std.Io.net.Stream) !void {
+        self.done.store(false, .seq_cst);
+        self.thread = if (deadline) |limit|
+            try spawnHttpCancelWatcherBounded(&self.done, cancel, limit, connection)
+        else
+            try spawnHttpCancelWatcher(&self.done, cancel, connection);
+    }
+
+    pub fn stop(self: *CancelWatch) void {
+        self.done.store(true, .seq_cst);
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+    }
+};
+
 fn spawn_gateway_cancel_watcher(
     done: *std.atomic.Value(bool),
     cancel_flag: *std.atomic.Value(bool),

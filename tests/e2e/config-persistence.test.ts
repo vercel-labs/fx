@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { createConfiguredProviderFixture, completion as configuredCompletion } from "./fixtures/chat-completions";
 import {
   existsSync,
   mkdirSync,
@@ -6,6 +7,7 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -124,6 +126,137 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
     session = null;
     secondSession = null;
   });
+
+  serialTest("configured provider interactive unsafe profile permits inspection but blocks model sends", async () => {
+    const fixture = createConfiguredProviderFixture();
+    const profile = join(fixture.home, ".fx");
+    const target = join(fixture.home, "profile-target");
+    try {
+      renameSync(profile, target);
+      symlinkSync(target, profile);
+      session = await TmuxSession.create({ cwd: fixture.workspace, env: fixture.env });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("must not send with an unreadable profile");
+      await session.waitForText("restart fx before sending a message", TIMEOUT);
+      expect(fixture.requests).toHaveLength(0);
+      rmSync(profile);
+      renameSync(target, profile);
+      await session.sendKeys("C-u");
+      await session.sendText("must still not send until restart");
+      await Bun.sleep(300);
+      await session.kill();
+      session = null;
+      expect(fixture.requests).toHaveLength(0);
+    } finally {
+      await session?.kill();
+      session = null;
+      fixture.close();
+    }
+  }, TIMEOUT * 2);
+
+  serialTest("configured provider interactive resume isolates keys and honors process selection", async () => {
+    const fixture = createConfiguredProviderFixture();
+    try {
+      (fixture.settings.providers.local as any).auth = { type: "bearer", env: "FX_TEST_LOCAL_TOKEN" };
+      fixture.save();
+      const env = { ...fixture.env, FX_TEST_LOCAL_TOKEN: "local-only-token" };
+      const created = await runFx(["ask", "--json", "remember remote"], { cwd: fixture.workspace, env: { ...env, FX_PROVIDER: "remote" } });
+      if (created.code !== 0) throw new Error(created.stdout + created.stderr);
+      const id = JSON.parse(created.stdout).session_id;
+      for (const [index, override] of [undefined, "local"].entries()) {
+        session = await TmuxSession.create({ cmd: `${JSON.stringify(FX_BIN)} --resume ${JSON.stringify(id)}`, cwd: fixture.workspace, env: { ...env, FX_PROVIDER: override } });
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText(`resume check ${index}`);
+        await session.waitForText("local reply", TIMEOUT);
+        await session.waitForComposer(TIMEOUT);
+        const until = Date.now() + TIMEOUT;
+        while (fixture.requests.length < index + 2 && Date.now() < until) await Bun.sleep(20);
+        expect(fixture.requests).toHaveLength(index + 2);
+        expect(fixture.requests[index + 1].authorization).toBe(override ? "Bearer local-only-token" : "Bearer own-provider-token");
+        expect(fixture.requests[index + 1].body.model).toBe(override ? "local-model" : "remote-model");
+        expect(await session.captureFullScrollbackEscapes()).toContain(`resume check ${index}`);
+        await session.sendText("/quit");
+        await session.waitForSessionEnd(TIMEOUT);
+        session = null;
+      }
+    } finally {
+      await session?.kill();
+      session = null;
+      fixture.close();
+    }
+  }, TIMEOUT * 3);
+
+  serialTest("configured provider interactive resume cannot borrow a key when its own is missing", async () => {
+    const fixture = createConfiguredProviderFixture();
+    try {
+      (fixture.settings.providers.local as any).auth = { type: "bearer", env: "FX_TEST_LOCAL_TOKEN" };
+      fixture.save();
+      const env = { ...fixture.env, FX_TEST_LOCAL_TOKEN: "local-only-token" };
+      const created = await runFx(["ask", "--json", "remember remote"], { cwd: fixture.workspace, env: { ...env, FX_PROVIDER: "remote" } });
+      if (created.code !== 0) throw new Error(created.stdout + created.stderr);
+      const id = JSON.parse(created.stdout).session_id;
+      session = await TmuxSession.create({ cmd: `${JSON.stringify(FX_BIN)} --resume ${JSON.stringify(id)}`, cwd: fixture.workspace, env: { ...env, FX_TEST_PROVIDER_TOKEN: undefined } });
+      await session.waitForText("Configured provider authentication is unavailable", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("must not send with the startup key");
+      await Bun.sleep(500);
+      expect(fixture.requests).toHaveLength(1);
+      expect(await session.captureFullScrollback()).not.toContain("Connect ChatGPT");
+      await session.kill();
+      session = null;
+    } finally {
+      await session?.kill();
+      session = null;
+      fixture.close();
+    }
+  }, TIMEOUT * 2);
+
+  serialTest("configured provider interactive chat and compaction stay on the local connection", async () => {
+    let replies = 0;
+    const fixture = createConfiguredProviderFixture(body => configuredCompletion(body.model, body.tools?.length ? `local reply ${++replies}` : "provider summary"));
+    fixture.settings.providers.local.model_metadata["local-model"].context_window = 65536;
+    fixture.settings.providers.local.model_metadata["local-model"].max_output_tokens = 4096;
+    fixture.save();
+    const stderrPath = join(fixture.home, "stderr.log");
+    try {
+      session = await TmuxSession.create({ cwd: fixture.workspace, env: fixture.env, stderrPath });
+      await session.waitForComposer(TIMEOUT);
+      for (let turn = 1; turn <= 5; turn++) {
+        await session.sendText("remember context " + "detail ".repeat(500));
+        await session.waitForText(`local reply ${turn}`, TIMEOUT);
+        await session.waitForComposer(TIMEOUT);
+      }
+      expect(fixture.requests).toHaveLength(5);
+      await session.sendText("/status");
+      await session.waitForText(`provider_endpoint=${fixture.settings.providers.local.base_url}`, TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("/compact");
+      const until = Date.now() + TIMEOUT;
+      let committed = false;
+      while (Date.now() < until) {
+        const root = join(fixture.home, ".fx", "sessions");
+        if (existsSync(root)) committed = readdirSync(root, { withFileTypes: true }).filter(entry => entry.isDirectory()).some(entry => {
+          const events = join(root, entry.name, "events.jsonl");
+          return existsSync(events) && readFileSync(events, "utf8").includes("provider summary");
+        });
+        if (committed) break;
+        await Bun.sleep(25);
+      }
+      if (!committed) throw new Error(`compaction did not commit; requests=${JSON.stringify(fixture.requests.map(request => ({ bytes: JSON.stringify(request.body).length, tools: request.body.tools?.length, messageBytes: JSON.stringify(request.body.messages).length })))}\n${(await session.captureFullScrollback()).slice(-1500)}`);
+      expect(fixture.requests.length).toBeGreaterThanOrEqual(6);
+      expect(fixture.requests.every(request => request.authorization === null && request.path === "/v1/chat/completions")).toBe(true);
+      const scrollback = await session.captureFullScrollbackEscapes();
+      expect(scrollback).toContain("local reply");
+      await session.sendText("/quit");
+      await session.waitForSessionEnd(TIMEOUT);
+      session = null;
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      await session?.kill();
+      session = null;
+      fixture.close();
+    }
+  }, TIMEOUT * 3);
 
   serialTest(
     "user preferences migrate globally and load in another project",

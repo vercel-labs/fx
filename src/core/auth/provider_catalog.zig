@@ -52,8 +52,19 @@ pub fn parse(value: []const u8) ?model_provider.ProviderId {
     return null;
 }
 
+const configured_entry = Entry{
+    .id = model_provider.parse("configured").?,
+    .slug = "configured",
+    .name = "Configured provider",
+    .route_name = "Configured provider",
+    .description = "Endpoint and authentication from profile settings",
+    .subscription = false,
+    .login_source = .configured,
+};
+
 pub fn find(id: model_provider.ProviderId) *const Entry {
-    for (&entries) |*entry| if (entry.id == id) return entry;
+    if (id == .configured) return &configured_entry;
+    for (&entries) |*entry| if (entry.id.eql(id)) return entry;
     unreachable;
 }
 

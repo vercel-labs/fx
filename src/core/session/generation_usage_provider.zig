@@ -95,6 +95,7 @@ pub const Set = struct {
             .gateway => self.gateway,
             .codex => self.codex,
             .grok => self.grok,
+            .configured => null,
         };
     }
 };

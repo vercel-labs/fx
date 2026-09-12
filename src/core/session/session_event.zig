@@ -1604,7 +1604,7 @@ fn writePayload(writer: *std.Io.Writer, event: Event) !void {
             var wrote = false;
             if (payload.provider) |provider| {
                 try writer.writeAll("\"provider\":");
-                try writeJsonString(writer, @tagName(provider));
+                try std.json.Stringify.value(provider, .{}, writer);
                 wrote = true;
             }
             if (payload.model) |model| {
@@ -1753,8 +1753,7 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
             if (object.count() == 0 or object.count() > 4) return error.InvalidEventFrame;
             try rejectUnknownKeys(object, &.{ "provider", "model", "effort", "fast_mode" });
             const provider = if (object.get("provider")) |provider_value| provider_blk: {
-                if (provider_value != .string) return error.InvalidEventFrame;
-                break :provider_blk model_provider.parse(provider_value.string) orelse return error.InvalidEventFrame;
+                break :provider_blk model_provider.parse_saved(provider_value) catch return error.InvalidEventFrame;
             } else null;
             const model = if (object.get("model")) |_| try dupeString(alloc, object, "model") else null;
             errdefer if (model) |owned| alloc.free(owned);
@@ -1945,7 +1944,7 @@ fn writePreferences(
     try writer.print(",\"fast_mode\":{s},\"provider\":", .{
         if (preferences.fast_mode) "true" else "false",
     });
-    try writeJsonString(writer, @tagName(preferences.provider));
+    try std.json.Stringify.value(preferences.provider, .{}, writer);
     try writer.writeByte('}');
 }
 

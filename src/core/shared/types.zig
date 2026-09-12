@@ -111,6 +111,7 @@ pub const CredentialSource = enum {
     chatgpt_subscription,
     grok_subscription,
     host_managed,
+    configured,
 };
 
 pub const DirectCredentialLease = struct {
@@ -171,7 +172,7 @@ test "empty direct credential lease preserves absent authority" {
 
 pub fn parseCredentialSource(text: []const u8) ?CredentialSource {
     const source = parseRuntimeCredentialSource(text) orelse return null;
-    return if (source == .host_managed) null else source;
+    return if (source == .host_managed or source == .configured) null else source;
 }
 
 pub fn parseRuntimeCredentialSource(text: []const u8) ?CredentialSource {
@@ -180,7 +181,7 @@ pub fn parseRuntimeCredentialSource(text: []const u8) ?CredentialSource {
 
 test "credential source round trips through its persisted name" {
     for (std.meta.tags(CredentialSource)) |source| {
-        if (source == .host_managed) continue;
+        if (source == .host_managed or source == .configured) continue;
         try std.testing.expectEqual(source, parseCredentialSource(@tagName(source)).?);
     }
     try std.testing.expect(parseCredentialSource("keychain") == null);
@@ -1141,7 +1142,7 @@ pub const ProviderReplay = struct {
     parts_json: []const u8,
 
     pub fn matches(self: ProviderReplay, source: @import("../config/model_provider.zig").ProviderSelection) bool {
-        return self.source.provider == source.provider and std.mem.eql(u8, self.source.model, source.model);
+        return self.source.provider.same_authority(source.provider) and std.mem.eql(u8, self.source.model, source.model);
     }
 };
 

@@ -649,7 +649,7 @@ fn encodeConversationMetadataWithTitle(
         .created_at_ms = state.created_at_ms,
         .updated_at_ms = state.updated_at_ms,
         .conversation_language = state.conversation_language.view(),
-        .provider = @tagName(state.preferences.provider),
+        .provider = state.preferences.provider,
         .model = state.preferences.model,
         .effort = state.preferences.effort.label(),
         .fast_mode = state.preferences.fast_mode,
@@ -879,8 +879,7 @@ fn load_conversation_state_at_boundary(
     const language = session.ConversationLanguage.fromSlice(
         metadata.value.conversation_language,
     ) catch return error.InvalidSessionMetadata;
-    const provider = model_provider.parse(metadata.value.provider) orelse
-        return error.InvalidSessionMetadata;
+    const provider = metadata.value.provider;
     const effort = types.ReasoningEffort.parse(metadata.value.effort) orelse
         return error.InvalidSessionMetadata;
     return .{
@@ -3710,7 +3709,7 @@ fn createNativeSession(
         .created_at_ms = initial_state.created_at_ms,
         .updated_at_ms = initial_state.updated_at_ms,
         .conversation_language = initial_state.conversation_language.view(),
-        .provider = @tagName(initial_state.preferences.provider),
+        .provider = initial_state.preferences.provider,
         .model = initial_state.preferences.model,
         .effort = initial_state.preferences.effort.label(),
         .fast_mode = initial_state.preferences.fast_mode,
@@ -4664,7 +4663,7 @@ test "conversation storage creates only metadata and event log" {
         .created_at_ms = 10,
         .updated_at_ms = 10,
         .conversation_language = "en",
-        .provider = "gateway",
+        .provider = .gateway,
         .model = "openai/gpt-5.6",
         .effort = "high",
         .fast_mode = false,

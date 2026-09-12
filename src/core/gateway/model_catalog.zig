@@ -1,6 +1,7 @@
 const std = @import("std");
 const credentials = @import("../auth/credentials.zig");
 const model_provider = @import("../config/model_provider.zig");
+const model_capabilities = @import("../config/model_capabilities.zig");
 const collections = @import("../shared/collections.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -136,9 +137,11 @@ pub const FetchFn = *const fn (
 ) Allocator.Error!ProviderResult;
 
 pub const Provider = struct {
-    /// When set, context must remain valid until every in-flight `fetch` returns.
+    /// When set, context must outlive every in-flight fetch and capability lookup.
     context: ?*anyopaque = null,
     fetch_fn: FetchFn,
+    /// Reads already-owned metadata without allocation, I/O, or waiting.
+    lookup_capabilities_fn: ?*const fn (?*anyopaque, []const u8) model_capabilities.Capabilities = null,
     provider_id: model_provider.ProviderId = .gateway,
     refresh_interval_ms: ?i64 = null,
 
@@ -146,7 +149,38 @@ pub const Provider = struct {
     pub fn fetch(self: Provider, alloc: Allocator, input: FetchInput) Allocator.Error!ProviderResult {
         return self.fetch_fn(self.context, alloc, input);
     }
+
+    /// Null means lookup is unsupported, not that the model is unknown.
+    pub fn lookupCapabilities(self: Provider, model: []const u8) ?model_capabilities.Capabilities {
+        const lookup = self.lookup_capabilities_fn orelse return null;
+        return lookup(self.context, model);
+    }
 };
+
+test "catalog capability lookup distinguishes unsupported and unknown without fetching" {
+    const Fixture = struct {
+        fetches: usize = 0,
+        limit: u32 = 512,
+
+        fn fetch(raw: ?*anyopaque, _: Allocator, _: FetchInput) Allocator.Error!ProviderResult {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.fetches += 1;
+            return .{ .failure = .{ .category = .runtime } };
+        }
+
+        fn lookup(raw: ?*anyopaque, model: []const u8) model_capabilities.Capabilities {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return if (std.mem.eql(u8, model, "known")) .{ .max_output_tokens = self.limit } else .{};
+        }
+    };
+    var fixture: Fixture = .{};
+    var provider = Provider{ .context = &fixture, .fetch_fn = Fixture.fetch };
+    try std.testing.expect(provider.lookupCapabilities("known") == null);
+    provider.lookup_capabilities_fn = Fixture.lookup;
+    try std.testing.expectEqual(@as(?u32, 512), provider.lookupCapabilities("known").?.max_output_tokens);
+    try std.testing.expectEqualDeep(model_capabilities.Capabilities{}, provider.lookupCapabilities("unknown").?);
+    try std.testing.expectEqual(@as(usize, 0), fixture.fetches);
+}
 
 pub const FetchResult = union(enum) {
     loaded: struct {

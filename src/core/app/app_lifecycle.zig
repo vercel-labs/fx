@@ -122,6 +122,8 @@ pub const StartupState = struct {
     credential_onboarding_skipped: bool = false,
     stored_key_status: credentials.StoredKeyReadStatus = .not_attempted,
     fx_login_status: credentials.FxLoginReadStatus = .not_attempted,
+    configured_providers: @import("../config/configured_provider.zig").Registry = .{},
+    model_requests_blocked: bool = false,
     provider: model_provider.ProviderId = .gateway,
     selected_model: []u8 = &.{},
     configured_model: []u8 = &.{},
@@ -157,6 +159,7 @@ pub const StartupState = struct {
 
     pub fn deinit(self: *StartupState, alloc: Allocator) void {
         self.workspace_access.deinit(alloc);
+        self.configured_providers.deinit(alloc);
         if (self.workspace_root.len > 0) alloc.free(self.workspace_root);
         if (self.credential) |*credential| credential.deinit(alloc);
         if (self.selected_model.len > 0) alloc.free(self.selected_model);
@@ -223,6 +226,7 @@ pub const StartupState = struct {
 
 pub const StartupStatus = struct {
     workspace_root: []u8,
+    provider_endpoint: ?[]u8 = null,
     provider: model_provider.ProviderId = .gateway,
     selected_model: []const u8,
     owned_selected_model: ?[]u8 = null,
@@ -234,6 +238,7 @@ pub const StartupStatus = struct {
 
     pub fn deinit(self: *StartupStatus, alloc: Allocator) void {
         alloc.free(self.workspace_root);
+        if (self.provider_endpoint) |endpoint| alloc.free(endpoint);
         if (self.owned_selected_model) |model| alloc.free(model);
         self.auth.deinit(alloc);
         if (self.config_diagnostics.len > 0) {
@@ -405,8 +410,10 @@ pub fn loadStartupStatusWithAuthMode(
         );
     errdefer auth_status.deinit(alloc);
 
+    const definitions: @import("../config/configured_provider.zig").Registry = settings.providers orelse .{};
     const result = StartupStatus{
         .workspace_root = workspace_root,
+        .provider_endpoint = if (definitions.get(configured_selection.provider.label())) |definition| try alloc.dupe(u8, definition.base_url) else null,
         .provider = configured_selection.provider,
         .selected_model = selected_model.value,
         .owned_selected_model = selected_model.owned,
@@ -467,6 +474,18 @@ fn loadStartupStateFromOwnedWorkspace(
         try config_runtime.loadMergedSettingsDetailed(alloc, state.workspace_root);
     defer detailed.deinit(alloc);
     const settings = &detailed.settings;
+    // A rejected profile cannot safely identify the destination of model data.
+    if (auth_mode == .local) for (detailed.diagnostics) |diagnostic| {
+        if (diagnostic.layer != .user) continue;
+        switch (diagnostic.cause) {
+            .durable_path_unsafe => {
+                if (credential_mode != .stored) return error.InvalidProfileConfiguration;
+                state.model_requests_blocked = true;
+            },
+            .malformed_settings, .settings_too_large, .invalid_model_id => return error.InvalidProfileConfiguration,
+            else => {},
+        }
+    };
 
     state.workspace_access = try workspace_access.WorkspaceAccess.init(
         alloc,
@@ -478,6 +497,8 @@ fn loadStartupStateFromOwnedWorkspace(
 
     const configured_selection = try configuredProviderSelection(default_model, settings);
     state.provider = configured_selection.provider;
+    state.configured_providers = settings.providers orelse .{};
+    settings.providers = null;
     state.configured_model = try alloc.dupe(u8, configured_selection.model);
     state.model_source = detailed.model_source orelse .compiled_default;
     state.selected_model = try loadInitialModel(alloc, configured_selection.model, null);
@@ -487,7 +508,7 @@ fn loadStartupStateFromOwnedWorkspace(
     state.prompt_history_enabled = settings.prompt_history_enabled orelse true;
     state.prompt_history_store_allowed = detailed.prompt_history_store_allowed;
     state.credential_source_preference = settings.credential_source;
-    if (auth_mode == .local) {
+    if (auth_mode == .local and !state.model_requests_blocked) {
         if (credential_mode) |mode| {
             const resolution = try credentials.resolveForProvider(
                 alloc,
@@ -1138,6 +1159,7 @@ fn configuredProviderSelection(
         .gateway => default_model,
         .codex => return error.CodexModelNotSelected,
         .grok => return error.GrokModelNotSelected,
+        .configured => io_mod.getenv("FX_MODEL") orelse return error.ConfiguredModelNotSelected,
     };
     return .{ .provider = provider, .model = model };
 }
@@ -1150,15 +1172,17 @@ fn initialModelId(default_model: []const u8, configured: ?[]const u8) []const u8
 
 test "startup provider chooses only its provider-scoped model" {
     var gateway_settings = config_runtime.Settings{ .provider = .gateway };
-    gateway_settings.models.values[@intFromEnum(model_provider.ProviderId.gateway)] = @constCast("gateway/model");
-    gateway_settings.models.values[@intFromEnum(model_provider.ProviderId.codex)] = @constCast("gpt-model");
+    defer gateway_settings.deinit(std.testing.allocator);
+    try gateway_settings.models.putCopy(std.testing.allocator, .gateway, "gateway/model");
+    try gateway_settings.models.putCopy(std.testing.allocator, .codex, "gpt-model");
     const gateway = try configuredProviderSelection("default/model", &gateway_settings);
     try std.testing.expectEqual(model_provider.ProviderId.gateway, gateway.provider);
     try std.testing.expectEqualStrings("gateway/model", gateway.model);
 
     var codex_settings = config_runtime.Settings{ .provider = .codex };
-    codex_settings.models.values[@intFromEnum(model_provider.ProviderId.gateway)] = @constCast("gateway/model");
-    codex_settings.models.values[@intFromEnum(model_provider.ProviderId.codex)] = @constCast("gpt-model");
+    defer codex_settings.deinit(std.testing.allocator);
+    try codex_settings.models.putCopy(std.testing.allocator, .gateway, "gateway/model");
+    try codex_settings.models.putCopy(std.testing.allocator, .codex, "gpt-model");
     const codex = try configuredProviderSelection("default/model", &codex_settings);
     try std.testing.expectEqual(model_provider.ProviderId.codex, codex.provider);
     try std.testing.expectEqualStrings("gpt-model", codex.model);
@@ -1170,7 +1194,8 @@ test "startup provider chooses only its provider-scoped model" {
     );
 
     var grok_settings = config_runtime.Settings{ .provider = .grok };
-    grok_settings.models.values[@intFromEnum(model_provider.ProviderId.grok)] = @constCast("grok-model");
+    defer grok_settings.deinit(std.testing.allocator);
+    try grok_settings.models.putCopy(std.testing.allocator, .grok, "grok-model");
     const grok = try configuredProviderSelection("default/model", &grok_settings);
     try std.testing.expectEqual(model_provider.ProviderId.grok, grok.provider);
     try std.testing.expectEqualStrings("grok-model", grok.model);

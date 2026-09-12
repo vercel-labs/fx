@@ -27,7 +27,7 @@ pub fn provider_work_busy(stream_active: bool, queued_prompts: usize) bool {
 }
 
 pub fn decideProviderSwitch(facts: ProviderSwitchFacts) ProviderSwitchDecision {
-    if (facts.intent == .manual and facts.current == facts.target and facts.target_credential_ready) {
+    if (facts.intent == .manual and facts.current.eql(facts.target) and facts.target_credential_ready) {
         return .no_change;
     }
     if (provider_work_busy(facts.stream_active, facts.queued_prompts)) return .busy;
@@ -61,11 +61,11 @@ pub fn decideLogoutProvider(facts: LogoutFacts) model_provider.ProviderId {
 pub fn logoutFallbackProviders(facts: LogoutFacts) [2]?model_provider.ProviderId {
     var candidates: [2]?model_provider.ProviderId = .{ null, null };
     const removed = decideLogoutProvider(facts);
-    if (removed != facts.selected or removed == .gateway) return candidates;
+    if (!removed.eql(facts.selected) or removed == .gateway) return candidates;
 
     var count: usize = 0;
     for ([_]model_provider.ProviderId{ .gateway, .codex, .grok }) |provider| {
-        if (provider == removed) continue;
+        if (provider.eql(removed)) continue;
         const available = switch (provider) {
             .gateway => facts.available_sources.contains(.vercel_oidc_token) or
                 facts.available_sources.contains(.ai_gateway_api_key) or
@@ -73,6 +73,7 @@ pub fn logoutFallbackProviders(facts: LogoutFacts) [2]?model_provider.ProviderId
                 facts.available_sources.contains(.stored_key),
             .codex => facts.available_sources.contains(.chatgpt_subscription),
             .grok => facts.available_sources.contains(.grok_subscription),
+            .configured => false,
         };
         if (!available) continue;
         candidates[count] = provider;
@@ -94,7 +95,7 @@ test "logout fallback prefers Gateway then the remaining subscription" {
         });
         try std.testing.expectEqual(model_provider.ProviderId.gateway, candidates[0].?);
         try std.testing.expectEqual(
-            if (provider == .codex) model_provider.ProviderId.grok else model_provider.ProviderId.codex,
+            @as(model_provider.ProviderId, if (provider == .codex) .grok else .codex),
             candidates[1].?,
         );
     }
@@ -147,6 +148,7 @@ pub fn signInCompletion(
 ) SignInCompletionAction {
     return switch (provider) {
         .gateway => .vercel,
+        .configured => .{ .switch_provider = provider },
         .codex => if (provider_routing_supported)
             .{ .switch_provider = .codex }
         else
@@ -176,7 +178,7 @@ pub fn decideCredentialChange(
     candidate: CredentialAuthorityFacts,
     secret_changed: bool,
 ) CredentialChange {
-    if (current.provider != candidate.provider or
+    if (!current.provider.same_authority(candidate.provider) or
         current.source != candidate.source or
         !optionalBytesEqual(current.account_id, candidate.account_id) or
         !optionalBytesEqual(current.team, candidate.team))

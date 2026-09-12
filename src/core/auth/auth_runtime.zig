@@ -301,7 +301,7 @@ fn prepareResolvedCredential(
     };
     resolution.credential = null;
 
-    const blocked = credential.token.len == 0 or
+    const blocked = (credential.token.len == 0 and !(provider == .configured and credential.source == .configured)) or
         !model_provider.authorizesCredential(provider, credential.source) or
         credential.needsRefreshAt(now_ms) or
         (credential.source == .fx_login and
@@ -1155,7 +1155,7 @@ pub const Choice = union(enum) {
     pub fn eql(self: Choice, other: Choice) bool {
         return switch (self) {
             .provider => |provider| switch (other) {
-                .provider => |other_provider| provider == other_provider,
+                .provider => |other_provider| provider.eql(other_provider),
                 .source, .action, .team => false,
             },
             .source => |source| switch (other) {
@@ -1297,7 +1297,7 @@ pub const PickerView = struct {
 
     pub fn choiceDescription(self: PickerView, choice: Choice) []const u8 {
         return switch (choice) {
-            .provider => |provider| if (provider == self.active_provider) "current" else "available",
+            .provider => |provider| if (provider.eql(self.active_provider)) "current" else "available",
             .source => |source| if (self.active_source == source) "current" else "available",
             .action => |action| switch (action) {
                 .connections => "",
@@ -1446,6 +1446,7 @@ pub const StatusSnapshot = struct {
                 .interactive => credentials.missing_grok_interactive_credential_message,
             },
             .host_managed => automatic_help,
+            .configured => "The configured provider credential is unavailable. Check its auth environment variable in settings.json; no other provider was selected.",
         };
     }
 
@@ -1522,8 +1523,8 @@ pub fn loadStatusSnapshotForProvider(
         },
     };
     const resolved_source = if (resolution.credential) |credential| credential.source else null;
-    var gateway_connected = resolved_source != null and resolved_source != .chatgpt_subscription and resolved_source != .grok_subscription;
-    const gateway_probe_required = provider == .codex or provider == .grok or
+    var gateway_connected = resolved_source != null and resolved_source != .chatgpt_subscription and resolved_source != .grok_subscription and resolved_source != .configured;
+    const gateway_probe_required = (provider != null and (provider.? == .codex or provider.? == .grok)) or
         resolved_source == .chatgpt_subscription or resolved_source == .grok_subscription;
     if (gateway_probe_required) {
         for ([_]credentials.Source{ .vercel_oidc_token, .ai_gateway_api_key, .fx_login, .stored_key }) |source| {
@@ -2710,7 +2711,7 @@ pub const Runtime = struct {
         preferred: ?credentials.Source,
     ) Allocator.Error!ProviderCredentialSelection {
         if (self.auth_mode == .host_managed or
-            model_provider.authorizesCredential(provider, self.credentialSource())) return .unchanged;
+            (provider != .configured and model_provider.authorizesCredential(provider, self.credentialSource()))) return .unchanged;
 
         var resolution = credentials.resolveForProvider(
             alloc,

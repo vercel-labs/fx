@@ -171,7 +171,7 @@ fn appendShadowedUserSources(
 ) !void {
     var wrote_header = false;
     const model_source = if (patch.model_preference) |preference|
-        sources.models.get(preference.provider)
+        sources.models.get(model_provider.NameKey.fromProvider(preference.provider))
     else
         .compiled_default;
     try appendShadowedUserSource(writer, "model", patch.model_preference != null, model_source, &wrote_header);
@@ -286,6 +286,10 @@ pub fn Commands(comptime App: type) type {
             const text = try (output_contracts.StatusSnapshot{
                 .model = provider_runtime.model(app),
                 .provider = provider,
+                .provider_endpoint = if (comptime @hasField(App, "provider_selection"))
+                    if (app.provider_selection.definitions.get(provider.label())) |definition| definition.base_url else null
+                else
+                    null,
                 .update_channel = update_channel_label(app),
                 .build_channel = if (@hasDecl(App, "build_update_channel")) App.build_update_channel.label() else "stable",
                 .build_revision = if (@hasDecl(App, "build_revision")) App.build_revision else "",
@@ -939,7 +943,7 @@ pub fn Commands(comptime App: type) type {
             const startup_scrollback_label = if (settings.startup_scrollback orelse true) "on" else "off";
             const msg = try std.fmt.allocPrint(app.alloc, "model: {s}\nmodel_config_source: {s}\npermission_mode: {s}\nworkspace: {s}\nstep_limit: {d}\nstartup_scrollback: {s}", .{
                 provider_runtime.model(app),
-                @tagName(detailed.sources.models.get(.gateway)),
+                @tagName(detailed.sources.models.get(model_provider.NameKey.fromProvider(.gateway))),
                 permissions.permissionModeDisplayLabel(app.permission_engine.mode),
                 app.workspace_root,
                 app.agent_step_limit,

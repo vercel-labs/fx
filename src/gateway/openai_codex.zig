@@ -191,45 +191,6 @@ const PreparedStreamOperation = struct {
     }
 };
 
-const OpenedRequest = struct {
-    request: ?std.http.Client.Request,
-
-    pub fn deinit(self: *OpenedRequest, _: Allocator) void {
-        if (self.request) |*request| request.deinit();
-        self.request = null;
-    }
-
-    pub fn take(self: *OpenedRequest) std.http.Client.Request {
-        const request = self.request.?;
-        self.request = null;
-        return request;
-    }
-};
-
-const OpenRequestOperation = struct {
-    client: *std.http.Client,
-    uri: std.Uri,
-    auth_header: ?[]const u8,
-    extra_headers: []const std.http.Header,
-
-    pub fn run(self: *@This()) !OpenedRequest {
-        var headers: std.http.Client.Request.Headers = .{
-            .content_type = .{ .override = "application/json" },
-            .accept_encoding = .omit,
-            .user_agent = .{ .override = gateway_client.user_agent },
-        };
-        if (self.auth_header) |authorization| {
-            headers.authorization = .{ .override = authorization };
-        }
-        return .{ .request = try self.client.request(.POST, self.uri, .{
-            .headers = headers,
-            .extra_headers = self.extra_headers,
-            .keep_alive = false,
-            .redirect_behavior = .unhandled,
-        }) };
-    }
-};
-
 const RequestAuthHeaders = struct {
     authorization: ?[]u8 = null,
     account_id: ?[]u8 = null,
@@ -300,10 +261,10 @@ pub fn streamPrepared(
 
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();
-    var open_operation = OpenRequestOperation{
+    var open_operation = gateway_client.PostOperation{
         .client = &client,
         .uri = uri,
-        .auth_header = auth_headers.authorization,
+        .authorization = auth_headers.authorization,
         .extra_headers = extra_headers_buf[0..extra_count],
     };
     const connect_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
@@ -311,8 +272,7 @@ pub fn streamPrepared(
         .raw = .fromMilliseconds(connect_timeout_ms),
     });
     try request.admission.admit();
-    var opened = try gateway_client.runBoundedHttpOperation(
-        OpenedRequest,
+    var opened = try gateway_client.openBoundedPost(
         alloc,
         request.cancel_flag,
         connect_deadline,
@@ -320,19 +280,10 @@ pub fn streamPrepared(
     );
     var http_request = opened.take();
     defer http_request.deinit();
-    var cancel_watch_done = std.atomic.Value(bool).init(false);
-    const cancel_watcher = if (http_request.connection) |connection|
-        try gateway_client.spawnHttpCancelWatcher(
-            &cancel_watch_done,
-            request.cancel_flag,
-            connection.stream_writer.stream,
-        )
-    else
-        null;
-    defer {
-        cancel_watch_done.store(true, .seq_cst);
-        if (cancel_watcher) |thread| thread.join();
-    }
+    var cancel_watch: gateway_client.CancelWatch = .{};
+    defer cancel_watch.stop();
+    if (http_request.connection) |connection|
+        try cancel_watch.start(request.cancel_flag, null, connection.stream_writer.stream);
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
 
     http_request.transfer_encoding = .{ .content_length = payload.len };

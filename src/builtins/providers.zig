@@ -9,6 +9,7 @@ const xai_grok_permission_reviewer = @import("../gateway/xai_grok_permission_rev
 const provider_catalog = @import("../core/auth/provider_catalog.zig");
 
 pub const native = provider_set.Set{
+    .configured_fn = @import("../gateway/chat_completions.zig").bundle,
     .gateway = gateway.provider_bundle,
     .codex = .{
         .presentation = provider_catalog.find(.codex),

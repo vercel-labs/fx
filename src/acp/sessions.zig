@@ -313,7 +313,7 @@ fn writeNewSessionResponse(
     try writeJsonStr(session_id, &out.writer);
     try out.writer.writeAll(",\"configOptions\":[");
     if (comptime !host_target.is_wasm) {
-        try writeProviderConfigOption(&out.writer, state.active_session.?.provider);
+        try writeProviderConfigOption(&out.writer, state.active_session.?.provider, state.configured_providers.definitions);
         try out.writer.writeAll(",");
     }
     try writeModelConfigOption(
@@ -625,25 +625,29 @@ fn handleRestoreSession(
     const sid_copy = try alloc.dupe(u8, writable.state.id);
     var sid_owned = true;
     defer if (sid_owned) alloc.free(sid_copy);
-    const effective_provider = if (state.process_model_override)
+    const effective_provider = if (state.process_provider_override)
         state.provider
     else
         writable.state.preferences.provider;
-    const effective_model = if (state.process_model_override)
+    const effective_model = if (state.process_model_override or state.process_provider_override)
         state.selected_model
     else
         writable.state.preferences.model;
-    if (!try server.selectCredentialForProvider(state, effective_provider)) {
+    var staged_credential = server.prepareCredentialForProvider(state, effective_provider) catch |err| {
+        if (err != error.ProviderCredentialUnavailable) return err;
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
             .message = if (effective_provider == .codex)
                 credentials.missing_chatgpt_credential_message
             else if (effective_provider == .grok)
                 credentials.missing_grok_credential_message
+            else if (effective_provider == .configured)
+                "Configured provider authentication is unavailable"
             else
                 credentials.missing_credential_message,
         });
-    }
+    };
+    defer if (staged_credential) |*credential| credential.deinit(alloc);
     const model_copy = try alloc.dupe(u8, effective_model);
     var model_owned = true;
     defer if (model_owned) alloc.free(model_copy);
@@ -683,6 +687,7 @@ fn handleRestoreSession(
         .writable = writable,
         .model = model_copy,
         .provider = effective_provider,
+        .credential = if (staged_credential) |*credential| credential else null,
         .fast_mode = writable.state.preferences.fast_mode,
         .effort = writable.state.preferences.effort,
         .session_rt = session_rt,
@@ -854,7 +859,7 @@ fn writeLoadSessionResponse(
     defer out.deinit();
     try out.writer.writeAll("{\"configOptions\":[");
     if (comptime !host_target.is_wasm) {
-        try writeProviderConfigOption(&out.writer, state.active_session.?.provider);
+        try writeProviderConfigOption(&out.writer, state.active_session.?.provider, state.configured_providers.definitions);
         try out.writer.writeAll(",");
     }
     try writeModelConfigOption(
@@ -920,6 +925,7 @@ const SessionActivation = struct {
     writable: session_store.LoadedWritableSession,
     model: []u8,
     provider: model_provider.ProviderId,
+    credential: ?*credentials.Credential = null,
     fast_mode: bool,
     effort: types.ReasoningEffort,
     session_rt: session_runtime.SessionRuntime,
@@ -932,6 +938,7 @@ fn activateSession(
     activation: SessionActivation,
 ) !void {
     try server.releaseActiveSession(state);
+    if (activation.credential) |credential| server.adoptServerCredential(state, credential);
     state.active_session = .{
         .session_id = activation.session_id,
         .store = store,
@@ -1583,12 +1590,20 @@ pub fn writeModelConfigOption(
 pub fn writeProviderConfigOption(
     w: *std.Io.Writer,
     current: model_provider.ProviderId,
+    definitions: []const @import("../core/config/configured_provider.zig").Definition,
 ) !void {
     try w.writeAll("{\"id\":\"provider\",\"name\":\"Provider\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":");
-    try writeJsonStr(@tagName(current), w);
+    try writeJsonStr(current.label(), w);
     try w.writeAll(",\"options\":[{\"value\":\"gateway\",\"name\":\"Vercel AI Gateway\"},{\"value\":\"codex\",\"name\":\"Codex subscription\"}");
     if (comptime !host_target.is_wasm) {
         try w.writeAll(",{\"value\":\"grok\",\"name\":\"Grok subscription\"}");
+        for (definitions) |definition| {
+            try w.writeAll(",{\"value\":");
+            try writeJsonStr(definition.id, w);
+            try w.writeAll(",\"name\":");
+            try writeJsonStr(definition.id, w);
+            try w.writeAll("}");
+        }
     }
     try w.writeAll("]}");
 }
