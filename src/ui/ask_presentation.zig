@@ -335,8 +335,7 @@ const SolveContext = struct {
             self.runtime.alloc,
             self.source,
             paint,
-            false,
-            false,
+            .unchanged,
         );
         self.scroll_facts = scroll_facts;
         const occupied_transcript_rows = if (paint.selection.last_visible_row >= candidate.transcript_area.top)
