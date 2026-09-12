@@ -2,6 +2,16 @@
 
 fx includes material from the following projects and data sources.
 
+## xAI Grok
+
+The terminal Mermaid parser, layout, and Unicode canvas design are adapted
+from the Grok terminal Markdown renderer by xAI.
+
+Copyright 2023-2026 SpaceXAI
+
+Licensed under the Apache License, Version 2.0. The license terms are included
+in the root `LICENSE` file.
+
 ## cuelume
 
 The embedded interface sounds are derived from the sound recipes in
