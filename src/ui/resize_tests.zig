@@ -2867,12 +2867,16 @@ test "completed presentation tail keeps activity slot until turn summary" {
     const footer_after_assistant = try findFirstDividerRowAfter(&h, assistant_row);
     try expectOnlyBlankRowsBetween(&h, assistant_row, footer_after_assistant);
 
+    try std.testing.expect(!h.shell.transcript_band_dirty);
+    try std.testing.expect(!h.shell.render_requests.hasPending());
     _ = try h.shell.appendTurnSummaryEntry(h.alloc, .{
         .thinking_duration_ms = 1_000,
         .turn_duration_ms = 4_000,
         .token_progress = .{ .input_tokens = 200, .output_tokens = 118 },
     });
-    try h.renderTranscriptFrame();
+    try h.renderTranscriptFrameIfDirty();
+    try h.flush();
+    try expectGridContains(&h, "  4s (↑200 ↓118)");
     ctx.completed_assistant_presentation_tail = false;
     h.frame_redraw = true;
     try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);

@@ -3095,7 +3095,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendText(seedPrompt);
-      await session.waitForText(seedReply, TIMEOUT);
+      await waitForScrollback(
+        session,
+        (value) => value.includes(seedReply) && TURN_SUMMARY_WITH_TOKENS.test(value),
+        "completed seed turn before idle submission",
+      );
       await session.waitForComposer(TIMEOUT);
       await session.sendLiteral(submittedPrompt);
       session.sendKeysImmediate(["Enter"]);
