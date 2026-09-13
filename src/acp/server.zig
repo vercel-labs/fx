@@ -21,6 +21,7 @@ const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const hooks = @import("../core/hooks/hooks.zig");
+const builtin_hooks = @import("../builtins/hooks.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
 const mode_registry = @import("../core/modes/mode_registry.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
@@ -289,6 +290,7 @@ pub const ServerState = struct {
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{}),
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
+    otel: builtin_hooks.otel.State = .{},
     host_tools: host_tool_runtime.Runtime = .{},
     host_instructions: []u8 = &.{},
     outbound_mutex: std.Io.Mutex = .init,
@@ -322,6 +324,7 @@ pub const ServerState = struct {
         self.worker.deinit(std.heap.c_allocator);
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
+        self.otel.deinit();
         self.lifecycle_runtime.deinit();
         self.host_tools.deinit();
         if (self.host_instructions.len > 0) self.alloc.free(self.host_instructions);
@@ -746,8 +749,7 @@ pub fn runWithTransport(
         try debug_trace.configure(.{ .file_path = path });
     }
 
-    var lifecycle_runtime = hooks.Runtime.init(alloc);
-    const lifecycle_view = lifecycle_runtime.freeze();
+    const lifecycle_runtime = hooks.Runtime.init(alloc);
     var state = ServerState{
         .alloc = alloc,
         .cfg = cfg,
@@ -760,9 +762,10 @@ pub fn runWithTransport(
         ),
         .managed_executions = managed_execution.Runtime.init(alloc),
         .lifecycle_runtime = lifecycle_runtime,
-        .lifecycle_view = lifecycle_view,
     };
     defer state.deinit();
+    try builtin_hooks.otel.Runtime(ServerState).configure(&state);
+    state.lifecycle_view = state.lifecycle_runtime.freeze();
 
     var reader = reader_value;
     while (!state.terminate_connection) {

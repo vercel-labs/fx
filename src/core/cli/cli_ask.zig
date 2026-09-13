@@ -26,6 +26,7 @@ const file_mutation = @import("../tooling/file_mutation.zig");
 const gateway_error_format = @import("../shared/gateway_error_format.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const hooks = @import("../hooks/hooks.zig");
+const builtin_hooks = @import("../../builtins/hooks.zig");
 const notification_sound = @import("../notifications/sound.zig");
 const io_mod = @import("../shared/io.zig");
 const session_title_generation = @import("../session/session_title_generation.zig");
@@ -594,6 +595,7 @@ const AskContext = struct {
     capability_resolver: gateway_provider.CapabilityResolver = .{},
     lifecycle_runtime: hooks.Runtime,
     lifecycle_view: hooks.RuntimeView,
+    otel: builtin_hooks.otel.State = .{},
     active_turn_id: u64 = 0,
     notification_player: ?notification_sound.Player = null,
     image_snapshot_temp_dir: ?[]u8 = null,
@@ -632,6 +634,7 @@ const AskContext = struct {
         turn_end: bool,
         attention_required: bool,
     ) !void {
+        try builtin_hooks.otel.Runtime(AskContext).configure(self);
         self.notification_player = notification_sound.Player.init(.{
             .ctx = self,
             .emit = emitAskNotificationBell,
@@ -731,6 +734,7 @@ const AskContext = struct {
         self.web_search_runtime.deinit();
         if (self.refreshed_credential) |*credential| credential.deinit(self.alloc);
         self.capability_resolver.deinit(self.alloc);
+        self.otel.deinit();
         self.lifecycle_runtime.deinit();
         if (self.writable) |*writable| writable.deinit(self.alloc);
         self.writable = null;
