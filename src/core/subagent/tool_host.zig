@@ -1330,22 +1330,30 @@ test "creation defaults keep parent values unless the request overrides them" {
         .provider = .gateway,
         .model = "parent-model",
         .effort = .auto,
+        .fast_mode = true,
         .conversation_language = session.ConversationLanguage.default(),
     };
     const inherited = effectiveDefaults(parent, .{});
     try std.testing.expectEqualStrings("parent-model", inherited.model);
     try std.testing.expect(inherited.effort.isDefault());
+    try std.testing.expect(inherited.fast_mode);
     const overridden = effectiveDefaults(parent, .{
         .model = "gpt-5.6-sol-fast",
         .effort = types.ReasoningEffort.parse("medium"),
+        .fast = false,
     });
     try std.testing.expectEqualStrings("gpt-5.6-sol-fast", overridden.model);
     try std.testing.expectEqualStrings("medium", overridden.effort.label());
+    try std.testing.expect(!overridden.fast_mode);
     try std.testing.expectEqual(parent.provider, overridden.provider);
     // Model-only and effort-only overrides leave the other value inherited.
     const model_only = effectiveDefaults(parent, .{ .model = "other-model" });
     try std.testing.expectEqualStrings("other-model", model_only.model);
     try std.testing.expect(model_only.effort.isDefault());
+    try std.testing.expect(model_only.fast_mode);
+    var normal_parent = parent;
+    normal_parent.fast_mode = false;
+    try std.testing.expect(effectiveDefaults(normal_parent, .{ .fast = true }).fast_mode);
 }
 
 fn formatFailedResult(alloc: Allocator, failure: ?[]const u8, partial: ?[]const u8) ![]u8 {
@@ -1518,6 +1526,7 @@ fn effectiveDefaults(
     var resolved = defaults;
     if (override.model) |model| resolved.model = model;
     if (override.effort) |effort| resolved.effort = effort;
+    if (override.fast) |fast| resolved.fast_mode = fast;
     return resolved;
 }
 
@@ -1575,6 +1584,7 @@ fn captureAdmission(
         .model = request.preferences.model,
         .provider = request.preferences.provider,
         .effort = request.preferences.effort,
+        .fast_mode = request.preferences.fast_mode,
         .permission_mode = snapshot.permission_mode,
         .tool_names = snapshot.tools,
         .rules = snapshot.rules,

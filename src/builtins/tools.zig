@@ -181,13 +181,14 @@ const ask_user_question_question_schema = model_tool_schema.ObjectSchema{
 };
 
 const subagent_description =
-    "Delegate work and receive one terminal child result. Use run for one temporary child and one task. Use message with a stable name to create or continue a persistent conversation in this parent session. A plain message to a working child queues feedback for its next safe boundary without cancelling its current tool. A delivery receipt is not the child's final result; that result arrives separately. Optional instructions replace only that child's system overlay between turns; fx preserves its trusted base prompt. Optional model and effort apply only when a child is created and are rejected for an existing child. fx owns timing, worker identities, cancellation, permissions, persistence, and cleanup.";
+    "Delegate work and receive one terminal child result. Use run for one temporary child and one task. Use message with a stable name to create or continue a persistent conversation in this parent session. A plain message to a working child queues feedback for its next safe boundary without cancelling its current tool. A delivery receipt is not the child's final result; that result arrives separately. Optional instructions replace only that child's system overlay between turns; fx preserves its trusted base prompt. Optional model, effort, and Fast mode apply only when a child is created and are rejected for an existing child. fx owns timing, worker identities, cancellation, permissions, persistence, and cleanup.";
 
 const subagent_model_run_properties = [_]model_tool_schema.Property{
     .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"run"} } },
     .{ .name = "task", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_prompt_bytes }, .description = "One complete task for a temporary child. The child accepts no follow-up." },
     .{ .name = "model", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_model_bytes }, .description = "Optional model for this child. Inherits the parent's model when omitted." },
     .{ .name = "effort", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = types.ReasoningEffort.max_name_bytes }, .description = "Optional reasoning effort for this child. Inherits the parent's effort when omitted." },
+    .{ .name = "fast", .json_type = .boolean, .description = "Optional Fast mode for this child. Inherits the parent's Fast mode when omitted." },
 };
 
 const subagent_model_message_properties = [_]model_tool_schema.Property{
@@ -197,6 +198,7 @@ const subagent_model_message_properties = [_]model_tool_schema.Property{
     .{ .name = "message", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_message_bytes }, .description = "Message for that named agent: creates it on first use, continues an idle conversation, or queues feedback for a working child. Do not resend merely to poll for completion." },
     .{ .name = "model", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_model_bytes }, .description = "Optional model applied when this message creates the child. Inherits the parent's model when omitted. Rejected when the named child already exists." },
     .{ .name = "effort", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = types.ReasoningEffort.max_name_bytes }, .description = "Optional reasoning effort applied when this message creates the child. Inherits the parent's effort when omitted. Rejected when the named child already exists." },
+    .{ .name = "fast", .json_type = .boolean, .description = "Optional Fast mode applied when this message creates the child. Inherits the parent's Fast mode when omitted. Rejected when the named child already exists." },
 };
 
 const subagent_model_action_schemas = [_]model_tool_schema.ObjectSchema{
@@ -933,7 +935,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "f22369b30518c28caadeb5275297ada8655741986eb8125086e01665f1288a41",
+        "cf48f93ff5812c2271d5312b5a07b984189127f58406c9d6712d709249190620",
         &actual_hex,
     );
 }
@@ -1385,7 +1387,9 @@ test "built-in subagent owns product metadata schema and callbacks" {
     // Creation-time routing overrides are advertised on both actions.
     try std.testing.expect(std.mem.find(u8, schema_json, "\"model\":") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"effort\":") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"fast\":") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "Inherits the parent's model when omitted") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "Inherits the parent's Fast mode when omitted") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "Rejected when the named child already exists") != null);
     for ([_][]const u8{
         "\"command\":",

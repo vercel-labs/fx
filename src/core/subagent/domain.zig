@@ -47,6 +47,7 @@ pub const AdmissionSnapshot = struct {
     model: []u8,
     provider: model_provider.ProviderId = .gateway,
     effort: types.ReasoningEffort,
+    fast_mode: bool = false,
     permission_mode: types.PermissionMode = .yolo,
     tool_names: [][]u8,
     rules: types.PermissionRuleSet,
@@ -76,6 +77,7 @@ pub const AdmissionInput = struct {
     model: []const u8,
     provider: model_provider.ProviderId = .gateway,
     effort: types.ReasoningEffort,
+    fast_mode: bool = false,
     permission_mode: types.PermissionMode = .yolo,
     tool_names: []const []const u8 = &.{},
     rules: types.PermissionRuleSet = .{},
@@ -152,6 +154,7 @@ pub fn captureAdmission(
         .model = model,
         .provider = input.provider,
         .effort = input.effort,
+        .fast_mode = input.fast_mode,
         .permission_mode = input.permission_mode,
         .tool_names = tool_names,
         .rules = rules,
@@ -237,8 +240,10 @@ test "captured admission owns independent authority slices" {
         .source_id = "01J00000000000000000000000",
         .model = "test/model",
         .effort = .auto,
+        .fast_mode = true,
         .tool_names = &.{"read_file"},
     });
     defer snapshot.deinit(alloc);
     try std.testing.expectEqualStrings("read_file", snapshot.tool_names[0]);
+    try std.testing.expect(snapshot.fast_mode);
 }

@@ -103,21 +103,23 @@ fn parseRoot(value: std.json.Value) DecodeError!model_contract.RequestInput {
     const action = try requiredString(request, "action");
 
     if (std.mem.eql(u8, action, "run")) {
-        try rejectUnknown(request, &.{ "action", "task", "model", "effort" });
+        try rejectUnknown(request, &.{ "action", "task", "model", "effort", "fast" });
         return .{ .run = .{
             .task = try requiredString(request, "task"),
             .model = try optionalString(request, "model"),
             .effort = try optionalString(request, "effort"),
+            .fast = try optionalBool(request, "fast"),
         } };
     }
     if (std.mem.eql(u8, action, "message")) {
-        try rejectUnknown(request, &.{ "action", "agent", "instructions", "message", "model", "effort" });
+        try rejectUnknown(request, &.{ "action", "agent", "instructions", "message", "model", "effort", "fast" });
         return .{ .message = .{
             .agent = try requiredString(request, "agent"),
             .instructions = try optionalString(request, "instructions"),
             .message = try requiredString(request, "message"),
             .model = try optionalString(request, "model"),
             .effort = try optionalString(request, "effort"),
+            .fast = try optionalBool(request, "fast"),
         } };
     }
     return error.InvalidEnum;
@@ -145,6 +147,14 @@ fn optionalString(
 ) DecodeError!?[]const u8 {
     const value = object.get(key) orelse return null;
     return try stringValue(value);
+}
+
+fn optionalBool(
+    object: std.json.ObjectMap,
+    key: []const u8,
+) DecodeError!?bool {
+    const value = object.get(key) orelse return null;
+    return if (value == .bool) value.bool else error.InvalidFieldType;
 }
 
 fn rejectUnknown(
@@ -180,12 +190,13 @@ pub fn call(
     const request = &erased.as(Input).request;
     debug_trace.logf(
         "subagent",
-        "request accepted action={s} agent={s} model_override={s} effort_override={s}",
+        "request accepted action={s} agent={s} model_override={s} effort_override={s} fast_override={s}",
         .{
             @tagName(request.action()),
             request.agentName() orelse "none",
             request.override().model orelse "none",
             if (request.override().effort) |effort| effort.label() else "none",
+            if (request.override().fast) |fast| if (fast) "true" else "false" else "none",
         },
     );
     const result = try provider.execute(
@@ -305,8 +316,10 @@ test "decode accepts only delegation intents" {
     try expectRequestTag("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\"}}", .message);
     try expectRequestTag("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"instructions\":\"Review strictly.\",\"message\":\"next\"}}", .message);
     try expectRequestTag("{\"request\":{\"action\":\"run\",\"task\":\"do it\",\"model\":\"gpt-5.6-sol-fast\",\"effort\":\"medium\"}}", .run);
+    try expectRequestTag("{\"request\":{\"action\":\"run\",\"task\":\"do it\",\"fast\":true}}", .run);
     try expectRequestTag("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\",\"model\":\"gpt-5.6-sol-fast\"}}", .message);
     try expectRequestTag("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\",\"effort\":\"high\"}}", .message);
+    try expectRequestTag("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\",\"fast\":false}}", .message);
     try expectDecodeFailure("{\"request\":{\"action\":\"wait\",\"child_id\":\"01J00000000000000000000000\"}}", "invalid_enum");
     try expectDecodeFailure("{\"request\":{\"action\":\"stop\",\"child_id\":\"01J00000000000000000000000\"}}", "invalid_enum");
     try expectDecodeFailure("{\"request\":{\"action\":\"cancel\",\"child_id\":\"01J00000000000000000000000\"}}", "invalid_enum");
@@ -316,6 +329,7 @@ test "decode rejects invalid creation overrides" {
     try expectDecodeFailure("{\"request\":{\"action\":\"run\",\"task\":\"do it\",\"model\":\"\"}}", "invalid_model");
     try expectDecodeFailure("{\"request\":{\"action\":\"run\",\"task\":\"do it\",\"effort\":\"not an effort!\"}}", "invalid_effort");
     try expectDecodeFailure("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\",\"model\":7}}", "invalid_field_type");
+    try expectDecodeFailure("{\"request\":{\"action\":\"run\",\"task\":\"do it\",\"fast\":\"yes\"}}", "invalid_field_type");
     try expectDecodeFailure("{\"request\":{\"action\":\"run\",\"task\":\"do it\",\"provider\":\"gateway\"}}", "unknown_field");
 }
 

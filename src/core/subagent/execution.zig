@@ -153,6 +153,7 @@ pub const TurnPreferences = struct {
     provider: @import("../config/model_provider.zig").ProviderId = .gateway,
     model: []const u8,
     effort: types.ReasoningEffort,
+    fast_mode: bool = false,
 };
 
 pub const CaptureRequest = struct {

@@ -8,6 +8,8 @@ const credentials = @import("../auth/credentials.zig");
 const secret = @import("../auth/secret.zig");
 const model_provider = @import("../config/model_provider.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const gateway_provider = @import("../gateway/gateway_provider.zig");
+const gateway_model_catalog = @import("../gateway/model_catalog.zig");
 const provider_set = @import("../gateway/provider_set.zig");
 const auto_classifier = @import("../permissions/auto_classifier.zig");
 const command_admission = @import("../permissions/command_admission.zig");
@@ -42,6 +44,28 @@ fn childModelCapabilityResolver(
     return parent;
 }
 
+fn resolveChildModelCapabilities(
+    resolver: *gateway_provider.CapabilityResolver,
+    alloc: Allocator,
+    providers: provider_set.Set,
+    provider_id: model_provider.ProviderId,
+    access: credentials.CatalogAccess,
+    endpoint: []const u8,
+    cancel: *std.atomic.Value(bool),
+    fast_mode: bool,
+    model: []const u8,
+) model_capabilities.ResolveError!model_capabilities.Capabilities {
+    if (!fast_mode) return model_capabilities.capabilitiesForModel(model);
+    const provider = providers.select(provider_id);
+    const fallback = provider.fallbackModelCapabilities(model);
+    const catalog = provider.model_catalog orelse return fallback;
+    return resolver.resolve(alloc, catalog, .{
+        .access = access,
+        .endpoint = endpoint,
+        .cancel_flag = cancel,
+    }, model, fallback);
+}
+
 pub const Config = struct {
     host: *tool_host.Runtime,
     tool_context: tool_runtime.Context,
@@ -64,6 +88,7 @@ const Context = struct {
     admission: domain.AdmissionSnapshot,
     cancel: *std.atomic.Value(bool),
     subagent_id: u64,
+    provider_capability_resolver: gateway_provider.CapabilityResolver = .{},
     input_tokens: u64 = 0,
     output_tokens: u64 = 0,
     turn_outcome: ?types.TurnPresentationOutcome = null,
@@ -171,15 +196,17 @@ pub fn run(
     }
     routed_config.tool_context.model = admission.model;
     routed_config.tool_context.provider = admission.provider;
+    routed_config.tool_context.fast_mode = admission.fast_mode;
     routed_config.tool_context.provider_capabilities = config.provider_set.select(admission.provider).capabilities;
     debug_trace.logf(
         "subagent",
-        "child turn routed child_id={s} provider={s} model={s} effort={s}",
+        "child turn routed child_id={s} provider={s} model={s} effort={s} fast_mode={}",
         .{
             turn.child_id orelse "unknown",
             @tagName(admission.provider),
             admission.model,
             admission.effort.label(),
+            admission.fast_mode,
         },
     );
     if (!routed_config.tool_context.provider_capabilities.fx_search) {
@@ -201,6 +228,7 @@ pub fn run(
         .cancel = cancel,
         .subagent_id = trace_context.subagent_id,
     };
+    defer context.provider_capability_resolver.deinit(turn.alloc);
     defer if (context.refreshed_credential) |*credential| credential.deinit(turn.alloc);
     const recovery_checkpoint = turn.prepareRecoveryForActiveWork(arena) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -235,7 +263,7 @@ pub fn run(
         .agent_settings = .{
             .max_tool_result_bytes = config.tool_context.max_tool_result_bytes,
             .first_call_tool_choice = config.tool_context.first_call_tool_choice,
-            .fast_mode = config.tool_context.fast_mode,
+            .fast_mode = admission.fast_mode,
             .effort = admission.effort,
         },
         .recovery_checkpoint = recovery_checkpoint,
@@ -296,7 +324,7 @@ pub fn run(
             .agent_step_limit = config.tool_context.agent_step_limit,
             .max_tool_result_bytes = config.tool_context.max_tool_result_bytes,
             .cancel_flag = cancel,
-            .fast_mode = config.tool_context.fast_mode,
+            .fast_mode = admission.fast_mode,
             .effort = admission.effort,
             .first_call_tool_choice = config.tool_context.first_call_tool_choice,
             .workspace_root = config.tool_context.workspace_root,
@@ -425,11 +453,41 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .push_command_output_complete = pushLiveCommandOutputComplete,
         .push_http_error = captureHttpError,
         .refresh_gateway_credential = refreshGatewayCredential,
+        .available_model_capabilities = availableModelCapabilities,
+        .resolve_model_capabilities = resolveModelCapabilities,
         .format_tool_execution_error = formatToolExecutionError,
         .report_usage = reportUsage,
         .usage = &context.turn.sessionRuntime().usage,
         .usage_allocator = context.turn.alloc,
     };
+}
+
+fn availableModelCapabilities(raw: *anyopaque, model: []const u8) model_capabilities.Capabilities {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    if (!context.admission.fast_mode) return model_capabilities.capabilitiesForModel(model);
+    const fallback = context.config.provider_set.select(context.admission.provider).fallbackModelCapabilities(model);
+    return context.provider_capability_resolver.available(model, fallback);
+}
+
+fn resolveModelCapabilities(raw: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    const tool_context = context.config.tool_context;
+    return resolveChildModelCapabilities(
+        &context.provider_capability_resolver,
+        context.turn.alloc,
+        context.config.provider_set,
+        context.admission.provider,
+        credentials.catalogAccessForCredentialAndAccount(
+            tool_context.credential_source,
+            tool_context.api_key,
+            tool_context.gateway_team,
+            tool_context.account_id,
+        ),
+        tool_context.gateway_models_path,
+        context.cancel,
+        context.admission.fast_mode,
+        model,
+    );
 }
 
 fn takeChildSteeringBoundary(
@@ -613,6 +671,97 @@ test "subagent inherits model capabilities" {
     try std.testing.expect(inherited != null);
     try std.testing.expectEqual(resolver.ctx, inherited.?.ctx);
     try std.testing.expectEqual(resolver.resolve_fn, inherited.?.resolve_fn);
+}
+
+test "subagent runtime resolves Fast capabilities from its admitted provider" {
+    const alloc = std.testing.allocator;
+    const ProviderFixture = struct {
+        calls: usize = 0,
+        expected_cancel: *std.atomic.Value(bool),
+        saw_expected_cancel: bool = false,
+
+        fn fallback(_: []const u8) model_capabilities.Capabilities {
+            return .{ .supports_fast_mode = true, .context_window = 128_000 };
+        }
+
+        fn fetch(
+            raw: ?*anyopaque,
+            allocator: Allocator,
+            input: gateway_model_catalog.FetchInput,
+        ) Allocator.Error!gateway_model_catalog.ProviderResult {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            self.saw_expected_cancel = input.cancel_flag != null and input.cancel_flag.? == self.expected_cancel;
+            var entries: std.ArrayList(gateway_model_catalog.ModelCatalogEntry) = .empty;
+            errdefer gateway_model_catalog.freeModelCatalog(allocator, &entries);
+            const id = try allocator.dupe(u8, "codex/child-model");
+            errdefer allocator.free(id);
+            const model_type = try allocator.dupe(u8, "language");
+            errdefer allocator.free(model_type);
+            try entries.append(allocator, .{
+                .id = id,
+                .model_type = model_type,
+                .supports_fast_mode = true,
+            });
+            return .{ .catalog = entries };
+        }
+    };
+    var parent_cancel: std.atomic.Value(bool) = .init(false);
+    var child_cancel: std.atomic.Value(bool) = .init(false);
+    var gateway_fixture = ProviderFixture{ .expected_cancel = &parent_cancel };
+    var codex_fixture = ProviderFixture{ .expected_cancel = &child_cancel };
+    const providers = provider_set.Set{
+        .gateway = .{
+            .fallback_model_capabilities_fn = ProviderFixture.fallback,
+            .model_catalog = .{
+                .context = &gateway_fixture,
+                .fetch_fn = ProviderFixture.fetch,
+                .provider_id = .gateway,
+            },
+        },
+        .codex = .{
+            .model_catalog = .{
+                .context = &codex_fixture,
+                .fetch_fn = ProviderFixture.fetch,
+                .provider_id = .codex,
+            },
+        },
+        .grok = .{},
+    };
+    var provider_resolver: gateway_provider.CapabilityResolver = .{};
+    defer provider_resolver.deinit(alloc);
+
+    const normal_resolved = try resolveChildModelCapabilities(
+        &provider_resolver,
+        alloc,
+        providers,
+        .gateway,
+        .{ .public_only = .no_credential },
+        "/models",
+        &child_cancel,
+        false,
+        "gateway/child-model-fast",
+    );
+    try std.testing.expect(!normal_resolved.supports_fast_mode);
+    try std.testing.expect(normal_resolved.intrinsic_fast);
+    try std.testing.expect(normal_resolved.context_window == null);
+    try std.testing.expectEqual(@as(usize, 0), gateway_fixture.calls);
+
+    const fast_resolved = try resolveChildModelCapabilities(
+        &provider_resolver,
+        alloc,
+        providers,
+        .codex,
+        .{ .public_only = .no_credential },
+        "/models",
+        &child_cancel,
+        true,
+        "codex/child-model",
+    );
+    try std.testing.expect(fast_resolved.supports_fast_mode);
+    try std.testing.expectEqual(@as(usize, 0), gateway_fixture.calls);
+    try std.testing.expectEqual(@as(usize, 1), codex_fixture.calls);
+    try std.testing.expect(codex_fixture.saw_expected_cancel);
 }
 
 fn snapshotMcpDefinition(raw: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {

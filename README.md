@@ -61,7 +61,7 @@ The SDK is published to npm as [libfx](https://www.npmjs.com/package/libfx). For
 
 - [Skills](https://fx.sh/docs/capabilities/skills): reusable instructions the agent loads when invoked
 - [MCP](https://fx.sh/docs/capabilities/mcp): connect external tools and servers
-- [Subagents](https://fx.sh/docs/capabilities/subagents): delegate independent work
+- [Subagents](https://fx.sh/docs/capabilities/subagents): delegate independent work with per-agent model, effort, and Fast mode settings
 
 ## Documentation
 

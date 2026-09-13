@@ -12,6 +12,7 @@ pub const RunInput = struct {
     task: []const u8,
     model: ?[]const u8 = null,
     effort: ?[]const u8 = null,
+    fast: ?bool = null,
 };
 pub const MessageInput = struct {
     agent: []const u8,
@@ -19,20 +20,22 @@ pub const MessageInput = struct {
     message: []const u8,
     model: ?[]const u8 = null,
     effort: ?[]const u8 = null,
+    fast: ?bool = null,
 };
 pub const RequestInput = union(Action) {
     run: RunInput,
     message: MessageInput,
 };
 
-/// Creation-time routing overrides carried by a request. Both default to the
+/// Creation-time routing overrides carried by a request. All default to the
 /// parent's values; overrides apply only when a child session is created.
 pub const Override = struct {
     model: ?[]const u8 = null,
     effort: ?types.ReasoningEffort = null,
+    fast: ?bool = null,
 
     pub fn present(self: Override) bool {
-        return self.model != null or self.effort != null;
+        return self.model != null or self.effort != null or self.fast != null;
     }
 };
 
@@ -41,6 +44,7 @@ pub const Request = union(Action) {
         task: []u8,
         model: ?[]u8 = null,
         effort: ?types.ReasoningEffort = null,
+        fast: ?bool = null,
     },
     message: struct {
         agent: []u8,
@@ -48,6 +52,7 @@ pub const Request = union(Action) {
         message: []u8,
         model: ?[]u8 = null,
         effort: ?types.ReasoningEffort = null,
+        fast: ?bool = null,
     },
     pub fn deinit(self: *Request, alloc: Allocator) void {
         switch (self.*) {
@@ -79,8 +84,8 @@ pub const Request = union(Action) {
     /// Borrows from the request; the request must outlive the returned value.
     pub fn override(self: Request) Override {
         return switch (self) {
-            .run => |value| .{ .model = value.model, .effort = value.effort },
-            .message => |value| .{ .model = value.model, .effort = value.effort },
+            .run => |value| .{ .model = value.model, .effort = value.effort, .fast = value.fast },
+            .message => |value| .{ .model = value.model, .effort = value.effort, .fast = value.fast },
         };
     }
 };
@@ -109,6 +114,7 @@ pub fn validateRequest(
                 .task = task,
                 .model = try dupeOptional(alloc, value.model),
                 .effort = effort,
+                .fast = value.fast,
             } };
         },
         .message => |value| blk: {
@@ -137,6 +143,7 @@ pub fn validateRequest(
                 .message = message,
                 .model = try dupeOptional(alloc, value.model),
                 .effort = effort,
+                .fast = value.fast,
             } };
         },
     };
@@ -250,6 +257,12 @@ pub fn requestFingerprint(request: Request) [32]u8 {
             hash.update(effort.label());
         } else {
             hash.update("\x00");
+        }
+        // Preserve fingerprints produced before Fast overrides existed when
+        // no Fast preference is supplied.
+        if (override.fast) |fast| {
+            hash.update("\x00\x01");
+            hash.update(if (fast) "\x01" else "\x00");
         }
     }
     return hash.finalResult();
@@ -380,6 +393,7 @@ test "creation overrides validate and participate in operation identity" {
     defer routed.deinit(alloc);
     try std.testing.expectEqualStrings("gpt-5.6-sol-fast", routed.run.model.?);
     try std.testing.expectEqualStrings("medium", routed.run.effort.?.label());
+    try std.testing.expect(routed.run.fast == null);
     try std.testing.expect(plain.override().present() == false);
     try std.testing.expect(routed.override().present());
     // Override-less requests keep their pre-override fingerprint.
@@ -396,6 +410,39 @@ test "creation overrides validate and participate in operation identity" {
     try std.testing.expectEqual(expected_plain, plain_digest);
     const routed_digest = requestFingerprint(routed);
     try std.testing.expect(!std.mem.eql(u8, &plain_digest, &routed_digest));
+    const expected_routed = comptime blk: {
+        @setEvalBranchQuota(100_000);
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("fx.subagent.request.v1\x00");
+        hash.update("run");
+        hash.update("\x00");
+        hash.update("review this");
+        hash.update("\x00\x01\x01");
+        hash.update("gpt-5.6-sol-fast");
+        hash.update("\x00\x01");
+        hash.update("medium");
+        break :blk hash.finalResult();
+    };
+    try std.testing.expectEqual(expected_routed, routed_digest);
+
+    var accelerated = try validateRequest(alloc, .{ .run = .{
+        .task = "review this",
+        .fast = true,
+    } });
+    defer accelerated.deinit(alloc);
+    try std.testing.expectEqual(true, accelerated.run.fast.?);
+    const accelerated_digest = requestFingerprint(accelerated);
+    try std.testing.expect(!std.mem.eql(u8, &plain_digest, &accelerated_digest));
+
+    var normal = try validateRequest(alloc, .{ .run = .{
+        .task = "review this",
+        .fast = false,
+    } });
+    defer normal.deinit(alloc);
+    try std.testing.expect(normal.override().present());
+    const normal_digest = requestFingerprint(normal);
+    try std.testing.expect(!std.mem.eql(u8, &plain_digest, &normal_digest));
+    try std.testing.expect(!std.mem.eql(u8, &accelerated_digest, &normal_digest));
 
     var rerouted = try validateRequest(alloc, .{ .message = .{
         .agent = "reviewer",
