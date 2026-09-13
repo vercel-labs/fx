@@ -21,6 +21,7 @@ pub fn derive(
     hash.update("fx-credential-authority-v1\x00");
     hash.update(@tagName(source));
     switch (source) {
+        .gemini_api_key,
         .vercel_oidc_token,
         .ai_gateway_api_key,
         .fx_login,

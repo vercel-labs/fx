@@ -64,11 +64,13 @@ pub const CatalogAuthenticatedSource = enum {
     stored_key,
     chatgpt_subscription,
     grok_subscription,
+    gemini_api_key,
 
     fn credentialSource(self: CatalogAuthenticatedSource) Source {
         return switch (self) {
             .vercel_oidc_token => .vercel_oidc_token,
             .ai_gateway_api_key => .ai_gateway_api_key,
+            .gemini_api_key => .gemini_api_key,
             .fx_login => .fx_login,
             .stored_key => .stored_key,
             .chatgpt_subscription => .chatgpt_subscription,
@@ -121,7 +123,7 @@ pub const CatalogAccess = union(enum) {
             .public_only => null,
             .authenticated => |access| if (access.authority == .explicit or
                 access.source == .chatgpt_subscription or
-                access.source == .grok_subscription)
+                access.source == .grok_subscription or access.source == .gemini_api_key)
                 null
             else
                 .{
@@ -217,6 +219,7 @@ pub fn catalogAccessForCredentialAndAccount(
     const authenticated_source: CatalogAuthenticatedSource = switch (selected_source) {
         .vercel_oidc_token => .vercel_oidc_token,
         .ai_gateway_api_key => .ai_gateway_api_key,
+        .gemini_api_key => .gemini_api_key,
         .stored_key => .stored_key,
         .chatgpt_subscription => .chatgpt_subscription,
         .grok_subscription => .grok_subscription,
@@ -233,7 +236,7 @@ pub fn catalogAccessForCredentialAndAccount(
         .authenticated = .{
             .source = authenticated_source,
             .credential = credential,
-            .team_context = if (authenticated_source == .chatgpt_subscription or authenticated_source == .grok_subscription) null else team_context,
+            .team_context = if (authenticated_source == .chatgpt_subscription or authenticated_source == .grok_subscription or authenticated_source == .gemini_api_key) null else team_context,
             .account_id = if (authenticated_source == .grok_subscription) account_id else null,
         },
     };
@@ -393,7 +396,7 @@ pub fn resolveForProvider(
         transport,
         secret_store,
         mode,
-        if (preferred == .chatgpt_subscription or preferred == .grok_subscription) null else preferred,
+        if (preferred == .chatgpt_subscription or preferred == .grok_subscription or preferred == .gemini_api_key) null else preferred,
     );
 }
 
@@ -521,6 +524,7 @@ pub fn loadSource(
     return switch (source) {
         .vercel_oidc_token => loadEnvCredential(alloc, "VERCEL_OIDC_TOKEN", source),
         .ai_gateway_api_key => loadEnvCredential(alloc, "AI_GATEWAY_API_KEY", source),
+        .gemini_api_key => loadEnvCredential(alloc, "GEMINI_API_KEY", source),
         .fx_login => loadFxLoginCredential(alloc, transport),
         .stored_key => loadStoredKeyCredential(alloc, secret_store),
         .chatgpt_subscription => loadChatGptCredential(alloc, transport, .if_needed),
@@ -538,6 +542,7 @@ pub fn sourceExists(
     return switch (source) {
         .vercel_oidc_token => nonEmptyEnvValue("VERCEL_OIDC_TOKEN") != null,
         .ai_gateway_api_key => nonEmptyEnvValue("AI_GATEWAY_API_KEY") != null,
+        .gemini_api_key => nonEmptyEnvValue("GEMINI_API_KEY") != null,
         .fx_login => blk: {
             const loaded = oauth_session.load(alloc) catch |err| switch (err) {
                 error.OutOfMemory => return err,
@@ -592,6 +597,7 @@ pub fn sourcePresence(
             .present
         else
             .missing,
+        .gemini_api_key => if (nonEmptyEnvValue("GEMINI_API_KEY") != null) .present else .missing,
         .ai_gateway_api_key => if (nonEmptyEnvValue("AI_GATEWAY_API_KEY") != null)
             .present
         else
@@ -897,6 +903,7 @@ pub fn sourceLabel(source: Source) []const u8 {
     return switch (source) {
         .vercel_oidc_token => "VERCEL_OIDC_TOKEN",
         .ai_gateway_api_key => "AI_GATEWAY_API_KEY",
+        .gemini_api_key => "GEMINI_API_KEY",
         .fx_login => "fx login",
         .stored_key => "stored API key (" ++ stored_key_backend_label ++ ")",
         .chatgpt_subscription => "Codex subscription",
@@ -1645,4 +1652,38 @@ test "a disabled store still reports why the fx login was silent" {
     try std.testing.expect(resolution.credential == null);
     try std.testing.expectEqual(FxLoginReadStatus.unavailable, resolution.fx_login_status);
     try std.testing.expectEqual(StoredKeyReadStatus.not_attempted, resolution.stored_key_status);
+}
+
+test "Gemini credential resolution isolates Google and Gateway keys" {
+    const alloc = std.testing.allocator;
+    const env = try CredentialTestEnv.install(alloc, &.{
+        .{ "GEMINI_API_KEY", "google-test-key" },
+        .{ "AI_GATEWAY_API_KEY", "gateway-test-key" },
+    });
+    defer env.deinit();
+    var google = (try resolveForProvider(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .stored, .gemini, .ai_gateway_api_key)).credential.?;
+    defer google.deinit(alloc);
+    try std.testing.expectEqual(Source.gemini_api_key, google.source);
+    try std.testing.expectEqualStrings("google-test-key", google.token);
+    var gateway = (try resolveForProvider(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .stored, .gateway, .gemini_api_key)).credential.?;
+    defer gateway.deinit(alloc);
+    try std.testing.expectEqual(Source.ai_gateway_api_key, gateway.source);
+    try std.testing.expectEqualStrings("gateway-test-key", gateway.token);
+
+    try env.map.put("GEMINI_API_KEY", "");
+    const absent = try resolveForProvider(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .stored, .gemini, .ai_gateway_api_key);
+    try std.testing.expect(absent.credential == null);
+    try std.testing.expect(!(try sourceExists(alloc, host.unavailable_secret_store, .gemini_api_key)));
+    try env.map.put("GEMINI_API_KEY", "google-test-key");
+    try env.map.put("AI_GATEWAY_API_KEY", "");
+    const missing_gateway = try resolveForProvider(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .stored, .gateway, .gemini_api_key);
+    try std.testing.expect(missing_gateway.credential == null);
+}
+
+test "Gemini catalog credentials carry no Gateway context or public fallback" {
+    const access = catalogAccessForCredentialAndAccount(.gemini_api_key, "google-test-key", "gateway-team", "gateway-account");
+    try std.testing.expectEqual(CatalogAuthenticatedSource.gemini_api_key, access.authenticated.source);
+    try std.testing.expect(access.authenticated.team_context == null);
+    try std.testing.expect(access.authenticated.account_id == null);
+    try std.testing.expect(access.publicFallbackAfterRejection() == null);
 }

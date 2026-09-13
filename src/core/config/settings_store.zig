@@ -1598,14 +1598,14 @@ fn putModelPreference(
         break :blk &root.getPtr("models").?.object;
     };
     changed = try putString(arena, models, @tagName(preference.provider), preference.model) or changed;
-    const legacy_key = switch (preference.provider) {
+    const legacy_key: ?[]const u8 = switch (preference.provider) {
         .gateway => "model",
         .codex => "codex_model",
         .grok => "grok_model",
+        .gemini => null,
     };
-    if (root.contains(legacy_key)) {
-        _ = root.orderedRemove(legacy_key);
-        changed = true;
+    if (legacy_key) |key| {
+        if (root.orderedRemove(key)) changed = true;
     }
     return changed;
 }

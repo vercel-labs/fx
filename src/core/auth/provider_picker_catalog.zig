@@ -110,7 +110,7 @@ pub fn parseMethod(value: []const u8) ?Method {
 }
 
 fn providerVisible(id: model_provider.ProviderId) bool {
-    if (comptime host_target.is_wasm) return id != .grok;
+    if (comptime host_target.is_wasm) return id != .grok and id != .gemini;
     return true;
 }
 
@@ -128,7 +128,7 @@ pub fn providerOptions(out: *[max_provider_options][]const u8) usize {
 pub fn providerMethods(id: model_provider.ProviderId) []const Method {
     return switch (id) {
         .gateway => &.{ .oauth, .api_key },
-        .codex, .grok => &.{},
+        .codex, .grok, .gemini => &.{},
     };
 }
 

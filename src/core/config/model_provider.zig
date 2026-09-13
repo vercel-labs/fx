@@ -5,6 +5,7 @@ pub const ProviderId = enum {
     gateway,
     codex,
     grok,
+    gemini,
 };
 
 pub const ProviderSelection = struct {
@@ -16,6 +17,7 @@ pub fn parse(value: []const u8) ?ProviderId {
     if (std.ascii.eqlIgnoreCase(value, "gateway")) return .gateway;
     if (std.ascii.eqlIgnoreCase(value, "codex")) return .codex;
     if (std.ascii.eqlIgnoreCase(value, "grok")) return .grok;
+    if (std.ascii.eqlIgnoreCase(value, "gemini")) return .gemini;
     return null;
 }
 
@@ -23,9 +25,10 @@ pub fn authorizesCredential(provider: ProviderId, source: ?types.CredentialSourc
     const selected = source orelse return false;
     if (selected == .host_managed) return true;
     return switch (provider) {
-        .gateway => selected != .chatgpt_subscription and selected != .grok_subscription,
+        .gateway => selected != .chatgpt_subscription and selected != .grok_subscription and selected != .gemini_api_key,
         .codex => selected == .chatgpt_subscription,
         .grok => selected == .grok_subscription,
+        .gemini => selected == .gemini_api_key,
     };
 }
 
@@ -47,4 +50,17 @@ test "provider parsing exposes gateway codex and grok" {
     try std.testing.expectEqual(ProviderId.grok, parse("GROK").?);
     try std.testing.expect(parse("openai-codex") == null);
     try std.testing.expect(parse("") == null);
+}
+
+test "Gemini credentials cannot authorize other providers" {
+    inline for (@typeInfo(ProviderId).@"enum".fields) |field| {
+        const provider = @field(ProviderId, field.name);
+        try std.testing.expectEqual(provider == .gemini, authorizesCredential(provider, .gemini_api_key));
+    }
+    inline for (@typeInfo(types.CredentialSource).@"enum".fields) |field| {
+        const source = @field(types.CredentialSource, field.name);
+        try std.testing.expectEqual(source == .gemini_api_key or source == .host_managed, authorizesCredential(.gemini, source));
+    }
+    try std.testing.expect(!authorizesCredential(.gemini, null));
+    try std.testing.expectEqual(ProviderId.gemini, parse("GEMINI").?);
 }

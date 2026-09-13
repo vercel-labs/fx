@@ -111,6 +111,7 @@ pub const CredentialSource = enum {
     chatgpt_subscription,
     grok_subscription,
     host_managed,
+    gemini_api_key,
 };
 
 pub const DirectCredentialLease = struct {
@@ -1141,7 +1142,9 @@ pub const ProviderReplay = struct {
     parts_json: []const u8,
 
     pub fn matches(self: ProviderReplay, source: @import("../config/model_provider.zig").ProviderSelection) bool {
-        return self.source.provider == source.provider and std.mem.eql(u8, self.source.model, source.model);
+        // Google requires thought steps to survive switches between Gemini models.
+        return self.source.provider == source.provider and
+            (source.provider == .gemini or std.mem.eql(u8, self.source.model, source.model));
     }
 };
 

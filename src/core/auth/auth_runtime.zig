@@ -35,6 +35,7 @@ const credential_source_order = [_]credentials.Source{
     .stored_key,
     .chatgpt_subscription,
     .grok_subscription,
+    .gemini_api_key,
 };
 
 const SourceProbeFn = *const fn (?*anyopaque, Allocator, credentials.Source) anyerror!bool;
@@ -1207,7 +1208,7 @@ pub const PickerView = struct {
             else
                 4,
             .connections => connectionChoiceCount(),
-            .provider => if (comptime host_target.is_wasm) 2 else 3,
+            .provider => if (comptime host_target.is_wasm) 2 else 4,
             .sign_in, .api_key => 0,
             .change_team => blk: {
                 var count: usize = 0;
@@ -1241,6 +1242,7 @@ pub const PickerView = struct {
                 0 => .{ .provider = .gateway },
                 1 => .{ .provider = .codex },
                 2 => if (comptime host_target.is_wasm) null else .{ .provider = .grok },
+                3 => if (comptime host_target.is_wasm) null else .{ .provider = .gemini },
                 else => null,
             },
             .sign_in, .api_key => null,
@@ -1422,6 +1424,7 @@ pub const StatusSnapshot = struct {
         const required_source = self.required_source orelse return automatic_help;
         return switch (required_source) {
             .vercel_oidc_token => "VERCEL_OIDC_TOKEN is selected but unavailable. Set VERCEL_OIDC_TOKEN before starting fx; no other credential was selected.",
+            .gemini_api_key => "Set GEMINI_API_KEY before starting fx, then select the Gemini provider.",
             .ai_gateway_api_key => "AI_GATEWAY_API_KEY is selected but unavailable. Set AI_GATEWAY_API_KEY before starting fx; no other credential was selected.",
             .stored_key => switch (surface) {
                 .cli => "A stored API key is selected but unavailable. Start fx and open /provider to choose an available credential; no other credential was selected.",
@@ -1522,9 +1525,9 @@ pub fn loadStatusSnapshotForProvider(
         },
     };
     const resolved_source = if (resolution.credential) |credential| credential.source else null;
-    var gateway_connected = resolved_source != null and resolved_source != .chatgpt_subscription and resolved_source != .grok_subscription;
-    const gateway_probe_required = provider == .codex or provider == .grok or
-        resolved_source == .chatgpt_subscription or resolved_source == .grok_subscription;
+    var gateway_connected = model_provider.authorizesCredential(.gateway, resolved_source);
+    const gateway_probe_required = (provider != null and provider != .gateway) or
+        (resolved_source != null and !model_provider.authorizesCredential(.gateway, resolved_source));
     if (gateway_probe_required) {
         for ([_]credentials.Source{ .vercel_oidc_token, .ai_gateway_api_key, .fx_login, .stored_key }) |source| {
             if (credentials.sourceExists(alloc, secret_store, source) catch |err| switch (err) {
@@ -2205,7 +2208,7 @@ pub const Runtime = struct {
         self.picker_stage = .switch_credential;
         const active_source = self.credentialSource();
         self.picker_selection = if (active_source) |source|
-            if (source != .chatgpt_subscription and source != .grok_subscription and self.source_inventory.contains(source))
+            if (source != .chatgpt_subscription and source != .grok_subscription and source != .gemini_api_key and self.source_inventory.contains(source))
                 .{ .source = source }
             else
                 self.pickerView().choiceAt(0)
@@ -2797,7 +2800,7 @@ pub const Runtime = struct {
 
         try self.refreshSourceInventoryWithProbe(alloc, ctx, probe);
         for (credential_source_order) |source| {
-            if (source == .chatgpt_subscription or source == .grok_subscription) continue;
+            if (!model_provider.authorizesCredential(.gateway, source)) continue;
             if (!self.source_inventory.contains(source)) continue;
             if (try self.selectSourceWithLoader(alloc, source, ctx, loader) != null) {
                 return self.credentialSource() != previous;
@@ -2859,7 +2862,7 @@ pub const Runtime = struct {
         if (!login_was_active) return false;
 
         for (credential_source_order) |source| {
-            if (source == .chatgpt_subscription or source == .grok_subscription) continue;
+            if (!model_provider.authorizesCredential(.gateway, source)) continue;
             if (!self.source_inventory.contains(source)) continue;
             if (try self.selectSourceWithLoader(alloc, source, ctx, loader) != null) return true;
             self.source_inventory.remove(source);
@@ -3025,7 +3028,7 @@ fn takeDisplayTeam(alloc: Allocator, credential: *credentials.Credential) ?[]u8 
 fn gatewaySourceCount(sources: SourceSet) usize {
     var count: usize = 0;
     for (credential_source_order) |source| {
-        if (source == .chatgpt_subscription or source == .grok_subscription or !sources.contains(source)) continue;
+        if (source == .chatgpt_subscription or source == .grok_subscription or source == .gemini_api_key or !sources.contains(source)) continue;
         count += 1;
     }
     return count;
@@ -3034,7 +3037,7 @@ fn gatewaySourceCount(sources: SourceSet) usize {
 fn gatewaySourceAtIndex(sources: SourceSet, wanted_index: usize) ?credentials.Source {
     var index: usize = 0;
     for (credential_source_order) |source| {
-        if (source == .chatgpt_subscription or source == .grok_subscription or !sources.contains(source)) continue;
+        if (source == .chatgpt_subscription or source == .grok_subscription or source == .gemini_api_key or !sources.contains(source)) continue;
         if (index == wanted_index) return source;
         index += 1;
     }
@@ -3052,6 +3055,7 @@ fn credentialAuthorityFacts(credential: credentials.Credential) auth_transition.
         .provider = switch (credential.source) {
             .chatgpt_subscription => .codex,
             .grok_subscription => .grok,
+            .gemini_api_key => .gemini,
             else => .gateway,
         },
         .source = credential.source,
@@ -5023,4 +5027,32 @@ test "manual code visibility cannot toggle without provider capability" {
     try std.testing.expect(!runtime.toggleSignInCodeEntry());
     try std.testing.expect(!runtime.pickerView().sign_in_code_visible);
     try std.testing.expect(!runtime.signInCodeEntryActive());
+}
+
+test "Gemini credential inventory stays out of Gateway key choices" {
+    const sources: SourceSet = .initMany(&.{ .gemini_api_key, .ai_gateway_api_key, .chatgpt_subscription, .grok_subscription });
+    try std.testing.expectEqual(@as(usize, 1), gatewaySourceCount(sources));
+    try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, gatewaySourceAtIndex(sources, 0).?);
+    try std.testing.expect(gatewaySourceAtIndex(sources, 1) == null);
+    try std.testing.expectEqual(@as(usize, 0), gatewaySourceCount(.initOne(.gemini_api_key)));
+}
+
+test "Gemini cannot become the Gateway fallback after logout or automatic selection" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var active = try makeTestCredential(alloc, "fx-token", .fx_login, "team_1", null);
+    defer active.deinit(alloc);
+    _ = runtime.adoptCredential(alloc, &active);
+    var fixture = LogoutFixture{ .existing = .initOne(.gemini_api_key) };
+    try std.testing.expect(try runtime.reconcileAfterFxLoginLogoutWithDeps(alloc, &fixture, LogoutFixture.probe, LogoutFixture.load));
+    try std.testing.expect(runtime.credentialSource() == null);
+    try std.testing.expectEqual(@as(usize, 0), fixture.load_count);
+    _ = try runtime.reselectByPrecedenceWithDeps(alloc, &fixture, LogoutFixture.probe, LogoutFixture.load);
+    try std.testing.expect(runtime.credentialSource() == null);
+    try std.testing.expectEqual(@as(usize, 0), fixture.load_count);
+    try std.testing.expect(runtime.source_inventory.contains(.gemini_api_key));
+    try std.testing.expect(!runtime.statusSnapshot(.gemini, null).gateway_connected);
+    try std.testing.expectEqual(credentials.Source.gemini_api_key, requestedSource(.gemini, .ai_gateway_api_key).?);
+    try std.testing.expect(requestedSource(.gateway, .gemini_api_key) == null);
 }

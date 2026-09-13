@@ -528,3 +528,11 @@ Minimum checklist:
 3. Push the feature branch and open a draft PR immediately.
 4. Require all four **Full CI** jobs and the final ship gate to pass for the exact current commit before marking the PR ready.
 5. Update `README.md` if user-facing behavior changed.
+
+### Direct Gemini provider checks
+
+Use `bun test gemini.test.ts` in `tests/e2e` for deterministic Google transport checks. These tests use loopback fixtures and need no live key. They cover credential isolation, model pagination, streamed tool calls, saved-session replay, and failed streams. The Gemini inline Zig tests also check allocation failures and opaque thought state.
+
+For a live check, set `GEMINI_API_KEY`, run `./zig-out/bin/fx login gemini`, then run `./zig-out/bin/fx ask` with a small file task. Use a separate test workspace. Do not add the key to fixtures, logs, or commits. Verify streaming, the tool result, and a resumed conversation. Google API usage can incur charges.
+
+The native adapter follows Google's [Interactions API](https://ai.google.dev/gemini-api/docs/interactions-overview), [streaming interface](https://ai.google.dev/gemini-api/docs/streaming), and [function calling interface](https://ai.google.dev/gemini-api/docs/function-calling). Requests set `store: false` and replay local interaction steps, including opaque thought signatures.

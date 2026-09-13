@@ -43,6 +43,7 @@ pub const LogoutFacts = struct {
 
 pub fn decideLogoutProvider(facts: LogoutFacts) model_provider.ProviderId {
     if (facts.requested) |provider| return provider;
+    if (facts.selected == .gemini or facts.active_source == .gemini_api_key) return .gemini;
     if (facts.selected == .grok or facts.active_source == .grok_subscription) return .grok;
     if (facts.selected == .codex or facts.active_source == .chatgpt_subscription) return .codex;
     if (facts.active_source == .fx_login) return .gateway;
@@ -58,13 +59,13 @@ pub fn decideLogoutProvider(facts: LogoutFacts) model_provider.ProviderId {
     return .gateway;
 }
 
-pub fn logoutFallbackProviders(facts: LogoutFacts) [2]?model_provider.ProviderId {
-    var candidates: [2]?model_provider.ProviderId = .{ null, null };
+pub fn logoutFallbackProviders(facts: LogoutFacts) [3]?model_provider.ProviderId {
+    var candidates: [3]?model_provider.ProviderId = .{ null, null, null };
     const removed = decideLogoutProvider(facts);
     if (removed != facts.selected or removed == .gateway) return candidates;
 
     var count: usize = 0;
-    for ([_]model_provider.ProviderId{ .gateway, .codex, .grok }) |provider| {
+    for ([_]model_provider.ProviderId{ .gateway, .codex, .grok, .gemini }) |provider| {
         if (provider == removed) continue;
         const available = switch (provider) {
             .gateway => facts.available_sources.contains(.vercel_oidc_token) or
@@ -73,6 +74,7 @@ pub fn logoutFallbackProviders(facts: LogoutFacts) [2]?model_provider.ProviderId
                 facts.available_sources.contains(.stored_key),
             .codex => facts.available_sources.contains(.chatgpt_subscription),
             .grok => facts.available_sources.contains(.grok_subscription),
+            .gemini => facts.available_sources.contains(.gemini_api_key),
         };
         if (!available) continue;
         candidates[count] = provider;
@@ -127,12 +129,12 @@ test "logout fallback excludes inactive removal and disconnected providers" {
         .active_source = .grok_subscription,
         .available_sources = .initMany(&.{ .ai_gateway_api_key, .grok_subscription }),
     };
-    try std.testing.expectEqual([2]?model_provider.ProviderId{ null, null }, logoutFallbackProviders(facts));
+    try std.testing.expectEqual([3]?model_provider.ProviderId{ null, null, null }, logoutFallbackProviders(facts));
     facts.selected = .codex;
     facts.available_sources = .initOne(.grok_subscription);
-    try std.testing.expectEqual([2]?model_provider.ProviderId{ .grok, null }, logoutFallbackProviders(facts));
+    try std.testing.expectEqual([3]?model_provider.ProviderId{ .grok, null, null }, logoutFallbackProviders(facts));
     facts.available_sources = .empty;
-    try std.testing.expectEqual([2]?model_provider.ProviderId{ null, null }, logoutFallbackProviders(facts));
+    try std.testing.expectEqual([3]?model_provider.ProviderId{ null, null, null }, logoutFallbackProviders(facts));
 }
 
 pub const SignInCompletionAction = union(enum) {
@@ -147,6 +149,7 @@ pub fn signInCompletion(
 ) SignInCompletionAction {
     return switch (provider) {
         .gateway => .vercel,
+        .gemini => .{ .switch_provider = .gemini },
         .codex => if (provider_routing_supported)
             .{ .switch_provider = .codex }
         else
@@ -315,4 +318,21 @@ test "auth replay is one delivery-safe refresh outside semantic policy" {
     blocked = eligible;
     blocked.delivery_safe = false;
     try std.testing.expectEqual(AuthReplayDecision.fail, decideAuthReplay(blocked));
+}
+
+test "Gemini logout selection and subscription fallbacks stay provider scoped" {
+    const facts: LogoutFacts = .{
+        .requested = null,
+        .selected = .gemini,
+        .active_source = .gemini_api_key,
+        .available_sources = .initMany(&.{ .gemini_api_key, .ai_gateway_api_key, .chatgpt_subscription, .grok_subscription }),
+    };
+    try std.testing.expectEqual(model_provider.ProviderId.gemini, decideLogoutProvider(facts));
+    var codex_logout = facts;
+    codex_logout.selected = .codex;
+    codex_logout.requested = .codex;
+    try std.testing.expectEqual([3]?model_provider.ProviderId{ .gateway, .grok, .gemini }, logoutFallbackProviders(codex_logout));
+    var explicit_gateway = facts;
+    explicit_gateway.requested = .gateway;
+    try std.testing.expectEqual(model_provider.ProviderId.gateway, decideLogoutProvider(explicit_gateway));
 }

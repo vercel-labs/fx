@@ -4377,6 +4377,9 @@ test {
     _ = @import("ui/transcript/runtime.zig");
     _ = @import("ui/transcript/runtime_tests.zig");
     _ = @import("core/agent/worker_runtime.zig");
+    _ = @import("gateway/gemini_protocol.zig");
+    _ = @import("gateway/gemini_models.zig");
+    _ = @import("gateway/gemini_permission_reviewer.zig");
     _ = @import("gateway/client.zig");
     _ = @import("gateway/host_stream_provider.zig");
 }

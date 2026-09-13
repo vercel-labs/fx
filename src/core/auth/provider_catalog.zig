@@ -42,6 +42,15 @@ pub const entries = [_]Entry{
         .subscription = true,
         .login_source = .grok_subscription,
     },
+    .{
+        .id = .gemini,
+        .slug = "gemini",
+        .name = "Gemini",
+        .route_name = "Google Gemini API",
+        .description = "Google API key from GEMINI_API_KEY",
+        .subscription = false,
+        .login_source = .gemini_api_key,
+    },
 };
 
 pub fn parse(value: []const u8) ?model_provider.ProviderId {

@@ -1138,6 +1138,7 @@ fn configuredProviderSelection(
         .gateway => default_model,
         .codex => return error.CodexModelNotSelected,
         .grok => return error.GrokModelNotSelected,
+        .gemini => "gemini-3.8-flash",
     };
     return .{ .provider = provider, .model = model };
 }

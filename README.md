@@ -27,6 +27,7 @@ Sign in with one of:
 - `fx login codex`: ChatGPT subscription (OpenAI Codex OAuth)
 - `fx login grok`: Grok subscription (xAI OAuth)
 - `fx setup`: AI Gateway API key
+- `fx login gemini`: Google Gemini API key (`GEMINI_API_KEY`)
 
 Then start the interactive shell from a project:
 
@@ -42,6 +43,18 @@ fx ask "explain the changes in this repository"
 ```
 
 Inside the shell, run `/help` to browse interactive commands.
+
+To use Gemini directly, set the key before starting fx:
+
+```bash
+export GEMINI_API_KEY="your-google-api-key"
+fx login gemini
+fx
+```
+
+Inside the shell, use `/provider gemini` to select the direct Google provider, then `/model` to choose a model. Selecting a `google/...` model in the Gateway catalog still uses Gateway. The direct provider uses Google's Interactions API and keeps the key in the environment. To disconnect, unset `GEMINI_API_KEY` and restart fx.
+
+Gemini supports streaming, function tools, images, and saved-session replay of signed thought state. It reports token usage without authoritative dollar cost and uses local session titles. Tool-call history from another provider requires a new Gemini session. See [CONTRIBUTING.md](CONTRIBUTING.md#direct-gemini-provider-checks) for verification steps.
 
 ## Embed fx
 

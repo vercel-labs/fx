@@ -9,6 +9,15 @@ const xai_grok_permission_reviewer = @import("../gateway/xai_grok_permission_rev
 const provider_catalog = @import("../core/auth/provider_catalog.zig");
 
 pub const native = provider_set.Set{
+    .gemini = .{
+        .presentation = provider_catalog.find(.gemini),
+        .auth_strategy = .gemini,
+        .agent_stream = @import("../gateway/gemini.zig").agent_stream_provider,
+        .model_catalog = @import("../gateway/gemini_models.zig").model_catalog_provider,
+        .cli_model_catalog = @import("../gateway/gemini_models.zig").cli_model_catalog_provider,
+        .fallback_model_capabilities_fn = @import("../gateway/gemini_models.zig").fallbackCapabilities,
+        .permission_reviewer = @import("../gateway/gemini_permission_reviewer.zig").provider,
+    },
     .gateway = gateway.provider_bundle,
     .codex = .{
         .presentation = provider_catalog.find(.codex),

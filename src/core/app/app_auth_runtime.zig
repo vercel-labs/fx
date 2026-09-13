@@ -170,6 +170,7 @@ pub fn Runtime(comptime App: type) type {
                         .gateway => credentials.missing_interactive_credential_message,
                         .codex => credentials.missing_chatgpt_interactive_credential_message,
                         .grok => credentials.missing_grok_interactive_credential_message,
+                        .gemini => "Set GEMINI_API_KEY before starting fx.",
                     },
                 }, true),
                 .failed => |failure| {
@@ -278,6 +279,10 @@ pub fn Runtime(comptime App: type) type {
                 .active_source = app.auth.credentialSource(),
                 .available_sources = provider_inventory,
             });
+            if (logout_provider == .gemini) {
+                try writeAuthNotice(app, .{ .topic = "auth", .tone = .neutral, .body = "Gemini uses GEMINI_API_KEY. Unset it in your shell and restart fx to disconnect." });
+                return;
+            }
             const hold_turn_start = logout_provider == selected_provider and logout_provider != .gateway;
             if (hold_turn_start and (app.stream.active or !app.worker.tryHoldTurnStart())) {
                 try writeAuthNotice(app, .{
@@ -1214,14 +1219,15 @@ pub fn Runtime(comptime App: type) type {
                     switch (target) {
                         .codex => try beginCodexSignInForProviderSwitch(app),
                         .grok => try beginGrokSignInForProviderSwitch(app),
+                        .gemini => {},
                         .gateway => {},
                     }
                 }
-                if (target == .gateway or !request.allow_login) {
+                if (target == .gateway or target == .gemini or !request.allow_login) {
                     try app.writeDomainNotice(.{
                         .topic = "provider",
                         .tone = .warning,
-                        .body = if (intent == .post_oauth) "Subscription sign-in completed, but its saved credential is unavailable. The current provider is unchanged." else if (target == .codex) "Run fx login codex, then try switching again." else if (target == .grok) "Run fx login grok, then try switching again." else credentials.missing_interactive_credential_message,
+                        .body = if (intent == .post_oauth) "Subscription sign-in completed, but its saved credential is unavailable. The current provider is unchanged." else if (target == .codex) "Run fx login codex, then try switching again." else if (target == .grok) "Run fx login grok, then try switching again." else if (target == .gemini) "Set GEMINI_API_KEY before starting fx, then try switching again." else credentials.missing_interactive_credential_message,
                     }, true);
                 }
                 return false;
@@ -1822,6 +1828,7 @@ pub fn Runtime(comptime App: type) type {
                 .grok_subscription => try beginGrokSignIn(app),
                 .vercel_oidc_token,
                 .ai_gateway_api_key,
+                .gemini_api_key,
                 .stored_key,
                 .host_managed,
                 => {},
@@ -2217,7 +2224,7 @@ test "interactive subscription sign-in rejects active and queued work before OAu
             switch (provider) {
                 .codex => try Runtime(BusySignInApp).beginChatGptSignIn(&app),
                 .grok => try Runtime(BusySignInApp).beginGrokSignIn(&app),
-                .gateway => unreachable,
+                .gateway, .gemini => unreachable,
             }
 
             try std.testing.expectEqual(@as(usize, 0), app.auth.start_count);

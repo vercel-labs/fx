@@ -16,6 +16,7 @@ pub const Bundle = struct {
         vercel,
         chatgpt,
         grok,
+        gemini,
     };
     pub const Capabilities = struct {
         fx_search: bool = false,
@@ -54,12 +55,14 @@ pub const Set = struct {
     gateway: Bundle,
     codex: Bundle,
     grok: Bundle,
+    gemini: Bundle = .{},
 
     pub fn select(self: Set, provider: model_provider.ProviderId) Bundle {
         return switch (provider) {
             .gateway => self.gateway,
             .codex => self.codex,
             .grok => self.grok,
+            .gemini => self.gemini,
         };
     }
 
