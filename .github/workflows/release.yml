@@ -1,30 +1,53 @@
 name: Release
+run-name: Prepare ${{ inputs.validate_only && 'rehearsal' || 'release' }} ${{ inputs.source_sha || github.sha }}
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       validate_only:
         description: Build all platforms and compare arm64 signing pages without publishing
         type: boolean
         default: false
+      source_sha:
+        description: Exact source SHA for a preparation-only rehearsal
+        type: string
+        default: ""
+      web_sha:
+        description: Exact website SHA for a preparation-only rehearsal
+        type: string
+        default: ""
+      release_pr:
+        description: Qualified version preparation PR, kept open until publication approval
+        type: string
+        default: ""
 
 permissions:
   contents: read
 
+env:
+  FX_RELEASE_VERCEL_TEAM_ID: ${{ vars.FX_RELEASE_VERCEL_TEAM_ID }}
+
 concurrency:
-  group: stable-release
+  group: release-preparation
   cancel-in-progress: false
 
 jobs:
   check-version:
-    if: github.ref == 'refs/heads/main'
+    if: github.repository == 'vercel-labs/fx' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    environment: release-preparation
+    permissions:
+      actions: read
+      contents: read
+      checks: read
+      pull-requests: read
     outputs:
       needed: ${{ steps.check.outputs.needed }}
       publish: ${{ steps.check.outputs.publish }}
       version: ${{ steps.check.outputs.version }}
+      sdk_version: ${{ steps.check.outputs.sdk_version }}
+      source_sha: ${{ steps.check.outputs.source_sha }}
+      release_pr: ${{ steps.check.outputs.release_pr }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -34,14 +57,48 @@ jobs:
         id: check
         env:
           VALIDATE_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.validate_only }}
+          SOURCE_OVERRIDE: ${{ inputs.source_sha }}
+          WEB_OVERRIDE: ${{ inputs.web_sha }}
+          RELEASE_PR: ${{ inputs.release_pr }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          VERSION=$(grep 'pub const version' src/main.zig | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          set -euo pipefail
+          if [[ -n "$WEB_OVERRIDE" && "$VALIDATE_ONLY" != true ]]; then
+            echo "::error::website source overrides are allowed only for rehearsals"
+            exit 1
+          fi
+          for value in "$SOURCE_OVERRIDE" "$WEB_OVERRIDE"; do
+            if [[ -n "$value" && ! "$value" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::source overrides must be full commit SHAs"
+              exit 1
+            fi
+          done
+          SOURCE_SHA="${SOURCE_OVERRIDE:-$GITHUB_SHA}"
+          if [[ -n "$RELEASE_PR" ]]; then
+            if ! [[ "$RELEASE_PR" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error::release_pr must be a positive PR number"
+              exit 1
+            fi
+            python3 -m scripts.release_preparation wait --pr "$RELEASE_PR" --source-sha "$SOURCE_SHA"
+          elif [[ -n "$SOURCE_OVERRIDE" && "$VALIDATE_ONLY" != true ]]; then
+            echo "::error::an unpublished source override requires a qualified release PR"
+            exit 1
+          elif ! git merge-base --is-ancestor "$SOURCE_SHA" "$GITHUB_SHA"; then
+            echo "::error::rehearsals may only build source already reviewed on main"
+            exit 1
+          fi
+          VERSION=$(git show "$SOURCE_SHA:src/main.zig" | sed -n 's/^pub const version = "\([^"]*\)";$/\1/p')
           if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "::error::src/main.zig version is not strict SemVer"
             exit 1
           fi
           TAG="v${VERSION}"
-          echo "version=${TAG}" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=${TAG}"
+            echo "sdk_version=${VERSION}"
+            echo "source_sha=$SOURCE_SHA"
+            echo "release_pr=${RELEASE_PR:-0}"
+          } >> "$GITHUB_OUTPUT"
           if [[ "$VALIDATE_ONLY" == true ]]; then
             echo "needed=true" >> "$GITHUB_OUTPUT"
             echo "publish=false" >> "$GITHUB_OUTPUT"
@@ -55,6 +112,57 @@ jobs:
             echo "publish=true" >> "$GITHUB_OUTPUT"
             echo "Tag ${TAG} missing, release needed"
           fi
+
+      - name: Require configured release automation before building
+        if: steps.check.outputs.needed == 'true'
+        env:
+          APP_ID: ${{ vars.FX_RELEASE_APP_ID }}
+          APP_KEY: ${{ secrets.FX_RELEASE_APP_PRIVATE_KEY }}
+          WEB_TOKEN: ${{ secrets.FX_WEB_VERCEL_TOKEN }}
+          PREVIEW_BYPASS: ${{ secrets.FX_WEB_PREVIEW_BYPASS }}
+        run: |
+          for name in APP_ID APP_KEY WEB_TOKEN PREVIEW_BYPASS; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Release automation credential $name is not configured"
+              exit 1
+            fi
+          done
+
+      - name: Validate scoped repository access before builds
+        if: steps.check.outputs.needed == 'true'
+        id: preflight-app
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.FX_RELEASE_APP_ID }}
+          private-key: ${{ secrets.FX_RELEASE_APP_PRIVATE_KEY }}
+          owner: vercel-labs
+          repositories: |
+            fx
+            fx-web
+
+      - name: Validate website credentials before builds
+        if: steps.check.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.preflight-app.outputs.token }}
+          WEB_TOKEN: ${{ secrets.FX_WEB_VERCEL_TOKEN }}
+        run: |
+          test "$(gh api repos/vercel-labs/fx-web --jq .full_name)" = vercel-labs/fx-web
+          python3 - <<'PY'
+          import json, os, urllib.request
+          from scripts.release_delivery import require_website_protection
+          from scripts.release_examples import vercel_team
+          team = vercel_team()
+          request = urllib.request.Request(
+              f'https://api.vercel.com/v9/projects/prj_rIMZjpSjEoVhPtOV7y2v35UIDWQK?teamId={team}',
+              headers={'Authorization': 'Bearer ' + os.environ['WEB_TOKEN']},
+          )
+          with urllib.request.urlopen(request, timeout=30) as response:
+              project = json.load(response)
+          assert project['id'] == 'prj_rIMZjpSjEoVhPtOV7y2v35UIDWQK'
+          assert project['accountId'] == team
+          require_website_protection(project)
+          print('Release website credentials verified')
+          PY
 
   build-linux:
     needs: check-version
@@ -71,6 +179,8 @@ jobs:
             target: aarch64-linux
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.check-version.outputs.source_sha }}
 
       - name: Setup Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -93,6 +203,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: fx-${{ matrix.name }}
+          overwrite: true
           path: |
             fx-${{ matrix.name }}.tar.gz
             fx-${{ matrix.name }}.tar.gz.sha256
@@ -105,6 +216,15 @@ jobs:
     environment: apple-signing
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.check-version.outputs.source_sha }}
+
+      - name: Check out trusted signing scripts
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: .release-automation
+          persist-credentials: false
 
       - name: Setup Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -121,7 +241,7 @@ jobs:
           APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
           APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
           APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
-        run: scripts/sign-and-notarize-macos.sh zig-out/bin/fx
+        run: .release-automation/scripts/sign-and-notarize-macos.sh zig-out/bin/fx
 
       - name: Verify notarized Intel binary
         if: github.event_name == 'workflow_dispatch' && inputs.validate_only
@@ -143,6 +263,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: fx-macos-x86_64
+          overwrite: true
           path: |
             fx-macos-x86_64.tar.gz
             fx-macos-x86_64.tar.gz.sha256
@@ -154,6 +275,8 @@ jobs:
       actions: read
       contents: read
     uses: ./.github/workflows/pgso-macos-arm64.yml
+    with:
+      source_sha: ${{ needs.check-version.outputs.source_sha }}
 
   sign-macos-arm64:
     needs: [check-version, build-macos-arm64]
@@ -167,6 +290,15 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.check-version.outputs.source_sha }}
+
+      - name: Check out trusted signing scripts
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: .release-automation
+          persist-credentials: false
 
       - name: Require native arm64 host
         run: test "$(uname -m)" = arm64
@@ -181,6 +313,7 @@ jobs:
         run: chmod +x "$RUNNER_TEMP/fx-pgso-aggregate/candidate/fx"
 
       - name: Confirm release eligibility
+        working-directory: .release-automation
         run: python3 -m scripts.pgso report --output-dir "$RUNNER_TEMP/fx-pgso-aggregate" >/dev/null
 
       - name: Sign and notarize stable release candidate
@@ -196,10 +329,10 @@ jobs:
             control_dir="$RUNNER_TEMP/fx-signing-control"
             mkdir -p "$control_dir"
             cp "$RUNNER_TEMP/fx-pgso-aggregate/candidate/fx" "$control_dir/fx"
-            scripts/sign-and-notarize-macos.sh "$control_dir/fx" 4096
-            scripts/sign-and-notarize-macos.sh "$RUNNER_TEMP/fx-pgso-aggregate/candidate/fx" 16384
+            .release-automation/scripts/sign-and-notarize-macos.sh "$control_dir/fx" 4096
+            .release-automation/scripts/sign-and-notarize-macos.sh "$RUNNER_TEMP/fx-pgso-aggregate/candidate/fx" 16384
           else
-            scripts/sign-and-notarize-macos.sh "$RUNNER_TEMP/fx-pgso-aggregate/candidate/fx"
+            .release-automation/scripts/sign-and-notarize-macos.sh "$RUNNER_TEMP/fx-pgso-aggregate/candidate/fx"
           fi
 
       - name: Verify notarized arm64 binaries
@@ -219,6 +352,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: signing-control-macos-arm64
+          overwrite: true
           path: ${{ runner.temp }}/fx-signing-control.tar.gz
           if-no-files-found: error
 
@@ -236,92 +370,141 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: fx-macos-aarch64
+          overwrite: true
           path: |
             ${{ runner.temp }}/fx-macos-aarch64.tar.gz
             ${{ runner.temp }}/fx-macos-aarch64.tar.gz.sha256
           if-no-files-found: error
 
-  release:
-    needs: [check-version, build-linux, build-macos-x86_64, sign-macos-arm64]
-    if: needs.check-version.outputs.publish == 'true' && !(github.event_name == 'workflow_dispatch' && inputs.validate_only)
-    runs-on: ubuntu-latest
-    environment: release
+  build-sdk:
+    needs: check-version
+    if: needs.check-version.outputs.needed == 'true'
+    uses: ./.github/workflows/build-libfx.yml
+    with:
+      source_sha: ${{ needs.check-version.outputs.source_sha }}
+      version: ${{ needs.check-version.outputs.sdk_version }}
+      update_channel: stable
+
+  prepare-website:
+    name: Prepare complete release preview
+    needs: [check-version, build-linux, build-macos-x86_64, sign-macos-arm64, build-sdk]
+    if: needs.check-version.outputs.needed == 'true'
+    runs-on: ubuntu-24.04
+    environment: release-preparation
+    timeout-minutes: 60
     permissions:
-      contents: write
+      actions: read
+      contents: read
+    defaults:
+      run:
+        working-directory: automation
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: automation
 
-      - name: Download artifacts
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: fx-source
+          ref: ${{ needs.check-version.outputs.source_sha }}
+          fetch-depth: 0
+
+      - name: Create scoped website token
+        id: app
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.FX_RELEASE_APP_ID }}
+          private-key: ${{ secrets.FX_RELEASE_APP_PRIVATE_KEY }}
+          owner: vercel-labs
+          repositories: |
+            fx
+            fx-web
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: vercel-labs/fx-web
+          ref: main
+          path: fx-web
+          fetch-depth: 0
+          token: ${{ steps.app.outputs.token }}
+
+      - name: Restrict website rehearsals to reviewed source
+        working-directory: fx-web
+        env:
+          WEB_OVERRIDE: ${{ inputs.web_sha }}
+        run: |
+          if [[ -n "$WEB_OVERRIDE" ]]; then
+            if ! git merge-base --is-ancestor "$WEB_OVERRIDE" HEAD; then
+              echo "::error::website rehearsals may only use source already reviewed on main"
+              exit 1
+            fi
+            git switch --detach "$WEB_OVERRIDE"
+          fi
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "11.1.1"
+          run_install: false
+
+      - name: Install deployment CLI
+        run: npm install --global vercel@59.11.7
+
+      - name: Download native archives
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: fx-*
           merge-multiple: true
+          path: ${{ runner.temp }}/fx-release-prepared
 
-      - name: Create git tag
-        env:
-          RELEASE_TAG: ${{ needs.check-version.outputs.version }}
-        run: |
-          set -euo pipefail
-          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
-          git tag -- "$RELEASE_TAG"
-          git push origin "refs/tags/${RELEASE_TAG}"
-
-      - name: Extract changelog entry
-        run: |
-          awk '/<!-- release:start -->/{found=1; next} /<!-- release:end -->/{found=0} found{print}' CHANGELOG.md > /tmp/release-notes.md
-          LINES=$(wc -l < /tmp/release-notes.md | tr -d ' ')
-          if [ "$LINES" -lt 2 ]; then
-            echo "Error: No release notes found between <!-- release:start --> and <!-- release:end --> markers in CHANGELOG.md"
-            exit 1
-          fi
-          echo "Extracted release notes ($LINES lines)"
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+      - name: Download verified SDK archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          tag_name: ${{ needs.check-version.outputs.version }}
-          body_path: /tmp/release-notes.md
-          files: |
-            fx-*.tar.gz
-            fx-*.tar.gz.sha256
+          name: libfx-package
+          path: ${{ runner.temp }}/fx-release-prepared
 
-      - name: Publish to CDN
+      - name: Bind source, notes, SDK and final signed sizes
         env:
-          BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
-          VERSION: ${{ needs.check-version.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.check-version.outputs.source_sha }}
+          RELEASE_VERSION: ${{ needs.check-version.outputs.sdk_version }}
         run: |
-          set -euo pipefail
-          [[ "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
-          CDN_BASE="cli"
+          prepared_at=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .created_at)
+          python3 -m scripts.release_candidate create \
+            --artifacts "$RUNNER_TEMP/fx-release-prepared" \
+            --changelog "$GITHUB_WORKSPACE/fx-source/CHANGELOG.md" \
+            --version "$RELEASE_VERSION" --source-sha "$SOURCE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --prepared-at "$prepared_at" \
+            --output "$RUNNER_TEMP/fx-release-prepared/candidate.json"
 
-          for FILE in fx-*.tar.gz fx-*.tar.gz.sha256; do
-            [ -f "$FILE" ] || continue
-            CONTENT_TYPE="application/octet-stream"
-            [[ "$FILE" == *.sha256 ]] && CONTENT_TYPE="text/plain"
-            [[ "$FILE" == *.tar.gz ]] && [[ "$FILE" != *.sha256 ]] && CONTENT_TYPE="application/gzip"
+      - name: Prepare and verify website without promoting production
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FX_WEB_GITHUB_TOKEN: ${{ steps.app.outputs.token }}
+          VERCEL_TOKEN: ${{ secrets.FX_WEB_VERCEL_TOKEN }}
+          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.FX_WEB_PREVIEW_BYPASS }}
+          BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
+          FX_EXAMPLE_VERCEL_TOKENS: ${{ secrets.FX_EXAMPLE_VERCEL_TOKENS }}
+          PUBLICATION_ALLOWED: ${{ needs.check-version.outputs.publish }}
+          RELEASE_PR: ${{ needs.check-version.outputs.release_pr }}
+        run: |
+          args=()
+          if [[ "$PUBLICATION_ALLOWED" == true ]]; then args+=(--allow-publication); fi
+          python3 -m scripts.release_delivery \
+            --candidate "$RUNNER_TEMP/fx-release-prepared/candidate.json" \
+            --artifacts "$RUNNER_TEMP/fx-release-prepared" \
+            --fx-root "$GITHUB_WORKSPACE/fx-source" --web-root "$GITHUB_WORKSPACE/fx-web" \
+            --output "$RUNNER_TEMP/fx-release-prepared/ready.json" --release-pr "$RELEASE_PR" "${args[@]}"
+          python3 -m scripts.release_summary "$RUNNER_TEMP/fx-release-prepared" >> "$GITHUB_STEP_SUMMARY"
 
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-              -X PUT "https://blob.vercel-storage.com/${CDN_BASE}/${VERSION}/${FILE}" \
-              -H "Authorization: Bearer ${BLOB_READ_WRITE_TOKEN}" \
-              -H "x-api-version: 7" \
-              -H "x-content-type: ${CONTENT_TYPE}" \
-              -H "x-add-random-suffix: 0" \
-              -H "x-cache-control-max-age: 31536000" \
-              --data-binary "@${FILE}")
-            echo "Uploaded ${FILE} -> ${CDN_BASE}/${VERSION}/${FILE} ($HTTP_CODE)"
-            if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-              echo "::error::Failed to upload ${FILE} to CDN ($HTTP_CODE)"
-              exit 1
-            fi
-          done
-
-          echo -n "$VERSION" > /tmp/latest.txt
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-            -X PUT "https://blob.vercel-storage.com/${CDN_BASE}/latest.txt" \
-            -H "Authorization: Bearer ${BLOB_READ_WRITE_TOKEN}" \
-            -H "x-api-version: 7" \
-            -H "x-content-type: text/plain" \
-            -H "x-add-random-suffix: 0" \
-            -H "x-cache-control-max-age: 60" \
-            --data-binary "@/tmp/latest.txt")
-          echo "Updated latest.txt to $VERSION ($HTTP_CODE)"
+      - name: Retain the complete candidate for final approval
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fx-release-ready
+          path: ${{ runner.temp }}/fx-release-prepared
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30

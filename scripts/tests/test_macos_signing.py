@@ -518,7 +518,7 @@ class MacosSigningWorkflowTests(unittest.TestCase):
         check_job = release.split("  check-version:\n", 1)[1].split(
             "\n  build-linux:", 1
         )[0]
-        check_script = textwrap.dedent(check_job.split("        run: |\n", 1)[1])
+        check_script = textwrap.dedent(check_job.split("        run: |\n", 1)[1].split("\n      - name:", 1)[0])
         for validate, tag_exists, expected_needed, expected_publish in (
             ("true", True, "true", "false"),
             ("true", False, "true", "false"),
@@ -533,7 +533,12 @@ class MacosSigningWorkflowTests(unittest.TestCase):
                         'pub const version = "0.0.8";\n'
                     )
                     git = root / "git"
-                    git.write_text(f"#!/bin/sh\nexit {0 if tag_exists else 1}\n")
+                    git.write_text(
+                        "#!/bin/sh\n"
+                        "if [ \"$1\" = merge-base ] && [ \"$2\" = --is-ancestor ] && [ \"$3\" = \"$GITHUB_SHA\" ] && [ \"$4\" = \"$GITHUB_SHA\" ]; then exit 0; fi\n"
+                        "if [ \"$1\" = show ]; then printf 'pub const version = \"0.0.8\";\\n'; exit 0; fi\n"
+                        f"exit {0 if tag_exists else 1}\n"
+                    )
                     git.chmod(0o755)
                     output = root / "outputs"
                     env = dict(
@@ -541,6 +546,10 @@ class MacosSigningWorkflowTests(unittest.TestCase):
                         PATH=f"{root}:{os.environ['PATH']}",
                         GITHUB_OUTPUT=str(output),
                         VALIDATE_ONLY=validate,
+                        SOURCE_OVERRIDE="",
+                        WEB_OVERRIDE="",
+                        RELEASE_PR="",
+                        GITHUB_SHA="a" * 40,
                     )
                     result = subprocess.run(
                         ["bash", "-euo", "pipefail", "-c", check_script],
@@ -562,8 +571,8 @@ class MacosSigningWorkflowTests(unittest.TestCase):
             with self.subTest(validate=validate):
                 with tempfile.TemporaryDirectory(prefix="fx-signing-route-") as tmp:
                     root = pathlib.Path(tmp)
-                    (root / "scripts").mkdir()
-                    signer = root / "scripts/sign-and-notarize-macos.sh"
+                    (root / ".release-automation/scripts").mkdir(parents=True)
+                    signer = root / ".release-automation/scripts/sign-and-notarize-macos.sh"
                     signer.write_text(
                         "#!/bin/sh\nprintf '%s' \"${2-default}\" >> \"$1\"\n"
                     )
@@ -592,11 +601,13 @@ class MacosSigningWorkflowTests(unittest.TestCase):
         release = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
         publish_libfx = PUBLISH_LIBFX_WORKFLOW_PATH.read_text(encoding="utf-8")
 
-        release_job = release.split("  release:\n", 1)[1]
-        npm_publish_job = publish_libfx.split("  publish:\n", 1)[1]
-
-        self.assertIn("environment: release", release_job)
+        npm_publish_job = publish_libfx.split("  publish:\n", 1)[1].split("\n  verify-published:\n", 1)[0]
         self.assertIn("environment: npm", npm_publish_job)
+        self.assertIn("scripts.publish_prepared_sdk", npm_publish_job)
+        self.assertIn("scripts.release_publication publish", npm_publish_job)
+        self.assertIn("needs.prepared.outputs.eligible == 'true'", npm_publish_job)
+        self.assertNotIn("scripts.release_publication publish", release)
+        self.assertNotIn("Create git tag", release)
 
     def test_stable_release_is_the_only_workflow_with_signing_secrets(self) -> None:
         release = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
@@ -622,12 +633,12 @@ class MacosSigningWorkflowTests(unittest.TestCase):
         self.assertNotIn("secrets:", arm64_caller)
         self.assertNotIn("package_release", arm64_caller)
         sign_release = release.split("  sign-macos-arm64:\n", 1)[1].split(
-            "\n  release:\n", 1
+            "\n  build-sdk:\n", 1
         )[0]
         self.assertIn("needs: [check-version, build-macos-arm64]", sign_release)
         self.assertIn("environment: apple-signing", sign_release)
         self.assertIn(
-            "needs: [check-version, build-linux, build-macos-x86_64, sign-macos-arm64]",
+            "needs: [check-version, build-linux, build-macos-x86_64, sign-macos-arm64, build-sdk]",
             release,
         )
         workflow_call = pgso.split("  workflow_dispatch:\n", 1)[0]

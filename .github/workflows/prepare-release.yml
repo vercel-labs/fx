@@ -3,19 +3,14 @@ name: Prepare Release
 on:
   workflow_dispatch:
     inputs:
-      bump:
-        description: "Version bump type"
+      release_pr:
+        description: Open fx PR containing your committed changelog entry
         required: true
-        type: choice
-        options:
-          - patch
-          - minor
-          - major
+        type: string
 
 permissions:
-  actions: write
-  contents: write
-  pull-requests: write
+  contents: read
+  pull-requests: read
 
 concurrency:
   group: prepare-release
@@ -23,294 +18,128 @@ concurrency:
 
 jobs:
   prepare:
+    if: github.repository == 'vercel-labs/fx' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    environment: release-preparation
+    timeout-minutes: 180
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      branch: ${{ steps.plan.outputs.branch }}
+      release_sha: ${{ steps.commit.outputs.sha || steps.plan.outputs.expected_head }}
+      pr_number: ${{ steps.plan.outputs.pr_number }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: main
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Compute new version
-        id: version
-        run: |
-          CURRENT=$(grep 'pub const version' src/main.zig | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
-          case "${{ inputs.bump }}" in
-            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
-            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
-            patch) PATCH=$((PATCH + 1)) ;;
-          esac
-          NEW="${MAJOR}.${MINOR}.${PATCH}"
-          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
-          echo "new=$NEW" >> "$GITHUB_OUTPUT"
-          echo "Bumping $CURRENT -> $NEW (${{ inputs.bump }})"
-
-      - name: Collect changes since last tag
-        id: changes
-        run: |
-          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || git rev-list --max-parents=0 HEAD)
-          echo "prev_tag=$PREV_TAG" >> "$GITHUB_OUTPUT"
-
-          git diff --stat "${PREV_TAG}..HEAD" > /tmp/diff-stat.txt
-
-          git diff "${PREV_TAG}..HEAD" -- src/ > /tmp/full-diff.txt
-          DIFF_SIZE=$(wc -c < /tmp/full-diff.txt | tr -d ' ')
-          if [ "$DIFF_SIZE" -gt 81920 ]; then
-            head -c 81920 /tmp/full-diff.txt > /tmp/diff.txt
-            printf '\n\n[diff truncated at 80KB — %s bytes total]' "$DIFF_SIZE" >> /tmp/diff.txt
-          else
-            cp /tmp/full-diff.txt /tmp/diff.txt
-          fi
-
-          git log "${PREV_TAG}..HEAD" --oneline > /tmp/log.txt
-          echo "Diff: ${DIFF_SIZE} bytes, $(wc -l < /tmp/diff.txt) lines"
-          echo "Commits: $(wc -l < /tmp/log.txt)"
-
-      - name: Generate changelog with AI
+      - name: Read the locally written release notes
+        id: plan
         env:
-          AI_GATEWAY_API_KEY: ${{ secrets.AI_GATEWAY_API_KEY }}
-        run: |
-          NEW_VERSION="${{ steps.version.outputs.new }}"
-          PREV_TAG="${{ steps.changes.outputs.prev_tag }}"
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_PR: ${{ inputs.release_pr }}
+        run: python3 -m scripts.prepare_release_notes plan --pr "$RELEASE_PR" --plan "$RUNNER_TEMP/release-plan.json"
 
-          cat > /tmp/system-prompt.txt <<'SYSPROMPT'
-          You write changelogs for fx, an open-source AI-powered CLI tool written in Zig.
-
-          You will receive the actual code diff since the last release, a diff stat summary, and a commit log. Treat the commit log as private research context.
-
-          Rules:
-          - Base your changelog ONLY on what the diff actually shows. Do not trust commit messages or PR descriptions as authoritative — they go stale. The diff is the source of truth.
-          - Write public, user-facing product notes. Describe observable behavior and outcomes, not how the work was implemented or delivered.
-          - Always spell the product name fx. Preserve different casing only for exact code identifiers such as FX_MODEL.
-          - Group changes under ### Breaking Changes, ### New Features, ### Improvements, ### Bug Fixes, and ### Security as appropriate. Omit empty sections.
-          - Bold a short feature or fix name, then describe the user-visible change after a colon.
-          - Do not include pull request or issue numbers, links to trackers, commit hashes, contributor names, author attribution, or a Contributors section.
-          - Do not include internal details such as repository moves, website or marketing work, CDN layout, CI workflows, tests or fixtures, branch history, or implementation-only refactors. Translate relevant work into its public user outcome or omit it.
-          - Do not force every commit into the changelog. Omit changes without a public user outcome.
-          - Output ONLY the changelog body (the content that goes between the release markers). Do not include the ## version heading, do not include the <!-- release:start/end --> markers, do not include any preamble or explanation.
-          - Do not use emojis.
-          SYSPROMPT
-
-          cat > /tmp/user-header.txt <<USERHEADER
-          Write the changelog body for version ${NEW_VERSION} (previous tag: ${PREV_TAG}).
-          USERHEADER
-
-          jq -n \
-            --rawfile system /tmp/system-prompt.txt \
-            --rawfile user_header /tmp/user-header.txt \
-            --rawfile diff_stat /tmp/diff-stat.txt \
-            --rawfile src_diff /tmp/diff.txt \
-            --rawfile commit_log /tmp/log.txt \
-            '{
-              prompt: [
-                {role: "system", content: $system},
-                {role: "user", content: [{
-                  type: "text",
-                  text: (
-                    $user_header + "\n\n## Diff stat (file-level summary)\n" + $diff_stat
-                    + "\n\n## Source diff (src/ changes — the ground truth)\n" + $src_diff
-                    + "\n\n## Commit log (supplementary context only — do not trust these as authoritative)\n" + $commit_log
-                  )
-                }]}
-              ]
-            }' > /tmp/request.json
-
-          if ! jq -e '
-            (.prompt | type == "array") and
-            (.prompt[0].role == "system") and
-            (.prompt[0].content | type == "string") and
-            (.prompt[1].role == "user") and
-            (.prompt[1].content | type == "array") and
-            (.prompt[1].content | length == 1) and
-            (.prompt[1].content[0].type == "text") and
-            (.prompt[1].content[0].text | type == "string")
-          ' /tmp/request.json >/dev/null; then
-            echo "::error::Generated AI Gateway payload does not match the expected prompt schema"
-            exit 1
-          fi
-
-          echo "Request payload: $(wc -c < /tmp/request.json) bytes"
-
-          HTTP_STATUS=$(curl -sS -N -X POST "https://ai-gateway.vercel.sh/v4/ai/language-model" \
-            -H "Authorization: Bearer ${AI_GATEWAY_API_KEY}" \
-            -H "Content-Type: application/json" \
-            -H "ai-gateway-protocol-version: 0.0.1" \
-            -H "ai-language-model-specification-version: 4" \
-            -H "ai-language-model-id: anthropic/claude-opus-4.7" \
-            -H "ai-language-model-streaming: true" \
-            -H "HTTP-Referer: https://github.com/vercel-labs/fx" \
-            -H "X-Title: fx" \
-            -d @/tmp/request.json -o /tmp/sse-response.txt -w '%{http_code}')
-
-          if [ "$HTTP_STATUS" -ne 200 ]; then
-            echo "::error::AI Gateway returned HTTP ${HTTP_STATUS}"
-            head -c 2000 /tmp/sse-response.txt
-            exit 1
-          fi
-
-          grep '^data: ' /tmp/sse-response.txt \
-            | sed 's/^data: //' \
-            | grep -v '^\[DONE\]$' \
-            | jq -rj 'select(.type == "text-delta") | .delta' \
-            > /tmp/changelog-body.md
-
-          LINES=$(wc -l < /tmp/changelog-body.md | tr -d ' ')
-          echo "Generated changelog: ${LINES} lines"
-          if [ "$LINES" -lt 2 ]; then
-            echo "::error::AI generated an empty or too-short changelog"
-            echo "Raw SSE response (first 2000 chars):"
-            head -c 2000 /tmp/sse-response.txt
-            exit 1
-          fi
-          cat /tmp/changelog-body.md
-
-          python3 <<'PYEOF'
-          import re
-          from pathlib import Path
-
-          body = Path("/tmp/changelog-body.md").read_text()
-          forbidden = {
-              "contributor attribution": r"(?im)^###\s+contributors\b|\bcontributors?\b|\bauthors?\b",
-              "tracker references": r"(?i)#[0-9]+\b|\bPRs?\s*#?[0-9]+\b|\bpull requests?\b|github\.com/[^\s)]+/(?:pull|issues|commit)/",
-              "internal web or delivery details": r"(?i)\b(?:fx-web|website|marketing|CDN|deployments?|repository moves?|repository split|repo(?:sitory)? migration)\b|vercel-labs/[A-Za-z0-9_.-]+",
-              "internal engineering details": r"(?i)\b(?:CI|workflows?|tests?|fixtures?|branch history|Git history|commit hashes?|implementation-only refactors?|refactors?)\b",
-          }
-          errors = [label for label, pattern in forbidden.items() if re.search(pattern, body)]
-          if re.search(r"(?<![A-Za-z0-9_])(?:Fx|FX)(?![A-Za-z0-9_])", body):
-              errors.append("product name is not lowercase fx")
-
-          allowed_headings = {
-              "### Breaking Changes",
-              "### New Features",
-              "### Improvements",
-              "### Bug Fixes",
-              "### Security",
-          }
-          headings = set(re.findall(r"(?m)^### .+$", body))
-          if not headings.issubset(allowed_headings):
-              errors.append("unsupported changelog section")
-
-          bullets = re.findall(r"(?m)^- .+$", body)
-          if not bullets or any(not re.match(r"^- \*\*[^*]+:\*\* \S", bullet) for bullet in bullets):
-              errors.append("release bullets must use '- **Name:** Description'")
-
-          if errors:
-              for error in errors:
-                  print(f"::error::Public changelog policy violation: {error}")
-              raise SystemExit(1)
-          PYEOF
-
-      - name: Update version and changelog
-        run: |
-          NEW="${{ steps.version.outputs.new }}"
-          CURRENT="${{ steps.version.outputs.current }}"
-
-          sed -i "s/pub const version = \"${CURRENT}\"/pub const version = \"${NEW}\"/" src/main.zig
-          sed -i "s|bash -s v${CURRENT}|bash -s v${NEW}|g" README.md
-
-          python3 - "$NEW" <<'PYEOF'
-          import sys
-
-          new_version = sys.argv[1]
-
-          with open("/tmp/changelog-body.md") as f:
-              body = f.read().rstrip()
-
-          with open("CHANGELOG.md") as f:
-              content = f.read()
-
-          content = content.replace("<!-- release:start -->\n", "")
-          content = content.replace("<!-- release:end -->\n", "")
-
-          entry = f"## {new_version}\n\n<!-- release:start -->\n{body}\n<!-- release:end -->\n"
-
-          marker = "# fx\n\n"
-          idx = content.find(marker)
-          if idx >= 0:
-              pos = idx + len(marker)
-              content = content[:pos] + entry + "\n" + content[pos:]
-          else:
-              content = entry + "\n" + content
-
-          with open("CHANGELOG.md", "w") as f:
-              f.write(content)
-
-          print(f"Changelog updated with {new_version} entry")
-          PYEOF
-
-      - name: Create pull request
+      - name: Align the version without changing the changelog
+        if: steps.plan.outputs.prepare == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -m scripts.prepare_release_notes apply --plan "$RUNNER_TEMP/release-plan.json"
+
+      - name: Create release preparation token
+        id: app
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.FX_RELEASE_APP_ID }}
+          private-key: ${{ secrets.FX_RELEASE_APP_PRIVATE_KEY }}
+          owner: vercel-labs
+          repositories: fx
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Commit prepared release
+        id: commit
+        if: steps.plan.outputs.prepare == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          VERSION: ${{ steps.plan.outputs.version }}
+          BRANCH: ${{ steps.plan.outputs.branch }}
+          EXPECTED_HEAD: ${{ steps.plan.outputs.expected_head }}
         run: |
-          NEW="${{ steps.version.outputs.new }}"
-          BRANCH="prepare-v${NEW}"
-          REF="refs/heads/${BRANCH}"
-
-          EXISTING_PR=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
-          if [ -n "$EXISTING_PR" ]; then
-            echo "Closing existing PR #${EXISTING_PR} for ${BRANCH}"
-            gh pr close "$EXISTING_PR" --comment "Superseded by a new prepare-release run."
-          fi
-
-          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}" >/dev/null 2>&1 || true
-          gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
-            -f ref="$REF" \
-            -f sha="$GITHUB_SHA" \
-            >/dev/null
-
+          set -euo pipefail
           jq -n \
             --arg repository "$GITHUB_REPOSITORY" \
             --arg branch "$BRANCH" \
-            --arg expected_head "$GITHUB_SHA" \
-            --arg headline "Prepare v${NEW} release" \
+            --arg expected_head "$EXPECTED_HEAD" \
+            --arg headline "Prepare v${VERSION} release" \
             --arg main_zig "$(base64 -w 0 src/main.zig)" \
             --arg readme "$(base64 -w 0 README.md)" \
-            --arg changelog "$(base64 -w 0 CHANGELOG.md)" \
             '{
               query: "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }",
-              variables: {
-                input: {
-                  branch: {
-                    repositoryNameWithOwner: $repository,
-                    branchName: $branch
-                  },
-                  expectedHeadOid: $expected_head,
-                  message: {headline: $headline},
-                  fileChanges: {
-                    additions: [
-                      {path: "src/main.zig", contents: $main_zig},
-                      {path: "README.md", contents: $readme},
-                      {path: "CHANGELOG.md", contents: $changelog}
-                    ]
-                  }
-                }
-              }
-            }' > /tmp/create-release-commit.json
-
-          COMMIT_SHA=$(gh api graphql --input /tmp/create-release-commit.json --jq '.data.createCommitOnBranch.commit.oid')
-          if [ -z "$COMMIT_SHA" ]; then
+              variables: {input: {
+                branch: {repositoryNameWithOwner: $repository, branchName: $branch},
+                expectedHeadOid: $expected_head,
+                message: {headline: $headline},
+                fileChanges: {additions: [
+                  {path: "src/main.zig", contents: $main_zig},
+                  {path: "README.md", contents: $readme}
+                ]}
+              }}
+            }' > "$RUNNER_TEMP/create-release-commit.json"
+          COMMIT_SHA=$(gh api graphql --input "$RUNNER_TEMP/create-release-commit.json" \
+            --jq '.data.createCommitOnBranch.commit.oid')
+          if ! [[ "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error::GitHub did not return the release commit SHA"
             exit 1
           fi
-
-          VERIFIED=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${COMMIT_SHA}" --jq '.commit.verification.verified')
-          if [ "$VERIFIED" != "true" ]; then
+          VERIFIED=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${COMMIT_SHA}" \
+            --jq '.commit.verification.verified')
+          if [ "$VERIFIED" != true ]; then
             echo "::error::Release commit ${COMMIT_SHA} does not have a verified signature"
             exit 1
           fi
+          echo "sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
 
-          gh pr create \
-            --title "Prepare v${NEW} release" \
-            --body "$(cat <<EOF
-          ## Summary
+      - name: Confirm the prepared pull request
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          PR_NUMBER: ${{ steps.plan.outputs.pr_number }}
+          RELEASE_SHA: ${{ steps.commit.outputs.sha || steps.plan.outputs.expected_head }}
+        run: |
+          set -euo pipefail
+          CURRENT_HEAD=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)
+          if [ "$CURRENT_HEAD" != "$RELEASE_SHA" ]; then
+            echo "::error::Release branch changed during preparation; preserving its edits"
+            exit 1
+          fi
+          gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --add-label "type: release"
 
-          - Bump version to ${NEW} in \`src/main.zig\`
-          - Update \`README.md\` install example to v${NEW}
-          - Add the draft changelog entry for ${NEW}
-
-          When merged, CI will detect the version change, cross-compile platform binaries, and publish the GitHub release automatically.
-          EOF
-          )"
-
-          gh workflow run ci.yml --ref "$BRANCH"
-          gh workflow run bench.yml --ref "$BRANCH"
-          gh workflow run full-ci.yml --ref "$BRANCH"
+  qualify:
+    name: Qualify the release snapshot and start its preview
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      actions: write
+      contents: read
+      checks: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Require exact-source release checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.release_sha }}
+          RELEASE_PR: ${{ needs.prepare.outputs.pr_number }}
+        run: python3 -m scripts.release_preparation wait --source-sha "$RELEASE_SHA" --pr "$RELEASE_PR"
+      - name: Prepare the verified release without merging or publishing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.release_sha }}
+          RELEASE_PR: ${{ needs.prepare.outputs.pr_number }}
+        run: |
+          gh workflow run release.yml --ref main \
+            -f source_sha="$RELEASE_SHA" -f release_pr="$RELEASE_PR" -f validate_only=false

@@ -378,17 +378,22 @@ Do not document intended behavior as if it already exists.
 
 ## Releasing
 
-Releases use a two-workflow pipeline. The maintainer controls the changelog voice and format.
+Release preparation and publication start in this repository. The maintainer
+controls the changelog and gives one final publication approval. See
+[`scripts/RELEASE.md`](scripts/RELEASE.md) for setup, retries and recovery.
 
 ### Automated flow (preferred)
 
-1. Go to **Actions > Prepare Release** on GitHub
-2. Select the bump type (`patch`, `minor`, or `major`) and run the workflow
-3. The workflow bumps the version, feeds the actual `git diff` to an LLM to draft the changelog, and opens a PR
-4. Review the PR — edit the AI-drafted changelog if needed — then merge
-5. The existing `release.yml` detects the version change and handles build, publish, tagging, and the GitHub Release
+1. Write the next release entry locally in `CHANGELOG.md`, including its version heading and release markers, then push an open release PR targeting `main`
+2. Go to **Actions > Prepare Release** on `main`, enter that PR number, and run the workflow
+3. The workflow validates the committed notes, aligns the version and README install example, waits for exact-source checks, then prepares the preview without merging the PR
+4. Review the notes and the completed website preview. Edit the preparation PR if needed and rerun preparation; existing notes are preserved
+5. Approve the verified candidate in the `npm` environment. The publisher merges eligible preparation PRs and publishes the retained native binaries, SDK, website and affected demos without rebuilding them
 
-The `prepare-release.yml` workflow uses the Vercel AI Gateway (`AI_GATEWAY_API_KEY` secret) to generate the changelog from the real code diff, not from commit messages or PR descriptions.
+Preparation never writes `CHANGELOG.md` or calls a model. The version comes
+from the marked changelog entry. Missing or invalid notes stop preparation
+without replacing the maintainer's text. Keep release PRs limited to the
+changelog, version declaration and README; product changes must reach main first.
 
 ### Manual flow
 
@@ -398,19 +403,23 @@ To prepare a release by hand:
 2. Bump `pub const version` in `src/main.zig`
 3. Write the changelog entry in `CHANGELOG.md` at the top, under a new `## <version>` heading, wrapped in `<!-- release:start -->` and `<!-- release:end -->` markers. Remove the markers from the previous release entry so only the new release has them.
 4. Update `README.md` install example version
-5. Open a PR and merge to `main`
+5. Open a PR, wait for Full CI, then run **Release** on `main` with its exact `source_sha` and `release_pr`
 
-When the PR merges, CI compares the version tag to what exists in git. If the tag is missing, it cross-compiles all platform binaries, creates the git tag, and publishes a GitHub Release with the binaries attached. The release body is extracted from the content between the `<!-- release:start -->` and `<!-- release:end -->` markers in `CHANGELOG.md`.
+Keep the preparation PR open until final approval. Only the version line,
+README install example and changelog may differ from its reviewed main
+ancestor. Release notes come from the current `<!-- release:start -->` and
+`<!-- release:end -->` block. Do not publish a tag or npm version to make the
+preview work: it installs the verified stable SDK archive directly.
 
 ### Writing the changelog
 
-Whether automated or manual, the changelog is public product copy. Describe observable user behavior, not the engineering process behind it. Use the diff, commits, and merged pull requests as research evidence only.
+The changelog is public product copy. Describe observable user behavior, not the engineering process behind it. Use the diff, commits, and merged pull requests as research evidence only.
 
 Public changelog entries must:
 
 * Spell the product name `fx`. Preserve different casing only when it is part of an exact code identifier such as `FX_MODEL`.
 * Use only relevant sections from `### Breaking Changes`, `### New Features`, `### Improvements`, `### Bug Fixes`, and `### Security`. Omit empty sections.
-* Bold a short feature or fix name, then describe the user-visible change after a colon.
+* Start with a short bold summary, then use short, plain bullets without bold labels or technical prefixes.
 * Omit pull request numbers, issue numbers, commit hashes, contributor names, and author attribution.
 * Omit internal details such as repository moves, website or marketing work, CDN layout, CI workflows, test fixtures, branch history, and implementation-only refactors. Translate relevant work into its public user outcome or leave it out.
 * Avoid forcing every merged change into the notes. A change without a public user outcome does not need a bullet.
@@ -421,16 +430,18 @@ Only the current release should have markers; remove `<!-- release:start -->` an
 ## 0.3.0
 
 <!-- release:start -->
+**fx keeps more work in the conversation.**
+
 ### New Features
 
-- **Interactive terminal startup:** Start an interactive shell when the `terminal` tool receives an empty command
+- Send feedback to a running subagent without interrupting its current tool.
 <!-- release:end -->
 
 ## 0.2.5
 
 ### Improvements
 
-- **Inline rendering:** Keep the active conversation visible in terminal scrollback
+- Keep the active conversation visible in terminal scrollback.
 ```
 
 Do not add a `### Contributors` section or tracker references. Use descriptive section names.

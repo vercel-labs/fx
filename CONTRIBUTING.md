@@ -430,11 +430,17 @@ Check in the golden file and wire a regression test that re-runs `fx replay` in 
 
 ## Releases
 
-Releases are triggered automatically when the version in `src/main.zig` changes on `main`:
+Start **Actions > Prepare Release** in this repository:
 
-1. Edit `pub const version = "X.Y.Z";` in `src/main.zig`
-2. Merge to `main`
-3. The release workflow checks if `vX.Y.Z` tag exists; if not, it builds four platform binaries, creates the git tag, and publishes a GitHub Release with the binaries attached
+1. Write the next changelog entry locally and push a release PR. Enter its number in Prepare Release. The workflow reads the marked version, aligns the version declaration and install example, and waits for the PR's checks without rewriting the notes.
+2. Review the completed release preview. The binaries are signed, the stable SDK is built, and the website and affected demos are tested before approval.
+3. Approve the candidate in the `npm` environment. Publication reuses those artifacts, merges the preparation PRs, publishes the downloads and SDK, and promotes the prepared deployments.
+
+Do not merge the preparation PR or edit fx-web by hand to advance a release.
+Changelog preparation does not use a model or require an inference API key.
+The terminal version, changelog, signed binary sizes and example sources come
+from the same candidate. Setup and recovery are documented in
+[`scripts/RELEASE.md`](scripts/RELEASE.md).
 
 The install script and `fx upgrade` fetch binaries from `releases.fx.sh`, backed by the public Vercel Blob CDN. No authentication or external CLI tools are required. The release workflow also publishes binaries to the CDN and updates `latest.txt` automatically.
 
@@ -447,9 +453,15 @@ Do not create tags manually. The workflow owns tag creation.
 ### Validate release artifacts without publishing
 
 Run **Actions > Release** on `main` with `validate_only` enabled. This builds
-all four release targets, runs macOS arm64 PGSO qualification, and uses the
-existing `apple-signing` approval to notarize both macOS targets. It does not
-create a tag, publish a GitHub Release, upload to the CDN, or change a channel.
+all four release targets, runs macOS arm64 PGSO qualification, notarizes both
+macOS targets, builds the stable SDK, and prepares the website. Signing uses
+the main-only `apple-signing` environment. The rehearsal can upload immutable
+candidate archives and create review deployments, but cannot create a tag,
+publish npm or a GitHub Release, or change a public channel.
+
+Optional `source_sha` and `web_sha` overrides must be full commits already
+reviewed on their respective main branches. Unmerged feature code cannot use
+release credentials through a rehearsal.
 
 The arm64 validation retains both 4 KiB and 16 KiB signature variants of the
 same PGSO payload for comparison. Intel retains 4 KiB signatures. Download the
