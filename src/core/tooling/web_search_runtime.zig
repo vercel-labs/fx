@@ -1,6 +1,7 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
+const secret = @import("../auth/secret.zig");
 const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
@@ -57,8 +58,28 @@ const OwnedInputs = struct {
     usage: ?*session_usage.Usage,
     usage_allocator: Allocator,
 
+    fn dupe(alloc: Allocator, inputs: Inputs) Allocator.Error!OwnedInputs {
+        const api_key = try alloc.dupe(u8, inputs.api_key);
+        errdefer secret.zeroAndFree(alloc, api_key);
+        const gateway_team = if (inputs.gateway_team) |team| try alloc.dupe(u8, team) else null;
+        errdefer if (gateway_team) |team| alloc.free(team);
+        const worker_model = try alloc.dupe(u8, inputs.worker_model);
+        errdefer alloc.free(worker_model);
+        const gateway_chat_url = try alloc.dupe(u8, inputs.gateway_chat_url);
+        return .{
+            .api_key = api_key,
+            .credential_source = inputs.credential_source,
+            .gateway_team = gateway_team,
+            .worker_model = worker_model,
+            .gateway_retry_count = inputs.gateway_retry_count,
+            .gateway_chat_url = gateway_chat_url,
+            .usage = inputs.usage,
+            .usage_allocator = inputs.usage_allocator,
+        };
+    }
+
     fn deinit(self: *OwnedInputs, alloc: Allocator) void {
-        alloc.free(self.api_key);
+        secret.zeroAndFree(alloc, self.api_key);
         if (self.gateway_team) |team| alloc.free(team);
         alloc.free(self.worker_model);
         alloc.free(self.gateway_chat_url);
@@ -85,6 +106,8 @@ pub const Runtime = struct {
     provider: ?web_search_provider.Provider,
     clock: Clock,
     policy: web_search_policy.WebSearchPolicy,
+    // Current worker inputs. `init` points these at caller-provided defaults
+    // that must outlive the runtime; `configure` points them at `owned`.
     api_key: []const u8,
     credential_source: ?types.CredentialSource = null,
     gateway_team: ?[]const u8 = null,
@@ -93,6 +116,9 @@ pub const Runtime = struct {
     gateway_chat_url: []const u8,
     usage: ?*session_usage.Usage,
     usage_allocator: Allocator,
+    owned: ?OwnedInputs = null,
+    owned_allocator: ?Allocator = null,
+    configure_failed: bool = false,
     config_mutex: std.Io.Mutex = .init,
     fallback_cancel_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
@@ -112,19 +138,42 @@ pub const Runtime = struct {
         };
     }
 
-    pub fn deinit(_: *Runtime) void {}
+    pub fn deinit(self: *Runtime) void {
+        if (self.owned) |*owned| owned.deinit(self.owned_allocator.?);
+        self.owned = null;
+        self.owned_allocator = null;
+    }
 
-    pub fn configure(self: *Runtime, inputs: Inputs) void {
+    /// Retains an owned copy of `inputs`, so callers may free their strings
+    /// (for example on credential rotation) while searches are still running
+    /// on other threads. When the copy cannot be allocated the previous
+    /// inputs stay in place and the next search fails with `OutOfMemory`
+    /// instead of reading caller memory of unknown lifetime.
+    pub fn configure(self: *Runtime, alloc: Allocator, inputs: Inputs) void {
+        const next = OwnedInputs.dupe(alloc, inputs) catch {
+            debug_trace.logf("web_search", "configure failed err=OutOfMemory", .{});
+            self.config_mutex.lockUncancelable(io_mod.getIo());
+            defer self.config_mutex.unlock(io_mod.getIo());
+            self.configure_failed = true;
+            return;
+        };
         self.config_mutex.lockUncancelable(io_mod.getIo());
-        defer self.config_mutex.unlock(io_mod.getIo());
-        self.api_key = inputs.api_key;
-        self.credential_source = inputs.credential_source;
-        self.gateway_team = inputs.gateway_team;
-        self.worker_model = inputs.worker_model;
-        self.gateway_retry_count = inputs.gateway_retry_count;
-        self.gateway_chat_url = inputs.gateway_chat_url;
-        self.usage = inputs.usage;
-        self.usage_allocator = inputs.usage_allocator;
+        var previous = self.owned;
+        const previous_allocator = self.owned_allocator;
+        self.owned = next;
+        self.owned_allocator = alloc;
+        self.configure_failed = false;
+        const current = &self.owned.?;
+        self.api_key = current.api_key;
+        self.credential_source = current.credential_source;
+        self.gateway_team = current.gateway_team;
+        self.worker_model = current.worker_model;
+        self.gateway_retry_count = current.gateway_retry_count;
+        self.gateway_chat_url = current.gateway_chat_url;
+        self.usage = current.usage;
+        self.usage_allocator = current.usage_allocator;
+        self.config_mutex.unlock(io_mod.getIo());
+        if (previous) |*owned| owned.deinit(previous_allocator.?);
     }
 
     pub fn dispatchBackend(self: *Runtime) tool_dispatch.WebSearchBackend {
@@ -222,23 +271,17 @@ pub const Runtime = struct {
     fn inputsSnapshot(self: *Runtime, alloc: Allocator) !OwnedInputs {
         self.config_mutex.lockUncancelable(io_mod.getIo());
         defer self.config_mutex.unlock(io_mod.getIo());
-        const api_key = try alloc.dupe(u8, self.api_key);
-        errdefer alloc.free(api_key);
-        const gateway_team = if (self.gateway_team) |team| try alloc.dupe(u8, team) else null;
-        errdefer if (gateway_team) |team| alloc.free(team);
-        const worker_model = try alloc.dupe(u8, self.worker_model);
-        errdefer alloc.free(worker_model);
-        const gateway_chat_url = try alloc.dupe(u8, self.gateway_chat_url);
-        return .{
-            .api_key = api_key,
+        if (self.configure_failed) return error.OutOfMemory;
+        return OwnedInputs.dupe(alloc, .{
+            .api_key = self.api_key,
             .credential_source = self.credential_source,
-            .gateway_team = gateway_team,
-            .worker_model = worker_model,
+            .gateway_team = self.gateway_team,
+            .worker_model = self.worker_model,
             .gateway_retry_count = self.gateway_retry_count,
-            .gateway_chat_url = gateway_chat_url,
+            .gateway_chat_url = self.gateway_chat_url,
             .usage = self.usage,
             .usage_allocator = self.usage_allocator,
-        };
+        });
     }
 
     fn executeProvider(
@@ -827,13 +870,14 @@ const SearchConfigStress = struct {
     inputs: Inputs,
 
     fn run(self: SearchConfigStress) void {
-        for (0..2000) |_| self.runtime.configure(self.inputs);
+        for (0..2000) |_| self.runtime.configure(std.testing.allocator, self.inputs);
     }
 };
 
 test "web_search runtime updates its worker model during configuration" {
     var runtime = Runtime.init(.{});
-    runtime.configure(.{
+    defer runtime.deinit();
+    runtime.configure(std.testing.allocator, .{
         .api_key = "key",
         .worker_model = "provider/model",
         .gateway_retry_count = 2,
@@ -844,6 +888,74 @@ test "web_search runtime updates its worker model during configuration" {
     try std.testing.expectEqualStrings("key", runtime.api_key);
     try std.testing.expectEqual(@as(usize, 2), runtime.gateway_retry_count);
     try std.testing.expectEqualStrings("https://gateway.test/chat", runtime.gateway_chat_url);
+}
+
+test "web_search runtime owns configured inputs after the caller frees its strings" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(.{});
+    defer runtime.deinit();
+
+    const caller_key = try alloc.dupe(u8, "rotating-key");
+    const caller_team = try alloc.dupe(u8, "team-a");
+    runtime.configure(alloc, .{
+        .api_key = caller_key,
+        .gateway_team = caller_team,
+        .worker_model = "provider/model",
+        .gateway_retry_count = 2,
+        .gateway_chat_url = "https://gateway.test/chat",
+    });
+    try std.testing.expect(runtime.api_key.ptr != caller_key.ptr);
+    try std.testing.expect(runtime.gateway_team.?.ptr != caller_team.ptr);
+    // Credential rotation frees the caller's strings while the runtime may
+    // still be executing searches on another thread.
+    alloc.free(caller_key);
+    alloc.free(caller_team);
+
+    var snapshot = try runtime.inputsSnapshot(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqualStrings("rotating-key", snapshot.api_key);
+    try std.testing.expectEqualStrings("team-a", snapshot.gateway_team.?);
+
+    runtime.configure(alloc, .{
+        .api_key = "next-key",
+        .worker_model = "provider/model",
+        .gateway_retry_count = 2,
+        .gateway_chat_url = "https://gateway.test/chat",
+    });
+    try std.testing.expectEqualStrings("next-key", runtime.api_key);
+    try std.testing.expect(runtime.gateway_team == null);
+}
+
+test "web_search runtime fails searches when configured inputs cannot be retained" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(.{});
+    defer runtime.deinit();
+    runtime.configure(alloc, .{
+        .api_key = "key",
+        .worker_model = "provider/model",
+        .gateway_retry_count = 2,
+        .gateway_chat_url = "https://gateway.test/chat",
+    });
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    runtime.configure(failing.allocator(), .{
+        .api_key = "unretained-key",
+        .worker_model = "provider/model",
+        .gateway_retry_count = 2,
+        .gateway_chat_url = "https://gateway.test/chat",
+    });
+    try std.testing.expectEqualStrings("key", runtime.api_key);
+    try std.testing.expectError(error.OutOfMemory, runtime.inputsSnapshot(alloc));
+
+    runtime.configure(alloc, .{
+        .api_key = "recovered-key",
+        .worker_model = "provider/model",
+        .gateway_retry_count = 2,
+        .gateway_chat_url = "https://gateway.test/chat",
+    });
+    var snapshot = try runtime.inputsSnapshot(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqualStrings("recovered-key", snapshot.api_key);
 }
 
 test "web_search runtime preserves session usage through worker input snapshots" {
@@ -864,6 +976,7 @@ test "web_search runtime preserves session usage through worker input snapshots"
 
 test "web_search input snapshots stay coherent during parallel reconfiguration" {
     var runtime = Runtime.init(.{});
+    defer runtime.deinit();
     const inputs_a = Inputs{
         .api_key = "key-a",
         .worker_model = "model-a",
@@ -876,7 +989,7 @@ test "web_search input snapshots stay coherent during parallel reconfiguration" 
         .gateway_retry_count = 2,
         .gateway_chat_url = "https://b.invalid/chat",
     };
-    runtime.configure(inputs_a);
+    runtime.configure(std.testing.allocator, inputs_a);
 
     const thread_a = try std.Thread.spawn(.{}, SearchConfigStress.run, .{SearchConfigStress{ .runtime = &runtime, .inputs = inputs_a }});
     defer thread_a.join();
