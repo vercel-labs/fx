@@ -590,6 +590,7 @@ fn runOne(slot: *Slot) OneOutcome {
             .provider = loaded.state.preferences.provider,
             .model = loaded.state.preferences.model,
             .effort = loaded.state.preferences.effort,
+            .fast_mode = loaded.state.preferences.fast_mode,
         },
     }) catch |err| return if (err == error.Cancelled) .{
         .work_id = work_id,
@@ -597,13 +598,14 @@ fn runOne(slot: *Slot) OneOutcome {
     } else failedOutcome(work_id, "admission", err);
     @import("../shared/debug_trace.zig").logf(
         "subagent",
-        "child turn admitted child_id={s} work_id={s} provider={s} model={s} effort={s}",
+        "child turn admitted child_id={s} work_id={s} provider={s} model={s} effort={s} fast_mode={}",
         .{
             slot.child_id,
             work_id,
             @tagName(admission.provider),
             admission.model,
             admission.effort.label(),
+            admission.fast_mode,
         },
     );
     var owned_admission = admission;

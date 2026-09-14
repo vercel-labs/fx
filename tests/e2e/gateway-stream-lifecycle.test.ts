@@ -7735,36 +7735,63 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
             agent: "reviewer",
             instructions: persistentInstructions,
             message: persistentFirst,
+            fast: true,
           },
         });
       }
       if (body.includes(persistentThird)) {
+        expect(JSON.parse(body)).toHaveProperty(
+          "providerOptions.gateway.speed",
+          "fast",
+        );
         expect(body).toContain(replacementInstructions);
         expect(body).not.toContain(persistentInstructions);
         expect(body).not.toContain(testerInstructions);
         return fakeGatewayFinalText("PERSIST_THREE");
       }
       if (body.includes(testerFirst)) {
+        expect(JSON.parse(body)).not.toHaveProperty(
+          "providerOptions.gateway.speed",
+        );
         expect(body).toContain(testerInstructions);
         expect(body).not.toContain(persistentInstructions);
         expect(body).not.toContain(replacementInstructions);
         return fakeGatewayFinalText("TESTER_ONE");
       }
       if (body.includes(persistentSecond)) {
+        expect(JSON.parse(body)).toHaveProperty(
+          "providerOptions.gateway.speed",
+          "fast",
+        );
         expect(body).toContain(persistentInstructions);
         return fakeGatewayFinalText("PERSIST_TWO");
       }
       if (body.includes(persistentFirst)) {
+        expect(JSON.parse(body)).toHaveProperty(
+          "providerOptions.gateway.speed",
+          "fast",
+        );
         expect(body).toContain(persistentInstructions);
         return fakeGatewayFinalText("PERSIST_ONE");
       }
-      if (body.includes(firstTask)) return fakeGatewayFinalText("CHILD_ONE");
+      if (body.includes(firstTask)) {
+        expect(JSON.parse(body)).toHaveProperty(
+          "providerOptions.gateway.speed",
+          "fast",
+        );
+        return fakeGatewayFinalText("CHILD_ONE");
+      }
       return fakeGatewayToolCall("managed_run_one_1", "subagent", {
-        request: { action: "run", task: firstTask },
+        request: { action: "run", task: firstTask, fast: true },
       });
     }, {
       classifierDecision: "clear",
-      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      models: [{
+        id: MODEL,
+        type: "language",
+        tags: ["tool-use"],
+        fast_options: [{ type: "toggle" }],
+      }],
     });
 
     try {
@@ -7772,7 +7799,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         ["ask", "--json", "--auto", "Exercise managed delegation."],
         {
           cwd: root.workspace,
-          env: fixtureEnv(root, gateway, tracePath),
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          },
           timeoutMs: 30_000,
         },
       );
@@ -7784,6 +7814,14 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           `managed subagent flow failed: code=${result.code}\nstdout=${result.stdout}\nstderr=${result.stderr}\ntrace=${trace}`,
         );
       }
+      expect(result.code).toBe(0);
+      expect(result.stderr).toBe(
+        `Subagent working · ${firstTask}\n` +
+          `reviewer working · ${persistentFirst}\n` +
+          `reviewer working · ${persistentSecond}\n` +
+          `tester working · ${testerFirst}\n` +
+          `reviewer working · ${persistentThird}\n`,
+      );
       expect(parseAskJson(result.stdout).output).toContain(
         "MANAGED_SUBAGENT_OK",
       );
