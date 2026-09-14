@@ -5478,3 +5478,57 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     await expectFixtureProcessesExited(wire);
   }, 30_000);
 });
+
+describe("MCP suppression launch modifiers", () => {
+  test("--no-mcp loads no configured MCP server during a noninteractive ask", async () => {
+    const root = createRoot("no-mcp-ask", MODERN_FIXTURE, { recordLaunchAttempts: true });
+    gateway = startFakeGateway([fakeGatewayFinalText("No-MCP ask complete.\n")]);
+
+    const result = await runFx(
+      ["--no-mcp", "ask", "--json", "--auto", "--no-save", "Answer without MCP."],
+      { cwd: root.workspace, env: fixtureEnv(root, gateway), timeoutMs: 20_000 },
+    );
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("No-MCP ask complete.");
+    // The configured server is never launched and never speaks on the wire.
+    expect(existsSync(root.launchLogPath)).toBe(false);
+    expect(existsSync(root.wireLogPath)).toBe(false);
+  }, 30_000);
+
+  test("FX_DISABLE_MCP suppresses the same server without an argv flag", async () => {
+    const root = createRoot("no-mcp-env", MODERN_FIXTURE, { recordLaunchAttempts: true });
+    gateway = startFakeGateway([fakeGatewayFinalText("Env-disabled ask complete.\n")]);
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Answer without MCP."],
+      {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway), FX_DISABLE_MCP: "1" },
+        timeoutMs: 20_000,
+      },
+    );
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("Env-disabled ask complete.");
+    expect(existsSync(root.launchLogPath)).toBe(false);
+    expect(existsSync(root.wireLogPath)).toBe(false);
+  }, 30_000);
+
+  test("the same launch still loads the configured server without suppression", async () => {
+    const root = createRoot("no-mcp-control", MODERN_FIXTURE, { recordLaunchAttempts: true });
+    gateway = startToolGateway("Control MCP complete.");
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Use the MCP tool."],
+      { cwd: root.workspace, env: fixtureEnv(root, gateway), timeoutMs: 20_000 },
+    );
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("Control MCP complete.");
+    expect(existsSync(root.launchLogPath)).toBe(true);
+    const wire = readWire(root.wireLogPath);
+    expect(wire.filter((entry) => entry.message.method === "tools/call")).toHaveLength(1);
+    await expectFixtureProcessesExited(wire);
+  }, 30_000);
+});

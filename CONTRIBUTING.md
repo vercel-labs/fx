@@ -185,6 +185,13 @@ rejected entries do not read environment values. Missing required variables
 leave an approved server unloaded and appear in `/mcp list` without exposing
 values.
 
+`fx --no-mcp` loads no MCP servers for that launch, and keeps them off through
+later reloads. `FX_DISABLE_MCP=1` selects the same policy for wrappers that
+cannot add argv flags. Use either when fx runs as a worker inside another
+orchestrator, so a nested launch cannot reach the MCP server that spawned it.
+The flag is accepted before an interactive, resume, ask, ACP, PR, or issue
+launch.
+
 Interactive sessions keep pending workspace servers disconnected and request
 project trust before any project-defined process or network effect. Pending
 resource, prompt, completion, and authentication commands require explicit

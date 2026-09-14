@@ -112,6 +112,25 @@ pub const LoadRuntimeFn = *const fn (
     elicitation.Capabilities,
 ) anyerror!?*McpRuntime;
 
+/// The loader that intentionally loads nothing. `fx --no-mcp` selects it so a
+/// nested or unattended launch cannot inherit the operator's configured servers.
+pub fn noMcpRuntime(
+    _: Allocator,
+    _: []const u8,
+    _: elicitation.Capabilities,
+) !?*McpRuntime {
+    return null;
+}
+
+/// Environment equivalent of `--no-mcp`, for wrappers that cannot add argv
+/// flags (for example a worker process spawned by another agent).
+pub const disable_env_var = "FX_DISABLE_MCP";
+
+pub fn envDisablesMcp(value: ?[]const u8) bool {
+    const text = value orelse return false;
+    return std.mem.eql(u8, text, "1") or std.ascii.eqlIgnoreCase(text, "true");
+}
+
 pub const PreviewNativeWorkspaceAuthorityFn = *const fn (
     Allocator,
     []const u8,

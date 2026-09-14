@@ -569,6 +569,8 @@ const App = struct {
     upgrader: auto_upgrade.AutoUpgrade = .{},
     change_tracker: change_tracker_mod.ChangeTracker = .{},
     mcp: app_mcp_runtime.State = .{},
+    /// `--no-mcp`: this process loads no MCP servers, including on reload.
+    mcp_suppressed: bool = false,
     skills: skill_runtime.Runtime = .{},
     context_snapshot: context_contract.GatheredContextSnapshot = .{},
     file_index: file_index_mod.FileIndex = .{},
@@ -600,6 +602,14 @@ const App = struct {
         _: @import("core/mcp/elicitation.zig").Capabilities,
     ) !?*mcp_runtime_mod.McpRuntime {
         return null;
+    }
+
+    /// The loader every MCP entry point in this process must use. `--no-mcp`
+    /// wins over the configured profile loader, so a nested launch cannot
+    /// re-enable the operator's servers through a reload or a new session.
+    fn mcpRuntimeLoader(self: *const App) mcp_runtime_mod.LoadRuntimeFn {
+        if (comptime host_target.is_wasm) return loadNoMcpRuntime;
+        return if (self.mcp_suppressed) mcp_runtime_mod.noMcpRuntime else builtin_mcp.loadRuntime;
     }
 
     pub fn init(
@@ -654,6 +664,7 @@ const App = struct {
             launch.requested_resume = null;
         }
         errdefer if (app.requested_resume) |*target| target.deinit(alloc);
+        app.mcp_suppressed = launch.modifiers.mcp_suppressed;
         try BootstrapAppRuntime.bootstrap(
             &app,
             footer_rows,
@@ -661,7 +672,7 @@ const App = struct {
             default_max_agent_steps,
             handle_sigwinch,
             .{
-                .load_mcp_runtime = if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
+                .load_mcp_runtime = app.mcpRuntimeLoader(),
                 .skill_root_policy = if (comptime host_target.is_wasm) wasm_skill_root_policy else builtin_skills.root_policy,
                 .terminal_title = app.terminalTitle(),
             },
@@ -1567,7 +1578,7 @@ const App = struct {
             self.alloc,
             self.workspace_root,
             .{ .form = true, .url = true },
-            if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
+            self.mcpRuntimeLoader(),
             builtin_mcp.previewNativeWorkspaceAuthority,
             self.toolRegistry(),
             @intCast(@max(io_mod.milliTimestamp(), 0)),
@@ -1579,7 +1590,7 @@ const App = struct {
             self.alloc,
             self.workspace_root,
             .{ .form = true, .url = true },
-            if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
+            self.mcpRuntimeLoader(),
             builtin_mcp.previewNativeWorkspaceAuthority,
             self.toolRegistry(),
             @intCast(@max(io_mod.milliTimestamp(), 0)),
@@ -1592,7 +1603,7 @@ const App = struct {
             self.alloc,
             self.workspace_root,
             .{ .form = true, .url = true },
-            if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
+            self.mcpRuntimeLoader(),
             self.toolRegistry(),
             @intCast(@max(io_mod.milliTimestamp(), 0)),
             rebuild,
@@ -1611,7 +1622,7 @@ const App = struct {
             self.alloc,
             self.workspace_root,
             .{ .form = true, .url = true },
-            if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
+            self.mcpRuntimeLoader(),
             self.toolRegistry(),
             @intCast(@max(io_mod.milliTimestamp(), 0)),
             rebuild,
@@ -3700,6 +3711,25 @@ test "interactive app keeps notification handlers registered for live preference
     try std.testing.expect(preferences.max);
     try std.testing.expect(app.soundMaxEnabled());
     try std.testing.expect(!@hasField(App, "notification_player"));
+}
+
+test "app mcp loader honors the no-mcp launch policy" {
+    var app = App{ .alloc = std.testing.allocator };
+    try std.testing.expect(app.mcpRuntimeLoader() == builtin_mcp.loadRuntime);
+
+    app.mcp_suppressed = true;
+    try std.testing.expect(app.mcpRuntimeLoader() == mcp_runtime_mod.noMcpRuntime);
+}
+
+test "app mcp suppression outranks a configured loader on reload" {
+    var app = App{ .alloc = std.testing.allocator };
+    app.mcp_suppressed = true;
+
+    var modifiers = cli_surface.LaunchModifiers{ .mcp_suppressed = true };
+    defer modifiers.deinit(std.testing.allocator);
+    try std.testing.expect(
+        modifiers.mcpRuntimeLoader(builtin_mcp.loadRuntime) == mcp_runtime_mod.noMcpRuntime,
+    );
 }
 
 test "native app preserves the built-in tool set without workspace metadata" {

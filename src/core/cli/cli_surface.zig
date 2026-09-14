@@ -124,6 +124,8 @@ pub const LaunchModifiers = struct {
     context_limit_overrides: []config_runtime.context_limits.Override = &.{},
     additional_directories: [][]u8 = &.{},
     saved_directories_suppressed: bool = false,
+    /// `--no-mcp`: load no MCP servers for this launch, including reloads.
+    mcp_suppressed: bool = false,
 
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {
         if (self.context_limit_overrides.len > 0) alloc.free(self.context_limit_overrides);
@@ -134,6 +136,16 @@ pub const LaunchModifiers = struct {
 
     pub fn hasWorkspaceModifiers(self: LaunchModifiers) bool {
         return self.additional_directories.len > 0 or self.saved_directories_suppressed;
+    }
+
+    /// The MCP loader this launch must use. `--no-mcp` overrides the configured
+    /// loader everywhere, so reloads and nested loads cannot re-enable servers.
+    pub fn mcpRuntimeLoader(self: LaunchModifiers, configured: mcp_runtime.LoadRuntimeFn) mcp_runtime.LoadRuntimeFn {
+        return if (self.mcp_suppressed) mcp_runtime.noMcpRuntime else configured;
+    }
+
+    pub fn hasLaunchSuppression(self: LaunchModifiers) bool {
+        return self.hasWorkspaceModifiers() or self.mcp_suppressed;
     }
 };
 
@@ -360,6 +372,7 @@ fn parseGlobalLaunchArgs(
         directories.deinit(alloc);
     }
     var suppress_saved = false;
+    var suppress_mcp = false;
 
     var index: usize = 0;
     while (index < args.len) {
@@ -381,6 +394,9 @@ fn parseGlobalLaunchArgs(
         } else if (std.mem.eql(u8, arg, "--no-additional-dirs")) {
             if (suppress_saved) return error.DuplicateAdditionalDirectorySuppression;
             suppress_saved = true;
+        } else if (std.mem.eql(u8, arg, "--no-mcp")) {
+            if (suppress_mcp) return error.DuplicateMcpSuppression;
+            suppress_mcp = true;
         } else {
             break;
         }
@@ -396,6 +412,7 @@ fn parseGlobalLaunchArgs(
             .context_limit_overrides = override_slice,
             .additional_directories = directory_slice,
             .saved_directories_suppressed = suppress_saved,
+            .mcp_suppressed = suppress_mcp,
         },
     };
 }
@@ -417,7 +434,8 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
             if (index >= args.len) return &.{};
         } else if (!std.mem.startsWith(u8, arg, "--context-limit=") and
             !std.mem.startsWith(u8, arg, "--add-dir=") and
-            !std.mem.eql(u8, arg, "--no-additional-dirs"))
+            !std.mem.eql(u8, arg, "--no-additional-dirs") and
+            !std.mem.eql(u8, arg, "--no-mcp"))
         {
             return args[index..];
         }
@@ -873,8 +891,25 @@ fn activateProviderSelectionFallible(
     return true;
 }
 
+/// `FX_DISABLE_MCP` is a blunt wrapper-level switch, so it only suppresses
+/// launches that can own the policy. It never turns another command into an
+/// argv-style usage error.
+fn applyMcpEnvSuppression(
+    launch: *InteractiveLaunchParseResult,
+    env_value: ?[]const u8,
+    command_supports_suppression: bool,
+) void {
+    if (!mcp_runtime.envDisablesMcp(env_value)) return;
+    switch (launch.*) {
+        .interactive => |*value| value.modifiers.mcp_suppressed = true,
+        .noninteractive => |*value| {
+            if (command_supports_suppression) value.global_args.modifiers.mcp_suppressed = true;
+        },
+    }
+}
+
 fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: RunDeps) !RunResult {
-    const parsed_launch = parseInteractiveLaunch(alloc, args, cfg.command_catalog) catch |err| {
+    var parsed_launch = parseInteractiveLaunch(alloc, args, cfg.command_catalog) catch |err| {
         if (err == error.InvalidResumeArgs) {
             try writeTopLevelUsage(cfg.command_catalog, deps, .@"resume");
             return .handled_failure;
@@ -886,10 +921,20 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         } else {
             try writer.writer.print("fx: invalid global launch option: {s}\n", .{@errorName(err)});
         }
-        try writer.writer.writeAll("usage: fx [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] <command>\n");
+        try writer.writer.writeAll("usage: fx [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] [--no-mcp] <command>\n");
         try writeStderr(deps, writer.written());
         return .handled_failure;
     };
+    const command_supports_suppression = switch (parsed_launch) {
+        .interactive => true,
+        .noninteractive => |value| commandSupportsLaunchSuppression(value.command),
+    };
+
+    applyMcpEnvSuppression(
+        &parsed_launch,
+        deps.getenv(deps.env_ctx, mcp_runtime.disable_env_var),
+        command_supports_suppression,
+    );
     switch (parsed_launch) {
         .interactive => |launch| {
             try writeMcpProfileWarningIfPresent(alloc, cfg, deps);
@@ -913,8 +958,8 @@ fn runNonInteractiveWithDeps(
     const effective_args = parsed_launch.effective_args;
     const parsed_command = parsed_launch.command;
 
-    if (global_args.modifiers.hasWorkspaceModifiers() and
-        !commandSupportsWorkspaceModifiers(parsed_command))
+    if (global_args.modifiers.hasLaunchSuppression() and
+        !commandSupportsLaunchSuppression(parsed_command))
     {
         try writeWorkspaceModifierUsage(deps);
         return .handled_failure;
@@ -978,6 +1023,7 @@ fn runNonInteractiveWithDeps(
                 .context_limit_overrides = global_args.modifiers.context_limit_overrides,
                 .additional_directories = global_args.modifiers.additional_directories,
                 .saved_directories_suppressed = global_args.modifiers.saved_directories_suppressed,
+                .allow_acp_mcp = !global_args.modifiers.mcp_suppressed,
                 .model_override = acp_opts.model,
                 .log_file = acp_opts.log_file,
             });
@@ -3204,10 +3250,11 @@ fn workflowConfigWithLaunchModifiers(
     result.context_limit_overrides = modifiers.context_limit_overrides;
     result.additional_directories = modifiers.additional_directories;
     result.saved_directories_suppressed = modifiers.saved_directories_suppressed;
+    result.load_mcp_runtime = modifiers.mcpRuntimeLoader(cfg.load_mcp_runtime);
     return result;
 }
 
-fn commandSupportsWorkspaceModifiers(command: Command) bool {
+fn commandSupportsLaunchSuppression(command: Command) bool {
     return switch (command) {
         .interactive, .ask, .acp, .pr, .issue, .resume_session => true,
         else => false,
@@ -3217,7 +3264,7 @@ fn commandSupportsWorkspaceModifiers(command: Command) bool {
 fn writeWorkspaceModifierUsage(deps: RunDeps) !void {
     try writeStderr(
         deps,
-        "fx: --add-dir and --no-additional-dirs are only supported for interactive, resume, ask, ACP, PR, and issue launches\n",
+        "fx: --add-dir, --no-additional-dirs, and --no-mcp are only supported for interactive, resume, ask, ACP, PR, and issue launches\n",
     );
 }
 
@@ -3225,6 +3272,7 @@ fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.MissingAddDirectoryValue => "--add-dir requires a directory path",
         error.DuplicateAdditionalDirectorySuppression => "--no-additional-dirs may only be specified once",
+        error.DuplicateMcpSuppression => "--no-mcp may only be specified once",
         else => null,
     };
 }
@@ -3801,6 +3849,80 @@ test "global launch modifiers own repeatable additional directories and suppress
     try std.testing.expectEqualStrings("/tmp/shared-two", parsed.modifiers.additional_directories[1]);
     try std.testing.expect(parsed.modifiers.saved_directories_suppressed);
     try std.testing.expectEqualStrings("ask", parsed.remaining[0]);
+}
+
+test "no-mcp suppresses every MCP loader for the launch" {
+    var parsed = try parseGlobalLaunchArgs(std.testing.allocator, &.{
+        @constCast("--no-mcp"),
+        @constCast("ask"),
+        @constCast("inspect"),
+    });
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expect(parsed.modifiers.mcp_suppressed);
+    try std.testing.expect(parsed.modifiers.hasLaunchSuppression());
+    try std.testing.expect(parsed.modifiers.mcpRuntimeLoader(configuredMcpRuntimeForTest) ==
+        mcp_runtime.noMcpRuntime);
+    try std.testing.expectEqualStrings("ask", parsed.remaining[0]);
+
+    // Without the flag the configured loader is preserved.
+    var plain = try parseGlobalLaunchArgs(std.testing.allocator, &.{
+        @constCast("ask"),
+        @constCast("inspect"),
+    });
+    defer plain.deinit(std.testing.allocator);
+    try std.testing.expect(!plain.modifiers.mcp_suppressed);
+    try std.testing.expect(plain.modifiers.mcpRuntimeLoader(configuredMcpRuntimeForTest) ==
+        configuredMcpRuntimeForTest);
+}
+
+test "no-mcp is rejected twice and stays ahead of the command" {
+    try std.testing.expectError(
+        error.DuplicateMcpSuppression,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{
+            @constCast("--no-mcp"),
+            @constCast("--no-mcp"),
+            @constCast("ask"),
+        }),
+    );
+    try std.testing.expectEqualStrings(
+        "ask",
+        argsAfterGlobalLaunchArgs(&.{
+            @constCast("--no-mcp"),
+            @constCast("ask"),
+            @constCast("inspect"),
+        })[0],
+    );
+}
+
+test "no-mcp is only accepted for launches that can own it" {
+    try std.testing.expect(commandSupportsLaunchSuppression(.interactive));
+    try std.testing.expect(commandSupportsLaunchSuppression(.{ .ask = &.{} }));
+    try std.testing.expect(commandSupportsLaunchSuppression(.{ .acp = &.{} }));
+    try std.testing.expect(!commandSupportsLaunchSuppression(.{ .mcp = &.{} }));
+    try std.testing.expect(!commandSupportsLaunchSuppression(.{ .status = &.{} }));
+}
+
+test "FX_DISABLE_MCP suppresses launches that can own the policy" {
+    try std.testing.expect(mcp_runtime.envDisablesMcp("1"));
+    try std.testing.expect(mcp_runtime.envDisablesMcp("TRUE"));
+    try std.testing.expect(!mcp_runtime.envDisablesMcp("0"));
+    try std.testing.expect(!mcp_runtime.envDisablesMcp(null));
+
+    var interactive = InteractiveLaunchParseResult{ .interactive = .{} };
+    applyMcpEnvSuppression(&interactive, "1", true);
+    try std.testing.expect(interactive.interactive.modifiers.mcp_suppressed);
+    try std.testing.expect(interactive.interactive.modifiers.mcpRuntimeLoader(configuredMcpRuntimeForTest) ==
+        mcp_runtime.noMcpRuntime);
+
+    // A command that cannot own the policy is left untouched rather than failed.
+    var status = InteractiveLaunchParseResult{ .noninteractive = .{
+        .global_args = .{ .remaining = &.{} },
+        .effective_args = &.{},
+        .command = .{ .status = &.{} },
+    } };
+    applyMcpEnvSuppression(&status, "1", false);
+    try std.testing.expect(!status.noninteractive.global_args.modifiers.mcp_suppressed);
 }
 
 test "additional directory flags fail closed when malformed" {

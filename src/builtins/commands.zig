@@ -339,6 +339,10 @@ pub const top_level_flags = [_]TopLevelFlag{
         .description = "Ignore saved additional directories",
     },
     .{
+        .usage = "--no-mcp",
+        .description = "Load no MCP servers for this launch",
+    },
+    .{
         .usage = "-c, --continue",
         .description = "Resume the remembered workspace session",
     },
