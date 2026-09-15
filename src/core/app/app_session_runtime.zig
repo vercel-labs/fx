@@ -416,6 +416,8 @@ pub const SessionPicker = struct {
     selected: usize = 0,
     window_start: usize = 0,
     scope: SessionPickerScope = .current_workspace,
+    /// Tab expands the selected row into a detail line; hidden by default.
+    expanded: bool = false,
     query_buf: [256]u8 = undefined,
     query_len: usize = 0,
     selection_failure: ?session_catalog.ResumeFailure = null,
@@ -2143,6 +2145,19 @@ pub fn Runtime(comptime App: type) type {
                 .all_workspaces => .current_workspace,
             };
             try openSessionPickerWithScope(app, next);
+            return true;
+        }
+
+        /// Right expands the selected row's detail line, Left collapses it —
+        /// the file-tree idiom. Returns false when the picker is closed.
+        pub fn setSessionPickerDetailsExpanded(app: *App, expanded: bool) bool {
+            const picker = &app.session_persistence.session_picker;
+            if (!picker.active) return false;
+            // Arrows belong to the picker while it owns the footer; details
+            // respond only once a session row is actually selectable.
+            if (picker.load_state == .ready and picker.selectedId() != null) {
+                picker.expanded = expanded;
+            }
             return true;
         }
 

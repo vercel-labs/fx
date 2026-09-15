@@ -454,7 +454,8 @@ async function waitForSessionPicker(session: TmuxSession): Promise<string> {
     (pane) => {
       const plain = stripAnsi(pane);
       return plain.includes("Sessions") &&
-        (plain.includes("[Current workspace]") || plain.includes("[All workspaces]"));
+        (plain.includes("[Current workspace]") || plain.includes("[All workspaces]")) &&
+        !plain.includes("Loading sessions");
     },
     TIMEOUT,
   );
@@ -4475,7 +4476,7 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "interactive resume shows session contention and retries the preserved selection",
+  "interactive resume hides sessions open elsewhere and lists them once closed",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-interactive-contention-")));
     const home = join(root, "home");
@@ -4518,38 +4519,29 @@ test.skipIf(!tmuxAvailable())(
       await contender.waitForComposer(TIMEOUT);
       await contender.sendText("/resume");
       await waitForSessionPicker(contender);
-      await contender.waitForText(savedTitle, TIMEOUT);
-      const contentionStartedAt = Date.now();
-      await contender.sendKeys("Enter");
+      // The session held by the owner never appears as resumable.
       await contender.waitForPane(
-        (pane) => stripAnsi(pane).includes(
-          "This session is open in another fx. Close it there, then press enter to retry.",
-        ),
-        1_000,
+        (pane) => stripAnsi(pane).includes("No sessions found"),
+        TIMEOUT,
       );
-      expect(Date.now() - contentionStartedAt).toBeLessThan(1_000);
-
-      const contendedPicker = stripAnsi(await contender.capturePane());
-      expect(contendedPicker).toContain(savedTitle);
-      expect(contendedPicker).toContain(
-        "This session is open in another fx. Close it there, then press enter to retry.",
-      );
-      expect(contendedPicker).not.toContain("SessionBusy");
-      const contendedEntries = visibleSessionPickerEntries(
-        await contender.capturePaneEscapes(),
-      );
-      expect(contendedEntries).toHaveLength(1);
-      expect(contendedEntries[0]!.selected).toBe(true);
+      expect(stripAnsi(await contender.capturePane())).not.toContain(savedTitle);
       expect(owner.isPaneAlive()).toBe(true);
       expect(contender.isPaneAlive()).toBe(true);
       expect(readFileSync(ownerStderrPath, "utf8")).toBe("");
       expect(readFileSync(contenderStderrPath, "utf8")).toBe("");
 
+      await contender.sendKeys("Escape");
+      await waitForSessionPickerClosed(contender);
       await owner.sendText("/quit");
       expect(await owner.waitForSessionEnd()).toBe(true);
       await owner.kill();
       owner = null;
 
+      // Once the owner lets go, the next catalog load lists the session.
+      await new Promise((resolve) => setTimeout(resolve, 6_000));
+      await contender.sendText("/resume");
+      await waitForSessionPicker(contender);
+      await contender.waitForText(savedTitle, TIMEOUT);
       await contender.sendKeys("Enter");
       const resumed = await waitForScrollback(contender, savedMarker);
       expect(resumed).toContain(`* session resumed: ${savedTitle}`);
@@ -6158,7 +6150,10 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       await active.sendText("/resume");
       await waitForSessionPicker(active);
-      const currentPicker = stripAnsi(await active.capturePane());
+      const currentPicker = stripAnsi(await active.waitForPane((pane) => {
+        const plain = stripAnsi(pane);
+        return plain.includes("Sessions 1") && plain.includes("Save the workspace A transcript.");
+      }, TIMEOUT));
       expect(currentPicker).toContain("Sessions 1");
       expect(currentPicker).toContain("[Current workspace]");
       expect(currentPicker).toContain("𝒇x");
@@ -6291,6 +6286,82 @@ test.skipIf(!tmuxAvailable())(
     }
   },
   TIMEOUT * 4,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "interactive /resume expands the selected session details with the arrow keys",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-session-details-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    const workspaceRoot = realpathSync(workspace);
+    const gateway = startFakeGateway([fakeGatewayFinalText("DETAIL_TURN_SAVED")]);
+    let active: TmuxSession | null = null;
+
+    try {
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: workspaceRoot,
+        env: gatewayEnv(home, gateway),
+        stderrPath,
+        width: 100,
+        height: 28,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Save a turn for the details line.");
+      await active.waitForText("DETAIL_TURN_SAVED", TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+      const sessionId = sessionIdFromHome(home);
+      const recorded = JSON.parse(readFileSync(join(home, ".fx", "sessions", sessionId, "session.json"), "utf8"));
+
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: workspaceRoot,
+        env: gatewayEnv(home, gateway),
+        stderrPath,
+        width: 100,
+        height: 28,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("/resume");
+      await waitForSessionPicker(active);
+      const picker = stripAnsi(await active.waitForPane((pane) => {
+        const plain = stripAnsi(pane);
+        return plain.includes("Sessions 1") && plain.includes("Save a turn for the details line.");
+      }, TIMEOUT));
+      expect(picker).toContain("Sessions 1");
+      expect(picker).not.toContain("created");
+
+      await active.sendKeys("Right");
+      const expanded = stripAnsi(await active.waitForText("created", TIMEOUT).then(() => active.capturePane()));
+      // The path middle-ellipsizes on narrow panes; its head always survives.
+      expect(expanded).toContain(workspaceRoot.slice(0, 20));
+      expect(expanded).toContain(recorded.model);
+      expect(expanded).toContain("→ details");
+
+      await active.sendKeys("Left");
+      await active.waitForPane(
+        (pane) => !stripAnsi(pane).includes("created"),
+        TIMEOUT,
+      );
+
+      await active.sendKeys("Escape");
+      await waitForSessionPickerClosed(active);
+      expect(active.isAlive()).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      if (active) await active.kill();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 2,
 );
 
 test.skipIf(!tmuxAvailable())(

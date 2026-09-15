@@ -56,12 +56,15 @@ pub fn cloneSessionSummary(
     errdefer if (title) |value| alloc.free(value);
     const preview = if (source.preview) |value| try alloc.dupe(u8, value) else null;
     errdefer if (preview) |value| alloc.free(value);
+    const model = if (source.model) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (model) |value| alloc.free(value);
     return .{
         .id = id,
         .workspace_root = workspace_root,
         .origin_workspace_root = origin_workspace_root,
         .title = title,
         .preview = preview,
+        .model = model,
         .display_metadata_present = source.display_metadata_present,
         .created_at_ms = source.created_at_ms,
         .updated_at_ms = source.updated_at_ms,
