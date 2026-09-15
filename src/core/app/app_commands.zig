@@ -30,6 +30,8 @@ const permissions = @import("../permissions/permissions.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const skill_commands = @import("../skills/skill_commands.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
+const swarm_provider = @import("../swarm/provider.zig");
+const swarm_snapshot = @import("../swarm/snapshot.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_presentation = @import("../tooling/tool_presentation.zig");
 const session_commands = @import("../session/session_commands.zig");
@@ -375,6 +377,7 @@ pub fn Handlers(comptime App: type) type {
                 .undo_last = commandUndoLast,
                 .handle_mcp = commandHandleMcp,
                 .handle_skills = commandHandleSkills,
+                .handle_swarm = commandHandleSwarm,
                 .copy_last = commandCopyLast,
                 .submit_feedback = commandSubmitFeedback,
                 .create_trace = commandCreateTrace,
@@ -1680,6 +1683,108 @@ pub fn Handlers(comptime App: type) type {
                 .revocation_failed = result.revocation_failed,
                 .repaired_entries = result.repaired_entries,
                 .local_only = result.local_only,
+            };
+        }
+
+        /// `/swarm [job-id|findings]` renders Puppetmaster's own job state.
+        ///
+        /// Puppetmaster owns the swarm; fx owns how it reads in the transcript.
+        /// The view is read-only and one-shot: it asks the Puppetmaster CLI for
+        /// two JSON documents and renders them through the notice path.
+        fn commandHandleSwarm(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime !runtime_profile.allows(App, .tools)) {
+                try app.writeDomainNotice(.{
+                    .topic = "swarm",
+                    .tone = .warning,
+                    .body = "Swarm status is unavailable in this host.",
+                }, true);
+                return;
+            }
+
+            const parsed = parseSwarmArgs(rest);
+            var read = swarm_provider.readJob(
+                app.alloc,
+                app.swarm_read_fn,
+                parsed.job_id,
+                swarm_provider.default_timeout_ms,
+            ) catch |err| {
+                const reason = swarmProviderReason(err);
+                const body = try swarm_snapshot.renderFailure(app.alloc, reason);
+                defer app.alloc.free(body);
+                try app.writeDomainNotice(.{
+                    .topic = "swarm",
+                    .tone = .warning,
+                    .body = body,
+                }, true);
+                return;
+            } orelse {
+                try app.writeDomainNotice(.{
+                    .topic = "swarm",
+                    .tone = .neutral,
+                    .body = "No Puppetmaster swarm found for this workspace. Run `puppetmaster swarm` from the repository, or pass a job id.",
+                }, true);
+                return;
+            };
+            defer read.deinit(app.alloc);
+
+            var snapshot = swarm_snapshot.parse(app.alloc, read.status, read.feed) catch |err| {
+                const reason = switch (err) {
+                    error.InvalidSwarmJson => "Puppetmaster returned a document fx could not parse",
+                    error.SwarmShapeUnexpected => "Puppetmaster returned an unexpected status shape",
+                    else => "the swarm snapshot could not be built",
+                };
+                const body = try swarm_snapshot.renderFailure(app.alloc, reason);
+                defer app.alloc.free(body);
+                try app.writeDomainNotice(.{
+                    .topic = "swarm",
+                    .tone = .warning,
+                    .body = body,
+                }, true);
+                return;
+            };
+            defer snapshot.deinit(app.alloc);
+
+            const body = try swarm_snapshot.render(app.alloc, snapshot, parsed.findings_only);
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(.{
+                .topic = "swarm",
+                .tone = .neutral,
+                .body = body,
+            }, true);
+        }
+
+        const SwarmArgs = struct {
+            job_id: ?[]const u8 = null,
+            findings_only: bool = false,
+        };
+
+        /// `/swarm`, `/swarm <job-id>`, `/swarm findings`, and
+        /// `/swarm findings <job-id>` all mean something specific; anything else is
+        /// treated as a job id so a mistyped subcommand reports a lookup failure rather
+        /// than silently rendering the latest job.
+        fn parseSwarmArgs(rest: []const u8) SwarmArgs {
+            var parsed = SwarmArgs{};
+            var tokens = std.mem.tokenizeAny(u8, rest, " \t");
+            while (tokens.next()) |token| {
+                if (std.mem.eql(u8, token, "findings")) {
+                    // Keyword, never a job id: a repeated `findings` must not be
+                    // mistaken for the job it was meant to filter.
+                    parsed.findings_only = true;
+                } else if (parsed.job_id == null) {
+                    parsed.job_id = token;
+                }
+            }
+            return parsed;
+        }
+
+        fn swarmProviderReason(err: anyerror) []const u8 {
+            return switch (err) {
+                error.SwarmCommandMissing, error.FileNotFound => "Puppetmaster is not installed or not on PATH",
+                error.SwarmCommandFailed => "Puppetmaster could not read that job",
+                error.SwarmCommandTimedOut => "Puppetmaster did not answer in time",
+                error.SwarmOutputTooLarge => "Puppetmaster returned more output than fx will render",
+                else => "the Puppetmaster read failed",
             };
         }
 
@@ -5128,4 +5233,126 @@ test "skills show missing name keeps not found notice" {
     const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.entries.items, 80, .{});
     defer alloc.free(rendered);
     try std.testing.expect(std.mem.find(u8, rendered, "Skill 'missing' not found.") != null);
+}
+
+test "swarm arguments separate a job id from the findings view" {
+    const SwarmHarness = struct {};
+    const bare = Handlers(SwarmHarness).parseSwarmArgs("");
+    try std.testing.expect(bare.job_id == null);
+    try std.testing.expect(!bare.findings_only);
+
+    const named = Handlers(SwarmHarness).parseSwarmArgs("job_abc123");
+    try std.testing.expectEqualStrings("job_abc123", named.job_id.?);
+    try std.testing.expect(!named.findings_only);
+
+    const findings = Handlers(SwarmHarness).parseSwarmArgs("findings");
+    try std.testing.expect(findings.job_id == null);
+    try std.testing.expect(findings.findings_only);
+
+    const both = Handlers(SwarmHarness).parseSwarmArgs("  findings\tjob_abc123  ");
+    try std.testing.expectEqualStrings("job_abc123", both.job_id.?);
+    try std.testing.expect(both.findings_only);
+
+    // A repeated keyword is not a job id, and the first id wins.
+    const repeated = Handlers(SwarmHarness).parseSwarmArgs("findings findings job_first job_second");
+    try std.testing.expectEqualStrings("job_first", repeated.job_id.?);
+}
+
+test "swarm provider failures get a specific reason" {
+    const SwarmHarness = struct {};
+    try std.testing.expectEqualStrings(
+        "Puppetmaster is not installed or not on PATH",
+        Handlers(SwarmHarness).swarmProviderReason(error.SwarmCommandMissing),
+    );
+    try std.testing.expectEqualStrings(
+        "Puppetmaster did not answer in time",
+        Handlers(SwarmHarness).swarmProviderReason(error.SwarmCommandTimedOut),
+    );
+    try std.testing.expectEqualStrings(
+        "Puppetmaster returned more output than fx will render",
+        Handlers(SwarmHarness).swarmProviderReason(error.SwarmOutputTooLarge),
+    );
+}
+
+// Minimal App surface `/swarm` needs: an allocator, a notice sink, a slash
+// registry, and an injected Puppetmaster read. Nothing here spawns a process.
+test "swarm renders a snapshot through the notice path" {
+    const alloc = std.testing.allocator;
+    const FakeSwarmApp = struct {
+        alloc: std.mem.Allocator,
+        shell: transcript_runtime.TranscriptRuntime = .{},
+        swarm_read_fn: swarm_provider.ReadFn = fakeRead,
+
+        fn deinit(self: *@This()) void {
+            self.shell.deinit(self.alloc);
+        }
+
+        pub fn slashRegistry(self: *@This()) command_specs.SlashRegistry {
+            _ = self;
+            return command_specs.SlashRegistry{ .commands = &.{} };
+        }
+
+        pub fn writeDomainNotice(self: *@This(), notice: types.SemanticNotice, record: bool) !void {
+            _ = record;
+            _ = try self.shell.appendSemanticNotice(self.alloc, notice);
+        }
+
+        fn fakeRead(a: std.mem.Allocator, argv: []const []const u8, _: u64) anyerror![]u8 {
+            if (std.mem.eql(u8, argv[1], "last")) return a.dupe(u8, "{\"job_id\":\"job_1\"}");
+            if (std.mem.eql(u8, argv[1], "status")) {
+                return a.dupe(u8, "{\"job\":{\"id\":\"job_1\",\"status\":\"complete\"},\"task_counts\":{\"complete\":2},\"outcome\":{\"trustworthy\":true}}");
+            }
+            return a.dupe(u8, "[{\"event\":\"artifact.saved\",\"artifact\":{\"type\":\"finding\"}}]");
+        }
+    };
+    var app = FakeSwarmApp{ .alloc = alloc };
+    defer app.deinit();
+
+    try Handlers(FakeSwarmApp).commandHandleSwarm(@ptrCast(&app), "");
+
+    try std.testing.expectEqual(@as(usize, 1), app.shell.entries.items.len);
+    try std.testing.expect(app.shell.entries.items[0] == .semantic_notice);
+    const notice = app.shell.entries.items[0].semantic_notice;
+    try std.testing.expectEqualStrings("swarm", notice.topic);
+    try std.testing.expectEqual(types.NoticeTone.neutral, notice.tone);
+    try std.testing.expect(std.mem.find(u8, notice.body, "swarm job_1 \u{b7} complete") != null);
+    try std.testing.expect(std.mem.find(u8, notice.body, "tasks: 2 total \u{b7} 2 complete") != null);
+    try std.testing.expect(std.mem.find(u8, notice.body, "findings: 1") != null);
+}
+
+test "swarm explains a missing Puppetmaster instead of claiming an empty workspace" {
+    const alloc = std.testing.allocator;
+    const MissingSwarmApp = struct {
+        alloc: std.mem.Allocator,
+        shell: transcript_runtime.TranscriptRuntime = .{},
+        swarm_read_fn: swarm_provider.ReadFn = missingRead,
+
+        fn deinit(self: *@This()) void {
+            self.shell.deinit(self.alloc);
+        }
+
+        pub fn slashRegistry(self: *@This()) command_specs.SlashRegistry {
+            _ = self;
+            return command_specs.SlashRegistry{ .commands = &.{} };
+        }
+
+        pub fn writeDomainNotice(self: *@This(), notice: types.SemanticNotice, record: bool) !void {
+            _ = record;
+            _ = try self.shell.appendSemanticNotice(self.alloc, notice);
+        }
+
+        fn missingRead(_: std.mem.Allocator, _: []const []const u8, _: u64) anyerror![]u8 {
+            return error.FileNotFound;
+        }
+    };
+    var app = MissingSwarmApp{ .alloc = alloc };
+    defer app.deinit();
+
+    try Handlers(MissingSwarmApp).commandHandleSwarm(@ptrCast(&app), "");
+
+    const notice = app.shell.entries.items[0].semantic_notice;
+    try std.testing.expectEqualStrings("swarm", notice.topic);
+    try std.testing.expectEqual(types.NoticeTone.warning, notice.tone);
+    try std.testing.expect(std.mem.find(u8, notice.body, "not installed") != null);
+    try std.testing.expect(std.mem.find(u8, notice.body, "No Puppetmaster swarm found") == null);
 }
