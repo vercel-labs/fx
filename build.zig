@@ -65,6 +65,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("build_options", build_options.createModule());
+    exe.headerpad_size = b.option(u32, "macho-headerpad", "Reserve Mach-O load-command bytes for offline experiments");
 
     b.installArtifact(exe);
 

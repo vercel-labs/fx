@@ -53,6 +53,12 @@ jobs:
       - name: Test signing and release routing
         run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos -q
 
+      - name: Test pager layout without executing experimental binaries
+        run: |
+          python3 -m unittest discover -s experiments/pager -p test_rewrite.py -v
+          zig test experiments/pager/contract.zig
+          zig fmt --check experiments/pager/contract.zig experiments/pager/pager_freestanding.zig
+
       - name: Build
         run: zig build -Doptimize=${{ matrix.optimize }}
 
