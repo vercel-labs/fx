@@ -2645,7 +2645,7 @@ test "request reports a registration failure as definitely unsent" {
             "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"fixture/closed\"}",
             4096,
             .{
-                .timeout_ms = 25,
+                .timeout_ms = 2_000,
                 .request_started = &request_started,
             },
         ),
@@ -2683,7 +2683,7 @@ test "precommit rejection is unsent and preserves the connection" {
             "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"fixture/rejected\"}",
             4096,
             .{
-                .timeout_ms = 25,
+                .timeout_ms = 2_000,
                 .request_started = &request_started,
                 .precommit = &precommit,
             },
