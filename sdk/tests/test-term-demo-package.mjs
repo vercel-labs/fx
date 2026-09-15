@@ -28,6 +28,13 @@ try {
   assert.match(sdk, new RegExp(`from "\\./${manifest.wasmModule.file.replaceAll(".", "\\.")}";`));
   assert.doesNotMatch(sdk, /from "\.\/wasm-module\.js";/);
 
+  const browser = await readFile(join(temp, manifest.browser.file), "utf8");
+  const remote = await readFile(join(temp, manifest.remoteTerminal.file));
+  assert.equal(digest(remote), manifest.remoteTerminal.sha256);
+  assert.equal(remote.byteLength, manifest.remoteTerminal.bytes);
+  assert.ok(sdk.includes(`from "./${manifest.remoteTerminal.file}";`));
+  assert.ok(browser.includes(`from "./${manifest.remoteTerminal.file}";`));
+  assert.ok(!sdk.includes('from "./remote-terminal.js";'));
   const vercel = JSON.parse(await readFile(join(temp, "vercel.json"), "utf8"));
   const header = vercel.headers.find(({ source }) => source === `/${manifest.wasmModule.file}`);
   assert.deepEqual(header?.headers, [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }]);
