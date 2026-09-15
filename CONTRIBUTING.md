@@ -53,7 +53,7 @@ warning at increases of 52,429 bytes (0.050000 MiB) or more. The warning request
 investigation but does not replace the full PGSO release gate or reject a valid
 feature solely for adding code.
 
-### Gateway request diagnostics
+### Qwen Gateway compatibility
 
 Qwen instruction normalization is a wire-only compatibility policy in
 `src/gateway/vercel_model_policy.zig` and `src/builtins/gateway.zig`. The
@@ -63,29 +63,11 @@ or one instruction is left unchanged; no empty system message is synthesized.
 This family-wide policy is supported by live `qwen3.8-max`/Fireworks continuation
 experiments, not verified requirements for every Qwen route. Do not mutate core
 instruction lanes or durable history to satisfy a provider format. Other model
-families keep their existing layout. Request-shape diagnostics reflect the final
-wire projection.
-
-Native streaming Gateway requests support opt-in structural events through
-`FX_TRACE_LOG=<path>` and `FX_TRACE_SCOPES=gateway`. The transport records each
-attempt's actual serialized prompt roles, total and leading system-message
-counts, response correlation IDs, and outcome. Request parsing for these
-summaries is skipped when the scope is disabled. Diagnostic failures must not
-change provider behavior.
-
-For temporary research, `FX_TRACE_GATEWAY_BODIES=1` additionally emits sensitive,
-unredacted HTTP error bodies and consumed SSE data payloads to the same log.
-This is not an HTTP packet capture: SSE framing, unread data after completion,
-and successful non-streaming requests are not captured. A 256 KiB per-attempt
-limit and 2048-byte chunks bound the dump; the outcome records truncation.
-Use a private log path and `umask 077`, and never commit or publicly attach these
-logs without reviewing them. The flag alone does not enable tracing.
+families keep their existing layout.
 
 The deterministic owner is `tests/e2e/gateway-stream-lifecycle.test.ts` (PGSO
 training, because the file continues to own common Gateway runtime behavior).
-Run its focused `gateway request tracing` cases rather than the full file while
-developing this diagnostic path. No CLI flag, session persistence format, or
-JSON product-output contract changes are involved.
+Run its focused `Qwen Gateway continuations` cases while developing this path.
 
 ## Pull Requests
 

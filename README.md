@@ -67,34 +67,12 @@ The SDK is published to npm as [libfx](https://www.npmjs.com/package/libfx). For
 
 Read the [fx documentation](https://fx.sh/docs) for sessions, models, permissions, configuration, and the full CLI and slash command references.
 
-## Diagnose Gateway requests
+## Qwen compatibility
 
 For Qwen models on AI Gateway, fx combines multiple instruction blocks into one
 leading system message to support follow-up turns and tool continuations. Zero
 or one instruction is left unchanged. Instruction order and saved conversation
 history are preserved; other models retain their existing message layout.
-
-Run `/trace` immediately after an error to export a private report with recent
-request models, statuses, and bounded failure request shapes. Review it before
-sharing: it can include conversation and workspace data.
-
-For persistent native Gateway diagnostics from a source checkout:
-
-```bash
-zig build
-(umask 077; FX_TRACE_LOG="$HOME/.fx/logs/gateway-$(date +%s).log" \
-  FX_TRACE_SCOPES=gateway ./zig-out/bin/fx)
-```
-
-The log correlates request roles, system-message counts, response IDs, and
-outcomes without dumping message contents. For temporary testing, additionally
-set `FX_TRACE_GATEWAY_BODIES=1` on that invocation to dump HTTP error bodies and
-consumed SSE data payloads. These response dumps are **unredacted and sensitive**:
-they can contain model output, tool arguments, provider metadata, or echoed
-prompts and secrets. Control bytes are escaped, payload capture is capped at
-256 KiB per attempt, and truncation is reported. Request bodies and arbitrary
-response headers are not dumped. The body flag does nothing without enabled
-Gateway tracing. Keep the log private and remove the flag after testing.
 
 ## Build from source
 

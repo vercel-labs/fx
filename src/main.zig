@@ -4271,7 +4271,6 @@ test {
     _ = @import("core/workspace/directory_completion_job.zig");
     _ = @import("core/input/file_completion_state.zig");
     _ = @import("gateway/vercel_protocol.zig");
-    _ = @import("gateway/request_trace.zig");
     _ = @import("gateway/vercel_model_policy.zig");
     _ = @import("core/gateway/provider_set.zig");
     _ = @import("core/github/git_context.zig");
