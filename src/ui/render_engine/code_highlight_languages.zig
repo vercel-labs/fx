@@ -1,4 +1,5 @@
 const std = @import("std");
+const string_pool = @import("../../core/shared/comptime_string_pool.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -7,7 +8,7 @@ pub const KeywordCase = enum {
     ascii_insensitive,
 };
 
-pub const BlockComment = struct {
+const BlockCommentSpec = struct {
     start: []const u8,
     end: []const u8,
 };
@@ -24,11 +25,11 @@ pub const Detection = enum {
     rust_function,
 };
 
-pub const Profile = struct {
+const ProfileSpec = struct {
     label: []const u8,
     aliases: []const []const u8,
     line_comments: []const []const u8 = &.{},
-    block_comment: ?BlockComment = null,
+    block_comment: ?BlockCommentSpec = null,
     quotes: []const u8 = &.{},
     keywords: []const []const u8 = &.{},
     literals: []const []const u8 = &.{},
@@ -40,7 +41,7 @@ const double_quote = &[_]u8{'"'};
 const double_single_quotes = &[_]u8{ '"', '\'' };
 const shell_quotes = &[_]u8{ '"', '\'', '`' };
 
-const profiles = [_]Profile{
+const profile_specs = [_]ProfileSpec{
     .{
         .label = "zig",
         .aliases = &.{"zig"},
@@ -259,10 +260,66 @@ const profiles = [_]Profile{
     },
 };
 
+// Every string in the spec table is interned into one comptime blob; the
+// published profiles reference it with 6-byte (offset, length) pairs
+// instead of 16-byte slices. The spec table above stays in natural form.
+const pool = string_pool.Interned(blk: {
+    var flat: []const []const u8 = &.{};
+    for (profile_specs) |p| {
+        flat = flat ++ &[1][]const u8{p.label};
+        flat = flat ++ p.aliases;
+        flat = flat ++ p.line_comments;
+        if (p.block_comment) |bc| flat = flat ++ &[2][]const u8{ bc.start, bc.end };
+        flat = flat ++ p.keywords;
+        flat = flat ++ p.literals;
+    }
+    break :blk flat;
+});
+
+pub const Ref = pool.Ref;
+
+pub const BlockComment = struct {
+    start: Ref,
+    end: Ref,
+};
+
+pub const Profile = struct {
+    label: Ref,
+    aliases: []const Ref,
+    line_comments: []const Ref = &.{},
+    block_comment: ?BlockComment = null,
+    quotes: []const u8 = &.{},
+    keywords: []const Ref = &.{},
+    literals: []const Ref = &.{},
+    keyword_case: KeywordCase = .sensitive,
+    detection: Detection = .none,
+};
+
+pub const profiles = blk: {
+    var out: [profile_specs.len]Profile = undefined;
+    for (profile_specs, 0..) |spec, i| {
+        out[i] = .{
+            .label = pool.ref(spec.label),
+            .aliases = pool.List(spec.aliases).items[0..],
+            .line_comments = pool.List(spec.line_comments).items[0..],
+            .block_comment = if (spec.block_comment) |bc| .{
+                .start = pool.ref(bc.start),
+                .end = pool.ref(bc.end),
+            } else null,
+            .quotes = spec.quotes,
+            .keywords = pool.List(spec.keywords).items[0..],
+            .literals = pool.List(spec.literals).items[0..],
+            .keyword_case = spec.keyword_case,
+            .detection = spec.detection,
+        };
+    }
+    break :blk out;
+};
+
 pub fn resolve(label: []const u8) ?*const Profile {
     for (&profiles) |*profile| {
         for (profile.aliases) |alias| {
-            if (std.ascii.eqlIgnoreCase(label, alias)) return profile;
+            if (std.ascii.eqlIgnoreCase(label, alias.get())) return profile;
         }
     }
     return null;
@@ -377,7 +434,7 @@ test "TypeScript assertions infer the canonical TypeScript label" {
     const source =
         "const hook = await resumeHook(token, { cleanup: true } as CleanupSignal);";
 
-    try std.testing.expectEqualStrings("ts", infer(std.testing.allocator, source).?.label);
+    try std.testing.expectEqualStrings("ts", infer(std.testing.allocator, source).?.label.get());
     try std.testing.expect(infer(std.testing.allocator, "const value = 1;") == null);
     try std.testing.expect(infer(std.testing.allocator, "const value = {} as cleanupSignal;") == null);
 }
@@ -397,7 +454,7 @@ test "supported code fence labels resolve case insensitively" {
         .{ .label = "zsh", .profile = "sh" },
         .{ .label = "Shell", .profile = "sh" },
     };
-    for (cases) |case| try std.testing.expectEqualStrings(case.profile, resolve(case.label).?.label);
+    for (cases) |case| try std.testing.expectEqualStrings(case.profile, resolve(case.label).?.label.get());
     try std.testing.expect(resolve("") == null);
     try std.testing.expect(resolve("text") == null);
 }
@@ -420,7 +477,7 @@ test "expanded code fence labels resolve through the language registry" {
         .{ .label = "hcl", .profile = "hcl" },               .{ .label = "terraform", .profile = "hcl" },
         .{ .label = "tf", .profile = "hcl" },
     };
-    for (cases) |case| try std.testing.expectEqualStrings(case.profile, resolve(case.label).?.label);
+    for (cases) |case| try std.testing.expectEqualStrings(case.profile, resolve(case.label).?.label.get());
 }
 
 test "high-confidence source shapes infer registered profiles" {
@@ -435,7 +492,7 @@ test "high-confidence source shapes infer registered profiles" {
         .{ .source = "fn main() { println!(\"ready\"); }", .profile = "rust" },
     };
 
-    for (cases) |case| try std.testing.expectEqualStrings(case.profile, infer(alloc, case.source).?.label);
+    for (cases) |case| try std.testing.expectEqualStrings(case.profile, infer(alloc, case.source).?.label.get());
     try std.testing.expect(infer(alloc, "const value = 1;") == null);
     try std.testing.expect(infer(alloc, "title: ready") == null);
 }
@@ -445,7 +502,7 @@ test "aliases do not collide across profiles" {
         for (profile.aliases) |alias| {
             for (profiles[profile_index + 1 ..]) |other| {
                 for (other.aliases) |other_alias| {
-                    try std.testing.expect(!std.ascii.eqlIgnoreCase(alias, other_alias));
+                    try std.testing.expect(!std.ascii.eqlIgnoreCase(alias.get(), other_alias.get()));
                 }
             }
         }

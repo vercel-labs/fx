@@ -105,15 +105,17 @@ fn appendStyled(alloc: Allocator, out: *std.ArrayList(u8), style: []const u8, te
 
 fn blockCommentEnd(source: []const u8, index: usize, block_comment: ?languages.BlockComment) ?usize {
     const comment = block_comment orelse return null;
-    if (!std.mem.startsWith(u8, source[index..], comment.start)) return null;
-    const content_start = index + comment.start.len;
-    const close_start = std.mem.indexOfPos(u8, source, content_start, comment.end) orelse return source.len;
-    return close_start + comment.end.len;
+    const start = comment.start.get();
+    if (!std.mem.startsWith(u8, source[index..], start)) return null;
+    const content_start = index + start.len;
+    const end = comment.end.get();
+    const close_start = std.mem.indexOfPos(u8, source, content_start, end) orelse return source.len;
+    return close_start + end.len;
 }
 
-fn lineCommentEnd(source: []const u8, index: usize, prefixes: []const []const u8) ?usize {
+fn lineCommentEnd(source: []const u8, index: usize, prefixes: []const languages.Ref) ?usize {
     for (prefixes) |prefix| {
-        if (std.mem.startsWith(u8, source[index..], prefix)) return lineEnd(source, index);
+        if (std.mem.startsWith(u8, source[index..], prefix.get())) return lineEnd(source, index);
     }
     return null;
 }
@@ -164,11 +166,11 @@ fn identifierEnd(source: []const u8, start: usize) usize {
     return index;
 }
 
-fn inList(token: []const u8, options: []const []const u8, keyword_case: languages.KeywordCase) bool {
+fn inList(token: []const u8, options: []const languages.Ref, keyword_case: languages.KeywordCase) bool {
     for (options) |option| {
         const matches = switch (keyword_case) {
-            .sensitive => std.mem.eql(u8, token, option),
-            .ascii_insensitive => std.ascii.eqlIgnoreCase(token, option),
+            .sensitive => std.mem.eql(u8, token, option.get()),
+            .ascii_insensitive => std.ascii.eqlIgnoreCase(token, option.get()),
         };
         if (matches) return true;
     }
