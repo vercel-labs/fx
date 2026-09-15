@@ -64,6 +64,12 @@ pub fn build(b: *std.Build) void {
             .strip = optimize != .Debug,
         }),
     });
+    const opentelemetry = b.dependency("opentelemetry", .{
+        .target = target,
+    });
+    const opentelemetry_sdk = opentelemetry.module("sdk");
+    configureDependencyModules(b.allocator, opentelemetry_sdk, optimize);
+    exe.root_module.addImport("opentelemetry-sdk", opentelemetry_sdk);
     exe.root_module.addImport("build_options", build_options.createModule());
 
     b.installArtifact(exe);
@@ -387,6 +393,32 @@ fn addNapiArtifact(
     const step = b.step("libfx-napi", "Build the libfx Node-API core addon");
     step.dependOn(&install.step);
     b.getInstallStep().dependOn(&install.step);
+}
+
+fn configureDependencyModules(
+    allocator: std.mem.Allocator,
+    root: *std.Build.Module,
+    optimize: std.builtin.OptimizeMode,
+) void {
+    var visited: std.AutoHashMapUnmanaged(*std.Build.Module, void) = .empty;
+    defer visited.deinit(allocator);
+    configureDependencyModule(allocator, root, optimize, &visited);
+}
+
+fn configureDependencyModule(
+    allocator: std.mem.Allocator,
+    module: *std.Build.Module,
+    optimize: std.builtin.OptimizeMode,
+    visited: *std.AutoHashMapUnmanaged(*std.Build.Module, void),
+) void {
+    const entry = visited.getOrPut(allocator, module) catch @panic("out of memory");
+    if (entry.found_existing) return;
+    module.optimize = optimize;
+    module.strip = optimize != .Debug;
+    module.omit_frame_pointer = true;
+    module.unwind_tables = .none;
+    module.error_tracing = false;
+    for (module.import_table.values()) |dependency| configureDependencyModule(allocator, dependency, optimize, visited);
 }
 
 fn discoverNodeIncludeDir(b: *std.Build) []const u8 {

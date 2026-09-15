@@ -187,6 +187,7 @@ pub const PostTurnEndInput = struct {
     invocation: Invocation,
     outcome: types.TurnPresentationOutcome,
     provider_disposition: ?types.ProviderCompletionDisposition = null,
+    turn_summary: ?types.TurnSummary = null,
 };
 
 pub const PostTurnEndHandler = struct {

@@ -535,6 +535,7 @@ const App = struct {
     web_search_models_path: []const u8 = builtin_gateway.models_path,
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
+    otel: builtin_hooks.otel.State = .{},
     notifications: builtin_hooks.notifications.State = .{},
     herdr: builtin_hooks.Client = .{},
 
@@ -720,6 +721,7 @@ const App = struct {
         // Register herdr hooks before NotificationAppRuntime.configure freezes
         // the lifecycle runtime (its call to freeze() is the sole freeze site).
         try HerdrAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
+        try builtin_hooks.otel.Runtime(App).configure(self);
         try NotificationAppRuntime.configure(self);
     }
 
@@ -904,6 +906,7 @@ const App = struct {
         self.skills.deinit(std.heap.c_allocator);
         self.context_snapshot.deinit(self.alloc);
         self.file_index.deinit(std.heap.c_allocator);
+        self.otel.deinit();
         self.lifecycle_runtime.deinit();
 
         self.auth.deinit(self.alloc);
