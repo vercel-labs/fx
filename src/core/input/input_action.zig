@@ -89,6 +89,10 @@ pub const Action = union(enum) {
     delete_to_line_end,
     clear_line,
     toggle_full_transcript,
+    /// Ctrl+[ — step umbrella toward fuller collapse (non-printable).
+    collapse_tools_step,
+    /// Ctrl+] — step umbrella toward fuller expand (non-printable).
+    expand_tools_step,
     toggle_permission_mode,
     open_all_sessions,
     open_model_catalog,

@@ -92,6 +92,19 @@ fn ctrlOKeyAction(meta_prefixed: bool, modifiers: u16) InputEscapeAction {
     return .ignore;
 }
 
+fn ctrlBracketCollapseAction(meta_prefixed: bool, modifiers: u16, keycode: u16) ?InputEscapeAction {
+    // Ctrl+[ / Ctrl+] via Kitty CSI-u or modifyOtherKeys. Bare `[`/`]` stay typed.
+    // Ctrl+[ is ESC (0x1b) on legacy terminals — never steal that path.
+    if (meta_prefixed) return null;
+    const mods = modifiers & 0x3F;
+    if (mods != ctrl_modifier) return null;
+    return switch (keycode) {
+        '[' => .collapse_tools_step, // 91
+        ']' => .expand_tools_step, // 93
+        else => null,
+    };
+}
+
 // Resolve a Kitty CSI u report (`ESC[<keycode>;<mod>u`). Shared by the
 // single-parameter and modifier stages, and never returns null so the leading
 // ESC's pending-cancel is always cleared.
@@ -144,6 +157,7 @@ fn kittyUnicodeKeyAction(keycode: u16, modifiers: u16, meta_prefixed: bool) Inpu
     }
     if ((keycode == 'd' or keycode == 'D') and (meta_prefixed or (mods & 0x02) != 0)) return .delete_word_right;
     if (keycode == 'o' or keycode == 'O') return ctrlOKeyAction(meta_prefixed, mods);
+    if (ctrlBracketCollapseAction(meta_prefixed, mods, keycode)) |action| return action;
     if ((keycode == 'r' or keycode == 'R') and (mods & 0x08) != 0) return .open_all_sessions;
     if (keycode == 9 and (mods & 0x01) != 0) return .toggle_permission_mode;
     if ((mods & 0x04) != 0) {
@@ -163,6 +177,10 @@ pub fn controlByteFeatureAction(byte: u8) ?InputEscapeAction {
     return switch (byte) {
         15 => .toggle_full_transcript,
         16 => .open_model_catalog,
+        // Legacy Ctrl+] (GS). Ctrl+[ is ESC — not bound here.
+        // Legacy Ctrl+\ (FS) pairs as collapse so non-Kitty terminals still work.
+        0x1c => .collapse_tools_step,
+        0x1d => .expand_tools_step,
         else => null,
     };
 }
