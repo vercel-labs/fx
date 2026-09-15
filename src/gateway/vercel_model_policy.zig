@@ -10,6 +10,23 @@ pub fn capabilitiesForModel(model: []const u8) model_capabilities.Capabilities {
     return capabilities;
 }
 
+/// Gateway compatibility policy: qwen3.8-max via Fireworks rejected multiple
+/// leading systems on continuation, while a single combined block succeeded.
+/// Apply that projection to this family; this is not a verified requirement
+/// of every Qwen route. Core instruction ownership remains unchanged.
+pub fn uses_single_system_message(model: []const u8) bool {
+    return std.mem.startsWith(u8, model, "alibaba/qwen");
+}
+
+test "Qwen system message policy leaves other model families unchanged" {
+    try std.testing.expect(uses_single_system_message("alibaba/qwen3.8-max"));
+    try std.testing.expect(uses_single_system_message("alibaba/qwen3.6-27b"));
+    try std.testing.expect(!uses_single_system_message("openai/gpt-6-astra"));
+    try std.testing.expect(!uses_single_system_message("anthropic/claude-opus-4.8"));
+    try std.testing.expect(!uses_single_system_message("moonshotai/kimi-k3"));
+    try std.testing.expect(!uses_single_system_message("alibaba/other"));
+}
+
 pub fn contextWindowSize(model: []const u8) ?u32 {
     if (std.mem.startsWith(u8, model, "anthropic/")) {
         const million_context_models = [_][]const u8{

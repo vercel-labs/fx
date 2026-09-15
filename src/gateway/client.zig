@@ -8,6 +8,7 @@ const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
 const json_comparison = @import("../core/shared/json_comparison.zig");
 const sse = @import("sse.zig");
+const request_trace = @import("request_trace.zig");
 
 pub fn isRetryableGatewayError(err: anyerror) bool {
     return err == error.HttpConnectionClosing or
@@ -1412,6 +1413,9 @@ fn streamGatewayCompletionCoreWithOptions(
     var setup_epoch: ?ConnectionSetupEpoch = null;
     while (attempt < retry_count) : (attempt += 1) {
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+        var trace = request_trace.Attempt.start(alloc, trace_ctx, model, payload, attempt + 1);
+        defer trace.end();
+        errdefer |err| trace.fail(err);
         var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
         defer client.deinit();
 
@@ -1434,6 +1438,7 @@ fn streamGatewayCompletionCoreWithOptions(
             .keep_alive = false,
             .redirect_behavior = .unhandled,
         }, core_options.request_open_override, epoch, cancel_flag) catch |err| {
+            trace.fail(err);
             debug_trace.eventf("gateway", "http_open_connect_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
             const decision = decideConnectionSetup(.{
                 .attempt = attempt + 1,
@@ -1569,6 +1574,7 @@ fn streamGatewayCompletionCoreWithOptions(
             if (request.provider_attempt_owner == .transport and
                 isRetryableGatewayError(mapped) and attempt + 1 < retry_count)
             {
+                trace.fail(mapped);
                 delivery_ambiguous = true;
                 try sleepGatewayRetry((attempt + 1) * 150 * std.time.ns_per_ms, cancel_flag);
                 continue;
@@ -1578,6 +1584,7 @@ fn streamGatewayCompletionCoreWithOptions(
         if (active_connected_watch) |watch| {
             if (watch.commit_response_head()) |err| return @as(anyerror!StreamResult, err);
         }
+        trace.headers(response.head);
         debug_trace.eventf("gateway", "after_receive_head", trace_ctx, "attempt={d} status={d}", .{ attempt + 1, @intFromEnum(response.head.status) });
         const resolved_model_seen_in_head = traceResolvedModelHeader(response.head, model, trace_ctx);
 
@@ -1596,6 +1603,7 @@ fn streamGatewayCompletionCoreWithOptions(
             var err_buf: [4096]u8 = undefined;
             const err_reader = response.reader(&err_buf);
             _ = err_reader.streamRemaining(&err_out.writer) catch {};
+            trace.httpError(err_out.written());
             if (cancel_flag.load(.seq_cst)) return error.Cancelled;
             if (retry_delay_ns) |delay_ns| {
                 debug_trace.eventf("gateway", "http_status_retry", trace_ctx, "attempt={d} status={d} delay_ms={d}", .{
@@ -1631,6 +1639,7 @@ fn streamGatewayCompletionCoreWithOptions(
             .{ .requested_model = model, .ctx = trace_ctx },
             expected_provider_tool_name,
             request.content_capture_limit,
+            &trace,
         ) catch |err| {
             debug_trace.eventf("gateway", "sse_consume_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
             return @as(anyerror!StreamResult, connectedIoFailureWithWatch(
@@ -1655,6 +1664,7 @@ fn streamGatewayCompletionCoreWithOptions(
             return error.SystemResumed;
         }
         completion.delivery_ambiguous = delivery_ambiguous;
+        trace.complete(finish_reason_label(completion.finish_reason));
         if (!resolved_model_seen_in_head) traceResolvedModelMissingOnce(model, trace_ctx);
         debug_trace.eventf("gateway", "after_sse_consume", trace_ctx, "attempt={d} finish_reason={s} content_bytes={d} tool_call_count={d}", .{
             attempt + 1,
@@ -3179,7 +3189,7 @@ fn consumeSseStream(
     on_tool_start: ?ToolStartCallback,
     cancel_flag: *std.atomic.Value(bool),
 ) !types.ModelCompletion {
-    return consumeSseStreamTraced(alloc, reader, callback_ctx, on_content_chunk, on_tool_start, null, null, cancel_flag, null, null, null);
+    return consumeSseStreamTraced(alloc, reader, callback_ctx, on_content_chunk, on_tool_start, null, null, cancel_flag, null, null, null, null);
 }
 
 /// Decodes an AI Gateway SSE response from a transport-owned reader.
@@ -3209,6 +3219,7 @@ pub fn consumeGatewaySseStream(
         null,
         null,
         content_capture_limit,
+        null,
     );
 }
 
@@ -3224,6 +3235,7 @@ fn consumeSseStreamTraced(
     resolved_model_trace: ?ResolvedModelTrace,
     expected_provider_tool_name: ?[]const u8,
     content_capture_limit: ?usize,
+    response_trace: ?*request_trace.Attempt,
 ) !types.ModelCompletion {
     var content_buf: std.ArrayList(u8) = .empty;
     defer content_buf.deinit(alloc);
@@ -3291,6 +3303,7 @@ fn consumeSseStreamTraced(
             traceSseTermination(resolved_model_trace, "eof_without_finish", finish_reason_holder);
             break;
         };
+        if (response_trace) |trace| trace.body(.sse, json_text);
         if (std.mem.eql(u8, json_text, "[DONE]")) {
             traceSseTermination(resolved_model_trace, "done_without_finish", finish_reason_holder);
             break;
@@ -8289,6 +8302,71 @@ test "gateway chat request sends extended time and attribution headers" {
     try std.testing.expectEqualStrings("session_wire_123", fixture.capturedHeaderValue("x-session-id").?);
     try std.testing.expectEqualStrings("session_wire_123", fixture.capturedHeaderValue("x-session-affinity").?);
     try std.testing.expect(std.mem.find(u8, fixture.capturedHeaderValue("user-agent").?, "zig") == null);
+}
+
+test "gateway request trace correlates a failed setup retry and its successful attempt" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const path = try std.fs.path.join(alloc, &.{ root, "trace.log" });
+    defer alloc.free(path);
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, path, "gateway");
+    var fixture = try LoopbackGatewayFixture.init(.success_capture, 0);
+    defer fixture.deinit();
+    try fixture.start();
+    try std.testing.expect(fixture.waitForAcceptStart(5000));
+    const url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/chat", .{fixture.port()});
+    defer alloc.free(url);
+    const Open = struct {
+        count: usize = 0,
+        fn run(raw: *anyopaque, client: *std.http.Client, method: std.http.Method, uri: std.Uri, options: std.http.Client.RequestOptions) anyerror!std.http.Client.Request {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.count += 1;
+            if (self.count == 1) return error.TlsInitializationFailed;
+            return client.request(method, uri, options);
+        }
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+    var open: Open = .{};
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var result = try streamGatewayCompletionCoreWithOptions(alloc, .{
+        .api_key = null,
+        .model = "test/model",
+        .retry_count = 2,
+        .chat_url = url,
+        .payload = "{\"prompt\":[{\"role\":\"user\",\"content\":[]}]}",
+    }, &open, Open.chunk, null, &cancel, null, false, .{
+        .request_open_override = .{ .ctx = &open, .run = Open.run },
+    });
+    defer result.deinit(alloc);
+    fixture.deinit();
+    if (fixture.failure) |err| return err;
+    try std.testing.expectEqualStrings("ok", result.completion.content.?);
+    const output = try readTraceFileForTest(alloc, path);
+    defer alloc.free(output);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, output, "event=request_shape "));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, output, "event=request_outcome "));
+    var ids: [2]u64 = undefined;
+    var count: usize = 0;
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.find(u8, line, "event=request_outcome ") == null) continue;
+        const start = (std.mem.find(u8, line, "request_id=") orelse return error.MissingTraceId) + "request_id=".len;
+        const tail = line[start..];
+        ids[count] = try std.fmt.parseInt(u64, tail[0 .. std.mem.findScalar(u8, tail, ' ') orelse tail.len], 10);
+        if (count == 0) {
+            try std.testing.expect(std.mem.find(u8, line, "outcome=transport_error") != null);
+            try std.testing.expect(std.mem.find(u8, line, "err=TlsInitializationFailed") != null);
+        } else {
+            try std.testing.expect(std.mem.find(u8, line, "status=200 outcome=completed") != null);
+        }
+        count += 1;
+    }
+    try std.testing.expect(ids[0] != ids[1]);
 }
 
 test "host-managed Gateway chat omits authentication-owned headers" {

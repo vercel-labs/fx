@@ -9955,3 +9955,469 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 });
+
+describe("gateway request tracing", () => {
+  const requestSecret = "TRACE_PRIVATE_REQUEST_SENTINEL";
+  const toolSecret = "TRACE_PRIVATE_TOOL_ARGUMENT_SENTINEL.txt";
+  const responseSecret = "TRACE_PRIVATE_RESPONSE_SENTINEL";
+  const keySecret = "synthetic-trace-authorization-sentinel";
+  const headerSecrets = [
+    "TRACE_PRIVATE_COOKIE_SENTINEL",
+    "TRACE_PRIVATE_HEADER_SENTINEL",
+    "TRACE_PRIVATE_RESPONSE_AUTH_SENTINEL",
+  ];
+  const responseIds = {
+    "x-request-id": "trace-request-123",
+    "request-id": "trace-provider-456",
+    "x-vercel-id": "sfo1::trace-789",
+  };
+
+  function tracingEnv(
+    root: FixtureRoot,
+    gateway: GatewayFixture,
+    tracePath: string,
+  ): Record<string, string | undefined> {
+    // runFx inherits its environment. Do not inherit tracing, provider routing,
+    // auth selection, or other FX overrides from the developer running Bun.
+    const cleared = Object.fromEntries(
+      Object.keys(process.env).filter((key) => key.startsWith("FX_")).map((key) => [key, undefined]),
+    );
+    return {
+      ...cleared,
+      ...fixtureEnv(root, gateway, tracePath),
+      AI_GATEWAY_API_KEY: keySecret,
+      VERCEL_OIDC_TOKEN: undefined,
+      FX_E2E_DISABLE_DOTENV: "1",
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_AUTO_UPGRADE: "0",
+      FX_SOUND: "0",
+      FX_SKIP_ONBOARDING: "1",
+      FX_MAX_AGENT_STEPS: "4",
+      FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      FX_TRACE_SCOPES: "gateway",
+      FX_TRACE_GATEWAY_BODIES: undefined,
+      FX_TRACE_STDERR: undefined,
+    };
+  }
+
+  function responseHeaders(response: Response): Response {
+    for (const [name, value] of Object.entries(responseIds)) response.headers.set(name, value);
+    response.headers.set("set-cookie", `trace=${headerSecrets[0]}`);
+    response.headers.set("x-private-debug", headerSecrets[1]!);
+    response.headers.set("authorization", `Bearer ${headerSecrets[2]}`);
+    return response;
+  }
+
+  function events(trace: string, event: string): string[] {
+    return trace.split("\n").filter((line) => line.includes(`[gateway] event=${event} `));
+  }
+
+  function fields(line: string): Record<string, string> {
+    // Body text is untrusted and can itself contain strings such as status=400.
+    const head = line.split(" data=", 1)[0]!;
+    return Object.fromEntries([...head.matchAll(/(?:^| )([a-z_]+)=([^ ]*)/g)].map((match) => [match[1]!, match[2]!]));
+  }
+
+  function requestEvents(trace: string, event: string, id: string): string[] {
+    return events(trace, event).filter((line) => fields(line).request_id === id);
+  }
+
+  function expectShape(trace: string, request: GatewayFixture["requests"][number]): string {
+    const prompt = gatewayRequest(request.body).prompt;
+    const roles = prompt.map((message) => message.role);
+    const firstConversation = roles.findIndex((role) => role !== "system");
+    const leading = firstConversation < 0 ? roles.length : firstConversation;
+    const nonleading = roles.findIndex((role, index) => role === "system" && index >= leading);
+    // Match the actual HTTP payload, not a reconstructed prompt. Saved asks can
+    // also trace title-generation requests, so do not rely on global line order.
+    const matching = events(trace, "request_shape").filter((line) => {
+      const shape = fields(line);
+      return shape.request_bytes === String(Buffer.byteLength(request.body)) &&
+        shape.roles === roles.slice(0, 512).join(",");
+    });
+    expect(matching).toHaveLength(1);
+    const shape = fields(matching[0]!);
+    expect(shape).toMatchObject({
+      attempt: "1",
+      model: request.headers.get("ai-language-model-id"),
+      request_bytes: String(Buffer.byteLength(request.body)),
+      prompt_count: String(prompt.length),
+      system_count: String(roles.filter((role) => role === "system").length),
+      leading_system_count: String(leading),
+      invalid_roles: "0",
+      first_nonleading_system: nonleading < 0 ? "none" : String(nonleading),
+      roles: roles.slice(0, 512).join(","),
+      roles_omitted: String(Math.max(0, roles.length - 512)),
+    });
+    expect(shape.request_id).toMatch(/^[1-9][0-9]*$/);
+    // Qwen's wire policy combines instructions; other model families retain
+    // their independent blocks. Tracing itself must not change either layout.
+    const qwen = request.headers.get("ai-language-model-id")?.startsWith("alibaba/qwen");
+    if (qwen) expect(leading).toBe(1);
+    else expect(leading).toBeGreaterThanOrEqual(2);
+    expectOnlyLeadingSystemMessages(request.body);
+    expect(contentText(prompt[0]!.content)).toContain("# Identity and context");
+    if (qwen) expect(contentText(prompt[0]!.content)).toContain(WEB_SEARCH_GUIDANCE);
+    else expect(prompt.some((message) => message.role === "system" && contentText(message.content) === WEB_SEARCH_GUIDANCE)).toBe(true);
+    return shape.request_id!;
+  }
+
+  function expectResponse(trace: string, id: string, status: number): Record<string, string> {
+    const headers = requestEvents(trace, "response_headers", id);
+    expect(headers).toHaveLength(1);
+    expect(fields(headers[0]!)).toMatchObject({ request_id: id, status: String(status) });
+    const ids = requestEvents(trace, "response_id", id).map(fields);
+    expect(ids).toHaveLength(3);
+    expect(Object.fromEntries(ids.map((entry) => [entry.header, entry.value]))).toEqual(responseIds);
+    const outcomes = requestEvents(trace, "request_outcome", id);
+    expect(outcomes).toHaveLength(1);
+    expect(fields(outcomes[0]!)).toMatchObject({ request_id: id, status: String(status) });
+    for (const secret of [keySecret, ...headerSecrets]) expect(trace).not.toContain(secret);
+    expect(trace.toLowerCase()).not.toContain("authorization");
+    expect(trace.toLowerCase()).not.toContain("set-cookie");
+    return fields(outcomes[0]!);
+  }
+
+  function expectExited(result: Awaited<ReturnType<typeof runFx>>, code: number, expectedStderr = ""): void {
+    expect(result.timedOut).toBe(false);
+    expect(result.signal).toBeNull();
+    expect(result.code).toBe(code);
+    expect(parseAskJson(result.stdout).exit_code).toBe(code);
+    if (code === 0) expect(result.stderr).toBe(expectedStderr);
+  }
+
+  test("default capture records each tool-loop request shape without private contents", async () => {
+    const root = createFixtureRoot("trace-default-success");
+    const tracePath = join(root.root, "trace.log");
+    writeFileSync(join(root.workspace, toolSecret), responseSecret);
+    let index = 0;
+    const gateway = startDynamicFakeGateway(() => responseHeaders(index++ === 0
+      ? fakeGatewayToolCall("trace_read", "read_file", { path: toolSecret })
+      : fakeGatewayFinalText("TRACE_DEFAULT_SUCCESS")), {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    try {
+      const result = await runFx(["ask", "--json", "--full-access", "--no-save", requestSecret], {
+        cwd: root.workspace, env: tracingEnv(root, gateway, tracePath), timeoutMs: 15_000,
+      });
+      expectExited(result, 0, `Full access enabled: fx permission checks disabled\nReading ${toolSecret}\n`);
+      expect(parseAskJson(result.stdout).output).toBe("TRACE_DEFAULT_SUCCESS");
+      expect(parseAskJson(result.stdout).tool_calls).toEqual([{ name: "read_file", status: "success" }]);
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.requests[0]!.headers.get("authorization")).toContain(keySecret);
+      expect(gateway.requests[0]!.body).toContain(requestSecret);
+      expect(gateway.requests[1]!.body).toContain(toolSecret);
+      expect(toolResultOutput(gateway.requests[1]!.body, "trace_read")).toContain(responseSecret);
+      const trace = readFileSync(tracePath, "utf8");
+      expect(events(trace, "request_shape")).toHaveLength(2);
+      const ids = gateway.requests.map((request, requestIndex) => {
+        const id = expectShape(trace, request);
+        expect(expectResponse(trace, id, 200)).toMatchObject({
+          outcome: "completed", error_category: "none", error_bytes: "0",
+          finish_reason: requestIndex === 0 ? "tool-calls" : "stop",
+          sensitive_body_capture: "false", body_bytes_logged: "0", body_truncated: "false",
+        });
+        return id;
+      });
+      expect(new Set(ids).size).toBe(2);
+      expect(gatewayRequest(gateway.requests[1]!.body).prompt.map((message) => message.role)).toContain("tool");
+      expect(events(trace, "response_body")).toHaveLength(0);
+      for (const secret of [requestSecret, toolSecret, responseSecret, "TRACE_DEFAULT_SUCCESS"]) expect(trace).not.toContain(secret);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  for (const capture of [false, true]) {
+    test(`HTTP 400 classifies the Jinja error with response bodies ${capture ? "enabled" : "off by default"}`, async () => {
+      const root = createFixtureRoot(`trace-http-error-${capture}`);
+      const tracePath = join(root.root, "trace.log");
+      const message = "jinja template rendering failed: System message must be at the beginning";
+      // The response deliberately echoes request contents. The opt-in is an
+      // actual dump, not a redacted summary; terminal controls still get escaped.
+      const body = `${message}\n${requestSecret} ${responseSecret}\t\x1b[31mprovider detail\x1b[0m`;
+      const gateway = startDynamicFakeGateway(() => responseHeaders(new Response(body, {
+        status: 400, headers: { "content-type": "text/plain" },
+      })), { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+      try {
+        const result = await runFx(["ask", "--json", "--auto", "--no-save", requestSecret], {
+          cwd: root.workspace,
+          env: { ...tracingEnv(root, gateway, tracePath), FX_TRACE_GATEWAY_BODIES: capture ? "1" : undefined },
+          timeoutMs: 15_000,
+        });
+        expectExited(result, 1);
+        expect(gateway.requests).toHaveLength(1);
+        expect(gateway.requests[0]!.body).toContain(requestSecret);
+        const trace = readFileSync(tracePath, "utf8");
+        expect(events(trace, "request_shape")).toHaveLength(1);
+        const id = expectShape(trace, gateway.requests[0]!);
+        expect(expectResponse(trace, id, 400)).toMatchObject({
+          outcome: "http_error", error_category: "system_message_not_first",
+          error_bytes: String(Buffer.byteLength(body)), finish_reason: "none",
+          sensitive_body_capture: String(capture),
+          body_bytes_seen: String(capture ? Buffer.byteLength(body) : 0),
+          body_bytes_logged: String(capture ? Buffer.byteLength(body) : 0), body_truncated: "false",
+        });
+        const bodies = requestEvents(trace, "response_body", id);
+        expect(bodies).toHaveLength(capture ? 1 : 0);
+        if (capture) {
+          expect(fields(bodies[0]!)).toMatchObject({ kind: "http_error", sensitive: "true" });
+          expect(bodies[0]!).toContain(`data=${message}\\x0a${requestSecret} ${responseSecret}\\x09\\x1b[31mprovider detail\\x1b[0m`);
+          expect(trace).not.toContain("\x1b");
+        } else {
+          for (const secret of [message, requestSecret, responseSecret, "provider detail"]) expect(trace).not.toContain(secret);
+        }
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }, 30_000);
+  }
+
+  for (const truncate of [false, true]) {
+    test(`opt-in SSE dumps ${truncate ? "honor the per-attempt byte budget and chunk limit" : "include every payload and providerMetadata"}`, async () => {
+      const root = createFixtureRoot(`trace-sse-${truncate}`);
+      const tracePath = join(root.root, "trace.log");
+      const marker = "TRACE_SSE_RESPONSE_MARKER";
+      const deltas = truncate ? Array.from({ length: 70 }, () => "x".repeat(4096)) : [marker];
+      const payloads = [
+        JSON.stringify({ type: "text-start", id: "trace_answer" }),
+        ...deltas.map((delta) => JSON.stringify({ type: "text-delta", id: "trace_answer", delta })),
+        JSON.stringify({ type: "text-end", id: "trace_answer" }),
+        JSON.stringify({
+          type: "finish", finishReason: { unified: "stop", raw: "stop" },
+          usage: { inputTokens: { total: 3 }, outputTokens: { total: 5 } },
+          providerMetadata: { gateway: { traceMarker: "TRACE_PROVIDER_METADATA_SENTINEL" } },
+        }),
+      ];
+      // EOF after finish avoids making assertions about whether [DONE] is
+      // consumed. Comments and SSE framing must never enter the body dump.
+      const gateway = startDynamicFakeGateway(() => responseHeaders(sse(
+        ": TRACE_SSE_COMMENT_NOT_PAYLOAD\n\n" + payloads.map((payload) => `data: ${payload}\n\n`).join(""),
+      )), { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+      try {
+        const result = await runFx(["ask", "--json", "--auto", "--no-save", requestSecret], {
+          cwd: root.workspace,
+          env: { ...tracingEnv(root, gateway, tracePath), FX_TRACE_GATEWAY_BODIES: "1" },
+          timeoutMs: 15_000,
+        });
+        expectExited(result, 0);
+        expect(parseAskJson(result.stdout).output).toBe(deltas.join(""));
+        expect(gateway.requests).toHaveLength(1);
+        const trace = readFileSync(tracePath, "utf8");
+        const id = expectShape(trace, gateway.requests[0]!);
+        const expected = payloads.join("");
+        const loggedBytes = Math.min(Buffer.byteLength(expected), 256 * 1024);
+        expect(expectResponse(trace, id, 200)).toMatchObject({
+          outcome: "completed", error_category: "none", error_bytes: "0", finish_reason: "stop",
+          sensitive_body_capture: "true", body_bytes_seen: String(Buffer.byteLength(expected)),
+          body_bytes_logged: String(loggedBytes), body_truncated: String(truncate),
+        });
+        const bodies = requestEvents(trace, "response_body", id);
+        expect(bodies.length).toBeGreaterThan(0);
+        const chunks = bodies.map((line) => {
+          expect(fields(line)).toMatchObject({ kind: "sse", sensitive: "true" });
+          const data = line.slice(line.indexOf(" data=") + " data=".length);
+          expect(Buffer.byteLength(data)).toBeLessThanOrEqual(2048);
+          return data;
+        });
+        // ASCII payloads make this an exact byte comparison across chunk and
+        // event boundaries, including the final partial chunk at the budget.
+        expect(chunks.join("")).toBe(expected.slice(0, loggedBytes));
+        expect(trace).not.toContain(requestSecret);
+        expect(trace).not.toContain("TRACE_SSE_COMMENT_NOT_PAYLOAD");
+        expect(trace).not.toContain("data: ");
+        if (!truncate) {
+          expect(bodies).toHaveLength(payloads.length);
+          expect(trace).toContain(marker);
+          expect(trace).toContain('"providerMetadata":{"gateway":{"traceMarker":"TRACE_PROVIDER_METADATA_SENTINEL"}}');
+        }
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }, 30_000);
+  }
+
+  test("body opt-in cannot bypass a disabled gateway scope", async () => {
+    const root = createFixtureRoot("trace-scope-disabled");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startDynamicFakeGateway(() => responseHeaders(fakeGatewayFinalText(responseSecret)), {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    try {
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", requestSecret], {
+        cwd: root.workspace,
+        env: { ...tracingEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "trace_scope_disabled", FX_TRACE_GATEWAY_BODIES: "1" },
+        timeoutMs: 15_000,
+      });
+      expectExited(result, 0);
+      expect(parseAskJson(result.stdout).output).toBe(responseSecret);
+      expect(gateway.requests).toHaveLength(1);
+      expect(existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "").toBe("");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("Qwen Gateway preserves a tool-free saved-session continuation", async () => {
+    const root = createFixtureRoot("qwen-text-continuation");
+    const qwen = "alibaba/qwen3.8-max";
+    const firstPrompt = "QWEN_TEXT_FIRST_PROMPT";
+    const secondPrompt = "QWEN_TEXT_SECOND_PROMPT";
+    const firstReply = "QWEN_TEXT_FIRST_REPLY";
+    const secondReply = "QWEN_TEXT_SECOND_REPLY";
+    const tracePaths = [join(root.root, "first.log"), join(root.root, "second.log")];
+    let calls = 0;
+    const gateway = startDynamicFakeGateway(raw => {
+      const prompt = gatewayRequest(raw).prompt;
+      // Match the observed failure boundary: initial prompts can succeed, but
+      // assistant history with multiple systems rejects even without tools.
+      if (prompt.some(message => message.role === "assistant") &&
+        prompt.filter(message => message.role === "system").length !== 1) {
+        return new Response("System message must be at the beginning.", { status: 400 });
+      }
+      return responseHeaders(fakeGatewayFinalText(calls++ === 0 ? firstReply : secondReply));
+    }, { models: [{ id: qwen, type: "language", tags: ["tool-use"] }] });
+    try {
+      const first = await runFx(["ask", "--json", "--auto", "--model", qwen, firstPrompt], {
+        cwd: root.workspace, env: tracingEnv(root, gateway, tracePaths[0]!), timeoutMs: 15_000,
+      });
+      expectExited(first, 0);
+      const firstResult = parseAskJson(first.stdout);
+      expect(firstResult.output).toBe(firstReply);
+      expect(firstResult.tool_calls).toEqual([]);
+      expect(firstResult.session_id.length).toBeGreaterThan(0);
+      expect(gateway.requests).toHaveLength(1);
+
+      const second = await runFx([
+        "ask", "--json", "--auto", "--model", qwen, "--resume-id", firstResult.session_id, secondPrompt,
+      ], {
+        cwd: root.workspace, env: tracingEnv(root, gateway, tracePaths[1]!), timeoutMs: 15_000,
+      });
+      expectExited(second, 0);
+      const secondResult = parseAskJson(second.stdout);
+      expect(secondResult.session_id).toBe(firstResult.session_id);
+      expect(secondResult.output).toBe(secondReply);
+      expect(secondResult.tool_calls).toEqual([]);
+      expect(gateway.requests).toHaveLength(2);
+      expect(calls).toBe(2);
+      for (const [index, request] of gateway.requests.entries()) {
+        expect(request.headers.get("ai-language-model-id")).toBe(qwen);
+        const prompt = gatewayRequest(request.body).prompt;
+        expect(prompt.map(message => message.role)).toEqual(index === 0
+          ? ["system", "user"]
+          : ["system", "user", "assistant", "user"]);
+        expect(contentText(prompt[1]!.content)).toContain(firstPrompt);
+        if (index === 1) {
+          expect(contentText(prompt[2]!.content)).toBe(firstReply);
+          expect(contentText(prompt[3]!.content)).toContain(secondPrompt);
+        }
+        const trace = readFileSync(tracePaths[index]!, "utf8");
+        const id = expectShape(trace, request);
+        expect(expectResponse(trace, id, 200)).toMatchObject({ outcome: "completed", finish_reason: "stop" });
+      }
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("Qwen Gateway single-system projection survives tools and model switches", async () => {
+    const root = createFixtureRoot("qwen-system-projection");
+    const qwen = "alibaba/qwen3.8-max";
+    writeFileSync(join(root.workspace, "note.txt"), "QWEN_NOTE_OK");
+    let calls = 0;
+    let expectQwen = true;
+    const gateway = startDynamicFakeGateway(raw => {
+      // A strict single-system serving template must accept every Qwen leg,
+      // not just the initial prompt before assistant history exists.
+      if (expectQwen && gatewayRequest(raw).prompt.filter(message => message.role === "system").length !== 1) {
+        return new Response("System message must be at the beginning.", { status: 400 });
+      }
+      return responseHeaders(calls++ === 0
+        ? fakeGatewayToolCall("qwen_read", "read_file", { path: "note.txt" })
+        : fakeGatewayFinalText("QWEN_NOTE_OK"));
+    }, { models: [qwen, MODEL].map(id => ({ id, type: "language", tags: ["tool-use"] })) });
+    try {
+      const firstPath = join(root.root, "qwen-tools.log");
+      const first = await runFx(["ask", "--json", "--auto", "--model", qwen, "Read note.txt"], {
+        cwd: root.workspace, env: tracingEnv(root, gateway, firstPath), timeoutMs: 15_000,
+      });
+      expectExited(first, 0, "Reading note.txt\n");
+      const sessionId = parseAskJson(first.stdout).session_id;
+      expect(sessionId.length).toBeGreaterThan(0);
+      expect(parseAskJson(first.stdout).output).toBe("QWEN_NOTE_OK");
+      expect(gateway.requests).toHaveLength(2);
+      expect(toolResultOutput(gateway.requests[1]!.body, "qwen_read")).toContain("QWEN_NOTE_OK");
+      for (const request of gateway.requests) expectShape(readFileSync(firstPath, "utf8"), request);
+
+      for (const [index, model] of [MODEL, qwen].entries()) {
+        expectQwen = model === qwen;
+        const path = join(root.root, `switch-${index}.log`);
+        const result = await runFx(["ask", "--json", "--auto", "--model", model, "--resume-id", sessionId, `Follow-up ${index}`], {
+          cwd: root.workspace, env: tracingEnv(root, gateway, path), timeoutMs: 15_000,
+        });
+        expectExited(result, 0);
+        expect(parseAskJson(result.stdout).session_id).toBe(sessionId);
+        expect(parseAskJson(result.stdout).output).toBe("QWEN_NOTE_OK");
+        expect(gateway.requests).toHaveLength(3 + index);
+        const request = gateway.requests.at(-1)!;
+        expect(request.headers.get("ai-language-model-id")).toBe(model);
+        expectShape(readFileSync(path, "utf8"), request);
+        expect(promptText(request.body)).toContain("Read note.txt");
+        expect(promptText(request.body)).toContain("QWEN_NOTE_OK");
+        expect(toolResultOutput(request.body, "qwen_read")).toContain("QWEN_NOTE_OK");
+      }
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45_000);
+
+  test("resumed model switch traces the actual history and preserves separate systems", async () => {
+    const root = createFixtureRoot("trace-resume-model");
+    const firstTracePath = join(root.root, "first.log");
+    const secondTracePath = join(root.root, "second.log");
+    const gateway = startDynamicFakeGateway(() => responseHeaders(fakeGatewayFinalText("TRACE_SAVED_REPLY")), {
+      models: [MODEL, DEFAULT_MODEL].map((id) => ({ id, type: "language", tags: ["tool-use"] })),
+    });
+    try {
+      const first = await runFx(["ask", "--json", "--auto", requestSecret], {
+        cwd: root.workspace, env: tracingEnv(root, gateway, firstTracePath), timeoutMs: 15_000,
+      });
+      expectExited(first, 0);
+      const sessionId = parseAskJson(first.stdout).session_id;
+      expect(sessionId.length).toBeGreaterThan(0);
+      expect(gateway.requests).toHaveLength(1);
+      const second = await runFx([
+        "ask", "--json", "--auto", "--resume-id", sessionId, "--model", DEFAULT_MODEL, "TRACE_SECOND_TURN",
+      ], {
+        cwd: root.workspace, env: tracingEnv(root, gateway, secondTracePath), timeoutMs: 15_000,
+      });
+      expectExited(second, 0);
+      expect(parseAskJson(second.stdout).session_id).toBe(sessionId);
+      expect(parseAskJson(second.stdout).output).toBe("TRACE_SAVED_REPLY");
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.requests[0]!.headers.get("ai-language-model-id")).toBe(MODEL);
+      expect(gateway.requests[1]!.headers.get("ai-language-model-id")).toBe(DEFAULT_MODEL);
+      const prompt = gatewayRequest(gateway.requests[1]!.body).prompt;
+      expect(prompt.filter((message) => message.role !== "system").map((message) => message.role)).toEqual(["user", "assistant", "user"]);
+      expect(promptText(gateway.requests[1]!.body)).toContain(requestSecret);
+      expect(promptText(gateway.requests[1]!.body)).toContain("TRACE_SAVED_REPLY");
+      expect(contentText(prompt.at(-1)!.content)).toContain("TRACE_SECOND_TURN");
+      for (const [index, path] of [firstTracePath, secondTracePath].entries()) {
+        const trace = readFileSync(path, "utf8");
+        const id = expectShape(trace, gateway.requests[index]!);
+        expect(expectResponse(trace, id, 200)).toMatchObject({ outcome: "completed", finish_reason: "stop", sensitive_body_capture: "false" });
+        expect(events(trace, "response_body")).toHaveLength(0);
+        for (const secret of [requestSecret, "TRACE_SAVED_REPLY", "TRACE_SECOND_TURN"]) expect(trace).not.toContain(secret);
+      }
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45_000);
+});

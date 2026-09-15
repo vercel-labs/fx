@@ -190,15 +190,27 @@ pub fn buildAgentRequest(
 
     const tools_json = try buildAgentToolsJson(alloc, request);
     defer alloc.free(tools_json);
+    // This is a wire-only projection: keep core instructions and durable
+    // conversation history untouched, including when switching models.
+    var system_text: std.Io.Writer.Allocating = .init(alloc);
+    defer system_text.deinit();
+    const merge_systems = vercel_model_policy.uses_single_system_message(request.model) and request.instructions.len > 1;
+    if (merge_systems) for (request.instructions, 0..) |instruction, index| {
+        if (budget) |active| try active.check();
+        if (index > 0) try system_text.writer.writeAll("\n\n");
+        try system_text.writer.writeAll(instruction.content.?);
+    };
+    const system_instruction = [_]shared_types.ChatMessage{.{ .role = .system, .content = system_text.written() }};
+    const instructions = if (merge_systems) &system_instruction else request.instructions;
     const prompt_len = try std.math.add(
         usize,
-        request.instructions.len,
+        instructions.len,
         request.messages.len,
     );
     const prompt = try alloc.alloc(shared_types.ChatMessage, prompt_len);
     defer alloc.free(prompt);
-    @memcpy(prompt[0..request.instructions.len], request.instructions);
-    @memcpy(prompt[request.instructions.len..], projected orelse request.messages);
+    @memcpy(prompt[0..instructions.len], instructions);
+    @memcpy(prompt[instructions.len..], projected orelse request.messages);
 
     if (request.verified_images) |images| {
         const response_format = request.response_format orelse
@@ -266,6 +278,87 @@ pub fn buildAgentRequest(
     }
 
     unreachable;
+}
+
+test "Qwen Gateway instructions merge in order without mutating history" {
+    const alloc = std.testing.allocator;
+    const instructions = [_]shared_types.ChatMessage{
+        .{ .role = .system, .content = "base \"rules\"" },
+        .{ .role = .system, .content = "" },
+        .{ .role = .system, .content = "project\nruntime" },
+    };
+    const calls = [_]shared_types.ToolCall{.{ .id = "read_1", .name = "read_file", .arguments_json = "{\"path\":\"note.txt\"}" }};
+    const messages = [_]shared_types.ChatMessage{
+        .{ .role = .user, .content = "read" },
+        .{ .role = .assistant, .content = "checking", .tool_calls = &calls },
+        .{ .role = .tool, .tool_call_id = "read_1", .tool_name = "read_file", .content = "result" },
+        .{ .role = .user, .content = "thanks" },
+    };
+    for ([_][]const u8{ "alibaba/qwen3.8-max", "openai/gpt-6-astra", "alibaba/qwen3.8-max" }) |model| {
+        const body = try buildAgentRequest(alloc, .{
+            .model = model,
+            .instructions = &instructions,
+            .messages = &messages,
+            .tool_choice = .auto,
+            .provider_options = .{},
+        });
+        defer alloc.free(body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer parsed.deinit();
+        const prompt = parsed.value.object.get("prompt").?.array.items;
+        const system_count: usize = if (std.mem.startsWith(u8, model, "alibaba/qwen")) 1 else instructions.len;
+        try std.testing.expectEqual(system_count + messages.len, prompt.len);
+        if (system_count == 1) {
+            try std.testing.expectEqualStrings("base \"rules\"\n\n\n\nproject\nruntime", prompt[0].object.get("content").?.string);
+        } else {
+            for (instructions, prompt[0..system_count]) |source, wire| {
+                try std.testing.expectEqualStrings(source.content.?, wire.object.get("content").?.string);
+            }
+        }
+        for ([_][]const u8{ "user", "assistant", "tool", "user" }, prompt[system_count..]) |role, wire| {
+            try std.testing.expectEqualStrings(role, wire.object.get("role").?.string);
+        }
+        try std.testing.expect(std.mem.find(u8, body, "\"toolCallId\":\"read_1\"") != null);
+        try std.testing.expectEqualStrings("base \"rules\"", instructions[0].content.?);
+        try std.testing.expectEqualStrings("", instructions[1].content.?);
+        try std.testing.expectEqualStrings("result", messages[2].content.?);
+        try std.testing.expectEqualStrings("thanks", messages[3].content.?);
+    }
+}
+
+test "Qwen Gateway preserves absent and single instruction lanes" {
+    const alloc = std.testing.allocator;
+    const instruction = [_]shared_types.ChatMessage{.{ .role = .system, .content = "only rules" }};
+    const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "hello" }};
+    for ([_][]const shared_types.ChatMessage{ &.{}, &instruction }) |instructions| {
+        const body = try buildAgentRequest(alloc, .{
+            .model = "alibaba/qwen3.8-max",
+            .instructions = instructions,
+            .messages = &messages,
+            .tool_choice = .auto,
+            .provider_options = .{},
+        });
+        defer alloc.free(body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer parsed.deinit();
+        const prompt = parsed.value.object.get("prompt").?.array.items;
+        try std.testing.expectEqual(instructions.len + 1, prompt.len);
+        if (instructions.len == 1) try std.testing.expectEqualStrings("only rules", prompt[0].object.get("content").?.string);
+        try std.testing.expectEqualStrings("user", prompt[instructions.len].object.get("role").?.string);
+    }
+}
+
+test "Qwen Gateway still rejects late system messages instead of promoting them" {
+    const messages = [_]shared_types.ChatMessage{
+        .{ .role = .user, .content = "hello" },
+        .{ .role = .system, .content = "late" },
+    };
+    try std.testing.expectError(error.InvalidProviderPrompt, buildAgentRequest(std.testing.allocator, .{
+        .model = "alibaba/qwen3.8-max",
+        .messages = &messages,
+        .tool_choice = .auto,
+        .provider_options = .{},
+    }));
 }
 
 fn buildAgentRequestForProvider(
