@@ -539,7 +539,7 @@ fn loadStartupStateFromOwnedWorkspace(
     settings.providers = null;
     state.configured_model = try alloc.dupe(u8, configured_selection.model);
     state.model_source = if (bound_override) |override|
-        detailed.sources.models.get(model_provider.NameKey.fromProvider(override))
+        detailed.model_source_for(override)
     else
         detailed.model_source orelse .compiled_default;
     state.selected_model = try loadInitialModel(alloc, configured_selection.model, null);

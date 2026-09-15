@@ -1,9 +1,14 @@
 const std = @import("std");
+const config_source = @import("config_source.zig");
 const model_provider = @import("model_provider.zig");
 
 pub const max_preferences = 35;
 pub const Preferences = struct {
-    pub const Entry = struct { provider: model_provider.NameKey, model: []u8 };
+    pub const Entry = struct {
+        provider: model_provider.NameKey,
+        model: []u8,
+        source: config_source.Source = .compiled_default,
+    };
     entries: std.ArrayList(Entry) = .empty,
 
     pub fn get(self: *const Preferences, provider: model_provider.ProviderId) ?[]const u8 {
@@ -13,6 +18,15 @@ pub const Preferences = struct {
     fn getName(self: *const Preferences, name: []const u8) ?[]const u8 {
         for (self.entries.items) |*entry| if (entry.provider.eqlName(name)) return entry.model;
         return null;
+    }
+
+    pub fn source(self: *const Preferences, provider: model_provider.ProviderId) config_source.Source {
+        for (self.entries.items) |*entry| if (entry.provider.eqlProvider(provider)) return entry.source;
+        return .compiled_default;
+    }
+
+    pub fn set_source(self: *Preferences, source_value: config_source.Source) void {
+        for (self.entries.items) |*entry| entry.source = source_value;
     }
 
     pub fn putCopy(self: *Preferences, alloc: std.mem.Allocator, provider: model_provider.ProviderId, model: []const u8) !void {
@@ -74,6 +88,24 @@ test "model preferences are bounded and provider keyed" {
     try std.testing.expectEqualStrings("gateway/model", preferences.get(.gateway).?);
     try std.testing.expectEqualStrings("gpt-5.6", preferences.get(.codex).?);
     try std.testing.expectEqualStrings("local-model", preferences.get(model_provider.parse("local").?).?);
+    try std.testing.expectEqual(config_source.Source.compiled_default, preferences.source(.gateway));
     try std.testing.expect(preferences.get(.grok) == null);
     try std.testing.expectEqual(@as(usize, 3), preferences.count());
+}
+
+test "model preference source follows replacement and merge ownership" {
+    var preferences: Preferences = .{};
+    defer preferences.deinit(std.testing.allocator);
+    try preferences.putCopy(std.testing.allocator, .gateway, "global/model");
+    preferences.set_source(.user_global);
+
+    var incoming: Preferences = .{};
+    defer incoming.deinit(std.testing.allocator);
+    try incoming.putCopy(std.testing.allocator, .gateway, "workspace/model");
+    incoming.set_source(.user_workspace);
+    try preferences.mergeOwnedFrom(std.testing.allocator, &incoming);
+
+    try std.testing.expectEqualStrings("workspace/model", preferences.get(.gateway).?);
+    try std.testing.expectEqual(config_source.Source.user_workspace, preferences.source(.gateway));
+    try std.testing.expectEqual(@as(usize, 0), incoming.count());
 }

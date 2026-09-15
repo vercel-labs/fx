@@ -8,6 +8,7 @@ const types = @import("../shared/types.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const settings_store = @import("settings_store.zig");
 const project_config = @import("../mcp/project_config.zig");
+const config_source = @import("config_source.zig");
 const model_provider = @import("model_provider.zig");
 const model_preferences = @import("model_preferences.zig");
 const configured_provider = @import("configured_provider.zig");
@@ -104,18 +105,11 @@ pub const ConfigLayer = enum {
     project,
 };
 
-pub const ConfigSource = enum {
-    compiled_default,
-    user_global,
-    project,
-    user_workspace,
-    process_override,
-};
+pub const ConfigSource = config_source.Source;
 
 pub const ModelSource = ConfigSource;
 
 pub const ConfigSources = struct {
-    models: ProviderModelSources = .{},
     provider: ConfigSource = .compiled_default,
     permission_mode: ConfigSource = .compiled_default,
     effort: ConfigSource = .compiled_default,
@@ -133,31 +127,10 @@ pub const ConfigSources = struct {
     notification_max: ConfigSource = .compiled_default,
 };
 
-pub const ProviderModelSources = struct {
-    const Entry = struct { provider: model_provider.NameKey, source: ConfigSource };
-    entries: [model_preferences.max_preferences]?Entry = @splat(null),
-
-    pub fn get(self: *const ProviderModelSources, provider: model_provider.NameKey) ConfigSource {
-        for (self.entries) |entry| if (entry) |*value| {
-            if (value.provider.eqlName(provider.label())) return value.source;
-        };
-        return .compiled_default;
-    }
-
-    pub fn set(self: *ProviderModelSources, provider: model_provider.NameKey, source: ConfigSource) !void {
-        for (&self.entries) |*entry| {
-            if (entry.*) |*value| {
-                if (!value.provider.eqlName(provider.label())) continue;
-                value.source = source;
-                return;
-            } else {
-                entry.* = .{ .provider = provider, .source = source };
-                return;
-            }
-        }
-        return error.TooManyModelPreferences;
-    }
-};
+test "model provenance reuses model preference storage" {
+    try std.testing.expectEqual(@as(usize, 15), @sizeOf(ConfigSources));
+    try std.testing.expectEqual(@as(usize, 88), @sizeOf(model_preferences.Preferences.Entry));
+}
 
 pub fn resolveContextLimits(settings: *const Settings, command_line: []const context_limits.Override) context_limits.Values {
     var values = context_limits.Values{};
@@ -235,6 +208,12 @@ pub const DetailedSettings = struct {
     prompt_history_store_allowed: bool = true,
     additional_directories: ?[][]u8 = null,
     additional_directory_sources: ?[][]u8 = null,
+
+    pub fn model_source_for(self: *const DetailedSettings, provider: model_provider.ProviderId) ModelSource {
+        const selected = self.settings.provider orelse model_provider.ProviderId.gateway;
+        if (selected.eql(provider)) return self.model_source orelse .compiled_default;
+        return self.settings.models.source(provider);
+    }
 
     pub fn deinit(self: *DetailedSettings, alloc: Allocator) void {
         self.settings.deinit(alloc);
@@ -547,23 +526,20 @@ fn loadMergedSettingsDetailedWithOptionalHome(
 
     try resolve_provider_selection(&settings);
     if (providerEnvOverride() != null) sources.provider = .process_override;
+    const selected_provider = settings.provider orelse model_provider.ProviderId.gateway;
+    var selected_model_source = settings.models.source(selected_provider);
     if (io_mod.getenv("FX_MODEL")) |model_override| {
-        if (std.mem.trim(u8, model_override, " \t\r\n").len > 0) {
-            const override_provider = model_provider.NameKey.fromProvider(settings.provider orelse .gateway);
-            sources.models.set(override_provider, .process_override) catch |err| switch (err) {
-                error.TooManyModelPreferences => debug_trace.logf(
-                    "config",
-                    "dropping process model override provenance provider={s}: provenance table holds at most {d} provider names",
-                    .{ override_provider.label(), model_preferences.max_preferences },
-                ),
-            };
+        if (std.mem.trim(u8, model_override, " \t\r\n").len > 0 and
+            (settings.models.get(selected_provider) != null or settings.models.count() < model_preferences.max_preferences))
+        {
+            selected_model_source = .process_override;
         }
     }
 
     return .{
         .settings = settings,
         .diagnostics = try diagnostics.toOwnedSlice(alloc),
-        .model_source = sources.models.get(model_provider.NameKey.fromProvider(settings.provider orelse .gateway)),
+        .model_source = selected_model_source,
         .sources = sources,
         .permission_sources = permission_sources,
         .prompt_history_store_allowed = prompt_history_store_allowed,
@@ -725,6 +701,7 @@ fn salvageProviderRouting(alloc: Allocator, settings: *Settings, sources: *Confi
     };
     defer salvaged.deinit(alloc);
     if (salvaged.provider == null and salvaged.providers == null and salvaged.models.isEmpty()) return false;
+    salvaged.models.set_source(source);
     updateConfigSources(sources, salvaged, source);
     if (salvaged.providers) |registry| {
         if (settings.providers) |*old| old.deinit(alloc);
@@ -740,13 +717,6 @@ fn salvageProviderRouting(alloc: Allocator, settings: *Settings, sources: *Confi
 }
 
 fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: ConfigSource) void {
-    for (settings.models.entries.items) |entry| sources.models.set(entry.provider, source) catch |err| switch (err) {
-        error.TooManyModelPreferences => debug_trace.logf(
-            "config",
-            "dropping model provenance provider={s} source={s}: provenance table holds at most {d} provider names",
-            .{ entry.provider.label(), @tagName(source), model_preferences.max_preferences },
-        ),
-    };
     if (settings.provider != null) sources.provider = source;
     if (settings.permission_mode != null) sources.permission_mode = source;
     if (settings.effort != null) sources.effort = source;
@@ -805,6 +775,7 @@ fn mergeDetailedSettingsLayer(
         if (source == .user_workspace) {
             incoming.update_channel = null;
         }
+        incoming.models.set_source(source);
         updateConfigSources(state.sources, incoming, source);
         if (incoming.has_permission_rules) {
             switch (permission_source) {
@@ -3473,7 +3444,7 @@ test "detailed settings expose target sources and permission views" {
 
     const user_settings = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"model\":\"user/model\",\"permission_mode\":\"ask\",\"fast_mode\":true,\"input_appearance\":\"tint\",\"startup_scrollback\":false," ++
+        "{{\"model\":\"user/model\",\"codex_model\":\"codex/user\",\"permission_mode\":\"ask\",\"fast_mode\":true,\"input_appearance\":\"tint\",\"startup_scrollback\":false," ++
             "\"prompt_history\":{{\"enabled\":false}},\"statusLine\":{{\"sandbox\":true,\"context\":false,\"session\":true}}," ++
             "\"permission\":{{\"bash\":{{\"user *\":\"allow\"}}}},\"workspaces\":{{\"{s}\":{{" ++
             "\"model\":\"workspace/model\",\"permission_mode\":\"auto\",\"input_appearance\":\"lines\",\"sandbox\":\"none\",\"permission\":{{\"bash\":{{\"local *\":\"allow\"}}}}" ++
@@ -3491,7 +3462,8 @@ test "detailed settings expose target sources and permission views" {
     var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
     defer result.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(ConfigSource.user_workspace, result.sources.models.get(model_provider.NameKey.fromProvider(.gateway)));
+    try std.testing.expectEqual(ConfigSource.user_workspace, result.model_source_for(.gateway));
+    try std.testing.expectEqual(ConfigSource.user_global, result.model_source_for(.codex));
     try std.testing.expectEqual(ConfigSource.user_workspace, result.sources.permission_mode);
     try std.testing.expectEqual(ConfigSource.compiled_default, result.sources.effort);
     try std.testing.expectEqual(ConfigSource.user_global, result.sources.fast_mode);
@@ -3533,7 +3505,7 @@ test "detailed settings report non-empty process model override as winning sourc
     var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
     defer result.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(ConfigSource.process_override, result.sources.models.get(model_provider.NameKey.fromProvider(.gateway)));
+    try std.testing.expectEqual(ConfigSource.process_override, result.model_source_for(.gateway));
     try std.testing.expectEqual(ModelSource.process_override, result.model_source.?);
     try std.testing.expectEqualStrings("user/model", result.settings.models.get(.gateway).?);
 }
