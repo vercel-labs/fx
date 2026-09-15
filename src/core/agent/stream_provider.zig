@@ -88,6 +88,12 @@ pub const ProviderAttemptOwner = enum {
 pub const NetworkFailureCause = enum {
     transport_interrupted,
     system_resumed,
+    /// The network path is provably down (refused, unreachable, DNS). Nothing
+    /// was sent; probing it is free and never consumes the attempt budget.
+    connectivity_lost,
+    /// The stream produced no bytes past the stall threshold. Positive
+    /// evidence that this exchange is dead; restarting it is the recovery.
+    stream_stalled,
 };
 
 /// Stable native transport evidence consumed by model recovery policy.

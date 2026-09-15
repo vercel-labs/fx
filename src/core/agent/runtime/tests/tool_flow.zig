@@ -6170,6 +6170,12 @@ test "processQueuedPrompt pauses retryable failures and preserves execution on t
 
         var config = fixture.config();
         config.max_provider_attempts = 2;
+        // Retryable failures recover autonomously now; park the turn with a
+        // lifecycle pause (the user's try-later) when the retry is scheduled.
+        var pause_flag = std.atomic.Value(bool).init(false);
+        deps.pause_on_auto_retry_status = true;
+        deps.recovery_pause_flag = &pause_flag;
+        config.recovery_pause_flag = &pause_flag;
         switch (case.expected) {
             .paused => try runFakePrompt(
                 &gateway,

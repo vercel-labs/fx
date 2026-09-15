@@ -6783,8 +6783,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const trace = readFileSync(tracePath, "utf8");
 
       expect(result.code).toBe(0);
-      expect(result.stderr).toContain("Provider unavailable · provider_error: turn route failure one · retrying request · attempt 1/10");
-      expect(result.stderr).toContain("Provider unavailable · provider_error: turn route failure two · retrying request in 1s · attempt 2/10");
+      expect(result.stderr).toContain("Provider unavailable · provider_error: turn route failure one · retrying request");
+      expect(result.stderr).toContain("Provider unavailable · provider_error: turn route failure two · retrying request in 1s");
       expect(result.stderr).toContain("recovered · succeeded on attempt 3/10");
       expect(result.stdout).toContain("Recovered in ask turn.");
       expect(gateway.requestCount()).toBe(3);
@@ -6895,7 +6895,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(result.code).toBe(0);
         expect(result.signal).toBeNull();
         expect(result.stderr).toMatch(
-          /^\[notice\] ⚠ Network interrupted · [^\n]+ · retrying request · attempt 1\/10$/m,
+          /^\[notice\] ⚠ Network interrupted · [^\n]+ · retrying request$/m,
         );
         expect(result.stderr).toContain("recovered · succeeded on attempt 2/10");
         expect(json.exit_code).toBe(0);
@@ -7017,10 +7017,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(result.signal).toBeNull();
       expect(result.stdout).toContain(expectedOutput);
       expect(result.stderr).toContain(
-        "Provider unavailable · HTTP 503 · provider temporarily unavailable · retrying request · attempt 5/10",
+        "Provider unavailable · HTTP 503 · provider temporarily unavailable · retrying request",
       );
       expect(result.stderr).toMatch(
-        /Network interrupted · [^\r\n]+ · retrying request · attempt 6\/10/,
+        /Network interrupted · [^\r\n]+ · retrying request/,
       );
       expect(result.stderr).not.toContain("retrying request in 16s");
       expect(result.stderr).toContain("recovered · succeeded on attempt 7/10");
@@ -8688,7 +8688,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(existsSync(sentinelPath)).toBe(false);
       expect(gateway.requestCount()).toBe(2);
       expect(result.stderr).toContain(
-        "Provider unavailable · provider_error · checking uncertain tool state · attempt 1/10",
+        "Provider unavailable · provider_error · checking uncertain tool state",
       );
       expect(result.stderr).toContain("recovered · succeeded on attempt 2/10");
       expect(trace).toContain("termination cause=valid_finish finish_reason=error");
@@ -8830,10 +8830,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.recovery?.message).not.toContain("provider_error");
       expect(json.recovery?.message).not.toContain("first route failure");
       expect(result.stderr).toContain(
-        "Provider unavailable · provider_error: first route failure · retrying request · attempt 1/10",
+        "Provider unavailable · provider_error: first route failure · retrying request",
       );
       expect(result.stderr).toContain(
-        "Provider unavailable · provider_error: second route failure · retrying request in 1s · attempt 2/10",
+        "Provider unavailable · provider_error: second route failure · retrying request in 1s",
       );
       expect(result.stderr).toContain("recovered · succeeded on attempt 3/10");
       expect(gateway.requestCount()).toBe(3);
@@ -8851,10 +8851,15 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 30_000);
 
-  test("gateway stream timeout pauses without automatic retry", async () => {
+  test("gateway stream timeout probes the connection without spending the attempt budget", async () => {
     const root = createFixtureRoot("gateway-stream-timeout");
     const tracePath = join(root.root, "trace.log");
-    const gateway = startGateway(() => gatewayStreamTimeoutResponse());
+    let timeouts = 2;
+    const gateway = startGateway(() =>
+      timeouts-- > 0
+        ? gatewayStreamTimeoutResponse()
+        : fakeGatewayFinalText("Recovered after the gateway stream timeout.")
+    );
     try {
       const result = await runFx(
         ["ask", "--json", "--auto", "--no-save", "Return the fixture response."],
@@ -8867,18 +8872,17 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const json = parseAskJson(result.stdout);
       const trace = readFileSync(tracePath, "utf8");
 
-      expect(result.code).toBe(1);
-      expect(json.exit_code).toBe(1);
-      expect(gateway.requestCount()).toBe(1);
-      expect(json.recovery?.state).toBe("paused");
-      expect(json.recovery?.cause).toBe("provider_stream_timeout");
+      expect(result.code).toBe(0);
+      expect(json.exit_code).toBe(0);
+      expect(json.output).toBe("Recovered after the gateway stream timeout.");
+      expect(gateway.requestCount()).toBe(3);
+      expect(json.recovery?.state).toBe("recovered");
       expect(json.recovery?.attempt).toBe(1);
       expect(json.recovery?.attempt_limit).toBe(10);
-      expect(json.recovery?.required_action).toBe("continue_later");
-      expect(result.stderr).toContain("Gateway stream timed out");
-      expect(result.stderr).toContain("gateway_stream_timeout: stream exceeded maximum duration");
-      expect(result.stderr).toContain("automatic retry paused · attempt 1/10");
+      expect(result.stderr).toContain("Gateway stream timed out · checking the connection");
+      expect(result.stderr).toContain("checking the connection · 1s");
       expect(result.stderr).not.toContain("retrying request");
+      expect(result.stderr).not.toContain("automatic retry paused");
       expect(trace).toContain("event=route_failure");
       expect(trace).toContain("retry=false");
       expect(trace).toContain("detail=gateway_stream_timeout: stream exceeded maximum duration");
@@ -8886,12 +8890,17 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 
-  test("finish-only gateway stream timeout pauses without automatic retry", async () => {
+  test("finish-only gateway stream timeout probes the connection without spending the attempt budget", async () => {
     const root = createFixtureRoot("finish-only-gateway-stream-timeout");
     const tracePath = join(root.root, "trace.log");
-    const gateway = startGateway(() => finishOnlyGatewayStreamTimeoutResponse());
+    let timeouts = 2;
+    const gateway = startGateway(() =>
+      timeouts-- > 0
+        ? finishOnlyGatewayStreamTimeoutResponse()
+        : fakeGatewayFinalText("Recovered after the finish-only timeout.")
+    );
     try {
       const result = await runFx(
         ["ask", "--json", "--auto", "--no-save", "Return the fixture response."],
@@ -8904,16 +8913,15 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const json = parseAskJson(result.stdout);
       const trace = readFileSync(tracePath, "utf8");
 
-      expect(result.code).toBe(1);
-      expect(json.exit_code).toBe(1);
-      expect(gateway.requestCount()).toBe(1);
-      expect(json.recovery?.state).toBe("paused");
-      expect(json.recovery?.cause).toBe("provider_stream_timeout");
-      expect(json.recovery?.required_action).toBe("continue_later");
-      expect(result.stderr).toContain("Gateway stream timed out");
-      expect(result.stderr).toContain("gateway_stream_timeout");
-      expect(result.stderr).toContain("automatic retry paused · attempt 1/10");
+      expect(result.code).toBe(0);
+      expect(json.exit_code).toBe(0);
+      expect(json.output).toBe("Recovered after the finish-only timeout.");
+      expect(gateway.requestCount()).toBe(3);
+      expect(json.recovery?.state).toBe("recovered");
+      expect(json.recovery?.attempt).toBe(1);
+      expect(result.stderr).toContain("Gateway stream timed out · checking the connection");
       expect(result.stderr).not.toContain("retrying request");
+      expect(result.stderr).not.toContain("automatic retry paused");
       expect(trace).toContain("event=route_failure");
       expect(trace).toContain("http_status=200");
       expect(trace).toContain("retry=false");
@@ -8921,7 +8929,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 
   test("saved gateway stream timeout reloads and continues explicitly", async () => {
     const root = createFixtureRoot("saved-gateway-stream-timeout");
@@ -8933,32 +8941,40 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         : gatewayStreamTimeoutWithFinishResponse()
     );
     try {
+      // The timeout probes the connection forever on its own; the only way the
+      // turn parks is killing the process, which leaves a durable checkpoint.
       const first = await runFx(
         ["ask", "--json", "--auto", "Pause on the fixture timeout."],
         {
           cwd: root.workspace,
           env: fixtureEnv(root, gateway, tracePath),
-          timeoutMs: 15_000,
+          timeoutMs: 5_000,
         },
       );
-      const paused = parseAskJson(first.stdout);
 
-      expect(first.code).toBe(1);
-      expect(gateway.requestCount()).toBe(1);
-      expect(paused.recovery?.state).toBe("paused");
-      expect(paused.recovery?.cause).toBe("provider_stream_timeout");
-      expect(paused.recovery?.required_action).toBe("continue_later");
-      expect(paused.recovery?.durable).toBe(true);
-      expect(paused.recovery?.message).toContain(
-        "gateway_stream_timeout: stream exceeded maximum duration",
+      expect(first.timedOut).toBe(true);
+      expect(first.stderr).toContain(
+        "Gateway stream timed out · checking the connection",
       );
+      expect(first.stderr).not.toContain("retrying request");
+      const probedRequests = gateway.requestCount();
+      expect(probedRequests).toBeGreaterThanOrEqual(2);
+      const sessionsRoot = join(root.home, ".fx", "sessions");
+      const sessionId = readdirSync(sessionsRoot).find((name) =>
+        existsSync(join(sessionsRoot, name, "recovery.json"))
+      );
+      expect(sessionId).toBeDefined();
+      const checkpoint = JSON.parse(
+        readFileSync(join(sessionsRoot, sessionId!, "recovery.json"), "utf8"),
+      ).checkpoint;
+      expect(checkpoint.cause).toBe("provider_stream_timeout");
 
       const detail = await runFx(
-        ["session", "--id", paused.session_id, "--json"],
+        ["session", "--id", sessionId!, "--json"],
         { cwd: root.workspace, env: { HOME: root.home } },
       );
       expect(detail.code).toBe(0);
-      expect(gateway.requestCount()).toBe(1);
+      expect(gateway.requestCount()).toBe(probedRequests);
 
       continued = true;
       const resumed = await runFx(
@@ -8967,7 +8983,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           "--json",
           "--auto",
           "--resume-id",
-          paused.session_id,
+          sessionId!,
           "--continue-recovery",
         ],
         {
@@ -8982,21 +8998,27 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(recovered.output).toContain(
         "Recovered after explicit timeout continuation.",
       );
-      expect(gateway.requestCount()).toBe(2);
-      expect(gateway.requests[1]!.body).toContain("Pause on the fixture timeout.");
+      expect(gateway.requestCount()).toBe(probedRequests + 1);
+      expect(gateway.requests[probedRequests]!.body).toContain("Pause on the fixture timeout.");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
-  test("model response budget stops at ten real requests", async () => {
+  test("model response recovery keeps retrying status failures past ten real requests", async () => {
     const root = createFixtureRoot("provider-attempt-budget");
     const tracePath = join(root.root, "trace.log");
-    const gateway = startGateway(() => unavailableResponse("0"));
+    const responses = [
+      ...Array.from({ length: 12 }, () => unavailableResponse("0")),
+      fakeGatewayFinalText("Recovered beyond the old budget."),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
     try {
       const result = await runFx(
-        ["ask", "--json", "--auto", "Exhaust the model response budget."],
+        ["ask", "--json", "--auto", "Recover beyond the old response budget."],
         {
           cwd: root.workspace,
           env: fixtureEnv(root, gateway, tracePath),
@@ -9005,63 +9027,101 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       );
       const json = parseAskJson(result.stdout);
 
-      expect(result.code).toBe(1);
-      expect(json.exit_code).toBe(1);
-      expect(gateway.requestCount()).toBe(10);
-      expect(json.recovery?.state).toBe("paused");
-      expect(json.recovery?.cause).toBe("provider_unavailable");
-      expect(json.recovery?.attempt).toBe(10);
+      expect(result.code).toBe(0);
+      expect(json.exit_code).toBe(0);
+      expect(json.output).toBe("Recovered beyond the old budget.");
+      expect(gateway.requestCount()).toBe(13);
+      expect(json.recovery?.state).toBe("recovered");
+      expect(json.recovery?.attempt).toBe(13);
       expect(json.recovery?.attempt_limit).toBe(10);
-      expect(json.recovery?.required_action).toBe("continue_later");
-      expect(json.recovery?.durable).toBe(true);
-      expect(json.recovery?.message).toContain(
-        "HTTP 503 · provider temporarily unavailable",
+      expect(result.stderr).toContain(
+        "Provider unavailable · HTTP 503 · provider temporarily unavailable · retrying request",
       );
-      expect(result.stderr).toContain("retrying request · attempt 1/10");
-      expect(result.stderr).toContain("recovery paused after 10/10 attempts");
+      expect(result.stderr).toContain("recovered · succeeded on attempt 13/10");
+      expect(result.stderr).not.toContain("recovery paused");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 30_000);
 
-  test("exhausted retry budget pauses once and explicit continue preserves context", async () => {
-    const root = createFixtureRoot("retry-budget-pause-continue");
+  test("identical interrupted responses stop as a no-progress stall after three attempts", async () => {
+    const root = createFixtureRoot("identical-stall-stop");
     const tracePath = join(root.root, "trace.log");
-    let continued = false;
-    const gateway = startGateway(() =>
-      continued
-        ? fakeGatewayFinalText("Recovered after explicit continuation.")
-        : unavailableResponse("0")
-    );
+    const gateway = startGateway(() => sse("data: [DONE]\n\n"));
     try {
-      const first = await runFx(
-        ["ask", "--json", "--auto", "Pause after exhausting recovery."],
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Return the fixture response."],
         {
           cwd: root.workspace,
           env: fixtureEnv(root, gateway, tracePath),
           timeoutMs: 15_000,
         },
       );
-      const paused = parseAskJson(first.stdout);
-      expect(first.code).toBe(1);
-      expect(gateway.requestCount()).toBe(10);
-      expect(paused.recovery?.state).toBe("paused");
-      expect(paused.recovery?.cause).toBe("provider_unavailable");
-      expect(paused.recovery?.attempt).toBe(10);
-      expect(paused.recovery?.attempt_limit).toBe(10);
-      expect(paused.recovery?.required_action).toBe("continue_later");
-      expect(paused.recovery?.durable).toBe(true);
-      expect(paused.recovery?.message).toContain(
-        "HTTP 503 · provider temporarily unavailable",
+      const json = parseAskJson(result.stdout);
+      const trace = readFileSync(tracePath, "utf8");
+
+      expect(result.code).toBe(1);
+      expect(json.exit_code).toBe(1);
+      expect(gateway.requestCount()).toBe(3);
+      expect(json.recovery?.state).toBe("failed");
+      expect(json.recovery?.cause).toBe("response_interrupted");
+      expect(json.recovery?.attempt).toBe(3);
+      expect(json.recovery?.attempt_limit).toBe(10);
+      expect(json.recovery?.required_action).toBe("surface_stall");
+      expect(json.recovery?.message).toContain("kept failing at the same point · stopped");
+      expect(result.stderr).toContain(
+        "⚠ Response ended early · stream interrupted · kept failing at the same point · stopped",
       );
+      expect(result.stderr).not.toContain("recovery paused");
+      expect(trace).toContain("termination cause=done_without_finish");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test("interrupted status-failure backoff continues explicitly with preserved context", async () => {
+    const root = createFixtureRoot("retry-backoff-kill-continue");
+    const tracePath = join(root.root, "trace.log");
+    let continued = false;
+    const gateway = startGateway(() =>
+      continued
+        ? fakeGatewayFinalText("Recovered after explicit continuation.")
+        : unavailableResponse("30")
+    );
+    try {
+      // A 30 s server-hinted backoff parks the retry inside the first run; the
+      // SIGKILL leaves a durable checkpoint behind for explicit continuation.
+      const first = await runFx(
+        ["ask", "--json", "--auto", "Pause after exhausting recovery."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 5_000,
+        },
+      );
+      expect(first.timedOut).toBe(true);
+      expect(first.stderr).toContain(
+        "Provider unavailable · HTTP 503 · provider temporarily unavailable · retrying request in 30s",
+      );
+      expect(gateway.requestCount()).toBe(1);
+      const sessionsRoot = join(root.home, ".fx", "sessions");
+      const sessionId = readdirSync(sessionsRoot).find((name) =>
+        existsSync(join(sessionsRoot, name, "recovery.json"))
+      );
+      expect(sessionId).toBeDefined();
+      const checkpoint = JSON.parse(
+        readFileSync(join(sessionsRoot, sessionId!, "recovery.json"), "utf8"),
+      ).checkpoint;
+      expect(checkpoint.consumed_provider_attempts).toBe(1);
 
       const detail = await runFx(
-        ["session", "--id", paused.session_id, "--json"],
+        ["session", "--id", sessionId!, "--json"],
         { cwd: root.workspace, env: { HOME: root.home } },
       );
       expect(detail.code).toBe(0);
-      expect(gateway.requestCount()).toBe(10);
+      expect(gateway.requestCount()).toBe(1);
 
       continued = true;
       const resumed = await runFx(
@@ -9070,7 +9130,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           "--json",
           "--auto",
           "--resume-id",
-          paused.session_id,
+          sessionId!,
           "--continue-recovery",
         ],
         {
@@ -9082,16 +9142,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const recovered = parseAskJson(resumed.stdout);
       expect(resumed.code).toBe(0);
       expect(recovered.output).toContain("Recovered after explicit continuation.");
-      expect(gateway.requestCount()).toBe(11);
-      expect(gateway.requests[10]!.body).toContain("Pause after exhausting recovery.");
+      expect(gateway.requestCount()).toBe(2);
+      expect(gateway.requests[1]!.body).toContain("Pause after exhausting recovery.");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
-  test("CLI continuation prints one complete response after checkpointed partial output", async () => {
-    const root = createFixtureRoot("partial-pause-continue");
+  test("CLI recovery prints one complete response after checkpointed partial output", async () => {
+    const root = createFixtureRoot("partial-autonomous-recovery");
     const tracePath = join(root.root, "trace.log");
     const partialText = "CLI partial output before EOF.";
     const finalText = "CLI recovery completed.";
@@ -9110,7 +9170,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       responses.shift() ?? new Response("unexpected request", { status: 500 })
     );
     try {
-      const first = await runFx(
+      // The interrupted stream and the nine 503s recover inside one run; no
+      // pause, no explicit continuation.
+      const result = await runFx(
         ["ask", "--json", "--auto", "Recover this CLI response."],
         {
           cwd: root.workspace,
@@ -9118,30 +9180,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           timeoutMs: 15_000,
         },
       );
-      const paused = parseAskJson(first.stdout);
-      expect(first.code).toBe(1);
-      expect(paused.output).toBe(partialText);
-      expect(paused.final_output).toBe("");
-      expect(paused.recovery?.state).toBe("paused");
-      expect(gateway.requestCount()).toBe(10);
-
-      const resumed = await runFx(
-        [
-          "ask",
-          "--json",
-          "--auto",
-          "--resume-id",
-          paused.session_id,
-          "--continue-recovery",
-        ],
-        {
-          cwd: root.workspace,
-          env: fixtureEnv(root, gateway, tracePath),
-          timeoutMs: 15_000,
-        },
-      );
-      const recovered = parseAskJson(resumed.stdout);
-      expect(resumed.code).toBe(0);
+      const recovered = parseAskJson(result.stdout);
+      expect(result.code).toBe(0);
       expect(recovered.output).toBe(finalText);
       expect(recovered.final_output).toBe(finalText);
       expect(recovered.recovery?.state).toBe("recovered");
@@ -9373,11 +9413,12 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     const commentary = "Completed tool commentary.";
     const partialText = "OBSOLETE_PREVIEW";
     writeFileSync(join(root.workspace, "fixture.txt"), "settled evidence\n");
+    const finalText = "Replacement inspection completed.";
     const responses = [
       fakeGatewaySerializedToolCall("first_read", "read_file", '{"path":"fixture.txt"}', commentary),
       sse(`data: ${JSON.stringify({ type: "text-delta", id: "answer", delta: partialText })}\n\n`),
       fakeGatewayToolCall("replacement_read", "read_file", { path: "fixture.txt" }),
-      ...Array.from({ length: 9 }, () => unavailableResponse("0")),
+      fakeGatewayFinalText(finalText),
     ];
     const gateway = startGateway(() =>
       responses.shift() ?? new Response("unexpected request", { status: 500 })
@@ -9388,14 +9429,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         { cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000 },
       );
       const json = parseAskJson(result.stdout);
-      expect(result.code).toBe(1);
-      expect(json.output).toBe(commentary);
-      expect(json.final_output).toBe("");
+      expect(result.code).toBe(0);
+      expect(json.output).toContain(commentary);
+      expect(json.output).toContain(finalText);
+      expect(json.output).not.toContain(partialText);
+      expect(json.final_output).toBe(finalText);
       expect(json.tool_calls).toEqual([
         { name: "read_file", status: "success" },
         { name: "read_file", status: "success" },
       ]);
-      expect(gateway.requestCount()).toBe(12);
+      expect(gateway.requestCount()).toBe(4);
       expect(gateway.requests[3]!.body).not.toContain(partialText);
       expect(toolResultOutput(gateway.requests[3]!.body, "replacement_read")).toContain("settled evidence");
     } finally {
@@ -9411,19 +9454,20 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const partialText = `OBSOLETE_${variant}`;
       writeFileSync(join(root.workspace, "fixture.txt"), "settled evidence\n");
       const partial = sse(`data: ${JSON.stringify({ type: "text-delta", id: "answer", delta: partialText })}\n\n`);
+      const finalText = `REPLACEMENT_${variant}_ACCEPTED`;
       const responses = variant === "duplicate-provider"
         ? [
           providerToolResultResponse("provider_error"),
           partial,
           providerToolResultResponse("tool-calls"),
-          ...Array.from({ length: 8 }, () => unavailableResponse("0")),
+          fakeGatewayFinalText(finalText),
         ]
         : [
           fakeGatewayToolCall("silent_read_1", "read_file", { path: "fixture.txt" }),
           fakeGatewayToolCall("silent_read_2", "read_file", { path: "fixture.txt" }),
           partial,
           fakeGatewayFinalText(""),
-          ...Array.from({ length: 9 }, () => unavailableResponse("0")),
+          fakeGatewayFinalText(finalText),
         ];
       const gateway = startGateway(() =>
         responses.shift() ?? new Response("unexpected request", { status: 500 })
@@ -9434,10 +9478,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           { cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000 },
         );
         const json = parseAskJson(result.stdout);
-        expect(result.code).toBe(1);
-        expect(json.output).toBe("");
-        expect(json.final_output).toBe("");
-        expect(gateway.requestCount()).toBe(variant === "duplicate-provider" ? 11 : 13);
+        expect(result.code).toBe(0);
+        expect(json.output).toContain(finalText);
+        expect(json.final_output).toBe(finalText);
+        expect(gateway.requestCount()).toBe(variant === "duplicate-provider" ? 4 : 5);
         expect(readFileSync(tracePath, "utf8")).toContain(
           variant === "duplicate-provider"
             ? "event=provider_tool_recovery_duplicate_suppressed"
@@ -9767,7 +9811,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(result.stderr).toContain(
           fixture.streamedText ? "restarting response" : "retrying request",
         );
-        expect(result.stderr).toContain("attempt 1/10");
+        expect(result.stderr).not.toContain("· attempt 1/10");
         expect(result.stderr).toContain("recovered · succeeded on attempt 2/10");
 
         const json = parseAskJson(result.stdout);

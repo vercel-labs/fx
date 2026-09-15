@@ -1996,6 +1996,47 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasDecl(App, "restoreSessionCredential")) {
                 try app.restoreSessionCredential(previous_provider);
             }
+            // A paused recovery resumes on its own after every restart or
+            // resume; the user never re-runs a manual continuation. Harnesses
+            // without a real worker queue opt out via the decl check. A
+            // compaction_prepared checkpoint records completed source, not a
+            // turn waiting to run; the compaction flow owns it.
+            if (comptime @hasDecl(App, "queueRecoveryCheckpoint")) {
+                if (state.recovery_checkpoint) |checkpoint| {
+                    if (checkpoint.cause == .compaction_prepared) {
+                        debug_trace.logf(
+                            "session",
+                            "event=auto_continue_skipped cause=compaction_prepared",
+                            .{},
+                        );
+                    } else {
+                        const queued = continuePausedRecovery(app) catch |err| switch (err) {
+                            error.MissingApiKey => missing: {
+                                try app.writeDomainNotice(.{
+                                    .topic = "recovery",
+                                    .tone = .warning,
+                                    .body = "sign in to let the interrupted response continue automatically",
+                                }, true);
+                                break :missing false;
+                            },
+                            else => other: {
+                                debug_trace.logf(
+                                    "session",
+                                    "event=auto_continue_failed err={s}",
+                                    .{@errorName(err)},
+                                );
+                                try app.writeDomainNotice(.{
+                                    .topic = "recovery",
+                                    .tone = .warning,
+                                    .body = "the interrupted response could not continue automatically; it will try again on the next resume",
+                                }, true);
+                                break :other false;
+                            },
+                        };
+                        _ = queued;
+                    }
+                }
+            }
         }
 
         pub fn openSessionPicker(app: *App) !void {
@@ -3855,30 +3896,35 @@ pub fn Runtime(comptime App: type) type {
                     checkpoint.assistant_source,
                 );
             }
-            const recovery_notice = if (checkpoint.tool_state == .uncertain)
-                try std.fmt.allocPrint(
-                    app.alloc,
-                    "model response recovery is paused at attempt {d}/{d}; inspect the uncertain tool state before /continue",
-                    .{
-                        checkpoint.consumed_provider_attempts +| @intFromBool(checkpoint.outstanding_reservation),
-                        checkpoint.max_provider_attempts,
-                    },
-                )
-            else
-                try std.fmt.allocPrint(
-                    app.alloc,
-                    "model response recovery is paused at attempt {d}/{d}; run /continue to resume the preserved turn",
-                    .{
-                        checkpoint.consumed_provider_attempts +| @intFromBool(checkpoint.outstanding_reservation),
-                        checkpoint.max_provider_attempts,
-                    },
-                );
-            defer app.alloc.free(recovery_notice);
-            try sink.appendNotice(.{
-                .topic = "recovery",
-                .tone = .warning,
-                .body = recovery_notice,
-            });
+            // A compaction_prepared checkpoint records completed source owned by
+            // the compaction flow, not a turn waiting to run; it gets no recovery
+            // notice and no automatic continuation.
+            if (checkpoint.cause != .compaction_prepared) {
+                const recovery_notice = if (checkpoint.tool_state == .uncertain)
+                    try std.fmt.allocPrint(
+                        app.alloc,
+                        "model response recovery paused at attempt {d}/{d} and continues automatically; inspect the uncertain tool state if anything looks wrong",
+                        .{
+                            checkpoint.consumed_provider_attempts +| @intFromBool(checkpoint.outstanding_reservation),
+                            checkpoint.max_provider_attempts,
+                        },
+                    )
+                else
+                    try std.fmt.allocPrint(
+                        app.alloc,
+                        "model response recovery paused at attempt {d}/{d} and continues automatically",
+                        .{
+                            checkpoint.consumed_provider_attempts +| @intFromBool(checkpoint.outstanding_reservation),
+                            checkpoint.max_provider_attempts,
+                        },
+                    );
+                defer app.alloc.free(recovery_notice);
+                try sink.appendNotice(.{
+                    .topic = "recovery",
+                    .tone = .warning,
+                    .body = recovery_notice,
+                });
+            }
         }
 
         fn replayHistory(app: *App, history: []const types.HistoryTurn) !void {

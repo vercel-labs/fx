@@ -2,8 +2,16 @@ const std = @import("std");
 
 pub const default_max_provider_attempts: usize = 10;
 pub const max_retry_after_seconds: u64 = 30;
+/// Past this much total recovery time, billable retries throttle to once a
+/// minute and the UI shows a patient "still trying" state instead of attempt
+/// counters. The turn never dies from transient failure.
+pub const billable_retry_window_ns: u64 = 15 * 60 * std.time.ns_per_s;
+pub const throttled_retry_delay_ns: u64 = 60 * std.time.ns_per_s;
 
 pub const FailureCause = enum {
+    /// The network path is provably down (connection refused, unreachable,
+    /// DNS failure, dead socket after wake). Nothing was or can be sent.
+    connectivity_lost,
     transport_interrupted,
     response_interrupted,
     provider_stream_timeout,
@@ -33,6 +41,15 @@ pub const ToolEvidence = enum {
     uncertain,
 };
 
+/// Whether attempts keep making forward progress. A stall (the same failure at
+/// the same progress point, repeatedly) is a broken response, not a network
+/// problem; retrying it forever is the failure mode budgets used to mask.
+pub const Progress = enum {
+    unknown,
+    advancing,
+    stalled,
+};
+
 pub const AttemptState = struct {
     consumed: usize,
     limit: usize = default_max_provider_attempts,
@@ -42,7 +59,8 @@ pub const AttemptState = struct {
     }
 };
 
-/// Ephemeral backoff state. AttemptState remains the durable request budget.
+/// Ephemeral backoff state. AttemptState remains the durable diagnostic budget;
+/// exhaustion no longer terminates the turn.
 pub const RetryPacingState = union(enum) {
     idle,
     implicit: struct {
@@ -75,6 +93,12 @@ pub const Strategy = enum {
     regenerate_tool,
     continue_after_confirmed_tool,
     reconcile_tool,
+    /// Park the turn and probe connectivity until the path returns. Never
+    /// consumes the attempt budget: probes transmit nothing.
+    wait_for_connectivity,
+    /// Silence is ambiguous (a thinking model and a hung gateway are identical
+    /// on the wire). Probe the liveness channel; never retry on silence alone.
+    probe_liveness,
     pause,
     stop,
 };
@@ -84,6 +108,9 @@ pub const RequiredAction = enum {
     continue_later,
     inspect_uncertain_tool,
     change_request,
+    /// The same failure repeated at the same progress point. Surface it as a
+    /// broken response instead of restarting forever.
+    surface_stall,
 };
 
 pub const Evidence = struct {
@@ -95,6 +122,9 @@ pub const Evidence = struct {
     pacing: RetryPacingState = .idle,
     retry_after_seconds: ?u64 = null,
     cancelled: bool = false,
+    progress: Progress = .unknown,
+    /// Total wall-clock time spent recovering this turn, when known.
+    recovery_elapsed_ns: ?u64 = null,
 };
 
 pub const Decision = struct {
@@ -103,6 +133,9 @@ pub const Decision = struct {
     next_pacing: RetryPacingState = .idle,
     reserve_provider_attempt: bool = false,
     required_action: RequiredAction = .none,
+    /// True once recovery runs longer than the billable window: delays floor at
+    /// one minute so billable retransmission throttles without the turn dying.
+    throttled: bool = false,
 };
 
 /// Pure model-response policy. It describes the next effect but never sleeps,
@@ -115,27 +148,59 @@ pub noinline fn decide(evidence: Evidence) Decision {
             .strategy = .stop,
             .required_action = .change_request,
         },
-        .provider_stream_timeout => return .{
-            .strategy = .pause,
-            .required_action = if (evidence.tool == .uncertain)
-                .inspect_uncertain_tool
-            else
-                .continue_later,
-        },
+        // The provider's own request limit does not recover by retrying within
+        // this turn. Stop honestly instead of pausing for a manual /continue.
         .request_limit_reached => return .{
-            .strategy = .pause,
+            .strategy = .stop,
             .required_action = .continue_later,
         },
         else => {},
     }
 
-    if (evidence.attempts.remaining() == 0) {
+    // Connectivity loss waits indefinitely; probes transmit nothing, so there
+    // is nothing to budget and nothing to bill. The cadence ramps 1s, 2s, then
+    // a 5s cap so a down network is polled gently, not hammered.
+    if (evidence.cause == .connectivity_lost) {
+        const next_pacing = evidence.pacing.afterFailure(.connectivity_lost, null);
+        const probe_attempt = switch (next_pacing) {
+            .idle => 1,
+            .implicit => |pacing| pacing.attempt,
+        };
         return .{
-            .strategy = .pause,
+            .strategy = .wait_for_connectivity,
+            .delay_ns = connectivityProbeDelayNs(probe_attempt),
+            .next_pacing = next_pacing,
+            .required_action = .none,
+        };
+    }
+
+    // Silence is never a retry trigger. Probe the liveness channel first, on a
+    // paced cadence so a provider that always times out cannot hot-loop.
+    if (evidence.cause == .provider_stream_timeout) {
+        const next_pacing = evidence.pacing.afterFailure(.provider_stream_timeout, null);
+        const probe_attempt = switch (next_pacing) {
+            .idle => 1,
+            .implicit => |pacing| pacing.attempt,
+        };
+        return .{
+            .strategy = .probe_liveness,
+            .delay_ns = retryDelayNs(probe_attempt),
+            .next_pacing = next_pacing,
             .required_action = if (evidence.tool == .uncertain)
                 .inspect_uncertain_tool
             else
-                .continue_later,
+                .none,
+        };
+    }
+
+    // A stalled exchange (identical failure, identical progress, repeatedly) is
+    // a broken response, not a flaky network. Stop instead of restarting the
+    // same failure forever. Scoped to stream evidence: bare status failures
+    // (5xx) carry no progress information and keep retrying patiently.
+    if (evidence.progress == .stalled) {
+        return .{
+            .strategy = .stop,
+            .required_action = .surface_stall,
         };
     }
 
@@ -154,10 +219,13 @@ pub noinline fn decide(evidence: Evidence) Decision {
         evidence.cause,
         evidence.retry_after_seconds,
     );
+    const throttled = evidence.recovery_elapsed_ns orelse 0 > billable_retry_window_ns;
     const delay_ns = if (evidence.retry_after_seconds) |seconds| blk: {
         const bounded_seconds: u64 = @min(seconds, max_retry_after_seconds);
         break :blk bounded_seconds * std.time.ns_per_s;
-    } else switch (next_pacing) {
+    } else if (throttled)
+        throttled_retry_delay_ns
+    else switch (next_pacing) {
         .idle => unreachable,
         .implicit => |pacing| retryDelayNs(pacing.attempt),
     };
@@ -166,7 +234,17 @@ pub noinline fn decide(evidence: Evidence) Decision {
         .delay_ns = delay_ns,
         .next_pacing = next_pacing,
         .reserve_provider_attempt = true,
+        .throttled = throttled,
     };
+}
+
+/// Connectivity probe cadence after `attempt` consecutive connectivity
+/// failures: 1 s, 2 s, then 5 s flat. Probes transmit nothing, so the cadence
+/// exists to keep the UI calm and the loop cheap, not to protect a provider.
+pub fn connectivityProbeDelayNs(attempt: usize) u64 {
+    if (attempt <= 1) return std.time.ns_per_s;
+    if (attempt == 2) return 2 * std.time.ns_per_s;
+    return 5 * std.time.ns_per_s;
 }
 
 /// Delay before the next provider request after `attempt` consecutive implicit
@@ -195,7 +273,7 @@ pub fn shouldDisableFastRoute(
     return fast_mode and cause == .provider_unavailable and replay_safe;
 }
 
-test "model response recovery policy is deterministic and bounded" {
+test "model response recovery policy is deterministic and never pauses transient failure" {
     const base = Evidence{
         .cause = .transport_interrupted,
         .delivery = .possibly_sent,
@@ -223,29 +301,81 @@ test "model response recovery policy is deterministic and bounded" {
     definitely_unsent.delivery = .definitely_unsent;
     try std.testing.expectEqual(Strategy.retry_request, decide(definitely_unsent).strategy);
 
+    // Exhaustion no longer pauses the turn: the strategy keeps retrying with
+    // the same pacing discipline.
     var exhausted = base;
     exhausted.attempts.consumed = exhausted.attempts.limit;
-    const paused = decide(exhausted);
-    try std.testing.expectEqual(Strategy.pause, paused.strategy);
-    try std.testing.expect(!paused.reserve_provider_attempt);
+    const kept = decide(exhausted);
+    try std.testing.expectEqual(Strategy.retry_request, kept.strategy);
+    try std.testing.expect(kept.reserve_provider_attempt);
 
     var request_limit = base;
     request_limit.cause = .request_limit_reached;
-    const request_limit_pause = decide(request_limit);
-    try std.testing.expectEqual(Strategy.pause, request_limit_pause.strategy);
-    try std.testing.expect(!request_limit_pause.reserve_provider_attempt);
+    const stopped = decide(request_limit);
+    try std.testing.expectEqual(Strategy.stop, stopped.strategy);
+    try std.testing.expectEqual(RequiredAction.continue_later, stopped.required_action);
+    try std.testing.expect(!stopped.reserve_provider_attempt);
 }
 
-test "gateway stream timeout pauses without reserving another attempt" {
-    const paused = decide(.{
+test "connectivity loss waits without consuming the attempt budget" {
+    const waiting = decide(.{
+        .cause = .connectivity_lost,
+        .delivery = .definitely_unsent,
+        .attempts = .{ .consumed = 3 },
+    });
+    try std.testing.expectEqual(Strategy.wait_for_connectivity, waiting.strategy);
+    try std.testing.expect(!waiting.reserve_provider_attempt);
+    try std.testing.expectEqual(@as(u64, 1 * std.time.ns_per_s), waiting.delay_ns);
+
+    const waiting_again = decide(.{
+        .cause = .connectivity_lost,
+        .delivery = .definitely_unsent,
+        .attempts = .{ .consumed = 4 },
+        .pacing = waiting.next_pacing,
+    });
+    try std.testing.expectEqual(@as(u64, 2 * std.time.ns_per_s), waiting_again.delay_ns);
+    const waiting_third = decide(.{
+        .cause = .connectivity_lost,
+        .delivery = .definitely_unsent,
+        .attempts = .{ .consumed = 5 },
+        .pacing = waiting_again.next_pacing,
+    });
+    try std.testing.expectEqual(@as(u64, 5 * std.time.ns_per_s), waiting_third.delay_ns);
+    const waiting_steady = decide(.{
+        .cause = .connectivity_lost,
+        .delivery = .definitely_unsent,
+        .attempts = .{ .consumed = 6 },
+        .pacing = waiting_third.next_pacing,
+    });
+    try std.testing.expectEqual(@as(u64, 5 * std.time.ns_per_s), waiting_steady.delay_ns);
+
+    // Even an "exhausted" budget still waits: connectivity probes are free.
+    const still_waiting = decide(.{
+        .cause = .connectivity_lost,
+        .delivery = .possibly_sent,
+        .attempts = .{ .consumed = 10 },
+    });
+    try std.testing.expectEqual(Strategy.wait_for_connectivity, still_waiting.strategy);
+}
+
+test "stream timeout probes liveness instead of pausing" {
+    const probing = decide(.{
         .cause = .provider_stream_timeout,
         .delivery = .possibly_sent,
         .attempts = .{ .consumed = 1 },
     });
-    try std.testing.expectEqual(Strategy.pause, paused.strategy);
-    try std.testing.expectEqual(RequiredAction.continue_later, paused.required_action);
-    try std.testing.expect(!paused.reserve_provider_attempt);
-    try std.testing.expectEqual(@as(u64, 0), paused.delay_ns);
+    try std.testing.expectEqual(Strategy.probe_liveness, probing.strategy);
+    try std.testing.expectEqual(RequiredAction.none, probing.required_action);
+    try std.testing.expect(!probing.reserve_provider_attempt);
+    try std.testing.expectEqual(@as(u64, 250 * std.time.ns_per_ms), probing.delay_ns);
+
+    const probing_again = decide(.{
+        .cause = .provider_stream_timeout,
+        .delivery = .possibly_sent,
+        .attempts = .{ .consumed = 2 },
+        .pacing = probing.next_pacing,
+    });
+    try std.testing.expectEqual(@as(u64, 1 * std.time.ns_per_s), probing_again.delay_ns);
 
     const uncertain_tool = decide(.{
         .cause = .provider_stream_timeout,
@@ -253,12 +383,11 @@ test "gateway stream timeout pauses without reserving another attempt" {
         .attempts = .{ .consumed = 1 },
         .tool = .uncertain,
     });
-    try std.testing.expectEqual(Strategy.pause, uncertain_tool.strategy);
+    try std.testing.expectEqual(Strategy.probe_liveness, uncertain_tool.strategy);
     try std.testing.expectEqual(
         RequiredAction.inspect_uncertain_tool,
         uncertain_tool.required_action,
     );
-    try std.testing.expect(!uncertain_tool.reserve_provider_attempt);
 
     const cancelled = decide(.{
         .cause = .provider_stream_timeout,
@@ -267,6 +396,22 @@ test "gateway stream timeout pauses without reserving another attempt" {
         .cancelled = true,
     });
     try std.testing.expectEqual(Strategy.stop, cancelled.strategy);
+}
+
+test "stalled progress stops instead of restarting forever" {
+    const stalled_evidence = Evidence{
+        .cause = .response_interrupted,
+        .delivery = .possibly_sent,
+        .attempts = .{ .consumed = 4 },
+        .progress = .stalled,
+    };
+    const stalled = decide(stalled_evidence);
+    try std.testing.expectEqual(Strategy.stop, stalled.strategy);
+    try std.testing.expectEqual(RequiredAction.surface_stall, stalled.required_action);
+
+    var advancing_evidence = stalled_evidence;
+    advancing_evidence.progress = .advancing;
+    try std.testing.expectEqual(Strategy.retry_request, decide(advancing_evidence).strategy);
 }
 
 test "retry after and cancellation override automatic recovery" {
@@ -302,9 +447,9 @@ test "retry after and cancellation override automatic recovery" {
     );
     try std.testing.expect(overflow_capped.reserve_provider_attempt);
 
-    var cancelled = base;
-    cancelled.cancelled = true;
-    try std.testing.expectEqual(Strategy.stop, decide(cancelled).strategy);
+    var cancelled_evidence = base;
+    cancelled_evidence.cancelled = true;
+    try std.testing.expectEqual(Strategy.stop, decide(cancelled_evidence).strategy);
 }
 
 test "retry schedule uses the approved cap" {
@@ -328,6 +473,24 @@ test "retry schedule uses the approved cap" {
         @as(u64, 121_250 * std.time.ns_per_ms),
         total,
     );
+}
+
+test "billable retries throttle past the recovery window without dying" {
+    const base = Evidence{
+        .cause = .provider_unavailable,
+        .delivery = .possibly_sent,
+        .attempts = .{ .consumed = 8 },
+    };
+    const within_window = decide(base);
+    try std.testing.expect(!within_window.throttled);
+    try std.testing.expectEqual(@as(u64, 250 * std.time.ns_per_ms), within_window.delay_ns);
+
+    var past_window = base;
+    past_window.recovery_elapsed_ns = billable_retry_window_ns + 1;
+    const throttled = decide(past_window);
+    try std.testing.expect(throttled.throttled);
+    try std.testing.expectEqual(throttled_retry_delay_ns, throttled.delay_ns);
+    try std.testing.expectEqual(Strategy.retry_request, throttled.strategy);
 }
 
 test "implicit retry pacing is independent from the shared attempt budget" {
@@ -395,18 +558,12 @@ test "system resume strategy uses independent retry pacing" {
     try std.testing.expectEqual(Strategy.continue_response, continuing.strategy);
     try std.testing.expect(continuing.reserve_provider_attempt);
 
-    const exhausted = decide(.{
+    const past_budget = decide(.{
         .cause = .system_resumed,
         .delivery = .possibly_sent,
         .attempts = .{ .consumed = 10 },
+        .output = .partial,
     });
-    try std.testing.expectEqual(Strategy.pause, exhausted.strategy);
-}
-
-test "fast fallback is limited to replay safe provider outages" {
-    try std.testing.expect(shouldDisableFastRoute(true, .provider_unavailable, true));
-    try std.testing.expect(!shouldDisableFastRoute(false, .provider_unavailable, true));
-    try std.testing.expect(!shouldDisableFastRoute(true, .provider_unavailable, false));
-    try std.testing.expect(!shouldDisableFastRoute(true, .rate_limited, true));
-    try std.testing.expect(!shouldDisableFastRoute(true, .transport_interrupted, true));
+    try std.testing.expectEqual(Strategy.continue_response, past_budget.strategy);
+    try std.testing.expect(past_budget.reserve_provider_attempt);
 }

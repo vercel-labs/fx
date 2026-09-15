@@ -5574,8 +5574,8 @@ test "processQueuedPrompt reconciles provider error before tool execution" {
     try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_count);
     try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
     try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
-    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Provider unavailable · provider_error · checking uncertain tool state · attempt 1/2");
-    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Provider unavailable · provider_error · checking uncertain tool state · attempt 2/2");
+    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Provider unavailable · provider_error · checking uncertain tool state");
+    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Provider unavailable · provider_error · checking uncertain tool state");
     try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 2/2");
 }
 
@@ -5764,6 +5764,12 @@ test "processQueuedPrompt pauses uncertain tool recovery with an inspection acti
     var fixture = PromptFixture{};
     var config = fixture.config();
     config.max_provider_attempts = 1;
+    // The provider-attempt budget no longer pauses; a lifecycle pause (the
+    // user's try-later) parks the recovery retry instead.
+    var pause_flag = std.atomic.Value(bool).init(false);
+    hooks.pause_on_auto_retry_status = true;
+    hooks.recovery_pause_flag = &pause_flag;
+    config.recovery_pause_flag = &pause_flag;
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
@@ -5863,20 +5869,28 @@ test "processQueuedPrompt retries replay-safe provider errors before success" {
     try std.testing.expectEqual(@as(usize, 1), countText(&hooks, "Recovered"));
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
     try std.testing.expectEqual(@as(usize, 5), hooks.route_recovery_statuses.items.len);
-    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Provider unavailable · provider_error: route failed once · retrying request · attempt 1/3");
-    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Provider unavailable · provider_error: route failed once · retrying request · attempt 2/3");
-    try expectRouteStatus(&hooks, 2, .auto_retry, "⚠ Provider unavailable · provider_error: route failed twice · retrying request in 1s · attempt 2/3");
-    try expectRouteStatus(&hooks, 3, .auto_retry, "⚠ Provider unavailable · provider_error: route failed twice · retrying request · attempt 3/3");
+    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Provider unavailable · provider_error: route failed once · retrying request");
+    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Provider unavailable · provider_error: route failed once · retrying request");
+    try expectRouteStatus(&hooks, 2, .auto_retry, "⚠ Provider unavailable · provider_error: route failed twice · retrying request in 1s");
+    try expectRouteStatus(&hooks, 3, .auto_retry, "⚠ Provider unavailable · provider_error: route failed twice · retrying request");
     try expectRouteStatus(&hooks, 4, .auto_recovered, "✓ recovered · succeeded on attempt 3/3");
 }
 
-test "processQueuedPrompt pauses gateway stream timeout without retry" {
+test "processQueuedPrompt probes gateway stream timeout without consuming the attempt budget" {
     const alloc = std.testing.allocator;
-    const completions = [_]FakeCompletion{.{
-        .finish_reason = .provider_error,
-        .provider_failure_cause = .gateway_stream_timeout,
-        .provider_failure_detail = "gateway_stream_timeout: stream exceeded maximum duration",
-    }};
+    const completions = [_]FakeCompletion{
+        .{
+            .finish_reason = .provider_error,
+            .provider_failure_cause = .gateway_stream_timeout,
+            .provider_failure_detail = "gateway_stream_timeout: stream exceeded maximum duration",
+        },
+        .{
+            .finish_reason = .provider_error,
+            .provider_failure_cause = .gateway_stream_timeout,
+            .provider_failure_detail = "gateway_stream_timeout: stream exceeded maximum duration",
+        },
+        .{ .content = "Recovered after probe" },
+    };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -5886,22 +5900,29 @@ test "processQueuedPrompt pauses gateway stream timeout without retry" {
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
-    try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
-    try std.testing.expectEqual(types.TurnPresentationOutcome.paused, hooks.finalized_outcome.?);
-    try std.testing.expect(hooks.recovery_checkpoints.items.len > 0);
-    const checkpoint = hooks.recovery_checkpoints.items[hooks.recovery_checkpoints.items.len - 1];
-    try std.testing.expectEqual(
-        types.ModelRecoveryCause.provider_stream_timeout,
-        checkpoint.cause,
-    );
-    try std.testing.expectEqual(@as(usize, 1), checkpoint.consumed_provider_attempts);
-    try std.testing.expect(!checkpoint.outstanding_reservation);
+    // A gateway stream timeout is never terminal on its own and never stalls:
+    // the turn probes the connection immediately without consuming the
+    // provider-attempt budget, then recovers on the first healthy response.
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+    try std.testing.expectEqualStrings("Recovered after probe", hooks.history_assistant_text.?);
+    try std.testing.expectEqual(@as(usize, 5), hooks.route_recovery_statuses.items.len);
+    // Probes are paced (250ms, then 1s) so a provider that always times out
+    // cannot hot-loop; the pacing still never consumes the attempt budget.
     try expectRouteStatus(
         &hooks,
         0,
-        .terminal_provider_error,
-        "⚠ Gateway stream timed out · gateway_stream_timeout: stream exceeded maximum duration · automatic retry paused · attempt 1/10",
+        .auto_retry,
+        "⚠ Gateway stream timed out · checking the connection",
     );
+    try expectRouteStatus(
+        &hooks,
+        2,
+        .auto_retry,
+        "⚠ Gateway stream timed out · checking the connection · 1s",
+    );
+    // Both probes transmitted nothing billable, so the success is attempt 1.
+    try expectRouteStatus(&hooks, 4, .auto_recovered, "✓ recovered · succeeded on attempt 1/10");
 }
 
 test "processQueuedPrompt retries post-tool provider error without synthetic recovery message" {
@@ -5933,10 +5954,20 @@ test "processQueuedPrompt retries post-tool provider error without synthetic rec
 
 test "processQueuedPrompt masks and terminal-encodes provider diagnostics" {
     const alloc = std.testing.allocator;
-    const completions = [_]FakeCompletion{.{
-        .finish_reason = .provider_error,
-        .provider_failure_detail = "provider_down: AI_GATEWAY_API_KEY=abcdefghijklmnop bad\x1b[31m",
-    }};
+    const completions = [_]FakeCompletion{
+        .{
+            .finish_reason = .provider_error,
+            .provider_failure_detail = "provider_down: AI_GATEWAY_API_KEY=abcdefghijklmnop bad\x1b[31m",
+        },
+        .{
+            .finish_reason = .provider_error,
+            .provider_failure_detail = "provider_down: AI_GATEWAY_API_KEY=abcdefghijklmnop bad\x1b[31m",
+        },
+        .{
+            .finish_reason = .provider_error,
+            .provider_failure_detail = "provider_down: AI_GATEWAY_API_KEY=abcdefghijklmnop bad\x1b[31m",
+        },
+    };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -5947,12 +5978,21 @@ test "processQueuedPrompt masks and terminal-encodes provider diagnostics" {
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
-    try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_statuses.items.len);
-    try expectRouteStatus(
-        &hooks,
-        0,
-        .terminal_provider_error,
-        "⚠ Provider unavailable · provider_down: AI_GATEWAY_API_KEY=[redacted] bad\\x1b[31m · recovery paused after 1/1 attempts",
+    // The detail must stay masked in every published status, including the
+    // terminal stall stop after three identical failures.
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
+    for (hooks.route_recovery_statuses.items) |status| {
+        var buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
+        const text = status.label(&buf);
+        try std.testing.expect(std.mem.find(u8, text, "abcdefghijklmnop") == null);
+        try std.testing.expect(std.mem.find(u8, text, "\x1b") == null);
+    }
+    const last = hooks.route_recovery_statuses.items[hooks.route_recovery_statuses.items.len - 1];
+    try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.terminal_provider_error, last.kind);
+    var label_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "⚠ Provider unavailable · provider_down: AI_GATEWAY_API_KEY=[redacted] bad\\x1b[31m · kept failing at the same point · stopped",
+        last.label(&label_buf),
     );
 }
 
@@ -5977,6 +6017,15 @@ fn expect_rejected_replacement_retains_preview(cancel_after_replacement: bool) !
     var fixture = PromptFixture{};
     var config = fixture.config();
     config.max_provider_attempts = 2;
+    // Without cancellation, a lifecycle pause (the user's try-later) parks the
+    // recovery after the rejected replacement; the budget no longer pauses.
+    var pause_flag = std.atomic.Value(bool).init(false);
+    if (!cancel_after_replacement) {
+        hooks.pause_on_auto_retry_status = true;
+        hooks.pause_on_auto_retry_attempt = 2;
+        hooks.recovery_pause_flag = &pause_flag;
+        config.recovery_pause_flag = &pause_flag;
+    }
     var job = fixture.job();
     job.prompt = @constCast("Explain the lockfile issue in English.");
 
@@ -6004,7 +6053,7 @@ test "processQueuedPrompt cancellation retains preview during a rejected replace
     try expect_rejected_replacement_retains_preview(true);
 }
 
-test "processQueuedPrompt exhaustion retains preview during a rejected replacement" {
+test "processQueuedPrompt recovery pause retains preview during a rejected replacement" {
     try expect_rejected_replacement_retains_preview(false);
 }
 
@@ -6249,9 +6298,9 @@ test "processQueuedPrompt retries replay-safe ReadFailed before success" {
     try std.testing.expectEqual(@as(usize, 1), countText(&hooks, "Recovered"));
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
     try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
-    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · ReadFailed · retrying request · attempt 1/3");
+    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · connection dropped · retrying request");
     try std.testing.expect(hooks.route_recovery_statuses.items[0].retry_deadline != null);
-    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Network interrupted · ReadFailed · retrying request · attempt 2/3");
+    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Network interrupted · connection dropped · retrying request");
     try std.testing.expect(hooks.route_recovery_statuses.items[1].retry_deadline == null);
     try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 2/3");
 
@@ -6292,13 +6341,13 @@ test "processQueuedPrompt counts and retries a definitely unsent native setup fa
         &hooks,
         0,
         .auto_retry,
-        "⚠ Network interrupted · TlsInitializationFailed · retrying request · attempt 1/2",
+        "⚠ Network interrupted · TlsInitializationFailed · retrying request",
     );
     try expectRouteStatus(
         &hooks,
         1,
         .auto_retry,
-        "⚠ Network interrupted · TlsInitializationFailed · retrying request · attempt 2/2",
+        "⚠ Network interrupted · TlsInitializationFailed · retrying request",
     );
     try expectRouteStatus(
         &hooks,
@@ -6642,6 +6691,13 @@ test "processQueuedPrompt counts only failed provider attempts across tool follo
     var fixture = PromptFixture{};
     var config = fixture.config();
     config.max_provider_attempts = 2;
+    // HTTP status failures retry patiently forever now; park the turn with a
+    // lifecycle pause (the user's try-later) after the second failure.
+    var pause_flag = std.atomic.Value(bool).init(false);
+    hooks.pause_on_auto_retry_status = true;
+    hooks.pause_on_auto_retry_attempt = 2;
+    hooks.recovery_pause_flag = &pause_flag;
+    config.recovery_pause_flag = &pause_flag;
     var initial_job = fixture.job();
     initial_job.credential_source = .fx_login;
     initial_job.account_id = @constCast("acct_1");
@@ -6656,7 +6712,9 @@ test "processQueuedPrompt counts only failed provider attempts across tool follo
     try std.testing.expect(!checkpoint.outstanding_reservation);
     try std.testing.expectEqual(@as(usize, 1), checkpoint.execution.tool_steps.len);
     try std.testing.expectEqual(types.ModelRecoveryCause.provider_unavailable, checkpoint.cause);
-    try expectRouteStatus(&hooks, 2, .terminal_provider_error, "⚠ Provider unavailable · HTTP 502: gateway unavailable · recovery paused after 2/2 attempts");
+    // Each failure status is published once at failure and republished when the
+    // next attempt is admitted, so the pause status lands at index 3.
+    try expectRouteStatus(&hooks, 3, .terminal_provider_error, "⚠ Provider unavailable · HTTP 502: gateway unavailable · recovery paused after 2/2 attempts");
 
     var continued_checkpoint = try checkpoint.dupe(alloc);
     defer continued_checkpoint.deinit(alloc);
@@ -6670,8 +6728,10 @@ test "processQueuedPrompt counts only failed provider attempts across tool follo
     continued_job.credential_source = .fx_login;
     continued_job.account_id = @constCast("acct_1");
     continued_job.recovery_checkpoint = continued_checkpoint;
+    var continued_config = fixture.config();
+    continued_config.max_provider_attempts = 2;
 
-    try runFakePrompt(&continued_gateway, &continued_hooks, config, continued_job);
+    try runFakePrompt(&continued_gateway, &continued_hooks, continued_config, continued_job);
 
     try std.testing.expectEqual(@as(usize, 1), continued_gateway.request_models.items.len);
     try expectBodyContains(&continued_gateway, 0, "call_first");
@@ -6679,7 +6739,7 @@ test "processQueuedPrompt counts only failed provider attempts across tool follo
     try std.testing.expectEqualStrings("Finished after Continue", continued_hooks.history_assistant_text.?);
 }
 
-test "processQueuedPrompt explicit checkpoint continuation starts a fresh exhausted budget" {
+test "processQueuedPrompt explicit checkpoint continuation starts a fresh attempt budget" {
     const alloc = std.testing.allocator;
     const partial_chunks = [_][]const u8{"partial"};
     const interrupted = [_]FakeCompletion{.{
@@ -6694,6 +6754,12 @@ test "processQueuedPrompt explicit checkpoint continuation starts a fresh exhaus
     var fixture = PromptFixture{};
     var first_config = fixture.config();
     first_config.max_provider_attempts = 1;
+    // Park the interrupted first turn with a lifecycle pause (the user's
+    // try-later); the provider-attempt budget no longer pauses on its own.
+    var pause_flag = std.atomic.Value(bool).init(false);
+    first_hooks.pause_on_auto_retry_status = true;
+    first_hooks.recovery_pause_flag = &pause_flag;
+    first_config.recovery_pause_flag = &pause_flag;
     var first_job = fixture.job();
     first_job.credential_source = .fx_login;
     first_job.account_id = @constCast("acct_1");
@@ -6756,7 +6822,7 @@ test "processQueuedPrompt retries system resume through the heartbeat" {
         &hooks,
         0,
         .auto_retry,
-        "⚠ Mac woke from sleep · SystemResumed · retrying request · attempt 1/2",
+        "⚠ Mac woke from sleep · SystemResumed · retrying request",
     );
 }
 
@@ -6824,6 +6890,12 @@ test "processQueuedPrompt keeps the settled checkpoint when recovery pauses" {
     var fixture = PromptFixture{};
     var config = fixture.config();
     config.max_provider_attempts = 1;
+    // The pause now comes from the lifecycle pause flag (the user's try-later)
+    // raised when the retry is scheduled, not from budget exhaustion.
+    var pause_flag = std.atomic.Value(bool).init(false);
+    hooks.pause_on_auto_retry_status = true;
+    hooks.recovery_pause_flag = &pause_flag;
+    config.recovery_pause_flag = &pause_flag;
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
@@ -6914,7 +6986,7 @@ test "processQueuedPrompt replaces scheduled retry after provider pre-admission 
         &hooks,
         1,
         .terminal_provider_error,
-        "⚠ Provider unavailable · TestProviderSerializationFailed · recovery paused after 1/2 attempts",
+        "⚠ Network interrupted · TestProviderSerializationFailed · stopped after 1/2 attempts",
     );
     try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_clear_count);
 }
@@ -6947,12 +7019,12 @@ test "processQueuedPrompt replaces scheduled retry when in-flight publication fa
         &hooks,
         1,
         .terminal_provider_error,
-        "⚠ Provider unavailable · TestRouteRecoveryPublicationFailed · recovery paused after 1/2 attempts",
+        "⚠ Network interrupted · TestRouteRecoveryPublicationFailed · stopped after 1/2 attempts",
     );
     try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_clear_count);
 }
 
-test "processQueuedPrompt pauses replay-safe ReadFailed at attempt limit" {
+test "processQueuedPrompt stops replay-safe ReadFailed when identical failures stop progressing" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{
         .{ .stream_error = error.ReadFailed },
@@ -6973,19 +7045,21 @@ test "processQueuedPrompt pauses replay-safe ReadFailed at attempt limit" {
     try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
-    try std.testing.expectEqual(types.TurnPresentationOutcome.paused, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+    // Each retry publishes its status at failure and republishes it when the
+    // next attempt is admitted; the stall stop ends the sequence.
     try std.testing.expectEqual(@as(usize, 5), hooks.route_recovery_statuses.items.len);
-    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · ReadFailed · retrying request · attempt 1/3");
-    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Network interrupted · ReadFailed · retrying request · attempt 2/3");
-    try expectRouteStatus(&hooks, 2, .auto_retry, "⚠ Network interrupted · ReadFailed · retrying request in 1s · attempt 2/3");
-    try expectRouteStatus(&hooks, 3, .auto_retry, "⚠ Network interrupted · ReadFailed · retrying request · attempt 3/3");
-    try expectRouteStatus(&hooks, 4, .terminal_provider_error, "⚠ Network interrupted · ReadFailed · recovery paused after 3/3 attempts");
+    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · connection dropped · retrying request");
+    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Network interrupted · connection dropped · retrying request");
+    try expectRouteStatus(&hooks, 2, .auto_retry, "⚠ Network interrupted · connection dropped · retrying request in 1s");
+    try expectRouteStatus(&hooks, 4, .terminal_provider_error, "⚠ Network interrupted · connection dropped · kept failing at the same point · stopped");
 }
 
 test "processQueuedPrompt replaces retry status after a different stream error" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{
         .{ .stream_error = error.ReadFailed },
+        .{ .stream_error = error.ConnectionResetByPeer },
         .{ .stream_error = error.ConnectionResetByPeer },
     };
     var gateway = FakeGateway.init(alloc, &completions);
@@ -6999,11 +7073,13 @@ test "processQueuedPrompt replaces retry status after a different stream error" 
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
-    try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
-    try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
-    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · ReadFailed · retrying request · attempt 1/2");
-    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Network interrupted · ReadFailed · retrying request · attempt 2/2");
-    try expectRouteStatus(&hooks, 2, .terminal_provider_error, "⚠ Network interrupted · ConnectionResetByPeer · recovery paused after 2/2 attempts");
+    // The budget no longer stops the turn; the no-progress detector does after
+    // three identical zero-progress failures.
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
+    try std.testing.expectEqual(@as(usize, 5), hooks.route_recovery_statuses.items.len);
+    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · connection dropped · retrying request");
+    try expectRouteStatus(&hooks, 2, .auto_retry, "⚠ Network interrupted · connection reset · retrying request in 1s");
+    try expectRouteStatus(&hooks, 4, .terminal_provider_error, "⚠ Network interrupted · connection reset · kept failing at the same point · stopped");
 }
 
 test "processQueuedPrompt clears retry status when a replay is cancelled" {
@@ -7025,8 +7101,8 @@ test "processQueuedPrompt clears retry status when a replay is cancelled" {
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 2), hooks.route_recovery_statuses.items.len);
-    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · ReadFailed · retrying request · attempt 1/3");
-    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Network interrupted · ReadFailed · retrying request · attempt 2/3");
+    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · connection dropped · retrying request");
+    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Network interrupted · connection dropped · retrying request");
     try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_clear_count);
     try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
 }
@@ -7035,6 +7111,7 @@ test "processQueuedPrompt replaces retry status when replay finish is missing" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{
         .{ .stream_error = error.ReadFailed },
+        .{ .omit_finish = true },
         .{ .omit_finish = true },
     };
     var gateway = FakeGateway.init(alloc, &completions);
@@ -7048,11 +7125,11 @@ test "processQueuedPrompt replaces retry status when replay finish is missing" {
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
-    try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
-    try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
-    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · ReadFailed · retrying request · attempt 1/2");
-    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Network interrupted · ReadFailed · retrying request · attempt 2/2");
-    try expectRouteStatus(&hooks, 2, .terminal_provider_error, "⚠ Response ended early · StreamInterrupted · recovery paused after 2/2 attempts");
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
+    try std.testing.expectEqual(@as(usize, 5), hooks.route_recovery_statuses.items.len);
+    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · connection dropped · retrying request");
+    try expectRouteStatus(&hooks, 2, .auto_retry, "⚠ Response ended early · stream interrupted · retrying request");
+    try expectRouteStatus(&hooks, 4, .terminal_provider_error, "⚠ Response ended early · stream interrupted · kept failing at the same point · stopped");
 }
 
 test "processQueuedPrompt replaces retry status after an invalid replay completion" {
@@ -7077,23 +7154,26 @@ test "processQueuedPrompt replaces retry status after an invalid replay completi
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
-    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · ReadFailed · retrying request · attempt 1/3");
-    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Network interrupted · ReadFailed · retrying request · attempt 2/3");
-    try expectRouteStatus(&hooks, 2, .terminal_provider_error, "⚠ Provider unavailable · InvalidProviderCompletion · recovery paused after 2/3 attempts");
+    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · connection dropped · retrying request");
+    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Network interrupted · connection dropped · retrying request");
+    try expectRouteStatus(&hooks, 2, .terminal_provider_error, "⚠ Provider unavailable · InvalidProviderCompletion · stopped after 2/3 attempts");
 }
 
-test "processQueuedPrompt pauses ReadFailed after assistant source is published" {
+test "processQueuedPrompt retries ReadFailed after assistant source until the stall detector stops" {
     const alloc = std.testing.allocator;
     const chunks = [_][]const u8{"partial"};
-    const repeated_chunks = [_][]const u8{"partial response"};
     const completions = [_]FakeCompletion{
         .{
             .chunks = &chunks,
             .stream_error_after_chunks = error.ReadFailed,
         },
         .{
-            .chunks = &repeated_chunks,
-            .content = "partial response",
+            .chunks = &chunks,
+            .stream_error_after_chunks = error.ReadFailed,
+        },
+        .{
+            .chunks = &chunks,
+            .stream_error_after_chunks = error.ReadFailed,
         },
     };
     var gateway = FakeGateway.init(alloc, &completions);
@@ -7107,17 +7187,20 @@ test "processQueuedPrompt pauses ReadFailed after assistant source is published"
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
-    try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
+    // No budget exhaustion stop: the turn restarts the interrupted response
+    // until three identical failures trip the no-progress detector.
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
-    try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_statuses.items.len);
-    try expectRouteStatus(&hooks, 0, .terminal_provider_error, "⚠ Network interrupted · ReadFailed · recovery paused after 1/1 attempts");
-    try std.testing.expectEqual(@as(usize, 1), countText(&hooks, "partial"));
+    try std.testing.expectEqual(@as(usize, 5), hooks.route_recovery_statuses.items.len);
+    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · connection dropped · restarting response");
+    try expectRouteStatus(&hooks, 2, .auto_retry, "⚠ Network interrupted · connection dropped · restarting response in 1s");
+    try expectRouteStatus(&hooks, 4, .terminal_provider_error, "⚠ Network interrupted · connection dropped · kept failing at the same point · stopped");
     try std.testing.expectEqual(@as(usize, 0), hooks.history_turns.items.len);
-    try std.testing.expectEqual(types.TurnPresentationOutcome.paused, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
     try std.testing.expectEqual(@as(usize, 0), hooks.finish_event_count);
 }
 
-test "processQueuedPrompt preserves whitespace source bytes in a paused response" {
+test "processQueuedPrompt retries whitespace-only responses until the stall stop" {
     const alloc = std.testing.allocator;
     const chunks = [_][]const u8{" \n"};
     const completions = [_]FakeCompletion{
@@ -7125,6 +7208,14 @@ test "processQueuedPrompt preserves whitespace source bytes in a paused response
             .chunks = &chunks,
             .stream_error_after_chunks = error.ReadFailed,
         },
+        .{
+            .chunks = &chunks,
+            .stream_error_after_chunks = error.ReadFailed,
+        },
+        .{
+            .chunks = &chunks,
+            .stream_error_after_chunks = error.ReadFailed,
+        },
     };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
@@ -7137,22 +7228,36 @@ test "processQueuedPrompt preserves whitespace source bytes in a paused response
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
-    try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
-    try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_statuses.items.len);
-    try expectRouteStatus(&hooks, 0, .terminal_provider_error, "⚠ Network interrupted · ReadFailed · recovery paused after 1/1 attempts");
-    try std.testing.expectEqual(types.TurnPresentationOutcome.paused, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(@as(usize, 5), hooks.route_recovery_statuses.items.len);
+    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · connection dropped · restarting response");
+    try expectRouteStatus(&hooks, 2, .auto_retry, "⚠ Network interrupted · connection dropped · restarting response in 1s");
+    try expectRouteStatus(&hooks, 4, .terminal_provider_error, "⚠ Network interrupted · connection dropped · kept failing at the same point · stopped");
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
 }
 
-test "processQueuedPrompt pauses a local tool after assistant source when budget is exhausted" {
+test "processQueuedPrompt regenerates a local tool until identical failures stall the turn" {
     const alloc = std.testing.allocator;
     const chunks = [_][]const u8{"I will read it."};
     const starts = [_]ToolCall{toolCall("call_read_interrupted", "read_file", "{}")};
-    const completions = [_]FakeCompletion{.{
-        .chunks = &chunks,
-        .streamed_tool_starts = &starts,
-        .stream_error_after_tool_starts = error.ReadFailed,
-    }};
+    const completions = [_]FakeCompletion{
+        .{
+            .chunks = &chunks,
+            .streamed_tool_starts = &starts,
+            .stream_error_after_tool_starts = error.ReadFailed,
+        },
+        .{
+            .chunks = &chunks,
+            .streamed_tool_starts = &starts,
+            .stream_error_after_tool_starts = error.ReadFailed,
+        },
+        .{
+            .chunks = &chunks,
+            .streamed_tool_starts = &starts,
+            .stream_error_after_tool_starts = error.ReadFailed,
+        },
+    };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -7164,11 +7269,14 @@ test "processQueuedPrompt pauses a local tool after assistant source when budget
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
-    try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
-    try expectRouteStatus(&hooks, 0, .terminal_provider_error, "⚠ Network interrupted · ReadFailed · recovery paused after 1/1 attempts");
+    try std.testing.expectEqual(@as(usize, 5), hooks.route_recovery_statuses.items.len);
+    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · connection dropped · regenerating unstarted tool");
+    try expectRouteStatus(&hooks, 2, .auto_retry, "⚠ Network interrupted · connection dropped · regenerating unstarted tool in 1s");
+    try expectRouteStatus(&hooks, 4, .terminal_provider_error, "⚠ Network interrupted · connection dropped · kept failing at the same point · stopped");
     try std.testing.expectEqual(@as(usize, 0), hooks.history_turns.items.len);
-    try std.testing.expectEqual(types.TurnPresentationOutcome.paused, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
 }
 
 test "processQueuedPrompt settles retry tool starts before pausing" {
@@ -7186,6 +7294,13 @@ test "processQueuedPrompt settles retry tool starts before pausing" {
     var config = fixture.config();
     config.gateway_retry_count = 1;
     config.max_provider_attempts = 2;
+    // Park the turn with a lifecycle pause after the second identical failure;
+    // the budget no longer pauses on its own.
+    var pause_flag = std.atomic.Value(bool).init(false);
+    hooks.pause_on_auto_retry_status = true;
+    hooks.pause_on_auto_retry_attempt = 2;
+    hooks.recovery_pause_flag = &pause_flag;
+    config.recovery_pause_flag = &pause_flag;
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
     try std.testing.expectEqual(types.TurnPresentationOutcome.paused, hooks.finalized_outcome.?);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
@@ -7264,8 +7379,8 @@ test "processQueuedPrompt regenerates and executes a local tool once after ReadF
     try std.testing.expectEqualStrings("read_file", hooks.executed_names.items[0]);
     try std.testing.expectEqualStrings("call_read_recovered", hooks.executed_call_ids.items[0]);
     try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
-    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · ReadFailed · regenerating unstarted tool · attempt 1/3");
-    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Network interrupted · ReadFailed · regenerating unstarted tool · attempt 2/3");
+    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · connection dropped · regenerating unstarted tool");
+    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Network interrupted · connection dropped · regenerating unstarted tool");
     try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 2/3");
     try expectBodyContains(&gateway, 1, "fx did not execute that call");
     try expectBodyContains(&gateway, 2, "call_read_recovered");
@@ -7287,6 +7402,7 @@ test "processQueuedPrompt settles an interrupted local tool after a different st
             .stream_error_after_tool_starts = error.ReadFailed,
         },
         .{ .stream_error = error.ConnectionResetByPeer },
+        .{ .stream_error = error.ConnectionResetByPeer },
     };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
@@ -7299,11 +7415,14 @@ test "processQueuedPrompt settles an interrupted local tool after a different st
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
-    try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
+    // The unexecuted tool stays unexecuted while the turn retries; three
+    // identical zero-progress failures then stop it via the stall detector.
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
-    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · ReadFailed · regenerating unstarted tool · attempt 1/2");
-    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Network interrupted · ReadFailed · regenerating unstarted tool · attempt 2/2");
-    try expectRouteStatus(&hooks, 2, .terminal_provider_error, "⚠ Network interrupted · ConnectionResetByPeer · recovery paused after 2/2 attempts");
+    try std.testing.expectEqual(@as(usize, 5), hooks.route_recovery_statuses.items.len);
+    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · connection dropped · regenerating unstarted tool");
+    try expectRouteStatus(&hooks, 2, .auto_retry, "⚠ Network interrupted · connection reset · regenerating unstarted tool in 1s");
+    try expectRouteStatus(&hooks, 4, .terminal_provider_error, "⚠ Network interrupted · connection reset · kept failing at the same point · stopped");
     try expectFailedLifecycleContains(
         hooks.lifecycle_events.items,
         "call_read_interrupted",
@@ -7329,6 +7448,13 @@ test "processQueuedPrompt settles an interrupted local tool after an HTTP failur
     var config = fixture.config();
     config.gateway_retry_count = 3;
     config.max_provider_attempts = 2;
+    // HTTP status failures retry patiently forever now; park the turn with a
+    // lifecycle pause (the user's try-later) after the HTTP failure.
+    var pause_flag = std.atomic.Value(bool).init(false);
+    hooks.pause_on_auto_retry_status = true;
+    hooks.pause_on_auto_retry_attempt = 2;
+    hooks.recovery_pause_flag = &pause_flag;
+    config.recovery_pause_flag = &pause_flag;
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
@@ -7449,8 +7575,8 @@ test "processQueuedPrompt reconciles ReadFailed after provider-executed tool sta
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
-    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · ReadFailed · checking uncertain tool state · attempt 1/2");
-    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Network interrupted · ReadFailed · checking uncertain tool state · attempt 2/2");
+    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · connection dropped · checking uncertain tool state");
+    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Network interrupted · connection dropped · checking uncertain tool state");
     try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 2/2");
 }
 
@@ -7485,8 +7611,8 @@ test "processQueuedPrompt restarts failed response without committing its partia
     try std.testing.expectEqual(@as(usize, 1), countText(&hooks, "DISCARDED_PREVIEW software"));
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
     try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
-    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Provider unavailable · provider_error: failed after text · restarting response · attempt 1/2");
-    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Provider unavailable · provider_error: failed after text · restarting response · attempt 2/2");
+    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Provider unavailable · provider_error: failed after text · restarting response");
+    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Provider unavailable · provider_error: failed after text · restarting response");
     try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 2/2");
     try std.testing.expectEqualStrings("A complete replacement response.", hooks.history_turns.items[0].assistant.assistant);
 }
@@ -7518,8 +7644,8 @@ test "processQueuedPrompt recovers provider error after streamed tool start" {
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
     try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
-    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Provider unavailable · provider_error: failed after tool start · regenerating unstarted tool · attempt 1/2");
-    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Provider unavailable · provider_error: failed after tool start · regenerating unstarted tool · attempt 2/2");
+    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Provider unavailable · provider_error: failed after tool start · regenerating unstarted tool");
+    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Provider unavailable · provider_error: failed after tool start · regenerating unstarted tool");
     try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 2/2");
 }
 
@@ -7598,32 +7724,40 @@ test "processQueuedPrompt disable Fast recovery retries the same exact model" {
     try std.testing.expectEqual(@as(usize, 1), countText(&hooks, "Recovered without Fast"));
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
     try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
-    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Provider unavailable · provider_error: fast route failed · retrying request · attempt 1/2");
-    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Provider unavailable · provider_error: fast route failed · retrying request · attempt 2/2");
+    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Provider unavailable · provider_error: fast route failed · retrying request");
+    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Provider unavailable · provider_error: fast route failed · retrying request");
     try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 2/2");
 }
 
-test "processQueuedPrompt exhaustion pauses without invoking route recovery" {
+test "processQueuedPrompt keeps retrying past the old budget without invoking route recovery" {
     const alloc = std.testing.allocator;
     const decisions = [_]runtime_deps.RouteRecoveryDecision{.cancel};
-    const completions = [_]FakeCompletion{.{ .finish_reason = .provider_error, .provider_failure_detail = "route failed" }};
+    const completions = [_]FakeCompletion{
+        .{ .finish_reason = .provider_error, .provider_failure_detail = "route failed" },
+        .{ .finish_reason = .provider_error, .provider_failure_detail = "route failed" },
+    };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     hooks.route_recovery_decisions = &decisions;
-    defer hooks.deinit();
     var fixture = PromptFixture{};
+    // Status-class failures retry patiently forever now; cancel is the user's
+    // brake. Cancel when the second attempt's retry status publishes.
+    hooks.cancel_on_auto_retry_status = &fixture.cancel_flag;
+    hooks.cancel_on_auto_retry_attempt = 2;
+    defer hooks.deinit();
     var config = fixture.config();
     config.gateway_retry_count = 1;
     config.max_provider_attempts = 1;
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
-    try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_count);
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
-    try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_statuses.items.len);
-    try expectRouteStatus(&hooks, 0, .terminal_provider_error, "⚠ Provider unavailable · provider_error: route failed · recovery paused after 1/1 attempts");
+    try std.testing.expect(hooks.route_recovery_statuses.items.len >= 1);
+    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Provider unavailable · provider_error: route failed · retrying request");
+    try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
 }
 
 test "processQueuedPrompt stops nonretryable provider outcomes without releasing tools" {

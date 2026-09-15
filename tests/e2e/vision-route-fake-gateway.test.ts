@@ -3220,7 +3220,8 @@ test.skipIf(!tmuxAvailable())("TUI recovery retains images through failure and c
     rmSync(input);
     session = await TmuxSession.create({ cmd: `${FX_BIN} --resume ${id}`, cwd: root.workspace, env, isolated: true, remainOnExit: true });
     await session.waitForStableComposer(TIMEOUT);
-    await session.sendText("/continue");
+    // A pending recovery checkpoint continues automatically on resume.
+    await session.waitForText(/continues\s+automatically/, TIMEOUT);
     await session.waitForText("TUI_RECOVERY_IMAGE_COMPLETE", TIMEOUT);
     await session.waitForStableComposer(TIMEOUT);
     expect(nativeFileParts(gateway.chatRequests[2]!.body)[0]!.data.data).toBe(original);

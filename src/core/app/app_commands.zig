@@ -359,7 +359,7 @@ pub fn Handlers(comptime App: type) type {
                 .new_session = commandNewSession,
                 .reset_session = commandResetSession,
                 .resume_session = commandResumeSession,
-                .continue_recovery = commandContinueRecovery,
+
                 .show_help = commandShowHelp,
                 .login = commandLogin,
                 .logout = commandLogout,
@@ -648,27 +648,6 @@ pub fn Handlers(comptime App: type) type {
                 return;
             }
             try app_session_runtime.Runtime(App).openSessionPicker(app);
-        }
-
-        fn commandContinueRecovery(ctx: *anyopaque) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            const queued = app.continuePausedRecovery() catch |err| switch (err) {
-                error.RecoveryBusy => {
-                    try app.writeDomainNotice(.{
-                        .topic = "recovery",
-                        .tone = .neutral,
-                        .body = "wait for the current response to finish before continuing recovery",
-                    }, true);
-                    return;
-                },
-                else => return err,
-            };
-            if (queued) return;
-            try app.writeDomainNotice(.{
-                .topic = "recovery",
-                .tone = .neutral,
-                .body = "there is no paused model response to continue",
-            }, true);
         }
 
         fn commandRenameSession(ctx: *anyopaque, rest: []const u8) !void {

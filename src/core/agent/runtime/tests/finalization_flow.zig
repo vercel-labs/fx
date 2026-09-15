@@ -130,6 +130,12 @@ test "processQueuedPrompt pauses missing finish without synthesizing output" {
 
     var config = fixture.config();
     config.max_provider_attempts = 1;
+    // Missing finish retries autonomously now; park the turn with a lifecycle
+    // pause (the user's try-later) raised when the retry is scheduled.
+    var pause_flag = std.atomic.Value(bool).init(false);
+    hooks.pause_on_auto_retry_status = true;
+    hooks.recovery_pause_flag = &pause_flag;
+    config.recovery_pause_flag = &pause_flag;
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 0), hooks.finish_event_count);
@@ -154,6 +160,12 @@ test "processQueuedPrompt pauses partial text without finish proof" {
 
     var config = fixture.config();
     config.max_provider_attempts = 1;
+    // Missing finish retries autonomously now; park the turn with a lifecycle
+    // pause (the user's try-later) raised when the retry is scheduled.
+    var pause_flag = std.atomic.Value(bool).init(false);
+    hooks.pause_on_auto_retry_status = true;
+    hooks.recovery_pause_flag = &pause_flag;
+    config.recovery_pause_flag = &pause_flag;
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expect(textContains(&hooks, "Partial answer"));
@@ -179,6 +191,12 @@ test "processQueuedPrompt pauses tool calls without finish proof" {
     var config = fixture.config();
     config.agent_step_limit = 1;
     config.max_provider_attempts = 1;
+    // Missing finish retries autonomously now; park the turn with a lifecycle
+    // pause (the user's try-later) raised when the retry is scheduled.
+    var pause_flag = std.atomic.Value(bool).init(false);
+    hooks.pause_on_auto_retry_status = true;
+    hooks.recovery_pause_flag = &pause_flag;
+    config.recovery_pause_flag = &pause_flag;
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
@@ -229,6 +247,12 @@ test "processQueuedPrompt preserves finish precedence over malformed argument re
 
         var config = fixture.config();
         config.max_provider_attempts = 1;
+        // Recoverable cases retry autonomously now; park the turn with a
+        // lifecycle pause (the user's try-later) when the retry is scheduled.
+        var pause_flag = std.atomic.Value(bool).init(false);
+        hooks.pause_on_auto_retry_status = true;
+        hooks.recovery_pause_flag = &pause_flag;
+        config.recovery_pause_flag = &pause_flag;
         switch (case.expected) {
             .paused => try runFakePrompt(&gateway, &hooks, config, fixture.job()),
             .model_error => try std.testing.expectError(
@@ -1085,6 +1109,12 @@ test "common Stop later provider failure pauses with candidate still visible" {
 
     var config = fixture.config();
     config.max_provider_attempts = 1;
+    // The provider failure retries autonomously now; park the turn with a
+    // lifecycle pause (the user's try-later) when the retry is scheduled.
+    var pause_flag = std.atomic.Value(bool).init(false);
+    deps.pause_on_auto_retry_status = true;
+    deps.recovery_pause_flag = &pause_flag;
+    config.recovery_pause_flag = &pause_flag;
     try runFakePromptWithLifecycle(
         &gateway,
         &deps,
@@ -1375,6 +1405,12 @@ test "common Stop HTTP failure pauses with candidate and partial still visible" 
 
     var config = fixture.config();
     config.max_provider_attempts = 2;
+    // HTTP status failures retry patiently forever now; park the turn with a
+    // lifecycle pause (the user's try-later) when the retry is scheduled.
+    var pause_flag = std.atomic.Value(bool).init(false);
+    deps.pause_on_auto_retry_status = true;
+    deps.recovery_pause_flag = &pause_flag;
+    config.recovery_pause_flag = &pause_flag;
     try runFakePromptWithLifecycle(
         &gateway,
         &deps,

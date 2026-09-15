@@ -346,6 +346,7 @@ pub fn Runtime(comptime App: type) type {
                 .turn_token_update,
                 .turn_phase_update,
                 .diff_block,
+                .restore_failed_prompt,
                 => .drop,
                 .route_recovery_status => |status| if (status.action == .paused)
                     .admit
@@ -1169,6 +1170,21 @@ pub fn Runtime(comptime App: type) type {
                         resetStream(app, false);
                         app.shell.render_requests.request(.footer);
                         try handlers.error_text(handlers.ctx, notice);
+                    },
+                    .restore_failed_prompt => |prompt| {
+                        // Never clobber a draft the user typed while the doomed
+                        // turn was still retrying; only an empty composer gets
+                        // the failed prompt back.
+                        if (app.input_runtime.edit_state.input.items.len == 0) {
+                            try app.input_runtime.textReplacementState().replace(app.alloc, prompt);
+                            app.shell.render_requests.request(.footer);
+                        } else {
+                            debug_trace.logf(
+                                "worker",
+                                "event=restore_failed_prompt_skipped reason=composer_occupied",
+                                .{},
+                            );
+                        }
                     },
                 }
             }
@@ -2510,7 +2526,7 @@ test "core.app_worker_runtime refreshes root retry countdown" {
     ));
     switch (app.shell.activityProjection()) {
         .turn_thinking => |projection| try std.testing.expectEqualStrings(
-            "⚠ Provider unavailable · retrying request in 1s · attempt 1/3",
+            "⚠ Provider unavailable · retrying request in 1s",
             projection.label,
         ),
         .none, .tool_slot => return error.TestUnexpectedResult,
@@ -2600,7 +2616,7 @@ test "core.app_worker_runtime projects route recovery status activity and clears
     switch (app.shell.activityProjection()) {
         .turn_thinking => |thinking| {
             try std.testing.expectEqual(activity_runtime.ActivityProjection.Tone.warning, thinking.tone);
-            try std.testing.expectEqualStrings("⚠ Provider unavailable · retrying request · attempt 1/3", thinking.label);
+            try std.testing.expectEqualStrings("⚠ Provider unavailable · retrying request", thinking.label);
         },
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
@@ -2645,7 +2661,7 @@ test "core.app_worker_runtime clears route recovery activity on clear event but 
     } });
     try tickNoop(&app);
     switch (app.shell.activityProjection()) {
-        .turn_thinking => |thinking| try std.testing.expectEqualStrings("⚠ Provider unavailable · recovery paused after 3/3 attempts", thinking.label),
+        .turn_thinking => |thinking| try std.testing.expectEqualStrings("⚠ Provider unavailable · stopped after 3/3 attempts", thinking.label),
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
 }
@@ -2676,7 +2692,7 @@ test "core.app_worker_runtime replaces a due retry with its consumed terminal at
 
     switch (app.shell.activityProjection()) {
         .turn_thinking => |thinking| try std.testing.expectEqualStrings(
-            "⚠ Provider unavailable · TestProviderSerializationFailed · recovery paused after 1/2 attempts",
+            "⚠ Provider unavailable · TestProviderSerializationFailed · stopped after 1/2 attempts",
             thinking.label,
         ),
         .none, .tool_slot => return error.TestUnexpectedResult,
@@ -2709,7 +2725,7 @@ test "core.app_worker_runtime recovery pause replaces cancelled waiting status" 
 
     switch (app.shell.activityProjection()) {
         .turn_thinking => |thinking| try std.testing.expectEqualStrings(
-            "⚠ Mac woke from sleep · connection still unavailable · recovery paused · attempt 2/10 · /continue to resume",
+            "⚠ Mac woke from sleep · connection still unavailable · recovery paused · attempt 2/10 · send a new message when you're ready",
             thinking.label,
         ),
         .none, .tool_slot => return error.TestUnexpectedResult,

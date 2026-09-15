@@ -10,7 +10,6 @@ pub const ParsedCommand = union(enum) {
     new_session,
     reset_session,
     resume_session,
-    continue_recovery,
     rename_session: []const u8,
     help,
     login,
@@ -50,7 +49,6 @@ pub const CommandHandlers = struct {
     new_session: *const fn (ctx: *anyopaque) anyerror!void,
     reset_session: *const fn (ctx: *anyopaque) anyerror!void,
     resume_session: *const fn (ctx: *anyopaque) anyerror!void,
-    continue_recovery: *const fn (ctx: *anyopaque) anyerror!void,
     show_help: *const fn (ctx: *anyopaque) anyerror!void,
     login: *const fn (ctx: *anyopaque) anyerror!void,
     logout: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
@@ -94,7 +92,6 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .new_session => .new_session,
         .reset_session => .reset_session,
         .resume_session => .resume_session,
-        .continue_recovery => .continue_recovery,
         .rename_session => .{ .rename_session = payload },
         .help => .help,
         .login => .login,
@@ -147,7 +144,6 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .new_session => try handlers.new_session(handlers.ctx),
         .reset_session => try handlers.reset_session(handlers.ctx),
         .resume_session => try handlers.resume_session(handlers.ctx),
-        .continue_recovery => try handlers.continue_recovery(handlers.ctx),
         .rename_session => |rest| try handlers.rename_session(handlers.ctx, rest),
         .help => try handlers.show_help(handlers.ctx),
         .login => try handlers.login(handlers.ctx),
@@ -234,10 +230,6 @@ test "parse distinguishes new and reset lifecycle commands" {
 
 test "parse recognizes interactive resume" {
     try std.testing.expectEqual(ParsedCommand.resume_session, parse(testSlashRegistry(), "/resume"));
-}
-
-test "parse recognizes explicit recovery continuation" {
-    try std.testing.expectEqual(ParsedCommand.continue_recovery, parse(testSlashRegistry(), "/continue"));
 }
 
 test "parse recognizes logout" {
@@ -417,10 +409,6 @@ fn recordResumeSession(ctx: *anyopaque) anyerror!void {
     testContext(ctx).called = "resume";
 }
 
-fn recordContinueRecovery(ctx: *anyopaque) anyerror!void {
-    testContext(ctx).called = "continue_recovery";
-}
-
 fn recordModel(ctx: *anyopaque, value: []const u8) anyerror!void {
     const test_context = testContext(ctx);
     test_context.called = "model";
@@ -464,7 +452,6 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .new_session = unexpectedNoPayload,
         .reset_session = unexpectedNoPayload,
         .resume_session = unexpectedNoPayload,
-        .continue_recovery = unexpectedNoPayload,
         .show_help = unexpectedNoPayload,
         .login = unexpectedNoPayload,
         .logout = unexpectedPayload,
@@ -517,16 +504,6 @@ test "route calls interactive resume handler" {
     try route(testSlashRegistry(), &handlers, "/resume");
 
     try std.testing.expectEqualStrings("resume", ctx.called);
-}
-
-test "route calls explicit recovery continuation handler" {
-    var ctx: TestContext = .{};
-    var handlers = testHandlers(&ctx);
-    handlers.continue_recovery = recordContinueRecovery;
-
-    try route(testSlashRegistry(), &handlers, "/continue");
-
-    try std.testing.expectEqualStrings("continue_recovery", ctx.called);
 }
 
 test "route forwards borrowed payload slice" {

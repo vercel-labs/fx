@@ -667,6 +667,7 @@ pub const FakeAgentRuntimeDeps = struct {
     recovery_checkpoint_calls: usize = 0,
     cancel_on_recovery_reservation: ?*std.atomic.Value(bool) = null,
     pause_on_auto_retry_status: bool = false,
+    pause_on_auto_retry_attempt: ?usize = null,
     recovery_pause_flag: ?*std.atomic.Value(bool) = null,
     route_recovery_status_error_attempt: ?usize = null,
     steering_messages: []const []const u8 = &.{},
@@ -1774,7 +1775,9 @@ pub const FakeAgentRuntimeDeps = struct {
         }
         if (self.pause_on_auto_retry_status and
             status.kind == .auto_retry and
-            status.retry_deadline != null)
+            status.retry_deadline != null and
+            (self.pause_on_auto_retry_attempt == null or
+                self.pause_on_auto_retry_attempt.? == status.failed_attempt))
         {
             if (self.recovery_pause_flag) |flag| flag.store(true, .seq_cst);
         }
