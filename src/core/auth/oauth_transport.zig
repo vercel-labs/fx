@@ -26,6 +26,8 @@ pub const Disposition = enum {
 
 pub const Response = struct {
     disposition: Disposition,
+    /// HTTP status when the transport can expose one.
+    status_code: ?u16 = null,
     /// Owned bytes allocated with the allocator passed to `Provider.execute`.
     body: []u8,
 
@@ -33,6 +35,7 @@ pub const Response = struct {
         secret.zeroAndFree(alloc, self.body);
         self.* = .{
             .disposition = .rejected,
+            .status_code = null,
             .body = &.{},
         };
     }

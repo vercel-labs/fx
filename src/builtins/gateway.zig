@@ -886,6 +886,7 @@ const OAuthHttpOperation = struct {
 
         return .{
             .disposition = if (result.status == .ok) .accepted else .rejected,
+            .status_code = @intFromEnum(result.status),
             .body = try self.alloc.dupe(u8, body),
         };
     }
