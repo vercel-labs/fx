@@ -403,7 +403,7 @@ pub fn modelMenuProjection(cache: *const model_cache_runtime.Runtime) ModelMenuP
     };
 }
 
-const max_static_status_activity_rows: u16 = 3;
+const max_static_status_activity_rows: u16 = 8;
 
 pub const RenderContext = struct {
     slash_registry: command_specs.SlashRegistry = .{},
