@@ -1383,8 +1383,9 @@ fn planToolCallFrame(
         .kind = tool_call_presentation.mapToolKind(name),
         .status = replayStatus(result),
         .raw_input = if (parsed) |p| p.value else null,
-        // Result content replays verbatim, matching the live tool-update
-        // path; only arguments are masked for display (redactToolArgumentsJson).
+        // Result content follows the same unmasked tool-update content
+        // contract as the live path; only arguments are masked for display
+        // (redactToolArgumentsJson).
         .content_text = if (result) |r| if (r.output.len > 0)
             tool_call_presentation.toolUpdateContentText(r.status == .failure, r.output)
         else

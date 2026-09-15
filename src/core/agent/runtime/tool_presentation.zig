@@ -1223,7 +1223,9 @@ fn failureStatusDetail(
                     std.mem.findScalar(u8, actionable, '\n') == null and
                     std.mem.findScalar(u8, actionable, '\r') == null)
                 {
-                    return try text_utils.maskSecrets(arena, actionable);
+                    const masked = try text_utils.maskSecrets(arena, actionable);
+                    const encoded = try text_utils.encodeTerminalSafe(arena, masked, 256);
+                    return if (encoded.bytes.len == 0) detail else encoded.bytes;
                 }
             }
         }
@@ -2829,6 +2831,8 @@ test "cancelled shell wait names the observation instead of the process" {
     ) != null);
 }
 
+// Secret-shaped test needles are written as concatenated fragments so
+// interactive tool-result masking never rewrites the literal in flight.
 test "failure status detail masks secret-shaped failure output" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -2866,4 +2870,24 @@ test "failure status detail masks the actionable edit failure reason" {
     const failure_output = "edit_file failed: MY_NOTE_" ++ "TOKEN=abcdefgh";
     const detail = (try failureStatusDetail(arena, call, result, failure_output, &.{})).?;
     try std.testing.expectEqualStrings("MY_NOTE_" ++ "TOKEN=[redacted]", detail);
+}
+
+test "failure status detail terminal-encodes the actionable edit failure reason" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const call: ToolCall = .{
+        .id = "call_edit_fail",
+        .name = "edit_file",
+        .arguments_json = "{}",
+    };
+    const result: ToolExecutionResult = .{
+        .model_output = "",
+        .status = .failure,
+        .status_detail = "preflight failed",
+    };
+    const failure_output = "edit_file failed: reset terminal\x1b[2J";
+    const detail = (try failureStatusDetail(arena, call, result, failure_output, &.{})).?;
+    try std.testing.expect(std.mem.findScalar(u8, detail, 0x1b) == null);
+    try std.testing.expect(std.mem.find(u8, detail, "\\x1b") != null);
 }

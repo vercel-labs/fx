@@ -437,7 +437,7 @@ pub fn maskSecrets(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
             modified = true;
             try out.writer.writeAll(text[i..span.prefix_end]);
             try out.writer.writeAll("[redacted]");
-            debug_trace.logf("core", "display secret redacted kind={s} bytes={d}", .{ span.kind, span.value_len });
+            debug_trace.logf("core", "secret redacted kind={s} bytes={d}", .{ span.kind, span.value_len });
             i = span.prefix_end + span.value_len;
         } else {
             try out.writer.writeByte(text[i]);

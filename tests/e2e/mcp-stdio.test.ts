@@ -107,6 +107,7 @@ type RootOptions = {
     | "subscription_cache"
     | "features"
     | "features_no_tools"
+    | "feature_protocol_error"
     | "draft7_schema"
     | "list_changed"
     | "crash_once"
@@ -3104,8 +3105,10 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
   );
 
   test.skipIf(!tmuxAvailable())(
-    "MCP resource read command masks secret-shaped protocol diagnostics",
+    "MCP resource and prompt commands mask secret-shaped protocol diagnostics",
     async () => {
+      // Secret-shaped needles are written as concatenated fragments so
+      // interactive tool-result masking never rewrites the literal in flight.
       const secretNeedle = ["SERVICE_", "TOKEN=fixture-token-123456"].join("");
       const root = createRoot("tui-feature-protocol-error-masked", MODERN_FIXTURE, {
         mode: "feature_protocol_error",
@@ -3127,7 +3130,13 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       await tui.waitForComposer(15_000);
       await tui.sendText("/mcp resource read fixture custom://alpha");
       await tui.waitForText("MCP protocol error -32602", 15_000);
-      const pane = await tui.capturePane();
+      let pane = await tui.capturePane();
+      expect(pane).toContain("[redacted]");
+      expect(pane).not.toContain(secretNeedle);
+
+      await tui.sendText("/mcp prompt get fixture review {\"tone\":\"brief\"}");
+      await tui.waitForText("MCP protocol error -32603", 15_000);
+      pane = await tui.capturePane();
       expect(pane).toContain("[redacted]");
       expect(pane).not.toContain(secretNeedle);
 
@@ -3136,7 +3145,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       tui = null;
       await expectFixtureProcessesExited(readWire(root.wireLogPath));
     },
-    35_000,
+    45_000,
   );
 
   test.skipIf(!tmuxAvailable())(
