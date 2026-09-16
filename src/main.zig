@@ -76,6 +76,7 @@ const display_width = @import("core/shared/display_width.zig");
 const file_index_mod = @import("core/workspace/file_index.zig");
 const mcp_command_provider = @import("core/mcp/command_provider.zig");
 const mcp_runtime_mod = @import("core/mcp/mcp_runtime.zig");
+const swarm_provider = @import("core/swarm/provider.zig");
 const mcp_model_catalog = @import("core/mcp/model_catalog.zig");
 const mcp_access_policy = @import("core/mcp/access_policy.zig");
 const mcp_menu_state = @import("core/mcp/menu_state.zig");
@@ -569,6 +570,9 @@ const App = struct {
     upgrader: auto_upgrade.AutoUpgrade = .{},
     change_tracker: change_tracker_mod.ChangeTracker = .{},
     mcp: app_mcp_runtime.State = .{},
+    /// The Puppetmaster read `/swarm` uses. Injected so tests and restricted
+    /// hosts can substitute a fake or an unsupported stub.
+    swarm_read_fn: swarm_provider.ReadFn = swarm_provider.run,
     skills: skill_runtime.Runtime = .{},
     context_snapshot: context_contract.GatheredContextSnapshot = .{},
     file_index: file_index_mod.FileIndex = .{},
@@ -4326,6 +4330,8 @@ test {
     _ = @import("core/config/prompt_policy.zig");
     _ = @import("core/workspace/record_tape.zig");
     _ = @import("core/session/session.zig");
+    _ = @import("core/swarm/snapshot.zig");
+    _ = @import("core/swarm/provider.zig");
     _ = @import("core/session/session_commands.zig");
     _ = @import("core/session/session_json.zig");
     _ = @import("core/session/session_store.zig");
