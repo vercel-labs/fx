@@ -1,10 +1,11 @@
 //! Behavior for the columnar `/provider` picker.
 //!
-//! The picker walks left to right: provider, then the sign-in method for the
-//! gateway (`oauth`/`api-key`), then either the Vercel team (oauth with a live
-//! session), the which-key column (`env`/`saved`/`new`), or the masked key
-//! entry field. Each list column writes its choice into the composer, so the
-//! next column anchors under its own argument the way `/model` does.
+//! The picker walks left to right: provider, then a sign-in method when the
+//! command needs one. Gateway offers `oauth`/`api-key`; `/login codex` offers
+//! `browser`/`device-code`. Gateway methods may continue to the Vercel team,
+//! the which-key column (`env`/`saved`/`new`), or the masked key entry field.
+//! Each list column writes its choice into the composer, so the next column
+//! anchors under its own argument the way `/model` does.
 //!
 //! Terminal actions are not reimplemented here. Every commit is expressed as an
 //! `auth_runtime.Choice` and handed to the auth runtime, which already owns
@@ -85,10 +86,10 @@ pub fn Runtime(comptime App: type) type {
                     const pending = app.input_runtime.picker.provider_picker_pending_provider.items;
                     const provider = provider_catalog.parse(pending) orelse return 0;
                     const active_source = app.auth.credentialSource();
-                    const methods = provider_picker_catalog.providerMethods(provider);
+                    const methods = methodsForQuery(query, provider);
                     for (methods, 0..) |method, i| {
                         column.labels[i] = provider_picker_catalog.methodSlug(method);
-                        const in_use = provider.eql(active_provider) and
+                        const in_use = provider == .gateway and provider.eql(active_provider) and
                             if (active_source) |source| provider_picker_catalog.methodMatchesSource(method, source) else false;
                         column.annotations[i] = if (in_use) "current" else "";
                     }
@@ -233,7 +234,7 @@ pub fn Runtime(comptime App: type) type {
             switch (query.stage) {
                 .provider => {
                     const provider = provider_catalog.parse(selected) orelse return false;
-                    if (provider_picker_catalog.providerMethods(provider).len == 0) return false;
+                    if (methodsForQuery(query, provider).len == 0) return false;
                 },
                 .method => {
                     if (provider_picker_catalog.parseMethod(selected) != .api_key) return false;
@@ -259,7 +260,7 @@ pub fn Runtime(comptime App: type) type {
             switch (query.stage) {
                 .provider => {
                     const provider = provider_catalog.parse(selected) orelse return false;
-                    if (provider_picker_catalog.providerMethods(provider).len == 0) {
+                    if (methodsForQuery(query, provider).len == 0) {
                         try commit(app, .{ .provider = provider });
                         return true;
                     }
@@ -280,6 +281,14 @@ pub fn Runtime(comptime App: type) type {
                     const provider = provider_catalog.parse(
                         app.input_runtime.picker.provider_picker_pending_provider.items,
                     ) orelse .gateway;
+                    if (provider == .codex) {
+                        try commit(app, .{ .action = switch (method) {
+                            .browser => .chatgpt_login,
+                            .device_code => .chatgpt_device_login,
+                            .oauth, .api_key => unreachable,
+                        } });
+                        return true;
+                    }
                     if (method == .api_key) {
                         // With detected keys the next column asks which to use
                         // (or `new` to paste one); with none there is nothing
@@ -488,6 +497,14 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
             app.shell.render_requests.request(.footer);
+        }
+
+        fn methodsForQuery(
+            query: picker_state.ProviderPickerQuery,
+            provider: model_provider.ProviderId,
+        ) []const provider_picker_catalog.Method {
+            if (provider == .codex and !std.mem.eql(u8, query.prefix, picker_state.login_prefix)) return &.{};
+            return provider_picker_catalog.providerMethods(provider);
         }
 
         fn selectedLabel(
@@ -755,13 +772,24 @@ test "method column marks the credential the active provider is using" {
     try std.testing.expectEqualStrings("current", column.annotations[1]);
 }
 
-test "a subscription provider has no method column to open" {
+test "Codex exposes login methods without changing provider switching" {
     const alloc = std.testing.allocator;
     var app = ColumnTestApp.init(alloc);
     defer app.deinit();
     try app.input_runtime.picker.beginProviderPickerFlow(alloc, "codex", "", .method);
 
     try std.testing.expectEqual(@as(usize, 0), columnFor(&app, .method, "").count);
+
+    var login_column: ColumnBuffer = .{};
+    _ = Runtime(ColumnTestApp).columnOptions(&app, .{
+        .stage = .method,
+        .prefix = picker_state.login_prefix,
+        .query = "",
+        .token_start = picker_state.login_prefix.len,
+    }, &login_column);
+    try std.testing.expectEqual(@as(usize, 2), login_column.count);
+    try std.testing.expectEqualStrings("browser", login_column.labels[0]);
+    try std.testing.expectEqualStrings("device-code", login_column.labels[1]);
 }
 
 test "key column is a masked field, not a list of options" {

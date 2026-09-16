@@ -22,6 +22,13 @@ const jwt_auth_claim = "https://api.openai.com/auth";
 const browser_scope = "openid profile email offline_access api.connectors.read api.connectors.invoke";
 const browser_callback_ports = [_]u16{ 1455, 1457 };
 const browser_login_timeout_seconds: i64 = 5 * 60;
+const device_login_timeout_seconds: i64 = 15 * 60;
+const device_default_poll_interval_seconds: i64 = 5;
+
+pub const LoginMode = enum {
+    browser,
+    device_code,
+};
 
 pub const RefreshMode = enum {
     if_needed,
@@ -85,12 +92,38 @@ const PreparedBrowserLogin = struct {
     context: *BrowserLoginContext,
 };
 
+const DeviceLoginContext = struct {
+    user_code: []u8,
+
+    fn deinit(self: *DeviceLoginContext, alloc: Allocator) void {
+        secret.zeroAndFree(alloc, self.user_code);
+        self.* = undefined;
+    }
+};
+
+const PreparedDeviceLogin = struct {
+    prepared: login_flow.PreparedLogin,
+    context: *DeviceLoginContext,
+};
+
 pub fn startSignIn(
     runtime: *login_flow.SignInRuntime,
     alloc: Allocator,
     transport: oauth_transport.Provider,
+    mode: LoginMode,
 ) !bool {
     try credentials.requireSignInStorage(.chatgpt_subscription);
+    return switch (mode) {
+        .browser => startBrowserSignIn(runtime, alloc, transport),
+        .device_code => startDeviceSignIn(runtime, alloc, transport),
+    };
+}
+
+fn startBrowserSignIn(
+    runtime: *login_flow.SignInRuntime,
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+) !bool {
     const browser = try prepareBrowserSignIn(alloc);
     return runtime.startPrepared(
         alloc,
@@ -106,6 +139,29 @@ pub fn startSignIn(
             .complete = completeSignIn,
             .save = saveSignIn,
             .finish = finishSignIn,
+        },
+    );
+}
+
+fn startDeviceSignIn(
+    runtime: *login_flow.SignInRuntime,
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+) !bool {
+    const device = try prepareDeviceSignIn(alloc, transport);
+    return runtime.startPrepared(
+        alloc,
+        device.prepared,
+        .{
+            .ctx = device.context,
+            .deinit_ctx = deinitDeviceLoginContext,
+            .oauth_transport = transport,
+            .poll = .{
+                .ctx = device.context,
+                .poll_device_token = pollDeviceToken,
+            },
+            .complete = completeSignIn,
+            .save = saveSignIn,
         },
     );
 }
@@ -186,8 +242,90 @@ fn prepareBrowserSignIn(alloc: Allocator) !PreparedBrowserLogin {
     };
 }
 
+fn prepareDeviceSignIn(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+) !PreparedDeviceLogin {
+    const configured_issuer = try configuredEndpoint(alloc, e2e_issuer_url_env, issuer_url);
+    errdefer alloc.free(configured_issuer);
+    const configured_token_endpoint = try configuredEndpoint(alloc, e2e_token_url_env, token_url);
+    errdefer alloc.free(configured_token_endpoint);
+    const device_endpoint = try std.fmt.allocPrint(
+        alloc,
+        "{s}/api/accounts/deviceauth/usercode",
+        .{std.mem.trimEnd(u8, configured_issuer, "/")},
+    );
+    defer alloc.free(device_endpoint);
+    const device_token_endpoint = try std.fmt.allocPrint(
+        alloc,
+        "{s}/api/accounts/deviceauth/token",
+        .{std.mem.trimEnd(u8, configured_issuer, "/")},
+    );
+    errdefer alloc.free(device_token_endpoint);
+
+    var payload: std.Io.Writer.Allocating = .init(alloc);
+    defer payload.deinit();
+    try payload.writer.writeAll("{\"client_id\":");
+    try std.json.Stringify.value(client_id, .{}, &payload.writer);
+    try payload.writer.writeByte('}');
+    var response = try transport.execute(alloc, .{
+        .method = .post_json,
+        .url = device_endpoint,
+        .payload = payload.written(),
+    });
+    defer response.deinit(alloc);
+    if (response.disposition != .accepted) return error.ChatGptDeviceAuthorizationFailed;
+
+    var parsed = try parseDeviceAuthorization(alloc, response.body);
+    errdefer parsed.deinit(alloc);
+    const verification_uri = try std.fmt.allocPrint(
+        alloc,
+        "{s}/codex/device",
+        .{std.mem.trimEnd(u8, configured_issuer, "/")},
+    );
+    errdefer alloc.free(verification_uri);
+    const displayed_user_code = try alloc.dupe(u8, parsed.user_code);
+    errdefer alloc.free(displayed_user_code);
+    const owned_client_id = try alloc.dupe(u8, client_id);
+    errdefer alloc.free(owned_client_id);
+
+    const context = try alloc.create(DeviceLoginContext);
+    errdefer alloc.destroy(context);
+    context.* = .{ .user_code = parsed.user_code };
+    parsed.user_code = &.{};
+
+    const device_auth_id = parsed.device_auth_id;
+    parsed.device_auth_id = &.{};
+    const poll_interval = parsed.interval;
+    parsed.deinit(alloc);
+    return .{
+        .prepared = .{
+            .metadata = .{
+                .issuer = configured_issuer,
+                .device_authorization_endpoint = device_token_endpoint,
+                .token_endpoint = configured_token_endpoint,
+            },
+            .device = .{
+                .device_code = device_auth_id,
+                .user_code = displayed_user_code,
+                .verification_uri = verification_uri,
+                .expires_in = device_login_timeout_seconds,
+                .interval = poll_interval,
+            },
+            .client_id = owned_client_id,
+        },
+        .context = context,
+    };
+}
+
 fn deinitBrowserLoginContext(raw: ?*anyopaque, alloc: Allocator) void {
     const context: *BrowserLoginContext = @ptrCast(@alignCast(raw.?));
+    context.deinit(alloc);
+    alloc.destroy(context);
+}
+
+fn deinitDeviceLoginContext(raw: ?*anyopaque, alloc: Allocator) void {
+    const context: *DeviceLoginContext = @ptrCast(@alignCast(raw.?));
     context.deinit(alloc);
     alloc.destroy(context);
 }
@@ -223,6 +361,166 @@ fn pkceChallengeAlloc(alloc: Allocator, verifier: []const u8) ![]u8 {
     const encoded = try alloc.alloc(u8, encoded_len);
     _ = std.base64.url_safe_no_pad.Encoder.encode(encoded, &digest);
     return encoded;
+}
+
+const DeviceAuthorization = struct {
+    device_auth_id: []u8,
+    user_code: []u8,
+    interval: i64,
+
+    fn deinit(self: *DeviceAuthorization, alloc: Allocator) void {
+        secret.zeroAndFree(alloc, self.device_auth_id);
+        secret.zeroAndFree(alloc, self.user_code);
+        self.* = undefined;
+    }
+};
+
+fn parseDeviceAuthorization(alloc: Allocator, bytes: []const u8) !DeviceAuthorization {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidChatGptDeviceAuthorizationResponse;
+    const object = parsed.value.object;
+    const device_auth_id = dupeRequiredString(alloc, object, "device_auth_id") catch
+        return error.InvalidChatGptDeviceAuthorizationResponse;
+    errdefer secret.zeroAndFree(alloc, device_auth_id);
+    const user_code = dupeRequiredString(alloc, object, "user_code") catch
+        return error.InvalidChatGptDeviceAuthorizationResponse;
+    errdefer secret.zeroAndFree(alloc, user_code);
+    const interval = parseDevicePollInterval(object.get("interval")) catch
+        return error.InvalidChatGptDeviceAuthorizationResponse;
+    return .{
+        .device_auth_id = device_auth_id,
+        .user_code = user_code,
+        .interval = interval,
+    };
+}
+
+fn parseDevicePollInterval(value: ?std.json.Value) !i64 {
+    const candidate = value orelse return device_default_poll_interval_seconds;
+    const interval = switch (candidate) {
+        .integer => |number| number,
+        .string => |text| std.fmt.parseInt(i64, std.mem.trim(u8, text, " \t\r\n"), 10) catch
+            return error.InvalidChatGptDeviceAuthorizationResponse,
+        else => return error.InvalidChatGptDeviceAuthorizationResponse,
+    };
+    if (interval < 0) return error.InvalidChatGptDeviceAuthorizationResponse;
+    return interval;
+}
+
+fn pollDeviceToken(
+    raw: ?*anyopaque,
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    metadata: oauth.Metadata,
+    _: []const u8,
+    device_auth_id: []const u8,
+    cancel_flag: *std.atomic.Value(bool),
+    deadline: std.Io.Clock.Timestamp,
+) !oauth.PollResult {
+    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+    const context: *DeviceLoginContext = @ptrCast(@alignCast(raw.?));
+    var payload: std.Io.Writer.Allocating = .init(alloc);
+    defer payload.deinit();
+    try payload.writer.writeAll("{\"device_auth_id\":");
+    try std.json.Stringify.value(device_auth_id, .{}, &payload.writer);
+    try payload.writer.writeAll(",\"user_code\":");
+    try std.json.Stringify.value(context.user_code, .{}, &payload.writer);
+    try payload.writer.writeByte('}');
+
+    var response = try transport.execute(alloc, .{
+        .method = .post_json,
+        .url = metadata.device_authorization_endpoint,
+        .payload = payload.written(),
+        .cancel_flag = cancel_flag,
+        .deadline = deadline,
+    });
+    defer response.deinit(alloc);
+    if (response.disposition != .accepted) {
+        if (response.status_code == 403 or response.status_code == 404) return .pending;
+        return classifyDevicePollFailure(alloc, response.body);
+    }
+
+    var authorization = try parseDeviceTokenAuthorization(alloc, response.body);
+    defer authorization.deinit(alloc);
+    const redirect_uri = try std.fmt.allocPrint(
+        alloc,
+        "{s}/deviceauth/callback",
+        .{std.mem.trimEnd(u8, metadata.issuer, "/")},
+    );
+    defer alloc.free(redirect_uri);
+    var token = try exchangeAuthorizationCodeForRedirectWithBounds(
+        alloc,
+        transport,
+        metadata.token_endpoint,
+        authorization.code,
+        authorization.code_verifier,
+        redirect_uri,
+        cancel_flag,
+        deadline,
+    );
+    errdefer token.deinit(alloc);
+    const scope = try alloc.dupe(u8, "");
+    errdefer alloc.free(scope);
+    const token_type = try alloc.dupe(u8, "Bearer");
+    errdefer alloc.free(token_type);
+    const access_token = token.access_token;
+    token.access_token = &.{};
+    const refresh_token = token.refresh_token;
+    token.refresh_token = &.{};
+    return .{ .success = .{
+        .access_token = access_token,
+        .refresh_token = refresh_token,
+        .expires_in = token.expires_in,
+        .scope = scope,
+        .token_type = token_type,
+    } };
+}
+
+fn classifyDevicePollFailure(alloc: Allocator, bytes: []const u8) !oauth.PollResult {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch
+        return error.ChatGptDeviceAuthorizationFailed;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.ChatGptDeviceAuthorizationFailed;
+    const raw_error = parsed.value.object.get("error") orelse
+        return error.ChatGptDeviceAuthorizationFailed;
+    const code = switch (raw_error) {
+        .string => |value| value,
+        .object => |object| blk: {
+            const value = object.get("code") orelse return error.ChatGptDeviceAuthorizationFailed;
+            if (value != .string) return error.ChatGptDeviceAuthorizationFailed;
+            break :blk value.string;
+        },
+        else => return error.ChatGptDeviceAuthorizationFailed,
+    };
+    if (std.mem.eql(u8, code, "deviceauth_authorization_pending") or
+        std.mem.eql(u8, code, "authorization_pending")) return .pending;
+    if (std.mem.eql(u8, code, "slow_down")) return .slow_down;
+    if (std.mem.eql(u8, code, "access_denied")) return error.ChatGptAuthorizationFailed;
+    if (std.mem.eql(u8, code, "expired_token")) return error.ChatGptLoginTimedOut;
+    return error.ChatGptDeviceAuthorizationFailed;
+}
+
+const DeviceTokenAuthorization = struct {
+    code: []u8,
+    code_verifier: []u8,
+
+    fn deinit(self: *DeviceTokenAuthorization, alloc: Allocator) void {
+        secret.zeroAndFree(alloc, self.code);
+        secret.zeroAndFree(alloc, self.code_verifier);
+        self.* = undefined;
+    }
+};
+
+fn parseDeviceTokenAuthorization(alloc: Allocator, bytes: []const u8) !DeviceTokenAuthorization {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidChatGptDeviceAuthorizationResponse;
+    const code = dupeRequiredString(alloc, parsed.value.object, "authorization_code") catch
+        return error.InvalidChatGptDeviceAuthorizationResponse;
+    errdefer secret.zeroAndFree(alloc, code);
+    const code_verifier = dupeRequiredString(alloc, parsed.value.object, "code_verifier") catch
+        return error.InvalidChatGptDeviceAuthorizationResponse;
+    return .{ .code = code, .code_verifier = code_verifier };
 }
 
 fn pollBrowserToken(
@@ -369,18 +667,27 @@ pub fn runLogin(
     alloc: Allocator,
     transport: oauth_transport.Provider,
     url_opener: host.UrlOpener,
+    mode: LoginMode,
 ) !void {
     var runtime: login_flow.SignInRuntime = .{};
     defer runtime.deinit(alloc);
-    if (!try startSignIn(&runtime, alloc, transport)) return error.ChatGptLoginBusy;
+    if (!try startSignIn(&runtime, alloc, transport, mode)) return error.ChatGptLoginBusy;
 
+    const snapshot = runtime.snapshot();
     const authorization_url = (try runtime.browserUrlAlloc(alloc)) orelse
         return error.ChatGptAuthorizationUrlMissing;
     defer alloc.free(authorization_url);
     try writeStdout("Open this URL to sign in with Codex:\n");
     try writeStdout(authorization_url);
-    try writeStdout("\n\nWaiting for browser authorization...\n");
-    if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) {
+    if (mode == .device_code) {
+        try writeStdout("\nCode: ");
+        try writeStdout(snapshot.user_code);
+    }
+    try writeStdout(if (mode == .browser)
+        "\n\nWaiting for browser authorization...\n"
+    else
+        "\n\nWaiting for device authorization...\n");
+    if (mode == .browser and io_mod.getenv("FX_NO_OPEN_BROWSER") == null) {
         _ = url_opener.open(alloc, authorization_url) catch false;
     }
 
@@ -942,6 +1249,134 @@ test "Codex refresh uses JSON and accepts omitted token rotation and lifetime" {
     try std.testing.expect(std.mem.find(u8, state.payload[0..state.payload_len], "\"grant_type\":\"refresh_token\"") != null);
     try std.testing.expect(response.refresh_token == null);
     try std.testing.expect(response.expires_in == null);
+}
+
+test "ChatGPT device authorization accepts string and integer poll intervals" {
+    var string_interval = try parseDeviceAuthorization(
+        std.testing.allocator,
+        "{\"device_auth_id\":\"device\",\"user_code\":\"ABCD-EFGH\",\"interval\":\"7\"}",
+    );
+    defer string_interval.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(i64, 7), string_interval.interval);
+
+    var integer_interval = try parseDeviceAuthorization(
+        std.testing.allocator,
+        "{\"device_auth_id\":\"device\",\"user_code\":\"ABCD-EFGH\",\"interval\":3}",
+    );
+    defer integer_interval.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(i64, 3), integer_interval.interval);
+
+    try std.testing.expectError(
+        error.InvalidChatGptDeviceAuthorizationResponse,
+        parseDeviceAuthorization(
+            std.testing.allocator,
+            "{\"device_auth_id\":\"device\",\"user_code\":\"ABCD-EFGH\",\"interval\":-1}",
+        ),
+    );
+}
+
+test "ChatGPT device polling classifies provider outcomes" {
+    try std.testing.expect((try classifyDevicePollFailure(
+        std.testing.allocator,
+        "{\"error\":{\"code\":\"deviceauth_authorization_pending\"}}",
+    )) == .pending);
+    try std.testing.expect((try classifyDevicePollFailure(
+        std.testing.allocator,
+        "{\"error\":\"slow_down\"}",
+    )) == .slow_down);
+    try std.testing.expectError(
+        error.ChatGptAuthorizationFailed,
+        classifyDevicePollFailure(std.testing.allocator, "{\"error\":\"access_denied\"}"),
+    );
+    try std.testing.expectError(
+        error.ChatGptLoginTimedOut,
+        classifyDevicePollFailure(std.testing.allocator, "{\"error\":\"expired_token\"}"),
+    );
+}
+
+test "ChatGPT device polling exchanges the granted code with the hosted redirect" {
+    const State = struct {
+        request_count: usize = 0,
+        poll_payload: [256]u8 = undefined,
+        poll_payload_len: usize = 0,
+        exchange_payload: [512]u8 = undefined,
+        exchange_payload_len: usize = 0,
+
+        fn execute(
+            raw: ?*anyopaque,
+            alloc: Allocator,
+            request: oauth_transport.Request,
+        ) !oauth_transport.Response {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.request_count += 1;
+            const payload = request.payload orelse &.{};
+            if (std.mem.endsWith(u8, request.url, "/api/accounts/deviceauth/token")) {
+                self.poll_payload_len = @min(payload.len, self.poll_payload.len);
+                @memcpy(self.poll_payload[0..self.poll_payload_len], payload[0..self.poll_payload_len]);
+                return .{
+                    .disposition = .accepted,
+                    .body = try alloc.dupe(
+                        u8,
+                        "{\"authorization_code\":\"granted-code\",\"code_verifier\":\"device-verifier\"}",
+                    ),
+                };
+            }
+            if (std.mem.endsWith(u8, request.url, "/oauth/token")) {
+                self.exchange_payload_len = @min(payload.len, self.exchange_payload.len);
+                @memcpy(self.exchange_payload[0..self.exchange_payload_len], payload[0..self.exchange_payload_len]);
+                return .{
+                    .disposition = .accepted,
+                    .body = try alloc.dupe(
+                        u8,
+                        "{\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"expires_in\":3600}",
+                    ),
+                };
+            }
+            return error.UnexpectedDeviceLoginRequest;
+        }
+    };
+
+    var state = State{};
+    var context = DeviceLoginContext{ .user_code = try std.testing.allocator.dupe(u8, "ABCD-EFGH") };
+    defer context.deinit(std.testing.allocator);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .clock = .awake,
+        .raw = .fromSeconds(1),
+    });
+    var result = try pollDeviceToken(
+        &context,
+        std.testing.allocator,
+        .{ .context = &state, .execute_fn = State.execute },
+        .{
+            .issuer = @constCast("https://auth.openai.com"),
+            .device_authorization_endpoint = @constCast("https://auth.openai.com/api/accounts/deviceauth/token"),
+            .token_endpoint = @constCast("https://auth.openai.com/oauth/token"),
+        },
+        client_id,
+        "device-auth-id",
+        &cancel_flag,
+        deadline,
+    );
+    switch (result) {
+        .success => |*token| {
+            defer token.deinit(std.testing.allocator);
+            try std.testing.expectEqualStrings("access", token.access_token);
+            try std.testing.expectEqualStrings("refresh", token.refresh_token.?);
+        },
+        .pending, .slow_down => return error.ExpectedDeviceLoginSuccess,
+    }
+    try std.testing.expectEqual(@as(usize, 2), state.request_count);
+    try std.testing.expect(std.mem.find(
+        u8,
+        state.poll_payload[0..state.poll_payload_len],
+        "\"device_auth_id\":\"device-auth-id\"",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        state.exchange_payload[0..state.exchange_payload_len],
+        "redirect_uri=https%3A%2F%2Fauth.openai.com%2Fdeviceauth%2Fcallback",
+    ) != null);
 }
 
 test "ChatGPT browser authorization URL uses PKCE without device authentication" {

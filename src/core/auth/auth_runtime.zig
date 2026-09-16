@@ -504,6 +504,7 @@ pub const AcquisitionAction = enum {
     connections,
     login,
     chatgpt_login,
+    chatgpt_device_login,
     grok_login,
     setup,
     change_team,
@@ -1325,6 +1326,7 @@ pub const PickerView = struct {
                 .connections => "Connections",
                 .login => "Sign in with Vercel",
                 .chatgpt_login => "Sign in with Codex",
+                .chatgpt_device_login => "Sign in with Codex using a device code",
                 .grok_login => "Sign in with Grok",
                 .setup => if (self.include_skip) "Add an API key" else "API key",
                 .change_team => "Change team",
@@ -1344,6 +1346,7 @@ pub const PickerView = struct {
                 .connections => "",
                 .login => if (self.fx_login_session_available) "connected" else "",
                 .chatgpt_login => if (self.available_sources.contains(.chatgpt_subscription)) "connected" else "",
+                .chatgpt_device_login => "headless",
                 .grok_login => if (self.available_sources.contains(.grok_subscription)) "connected" else "",
                 .setup, .switch_credential, .switch_provider => "",
                 .automatic => "use the first available source",
@@ -1356,7 +1359,7 @@ pub const PickerView = struct {
     pub fn choiceEnabled(self: PickerView, choice: Choice) bool {
         return switch (choice) {
             .action => |action| (action != .change_team or self.fx_login_session_available) and
-                (action != .chatgpt_login or !host_target.is_wasm) and
+                ((action != .chatgpt_login and action != .chatgpt_device_login) or !host_target.is_wasm) and
                 (action != .grok_login or !host_target.is_wasm),
             .provider, .source, .team => true,
         };
@@ -1371,7 +1374,7 @@ pub const PickerView = struct {
 };
 
 fn connectionChoiceCount() usize {
-    return if (comptime host_target.is_wasm) 2 else 4;
+    return if (comptime host_target.is_wasm) 2 else 5;
 }
 
 fn connectionChoiceAt(index: usize) ?Choice {
@@ -1385,8 +1388,9 @@ fn connectionChoiceAt(index: usize) ?Choice {
     return switch (index) {
         0 => .{ .action = .login },
         1 => .{ .action = .chatgpt_login },
-        2 => .{ .action = .grok_login },
-        3 => .{ .action = .setup },
+        2 => .{ .action = .chatgpt_device_login },
+        3 => .{ .action = .grok_login },
+        4 => .{ .action = .setup },
         else => null,
     };
 }
@@ -2310,6 +2314,16 @@ pub const Runtime = struct {
         return self.openSignInPickerWithParent(alloc, true, .chatgpt_subscription);
     }
 
+    pub fn openChatGptDeviceSignInPickerFromRoot(self: *Self, alloc: Allocator) !bool {
+        if (comptime host_target.is_wasm) return error.ChatGptOAuthUnavailable;
+        return self.openSignInPickerWithParentMode(
+            alloc,
+            true,
+            .chatgpt_subscription,
+            .device_code,
+        );
+    }
+
     pub fn openChatGptSignInPickerForProviderSwitch(self: *Self, alloc: Allocator) !bool {
         if (comptime host_target.is_wasm) return error.ChatGptOAuthUnavailable;
         return self.openSignInPickerWithParent(alloc, false, .chatgpt_subscription);
@@ -2331,10 +2345,25 @@ pub const Runtime = struct {
         returns_to_root: bool,
         source: credentials.Source,
     ) !bool {
+        return self.openSignInPickerWithParentMode(alloc, returns_to_root, source, .browser);
+    }
+
+    fn openSignInPickerWithParentMode(
+        self: *Self,
+        alloc: Allocator,
+        returns_to_root: bool,
+        source: credentials.Source,
+        chatgpt_mode: chatgpt_oauth.LoginMode,
+    ) !bool {
         self.exitSignInStage(alloc);
         const started = switch (source) {
             .fx_login => try self.sign_in_flow.start(alloc, self.oauth_transport),
-            .chatgpt_subscription => try chatgpt_oauth.startSignIn(&self.sign_in_flow, alloc, self.oauth_transport),
+            .chatgpt_subscription => try chatgpt_oauth.startSignIn(
+                &self.sign_in_flow,
+                alloc,
+                self.oauth_transport,
+                chatgpt_mode,
+            ),
             .grok_subscription => try grok_oauth.startSignIn(&self.sign_in_flow, alloc, self.oauth_transport),
             else => return error.InvalidSignInSource,
         };
@@ -2598,7 +2627,7 @@ pub const Runtime = struct {
             .sign_in, .api_key => unreachable,
             .connections => switch (selected) {
                 .action => |action| switch (action) {
-                    .login, .chatgpt_login, .grok_login => self.closePicker(alloc),
+                    .login, .chatgpt_login, .chatgpt_device_login, .grok_login => self.closePicker(alloc),
                     .setup => {},
                     .connections,
                     .change_team,
@@ -2630,7 +2659,7 @@ pub const Runtime = struct {
                     .setup => {},
                     // Only reachable from the switch screen, never the root.
                     .automatic => unreachable,
-                    .login, .chatgpt_login, .grok_login => self.closePicker(alloc),
+                    .login, .chatgpt_login, .chatgpt_device_login, .grok_login => self.closePicker(alloc),
                 },
                 .team => unreachable,
             },
@@ -4420,13 +4449,14 @@ test "auth onboarding picker exposes the setup paths" {
 
     const picker = runtime.pickerView();
     try std.testing.expect(picker.include_skip);
-    try std.testing.expectEqual(@as(usize, 4), picker.choiceCount());
+    try std.testing.expectEqual(@as(usize, 5), picker.choiceCount());
     try std.testing.expect((Choice{ .action = .login }).eql(picker.choiceAt(0).?));
     try std.testing.expect((Choice{ .action = .chatgpt_login }).eql(picker.choiceAt(1).?));
-    try std.testing.expect((Choice{ .action = .grok_login }).eql(picker.choiceAt(2).?));
-    try std.testing.expect((Choice{ .action = .setup }).eql(picker.choiceAt(3).?));
-    try std.testing.expectEqualStrings("Add an API key", picker.choiceLabel(picker.choiceAt(3).?));
-    try std.testing.expect(picker.choiceAt(4) == null);
+    try std.testing.expect((Choice{ .action = .chatgpt_device_login }).eql(picker.choiceAt(2).?));
+    try std.testing.expect((Choice{ .action = .grok_login }).eql(picker.choiceAt(3).?));
+    try std.testing.expect((Choice{ .action = .setup }).eql(picker.choiceAt(4).?));
+    try std.testing.expectEqualStrings("Add an API key", picker.choiceLabel(picker.choiceAt(4).?));
+    try std.testing.expect(picker.choiceAt(5) == null);
 }
 
 test "clearing a remembered choice re-resolves even when no login was active" {
@@ -4653,7 +4683,7 @@ test "api key save from setup returns to the selected Connections row" {
     runtime.openPicker(alloc);
     try std.testing.expect(runtime.takePickerChoice(alloc) == null);
     try std.testing.expectEqual(PickerStage.connections, runtime.pickerView().stage);
-    for (0..3) |_| try std.testing.expect(runtime.movePicker(1));
+    for (0..4) |_| try std.testing.expect(runtime.movePicker(1));
     try std.testing.expect((Choice{ .action = .setup }).eql(runtime.takePickerChoice(alloc).?));
 
     runtime.openApiKeyPickerFromRoot(alloc);
@@ -4668,7 +4698,7 @@ test "api key save from setup returns to the selected Connections row" {
     const picker = runtime.pickerView();
     try std.testing.expectEqual(PickerStage.connections, picker.stage);
     try std.testing.expect((Choice{ .action = .setup }).eql(picker.selected_choice.?));
-    try std.testing.expect(picker.choiceIsSelected(picker.choiceAt(3).?));
+    try std.testing.expect(picker.choiceIsSelected(picker.choiceAt(4).?));
 }
 
 test "auth runtime saves and reloads through its injected secret store" {
