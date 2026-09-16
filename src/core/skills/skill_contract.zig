@@ -290,6 +290,14 @@ pub fn parseSkillFile(content: []const u8) ParsedSkillFile {
             previous_line_recognized = false;
             continue;
         }
+        // A top-level YAML key starts at column zero. An indented line belongs to
+        // a nested mapping or sequence, so a colon inside it does not introduce a
+        // skill key: a nested "description:" must not read as a duplicate, and a
+        // nested "name:" must not read as a second name.
+        if (line.bytes[0] == ' ' or line.bytes[0] == '\t') {
+            previous_line_recognized = false;
+            continue;
+        }
 
         const colon_idx = std.mem.find(u8, trimmed, ":") orelse {
             previous_line_recognized = false;
@@ -676,6 +684,32 @@ test "parseSkillFile with full frontmatter" {
     try std.testing.expectEqualStrings("my-skill", parsed.name.?);
     try std.testing.expectEqualStrings("Helps with testing", parsed.description.?);
     try std.testing.expectEqualStrings("# My Skill\n\nDo the thing.", parsed.body);
+}
+
+test "parseSkillFile ignores nested keys when detecting duplicates" {
+    // A skill may carry a nested metadata block (for example an installer's
+    // required environment variables). Indented keys belong to that block, so a
+    // nested "description:" is not a duplicate of the top-level one and the skill
+    // must still load.
+    const content =
+        \\---
+        \\name: nested
+        \\description: Top level description
+        \\version: 1.2.3
+        \\metadata:
+        \\  requires:
+        \\    envVars:
+        \\      - name: INNER
+        \\        required: false
+        \\        description: A nested description must not read as a duplicate.
+        \\        name: NOT_A_SECOND_NAME
+        \\---
+        \\Body
+    ;
+    const parsed = parseSkillFile(content);
+    try std.testing.expectEqual(MetadataStatus.valid, parsed.status);
+    try std.testing.expectEqualStrings("nested", parsed.name.?);
+    try std.testing.expectEqualStrings("Top level description", parsed.description.?);
 }
 
 test "parseSkillFile accepts supported description block forms" {
