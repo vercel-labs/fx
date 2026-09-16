@@ -835,6 +835,24 @@ const AskContext = struct {
         );
     }
 
+    /// Record whether restored history references shell execution handles this
+    /// process does not own. Registry membership, not the resume itself,
+    /// decides staleness (see session_runtime.detectStaleShellHandles).
+    fn updateStaleShellHandles(self: *AskContext, history: []const session_runtime.HistoryTurn) void {
+        self.session.has_stale_shell_handles = session_runtime.detectStaleShellHandles(
+            self.alloc,
+            history,
+            &self.managed_executions,
+        ) catch |err| blk: {
+            debug_trace.logf(
+                "session",
+                "event=stale_shell_handle_scan outcome=skipped err={s}",
+                .{@errorName(err)},
+            );
+            break :blk false;
+        };
+    }
+
     fn initializeSessionStores(self: *AskContext) !void {
         var store = session_store.Store.init(self.alloc, self.workspace_root) catch |err| {
             if (err == error.OutOfMemory or self.requested_resume != null) return err;
@@ -880,6 +898,7 @@ const AskContext = struct {
                 writable.state.history,
                 writable.state.permission_state,
             );
+            updateStaleShellHandles(self, writable.state.history);
             writable.releaseHydrationHistory(self.alloc);
             if (writable.state.usage) |usage| {
                 try self.session.usage.restore(
@@ -2265,6 +2284,7 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
         .access_scope = ctx.workspace_access.scope(ctx.workspace_root),
         .interactive = false,
         .permission_mode = ctx.permission_mode,
+        .stale_shell_handles = ctx.session.has_stale_shell_handles,
     }, arena, messages);
 }
 

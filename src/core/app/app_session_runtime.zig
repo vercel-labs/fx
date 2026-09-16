@@ -1953,6 +1953,25 @@ pub fn Runtime(comptime App: type) type {
             enableSessionStores(app);
         }
 
+        /// Record whether restored history references shell execution handles
+        /// this process does not own. Registry membership, not the resume
+        /// itself, decides staleness (see session_runtime.detectStaleShellHandles).
+        fn updateStaleShellHandles(app: *App, history: []const session_runtime.HistoryTurn) void {
+            if (comptime !@hasField(App, "managed_executions")) return;
+            app.session.has_stale_shell_handles = session_runtime.detectStaleShellHandles(
+                app.alloc,
+                history,
+                &app.managed_executions,
+            ) catch |err| blk: {
+                debug_trace.logf(
+                    "session",
+                    "event=stale_shell_handle_scan outcome=skipped err={s}",
+                    .{@errorName(err)},
+                );
+                break :blk false;
+            };
+        }
+
         fn hydrateResumedSession(
             app: *App,
             state: session_codec.DurableSessionState,
@@ -1973,6 +1992,7 @@ pub fn Runtime(comptime App: type) type {
                 state.history,
                 state.permission_state,
             );
+            updateStaleShellHandles(app, state.history);
             if (state.usage) |usage| {
                 try app.session.usage.restore(
                     app.alloc,

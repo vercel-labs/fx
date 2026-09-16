@@ -251,6 +251,9 @@ pub const TransientContextInput = struct {
     access_scope: ?workspace_access.AccessScope = null,
     interactive: bool,
     permission_mode: types.PermissionMode,
+    /// True when the resumed session history references shell execution handles
+    /// the current process does not own; the model must not reuse them.
+    stale_shell_handles: bool = false,
 };
 
 pub const Provider = struct {

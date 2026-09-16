@@ -2977,6 +2977,9 @@ fn permissionModeContext(permission_mode: types.PermissionMode) []const u8 {
     };
 }
 
+const stale_shell_handles_context =
+    "Runtime context: fx restarted since this session was last active, so earlier shell session_id handles no longer exist; stopping or interacting with them fails with ExecutionNotFound. Their processes are normally terminated when fx exits but can survive an unclean exit, so check for a survivor before starting a duplicate. Otherwise start fresh shell sessions instead of reusing earlier handles.";
+
 fn appendTransient(input: TransientContextInput, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
     const turn_context = try buildTurnContextFragmentForHost(
         arena,
@@ -2994,6 +2997,10 @@ fn appendTransient(input: TransientContextInput, arena: Allocator, messages: *st
     try messages.append(arena, .{ .role = .system, .content = content });
     try appendWorkspaceAccessContext(input.access_scope, arena, messages);
     try messages.append(arena, .{ .role = .system, .content = permissionModeContext(input.permission_mode) });
+    if (input.stale_shell_handles) try messages.append(arena, .{
+        .role = .system,
+        .content = stale_shell_handles_context,
+    });
     if (input.interactive) try messages.append(arena, .{
         .role = .system,
         .content = "Runtime context: if this turn changes files, choose focused verification from the touched areas first. Use changed paths in tool calls and results to select checks; avoid generic or expensive verification unless those paths justify it or the user requested it. Tests under tests/evals can be deterministic; do not assume they require live models. Preserve exact verification evidence in the final summary.",
@@ -3056,6 +3063,33 @@ fn expectContains(haystack: []const u8, needle: []const u8) !void {
 
 fn expectNotContains(haystack: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.find(u8, haystack, needle) == null);
+}
+
+test "runtime context includes stale shell handle note only when flagged" {
+    var rt = PromptContextFixture{};
+    defer rt.deinit(std.testing.allocator);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var plain: std.ArrayList(ChatMessage) = .empty;
+    try appendTransient(rt.transientInput(), arena, &plain);
+    for (plain.items) |msg| {
+        if (msg.content) |content| try expectNotContains(content, "earlier shell session_id handles no longer exist");
+    }
+
+    var flagged_input = rt.transientInput();
+    flagged_input.stale_shell_handles = true;
+    var flagged: std.ArrayList(ChatMessage) = .empty;
+    try appendTransient(flagged_input, arena, &flagged);
+    var found = false;
+    for (flagged.items) |msg| {
+        if (msg.content) |content| {
+            if (std.mem.find(u8, content, "earlier shell session_id handles no longer exist") != null) found = true;
+        }
+    }
+    try std.testing.expect(found);
 }
 
 test "runtime context composes exact auto mode with noninteractive blockers" {

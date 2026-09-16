@@ -1453,6 +1453,148 @@ test.skipIf(!tmuxAvailable())(
   60_000,
 );
 
+const STALE_HANDLE_NOTE = "earlier shell session_id handles no longer exist";
+
+function gatewaySawNote(gateway: ReturnType<typeof startFakeGateway>): boolean {
+  return gateway.requests.some((request) =>
+    JSON.stringify(request.body).includes(STALE_HANDLE_NOTE),
+  );
+}
+
+test.skipIf(!tmuxAvailable())(
+  "resume after process restart warns the model about stale shell handles",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-resume-stale-handles-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "full-access", permission: {} }),
+    );
+
+    const gateway = startFakeGateway([
+      fakeShellRun("call-run", "sleep 300", { yield_time_ms: 1_000 }),
+      fakeGatewayFinalText("STALE_NOTE_PHASE1_DONE"),
+    ]);
+    let active: TmuxSession | null = null;
+    let resumedGateway: ReturnType<typeof startFakeGateway> | null = null;
+    try {
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: workspace,
+        env: gatewayEnv(home, gateway),
+        stderrPath: join(root, "stderr.log"),
+        width: 100,
+        height: 30,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Start the watcher.");
+      await waitForScrollback(active, "STALE_NOTE_PHASE1_DONE");
+      expect(gatewaySawNote(gateway)).toBe(false);
+
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+      await active.kill();
+      active = null;
+
+      resumedGateway = startFakeGateway([fakeGatewayFinalText("STALE_NOTE_PHASE2_DONE")]);
+      active = await TmuxSession.create({
+        cmd: `${FX_BIN} --resume-last`,
+        cwd: workspace,
+        env: gatewayEnv(home, resumedGateway),
+        stderrPath: join(root, "stderr-resumed.log"),
+        width: 100,
+        height: 30,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Is the watcher still running?");
+      await waitForScrollback(active, "STALE_NOTE_PHASE2_DONE");
+      expect(gatewaySawNote(resumedGateway)).toBe(true);
+
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+    } finally {
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      gateway.stop();
+      resumedGateway?.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  60_000,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "picker resume with live shell handles omits the stale-handle note",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-resume-live-handles-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "full-access", permission: {} }),
+    );
+
+    const gateway = startFakeGateway([
+      fakeShellRun("call-run", "sleep 300", { yield_time_ms: 1_000 }),
+      fakeGatewayFinalText("LIVE_HANDLE_S1_DONE"),
+      fakeGatewayFinalText("LIVE_HANDLE_FOLLOWUP_DONE"),
+    ]);
+    let active: TmuxSession | null = null;
+    try {
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: workspace,
+        env: gatewayEnv(home, gateway),
+        stderrPath: join(root, "stderr.log"),
+        width: 100,
+        height: 30,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Start the watcher for session one.");
+      await waitForScrollback(active, "LIVE_HANDLE_S1_DONE");
+
+      await active.sendText("/new");
+      await active.waitForPane((pane) => hasEmptyComposer(stripAnsi(pane)), TIMEOUT);
+
+      await active.sendText("/resume");
+      await waitForSessionPicker(active);
+      await active.waitForPane(
+        (pane) => pane.includes("Start the watcher for session one.") && SESSION_PICKER_META_RE.test(pane),
+        TIMEOUT,
+      );
+      await active.sendKeys("Enter");
+      await waitForSessionPickerClosed(active);
+
+      await active.sendText("Checking in on the watcher.");
+      await waitForScrollback(active, "LIVE_HANDLE_FOLLOWUP_DONE");
+      expect(gateway.requests).toHaveLength(3);
+      expect(gatewaySawNote(gateway)).toBe(false);
+
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+    } finally {
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  60_000,
+);
+
 test.skipIf(!tmuxAvailable())(
   "Ctrl-O opens full retained command output and restores grouped compact output",
   async () => {
