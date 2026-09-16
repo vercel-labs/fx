@@ -4,6 +4,11 @@ const command_specs = @import("command_specs.zig");
 const SlashKind = command_specs.SlashKind;
 const SlashRegistry = command_specs.SlashRegistry;
 
+pub const InitPayload = struct {
+    extras: []const u8,
+    full: bool,
+};
+
 pub const ParsedCommand = union(enum) {
     quit,
     clear_screen,
@@ -38,9 +43,15 @@ pub const ParsedCommand = union(enum) {
     statusline: []const u8,
     notifications: []const u8,
     workspace: []const u8,
+    init: InitPayload,
     version,
     unknown,
 };
+
+fn noop_init_workspace(ctx: *anyopaque, opts: InitPayload) anyerror!void {
+    _ = ctx;
+    _ = opts;
+}
 
 pub const CommandHandlers = struct {
     ctx: *anyopaque,
@@ -77,12 +88,46 @@ pub const CommandHandlers = struct {
     rename_session: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_notifications: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_workspace: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
+    init_workspace: *const fn (ctx: *anyopaque, opts: InitPayload) anyerror!void = noop_init_workspace,
     show_version: *const fn (ctx: *anyopaque) anyerror!void,
     unknown: *const fn (ctx: *anyopaque, cmd: []const u8) anyerror!void,
 };
 
 fn command_payload(cmd: []const u8, prefix: []const u8) []const u8 {
     return std.mem.trim(u8, cmd[prefix.len..], " \t");
+}
+
+fn parse_init_payload(payload: []const u8) InitPayload {
+    var rest = std.mem.trim(u8, payload, " \t");
+    if (rest.len == 0) return .{ .extras = "", .full = false };
+    var full = false;
+    var tokens = std.mem.tokenizeAny(u8, rest, " \t");
+    while (tokens.next()) |token| {
+        if (std.mem.eql(u8, token, "--full")) {
+            full = true;
+            break;
+        }
+    }
+    if (!full) return .{ .extras = rest, .full = false };
+    while (true) {
+        const trimmed = std.mem.trim(u8, rest, " \t");
+        if (std.mem.eql(u8, trimmed, "--full")) return .{ .extras = "", .full = true };
+        if (std.mem.startsWith(u8, trimmed, "--full")) {
+            const after = trimmed["--full".len..];
+            if (after.len > 0 and (after[0] == ' ' or after[0] == '\t')) {
+                rest = std.mem.trim(u8, after, " \t");
+                continue;
+            }
+        }
+        if (std.mem.endsWith(u8, trimmed, "--full")) {
+            const before = trimmed[0 .. trimmed.len - "--full".len];
+            if (before.len > 0 and (before[before.len - 1] == ' ' or before[before.len - 1] == '\t')) {
+                rest = std.mem.trim(u8, before, " \t");
+                continue;
+            }
+        }
+        return .{ .extras = trimmed, .full = true };
+    }
 }
 
 fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
@@ -120,6 +165,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .statusline => .{ .statusline = payload },
         .notifications => .{ .notifications = payload },
         .workspace => .{ .workspace = payload },
+        .init => .{ .init = parse_init_payload(payload) },
         .version => .version,
     };
 }
@@ -172,6 +218,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .statusline => |rest| try handlers.handle_statusline(handlers.ctx, rest),
         .notifications => |rest| try handlers.handle_notifications(handlers.ctx, rest),
         .workspace => |rest| try handlers.handle_workspace(handlers.ctx, rest),
+        .init => |opts| try handlers.init_workspace(handlers.ctx, opts),
         .version => try handlers.show_version(handlers.ctx),
         .unknown => try handlers.unknown(handlers.ctx, cmd),
     }
@@ -384,6 +431,7 @@ test "parse payload acceptance follows slash spec metadata" {
 const TestContext = struct {
     called: []const u8 = "",
     payload: []const u8 = "",
+    full: bool = false,
 };
 
 fn testContext(ctx: *anyopaque) *TestContext {
@@ -439,6 +487,13 @@ fn recordUnknown(ctx: *anyopaque, value: []const u8) anyerror!void {
     test_context.payload = value;
 }
 
+fn record_init_workspace(ctx: *anyopaque, opts: InitPayload) anyerror!void {
+    const test_context = testContext(ctx);
+    test_context.called = "init";
+    test_context.payload = opts.extras;
+    test_context.full = opts.full;
+}
+
 fn failStatus(ctx: *anyopaque) anyerror!void {
     _ = ctx;
     return error.TestRouteFailure;
@@ -480,6 +535,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .rename_session = unexpectedPayload,
         .handle_notifications = unexpectedPayload,
         .handle_workspace = unexpectedPayload,
+        .init_workspace = noop_init_workspace,
         .show_version = unexpectedNoPayload,
         .unknown = unexpectedPayload,
     };
@@ -574,4 +630,60 @@ test "route propagates callback errors" {
     handlers.show_status = failStatus;
 
     try std.testing.expectError(error.TestRouteFailure, route(testSlashRegistry(), &handlers, "/status"));
+}
+
+test "route forwards init payload" {
+    var ctx: TestContext = .{};
+    var handlers = testHandlers(&ctx);
+    handlers.init_workspace = record_init_workspace;
+
+    try route(testSlashRegistry(), &handlers, "/init focus on docs --full");
+
+    try std.testing.expectEqualStrings("init", ctx.called);
+    try std.testing.expectEqualStrings("focus on docs", ctx.payload);
+    try std.testing.expect(ctx.full);
+}
+
+test "parse init bare returns empty extras without full" {
+    switch (parse(testSlashRegistry(), "/init")) {
+        .init => |opts| {
+            try std.testing.expectEqualStrings("", opts.extras);
+            try std.testing.expect(!opts.full);
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "parse init forwards extras passthrough" {
+    switch (parse(testSlashRegistry(), "/init focus on docs")) {
+        .init => |opts| {
+            try std.testing.expectEqualStrings("focus on docs", opts.extras);
+            try std.testing.expect(!opts.full);
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "parse init strips full flag" {
+    switch (parse(testSlashRegistry(), "/init --full")) {
+        .init => |opts| {
+            try std.testing.expectEqualStrings("", opts.extras);
+            try std.testing.expect(opts.full);
+        },
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/init focus on docs --full")) {
+        .init => |opts| {
+            try std.testing.expectEqualStrings("focus on docs", opts.extras);
+            try std.testing.expect(opts.full);
+        },
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/init --full focus on docs")) {
+        .init => |opts| {
+            try std.testing.expectEqualStrings("focus on docs", opts.extras);
+            try std.testing.expect(opts.full);
+        },
+        else => return error.TestExpectedEqual,
+    }
 }

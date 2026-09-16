@@ -10,6 +10,7 @@ const host = @import("../hosts/host.zig");
 const change_tracker_mod = @import("../workspace/change_tracker.zig");
 const command_router = @import("../slash_commands/command_router.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
+const init_prompt = @import("../workspace/init_prompt.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const editor_state = @import("../input/editor_state.zig");
@@ -325,6 +326,19 @@ fn writeWorkspaceSnapshot(
     }, true);
 }
 
+fn initWantsFull() bool {
+    const raw = io_mod.getenv("FX_INIT_MODE") orelse return false;
+    return std.ascii.eqlIgnoreCase(raw, "full");
+}
+
+fn initModeForWorkspace(alloc: std.mem.Allocator, workspace_root: []const u8) !init_prompt.Mode {
+    const path = try std.fs.path.join(alloc, &.{ workspace_root, "AGENTS.md" });
+    defer alloc.free(path);
+    const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{ .follow_symlinks = false }) catch return .create;
+    if (stat.kind != .file and stat.kind != .sym_link) return .create;
+    return .audit;
+}
+
 fn requestResumeExit(app: anytype) void {
     const App = @TypeOf(app.*);
     app_session_runtime.Runtime(App).requestResumeHandoff(app);
@@ -388,6 +402,7 @@ pub fn Handlers(comptime App: type) type {
                 .rename_session = commandRenameSession,
                 .handle_notifications = commandHandleNotifications,
                 .handle_workspace = commandHandleWorkspace,
+                .init_workspace = commandInitWorkspace,
                 .show_version = commandShowVersion,
                 .unknown = commandUnknown,
             };
@@ -2062,6 +2077,63 @@ pub fn Handlers(comptime App: type) type {
             try handleWorkspaceCommand(app, rest);
         }
 
+        fn commandInitWorkspace(ctx: *anyopaque, opts: command_router.InitPayload) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime !@hasField(App, "workspace_root")) {
+                try app.writeDomainNotice(.{
+                    .topic = "init",
+                    .tone = .@"error",
+                    .body = "Workspace root is unavailable in this runtime.",
+                }, true);
+                return;
+            }
+            if (comptime !@hasDecl(App, "enqueuePrompt")) {
+                try app.writeDomainNotice(.{
+                    .topic = "init",
+                    .tone = .@"error",
+                    .body = "Prompt submission is unavailable in this runtime.",
+                }, true);
+                return;
+            }
+            const mode = try initModeForWorkspace(app.alloc, app.workspace_root);
+            const want_full = opts.full or initWantsFull();
+            const prompt = if (want_full)
+                try init_prompt.buildFull(app.alloc, app.workspace_root, opts.extras, mode)
+            else
+                try init_prompt.buildDistilled(app.alloc, app.workspace_root, opts.extras, mode);
+            defer app.alloc.free(prompt);
+            const accepted = app.enqueuePrompt(prompt) catch |err| {
+                const message = try std.fmt.allocPrint(app.alloc, "Init prompt was rejected: {s}", .{@errorName(err)});
+                defer app.alloc.free(message);
+                try app.writeDomainNotice(.{
+                    .topic = "init",
+                    .tone = .@"error",
+                    .body = message,
+                }, true);
+                return;
+            };
+            if (!accepted) {
+                try app.writeDomainNotice(.{
+                    .topic = "init",
+                    .tone = .@"error",
+                    .body = "Init prompt was rejected by the worker.",
+                }, true);
+                return;
+            }
+            // No tryBeginWorkspaceMutation gate: normal prompt admission already queues during active work.
+            // Note: enqueuePrompt renders the full prompt as the user card
+            // (worker begin_prompt path). A short card here would render a
+            // second card, so the one-liner stays a notice until /init uses
+            // the presented-prompt flow.
+            const notice = try std.fmt.allocPrint(app.alloc, "Generating AGENTS.md ({s}, {s}).", .{ @tagName(mode), if (want_full) "full" else "distilled" });
+            defer app.alloc.free(notice);
+            try app.writeDomainNotice(.{
+                .topic = "init",
+                .tone = .neutral,
+                .body = notice,
+            }, true);
+        }
+
         fn commandShowVersion(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app.writeDomainNotice(.{
@@ -3433,6 +3505,80 @@ test "workspace list reports refresh rejection without replacing access" {
     try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Workspace refresh rejected: additional directory limit reached") != null);
     try std.testing.expectEqual(@as(usize, 0), app.access.entries.len);
+}
+
+const InitCommandFakeApp = struct {
+    alloc: std.mem.Allocator,
+    workspace_root: []const u8 = "",
+    submitted: ?[]u8 = null,
+    displayed: ?[]u8 = null,
+    last_topic: ?[]const u8 = null,
+    last_tone: ?types.NoticeTone = null,
+    last_body: ?[]u8 = null,
+    enqueue_calls: usize = 0,
+
+    fn deinit(self: *InitCommandFakeApp) void {
+        if (self.submitted) |owned| self.alloc.free(owned);
+        if (self.displayed) |owned| self.alloc.free(owned);
+        if (self.last_body) |owned| self.alloc.free(owned);
+    }
+
+    fn enqueuePrompt(self: *InitCommandFakeApp, prompt: []const u8) !bool {
+        self.enqueue_calls += 1;
+        if (self.submitted) |old| self.alloc.free(old);
+        self.submitted = try self.alloc.dupe(u8, prompt);
+        return true;
+    }
+
+    fn writeUserPromptCard(self: *InitCommandFakeApp, user: types.UserTurn) !void {
+        if (self.displayed) |old| self.alloc.free(old);
+        self.displayed = try self.alloc.dupe(u8, user.text);
+    }
+
+    noinline fn writeDomainNotice(self: *InitCommandFakeApp, notice: types.SemanticNotice, _: bool) !void {
+        self.last_topic = notice.topic;
+        self.last_tone = notice.tone;
+        if (self.last_body) |old| self.alloc.free(old);
+        self.last_body = try self.alloc.dupe(u8, notice.body);
+    }
+};
+
+test "init workspace auto-submits distilled create and full audit" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "fresh");
+    const fresh_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "fresh");
+    defer alloc.free(fresh_root);
+    var fresh = InitCommandFakeApp{ .alloc = alloc, .workspace_root = fresh_root };
+    defer fresh.deinit();
+    try Handlers(InitCommandFakeApp).commandInitWorkspace(@ptrCast(&fresh), .{ .extras = "", .full = false });
+    try std.testing.expectEqual(@as(usize, 1), fresh.enqueue_calls);
+    try std.testing.expect(fresh.submitted != null);
+    try std.testing.expect(std.mem.find(u8, fresh.submitted.?, "Mode: create") != null);
+    try std.testing.expect(std.mem.find(u8, fresh.submitted.?, "300") != null);
+    try std.testing.expect(fresh.displayed == null);
+    try std.testing.expect(fresh.last_body != null);
+    try std.testing.expect(std.mem.find(u8, fresh.last_body.?, "Generating AGENTS.md (create, distilled)") != null);
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "existing");
+    var guide = try tmp.dir.createFile(io_mod.getIo(), "existing/AGENTS.md", .{ .truncate = true });
+    defer guide.close(io_mod.getIo());
+    try guide.writeStreamingAll(io_mod.getIo(), "# guide\n");
+    const existing_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "existing");
+    defer alloc.free(existing_root);
+    var existing = InitCommandFakeApp{ .alloc = alloc, .workspace_root = existing_root };
+    defer existing.deinit();
+    try Handlers(InitCommandFakeApp).commandInitWorkspace(@ptrCast(&existing), .{ .extras = "focus on docs", .full = true });
+    try std.testing.expectEqual(@as(usize, 1), existing.enqueue_calls);
+    try std.testing.expect(std.mem.find(u8, existing.submitted.?, "Mode: audit") != null);
+    try std.testing.expect(std.mem.find(u8, existing.submitted.?, "AGENTS.md Builder") != null);
+    try std.testing.expect(std.mem.find(u8, existing.submitted.?, "focus on docs") != null);
+    try std.testing.expect(std.mem.find(u8, existing.submitted.?, existing_root) != null);
+    try std.testing.expect(existing.displayed == null);
+    try std.testing.expect(existing.last_body != null);
+    try std.testing.expect(std.mem.find(u8, existing.last_body.?, "Generating AGENTS.md (audit, full)") != null);
 }
 
 test "trace timeline retains semantic table contents" {
