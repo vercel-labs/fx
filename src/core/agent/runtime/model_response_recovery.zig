@@ -14,6 +14,11 @@ pub const FailureCause = enum {
     authentication,
     request_limit_reached,
     content_filter,
+    /// The provider stream violated the wire contract and could not be parsed.
+    /// Distinct from `transport_interrupted`: the transport was healthy, and a
+    /// partial response from a malformed stream must be discarded rather than
+    /// continued, so recovery replays the request from the beginning.
+    provider_stream_malformed,
 };
 
 pub const Delivery = enum {
@@ -110,6 +115,42 @@ pub const Decision = struct {
 pub noinline fn decide(evidence: Evidence) Decision {
     if (evidence.cancelled) return .{ .strategy = .stop };
 
+    // A provider stream that violated the wire contract. The request was sound
+    // and the connection was healthy, so the correct recovery is to replay the
+    // identical request from the beginning: a partial response produced by a
+    // malformed stream is not trustworthy enough to continue.
+    if (evidence.cause == .provider_stream_malformed) {
+        if (evidence.tool == .uncertain or evidence.tool == .confirmed) {
+            return .{
+                .strategy = .reconcile_tool,
+                .required_action = .inspect_uncertain_tool,
+            };
+        }
+        if (evidence.attempts.remaining() == 0) {
+            return .{
+                .strategy = .pause,
+                .required_action = .continue_later,
+            };
+        }
+        const next_pacing = evidence.pacing.afterFailure(
+            evidence.cause,
+            evidence.retry_after_seconds,
+        );
+        const delay_ns = if (evidence.retry_after_seconds) |seconds| blk: {
+            const bounded_seconds: u64 = @min(seconds, max_retry_after_seconds);
+            break :blk bounded_seconds * std.time.ns_per_s;
+        } else switch (next_pacing) {
+            .idle => unreachable,
+            .implicit => |pacing| retryDelayNs(pacing.attempt),
+        };
+        return .{
+            .strategy = .retry_request,
+            .delay_ns = delay_ns,
+            .next_pacing = next_pacing,
+            .reserve_provider_attempt = true,
+        };
+    }
+
     switch (evidence.cause) {
         .content_filter => return .{
             .strategy = .stop,
@@ -167,6 +208,49 @@ pub noinline fn decide(evidence: Evidence) Decision {
         .next_pacing = next_pacing,
         .reserve_provider_attempt = true,
     };
+}
+
+test "malformed provider streams replay the request instead of continuing" {
+    const base = Evidence{
+        .cause = .provider_stream_malformed,
+        .delivery = .possibly_sent,
+        .attempts = .{ .consumed = 1 },
+    };
+
+    const first = decide(base);
+    try std.testing.expectEqual(Strategy.retry_request, first.strategy);
+    try std.testing.expect(first.reserve_provider_attempt);
+    try std.testing.expectEqual(@as(u64, 250 * std.time.ns_per_ms), first.delay_ns);
+
+    // Output from a malformed stream is untrustworthy, so it is discarded and
+    // the request is replayed rather than continued.
+    var partial = base;
+    partial.output = .partial;
+    try std.testing.expectEqual(Strategy.retry_request, decide(partial).strategy);
+
+    // A tool that may have executed must be inspected, never replayed blindly.
+    var uncertain = base;
+    uncertain.tool = .uncertain;
+    const guarded = decide(uncertain);
+    try std.testing.expectEqual(Strategy.reconcile_tool, guarded.strategy);
+    try std.testing.expectEqual(RequiredAction.inspect_uncertain_tool, guarded.required_action);
+    try std.testing.expect(!guarded.reserve_provider_attempt);
+
+    var confirmed = base;
+    confirmed.tool = .confirmed;
+    try std.testing.expectEqual(Strategy.reconcile_tool, decide(confirmed).strategy);
+
+    // Budget exhaustion pauses instead of retrying without bound.
+    var exhausted = base;
+    exhausted.attempts = .{ .consumed = 10, .limit = 10 };
+    const paused = decide(exhausted);
+    try std.testing.expectEqual(Strategy.pause, paused.strategy);
+    try std.testing.expect(!paused.reserve_provider_attempt);
+
+    // Cancellation always wins.
+    var cancelled = base;
+    cancelled.cancelled = true;
+    try std.testing.expectEqual(Strategy.stop, decide(cancelled).strategy);
 }
 
 /// Delay before the next provider request after `attempt` consecutive implicit

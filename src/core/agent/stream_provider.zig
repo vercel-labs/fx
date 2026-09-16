@@ -88,6 +88,12 @@ pub const ProviderAttemptOwner = enum {
 pub const NetworkFailureCause = enum {
     transport_interrupted,
     system_resumed,
+    /// The provider delivered a stream that violates the wire contract and could
+    /// not be parsed (malformed chunk, unusable finish reason, tool arguments
+    /// that are not a JSON object). The transport itself was healthy, so this is
+    /// transient provider behavior rather than a local error, and replaying the
+    /// identical request is the correct recovery.
+    provider_stream_malformed,
 };
 
 /// Stable native transport evidence consumed by model recovery policy.

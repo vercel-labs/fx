@@ -23,9 +23,70 @@ pub fn networkFailureEvidence(
         .system_resumed
     else if (isRetryableAgentNetworkError(err))
         .transport_interrupted
+    else if (isMalformedProviderStreamError(err))
+        .provider_stream_malformed
     else
         return null;
     return .{ .cause = cause, .delivery = delivery };
+}
+
+/// Provider streams that break the Chat Completions wire contract. These are
+/// transient provider faults, not local failures: the request was well formed
+/// and the connection was healthy, so replaying the identical request is the
+/// correct recovery. Model recovery additionally requires that no tool was
+/// executed before it will actually retry, so listing an error here never
+/// replays an action that already ran.
+fn isMalformedProviderStreamError(err: anyerror) bool {
+    return err == error.InvalidChunk or
+        err == error.InconsistentFinishReason or
+        err == error.InvalidFinishReason or
+        err == error.IncompleteStream or
+        err == error.ConflictingIdentity or
+        err == error.UnexpectedToolCall or
+        err == error.InvalidToolCallId or
+        err == error.InvalidToolName or
+        err == error.InvalidToolArguments;
+}
+
+test "provider stream contract violations are retryable structural evidence" {
+    for ([_]anyerror{
+        error.InvalidChunk,
+        error.InconsistentFinishReason,
+        error.InvalidFinishReason,
+        error.IncompleteStream,
+        error.ConflictingIdentity,
+        error.UnexpectedToolCall,
+        error.InvalidToolCallId,
+        error.InvalidToolName,
+        error.InvalidToolArguments,
+    }) |err| {
+        const evidence = networkFailureEvidence(err, .possibly_sent) orelse
+            return error.TestExpectedNetworkFailureEvidence;
+        try std.testing.expectEqual(
+            agent_stream_provider.NetworkFailureCause.provider_stream_malformed,
+            evidence.cause,
+        );
+        try std.testing.expectEqual(
+            DeliveryCertainty.State.possibly_sent,
+            evidence.delivery,
+        );
+    }
+}
+
+test "terminal and local outcomes never become retry evidence" {
+    // A truncated response is a legitimate stop, not a provider fault, and the
+    // remaining outcomes are local or policy decisions. Retrying any of them
+    // would either discard real output or loop on an unchangeable condition.
+    for ([_]anyerror{
+        error.OutputTruncated,
+        error.ContentFiltered,
+        error.Refused,
+        error.RequiredToolMissing,
+        error.InvalidToolHistory,
+        error.Cancelled,
+    }) |err| {
+        try std.testing.expect(networkFailureEvidence(err, .possibly_sent) == null);
+    }
 }
 
 fn isRetryableAgentNetworkError(err: anyerror) bool {
