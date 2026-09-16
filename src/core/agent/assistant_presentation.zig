@@ -28,6 +28,7 @@ pub const MarkdownCompletions = payload.MarkdownCompletions;
 /// Allocator-owned assistant output queued for root or child presentation.
 pub const Event = union(enum) {
     text: []u8,
+    reasoning_text: []u8,
     table: TablePayload,
     code_block: CodeBlockPayload,
     thematic_rule,
@@ -35,6 +36,7 @@ pub const Event = union(enum) {
     pub fn clone(self: Event, alloc: Allocator) Allocator.Error!Event {
         return switch (self) {
             .text => |text| .{ .text = try alloc.dupe(u8, text) },
+            .reasoning_text => |text| .{ .reasoning_text = try alloc.dupe(u8, text) },
             .table => |table| .{ .table = try table.clone(alloc) },
             .code_block => |block| .{ .code_block = try block.clone(alloc) },
             .thematic_rule => .thematic_rule,
@@ -44,13 +46,14 @@ pub const Event = union(enum) {
     pub fn requiresTextDrain(self: Event) bool {
         return switch (self) {
             .text => false,
-            .table, .code_block, .thematic_rule => true,
+            .reasoning_text, .table, .code_block, .thematic_rule => true,
         };
     }
 
     pub fn retainedByteCount(self: Event) usize {
         return switch (self) {
             .text => |text| text.len,
+            .reasoning_text => |text| text.len,
             .table => |table| blk: {
                 var total: usize = table.alignments.len;
                 for (table.rows) |row| {
@@ -67,6 +70,7 @@ pub const Event = union(enum) {
     pub fn deinit(self: *Event, alloc: Allocator) void {
         switch (self.*) {
             .text => |text| alloc.free(text),
+            .reasoning_text => |text| alloc.free(text),
             .table => |*table| table.deinit(alloc),
             .code_block => |*block| block.deinit(alloc),
             .thematic_rule => {},

@@ -68,6 +68,23 @@ pub const Styles = transcript_blocks.Styles;
 pub const AssistantTurnSegments = transcript_blocks.AssistantTurnSegments;
 pub const RawEntryClass = transcript_blocks.RawEntryClass;
 pub const TranscriptEntry = transcript_blocks.TranscriptEntry;
+
+/// How often a streaming reasoning block may regenerate transcript bytes.
+const reasoning_render_min_interval_ms: i64 = 100;
+
+/// Accumulated reasoning text for the turn being displayed, plus the
+/// transcript entry it renders into. The entry stays in scrollback when the
+/// next turn resets the accumulator.
+pub const ReasoningDisplay = struct {
+    bytes: std.ArrayList(u8) = .empty,
+    entry_id: ?u32 = null,
+    last_render_ms: i64 = 0,
+    rendered_bytes: usize = 0,
+
+    pub fn deinit(self: *ReasoningDisplay, alloc: Allocator) void {
+        self.bytes.deinit(alloc);
+    }
+};
 pub const TranscriptPreparationSource = source_preparation.TranscriptPreparationSource;
 
 pub const VisibleTranscriptSnapshot = struct {
@@ -769,6 +786,63 @@ test "appendTurnSummaryEntry stores classified dim transcript row" {
     const rendered = try renderEntriesToBytes(alloc, runtime.entries.items, runtime.layout.cols, .{});
     defer alloc.free(rendered);
     try std.testing.expectEqualStrings("\x1b[38;5;245m  2m 10s (↑10k ↓5k)\x1b[0m\n", rendered);
+}
+
+test "reasoning display accumulates deltas into one throttled dim entry" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 20,
+            .divider_top_row = 21,
+            .input_row = 22,
+            .divider_bottom_row = 23,
+            .hint_row = 24,
+        },
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    try runtime.appendReasoningText(alloc, "thinking about");
+    try std.testing.expectEqual(@as(usize, 1), runtime.entries.items.len);
+    const entry_id = runtime.reasoning_display.entry_id.?;
+
+    // Second delta lands inside the throttle window: stored but not yet rendered.
+    try runtime.appendReasoningText(alloc, " the answer");
+    try std.testing.expect(std.mem.find(u8, runtime.entries.items[0].raw_bytes.bytes, "the answer") == null);
+
+    try runtime.flushReasoningDisplay(alloc);
+    try std.testing.expectEqual(entry_id, runtime.reasoning_display.entry_id.?);
+    const rendered = try renderEntriesToBytes(alloc, runtime.entries.items, runtime.layout.cols, .{});
+    defer alloc.free(rendered);
+    try std.testing.expectEqualStrings("\x1b[38;5;245mthinking about the answer\x1b[0m\n", rendered);
+}
+
+test "reasoning display reset starts a new entry and keeps the old one" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 20,
+            .divider_top_row = 21,
+            .input_row = 22,
+            .divider_bottom_row = 23,
+            .hint_row = 24,
+        },
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    try runtime.appendReasoningText(alloc, "first turn");
+    runtime.resetReasoningDisplay();
+    try std.testing.expect(runtime.reasoning_display.entry_id == null);
+
+    try runtime.appendReasoningText(alloc, "second turn");
+    try std.testing.expectEqual(@as(usize, 2), runtime.entries.items.len);
+    try std.testing.expect(std.mem.find(u8, runtime.entries.items[0].raw_bytes.bytes, "first turn") != null);
+    try std.testing.expect(std.mem.find(u8, runtime.entries.items[1].raw_bytes.bytes, "second turn") != null);
 }
 
 test "recovered route status is transient and final summary stays normal" {
@@ -4339,6 +4413,11 @@ pub const TranscriptRuntime = struct {
     /// When enabled, compact transcript tool groups render only their summary
     /// header while the full transcript retains every individual tool call.
     collapse_tool_calls: bool = false,
+    /// When enabled, streamed model reasoning renders as a dim transcript
+    /// block ahead of the answer (see /reasoning).
+    show_reasoning: bool = false,
+    /// Accumulator for the in-flight turn's displayed reasoning block.
+    reasoning_display: ReasoningDisplay = .{},
     /// Structured-entry store used to regenerate transcript bytes at the
     /// current width while retaining the raw byte buffer for append paths
     /// that still write pre-rendered transcript content.
@@ -4462,6 +4541,7 @@ pub const TranscriptRuntime = struct {
         self.full_transcript_page_load.deinit();
         self.discardInstalledFullTranscriptPage();
         self.compact_transcript_source_cache.deinit(alloc);
+        self.reasoning_display.deinit(alloc);
         self.lifecycle_state.deinit(alloc);
         for (self.tool_details.items) |*detail| detail.deinit(alloc);
         self.tool_details.deinit(alloc);
@@ -6332,6 +6412,54 @@ pub const TranscriptRuntime = struct {
         self.markTranscriptContentDirtyFrom(entry_id);
         if (self.worker_status.clear_recovered_route()) self.render_requests.request(.footer);
         return entry_id;
+    }
+
+    /// Appends streamed reasoning text to the current turn's dim transcript
+    /// block. Renders are throttled so token-rate deltas do not regenerate the
+    /// transcript byte buffer on every chunk; call flushReasoningDisplay at
+    /// stream boundaries to settle the tail.
+    pub fn appendReasoningText(self: *TranscriptRuntime, alloc: Allocator, text: []const u8) !void {
+        try self.reasoning_display.bytes.appendSlice(alloc, text);
+        const display = &self.reasoning_display;
+        if (display.entry_id != null and
+            io_mod.milliTimestamp() - display.last_render_ms < reasoning_render_min_interval_ms) return;
+        try self.renderReasoningDisplay(alloc);
+    }
+
+    /// Renders any buffered reasoning tail. Cheap no-op when fully rendered.
+    pub fn flushReasoningDisplay(self: *TranscriptRuntime, alloc: Allocator) !void {
+        const display = &self.reasoning_display;
+        if (display.rendered_bytes == display.bytes.items.len) return;
+        try self.renderReasoningDisplay(alloc);
+    }
+
+    /// Starts a fresh reasoning block for the next turn. Previous blocks stay
+    /// in scrollback as plain dim entries.
+    pub fn resetReasoningDisplay(self: *TranscriptRuntime) void {
+        self.reasoning_display.bytes.clearRetainingCapacity();
+        self.reasoning_display.entry_id = null;
+        self.reasoning_display.last_render_ms = 0;
+        self.reasoning_display.rendered_bytes = 0;
+    }
+
+    fn renderReasoningDisplay(self: *TranscriptRuntime, alloc: Allocator) !void {
+        const display = &self.reasoning_display;
+        if (display.bytes.items.len == 0) return;
+        const rendered = try std.fmt.allocPrint(alloc, "{s}{s}{s}\n", .{ ui_render.dim_style, display.bytes.items, ui_render.reset_style });
+        defer alloc.free(rendered);
+        if (display.entry_id) |entry_id| {
+            if (try self.updateRawBytesEntry(alloc, entry_id, rendered)) {
+                display.last_render_ms = io_mod.milliTimestamp();
+                display.rendered_bytes = display.bytes.items.len;
+                return;
+            }
+            // The entry vanished (transcript cleared); start a new one.
+            display.entry_id = null;
+        }
+        display.entry_id = try self.appendRawTranscriptEntryClassified(alloc, rendered, .unknown_raw);
+        display.last_render_ms = io_mod.milliTimestamp();
+        display.rendered_bytes = display.bytes.items.len;
+        if (display.entry_id) |entry_id| self.markTranscriptContentDirtyFrom(entry_id);
     }
 
     /// Swap the bytes of the `raw_bytes` entry with `entry_id` to a dup of

@@ -1283,6 +1283,17 @@ pub const TurnSummary = struct {
     thinking_duration_ms: u64 = 0,
     turn_duration_ms: u64 = 0,
     token_progress: TurnTokenProgress = .{},
+    /// Client-observed stream milestones of the turn's last model completion.
+    stream_timings: StreamTimings = .{},
+    /// Gateway generation id of the turn's last model completion. Exactly
+    /// gateway_generation_id_len bytes when set; stored inline so the summary
+    /// stays a pure value with no owned memory.
+    generation_id: ?[gateway_generation_id_len]u8 = null,
+
+    pub fn generationIdSlice(self: *const TurnSummary) ?[]const u8 {
+        if (self.generation_id == null) return null;
+        return &self.generation_id.?;
+    }
 };
 
 pub const ProviderFinishReason = enum {
@@ -1327,10 +1338,25 @@ pub const ProviderFailureCause = enum {
     rate_limited,
 };
 
+/// Client-observed stream milestones, in milliseconds from request body send.
+/// A null field means the stream ended without that milestone (or the request
+/// never ran a measured stream). Pure value; carries no owned memory.
+pub const StreamTimings = struct {
+    /// Response head received after the request body finished sending.
+    head_ms: ?u32 = null,
+    /// First reasoning-delta received after request send.
+    first_reasoning_ms: ?u32 = null,
+    /// First text-delta received after request send.
+    first_text_ms: ?u32 = null,
+    /// First tool call (tool-input-start or tool-call) after request send.
+    first_tool_call_ms: ?u32 = null,
+};
+
 pub const ModelCompletion = struct {
     content: ?[]const u8 = null,
     tool_calls: []const ToolCall = &.{},
     generation_id: ?[]const u8 = null,
+    stream_timings: StreamTimings = .{},
     billing: ?ProviderBilling = null,
     /// Gateway generation or resolved-model metadata was malformed or conflicting.
     generation_metadata_invalid: bool = false,
@@ -1446,8 +1472,10 @@ fn daysFromCivil(year_value: u32, month_value: u32, day_value: u32) i64 {
     return era * 146097 + day_of_era - 719468;
 }
 
+pub const gateway_generation_id_len: usize = 30;
+
 pub fn validGatewayGenerationId(id: []const u8) bool {
-    if (id.len != 30 or !std.mem.startsWith(u8, id, "gen_")) return false;
+    if (id.len != gateway_generation_id_len or !std.mem.startsWith(u8, id, "gen_")) return false;
     for (id[4..]) |char| switch (char) {
         '0'...'9', 'A'...'H', 'J'...'K', 'M'...'N', 'P'...'T', 'V'...'Z' => {},
         else => return false,

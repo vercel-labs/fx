@@ -494,6 +494,13 @@ function parseAskJson(stdout: string): {
   session_id: string;
   tool_calls: Array<{ name: string; status: string }>;
   usage: { input_tokens: number | null; output_tokens: number | null };
+  stream?: {
+    generation_id?: string;
+    head_ms?: number;
+    first_reasoning_ms?: number;
+    first_text_ms?: number;
+    first_tool_call_ms?: number;
+  };
   recovery?: {
     state: string;
     kind: string;
@@ -817,6 +824,94 @@ async function waitForMcpServerReady(
 }
 
 describe("gateway stream lifecycle", () => {
+  test("ask --json reports stream milestones and generation id", async () => {
+    const root = createFixtureRoot("stream-stats");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startDynamicFakeGateway(
+      () =>
+        fakeGatewaySse([
+          { type: "reasoning-delta", id: "reasoning_1", delta: "STREAM_STATS_REASONING" },
+          { type: "text-delta", id: "answer_1", delta: "STREAM_STATS_ANSWER" },
+          {
+            type: "finish",
+            finishReason: { unified: "stop", raw: "stop" },
+            usage: { inputTokens: { total: 3 }, outputTokens: { total: 5 } },
+            providerMetadata: { gateway: { generationId: "gen_01M2MHJSKXW70AFEQ8DTNFD31D" } },
+          },
+        ]),
+      { models: [{ id: MODEL, type: "language", tags: ["tool-use"], context_window: 100_000 }] },
+    );
+    try {
+      const result = await runFx(["ask", "--json", "--no-save", "say hello"], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 30_000,
+      });
+      if (result.code !== 0) throw new Error(`stream stats ask failed: ${result.stderr}\n${result.stdout}`);
+      const output = parseAskJson(result.stdout);
+      expect(output.exit_code).toBe(0);
+      const stream = output.stream;
+      if (!stream) throw new Error(`missing stream stats: ${result.stdout}`);
+      expect(stream.generation_id).toBe("gen_01M2MHJSKXW70AFEQ8DTNFD31D");
+      expect(Number.isInteger(stream.head_ms)).toBe(true);
+      expect(Number.isInteger(stream.first_reasoning_ms)).toBe(true);
+      expect(Number.isInteger(stream.first_text_ms)).toBe(true);
+      expect(stream.first_tool_call_ms).toBeUndefined();
+      expect(stream.first_reasoning_ms!).toBeLessThanOrEqual(stream.first_text_ms!);
+      expect(stream.head_ms!).toBeLessThanOrEqual(stream.first_text_ms!);
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).toContain("event=stream_complete");
+      expect(trace).toContain("generation_id=gen_01M2MHJSKXW70AFEQ8DTNFD31D");
+      expect(trace).toContain("first_reasoning_ms=");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test.skipIf(!tmuxAvailable())("/reasoning toggles the streamed reasoning transcript block", async () => {
+    const root = createFixtureRoot("reasoning-toggle");
+    const gateway = startDynamicFakeGateway(
+      () =>
+        fakeGatewaySse([
+          { type: "reasoning-delta", id: "reasoning_1", delta: "REASONING_TOGGLE_MARKER thinking" },
+          { type: "text-delta", id: "answer_1", delta: "REASONING_TOGGLE_ANSWER" },
+          {
+            type: "finish",
+            finishReason: { unified: "stop", raw: "stop" },
+            usage: { inputTokens: { total: 3 }, outputTokens: { total: 5 } },
+          },
+        ]),
+      { models: [{ id: MODEL, type: "language", tags: ["tool-use"], context_window: 100_000 }] },
+    );
+    let tui: TmuxSession | undefined;
+    try {
+      tui = await TmuxSession.create({
+        cmd: JSON.stringify(FX_BIN), cwd: root.workspace, isolated: true, remainOnExit: true,
+        stderrPath: join(root.root, "stderr.log"),
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root.home,
+          AI_GATEWAY_API_KEY: "fake-reasoning-toggle", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
+          FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_SKIP_ONBOARDING: "1", FX_MODEL: MODEL,
+          FX_PERMISSION_MODE: "full-access", FX_MAX_AGENT_STEPS: "3",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+        },
+      });
+      await tui.sendText("first turn");
+      await tui.waitForText("REASONING_TOGGLE_ANSWER", 15_000);
+      // Reasoning stays out of the transcript while the display is off.
+      expect(await tui.captureFullScrollback()).not.toContain("REASONING_TOGGLE_MARKER");
+      await tui.sendText("/reasoning on");
+      await tui.waitForText("reasoning: on", 5_000);
+      await tui.sendText("second turn");
+      await tui.waitForText("REASONING_TOGGLE_MARKER", 15_000);
+      await tui.waitForText("REASONING_TOGGLE_ANSWER", 15_000);
+    } finally {
+      if (tui) await tui.kill();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45_000);
+
   test("skill context keeps complete scoped resources visible through saved tool results", async () => {
     const root = createFixtureRoot("complete-skill-resources");
     writeLargeSkillCatalog(root.workspace, 48);

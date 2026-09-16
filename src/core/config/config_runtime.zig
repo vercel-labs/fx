@@ -53,6 +53,7 @@ pub const Settings = struct {
     fast_mode_model_bound: ?bool = null,
     slash_menu_categories: ?bool = null,
     collapse_tool_calls: ?bool = null,
+    show_reasoning: ?bool = null,
     auto_upgrade: ?bool = null,
     update_channel: ?update_target.Channel = null,
     startup_scrollback: ?bool = null,
@@ -123,6 +124,7 @@ pub const ConfigSources = struct {
     fast_mode_model_bound: ConfigSource = .compiled_default,
     slash_menu_categories: ConfigSource = .compiled_default,
     collapse_tool_calls: ConfigSource = .compiled_default,
+    show_reasoning: ConfigSource = .compiled_default,
     startup_scrollback: ConfigSource = .compiled_default,
     prompt_history_enabled: ConfigSource = .compiled_default,
     statusline_context: ConfigSource = .compiled_default,
@@ -632,6 +634,7 @@ fn hasLegacyWorkspacePreferences(root: std.json.Value) bool {
             "fast_mode_model_bound",
             "slash_menu_categories",
             "collapse_tool_calls",
+            "show_reasoning",
             "startup_scrollback",
         }) |key| {
             if (workspace.contains(key)) return true;
@@ -664,6 +667,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "fast_mode_model_bound",
         "slash_menu_categories",
         "collapse_tool_calls",
+        "show_reasoning",
         "session_titles",
         "startup_scrollback",
         "prompt_history",
@@ -754,6 +758,7 @@ fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: Conf
     if (settings.fast_mode_model_bound != null) sources.fast_mode_model_bound = source;
     if (settings.slash_menu_categories != null) sources.slash_menu_categories = source;
     if (settings.collapse_tool_calls != null) sources.collapse_tool_calls = source;
+    if (settings.show_reasoning != null) sources.show_reasoning = source;
     if (settings.session_titles != null) sources.session_titles = source;
     if (settings.startup_scrollback != null) sources.startup_scrollback = source;
     if (settings.prompt_history_enabled != null) sources.prompt_history_enabled = source;
@@ -1540,6 +1545,12 @@ fn parseProfileOnlyFields(
         settings.collapse_tool_calls = value.bool;
     }
 
+    if (root.object.get("show_reasoning")) |show_reasoning_value| {
+        const value = show_reasoning_value;
+        if (value != .bool) return error.InvalidShowReasoningType;
+        settings.show_reasoning = value.bool;
+    }
+
     if (root.object.get("session_titles")) |session_titles_value| {
         const value = session_titles_value;
         if (value != .bool) return error.InvalidSessionTitlesType;
@@ -1670,6 +1681,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.fast_mode_model_bound) |value| target.fast_mode_model_bound = value;
     if (incoming.slash_menu_categories) |value| target.slash_menu_categories = value;
     if (incoming.collapse_tool_calls) |value| target.collapse_tool_calls = value;
+    if (incoming.show_reasoning) |value| target.show_reasoning = value;
     if (incoming.session_titles) |value| target.session_titles = value;
     if (incoming.auto_upgrade) |value| target.auto_upgrade = value;
     if (incoming.update_channel) |value| target.update_channel = value;

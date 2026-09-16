@@ -42,6 +42,8 @@ fn discardTable(_: *anyopaque, table: assistant_presentation.TablePayload) !void
     owned.deinit(std.heap.c_allocator);
 }
 
+fn discardReasoning(_: *anyopaque, _: []const u8) !void {}
+
 fn discardCodeBlock(_: *anyopaque, block: assistant_presentation.CodeBlockPayload) !void {
     var owned = block;
     owned.deinit(std.heap.c_allocator);
@@ -66,6 +68,7 @@ pub const WorkerEventHandlers = struct {
     write_user_prompt: *const fn (*anyopaque, types.UserTurn) anyerror!void,
     write_user_prompt_with_skill_bindings: ?*const fn (*anyopaque, types.UserTurn, []const worker_runtime.SkillBinding, []const worker_runtime.SkillDisplaySpan) anyerror!void = null,
     append_text: *const fn (*anyopaque, []const u8) anyerror!void,
+    append_reasoning: *const fn (*anyopaque, []const u8) anyerror!void = discardReasoning,
     append_table: *const fn (*anyopaque, assistant_presentation.TablePayload) anyerror!void = discardTable,
     append_code_block: *const fn (*anyopaque, assistant_presentation.CodeBlockPayload) anyerror!void = discardCodeBlock,
     append_thematic_rule: *const fn (*anyopaque) anyerror!void = discardThematicRule,
@@ -603,6 +606,21 @@ pub fn Runtime(comptime App: type) type {
             );
         }
 
+        /// Reasoning deltas always queue as presentation events (never the
+        /// direct pushText path) so they cannot overtake unpaced answer text.
+        pub fn pushReasoning(app: *App, text: []const u8) !void {
+            try pushEvent(app, .{ .assistant_presentation = .{
+                .reasoning_text = @constCast(text),
+            } });
+            debug_trace.eventf(
+                "worker",
+                "reasoning_chunk_received",
+                .{},
+                "chunk_bytes={d}",
+                .{text.len},
+            );
+        }
+
         pub fn pushTable(app: *App, table: assistant_presentation.TablePayload) !void {
             try pushEvent(app, .{ .assistant_presentation = .{ .table = table } });
         }
@@ -1038,6 +1056,16 @@ pub fn Runtime(comptime App: type) type {
                                 debug_trace.eventf(
                                     "worker",
                                     "assistant_chunk_applied",
+                                    .{},
+                                    "chunk_bytes={d}",
+                                    .{text.len},
+                                );
+                            },
+                            .reasoning_text => |text| {
+                                try handlers.append_reasoning(handlers.ctx, text);
+                                debug_trace.eventf(
+                                    "worker",
+                                    "reasoning_chunk_applied",
                                     .{},
                                     "chunk_bytes={d}",
                                     .{text.len},

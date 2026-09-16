@@ -387,6 +387,7 @@ pub fn Handlers(comptime App: type) type {
                 .handle_statusline = commandHandleStatusline,
                 .rename_session = commandRenameSession,
                 .handle_notifications = commandHandleNotifications,
+                .handle_reasoning = commandHandleReasoning,
                 .handle_workspace = commandHandleWorkspace,
                 .show_version = commandShowVersion,
                 .unknown = commandUnknown,
@@ -2047,6 +2048,11 @@ pub fn Handlers(comptime App: type) type {
         fn commandHandleNotifications(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try handleNotificationsCommand(app, rest);
+        }
+
+        fn commandHandleReasoning(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try handleReasoningCommand(app, rest);
         }
 
         fn commandHandleWorkspace(ctx: *anyopaque, rest: []const u8) !void {
@@ -3741,6 +3747,31 @@ fn parseSoundLevel(value: []const u8) ?SoundLevel {
     return null;
 }
 
+fn handleReasoningCommand(app: anytype, rest: []const u8) !void {
+    const trimmed = std.mem.trim(u8, rest, " \t");
+    // Bare /reasoning toggles the current state.
+    const enabled = if (trimmed.len == 0)
+        !app.shell.show_reasoning
+    else
+        parseOnOff(trimmed) orelse {
+            try app.writeDomainNotice(.{
+                .topic = "",
+                .tone = .@"error",
+                .body = "usage: /reasoning [on|off]",
+            }, true);
+            return;
+        };
+    try applySettingsCatalogChange(app, .{
+        .setting = .show_reasoning,
+        .value = if (enabled) "on" else "off",
+    });
+    try app.writeDomainNotice(.{
+        .topic = "reasoning",
+        .tone = .neutral,
+        .body = if (app.shell.show_reasoning) "on" else "off",
+    }, true);
+}
+
 fn handleNotificationsCommand(app: anytype, rest: []const u8) !void {
     const current = app.notificationPreferences();
     const level: SoundLevel = switch (parseSoundCommand(rest)) {
@@ -3819,6 +3850,9 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
     if (comptime @hasField(App, "shell") and @hasField(@TypeOf(app.shell), "collapse_tool_calls")) {
         snapshot.collapse_tool_calls = app.shell.collapse_tool_calls;
     }
+    if (comptime @hasField(App, "shell") and @hasField(@TypeOf(app.shell), "show_reasoning")) {
+        snapshot.show_reasoning = app.shell.show_reasoning;
+    }
     if (comptime @hasField(App, "statusline_context")) snapshot.statusline_context = app.statusline_context;
     if (comptime @hasField(App, "statusline_session")) snapshot.statusline_session = app.statusline_session;
     if (comptime @hasField(App, "session_title_generation")) snapshot.session_titles = app.session_title_generation;
@@ -3893,6 +3927,20 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
                 app,
                 "collapse tool calls",
                 .{ .collapse_tool_calls = enabled },
+                runtime_changed,
+            );
+        },
+        .show_reasoning => {
+            const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
+            const runtime_changed = enabled != app.shell.show_reasoning;
+            if (runtime_changed) {
+                app.shell.show_reasoning = enabled;
+                if (!enabled) app.shell.resetReasoningDisplay();
+            }
+            try persistUserPreferences(
+                app,
+                "reasoning text",
+                .{ .show_reasoning = enabled },
                 runtime_changed,
             );
         },

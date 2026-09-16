@@ -53,6 +53,12 @@ fx automatically compacts context at 80% of the selected model's usable input ca
 
 Recent complete tool exchanges stay in context within a budget; older available results remain accessible through stored handles. Compaction uses the model's normal input/output limits and settings, validates the finished context, and switches only after the checkpoint is committed. Failed or cancelled compaction keeps the previous committed context. A saved session can resume from that checkpoint and later saved work.
 
+### Reasoning display and stream diagnostics
+
+Thinking-capable models may stream reasoning before the visible answer. Run `/reasoning on` in the shell (or toggle "Reasoning text" in `/settings`) to show that reasoning as dim text while it streams.
+
+For latency investigation, `fx ask --json` reports per-request stream milestones under `stream`: `head_ms` (request send to response headers), `first_reasoning_ms`, `first_text_ms`, `first_tool_call_ms` (all relative to request send), and the gateway `generation_id` for the turn's last model call. The same milestones plus edge correlation headers (`x-vercel-id`, `Date`, `x-matched-path`) are logged for every gateway request when `FX_TRACE=1 FX_TRACE_SCOPES=gateway,stream` is set, written to `FX_TRACE_LOG` when provided.
+
 ## Custom model connections
 
 The native CLI can use a user-configured OpenAI Chat Completions endpoint, including local servers and gateways such as Ollama and OpenRouter. Add named connections to `~/.fx/settings.json`; keep existing unrelated settings. For example:

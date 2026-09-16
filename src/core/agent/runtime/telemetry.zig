@@ -83,6 +83,8 @@ pub const TurnSummaryAccumulator = struct {
     thinking_duration_ms: u64 = 0,
     settled_token_progress: types.TurnTokenProgress = .{},
     active_token_request: ?ActiveTokenRequest = null,
+    last_stream_timings: types.StreamTimings = .{},
+    last_generation_id: ?[types.gateway_generation_id_len]u8 = null,
 
     pub fn init(turn_started_at_ms: i64, submitted_prompt: []const u8) TurnSummaryAccumulator {
         var estimator = token_estimate.StreamingEstimator{};
@@ -99,6 +101,19 @@ pub const TurnSummaryAccumulator = struct {
     pub fn addThinkingWait(self: *TurnSummaryAccumulator, started_at_ms: i64, ended_at_ms: i64) void {
         if (ended_at_ms <= started_at_ms) return;
         self.thinking_duration_ms += @intCast(ended_at_ms - started_at_ms);
+    }
+
+    /// Records the client-observed stream milestones of a settled model
+    /// completion. Later completions overwrite earlier ones, so the finished
+    /// summary carries the stats of the step the user waited on last.
+    pub fn noteGenerationStats(self: *TurnSummaryAccumulator, timings: types.StreamTimings, generation_id: ?[]const u8) void {
+        self.last_stream_timings = timings;
+        self.last_generation_id = null;
+        const id = generation_id orelse return;
+        if (id.len != types.gateway_generation_id_len) return;
+        var buf: [types.gateway_generation_id_len]u8 = undefined;
+        @memcpy(&buf, id);
+        self.last_generation_id = buf;
     }
 
     pub fn prepareTokenRequest(self: *TurnSummaryAccumulator) void {
@@ -176,6 +191,8 @@ pub const TurnSummaryAccumulator = struct {
             .thinking_duration_ms = self.thinking_duration_ms,
             .turn_duration_ms = @intCast(elapsed),
             .token_progress = self.tokenProgress(),
+            .stream_timings = self.last_stream_timings,
+            .generation_id = self.last_generation_id,
         };
     }
 };
@@ -354,6 +371,35 @@ test "turn token progress counts only the submitted prompt once" {
         .input_exact = false,
         .output_exact = false,
     }, accumulator.tokenProgress());
+}
+
+test "finished turn summary carries the last generation's stream stats" {
+    var accumulator = TurnSummaryAccumulator.init(0, "hi");
+
+    accumulator.noteGenerationStats(.{ .head_ms = 40, .first_text_ms = 900 }, null);
+    accumulator.noteGenerationStats(.{
+        .head_ms = 55,
+        .first_reasoning_ms = 120,
+        .first_text_ms = 4800,
+    }, "gen_01M2JE74VF1DM93P5EH6G00000");
+
+    const summary = accumulator.finish();
+    try std.testing.expectEqual(@as(?u32, 55), summary.stream_timings.head_ms);
+    try std.testing.expectEqual(@as(?u32, 120), summary.stream_timings.first_reasoning_ms);
+    try std.testing.expectEqual(@as(?u32, 4800), summary.stream_timings.first_text_ms);
+    try std.testing.expect(summary.stream_timings.first_tool_call_ms == null);
+    try std.testing.expectEqualStrings("gen_01M2JE74VF1DM93P5EH6G00000", summary.generationIdSlice().?);
+}
+
+test "generation stats reject malformed generation ids" {
+    var accumulator = TurnSummaryAccumulator.init(0, "hi");
+
+    accumulator.noteGenerationStats(.{ .head_ms = 40 }, "not-a-generation-id");
+
+    const summary = accumulator.finish();
+    try std.testing.expectEqual(@as(?u32, 40), summary.stream_timings.head_ms);
+    try std.testing.expect(summary.generation_id == null);
+    try std.testing.expect(summary.generationIdSlice() == null);
 }
 
 test "turn token progress advances while the model composes a tool call" {

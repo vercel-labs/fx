@@ -343,6 +343,10 @@ pub fn Bindings(comptime App: type) type {
                 .propagate_grant = agentPropagateGrant,
                 .push_event = agentPushEvent,
                 .push_text = agentPushText,
+                .push_reasoning_delta = if (comptime @hasField(App, "shell") and @hasField(@TypeOf(app.shell), "show_reasoning"))
+                    agentPushReasoningDelta
+                else
+                    null,
                 .push_tool_lifecycle = agentPushToolLifecycle,
                 .push_diff_block = agentPushDiffBlock,
                 .push_system_notice = agentPushSystemNotice,
@@ -457,6 +461,7 @@ pub fn Bindings(comptime App: type) type {
                 .write_user_prompt = workerBridgeWriteUserPrompt,
                 .write_user_prompt_with_skill_bindings = workerBridgeWriteUserPromptWithSkillBindings,
                 .append_text = workerBridgeAppendText,
+                .append_reasoning = workerBridgeAppendReasoning,
                 .append_table = workerBridgeAppendTable,
                 .append_code_block = workerBridgeAppendCodeBlock,
                 .append_thematic_rule = workerBridgeAppendThematicRule,
@@ -1197,6 +1202,12 @@ pub fn Bindings(comptime App: type) type {
             }
         }
 
+        fn agentPushReasoningDelta(ctx: *anyopaque, delta: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (!app.shell.show_reasoning) return;
+            try app_worker_runtime.Runtime(App).pushReasoning(app, delta);
+        }
+
         fn agentPushTable(ctx: *anyopaque, table: assistant_presentation.TablePayload) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app_worker_runtime.Runtime(App).pushTable(app, table);
@@ -1379,6 +1390,9 @@ pub fn Bindings(comptime App: type) type {
 
         fn workerBridgeWriteUserPrompt(ctx: *anyopaque, prompt: types.UserTurn) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime @hasField(@TypeOf(app.shell), "reasoning_display")) {
+                app.shell.resetReasoningDisplay();
+            }
             try app.writeUserPromptCard(prompt);
         }
 
@@ -1399,6 +1413,13 @@ pub fn Bindings(comptime App: type) type {
         fn workerBridgeAppendText(ctx: *anyopaque, text: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app.pacer.enqueue(app.alloc, text);
+        }
+
+        fn workerBridgeAppendReasoning(ctx: *anyopaque, text: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime @hasField(@TypeOf(app.shell), "show_reasoning")) {
+                try app.shell.appendReasoningText(app.alloc, text);
+            }
         }
 
         fn workerBridgeAppendTable(ctx: *anyopaque, table: assistant_presentation.TablePayload) !void {
@@ -1443,6 +1464,9 @@ pub fn Bindings(comptime App: type) type {
                 io_mod.nanoTimestamp(),
                 app.pacerCallbacks(),
             );
+            if (comptime @hasField(@TypeOf(app.shell), "reasoning_display")) {
+                try app.shell.flushReasoningDisplay(app.alloc);
+            }
             return .drained;
         }
 
@@ -1596,7 +1620,7 @@ const FakeWorker = struct {
             switch (event) {
                 .assistant_presentation => |presentation| switch (presentation) {
                     .table, .code_block => return error.TestSemanticPresentationPublicationFailure,
-                    .text, .thematic_rule => {},
+                    .text, .reasoning_text, .thematic_rule => {},
                 },
                 else => {},
             }

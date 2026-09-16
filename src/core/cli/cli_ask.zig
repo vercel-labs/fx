@@ -294,6 +294,10 @@ pub const PromptRunResult = struct {
     session_id: []u8 = &.{},
     tool_calls: []ToolCallRecord = &.{},
     step_count: usize = 0,
+    /// Client-observed stream milestones and gateway generation id of the
+    /// turn's last model completion, for gateway latency investigation.
+    stream_timings: types.StreamTimings = .{},
+    generation_id: ?[types.gateway_generation_id_len]u8 = null,
     error_code: ?[]const u8 = null,
     auth_failure: ?auth_runtime.FailureSnapshot = null,
     recovery: ?types.RouteRecoveryStatus = null,
@@ -596,6 +600,8 @@ const AskContext = struct {
     tool_call_records_mutex: std.Io.Mutex = .init,
     web_search_progress_mutex: std.Io.Mutex = .init,
     step_count: usize = 0,
+    stream_timings: types.StreamTimings = .{},
+    generation_id: ?[types.gateway_generation_id_len]u8 = null,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
     web_search_runtime: web_search_runtime.Runtime,
     capability_resolver: gateway_provider.CapabilityResolver = .{},
@@ -2001,6 +2007,8 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
         .session_id = session_id,
         .tool_calls = tool_calls,
         .step_count = ctx.step_count,
+        .stream_timings = ctx.stream_timings,
+        .generation_id = ctx.generation_id,
         .error_code = ctx.typed_error_code,
         .auth_failure = ctx.auth_failure,
         .recovery = ctx.last_recovery_status,
@@ -3068,6 +3076,10 @@ fn pushEvent(raw_ctx: *anyopaque, event: WorkerEvent) !void {
     switch (event) {
         .clear_route_recovery_status => ctx.last_recovery_status = null,
         .finish_prompt => |finished| {
+            if (finished.summary) |summary| {
+                ctx.stream_timings = summary.stream_timings;
+                ctx.generation_id = summary.generation_id;
+            }
             ctx.final_output.clearRetainingCapacity();
             if (finished.terminal_outcome == .completed) switch (finished.turn) {
                 .assistant => |turn| {
@@ -4000,6 +4012,39 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
         .input_tokens = result.usage.input_tokens,
         .output_tokens = result.usage.output_tokens,
     }, .{}, &out.writer);
+    const timings = result.stream_timings;
+    if (timings.head_ms != null or timings.first_reasoning_ms != null or
+        timings.first_text_ms != null or timings.first_tool_call_ms != null or
+        result.generation_id != null)
+    {
+        try out.writer.writeAll(",\"stream\":{");
+        var first_field = true;
+        if (result.generation_id) |id| {
+            try out.writer.writeAll("\"generation_id\":");
+            try std.json.Stringify.value(@as([]const u8, &id), .{}, &out.writer);
+            first_field = false;
+        }
+        if (timings.head_ms) |head_ms| {
+            if (!first_field) try out.writer.writeByte(',');
+            try out.writer.print("\"head_ms\":{d}", .{head_ms});
+            first_field = false;
+        }
+        if (timings.first_reasoning_ms) |value| {
+            if (!first_field) try out.writer.writeByte(',');
+            try out.writer.print("\"first_reasoning_ms\":{d}", .{value});
+            first_field = false;
+        }
+        if (timings.first_text_ms) |value| {
+            if (!first_field) try out.writer.writeByte(',');
+            try out.writer.print("\"first_text_ms\":{d}", .{value});
+            first_field = false;
+        }
+        if (timings.first_tool_call_ms) |value| {
+            if (!first_field) try out.writer.writeByte(',');
+            try out.writer.print("\"first_tool_call_ms\":{d}", .{value});
+        }
+        try out.writer.writeByte('}');
+    }
     if (result.error_code) |error_code| {
         try out.writer.writeAll(",\"error\":");
         try std.json.Stringify.value(error_code, .{}, &out.writer);
@@ -7098,6 +7143,38 @@ test "final ask json keeps shell tool call shape and adds command result" {
     try std.testing.expectEqualStrings("command", command_result.get("kind").?.string);
     try std.testing.expectEqual(@as(i64, 0), command_result.get("exit_code").?.integer);
     try std.testing.expectEqual(@as(i64, 2), command_result.get("stdout_bytes").?.integer);
+    try std.testing.expect(parsed.value.object.get("stream") == null);
+}
+
+test "final ask json includes stream stats when measured" {
+    const alloc = std.testing.allocator;
+    var generation_id: [types.gateway_generation_id_len]u8 = undefined;
+    @memcpy(&generation_id, "gen_01M2JE74VF1DM93P5EH6G00000");
+    const result = PromptRunResult{
+        .exit_code = 0,
+        .assistant_output = try alloc.dupe(u8, "ok"),
+        .model = try alloc.dupe(u8, "test-model"),
+        .session_id = try alloc.dupe(u8, "session-1"),
+        .step_count = 1,
+        .stream_timings = .{
+            .head_ms = 120,
+            .first_reasoning_ms = 340,
+            .first_text_ms = 5100,
+        },
+        .generation_id = generation_id,
+    };
+    defer result.deinit(alloc);
+
+    const rendered = try renderFinalJsonResult(alloc, result);
+    defer alloc.free(rendered);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, rendered, .{});
+    defer parsed.deinit();
+    const stream = parsed.value.object.get("stream").?.object;
+    try std.testing.expectEqualStrings("gen_01M2JE74VF1DM93P5EH6G00000", stream.get("generation_id").?.string);
+    try std.testing.expectEqual(@as(i64, 120), stream.get("head_ms").?.integer);
+    try std.testing.expectEqual(@as(i64, 340), stream.get("first_reasoning_ms").?.integer);
+    try std.testing.expectEqual(@as(i64, 5100), stream.get("first_text_ms").?.integer);
+    try std.testing.expect(stream.get("first_tool_call_ms") == null);
 }
 
 test "runWithDeps honors no-save by skipping ask session stores" {

@@ -103,6 +103,7 @@ pub const UserSettingsPatch = struct {
     fast_mode: ?bool = null,
     slash_menu_categories: ?bool = null,
     collapse_tool_calls: ?bool = null,
+    show_reasoning: ?bool = null,
     update_channel: ?update_target.Channel = null,
     startup_scrollback: ?bool = null,
     prompt_history_enabled: ?bool = null,
@@ -123,6 +124,7 @@ pub const UserSettingsPatch = struct {
             self.fast_mode == null and
             self.slash_menu_categories == null and
             self.collapse_tool_calls == null and
+            self.show_reasoning == null and
             self.update_channel == null and
             self.startup_scrollback == null and
             self.prompt_history_enabled == null and
@@ -217,6 +219,7 @@ const UserPreferenceField = enum(u4) {
     fast_mode,
     slash_menu_categories,
     collapse_tool_calls,
+    show_reasoning,
     update_channel,
     startup_scrollback,
     prompt_history_enabled,
@@ -236,6 +239,7 @@ const UserPreferenceField = enum(u4) {
             .fast_mode => "settings.json.preference-migration.fast_mode.json",
             .slash_menu_categories => "settings.json.preference-migration.slash_menu_categories.json",
             .collapse_tool_calls => "settings.json.preference-migration.collapse_tool_calls.json",
+            .show_reasoning => "settings.json.preference-migration.show_reasoning.json",
             .update_channel => "settings.json.preference-migration.update_channel.json",
             .startup_scrollback => "settings.json.preference-migration.startup_scrollback.json",
             .prompt_history_enabled => "settings.json.preference-migration.prompt_history_enabled.json",
@@ -253,6 +257,7 @@ const user_preference_fields = [_]UserPreferenceField{
     .fast_mode,
     .slash_menu_categories,
     .collapse_tool_calls,
+    .show_reasoning,
     .update_channel,
     .startup_scrollback,
     .prompt_history_enabled,
@@ -1033,6 +1038,7 @@ fn applyUserPatchToRoot(
     }
     if (patch.slash_menu_categories) |value| application.changed = try putBool(arena, &root.object, "slash_menu_categories", value) or application.changed;
     if (patch.collapse_tool_calls) |value| application.changed = try putBool(arena, &root.object, "collapse_tool_calls", value) or application.changed;
+    if (patch.show_reasoning) |value| application.changed = try putBool(arena, &root.object, "show_reasoning", value) or application.changed;
     if (patch.update_channel) |value| application.changed = try putString(arena, &root.object, "update_channel", value.label()) or application.changed;
     if (patch.startup_scrollback) |value| application.changed = try putBool(arena, &root.object, "startup_scrollback", value) or application.changed;
     if (patch.session_titles) |value| application.changed = try putBool(arena, &root.object, "session_titles", value) or application.changed;
@@ -1170,6 +1176,13 @@ fn cleanupLegacyWorkspacePreferences(
             "collapse_tool_calls",
             .collapse_tool_calls,
             patch.collapse_tool_calls != null,
+            application,
+        );
+        removeLegacyLeaf(
+            &entry.value_ptr.object,
+            "show_reasoning",
+            .show_reasoning,
+            patch.show_reasoning != null,
             application,
         );
         removeLegacyLeaf(

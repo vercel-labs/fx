@@ -8060,6 +8060,7 @@ fn processQueuedPromptLoop(
             };
             const gateway_wait_finished_ms = io_mod.milliTimestamp();
             summary_accumulator.addThinkingWait(gateway_wait_started_ms, stream_ctx.first_model_output_at_ms orelse gateway_wait_finished_ms);
+            summary_accumulator.noteGenerationStats(response_completion.stream_timings, response_completion.generation_id);
 
             if (!assistant_prefill_recovery_used and
                 semantic_attempt + 1 < semantic_limit and

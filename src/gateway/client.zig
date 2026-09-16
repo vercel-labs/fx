@@ -1507,6 +1507,7 @@ fn streamGatewayCompletionCoreWithOptions(
         }
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
+        var stream_timings: types.StreamTimings = .{};
         req.transfer_encoding = .{ .content_length = payload.len };
         var send_buf: [8192]u8 = undefined;
         debug_trace.eventf("gateway", "before_request_send", trace_ctx, "attempt={d} payload_bytes={d}", .{ attempt + 1, payload.len });
@@ -1550,6 +1551,7 @@ fn streamGatewayCompletionCoreWithOptions(
         };
         debug_trace.eventf("gateway", "after_request_send", trace_ctx, "attempt={d} payload_bytes={d}", .{ attempt + 1, payload.len });
         debug_trace.eventf("gateway", "after_send", trace_ctx, "attempt={d} payload_bytes={d}", .{ attempt + 1, payload.len });
+        const sent_at_ms = io_mod.milliTimestamp();
 
         if (active_connected_watch) |watch| {
             if (watch.arm_response_head()) |err| return @as(anyerror!StreamResult, err);
@@ -1579,6 +1581,8 @@ fn streamGatewayCompletionCoreWithOptions(
             if (watch.commit_response_head()) |err| return @as(anyerror!StreamResult, err);
         }
         debug_trace.eventf("gateway", "after_receive_head", trace_ctx, "attempt={d} status={d}", .{ attempt + 1, @intFromEnum(response.head.status) });
+        stampStreamMilestone(&stream_timings.head_ms, sent_at_ms);
+        traceGatewayResponseHeaders(response.head, trace_ctx);
         const resolved_model_seen_in_head = traceResolvedModelHeader(response.head, model, trace_ctx);
 
         if (response.head.status != .ok) {
@@ -1631,6 +1635,7 @@ fn streamGatewayCompletionCoreWithOptions(
             .{ .requested_model = model, .ctx = trace_ctx },
             expected_provider_tool_name,
             request.content_capture_limit,
+            .{ .sent_at_ms = sent_at_ms, .out = &stream_timings },
         ) catch |err| {
             debug_trace.eventf("gateway", "sse_consume_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
             return @as(anyerror!StreamResult, connectedIoFailureWithWatch(
@@ -1676,13 +1681,18 @@ fn streamGatewayCompletionCoreWithOptions(
             "gateway",
             "stream_complete",
             trace_ctx,
-            "attempt={d} finish_reason={s} content_bytes={d} tool_call_count={d} tool_calls={d}",
+            "attempt={d} finish_reason={s} content_bytes={d} tool_call_count={d} tool_calls={d} head_ms={?d} first_reasoning_ms={?d} first_text_ms={?d} first_tool_call_ms={?d} generation_id={s}",
             .{
                 attempt + 1,
                 finish_reason_label(completion.finish_reason),
                 if (completion.content) |content| content.len else 0,
                 completion.tool_calls.len,
                 completion.tool_calls.len,
+                completion.stream_timings.head_ms,
+                completion.stream_timings.first_reasoning_ms,
+                completion.stream_timings.first_text_ms,
+                completion.stream_timings.first_tool_call_ms,
+                completion.generation_id orelse "-",
             },
         );
 
@@ -2256,6 +2266,44 @@ fn traceResolvedModelHeader(head: std.http.Client.Response.Head, requested_model
         return true;
     }
     return false;
+}
+
+const GatewayResponseHeaders = struct {
+    vercel_id: ?[]const u8 = null,
+    date: ?[]const u8 = null,
+    matched_path: ?[]const u8 = null,
+};
+
+fn findGatewayResponseHeaders(head: std.http.Client.Response.Head) GatewayResponseHeaders {
+    var found: GatewayResponseHeaders = .{};
+    var it = head.iterateHeaders();
+    while (it.next()) |header| {
+        const value = std.mem.trim(u8, header.value, " \t\r\n");
+        if (std.ascii.eqlIgnoreCase(header.name, "x-vercel-id")) {
+            found.vercel_id = value;
+        } else if (std.ascii.eqlIgnoreCase(header.name, "date")) {
+            found.date = value;
+        } else if (std.ascii.eqlIgnoreCase(header.name, "x-matched-path")) {
+            found.matched_path = value;
+        }
+    }
+    return found;
+}
+
+/// Logs the edge-correlation headers the gateway investigation needs:
+/// x-vercel-id (embeds edge receipt time), Date (server clock), and
+/// x-matched-path (route). Emitted per attempt so slow responses can be
+/// aligned with gateway-side logs without a local patch.
+fn traceGatewayResponseHeaders(head: std.http.Client.Response.Head, trace_ctx: debug_trace.TraceContext) void {
+    const found = findGatewayResponseHeaders(head);
+    if (found.vercel_id == null and found.date == null and found.matched_path == null) return;
+    debug_trace.eventf(
+        "gateway",
+        "response_headers",
+        trace_ctx,
+        "x_vercel_id={s} date={s} x_matched_path={s}",
+        .{ found.vercel_id orelse "-", found.date orelse "-", found.matched_path orelse "-" },
+    );
 }
 
 fn traceResolvedModelOnce(requested_model: []const u8, source: []const u8, resolved_model: []const u8, trace_ctx: debug_trace.TraceContext) void {
@@ -3246,7 +3294,7 @@ fn consumeSseStream(
     on_tool_start: ?ToolStartCallback,
     cancel_flag: *std.atomic.Value(bool),
 ) !types.ModelCompletion {
-    return consumeSseStreamTraced(alloc, reader, callback_ctx, on_content_chunk, on_tool_start, null, null, cancel_flag, null, null, null);
+    return consumeSseStreamTraced(alloc, reader, callback_ctx, on_content_chunk, on_tool_start, null, null, cancel_flag, null, null, null, null);
 }
 
 /// Decodes an AI Gateway SSE response from a transport-owned reader.
@@ -3276,7 +3324,22 @@ pub fn consumeGatewaySseStream(
         null,
         null,
         content_capture_limit,
+        null,
     );
+}
+
+/// Per-attempt measurement channel for client-observed stream milestones.
+/// `out` is caller-owned stack state for the in-flight attempt; on success its
+/// value is copied onto the returned completion.
+const StreamTimingsSink = struct {
+    sent_at_ms: i64,
+    out: *types.StreamTimings,
+};
+
+fn stampStreamMilestone(field: *?u32, sent_at_ms: i64) void {
+    if (field.* != null) return;
+    const delta = io_mod.milliTimestamp() - sent_at_ms;
+    field.* = @intCast(@min(@max(delta, 0), std.math.maxInt(u32)));
 }
 
 fn consumeSseStreamTraced(
@@ -3291,6 +3354,7 @@ fn consumeSseStreamTraced(
     resolved_model_trace: ?ResolvedModelTrace,
     expected_provider_tool_name: ?[]const u8,
     content_capture_limit: ?usize,
+    timings: ?StreamTimingsSink,
 ) !types.ModelCompletion {
     var content_buf: std.ArrayList(u8) = .empty;
     defer content_buf.deinit(alloc);
@@ -3435,6 +3499,7 @@ fn consumeSseStreamTraced(
         } else if (std.mem.eql(u8, event_type, "text-delta")) {
             if (root.object.get("delta")) |delta_val| {
                 if (delta_val == .string and delta_val.string.len > 0) {
+                    if (timings) |sink| stampStreamMilestone(&sink.out.first_text_ms, sink.sent_at_ms);
                     const retained = if (content_capture_limit) |limit|
                         delta_val.string[0..@min(delta_val.string.len, limit -| content_buf.items.len)]
                     else
@@ -3444,15 +3509,17 @@ fn consumeSseStreamTraced(
                 }
             }
         } else if (std.mem.eql(u8, event_type, "reasoning-delta")) {
-            if (on_reasoning_chunk) |callback| {
-                if (root.object.get("delta")) |delta_val| {
-                    if (delta_val == .string and delta_val.string.len > 0) {
+            if (root.object.get("delta")) |delta_val| {
+                if (delta_val == .string and delta_val.string.len > 0) {
+                    if (timings) |sink| stampStreamMilestone(&sink.out.first_reasoning_ms, sink.sent_at_ms);
+                    if (on_reasoning_chunk) |callback| {
                         callback(callback_ctx, delta_val.string);
                     }
                 }
             }
         } else if (std.mem.eql(u8, event_type, "tool-input-start")) {
             const id = streamedToolInputId(root, .invalid_start) orelse continue;
+            if (timings) |sink| stampStreamMilestone(&sink.out.first_tool_call_ms, sink.sent_at_ms);
             const name = if (root.object.get("toolName")) |name_value|
                 if (name_value == .string) name_value.string else ""
             else
@@ -3503,6 +3570,7 @@ fn consumeSseStreamTraced(
                 record.state = .ended;
             }
         } else if (std.mem.eql(u8, event_type, "tool-call")) {
+            if (timings) |sink| stampStreamMilestone(&sink.out.first_tool_call_ms, sink.sent_at_ms);
             var acc: SseToolCallAccumulator = .{
                 .id = .empty,
                 .name = .empty,
@@ -3792,13 +3860,19 @@ fn consumeSseStreamTraced(
     completion.generation_metadata_invalid = generation_metadata_invalid;
     completion.finish_reason = finish_reason_holder;
     completion.usage = finish_usage;
+    if (timings) |sink| completion.stream_timings = sink.out.*;
 
     debug_trace.logf(
         "stream",
-        "sse summary events={d} finish_reason={s}",
+        "sse summary events={d} finish_reason={s} head_ms={?d} first_reasoning_ms={?d} first_text_ms={?d} first_tool_call_ms={?d} generation_id={s}",
         .{
             data_event_count,
             finish_reason_label(completion.finish_reason),
+            completion.stream_timings.head_ms,
+            completion.stream_timings.first_reasoning_ms,
+            completion.stream_timings.first_text_ms,
+            completion.stream_timings.first_tool_call_ms,
+            completion.generation_id orelse "-",
         },
     );
 
@@ -4707,6 +4781,128 @@ test "findResolvedModelHeader ignores unrelated headers" {
     const head = try std.http.Client.Response.Head.parse(response_bytes);
 
     try std.testing.expect(findResolvedModelHeader(head) == null);
+}
+
+test "findGatewayResponseHeaders reads edge correlation headers" {
+    const response_bytes = "HTTP/1.1 200 OK\r\n" ++
+        "content-type: text/event-stream\r\n" ++
+        "X-Vercel-Id: iad1::iad1::stglf-1789493255406-46bc65e3337a \r\n" ++
+        "Date: Tue, 15 Sep 2026 17:27:43 GMT\r\n" ++
+        "x-matched-path: /v4/ai/language-model\r\n" ++
+        "\r\n";
+    const head = try std.http.Client.Response.Head.parse(response_bytes);
+
+    const found = findGatewayResponseHeaders(head);
+    try std.testing.expectEqualStrings("iad1::iad1::stglf-1789493255406-46bc65e3337a", found.vercel_id.?);
+    try std.testing.expectEqualStrings("Tue, 15 Sep 2026 17:27:43 GMT", found.date.?);
+    try std.testing.expectEqualStrings("/v4/ai/language-model", found.matched_path.?);
+}
+
+test "findGatewayResponseHeaders returns nulls when headers absent" {
+    const response_bytes = "HTTP/1.1 200 OK\r\n" ++
+        "content-type: text/event-stream\r\n" ++
+        "\r\n";
+    const head = try std.http.Client.Response.Head.parse(response_bytes);
+
+    const found = findGatewayResponseHeaders(head);
+    try std.testing.expect(found.vercel_id == null);
+    try std.testing.expect(found.date == null);
+    try std.testing.expect(found.matched_path == null);
+}
+
+test "stampStreamMilestone keeps the first stamp" {
+    const now_ms = io_mod.milliTimestamp();
+    var field: ?u32 = null;
+    stampStreamMilestone(&field, now_ms);
+    try std.testing.expect(field.? <= 1000);
+    field = 4242;
+    stampStreamMilestone(&field, now_ms);
+    try std.testing.expectEqual(@as(u32, 4242), field.?);
+}
+
+test "stampStreamMilestone clamps clock skew to zero" {
+    var field: ?u32 = null;
+    stampStreamMilestone(&field, io_mod.milliTimestamp() + 60_000);
+    try std.testing.expectEqual(@as(u32, 0), field.?);
+}
+
+test "consumeSseStreamTraced stamps first reasoning text and tool call milestones" {
+    const payload =
+        "data: {\"type\":\"reasoning-delta\",\"delta\":\"thinking\"}\n" ++
+        "\n" ++
+        "data: {\"type\":\"reasoning-delta\",\"delta\":\" more\"}\n" ++
+        "\n" ++
+        "data: {\"type\":\"text-delta\",\"delta\":\"hi\"}\n" ++
+        "\n" ++
+        "data: {\"type\":\"tool-input-start\",\"id\":\"t1\",\"toolName\":\"read_file\"}\n" ++
+        "\n" ++
+        "data: [DONE]\n" ++
+        "\n";
+
+    var reader = std.Io.Reader.fixed(payload);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var timings: types.StreamTimings = .{};
+
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+    var completion = try consumeSseStreamTraced(
+        std.testing.allocator,
+        &reader,
+        undefined,
+        Noop.chunk,
+        null,
+        Noop.chunk,
+        null,
+        &cancel_flag,
+        null,
+        null,
+        null,
+        .{ .sent_at_ms = io_mod.milliTimestamp(), .out = &timings },
+    );
+    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+
+    try std.testing.expect(timings.first_reasoning_ms != null);
+    try std.testing.expect(timings.first_text_ms != null);
+    try std.testing.expect(timings.first_tool_call_ms != null);
+    try std.testing.expect(timings.first_reasoning_ms.? <= timings.first_text_ms.?);
+    try std.testing.expect(timings.first_text_ms.? <= timings.first_tool_call_ms.?);
+    try std.testing.expectEqual(timings, completion.stream_timings);
+}
+
+test "consumeSseStreamTraced leaves absent milestones null" {
+    const payload =
+        "data: {\"type\":\"text-delta\",\"delta\":\"hi\"}\n" ++
+        "\n" ++
+        "data: [DONE]\n" ++
+        "\n";
+
+    var reader = std.Io.Reader.fixed(payload);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var timings: types.StreamTimings = .{};
+
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+    var completion = try consumeSseStreamTraced(
+        std.testing.allocator,
+        &reader,
+        undefined,
+        Noop.chunk,
+        null,
+        null,
+        null,
+        &cancel_flag,
+        null,
+        null,
+        null,
+        .{ .sent_at_ms = io_mod.milliTimestamp(), .out = &timings },
+    );
+    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+
+    try std.testing.expect(timings.first_reasoning_ms == null);
+    try std.testing.expect(timings.first_text_ms != null);
+    try std.testing.expect(timings.first_tool_call_ms == null);
 }
 
 test "gateway retry policy covers rate limits and transient server errors" {
