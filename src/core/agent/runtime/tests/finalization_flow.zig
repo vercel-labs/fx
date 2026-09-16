@@ -2146,7 +2146,7 @@ test "TurnFinalizationGuard removes explicit release without cleanup" {
     try std.testing.expectEqual(@as(usize, 1), deps.finalization_count);
 }
 
-test "TurnFinalizationGuard skips PostTurnEnd when terminal finalization fails" {
+test "TurnFinalizationGuard runs PostTurnEnd when terminal finalization fails" {
     const alloc = std.testing.allocator;
     var hook_capture = PostTurnEndFinalizationCapture{};
     var hook_runtime = lifecycle_hooks.Runtime.init(alloc);
@@ -2174,7 +2174,9 @@ test "TurnFinalizationGuard skips PostTurnEnd when terminal finalization fails" 
 
     try std.testing.expectEqual(TurnFinalizationGuard.State.fatal, finalization.state);
     try std.testing.expectEqual(@as(usize, 1), deps.finalization_count);
-    try std.testing.expectEqual(@as(usize, 0), hook_capture.calls);
+    try std.testing.expectEqual(@as(usize, 1), hook_capture.calls);
+    try std.testing.expectEqual(@as(u64, 7), hook_capture.turn_ids[0]);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hook_capture.outcomes[0]);
 }
 
 test "TurnFinalizationGuard runs PostTurnEnd after failed finish prompt publication" {

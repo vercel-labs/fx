@@ -124,6 +124,13 @@ pub const TurnFinalizationGuard = struct {
 
         self.cleanup_agent_terminal_leases();
 
+        defer lifecycle_runtime.dispatchPostTurnEndCheckpoint(self.lifecycle, .{
+            .turn_id = self.turn_id,
+            .outcome = outcome,
+            .provider_disposition = disposition,
+            .turn_summary = if (finished_prompt) |finished| finished.summary else null,
+        });
+
         self.deps.finalize_turn(self.deps.ctx, self.turn_id, outcome, disposition) catch |err| {
             self.state = .fatal;
             if (finished_prompt) |finished| {
@@ -133,12 +140,6 @@ pub const TurnFinalizationGuard = struct {
         };
         self.state = .emitted;
         self.outcome = outcome;
-
-        defer lifecycle_runtime.dispatchPostTurnEndCheckpoint(self.lifecycle, .{
-            .turn_id = self.turn_id,
-            .outcome = outcome,
-            .provider_disposition = disposition,
-        });
 
         if (finished_prompt) |finished| {
             var qualified_finished = finished;
