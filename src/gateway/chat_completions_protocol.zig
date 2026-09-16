@@ -607,7 +607,24 @@ pub const Reducer = struct {
         if (try index_value(choice.get("index") orelse return error.InvalidChunk) != 0) return error.InvalidChunk;
         const delta = try object(choice.get("delta") orelse return error.InvalidChunk);
         if (self.phase == .finished) {
-            const reason = try string(non_null(choice, "finish_reason") orelse return error.InconsistentFinishReason);
+            const trailing_finish = non_null(choice, "finish_reason");
+            if (trailing_finish == null) {
+                // A choice-bearing frame that arrives after the terminal frame
+                // without a finish_reason of its own is a late delta, not a
+                // contradiction: this endpoint emits the assistant's trailing
+                // text after it has already declared finish_reason. The response
+                // is otherwise complete, so keep the text and the turn rather
+                // than discarding a finished answer.
+                const trailing_reasoning = try self.accept_reasoning(delta);
+                const trailing_start = self.content.items.len;
+                if (non_null(delta, "content")) |value| try append_bounded(self.alloc, &self.content, try string(value), self.limits.content_bytes, error.ContentTooLarge);
+                if (non_null(root, "usage")) |usage| try self.accept_usage(usage, false);
+                return .{
+                    .content = if (self.content.items.len > trailing_start) self.content.items[trailing_start..] else null,
+                    .reasoning = trailing_reasoning,
+                };
+            }
+            const reason = try string(trailing_finish.?);
             if (!std.mem.eql(u8, reason, @tagName(self.finish_reason.?))) return error.InconsistentFinishReason;
             var fields = delta.iterator();
             while (fields.next()) |field| {
@@ -1976,6 +1993,24 @@ test "chat completions terminal evidence and finish reasons are strict" {
     }
 }
 
+test "chat completions keeps a trailing delta that follows the terminal frame" {
+    const alloc = std.testing.allocator;
+    // This endpoint emits the assistant's trailing text after it has already
+    // declared finish_reason, in a frame that carries no finish_reason of its
+    // own. The answer is already complete, so the text is kept rather than
+    // failing the turn with InconsistentFinishReason.
+    var reducer = try Reducer.init(alloc, test_request(), .{});
+    defer reducer.deinit();
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"found it\"},\"finish_reason\":null}]}");
+    try test_accept(&reducer, test_stop);
+    const trailing = try reducer.accept("{\"choices\":[{\"index\":0,\"delta\":{\"content\":\" and\"}}]}", false);
+    try std.testing.expectEqualStrings(" and", trailing.content.?);
+    try test_accept(&reducer, "[DONE]");
+    var result = try reducer.finish(false);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("found it and", result.completed.completion.content.?);
+}
+
 test "chat completions rejects malformed chunks contradictory identities and extra choices" {
     const alloc = std.testing.allocator;
     const cases = [_]struct { first: ?[]const u8 = null, chunk: []const u8, failure: Error }{
@@ -2253,7 +2288,7 @@ test "chat completions repeated consistent identity preserves one call and selec
     try std.testing.expectEqualStrings("{\"path\":\"x\"}", result.completed.completion.tool_calls[0].arguments_json);
 }
 
-test "chat completions usage conflicts late errors and post terminal data cannot succeed" {
+test "chat completions usage conflicts late errors and post terminal closing cannot succeed" {
     const alloc = std.testing.allocator;
     {
         var reducer = try Reducer.init(alloc, test_request(), .{});
@@ -2272,7 +2307,14 @@ test "chat completions usage conflicts late errors and post terminal data cannot
         var reducer = try Reducer.init(alloc, test_request(), .{});
         defer reducer.deinit();
         try test_accept(&reducer, test_stop);
-        try std.testing.expectError(error.InconsistentFinishReason, reducer.accept(test_text, false));
+        const trailing = try reducer.accept(test_text, false);
+        // A frame without a finish_reason that arrives after the terminal frame
+        // carries a late delta. The reducer keeps it and returns the new content.
+        try std.testing.expectEqualStrings("hello", trailing.content.?);
+        try test_accept(&reducer, "[DONE]");
+        var result = try reducer.finish(false);
+        defer result.deinit(alloc);
+        try std.testing.expectEqualStrings("hello", result.completed.completion.content.?);
     }
     {
         var reducer = try Reducer.init(alloc, test_request(), .{});
