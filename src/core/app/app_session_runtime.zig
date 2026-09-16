@@ -2047,6 +2047,36 @@ pub fn Runtime(comptime App: type) type {
             return openSessionPickerWithScope(app, .current_workspace);
         }
 
+        /// Warms the session catalog in the background right after interactive
+        /// startup, so the first picker open can paint from memory instead of
+        /// waiting for a scan. Runs only when a persisted catalog exists: a
+        /// profile that has never listed sessions has nothing worth warming.
+        /// A picker opened while the preload is in flight adopts that scan as
+        /// its own; the completed scan lands in the in-memory catalog cache
+        /// through the ordinary poll path.
+        pub fn preloadSessionCatalog(app: *App) void {
+            const persistence = &app.session_persistence;
+            if (persistence.session_picker.active) return;
+            const loader = &persistence.session_picker_load;
+            if (loader.task != null or loader.pending != null) return;
+            const store = if (persistence.store) |*value| value else return;
+            if (!session_catalog_cache.catalogFileExists(store.canonical_root.sessions)) return;
+            const active_id = if (persistence.writable) |*loaded| loaded.active_id else null;
+            const cache = &persistence.session_picker_cache;
+            if (cache.matches(active_id) and cache.isFresh()) return;
+            const request = SessionPickerLoad.PageRequest.init(
+                loader.allocateGeneration(),
+                active_id,
+            ) catch return;
+            loader.schedule(store, request) catch |err| {
+                debug_trace.logf(
+                    "core",
+                    "session catalog preload unavailable err={s}",
+                    .{@errorName(err)},
+                );
+            };
+        }
+
         pub fn openAllSessionPicker(app: *App) !void {
             return openSessionPickerWithScope(app, .all_workspaces);
         }
@@ -10106,6 +10136,125 @@ test "session picker cold open paints the persisted catalog before revalidation"
     // Revalidation scheduling is best-effort: thread spawn can fail under
     // load, so the scheduling contract is covered by the not-fresh state and
     // the loading-state tests rather than by observing the task handle here.
+}
+
+test "session catalog preload feeds the picker open without a second scan" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    const history = [_]session_runtime.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("saved request") },
+        .assistant = @constCast("saved response"),
+    } }};
+    try writeSessionFixture(alloc, app.session_persistence.store.?, "preloaded-session", &history, 0);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    // The preload only runs for picker-known profiles: seed the persisted
+    // catalog once, as a previous picker open would.
+    const store = app.session_persistence.store.?;
+    var writer = (try session_catalog_cache.Writer.init(store)).?;
+    defer writer.deinit();
+    var stopped = std.atomic.Value(bool).init(false);
+    var seeded = try subagent_resume_admission.listActionableCatalog(
+        store,
+        alloc,
+        app.session_persistence.writable.?.active_id,
+        &stopped,
+        &writer,
+    );
+    defer seeded.deinit(alloc);
+    app.session_persistence.session_picker_cache.deinit();
+
+    Runtime(TestApp).preloadSessionCatalog(&app);
+    const loader = &app.session_persistence.session_picker_load;
+    const preloaded = loader.task orelse return error.TestExpectedEqual;
+
+    // A picker opened mid-preload adopts the in-flight scan instead of
+    // scheduling a second one.
+    try Runtime(TestApp).openSessionPicker(&app);
+    try std.testing.expect(loader.task == preloaded);
+    try std.testing.expectEqual(
+        preloaded.request.generation,
+        app.session_persistence.session_picker.generation,
+    );
+
+    // The picker may already read ready from the persisted catalog, so drain
+    // the loader rather than the load state: the preload is installed into the
+    // in-memory catalog only through the poll path.
+    try waitForSessionPickerPrewarm(&app);
+    const picker = &app.session_persistence.session_picker;
+    try std.testing.expectEqual(.ready, picker.load_state);
+    try std.testing.expectEqual(@as(usize, 1), picker.summaries.items.len);
+    try std.testing.expectEqualStrings("preloaded-session", picker.summaries.items[0].id);
+
+    // Once the preload lands, a reopen within the freshness window paints from
+    // memory and schedules nothing.
+    Runtime(TestApp).cancelSessionPicker(&app);
+    try Runtime(TestApp).openSessionPicker(&app);
+    try std.testing.expectEqual(.ready, picker.load_state);
+    try std.testing.expectEqual(@as(usize, 1), picker.summaries.items.len);
+    try std.testing.expect(loader.task == null);
+    try std.testing.expect(loader.pending == null);
+}
+
+test "session catalog preload is best-effort and never duplicates an in-flight scan" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    // Without a session store there is nothing to scan; preload is a no-op.
+    Runtime(TestApp).preloadSessionCatalog(&app);
+    try std.testing.expect(app.session_persistence.session_picker_load.task == null);
+
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    // A profile that has never listed sessions has no catalog to warm; the
+    // preload stays off until one exists.
+    Runtime(TestApp).preloadSessionCatalog(&app);
+    try std.testing.expect(app.session_persistence.session_picker_load.task == null);
+
+    const store = app.session_persistence.store.?;
+    var writer = (try session_catalog_cache.Writer.init(store)).?;
+    defer writer.deinit();
+    var stopped = std.atomic.Value(bool).init(false);
+    var seeded = try subagent_resume_admission.listActionableCatalog(
+        store,
+        alloc,
+        app.session_persistence.writable.?.active_id,
+        &stopped,
+        &writer,
+    );
+    defer seeded.deinit(alloc);
+    app.session_persistence.session_picker_cache.deinit();
+
+    Runtime(TestApp).preloadSessionCatalog(&app);
+    const loader = &app.session_persistence.session_picker_load;
+    const first = loader.task orelse return error.TestExpectedEqual;
+    Runtime(TestApp).preloadSessionCatalog(&app);
+    try std.testing.expect(loader.task == first);
+    try std.testing.expect(loader.pending == null);
+    try waitForSessionPickerPrewarm(&app);
 }
 
 test "session picker current mode filters workspace and all mode includes every workspace" {

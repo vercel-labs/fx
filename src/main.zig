@@ -1260,6 +1260,10 @@ const App = struct {
         return SessionAppRuntime.resumeSelectedSession(self);
     }
 
+    pub fn startSessionCatalogPreload(self: *App) void {
+        SessionAppRuntime.preloadSessionCatalog(self);
+    }
+
     pub fn loadMoreSessionPicker(self: *App) !bool {
         return SessionAppRuntime.loadMoreSessionPicker(self);
     }

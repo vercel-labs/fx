@@ -357,6 +357,14 @@ fn writeRow(payload: *std.Io.Writer.Allocating, written: *usize, row: Row) !void
     if (payload.written().len > max_bytes - magic.len - Sha256.digest_length - 1) return error.CatalogCacheTooLarge;
 }
 
+/// Reports whether a persisted catalog exists, without parsing it. Callers use
+/// this to decide whether warming the catalog is worth any work at all.
+pub fn catalogFileExists(sessions: ?io_mod.VerifiedDir) bool {
+    const root = sessions orelse return false;
+    const stat = root.dir.statFile(io_mod.getIo(), file_name, .{ .follow_symlinks = false }) catch return false;
+    return stat.kind == .file;
+}
+
 /// Stats are freshness evidence only. Cache misses still use canonical discovery and admission.
 pub fn fingerprint(dir: std.Io.Dir, id: []const u8) !?Fingerprint {
     try session_layout.validateSessionId(id);
