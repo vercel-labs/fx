@@ -110,6 +110,15 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: streams.ModelRequest) !st
     defer if (request.prepared_request_body == null) alloc.free(payload);
     return post(alloc, definition, request, token, payload) catch |err| {
         request.attempt_evidence.network_failure = client_mod.networkFailureEvidence(err, request.delivery.load());
+        // A provider stream that violates the wire contract is retried, so the
+        // failing error name is the only evidence of what the provider actually
+        // sent. Without it an exhausted retry budget reports only that recovery
+        // paused, which is undiagnosable after the fact.
+        debug_trace.logf("gateway", "provider_failure err={s} retryable={} evidence={s}", .{
+            @errorName(err),
+            request.attempt_evidence.network_failure != null,
+            if (request.attempt_evidence.network_failure) |evidence| @tagName(evidence.cause) else "none",
+        });
         if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
         if (request.deadline) |deadline| if (expired(deadline)) return error.Timeout;
         return err;
