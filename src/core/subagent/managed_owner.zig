@@ -4,6 +4,7 @@ const authority = @import("authority.zig");
 const child_state = @import("child_state.zig");
 const domain = @import("domain.zig");
 const execution = @import("execution.zig");
+const live_metrics = @import("live_metrics.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const permission_request = @import("../permissions/permission_request.zig");
@@ -22,11 +23,13 @@ pub const Observation = struct {
     phase: child_state.Phase,
     outcome: ?child_state.Outcome = null,
     failure: ?types.ModelFailureDiagnostic = null,
+    metrics: live_metrics.Snapshot = .{},
 };
 
 const Slot = struct {
     owner: *Owner,
     child_id: []u8,
+    metrics: live_metrics.LiveMetrics = .{},
     cancel: std.atomic.Value(bool) = .init(false),
     shutdown: std.atomic.Value(bool) = .init(false),
     worker: ?*worker_runtime.WorkerRuntime = null,
@@ -275,11 +278,12 @@ pub const Owner = struct {
         self.mutex.lockUncancelable(io_mod.getIo());
         // A finished slot's observation must not follow the registry into a new turn.
         const unpublished = active.completion == .unpublished;
-        const observation: WaitError!Observation = switch (active.completion) {
+        var observation: WaitError!Observation = switch (active.completion) {
             .published => |completed| completed,
             .unpublished => error.StateUnavailable,
             .running => self.observe(child_id),
         };
+        if (observation) |*observed| observed.metrics = active.metrics.snapshot() else |_| {}
         active.waiters -= 1;
         self.waiters_changed.broadcast(io_mod.getIo());
         const reaped = !self.closed and self.takeCompletedSlotLocked(active);
@@ -568,6 +572,7 @@ fn runOne(slot: *Slot) OneOutcome {
     turn.active_work_id = snapshot.active.id;
     turn.phase_context = owner;
     turn.phase_fn = Owner.phaseTransition;
+    turn.live_metrics = &slot.metrics;
     owner.mutex.lockUncancelable(io_mod.getIo());
     slot.worker = turn.workerRuntime();
     slot.work_id = turn.active_work_id;

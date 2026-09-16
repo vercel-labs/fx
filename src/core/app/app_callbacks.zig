@@ -320,6 +320,7 @@ pub fn Bindings(comptime App: type) type {
                 .describe_tool_action = agentDescribeToolAction,
                 .describe_tool_action_completed = agentDescribeToolActionCompleted,
                 .describe_tool_action_denied = agentDescribeToolActionDenied,
+                .subagent_status_renderer = subagentStatusRenderer(app),
                 .permission_target_for_call = agentPermissionTargetForCall,
                 .execute_tool_call = agentExecuteToolCall,
                 .publish_committed_file_handoff = agentPublishCommittedFileHandoff,
@@ -705,6 +706,47 @@ pub fn Bindings(comptime App: type) type {
                 return;
             };
             debug_trace.logf("mcp", "queued MCP tool progress turn_id={d}", .{lifecycle_id.turn_id});
+        }
+
+        pub fn onToolProgress(ctx: *anyopaque, lifecycle_id: types.ToolLifecycleId, text: []const u8) void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            app_worker_runtime.Runtime(App).pushToolLifecycle(app, .{ .progress = .{
+                .id = lifecycle_id,
+                .text = text,
+            } }) catch |err| {
+                debug_trace.logf("subagent", "failed to publish subagent progress err={s}", .{@errorName(err)});
+            };
+        }
+
+        fn renderSubagentStatusLine(ctx: *anyopaque, buf: []u8, status: types.SubagentStatus) []const u8 {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            const show_context = if (comptime @hasField(App, "statusline_context")) app.statusline_context else false;
+            const show_session = if (comptime @hasField(App, "statusline_session")) app.statusline_session else false;
+            var items: ui_render.StatuslineItems = .{
+                .context_used = if (show_context) status.input_tokens else 0,
+                .context_total = if (show_context) status.context_window else null,
+                .session_title = if (show_session) status.session_title else null,
+            };
+            if (comptime @hasField(App, "workspace_identity")) {
+                if (app.workspace_identity.enabled) {
+                    const identity = app.workspace_identity.snapshot();
+                    items.workspace_label = identity.workspace_label;
+                    items.git_branch = identity.git_branch;
+                }
+            }
+            const caps = model_capabilities.resolveForApp(App, app, status.model);
+            return ui_render.buildSessionStatusLine(
+                status.model,
+                status.effort,
+                caps.supports_reasoning,
+                items,
+                ui_render.subagent_status_width,
+                buf,
+            );
+        }
+
+        pub fn subagentStatusRenderer(app: *App) types.SubagentStatusRenderer {
+            return .{ .ctx = app, .render_fn = renderSubagentStatusLine };
         }
 
         pub fn onWebSearchProgress(ctx: *anyopaque, call_id: []const u8, progress: types.WebSearchProgress) void {
@@ -2676,6 +2718,42 @@ test "MCP progress callback publishes the owning tool lifecycle" {
         lifecycle.progress.text,
         "● MCP fixture halfway",
     ) != null);
+}
+
+test "subagent status renderer honors session and parent workspace toggles" {
+    const StatusApp = struct {
+        statusline_context: bool = true,
+        statusline_session: bool = true,
+        workspace_identity: @import("../workspace/statusline_identity.zig").Runtime = .{
+            .enabled = true,
+            .workspace_label = @constCast("~/fx"),
+            .branch_label = @constCast("feature/status"),
+        },
+
+        pub fn resolvedModelCapabilities(_: *@This(), _: []const u8) model_capabilities.Capabilities {
+            return .{ .supports_reasoning = true };
+        }
+    };
+    var app = StatusApp{};
+    const renderer = Bindings(StatusApp).subagentStatusRenderer(&app);
+    var buf: [256]u8 = undefined;
+    const status = types.SubagentStatus{
+        .model = "openai/gpt-5.5",
+        .effort = types.ReasoningEffort.literal("high"),
+        .input_tokens = 12_000,
+        .context_window = 100_000,
+        .session_title = "reviewer",
+    };
+
+    try std.testing.expectEqualStrings(
+        "gpt-5.5 · high · reviewer · 12k/100k 12% · ~/fx (feature/status)",
+        renderer.render(&buf, status),
+    );
+
+    app.statusline_context = false;
+    app.statusline_session = false;
+    app.workspace_identity.enabled = false;
+    try std.testing.expectEqualStrings("gpt-5.5 · high", renderer.render(&buf, status));
 }
 
 test "agent context and system notices share semantic transport with distinct fields" {

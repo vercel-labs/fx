@@ -911,6 +911,9 @@ fn reportUsage(raw: *anyopaque, usage: types.Usage) void {
     const context: *Context = @ptrCast(@alignCast(raw));
     if (usage.input_tokens) |value| context.input_tokens = value;
     if (usage.output_tokens) |value| context.output_tokens = value;
+    if (context.turn.live_metrics) |metrics| {
+        metrics.input_tokens.store(context.input_tokens, .monotonic);
+    }
 }
 
 fn publishCommittedFileHandoff(_: *anyopaque, _: file_mutation.CommittedFileHandoff) agent_runtime.SecondaryPublicationReport {

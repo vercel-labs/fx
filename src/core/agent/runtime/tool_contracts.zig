@@ -87,6 +87,7 @@ pub const ToolExecutionResult = struct {
     command_result_json: ?[]const u8 = null,
     web_search_completion: ?types.WebSearchCompletion = null,
     web_fetch_completion: ?types.WebFetchCompletion = null,
+    subagent_completion: ?types.SubagentStatus = null,
     inner_usage: ?types.ToolUsage = null,
     selected_dynamic_tools: []const @import("../../tooling/tool_mcp_runtime.zig").SelectedTool = &.{},
     retired_dynamic_tool_names: []const []const u8 = &.{},

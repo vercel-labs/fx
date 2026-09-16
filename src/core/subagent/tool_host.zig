@@ -5,8 +5,10 @@ const child_state = @import("child_state.zig");
 const domain = @import("domain.zig");
 const execution = @import("execution.zig");
 const managed_owner = @import("managed_owner.zig");
+const live_metrics = @import("live_metrics.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const model_contract = @import("model_contract.zig");
+const model_capabilities = @import("../config/model_capabilities.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const mcp_access = @import("../mcp/access_policy.zig");
@@ -53,6 +55,15 @@ fn unavailableChildRun(
     return error.ProviderFailed;
 }
 
+pub const ProgressSink = struct {
+    context: *anyopaque,
+    publish_fn: *const fn (*anyopaque, types.SubagentStatus) void,
+
+    pub fn publish(self: ProgressSink, status: types.SubagentStatus) void {
+        self.publish_fn(self.context, status);
+    }
+};
+
 pub const ExecuteOptions = struct {
     caller_id: []const u8,
     invocation_id: []const u8,
@@ -66,11 +77,15 @@ pub const ExecuteOptions = struct {
     identity_epoch: u64 = 0,
     cancel_flag: ?*std.atomic.Value(bool) = null,
     steering_worker: ?*worker_runtime.WorkerRuntime = null,
+    progress: ?ProgressSink = null,
+    model_capability_resolver: ?model_capabilities.Resolver = null,
 };
 
 pub const ManagedExecutionResult = struct {
     success: bool,
     body: []u8,
+    /// The final status model is owned by the result allocator.
+    final_status: ?types.SubagentStatus = null,
 };
 
 pub const ApprovalResolveOptions = struct {
@@ -295,8 +310,11 @@ pub const Runtime = struct {
                                 alloc,
                                 ready.child_id,
                                 operation_id,
+                                effectiveDefaults(options.defaults, request.override()),
+                                options.progress,
                                 options.cancel_flag,
                                 options.steering_worker,
+                                options.model_capability_resolver,
                             );
                             break :blk result;
                         },
@@ -578,9 +596,18 @@ pub const Runtime = struct {
         alloc: Allocator,
         child_id: []const u8,
         work_id: []const u8,
+        fallback_defaults: Defaults,
+        progress: ?ProgressSink,
         cancel_flag: ?*std.atomic.Value(bool),
         steering_worker: ?*worker_runtime.WorkerRuntime,
+        model_capability_resolver: ?model_capabilities.Resolver,
     ) !ManagedExecutionResult {
+        var status = self.startStatusPublisher(alloc, child_id, fallback_defaults, progress, model_capability_resolver) catch StatusPublisher{
+            .model = fallback_defaults.model,
+            .effort = fallback_defaults.effort,
+        };
+        defer status.deinit(alloc);
+        status.tick(.{}, io_mod.milliTimestamp());
         while (true) {
             if (cancel_flag) |flag| {
                 if (flag.load(.seq_cst)) {
@@ -615,19 +642,23 @@ pub const Runtime = struct {
             if (try self.takeCapturedResult(alloc, child_id, work_id)) |result| return result;
             switch (observation.phase) {
                 .running, .awaiting_approval => {
+                    status.tick(observation.metrics, io_mod.milliTimestamp());
                     if (steering_worker) |worker| {
                         if (worker.hasPendingPlainSteering()) {
                             debug_trace.eventf("subagent", "steering_wait_yielded", .{}, "child_id={s} work_id={s} child_cancelled=false", .{ child_id, work_id });
                             const pending_text = try std.fmt.allocPrint(alloc, "{s}\nchild_id={s} work_id={s}", .{ model_contract.steering_pending_result, child_id, work_id });
                             defer alloc.free(pending_text);
-                            return self.encodeManaged(alloc, .{ .ok = true, .pending = true, .result = pending_text });
+                            var pending = try self.encodeManaged(alloc, .{ .ok = true, .pending = true, .result = pending_text });
+                            if (status.sink != null) attachStatusPresentation(alloc, &pending, status.current(observation.metrics));
+                            return pending;
                         }
                     }
                     continue;
                 },
                 .idle, .finished, .interrupted => {},
             }
-            const result = try self.completeManagedResult(alloc, child_id, work_id, observation);
+            var result = try self.completeManagedResult(alloc, child_id, work_id, observation);
+            if (status.sink != null) attachStatusPresentation(alloc, &result, status.current(observation.metrics));
             self.removeYielded(child_id, work_id);
             return result;
         }
@@ -831,7 +862,98 @@ pub const Runtime = struct {
             .body = try model_contract.encodeResultAlloc(alloc, result),
         };
     }
+
+    fn startStatusPublisher(
+        self: *Runtime,
+        alloc: Allocator,
+        child_id: []const u8,
+        fallback: Defaults,
+        sink: ?ProgressSink,
+        model_capability_resolver: ?model_capabilities.Resolver,
+    ) Allocator.Error!StatusPublisher {
+        var model: []u8 = undefined;
+        var effort: types.ReasoningEffort = undefined;
+        if (self.sessions.loadReadOnly(alloc, child_id)) |loaded| {
+            var state = loaded;
+            defer state.deinit(alloc);
+            model = try alloc.dupe(u8, state.preferences.model);
+            effort = state.preferences.effort;
+        } else |err| {
+            debug_trace.eventf("subagent", "status_publisher_fallback", .{}, "child_id={s} reason=session_load_failed error={s}", .{ child_id, @errorName(err) });
+            model = try alloc.dupe(u8, fallback.model);
+            effort = fallback.effort;
+        }
+        var context_window: ?u32 = null;
+        if (model_capability_resolver) |resolver| {
+            var resolve_arena = std.heap.ArenaAllocator.init(alloc);
+            defer resolve_arena.deinit();
+            if (resolver.resolve(resolve_arena.allocator(), model)) |caps| {
+                context_window = caps.context_window;
+            } else |_| {}
+        }
+        return .{
+            .sink = sink,
+            .model = model,
+            .owns_model = true,
+            .effort = effort,
+            .context_window = context_window,
+        };
+    }
 };
+
+const StatusPublisher = struct {
+    sink: ?ProgressSink = null,
+    model: []const u8,
+    owns_model: bool = false,
+    effort: types.ReasoningEffort,
+    context_window: ?u32 = null,
+    last_publish_ms: ?i64 = null,
+    last_metrics: ?live_metrics.Snapshot = null,
+
+    fn deinit(self: *StatusPublisher, alloc: Allocator) void {
+        if (self.owns_model) alloc.free(@constCast(self.model));
+        self.* = undefined;
+    }
+
+    fn current(self: *const StatusPublisher, metrics: live_metrics.Snapshot) types.SubagentStatus {
+        return .{
+            .model = self.model,
+            .effort = self.effort,
+            .input_tokens = metrics.input_tokens,
+            .context_window = self.context_window,
+        };
+    }
+
+    fn tick(self: *StatusPublisher, metrics: live_metrics.Snapshot, now_ms: i64) void {
+        const changed = if (self.last_metrics) |last| !std.meta.eql(metrics, last) else true;
+        if (!shouldPublish(self.last_publish_ms, now_ms, changed)) return;
+        if (self.sink) |sink| sink.publish(self.current(metrics));
+        self.last_publish_ms = now_ms;
+        self.last_metrics = metrics;
+    }
+};
+
+fn attachStatusPresentation(
+    alloc: Allocator,
+    result: *ManagedExecutionResult,
+    status: types.SubagentStatus,
+) void {
+    const model = alloc.dupe(u8, status.model) catch return;
+    result.final_status = .{
+        .model = model,
+        .effort = status.effort,
+        .input_tokens = status.input_tokens,
+        .context_window = status.context_window,
+    };
+}
+
+const status_min_publish_interval_ms: i64 = 250;
+
+fn shouldPublish(last_publish_ms: ?i64, now_ms: i64, changed: bool) bool {
+    const last = last_publish_ms orelse return true;
+    if (now_ms < last) return false;
+    return changed and now_ms - last >= status_min_publish_interval_ms;
+}
 
 fn operationIdAlloc(
     alloc: Allocator,
@@ -1279,7 +1401,7 @@ fn checkObservationFailureBookkeeping(fail_publication: bool) !void {
         var entry = try capability.atomicReplace(alloc, .subagent_control, "children.json", "{");
         entry.deinit(alloc);
     }
-    const result = try runtime.observeManagedState(alloc, child_id, work_id, null, &worker);
+    const result = try runtime.observeManagedState(alloc, child_id, work_id, options.defaults, null, null, &worker, null);
     defer alloc.free(result.body);
     const expected = try model_contract.encodeResultAlloc(alloc, .{ .ok = false, .error_code = "state_unavailable" });
     defer alloc.free(expected);
@@ -1310,6 +1432,38 @@ test "subagent observation failure drops unpublished completed work" {
 
 test "subagent observation failure retains a live child for draining" {
     try checkObservationFailureBookkeeping(false);
+}
+
+test "subagent status publisher carries actual child facts and throttles unchanged metrics" {
+    const Capture = struct {
+        statuses: std.ArrayList(types.SubagentStatus) = .empty,
+
+        fn publish(raw: *anyopaque, status: types.SubagentStatus) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.statuses.append(std.testing.allocator, status) catch {};
+        }
+    };
+    var capture = Capture{};
+    defer capture.statuses.deinit(std.testing.allocator);
+    var publisher = StatusPublisher{
+        .sink = .{ .context = &capture, .publish_fn = Capture.publish },
+        .model = try std.testing.allocator.dupe(u8, "openai/gpt-5.5"),
+        .owns_model = true,
+        .effort = types.ReasoningEffort.literal("high"),
+        .context_window = 100_000,
+    };
+    defer publisher.deinit(std.testing.allocator);
+
+    publisher.tick(.{ .input_tokens = 12_000 }, 1_000);
+    publisher.tick(.{ .input_tokens = 12_000 }, 2_000);
+    publisher.tick(.{ .input_tokens = 13_000 }, 2_001);
+    publisher.tick(.{ .input_tokens = 13_000 }, 2_250);
+
+    try std.testing.expectEqual(@as(usize, 2), capture.statuses.items.len);
+    try std.testing.expectEqualStrings("openai/gpt-5.5", capture.statuses.items[1].model);
+    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), capture.statuses.items[1].effort);
+    try std.testing.expectEqual(@as(u64, 13_000), capture.statuses.items[1].input_tokens);
+    try std.testing.expectEqual(@as(?u32, 100_000), capture.statuses.items[1].context_window);
 }
 
 test "internal operation identity is deterministic and invocation-bound" {

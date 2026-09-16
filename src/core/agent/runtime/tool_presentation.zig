@@ -1046,6 +1046,8 @@ pub fn finishExecutedToolStatus(
         try formatWebFetchCompletion(arena, base_line, completion)
     else if (result.web_search_completion) |completion|
         try formatWebSearchCompletion(arena, base_line, completion)
+    else if (result.subagent_completion) |status|
+        renderedSubagentSummary(hooks, arena, base_line, status)
     else
         base_line;
     const line = if (diff_entry) |payload| blk: {
@@ -1358,6 +1360,19 @@ pub fn finishCommittedFileStatus(
             },
         },
     });
+}
+
+fn renderedSubagentSummary(
+    hooks: *const AgentRuntimeDeps,
+    arena: Allocator,
+    base: []const u8,
+    status: types.SubagentStatus,
+) []const u8 {
+    const renderer = hooks.subagent_status_renderer orelse return base;
+    var buf: [256]u8 = undefined;
+    const status_line = renderer.render(&buf, status);
+    if (status_line.len == 0) return base;
+    return std.fmt.allocPrint(arena, "{s}\n  {s}", .{ base, status_line }) catch base;
 }
 
 fn formatWebSearchCompletion(arena: Allocator, base: []const u8, completion: types.WebSearchCompletion) ![]const u8 {
@@ -2336,6 +2351,71 @@ test "provider search completion keeps terminal result detail" {
             try std.testing.expect(terminal.result != null);
             try std.testing.expect(std.mem.find(u8, terminal.result.?, "https://example.test/source") != null);
         },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "subagent terminal summary preserves request row before child status" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    var hooks = capture.hooks();
+    var renderer_context: u8 = 0;
+    hooks.subagent_status_renderer = .{
+        .ctx = &renderer_context,
+        .render_fn = struct {
+            fn render(_: *anyopaque, buf: []u8, status: types.SubagentStatus) []const u8 {
+                return std.fmt.bufPrint(buf, "{s} · {s} · {d}k", .{ status.model, status.effort.displayLabel(), status.input_tokens / 1000 }) catch "";
+            }
+        }.render,
+    };
+
+    try finishExecutedToolStatus(
+        &hooks,
+        arena,
+        3,
+        .{ .id = "child", .name = "subagent", .arguments_json = "{\"action\":\"run\",\"task\":\"inspect auth\"}" },
+        true,
+        null,
+        .{
+            .model_output = "{\"ok\":true,\"result\":\"done\"}",
+            .subagent_completion = .{
+                .model = "openai/gpt-5.5",
+                .effort = types.ReasoningEffort.literal("high"),
+                .input_tokens = 12_000,
+                .context_window = 100_000,
+            },
+        },
+        "{\"ok\":true,\"result\":\"done\"}",
+        .{},
+        null,
+        &.{},
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), capture.events.items.len);
+    switch (capture.events.items[0]) {
+        .terminal => |terminal| try std.testing.expectEqualStrings("started subagent\n  openai/gpt-5.5 · high · 12k", terminal.outcome.summary),
+        else => return error.TestExpectedEqual,
+    }
+
+    try finishExecutedToolStatus(
+        &hooks,
+        arena,
+        3,
+        .{ .id = "child-fallback", .name = "subagent", .arguments_json = "{\"action\":\"run\",\"task\":\"inspect auth\"}" },
+        true,
+        null,
+        .{ .model_output = "{\"ok\":true,\"result\":\"done\"}" },
+        "{\"ok\":true,\"result\":\"done\"}",
+        .{},
+        null,
+        &.{},
+    );
+    switch (capture.events.items[1]) {
+        .terminal => |terminal| try std.testing.expectEqualStrings("started subagent", terminal.outcome.summary),
         else => return error.TestExpectedEqual,
     }
 }

@@ -383,6 +383,60 @@ fn appendWorkspaceIdentity(
     appendStatusSegment(out, end, identity);
 }
 
+fn appendSessionStatusSegments(
+    out: []u8,
+    end: *usize,
+    status_limit: usize,
+    model: []const u8,
+    effort: types.ReasoningEffort,
+    model_supports_effort: bool,
+    fast_indicator_active: bool,
+    statusline: StatuslineItems,
+) void {
+    var model_buf: [96]u8 = undefined;
+    appendStatusSegment(out, end, compactModelLabel(model, &model_buf));
+    if (model_supports_effort and !effort.isDefault()) {
+        appendStatusSegment(out, end, effort.displayLabel());
+    }
+    if (fast_indicator_active) {
+        appendStatusSegment(out, end, "⚡︎");
+    }
+    if (statusline.session_title) |title| {
+        appendStatusSegment(out, end, display_width.prefixByWidth(title, max_session_title_cells));
+    }
+    if (statusline.context_used > 0) {
+        if (statusline.context_total) |total| {
+            const used_k = statusline.context_used / 1000;
+            const total_k: u64 = @as(u64, total) / 1000;
+            const pct = if (total > 0) (statusline.context_used * 100) / @as(u64, total) else 0;
+            var ctx_buf: [48]u8 = undefined;
+            appendStatusSegment(out, end, std.fmt.bufPrint(&ctx_buf, "{d}k/{d}k {d}%", .{ used_k, total_k, pct }) catch "");
+        } else {
+            const used_k = statusline.context_used / 1000;
+            var ctx_buf: [32]u8 = undefined;
+            appendStatusSegment(out, end, std.fmt.bufPrint(&ctx_buf, "{d}k", .{used_k}) catch "");
+        }
+    }
+    appendWorkspaceIdentity(out, end, status_limit, statusline);
+}
+
+pub const subagent_status_width: u16 = 200;
+
+pub fn buildSessionStatusLine(
+    model: []const u8,
+    effort: types.ReasoningEffort,
+    model_supports_effort: bool,
+    statusline: StatuslineItems,
+    width: u16,
+    out: []u8,
+) []const u8 {
+    var end: usize = 0;
+    const status_limit = @min(@as(usize, width), out.len);
+    appendSessionStatusSegments(out, &end, status_limit, model, effort, model_supports_effort, false, statusline);
+    if (width == 0) return "";
+    return display_width.prefixByWidthIgnoringAnsi(out[0..end], width);
+}
+
 pub fn buildHintLine(
     awaiting_permission: bool,
     has_api_key: bool,
@@ -405,36 +459,10 @@ pub fn buildHintLine(
         appendStatusSegment(out, &end, "run /login");
     }
     const status_limit = @min(@as(usize, width), out.len);
-    const show_effort = model_supports_effort and !effort.isDefault();
     if (leadingPermissionModeFits(status_limit, permission_label, model_label)) {
         appendStatusSegment(out, &end, permission_label);
     }
-    appendStatusSegment(out, &end, model_label);
-    if (show_effort) {
-        appendStatusSegment(out, &end, effort.displayLabel());
-    }
-    if (fast_indicator_active) {
-        appendStatusSegment(out, &end, "⚡︎");
-    }
-
-    if (statusline.session_title) |title| {
-        appendStatusSegment(out, &end, display_width.prefixByWidth(title, max_session_title_cells));
-    }
-
-    if (statusline.context_used > 0) {
-        if (statusline.context_total) |total| {
-            const used_k = statusline.context_used / 1000;
-            const total_k: u64 = @as(u64, total) / 1000;
-            const pct = if (total > 0) (statusline.context_used * 100) / @as(u64, total) else 0;
-            var ctx_buf: [48]u8 = undefined;
-            appendStatusSegment(out, &end, std.fmt.bufPrint(&ctx_buf, "{d}k/{d}k {d}%", .{ used_k, total_k, pct }) catch "");
-        } else {
-            const used_k = statusline.context_used / 1000;
-            var ctx_buf: [32]u8 = undefined;
-            appendStatusSegment(out, &end, std.fmt.bufPrint(&ctx_buf, "{d}k", .{used_k}) catch "");
-        }
-    }
-    appendWorkspaceIdentity(out, &end, status_limit, statusline);
+    appendSessionStatusSegments(out, &end, status_limit, model, effort, model_supports_effort, fast_indicator_active, statusline);
 
     const width_usize: usize = width;
     if (width_usize == 0) return "";
@@ -1130,4 +1158,17 @@ test "buildHintLine clips styled auto mode by visible width" {
     try std.testing.expectEqualStrings(expected, line);
     try std.testing.expectEqual(@as(usize, 13), display_width.visibleWidthIgnoringAnsi(line));
     try std.testing.expect(std.mem.endsWith(u8, line, "gpt-4o"));
+}
+
+test "buildSessionStatusLine reuses model effort and context formatting" {
+    var buf: [128]u8 = undefined;
+    const line = buildSessionStatusLine(
+        "google/gemini-3.8-flash",
+        types.ReasoningEffort.literal("high"),
+        true,
+        .{ .context_used = 12_000, .context_total = 100_000 },
+        100,
+        &buf,
+    );
+    try std.testing.expectEqualStrings("gemini-3.8-flash · high · 12k/100k 12%", line);
 }

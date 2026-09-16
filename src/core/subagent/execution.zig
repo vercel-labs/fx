@@ -8,6 +8,7 @@ const authority_mod = @import("authority.zig");
 const approval_registry_mod = @import("approval_registry.zig");
 const child_state = @import("child_state.zig");
 const domain = @import("domain.zig");
+const live_metrics = @import("live_metrics.zig");
 const io_mod = @import("../shared/io.zig");
 const session = @import("../session/session.zig");
 const session_child_store = @import("../session/session_child_store.zig");
@@ -230,6 +231,7 @@ pub const TurnContext = struct {
         []const u8,
         child_state.Phase,
     ) anyerror!void = null,
+    live_metrics: ?*live_metrics.LiveMetrics = null,
     failure_diagnostic: ?types.ModelFailureDiagnostic = null,
     committed: bool = false,
 

@@ -815,6 +815,23 @@ pub const WebFetchCompletion = struct {
     }
 };
 
+pub const SubagentStatus = struct {
+    session_title: ?[]const u8 = null,
+    model: []const u8,
+    effort: ReasoningEffort,
+    input_tokens: u64,
+    context_window: ?u32,
+};
+
+pub const SubagentStatusRenderer = struct {
+    ctx: *anyopaque,
+    render_fn: *const fn (*anyopaque, buf: []u8, SubagentStatus) []const u8,
+
+    pub fn render(self: SubagentStatusRenderer, buf: []u8, status: SubagentStatus) []const u8 {
+        return self.render_fn(self.ctx, buf, status);
+    }
+};
+
 pub const PersistedToolStatus = enum {
     success,
     failure,

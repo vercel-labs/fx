@@ -354,6 +354,21 @@ fn normalizeStatusPhrase(
     return if (phrase.len == 0) null else phrase;
 }
 
+fn subagentStatusContinuation(
+    entry: TranscriptEntry,
+    detail: ?*const ToolDetailRecord,
+) ?[]const u8 {
+    const record = detail orelse return null;
+    if (record.activity_kind != .subagent) return null;
+    const text = switch (entry) {
+        .raw_bytes => |raw| raw.bytes,
+        else => return null,
+    };
+    const newline = std.mem.findScalar(u8, text, '\n') orelse return null;
+    const continuation = std.mem.trim(u8, text[newline + 1 ..], " \t\r\n");
+    return if (continuation.len == 0) null else continuation;
+}
+
 fn clipSummary(
     alloc: std.mem.Allocator,
     text: []const u8,
@@ -596,6 +611,15 @@ fn formatGroupBlock(
         if (style.text_style.len > 0) try out.writer.writeAll(style.text_style);
         try out.writer.writeAll(accented);
         if (style.text_style.len > 0) try out.writer.writeAll(style.reset_style);
+        if (subagentStatusContinuation(entry, detail)) |continuation| {
+            const continuation_row = try std.fmt.allocPrint(scratch, "  {s}", .{continuation});
+            const clipped_continuation = try clipSummary(scratch, continuation_row, cols);
+            try lines.append(alloc, .{ .entry = .{ .entry_id = entry_id, .entry_class = .tool_status, .projection_part = .group_child } });
+            try out.writer.writeByte('\n');
+            if (style.text_style.len > 0) try out.writer.writeAll(style.text_style);
+            try out.writer.writeAll(clipped_continuation);
+            if (style.text_style.len > 0) try out.writer.writeAll(style.reset_style);
+        }
     }
 
     for (status_indices) |status_index| {
@@ -665,7 +689,30 @@ fn formatExpandedChild(
         try accentTrailingDiffStats(scratch, clipped, "")
     else
         clipped;
-    return alloc.dupe(u8, accented);
+    const continuation = subagentStatusContinuation(entry, detail) orelse return alloc.dupe(u8, accented);
+    const continuation_row = try std.fmt.allocPrint(scratch, "  {s}", .{continuation});
+    return std.fmt.allocPrint(alloc, "{s}\n{s}", .{ accented, try clipSummary(scratch, continuation_row, cols) });
+}
+
+test "expanded subagent row preserves status continuation" {
+    const alloc = std.testing.allocator;
+    const entry = TranscriptEntry{ .raw_bytes = .{
+        .id = 7,
+        .bytes = "● reviewer working · inspect auth\n  gpt-5.5 · high · 12k/256k 4%\n",
+        .class = .tool_status,
+    } };
+    const detail = ToolDetailRecord{
+        .entry_id = 7,
+        .tool_name = @constCast("subagent"),
+        .activity_kind = .subagent,
+    };
+    const row = try formatExpandedChild(alloc, entry, &detail, "└", 120);
+    defer alloc.free(row);
+
+    try std.testing.expectEqualStrings(
+        "└ reviewer working · inspect auth\n  gpt-5.5 · high · 12k/256k 4%",
+        row,
+    );
 }
 
 fn installExpandedGroup(

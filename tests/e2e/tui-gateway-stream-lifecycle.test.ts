@@ -60,7 +60,7 @@ for (const { cancelBeforeConsumption, lateFeedback } of [
   const home = join(root, "home"), workspace = join(root, "workspace");
   const trace = join(root, "trace.log"), stderr = join(root, "stderr.log");
   mkdirSync(join(home, ".fx"), { recursive: true }); mkdirSync(workspace);
-  writeFileSync(join(home, ".fx/settings.json"), "{}");
+  writeFileSync(join(home, ".fx/settings.json"), '{"statusLine":{"context":true}}');
   const release = join(workspace, "release");
   writeFileSync(join(workspace, "hold.sh"), "printf 'once\\n' >> starts\nwhile [ ! -f release ]; do sleep 0.05; done\nprintf ORIGINAL_TOOL_DONE\n");
   let first = true, sentFeedback = false, receivedFeedback: any, followup = false;
@@ -90,7 +90,10 @@ for (const { cancelBeforeConsumption, lateFeedback } of [
           else { expect(raw).toContain("CHILD_STEERING_ORIGINAL_DONE"); expect(raw).toContain("CHILD_FEEDBACK_TOKEN"); }
           followupDone = true; return fakeGatewayFinalText("CHILD_FOLLOWUP_DONE");
         }
-        if (childCalls === 1) return fakeShellRun("child-steering-shell", "sh hold.sh");
+        if (childCalls === 1) return fakeGatewaySse([
+          { type: "tool-call", toolCallId: "child-steering-shell", toolName: "shell", input: { request: { action: "run", command: "sh hold.sh", yield_time_ms: 30_000 } } },
+          { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" }, usage: { inputTokens: { total: 12_000 }, outputTokens: { total: 10 } } },
+        ]);
         expect(raw).toContain("ORIGINAL_TOOL_DONE");
         if (!lateFeedback) {
           expect(raw).toContain("CHILD_FEEDBACK_TOKEN");
@@ -143,6 +146,12 @@ for (const { cancelBeforeConsumption, lateFeedback } of [
     await session.waitForStableComposer(TIMEOUT);
     await session.sendText("Start the child task.");
     await waitForPath(join(workspace, "starts"));
+    await session.waitForPane(
+      pane => /reviewer working[^\n]*CHILD_STEERING_TASK[^\n]*\n[^\n]*gpt-5\.5/.test(pane),
+      TIMEOUT,
+    ).catch(error => {
+      throw new Error(`${error}\n${readFileSync(trace, "utf8").slice(-16_000)}`);
+    });
     const original = childState();
     await session.sendText("Send the child useful review feedback.");
     if (lateFeedback) {
