@@ -790,7 +790,13 @@ pub const Reducer = struct {
             const sum = std.math.add(u64, usage.input_tokens orelse 0, usage.output_tokens orelse 0) catch return error.InvalidChunk;
             const exact = (incoming.input_tokens != null and incoming.output_tokens != null) or (final_fields.input and final_fields.output);
             if (incoming_total != null or final_fields.total) {
-                if (tokens < sum or (exact and tokens != sum)) return error.InvalidChunk;
+                // A reported total may include cache, template, and reasoning
+                // tokens that prompt_tokens and completion_tokens do not itemize
+                // (Surplus and DeepSeek report totals above the itemized sum), so
+                // an exact sum is not required here; only an impossible total is a
+                // contradiction. The carried/progress else-branch below still
+                // guards against a later sum that overtakes an observed total.
+                if (tokens < sum) return error.InvalidChunk;
             } else if (exact and sum < tokens) return error.InvalidChunk;
         }
         for (
@@ -1579,14 +1585,34 @@ test "chat completions progress totals constrain current assertions rather than 
     try std.testing.expectEqual(@as(?u64, 2), result.completed.completion.usage.output_tokens);
 }
 
+test "chat completions accepts provider totals above itemized counts" {
+    const alloc = std.testing.allocator;
+    var reducer = try Reducer.init(alloc, test_request(), .{});
+    defer reducer.deinit();
+    try test_accept(&reducer, test_text);
+    // Surplus and DeepSeek report a total that includes template, cache, and
+    // reasoning tokens their prompt_tokens and completion_tokens do not
+    // itemize, so a total above the itemized sum is not a contradiction.
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":26,\"completion_tokens\":2,\"total_tokens\":87}}");
+    try test_accept(&reducer, "{\"choices\":[],\"usage\":{\"prompt_tokens\":26,\"completion_tokens\":2,\"total_tokens\":87}}");
+    try test_accept(&reducer, "[DONE]");
+    var result = try reducer.finish(false);
+    defer result.deinit(alloc);
+    const completion = result.completed.completion;
+    try std.testing.expectEqualStrings("hello", completion.content.?);
+    try std.testing.expectEqual(@as(?u64, 26), completion.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 2), completion.usage.output_tokens);
+    try std.testing.expectEqual(@as(?u64, 87), reducer.usage_total);
+}
+
 test "chat completions partial usage rejects conflicts against merged observations" {
     const alloc = std.testing.allocator;
     for ([_]struct { first: []const u8, next: []const u8, final: bool = false, failure: Error }{
         .{ .first = "{\"prompt_tokens\":10}", .next = "{\"completion_tokens\":3,\"total_tokens\":12}", .failure = error.InvalidChunk },
         .{ .first = "{\"total_tokens\":13}", .next = "{\"prompt_tokens\":10,\"completion_tokens\":2}", .failure = error.InvalidChunk },
-        .{ .first = "{\"prompt_tokens\":10}", .next = "{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":14}", .failure = error.InvalidChunk },
-        .{ .first = "{\"prompt_tokens\":10}", .next = "{\"completion_tokens\":3,\"total_tokens\":14}", .final = true, .failure = error.InvalidChunk },
-        .{ .first = "{\"prompt_tokens\":10,\"total_tokens\":13}", .next = "{\"completion_tokens\":2}", .final = true, .failure = error.InvalidChunk },
+        .{ .first = "{\"prompt_tokens\":10}", .next = "{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":12}", .failure = error.InvalidChunk },
+        .{ .first = "{\"prompt_tokens\":10}", .next = "{\"completion_tokens\":3,\"total_tokens\":12}", .final = true, .failure = error.InvalidChunk },
+        .{ .first = "{\"prompt_tokens\":12,\"total_tokens\":13}", .next = "{\"completion_tokens\":4}", .final = true, .failure = error.InvalidChunk },
         .{ .first = "{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":13}", .next = "{\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":14}", .final = true, .failure = error.ConflictingIdentity },
         .{ .first = "{\"prompt_tokens\":9223372036854775807}", .next = "{\"completion_tokens\":9223372036854775807,\"total_tokens\":9223372036854775807}", .failure = error.InvalidChunk },
         .{ .first = "{\"prompt_tokens\":10,\"total_tokens\":13}", .next = "{\"completion_tokens\":4}", .final = true, .failure = error.InvalidChunk },
@@ -1881,7 +1907,7 @@ test "chat completions repeated terminal choices reject invalid or conflicting u
     const cases = [_]struct { usage: []const u8, seed_usage: bool = false, expected: Error = error.InvalidChunk }{
         .{ .usage = "{\"prompt_tokens\":-1}" },
         .{ .usage = "{\"prompt_tokens\":1.5}" },
-        .{ .usage = "{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":3}" },
+        .{ .usage = "{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":1}" },
         .{ .usage = "{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}", .seed_usage = true, .expected = error.ConflictingIdentity },
     };
     for (cases) |case| {
@@ -2027,7 +2053,7 @@ test "chat completions usage trailers preserve observations without billing" {
     for ([_][]const u8{
         "{\"choices\":[],\"usage\":{\"prompt_tokens\":-1}}",
         "{\"choices\":[],\"usage\":{\"completion_tokens\":1.5}}",
-        "{\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":8}}",
+        "{\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":4}}",
     }) |invalid| {
         var bad = try Reducer.init(alloc, test_request(), .{});
         defer bad.deinit();
