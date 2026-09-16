@@ -1288,11 +1288,14 @@ printf '${trailingMarker}   '
       expect(fullTail).toContain(splitMarker);
       expect(fullTail).toContain(trailingMarker);
       expect(fullTail).not.toContain("lines more (ctrl+o");
-      await active.sendHexBytes(
-        Array.from({ length: 80 }, () => ["1b", "5b", "35", "7e"]).flat(),
-      );
-      await active.waitForText(ansiMarker, TIMEOUT);
-      const fullHead = await active.capturePane();
+      // Page up until the head region with the ANSI marker is visible; the
+      // page count varies with session and network record height at the top.
+      let fullHead = await active.capturePane();
+      for (let page = 0; page < 40 && !fullHead.includes(ansiMarker); page += 1) {
+        await active.sendHexBytes(["1b", "5b", "35", "7e"]);
+        await Bun.sleep(50);
+        fullHead = await active.capturePane();
+      }
       expect(fullHead).toContain(ansiMarker);
       expect(fullHead).toContain(crMarker);
       expect(fullHead).not.toContain("CR_STAGE_01");
@@ -1506,20 +1509,30 @@ test.skipIf(!tmuxAvailable())(
       expect(expandedAtTail).toContain(tailMarker);
       expect(expandedAtTail).not.toContain("FULL_CTRL_O_LINE_0001");
 
-      for (let page = 0; page < 20; page += 1) {
+      // Page up to the head of the retained command output. Content around the
+      // first output line can straddle a page boundary depending on transcript
+      // height, so collect markers across pages instead of requiring them in
+      // one pane.
+      let sawLineOne = false;
+      let sawToolHeader = false;
+      let sawCommandArgument = false;
+      for (let page = 0; page < 20 && !(sawLineOne && sawToolHeader && sawCommandArgument); page += 1) {
         const before = await active.capturePane();
-        if (
-          before.includes("FULL_CTRL_O_LINE_0001") &&
-          /\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} UTC · Tool/.test(before)
-        ) break;
+        if (before.includes("FULL_CTRL_O_LINE_0001")) {
+          sawLineOne = true;
+          // The head of a 100-line output never shares a viewport with its tail.
+          expect(before).not.toContain(tailMarker);
+        }
+        if (/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} UTC · Tool/.test(before)) sawToolHeader = true;
+        if (before.includes(commandArgumentTail)) sawCommandArgument = true;
+        if (sawLineOne && sawToolHeader && sawCommandArgument) break;
         await active.sendKeys("PPage");
-        await active.waitForPane((pane) => pane !== before, TIMEOUT);
+        const moved = await active.waitForPane((pane) => pane !== before, 5_000).catch(() => null);
+        if (moved === null) break;
       }
-      const expandedAtHead = await active.waitForText("command: awk", TIMEOUT);
-      expect(expandedAtHead).toMatch(/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} UTC · Tool/);
-      expect(expandedAtHead).toContain(commandArgumentTail);
-      expect(expandedAtHead).toContain("FULL_CTRL_O_LINE_0001");
-      expect(expandedAtHead).not.toContain(tailMarker);
+      expect(sawLineOne).toBe(true);
+      expect(sawToolHeader).toBe(true);
+      expect(sawCommandArgument).toBe(true);
 
       for (let page = 0; page < 20; page += 1) {
         const before = await active.capturePane();
@@ -1793,15 +1806,26 @@ printf '${tailMarker}\\n'
 
       await active.sendKeys("C-o");
       await active.waitForText(futureMarker, timeout);
-      const partialFull = await active.capturePane();
-      expect(partialFull).toContain(stableMarker);
+      let partialFull = await active.capturePane();
       expect(partialFull).toContain(futureMarker);
       expect(partialFull).not.toContain(unstableMarker);
       expect(partialFull).not.toContain(tailMarker);
+      // The stable head of the overflowed output sits above the live tail;
+      // page phase varies with session and network record height at the top.
+      for (let page = 0; page < 4 && !partialFull.includes(stableMarker); page += 1) {
+        await active.sendHexBytes(["1b", "5b", "35", "7e"]);
+        partialFull = await active.waitForText(stableMarker, timeout);
+      }
+      expect(partialFull).toContain(stableMarker);
 
-      await active.sendHexBytes(
-        Array.from({ length: 8 }, () => ["1b", "5b", "35", "7e"]).flat(),
-      );
+      // Page up to the scrolled-history region; the page count varies with
+      // session and network record height at the top.
+      for (let page = 0; page < 20; page += 1) {
+        const pane = await active.capturePane();
+        if (pane.includes(historicalSentinel)) break;
+        await active.sendHexBytes(["1b", "5b", "35", "7e"]);
+        await Bun.sleep(50);
+      }
       await active.waitForText(historicalSentinel, timeout);
       const scrolledHistory = (await active.capturePaneGrid()).filter((row) =>
         row.includes("ACTIVE_OVERFLOW_HISTORY_") || row.includes(historicalSentinel)
@@ -1820,9 +1844,12 @@ printf '${tailMarker}\\n'
       );
       expect(historyAfterMoreOutput).toEqual(scrolledHistory);
 
-      await active.sendHexBytes(
-        Array.from({ length: 8 }, () => ["1b", "5b", "36", "7e"]).flat(),
-      );
+      for (let page = 0; page < 20; page += 1) {
+        const pane = await active.capturePane();
+        if (pane.includes(futureMarker)) break;
+        await active.sendHexBytes(["1b", "5b", "36", "7e"]);
+        await Bun.sleep(50);
+      }
       await active.waitForText(futureMarker, timeout);
       await active.sendKeys("Escape");
       await active.waitForPane(

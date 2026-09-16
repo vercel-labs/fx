@@ -3980,6 +3980,72 @@ test "recovery checkpoints do not accumulate temporary history copies in the tur
     try std.testing.expectEqual(@as(usize, 1000), sink.checkpoint.?.execution.tool_steps.len);
 }
 
+/// Pure formatter for the full-only network record: provider, model, latency,
+/// and the settled outcome. Only enum labels and provider-assigned ids are
+/// rendered; provider-controlled detail text is deliberately excluded.
+fn writeNetworkRecordBody(
+    writer: *std.Io.Writer,
+    provider: []const u8,
+    model: []const u8,
+    elapsed_ms: u64,
+    result: *const runtime_gateway_step.StreamResult,
+) !void {
+    try writer.print("provider: {s} · model: {s} · {d}ms\n", .{ provider, model, elapsed_ms });
+    switch (result.*) {
+        .completed => |*completed| {
+            try writer.writeAll("finish: ");
+            if (completed.completion.finish_reason) |reason| {
+                try writer.writeAll(@tagName(reason));
+            } else {
+                try writer.writeAll("unknown");
+            }
+            if (completed.completion.generation_id) |generation_id| {
+                try writer.print(" · generation: {s}", .{generation_id});
+            }
+        },
+        .failed => |*failure| {
+            try writer.print("failed: {s}", .{@tagName(failure.kind)});
+            if (failure.retry_after_seconds) |seconds| {
+                try writer.print(" · retry after: {d}s", .{seconds});
+            }
+        },
+    }
+}
+
+/// Publishes one full-detail record per settled provider request so the
+/// ctrl+o full transcript carries network call outcomes that the footer only
+/// shows transiently. Publication failure never fails the turn.
+fn pushNetworkRecord(
+    deps: *const AgentRuntimeDeps,
+    provider: model_provider.ProviderId,
+    model: []const u8,
+    started_ms: i64,
+    result: *const runtime_gateway_step.StreamResult,
+) void {
+    const elapsed_ms: u64 = @intCast(@max(io_mod.milliTimestamp() - started_ms, 0));
+    var body: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
+    defer body.deinit();
+    writeNetworkRecordBody(&body.writer, provider.label(), model, elapsed_ms, result) catch |err| {
+        debug_trace.logf("agent", "network record format failed err={s}", .{@errorName(err)});
+        return;
+    };
+    // The event channel owns its payload: dupe before transfer, free on
+    // publication failure.
+    const owned = types.dupeSemanticNotice(std.heap.c_allocator, .{
+        .topic = "network",
+        .tone = if (streamSucceeded(result.*)) .neutral else .warning,
+        .body = body.written(),
+        .visibility = .full_only,
+    }) catch |err| {
+        debug_trace.logf("agent", "network record allocation failed err={s}", .{@errorName(err)});
+        return;
+    };
+    deps.push_event(deps.ctx, .{ .full_detail_record = owned }) catch |err| {
+        types.freeSemanticNotice(std.heap.c_allocator, owned);
+        debug_trace.logf("agent", "network record publication failed err={s}", .{@errorName(err)});
+    };
+}
+
 fn streamFailure(result: runtime_gateway_step.StreamResult) ?agent_stream_provider.Failure {
     return switch (result) {
         .completed => null,
@@ -7779,6 +7845,7 @@ fn processQueuedPromptLoop(
                 gateway_delivery.load(),
             );
             stream_result_set = true;
+            pushNetworkRecord(deps, job.provider, gateway_model, gateway_wait_started_ms, &stream_result);
             const first_failure = streamFailure(stream_result);
             const auth_replay = auth_transition.decideAuthReplay(.{
                 .authentication_rejected = first_failure != null and first_failure.?.kind == .unauthorized,
@@ -7804,6 +7871,7 @@ fn processQueuedPromptLoop(
                     model_request.credential.direct.secret_bytes = active_api_key;
                     model_request.delivery = &replay_delivery;
                     model_request.attempt_evidence = &replay_evidence;
+                    const replay_wait_started_ms = io_mod.milliTimestamp();
                     stream_result = try runtime_gateway_step.streamModelCompletion(
                         deps.agent_stream_provider,
                         arena,
@@ -7811,6 +7879,7 @@ fn processQueuedPromptLoop(
                         deps.usage,
                         deps.usage_allocator,
                     );
+                    pushNetworkRecord(deps, job.provider, gateway_model, replay_wait_started_ms, &stream_result);
                     parent_turn_delivery.observeGatewayDelivery(
                         deps,
                         overlay_arena,
@@ -12141,4 +12210,44 @@ test "malformed duplicate unauthorized and path Vision calls settle no image ids
         &catalog,
     ));
     try std.testing.expectEqual(@as(usize, 0), settled_ids.items.len);
+}
+
+test "writeNetworkRecordBody renders completed and failed outcomes" {
+    const alloc = std.testing.allocator;
+    var body: std.Io.Writer.Allocating = .init(alloc);
+    defer body.deinit();
+
+    var completed: runtime_gateway_step.StreamResult = .{ .completed = .{ .completion = .{
+        .finish_reason = .stop,
+        .generation_id = "gen_test_123",
+    } } };
+    try writeNetworkRecordBody(&body.writer, "gateway", "kimi-k3", 812, &completed);
+    try std.testing.expectEqualStrings(
+        "provider: gateway · model: kimi-k3 · 812ms\nfinish: stop · generation: gen_test_123",
+        body.written(),
+    );
+
+    body.clearRetainingCapacity();
+    var failed: runtime_gateway_step.StreamResult = .{ .failed = .{
+        .kind = .rate_limited,
+        .retry_after_seconds = 4,
+    } };
+    try writeNetworkRecordBody(&body.writer, "codex", "gpt-5.2", 1503, &failed);
+    try std.testing.expectEqualStrings(
+        "provider: codex · model: gpt-5.2 · 1503ms\nfailed: rate_limited · retry after: 4s",
+        body.written(),
+    );
+}
+
+test "writeNetworkRecordBody omits absent finish reason and generation" {
+    const alloc = std.testing.allocator;
+    var body: std.Io.Writer.Allocating = .init(alloc);
+    defer body.deinit();
+
+    var completed: runtime_gateway_step.StreamResult = .{ .completed = .{} };
+    try writeNetworkRecordBody(&body.writer, "gateway", "m", 0, &completed);
+    try std.testing.expectEqualStrings(
+        "provider: gateway · model: m · 0ms\nfinish: unknown",
+        body.written(),
+    );
 }

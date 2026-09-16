@@ -839,8 +839,15 @@ tmuxTest(
         (pane) => pane.includes(fullFooter) && pane.includes(response),
         READY_TIMEOUT,
       );
-      expect(pane).toContain("zz-history");
       expect(pane.split(response)).toHaveLength(2);
+      // The full transcript opens with session, context, and network records,
+      // so the resumed history marker sits above the initial tail viewport.
+      let top = pane;
+      for (let page = 0; page < 20 && !top.includes("zz-history"); page += 1) {
+        await active.sendHexBytes(["1b", "5b", "35", "7e"]);
+        top = await active.capturePane();
+      }
+      expect(top).toContain("zz-history");
     };
     const expectClearedInline = async () => {
       const footer = await waitForActiveFooter(

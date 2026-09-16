@@ -500,6 +500,9 @@ pub const WorkerEvent = union(enum) {
     question_requested,
     open_model_picker,
     semantic_notice: types.SemanticNotice,
+    /// A full-only observability record (network call outcome) for the ctrl+o
+    /// full transcript's detail section. Never enters the transcript store.
+    full_detail_record: types.SemanticNotice,
     route_recovery_status: types.RouteRecoveryStatus,
     clear_route_recovery_status,
     api_status_text: []u8,
@@ -3972,6 +3975,7 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
         .question_requested => .question_requested,
         .open_model_picker => .open_model_picker,
         .semantic_notice => |notice| .{ .semantic_notice = try types.dupeSemanticNotice(alloc, notice) },
+        .full_detail_record => |notice| .{ .full_detail_record = try types.dupeSemanticNotice(alloc, notice) },
         .route_recovery_status => |status| .{ .route_recovery_status = status },
         .clear_route_recovery_status => .clear_route_recovery_status,
         .api_status_text => |text| .{ .api_status_text = try alloc.dupe(u8, text) },
@@ -4073,6 +4077,7 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
         .notification => {},
         .open_model_picker => {},
         .semantic_notice => |notice| types.freeSemanticNotice(alloc, notice),
+        .full_detail_record => |notice| types.freeSemanticNotice(alloc, notice),
         .route_recovery_status => {},
         .clear_route_recovery_status => {},
         .api_status_text => |text| alloc.free(text),

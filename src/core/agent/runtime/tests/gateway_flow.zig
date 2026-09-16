@@ -4725,6 +4725,48 @@ test "explicit skill loads publish one interactive summary without extra tool ca
     try std.testing.expectEqualStrings("read_file", hooks.executed_names.items[0]);
 }
 
+test "processQueuedPrompt publishes a full-detail network record per settled provider request" {
+    const alloc = std.testing.allocator;
+    var gateway = FakeGateway.init(alloc, &.{.{ .content = "Plain answer" }});
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.full_detail_records.items.len);
+    const record = hooks.full_detail_records.items[0];
+    try std.testing.expectEqualStrings("network", record.topic);
+    try std.testing.expectEqual(types.NoticeVisibility.full_only, record.visibility);
+    try std.testing.expectEqual(types.NoticeTone.neutral, record.tone);
+    try std.testing.expect(std.mem.find(u8, record.body, "provider: gateway") != null);
+    try std.testing.expect(std.mem.find(u8, record.body, "model: ") != null);
+    try std.testing.expect(std.mem.find(u8, record.body, "finish: stop") != null);
+}
+
+test "processQueuedPrompt records provider failures in the network record" {
+    const alloc = std.testing.allocator;
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .status = .service_unavailable, .retry_after_seconds = 4 },
+        .{ .content = "Recovered answer" },
+    });
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expect(hooks.full_detail_records.items.len >= 2);
+    const records = hooks.full_detail_records.items;
+    try std.testing.expectEqual(types.NoticeTone.warning, records[0].tone);
+    try std.testing.expect(std.mem.find(u8, records[0].body, "failed: unavailable") != null);
+    try std.testing.expect(std.mem.find(u8, records[0].body, "retry after: 4s") != null);
+    try std.testing.expect(std.mem.find(u8, records[1].body, "finish: stop") != null);
+    try std.testing.expectEqualStrings("Recovered answer", hooks.finish_assistant_text.?);
+}
+
 test "unchanged skill catalog keeps its request prefix across user turns" {
     const alloc = std.testing.allocator;
     const skills = [_]@import("../../../skills/skill_runtime.zig").Skill{.{

@@ -5767,10 +5767,16 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(fullAtTail).toContain(`└ Ran ${thirdCommand}`);
       expect(withoutWorkspaceStatusline(fullAtTail)).not.toContain(workspace);
 
-      for (let page = 0; page < 10; page += 1) {
+      let fullAtFirst = await session.capturePane();
+      for (
+        let page = 0;
+        page < 20 && !fullAtFirst.includes(`├ Ran ${firstDisplayCommand}`);
+        page += 1
+      ) {
         await session.sendKeys("PPage");
+        await Bun.sleep(50);
+        fullAtFirst = await session.capturePane();
       }
-      const fullAtFirst = await session.waitForText(firstDisplayCommand, TIMEOUT);
       expect(fullAtFirst).toContain(`├ Ran ${firstDisplayCommand}`);
       expect(fullAtFirst).not.toContain(`Ran ${firstCommand}`);
       expect(withoutWorkspaceStatusline(fullAtFirst)).not.toContain(workspace);
