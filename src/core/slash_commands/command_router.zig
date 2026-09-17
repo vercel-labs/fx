@@ -4,6 +4,10 @@ const command_specs = @import("command_specs.zig");
 const SlashKind = command_specs.SlashKind;
 const SlashRegistry = command_specs.SlashRegistry;
 
+pub const InitPayload = struct {
+    raw: []const u8,
+};
+
 pub const ParsedCommand = union(enum) {
     quit,
     clear_screen,
@@ -38,6 +42,7 @@ pub const ParsedCommand = union(enum) {
     statusline: []const u8,
     notifications: []const u8,
     workspace: []const u8,
+    init: InitPayload,
     version,
     unknown,
 };
@@ -77,6 +82,7 @@ pub const CommandHandlers = struct {
     rename_session: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_notifications: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_workspace: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
+    init_workspace: *const fn (ctx: *anyopaque, opts: InitPayload) anyerror!void,
     show_version: *const fn (ctx: *anyopaque) anyerror!void,
     unknown: *const fn (ctx: *anyopaque, cmd: []const u8) anyerror!void,
 };
@@ -120,6 +126,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .statusline => .{ .statusline = payload },
         .notifications => .{ .notifications = payload },
         .workspace => .{ .workspace = payload },
+        .init => .{ .init = .{ .raw = payload } },
         .version => .version,
     };
 }
@@ -172,6 +179,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .statusline => |rest| try handlers.handle_statusline(handlers.ctx, rest),
         .notifications => |rest| try handlers.handle_notifications(handlers.ctx, rest),
         .workspace => |rest| try handlers.handle_workspace(handlers.ctx, rest),
+        .init => |opts| try handlers.init_workspace(handlers.ctx, opts),
         .version => try handlers.show_version(handlers.ctx),
         .unknown => try handlers.unknown(handlers.ctx, cmd),
     }
@@ -384,6 +392,7 @@ test "parse payload acceptance follows slash spec metadata" {
 const TestContext = struct {
     called: []const u8 = "",
     payload: []const u8 = "",
+    full: bool = false,
 };
 
 fn testContext(ctx: *anyopaque) *TestContext {
@@ -439,6 +448,18 @@ fn recordUnknown(ctx: *anyopaque, value: []const u8) anyerror!void {
     test_context.payload = value;
 }
 
+fn record_init_workspace(ctx: *anyopaque, opts: InitPayload) anyerror!void {
+    const test_context = testContext(ctx);
+    test_context.called = "init";
+    test_context.payload = opts.raw;
+}
+
+fn unexpected_init_workspace(ctx: *anyopaque, opts: InitPayload) anyerror!void {
+    _ = ctx;
+    _ = opts;
+    return error.UnexpectedCallback;
+}
+
 fn failStatus(ctx: *anyopaque) anyerror!void {
     _ = ctx;
     return error.TestRouteFailure;
@@ -480,6 +501,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .rename_session = unexpectedPayload,
         .handle_notifications = unexpectedPayload,
         .handle_workspace = unexpectedPayload,
+        .init_workspace = unexpected_init_workspace,
         .show_version = unexpectedNoPayload,
         .unknown = unexpectedPayload,
     };
@@ -574,4 +596,81 @@ test "route propagates callback errors" {
     handlers.show_status = failStatus;
 
     try std.testing.expectError(error.TestRouteFailure, route(testSlashRegistry(), &handlers, "/status"));
+}
+
+test "route forwards init payload" {
+    var ctx: TestContext = .{};
+    var handlers = testHandlers(&ctx);
+    handlers.init_workspace = record_init_workspace;
+
+    try route(testSlashRegistry(), &handlers, "/init focus on docs --full");
+
+    try std.testing.expectEqualStrings("init", ctx.called);
+    try std.testing.expectEqualStrings("focus on docs --full", ctx.payload);
+}
+
+test "parse init bare returns empty raw" {
+    switch (parse(testSlashRegistry(), "/init")) {
+        .init => |opts| {
+            try std.testing.expectEqualStrings("", opts.raw);
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "parse init forwards raw passthrough" {
+    switch (parse(testSlashRegistry(), "/init focus on docs")) {
+        .init => |opts| {
+            try std.testing.expectEqualStrings("focus on docs", opts.raw);
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "parse init keeps full flag text untouched" {
+    switch (parse(testSlashRegistry(), "/init --full")) {
+        .init => |opts| {
+            try std.testing.expectEqualStrings("--full", opts.raw);
+        },
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/init focus on docs --full")) {
+        .init => |opts| {
+            try std.testing.expectEqualStrings("focus on docs --full", opts.raw);
+        },
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/init --full focus on docs")) {
+        .init => |opts| {
+            try std.testing.expectEqualStrings("--full focus on docs", opts.raw);
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "parse init raw passthrough keeps flag text untouched" {
+    switch (parse(testSlashRegistry(), "/init")) {
+        .init => |opts| try std.testing.expectEqualStrings("", opts.raw),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/init focus on docs")) {
+        .init => |opts| try std.testing.expectEqualStrings("focus on docs", opts.raw),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/init --full")) {
+        .init => |opts| try std.testing.expectEqualStrings("--full", opts.raw),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/init focus on docs --full")) {
+        .init => |opts| try std.testing.expectEqualStrings("focus on docs --full", opts.raw),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/init --full focus on docs")) {
+        .init => |opts| try std.testing.expectEqualStrings("--full focus on docs", opts.raw),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/init focus --full on docs")) {
+        .init => |opts| try std.testing.expectEqualStrings("focus --full on docs", opts.raw),
+        else => return error.TestExpectedEqual,
+    }
 }

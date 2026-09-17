@@ -12226,8 +12226,10 @@ const FakeSubmitApp = struct {
     fail_command_after_pending_clear: bool = false,
     snapshot_dir: ?[]const u8 = null,
 
-    pub fn slashRegistry(_: *const FakeSubmitApp) command_specs.SlashRegistry {
-        return routing_test_slash_registry;
+    slash_registry: command_specs.SlashRegistry = routing_test_slash_registry,
+
+    pub fn slashRegistry(self: *const FakeSubmitApp) command_specs.SlashRegistry {
+        return self.slash_registry;
     }
 
     fn deinit(self: *FakeSubmitApp) void {
@@ -13866,6 +13868,38 @@ test "app_input_runtime preflight rejection removes captured inline snapshot" {
     try std.testing.expectEqualStrings(image_path, app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 0), app.pending_images.items.len);
     try std.testing.expectEqual(@as(usize, 0), try countTestSnapshotFiles(snapshot_dir));
+}
+
+test "app_input_runtime init credential preflight preserves rejected drafts and admits retries" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "/init", "/init focus on docs --full" }) |input| {
+        var app = FakeSubmitApp{
+            .alloc = alloc,
+            .prompt_admitted = false,
+            .slash_registry = @import("../../builtins/commands.zig").slash_registry,
+        };
+        defer app.deinit();
+        try app.input_runtime.edit_state.input.appendSlice(alloc, input);
+        app.input_runtime.edit_state.cursor = input.len;
+
+        try Runtime(FakeSubmitApp).submit(&app, 100);
+
+        try std.testing.expectEqual(@as(usize, 1), app.preflight_count);
+        try std.testing.expectEqualStrings(input, app.input_runtime.edit_state.input.items);
+        try std.testing.expectEqual(input.len, app.input_runtime.edit_state.cursor);
+        try std.testing.expectEqual(@as(usize, 0), app.command_count);
+        try std.testing.expectEqual(@as(usize, 0), app.input_runtime.composer_history.count());
+        try std.testing.expect(app.last_command == null);
+        try std.testing.expect(app.last_prompt == null);
+
+        app.prompt_admitted = true;
+        try Runtime(FakeSubmitApp).submit(&app, 100);
+
+        try std.testing.expectEqual(@as(usize, 2), app.preflight_count);
+        try std.testing.expectEqual(@as(usize, 1), app.command_count);
+        try std.testing.expectEqualStrings(input, app.last_command.?);
+        try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    }
 }
 
 test "app_input_runtime gates direct model selection but not bare model browse" {

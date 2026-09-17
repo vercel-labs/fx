@@ -43,6 +43,8 @@ fx ask "explain the changes in this repository"
 
 Inside the shell, run `/help` to browse interactive commands.
 
+Run `/init` to ask the selected model to generate a concise, repository-grounded `AGENTS.md`. If the file already exists, the prompt requests an audit and proposed diffs rather than an overwrite. Add focus instructions, such as `/init focus on testing`, or use `--full` for the expanded guide-building workflow. The command submits immediately and uses normal tool permissions. If authentication is unavailable, fx shows sign-in guidance and keeps the command in the composer for retry.
+
 ### Automatic tool review
 
 In auto mode, a valid structured safety decision remains usable when the reviewer adds commentary. If the response has no valid decision, fx retries the review once within its original 30-second deadline. A safety caution is never retried for approval. If review still fails, the action stays unexecuted and the agent can continue with other tools.
