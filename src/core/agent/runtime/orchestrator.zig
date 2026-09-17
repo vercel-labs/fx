@@ -3850,6 +3850,7 @@ fn persistRecoveryCheckpoint(
         .user = .{
             .text = @constCast(job.prompt),
             .images = job.images,
+            .paste_spans = job.paste_spans,
         },
         .assistant_source = @constCast(assistant_source),
         .execution = try finalization.compacted_execution.project(arena, execution),
@@ -3907,7 +3908,7 @@ fn persist_compaction_source(
     const execution = try runtime_execution_memory.buildExecutionMemory(arena, current_turn_messages);
     try effect.set(deps.ctx, .{
         .turn_id = job.turn_id,
-        .user = .{ .text = @constCast(job.prompt), .images = job.images },
+        .user = .{ .text = @constCast(job.prompt), .images = job.images, .paste_spans = job.paste_spans },
         .assistant_source = @constCast(""),
         .execution = try finalization.compacted_execution.project(arena, execution),
         .cause = .compaction_prepared,
@@ -7333,12 +7334,12 @@ fn processQueuedPromptLoop(
                             const prefix_execution = try runtime_execution_memory.buildExecutionMemory(arena, within_turn_suffix.items[compacted_suffix_len..]);
                             // The pending user is source too, even before the first tool.
                             const active_prefix: ?types.AssistantHistoryTurn = .{
-                                .user = .{ .text = job.prompt, .images = job.images },
+                                .user = .{ .text = job.prompt, .images = job.images, .paste_spans = job.paste_spans },
                                 .assistant = @constCast(""),
                                 .execution = prefix_execution,
                             };
                             const window = try prepareRetainedCompactionWindow(arena, compaction_history, .{
-                                .user = .{ .text = job.prompt, .images = job.images },
+                                .user = .{ .text = job.prompt, .images = job.images, .paste_spans = job.paste_spans },
                                 .assistant = @constCast(""),
                                 .execution = prefix_execution,
                             }, request_capabilities, request_cost.estimated_input_tokens, deps.agent_stream_provider, .{ .provider = job.provider, .model = gateway_model }, .{ .target = retention_target });
@@ -9271,7 +9272,7 @@ fn processQueuedPromptLoop(
             const finish_execution = try runtime_execution_memory.buildExecutionMemory(arena, within_turn_suffix.items);
             const completed_summary = summary_accumulator.finish();
             var turn: HistoryTurn = .{ .assistant = .{
-                .user = .{ .text = job.prompt, .images = job.images },
+                .user = .{ .text = job.prompt, .images = job.images, .paste_spans = job.paste_spans },
                 .assistant = @constCast(assistant_text),
                 .execution = try finalization.compacted_execution.project(arena, finish_execution),
             } };
@@ -12288,7 +12289,7 @@ fn finishFailedTurnWithNotice(
     );
     const completed_summary = summary_accumulator.finish();
     var turn: HistoryTurn = .{ .assistant = .{
-        .user = .{ .text = job.prompt, .images = job.images },
+        .user = .{ .text = job.prompt, .images = job.images, .paste_spans = job.paste_spans },
         .assistant = @constCast(notice),
         .execution = try finalization.compacted_execution.project(arena, execution_memory),
     } };

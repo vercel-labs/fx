@@ -50,8 +50,9 @@ pub fn countCodepoints(bytes: []const u8) usize {
     return count;
 }
 
-pub fn shouldUsePlaceholder(bytes: []const u8) bool {
-    return countCodepoints(bytes) > large_paste_char_threshold;
+pub fn shouldUsePlaceholder(bytes: []const u8, line_threshold: u32) bool {
+    return countCodepoints(bytes) > large_paste_char_threshold or
+        (line_threshold > 0 and countLines(bytes) > line_threshold);
 }
 
 /// Write the placeholder that stands in for a pasted block inside the input.
@@ -271,11 +272,11 @@ test "formatPlaceholder singular and plural" {
 }
 
 test "shouldUsePlaceholder matches large paste threshold" {
-    try std.testing.expect(!shouldUsePlaceholder("hello"));
-    try std.testing.expect(!shouldUsePlaceholder("x" ** large_paste_char_threshold));
-    try std.testing.expect(shouldUsePlaceholder("x" ** (large_paste_char_threshold + 1)));
-    try std.testing.expect(!shouldUsePlaceholder("\xc3\xa9" ** large_paste_char_threshold));
-    try std.testing.expect(shouldUsePlaceholder("\xc3\xa9" ** (large_paste_char_threshold + 1)));
+    try std.testing.expect(!shouldUsePlaceholder("hello", 0));
+    try std.testing.expect(!shouldUsePlaceholder("x" ** large_paste_char_threshold, 0));
+    try std.testing.expect(shouldUsePlaceholder("x" ** (large_paste_char_threshold + 1), 0));
+    try std.testing.expect(!shouldUsePlaceholder("\xc3\xa9" ** large_paste_char_threshold, 0));
+    try std.testing.expect(shouldUsePlaceholder("\xc3\xa9" ** (large_paste_char_threshold + 1), 0));
 }
 
 test "expand substitutes placeholder for real text" {
@@ -376,4 +377,20 @@ test "expand ignores typed lookalikes with a registered id" {
     const result = try expand(alloc, input, blocks.items);
     defer if (result.owned) alloc.free(result.text);
     try std.testing.expectEqualStrings("original typed [Pasted text #1, 999 lines]", result.text);
+}
+
+test "paste collapse line threshold is opt in and counts normalized logical lines" {
+    try std.testing.expect(!shouldUsePlaceholder("a\nb\nc\n", 0));
+    try std.testing.expect(!shouldUsePlaceholder("a\nb", 3));
+    try std.testing.expect(!shouldUsePlaceholder("a\nb\nc\n", 3));
+    try std.testing.expect(shouldUsePlaceholder("a\nb\nc\nd\n", 3));
+    try std.testing.expect(!shouldUsePlaceholder("", 1));
+    try std.testing.expect(!shouldUsePlaceholder("\n", 1));
+    try std.testing.expect(shouldUsePlaceholder("\n\n", 1));
+    try std.testing.expect(!shouldUsePlaceholder("é\n界\n", 2));
+    var crlf = "a\r\nb\rc\r\n".*;
+    const normalized = @import("../shared/text_utils.zig").normalizeLineEndingsInPlace(&crlf);
+    try std.testing.expect(!shouldUsePlaceholder(normalized, 3));
+    try std.testing.expect(shouldUsePlaceholder(normalized, 2));
+    try std.testing.expect(shouldUsePlaceholder("x" ** 1001, 10));
 }

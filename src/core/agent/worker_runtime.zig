@@ -116,6 +116,7 @@ pub const QueuedPrompt = struct {
     root_user_intent_context: []u8 = &.{},
     grants: []types.PermissionGrant,
     skill_bindings: []SkillBinding = &.{},
+    paste_spans: []types.PasteDisplaySpan = &.{},
     skill_display_spans: []SkillDisplaySpan = &.{},
     context_snapshot: context_contract.GatheredContextSnapshot = .{},
     agent_settings: AgentTurnSettings = .{},
@@ -1428,7 +1429,7 @@ pub const WorkerRuntime = struct {
                 .begin_presented_prompt = queued.turn_id,
             });
         } else if (queued.recovery_checkpoint == null) {
-            const begin_prompt = try types.dupeUserTurn(alloc, .{ .text = queued.prompt, .images = queued.images });
+            const begin_prompt = try types.dupeUserTurn(alloc, .{ .text = queued.prompt, .images = queued.images, .paste_spans = queued.paste_spans });
             errdefer types.freeUserTurn(alloc, begin_prompt);
             if (queued.skill_bindings.len > 0 or queued.skill_display_spans.len > 0) {
                 const skill_bindings = try dupeSkillBindings(alloc, queued.skill_bindings);
@@ -2808,6 +2809,7 @@ pub fn freeQueuedPrompt(alloc: std.mem.Allocator, prompt: QueuedPrompt) void {
         }
     }
     alloc.free(prompt.prompt);
+    if (prompt.paste_spans.len > 0) alloc.free(prompt.paste_spans);
     types.freeImageAttachmentSlice(alloc, prompt.images);
     types.freeImageAttachmentSlice(alloc, prompt.authorized_image_catalog);
     alloc.free(prompt.model);

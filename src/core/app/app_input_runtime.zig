@@ -15573,3 +15573,16 @@ test "app input bridge loads the most recent durable history in chronological or
     try std.testing.expectEqualStrings("prompt-1", app.input_runtime.composer_history.entryText(0).?);
     try std.testing.expectEqualStrings("prompt-100", app.input_runtime.composer_history.entryText(99).?);
 }
+
+test "paste collapse admits a short block at the expanded byte limit" {
+    const alloc = std.testing.allocator;
+    var app = FakeSubmitApp{ .alloc = alloc };
+    defer app.deinit();
+    app.input_runtime.paste_collapse_lines = 1;
+    try app.input_runtime.paste.buffer.appendSlice(alloc, "a\nb");
+    try Runtime(FakeSubmitApp).finalizePastedBlock(&app, 3);
+    try std.testing.expectEqualStrings("[Pasted text #1, 2 lines]", app.input_runtime.edit_state.input.items);
+    const expanded = try paste_blocks.expand(alloc, app.input_runtime.edit_state.input.items, app.input_runtime.entities.pasted_blocks.items);
+    defer if (expanded.owned) alloc.free(expanded.text);
+    try std.testing.expectEqualStrings("a\nb", expanded.text);
+}

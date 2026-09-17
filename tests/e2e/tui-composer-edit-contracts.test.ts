@@ -55,6 +55,7 @@ async function startFx(
   responseCount = 1,
   duplicateReview = false,
   traceScopes?: string,
+  profileSettings: Record<string, unknown> = {},
 ): Promise<TmuxSession> {
   root = realpathSync(mkdtempSync(join(tmpdir(), "fx-edit-contracts-")));
   const home = join(root, "home");
@@ -63,7 +64,7 @@ async function startFx(
   mkdirSync(workspace);
   writeFileSync(
     join(home, ".fx", "settings.json"),
-    JSON.stringify({}),
+    JSON.stringify(profileSettings),
   );
   stderrPath = join(root, "stderr.log");
   writeFileSync(stderrPath, "");
@@ -618,19 +619,8 @@ tmuxTest(
       await session.waitForStableComposer(20_000);
       const after = await session.captureFullScrollback();
 
-      const cardTailCandidates = after
-        .split("\n")
-        .filter((line) => line.trim().startsWith("┃ - PEND"));
-      expect(
-        cardTailCandidates.filter(
-          (line) => line.trim() === "┃ - PENDING_PROBE_LAST_LINE",
-        ),
-      ).toHaveLength(1);
-      expect(
-        cardTailCandidates.filter(
-          (line) => line.trim() !== "┃ - PENDING_PROBE_LAST_LINE",
-        ),
-      ).toHaveLength(0);
+      expect(after).not.toContain("PENDING_PROBE_LAST_LINE");
+      expect(after.split("\n").filter((line) => line.trim().startsWith("┃ [Pasted text"))).toHaveLength(1);
       expect(
         after.split("\n").filter((line) => line.trim() === priorSummary),
       ).toHaveLength(1);
@@ -1105,6 +1095,62 @@ tmuxTest(
     await waitForGatewayRequest(4);
     expect(finalUserText(3)).toBe("DELETE_OK");
     expectCleanRuntime(active);
+  },
+  TIMEOUT,
+);
+
+
+tmuxTest(
+  "paste collapse previews configured lines and Ctrl+O reveals the complete prompt",
+  async () => {
+    const active = await startFx(true, 1, false, undefined, { paste_collapse_lines: 2 });
+    const pasted = "PASTE_FIRST\r\nPASTE_MIDDLE\r\nPASTE_LAST\r\n";
+    await pasteExact(active, pasted);
+    await active.waitForText("[Pasted text #1, 3 lines]", TIMEOUT);
+    await active.sendKeys("Enter");
+    await waitForGatewayRequest();
+    await waitForCompletedTurn(active, 1);
+    expect(finalUserText()).toBe(pasted.replaceAll("\r\n", "\n"));
+    const compact = await active.capturePane();
+    expect(compact).toContain("[Pasted text #1, 1 line]");
+    expect(compact).toContain("PASTE_FIRST");
+    expect(compact).toContain("PASTE_MIDDLE");
+    expect(compact).not.toContain("PASTE_LAST");
+    const rows = compact.split("\n");
+    const cut = rows.findIndex((row) => row.includes("PASTE_MIDDLE"));
+    expect(rows[cut + 1]).toContain("[Pasted text #1, 1 line]");
+    await active.sendKeys("C-o");
+    await active.waitForText("PASTE_LAST", TIMEOUT);
+    await active.sendKeys("Escape");
+    const restored = await active.waitForText("[Pasted text #1, 1 line]", TIMEOUT);
+    expect(restored).toContain("PASTE_MIDDLE");
+    expect(restored).not.toContain("PASTE_LAST");
+    expectCleanRuntime(active);
+    await active.kill();
+    session = await TmuxSession.create({
+      cmd: `${FX_BIN} --resume-last`,
+      cwd: join(root!, "workspace"),
+      env: {
+        HOME: join(root!, "home"),
+        AI_GATEWAY_API_KEY: "fake-edit-contract-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_GATEWAY_BASE_URL: gateway!.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway!.chatUrl,
+        FX_E2E_GATEWAY_MODELS_URL: `${gateway!.baseUrl}/coding-agent/v1/models`,
+        FX_MODEL: FAKE_GATEWAY_MODEL,
+        FX_AUTO_UPGRADE: "0",
+      },
+      width: 112, height: 32, stderrPath: stderrPath!,
+    });
+    const resumed = await session.waitForText("[Pasted text #1, 1 line]", TIMEOUT);
+    expect(resumed).toContain("PASTE_FIRST");
+    expect(resumed).toContain("PASTE_MIDDLE");
+    expect(resumed).not.toContain("PASTE_LAST");
+    await session.sendKeys("C-o");
+    await session.waitForText("PASTE_LAST", TIMEOUT);
+    await session.sendKeys("Escape");
+    await session.waitForComposer(TIMEOUT);
+    expectCleanRuntime(session);
   },
   TIMEOUT,
 );
