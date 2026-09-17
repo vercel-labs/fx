@@ -145,6 +145,7 @@ const transcript_runtime = @import("ui/transcript/runtime.zig");
 const resume_projection = @import("ui/transcript/resume_projection.zig");
 const assistant_pacer = @import("ui/assistant/pacer.zig");
 const approval_prompt = @import("core/permissions/approval_prompt.zig");
+const goal_module = @import("core/goal/goal.zig");
 
 const Allocator = std.mem.Allocator;
 const Layout = types.Layout;
@@ -577,6 +578,10 @@ const App = struct {
     fast_mode: bool = false,
     auto_upgrade_enabled: bool = true,
     effort: ReasoningEffort = .auto,
+    goal: ?goal_module.goal_store.Goal = null,
+    goal_tool_context: goal_module.GoalToolContext = .{},
+    goal_terminal_transition_pending_accounting: bool = false,
+    goal_budget_wrapup_pending_accounting: bool = false,
     diff_entries: std.ArrayList(@import("core/output/diff.zig").DiffEntry) = .empty,
     next_diff_id: u32 = 1,
 
@@ -906,6 +911,7 @@ const App = struct {
         self.question_prompt.deinit(self.alloc);
 
         self.change_tracker.deinit(std.heap.c_allocator);
+        if (self.goal) |*goal| goal.deinit(self.alloc);
         for (self.diff_entries.items) |*entry| entry.deinit(std.heap.c_allocator);
         self.diff_entries.deinit(std.heap.c_allocator);
         self.mcp.deinit(self.alloc);
@@ -1170,6 +1176,7 @@ const App = struct {
             skill_tokens,
             null,
             draft.images,
+            null,
             draft.turn_id,
             true,
         )) return error.PendingPromptQueueRejected;
@@ -1323,6 +1330,7 @@ const App = struct {
             skill_tokens,
             null,
             null,
+            null,
             0,
             false,
         );
@@ -1345,6 +1353,7 @@ const App = struct {
             &.{},
             checkpoint,
             null,
+            null,
             checkpoint.turn_id,
             false,
         )) return false;
@@ -1362,6 +1371,7 @@ const App = struct {
         skill_tokens: []const registered_entities.SkillTokenSpan,
         recovery_checkpoint: ?*const session_codec.RecoveryCheckpoint,
         prompt_images: ?[]const types.ImageAttachment,
+        root_user_intent_override: ?[]const u8,
         turn_id: u64,
         user_prompt_already_presented: bool,
     ) !bool {
@@ -1370,6 +1380,7 @@ const App = struct {
             skill_tokens,
             recovery_checkpoint,
             prompt_images,
+            root_user_intent_override,
             turn_id,
             user_prompt_already_presented,
         );
@@ -1386,6 +1397,7 @@ const App = struct {
         skill_tokens: []const registered_entities.SkillTokenSpan,
         recovery_checkpoint: ?*const session_codec.RecoveryCheckpoint,
         prompt_images: ?[]const types.ImageAttachment,
+        root_user_intent_override: ?[]const u8,
         turn_id: u64,
         user_prompt_already_presented: bool,
     ) !worker_runtime.QueuedPrompt {
@@ -1436,11 +1448,14 @@ const App = struct {
 
         const history_copy = try self.session.snapshotHistory(std.heap.c_allocator);
         errdefer types.freeHistoryTurnSlice(std.heap.c_allocator, history_copy);
-        const root_user_intent_context = try auto_classifier_context.buildCanonicalRootUserContext(
-            std.heap.c_allocator,
-            prompt_copy,
-            self.session.agent.history.items,
-        );
+        const root_user_intent_context = if (root_user_intent_override) |intent|
+            try std.heap.c_allocator.dupe(u8, intent)
+        else
+            try auto_classifier_context.buildCanonicalRootUserContext(
+                std.heap.c_allocator,
+                prompt_copy,
+                self.session.agent.history.items,
+            );
         errdefer std.heap.c_allocator.free(root_user_intent_context);
 
         const images_copy = try types.dupeImageAttachmentSlice(
@@ -1882,6 +1897,7 @@ const App = struct {
             alloc,
             permission_mode,
             self.permission_engine.rules,
+            true,
         );
     }
 
@@ -1895,6 +1911,7 @@ const App = struct {
             alloc,
             permission_mode,
             permission_rules,
+            false,
         );
     }
 
@@ -1903,11 +1920,13 @@ const App = struct {
         alloc: Allocator,
         permission_mode: types.PermissionMode,
         permission_rules: types.PermissionRuleSet,
+        goal_available: bool,
     ) !tool_projection.EffectiveToolProjection {
         return tool_projection.buildModelToolProjectionForSet(alloc, self.toolAdvertisementSet(), .{
             .permission_mode = permission_mode,
             .permission_rules = permission_rules,
             .subagent_available = self.session_persistence.subagent_host != null,
+            .goal_available = goal_available,
         });
     }
 
@@ -2656,13 +2675,36 @@ const App = struct {
         return SessionAppRuntime.fastModeModelBound(self);
     }
 
+    pub fn persistGoalState(self: *App) !void {
+        try SessionAppRuntime.commitGoalState(self);
+    }
+
+    pub fn replaceGoal(self: *App, next: ?goal_module.goal_store.Goal) !void {
+        try goal_module.goal_runtime.replaceOwned(App, self, next);
+    }
+
+    pub fn queueGoalContinuation(self: *App, prompt: []const u8, objective: []const u8) !void {
+        _ = try self.snapshotAndQueuePrompt(prompt, &.{}, null, null, objective, 0, false);
+    }
+
     pub fn finishPromptPresentation(self: *App, finished: types.FinishedPrompt) !assistant_pacer.FinishResult {
-        return app_callbacks.Bindings(App).finishPromptPresentation(self, finished);
+        const result = try app_callbacks.Bindings(App).finishPromptPresentation(self, finished);
+        if (result == .committed) {
+            if (finished.summary) |summary| {
+                try goal_module.goal_runtime.advanceAfterTurn(
+                    App,
+                    self,
+                    summary,
+                    finished.terminal_outcome,
+                );
+            }
+        }
+        return result;
     }
 
     pub fn pacerFinish(ctx: *anyopaque, finished: types.FinishedPrompt) anyerror!assistant_pacer.FinishResult {
         const self: *App = @ptrCast(@alignCast(ctx));
-        const result = try app_callbacks.Bindings(App).finishPromptPresentation(self, finished);
+        const result = try self.finishPromptPresentation(finished);
         if (result == .committed) self.notificationPresentationFinished();
         return result;
     }
@@ -4401,6 +4443,7 @@ test {
     _ = @import("gateway/web_search_types.zig");
     _ = @import("tools/web/content.zig");
     _ = @import("tools/web/html_to_markdown.zig");
+    _ = @import("tools/agent/goal_tools.zig");
     _ = @import("tools/filesystem/read_file.zig");
     _ = @import("tools/session/read_tool_result.zig");
     _ = @import("tools/skills/install_skill.zig");
@@ -4430,4 +4473,5 @@ test {
     _ = @import("core/agent/worker_runtime.zig");
     _ = @import("gateway/client.zig");
     _ = @import("gateway/host_stream_provider.zig");
+    _ = @import("core/goal/goal.zig");
 }

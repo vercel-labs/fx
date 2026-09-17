@@ -42,6 +42,7 @@ const worker_runtime = @import("../agent/worker_runtime.zig");
 const agent_execution_memory = @import("../agent/execution_memory.zig");
 const transcript_blocks = @import("../../ui/render_engine/transcript_blocks.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
+const goal_runtime = @import("../goal/goal_runtime.zig");
 const test_builtin_skills = if (@import("builtin").is_test)
     @import("../../builtins/skills.zig")
 else
@@ -389,6 +390,7 @@ pub fn Handlers(comptime App: type) type {
                 .handle_notifications = commandHandleNotifications,
                 .handle_workspace = commandHandleWorkspace,
                 .show_version = commandShowVersion,
+                .handle_goal = commandHandleGoal,
                 .unknown = commandUnknown,
             };
         }
@@ -2090,6 +2092,11 @@ pub fn Handlers(comptime App: type) type {
                 .tone = .neutral,
                 .body = App.app_version,
             }, true);
+        }
+
+        fn commandHandleGoal(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try goal_runtime.handleGoalCommand(App, app, rest);
         }
 
         fn commandUnknown(ctx: *anyopaque, _: []const u8) !void {

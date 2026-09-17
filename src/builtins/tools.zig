@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_builtin = @import("builtin");
 const builtin_gateway = @import("gateway.zig");
 const terminal_contracts = @import("../core/terminal/contracts.zig");
 const managed_execution_contract = @import("../core/execution/managed_execution_contract.zig");
@@ -14,6 +15,7 @@ const types = @import("../core/shared/types.zig");
 const lexical_relevance = @import("../core/shared/lexical_relevance.zig");
 const capability_retrieval = @import("../core/tooling/capability_retrieval.zig");
 const permission_gate = @import("../core/permissions/permission_gate.zig");
+const goal_module = @import("../core/goal/goal.zig");
 const ask_user_question_impl = @import("../tools/agent/ask_user_question.zig");
 const subagent_impl = @import("../tools/agent/subagent.zig");
 const vision_impl = @import("../tools/agent/vision.zig");
@@ -29,6 +31,15 @@ const skill_impl = @import("../tools/skills/skill.zig");
 const capability_search_impl = @import("../tools/capabilities/capability_search.zig");
 const web_fetch_impl = @import("../tools/web/fetch.zig");
 const web_search_impl = @import("../tools/web/search.zig");
+const test_io_mod = if (std_builtin.is_test)
+    @import("../core/shared/io.zig")
+else
+    struct {};
+const test_session_child_store = if (std_builtin.is_test)
+    @import("../core/session/session_child_store.zig")
+else
+    struct {};
+const goal_tools_impl = @import("../tools/agent/goal_tools.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -843,6 +854,9 @@ pub const all = [_]tool_dispatch.Tool{
     ask_user_question,
     vision,
     read_tool_result,
+    goal_tools_impl.get_goal,
+    goal_tools_impl.create_goal,
+    goal_tools_impl.update_goal,
 };
 
 pub const registry = tool_dispatch.Registry{ .tools = all[0..] };
@@ -863,6 +877,9 @@ pub const advertisement_order = [_][]const u8{
     "ask_user_question",
     "web_fetch",
     "web_search",
+    "get_goal",
+    "create_goal",
+    "update_goal",
 };
 
 pub const read_only_tool_names = [_][]const u8{
@@ -905,6 +922,31 @@ pub fn toolHasPermissionContract(tool_name: []const u8) bool {
     return lookup(tool_name) != null;
 }
 
+test "production registry dispatches get_goal with a session context" {
+    const alloc = std.testing.allocator;
+    var goal: goal_module.goal_store.Goal = .{
+        .goal_id = try alloc.dupe(u8, "goal-production"),
+        .objective = try alloc.dupe(u8, "verify production dispatch"),
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+    };
+    defer goal.deinit(alloc);
+    var goal_ctx: goal_module.GoalToolContext = .{ .goal = goal };
+    var status_detail: ?[]u8 = null;
+    defer if (status_detail) |detail| alloc.free(detail);
+    var result = try tool_dispatch.dispatchAuthorizedToolCall(.{
+        .allocator = alloc,
+        .goal_ctx = &goal_ctx,
+    }, registry, types.ToolCall{
+        .id = "call-get-goal",
+        .name = "get_goal",
+        .arguments_json = "{}",
+    }, &status_detail);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(tool_dispatch.DispatchResult.Status.success, result.status);
+    try std.testing.expect(std.mem.find(u8, result.body, "verify production dispatch") != null);
+}
+
 test "built-in model-facing tool contract stays byte exact" {
     const alloc = std.testing.allocator;
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
@@ -933,7 +975,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "f22369b30518c28caadeb5275297ada8655741986eb8125086e01665f1288a41",
+        "b8233f5fdd5ee8e4e3a24412c4e2fc8c44e3a7bf46334449c5305504ae558c2b",
         &actual_hex,
     );
 }
@@ -989,6 +1031,9 @@ test "built-in tools register exact active local order" {
         "ask_user_question",
         "vision",
         "read_tool_result",
+        "get_goal",
+        "create_goal",
+        "update_goal",
     };
 
     try std.testing.expectEqual(expected_names.len, all.len);
