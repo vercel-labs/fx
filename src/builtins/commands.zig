@@ -474,7 +474,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .statusline, .command = "/statusline", .help_entry = "/statusline [context|session|workspace]", .completion_description = "toggle status line segments", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .notifications, .command = "/sound", .help_entry = "/sound [on|off|max]", .completion_description = "toggle sounds and terminal bells", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .workspace, .command = "/workspace", .help_entry = "/workspace [list|add PATH|remove PATH|clear]", .completion_description = "manage additional workspace directories", .presentation_category = .workspace, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
-    .{ .kind = .init, .command = "/init", .help_entry = "/init [extras] [--full]", .completion_description = "generate workspace instructions", .presentation_category = .workspace, .has_args = true, .accepts_payload = true },
+    .{ .kind = .init, .command = "/init", .help_entry = "/init [extras] [--full]", .completion_description = "generate workspace instructions", .presentation_category = .workspace, .has_args = true, .accepts_payload = true, .requires_prompt_credential = true },
     .{ .kind = .version, .command = "/version", .help_entry = "/version", .completion_description = "show the fx version", .presentation_category = .general },
     .{ .kind = .quit, .command = "/quit", .aliases = &.{"/exit"}, .help_entry = "/quit", .completion_description = "exit the interactive shell", .presentation_category = .general, .show_in_welcome = true },
 };

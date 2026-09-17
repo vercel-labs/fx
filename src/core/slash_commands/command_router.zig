@@ -5,8 +5,7 @@ const SlashKind = command_specs.SlashKind;
 const SlashRegistry = command_specs.SlashRegistry;
 
 pub const InitPayload = struct {
-    extras: []const u8,
-    full: bool,
+    raw: []const u8,
 };
 
 pub const ParsedCommand = union(enum) {
@@ -48,11 +47,6 @@ pub const ParsedCommand = union(enum) {
     unknown,
 };
 
-fn noop_init_workspace(ctx: *anyopaque, opts: InitPayload) anyerror!void {
-    _ = ctx;
-    _ = opts;
-}
-
 pub const CommandHandlers = struct {
     ctx: *anyopaque,
     quit: *const fn (ctx: *anyopaque) anyerror!void,
@@ -88,46 +82,13 @@ pub const CommandHandlers = struct {
     rename_session: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_notifications: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_workspace: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
-    init_workspace: *const fn (ctx: *anyopaque, opts: InitPayload) anyerror!void = noop_init_workspace,
+    init_workspace: *const fn (ctx: *anyopaque, opts: InitPayload) anyerror!void,
     show_version: *const fn (ctx: *anyopaque) anyerror!void,
     unknown: *const fn (ctx: *anyopaque, cmd: []const u8) anyerror!void,
 };
 
 fn command_payload(cmd: []const u8, prefix: []const u8) []const u8 {
     return std.mem.trim(u8, cmd[prefix.len..], " \t");
-}
-
-fn parse_init_payload(payload: []const u8) InitPayload {
-    var rest = std.mem.trim(u8, payload, " \t");
-    if (rest.len == 0) return .{ .extras = "", .full = false };
-    var full = false;
-    var tokens = std.mem.tokenizeAny(u8, rest, " \t");
-    while (tokens.next()) |token| {
-        if (std.mem.eql(u8, token, "--full")) {
-            full = true;
-            break;
-        }
-    }
-    if (!full) return .{ .extras = rest, .full = false };
-    while (true) {
-        const trimmed = std.mem.trim(u8, rest, " \t");
-        if (std.mem.eql(u8, trimmed, "--full")) return .{ .extras = "", .full = true };
-        if (std.mem.startsWith(u8, trimmed, "--full")) {
-            const after = trimmed["--full".len..];
-            if (after.len > 0 and (after[0] == ' ' or after[0] == '\t')) {
-                rest = std.mem.trim(u8, after, " \t");
-                continue;
-            }
-        }
-        if (std.mem.endsWith(u8, trimmed, "--full")) {
-            const before = trimmed[0 .. trimmed.len - "--full".len];
-            if (before.len > 0 and (before[before.len - 1] == ' ' or before[before.len - 1] == '\t')) {
-                rest = std.mem.trim(u8, before, " \t");
-                continue;
-            }
-        }
-        return .{ .extras = trimmed, .full = true };
-    }
 }
 
 fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
@@ -165,7 +126,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .statusline => .{ .statusline = payload },
         .notifications => .{ .notifications = payload },
         .workspace => .{ .workspace = payload },
-        .init => .{ .init = parse_init_payload(payload) },
+        .init => .{ .init = .{ .raw = payload } },
         .version => .version,
     };
 }
@@ -490,8 +451,13 @@ fn recordUnknown(ctx: *anyopaque, value: []const u8) anyerror!void {
 fn record_init_workspace(ctx: *anyopaque, opts: InitPayload) anyerror!void {
     const test_context = testContext(ctx);
     test_context.called = "init";
-    test_context.payload = opts.extras;
-    test_context.full = opts.full;
+    test_context.payload = opts.raw;
+}
+
+fn unexpected_init_workspace(ctx: *anyopaque, opts: InitPayload) anyerror!void {
+    _ = ctx;
+    _ = opts;
+    return error.UnexpectedCallback;
 }
 
 fn failStatus(ctx: *anyopaque) anyerror!void {
@@ -535,7 +501,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .rename_session = unexpectedPayload,
         .handle_notifications = unexpectedPayload,
         .handle_workspace = unexpectedPayload,
-        .init_workspace = noop_init_workspace,
+        .init_workspace = unexpected_init_workspace,
         .show_version = unexpectedNoPayload,
         .unknown = unexpectedPayload,
     };
@@ -640,50 +606,71 @@ test "route forwards init payload" {
     try route(testSlashRegistry(), &handlers, "/init focus on docs --full");
 
     try std.testing.expectEqualStrings("init", ctx.called);
-    try std.testing.expectEqualStrings("focus on docs", ctx.payload);
-    try std.testing.expect(ctx.full);
+    try std.testing.expectEqualStrings("focus on docs --full", ctx.payload);
 }
 
-test "parse init bare returns empty extras without full" {
+test "parse init bare returns empty raw" {
     switch (parse(testSlashRegistry(), "/init")) {
         .init => |opts| {
-            try std.testing.expectEqualStrings("", opts.extras);
-            try std.testing.expect(!opts.full);
+            try std.testing.expectEqualStrings("", opts.raw);
         },
         else => return error.TestExpectedEqual,
     }
 }
 
-test "parse init forwards extras passthrough" {
+test "parse init forwards raw passthrough" {
     switch (parse(testSlashRegistry(), "/init focus on docs")) {
         .init => |opts| {
-            try std.testing.expectEqualStrings("focus on docs", opts.extras);
-            try std.testing.expect(!opts.full);
+            try std.testing.expectEqualStrings("focus on docs", opts.raw);
         },
         else => return error.TestExpectedEqual,
     }
 }
 
-test "parse init strips full flag" {
+test "parse init keeps full flag text untouched" {
     switch (parse(testSlashRegistry(), "/init --full")) {
         .init => |opts| {
-            try std.testing.expectEqualStrings("", opts.extras);
-            try std.testing.expect(opts.full);
+            try std.testing.expectEqualStrings("--full", opts.raw);
         },
         else => return error.TestExpectedEqual,
     }
     switch (parse(testSlashRegistry(), "/init focus on docs --full")) {
         .init => |opts| {
-            try std.testing.expectEqualStrings("focus on docs", opts.extras);
-            try std.testing.expect(opts.full);
+            try std.testing.expectEqualStrings("focus on docs --full", opts.raw);
         },
         else => return error.TestExpectedEqual,
     }
     switch (parse(testSlashRegistry(), "/init --full focus on docs")) {
         .init => |opts| {
-            try std.testing.expectEqualStrings("focus on docs", opts.extras);
-            try std.testing.expect(opts.full);
+            try std.testing.expectEqualStrings("--full focus on docs", opts.raw);
         },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "parse init raw passthrough keeps flag text untouched" {
+    switch (parse(testSlashRegistry(), "/init")) {
+        .init => |opts| try std.testing.expectEqualStrings("", opts.raw),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/init focus on docs")) {
+        .init => |opts| try std.testing.expectEqualStrings("focus on docs", opts.raw),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/init --full")) {
+        .init => |opts| try std.testing.expectEqualStrings("--full", opts.raw),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/init focus on docs --full")) {
+        .init => |opts| try std.testing.expectEqualStrings("focus on docs --full", opts.raw),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/init --full focus on docs")) {
+        .init => |opts| try std.testing.expectEqualStrings("--full focus on docs", opts.raw),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/init focus --full on docs")) {
+        .init => |opts| try std.testing.expectEqualStrings("focus --full on docs", opts.raw),
         else => return error.TestExpectedEqual,
     }
 }

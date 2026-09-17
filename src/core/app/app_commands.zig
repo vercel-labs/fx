@@ -326,9 +326,12 @@ fn writeWorkspaceSnapshot(
     }, true);
 }
 
-fn initWantsFull() bool {
-    const raw = io_mod.getenv("FX_INIT_MODE") orelse return false;
-    return std.ascii.eqlIgnoreCase(raw, "full");
+fn writeInitError(app: anytype, body: []const u8) !void {
+    try app.writeDomainNotice(.{
+        .topic = "init",
+        .tone = .@"error",
+        .body = body,
+    }, true);
 }
 
 fn initModeForWorkspace(alloc: std.mem.Allocator, workspace_root: []const u8) !init_prompt.Mode {
@@ -337,6 +340,38 @@ fn initModeForWorkspace(alloc: std.mem.Allocator, workspace_root: []const u8) !i
     const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{ .follow_symlinks = false }) catch return .create;
     if (stat.kind != .file and stat.kind != .sym_link) return .create;
     return .audit;
+}
+
+const ParsedInitRequest = struct {
+    user_focus: []const u8,
+    full: bool,
+};
+
+noinline fn parseInitRequest(raw: []u8) ParsedInitRequest {
+    const full_flag = "--full";
+    var full = false;
+    var read: usize = 0;
+    var write: usize = 0;
+    var first = true;
+    while (read < raw.len) {
+        while (read < raw.len and (raw[read] == ' ' or raw[read] == '\t')) : (read += 1) {}
+        if (read >= raw.len) break;
+        const start = read;
+        while (read < raw.len and raw[read] != ' ' and raw[read] != '\t') : (read += 1) {}
+        const token = raw[start..read];
+        if (std.mem.eql(u8, token, full_flag)) {
+            full = true;
+            continue;
+        }
+        if (!first) {
+            raw[write] = ' ';
+            write += 1;
+        }
+        std.mem.copyForwards(u8, raw[write..][0..token.len], token);
+        write += token.len;
+        first = false;
+    }
+    return .{ .user_focus = raw[0..write], .full = full };
 }
 
 fn requestResumeExit(app: anytype) void {
@@ -2080,44 +2115,36 @@ pub fn Handlers(comptime App: type) type {
         fn commandInitWorkspace(ctx: *anyopaque, opts: command_router.InitPayload) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime !@hasField(App, "workspace_root")) {
-                try app.writeDomainNotice(.{
-                    .topic = "init",
-                    .tone = .@"error",
-                    .body = "Workspace root is unavailable in this runtime.",
-                }, true);
+                try writeInitError(app, "Workspace root is unavailable in this runtime.");
                 return;
             }
             if (comptime !@hasDecl(App, "enqueuePrompt")) {
-                try app.writeDomainNotice(.{
-                    .topic = "init",
-                    .tone = .@"error",
-                    .body = "Prompt submission is unavailable in this runtime.",
-                }, true);
+                try writeInitError(app, "Prompt submission is unavailable in this runtime.");
                 return;
             }
+            const working = try app.alloc.dupe(u8, opts.raw);
+            defer app.alloc.free(working);
+            const parsed = parseInitRequest(working);
             const mode = try initModeForWorkspace(app.alloc, app.workspace_root);
-            const want_full = opts.full or initWantsFull();
-            const prompt = if (want_full)
-                try init_prompt.buildFull(app.alloc, app.workspace_root, opts.extras, mode)
+            const request: init_prompt.InitRequest = .{
+                .workspace_root = app.workspace_root,
+                .user_focus = parsed.user_focus,
+                .mode = mode,
+                .full = parsed.full,
+            };
+            const prompt = if (request.full)
+                try init_prompt.buildFull(app.alloc, request)
             else
-                try init_prompt.buildDistilled(app.alloc, app.workspace_root, opts.extras, mode);
+                try init_prompt.buildDistilled(app.alloc, request);
             defer app.alloc.free(prompt);
             const accepted = app.enqueuePrompt(prompt) catch |err| {
                 const message = try std.fmt.allocPrint(app.alloc, "Init prompt was rejected: {s}", .{@errorName(err)});
                 defer app.alloc.free(message);
-                try app.writeDomainNotice(.{
-                    .topic = "init",
-                    .tone = .@"error",
-                    .body = message,
-                }, true);
+                try writeInitError(app, message);
                 return;
             };
             if (!accepted) {
-                try app.writeDomainNotice(.{
-                    .topic = "init",
-                    .tone = .@"error",
-                    .body = "Init prompt was rejected by the worker.",
-                }, true);
+                try writeInitError(app, "Init prompt was rejected by the worker.");
                 return;
             }
             // No tryBeginWorkspaceMutation gate: normal prompt admission already queues during active work.
@@ -2125,7 +2152,7 @@ pub fn Handlers(comptime App: type) type {
             // (worker begin_prompt path). A short card here would render a
             // second card, so the one-liner stays a notice until /init uses
             // the presented-prompt flow.
-            const notice = try std.fmt.allocPrint(app.alloc, "Generating AGENTS.md ({s}, {s}).", .{ @tagName(mode), if (want_full) "full" else "distilled" });
+            const notice = try std.fmt.allocPrint(app.alloc, "Generating AGENTS.md ({s}, {s}).", .{ @tagName(request.mode), if (request.full) "full" else "distilled" });
             defer app.alloc.free(notice);
             try app.writeDomainNotice(.{
                 .topic = "init",
@@ -3511,7 +3538,6 @@ const InitCommandFakeApp = struct {
     alloc: std.mem.Allocator,
     workspace_root: []const u8 = "",
     submitted: ?[]u8 = null,
-    displayed: ?[]u8 = null,
     last_topic: ?[]const u8 = null,
     last_tone: ?types.NoticeTone = null,
     last_body: ?[]u8 = null,
@@ -3519,7 +3545,6 @@ const InitCommandFakeApp = struct {
 
     fn deinit(self: *InitCommandFakeApp) void {
         if (self.submitted) |owned| self.alloc.free(owned);
-        if (self.displayed) |owned| self.alloc.free(owned);
         if (self.last_body) |owned| self.alloc.free(owned);
     }
 
@@ -3530,12 +3555,102 @@ const InitCommandFakeApp = struct {
         return true;
     }
 
-    fn writeUserPromptCard(self: *InitCommandFakeApp, user: types.UserTurn) !void {
-        if (self.displayed) |old| self.alloc.free(old);
-        self.displayed = try self.alloc.dupe(u8, user.text);
+    noinline fn writeDomainNotice(self: *InitCommandFakeApp, notice: types.SemanticNotice, _: bool) !void {
+        self.last_topic = notice.topic;
+        self.last_tone = notice.tone;
+        if (self.last_body) |old| self.alloc.free(old);
+        self.last_body = try self.alloc.dupe(u8, notice.body);
+    }
+};
+
+var init_test_empty_env: std.process.Environ.Map = std.process.Environ.Map.init(std.heap.c_allocator);
+
+const InitNoRootFakeApp = struct {
+    alloc: std.mem.Allocator,
+    last_topic: ?[]const u8 = null,
+    last_tone: ?types.NoticeTone = null,
+    last_body: ?[]u8 = null,
+
+    fn deinit(self: *InitNoRootFakeApp) void {
+        if (self.last_body) |owned| self.alloc.free(owned);
     }
 
-    noinline fn writeDomainNotice(self: *InitCommandFakeApp, notice: types.SemanticNotice, _: bool) !void {
+    fn enqueuePrompt(self: *InitNoRootFakeApp, prompt: []const u8) !bool {
+        _ = self;
+        _ = prompt;
+        return true;
+    }
+
+    noinline fn writeDomainNotice(self: *InitNoRootFakeApp, notice: types.SemanticNotice, _: bool) !void {
+        self.last_topic = notice.topic;
+        self.last_tone = notice.tone;
+        if (self.last_body) |old| self.alloc.free(old);
+        self.last_body = try self.alloc.dupe(u8, notice.body);
+    }
+};
+
+const InitNoEnqueueFakeApp = struct {
+    alloc: std.mem.Allocator,
+    workspace_root: []const u8 = "",
+    last_topic: ?[]const u8 = null,
+    last_tone: ?types.NoticeTone = null,
+    last_body: ?[]u8 = null,
+
+    fn deinit(self: *InitNoEnqueueFakeApp) void {
+        if (self.last_body) |owned| self.alloc.free(owned);
+    }
+
+    noinline fn writeDomainNotice(self: *InitNoEnqueueFakeApp, notice: types.SemanticNotice, _: bool) !void {
+        self.last_topic = notice.topic;
+        self.last_tone = notice.tone;
+        if (self.last_body) |old| self.alloc.free(old);
+        self.last_body = try self.alloc.dupe(u8, notice.body);
+    }
+};
+
+const InitDeclineFakeApp = struct {
+    alloc: std.mem.Allocator,
+    workspace_root: []const u8 = "",
+    last_topic: ?[]const u8 = null,
+    last_tone: ?types.NoticeTone = null,
+    last_body: ?[]u8 = null,
+
+    fn deinit(self: *InitDeclineFakeApp) void {
+        if (self.last_body) |owned| self.alloc.free(owned);
+    }
+
+    fn enqueuePrompt(self: *InitDeclineFakeApp, prompt: []const u8) !bool {
+        _ = self;
+        _ = prompt;
+        return false;
+    }
+
+    noinline fn writeDomainNotice(self: *InitDeclineFakeApp, notice: types.SemanticNotice, _: bool) !void {
+        self.last_topic = notice.topic;
+        self.last_tone = notice.tone;
+        if (self.last_body) |old| self.alloc.free(old);
+        self.last_body = try self.alloc.dupe(u8, notice.body);
+    }
+};
+
+const InitFailFakeApp = struct {
+    alloc: std.mem.Allocator,
+    workspace_root: []const u8 = "",
+    last_topic: ?[]const u8 = null,
+    last_tone: ?types.NoticeTone = null,
+    last_body: ?[]u8 = null,
+
+    fn deinit(self: *InitFailFakeApp) void {
+        if (self.last_body) |owned| self.alloc.free(owned);
+    }
+
+    fn enqueuePrompt(self: *InitFailFakeApp, prompt: []const u8) !bool {
+        _ = self;
+        _ = prompt;
+        return error.TestInitRejected;
+    }
+
+    noinline fn writeDomainNotice(self: *InitFailFakeApp, notice: types.SemanticNotice, _: bool) !void {
         self.last_topic = notice.topic;
         self.last_tone = notice.tone;
         if (self.last_body) |old| self.alloc.free(old);
@@ -3553,12 +3668,11 @@ test "init workspace auto-submits distilled create and full audit" {
     defer alloc.free(fresh_root);
     var fresh = InitCommandFakeApp{ .alloc = alloc, .workspace_root = fresh_root };
     defer fresh.deinit();
-    try Handlers(InitCommandFakeApp).commandInitWorkspace(@ptrCast(&fresh), .{ .extras = "", .full = false });
+    try Handlers(InitCommandFakeApp).commandInitWorkspace(@ptrCast(&fresh), .{ .raw = "" });
     try std.testing.expectEqual(@as(usize, 1), fresh.enqueue_calls);
     try std.testing.expect(fresh.submitted != null);
     try std.testing.expect(std.mem.find(u8, fresh.submitted.?, "Mode: create") != null);
     try std.testing.expect(std.mem.find(u8, fresh.submitted.?, "300") != null);
-    try std.testing.expect(fresh.displayed == null);
     try std.testing.expect(fresh.last_body != null);
     try std.testing.expect(std.mem.find(u8, fresh.last_body.?, "Generating AGENTS.md (create, distilled)") != null);
 
@@ -3570,15 +3684,151 @@ test "init workspace auto-submits distilled create and full audit" {
     defer alloc.free(existing_root);
     var existing = InitCommandFakeApp{ .alloc = alloc, .workspace_root = existing_root };
     defer existing.deinit();
-    try Handlers(InitCommandFakeApp).commandInitWorkspace(@ptrCast(&existing), .{ .extras = "focus on docs", .full = true });
+    try Handlers(InitCommandFakeApp).commandInitWorkspace(@ptrCast(&existing), .{ .raw = "focus on docs --full" });
     try std.testing.expectEqual(@as(usize, 1), existing.enqueue_calls);
     try std.testing.expect(std.mem.find(u8, existing.submitted.?, "Mode: audit") != null);
     try std.testing.expect(std.mem.find(u8, existing.submitted.?, "AGENTS.md Builder") != null);
     try std.testing.expect(std.mem.find(u8, existing.submitted.?, "focus on docs") != null);
     try std.testing.expect(std.mem.find(u8, existing.submitted.?, existing_root) != null);
-    try std.testing.expect(existing.displayed == null);
     try std.testing.expect(existing.last_body != null);
     try std.testing.expect(std.mem.find(u8, existing.last_body.?, "Generating AGENTS.md (audit, full)") != null);
+}
+
+test "init ignores FX_INIT_MODE env override" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "noenv");
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "noenv");
+    defer alloc.free(root);
+
+    var environ = std.process.Environ.Map.init(alloc);
+    defer environ.deinit();
+    try environ.put("FX_INIT_MODE", "full");
+    const prev = io_mod.environMap();
+    io_mod.setEnvironMap(&environ);
+    defer if (prev) |p| io_mod.setEnvironMap(p) else io_mod.setEnvironMap(&init_test_empty_env);
+
+    var app = InitCommandFakeApp{ .alloc = alloc, .workspace_root = root };
+    defer app.deinit();
+    try Handlers(InitCommandFakeApp).commandInitWorkspace(@ptrCast(&app), .{ .raw = "" });
+    try std.testing.expect(app.submitted != null);
+    try std.testing.expect(app.last_body != null);
+    try std.testing.expect(std.mem.find(u8, app.last_body.?, "distilled") != null);
+    try std.testing.expect(std.mem.find(u8, app.submitted.?, "AGENTS.md Builder") == null);
+}
+
+test "init error paths emit init error notices" {
+    const alloc = std.testing.allocator;
+
+    {
+        var app = InitNoRootFakeApp{ .alloc = alloc };
+        defer app.deinit();
+        try Handlers(InitNoRootFakeApp).commandInitWorkspace(@ptrCast(&app), .{ .raw = "" });
+        try std.testing.expectEqualStrings("init", app.last_topic.?);
+        try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
+        try std.testing.expect(std.mem.find(u8, app.last_body.?, "Workspace root is unavailable") != null);
+    }
+
+    {
+        var app = InitNoEnqueueFakeApp{ .alloc = alloc, .workspace_root = "/tmp" };
+        defer app.deinit();
+        try Handlers(InitNoEnqueueFakeApp).commandInitWorkspace(@ptrCast(&app), .{ .raw = "" });
+        try std.testing.expectEqualStrings("init", app.last_topic.?);
+        try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
+        try std.testing.expect(std.mem.find(u8, app.last_body.?, "Prompt submission is unavailable") != null);
+    }
+
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io_mod.getIo(), "decline");
+        const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "decline");
+        defer alloc.free(root);
+        var app = InitDeclineFakeApp{ .alloc = alloc, .workspace_root = root };
+        defer app.deinit();
+        try Handlers(InitDeclineFakeApp).commandInitWorkspace(@ptrCast(&app), .{ .raw = "" });
+        try std.testing.expectEqualStrings("init", app.last_topic.?);
+        try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
+        try std.testing.expect(std.mem.find(u8, app.last_body.?, "rejected by the worker") != null);
+    }
+
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io_mod.getIo(), "fail");
+        const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "fail");
+        defer alloc.free(root);
+        var app = InitFailFakeApp{ .alloc = alloc, .workspace_root = root };
+        defer app.deinit();
+        try Handlers(InitFailFakeApp).commandInitWorkspace(@ptrCast(&app), .{ .raw = "" });
+        try std.testing.expectEqualStrings("init", app.last_topic.?);
+        try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
+        try std.testing.expect(std.mem.find(u8, app.last_body.?, "Init prompt was rejected: ") != null);
+    }
+}
+
+test "parse init request filters middle flag without remnant" {
+    const buf = try std.testing.allocator.dupe(u8, "focus --full on docs");
+    defer std.testing.allocator.free(buf);
+    const parsed = parseInitRequest(buf);
+    try std.testing.expect(parsed.full);
+    try std.testing.expectEqualStrings("focus on docs", parsed.user_focus);
+    try std.testing.expect(std.mem.find(u8, parsed.user_focus, "--full") == null);
+}
+
+test "parse init request handles bare and edge flag positions" {
+    const alloc = std.testing.allocator;
+    {
+        const buf = try alloc.dupe(u8, "");
+        defer alloc.free(buf);
+        const parsed = parseInitRequest(buf);
+        try std.testing.expect(!parsed.full);
+        try std.testing.expectEqualStrings("", parsed.user_focus);
+    }
+    {
+        const buf = try alloc.dupe(u8, "--full");
+        defer alloc.free(buf);
+        const parsed = parseInitRequest(buf);
+        try std.testing.expect(parsed.full);
+        try std.testing.expectEqualStrings("", parsed.user_focus);
+    }
+    {
+        const buf = try alloc.dupe(u8, "--full focus on docs");
+        defer alloc.free(buf);
+        const parsed = parseInitRequest(buf);
+        try std.testing.expect(parsed.full);
+        try std.testing.expectEqualStrings("focus on docs", parsed.user_focus);
+    }
+    {
+        const buf = try alloc.dupe(u8, "focus on docs --full");
+        defer alloc.free(buf);
+        const parsed = parseInitRequest(buf);
+        try std.testing.expect(parsed.full);
+        try std.testing.expectEqualStrings("focus on docs", parsed.user_focus);
+    }
+    {
+        const buf = try alloc.dupe(u8, "focus --full --full on docs");
+        defer alloc.free(buf);
+        const parsed = parseInitRequest(buf);
+        try std.testing.expect(parsed.full);
+        try std.testing.expectEqualStrings("focus on docs", parsed.user_focus);
+    }
+    {
+        const buf = try alloc.dupe(u8, "--fuller");
+        defer alloc.free(buf);
+        const parsed = parseInitRequest(buf);
+        try std.testing.expect(!parsed.full);
+        try std.testing.expectEqualStrings("--fuller", parsed.user_focus);
+    }
+    {
+        const buf = try alloc.dupe(u8, "focus --fuller docs");
+        defer alloc.free(buf);
+        const parsed = parseInitRequest(buf);
+        try std.testing.expect(!parsed.full);
+        try std.testing.expectEqualStrings("focus --fuller docs", parsed.user_focus);
+    }
 }
 
 test "trace timeline retains semantic table contents" {
