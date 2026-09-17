@@ -1,4 +1,4 @@
-const paste_display = @import("../input/paste_display.zig");
+const user_turn_presentation = @import("../input/user_turn_presentation.zig");
 const std = @import("std");
 const image_data = @import("../images/image_data.zig");
 const session = @import("session.zig");
@@ -1424,7 +1424,7 @@ fn writeUserTurn(writer: *std.Io.Writer, user: session.UserTurn) !void {
         try writer.writeByte('}');
     }
     try writer.writeByte(']');
-    try paste_display.write(writer, user.paste_spans);
+    try user_turn_presentation.write(writer, user.presentation);
     if (user.work_id) |work_id| {
         try writer.writeAll(",\"work_id\":");
         try writeJsonString(writer, work_id);
@@ -1770,7 +1770,7 @@ fn parseUserTurn(alloc: Allocator, value: std.json.Value) !session.UserTurn {
     fields[0] = "text";
     fields[1] = "images";
     var field_count: usize = 2;
-    for ([_][]const u8{ "work_id", "paste_spans" }) |key| {
+    for ([_][]const u8{ "work_id", "presentation" }) |key| {
         if (source.contains(key)) {
             fields[field_count] = key;
             field_count += 1;
@@ -1779,8 +1779,8 @@ fn parseUserTurn(alloc: Allocator, value: std.json.Value) !session.UserTurn {
     const object = try exactObject(value, fields[0..field_count]);
     const text = try parseRequiredDurableBytes(alloc, object, "text");
     errdefer alloc.free(text);
-    const paste_spans = try paste_display.parse(alloc, text, object.get("paste_spans"));
-    errdefer alloc.free(paste_spans);
+    const presentation = try user_turn_presentation.parse(alloc, text, object.get("presentation"));
+    errdefer presentation.deinit(alloc);
     const work_id = if (object.get("work_id")) |_|
         try alloc.dupe(u8, try requireString(object, "work_id"))
     else
@@ -1789,7 +1789,7 @@ fn parseUserTurn(alloc: Allocator, value: std.json.Value) !session.UserTurn {
     if (work_id) |id| session.validateWorkId(id) catch return error.InvalidSessionFormat;
     const images_value = object.get("images") orelse return error.InvalidSessionFormat;
     if (images_value != .array) return error.InvalidSessionFormat;
-    if (images_value.array.items.len == 0) return .{ .text = text, .paste_spans = paste_spans, .work_id = work_id };
+    if (images_value.array.items.len == 0) return .{ .text = text, .presentation = presentation, .work_id = work_id };
 
     const images = try alloc.alloc(session.ImageAttachment, images_value.array.items.len);
     errdefer alloc.free(images);
@@ -1825,7 +1825,7 @@ fn parseUserTurn(alloc: Allocator, value: std.json.Value) !session.UserTurn {
         };
         parsed_count += 1;
     }
-    return .{ .text = text, .paste_spans = paste_spans, .images = images, .work_id = work_id };
+    return .{ .text = text, .presentation = presentation, .images = images, .work_id = work_id };
 }
 
 fn imageAttachmentObject(value: std.json.Value) !std.json.ObjectMap {
@@ -4772,18 +4772,20 @@ test "session metadata round trips without conversation or control state" {
 
 test "paste display metadata survives durable user turn roundtrip" {
     const alloc = std.testing.allocator;
-    var spans = [_]types.PasteDisplaySpan{.{ .id = 2, .start = 4, .end = 8 }};
-    const original: session.UserTurn = .{ .text = @constCast("ask a\nb\n"), .paste_spans = &spans };
+    var spans = [_]types.CollapsedRange{.{ .id = 2, .start = 4, .end = 8 }};
+    const original: session.UserTurn = .{ .text = @constCast("ask a\nb\n"), .presentation = .{ .collapsed_ranges = &spans } };
     var writer: std.Io.Writer.Allocating = .init(alloc);
     defer writer.deinit();
     try writeUserTurn(&writer.writer, original);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, writer.written(), .{});
     defer parsed.deinit();
+    const presentation = parsed.value.object.get("presentation").?;
+    try std.testing.expectEqual(@as(usize, 1), presentation.object.get("collapsed_ranges").?.array.items.len);
     const restored = try parseUserTurn(alloc, parsed.value);
     defer session.freeUserTurn(alloc, restored);
     try std.testing.expectEqualStrings(original.text, restored.text);
-    try std.testing.expectEqualSlices(types.PasteDisplaySpan, &spans, restored.paste_spans);
+    try std.testing.expectEqualSlices(types.CollapsedRange, &spans, restored.presentation.collapsed_ranges);
     const copy = try session.dupeUserTurn(alloc, restored);
     defer session.freeUserTurn(alloc, copy);
-    try std.testing.expectEqualSlices(types.PasteDisplaySpan, &spans, copy.paste_spans);
+    try std.testing.expectEqualSlices(types.CollapsedRange, &spans, copy.presentation.collapsed_ranges);
 }

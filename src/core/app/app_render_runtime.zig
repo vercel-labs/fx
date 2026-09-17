@@ -260,7 +260,7 @@ fn buildPendingCardProjection(
     const available_rows = presentation_shell.layout.content_bottom - cursor_row + 1 -| leading_advance_rows;
     const card = try user_message_card.buildUserTurnCard(
         app.alloc,
-        .{ .text = pending.draft.prompt, .images = pending.draft.images, .paste_spans = pending.draft.paste_spans },
+        .{ .text = pending.draft.prompt, .images = pending.draft.images, .presentation = pending.draft.presentation },
         presentation_shell.layout.cols,
         skill_tokens,
         false,

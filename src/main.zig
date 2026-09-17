@@ -1107,10 +1107,10 @@ const App = struct {
     }
 
     pub fn enqueuePromptWithSkillBindings(self: *App, prompt: []const u8, skill_tokens: []const registered_entities.SkillTokenSpan) !bool {
-        return self.enqueuePromptWithPasteSpans(prompt, skill_tokens, &.{});
+        return self.enqueuePromptWithPresentation(prompt, skill_tokens, .{});
     }
 
-    pub fn enqueuePromptWithPasteSpans(self: *App, prompt: []const u8, skill_tokens: []const registered_entities.SkillTokenSpan, paste_spans: []const types.PasteDisplaySpan) !bool {
+    pub fn enqueuePromptWithPresentation(self: *App, prompt: []const u8, skill_tokens: []const registered_entities.SkillTokenSpan, presentation: types.UserTurnPresentation) !bool {
         const context_targets = if (self.context_enabled)
             try context_contract.applicableTargetsForImages(self.alloc, self.pending_images.items)
         else
@@ -1133,7 +1133,7 @@ const App = struct {
         if (!try self.snapshotAndAdmitInteractivePromptWithSkillBindings(
             prompt,
             skill_tokens,
-            paste_spans,
+            presentation,
         )) return false;
         WorkerAppRuntime.syncState(
             self,
@@ -1147,7 +1147,7 @@ const App = struct {
         draft: *const input_submit_runtime.PendingPromptDraft,
     ) !void {
         try self.writeUserPromptCardWithSkillBindings(
-            .{ .text = draft.prompt, .images = draft.images, .paste_spans = draft.paste_spans },
+            .{ .text = draft.prompt, .images = draft.images, .presentation = draft.presentation },
             &.{},
             draft.skill_display_spans,
         );
@@ -1173,7 +1173,7 @@ const App = struct {
         if (!try self.snapshotAndQueuePrompt(
             draft.prompt,
             skill_tokens,
-            draft.paste_spans,
+            draft.presentation,
             null,
             draft.images,
             draft.turn_id,
@@ -1323,12 +1323,12 @@ const App = struct {
         self: *App,
         prompt: []const u8,
         skill_tokens: []const registered_entities.SkillTokenSpan,
-        paste_spans: []const types.PasteDisplaySpan,
+        presentation: types.UserTurnPresentation,
     ) !bool {
         const queued = try self.snapshotPrompt(
             prompt,
             skill_tokens,
-            paste_spans,
+            presentation,
             null,
             null,
             0,
@@ -1347,7 +1347,7 @@ const App = struct {
         if (!try self.snapshotAndQueuePrompt(
             checkpoint.user.text,
             &.{},
-            checkpoint.user.paste_spans,
+            checkpoint.user.presentation,
             checkpoint,
             null,
             checkpoint.turn_id,
@@ -1365,7 +1365,7 @@ const App = struct {
         self: *App,
         prompt: []const u8,
         skill_tokens: []const registered_entities.SkillTokenSpan,
-        paste_spans: []const types.PasteDisplaySpan,
+        presentation: types.UserTurnPresentation,
         recovery_checkpoint: ?*const session_codec.RecoveryCheckpoint,
         prompt_images: ?[]const types.ImageAttachment,
         turn_id: u64,
@@ -1374,7 +1374,7 @@ const App = struct {
         const queued = try self.snapshotPrompt(
             prompt,
             skill_tokens,
-            paste_spans,
+            presentation,
             recovery_checkpoint,
             prompt_images,
             turn_id,
@@ -1391,7 +1391,7 @@ const App = struct {
         self: *App,
         prompt: []const u8,
         skill_tokens: []const registered_entities.SkillTokenSpan,
-        paste_spans: []const types.PasteDisplaySpan,
+        presentation: types.UserTurnPresentation,
         recovery_checkpoint: ?*const session_codec.RecoveryCheckpoint,
         prompt_images: ?[]const types.ImageAttachment,
         turn_id: u64,
@@ -1476,8 +1476,8 @@ const App = struct {
         const skill_bindings = try dupeUniqueSkillBindingsFromTokens(std.heap.c_allocator, skill_tokens);
         errdefer worker_runtime.freeSkillBindings(std.heap.c_allocator, skill_bindings);
 
-        const paste_spans_copy = try std.heap.c_allocator.dupe(types.PasteDisplaySpan, paste_spans);
-        errdefer std.heap.c_allocator.free(paste_spans_copy);
+        const presentation_copy = try presentation.dupe(std.heap.c_allocator);
+        errdefer presentation_copy.deinit(std.heap.c_allocator);
         const skill_display_spans = try dupeSkillDisplaySpansFromTokens(std.heap.c_allocator, skill_tokens);
         errdefer worker_runtime.freeSkillDisplaySpans(std.heap.c_allocator, skill_display_spans);
 
@@ -1499,7 +1499,7 @@ const App = struct {
             .grants = grants_copy,
             .skill_bindings = skill_bindings,
             .skill_display_spans = skill_display_spans,
-            .paste_spans = paste_spans_copy,
+            .presentation = presentation_copy,
             .context_snapshot = context_snapshot_copy,
             .recovery_checkpoint = recovery_checkpoint_copy,
             .recovery_source_already_presented = recovery_checkpoint != null,

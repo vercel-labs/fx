@@ -1,6 +1,6 @@
 const std = @import("std");
 const paste_blocks = @import("../input/pasted_blocks.zig");
-const paste_display = @import("../input/paste_display.zig");
+const user_turn_presentation = @import("../input/user_turn_presentation.zig");
 const registered_entities = @import("../input/registered_entities.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
@@ -28,11 +28,11 @@ pub const PendingPromptDraft = struct {
     prompt: []u8,
     images: []types.ImageAttachment,
     skill_display_spans: []worker_runtime.SkillDisplaySpan,
-    paste_spans: []types.PasteDisplaySpan = &.{},
+    presentation: types.UserTurnPresentation = .{},
 
     fn deinit(self: PendingPromptDraft, alloc: std.mem.Allocator) void {
         alloc.free(self.prompt);
-        if (self.paste_spans.len > 0) alloc.free(self.paste_spans);
+        self.presentation.deinit(alloc);
         types.freeImageAttachmentSlice(alloc, self.images);
         worker_runtime.freeSkillDisplaySpans(alloc, self.skill_display_spans);
     }
@@ -743,7 +743,7 @@ pub fn SubmitRuntime(comptime App: type) type {
 
             if (trimmed.len == 0) {
                 if (app.pending_images.items.len > 0) {
-                    const admission = try enqueuePromptForSubmit(app, "", &.{}, &.{});
+                    const admission = try enqueuePromptForSubmit(app, "", &.{}, .{});
                     if (admission == .rejected) return;
                     releasePendingImages(app);
                     app.input_runtime.inputResetState().clearCurrent(app.alloc);
@@ -842,7 +842,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                 image_occurrences.items,
             );
             defer if (display_skill_tokens.len > 0) app.alloc.free(display_skill_tokens);
-            const paste_spans = try projectPasteSpansForSubmit(
+            const presentation = try projectPresentationForSubmit(
                 app.alloc,
                 app.input_runtime.edit_state.input.items,
                 expanded.text,
@@ -853,7 +853,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                 image_occurrences.items,
                 app.input_runtime.paste_collapse_lines,
             );
-            defer app.alloc.free(paste_spans);
+            defer presentation.deinit(app.alloc);
             var history_projection: ?ComposerHistoryProjection = if (composerHistoryEnabled(app))
                 try prepareComposerHistoryProjection(
                     app,
@@ -876,7 +876,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                     app,
                     visual_text.text,
                     display_skill_tokens,
-                    paste_spans,
+                    presentation,
                     images,
                 )
             else
@@ -884,7 +884,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                     app,
                     visual_text.text,
                     display_skill_tokens,
-                    paste_spans,
+                    presentation,
                 );
             if (admission == .rejected) return;
             commitStableExtractedImageIds(app, extracted.images);
@@ -1110,15 +1110,15 @@ pub fn SubmitRuntime(comptime App: type) type {
             app: *App,
             prompt: []const u8,
             skill_tokens: []const registered_entities.SkillTokenSpan,
-            paste_spans: []const types.PasteDisplaySpan,
+            presentation: types.UserTurnPresentation,
         ) !PromptAdmission {
-            switch (try installPendingSubmission(app, prompt, skill_tokens, paste_spans)) {
+            switch (try installPendingSubmission(app, prompt, skill_tokens, presentation)) {
                 .installed => return .pending,
                 .unavailable => {},
             }
             if (!try preflightPrompt(app)) return .rejected;
-            const accepted = if (comptime @hasDecl(App, "enqueuePromptWithPasteSpans"))
-                try App.enqueuePromptWithPasteSpans(app, prompt, skill_tokens, paste_spans)
+            const accepted = if (comptime @hasDecl(App, "enqueuePromptWithPresentation"))
+                try App.enqueuePromptWithPresentation(app, prompt, skill_tokens, presentation)
             else if (comptime @hasDecl(App, "enqueuePromptWithSkillBindings"))
                 try App.enqueuePromptWithSkillBindings(app, prompt, skill_tokens)
             else
@@ -1131,7 +1131,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             app: *App,
             prompt: []const u8,
             skill_tokens: []const registered_entities.SkillTokenSpan,
-            paste_spans: []const types.PasteDisplaySpan,
+            presentation: types.UserTurnPresentation,
         ) !PendingInstall {
             if (comptime !@hasField(App, "submission") or
                 !@hasField(App, "worker") or
@@ -1165,7 +1165,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                 skill_tokens,
             );
             errdefer draft.deinit(app.alloc);
-            draft.paste_spans = try app.alloc.dupe(types.PasteDisplaySpan, paste_spans);
+            draft.presentation = try presentation.dupe(app.alloc);
             app.submission.pending = PendingSubmission.init(draft);
             app.shell.render_requests.request(.transcript);
             app.shell.render_requests.request(.footer);
@@ -1183,7 +1183,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             app: *App,
             prompt: []const u8,
             skill_tokens: []const registered_entities.SkillTokenSpan,
-            paste_spans: []const types.PasteDisplaySpan,
+            presentation: types.UserTurnPresentation,
             staged_images: *std.ArrayList(types.ImageAttachment),
         ) !PromptAdmission {
             const original_images = app.pending_images;
@@ -1198,7 +1198,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                 app,
                 prompt,
                 skill_tokens,
-                paste_spans,
+                presentation,
             );
             if (admission == .rejected) {
                 staged_images.* = app.pending_images;
@@ -1840,7 +1840,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             end: usize,
         };
 
-        fn projectPasteSpansForSubmit(
+        fn projectPresentationForSubmit(
             alloc: std.mem.Allocator,
             raw_input: []const u8,
             expanded_text: []const u8,
@@ -1850,8 +1850,8 @@ pub fn SubmitRuntime(comptime App: type) type {
             edits: []const image_attachments.InlineImageEdit,
             image_occurrences: []const ImageOccurrence,
             preview_lines: u32,
-        ) ![]types.PasteDisplaySpan {
-            var spans: std.ArrayList(types.PasteDisplaySpan) = .empty;
+        ) !types.UserTurnPresentation {
+            var spans: std.ArrayList(types.CollapsedRange) = .empty;
             errdefer spans.deinit(alloc);
             for (blocks) |block| {
                 const expanded = projectSpanThroughPasteExpansion(raw_input, blocks, .{
@@ -1863,16 +1863,16 @@ pub fn SubmitRuntime(comptime App: type) type {
                 if (final.end > final_text.len or !std.mem.eql(u8, final_text[final.start..final.end], block.text)) continue;
                 try spans.append(alloc, .{
                     .id = block.id,
-                    .start = final.start + paste_display.hidden_start(block.text, preview_lines),
+                    .start = final.start + user_turn_presentation.hidden_start(block.text, preview_lines),
                     .end = final.end,
                 });
             }
-            std.mem.sort(types.PasteDisplaySpan, spans.items, {}, struct {
-                fn less(_: void, a: types.PasteDisplaySpan, b: types.PasteDisplaySpan) bool {
+            std.mem.sort(types.CollapsedRange, spans.items, {}, struct {
+                fn less(_: void, a: types.CollapsedRange, b: types.CollapsedRange) bool {
                     return a.start < b.start;
                 }
             }.less);
-            return spans.toOwnedSlice(alloc);
+            return .{ .collapsed_ranges = try spans.toOwnedSlice(alloc) };
         }
 
         fn projectSkillTokensForSubmit(

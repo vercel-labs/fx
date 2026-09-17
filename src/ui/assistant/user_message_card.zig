@@ -1,4 +1,4 @@
-const paste_display = @import("../../core/input/paste_display.zig");
+const user_turn_presentation = @import("../../core/input/user_turn_presentation.zig");
 // Renders submitted user turns and owns their row collection and wrapping.
 const std = @import("std");
 const build_checkpoint = @import("../render_engine/build_checkpoint.zig");
@@ -88,16 +88,16 @@ pub fn buildUserTurnCard(
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
     max_rows: ?usize,
 ) ![]u8 {
-    if (full or user.paste_spans.len == 0 or !paste_display.valid(user.text, user.paste_spans)) {
+    if (full or user.presentation.collapsed_ranges.len == 0 or !user_turn_presentation.valid(user.text, user.presentation.collapsed_ranges)) {
         return buildUserPromptCardWithSkillTokensAndLinksInterruptible(alloc, user.text, user.images, cols, skill_tokens, true, checkpoint, max_rows);
     }
-    const text = try paste_display.collapse(alloc, user.text, user.paste_spans);
+    const text = try user_turn_presentation.collapse(alloc, user.text, user.presentation.collapsed_ranges);
     defer alloc.free(text);
     var tokens: std.ArrayList(visual_layout.SkillTokenSpan) = .empty;
     defer tokens.deinit(alloc);
     for (skill_tokens) |token| {
-        const start = paste_display.collapsedOffset(user.text, user.paste_spans, token.raw_start) orelse continue;
-        const end = paste_display.collapsedOffset(user.text, user.paste_spans, token.raw_end) orelse continue;
+        const start = user_turn_presentation.collapsedOffset(user.text, user.presentation.collapsed_ranges, token.raw_start) orelse continue;
+        const end = user_turn_presentation.collapsedOffset(user.text, user.presentation.collapsed_ranges, token.raw_end) orelse continue;
         var projected = token;
         projected.raw_start = start;
         projected.raw_end = end;
@@ -873,8 +873,8 @@ test "pending terminal card keeps only the visible tail rows" {
 
 test "paste display is compact inline and complete in full transcript" {
     const alloc = std.testing.allocator;
-    var spans = [_]types.PasteDisplaySpan{.{ .id = 1, .start = 4, .end = 16 }};
-    const user: types.UserTurn = .{ .text = @constCast("ask FIRST\nLAST\n!"), .paste_spans = &spans };
+    var spans = [_]types.CollapsedRange{.{ .id = 1, .start = 4, .end = 16 }};
+    const user: types.UserTurn = .{ .text = @constCast("ask FIRST\nLAST\n!"), .presentation = .{ .collapsed_ranges = &spans } };
     const compact = try buildUserTurnCard(alloc, user, 80, &.{}, false, null, null);
     defer alloc.free(compact);
     try std.testing.expect(std.mem.find(u8, compact, "[Pasted text #1, 3 lines]") != null);
