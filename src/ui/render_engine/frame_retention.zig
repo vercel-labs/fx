@@ -24,8 +24,10 @@ pub const StableRetainCandidate = struct {
     committed_layout_id: u64,
     committed_flow: []const u8,
     committed_occupied_last_row: u16,
+    committed_sticky_rows: u16 = 0,
     source_layout: frame_layout.CommittedLayoutSnapshot,
     source_bytes: []const u8,
+    source_sticky_rows: u16 = 0,
     target_layout: frame_layout.CommittedLayoutSnapshot,
     scroll_plan: frame_scroll_plan.FrameScrollPlan,
     destructive_invalidation: bool = false,
@@ -40,6 +42,14 @@ pub fn stableRetainedTranscriptBody(candidate: StableRetainCandidate) ?RetainedT
 fn candidateHasStableSource(candidate: StableRetainCandidate) bool {
     if (candidate.full_transcript_active) return false;
     if (candidate.committed_layout_id != candidate.source_layout.layout_id) return false;
+    // Sticky inset changes move body rows without changing body flow bytes —
+    // refuse retain so vacated T1 chrome cannot ghost in the scrolling region.
+    if (candidate.committed_sticky_rows != candidate.source_sticky_rows) return false;
+    // While sticky owns the top inset, always repaint the scrolling body so
+    // collapse hotkeys (Ctrl+[ / Ctrl+]) and sticky chrome updates cannot be
+    // skipped by retain. Lookback is preserved separately via DL eviction
+    // before full-terminal newline release (not by partial DECSTBM).
+    if (candidate.source_sticky_rows > 0) return false;
     return std.mem.eql(u8, candidate.source_bytes, candidate.committed_flow);
 }
 
@@ -311,6 +321,8 @@ test "validate retains the primary transcript after a normal-screen transition" 
         0,
         .{ .restore_normal_screen = .{ .mouse_tracking_active = true } },
         .none,
+        1,
+        0,
     );
     defer movement.deinit(std.testing.allocator);
 
@@ -422,4 +434,36 @@ test "countSurfaceChanges treats identical combining suffixes as retained" {
         @as(usize, 1),
         countSurfaceChanges(baseline, surface, retained_area),
     );
+}
+
+test "stable retain refuses any sticky inset so hotkey paints are not skipped" {
+    const flow = "stable transcript\n";
+    const source_layout: frame_layout.CommittedLayoutSnapshot = .{
+        .layout_id = 9,
+        .owned_top = 1,
+        .owned_band = .{ .top = 1, .bottom = 8 },
+        .body_area = .{ .top = 1, .bottom = 5 },
+        .transcript_area = .{ .top = 1, .bottom = 5 },
+        .footer_area = .{ .top = 6, .bottom = 8 },
+        .solved_frame_height = 8,
+        .terminal_rows = 8,
+        .terminal_cols = 40,
+    };
+    const base_candidate = StableRetainCandidate{
+        .committed_layout_id = source_layout.layout_id,
+        .committed_flow = flow,
+        .committed_occupied_last_row = 5,
+        .committed_sticky_rows = 1,
+        .source_layout = source_layout,
+        .source_bytes = flow,
+        .source_sticky_rows = 1,
+        .target_layout = source_layout,
+        .scroll_plan = frame_scroll_plan.FrameScrollPlan.none(source_layout.terminal_rows, 1),
+    };
+    try std.testing.expect(stableRetainedTranscriptBody(base_candidate) == null);
+
+    var clear = base_candidate;
+    clear.committed_sticky_rows = 0;
+    clear.source_sticky_rows = 0;
+    try std.testing.expect(stableRetainedTranscriptBody(clear) != null);
 }

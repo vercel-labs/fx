@@ -1534,7 +1534,7 @@ fn buildCompactTranscriptProjectionInterruptible(
         self.tool_details.items,
         self.layout.cols,
         focused_entry_id,
-        collapseToolCalls(self),
+        collapseView(self),
         .{
             .marker_style = user_message_card.promptMarkerStyle(),
             .text_style = ui_render.statusline_style,
@@ -1549,6 +1549,18 @@ fn buildCompactTranscriptProjectionInterruptible(
         projection.entry_actions.items,
         command_overrides,
     );
+    if (comptime @hasField(@TypeOf(self.*), "sticky_umbrella_chrome")) {
+        if (self.sticky_umbrella_chrome) |old_bytes| {
+            alloc.free(old_bytes);
+            self.sticky_umbrella_chrome = null;
+        }
+        if (projection.sticky_chrome) |chrome| {
+            // Move ownership onto the shell for sticky paint; projection must
+            // not free it on deinit.
+            self.sticky_umbrella_chrome = chrome;
+            projection.sticky_chrome = null;
+        }
+    }
     return projection;
 }
 
@@ -1646,6 +1658,20 @@ fn buildCommandOutputOverridesInterruptible(
         }
     }
     return overrides;
+}
+
+fn collapseView(self: anytype) tool_group_projection.CollapseView {
+    const Shell = @TypeOf(self.*);
+    var view: tool_group_projection.CollapseView = .{
+        .collapse_tool_calls = collapseToolCalls(self),
+    };
+    if (comptime @hasField(Shell, "tool_collapse")) {
+        view.tree = &self.tool_collapse;
+        if (self.tool_collapse.preferred_turn_key) |turn_key| {
+            view.active_turn_key = turn_key;
+        }
+    }
+    return view;
 }
 
 fn collapseToolCalls(self: anytype) bool {

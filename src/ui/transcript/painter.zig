@@ -1130,6 +1130,10 @@ pub const PreparedTranscriptSurfacePaint = struct {
     // producer facts. Empty candidates mean the whole flow is final.
     finality_candidates: transcript_release.Candidates = .{},
     cursor: ViewportCursorResult = .{ .cursor_row = 1, .cursor_col = 1, .replaceable_row = 1 },
+    /// Borrowed sticky umbrella chrome (not owned); painted at sticky_top_row.
+    sticky_chrome: []const u8 = &.{},
+    sticky_rows: u16 = 0,
+    sticky_top_row: u16 = 0,
 
     pub fn deinit(self: *PreparedTranscriptSurfacePaint, alloc: Allocator) void {
         self.finality_candidates.deinit(alloc);
@@ -1814,6 +1818,29 @@ fn prepareTranscriptSurfacePaintInternal(
         transcript_line_count;
     var visible_rows: u16 = bottom_row - top_row + 1;
 
+    // Sticky T0 (+ compact T1 headers) inset: reserve top rows so the live
+    // umbrella stays visible while the main transcript scrolls underneath.
+    if (comptime @hasField(@TypeOf(self.*), "sticky_umbrella_chrome")) {
+        if (self.sticky_umbrella_chrome) |chrome| {
+            if (chrome.len > 0 and visible_rows > 1) {
+                var rows: u16 = 1;
+                for (chrome) |byte| {
+                    if (byte == '\n') rows += 1;
+                }
+                // Cap sticky so at least one scrolling row remains.
+                if (rows >= visible_rows) rows = visible_rows - 1;
+                if (rows > 0) {
+                    prepared.sticky_chrome = chrome;
+                    prepared.sticky_rows = rows;
+                    prepared.sticky_top_row = top_row;
+                    top_row += rows;
+                    visible_rows -= rows;
+                    prepared.projection_area.top = top_row;
+                }
+            }
+        }
+    }
+
     const capture_line_provenance = source.line_provenance.len > 0;
     var repl_line_idx: usize = total_lines;
     var tracked_visible_line: ?usize = null;
@@ -2040,6 +2067,37 @@ fn prepareTranscriptSurfacePaintInternal(
                                 committed.start_line,
                                 committed.partial_skip_rows,
                             },
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // Collapse hotkeys must not snap the viewport to the composer/tail. When the
+    // tree asks to preserve scroll, pin the prior visual offset across the
+    // incompatible flow rewrite that tiered projection produces.
+    if (comptime @hasField(@TypeOf(self.*), "tool_collapse")) {
+        if (self.tool_collapse.takePreserveViewport()) {
+            if (comptime @hasDecl(@TypeOf(self.*), "stableTranscriptProjectionForFlow")) {
+                if (self.stableTranscriptProjectionForFlow(transcript_bytes)) |stable| {
+                    const max_offset = prepared.sourceTotalVisualRows();
+                    const preserved = @min(stable.history_visual_offset, max_offset);
+                    if (preserved > 0 or stable.history_visual_offset > 0) {
+                        setSelectionVisualOffset(
+                            &viewport_selection_snapshot,
+                            prepared.sourceVisualRows(),
+                            preserved,
+                        );
+                        rows_budget = unusedRowsForSelection(
+                            prepared.sourceVisualRows(),
+                            viewport_selection_snapshot,
+                            visible_rows,
+                        );
+                        welcome_decision = .none;
+                        debug_trace.logf(
+                            "scroll",
+                            "collapse_preserve_viewport offset={d} total={d}",
+                            .{ preserved, max_offset },
                         );
                     }
                 }
@@ -2344,6 +2402,18 @@ pub fn reprojectPreparedTranscriptForVisualOffset(
         projectionRemainingVisualRows(prepared, visual_offset) orelse
         return error.InvalidTranscriptTransition;
     if (remaining_visual_rows > area.height()) {
+        debug_trace.logf(
+            "scroll",
+            "reproject_exceeds_area site=reproject visual_offset={d} remaining={d} area_height={d} area={d}..{d} sticky_rows={d}",
+            .{
+                visual_offset,
+                remaining_visual_rows,
+                area.height(),
+                area.top,
+                area.bottom,
+                prepared.sticky_rows,
+            },
+        );
         return error.InvalidTranscriptTransition;
     }
 
@@ -3285,12 +3355,56 @@ pub fn preparedTranscriptProjectionExceedsArea(
     return remaining_visual_rows > area.height();
 }
 
+fn padStickyChromeToRows(alloc: Allocator, chrome: []const u8, rows: u16) ![]u8 {
+    if (rows == 0) return try alloc.dupe(u8, "");
+    var line_count: u16 = 1;
+    for (chrome) |byte| {
+        if (byte == '\n') line_count += 1;
+    }
+    if (line_count >= rows) return try alloc.dupe(u8, chrome);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.writeAll(chrome);
+    var missing = rows - line_count;
+    while (missing > 0) : (missing -= 1) {
+        try out.writer.writeByte('\n');
+    }
+    return out.toOwnedSlice();
+}
+
 pub fn paintPreparedTranscriptIntoSurface(
     self: anytype,
     alloc: Allocator,
     surface: *frame_surface.FrameSurface,
     prepared: *const PreparedTranscriptSurfacePaint,
 ) !paint_plan.TranscriptPaintResult {
+    // Sticky T0(+T1) lives in the transcript band but outside the scrolling
+    // selection. When sticky shrinks, vacated rows must be cleared even if the
+    // body disposition retains — otherwise T1 chrome ghosts in the gutter.
+    if (comptime @hasField(@TypeOf(self.*), "last_sticky_umbrella_rows")) {
+        const old_top = self.last_sticky_umbrella_top;
+        const old_rows = self.last_sticky_umbrella_rows;
+        if (old_rows > 0 and surface.plan.transcript_band.containsRow(old_top) and
+            surface.plan.transcript_band.containsRow(old_top + old_rows - 1))
+        {
+            _ = try surface.writeAnsiBand(old_top, old_rows, "", .transcript, .same_owner);
+        }
+    }
+    if (prepared.sticky_rows > 0 and prepared.sticky_chrome.len > 0) {
+        const padded = try padStickyChromeToRows(alloc, prepared.sticky_chrome, prepared.sticky_rows);
+        defer alloc.free(padded);
+        _ = try surface.writeAnsiBand(
+            prepared.sticky_top_row,
+            prepared.sticky_rows,
+            padded,
+            .transcript,
+            .same_owner,
+        );
+    }
+    if (comptime @hasField(@TypeOf(self.*), "last_sticky_umbrella_rows")) {
+        self.last_sticky_umbrella_top = prepared.sticky_top_row;
+        self.last_sticky_umbrella_rows = prepared.sticky_rows;
+    }
     const render_context = .{
         .layout = self.layout,
         .replaceable_last_line = prepared.replaceable_last_line,
@@ -4334,4 +4448,43 @@ test "transcript paint row traces stay metadata only" {
     const forbidden_preview = "pre" ++ "view=";
     try std.testing.expect(std.mem.find(u8, source, "transcript_line row=") != null);
     try std.testing.expect(std.mem.find(u8, source, forbidden_preview) == null);
+}
+
+test "stage clips where reproject would reject tall remaining" {
+    const alloc = std.testing.allocator;
+    var body: std.Io.Writer.Allocating = .init(alloc);
+    defer body.deinit();
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        try body.writer.print("line-{d}\n", .{i});
+    }
+    var batch = try transcriptTestBatch(alloc, body.writer.buffer[0..body.writer.end], 40);
+    defer batch.deinit(alloc);
+
+    var prepared = PreparedTranscriptSurfacePaint{
+        .selection = .{
+            .top_row = 2,
+            .bottom_row = 5,
+            .start_line = 0,
+            .partial_skip_rows = 0,
+            .line_count = 0,
+            .replaceable_start_row = 2,
+        },
+    };
+    defer prepared.deinit(alloc);
+    prepared.bytes = try alloc.dupe(u8, batch.transcript_bytes);
+    try prepared.visible_lines.appendSlice(alloc, batch.lines);
+    try prepared.line_visual_rows.appendSlice(alloc, batch.line_visual_rows);
+    prepared.total_lines = batch.lines.len;
+    prepared.selection.line_count = prepared.total_lines;
+    prepared.transcript_ends_with_newline = true;
+
+    const layout = testLayout(40, 20, 18);
+    const area = render_engine.frame_layout.FrameRect{ .top = 2, .bottom = 5 };
+    try std.testing.expectError(
+        error.InvalidTranscriptTransition,
+        reprojectPreparedTranscriptForVisualOffset(alloc, layout, &prepared, area, 0),
+    );
+    _ = try stagePreparedTranscriptForVisualOffset(alloc, layout, &prepared, area, 0);
+    try std.testing.expect(prepared.selection.last_visible_row <= area.bottom);
 }

@@ -1706,6 +1706,19 @@ pub fn Runtime(comptime App: type) type {
                 presentation_shell,
                 active_committed_layout,
             );
+            // Evict sticky T0(+T1) via DL before full-terminal newline release so
+            // umbrella chrome does not spill into scrollback, while body rows still
+            // enter native lookback (partial DECSTBM would discard history).
+            if (prepared_transcript) |*prepared| {
+                if (prepared.sticky_rows > 0 and prepared.sticky_top_row > 0) {
+                    scroll_plan.sticky_top_row = prepared.sticky_top_row;
+                    scroll_plan.scroll_region_top = prepared.sticky_top_row + prepared.sticky_rows;
+                    if (transcript_transition) |*transition| {
+                        transition.scroll_plan.sticky_top_row = scroll_plan.sticky_top_row;
+                        transition.scroll_plan.scroll_region_top = scroll_plan.scroll_region_top;
+                    }
+                }
+            }
             const result = try render_engine.frame_builder.buildAndFlushFrame(
                 app.alloc,
                 &frame_shell,
@@ -2170,15 +2183,19 @@ fn FixedPointTranscriptContext(comptime App: type) type {
                 self.presentation_shell.committed_frame_layout.transcript_area,
                 candidate_plan.invalidation,
             );
+            const canonical_area = transcriptAreaBeforePendingTail(
+                candidate.transcript_area,
+                self.pending_tail_rows,
+            );
+            // Sticky umbrella owns the top inset; scrolling projection/staging
+            // must use the same shrunk area prepare already applied.
+            const projection_area = canonical_area.afterTopInset(prepared.sticky_rows);
             const target = try self.presentation_shell.resolveTranscriptTransitionTargetForFrameInArea(
                 self.app.alloc,
                 source,
                 prepared,
                 render_engine.frame_layout.CommittedLayoutSnapshot.fromLayout(candidate),
-                transcriptAreaBeforePendingTail(
-                    candidate.transcript_area,
-                    self.pending_tail_rows,
-                ),
+                projection_area,
                 scroll_plan,
                 scroll_facts,
                 destructive_invalidation,

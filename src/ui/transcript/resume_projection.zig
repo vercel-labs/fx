@@ -448,6 +448,9 @@ pub const ResumeProjection = struct {
         target.recomputeCursorFromTranscript();
         target.reconcileDetachedInstallSource(target.pendingResumeFlow());
         target.markTranscriptDirty();
+        // ToolCollapseTree is memory-only — re-seed preferred so sticky/hotkey
+        // umbrella chrome is active on `fx -c` without a persisted expand map.
+        target.tool_collapse.reseedPreferredTurnFromToolDetails(target.tool_details.items);
 
         self.consumed = true;
         self.runtime.deinit(self.alloc);
@@ -467,6 +470,9 @@ pub const ResumeProjection = struct {
             self.runtime.pendingResumeFlow(),
         );
         self.runtime.markTranscriptDirty();
+        self.runtime.tool_collapse.reseedPreferredTurnFromToolDetails(
+            self.runtime.tool_details.items,
+        );
 
         self.consumed = true;
         return self.runtime;
@@ -772,6 +778,35 @@ test "live resume projection preserves an incomplete command block" {
     try std.testing.expect(
         runtime.command_output_display.open_command_block == null,
     );
+}
+
+
+test "resume install reseeds preferred_turn_key from tool details" {
+    const alloc = std.testing.allocator;
+    var source: TranscriptRuntime = .{};
+    source.layout.cols = 80;
+    defer source.deinit(alloc);
+
+    var target: TranscriptRuntime = .{};
+    target.layout = source.layout;
+    defer target.deinit(alloc);
+
+    var projection = try ResumeProjection.initEmpty(alloc, &source, 42, 1);
+    defer projection.deinit();
+    const tool_name = try alloc.dupe(u8, "Read");
+    errdefer alloc.free(tool_name);
+    const call_id = try alloc.dupe(u8, "resume-seed");
+    errdefer alloc.free(call_id);
+    try projection.runtime.tool_details.append(alloc, .{
+        .entry_id = 1,
+        .tool_name = tool_name,
+        .lifecycle_id = .{ .turn_id = 42, .call_id = call_id },
+    });
+    try projection.finalize();
+    try std.testing.expect(projection.runtime.tool_collapse.preferred_turn_key == null);
+    try std.testing.expect(target.tool_collapse.preferred_turn_key == null);
+    projection.install(&target);
+    try std.testing.expectEqual(@as(?u64, 42), target.tool_collapse.preferred_turn_key);
 }
 
 fn checkResumeProjectionAllocationFailures(alloc: Allocator) !void {

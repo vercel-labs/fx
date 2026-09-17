@@ -3006,6 +3006,51 @@ test "input escape parser handles modifyOtherKeys ctrl o" {
     try std.testing.expectEqual(@as(?InputEscapeAction, .toggle_full_transcript), consumeInputEscapeByte(&stage, &param, &param2, '~'));
 }
 
+test "input escape parser handles kitty ctrl bracket collapse chords" {
+    // ESC[91;5u / ESC[93;5u — Kitty Ctrl+[ / Ctrl+].
+    var stage: u8 = 1;
+    var param: u16 = 0;
+    var param2: u16 = 0;
+    for ("[91;5") |byte| {
+        try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, byte));
+    }
+    try std.testing.expectEqual(@as(?InputEscapeAction, .collapse_tools_step), consumeInputEscapeByte(&stage, &param, &param2, 'u'));
+
+    stage = 1;
+    param = 0;
+    param2 = 0;
+    for ("[93;5") |byte| {
+        try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, byte));
+    }
+    try std.testing.expectEqual(@as(?InputEscapeAction, .expand_tools_step), consumeInputEscapeByte(&stage, &param, &param2, 'u'));
+}
+
+test "input escape parser handles modifyOtherKeys ctrl brackets" {
+    // ESC[27;5;91~ / ESC[27;5;93~
+    var stage: u8 = 1;
+    var param: u16 = 0;
+    var param2: u16 = 0;
+    for ("[27;5;91") |byte| {
+        try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, byte));
+    }
+    try std.testing.expectEqual(@as(?InputEscapeAction, .collapse_tools_step), consumeInputEscapeByte(&stage, &param, &param2, '~'));
+
+    stage = 1;
+    param = 0;
+    param2 = 0;
+    for ("[27;5;93") |byte| {
+        try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, byte));
+    }
+    try std.testing.expectEqual(@as(?InputEscapeAction, .expand_tools_step), consumeInputEscapeByte(&stage, &param, &param2, '~'));
+}
+
+test "controlByteFeatureAction maps legacy ctrl backslash and ctrl bracket" {
+    try std.testing.expectEqual(@as(?InputEscapeAction, .collapse_tools_step), controlByteFeatureAction(0x1c));
+    try std.testing.expectEqual(@as(?InputEscapeAction, .expand_tools_step), controlByteFeatureAction(0x1d));
+    // Ctrl+[ is ESC — must not be claimed as a collapse hotkey.
+    try std.testing.expectEqual(@as(?InputEscapeAction, null), controlByteFeatureAction(0x1b));
+}
+
 test "input cursor movement edits inside line" {
     var runtime = InputRuntime{};
     defer runtime.deinit(std.testing.allocator);

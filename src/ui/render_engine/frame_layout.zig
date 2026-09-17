@@ -33,6 +33,17 @@ pub const FrameRect = struct {
         return !self.isEmpty() and row >= self.top and row <= self.bottom;
     }
 
+    /// Raise the top edge by `rows`, leaving at least one row when possible.
+    /// Used for sticky umbrella chrome that owns the top of the transcript band
+    /// while scrolling projection occupies the remainder.
+    pub fn afterTopInset(self: FrameRect, rows: u16) FrameRect {
+        if (self.isEmpty() or rows == 0) return self;
+        if (rows >= self.height()) {
+            return .{ .top = self.bottom, .bottom = self.bottom };
+        }
+        return .{ .top = self.top + rows, .bottom = self.bottom };
+    }
+
     pub fn toBand(self: FrameRect, owner: paint_plan.CellOwner) paint_plan.FrameBand {
         if (self.isEmpty()) return paint_plan.FrameBand.empty(owner);
         return .{ .top = self.top, .bottom = self.bottom, .owner = owner };
@@ -1157,4 +1168,18 @@ fn testFooterRows(top: u16, rows: u16) footer_layout.FooterRows {
         .hint = top + rows - 1,
         .total_rows = rows,
     };
+}
+
+test "FrameRect afterTopInset reserves sticky rows" {
+    const full = FrameRect{ .top = 1, .bottom = 10 };
+    try std.testing.expectEqual(@as(u16, 1), full.afterTopInset(0).top);
+    try std.testing.expectEqual(@as(u16, 10), full.afterTopInset(0).bottom);
+    const inset = full.afterTopInset(2);
+    try std.testing.expectEqual(@as(u16, 3), inset.top);
+    try std.testing.expectEqual(@as(u16, 10), inset.bottom);
+    try std.testing.expectEqual(@as(u16, 8), inset.height());
+    const capped = full.afterTopInset(100);
+    try std.testing.expectEqual(@as(u16, 10), capped.top);
+    try std.testing.expectEqual(@as(u16, 10), capped.bottom);
+    try std.testing.expect(FrameRect.empty().afterTopInset(3).isEmpty());
 }
