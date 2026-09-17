@@ -105,3 +105,22 @@ Report security vulnerabilities through the [contact page](https://fx.sh/contact
 ## Credits
 
 Interface sounds by [cuelume](https://github.com/Danilaa1/cuelume).
+
+### Pasted text
+
+Pastes longer than 1,000 Unicode codepoints appear as a compact placeholder in
+both the composer and the submitted chat. Press Ctrl+O to read the complete
+submitted text in the full transcript; press Esc to return. The model always
+receives the complete text.
+
+To also collapse tall pastes, set `"paste_collapse_lines": 10` in
+`~/.fx/settings.json` or its profile workspace override. This collapses a paste
+with more than ten logical lines, independently of the character threshold.
+The composer shows a placeholder. Submitted chat shows the first ten lines,
+followed by a placeholder counting the remaining hidden lines. Ctrl+O shows
+the complete paste. Pastes collapsed only by character count keep a full placeholder.
+Omitting the setting or using `0` disables only the additional line threshold.
+CRLF and CR line endings normalize to LF; a final newline does not add a line.
+The setting is ignored in project `.fx.json` and does not change ACP client
+presentation or steering previews. Successfully attached image/text mixtures
+retain their existing presentation.

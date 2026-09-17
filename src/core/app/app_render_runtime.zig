@@ -258,14 +258,14 @@ fn buildPendingCardProjection(
         presentation_shell.layout.content_bottom,
     );
     const available_rows = presentation_shell.layout.content_bottom - cursor_row + 1 -| leading_advance_rows;
-    const card = try user_message_card.buildUserPromptCardTailForTerminalPresentationInterruptible(
+    const card = try user_message_card.buildUserTurnCard(
         app.alloc,
-        pending.draft.prompt,
-        pending.draft.images,
+        .{ .text = pending.draft.prompt, .images = pending.draft.images, .presentation = pending.draft.presentation },
         presentation_shell.layout.cols,
         skill_tokens,
-        @max(available_rows, 1),
+        false,
         checkpoint,
+        @max(available_rows, 1),
     );
     defer app.alloc.free(card);
     if (card.len == 0) return null;

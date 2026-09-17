@@ -2810,12 +2810,14 @@ pub fn writeUserPromptCard(
         );
     }
 
-    const card = try user_message_card.buildUserPromptCardWithSkillTokensForTerminalPresentation(
+    const card = try user_message_card.buildUserTurnCard(
         alloc,
-        user.text,
-        user.images,
+        user,
         shadow.layout.cols,
         skill_tokens,
+        false,
+        null,
+        null,
     );
     defer alloc.free(card);
     try shadow.writeTranscriptBytes(alloc, metrics, card, true);

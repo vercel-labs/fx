@@ -1,3 +1,4 @@
+const user_turn_presentation = @import("../input/user_turn_presentation.zig");
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
@@ -318,7 +319,9 @@ fn writeUserTurnJson(writer: *std.Io.Writer, user: session.UserTurn) !void {
         try std.json.Stringify.value(image.snapshot_sha256, .{}, writer);
         try writer.writeByte('}');
     }
-    try writer.writeAll("]}");
+    try writer.writeByte(']');
+    try user_turn_presentation.write(writer, user.presentation);
+    try writer.writeByte('}');
 }
 
 fn writeImageSnapshotLocatorJson(writer: *std.Io.Writer, value: ?[]const u8) !void {
@@ -1189,9 +1192,11 @@ fn parseUserTurn(alloc: Allocator, value: std.json.Value) !session.UserTurn {
     const object = try requireObject(value);
     const text = try alloc.dupe(u8, try requireString(object, "text"));
     errdefer alloc.free(text);
+    const presentation = try user_turn_presentation.parse(alloc, text, object.get("presentation"));
+    errdefer presentation.deinit(alloc);
     const images = try validateImagesArray(alloc, object.get("images"));
     errdefer session.freeImageAttachmentSlice(alloc, images);
-    return .{ .text = text, .images = images };
+    return .{ .text = text, .presentation = presentation, .images = images };
 }
 
 fn parseConversationLanguage(raw: []const u8) !session.ConversationLanguage {

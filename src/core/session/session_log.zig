@@ -1873,6 +1873,7 @@ const ConversationTurnBuilder = struct {
         self.user = try types.dupeUserTurn(self.alloc, .{
             .text = @constCast(value.text),
             .images = @constCast(value.images),
+            .presentation = value.presentation,
             .work_id = if (value.work_id) |work_id| @constCast(work_id) else null,
         });
     }

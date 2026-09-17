@@ -34,6 +34,7 @@ const ImageBlocks = kill_ring.ImageBlocks;
 pub const Runtime = struct {
     edit_state: editor_state.State = .{},
     slash_menu_categories: bool = true,
+    paste_collapse_lines: u32 = 0,
     picker: picker_state.State = .{},
     help_menu: command_specs.HelpMenu = .{},
     settings_menu: settings_catalog.Menu = .{},

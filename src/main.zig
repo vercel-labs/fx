@@ -1107,6 +1107,10 @@ const App = struct {
     }
 
     pub fn enqueuePromptWithSkillBindings(self: *App, prompt: []const u8, skill_tokens: []const registered_entities.SkillTokenSpan) !bool {
+        return self.enqueuePromptWithPresentation(prompt, skill_tokens, .{});
+    }
+
+    pub fn enqueuePromptWithPresentation(self: *App, prompt: []const u8, skill_tokens: []const registered_entities.SkillTokenSpan, presentation: types.UserTurnPresentation) !bool {
         const context_targets = if (self.context_enabled)
             try context_contract.applicableTargetsForImages(self.alloc, self.pending_images.items)
         else
@@ -1129,6 +1133,7 @@ const App = struct {
         if (!try self.snapshotAndAdmitInteractivePromptWithSkillBindings(
             prompt,
             skill_tokens,
+            presentation,
         )) return false;
         WorkerAppRuntime.syncState(
             self,
@@ -1142,7 +1147,7 @@ const App = struct {
         draft: *const input_submit_runtime.PendingPromptDraft,
     ) !void {
         try self.writeUserPromptCardWithSkillBindings(
-            .{ .text = draft.prompt, .images = draft.images },
+            .{ .text = draft.prompt, .images = draft.images, .presentation = draft.presentation },
             &.{},
             draft.skill_display_spans,
         );
@@ -1168,6 +1173,7 @@ const App = struct {
         if (!try self.snapshotAndQueuePrompt(
             draft.prompt,
             skill_tokens,
+            draft.presentation,
             null,
             draft.images,
             draft.turn_id,
@@ -1317,10 +1323,12 @@ const App = struct {
         self: *App,
         prompt: []const u8,
         skill_tokens: []const registered_entities.SkillTokenSpan,
+        presentation: types.UserTurnPresentation,
     ) !bool {
         const queued = try self.snapshotPrompt(
             prompt,
             skill_tokens,
+            presentation,
             null,
             null,
             0,
@@ -1339,6 +1347,7 @@ const App = struct {
         if (!try self.snapshotAndQueuePrompt(
             checkpoint.user.text,
             &.{},
+            checkpoint.user.presentation,
             checkpoint,
             null,
             checkpoint.turn_id,
@@ -1356,6 +1365,7 @@ const App = struct {
         self: *App,
         prompt: []const u8,
         skill_tokens: []const registered_entities.SkillTokenSpan,
+        presentation: types.UserTurnPresentation,
         recovery_checkpoint: ?*const session_codec.RecoveryCheckpoint,
         prompt_images: ?[]const types.ImageAttachment,
         turn_id: u64,
@@ -1364,6 +1374,7 @@ const App = struct {
         const queued = try self.snapshotPrompt(
             prompt,
             skill_tokens,
+            presentation,
             recovery_checkpoint,
             prompt_images,
             turn_id,
@@ -1380,6 +1391,7 @@ const App = struct {
         self: *App,
         prompt: []const u8,
         skill_tokens: []const registered_entities.SkillTokenSpan,
+        presentation: types.UserTurnPresentation,
         recovery_checkpoint: ?*const session_codec.RecoveryCheckpoint,
         prompt_images: ?[]const types.ImageAttachment,
         turn_id: u64,
@@ -1464,6 +1476,8 @@ const App = struct {
         const skill_bindings = try dupeUniqueSkillBindingsFromTokens(std.heap.c_allocator, skill_tokens);
         errdefer worker_runtime.freeSkillBindings(std.heap.c_allocator, skill_bindings);
 
+        const presentation_copy = try presentation.dupe(std.heap.c_allocator);
+        errdefer presentation_copy.deinit(std.heap.c_allocator);
         const skill_display_spans = try dupeSkillDisplaySpansFromTokens(std.heap.c_allocator, skill_tokens);
         errdefer worker_runtime.freeSkillDisplaySpans(std.heap.c_allocator, skill_display_spans);
 
@@ -1485,6 +1499,7 @@ const App = struct {
             .grants = grants_copy,
             .skill_bindings = skill_bindings,
             .skill_display_spans = skill_display_spans,
+            .presentation = presentation_copy,
             .context_snapshot = context_snapshot_copy,
             .recovery_checkpoint = recovery_checkpoint_copy,
             .recovery_source_already_presented = recovery_checkpoint != null,
@@ -4260,6 +4275,7 @@ test {
     _ = @import("ui/resize_tests.zig");
     _ = @import("ui/render_engine/assistant_wrap.zig");
     _ = @import("ui/render_engine/transcript_blocks.zig");
+    _ = @import("ui/assistant/user_message_card.zig");
     _ = @import("ui/render_engine/viewport_selection.zig");
     _ = @import("core/agent/assistant_presentation.zig");
     _ = @import("core/upgrade/auto_upgrade.zig");

@@ -1280,7 +1280,12 @@ pub const ImageAttachment = struct {
     snapshot_sha256: ?[]u8 = null,
 };
 
+pub const CollapsedRange = @import("../input/user_turn_presentation.zig").CollapsedRange;
+pub const UserTurnPresentation = @import("../input/user_turn_presentation.zig").Presentation;
+
 pub const UserTurn = struct {
+    /// Presentation metadata only; providers and ACP consume complete text.
+    presentation: UserTurnPresentation = .{},
     text: []u8,
     images: []ImageAttachment = &.{},
     /// Durable join key for manager-owned child work. This is metadata only;
@@ -3042,6 +3047,7 @@ test "ToolArgumentIntegrity preserves parser allocation failure" {
 
 pub fn freeUserTurn(alloc: std.mem.Allocator, user: UserTurn) void {
     alloc.free(user.text);
+    user.presentation.deinit(alloc);
     freeImageAttachmentSlice(alloc, user.images);
     if (user.work_id) |work_id| alloc.free(work_id);
 }
@@ -3053,12 +3059,15 @@ pub fn dupeUserTurn(alloc: std.mem.Allocator, user: UserTurn) !UserTurn {
     const images = try dupeImageAttachmentSlice(alloc, user.images);
     errdefer freeImageAttachmentSlice(alloc, images);
 
+    const presentation = try user.presentation.dupe(alloc);
+    errdefer presentation.deinit(alloc);
     const work_id = if (user.work_id) |value| try alloc.dupe(u8, value) else null;
 
     return .{
         .text = text,
         .images = images,
         .work_id = work_id,
+        .presentation = presentation,
     };
 }
 

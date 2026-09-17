@@ -1,3 +1,4 @@
+const user_turn_presentation = @import("../input/user_turn_presentation.zig");
 const std = @import("std");
 const builtin = @import("builtin");
 const session = @import("session.zig");
@@ -15,7 +16,7 @@ pub const raw_state_chunk_bytes: usize = 4 * 1024 * 1024;
 pub const Identifier = [16]u8;
 pub const Digest = [Sha256.digest_length]u8;
 
-pub const conversation_schema_version: u8 = 2;
+pub const conversation_schema_version: u8 = 3;
 pub const max_conversation_text_bytes: usize = event_frame_max_bytes;
 pub const max_conversation_identity_bytes: usize = types.ConversationIdentity.max_bytes;
 pub const max_conversation_arguments_bytes: usize = event_frame_max_bytes;
@@ -41,6 +42,7 @@ pub const ConversationUser = struct {
     text: []const u8,
     images: []const types.ImageAttachment = &.{},
     work_id: ?[]const u8 = null,
+    presentation: types.UserTurnPresentation = .{},
 };
 
 pub const ConversationToolCall = struct {
@@ -207,7 +209,7 @@ pub fn validateConversationTransition(
     state: ConversationStateView,
     envelope: ConversationEnvelope,
 ) ConversationTransitionError!void {
-    if (envelope.schema_version != 1 and envelope.schema_version != conversation_schema_version) {
+    if (envelope.schema_version < 1 or envelope.schema_version > conversation_schema_version) {
         return error.UnsupportedConversationSchema;
     }
     const expected_seq = std.math.add(u64, state.last_seq, 1) catch
@@ -254,6 +256,7 @@ fn validateConversationEventShape(event: ConversationEvent, schema_version: u8) 
     switch (event) {
         .user => |value| {
             try validateConversationText(value.text);
+            if (!user_turn_presentation.valid(value.text, value.presentation.collapsed_ranges)) return error.InvalidConversationEvent;
             if (value.images.len > 128) return error.InvalidConversationEvent;
             for (value.images) |image| {
                 if (image.path.len == 0 or
@@ -445,7 +448,7 @@ pub fn decodeConversationFrame(
         else => return error.InvalidConversationFrame,
     };
     errdefer parsed.deinit();
-    if ((parsed.value.schema_version != 1 and parsed.value.schema_version != conversation_schema_version) or
+    if ((parsed.value.schema_version < 1 or parsed.value.schema_version > conversation_schema_version) or
         parsed.value.seq == 0 or
         parsed.value.timestamp_ms < 0)
     {
@@ -471,6 +474,7 @@ pub fn appendHistoryTurnConversationEvents(
             try events.append(alloc, .{ .user = .{
                 .text = entry.user.text,
                 .images = entry.user.images,
+                .presentation = entry.user.presentation,
                 .work_id = entry.user.work_id,
             } });
             try appendExecutionConversationEvents(alloc, events, entry.execution);
@@ -488,6 +492,7 @@ pub fn appendHistoryTurnConversationEvents(
             try events.append(alloc, .{ .user = .{
                 .text = entry.user.text,
                 .images = entry.user.images,
+                .presentation = entry.user.presentation,
                 .work_id = entry.user.work_id,
             } });
             try appendExecutionConversationEvents(alloc, events, entry.execution);
@@ -3563,7 +3568,7 @@ test "conversation frame reads old records and preserves new reasoning-only assi
     defer alloc.free(encoded);
     var current = try decodeConversationFrame(alloc, encoded);
     defer current.deinit();
-    try std.testing.expectEqual(@as(u8, 2), current.value.schema_version);
+    try std.testing.expectEqual(conversation_schema_version, current.value.schema_version);
     try std.testing.expectEqualStrings(replay.parts_json, current.value.event.assistant.provider_replay.?.parts_json);
     try validateConversationTransition(.{ .last_seq = 1 }, current.value);
 }
@@ -3642,4 +3647,25 @@ test "history turn projects to flat conversation events with artifact references
     try std.testing.expect(events.items[5] == .turn_completed);
     results[0].tool_image_handle = null;
     try std.testing.expectError(error.ConversationArtifactRequired, appendHistoryTurnConversationEvents(std.testing.allocator, &events, turn));
+}
+
+test "paste display conversation frames roundtrip and older frames remain readable" {
+    const alloc = std.testing.allocator;
+    const spans = [_]types.CollapsedRange{.{ .id = 1, .start = 0, .end = 3 }};
+    const frame = try encodeConversationFrame(alloc, .{
+        .seq = 1,
+        .timestamp_ms = 1,
+        .event = .{ .user = .{ .text = "a\nb", .presentation = .{ .collapsed_ranges = &spans } } },
+    });
+    defer alloc.free(frame);
+    var decoded = try decodeConversationFrame(alloc, frame);
+    defer decoded.deinit();
+    try std.testing.expectEqualSlices(types.CollapsedRange, &spans, decoded.value.event.user.presentation.collapsed_ranges);
+    for ([_]u8{ 1, 2 }) |version| {
+        const old = try std.fmt.allocPrint(alloc, "{{\"schema_version\":{d},\"seq\":1,\"timestamp_ms\":1,\"event\":{{\"user\":{{\"text\":\"plain\"}}}}}}\n", .{version});
+        defer alloc.free(old);
+        var parsed = try decodeConversationFrame(alloc, old);
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(usize, 0), parsed.value.event.user.presentation.collapsed_ranges.len);
+    }
 }

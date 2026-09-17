@@ -1,5 +1,6 @@
 const std = @import("std");
 const paste_blocks = @import("../input/pasted_blocks.zig");
+const user_turn_presentation = @import("../input/user_turn_presentation.zig");
 const registered_entities = @import("../input/registered_entities.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
@@ -27,9 +28,11 @@ pub const PendingPromptDraft = struct {
     prompt: []u8,
     images: []types.ImageAttachment,
     skill_display_spans: []worker_runtime.SkillDisplaySpan,
+    presentation: types.UserTurnPresentation = .{},
 
     fn deinit(self: PendingPromptDraft, alloc: std.mem.Allocator) void {
         alloc.free(self.prompt);
+        self.presentation.deinit(alloc);
         types.freeImageAttachmentSlice(alloc, self.images);
         worker_runtime.freeSkillDisplaySpans(alloc, self.skill_display_spans);
     }
@@ -740,7 +743,7 @@ pub fn SubmitRuntime(comptime App: type) type {
 
             if (trimmed.len == 0) {
                 if (app.pending_images.items.len > 0) {
-                    const admission = try enqueuePromptForSubmit(app, "", &.{});
+                    const admission = try enqueuePromptForSubmit(app, "", &.{}, .{});
                     if (admission == .rejected) return;
                     releasePendingImages(app);
                     app.input_runtime.inputResetState().clearCurrent(app.alloc);
@@ -839,6 +842,18 @@ pub fn SubmitRuntime(comptime App: type) type {
                 image_occurrences.items,
             );
             defer if (display_skill_tokens.len > 0) app.alloc.free(display_skill_tokens);
+            const presentation = try projectPresentationForSubmit(
+                app.alloc,
+                app.input_runtime.edit_state.input.items,
+                expanded.text,
+                effective_text,
+                visual_text.text,
+                app.input_runtime.entities.pasted_blocks.items,
+                extracted.edits,
+                image_occurrences.items,
+                app.input_runtime.paste_collapse_lines,
+            );
+            defer presentation.deinit(app.alloc);
             var history_projection: ?ComposerHistoryProjection = if (composerHistoryEnabled(app))
                 try prepareComposerHistoryProjection(
                     app,
@@ -861,6 +876,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                     app,
                     visual_text.text,
                     display_skill_tokens,
+                    presentation,
                     images,
                 )
             else
@@ -868,6 +884,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                     app,
                     visual_text.text,
                     display_skill_tokens,
+                    presentation,
                 );
             if (admission == .rejected) return;
             commitStableExtractedImageIds(app, extracted.images);
@@ -1093,13 +1110,16 @@ pub fn SubmitRuntime(comptime App: type) type {
             app: *App,
             prompt: []const u8,
             skill_tokens: []const registered_entities.SkillTokenSpan,
+            presentation: types.UserTurnPresentation,
         ) !PromptAdmission {
-            switch (try installPendingSubmission(app, prompt, skill_tokens)) {
+            switch (try installPendingSubmission(app, prompt, skill_tokens, presentation)) {
                 .installed => return .pending,
                 .unavailable => {},
             }
             if (!try preflightPrompt(app)) return .rejected;
-            const accepted = if (comptime @hasDecl(App, "enqueuePromptWithSkillBindings"))
+            const accepted = if (comptime @hasDecl(App, "enqueuePromptWithPresentation"))
+                try App.enqueuePromptWithPresentation(app, prompt, skill_tokens, presentation)
+            else if (comptime @hasDecl(App, "enqueuePromptWithSkillBindings"))
                 try App.enqueuePromptWithSkillBindings(app, prompt, skill_tokens)
             else
                 try App.enqueuePrompt(app, prompt);
@@ -1111,6 +1131,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             app: *App,
             prompt: []const u8,
             skill_tokens: []const registered_entities.SkillTokenSpan,
+            presentation: types.UserTurnPresentation,
         ) !PendingInstall {
             if (comptime !@hasField(App, "submission") or
                 !@hasField(App, "worker") or
@@ -1136,13 +1157,15 @@ pub fn SubmitRuntime(comptime App: type) type {
             if (!app.worker.tryHoldTurnStart()) return .unavailable;
             errdefer app.worker.releaseTurnStartHold();
 
-            const draft = try buildPendingPromptDraft(
+            var draft = try buildPendingPromptDraft(
                 app.alloc,
                 debug_trace.nextTurnId(),
                 prompt,
                 app.pending_images.items,
                 skill_tokens,
             );
+            errdefer draft.deinit(app.alloc);
+            draft.presentation = try presentation.dupe(app.alloc);
             app.submission.pending = PendingSubmission.init(draft);
             app.shell.render_requests.request(.transcript);
             app.shell.render_requests.request(.footer);
@@ -1160,6 +1183,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             app: *App,
             prompt: []const u8,
             skill_tokens: []const registered_entities.SkillTokenSpan,
+            presentation: types.UserTurnPresentation,
             staged_images: *std.ArrayList(types.ImageAttachment),
         ) !PromptAdmission {
             const original_images = app.pending_images;
@@ -1174,6 +1198,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                 app,
                 prompt,
                 skill_tokens,
+                presentation,
             );
             if (admission == .rejected) {
                 staged_images.* = app.pending_images;
@@ -1814,6 +1839,41 @@ pub fn SubmitRuntime(comptime App: type) type {
             start: usize,
             end: usize,
         };
+
+        fn projectPresentationForSubmit(
+            alloc: std.mem.Allocator,
+            raw_input: []const u8,
+            expanded_text: []const u8,
+            effective_text: []const u8,
+            final_text: []const u8,
+            blocks: []const paste_blocks.PastedBlock,
+            edits: []const image_attachments.InlineImageEdit,
+            image_occurrences: []const ImageOccurrence,
+            preview_lines: u32,
+        ) !types.UserTurnPresentation {
+            var spans: std.ArrayList(types.CollapsedRange) = .empty;
+            errdefer spans.deinit(alloc);
+            for (blocks) |block| {
+                const expanded = projectSpanThroughPasteExpansion(raw_input, blocks, .{
+                    .start = block.span.raw_start,
+                    .end = block.span.raw_end,
+                }) orelse continue;
+                const effective = project_inline_span(expanded_text.len, expanded, edits) orelse continue;
+                const final = projectSpanThroughSubmittedImages(effective_text, image_occurrences, effective) orelse continue;
+                if (final.end > final_text.len or !std.mem.eql(u8, final_text[final.start..final.end], block.text)) continue;
+                try spans.append(alloc, .{
+                    .id = block.id,
+                    .start = final.start + user_turn_presentation.hidden_start(block.text, preview_lines),
+                    .end = final.end,
+                });
+            }
+            std.mem.sort(types.CollapsedRange, spans.items, {}, struct {
+                fn less(_: void, a: types.CollapsedRange, b: types.CollapsedRange) bool {
+                    return a.start < b.start;
+                }
+            }.less);
+            return .{ .collapsed_ranges = try spans.toOwnedSlice(alloc) };
+        }
 
         fn projectSkillTokensForSubmit(
             alloc: std.mem.Allocator,

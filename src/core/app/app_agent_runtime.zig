@@ -974,7 +974,7 @@ pub fn Runtime(comptime App: type) type {
                     var checkpoint = value;
                     defer checkpoint.deinit(std.heap.c_allocator);
                     fresh_history = try app_callbacks.Bindings(App).prepareFreshPrompt(app, .{
-                        .user = .{ .text = job.prompt, .images = job.images },
+                        .user = .{ .text = job.prompt, .images = job.images, .presentation = job.presentation },
                         .prior_turn = checkpoint.interruptedTurn(),
                     });
                     job.history = fresh_history.?.history;

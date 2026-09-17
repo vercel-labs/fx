@@ -53,6 +53,7 @@ pub const Settings = struct {
     fast_mode_model_bound: ?bool = null,
     slash_menu_categories: ?bool = null,
     collapse_tool_calls: ?bool = null,
+    paste_collapse_lines: ?u32 = null,
     auto_upgrade: ?bool = null,
     update_channel: ?update_target.Channel = null,
     theme: ?[]const u8 = null,
@@ -125,6 +126,7 @@ pub const ConfigSources = struct {
     fast_mode_model_bound: ConfigSource = .compiled_default,
     slash_menu_categories: ConfigSource = .compiled_default,
     collapse_tool_calls: ConfigSource = .compiled_default,
+    paste_collapse_lines: ConfigSource = .compiled_default,
     startup_scrollback: ConfigSource = .compiled_default,
     prompt_history_enabled: ConfigSource = .compiled_default,
     statusline_context: ConfigSource = .compiled_default,
@@ -666,6 +668,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "fast_mode_model_bound",
         "slash_menu_categories",
         "collapse_tool_calls",
+        "paste_collapse_lines",
         "theme",
         "session_titles",
         "startup_scrollback",
@@ -757,6 +760,7 @@ fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: Conf
     if (settings.fast_mode_model_bound != null) sources.fast_mode_model_bound = source;
     if (settings.slash_menu_categories != null) sources.slash_menu_categories = source;
     if (settings.collapse_tool_calls != null) sources.collapse_tool_calls = source;
+    if (settings.paste_collapse_lines != null) sources.paste_collapse_lines = source;
     if (settings.session_titles != null) sources.session_titles = source;
     if (settings.startup_scrollback != null) sources.startup_scrollback = source;
     if (settings.prompt_history_enabled != null) sources.prompt_history_enabled = source;
@@ -1537,6 +1541,12 @@ fn parseProfileOnlyFields(
         settings.slash_menu_categories = value.bool;
     }
 
+    if (root.object.get("paste_collapse_lines")) |value| {
+        if (value != .integer) return error.InvalidPasteCollapseLinesType;
+        settings.paste_collapse_lines = std.math.cast(u32, value.integer) orelse
+            return error.InvalidPasteCollapseLinesValue;
+    }
+
     if (root.object.get("collapse_tool_calls")) |collapse_tool_calls_value| {
         const value = collapse_tool_calls_value;
         if (value != .bool) return error.InvalidCollapseToolCallsType;
@@ -1679,6 +1689,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.fast_mode_model_bound) |value| target.fast_mode_model_bound = value;
     if (incoming.slash_menu_categories) |value| target.slash_menu_categories = value;
     if (incoming.collapse_tool_calls) |value| target.collapse_tool_calls = value;
+    if (incoming.paste_collapse_lines) |value| target.paste_collapse_lines = value;
     if (incoming.session_titles) |value| target.session_titles = value;
     if (incoming.auto_upgrade) |value| target.auto_upgrade = value;
     if (incoming.update_channel) |value| target.update_channel = value;
@@ -4018,4 +4029,27 @@ test "theme setting rejects non-string values" {
     var parsed = try parseSettingsJson(std.testing.allocator, "{\"theme\":\"cursor-light\"}");
     defer parsed.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("cursor-light", parsed.theme.?);
+}
+
+test "paste collapse setting validates profile integers and ignores project values" {
+    const alloc = std.testing.allocator;
+    var defaults = try parseSettingsJson(alloc, "{}");
+    defer defaults.deinit(alloc);
+    try std.testing.expectEqual(@as(?u32, null), defaults.paste_collapse_lines);
+    var profile = try parseSettingsJson(alloc, "{\"paste_collapse_lines\":10}");
+    defer profile.deinit(alloc);
+    var disabled = try parseSettingsJson(alloc, "{\"paste_collapse_lines\":0}");
+    defer disabled.deinit(alloc);
+    try mergeSettings(&profile, &disabled, alloc);
+    try std.testing.expectEqual(@as(?u32, 0), profile.paste_collapse_lines);
+    var sources: ConfigSources = .{};
+    updateConfigSources(&sources, disabled, .user_workspace);
+    try std.testing.expectEqual(ConfigSource.user_workspace, sources.paste_collapse_lines);
+    var project = try parseSettingsJsonForLayer(alloc, "{\"paste_collapse_lines\":\"invalid\"}", .project);
+    defer project.deinit(alloc);
+    try std.testing.expectEqual(@as(?u32, null), project.paste_collapse_lines);
+    try std.testing.expectError(error.InvalidPasteCollapseLinesValue, parseSettingsJson(alloc, "{\"paste_collapse_lines\":-1}"));
+    try std.testing.expectError(error.InvalidPasteCollapseLinesValue, parseSettingsJson(alloc, "{\"paste_collapse_lines\":4294967296}"));
+    try std.testing.expectError(error.InvalidPasteCollapseLinesType, parseSettingsJson(alloc, "{\"paste_collapse_lines\":1.5}"));
+    try std.testing.expectError(error.InvalidPasteCollapseLinesType, parseSettingsJson(alloc, "{\"paste_collapse_lines\":\"10\"}"));
 }

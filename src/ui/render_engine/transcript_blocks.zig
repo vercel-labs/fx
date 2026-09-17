@@ -1595,13 +1595,14 @@ fn renderEntryToBlockForPresentationInterruptible(
             break :blk try normalizeOwnedRenderedBlock(alloc, kind, rendered);
         },
         .user_turn => |e| blk: {
-            const card = try user_message_card.buildUserPromptCardWithSkillTokensForTerminalPresentationInterruptible(
+            const card = try user_message_card.buildUserTurnCard(
                 alloc,
-                e.turn.text,
-                e.turn.images,
+                e.turn,
                 cols,
                 e.skill_tokens,
+                presentation == .full,
                 checkpoint,
+                null,
             );
             break :blk try normalizeOwnedRenderedBlock(alloc, kind, card);
         },

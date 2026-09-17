@@ -307,11 +307,17 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 return;
             }
 
-            const text = try app.alloc.dupe(u8, app.input_runtime.paste.buffer.items);
+            try insertPastedText(app, app.input_runtime.paste.buffer.items, max_input_len);
+            app.input_runtime.paste.buffer.clearRetainingCapacity();
+        }
+
+        fn insertPastedText(app: *App, bytes: []const u8, max_input_len: usize) !void {
+            const text = try app.alloc.dupe(u8, bytes);
             var text_owned_by_block = false;
             errdefer if (!text_owned_by_block) app.alloc.free(text);
 
-            if (!paste_blocks.shouldUsePlaceholder(text)) {
+            const line_threshold = if (comptime @hasField(@TypeOf(app.input_runtime), "paste_collapse_lines")) app.input_runtime.paste_collapse_lines else 0;
+            if (!paste_blocks.shouldUsePlaceholder(text, line_threshold)) {
                 const start = if (app.input_runtime.edit_state.selectionRange()) |selection|
                     selection.start
                 else
@@ -326,7 +332,6 @@ pub fn PasteEditRuntime(comptime App: type) type {
                     .inactive => unreachable,
                     .limit_exceeded => try input_limit_feedback.report(App, app, .composer, text.len),
                 }
-                app.input_runtime.paste.buffer.clearRetainingCapacity();
                 app.alloc.free(text);
                 return;
             }
@@ -339,7 +344,6 @@ pub fn PasteEditRuntime(comptime App: type) type {
             const replacement = app.input_runtime.replacementState(&app.pending_images);
             if (!replacement.canReplaceSelectionOrInsert(text.len, max_input_len)) {
                 try input_limit_feedback.report(App, app, .composer, text.len);
-                app.input_runtime.paste.buffer.clearRetainingCapacity();
                 app.alloc.free(text);
                 return;
             }
@@ -353,7 +357,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
             std.debug.assert(try replacement.replaceSelectionOrInsertSliceBounded(
                 app.alloc,
                 placeholder,
-                max_input_len,
+                max_input_len +| (placeholder.len -| text.len),
                 .preserve,
             ) == .inserted);
             app.input_runtime.entities.registerPastedBlockAssumeCapacity(.{
@@ -370,7 +374,6 @@ pub fn PasteEditRuntime(comptime App: type) type {
             if (comptime @hasDecl(@TypeOf(app.input_runtime), "historyBoundary")) {
                 app.input_runtime.historyBoundary(app.alloc);
             }
-            app.input_runtime.paste.buffer.clearRetainingCapacity();
         }
 
         pub fn handlePastedBytes(app: *App, bytes: []const u8, max_input_len: usize) !void {
@@ -444,28 +447,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
             else
                 app.input_runtime.edit_state.cursor;
             if (image_count == 0) {
-                switch (try app.input_runtime.replacementState(&app.pending_images).replaceSelectionOrInsertSliceBounded(
-                    app.alloc,
-                    stage.replacement.items,
-                    max_input_len,
-                    .preserve,
-                )) {
-                    .inserted => {
-                        app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
-                        maybeOpenPastedSkillMenu(
-                            app,
-                            start,
-                            start + stage.replacement.items.len,
-                        );
-                    },
-                    .inactive => unreachable,
-                    .limit_exceeded => try input_limit_feedback.report(
-                        App,
-                        app,
-                        .composer,
-                        bytes.len,
-                    ),
-                }
+                try insertPastedText(app, stage.replacement.items, max_input_len);
                 return;
             }
 
