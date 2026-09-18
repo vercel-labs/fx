@@ -254,6 +254,18 @@ pub fn Runtime(comptime App: type) type {
         fn routeComposerShortcutAction(app: *App, action: input_action.ShortcutAction, max_input_len: usize) !void {
             switch (action) {
                 .move => |intent| {
+                    // In the session picker the arrows own the detail line,
+                    // file-tree style: Right expands, Left collapses.
+                    if (!intent.extend_selection and
+                        (intent.kind == .character_left or intent.kind == .character_right) and
+                        sessionMenuActive(app))
+                    {
+                        app.input_runtime.vertical_navigation.reset();
+                        if (setSessionPickerDetailsExpandedIfActive(app, intent.kind == .character_right)) {
+                            app.shell.render_requests.request(.footer);
+                        }
+                        return;
+                    }
                     switch (intent.kind) {
                         .character_left => {
                             app.input_runtime.vertical_navigation.reset();
@@ -2314,6 +2326,11 @@ pub fn Runtime(comptime App: type) type {
                 if (app.terminal.fullTranscriptScreenActive()) return true;
             }
             return false;
+        }
+
+        fn setSessionPickerDetailsExpandedIfActive(app: *App, expanded: bool) bool {
+            if (comptime !@hasField(App, "session_persistence")) return false;
+            return app_session_runtime.Runtime(App).setSessionPickerDetailsExpanded(app, expanded);
         }
 
         fn toggleSessionPickerScopeIfActive(app: *App) !bool {
@@ -5283,7 +5300,7 @@ test "app_input_runtime Tab cycles usage scopes in both directions" {
     try std.testing.expectEqual(usage_report.Scope.days_30, app.input_runtime.usage_menu.navigationScope());
 }
 
-test "app_input_runtime Tab toggles session picker scope before autocomplete" {
+test "app_input_runtime Tab toggles session picker scope while arrows own details" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5302,10 +5319,17 @@ test "app_input_runtime Tab toggles session picker scope before autocomplete" {
     app.session_persistence.session_picker.scope = .current_workspace;
     try app.input_runtime.textReplacementState().replace(alloc, "/sk");
 
+    // Tab keeps its scope job; the arrows take the detail line.
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
-
     try std.testing.expect(app.session_persistence.session_picker.active);
     try std.testing.expectEqual(app_session_runtime.SessionPickerScope.all_workspaces, app.session_persistence.session_picker.scope);
+    try std.testing.expectEqualStrings("/sk", app.input_runtime.edit_state.input.items);
+
+    // A plain Right arrow while the list is still loading is held, not leaked
+    // into the composer.
+    try feedRoutingBytes(&app, "\x1b[C");
+    try std.testing.expectEqual(app_session_runtime.SessionPickerScope.all_workspaces, app.session_persistence.session_picker.scope);
+    try std.testing.expect(!app.session_persistence.session_picker.expanded);
     try std.testing.expectEqualStrings("/sk", app.input_runtime.edit_state.input.items);
 }
 

@@ -225,7 +225,9 @@ pub const SessionMenuProjection = struct {
     query: []const u8 = "",
     now_ms: i64 = 0,
     selection_failure: ?session_catalog.ResumeFailure = null,
-
+    /// Tab expands the selected row into a detail line; hidden by default.
+    expanded: bool = false,
+    /// The session the user is currently inside, marked so it is not resumed onto itself.
     pub fn filteredItemCount(self: SessionMenuProjection) usize {
         return session_catalog.filteredCount(self.summaries, self.query);
     }

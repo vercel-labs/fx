@@ -68,6 +68,14 @@ const CatalogWorker = struct {
         const dir = self.read.store.canonical_root.sessions orelse return;
         while (try self.read.nextId(self.alloc)) |id| {
             defer self.alloc.free(id);
+            // The session attached to this process is never actionable: a
+            // resume of it would attach to itself. Skip it before the cache
+            // so a cached visible entry from another process cannot leak it
+            // back in.
+            if (self.read.active_id) |active| if (std.mem.eql(u8, id, active)) continue;
+            // A session locked by another live fx cannot be handed out; skip
+            // it before the cache so no stale visible entry leaks it back in.
+            if (self.read.store.writerLockHeld(id)) continue;
             const before = catalog_cache.fingerprint(dir.dir, id) catch null;
             if (before) |stamp| {
                 if (try self.read.cache.reuse(self.alloc, id, stamp)) |value| {
@@ -87,8 +95,6 @@ const CatalogWorker = struct {
             };
             var owned = true;
             defer if (owned) candidate.deinit(self.alloc);
-            const is_active = if (self.read.active_id) |active| std.mem.eql(u8, id, active) else false;
-            if (is_active and !candidate.summary.hasResumableContent()) continue;
             if (self.read.cancelled.load(.acquire)) return error.Cancelled;
             // Every storage class can reuse a cached row once the fingerprint
             // binds its classification inputs, with one exception: stale
@@ -406,6 +412,7 @@ test "actionable catalog preserves discovery and child visibility" {
     defer catalog.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), catalog.summaries.items.len);
     try std.testing.expectEqualStrings("public", catalog.summaries.items[0].id);
+    try std.testing.expectEqualStrings("test", catalog.summaries.items[0].model.?);
     var reference = try store.list(alloc);
     defer session_summary_codec.freeSummaries(alloc, &reference);
     var visible: usize = 0;
@@ -620,4 +627,112 @@ test "subagent work identity hides a partial child without owner sidecar" {
             .{},
         ),
     );
+}
+
+test "actionable catalog excludes the session attached to this process" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var store = try session_store.Store.initFromHome(alloc, home, workspace);
+    defer store.deinit(alloc);
+    const history = [_]session.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("saved request") },
+        .assistant = @constCast("saved response"),
+    } }};
+    for ([_][]const u8{ "live", "other" }) |id| {
+        const durable = session_codec.DurableSessionState{
+            .id = @constCast(id),
+            .origin_workspace_root = workspace,
+            .workspace_root = workspace,
+            .created_at_ms = 1,
+            .updated_at_ms = 1,
+            .conversation_language = session.ConversationLanguage.literal("en"),
+            .history = @constCast(&history),
+            .total_input_tokens = 0,
+            .total_output_tokens = 0,
+            .preferences = .{ .model = @constCast("test"), .effort = .auto, .fast_mode = false },
+        };
+        var writable = try store.startWritableSession(alloc, durable);
+        writable.deinit(alloc);
+    }
+    var stopped = std.atomic.Value(bool).init(false);
+    var writer = (try catalog_cache.Writer.init(store)).?;
+    defer writer.deinit();
+    // Prime the cache with both sessions visible, as a detached process would.
+    var detached = try listActionableCatalog(store, alloc, null, &stopped, &writer);
+    defer detached.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), detached.summaries.items.len);
+
+    var attached = try listActionableCatalog(store, alloc, "live", &stopped, &writer);
+    defer attached.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), attached.summaries.items.len);
+    try std.testing.expectEqualStrings("other", attached.summaries.items[0].id);
+}
+
+test "actionable catalog excludes sessions locked by another process" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var store = try session_store.Store.initFromHome(alloc, home, workspace);
+    defer store.deinit(alloc);
+    const history = [_]session.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("saved request") },
+        .assistant = @constCast("saved response"),
+    } }};
+    for ([_][]const u8{ "busy", "free" }) |id| {
+        const durable = session_codec.DurableSessionState{
+            .id = @constCast(id),
+            .origin_workspace_root = workspace,
+            .workspace_root = workspace,
+            .created_at_ms = 1,
+            .updated_at_ms = 1,
+            .conversation_language = session.ConversationLanguage.literal("en"),
+            .history = @constCast(&history),
+            .total_input_tokens = 0,
+            .total_output_tokens = 0,
+            .preferences = .{ .model = @constCast("test"), .effort = .auto, .fast_mode = false },
+        };
+        var writable = try store.startWritableSession(alloc, durable);
+        writable.deinit(alloc);
+    }
+    var stopped = std.atomic.Value(bool).init(false);
+    var writer = (try catalog_cache.Writer.init(store)).?;
+    defer writer.deinit();
+    // Prime the cache with both sessions visible before the lock is taken.
+    var primed = try listActionableCatalog(store, alloc, null, &stopped, &writer);
+    defer primed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), primed.summaries.items.len);
+
+    // Hold the writer lock the way another live fx process would.
+    const sessions = store.canonical_root.sessions.?;
+    var busy_dir = try sessions.dir.openDir(std.testing.io, "busy", .{ .follow_symlinks = false });
+    defer busy_dir.close(std.testing.io);
+    var verified = io_mod.VerifiedDir{ .dir = busy_dir };
+    var held = io_mod.acquireTimedAdvisoryLock(&verified, "session.lock", 0) catch return error.SkipZigTest;
+    var held_live = true;
+    defer if (held_live) held.release();
+
+    var filtered = try listActionableCatalog(store, alloc, null, &stopped, &writer);
+    defer filtered.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), filtered.summaries.items.len);
+    try std.testing.expectEqualStrings("free", filtered.summaries.items[0].id);
+
+    // Releasing the lock makes the session actionable again on the next load.
+    held.release();
+    held_live = false;
+    var freed = try listActionableCatalog(store, alloc, null, &stopped, &writer);
+    defer freed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), freed.summaries.items.len);
 }

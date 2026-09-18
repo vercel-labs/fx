@@ -1864,6 +1864,26 @@ pub const Store = struct {
         };
     }
 
+    /// Non-blocking ownership probe. True when another process holds the
+    /// session's writer lock. Missing lock files and probe failures count as
+    /// free so a readable session still lists; the resume path re-checks on
+    /// Enter and reports `SessionBusy` there. The probe never creates the
+    /// lock file, so it cannot disturb the catalog fingerprint.
+    pub fn writerLockHeld(self: Store, session_id: []const u8) bool {
+        const sessions = self.canonical_root.sessions orelse return false;
+        session_layout.validateSessionId(session_id) catch return false;
+        var dir = sessions.dir.openDir(io_mod.getIo(), session_id, .{ .follow_symlinks = false }) catch return false;
+        defer dir.close(io_mod.getIo());
+        _ = dir.statFile(io_mod.getIo(), "session.lock", .{ .follow_symlinks = false }) catch return false;
+        var verified = io_mod.VerifiedDir{ .dir = dir };
+        var lock = io_mod.acquireTimedAdvisoryLock(&verified, "session.lock", 0) catch |err| switch (err) {
+            error.LockBusy => return true,
+            else => return false,
+        };
+        lock.release();
+        return false;
+    }
+
     /// The caller owns the candidate. No directory handle escapes this read.
     pub fn readOnlyCandidate(
         self: Store,

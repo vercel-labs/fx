@@ -3,6 +3,7 @@ const display_width = @import("../../core/shared/display_width.zig");
 const list_window = @import("../../core/shared/list_window.zig");
 const picker_presentation = @import("picker_presentation.zig");
 const session_catalog = @import("../../core/session/session_catalog.zig");
+const session_display_metadata = @import("../../core/session/session_display_metadata.zig");
 const session_store = @import("../../core/session/session_store.zig");
 const ui_render = @import("../render.zig");
 const render_input = @import("render_input.zig");
@@ -36,8 +37,50 @@ const SessionMenuLayout = struct {
     feedback_inline: bool = false,
     show_header: bool = true,
     row_count: u16 = 0,
+    /// Row under the selected item showing the detail line, when expanded.
+    detail_row: ?u16 = null,
 
     fn build(projection: SessionMenuProjection, row_budget: u16) SessionMenuLayout {
+        return applyDetailRow(buildBase(projection, row_budget), projection, row_budget);
+    }
+
+    /// The expanded detail line rides under the selected session; the items
+    /// below it and the load-more action shift down one row. When the menu
+    /// already fills its budget the list lends it one session row at a time.
+    fn applyDetailRow(layout_in: SessionMenuLayout, projection: SessionMenuProjection, row_budget: u16) SessionMenuLayout {
+        if (!projection.expanded or projection.load_state != .ready) return layout_in;
+        var layout = layout_in;
+        if (layout.visible_session_items == 0 or layout.selected >= layout.session_count) return layout_in;
+
+        while (true) {
+            const window_start = sessionWindowStart(projection, layout);
+            if (layout.selected < window_start) return layout_in;
+            const selected_visible_offset = layout.selected - window_start;
+            if (selected_visible_offset >= layout.visible_session_items) return layout_in;
+            const detail = layout.first_item_row + @as(u16, @intCast(selected_visible_offset)) * layout.item_stride + 1;
+            if (layout.feedback_row != null and detail <= layout.feedback_row.?) return layout_in;
+
+            const selected_is_last_visible = selected_visible_offset == layout.visible_session_items - 1;
+            const last_item_row = layout.first_item_row +
+                (layout.visible_session_items - 1) * layout.item_stride +
+                @intFromBool(!selected_is_last_visible);
+            const content_bottom = @max(last_item_row, detail);
+            const load_more_row: ?u16 = if (layout.load_more_row != null) content_bottom + 1 else null;
+            const needed = (load_more_row orelse content_bottom) + 1;
+            if (needed > row_budget) {
+                if (layout.visible_session_items <= 1) return layout_in;
+                layout.visible_session_items -= 1;
+                layout.visible_items -|= 1;
+                continue;
+            }
+            layout.row_count = needed;
+            layout.load_more_row = load_more_row;
+            layout.detail_row = detail;
+            return layout;
+        }
+    }
+
+    fn buildBase(projection: SessionMenuProjection, row_budget: u16) SessionMenuLayout {
         if (row_budget == 0) return .{};
 
         const session_count = projection.filteredItemCount();
@@ -231,10 +274,20 @@ pub fn composeSessionMenuRow(
     if (row_index < layout.first_item_row) return row;
     if (layout.visible_session_items == 0) return row;
 
-    const body_offset = row_index - layout.first_item_row;
+    const window_start = sessionWindowStart(projection, layout);
+
+    // The Tab-expanded detail line sits directly under the selected session.
+    var body_offset = row_index - layout.first_item_row;
+    if (layout.detail_row) |detail| {
+        if (row_index == detail) {
+            const selected_summary = projection.itemAt(window_start + (detail - layout.first_item_row -| 1)) orelse return row;
+            return composeDetailRow(alloc, selected_summary.*, projection.now_ms, width);
+        }
+        if (row_index > detail) body_offset -= 1;
+    }
+
     const visible_offset = body_offset / layout.item_stride;
     if (visible_offset >= layout.visible_session_items) return row;
-    const window_start = sessionWindowStart(projection, layout);
     const display_index = window_start + visible_offset;
     const summary = projection.itemAt(display_index) orelse return row;
 
@@ -411,6 +464,39 @@ fn composeTitleRow(
         try row.appendSlice(alloc, turns);
         try row.appendSlice(alloc, ui_render.reset_style);
     }
+    return row;
+}
+
+/// Tab-expanded detail line: the full workspace path, the recorded model, and
+/// when the session was created — everything the one-line row cannot show.
+fn composeDetailRow(
+    alloc: Allocator,
+    summary: session_store.SessionSummary,
+    now_ms: i64,
+    width: u16,
+) !std.ArrayList(u8) {
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
+    const indent_width: usize = if (width <= 8) 0 else 4;
+    if (indent_width > 0) try row.appendNTimes(alloc, ' ', indent_width);
+    try row.appendSlice(alloc, ui_render.dim_style);
+
+    const budget = @as(usize, width) -| indent_width;
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(alloc);
+    try line.appendSlice(alloc, session_catalog.workspacePath(summary));
+    if (summary.model) |model| {
+        if (model.len > 0) {
+            try line.appendSlice(alloc, " · ");
+            try line.appendSlice(alloc, model);
+        }
+    }
+    var age_buf: [32]u8 = undefined;
+    try line.appendSlice(alloc, " · created ");
+    try line.appendSlice(alloc, session_catalog.relativeActivityAgeCompact(&age_buf, summary.created_at_ms, now_ms));
+    // Middle-ellipsize: long paths must not cut the model and created tail.
+    try row_text.appendSingleLineMiddleEllipsized(alloc, &row, line.items, budget);
+    try row.appendSlice(alloc, ui_render.reset_style);
     return row;
 }
 
@@ -1011,4 +1097,40 @@ test "resume menu keeps the selected paginated action visible in two rows" {
     var selected_load_more = try composeSessionMenuRow(alloc, projection, 1, 80, 2);
     defer selected_load_more.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, selected_load_more.items, "Load more") != null);
+}
+
+test "resume menu keeps the detail line hidden until expanded" {
+    const alloc = std.testing.allocator;
+    const summaries = [_]session_store.SessionSummary{.{
+        .id = @constCast("one"),
+        .workspace_root = @constCast("/Users/example/Developer/Fx"),
+        .title = @constCast("Detail session"),
+        .model = @constCast("anthropic/test-model"),
+        .created_at_ms = 1,
+        .updated_at_ms = std.time.ms_per_min,
+        .conversation_language = .literal("en"),
+        .history_len = 7,
+    }};
+    const collapsed: SessionMenuProjection = .{
+        .active = true,
+        .load_state = .ready,
+        .summaries = &summaries,
+        .now_ms = 2 * std.time.ms_per_min,
+    };
+    try std.testing.expectEqual(@as(u16, 3), menuRowCount(collapsed, 100, 12));
+
+    var expanded = collapsed;
+    expanded.expanded = true;
+    // The detail line grows the menu by one row and renders under the cursor.
+    try std.testing.expectEqual(@as(u16, 4), menuRowCount(expanded, 100, 12));
+    var detail = try composeSessionMenuRow(alloc, expanded, 3, 100, 12);
+    defer detail.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, detail.items, "/Users/example/Developer/Fx") != null);
+    try std.testing.expect(std.mem.find(u8, detail.items, "anthropic/test-model") != null);
+    try std.testing.expect(std.mem.find(u8, detail.items, "created") != null);
+
+    // The item below the detail line is unaffected when the cursor stays put.
+    var item = try composeSessionMenuRow(alloc, expanded, 2, 100, 12);
+    defer item.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, item.items, "Detail session") != null);
 }

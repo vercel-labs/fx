@@ -579,6 +579,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                 .window_start = picker.window_start,
                 .query = picker.query(),
                 .selection_failure = picker.selection_failure,
+                .expanded = picker.expanded,
             };
             return resume_menu_presentation.visibleNavigationItemsForBudget(
                 projection,

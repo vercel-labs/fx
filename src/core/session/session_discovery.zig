@@ -361,6 +361,8 @@ fn classifyConversationCandidate(
     errdefer alloc.free(origin);
     const workspace = try alloc.dupe(u8, metadata.workspace_root);
     errdefer alloc.free(workspace);
+    const model = try alloc.dupe(u8, metadata.model);
+    errdefer alloc.free(model);
     const title = if (metadata.title) |value| try alloc.dupe(u8, value) else null;
     return .{
         .summary = .{
@@ -368,6 +370,7 @@ fn classifyConversationCandidate(
             .workspace_root = workspace,
             .origin_workspace_root = origin,
             .title = title,
+            .model = model,
             .created_at_ms = metadata.created_at_ms,
             .updated_at_ms = if (history_len == 0 and !has_checkpoint)
                 metadata.updated_at_ms
@@ -526,6 +529,8 @@ pub fn classifySchemaV3Candidate(
     errdefer alloc.free(origin_workspace_root);
     const workspace_root = try alloc.dupe(u8, manifest.workspace_root);
     errdefer alloc.free(workspace_root);
+    const model = try alloc.dupe(u8, manifest.preferences.model);
+    errdefer alloc.free(model);
     var display = try session_display_metadata.readSidecarOrFallback(alloc, session_dir);
     if (display.origin_workspace_root) |root| {
         alloc.free(root);
@@ -539,6 +544,7 @@ pub fn classifySchemaV3Candidate(
             .origin_workspace_root = origin_workspace_root,
             .title = display.title,
             .preview = display.preview,
+            .model = model,
             .display_metadata_present = display.present,
             .created_at_ms = manifest.created_at_ms,
             .updated_at_ms = manifest.updated_at_ms,
@@ -674,6 +680,8 @@ pub fn summaryFromState(
     errdefer alloc.free(workspace_root);
     var display = try session_display_metadata.deriveFromHistory(alloc, state.history);
     errdefer display.deinit(alloc);
+    const model = try alloc.dupe(u8, state.preferences.model);
+    errdefer alloc.free(model);
 
     return .{
         .id = id,
@@ -681,6 +689,7 @@ pub fn summaryFromState(
         .origin_workspace_root = origin_workspace_root,
         .title = display.title,
         .preview = display.preview,
+        .model = model,
         .display_metadata_present = display.present,
         .created_at_ms = state.created_at_ms,
         .updated_at_ms = state.updated_at_ms,

@@ -57,6 +57,8 @@ pub const SessionSummary = struct {
     origin_workspace_root: ?[]u8 = null,
     title: ?[]u8 = null,
     preview: ?[]u8 = null,
+    /// Preferred model from the session's durable preferences, when recorded.
+    model: ?[]u8 = null,
     display_metadata_present: bool = false,
     created_at_ms: i64,
     updated_at_ms: i64,
@@ -76,6 +78,7 @@ pub const SessionSummary = struct {
         if (self.origin_workspace_root) |wr| alloc.free(wr);
         if (self.title) |title| alloc.free(title);
         if (self.preview) |preview| alloc.free(preview);
+        if (self.model) |model| alloc.free(model);
         self.* = undefined;
     }
 };

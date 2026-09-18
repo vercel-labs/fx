@@ -832,9 +832,9 @@ fn composeCatalogMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool,
         "enter esc",
     };
     const scope_variants = [_][]const u8{
-        "↑↓ navigate     tab scope     enter resume     esc close",
-        "↑↓ navigate  tab scope  enter resume  esc close",
-        "↑↓ move  tab scope  enter  esc",
+        "↑↓ navigate     tab scope     → details     enter resume     esc close",
+        "↑↓ navigate  tab scope  → details  enter resume  esc close",
+        "↑↓ move  tab scope  → details  enter  esc",
         "enter resume  esc close",
         "enter esc",
     };
