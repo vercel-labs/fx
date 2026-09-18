@@ -607,8 +607,15 @@ pub const Reducer = struct {
         if (try index_value(choice.get("index") orelse return error.InvalidChunk) != 0) return error.InvalidChunk;
         const delta = try object(choice.get("delta") orelse return error.InvalidChunk);
         if (self.phase == .finished) {
-            const reason = try string(non_null(choice, "finish_reason") orelse return error.InconsistentFinishReason);
-            if (!std.mem.eql(u8, reason, @tagName(self.finish_reason.?))) return error.InconsistentFinishReason;
+            // Some proxies send the trailing usage-only frame as a populated
+            // choice with an empty delta and no finish_reason, instead of an
+            // empty choices array. Tolerate that; still require an exact
+            // match when finish_reason is present, and still reject any
+            // unexpected delta content below.
+            if (non_null(choice, "finish_reason")) |finish_reason_value| {
+                const reason = try string(finish_reason_value);
+                if (!std.mem.eql(u8, reason, @tagName(self.finish_reason.?))) return error.InconsistentFinishReason;
+            }
             var fields = delta.iterator();
             while (fields.next()) |field| {
                 if (std.mem.eql(u8, field.key_ptr.*, "role")) {
@@ -1847,6 +1854,31 @@ test "chat completions accepts matching empty terminal usage choices" {
         try std.testing.expectEqual(@as(?u64, 6), result.completed.completion.usage.output_tokens);
         try std.testing.expectEqual(@as(usize, if (with_tools) 1 else 0), result.completed.completion.tool_calls.len);
         try std.testing.expectEqual(stream_provider.UsageUnavailable.possibly_billed, result.completed.usage.unavailable);
+    }
+}
+
+test "chat completions tolerates a finish-reason-less terminal usage trailer" {
+    // A finish_reason-less terminal usage frame must still be accepted, and
+    // still validated: an unexpected delta field on that frame must still be
+    // rejected even though finish_reason is absent.
+    const alloc = std.testing.allocator;
+    {
+        var reducer = try Reducer.init(alloc, test_request(), .{});
+        defer reducer.deinit();
+        try test_accept(&reducer, test_stop);
+        try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{}}],\"usage\":{\"prompt_tokens\":16,\"completion_tokens\":6,\"total_tokens\":22}}");
+        try test_accept(&reducer, "[DONE]");
+        var result = try reducer.finish(false);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(@as(?u64, 16), result.completed.completion.usage.input_tokens);
+        try std.testing.expectEqual(@as(?u64, 6), result.completed.completion.usage.output_tokens);
+    }
+    {
+        var reducer = try Reducer.init(alloc, test_request(), .{});
+        defer reducer.deinit();
+        try test_accept(&reducer, test_stop);
+        try std.testing.expectError(error.InconsistentFinishReason, reducer.accept("{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late\"}}],\"usage\":{\"prompt_tokens\":16,\"completion_tokens\":6,\"total_tokens\":22}}", false));
+        try std.testing.expectError(error.StreamClosed, reducer.finish(false));
     }
 }
 
