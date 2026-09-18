@@ -519,6 +519,83 @@ node benchmarks/libfx/bench-competitive.mjs --server /tmp/libfx-bench-server --p
 Build the SDK artifacts and install the pinned Pi package first, as shown in
 `.github/workflows/bench.yml`. Raw per-prompt samples remain in the output directory.
 
+## Compact Builds
+
+`scripts/compact-release.sh` builds stripped ReleaseSmall binaries per
+platform. It exists for size-sensitive distributions; the default product
+build remains ReleaseSafe and the macOS arm64 PGSO qualification remains the
+authoritative production pipeline.
+
+```bash
+scripts/compact-release.sh                      # host platform only
+scripts/compact-release.sh --all                # all four native targets
+scripts/compact-release.sh --xz                 # also emit .xz artifacts
+scripts/compact-release.sh --mergefunc          # LLVM mergefunc pipeline (macOS)
+```
+
+`--mergefunc` emits the whole-program bitcode (`zig build pgso-ir
+-Dpgso-artifact=fx -Doptimize=ReleaseSmall`), folds identical functions with
+LLVM's `mergefunc` pass, recompiles at `-Oz`, and links with ld64, whose
+cstring merge also dedups `__TEXT,__cstring` constants the Zig linker emits
+verbatim. It requires an LLVM toolchain with `opt` and `clang` (`brew install
+llvm`, or set `LLVM_DIR`). It only helps macOS targets: on Linux the `-Oz`
+recompile plus `zig cc` link costs more than the plain ReleaseSmall build, so
+those targets fall back to the plain path with a note.
+
+Reference sizes with `--mergefunc` on the macOS targets and plain builds on
+Linux (exact bytes vary by commit):
+
+| Target          | Stripped bytes | MiB    |
+| --------------- | -------------- | ------ |
+| aarch64-macos   | ~5,226,000     | 4.984  |
+| aarch64-linux   | ~5,454,000     | 5.201  |
+| x86_64-linux    | ~6,915,000     | 6.595  |
+| x86_64-macos    | ~6,920,000     | 6.600  |
+
+The post-link strip pass is required: the Zig Mach-O linker keeps local
+symbols for ReleaseSmall even with strip enabled (~770 KiB of `__LINKEDIT`
+on aarch64-macos), while ReleaseSafe emits a minimal linkedit segment.
+
+x86_64 text is roughly 1.4x the aarch64 equivalent for this codebase, so the
+compact surface only approaches 5 MiB on arm64.
+
+Two size levers are already applied in-tree and documented here so they are
+not rediscovered:
+
+- `std.json.static` parsing used to specialize one recursive-descent parser
+  per parsed type (115 `innerParse` clones, ~94 KiB). Concrete wire-type
+  parse sites now funnel through `src/core/shared/json_owned.zig`, which
+  shares the single `std.json.Value` parser and converts with
+  `parseFromValue`; all typed clones are gone. New parse sites for concrete
+  types should use `json_owned.parseOwned` unless they deliberately borrow
+  from the input buffer (see the image-measurement site in
+  `prompt_context.zig`).
+- Optimized builds select `std.debug.simple_panic` in `src/main.zig`, since
+  stripped binaries carry no symbols for the full panic handler's self-info
+  reader. Debug builds keep full stack traces.
+- The compact macOS link passes `-no_function_starts` and
+  `-no_data_in_code_info` to ld64, dropping ~31 KiB of debugger-only
+  metadata that dyld does not read. `LC_UUID` is not droppable: modern dyld
+  refuses to launch a binary without it.
+- Large static string tables (syntax-highlight profiles, slash-command
+  completions, credential redaction terms, entity maps, language signals)
+  intern their strings through `src/core/shared/comptime_string_pool.zig`.
+  Each entry stores a 4-byte (offset, length) pair into one shared blob
+  instead of a 16-byte slice, and the tables stay in natural literal form
+  as comptime-only inputs that never materialize. Measured: 16.6 KiB off
+  the plain ReleaseSmall build; on the compact pipeline the rebased-const
+  segment drops ~16 KiB of slice headers while blob and ref tables add
+  ~10 KiB back, and 16 KiB segment page alignment currently absorbs the
+  difference in file size. New static tables of short strings should use
+  the pool; strings over 255 bytes do not fit and should stay slices.
+  `pool.ref` is comptime-only.
+
+UPX-style executable packing is not viable on macOS arm64: the packed binary
+is killed at exec even after re-signing. It packs the Linux ELF correctly,
+but decompression happens at every launch and the startup-latency budget in
+`bench.yml` would not survive it. Distributing `.xz` artifacts keeps every
+platform's download under 3 MiB without touching runtime behavior.
+
 ## Before Marking a PR Ready
 
 Minimum checklist:

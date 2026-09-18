@@ -1,6 +1,7 @@
 const std = @import("std");
 const command_contract = @import("../execution/command_contract.zig");
 const io_mod = @import("../shared/io.zig");
+const json_owned = @import("../shared/json_owned.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -175,7 +176,7 @@ pub fn Adapter(comptime Host: type) type {
             const len: usize = @intCast(result);
             if (len > buffer.len) return error.InvalidContract;
 
-            const parsed = std.json.parseFromSlice(JsonInfo, alloc, buffer[0..len], .{}) catch |err| switch (err) {
+            const parsed = json_owned.parseOwned(JsonInfo, alloc, buffer[0..len], .{}) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.InvalidContract,
             };

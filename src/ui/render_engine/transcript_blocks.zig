@@ -948,7 +948,7 @@ fn renderCodeBlockForTranscriptWithTheme(
     const language = if (block.language.len > 0)
         block.language
     else if (profile) |inferred|
-        inferred.label
+        inferred.label.get()
     else
         "";
     const styled_code = if (profile) |resolved|

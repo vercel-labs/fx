@@ -1,5 +1,6 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
+const json_owned = @import("../shared/json_owned.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const host_target = @import("../hosts/target.zig");
@@ -117,7 +118,7 @@ fn readCached(alloc: Allocator, dir: std.Io.Dir, provider: Provider) !?Cached {
     const bytes = try io_mod.readFileToEnd(alloc, &file, max_cache_bytes);
     defer alloc.free(bytes);
     const Record = struct { version: []const u8, checked_at_ms: i64 };
-    const parsed = try std.json.parseFromSlice(Record, alloc, bytes, .{});
+    const parsed = try json_owned.parseOwned(Record, alloc, bytes, .{});
     defer parsed.deinit();
     return .{
         .version = Version.parse(parsed.value.version) orelse return error.InvalidProviderVersionCache,

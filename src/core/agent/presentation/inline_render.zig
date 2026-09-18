@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ansi = @import("ansi.zig");
+const string_pool = @import("../../shared/comptime_string_pool.zig");
 const tu = @import("text_util.zig");
 const unicode_classes = @import("unicode_classes.zig");
 const payload = @import("payload.zig");
@@ -701,6 +702,39 @@ const DecodedEntity = struct {
 const max_entity_name_len = 8;
 
 /// Decodes the HTML entities models commonly emit plus numeric references.
+const named_entity_strings = [_]struct { name: []const u8, codepoint: u21 }{
+    .{ .name = "amp", .codepoint = '&' },
+    .{ .name = "lt", .codepoint = '<' },
+    .{ .name = "gt", .codepoint = '>' },
+    .{ .name = "quot", .codepoint = '"' },
+    .{ .name = "apos", .codepoint = '\'' },
+    .{ .name = "nbsp", .codepoint = 0xA0 },
+    .{ .name = "copy", .codepoint = 0xA9 },
+    .{ .name = "reg", .codepoint = 0xAE },
+    .{ .name = "hellip", .codepoint = 0x2026 },
+    .{ .name = "mdash", .codepoint = 0x2014 },
+    .{ .name = "ndash", .codepoint = 0x2013 },
+    .{ .name = "larr", .codepoint = 0x2190 },
+    .{ .name = "rarr", .codepoint = 0x2192 },
+};
+
+const named_entity_pool = string_pool.Interned(blk: {
+    var flat: []const []const u8 = &.{};
+    for (named_entity_strings) |entry| flat = flat ++ &[1][]const u8{entry.name};
+    break :blk flat;
+});
+
+const named_entity_entries = blk: {
+    var out: [named_entity_strings.len]struct {
+        name: named_entity_pool.Ref,
+        codepoint: u21,
+    } = undefined;
+    for (named_entity_strings, 0..) |entry, i| {
+        out[i] = .{ .name = named_entity_pool.ref(entry.name), .codepoint = entry.codepoint };
+    }
+    break :blk out;
+};
+
 fn decodeEntity(text: []const u8, start: usize) ?DecodedEntity {
     if (start >= text.len or text[start] != '&') return null;
     // Bound the terminator search so a line full of ampersands stays linear.
@@ -720,23 +754,8 @@ fn decodeEntity(text: []const u8, start: usize) ?DecodedEntity {
         if (value != 0 and (value < 0x20 or (value >= 0x7F and value <= 0x9F))) return null;
         codepoint = if (value == 0 or (value >= 0xD800 and value <= 0xDFFF)) 0xFFFD else value;
     } else {
-        const named = [_]struct { name: []const u8, codepoint: u21 }{
-            .{ .name = "amp", .codepoint = '&' },
-            .{ .name = "lt", .codepoint = '<' },
-            .{ .name = "gt", .codepoint = '>' },
-            .{ .name = "quot", .codepoint = '"' },
-            .{ .name = "apos", .codepoint = '\'' },
-            .{ .name = "nbsp", .codepoint = 0xA0 },
-            .{ .name = "copy", .codepoint = 0xA9 },
-            .{ .name = "reg", .codepoint = 0xAE },
-            .{ .name = "hellip", .codepoint = 0x2026 },
-            .{ .name = "mdash", .codepoint = 0x2014 },
-            .{ .name = "ndash", .codepoint = 0x2013 },
-            .{ .name = "larr", .codepoint = 0x2190 },
-            .{ .name = "rarr", .codepoint = 0x2192 },
-        };
-        codepoint = for (named) |entry| {
-            if (std.mem.eql(u8, entry.name, name)) break entry.codepoint;
+        codepoint = for (named_entity_entries) |entry| {
+            if (std.mem.eql(u8, entry.name.get(), name)) break entry.codepoint;
         } else return null;
     }
 
