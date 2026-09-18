@@ -6840,12 +6840,15 @@ fn processQueuedPromptLoop(
         !selection_changed and restored_attempts >= checkpoint.max_provider_attempts
     else
         false;
-    const semantic_limit = if (selection_changed or restored_budget_exhausted)
+    const configured_semantic_limit = if (selection_changed or restored_budget_exhausted)
         semanticAttemptLimit(config.max_provider_attempts)
     else if (job.recovery_checkpoint) |checkpoint|
         checkpoint.max_provider_attempts
     else
         semanticAttemptLimit(config.max_provider_attempts);
+    const semantic_limit = config.provider_retry_policy.attemptLimit(
+        configured_semantic_limit,
+    );
     var route_fast_mode = if (selection_changed)
         selected_fast_mode
     else if (job.recovery_checkpoint) |checkpoint|
@@ -7569,6 +7572,16 @@ fn processQueuedPromptLoop(
                 .stream = &stream_ctx,
                 .pending_status = &pending_auto_retry_status,
             };
+            const response_head_timeout_ms = config.provider_retry_policy.responseHeadTimeoutMs(
+                semantic_attempt,
+            );
+            debug_trace.eventf(
+                "gateway",
+                "provider_attempt_policy",
+                step_ctx,
+                "semantic_attempt={d}/{d} response_head_timeout_ms={d} patient={}",
+                .{ semantic_attempt + 1, semantic_limit, response_head_timeout_ms orelse 0, response_head_timeout_ms == null },
+            );
             var model_request = agent_stream_provider.ModelRequest{
                 .credential = if (job.credential_source == .host_managed)
                     .host_managed
@@ -7593,6 +7606,7 @@ fn processQueuedPromptLoop(
                 .prepared_request_body = prepared_request_body,
                 .trace_ctx = step_ctx,
                 .content_capture_limit = null,
+                .response_head_timeout_ms = response_head_timeout_ms,
                 .cooperative_pulse = deps.cooperative_transport_pulse,
                 .delivery = &gateway_delivery,
                 .attempt_evidence = &gateway_attempt_evidence,
@@ -7691,6 +7705,7 @@ fn processQueuedPromptLoop(
 
                 var recovery_decision = if (network_failure) |evidence|
                     model_response_recovery.decide(.{
+                        .enforce_attempt_limit = config.provider_retry_policy.arm == .adaptive_v1,
                         .cause = failure_cause,
                         .delivery = switch (evidence.delivery) {
                             .definitely_unsent => .definitely_unsent,
@@ -8252,6 +8267,7 @@ fn processQueuedPromptLoop(
                 if (recovery_started_at_ms == null) recovery_started_at_ms = io_mod.milliTimestamp();
                 const recovery_elapsed_ns: u64 = recoveryElapsedNs(recovery_started_at_ms) orelse 0;
                 const decision = model_response_recovery.decide(.{
+                    .enforce_attempt_limit = config.provider_retry_policy.arm == .adaptive_v1,
                     .cause = cause,
                     .delivery = .possibly_sent,
                     .attempts = .{ .consumed = semantic_attempt + 1, .limit = semantic_limit },
@@ -8599,6 +8615,7 @@ fn processQueuedPromptLoop(
                     model_response_recovery.Decision{ .strategy = .stop, .required_action = .change_request }
                 else
                     model_response_recovery.decide(.{
+                        .enforce_attempt_limit = config.provider_retry_policy.arm == .adaptive_v1,
                         .cause = cause,
                         .delivery = .possibly_sent,
                         .attempts = .{ .consumed = semantic_attempt + 1, .limit = semantic_limit },

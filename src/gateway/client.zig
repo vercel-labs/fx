@@ -783,6 +783,17 @@ const ResponseHeadTiming = struct {
     stall_timeout_ms: i64 = 60_000,
 };
 
+fn selectedResponseHeadTiming(timeout_ms: ?i64) ResponseHeadTiming {
+    if (timeout_ms) |deadline_ms| return .{
+        .timeout_ms = deadline_ms,
+        .stall_timeout_ms = agent_stream_stall_timeout_ms,
+    };
+    return .{
+        .patient = true,
+        .stall_timeout_ms = agent_stream_stall_timeout_ms,
+    };
+}
+
 test "connection setup keeps the production timeout" {
     const timing = ConnectionSetupTiming{};
 
@@ -794,6 +805,20 @@ test "response head wait keeps the production timeout" {
 
     try std.testing.expectEqual(@as(i64, 120_000), timing.timeout_ms);
     try std.testing.expect(!timing.patient);
+}
+
+test "response head timing accepts one per-attempt override" {
+    try std.testing.expect(selectedResponseHeadTiming(null).patient);
+    try std.testing.expect(!selectedResponseHeadTiming(120_000).patient);
+    try std.testing.expectEqual(@as(i64, 600_000), selectedResponseHeadTiming(30_000).stall_timeout_ms);
+    try std.testing.expectEqual(
+        @as(i64, 120_000),
+        selectedResponseHeadTiming(null).timeout_ms,
+    );
+    try std.testing.expectEqual(
+        @as(i64, 120_000),
+        selectedResponseHeadTiming(120_000).timeout_ms,
+    );
 }
 
 const ConnectionSetupEpoch = struct {
@@ -1234,6 +1259,7 @@ pub const StreamRequest = struct {
     session_id: ?[]const u8 = null,
     trace_ctx: debug_trace.TraceContext = .{},
     content_capture_limit: ?usize = null,
+    response_head_timeout_ms: ?i64 = null,
     delivery: ?*DeliveryCertainty = null,
     admission: ?agent_stream_provider.Admission = null,
     on_reasoning_chunk: ?StreamCallback = null,
@@ -1457,15 +1483,9 @@ fn streamGatewayCompletionCore(
         cancel_flag,
         expected_provider_tool_name,
         watch_connected_socket,
-        .{
-            .response_head_timing = .{
-                // The agent path waits patiently for long-thinking models: head
-                // silence alone never aborts a sent request. Mid-stream stalls
-                // still get positive-evidence detection via the stall watchdog.
-                .patient = true,
-                .stall_timeout_ms = agent_stream_stall_timeout_ms,
-            },
-        },
+        .{ .response_head_timing = selectedResponseHeadTiming(
+            request.response_head_timeout_ms,
+        ) },
     );
 }
 
@@ -1686,7 +1706,13 @@ fn streamGatewayCompletionCoreWithOptions(
                 return @as(anyerror!StreamResult, err);
             }
         }
-        debug_trace.eventf("gateway", "before_receive_head", trace_ctx, "attempt={d}", .{attempt + 1});
+        debug_trace.eventf(
+            "gateway",
+            "before_receive_head",
+            trace_ctx,
+            "attempt={d} timeout_ms={d}",
+            .{ attempt + 1, core_options.response_head_timing.timeout_ms },
+        );
         var response = req.receiveHead(&.{}) catch |err| {
             debug_trace.eventf("gateway", "receive_head_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
             const mapped = connectedIoFailureWithWatch(
