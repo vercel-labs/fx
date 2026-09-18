@@ -1,6 +1,5 @@
 const std = @import("std");
 const paste_blocks = @import("../input/pasted_blocks.zig");
-const user_turn_presentation = @import("../input/user_turn_presentation.zig");
 const registered_entities = @import("../input/registered_entities.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
@@ -1863,7 +1862,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                 if (final.end > final_text.len or !std.mem.eql(u8, final_text[final.start..final.end], block.text)) continue;
                 try spans.append(alloc, .{
                     .id = block.id,
-                    .start = final.start + user_turn_presentation.hidden_start(block.text, preview_lines),
+                    .start = final.start + paste_blocks.hidden_start(block.text, preview_lines),
                     .end = final.end,
                 });
             }

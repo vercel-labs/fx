@@ -394,3 +394,25 @@ test "paste collapse line threshold is opt in and counts normalized logical line
     try std.testing.expect(shouldUsePlaceholder(normalized, 2));
     try std.testing.expect(shouldUsePlaceholder("x" ** 1001, 10));
 }
+
+/// Keep the configured line preview when there is a remainder to collapse.
+/// Zero, or a paste collapsed only for its character count, keeps a full marker.
+pub fn hidden_start(text: []const u8, preview_lines: u32) usize {
+    if (preview_lines == 0) return 0;
+    var lines: usize = 0;
+    for (text, 0..) |byte, i| {
+        if (byte != '\n') continue;
+        lines += 1;
+        if (lines == preview_lines) return if (i + 1 < text.len) i + 1 else 0;
+    }
+    return 0;
+}
+
+test "paste preview boundary preserves complete lines" {
+    const text = "first\né\nthird\nfourth\n";
+    try std.testing.expectEqual(@as(usize, 9), hidden_start(text, 2));
+    try std.testing.expectEqual(@as(usize, 0), hidden_start(text, 0));
+    try std.testing.expectEqual(@as(usize, 0), hidden_start(text, 4));
+    try std.testing.expectEqual(@as(usize, 0), hidden_start("first\nsecond", 2));
+    try std.testing.expectEqual(@as(usize, 2), hidden_start("\n\nlast", 2));
+}

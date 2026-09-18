@@ -1,4 +1,4 @@
-const user_turn_presentation = @import("../input/user_turn_presentation.zig");
+const user_turn_presentation = @import("user_turn_presentation_codec.zig");
 const std = @import("std");
 const image_data = @import("../images/image_data.zig");
 const session = @import("session.zig");

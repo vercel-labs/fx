@@ -1,4 +1,5 @@
-const user_turn_presentation = @import("../../core/input/user_turn_presentation.zig");
+const pasted_blocks = @import("../../core/input/pasted_blocks.zig");
+const user_turn_presentation = @import("../../core/shared/user_turn_presentation.zig");
 // Renders submitted user turns and owns their row collection and wrapping.
 const std = @import("std");
 const build_checkpoint = @import("../render_engine/build_checkpoint.zig");
@@ -91,13 +92,13 @@ pub fn buildUserTurnCard(
     if (full or user.presentation.collapsed_ranges.len == 0 or !user_turn_presentation.valid(user.text, user.presentation.collapsed_ranges)) {
         return buildUserPromptCardWithSkillTokensAndLinksInterruptible(alloc, user.text, user.images, cols, skill_tokens, true, checkpoint, max_rows);
     }
-    const text = try user_turn_presentation.collapse(alloc, user.text, user.presentation.collapsed_ranges);
+    const text = try collapse_pastes(alloc, user.text, user.presentation.collapsed_ranges);
     defer alloc.free(text);
     var tokens: std.ArrayList(visual_layout.SkillTokenSpan) = .empty;
     defer tokens.deinit(alloc);
     for (skill_tokens) |token| {
-        const start = user_turn_presentation.collapsedOffset(user.text, user.presentation.collapsed_ranges, token.raw_start) orelse continue;
-        const end = user_turn_presentation.collapsedOffset(user.text, user.presentation.collapsed_ranges, token.raw_end) orelse continue;
+        const start = collapsed_offset(user.text, user.presentation.collapsed_ranges, token.raw_start) orelse continue;
+        const end = collapsed_offset(user.text, user.presentation.collapsed_ranges, token.raw_end) orelse continue;
         var projected = token;
         projected.raw_start = start;
         projected.raw_end = end;
@@ -884,4 +885,56 @@ test "paste display is compact inline and complete in full transcript" {
     try std.testing.expect(std.mem.find(u8, full, "FIRST") != null);
     try std.testing.expect(std.mem.find(u8, full, "LAST") != null);
     try std.testing.expect(std.mem.find(u8, full, "Pasted text") == null);
+}
+
+/// Caller owns the result. Invalid metadata falls back to complete text.
+fn collapse_pastes(alloc: std.mem.Allocator, text: []const u8, spans: []const types.CollapsedRange) ![]u8 {
+    if (!user_turn_presentation.valid(text, spans)) return alloc.dupe(u8, text);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var offset: usize = 0;
+    for (spans) |span| {
+        try out.appendSlice(alloc, text[offset..span.start]);
+        var buffer: [96]u8 = undefined;
+        try out.appendSlice(alloc, try pasted_blocks.formatPlaceholder(&buffer, span.id, pasted_blocks.countLines(text[span.start..span.end])));
+        offset = span.end;
+    }
+    try out.appendSlice(alloc, text[offset..]);
+    return out.toOwnedSlice(alloc);
+}
+
+fn collapsed_offset(text: []const u8, spans: []const types.CollapsedRange, offset: usize) ?usize {
+    var source: usize = 0;
+    var target: usize = 0;
+    for (spans) |span| {
+        if (offset <= span.start) break;
+        if (offset < span.end) return null;
+        var buffer: [96]u8 = undefined;
+        const placeholder = pasted_blocks.formatPlaceholder(&buffer, span.id, pasted_blocks.countLines(text[span.start..span.end])) catch return null;
+        target += span.start - source + placeholder.len;
+        source = span.end;
+    }
+    return target + offset - source;
+}
+
+test "paste display preserves surrounding text and literal lookalikes" {
+    const text = "before a\nb\n after [Pasted text #1, 2 lines]";
+    const spans = [_]types.CollapsedRange{.{ .id = 7, .start = 7, .end = 11 }};
+    const collapsed = try collapse_pastes(std.testing.allocator, text, &spans);
+    defer std.testing.allocator.free(collapsed);
+    try std.testing.expectEqualStrings("before [Pasted text #7, 2 lines] after [Pasted text #1, 2 lines]", collapsed);
+    try std.testing.expectEqual(@as(?usize, null), collapsed_offset(text, &spans, 9));
+    try std.testing.expectEqual(@as(?usize, "before [Pasted text #7, 2 lines]".len), collapsed_offset(text, &spans, 11));
+}
+
+test "paste display previews complete lines and collapses only the remainder" {
+    const text = "first\né\nthird\nfourth\n";
+    const start = "first\né\n".len;
+    const spans = [_]types.CollapsedRange{.{ .id = 1, .start = start, .end = text.len }};
+    const compact = try collapse_pastes(std.testing.allocator, text, &spans);
+    defer std.testing.allocator.free(compact);
+    try std.testing.expectEqualStrings("first\né\n[Pasted text #1, 2 lines]", compact);
+    try std.testing.expectEqual(@as(?usize, 6), collapsed_offset(text, &spans, 6));
+    try std.testing.expectEqual(@as(?usize, null), collapsed_offset(text, &spans, start + 1));
+    try std.testing.expectEqual(@as(?usize, compact.len), collapsed_offset(text, &spans, text.len));
 }

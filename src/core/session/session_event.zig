@@ -1,4 +1,4 @@
-const user_turn_presentation = @import("../input/user_turn_presentation.zig");
+const user_turn_presentation = @import("../shared/user_turn_presentation.zig");
 const std = @import("std");
 const builtin = @import("builtin");
 const session = @import("session.zig");

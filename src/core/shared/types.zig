@@ -1280,8 +1280,8 @@ pub const ImageAttachment = struct {
     snapshot_sha256: ?[]u8 = null,
 };
 
-pub const CollapsedRange = @import("../input/user_turn_presentation.zig").CollapsedRange;
-pub const UserTurnPresentation = @import("../input/user_turn_presentation.zig").Presentation;
+pub const CollapsedRange = @import("user_turn_presentation.zig").CollapsedRange;
+pub const UserTurnPresentation = @import("user_turn_presentation.zig").Presentation;
 
 pub const UserTurn = struct {
     /// Presentation metadata only; providers and ACP consume complete text.
