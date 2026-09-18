@@ -132,7 +132,12 @@ pub const TerminalState = struct {
     pub fn disableRawMode(self: *TerminalState) void {
         if (!self.raw_enabled) return;
         if (comptime builtin.os.tag != .wasi) {
-            std.posix.tcsetattr(self.stdin_fd, .FLUSH, self.original_termios) catch {};
+            // Revoked terminals can return EBADF, which std.posix.tcsetattr
+            // treats as unreachable. Cleanup is best effort, but still retries EINTR.
+            while (true) {
+                const result = std.posix.system.tcsetattr(self.stdin_fd, .FLUSH, &self.original_termios);
+                if (std.posix.errno(result) != .INTR) break;
+            }
         }
         self.raw_enabled = false;
     }
@@ -265,7 +270,7 @@ pub const TerminalState = struct {
         return .{
             .readable = (revents & std.posix.POLL.IN) != 0,
             .hung_up = (revents & std.posix.POLL.HUP) != 0,
-            .has_error = (revents & std.posix.POLL.ERR) != 0,
+            .has_error = (revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0,
         };
     }
 };
@@ -688,6 +693,66 @@ test "enableRawMode preserves carriage return input" {
     var buf: [1]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 1), try std.posix.read(pty.slave, &buf));
     try std.testing.expectEqual(@as(u8, '\r'), buf[0]);
+}
+
+test "terminal poll reports an invalid descriptor as closed" {
+    if (!supports_test_pty) return error.SkipZigTest;
+
+    const terminal = TerminalState{ .stdin_fd = std.math.maxInt(std.posix.fd_t) };
+    const result = try terminal.pollInput(0);
+    try std.testing.expect(!result.readable);
+    try std.testing.expect(result.closed());
+}
+
+test "raw-mode cleanup tolerates an invalid descriptor" {
+    if (!supports_test_pty) return error.SkipZigTest;
+
+    var terminal = TerminalState{
+        .stdin_fd = std.math.maxInt(std.posix.fd_t),
+        .original_termios = std.mem.zeroes(std.posix.termios),
+        .raw_enabled = true,
+    };
+    terminal.disableRawMode();
+    try std.testing.expect(!terminal.raw_enabled);
+    terminal.disableRawMode();
+}
+
+test "raw-mode cleanup restores original termios" {
+    if (!supports_test_pty) return error.SkipZigTest;
+
+    const pty = try TestPty.open();
+    defer pty.close();
+    var terminal = TerminalState{ .stdin_fd = pty.slave };
+    try terminal.captureOriginalTermios();
+    try terminal.enableRawMode();
+    terminal.disableRawMode();
+
+    const restored = try std.posix.tcgetattr(pty.slave);
+    try std.testing.expectEqual(terminal.original_termios.lflag, restored.lflag);
+    try std.testing.expectEqual(terminal.original_termios.iflag, restored.iflag);
+    try std.testing.expectEqualSlices(u8, &terminal.original_termios.cc, &restored.cc);
+    try std.testing.expect(!terminal.raw_enabled);
+}
+
+test "revoked terminal input closes before cleanup" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const darwin = struct {
+        extern "c" fn revoke(path: [*:0]const u8) c_int;
+    };
+
+    const pty = try TestPty.open();
+    defer pty.close();
+    var terminal = TerminalState{ .stdin_fd = pty.slave };
+    try terminal.captureOriginalTermios();
+    try terminal.enableRawMode();
+    const slave_name = ptsname(pty.master) orelse return error.PtyUnavailable;
+    try std.testing.expectEqual(@as(c_int, 0), darwin.revoke(slave_name));
+
+    const result = try terminal.pollInput(0);
+    try std.testing.expect(!result.readable);
+    try std.testing.expect(result.closed());
+    terminal.disableRawMode();
+    try std.testing.expect(!terminal.raw_enabled);
 }
 
 test "reconstructive paint re-emits a full transcript in order" {
