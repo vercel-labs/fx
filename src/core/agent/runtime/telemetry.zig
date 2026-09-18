@@ -324,6 +324,45 @@ pub fn toolExecutionResultKind(result: ToolExecutionResult) []const u8 {
     return "model_output";
 }
 
+pub fn traceApplyPatchFailure(ctx: TraceContext, call: ToolCall, model_output: []const u8) void {
+    if (!std.mem.eql(u8, call.name, "apply_patch")) return;
+    const reason = applyPatchFailureReason(model_output) orelse return;
+    const matches = fieldValue(model_output, "matches=") orelse "unknown";
+    debug_trace.eventf(
+        "tool",
+        "apply_patch_failure",
+        ctx,
+        "call_id={s} reason={s} matches={s}",
+        .{ call.id, reason, matches },
+    );
+}
+
+fn applyPatchFailureReason(model_output: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, model_output, "PATCH_CONTEXT_MISSING")) return "context_missing";
+    if (std.mem.startsWith(u8, model_output, "PATCH_CONTEXT_AMBIGUOUS")) return "context_ambiguous";
+    if (std.mem.startsWith(u8, model_output, "PATCH_NO_CHANGE")) return "no_change";
+    return null;
+}
+
+fn fieldValue(text: []const u8, prefix: []const u8) ?[]const u8 {
+    const start = (std.mem.find(u8, text, prefix) orelse return null) + prefix.len;
+    var end = start;
+    while (end < text.len and text[end] != ' ' and text[end] != ';' and text[end] != '\n') : (end += 1) {}
+    return if (end > start) text[start..end] else null;
+}
+
+test "apply_patch failure telemetry classifies stable reasons" {
+    try std.testing.expectEqualStrings(
+        "context_missing",
+        applyPatchFailureReason("PATCH_CONTEXT_MISSING reason=context_missing hunk=1 matches=0").?,
+    );
+    try std.testing.expectEqualStrings(
+        "context_ambiguous",
+        applyPatchFailureReason("PATCH_CONTEXT_AMBIGUOUS reason=context_ambiguous hunk=2 matches=3").?,
+    );
+    try std.testing.expectEqualStrings("3", fieldValue("reason=x matches=3 lines=1,2", "matches=").?);
+}
+
 test "gateway call metrics retain provider terminal stop reason" {
     diagnostics.resetForTest();
     defer diagnostics.resetForTest();

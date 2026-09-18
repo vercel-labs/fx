@@ -102,6 +102,15 @@ Report security vulnerabilities through the [contact page](https://fx.sh/contact
 
 [Apache-2.0](LICENSE). Third-party licenses and attributions are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
+## Experimental patch editor
+
+Development builds can set `FX_EXPERIMENT_X9_EDITOR=patch_v3` to advertise the
+experimental `apply_patch` tool alongside `edit_file` in root and child `fx ask`
+requests. It validates workspace paths and all hunks before changing files and
+checks permission for every affected path, including move destinations. After
+a failed file mutation, later queued file edits wait for the model to observe
+the failure. This experiment has not been re-benchmarked on current main.
+
 ## Credits
 
 Interface sounds by [cuelume](https://github.com/Danilaa1/cuelume).

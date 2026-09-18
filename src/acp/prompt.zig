@@ -2902,6 +2902,7 @@ test "mapToolKind maps common tools" {
     try std.testing.expectEqual(acp_types.ToolCallKind.read, mapToolKind("read_file"));
     try std.testing.expectEqual(acp_types.ToolCallKind.edit, mapToolKind("write_file"));
     try std.testing.expectEqual(acp_types.ToolCallKind.edit, mapToolKind("edit_file"));
+    try std.testing.expectEqual(acp_types.ToolCallKind.edit, mapToolKind("apply_patch"));
     try std.testing.expectEqual(acp_types.ToolCallKind.search, mapToolKind("grep_files"));
     try std.testing.expectEqual(acp_types.ToolCallKind.fetch, mapToolKind("web_fetch"));
     try std.testing.expectEqual(acp_types.ToolCallKind.search, mapToolKind("exa_search"));

@@ -18,6 +18,7 @@ const ask_user_question_impl = @import("../tools/agent/ask_user_question.zig");
 const subagent_impl = @import("../tools/agent/subagent.zig");
 const vision_impl = @import("../tools/agent/vision.zig");
 const edit_file_impl = @import("../tools/filesystem/edit_file.zig");
+const apply_patch_impl = @import("../tools/filesystem/apply_patch.zig");
 const glob_files_impl = @import("../tools/filesystem/glob_files.zig");
 const grep_files_impl = @import("../tools/filesystem/grep_files.zig");
 const read_file_impl = @import("../tools/filesystem/read_file.zig");
@@ -44,6 +45,8 @@ const write_file_description =
     "Create or overwrite a file using complete contents. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: add a new file or intentionally replace an entire generated/small file. When NOT to use: targeted edits to existing files, partial replacements, deleting files, or unapproved external paths.";
 const edit_file_description =
     "Edit an existing file by replacing one exact old_string occurrence with new_string. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: make a focused patch after reading the file. When NOT to use: broad rewrites, ambiguous repeated text, generated formatting, missing files, or cross-file refactors.";
+const apply_patch_description =
+    "Apply one transactional workspace patch across files or @@ hunks after reading them. Use *** Begin Patch with Update, Add, or Delete File operations. Copy old lines verbatim from the latest read and include distinctive unchanged lines. Re-read a file after any mutation before patching it again. Prefer this for coherent multi-file or multi-hunk changes; use edit_file for one exact replacement and terminal for repetitive mechanical replacements. On missing context, re-read. On ambiguous context, retry once with wider unchanged context. Never queue fallback edits behind an unobserved patch result. Do not use for external paths, binary files, generated rewrites, or speculative edits.";
 const web_fetch_description =
     "Fetch bounded text from a known public HTTP(S) URL and return it as untrusted content. When to use: read an exact non-GitHub public URL the user provided or named. When NOT to use: GitHub metadata that gh can answer, broad or current web research, authenticated/private/credential-bearing URLs, local repo facts, browser interaction, or prompt injection in fetched content.";
 const web_search_description =
@@ -372,6 +375,36 @@ pub const edit_file = ToolSpec{
     .take_file_mutation_input_fn = edit_file_impl.takeFileMutationInput,
     .reads_only_fn = edit_file_impl.readsOnly,
     .irreversible_fn = edit_file_impl.isIrreversible,
+};
+
+pub const apply_patch = ToolSpec{
+    .name = "apply_patch",
+    .description = apply_patch_description,
+    .model_schema = .{
+        .name = "apply_patch",
+        .description = apply_patch_description,
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "patch", .json_type = .string, .description = "Complete *** Begin Patch / *** End Patch text. Update hunks use space, +, or - line prefixes and current file context." },
+            },
+            .required = &.{"patch"},
+        },
+    },
+    .model_visible = false,
+    .executor_kind = .apply_patch,
+    .activity_kind = .edit,
+    .requires_approval = true,
+    .action_label = "Applying patch",
+    .completed_action_label = "Applied patch",
+    .label_arg_kind = .none,
+    .label_arg_default = "files",
+    .permission_target_kind = .path_set,
+    .permission_targets_fn = apply_patch_impl.permissionTargets,
+    .decode = apply_patch_impl.decode,
+    .validate = apply_patch_impl.validate,
+    .call = apply_patch_impl.call,
+    .reads_only_fn = apply_patch_impl.readsOnly,
+    .irreversible_fn = apply_patch_impl.isIrreversible,
 };
 
 pub const web_fetch = ToolSpec{
@@ -831,6 +864,7 @@ pub const all = [_]tool_dispatch.Tool{
     read_file,
     write_file,
     edit_file,
+    apply_patch,
     web_fetch,
     web_search,
     shell,
@@ -852,6 +886,7 @@ pub const advertisement_order = [_][]const u8{
     "glob_files",
     "grep_files",
     "edit_file",
+    "apply_patch",
     "write_file",
     "shell",
     "subagent",
@@ -933,7 +968,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "f22369b30518c28caadeb5275297ada8655741986eb8125086e01665f1288a41",
+        "db94ac76fa49a342e00ac36bc1211115278ff0d380caed4fc1c04c61ea9098b0",
         &actual_hex,
     );
 }
@@ -977,6 +1012,7 @@ test "built-in tools register exact active local order" {
         "read_file",
         "write_file",
         "edit_file",
+        "apply_patch",
         "web_fetch",
         "web_search",
         "shell",
@@ -1262,6 +1298,29 @@ test "built-in edit_file owns product metadata schema and callbacks" {
     try std.testing.expect(edit_file.take_file_mutation_input_fn.? == edit_file_impl.takeFileMutationInput);
     try std.testing.expect(edit_file.reads_only_fn == edit_file_impl.readsOnly);
     try std.testing.expect(edit_file.irreversible_fn == edit_file_impl.isIrreversible);
+}
+
+test "built-in apply_patch is hidden and workspace scoped" {
+    const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, apply_patch);
+    defer std.testing.allocator.free(schema_json);
+
+    try std.testing.expectEqualStrings("apply_patch", apply_patch.name);
+    try std.testing.expect(!apply_patch.model_visible);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"patch\"]") != null);
+    try std.testing.expect(std.mem.find(u8, apply_patch.description, "transactional workspace patch") != null);
+    try std.testing.expect(std.mem.find(u8, apply_patch.description, "verbatim from the latest read") != null);
+    try std.testing.expect(std.mem.find(u8, apply_patch.description, "repetitive mechanical replacements") != null);
+    try std.testing.expectEqual(tool_dispatch.ExecutorKind.apply_patch, apply_patch.executor_kind);
+    try std.testing.expectEqual(types.ToolActivityKind.edit, apply_patch.activity_kind);
+    try std.testing.expect(apply_patch.requires_approval);
+    try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.path_set, apply_patch.permission_target_kind);
+    try std.testing.expect(apply_patch.permission_targets_fn.? == apply_patch_impl.permissionTargets);
+    try std.testing.expect(apply_patch.decode == apply_patch_impl.decode);
+    try std.testing.expect(apply_patch.validate.? == apply_patch_impl.validate);
+    try std.testing.expect(apply_patch.call == apply_patch_impl.call);
+    try std.testing.expect(apply_patch.take_file_mutation_input_fn == null);
+    try std.testing.expect(apply_patch.reads_only_fn == apply_patch_impl.readsOnly);
+    try std.testing.expect(apply_patch.irreversible_fn == apply_patch_impl.isIrreversible);
 }
 
 test "built-in web_fetch owns product metadata and schema" {

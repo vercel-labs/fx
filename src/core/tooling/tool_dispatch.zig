@@ -333,6 +333,14 @@ pub const PermissionDecider = *const fn (*const Tool, ToolInput, DispatchContext
 /// Function pointer that decodes JSON arguments into a concrete input.
 pub const DecodeFn = *const fn (DispatchContext, []const u8) DispatchError!DecodeResult;
 
+/// Resolves every canonical permission target for a multi-target tool call.
+/// The returned targets and their paths are owned by the supplied allocator.
+pub const PermissionTargetsFn = *const fn (
+    Allocator,
+    []const u8,
+    []const u8,
+) anyerror!core_permissions.PermissionCallTargets;
+
 /// Optional pure validation step run before the permission gate.
 pub const ValidateFn = *const fn (DispatchContext, ToolInput) DispatchError!?[]u8;
 
@@ -412,6 +420,7 @@ pub const ExecutorKind = enum {
     read_tool_result,
     write_file,
     edit_file,
+    apply_patch,
     web_fetch,
     web_search,
     run_command,
@@ -476,6 +485,7 @@ pub const Tool = struct {
     label_arg_default: []const u8 = "",
     presentation_fn: ?PresentationFn = null,
     permission_target_kind: PermissionTargetKind = .none,
+    permission_targets_fn: ?PermissionTargetsFn = null,
     decode: DecodeFn,
     validate: ?ValidateFn = null,
     call: CallFn,
