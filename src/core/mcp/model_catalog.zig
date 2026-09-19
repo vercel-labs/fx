@@ -186,13 +186,14 @@ pub fn classifyAvailability(
     authentication: health.AuthenticationState,
     deferred_for_ask: bool,
 ) Availability {
-    if (authentication == .required) return .authentication_required;
-    return switch (connection) {
+    return switch (health.classify(connection, authentication, deferred_for_ask)) {
         .disabled => .disabled,
         .connecting => .discovering,
         .ready => .ready,
+        .needs_auth => .authentication_required,
         .failed => .failed,
-        .disconnected => if (deferred_for_ask) .available_on_demand else .unavailable,
+        .unavailable => .unavailable,
+        .on_demand => .available_on_demand,
     };
 }
 
@@ -353,7 +354,9 @@ test "availability follows canonical connection authentication and deferred stat
         .{ .connection = .connecting, .expected = .discovering },
         .{ .connection = .disconnected, .deferred_for_ask = true, .expected = .available_on_demand },
         .{ .connection = .failed, .authentication = .required, .expected = .authentication_required },
+        .{ .connection = .disconnected, .authentication = .required, .expected = .authentication_required },
         .{ .connection = .disabled, .expected = .disabled },
+        .{ .connection = .disabled, .authentication = .required, .expected = .disabled },
         .{ .connection = .failed, .expected = .failed },
         .{ .connection = .disconnected, .expected = .unavailable },
     };

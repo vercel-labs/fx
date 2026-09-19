@@ -414,13 +414,13 @@ pub fn renderAuthenticationRequired(
         if (!server.isPublished()) continue;
         if (!access.allows(.{ .tool_server = server.config.name })) continue;
         if (!queryContainsCompleteIdentity(query, server.config.name)) continue;
+        const authentication = serverAuthenticationState(server);
         server.status_lock.lockUncancelable(io_mod.getIo());
         const failed = server.state.load(.acquire) == .failed;
         server.status_lock.unlock(io_mod.getIo());
-        if (!failed) continue;
-        const mode: enum { oauth, bearer_environment } = if (serverAuthenticationState(server) == .required)
+        const mode: enum { oauth, bearer_environment } = if (authentication == .required)
             .oauth
-        else if (server.config.bearer_token_env != null and
+        else if (failed and server.config.bearer_token_env != null and
             io_mod.getenv(server.config.bearer_token_env.?) == null)
             .bearer_environment
         else

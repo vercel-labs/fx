@@ -33,6 +33,41 @@ pub const AuthenticationState = enum {
     required,
 };
 
+/// The single product-level status of a configured server. Surfaces that
+/// render connection/authentication state (list, summary, menu, trace, model
+/// catalog, capability search) derive from this classification instead of
+/// re-classifying the raw axes; menus may additionally model their own axes
+/// (reloading, trust admission) on top.
+pub const Status = enum {
+    disabled,
+    connecting,
+    ready,
+    needs_auth,
+    failed,
+    unavailable,
+    on_demand,
+};
+
+/// Classifies one server from its connection and authentication axes.
+/// Precedence is deliberate: a disabled server needs enabling, not auth;
+/// a server with a pending auth challenge needs auth regardless of how the
+/// connection attempt ended; only then does the connection axis apply.
+pub fn classify(
+    connection: ConnectionState,
+    authentication: AuthenticationState,
+    deferred: bool,
+) Status {
+    if (connection == .disabled) return .disabled;
+    if (authentication == .required) return .needs_auth;
+    return switch (connection) {
+        .disabled => unreachable,
+        .connecting => .connecting,
+        .ready => .ready,
+        .failed => .failed,
+        .disconnected => if (deferred) .on_demand else .unavailable,
+    };
+}
+
 pub const CacheFreshness = enum {
     unavailable,
     fresh,
@@ -225,7 +260,8 @@ pub const StartupDecision = enum {
 pub fn startupDecision(servers: []const ServerSnapshot) StartupDecision {
     var degraded = false;
     for (servers) |server| {
-        if (server.connection == .ready or server.connection == .disabled and !server.required) continue;
+        const status = classify(server.connection, server.authentication, false);
+        if (status == .ready or status == .disabled and !server.required) continue;
         if (server.required) return .blocked;
         degraded = true;
     }
@@ -254,7 +290,7 @@ pub fn render(alloc: Allocator, snapshot: Snapshot) ![]u8 {
     }
     for (snapshot.servers) |server| {
         try out.writer.print(
-            "  {s} source={s} scope={s} policy={s} transport={s} state={s} auth={s}\n",
+            "  {s} source={s} scope={s} policy={s} transport={s} state={s} auth={s} status={s}\n",
             .{
                 server.configured_name,
                 @tagName(server.source),
@@ -263,6 +299,7 @@ pub fn render(alloc: Allocator, snapshot: Snapshot) ![]u8 {
                 @tagName(server.transport),
                 @tagName(server.connection),
                 @tagName(server.authentication),
+                @tagName(classify(server.connection, server.authentication, false)),
             },
         );
         if (server.workspace_admission) |admission| {
@@ -339,16 +376,15 @@ pub fn renderSummary(alloc: Allocator, snapshot: Snapshot) ![]u8 {
             }
             pending_count += 1;
         }
-        if (server.authentication == .required) {
-            auth_required += 1;
-            if (first_auth_server == null) first_auth_server = server.configured_name;
-            continue;
-        }
-        switch (server.connection) {
+        switch (classify(server.connection, server.authentication, false)) {
+            .needs_auth => {
+                auth_required += 1;
+                if (first_auth_server == null) first_auth_server = server.configured_name;
+            },
             .ready => ready += 1,
             .connecting => connecting += 1,
             .failed => failed += 1,
-            .disconnected, .disabled => {},
+            .disabled, .unavailable, .on_demand => {},
         }
     }
 
@@ -595,4 +631,80 @@ fn emptyServerSnapshot() ServerSnapshot {
         .last_successful_discovery_ms = null,
         .failure = null,
     };
+}
+
+test "classify applies one precedence rule for every surface" {
+    const Case = struct {
+        connection: ConnectionState,
+        authentication: AuthenticationState = .none,
+        deferred: bool = false,
+        expected: Status,
+    };
+    const cases = [_]Case{
+        .{ .connection = .ready, .expected = .ready },
+        .{ .connection = .connecting, .expected = .connecting },
+        .{ .connection = .failed, .expected = .failed },
+        .{ .connection = .disconnected, .expected = .unavailable },
+        .{ .connection = .disconnected, .deferred = true, .expected = .on_demand },
+        .{ .connection = .failed, .authentication = .required, .expected = .needs_auth },
+        .{ .connection = .disconnected, .authentication = .required, .expected = .needs_auth },
+        .{ .connection = .connecting, .authentication = .required, .expected = .needs_auth },
+        .{ .connection = .disabled, .expected = .disabled },
+        .{ .connection = .disabled, .authentication = .required, .expected = .disabled },
+        .{ .connection = .failed, .authentication = .authenticated, .expected = .failed },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(
+            case.expected,
+            classify(case.connection, case.authentication, case.deferred),
+        );
+    }
+}
+
+test "startupDecision keeps blocking required servers that need authentication" {
+    var required_auth = emptyServerSnapshot();
+    required_auth.required = true;
+    required_auth.connection = .failed;
+    required_auth.authentication = .required;
+    var servers = [_]ServerSnapshot{required_auth};
+    try std.testing.expectEqual(StartupDecision.blocked, startupDecision(&servers));
+
+    var optional_auth = emptyServerSnapshot();
+    optional_auth.connection = .failed;
+    optional_auth.authentication = .required;
+    var optional_servers = [_]ServerSnapshot{optional_auth};
+    try std.testing.expectEqual(StartupDecision.degraded, startupDecision(&optional_servers));
+
+    var ready_server = emptyServerSnapshot();
+    ready_server.required = true;
+    ready_server.connection = .ready;
+    ready_server.authentication = .authenticated;
+    var ready_servers = [_]ServerSnapshot{ ready_server, optional_auth };
+    try std.testing.expectEqual(StartupDecision.degraded, startupDecision(&ready_servers));
+
+    // A ready server with a freshly observed auth challenge classifies as
+    // needs_auth, so a required one still blocks and an optional one degrades.
+    var ready_challenged = emptyServerSnapshot();
+    ready_challenged.required = true;
+    ready_challenged.connection = .ready;
+    ready_challenged.authentication = .required;
+    try std.testing.expectEqual(Status.needs_auth, classify(ready_challenged.connection, ready_challenged.authentication, false));
+    var challenged_servers = [_]ServerSnapshot{ready_challenged};
+    try std.testing.expectEqual(StartupDecision.blocked, startupDecision(&challenged_servers));
+}
+
+test "render prints the classified status next to the raw axes" {
+    const alloc = std.testing.allocator;
+    var server = emptyServerSnapshot();
+    server.connection = .failed;
+    server.authentication = .required;
+    var snapshot = Snapshot{ .captured_at_ms = 0, .servers = try alloc.dupe(ServerSnapshot, &.{server}) };
+    defer snapshot.deinit(alloc);
+
+    const output = try render(alloc, snapshot);
+    defer alloc.free(output);
+
+    try std.testing.expect(std.mem.find(u8, output, "state=failed") != null);
+    try std.testing.expect(std.mem.find(u8, output, "auth=required") != null);
+    try std.testing.expect(std.mem.find(u8, output, "status=needs_auth") != null);
 }

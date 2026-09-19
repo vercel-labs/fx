@@ -767,7 +767,7 @@ pub const McpRuntime = struct {
                         .disabled => .disabled,
                         .ready => .ready,
                         .failed => .failed,
-                    }, serverAuthenticationState(server), server.last_error);
+                    }, serverAuthenticationState(server), server.config.name, server.last_error);
                     defer if (failure) |message| self.alloc.free(message);
                     return try std.fmt.allocPrint(self.alloc, "Required MCP server '{s}' failed to start: {s}", .{ safe_name, failure orelse "Check the trusted profile configuration and retry." });
                 }
@@ -1160,6 +1160,7 @@ pub const McpRuntime = struct {
         name: []u8,
         command: []u8,
         state: health.ConnectionState,
+        status: health.Status,
         tool_count: usize,
         last_error: ?[]u8,
 
@@ -1201,6 +1202,7 @@ pub const McpRuntime = struct {
                 .name = name,
                 .command = command,
                 .state = observed.connection,
+                .status = health.classify(observed.connection, observed.authentication, false),
                 .tool_count = observed.counts.tools orelse 0,
                 .last_error = if (observed.failure) |failure| try alloc.dupe(u8, failure) else null,
             };
@@ -7339,11 +7341,24 @@ test "MCP authentication guidance requires an observed challenge" {
     const output = (try renderAuthenticationRequired(alloc, &.{&servers[0]}, &access, "plain")).?;
     defer alloc.free(output);
     try std.testing.expect(std.mem.find(u8, output, "/mcp auth plain --open") != null);
+
+    servers[0].state = .init(.disconnected);
+    const disconnected_output = (try renderAuthenticationRequired(alloc, &.{&servers[0]}, &access, "plain")).?;
+    defer alloc.free(disconnected_output);
+    try std.testing.expect(std.mem.find(u8, disconnected_output, "/mcp auth plain --open") != null);
+}
+
+test "MCP authentication failure text names the server" {
+    const alloc = std.testing.allocator;
+    const output = (try healthFailureForState(alloc, false, .failed, .required, "linear", null)).?;
+    defer alloc.free(output);
+    try std.testing.expect(std.mem.find(u8, output, "/mcp auth linear --open") != null);
+    try std.testing.expect(std.mem.find(u8, output, "<name>") == null);
 }
 
 test "MCP connection diagnostics retain the cause and mask sensitive values" {
     const alloc = std.testing.allocator;
-    const output = (try healthFailureForState(alloc, false, .failed, .configured, "HTTP 500 TOKEN=example-secret")).?;
+    const output = (try healthFailureForState(alloc, false, .failed, .configured, "docs", "HTTP 500 TOKEN=example-secret")).?;
     defer alloc.free(output);
     try std.testing.expect(std.mem.find(u8, output, "HTTP 500") != null);
     try std.testing.expect(std.mem.find(u8, output, "example-secret") == null);

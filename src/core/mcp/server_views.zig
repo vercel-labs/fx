@@ -34,6 +34,7 @@ pub fn snapshotServerHealthBeforeDiscoveryPublication(
         server.config.required,
         connection,
         authentication,
+        server.config.name,
         null,
     );
     return .{
@@ -107,6 +108,7 @@ pub fn snapshotServerHealth(
         server.config.required,
         connection,
         authentication,
+        server.config.name,
         server.last_error,
     );
     errdefer if (failure) |value| alloc.free(value);
@@ -234,26 +236,35 @@ pub fn healthFailureForState(
     required: bool,
     connection: health.ConnectionState,
     authentication: health.AuthenticationState,
+    name: []const u8,
     last_error: ?[]const u8,
 ) Allocator.Error!?[]u8 {
-    if (required and connection == .disabled) {
-        return @as(?[]u8, try alloc.dupe(u8, "Enable this required server or mark it optional."));
+    switch (health.classify(connection, authentication, false)) {
+        .disabled => {
+            if (required) {
+                return @as(?[]u8, try alloc.dupe(u8, "Enable this required server or mark it optional."));
+            }
+            return null;
+        },
+        .needs_auth => {
+            const safe_name = try terminalSafeOwned(alloc, name, 256);
+            defer alloc.free(safe_name);
+            return @as(?[]u8, try std.fmt.allocPrint(
+                alloc,
+                "Authentication is required or the saved credentials lack access; run /mcp auth {s} --open and check server permissions.",
+                .{safe_name},
+            ));
+        },
+        .failed => {
+            if (last_error) |message| {
+                const masked = text_utils.maskSecrets(alloc, message) catch return error.OutOfMemory;
+                defer if (masked.ptr != message.ptr) alloc.free(masked);
+                return try terminalSafeOwned(alloc, masked, 1024);
+            }
+            return @as(?[]u8, try alloc.dupe(u8, "Connection or discovery failed; check the trusted profile configuration and trace logs."));
+        },
+        .connecting, .ready, .unavailable, .on_demand => return null,
     }
-    if (authentication == .required) {
-        return @as(?[]u8, try alloc.dupe(
-            u8,
-            "Authentication is required or the saved credentials lack access; run /mcp auth <name> --open and check server permissions.",
-        ));
-    }
-    if (connection == .failed) {
-        if (last_error) |message| {
-            const masked = text_utils.maskSecrets(alloc, message) catch return error.OutOfMemory;
-            defer if (masked.ptr != message.ptr) alloc.free(masked);
-            return try terminalSafeOwned(alloc, masked, 1024);
-        }
-        return @as(?[]u8, try alloc.dupe(u8, "Connection or discovery failed; check the trusted profile configuration and trace logs."));
-    }
-    return null;
 }
 
 fn aggregateCacheFreshness(server: *const McpServer, now_ms: u64) health.CacheFreshness {

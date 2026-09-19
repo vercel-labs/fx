@@ -2588,9 +2588,15 @@ fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
             var diagnostics_snapshot = try mcp.snapshotServerDiagnostics(alloc);
             defer diagnostics_snapshot.deinit(alloc);
             for (diagnostics_snapshot.items) |server| {
-                if (server.state != .failed) continue;
-                count += 1;
-                try writer.print("- mcp server failed name={s}", .{server.name});
+                if (server.status == .needs_auth) {
+                    count += 1;
+                    try writer.print("- mcp server needs authentication name={s}", .{server.name});
+                } else if (server.status == .failed) {
+                    count += 1;
+                    try writer.print("- mcp server failed name={s}", .{server.name});
+                } else {
+                    continue;
+                }
                 if (server.last_error) |err| {
                     try writer.writeAll(" error=");
                     try writeMaskedInline(writer, alloc, err);
@@ -2753,7 +2759,7 @@ fn writeRuntimeContextSummary(writer: *std.Io.Writer, app: anytype, alloc: std.m
             } else {
                 try writer.print("mcp_servers ({d}):\n", .{diagnostics_snapshot.items.len});
                 for (diagnostics_snapshot.items) |server| {
-                    try writer.print("  - {s} state={s} tools={d} command=", .{ server.name, @tagName(server.state), server.tool_count });
+                    try writer.print("  - {s} state={s} status={s} tools={d} command=", .{ server.name, @tagName(server.state), @tagName(server.status), server.tool_count });
                     try writeMaskedInline(writer, alloc, server.command);
                     try writer.writeByte('\n');
                     if (server.last_error) |err| {
