@@ -2353,7 +2353,39 @@ pub const McpRuntime = struct {
         try operation_access.authorize(.{ .feature_server = request.server_name });
         var images: []types.ToolImage = &.{};
         errdefer types.freeToolImages(alloc, images);
-        const model_output = switch (request.action) {
+        const model_output = self.renderFeatureModelOutput(
+            alloc,
+            request,
+            options,
+            &images,
+        ) catch |err| switch (err) {
+            // A server that never advertised resources or prompts has not
+            // failed; the feature is simply absent. Tell the model instead of
+            // surfacing a tool execution failure.
+            error.McpResourcesUnsupported, error.McpPromptsUnsupported => try renderUnsupportedForModel(
+                alloc,
+                request.action,
+                request.server_name,
+            ),
+            else => return err,
+        };
+        errdefer alloc.free(model_output);
+        if (model_output.len > options.output_limit_bytes) {
+            return error.McpFeatureOutputLimitExceeded;
+        }
+        try operation_access.refresh();
+        try operation_access.authorize(.{ .feature_server = request.server_name });
+        return .{ .model_output = model_output, .images = images };
+    }
+
+    fn renderFeatureModelOutput(
+        self: *McpRuntime,
+        alloc: Allocator,
+        request: tool_mcp_runtime.FeatureRequest,
+        options: tool_mcp_runtime.FeatureCallOptions,
+        images: *[]types.ToolImage,
+    ) ![]u8 {
+        return switch (request.action) {
             .resource_list, .resource_templates => output: {
                 var result = try self.listResources(
                     alloc,
@@ -2393,7 +2425,7 @@ pub const McpRuntime = struct {
                     return err;
                 };
                 defer result.deinit(alloc);
-                images = try feature_result.resourceImages(alloc, result);
+                images.* = try feature_result.resourceImages(alloc, result);
                 break :output try renderResourceReadForModel(alloc, result);
             },
             .prompt_list => output: {
@@ -2434,7 +2466,7 @@ pub const McpRuntime = struct {
                     return err;
                 };
                 defer result.deinit(alloc);
-                images = try feature_result.promptImages(alloc, result);
+                images.* = try feature_result.promptImages(alloc, result);
                 break :output try renderPromptGetForModel(alloc, result);
             },
             .prompt_complete, .resource_complete => output: {
@@ -2479,17 +2511,11 @@ pub const McpRuntime = struct {
                 );
             },
         };
-        errdefer alloc.free(model_output);
-        if (model_output.len > options.output_limit_bytes) {
-            return error.McpFeatureOutputLimitExceeded;
-        }
-        try operation_access.refresh();
-        try operation_access.authorize(.{ .feature_server = request.server_name });
-        return .{ .model_output = model_output, .images = images };
     }
 };
 
 const renderResourceCatalogForModel = feature_result.renderResourceCatalogForModel;
+const renderUnsupportedForModel = feature_result.renderUnsupportedForModel;
 const renderResourceReadForModel = feature_result.renderResourceReadForModel;
 const renderPromptCatalogForModel = feature_result.renderPromptCatalogForModel;
 const renderPromptGetForModel = feature_result.renderPromptGetForModel;
@@ -8515,4 +8541,34 @@ test "connection retirement waits for the admitted transport commit" {
         null,
     ));
     try std.testing.expect(!tool_snapshot.current(server, &snapshot));
+}
+
+test "feature calls on a server without the capability render as unsupported, not failure" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "linear"),
+        .command = try alloc.dupe(u8, "cmd"),
+    });
+    const server = runtime.servers.items[0];
+    server.state.store(.ready, .release);
+
+    var result = try runtime.callFeatureForModel(
+        alloc,
+        .{ .action = .resource_list, .server_name = "linear" },
+        .{ .output_limit_bytes = 64 * 1024 },
+    );
+    defer result.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, result.model_output, "\"unsupported\":true") != null);
+    try std.testing.expect(std.mem.find(u8, result.model_output, "did not advertise a resources capability") != null);
+
+    var prompts_result = try runtime.callFeatureForModel(
+        alloc,
+        .{ .action = .prompt_list, .server_name = "linear" },
+        .{ .output_limit_bytes = 64 * 1024 },
+    );
+    defer prompts_result.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, prompts_result.model_output, "did not advertise a prompts capability") != null);
 }

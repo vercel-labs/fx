@@ -305,6 +305,30 @@ fn writeFeatureEnvelopeStart(
     try std.json.Stringify.value(server_name, .{}, writer);
 }
 
+pub fn renderUnsupportedForModel(
+    alloc: Allocator,
+    action: tool_mcp_runtime.FeatureAction,
+    server_name: []const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeFeatureEnvelopeStart(&out.writer, action, server_name);
+    const feature: []const u8 = switch (action) {
+        .resource_list, .resource_read, .resource_templates, .resource_complete => "resources",
+        .prompt_list, .prompt_get, .prompt_complete => "prompts",
+    };
+    const message = try std.fmt.allocPrint(
+        alloc,
+        "{s} did not advertise a {s} capability, so this feature is unavailable on that server. Use its tools or pick another server.",
+        .{ server_name, feature },
+    );
+    defer alloc.free(message);
+    try out.writer.writeAll(",\"unsupported\":true,\"message\":");
+    try std.json.Stringify.value(message, .{}, &out.writer);
+    try out.writer.writeAll("}");
+    return out.toOwnedSlice();
+}
+
 pub fn resourceImages(alloc: Allocator, result: ResourceReadResult) ![]types.ToolImage {
     var images = image_data.ImageList{ .alloc = alloc };
     defer images.deinit();
