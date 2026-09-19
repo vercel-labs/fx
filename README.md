@@ -111,3 +111,23 @@ Report security vulnerabilities through the [contact page](https://fx.sh/contact
 ## Credits
 
 Interface sounds by [cuelume](https://github.com/Danilaa1/cuelume).
+
+### Experimental Jev compaction
+
+Development builds can set `FX_EXPERIMENT_JEV_COMPACTION=1` to try extractive
+compaction through `typesafe-ai/jev` on AI Gateway. The fast path evaluates older
+tool results, preserves original user messages and retrievable source artifacts,
+and falls back to the existing summarizer when it cannot safely fit the handoff.
+It requires a Gateway credential and is off by default. Performance and quality
+are experimental. Jev evaluation usage is recorded separately; total billing
+remains incomplete where Gateway does not return a generation identity. This
+feature does not change model selection.
+
+### Separate Jev evaluation credentials
+
+Set `FX_JEV_GATEWAY_API_KEY` to a dedicated AI Gateway key for Jev compaction
+evaluations. Normal model inference continues using its configured
+credential. With a dedicated key, `FX_JEV_GATEWAY_TEAM` optionally selects that
+key's team; the inference team's header is not inherited. An empty dedicated
+key rejects evaluation instead of using the inference key. Without the override,
+Jev uses the current Gateway credential and team as before.
