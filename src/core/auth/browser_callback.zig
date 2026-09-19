@@ -56,6 +56,32 @@ pub fn await(
     cancel_flag: *std.atomic.Value(bool),
     allowed_cors_origin: ?[]const u8,
 ) !?Accepted(Callback) {
+    return await_request(Callback, parse, alloc, listener, parser_context, cancel_flag, allowed_cors_origin, null);
+}
+
+/// Accept a browser form POST from one exact HTTPS bridge origin.
+pub fn await_form(
+    comptime Callback: type,
+    comptime parse: fn (?*anyopaque, Allocator, []const u8) ParseResult(Callback),
+    alloc: Allocator,
+    listener: *std.Io.net.Server,
+    parser_context: ?*anyopaque,
+    cancel_flag: *std.atomic.Value(bool),
+    origin: []const u8,
+) !?Accepted(Callback) {
+    return await_request(Callback, parse, alloc, listener, parser_context, cancel_flag, null, origin);
+}
+
+fn await_request(
+    comptime Callback: type,
+    comptime parse: fn (?*anyopaque, Allocator, []const u8) ParseResult(Callback),
+    alloc: Allocator,
+    listener: *std.Io.net.Server,
+    parser_context: ?*anyopaque,
+    cancel_flag: *std.atomic.Value(bool),
+    allowed_cors_origin: ?[]const u8,
+    form_origin: ?[]const u8,
+) !?Accepted(Callback) {
     var accepts: usize = 0;
     while (accepts < max_accepts_per_poll) : (accepts += 1) {
         if (!try listenerReady(listener, cancel_flag)) return null;
@@ -67,7 +93,7 @@ pub fn await(
         defer if (!handed_off) stream.close(io_mod.getIo());
         setSocketTimeouts(stream.socket.handle);
 
-        const maybe_request = readRequest(alloc, stream, cancel_flag, allowed_cors_origin) catch |err| switch (err) {
+        const maybe_request = readRequest(alloc, stream, cancel_flag, allowed_cors_origin, form_origin, listener.socket.address.getPort()) catch |err| switch (err) {
             error.Cancelled => return err,
             error.InvalidOAuthCallbackRequest, error.OAuthCallbackRequestTooLarge => {
                 writeResponse(stream, .unrelated, null) catch {};
@@ -179,6 +205,8 @@ fn readRequest(
     stream: std.Io.net.Stream,
     cancel_flag: *std.atomic.Value(bool),
     allowed_cors_origin: ?[]const u8,
+    form_origin: ?[]const u8,
+    port: u16,
 ) !?Request {
     const deadline_ms = io_mod.milliTimestamp() + silence_ms;
     var socket_buffer: [4096]u8 = undefined;
@@ -220,6 +248,28 @@ fn readRequest(
     const method = request_line[0..method_end];
     const target = request_line[target_start..target_end];
     const origin = requestHeaderValue(request_bytes[line_end + 2 .. request_len], "origin");
+    if (form_origin) |required_origin| {
+        var host_buf: [32]u8 = undefined;
+        const expected_host = try std.fmt.bufPrint(&host_buf, "127.0.0.1:{d}", .{port});
+        const headers = request_bytes[line_end + 2 .. request_len];
+        const content_type = unique_header(headers, "content-type") orelse return error.InvalidOAuthCallbackRequest;
+        const host_header = unique_header(headers, "host") orelse return error.InvalidOAuthCallbackRequest;
+        const form_request_origin = unique_header(headers, "origin") orelse return error.InvalidOAuthCallbackRequest;
+        if (!std.mem.eql(u8, method, "POST") or !std.mem.eql(u8, target, "/slack/oauth/callback") or
+            !std.mem.eql(u8, form_request_origin, required_origin) or !std.mem.eql(u8, host_header, expected_host) or
+            !std.mem.eql(u8, std.mem.trim(u8, std.mem.sliceTo(content_type, ';'), " "), "application/x-www-form-urlencoded") or
+            requestHeaderValue(headers, "transfer-encoding") != null) return error.InvalidOAuthCallbackRequest;
+        const length_header = unique_header(headers, "content-length") orelse return error.InvalidOAuthCallbackRequest;
+        const length = std.fmt.parseInt(usize, length_header, 10) catch return error.InvalidOAuthCallbackRequest;
+        if (length == 0 or length > 8192) return error.OAuthCallbackRequestTooLarge;
+        const body = try alloc.alloc(u8, length);
+        defer alloc.free(body);
+        for (body) |*byte| {
+            if (reader.interface.bufferedLen() == 0 and !try requestReadable(stream.socket.handle, cancel_flag, deadline_ms)) return null;
+            byte.* = reader.interface.takeByte() catch return error.InvalidOAuthCallbackRequest;
+        }
+        return .{ .kind = .callback, .target = try alloc.dupe(u8, body) };
+    }
     const cors_origin = allowed_cors_origin orelse {
         if (!std.mem.eql(u8, method, "GET")) return error.InvalidOAuthCallbackRequest;
         return .{
@@ -251,6 +301,18 @@ fn readRequest(
         .target = try alloc.dupe(u8, target),
         .cors_origin = if (origin_allowed) cors_origin else null,
     };
+}
+
+fn unique_header(headers: []const u8, name: []const u8) ?[]const u8 {
+    var result: ?[]const u8 = null;
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    while (lines.next()) |line| {
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(line[0..colon], name)) continue;
+        if (result != null) return null;
+        result = std.mem.trim(u8, line[colon + 1 ..], " \t");
+    }
+    return result;
 }
 
 fn requestHeaderValue(headers: []const u8, name: []const u8) ?[]const u8 {
@@ -307,7 +369,7 @@ pub fn writeResponse(stream: std.Io.net.Stream, outcome: Response, cors_origin: 
         try writer.interface.print("Access-Control-Allow-Origin: {s}\r\nVary: Origin\r\n", .{origin});
     }
     try writer.interface.print(
-        "Content-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        "Cache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
         .{ reply.body.len, reply.body },
     );
     try writer.interface.flush();

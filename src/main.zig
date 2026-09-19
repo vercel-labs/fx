@@ -3638,7 +3638,8 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
             std.mem.eql(u8, effective_args[1], "list") or
             std.mem.eql(u8, effective_args[1], "logout");
     }
-    return std.mem.eql(u8, command, "login") or
+    return std.mem.eql(u8, command, "slack") or
+        std.mem.eql(u8, command, "login") or
         std.mem.eql(u8, command, "logout") or
         std.mem.eql(u8, command, "teams") or
         std.mem.eql(u8, command, "provider") or
@@ -3655,6 +3656,7 @@ test "auth and upgrade commands use early threaded io without full entry config"
     const args = &.{@as([:0]const u8, "upgrade")};
     try std.testing.expect(!needsFullEntryConfig(args));
     try std.testing.expect(needsEarlyThreadedIo(args));
+    try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "slack")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "login")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "logout")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "teams")}));
@@ -4292,6 +4294,7 @@ test {
     _ = @import("core/cli/cli_ask.zig");
     _ = @import("core/cli/cli_replay.zig");
     _ = @import("core/cli/cli_surface.zig");
+    _ = @import("core/slack/install.zig");
     _ = @import("core/workspace/change_tracker.zig");
     _ = @import("core/shared/collections.zig");
     _ = @import("core/slash_commands/command_router.zig");

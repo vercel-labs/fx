@@ -52,6 +52,7 @@ const workspace_access = @import("../workspace/workspace_access.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
 const usage_cli_runtime = @import("usage_cli_runtime.zig");
 
+const slack_install = @import("../slack/install.zig");
 const Allocator = std.mem.Allocator;
 const CommandCatalog = command_specs.TopLevelRegistry;
 const TopLevelKind = command_specs.TopLevelKind;
@@ -69,6 +70,7 @@ pub const Command = union(enum) {
     status: []const [:0]const u8,
     permissions: []const [:0]const u8,
     mcp: []const [:0]const u8,
+    slack: []const [:0]const u8,
     models: []const [:0]const u8,
     provider: []const [:0]const u8,
     doctor: []const [:0]const u8,
@@ -549,6 +551,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
                 }
                 return .{ .session = args[1..] };
             }
+            if (command_specs.matchesTopLevel(command_catalog, command, .slack)) return .{ .slack = args[1..] };
         },
         't' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .teams)) return .{ .teams = args[1..] };
@@ -1331,6 +1334,28 @@ fn runNonInteractiveWithDeps(
                 .rules = rules,
                 .runtime_grants_available = false,
             }).render(alloc, opts.format);
+            defer alloc.free(text);
+            try writeFormattedOutput(deps, text, opts.format);
+            return .handled_success;
+        },
+        .slack => |rest| {
+            if (rest.len == 0) {
+                const help = try command_specs.renderTopLevelCommandHelp(alloc, cfg.command_catalog, .slack);
+                defer alloc.free(help);
+                try writeStdout(deps, help);
+                return .handled_success;
+            }
+            const opts = slack_install.parse(rest) catch |err| {
+                try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .slack, "slack", err, rest);
+                return .handled_failure;
+            };
+            var arena: std.heap.ArenaAllocator = .init(alloc);
+            defer arena.deinit();
+            const snapshot = slack_install.run(arena.allocator(), opts.action, cfg.gateway_provider.oauth_transport, cfg.url_opener) catch |err| {
+                try writeCommandFailure(alloc, deps, "slack", err, opts.format);
+                return .handled_failure;
+            };
+            const text = try snapshot.render(alloc, opts.format);
             defer alloc.free(text);
             try writeFormattedOutput(deps, text, opts.format);
             return .handled_success;

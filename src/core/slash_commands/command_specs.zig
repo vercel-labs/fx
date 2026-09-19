@@ -19,6 +19,7 @@ pub const TopLevelKind = enum {
     status,
     permissions,
     mcp,
+    slack,
     models,
     provider,
     doctor,
@@ -2134,3 +2135,18 @@ test "top-level help lines fit representative terminal widths" {
         try expectAllLinesFit(text, width);
     }
 }
+
+pub const slack_install_spec: TopLevelSpec = .{
+    .kind = .slack,
+    .token = "slack",
+    .usage = "slack <install|status|refresh> [--json]",
+    .summary = "Install and manage the workspace Slack bot locally",
+    .options = &.{.{ .flag = "--json", .description = "Emit installation metadata without credentials" }},
+    .details = &.{
+        "install opens Slack authorization through fx.sh and saves the bot credentials on this computer.",
+        "status shows local installation metadata; refresh renews tokens without browser authorization.",
+        "This is a workspace bot installer. Employee MCP login remains fx mcp auth NAME.",
+        "Credentials are saved in ~/.fx/slack/installation.json with owner-only permissions.",
+        "Refresh runs only when requested; no background service is installed.",
+    },
+};

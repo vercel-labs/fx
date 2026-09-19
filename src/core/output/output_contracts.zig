@@ -3124,3 +3124,27 @@ test "usage text and JSON render the same optional and ordered facts" {
         parsed.value.object.get("models").?.array.items[0].object.get("model").?.string,
     );
 }
+
+pub const SlackSnapshot = struct {
+    action: []const u8,
+    installed: bool,
+    app_id: ?[]const u8,
+    team_id: ?[]const u8,
+    bot_user_id: ?[]const u8,
+    expires_at_ms: ?i64,
+    refresh_expires_at_ms: ?i64,
+
+    pub fn render(self: SlackSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        if (format == .json) {
+            try std.json.Stringify.value(self, .{}, &out.writer);
+        } else if (!self.installed) {
+            try out.writer.writeAll("No local Slack bot installation. Run fx slack install.\n");
+        } else {
+            try out.writer.print("Slack bot {s} in workspace {s}: {s}.\n", .{ self.bot_user_id.?, self.team_id.?, self.action });
+            if (self.expires_at_ms) |expiry| try out.writer.print("Access expires at {d} (Unix milliseconds). Run fx slack refresh to renew locally.\n", .{expiry});
+        }
+        return out.toOwnedSlice();
+    }
+};

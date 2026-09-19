@@ -87,6 +87,23 @@ fx builds as a native binary or WebAssembly. Applications embedding fx can provi
 
 The SDK is published to npm as [libfx](https://www.npmjs.com/package/libfx). See the [WebAssembly SDK](sdk/README.md) and the runnable Node.js, browser, Next.js, and Nuxt [examples](examples/README.md). The WebAssembly SDK is experimental.
 
+## Slack workspace installation
+
+Run `fx slack install` to install the fx bot in the configured Vercel Slack
+workspace. Keep the command running and authorize Slack in a browser on the same
+computer. The HTTPS callback at fx.sh returns the authorization to the CLI;
+PKCE state and the verifier stay in memory. The companion web bridge must be
+deployed and configured first.
+
+`fx slack status --json` reports local installation metadata without tokens.
+`fx slack refresh` rotates the local bot credentials when needed. Credentials
+live in the owner-only file `~/.fx/slack/installation.json`; no hosted database
+or background refresh service is created. An expired refresh token requires
+installation again. This workspace operation is separate from each employee's
+existing MCP user authorization. Bot installation does not establish whether
+Slack will display a hoverable “Sent using @fx” attribution; that requires a
+live message test.
+
 ## Build from source
 
 Building fx requires [Zig 0.16.0+](https://ziglang.org/download/):

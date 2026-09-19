@@ -155,6 +155,27 @@ There are two distinct skill categories in `fx`:
 
 The interactive agent can also install skills via the `install_skill` tool when the user asks to install one in conversation, including pasted `npx skills add ...` syntax.
 
+## Slack installation testing
+
+`src/core/slack/install.zig` owns workspace bot installation, local credential
+persistence, and explicit refresh. The web bridge contract is fixed to
+`https://fx.sh/api/slack/install/config`, `/api/slack/install`, and
+`/api/slack/oauth/callback`. Employee MCP authentication is separate.
+
+Build with `zig build`, then run `cd tests/e2e && bun test slack-install.test.ts`.
+The fixture exercises the freshly built binary and real loopback sockets without
+live Slack credentials. `FX_E2E_SLACK_ORIGIN` accepts only an HTTP `127.0.0.1`
+origin with a non-privileged port, serving public metadata plus mocked
+`/api/oauth.v2.access` and `/api/auth.test` responses. Production uses pinned
+Slack endpoints. Local records bind to the bridge origin to prevent fixture
+commands from refreshing production credentials. `FX_NO_OPEN_BROWSER=1` prints
+the start URL for headless operation; authorization still requires a browser on
+the same computer as the listener.
+
+This E2E owner is verification-only in the PGSO corpus because it covers a rare
+workspace setup operation and security boundaries. Live Slack authorization and
+message attribution are not deterministic tests.
+
 ## MCP
 
 Native fx connections use MCP v1 initialization by default over stdio,
