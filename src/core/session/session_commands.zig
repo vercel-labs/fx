@@ -70,7 +70,11 @@ pub fn reportUserSettingsCommit(
 
     const benign_commit = "saved to user settings (scope=user)";
     try out.writer.writeAll(benign_commit);
-    try appendShadowedUserSources(&out.writer, patch, detailed.sources);
+    const model_source = if (patch.model_preference) |preference|
+        detailed.model_source_for(preference.provider)
+    else
+        config_runtime.ConfigSource.compiled_default;
+    try appendShadowedUserSources(&out.writer, patch, detailed.sources, model_source);
     try appendCommitCleanup(&out.writer, outcome);
     if (session_error) |err| {
         try out.writer.print("; current-session recovery degraded ({s})", .{@errorName(err)});
@@ -168,12 +172,9 @@ fn appendShadowedUserSources(
     writer: *std.Io.Writer,
     patch: config_runtime.UserSettingsPatch,
     sources: config_runtime.ConfigSources,
+    model_source: config_runtime.ConfigSource,
 ) !void {
     var wrote_header = false;
-    const model_source = if (patch.model_preference) |preference|
-        sources.models.get(model_provider.NameKey.fromProvider(preference.provider))
-    else
-        .compiled_default;
     try appendShadowedUserSource(writer, "model", patch.model_preference != null, model_source, &wrote_header);
     try appendShadowedUserSource(writer, "permission_mode", patch.permission_mode != null, sources.permission_mode, &wrote_header);
     try appendShadowedUserSource(writer, "effort", patch.effort != null, sources.effort, &wrote_header);
@@ -943,7 +944,7 @@ pub fn Commands(comptime App: type) type {
             const startup_scrollback_label = if (settings.startup_scrollback orelse true) "on" else "off";
             const msg = try std.fmt.allocPrint(app.alloc, "model: {s}\nmodel_config_source: {s}\npermission_mode: {s}\nworkspace: {s}\nstep_limit: {d}\nstartup_scrollback: {s}", .{
                 provider_runtime.model(app),
-                @tagName(detailed.sources.models.get(model_provider.NameKey.fromProvider(.gateway))),
+                @tagName(detailed.model_source_for(.gateway)),
                 permissions.permissionModeDisplayLabel(app.permission_engine.mode),
                 app.workspace_root,
                 app.agent_step_limit,
@@ -2126,10 +2127,28 @@ test "session_commands statusline shadow notice names the preference field" {
             },
         },
         .{ .statusline_context = .project },
+        .compiled_default,
     );
 
     try std.testing.expectEqualStrings(
         "; fresh sessions here use higher-precedence statusLine.context=project",
+        out.written(),
+    );
+}
+
+test "session_commands model shadow notice uses resolved provider source" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    try appendShadowedUserSources(
+        &out.writer,
+        .{ .model_preference = .{ .provider = .codex, .model = "codex/model" } },
+        .{},
+        .process_override,
+    );
+
+    try std.testing.expectEqualStrings(
+        "; fresh sessions here use higher-precedence model=process_override",
         out.written(),
     );
 }
@@ -2148,6 +2167,7 @@ test "session_commands notification shadow notice preserves valid workspace scop
             .notification_turn_end = .user_workspace,
             .notification_max = .user_workspace,
         },
+        .compiled_default,
     );
 
     try std.testing.expectEqualStrings(
