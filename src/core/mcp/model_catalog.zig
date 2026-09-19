@@ -55,6 +55,132 @@ pub const PromptSection = struct {
     }
 };
 
+/// A catalog snapshot paired with an optional model-visible note describing
+/// how server availability changed since the previously reported snapshot.
+/// Ownership follows the `render` convention: callers using a request arena
+/// may skip deinit and let the arena retain both values; a caller that frees
+/// the snapshot itself must keep `change_notice` alive for as long as the
+/// request messages reference it.
+pub const Report = struct {
+    snapshot: Snapshot,
+    change_notice: ?[]u8 = null,
+};
+
+/// One server's availability as previously shown to the model. Names are
+/// owned by the caller's long-lived baseline allocator.
+pub const BaselineEntry = struct {
+    name: []u8,
+    availability: Availability,
+};
+
+const max_change_notice_transitions: usize = 8;
+
+/// Renders a model-visible note describing availability changes between the
+/// previously reported baseline and the current snapshot. Returns null when
+/// availability is unchanged; tool-count-only changes do not render. The
+/// caller owns the returned slice.
+pub fn renderChangeNotice(
+    alloc: Allocator,
+    baseline: []const BaselineEntry,
+    current: []const ServerSummary,
+) Allocator.Error!?[]u8 {
+    var body: std.Io.Writer.Allocating = .init(alloc);
+    defer body.deinit();
+    var transitions: usize = 0;
+    var omitted: usize = 0;
+
+    for (current) |server| {
+        const entry = findBaselineEntry(baseline, server.name) orelse {
+            try renderAdditionLine(&body.writer, &transitions, &omitted, server.name, server.availability);
+            continue;
+        };
+        if (entry.availability == server.availability) continue;
+        try renderTransitionLine(&body.writer, &transitions, &omitted, server.name, entry.availability, server.availability, server.tool_count);
+    }
+    for (baseline) |entry| {
+        if (findCurrentEntry(current, entry.name) != null) continue;
+        try renderRemovalLine(&body.writer, &transitions, &omitted, entry.name);
+    }
+    if (transitions == 0) return null;
+    if (omitted > 0) {
+        body.writer.print("  and {d} more change{s}\n", .{ omitted, if (omitted == 1) "" else "s" }) catch return error.OutOfMemory;
+    }
+    const change_header = "MCP server availability changed since earlier in this session:\n";
+    const change_footer = "The <mcp_servers> section above is current. Treat earlier claims in this conversation that a listed server required authentication or was unavailable as outdated; re-run capability_search before concluding a server cannot be used.\n";
+    return std.mem.concat(alloc, u8, &.{ change_header, body.written(), change_footer }) catch return error.OutOfMemory;
+}
+
+fn renderAdditionLine(
+    writer: *std.Io.Writer,
+    transitions: *usize,
+    omitted: *usize,
+    name: []const u8,
+    availability: Availability,
+) Allocator.Error!void {
+    if (transitions.* == max_change_notice_transitions) {
+        omitted.* += 1;
+        return;
+    }
+    writer.writeAll("  ") catch return error.OutOfMemory;
+    model_context_encoding.writeScalar(writer, name) catch return error.OutOfMemory;
+    writer.print(": added ({s})\n", .{@tagName(availability)}) catch return error.OutOfMemory;
+    transitions.* += 1;
+}
+
+fn renderTransitionLine(
+    writer: *std.Io.Writer,
+    transitions: *usize,
+    omitted: *usize,
+    name: []const u8,
+    before: Availability,
+    after: Availability,
+    tool_count: ?usize,
+) Allocator.Error!void {
+    if (transitions.* == max_change_notice_transitions) {
+        omitted.* += 1;
+        return;
+    }
+    writer.writeAll("  ") catch return error.OutOfMemory;
+    model_context_encoding.writeScalar(writer, name) catch return error.OutOfMemory;
+    writer.print(": {s} -> {s}", .{ @tagName(before), @tagName(after) }) catch return error.OutOfMemory;
+    if (tool_count) |count| {
+        writer.print(" ({d} tools)\n", .{count}) catch return error.OutOfMemory;
+    } else {
+        writer.writeByte('\n') catch return error.OutOfMemory;
+    }
+    transitions.* += 1;
+}
+
+fn renderRemovalLine(
+    writer: *std.Io.Writer,
+    transitions: *usize,
+    omitted: *usize,
+    name: []const u8,
+) Allocator.Error!void {
+    if (transitions.* == max_change_notice_transitions) {
+        omitted.* += 1;
+        return;
+    }
+    writer.writeAll("  ") catch return error.OutOfMemory;
+    model_context_encoding.writeScalar(writer, name) catch return error.OutOfMemory;
+    writer.writeAll(": removed\n") catch return error.OutOfMemory;
+    transitions.* += 1;
+}
+
+fn findBaselineEntry(baseline: []const BaselineEntry, name: []const u8) ?BaselineEntry {
+    for (baseline) |entry| {
+        if (std.mem.eql(u8, entry.name, name)) return entry;
+    }
+    return null;
+}
+
+fn findCurrentEntry(current: []const ServerSummary, name: []const u8) ?ServerSummary {
+    for (current) |server| {
+        if (std.mem.eql(u8, server.name, name)) return server;
+    }
+    return null;
+}
+
 pub fn classifyAvailability(
     connection: health.ConnectionState,
     authentication: health.AuthenticationState,
@@ -308,4 +434,73 @@ test "render cleans up every partial allocation" {
         checkRenderAllocationFailures,
         .{},
     );
+}
+
+test "renderChangeNotice stays silent when availability is unchanged" {
+    const alloc = std.testing.allocator;
+    const baseline = [_]BaselineEntry{
+        .{ .name = @constCast("linear"), .availability = .ready },
+    };
+    const current = [_]ServerSummary{
+        .{ .name = @constCast("linear"), .availability = .ready, .tool_count = 12 },
+    };
+
+    const notice = try renderChangeNotice(alloc, &baseline, &current);
+
+    try std.testing.expectEqual(@as(?[]u8, null), notice);
+}
+
+test "renderChangeNotice reports authentication recovery with tool count" {
+    const alloc = std.testing.allocator;
+    const baseline = [_]BaselineEntry{
+        .{ .name = @constCast("linear"), .availability = .authentication_required },
+    };
+    const current = [_]ServerSummary{
+        .{ .name = @constCast("linear"), .availability = .ready, .tool_count = 74 },
+    };
+
+    const notice = try renderChangeNotice(alloc, &baseline, &current);
+    defer alloc.free(notice.?);
+
+    try std.testing.expect(std.mem.find(u8, notice.?, "linear: authentication_required -> ready (74 tools)") != null);
+    try std.testing.expect(std.mem.find(u8, notice.?, "Treat earlier claims") != null);
+}
+
+test "renderChangeNotice reports added and removed servers" {
+    const alloc = std.testing.allocator;
+    const baseline = [_]BaselineEntry{
+        .{ .name = @constCast("slack"), .availability = .ready },
+    };
+    const current = [_]ServerSummary{
+        .{ .name = @constCast("notion"), .availability = .failed },
+    };
+
+    const notice = try renderChangeNotice(alloc, &baseline, &current);
+    defer alloc.free(notice.?);
+
+    try std.testing.expect(std.mem.find(u8, notice.?, "notion: added (failed)") != null);
+    try std.testing.expect(std.mem.find(u8, notice.?, "slack: removed") != null);
+}
+
+test "renderChangeNotice bounds the transition list and encodes names" {
+    const alloc = std.testing.allocator;
+    var baseline: [10]BaselineEntry = undefined;
+    var current: [10]ServerSummary = undefined;
+    var names: [10][]u8 = undefined;
+    for (0..10) |index| {
+        names[index] = try std.fmt.allocPrint(alloc, "server<{d}>", .{index});
+    }
+    defer for (names) |name| alloc.free(name);
+    for (0..10) |index| {
+        baseline[index] = .{ .name = names[index], .availability = .failed };
+        current[index] = .{ .name = names[index], .availability = .ready };
+    }
+
+    const notice = try renderChangeNotice(alloc, &baseline, &current);
+    defer alloc.free(notice.?);
+
+    try std.testing.expect(std.mem.find(u8, notice.?, "server&lt;0&gt;: failed -> ready") != null);
+    try std.testing.expect(std.mem.find(u8, notice.?, "server&lt;7&gt;: failed -> ready") != null);
+    try std.testing.expect(std.mem.find(u8, notice.?, "server&lt;8&gt;") == null);
+    try std.testing.expect(std.mem.find(u8, notice.?, "and 2 more changes") != null);
 }

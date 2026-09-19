@@ -827,18 +827,23 @@ pub fn Runtime(comptime App: type) type {
             try app.contextRegistry().appendDefaultStatic(.{
                 .project_context = project_context orelse modelVisibleProjectContext(app),
             }, arena, messages);
-            var snapshot = if (comptime @hasDecl(App, "snapshotMcpModelCatalog"))
+            var report = if (comptime @hasDecl(App, "snapshotMcpModelCatalog"))
                 try app.snapshotMcpModelCatalog(
                     arena,
                     if (comptime @hasField(App, "permission_engine")) app.permission_engine.rules else .{},
                     false,
                 )
             else
-                try mcp_model_catalog.Snapshot.empty(arena);
-            defer snapshot.deinit(arena);
-            const section = try mcp_model_catalog.render(arena, snapshot);
+                mcp_model_catalog.Report{ .snapshot = try mcp_model_catalog.Snapshot.empty(arena) };
+            // The request arena retains the change notice, which outlives this
+            // function inside `messages`; only the snapshot names are released.
+            defer report.snapshot.deinit(arena);
+            const section = try mcp_model_catalog.render(arena, report.snapshot);
             if (section.text.len > 0) {
                 try messages.append(arena, .{ .role = .system, .content = section.text });
+            }
+            if (report.change_notice) |notice| {
+                try messages.append(arena, .{ .role = .system, .content = notice });
             }
             if (section.notice) |notice| try pushMcpModelCatalogNotice(app, notice);
         }
@@ -1682,6 +1687,7 @@ const FakeApp = struct {
     mcp_name: []const u8 = "mcp_lookup",
     mcp_has_tool_calls: usize = 0,
     mcp_result: []const u8 = "{\"ok\":true}",
+    mcp_change_notice: ?[]const u8 = null,
     diff_blocks: usize = 0,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{
@@ -1723,12 +1729,15 @@ const FakeApp = struct {
     }
 
     fn snapshotMcpModelCatalog(
-        _: *FakeApp,
+        self: *FakeApp,
         alloc: Allocator,
         _: types.PermissionRuleSet,
         _: bool,
-    ) !mcp_model_catalog.Snapshot {
-        return mcp_model_catalog.Snapshot.empty(alloc);
+    ) !mcp_model_catalog.Report {
+        return .{
+            .snapshot = try mcp_model_catalog.Snapshot.empty(alloc),
+            .change_notice = if (self.mcp_change_notice) |notice| try alloc.dupe(u8, notice) else null,
+        };
     }
 
     fn promptPolicy(_: *const FakeApp) prompt_policy_contract.Policy {
@@ -2647,6 +2656,26 @@ test "app agent runtime prefers active queued project context snapshot" {
     try std.testing.expect(std.mem.find(u8, messages.items[1].content.?, "<mcp_servers>") != null);
     const tool_context = testToolContext(&app);
     try std.testing.expectEqualStrings("test.default_context", tool_context.context_registry.defaultProvider().id);
+}
+
+test "app agent runtime shows MCP availability changes to the model" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+    app.mcp_change_notice = "MCP server availability changed since earlier in this session:\n  linear: authentication_required -> ready (74 tools)\n";
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var messages: std.ArrayList(ChatMessage) = .empty;
+    defer messages.deinit(arena);
+
+    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, null, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+
+    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
+    try std.testing.expect(std.mem.find(u8, messages.items[1].content.?, "<mcp_servers>") != null);
+    try std.testing.expectEqual(types.ChatRole.system, messages.items[2].role);
+    try std.testing.expect(std.mem.find(u8, messages.items[2].content.?, "linear: authentication_required -> ready (74 tools)") != null);
 }
 
 fn makeQueuedPrompt(alloc: Allocator) !worker_runtime.QueuedPrompt {

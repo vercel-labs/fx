@@ -1573,9 +1573,10 @@ const App = struct {
         alloc: Allocator,
         permission_rules: types.PermissionRuleSet,
         include_ask_deferred: bool,
-    ) !mcp_model_catalog.Snapshot {
+    ) !mcp_model_catalog.Report {
         return self.mcp.snapshotModelCatalog(
             alloc,
+            self.alloc,
             permission_rules,
             include_ask_deferred,
         );
