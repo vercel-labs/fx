@@ -1,11 +1,12 @@
 import { expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync, realpathSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
   fakeGatewayFinalText,
   startDynamicFakeGateway,
+  startUpgradeServer,
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
@@ -267,3 +268,51 @@ test.skipIf(SKIP_TMUX)("tui shows the generated session title", async () => {
     gateway.stop();
   }
 }, 60_000);
+
+test.skipIf(SKIP_TMUX)("tui generates a title after an upgrade relaunch resumes an untitled session", async () => {
+  const root = createFixtureRoot("tui-upgrade-title", JSON.stringify({ statusLine: { session: true } }));
+  const installDir = join(root.root, "install");
+  mkdirSync(installDir);
+  const installedFx = join(installDir, "fx");
+  copyFileSync(FX_BIN, installedFx);
+  chmodSync(installedFx, 0o755);
+  const argvLogPath = join(root.root, "upgrade-argv.log");
+  const release = startUpgradeServer(root.root, argvLogPath);
+  const gateway = startTitleAwareGateway();
+  let tui: TmuxSession | undefined;
+  try {
+    tui = await TmuxSession.create({
+      cmd: JSON.stringify(installedFx),
+      cwd: root.workspace,
+      isolated: true,
+      remainOnExit: true,
+      env: {
+        ...baseEnv(root, gateway),
+        FX_AUTO_UPGRADE: "1",
+        FX_E2E_UPGRADE_BASE_URL: release.baseUrl,
+      },
+    });
+    await tui.waitForStableComposer(15000);
+    // No prompt before the relaunch: the session stays pristine and untitled.
+    await tui.waitForText("update ready: ctrl+g to reload", 60_000);
+    await tui.sendHexBytes(["07"]);
+    await tui.waitForStableComposer(15000);
+
+    // Pin the resume leg: the relaunch must resume the same session, not start
+    // a fresh one (a fresh session would title on the first prompt anyway).
+    const sessionId = readdirSync(join(root.home, ".fx", "sessions"))
+      .filter(name => name !== "latest")[0]!;
+    const relaunchArgv = readFileSync(argvLogPath, "utf8").trim().split("\n");
+    expect(relaunchArgv).toContain(`${installedFx}\tresume\t${sessionId}\t--upgrade-relaunch`);
+
+    await tui.sendText("refactor the renderer loop to fix the crash");
+    await tui.waitForText("MAIN_ANSWER_OK", 20000);
+    await tui.waitForText(GENERATED_TITLE, 15000);
+    expect(sessionTitles(root)).toContain(GENERATED_TITLE);
+    expect(titleRequests(gateway).length).toBe(1);
+  } finally {
+    await tui?.kill();
+    gateway.stop();
+    release.stop();
+  }
+}, 120_000);

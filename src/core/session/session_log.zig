@@ -3194,6 +3194,9 @@ pub const LoadedWritableSession = struct {
         var display = session_display_metadata.deriveFromHistory(alloc, &.{turn}) catch return;
         defer display.deinit(alloc);
         if (!display.present) return;
+        // The fallback placeholder is not a title: persisting it would block
+        // background title generation, which never overwrites a named session.
+        if (std.mem.eql(u8, display.title, session_display_metadata.fallback_title)) return;
         _ = self.renameConversation(alloc, display.title) catch |err| {
             debug_trace.logf(
                 "session",
@@ -4540,6 +4543,48 @@ test "committed conversation language survives reopening" {
     defer restored.deinit(alloc);
     try std.testing.expectEqualStrings("fr", restored.conversation_language.view());
     try std.testing.expectEqual(@as(usize, 1), restored.history.len);
+}
+
+test "first commit never persists the fallback placeholder as a title" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+
+    // An unusable first prompt (a bare path reads as slash-command-only) must
+    // not persist the fallback title, or later title generation could never
+    // name the session.
+    var initial = try testState(alloc, "fallback-title-skipped", 10);
+    defer initial.deinit(alloc);
+    {
+        var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+            .conversation_language = .literal("en"),
+            .total_input_tokens = 0,
+            .total_output_tokens = 0,
+            .turn = .{ .interrupted = .{ .user = .{ .text = @constCast("/tmp/fx-trace.md") } } },
+        } }, 20);
+        const title = try loaded.conversationTitle(alloc);
+        defer if (title) |value| alloc.free(value);
+        try std.testing.expect(title == null);
+    }
+
+    // A usable first prompt still derives and persists a title.
+    var second = try testState(alloc, "derived-title-kept", 10);
+    defer second.deinit(alloc);
+    {
+        var loaded = try temp.root.startConversationSession(alloc, second, .{});
+        defer loaded.deinit(alloc);
+        _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+            .conversation_language = .literal("en"),
+            .total_input_tokens = 0,
+            .total_output_tokens = 0,
+            .turn = .{ .assistant = .{ .user = .{ .text = @constCast("refactor the renderer") }, .assistant = @constCast("done") } },
+        } }, 20);
+        const title = try loaded.conversationTitle(alloc);
+        defer if (title) |value| alloc.free(value);
+        try std.testing.expectEqualStrings("refactor the renderer", title.?);
+    }
 }
 
 test "conversation load retains history and qualifies missing or corrupt accounting" {

@@ -1818,7 +1818,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             defer display.deinit(app.alloc);
-            hydrateResumedSession(app, loaded.state, display.title, notice) catch |err| {
+            hydrateResumedSession(app, loaded.state, &display, notice) catch |err| {
                 traceJsHostRestoreFailure("hydrate", session_id, err);
                 try continueWithFreshJsHostSession(app);
                 return;
@@ -1949,7 +1949,7 @@ pub fn Runtime(comptime App: type) type {
                 app.session_persistence.writable = null;
             }
             const active = &app.session_persistence.writable.?;
-            try hydrateResumedSession(app, active.state, display.title, notice);
+            try hydrateResumedSession(app, active.state, &display, notice);
             active.releaseHydrationHistory(app.alloc);
             enableSessionStores(app);
         }
@@ -1976,7 +1976,7 @@ pub fn Runtime(comptime App: type) type {
         fn hydrateResumedSession(
             app: *App,
             state: session_codec.DurableSessionState,
-            display_title: []const u8,
+            display: *const session_display_metadata.DisplayMetadata,
             notice: ResumeNotice,
         ) !void {
             const previous_provider = provider_runtime.provider(app);
@@ -2035,7 +2035,7 @@ pub fn Runtime(comptime App: type) type {
                     .workspace_root = resume_workspace_root,
                     .labels = &historical_labels,
                 };
-                try writeResumeNotice(app, &sink, display_title, notice);
+                try writeResumeNotice(app, &sink, display, notice);
                 try replayResumedHistoryToSink(app, &sink, state.history, &historical_labels);
                 try writeRecoveryCheckpointToSink(app, &sink, state, &historical_labels);
                 const projection_finished_ns = io_mod.nanoTimestamp();
@@ -2055,7 +2055,7 @@ pub fn Runtime(comptime App: type) type {
                 );
             } else {
                 var sink = LiveHistorySink(App){ .app = app };
-                try writeResumeNotice(app, &sink, display_title, notice);
+                try writeResumeNotice(app, &sink, display, notice);
                 try replayResumedHistoryToSink(app, &sink, state.history, &historical_labels);
                 try writeRecoveryCheckpointToSink(app, &sink, state, &historical_labels);
             }
@@ -3999,15 +3999,18 @@ pub fn Runtime(comptime App: type) type {
         fn writeResumeNotice(
             app: *App,
             sink: anytype,
-            display_title: []const u8,
+            display: *const session_display_metadata.DisplayMetadata,
             notice: ResumeNotice,
         ) !void {
-            try setCachedSessionTitle(app, display_title);
+            // Only a real title enters the cache: the fallback placeholder must
+            // not count as an existing title, or background title generation
+            // would consider the session already named and never run.
+            if (display.present) try setCachedSessionTitle(app, display.title);
             switch (notice) {
                 .session => try sink.appendNotice(.{
                     .topic = "session resumed",
                     .tone = .neutral,
-                    .body = display_title,
+                    .body = display.title,
                 }),
                 .upgrade => |upgrade| {
                     var body: std.Io.Writer.Allocating = .init(app.alloc);
@@ -8240,6 +8243,83 @@ test "upgrade resume restores active session with the installed version notice" 
     );
     try std.testing.expectEqual(types.ReasoningEffort.literal("medium"), app.effort);
     try std.testing.expect(!app.fast_mode);
+}
+
+test "upgrade resume of a pristine session leaves the title cache empty for generation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+
+    const history = [_]types.HistoryTurn{};
+    try writeSessionFixture(alloc, app.session_persistence.store.?, "session-empty", &history, 0);
+    app.requested_resume = .{ .id = try alloc.dupe(u8, "session-empty") };
+
+    try Runtime(TestApp).resumeRequestedSessionAfterUpgrade(
+        &app,
+        "9.9.9",
+        .stable,
+        "",
+        "",
+    );
+
+    // The fallback placeholder must not be cached as a title: the session is
+    // still untitled, so its first prompt can start title generation.
+    try std.testing.expectEqual(@as(usize, 0), app.session_title.items.len);
+}
+
+test "upgrade resume caches the derived title for a session with usable history" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+
+    const history = [_]types.HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("hello") },
+            .assistant = @constCast("hi"),
+        } },
+    };
+    try writeSessionFixture(alloc, app.session_persistence.store.?, "session-hello", &history, 0);
+    app.requested_resume = .{ .id = try alloc.dupe(u8, "session-hello") };
+
+    try Runtime(TestApp).resumeRequestedSessionAfterUpgrade(
+        &app,
+        "9.9.9",
+        .stable,
+        "",
+        "",
+    );
+
+    try std.testing.expectEqualStrings("hello", app.session_title.items);
 }
 
 test "resumed recovery checkpoint replays its unfinished turn once" {

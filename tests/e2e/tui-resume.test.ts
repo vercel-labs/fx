@@ -30,6 +30,7 @@ import {
   isVolatileTokenStatusRow,
   paneExitMatches,
   startFakeGateway,
+  startUpgradeServer,
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
@@ -79,62 +80,6 @@ function sessionIdFromHome(home: string): string {
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
-}
-
-function startUpgradeServer(
-  root: string,
-  argvLogPath: string,
-  options: {
-    revision?: string;
-  } = {},
-): { baseUrl: string; stop: () => void } {
-  const artifactDir = join(root, "release-artifact");
-  const wrapperPath = join(artifactDir, "fx");
-  const archivePath = join(root, "fx.tar.gz");
-  mkdirSync(artifactDir);
-  const script = `#!/bin/sh
-{
-  printf '%s' "$0"
-  for arg in "$@"; do
-    printf '\\t%s' "$arg"
-  done
-  printf '\\n'
-} >> ${shellQuote(argvLogPath)}
-exec ${shellQuote(FX_BIN)} "$@"
-`;
-  writeFileSync(wrapperPath, script);
-  chmodSync(wrapperPath, 0o755);
-  const tar = Bun.spawnSync(["tar", "-czf", archivePath, "-C", artifactDir, "fx"]);
-  if (tar.exitCode !== 0) throw new Error(tar.stderr.toString());
-
-  const archive = readFileSync(archivePath);
-  const checksum = createHash("sha256").update(archive).digest("hex");
-  const platform = `${process.platform === "darwin" ? "macos" : "linux"}-${process.arch === "arm64" ? "aarch64" : "x86_64"}`;
-  const revision = options.revision ?? "abcdef0123456789abcdef0123456789abcdef01";
-  const stableArchiveRoute = `/v9.9.9/fx-${platform}.tar.gz`;
-  const devArchiveRoute = `/dev/${revision}/fx-${platform}.tar.gz`;
-  const server = Bun.serve({
-    hostname: "127.0.0.1",
-    port: 0,
-    fetch(request) {
-      const path = new URL(request.url).pathname;
-      if (path === "/latest.txt") return new Response("v9.9.9\n");
-      if (path === "/dev.json") {
-        return Response.json({ version: "9.9.9", commit: revision });
-      }
-      if (path === stableArchiveRoute || path === devArchiveRoute) {
-        return new Response(archive);
-      }
-      if (path === `${stableArchiveRoute}.sha256` || path === `${devArchiveRoute}.sha256`) {
-        return new Response(`${checksum}\n`);
-      }
-      return new Response("not found", { status: 404 });
-    },
-  });
-  return {
-    baseUrl: `http://127.0.0.1:${server.port}`,
-    stop: () => server.stop(true),
-  };
 }
 
 function gatewayEnv(
