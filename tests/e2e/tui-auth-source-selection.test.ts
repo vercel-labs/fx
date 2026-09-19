@@ -544,10 +544,12 @@ function startFakeChatGptOAuth(
     rejectRefresh?: boolean;
     beforeRefreshResponse?: () => void | Promise<void>;
     modelsResponse?: () => Promise<Response | void>;
+    devicePendingResponses?: number;
   } = {},
 ) {
   const accessToken = chatgptAccessToken();
   let responseCount = 0;
+  let devicePollCount = 0;
   let models = [
     { slug: "gpt-5.6-sol", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "max" }, { effort: "high" }], additional_speed_tiers: ["fast"], input_modalities: ["text", "image"], context_window: 272000 },
     { slug: "gpt-5.6-luna", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "medium" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272000 },
@@ -564,7 +566,9 @@ function startFakeChatGptOAuth(
     port: 0,
     async fetch(request) {
       const url = new URL(request.url);
-      const body = url.pathname === "/chatgpt/responses" || url.pathname === "/chatgpt/token"
+      const body = url.pathname === "/chatgpt/responses" ||
+          url.pathname === "/chatgpt/token" ||
+          url.pathname.startsWith("/api/accounts/deviceauth/")
         ? await request.text()
         : null;
       if (url.pathname === "/chatgpt/responses" && body?.includes(TITLE_GENERATION_MARKER)) {
@@ -584,6 +588,23 @@ function startFakeChatGptOAuth(
         callback.searchParams.set("code", "chatgpt-code");
         callback.searchParams.set("state", state);
         return Response.redirect(callback.toString(), 302);
+      }
+      if (url.pathname === "/api/accounts/deviceauth/usercode") {
+        return Response.json({
+          device_auth_id: "chatgpt-device-auth-id",
+          user_code: "ABCD-EFGH",
+          interval: "1",
+        });
+      }
+      if (url.pathname === "/api/accounts/deviceauth/token") {
+        devicePollCount += 1;
+        if (devicePollCount <= (options.devicePendingResponses ?? 0)) {
+          return new Response("not authorized yet", { status: 404 });
+        }
+        return Response.json({
+          authorization_code: "chatgpt-device-code",
+          code_verifier: "chatgpt-device-verifier",
+        });
       }
       if (url.pathname === "/chatgpt/token") {
         if (options.tokenDelayMs) await Bun.sleep(options.tokenDelayMs);
@@ -2613,6 +2634,7 @@ tmuxTest(
     );
     await session.sendKeys("Down");
     await session.sendKeys("Enter");
+    await session.sendKeys("Enter");
     await completeDisplayedCodexLogin(session, chatgptOauth);
     await session.waitForText("Switched to Codex subscription with gpt-5.6-sol.", TIMEOUT);
 
@@ -2621,6 +2643,47 @@ tmuxTest(
     expect(selected.models.codex).toBe("gpt-5.6-sol");
     await session.sendText("/status");
     await session.waitForText("model_source=Codex subscription", TIMEOUT);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "interactive Codex device login activates a Codex catalog model",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-chatgpt-device-login-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    chatgptOauth = startFakeChatGptOAuth();
+
+    session = await startFx(
+      home,
+      stderrPath,
+      gateway,
+      undefined,
+      undefined,
+      { ...chatgptOauth.env, FX_MODEL: undefined },
+    );
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/login");
+    await session.waitForPane(
+      (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
+      TIMEOUT,
+    );
+    await session.sendKeys("Down");
+    await session.sendKeys("Enter");
+    await session.waitForText("device-code", TIMEOUT);
+    await session.sendKeys("Down");
+    await session.sendKeys("Enter");
+    await session.waitForText("Switched to Codex subscription with gpt-5.6-sol.", TIMEOUT);
+
+    expect(chatgptOauth.requests.some(
+      (request) => request.path === "/api/accounts/deviceauth/usercode",
+    )).toBe(true);
+    const selected = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
+    expect(selected.provider).toBe("codex");
+    expect(selected.models.codex).toBe("gpt-5.6-sol");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
@@ -4011,6 +4074,57 @@ test("status never substitutes an environment key for a missing explicit login",
   expect(status.auth).toBe("missing");
   expect(result.stdout).not.toContain("AI_GATEWAY_API_KEY");
 });
+
+test(
+  "Codex CLI device login completes without a loopback browser callback",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-cli-device-login-"));
+    gateway = startFakeGateway([]);
+    chatgptOauth = startFakeChatGptOAuth({ devicePendingResponses: 1 });
+    const env = {
+      HOME: home,
+      AI_GATEWAY_API_KEY: ENV_TOKEN,
+      VERCEL_OIDC_TOKEN: undefined,
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_SKIP_ONBOARDING: "1",
+      FX_AUTO_UPGRADE: "0",
+      FX_NO_OPEN_BROWSER: "1",
+      FX_GATEWAY_BASE_URL: gateway.baseUrl,
+      FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      ...chatgptOauth.env,
+    };
+
+    const login = await runFx(["login", "codex", "--device-code"], {
+      env,
+      timeoutMs: TIMEOUT,
+    });
+    expect(login.code, `stdout: ${login.stdout}\nstderr: ${login.stderr}`).toBe(0);
+    expect(login.stdout).toContain(`${chatgptOauth.baseUrl}/codex/device`);
+    expect(login.stdout).toContain("Code: ABCD-EFGH");
+    expect(login.stdout).toContain("Signed in with Codex.");
+    expect(login.stderr).toBe("");
+
+    const userCodeRequest = chatgptOauth.requests.find(
+      (request) => request.path === "/api/accounts/deviceauth/usercode",
+    );
+    expect(userCodeRequest?.body).toContain('"client_id":"app_EMoamEEZ73f0CkXaXp7hrann"');
+    const pollRequests = chatgptOauth.requests.filter(
+      (request) => request.path === "/api/accounts/deviceauth/token",
+    );
+    expect(pollRequests).toHaveLength(2);
+    expect(pollRequests[0]?.body).toContain('"device_auth_id":"chatgpt-device-auth-id"');
+    expect(pollRequests[0]?.body).toContain('"user_code":"ABCD-EFGH"');
+    const exchange = chatgptOauth.requests.find(
+      (request) => request.path === "/chatgpt/token",
+    );
+    expect(exchange?.body).toContain("code=chatgpt-device-code");
+    expect(exchange?.body).toContain(
+      `redirect_uri=${encodeURIComponent(`${chatgptOauth.baseUrl}/deviceauth/callback`)}`,
+    );
+    expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(true);
+  },
+  TIMEOUT,
+);
 
 test(
   "Codex CLI browser login fetches raw models and replays one 401 without Gateway leakage",

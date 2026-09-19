@@ -568,7 +568,8 @@ pub fn Runtime(comptime App: type) type {
                 .action => |action| switch (action) {
                     .connections => unreachable,
                     .login => try beginSignIn(app, true),
-                    .chatgpt_login => try beginChatGptSignIn(app),
+                    .chatgpt_login => try beginChatGptSignIn(app, .browser),
+                    .chatgpt_device_login => try beginChatGptSignIn(app, .device_code),
                     .grok_login => try beginGrokSignIn(app),
                     .setup => {
                         if (comptime !runtime_profile.allows(App, .native_auth)) {
@@ -935,7 +936,7 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        fn beginChatGptSignIn(app: *App) !void {
+        fn beginChatGptSignIn(app: *App, mode: chatgpt_oauth.LoginMode) !void {
             if (comptime provider_runtime.supported(App)) {
                 const decision = decideProviderSwitch(.{
                     .current = provider_runtime.provider(app),
@@ -955,7 +956,10 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
             try app.flushBeforeBlockingExternalWork();
-            const started = app.auth.openChatGptSignInPickerFromRoot(app.alloc);
+            const started = switch (mode) {
+                .browser => app.auth.openChatGptSignInPickerFromRoot(app.alloc),
+                .device_code => app.auth.openChatGptDeviceSignInPickerFromRoot(app.alloc),
+            };
             if (started catch |err| {
                 cancelPromptRetryAfterAuth(app);
                 debug_trace.logf("auth", "ChatGPT login failed err={s}", .{@errorName(err)});
@@ -963,7 +967,9 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }) {
                 app.shell.render_requests.request(.footer);
-                if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) try openSignInBrowser(app);
+                if (mode == .browser and io_mod.getenv("FX_NO_OPEN_BROWSER") == null) {
+                    try openSignInBrowser(app);
+                }
             }
         }
 
@@ -1830,7 +1836,7 @@ pub fn Runtime(comptime App: type) type {
             requestPromptRetryAfterAuth(app);
             switch (failure.source) {
                 .fx_login => try beginSignIn(app, false),
-                .chatgpt_subscription => try beginChatGptSignIn(app),
+                .chatgpt_subscription => try beginChatGptSignIn(app, .browser),
                 .grok_subscription => try beginGrokSignIn(app),
                 .vercel_oidc_token,
                 .ai_gateway_api_key,
@@ -2165,6 +2171,11 @@ const BusySignInAuth = struct {
         return true;
     }
 
+    fn openChatGptDeviceSignInPickerFromRoot(self: *BusySignInAuth, _: std.mem.Allocator) !bool {
+        self.start_count += 1;
+        return true;
+    }
+
     fn openGrokSignInPickerFromRoot(self: *BusySignInAuth, _: std.mem.Allocator) !bool {
         self.start_count += 1;
         return true;
@@ -2228,7 +2239,7 @@ test "interactive subscription sign-in rejects active and queued work before OAu
             app.worker.queued_prompts = case.queued_prompts;
 
             switch (provider) {
-                .codex => try Runtime(BusySignInApp).beginChatGptSignIn(&app),
+                .codex => try Runtime(BusySignInApp).beginChatGptSignIn(&app, .browser),
                 .grok => try Runtime(BusySignInApp).beginGrokSignIn(&app),
                 .gateway, .configured => unreachable,
             }
@@ -2384,6 +2395,10 @@ const TestAuth = struct {
     }
 
     fn openChatGptSignInPickerFromRoot(self: *TestAuth, alloc: std.mem.Allocator) !bool {
+        return self.openSignInPicker(alloc);
+    }
+
+    fn openChatGptDeviceSignInPickerFromRoot(self: *TestAuth, alloc: std.mem.Allocator) !bool {
         return self.openSignInPicker(alloc);
     }
 

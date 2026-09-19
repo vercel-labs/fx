@@ -16,6 +16,10 @@ const types = @import("../shared/types.zig");
 pub const Method = enum {
     /// Browser sign-in that yields an fx login session.
     oauth,
+    /// Browser sign-in that yields a Codex subscription session.
+    browser,
+    /// Headless Codex sign-in on a separate device.
+    device_code,
     /// A pasted AI Gateway key held in the keychain or profile.
     api_key,
 };
@@ -99,12 +103,16 @@ pub fn keySourceCredential(source: KeySource) ?types.CredentialSource {
 pub fn methodSlug(method: Method) []const u8 {
     return switch (method) {
         .oauth => "oauth",
+        .browser => "browser",
+        .device_code => "device-code",
         .api_key => "api-key",
     };
 }
 
 pub fn parseMethod(value: []const u8) ?Method {
     if (std.ascii.eqlIgnoreCase(value, methodSlug(.oauth))) return .oauth;
+    if (std.ascii.eqlIgnoreCase(value, methodSlug(.browser))) return .browser;
+    if (std.ascii.eqlIgnoreCase(value, methodSlug(.device_code))) return .device_code;
     if (std.ascii.eqlIgnoreCase(value, methodSlug(.api_key))) return .api_key;
     return null;
 }
@@ -128,7 +136,8 @@ pub fn providerOptions(out: *[max_provider_options][]const u8) usize {
 pub fn providerMethods(id: model_provider.ProviderId) []const Method {
     return switch (id) {
         .gateway => &.{ .oauth, .api_key },
-        .codex, .grok, .configured => &.{},
+        .codex => &.{ .browser, .device_code },
+        .grok, .configured => &.{},
     };
 }
 
@@ -137,6 +146,7 @@ pub fn providerMethods(id: model_provider.ProviderId) []const Method {
 pub fn methodMatchesSource(method: Method, source: types.CredentialSource) bool {
     return switch (method) {
         .oauth => source == .fx_login or source == .vercel_oidc_token,
+        .browser, .device_code => source == .chatgpt_subscription,
         .api_key => source == .ai_gateway_api_key or source == .stored_key,
     };
 }
@@ -155,12 +165,12 @@ test "provider options expose the catalog slugs the composer accepts" {
 
 test "only the gateway offers a method column" {
     try std.testing.expectEqual(@as(usize, 2), providerMethods(.gateway).len);
-    try std.testing.expectEqual(@as(usize, 0), providerMethods(.codex).len);
+    try std.testing.expectEqual(@as(usize, 2), providerMethods(.codex).len);
     try std.testing.expectEqual(@as(usize, 0), providerMethods(.grok).len);
 }
 
 test "method slugs round trip and stay single tokens" {
-    for ([_]Method{ .oauth, .api_key }) |method| {
+    for ([_]Method{ .oauth, .browser, .device_code, .api_key }) |method| {
         const slug = methodSlug(method);
         try std.testing.expectEqual(method, parseMethod(slug).?);
         try std.testing.expect(std.mem.indexOfScalar(u8, slug, ' ') == null);
