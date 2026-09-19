@@ -3689,6 +3689,15 @@ describe("MCP remote authentication lifecycle", () => {
       expect(result.stdout).not.toContain(REFRESH_INITIAL);
       expect(result.stderr).not.toContain(REFRESH_INITIAL);
       expect(readFileSync(root.trace, "utf8")).not.toContain(REFRESH_INITIAL);
+
+      const listed = await runFx(["mcp", "list", "--connect"], {
+        cwd: root.workspace,
+        env: { ...baseEnv(root) },
+        timeoutMs: 20_000,
+      });
+      expect(listed.code).toBe(0);
+      expect(listed.stdout).toMatch(/fixture[\s\S]{0,240}auth=required/);
+      expect(listed.stdout).toMatch(/fixture[\s\S]{0,240}status=needs_auth/);
     },
     30_000,
   );

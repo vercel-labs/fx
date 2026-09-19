@@ -299,6 +299,7 @@ pub fn refreshSharedCredentials(
     if (source.credentials.refresh_token == null) {
         var auth_message: [512]u8 = undefined;
         server.setFailed(alloc, authRecoveryMessage(&auth_message, "MCP credentials expired.", server.config.name));
+        markReauthenticationRequired(server);
         return error.McpAuthenticationRequired;
     }
 
@@ -310,6 +311,7 @@ pub fn refreshSharedCredentials(
         if (err == error.Cancelled or err == error.McpRequestTimedOut) return err;
         var auth_message: [512]u8 = undefined;
         server.setFailed(alloc, authRecoveryMessage(&auth_message, "MCP credential refresh failed.", server.config.name));
+        if (err == error.McpRefreshRejected) markReauthenticationRequired(server);
         return err;
     };
     var transferred = false;
@@ -339,6 +341,20 @@ pub fn refreshSharedCredentials(
 
 pub fn authRecoveryMessage(buffer: []u8, reason: []const u8, name: []const u8) []const u8 {
     return std.fmt.bufPrint(buffer, "{s} Run /mcp auth {s} --open.", .{ reason, name }) catch reason;
+}
+
+/// Marks a server whose stored credentials can no longer be used (refresh
+/// rejected, or expired with no refresh token) as needing interactive
+/// re-authentication. The challenge flag flips every surface to needs_auth
+/// via serverAuthenticationState, and the credentials flag stops claiming a
+/// usable token. The dead credentials stay installed until a successful
+/// re-auth replaces them; a fresh challenge is re-discovered at auth time.
+fn markReauthenticationRequired(server: *McpServer) void {
+    server.auth_lock.lockUncancelable(io_mod.getIo());
+    defer server.auth_lock.unlock(io_mod.getIo());
+    advanceAuthGeneration(server);
+    server.auth_challenge_present.store(true, .release);
+    server.auth_credentials_present.store(false, .release);
 }
 
 pub fn markAuthenticationRequired(alloc: Allocator, server: *McpServer) void {
@@ -986,4 +1002,22 @@ pub fn logout(alloc: Allocator, catalog_mutex: *std.Io.RwLock, completions: *leg
         .revocation_failed = revocation_failed,
         .repaired_entries = deleted.repaired_entries,
     };
+}
+
+test "rejected credentials mark re-authentication required" {
+    const alloc = std.testing.allocator;
+    var server = McpServer{ .config = .{ .name = try alloc.dupe(u8, "datadog") } };
+    defer server.deinit(alloc);
+    server.auth_credentials_present.store(true, .release);
+    const generation_before = server.auth_generation.load(.acquire);
+
+    markReauthenticationRequired(&server);
+
+    try std.testing.expect(server.auth_challenge_present.load(.acquire));
+    try std.testing.expect(!server.auth_credentials_present.load(.acquire));
+    try std.testing.expect(server.auth_generation.load(.acquire) > generation_before);
+    try std.testing.expectEqual(
+        @import("health.zig").AuthenticationState.required,
+        @import("server_views.zig").serverAuthenticationState(&server),
+    );
 }
