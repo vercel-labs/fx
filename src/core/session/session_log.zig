@@ -31,6 +31,9 @@ const publication_intent_file = "commit.pending.json";
 const manifest_file = "session.json";
 const permission_state_file = "permissions.json";
 const recovery_checkpoint_file = "recovery.json";
+/// Liveness marker naming the live writable owner; also consulted by
+/// session_store.only_unpublished_creation, which ignores it.
+pub const owner_live_file = "owner.live";
 const conversation_migration_temp_file = "events.v4.tmp";
 const conversation_migration_backup_file = "events.v3.backup";
 const checkpoint_file = "checkpoint.json";
@@ -2902,12 +2905,54 @@ pub const WritableSessionDir = struct {
     dir: io_mod.VerifiedDir,
     writer_lock: ?io_mod.TimedAdvisoryLock,
     session_id: []u8,
+    /// True when a leftover owner marker was present at open time: the
+    /// previous owning process exited without deinit (crash or kill). A
+    /// still-live parked owner produces the same signal, so callers must
+    /// treat it as a reason to be careful, never as proof of corruption.
+    previous_owner_died: bool = false,
 
     pub fn deinit(self: *WritableSessionDir, alloc: Allocator) void {
+        self.clearOwnerLiveness();
         if (self.writer_lock) |*lock| lock.release();
         self.dir.close();
         alloc.free(self.session_id);
         self.* = undefined;
+    }
+
+    /// Records this process as the live owner of the session directory. The
+    /// marker is written on every writable open and removed by deinit while
+    /// the writer lock is still held, so a leftover marker means the previous
+    /// owner died. Advisory only: probe and write failures degrade to no
+    /// signal rather than blocking the open.
+    pub fn trackOwnerLiveness(self: *WritableSessionDir, alloc: Allocator) void {
+        self.previous_owner_died = entryExists(&self.dir, owner_live_file) catch |err| blk: {
+            debug_trace.logf("session", "owner liveness probe failed id={s} err={s}", .{ self.session_id, @errorName(err) });
+            break :blk false;
+        };
+        const body = std.fmt.allocPrint(alloc, "{{\"pid\":{d},\"opened_at_ms\":{d}}}\n", .{
+            std.c.getpid(),
+            io_mod.milliTimestamp(),
+        }) catch |err| {
+            debug_trace.logf("session", "owner liveness mark allocation failed id={s} err={s}", .{ self.session_id, @errorName(err) });
+            return;
+        };
+        defer alloc.free(body);
+        io_mod.durableReplaceVerified(alloc, &self.dir, owner_live_file, body) catch |err| {
+            debug_trace.logf("session", "owner liveness mark failed id={s} err={s}", .{ self.session_id, @errorName(err) });
+        };
+    }
+
+    fn clearOwnerLiveness(self: *WritableSessionDir) void {
+        self.dir.dir.deleteFile(io_mod.getIo(), owner_live_file) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => {
+                debug_trace.logf("session", "owner liveness clear failed id={s} err={s}", .{ self.session_id, @errorName(err) });
+                return;
+            },
+        };
+        io_mod.syncVerifiedDir(self.dir.dir) catch |err| {
+            debug_trace.logf("session", "owner liveness clear sync failed id={s} err={s}", .{ self.session_id, @errorName(err) });
+        };
     }
 
     fn isParked(self: *const WritableSessionDir) bool {
@@ -3811,6 +3856,7 @@ pub const Root = struct {
             .writer_lock = writer_lock,
             .session_id = session_id,
         };
+        writable.trackOwnerLiveness(alloc);
         var writable_owned = true;
         errdefer if (writable_owned) writable.deinit(alloc);
         var loaded = try createNativeSession(
@@ -3945,11 +3991,13 @@ pub const Root = struct {
             dir.close();
             return err;
         };
-        return .{
+        var writable = WritableSessionDir{
             .dir = dir,
             .writer_lock = writer_lock,
             .session_id = owned_id,
         };
+        writable.trackOwnerLiveness(alloc);
+        return writable;
     }
 
     fn entryExistsForTest(
@@ -4483,6 +4531,43 @@ test "conversation writer rolls back failed sync and refuses uncertain continuat
             }
         }
     }
+}
+
+test "owner liveness marker reports unclean exit and clears on clean close" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "owner-liveness", 10);
+    defer initial.deinit(alloc);
+
+    // A fresh start sees no leftover marker and writes its own while open.
+    {
+        var started = try temp.root.startConversationSession(alloc, initial, .{});
+        try std.testing.expect(!started.log.previous_owner_died);
+        try std.testing.expect(try entryExists(&started.log.dir, owner_live_file));
+        started.deinit(alloc);
+    }
+    // The clean close removed the marker, so the next open sees no death.
+    {
+        var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{ .session_lock_deadline_ms = 0 });
+        try std.testing.expect(!resumed.log.previous_owner_died);
+        resumed.deinit(alloc);
+    }
+    // A leftover marker simulates an owner that never reached deinit.
+    {
+        var dir = try openSessionDir(&temp.root.sessions.?, initial.id, .writable);
+        defer dir.close();
+        try io_mod.durableReplaceVerified(alloc, &dir, owner_live_file, "{\"pid\":0,\"opened_at_ms\":1}\n");
+    }
+    {
+        var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{ .session_lock_deadline_ms = 0 });
+        try std.testing.expect(resumed.log.previous_owner_died);
+        resumed.deinit(alloc);
+    }
+    // A clean close after the detection clears the signal again.
+    var reopened = try temp.root.resumeForWrite(alloc, initial.id, .{ .session_lock_deadline_ms = 0 });
+    try std.testing.expect(!reopened.log.previous_owner_died);
+    reopened.deinit(alloc);
 }
 
 test "parked session refuses history and control mutations" {
@@ -5180,6 +5265,7 @@ test "root starts a cache-free conversation session" {
     var saw_writer_lock = false;
     var saw_permissions = false;
     var saw_usage = false;
+    var saw_owner_live = false;
     var iterator = loaded.log.dir.dir.iterate();
     while (try iterator.next(std.testing.io)) |entry| {
         count += 1;
@@ -5188,13 +5274,15 @@ test "root starts a cache-free conversation session" {
         if (std.mem.eql(u8, entry.name, "session.lock")) saw_writer_lock = true;
         if (std.mem.eql(u8, entry.name, "permissions.json")) saw_permissions = true;
         if (std.mem.eql(u8, entry.name, "usage-v2.json")) saw_usage = true;
+        if (std.mem.eql(u8, entry.name, owner_live_file)) saw_owner_live = true;
     }
-    try std.testing.expectEqual(@as(usize, 5), count);
+    try std.testing.expectEqual(@as(usize, 6), count);
     try std.testing.expect(saw_events);
     try std.testing.expect(saw_metadata);
     try std.testing.expect(saw_writer_lock);
     try std.testing.expect(saw_permissions);
     try std.testing.expect(saw_usage);
+    try std.testing.expect(saw_owner_live);
 }
 
 test "root session creation stays outside discovery while preparing" {
@@ -5325,7 +5413,7 @@ test "conversation writer appends without duplicating live history" {
     var count: usize = 0;
     var iterator = loaded.log.dir.dir.iterate();
     while (try iterator.next(std.testing.io)) |_| count += 1;
-    try std.testing.expectEqual(@as(usize, 5), count);
+    try std.testing.expectEqual(@as(usize, 6), count);
 }
 
 test "cache-free conversation session resumes from metadata and JSONL" {

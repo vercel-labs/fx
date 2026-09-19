@@ -2820,8 +2820,10 @@ pub const Store = struct {
             if (entry.kind != .file) return false;
             const is_lock = std.mem.eql(u8, entry.name, "session.lock");
             const is_metadata = allow_metadata and std.mem.eql(u8, entry.name, "session.json");
+            // The owner liveness marker says nothing about publication state.
+            const is_owner_live = std.mem.eql(u8, entry.name, session_log.owner_live_file);
             const prefix = ".session.json.tmp.";
-            if (!is_lock and !is_metadata) {
+            if (!is_lock and !is_metadata and !is_owner_live) {
                 if (entry.name.len != prefix.len + 32 or !std.mem.startsWith(u8, entry.name, prefix)) return false;
                 for (entry.name[prefix.len..]) |byte| if (!std.ascii.isHex(byte)) return false;
             }
@@ -3254,6 +3256,7 @@ pub const Store = struct {
             .writer_lock = writer_lock,
             .session_id = owned_id,
         };
+        writable.trackOwnerLiveness(alloc);
         const loaded = self.migrateLegacyWithoutCache(
             alloc,
             &writable,
@@ -3383,11 +3386,13 @@ pub const Store = struct {
             dir.close(io_mod.getIo());
             return err;
         };
-        return .{
+        var writable = session_log.WritableSessionDir{
             .dir = verified,
             .writer_lock = writer_lock,
             .session_id = owned_id,
         };
+        writable.trackOwnerLiveness(alloc);
+        return writable;
     }
 
     /// Migrates a legacy session to schema-v3 in place without returning a live
