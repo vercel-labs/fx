@@ -276,6 +276,7 @@ fn runAskChild(
         .provider_set = ctx.cfg.provider_set,
         .system_prompt = ctx.cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = ctx.cfg.prompt_policy.modelPromptOverlay(admission.model),
+        .model_prompt_overlay_fn = ctx.cfg.prompt_policy.model_prompt_overlay_fn,
         .skill_catalog = .{ .skills = ctx.loaded_skills.skills, .diagnostics = ctx.loaded_skills.diagnostics },
         .advertised_tool_names = child_projection.advertised_names,
         .advertised_functions = child_projection.advertised_functions,
@@ -1873,6 +1874,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     options.deps.process_queued_prompt(&ctx.session.agent, &deps, semantic_presentation, ctx.lifecycleContext(), .{
         .system_prompt = cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = cfg.prompt_policy.modelPromptOverlay(ctx.model),
+        .model_prompt_overlay_fn = cfg.prompt_policy.model_prompt_overlay_fn,
         .skill_catalog = .{ .skills = loaded_skills.skills, .diagnostics = loaded_skills.diagnostics },
         .gateway_retry_count = cfg.gateway_retry_count,
         .gateway_chat_url = cfg.gateway_chat_url,
@@ -2008,7 +2010,7 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
     else
         @constCast(&.{});
     errdefer if (final_output.len > 0) alloc.free(final_output);
-    const model = try alloc.dupe(u8, ctx.model);
+    const model = try alloc.dupe(u8, ctx.session.agent.routed_model orelse ctx.model);
     errdefer alloc.free(model);
     const session_id = if (ctx.writable) |writable|
         try alloc.dupe(u8, writable.active_id)

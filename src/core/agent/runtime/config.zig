@@ -23,6 +23,7 @@ pub const Config = struct {
 
     system_prompt: []const u8,
     model_prompt_overlay: ?[]const u8 = null,
+    model_prompt_overlay_fn: ?@import("../../config/prompt_policy.zig").ModelPromptOverlayFn = null,
     host_instructions: []const u8 = "",
     skill_catalog: skill_invocation.Catalog = .{ .skills = &.{} },
     skill_bindings: []const skill_invocation.ExplicitBinding = &.{},
@@ -52,6 +53,8 @@ pub const Config = struct {
     workspace_root: []const u8 = "",
     access_scope: ?workspace_access.AccessScope = null,
     origin: TurnOrigin = .root,
+    /// Child-specific role overlay, used as context for assignment routing.
+    routing_role: []const u8 = "",
     /// Root-user evidence inherited by a subagent turn. Unused for root turns.
     root_user_intent_context: []const u8 = "",
     /// Exact ordered root-user authority inherited by a child. The child task

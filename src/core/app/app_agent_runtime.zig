@@ -2,6 +2,7 @@ const std = @import("std");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 const runtime_context_compaction = @import("../agent/runtime/context_compaction.zig");
+const jev_routing = @import("../agent/runtime/jev_routing.zig");
 const compaction_activity = @import("../output/compaction_activity.zig");
 const runtime_prompt_context = @import("../agent/runtime/prompt_context.zig");
 const command_admission = @import("../permissions/command_admission.zig");
@@ -1066,10 +1067,11 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn processContextCompaction(
             app: *App,
-            job: worker_runtime.ContextCompactionTask,
+            borrowed_job: worker_runtime.ContextCompactionTask,
             gateway_retry_count: usize,
             failure_provenance: ?*?compaction_activity.ErrorProvenance,
         ) anyerror!void {
+            var job = borrowed_job;
             if (failure_provenance) |out| out.* = null;
             const operation_id = job.operation_id orelse app.worker.beginCompactionActivity(.manual, job.turn_id);
             app.worker.runCompactionActivity(operation_id, .preparation);
@@ -1107,7 +1109,16 @@ pub fn Runtime(comptime App: type) type {
             );
             var deps = app_callbacks.Bindings(App).agentRuntimeDeps(app);
             if (comptime @hasDecl(App, "providerSet")) deps.agent_stream_provider = app.providerSet().select(job.provider).agent_stream_or_unavailable();
-            const capabilities = deps.available_model_capabilities(deps.ctx, job.model);
+            const routed = jev_routing.isAuto(job.model);
+            if (routed) {
+                if (job.provider != .gateway) return error.JevRoutingRequiresGateway;
+                job.model = @constCast(app.session.agent.routed_model orelse
+                    jev_routing.previousModel(job.history) orelse jev_routing.modelId(.kimi_k3));
+            }
+            const capabilities = if (routed)
+                try deps.resolve_model_capabilities(deps.ctx, arena, job.model)
+            else
+                deps.available_model_capabilities(deps.ctx, job.model);
             const permission_mode = app_permission_runtime.Runtime(App).livePermissionSnapshot(app).mode;
             var tool_projection = try app.snapshotModelToolProjection(arena, permission_mode);
             defer tool_projection.deinit(arena);
@@ -1256,6 +1267,7 @@ pub fn Runtime(comptime App: type) type {
                 .provider_set = providers,
                 .system_prompt = prompt_policy.system_prompt,
                 .model_prompt_overlay = prompt_policy.modelPromptOverlay(admission.model),
+                .model_prompt_overlay_fn = prompt_policy.model_prompt_overlay_fn,
                 .skill_catalog = .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
                 .advertised_tool_names = child_projection.advertised_names,
                 .advertised_functions = child_projection.advertised_functions,
@@ -1295,6 +1307,7 @@ pub fn Runtime(comptime App: type) type {
             return .{
                 .system_prompt = prompt_policy.system_prompt,
                 .model_prompt_overlay = prompt_policy.modelPromptOverlay(job.model),
+                .model_prompt_overlay_fn = prompt_policy.model_prompt_overlay_fn,
                 .skill_catalog = catalog,
                 .skill_bindings = bindings,
                 .gateway_retry_count = gateway_retry_count,

@@ -151,6 +151,7 @@ pub const generation_usage_provider = gateway_generation_usage.provider;
 
 pub const agent_stream_provider = agent_stream_provider_contract.Provider{
     .stream_fn = streamAgentCompletion,
+    .evaluate_fn = @import("../gateway/jev.zig").evaluate,
     .build_request_fn = buildAgentRequestForProvider,
     .project_replay_fn = vercel_protocol.selectReplayParts,
 };

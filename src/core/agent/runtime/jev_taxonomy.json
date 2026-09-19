@@ -1,0 +1,118 @@
+{
+  "taxonomy_v": "2.0.0",
+  "name": "task-family",
+  "amends": "1.0.0",
+  "families": [
+    {
+      "id": "code-generation",
+      "name": "Code generation",
+      "definition": "Create software code, tests, machine-readable configuration, database queries, or other artifacts intended for execution or parsing; exclude natural-language prompts for creative media."
+    },
+    {
+      "id": "debugging-review",
+      "name": "Debugging and review",
+      "definition": "Diagnose a technical failure, inspect existing code, review implementation quality, or recommend a fix to an existing technical artifact."
+    },
+    {
+      "id": "writing",
+      "name": "Writing",
+      "definition": "Create original text whose main deliverable is communicative, literary, commercial, or professional prose; exclude prompts or specifications whose target output is visual, audio, video, or interactive media."
+    },
+    {
+      "id": "editing-rewriting",
+      "name": "Editing and rewriting",
+      "definition": "Transform, polish, shorten, translate, or otherwise revise text supplied by the user while preserving its core subject or intent."
+    },
+    {
+      "id": "information-seeking",
+      "name": "Information and research",
+      "definition": "Retrieve, explain, compare, evaluate, or synthesize facts, sources, or bodies of evidence into an informational answer."
+    },
+    {
+      "id": "how-to-advice",
+      "name": "How-to and advice",
+      "definition": "Give practical instructions, recommendations, or guidance for accomplishing a concrete goal; the requested deliverable is advice, not a project plan."
+    },
+    {
+      "id": "tutoring",
+      "name": "Tutoring",
+      "definition": "Teach through explicit learning-oriented scaffolding, practice, quizzing, feedback, or adaptation to a learner; a one-off request to explain a fact belongs to information and research."
+    },
+    {
+      "id": "data-math",
+      "name": "Data and math",
+      "definition": "Produce a calculation, proof, statistical analysis, structured-data transformation, or quantitative result; use tutoring only when learning interaction is the dominant request."
+    },
+    {
+      "id": "planning-ideation",
+      "name": "Planning and ideation",
+      "definition": "Generate options, structure a project, develop a strategy, or sequence future work into a plan rather than merely explain how to perform one task."
+    },
+    {
+      "id": "agentic-tool-use",
+      "name": "Agentic tool use",
+      "definition": "Actually inspect or change external state through tools, or coordinate a multi-step workflow that requires such actions; discussion or advice about tools alone belongs to the underlying task family."
+    },
+    {
+      "id": "creative-media",
+      "name": "Creative and media generation",
+      "definition": "Create or direct visual, audio, video, interactive role-play, or other media, including natural-language prompts for a generative-media model; text-only prose intended for a reader remains writing."
+    },
+    {
+      "id": "conversational-other",
+      "name": "Conversational, other, and outlier",
+      "definition": "Social conversation, self-expression, unsupported or unsafe-to-classify requests, requests outside the listed families, or items without a dominant task family."
+    }
+  ],
+  "boundary_rules": [
+    "Choose the family of the requested deliverable, not merely the topic, domain, or length of the answer.",
+    "When revising user-supplied text, choose editing-rewriting; when creating new prose from a topic or brief, choose writing.",
+    "Natural-language prompts for image, audio, video, or interactive-media generation are creative-media, not code-generation or writing.",
+    "A direct factual explanation is information-seeking; tutoring requires an explicit learning interaction such as scaffolding, practice, a quiz, feedback, or adaptation.",
+    "Research breadth and source count are recorded as an orthogonal evidence-scope dimension and do not create a separate family.",
+    "Agentic-tool-use requires actual or explicitly requested external-state action, not hypothetical instructions about using a tool."
+  ],
+  "orthogonal_dimensions": {
+    "intent": [
+      "asking",
+      "doing",
+      "expressing"
+    ],
+    "complexity_tier": [
+      "low",
+      "medium",
+      "high"
+    ],
+    "context": [
+      "work",
+      "non-work",
+      "unknown"
+    ],
+    "evidence_scope": [
+      "none",
+      "single-source",
+      "multi-source",
+      "unknown"
+    ]
+  },
+  "migration": {
+    "removed_families": {
+      "research-synthesis": "information-seeking"
+    },
+    "added_families": [
+      "creative-media"
+    ],
+    "affected_families": [
+      "code-generation",
+      "writing",
+      "information-seeking",
+      "tutoring",
+      "data-math",
+      "planning-ideation",
+      "agentic-tool-use",
+      "creative-media",
+      "conversational-other"
+    ],
+    "rationale": "The original random-public ambiguous stratum contains a large code-generation versus writing cluster dominated by generative-media prompting, while research-synthesis is sparse and behaves as an unstable composite of informational breadth and output form."
+  }
+}

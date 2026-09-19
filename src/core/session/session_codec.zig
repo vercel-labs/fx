@@ -1489,7 +1489,7 @@ fn hasDurableExecutionMemory(execution: session.ExecutionMemory) bool {
 
 fn writeTurnSummary(writer: *std.Io.Writer, summary: types.TurnSummary) !void {
     try writer.print(
-        "{{\"started_at_ms\":{d},\"completed_at_ms\":{d},\"thinking_duration_ms\":{d},\"turn_duration_ms\":{d},\"token_progress\":{{\"input_tokens\":{d},\"output_tokens\":{d},\"input_exact\":{s},\"output_exact\":{s}}}}}",
+        "{{\"started_at_ms\":{d},\"completed_at_ms\":{d},\"thinking_duration_ms\":{d},\"turn_duration_ms\":{d},\"token_progress\":{{\"input_tokens\":{d},\"output_tokens\":{d},\"input_exact\":{s},\"output_exact\":{s}}}",
         .{
             summary.started_at_ms,
             summary.completed_at_ms,
@@ -1501,6 +1501,11 @@ fn writeTurnSummary(writer: *std.Io.Writer, summary: types.TurnSummary) !void {
             if (summary.token_progress.output_exact) "true" else "false",
         },
     );
+    if (summary.jev_model) |key| {
+        try writer.writeAll(",\"jev_model\":");
+        try std.json.Stringify.value(key, .{}, writer);
+    }
+    try writer.writeByte('}');
 }
 
 fn writeToolCall(writer: *std.Io.Writer, tool_call: session.ToolCall) !void {
@@ -1938,18 +1943,17 @@ fn parsePersistedSteering(
 
 fn parseOptionalTurnSummary(value: std.json.Value) !?types.TurnSummary {
     if (value == .null) return null;
-    const object = try exactObject(value, &.{
-        "started_at_ms",
-        "completed_at_ms",
-        "thinking_duration_ms",
-        "turn_duration_ms",
-        "token_progress",
-    });
+    const raw = try requireObject(value);
+    const object = if (raw.contains("jev_model"))
+        try exactObject(value, &.{ "started_at_ms", "completed_at_ms", "thinking_duration_ms", "turn_duration_ms", "token_progress", "jev_model" })
+    else
+        try exactObject(value, &.{ "started_at_ms", "completed_at_ms", "thinking_duration_ms", "turn_duration_ms", "token_progress" });
     const token_progress = try exactObject(
         object.get("token_progress") orelse return error.InvalidSessionFormat,
         &.{ "input_tokens", "output_tokens", "input_exact", "output_exact" },
     );
     const summary = types.TurnSummary{
+        .jev_model = if (object.contains("jev_model")) std.meta.stringToEnum(types.JevRoutingModel, try requireString(object, "jev_model")) orelse return error.InvalidSessionFormat else null,
         .started_at_ms = try requireI64(object, "started_at_ms"),
         .completed_at_ms = try requireI64(object, "completed_at_ms"),
         .thinking_duration_ms = try requireU64(object, "thinking_duration_ms"),
@@ -4757,4 +4761,18 @@ test "session metadata round trips without conversation or control state" {
     try std.testing.expectEqualStrings("/tmp/current", decoded.value.workspace_root);
     try std.testing.expectEqualStrings("openai/gpt-5.6", decoded.value.model);
     try std.testing.expectEqualStrings("Compaction work", decoded.value.title.?);
+}
+
+test "Jev routing metadata survives summary persistence and legacy summaries remain valid" {
+    const alloc = std.testing.allocator;
+    for ([_]?types.JevRoutingModel{ null, .kimi_k3, .gpt_5_6_luna, .gpt_5_6_sol }) |key| {
+        const summary = types.TurnSummary{ .jev_model = key };
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try writeTurnSummary(&out.writer, summary);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(summary, (try parseOptionalTurnSummary(parsed.value)).?);
+        if (key == null) try std.testing.expect(!parsed.value.object.contains("jev_model"));
+    }
 }

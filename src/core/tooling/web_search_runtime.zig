@@ -151,6 +151,11 @@ pub const Runtime = struct {
         const started_at_ms = self.clock.now();
         var inputs = try self.inputsSnapshot(alloc);
         defer inputs.deinit(alloc);
+        if (input.execution_model) |model| {
+            const copy = try alloc.dupe(u8, model);
+            alloc.free(inputs.worker_model);
+            inputs.worker_model = copy;
+        }
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
         var policy = self.policy;
@@ -279,9 +284,11 @@ fn executeForDispatch(
 ) anyerror!web_search_contract.ExecutionOutput {
     const self: *Runtime = @ptrCast(@alignCast(raw_ctx));
     var progress_forwarder = ProgressForwarder{ .dispatch = ctx };
+    var routed_request = request;
+    routed_request.execution_model = ctx.execution_model;
     return self.executeWithProgress(
         ctx.allocator,
-        request,
+        routed_request,
         ctx.cancel_flag orelse &self.fallback_cancel_flag,
         if (ctx.on_web_search_progress != null) ProgressForwarder.onProgress else null,
         if (ctx.on_web_search_progress != null) @ptrCast(&progress_forwarder) else null,
@@ -896,4 +903,21 @@ test "web_search input snapshots stay coherent during parallel reconfiguration" 
             std.mem.eql(u8, snapshot.gateway_chat_url, inputs_b.gateway_chat_url);
         try std.testing.expect(matches_a or matches_b);
     }
+}
+
+test "Jev routing forwards the execution model to search without mutating shared defaults" {
+    const alloc = std.testing.allocator;
+    var fake = FakeProvider{};
+    var runtime = Runtime.init(.{
+        .provider = fake.provider(),
+        .api_key = "provider-key",
+        .worker_model = "jev/auto",
+        .gateway_retry_count = 2,
+        .gateway_chat_url = "https://gateway.test/chat",
+    });
+    var cancel = std.atomic.Value(bool).init(false);
+    var result = try runtime.execute(alloc, .{ .query = "fixture", .execution_model = "provider/private-worker" }, &cancel);
+    defer result.deinit(alloc);
+    try std.testing.expect(fake.configured_inputs_seen);
+    try std.testing.expectEqualStrings("jev/auto", runtime.worker_model);
 }

@@ -245,6 +245,7 @@ pub const RunCommandBackend = struct {
 
 /// Context shared by core tool dispatch, validation, and execution.
 pub const DispatchContext = struct {
+    execution_model: ?[]const u8 = null,
     allocator: Allocator,
     permission_mode: permission_gate.PermissionMode = .ask,
     permission_decider: ?PermissionDecider = null,

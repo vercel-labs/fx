@@ -147,6 +147,8 @@ pub fn unavailableHostToolResult(alloc: Allocator) Allocator.Error!ToolExecution
 }
 
 pub const ToolExecutionRequest = struct {
+    /// Actual model executing this assignment; does not change saved preferences.
+    execution_model: ?[]const u8 = null,
     skill_locations: ?*const skill_contract.Locations = null,
     call_allocator: Allocator,
     result_allocator: Allocator,

@@ -1,0 +1,703 @@
+{
+  "retrievedAt": "2026-09-18",
+  "source": "https://ai-gateway.vercel.sh/v1/models",
+  "models": [
+    {
+      "id": "moonshotai/kimi-k3",
+      "object": "model",
+      "created": 1755815280,
+      "released": 1784160000,
+      "owned_by": "moonshotai",
+      "name": "Kimi K3",
+      "description": "Kimi\u2019s flagship model for long-horizon coding and end-to-end knowledge work, with a 1M-token context window.",
+      "context_window": 1000000,
+      "max_tokens": 131072,
+      "type": "language",
+      "zdr": "some",
+      "no_training": "some",
+      "tags": [
+        "reasoning",
+        "tool-use",
+        "implicit-caching",
+        "file-input",
+        "vision",
+        "structured-output",
+        "video-input"
+      ],
+      "regions": [
+        "us"
+      ],
+      "supported_specifications": [
+        "v2",
+        "v3",
+        "v4"
+      ],
+      "modalities": {
+        "input": [
+          "text",
+          "image",
+          "pdf",
+          "video"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "supported_parameters": [
+        "max_tokens",
+        "stop",
+        "tools",
+        "tool_choice",
+        "reasoning",
+        "include_reasoning",
+        "response_format",
+        "structured_outputs"
+      ],
+      "temperature": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "pricing": {
+        "input": "0.000003",
+        "output": "0.000015",
+        "input_cache_read": "0.0000003",
+        "varies_by_provider": true,
+        "fast": {
+          "input": "0.0000045",
+          "output": "0.0000225",
+          "input_cache_read": "0.00000045"
+        },
+        "regional": {
+          "us": {
+            "input": "0.000003",
+            "output": "0.000015",
+            "input_cache_read": "0.0000003"
+          }
+        }
+      }
+    },
+    {
+      "id": "openai/gpt-5.6-luna",
+      "object": "model",
+      "created": 1755815280,
+      "released": 1783555200,
+      "owned_by": "openai",
+      "name": "GPT 5.6 Luna",
+      "description": "GPT-5.6 Luna is a fast, affordable GPT-5.6 model that brings strong capability at the lowest cost in the series.",
+      "context_window": 1050000,
+      "max_tokens": 128000,
+      "type": "language",
+      "zdr": "some",
+      "no_training": "all",
+      "tags": [
+        "reasoning",
+        "file-input",
+        "tool-use",
+        "vision",
+        "implicit-caching",
+        "web-search",
+        "explicit-caching",
+        "websocket-realtime",
+        "fast"
+      ],
+      "regions": [
+        "us"
+      ],
+      "supported_specifications": [
+        "v2",
+        "v3",
+        "v4"
+      ],
+      "modalities": {
+        "input": [
+          "text",
+          "image",
+          "pdf"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "supported_parameters": [
+        "max_tokens",
+        "temperature",
+        "stop",
+        "tools",
+        "tool_choice",
+        "reasoning",
+        "include_reasoning"
+      ],
+      "temperature": true,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "knowledge": "2026-02-16",
+      "pricing": {
+        "input": "0.0000002",
+        "input_tiers": [
+          {
+            "cost": "0.0000002",
+            "min": 0,
+            "max": 272000
+          },
+          {
+            "cost": "0.0000004",
+            "min": 272000
+          }
+        ],
+        "output": "0.0000012",
+        "output_tiers": [
+          {
+            "cost": "0.0000012",
+            "min": 0,
+            "max": 272000
+          },
+          {
+            "cost": "0.0000018",
+            "min": 272000
+          }
+        ],
+        "input_cache_read": "0.00000002",
+        "input_cache_read_tiers": [
+          {
+            "cost": "0.00000002",
+            "max": 272000
+          },
+          {
+            "cost": "0.00000004",
+            "min": 272000
+          }
+        ],
+        "input_cache_write": "0.00000025",
+        "input_cache_write_tiers": [
+          {
+            "cost": "0.00000025",
+            "min": 0,
+            "max": 272000
+          },
+          {
+            "cost": "0.0000005",
+            "min": 272000
+          }
+        ],
+        "web_search": "10",
+        "service_tiers": {
+          "flex": {
+            "input": "0.0000001",
+            "output": "0.0000006",
+            "input_cache_read": "0.00000001",
+            "long_context": {
+              "threshold": 272000,
+              "input": "0.0000002",
+              "output": "0.0000009",
+              "input_cache_read": "0.00000002"
+            }
+          },
+          "priority": {
+            "input": "0.0000004",
+            "output": "0.0000024",
+            "input_cache_read": "0.00000004",
+            "long_context": {
+              "threshold": 272000,
+              "input": "0.0000008",
+              "output": "0.0000036",
+              "input_cache_read": "0.00000008"
+            }
+          }
+        },
+        "fast": {
+          "input": "0.0000004",
+          "input_tiers": [
+            {
+              "cost": "0.0000004",
+              "min": 0,
+              "max": 272000
+            },
+            {
+              "cost": "0.0000008",
+              "min": 272000
+            }
+          ],
+          "output": "0.0000024",
+          "output_tiers": [
+            {
+              "cost": "0.0000024",
+              "min": 0,
+              "max": 272000
+            },
+            {
+              "cost": "0.0000036",
+              "min": 272000
+            }
+          ],
+          "input_cache_read": "0.00000004",
+          "input_cache_read_tiers": [
+            {
+              "cost": "0.00000004",
+              "min": 0,
+              "max": 272000
+            },
+            {
+              "cost": "0.00000008",
+              "min": 272000
+            }
+          ],
+          "input_cache_write": "0.0000005",
+          "input_cache_write_tiers": [
+            {
+              "cost": "0.0000005",
+              "min": 0,
+              "max": 272000
+            },
+            {
+              "cost": "0.000001",
+              "min": 272000
+            }
+          ]
+        },
+        "regional": {
+          "us": {
+            "input": "0.00000022",
+            "input_tiers": [
+              {
+                "cost": "0.00000022",
+                "min": 0,
+                "max": 272000
+              },
+              {
+                "cost": "0.00000044",
+                "min": 272000
+              }
+            ],
+            "output": "0.00000132",
+            "output_tiers": [
+              {
+                "cost": "0.00000132",
+                "min": 0,
+                "max": 272000
+              },
+              {
+                "cost": "0.00000198",
+                "min": 272000
+              }
+            ],
+            "input_cache_read": "0.000000022",
+            "input_cache_read_tiers": [
+              {
+                "cost": "0.000000022",
+                "max": 272000
+              },
+              {
+                "cost": "0.000000044",
+                "min": 272000
+              }
+            ],
+            "input_cache_write": "0.000000275",
+            "input_cache_write_tiers": [
+              {
+                "cost": "0.000000275",
+                "min": 0,
+                "max": 272000
+              },
+              {
+                "cost": "0.00000055",
+                "min": 272000
+              }
+            ],
+            "fast": {
+              "input": "0.00000044",
+              "input_tiers": [
+                {
+                  "cost": "0.00000044",
+                  "min": 0,
+                  "max": 272000
+                },
+                {
+                  "cost": "0.00000088",
+                  "min": 272000
+                }
+              ],
+              "output": "0.00000264",
+              "output_tiers": [
+                {
+                  "cost": "0.00000264",
+                  "min": 0,
+                  "max": 272000
+                },
+                {
+                  "cost": "0.00000396",
+                  "min": 272000
+                }
+              ],
+              "input_cache_read": "0.000000044",
+              "input_cache_read_tiers": [
+                {
+                  "cost": "0.000000044",
+                  "min": 0,
+                  "max": 272000
+                },
+                {
+                  "cost": "0.000000088",
+                  "min": 272000
+                }
+              ],
+              "input_cache_write": "0.00000055",
+              "input_cache_write_tiers": [
+                {
+                  "cost": "0.00000055",
+                  "min": 0,
+                  "max": 272000
+                },
+                {
+                  "cost": "0.0000011",
+                  "min": 272000
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "openai/gpt-5.6-sol",
+      "object": "model",
+      "created": 1755815280,
+      "released": 1783555200,
+      "owned_by": "openai",
+      "name": "GPT 5.6 Sol",
+      "description": "GPT-5.6 Sol is the flagship of OpenAI's GPT-5.6 series, its most capable model for long-horizon agentic work across coding, biology, and cybersecurity.",
+      "context_window": 1050000,
+      "max_tokens": 128000,
+      "type": "language",
+      "zdr": "some",
+      "no_training": "all",
+      "tags": [
+        "reasoning",
+        "tool-use",
+        "implicit-caching",
+        "file-input",
+        "vision",
+        "web-search",
+        "explicit-caching",
+        "websocket-realtime",
+        "fast"
+      ],
+      "regions": [
+        "us"
+      ],
+      "supported_specifications": [
+        "v2",
+        "v3",
+        "v4"
+      ],
+      "modalities": {
+        "input": [
+          "text",
+          "image",
+          "pdf"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "supported_parameters": [
+        "max_tokens",
+        "temperature",
+        "stop",
+        "tools",
+        "tool_choice",
+        "reasoning",
+        "include_reasoning"
+      ],
+      "temperature": true,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "knowledge": "2026-02-16",
+      "pricing": {
+        "input": "0.000002",
+        "input_tiers": [
+          {
+            "cost": "0.000002",
+            "min": 0,
+            "max": 272000
+          },
+          {
+            "cost": "0.000004",
+            "min": 272000
+          }
+        ],
+        "output": "0.00001",
+        "output_tiers": [
+          {
+            "cost": "0.00001",
+            "min": 0,
+            "max": 272000
+          },
+          {
+            "cost": "0.000015",
+            "min": 272000
+          }
+        ],
+        "input_cache_read": "0.0000002",
+        "input_cache_read_tiers": [
+          {
+            "cost": "0.0000002",
+            "min": 0,
+            "max": 272000
+          },
+          {
+            "cost": "0.0000004",
+            "min": 272000
+          }
+        ],
+        "input_cache_write": "0.0000025",
+        "input_cache_write_tiers": [
+          {
+            "cost": "0.0000025",
+            "min": 0,
+            "max": 272000
+          },
+          {
+            "cost": "0.000005",
+            "min": 272000
+          }
+        ],
+        "web_search": "10",
+        "service_tiers": {
+          "flex": {
+            "input": "0.000001",
+            "output": "0.000005",
+            "input_cache_read": "0.0000001",
+            "long_context": {
+              "threshold": 272000,
+              "input": "0.000002",
+              "output": "0.0000075",
+              "input_cache_read": "0.0000002"
+            }
+          },
+          "priority": {
+            "input": "0.000004",
+            "output": "0.00002",
+            "input_cache_read": "0.0000004",
+            "long_context": {
+              "threshold": 272000,
+              "input": "0.000008",
+              "output": "0.00003",
+              "input_cache_read": "0.0000008"
+            }
+          }
+        },
+        "varies_by_provider": true,
+        "fast": {
+          "input": "0.000004",
+          "input_tiers": [
+            {
+              "cost": "0.000004",
+              "min": 0,
+              "max": 272000
+            },
+            {
+              "cost": "0.000008",
+              "min": 272000
+            }
+          ],
+          "output": "0.00002",
+          "output_tiers": [
+            {
+              "cost": "0.00002",
+              "min": 0,
+              "max": 272000
+            },
+            {
+              "cost": "0.00003",
+              "min": 272000
+            }
+          ],
+          "input_cache_read": "0.0000004",
+          "input_cache_read_tiers": [
+            {
+              "cost": "0.0000004",
+              "min": 0,
+              "max": 272000
+            },
+            {
+              "cost": "0.0000008",
+              "min": 272000
+            }
+          ],
+          "input_cache_write": "0.000005",
+          "input_cache_write_tiers": [
+            {
+              "cost": "0.000005",
+              "min": 0,
+              "max": 272000
+            },
+            {
+              "cost": "0.00001",
+              "min": 272000
+            }
+          ]
+        },
+        "regional": {
+          "us": {
+            "input": "0.0000022",
+            "input_tiers": [
+              {
+                "cost": "0.0000022",
+                "min": 0,
+                "max": 272000
+              },
+              {
+                "cost": "0.0000044",
+                "min": 272000
+              }
+            ],
+            "output": "0.000011",
+            "output_tiers": [
+              {
+                "cost": "0.000011",
+                "min": 0,
+                "max": 272000
+              },
+              {
+                "cost": "0.0000165",
+                "min": 272000
+              }
+            ],
+            "input_cache_read": "0.00000022",
+            "input_cache_read_tiers": [
+              {
+                "cost": "0.00000022",
+                "min": 0,
+                "max": 272000
+              },
+              {
+                "cost": "0.00000044",
+                "min": 272000
+              }
+            ],
+            "input_cache_write": "0.000001375",
+            "input_cache_write_tiers": [
+              {
+                "cost": "0.000001375",
+                "min": 0,
+                "max": 272000
+              },
+              {
+                "cost": "0.00000275",
+                "min": 272000
+              }
+            ],
+            "fast": {
+              "input": "0.0000044",
+              "input_tiers": [
+                {
+                  "cost": "0.0000044",
+                  "min": 0,
+                  "max": 272000
+                },
+                {
+                  "cost": "0.0000088",
+                  "min": 272000
+                }
+              ],
+              "output": "0.000022",
+              "output_tiers": [
+                {
+                  "cost": "0.000022",
+                  "min": 0,
+                  "max": 272000
+                },
+                {
+                  "cost": "0.000033",
+                  "min": 272000
+                }
+              ],
+              "input_cache_read": "0.00000044",
+              "input_cache_read_tiers": [
+                {
+                  "cost": "0.00000044",
+                  "min": 0,
+                  "max": 272000
+                },
+                {
+                  "cost": "0.00000088",
+                  "min": 272000
+                }
+              ],
+              "input_cache_write": "0.00000275",
+              "input_cache_write_tiers": [
+                {
+                  "cost": "0.00000275",
+                  "min": 0,
+                  "max": 272000
+                },
+                {
+                  "cost": "0.0000055",
+                  "min": 272000
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "typesafe-ai/jev",
+      "object": "model",
+      "created": 1755815280,
+      "released": 1789430400,
+      "owned_by": "typesafe-ai",
+      "name": "Jev",
+      "description": "Jev is TypeSafe AI\u2019s System One evaluation model for fast, structured decisions in software. It evaluates shared state against typed questions and returns choices, scores, and boolean probabilities, supporting classification, routing, rubric-based assessment, and automated verification. Multiple questions can be evaluated in parallel within a single request.",
+      "context_window": 0,
+      "max_tokens": 0,
+      "type": "evaluation",
+      "zdr": "all",
+      "no_training": "all",
+      "supported_specifications": [
+        "v4"
+      ],
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "pricing": {
+        "input": "0.000000042",
+        "output": "0"
+      }
+    }
+  ]
+}

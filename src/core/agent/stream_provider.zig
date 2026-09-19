@@ -547,6 +547,8 @@ pub const Provider = struct {
     /// When set, context must remain valid until every in-flight `stream` returns.
     context: ?*anyopaque = null,
     stream_fn: StreamFn,
+    /// Optional typed-decision transport, separate from text generation.
+    evaluate_fn: ?@import("evaluation_provider.zig").EvaluateFn = null,
     /// Optional exact provider serializer used for request-capacity decisions.
     build_request_fn: ?BuildRequestFn = null,
     /// Pure provider-owned slicing when one reply becomes separate history units.

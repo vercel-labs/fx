@@ -108,6 +108,24 @@ Report security vulnerabilities through the [contact page](https://fx.sh/contact
 
 [Apache-2.0](LICENSE). Third-party licenses and attributions are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
+## Experimental model routing
+
+Select `jev/auto` with `--model` or `FX_MODEL` to route each new prompt through
+Jev on AI Gateway. Enable `FX_EXPERIMENT_JEV_SUBAGENT_ROUTING=1` to route new
+child assignments independently. Each assignment keeps its selected model
+through tool calls; a concrete model choice stays pinned. See the
+[experimental routing guide](examples/jev-routing/README.md) for controls,
+fallbacks, telemetry and limitations.
+
 ## Credits
 
 Interface sounds by [cuelume](https://github.com/Danilaa1/cuelume).
+
+### Separate Jev evaluation credentials
+
+Set `FX_JEV_GATEWAY_API_KEY` to a dedicated AI Gateway key for Jev routing
+evaluations. Normal model inference continues using its configured
+credential. With a dedicated key, `FX_JEV_GATEWAY_TEAM` optionally selects that
+key's team; the inference team's header is not inherited. An empty dedicated
+key rejects evaluation instead of using the inference key. Without the override,
+Jev uses the current Gateway credential and team as before.

@@ -389,7 +389,7 @@ Options:
   --auto                Automatically review unresolved permission requests
   --full-access         Disable fx permission checks
   --yolo                Alias for --full-access
-  --model <id>          Override the model for this request
+  --model <id>          Override the model; jev/auto routes each prompt through Jev (Gateway only)
   --effort <level>      Override the reasoning effort for this request
   --fast                Enable Fast mode for this request when the model supports it
   --no-fast             Disable Fast mode for this request

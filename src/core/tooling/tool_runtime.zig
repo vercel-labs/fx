@@ -110,6 +110,7 @@ test {
 }
 
 pub const Context = struct {
+    execution_model: ?[]const u8 = null,
     workspace_root: []const u8,
     access_scope: ?workspace_access.AccessScope = null,
     ignored_list_entries: []const []const u8,
@@ -380,6 +381,8 @@ pub fn executeToolCallAuthorized(
         request.command_replay_capture.?.abort(request.result_allocator);
     };
     var execution_ctx = ctx;
+    execution_ctx.execution_model = request.execution_model;
+    if (request.execution_model) |model| execution_ctx.model = model;
     execution_ctx.skill_locations = request.skill_locations orelse ctx.skill_locations;
     if (request.permission_mode) |permission_mode| {
         execution_ctx.permission_mode = permission_mode;
@@ -1166,6 +1169,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .web_fetch_artifact_error = ctx.web_fetch_artifact_error,
         .tool_capabilities = capabilities,
         .web_search_backend = ctx.web_search_backend,
+        .execution_model = ctx.execution_model,
         .web_search_progress_ctx = ctx.web_search_progress_ctx,
         .on_web_search_progress = ctx.on_web_search_progress,
         .web_fetch_progress_ctx = ctx.web_fetch_progress_ctx,

@@ -1409,7 +1409,11 @@ pub const ToolUsage = struct {
     web_search_requests: u32 = 0,
 };
 
+/// Versioned, bounded identity for the experimental routing policy's candidates.
+pub const JevRoutingModel = enum { kimi_k3, gpt_5_6_luna, gpt_5_6_sol };
+
 pub const TurnSummary = struct {
+    jev_model: ?JevRoutingModel = null,
     started_at_ms: i64 = 0,
     completed_at_ms: i64 = 0,
     thinking_duration_ms: u64 = 0,

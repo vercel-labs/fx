@@ -79,6 +79,7 @@ pub fn recordGatewayCallMetricWithDiagnostics(
 }
 
 pub const TurnSummaryAccumulator = struct {
+    jev_model: ?types.JevRoutingModel = null,
     turn_started_at_ms: i64,
     thinking_duration_ms: u64 = 0,
     settled_token_progress: types.TurnTokenProgress = .{},
@@ -176,6 +177,7 @@ pub const TurnSummaryAccumulator = struct {
             .thinking_duration_ms = self.thinking_duration_ms,
             .turn_duration_ms = @intCast(elapsed),
             .token_progress = self.tokenProgress(),
+            .jev_model = self.jev_model,
         };
     }
 };

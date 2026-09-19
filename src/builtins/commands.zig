@@ -35,7 +35,7 @@ pub const top_level_specs = [_]TopLevelSpec{
             .{ .flag = "--auto", .description = "Automatically review unresolved permission requests" },
             .{ .flag = "--full-access", .description = "Disable fx permission checks" },
             .{ .flag = "--yolo", .description = "Alias for --full-access" },
-            .{ .flag = "--model <id>", .description = "Override the model for this request" },
+            .{ .flag = "--model <id>", .description = "Override the model; jev/auto routes each prompt through Jev (Gateway only)" },
             .{ .flag = "--effort <level>", .description = "Override the reasoning effort for this request" },
             .{ .flag = "--fast", .description = "Enable Fast mode for this request when the model supports it" },
             .{ .flag = "--no-fast", .description = "Disable Fast mode for this request" },
@@ -66,7 +66,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .usage = "acp [--model <id>] [--log-file <path>]",
         .summary = "Start an ACP server over stdio",
         .options = &.{
-            .{ .flag = "--model <id>", .description = "Override the default model" },
+            .{ .flag = "--model <id>", .description = "Override the default model; jev/auto routes each prompt through Jev" },
             .{ .flag = "--log-file <path>", .description = "Write ACP logs to a file" },
         },
     },
@@ -348,7 +348,7 @@ pub const top_level_flags = [_]TopLevelFlag{
     },
     .{
         .usage = "--model <id>",
-        .description = "Override the model for an interactive session",
+        .description = "Override the model for an interactive session; jev/auto routes each prompt through Jev",
     },
     .{
         .usage = "--effort <level>",

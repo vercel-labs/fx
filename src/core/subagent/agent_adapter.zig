@@ -48,6 +48,7 @@ pub const Config = struct {
     provider_set: provider_set.Set,
     system_prompt: []const u8,
     model_prompt_overlay: ?[]const u8 = null,
+    model_prompt_overlay_fn: ?@import("../config/prompt_policy.zig").ModelPromptOverlayFn = null,
     skill_catalog: skill_invocation.Catalog = .{ .skills = &.{} },
     advertised_tool_names: []const []const u8 = &.{},
     advertised_functions: []const model_tool_schema.FunctionSchema = &.{},
@@ -59,6 +60,7 @@ pub const Config = struct {
 };
 
 const Context = struct {
+    routing_capabilities: @import("../gateway/gateway_provider.zig").CapabilityResolver = .{},
     config: Config,
     turn: *execution.TurnContext,
     admission: domain.AdmissionSnapshot,
@@ -202,6 +204,7 @@ pub fn run(
         .subagent_id = trace_context.subagent_id,
     };
     defer if (context.refreshed_credential) |*credential| credential.deinit(turn.alloc);
+    defer context.routing_capabilities.deinit(turn.alloc);
     const recovery_checkpoint = turn.prepareRecoveryForActiveWork(arena) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         turn.setFailureDiagnostic("recovery_admission_failed", @errorName(err));
@@ -286,6 +289,7 @@ pub fn run(
         .{
             .system_prompt = child_system_prompt,
             .model_prompt_overlay = config.model_prompt_overlay,
+            .model_prompt_overlay_fn = config.model_prompt_overlay_fn,
             .skill_catalog = config.skill_catalog,
             .gateway_retry_count = config.tool_context.gateway_retry_count,
             .gateway_chat_url = config.tool_context.gateway_chat_url,
@@ -302,6 +306,7 @@ pub fn run(
             .workspace_root = config.tool_context.workspace_root,
             .access_scope = config.tool_context.access_scope,
             .origin = .subagent,
+            .routing_role = message.system_prompt_overlay,
             .root_user_intent_context = prompt.root_user_intent_context,
             .root_user_messages = message.root_user_messages,
             .root_user_evidence_complete = message.root_user_evidence_complete,
@@ -441,12 +446,32 @@ fn availableModelCapabilities(raw: *anyopaque, model: []const u8) model_capabili
     if (provider.model_catalog) |catalog| {
         if (catalog.lookupCapabilities(model)) |capabilities| return capabilities;
     }
-    return model_capabilities.capabilitiesForModel(model);
+    return context.routing_capabilities.available(model, model_capabilities.capabilitiesForModel(model));
 }
 
 fn resolveModelCapabilities(raw: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
     const context: *Context = @ptrCast(@alignCast(raw));
     if (context.cancel.load(.seq_cst)) return error.Cancelled;
+    if (@import("../agent/runtime/jev_routing.zig").isAuto(context.admission.model) and context.admission.provider == .gateway) {
+        const tool_context = context.config.tool_context;
+        const provider = context.config.provider_set.select(.gateway);
+        if (provider.model_catalog) |catalog| return context.routing_capabilities.resolve(
+            context.turn.alloc,
+            catalog,
+            .{
+                .access = credentials.catalogAccessForCredentialAndAccount(
+                    tool_context.credential_source,
+                    tool_context.api_key,
+                    tool_context.gateway_team,
+                    tool_context.account_id,
+                ),
+                .endpoint = tool_context.gateway_models_path,
+                .cancel_flag = context.cancel,
+            },
+            model,
+            provider.fallbackModelCapabilities(model),
+        );
+    }
     return availableModelCapabilities(raw, model);
 }
 

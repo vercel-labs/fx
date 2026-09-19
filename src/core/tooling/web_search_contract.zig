@@ -32,6 +32,8 @@ pub const BackendCapabilities = struct {
 };
 
 pub const Request = struct {
+    /// Host execution metadata, never part of the model-facing tool input.
+    execution_model: ?[]const u8 = null,
     query: []const u8,
     allowed_domains: ?[]const []const u8 = null,
     blocked_domains: ?[]const []const u8 = null,

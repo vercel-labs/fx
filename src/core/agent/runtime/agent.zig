@@ -10,6 +10,9 @@ pub const Agent = struct {
     history: std.ArrayList(types.HistoryTurn) = .empty,
     turn_usage: types.Usage = .{},
     fresh: bool = true,
+    /// Live assignment route, also used for display. Static ID; resume restores
+    /// continuity from durable turn metadata or the recovery checkpoint.
+    routed_model: ?[]const u8 = null,
 
     pub fn deinit(self: *Agent, alloc: Allocator) void {
         self.clearHistory(alloc);

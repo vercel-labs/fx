@@ -414,7 +414,10 @@ pub const Runtime = struct {
         options: ExecuteOptions,
     ) !ManagedAdmission {
         const fingerprint = model_contract.requestFingerprint(request);
-        const defaults = effectiveDefaults(options.defaults, request.override());
+        var defaults = effectiveDefaults(options.defaults, request.override());
+        if (request.override().model == null and defaults.provider == .gateway and @import("../agent/runtime/jev_routing.zig").routeChildren()) {
+            defaults.model = @import("../agent/runtime/jev_routing.zig").auto_model;
+        }
         debug_trace.logf(
             "subagent",
             "admission requested operation={s} action={s} agent={s} override={s}",

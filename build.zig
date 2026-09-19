@@ -78,6 +78,7 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     const exe_tests = b.addTest(.{
+        .filters = b.option([]const []const u8, "test-filter", "Run tests whose names contain a filter") orelse &.{},
         .root_module = exe.root_module,
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
