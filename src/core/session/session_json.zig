@@ -1,5 +1,6 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const types = @import("../shared/types.zig");
 const session = @import("session.zig");
@@ -399,9 +400,9 @@ fn parseLegacySummaryStreamingImpl(
 
     var schema_version: ?i64 = null;
     var id: ?[]u8 = null;
-    errdefer if (id) |owned| alloc.free(owned);
+    errdefer if (id) |owned| mem_utils.free(alloc, owned);
     var workspace_root: ?[]u8 = null;
-    errdefer if (workspace_root) |owned| alloc.free(owned);
+    errdefer if (workspace_root) |owned| mem_utils.free(alloc, owned);
     var workspace_root_seen = false;
     var created_at_ms: ?i64 = null;
     var updated_at_ms: ?i64 = null;
@@ -533,7 +534,7 @@ pub fn parseLegacyExact(
         try alloc.alloc(session.HistoryTurn, history_value.array.items.len)
     else
         &.{};
-    errdefer if (history.len > 0) alloc.free(history);
+    errdefer if (history.len > 0) mem_utils.free(alloc, history);
 
     var parsed_count: usize = 0;
     errdefer {
@@ -547,9 +548,9 @@ pub fn parseLegacyExact(
 
     if (try requireUsize(root, "history_len") != history.len) return error.InvalidSessionFormat;
     const id = try alloc.dupe(u8, try requireString(root, "id"));
-    errdefer alloc.free(id);
+    errdefer mem_utils.free(alloc, id);
     const workspace_root = try optionalStringDup(alloc, root.get("workspace_root"));
-    errdefer if (workspace_root) |wr| alloc.free(wr);
+    errdefer if (workspace_root) |wr| mem_utils.free(alloc, wr);
     const language = try parseConversationLanguage(try requireString(root, "conversation_language"));
 
     const total_input_tokens: u64 = if (root.get("total_input_tokens")) |v| blk: {
@@ -624,9 +625,9 @@ fn parseLegacyHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Hist
         const root_user_messages: [][]u8 = if (object.get("root_user_messages")) |messages_value| blk: {
             if (messages_value != .array) return error.InvalidSessionFormat;
             const messages = try alloc.alloc([]u8, messages_value.array.items.len);
-            errdefer alloc.free(messages);
+            errdefer mem_utils.free(alloc, messages);
             var copied: usize = 0;
-            errdefer for (messages[0..copied]) |message| alloc.free(message);
+            errdefer for (messages[0..copied]) |message| mem_utils.free(alloc, message);
             for (messages_value.array.items, 0..) |item, index| {
                 if (item != .string) return error.InvalidSessionFormat;
                 messages[index] = try alloc.dupe(u8, item.string);
@@ -661,7 +662,7 @@ fn parseLegacyHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Hist
         const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat);
         errdefer session.freeUserTurn(alloc, user);
         const assistant = try alloc.dupe(u8, try requireString(object, "assistant"));
-        errdefer alloc.free(assistant);
+        errdefer mem_utils.free(alloc, assistant);
         const execution = try parseOptionalExecutionMemory(alloc, object.get("execution"));
         errdefer session.freeExecutionMemory(alloc, execution);
         return .{ .assistant = .{
@@ -701,7 +702,7 @@ fn parseLegacyHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Hist
         const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat);
         errdefer session.freeUserTurn(alloc, user);
         const assistant = try optionalStringDup(alloc, object.get("assistant"));
-        errdefer if (assistant) |text| alloc.free(text);
+        errdefer if (assistant) |text| mem_utils.free(alloc, text);
         const tool_call = try parseOptionalToolCall(alloc, object.get("tool_call"));
         errdefer if (tool_call) |call| session.freeToolCall(alloc, call);
         const completed_tool_names = try parseOptionalStringArray(alloc, object.get("completed_tool_names"));
@@ -754,15 +755,15 @@ fn parseOptionalToolCall(alloc: Allocator, maybe_value: ?std.json.Value) !?sessi
 fn parseToolCall(alloc: Allocator, value: std.json.Value) !session.ToolCall {
     const object = try requireObject(value);
     const id = try alloc.dupe(u8, try requireString(object, "id"));
-    errdefer alloc.free(id);
+    errdefer mem_utils.free(alloc, id);
     const name = try alloc.dupe(u8, try requireString(object, "name"));
-    errdefer alloc.free(name);
+    errdefer mem_utils.free(alloc, name);
     const raw_arguments_json = try requireString(object, "arguments_json");
     const argument_integrity = try types.ToolArgumentIntegrity.classifyFunctionInput(alloc, raw_arguments_json);
     const arguments_json = try alloc.dupe(u8, if (argument_integrity == .malformed_json) "{}" else raw_arguments_json);
-    errdefer alloc.free(arguments_json);
+    errdefer mem_utils.free(alloc, arguments_json);
     const provider_result = try optionalStringDup(alloc, object.get("provider_result"));
-    errdefer if (provider_result) |result| alloc.free(result);
+    errdefer if (provider_result) |result| mem_utils.free(alloc, result);
     return .{
         .id = id,
         .name = name,
@@ -809,7 +810,7 @@ fn parseOptionalSteering(
     if (value != .array) return error.InvalidSessionFormat;
     if (value.array.items.len == 0) return &.{};
     const steering = try alloc.alloc(types.PersistedSteering, value.array.items.len);
-    errdefer alloc.free(steering);
+    errdefer mem_utils.free(alloc, steering);
     var parsed_count: usize = 0;
     errdefer for (steering[0..parsed_count]) |item| {
         alloc.free(item.text);
@@ -861,7 +862,7 @@ fn parseToolExecutionSteps(
     if (value.array.items.len == 0) return &.{};
 
     const steps = try alloc.alloc(session.ToolExecutionStep, value.array.items.len);
-    errdefer alloc.free(steps);
+    errdefer mem_utils.free(alloc, steps);
 
     var parsed_count: usize = 0;
     errdefer {
@@ -872,7 +873,7 @@ fn parseToolExecutionSteps(
     for (value.array.items, 0..) |item, i| {
         const object = try requireObject(item);
         const assistant = try optionalStringDup(alloc, object.get("assistant"));
-        errdefer if (assistant) |text| alloc.free(text);
+        errdefer if (assistant) |text| mem_utils.free(alloc, text);
         const tool_calls = try parseToolCallArray(alloc, object.get("tool_calls"));
         errdefer session.freeToolCallSlice(alloc, tool_calls);
         const tool_results = try parsePersistedToolResultArray(
@@ -898,7 +899,7 @@ fn parseToolCallArray(alloc: Allocator, maybe_value: ?std.json.Value) ![]session
     if (value.array.items.len == 0) return &.{};
 
     const calls = try alloc.alloc(session.ToolCall, value.array.items.len);
-    errdefer alloc.free(calls);
+    errdefer mem_utils.free(alloc, calls);
 
     var parsed_count: usize = 0;
     errdefer {
@@ -923,7 +924,7 @@ fn parsePersistedToolResultArray(
     if (value.array.items.len == 0) return &.{};
 
     const results = try alloc.alloc(session.PersistedToolResult, value.array.items.len);
-    errdefer alloc.free(results);
+    errdefer mem_utils.free(alloc, results);
 
     var parsed_count: usize = 0;
     errdefer {
@@ -945,15 +946,15 @@ fn parsePersistedToolResult(
 ) !session.PersistedToolResult {
     const object = try requireObject(value);
     const tool_call_id = try alloc.dupe(u8, try requireString(object, "tool_call_id"));
-    errdefer alloc.free(tool_call_id);
+    errdefer mem_utils.free(alloc, tool_call_id);
     const tool_name = try alloc.dupe(u8, try requireString(object, "tool_name"));
-    errdefer alloc.free(tool_name);
+    errdefer mem_utils.free(alloc, tool_name);
     const output = try alloc.dupe(u8, try requireString(object, "output"));
-    errdefer alloc.free(output);
+    errdefer mem_utils.free(alloc, output);
     const output_handle = try optionalStringDup(alloc, object.get("output_handle"));
-    errdefer if (output_handle) |handle| alloc.free(handle);
+    errdefer if (output_handle) |handle| mem_utils.free(alloc, handle);
     const preview = try optionalStringDup(alloc, object.get("preview"));
-    errdefer if (preview) |text| alloc.free(text);
+    errdefer if (preview) |text| mem_utils.free(alloc, text);
     const permission_feedback: [][]u8 = if (schema_version == 1)
         &.{}
     else blk: {
@@ -992,18 +993,18 @@ fn parseCommittedFilePresentation(
 ) !types.CommittedFilePresentation {
     const object = try requireObject(value);
     const path = try alloc.dupe(u8, try requireString(object, "path"));
-    errdefer alloc.free(path);
+    errdefer mem_utils.free(alloc, path);
     const lines = try parseCommittedFilePresentationLines(alloc, object.get("lines"));
     errdefer {
         for (lines) |line| alloc.free(@constCast(line.text));
         if (lines.len > 0) alloc.free(@constCast(lines));
     }
     const previous_content = try optionalStringDup(alloc, object.get("previous_content"));
-    errdefer if (previous_content) |content| alloc.free(content);
+    errdefer if (previous_content) |content| mem_utils.free(alloc, content);
     const after_content = try optionalStringDup(alloc, object.get("after_content"));
-    errdefer if (after_content) |content| alloc.free(content);
+    errdefer if (after_content) |content| mem_utils.free(alloc, content);
     const lifecycle_id = try parseOptionalLifecycleId(alloc, object.get("lifecycle_id"));
-    errdefer if (lifecycle_id) |id| alloc.free(@constCast(id.call_id));
+    errdefer if (lifecycle_id) |id| mem_utils.free(alloc, @constCast(id.call_id));
     return .{
         .path = path,
         .kind = try parseCommittedFilePresentationKind(try requireString(object, "kind")),
@@ -1025,9 +1026,9 @@ fn parseCommittedFilePresentationLines(
     if (value != .array) return error.InvalidSessionFormat;
     if (value.array.items.len == 0) return &.{};
     const lines = try alloc.alloc(types.CommittedFilePresentationLine, value.array.items.len);
-    errdefer alloc.free(lines);
+    errdefer mem_utils.free(alloc, lines);
     var parsed_count: usize = 0;
-    errdefer for (lines[0..parsed_count]) |line| alloc.free(@constCast(line.text));
+    errdefer for (lines[0..parsed_count]) |line| mem_utils.free(alloc, @constCast(line.text));
     for (value.array.items, 0..) |item, index| {
         const object = try requireObject(item);
         lines[index] = .{
@@ -1049,7 +1050,7 @@ fn parseOptionalLifecycleId(
     if (value == .null) return null;
     const object = try requireObject(value);
     const call_id = try alloc.dupe(u8, try requireString(object, "call_id"));
-    errdefer alloc.free(call_id);
+    errdefer mem_utils.free(alloc, call_id);
     return .{
         .turn_id = @intCast(try requireUsize(object, "turn_id")),
         .call_id = call_id,
@@ -1104,7 +1105,7 @@ fn parseFileEvidenceSlice(alloc: Allocator, maybe_value: ?std.json.Value) ![]ses
     if (value.array.items.len == 0) return &.{};
 
     const files = try alloc.alloc(session.FileEvidence, value.array.items.len);
-    errdefer alloc.free(files);
+    errdefer mem_utils.free(alloc, files);
 
     var parsed_count: usize = 0;
     errdefer {
@@ -1122,13 +1123,13 @@ fn parseFileEvidenceSlice(alloc: Allocator, maybe_value: ?std.json.Value) ![]ses
 fn parseFileEvidence(alloc: Allocator, value: std.json.Value) !session.FileEvidence {
     const object = try requireObject(value);
     const path = try alloc.dupe(u8, try requireString(object, "path"));
-    errdefer alloc.free(path);
+    errdefer mem_utils.free(alloc, path);
     const new_path = try optionalStringDup(alloc, object.get("new_path"));
-    errdefer if (new_path) |path_copy| alloc.free(path_copy);
+    errdefer if (new_path) |path_copy| mem_utils.free(alloc, path_copy);
     const tool_call_id = try alloc.dupe(u8, try requireString(object, "tool_call_id"));
-    errdefer alloc.free(tool_call_id);
+    errdefer mem_utils.free(alloc, tool_call_id);
     const tool_name = try alloc.dupe(u8, try requireString(object, "tool_name"));
-    errdefer alloc.free(tool_name);
+    errdefer mem_utils.free(alloc, tool_name);
     return .{
         .path = path,
         .new_path = new_path,
@@ -1188,7 +1189,7 @@ fn freeParsedFileEvidence(alloc: Allocator, file: session.FileEvidence) void {
 fn parseUserTurn(alloc: Allocator, value: std.json.Value) !session.UserTurn {
     const object = try requireObject(value);
     const text = try alloc.dupe(u8, try requireString(object, "text"));
-    errdefer alloc.free(text);
+    errdefer mem_utils.free(alloc, text);
     const images = try validateImagesArray(alloc, object.get("images"));
     errdefer session.freeImageAttachmentSlice(alloc, images);
     return .{ .text = text, .images = images };
@@ -1212,7 +1213,7 @@ fn validateImagesArray(alloc: Allocator, maybe_value: ?std.json.Value) ![]sessio
     if (value.array.items.len == 0) return &.{};
 
     const images = try alloc.alloc(session.ImageAttachment, value.array.items.len);
-    errdefer alloc.free(images);
+    errdefer mem_utils.free(alloc, images);
 
     var parsed_count: usize = 0;
     errdefer {
@@ -1259,9 +1260,9 @@ fn dupeParsedImageAttachment(
     snapshot_sha256_src: ?[]u8,
 ) !session.ImageAttachment {
     const path = try alloc.dupe(u8, path_src);
-    errdefer alloc.free(path);
+    errdefer mem_utils.free(alloc, path);
     const media_type = try alloc.dupe(u8, media_type_src);
-    errdefer alloc.free(media_type);
+    errdefer mem_utils.free(alloc, media_type);
     return .{
         .id = id,
         .path = path,
@@ -1427,7 +1428,7 @@ fn parseOptionalStringArray(alloc: Allocator, maybe_value: ?std.json.Value) ![][
     if (value.array.items.len == 0) return &.{};
 
     const items = try alloc.alloc([]u8, value.array.items.len);
-    errdefer alloc.free(items);
+    errdefer mem_utils.free(alloc, items);
 
     var parsed_count: usize = 0;
     errdefer {

@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const secret = @import("../auth/secret.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const generation_fact_codec = @import("generation_fact_codec.zig");
 const generation_usage = @import("generation_usage_provider.zig");
 const io_mod = @import("../shared/io.zig");
@@ -284,11 +285,11 @@ pub const PendingGeneration = struct {
 
     fn dupe(self: PendingGeneration, alloc: Allocator) Allocator.Error!PendingGeneration {
         const id = try alloc.dupe(u8, self.id);
-        errdefer alloc.free(id);
+        errdefer mem_utils.free(alloc, id);
         const origin = try alloc.dupe(u8, self.origin);
-        errdefer alloc.free(origin);
+        errdefer mem_utils.free(alloc, origin);
         const team = if (self.team) |value| try alloc.dupe(u8, value) else null;
-        errdefer if (team) |value| alloc.free(value);
+        errdefer if (team) |value| mem_utils.free(alloc, value);
         const account_id = if (self.account_id) |value| try alloc.dupe(u8, value) else null;
         return .{
             .id = id,
@@ -1028,13 +1029,13 @@ pub const Usage = struct {
             return error.UsageCapacityExceeded;
         }
         const owned_id = try alloc.dupe(u8, id);
-        errdefer alloc.free(owned_id);
+        errdefer mem_utils.free(alloc, owned_id);
         const owned_origin = try alloc.dupe(u8, origin);
-        errdefer alloc.free(owned_origin);
+        errdefer mem_utils.free(alloc, owned_origin);
         const owned_team = if (team) |value| try alloc.dupe(u8, value) else null;
-        errdefer if (owned_team) |value| alloc.free(value);
+        errdefer if (owned_team) |value| mem_utils.free(alloc, value);
         const owned_account_id = if (account_id) |value| try alloc.dupe(u8, value) else null;
-        errdefer if (owned_account_id) |value| alloc.free(value);
+        errdefer if (owned_account_id) |value| mem_utils.free(alloc, value);
         try self.pending.append(alloc, .{
             .id = owned_id,
             .sequence = sequence,
@@ -1164,7 +1165,7 @@ pub const Usage = struct {
         ) catch return self.failOverflow();
 
         var owned_model: ?[]u8 = null;
-        errdefer if (owned_model) |model| alloc.free(model);
+        errdefer if (owned_model) |model| mem_utils.free(alloc, model);
         if (model_index == null) {
             owned_model = try alloc.dupe(u8, record.model);
             try self.models.ensureUnusedCapacity(alloc, 1);
@@ -1288,7 +1289,7 @@ pub const Usage = struct {
             usage_report.PendingMarker,
             self.pending.items.len,
         );
-        errdefer alloc.free(pending);
+        errdefer mem_utils.free(alloc, pending);
         var copied_pending: usize = 0;
         errdefer for (pending[0..copied_pending]) |*marker| marker.deinit(alloc);
         for (self.pending.items, 0..) |generation, index| {
@@ -1303,13 +1304,13 @@ pub const Usage = struct {
             usage_report.Incident,
             self.incidents[0..self.incident_count],
         );
-        errdefer alloc.free(incidents);
+        errdefer mem_utils.free(alloc, incidents);
 
         const facts = try alloc.alloc(
             usage_report.GenerationFact,
             self.publication_backlog.items.len,
         );
-        errdefer alloc.free(facts);
+        errdefer mem_utils.free(alloc, facts);
         var copied_facts: usize = 0;
         errdefer for (facts[0..copied_facts]) |*fact| fact.deinit(alloc);
         for (self.publication_backlog.items, 0..) |fact, index| {
@@ -1604,7 +1605,7 @@ pub const Usage = struct {
         defer self.mutex.unlock(io_mod.getIo());
 
         const models = try alloc.alloc(ModelAggregate, self.models.items.len);
-        errdefer alloc.free(models);
+        errdefer mem_utils.free(alloc, models);
         var copied_models: usize = 0;
         errdefer for (models[0..copied_models]) |*model| model.deinit(alloc);
         for (self.models.items, 0..) |model, index| {
@@ -1613,7 +1614,7 @@ pub const Usage = struct {
         }
 
         const pending = try alloc.alloc(PendingGeneration, self.pending.items.len);
-        errdefer alloc.free(pending);
+        errdefer mem_utils.free(alloc, pending);
         var copied_pending: usize = 0;
         errdefer for (pending[0..copied_pending]) |*generation| generation.deinit(alloc);
         for (self.pending.items, 0..) |generation, index| {
@@ -1625,7 +1626,7 @@ pub const Usage = struct {
             usage_report.GenerationFact,
             self.publication_backlog.items.len,
         );
-        errdefer alloc.free(publication_backlog);
+        errdefer mem_utils.free(alloc, publication_backlog);
         var copied_publications: usize = 0;
         errdefer for (publication_backlog[0..copied_publications]) |*fact| {
             fact.deinit(alloc);
@@ -1639,7 +1640,7 @@ pub const Usage = struct {
             usage_report.Incident,
             self.incidents[0..self.incident_count],
         );
-        errdefer alloc.free(incidents);
+        errdefer mem_utils.free(alloc, incidents);
 
         const now_ms = io_mod.milliTimestamp();
         if (self.active_started_at_ms == 0) self.active_started_at_ms = now_ms;
@@ -2922,7 +2923,7 @@ fn parseSnapshotFields(alloc: Allocator, value: std.json.Value) !Snapshot {
     }
 
     const models = try alloc.alloc(ModelAggregate, models_value.array.items.len);
-    errdefer alloc.free(models);
+    errdefer mem_utils.free(alloc, models);
     var model_count: usize = 0;
     errdefer for (models[0..model_count]) |*model| model.deinit(alloc);
     for (models_value.array.items, 0..) |model_value, index| {
@@ -2973,7 +2974,7 @@ fn parseSnapshotFields(alloc: Allocator, value: std.json.Value) !Snapshot {
     }
 
     const pending = try alloc.alloc(PendingGeneration, pending_value.array.items.len);
-    errdefer alloc.free(pending);
+    errdefer mem_utils.free(alloc, pending);
     var pending_count: usize = 0;
     errdefer for (pending[0..pending_count]) |*generation| generation.deinit(alloc);
     for (pending_value.array.items, 0..) |pending_entry, index| {
@@ -3003,15 +3004,15 @@ fn parseSnapshotFields(alloc: Allocator, value: std.json.Value) !Snapshot {
         };
         if (team_value != .null and team_value != .string) return error.InvalidUsageSnapshot;
         const id = try alloc.dupe(u8, id_value.string);
-        errdefer alloc.free(id);
+        errdefer mem_utils.free(alloc, id);
         const origin = try alloc.dupe(u8, origin_value.string);
-        errdefer alloc.free(origin);
+        errdefer mem_utils.free(alloc, origin);
         const team = switch (team_value) {
             .null => null,
             .string => |text| try alloc.dupe(u8, text),
             else => unreachable,
         };
-        errdefer if (team) |text| alloc.free(text);
+        errdefer if (team) |text| mem_utils.free(alloc, text);
         const provider = if (provider_scoped) provider: {
             const field = pending_entry.object.get("provider") orelse return error.InvalidUsageSnapshot;
             if (field != .string) return error.InvalidUsageSnapshot;
@@ -3029,7 +3030,7 @@ fn parseSnapshotFields(alloc: Allocator, value: std.json.Value) !Snapshot {
             try parseOptionalOwnedString(alloc, pending_entry.object.get("account_id"))
         else
             null;
-        errdefer if (account_id) |text| alloc.free(text);
+        errdefer if (account_id) |text| mem_utils.free(alloc, text);
         pending[index] = .{
             .id = id,
             .sequence = sequence,
@@ -3058,7 +3059,7 @@ fn parseSnapshotFields(alloc: Allocator, value: std.json.Value) !Snapshot {
             usage_report.GenerationFact,
             backlog_value.array.items.len,
         );
-        errdefer alloc.free(backlog);
+        errdefer mem_utils.free(alloc, backlog);
         var backlog_count: usize = 0;
         errdefer for (backlog[0..backlog_count]) |*fact| fact.deinit(alloc);
         for (backlog_value.array.items, 0..) |fact_value, index| {
@@ -3092,7 +3093,7 @@ fn parseSnapshotFields(alloc: Allocator, value: std.json.Value) !Snapshot {
             usage_report.Incident,
             incidents_value.array.items.len,
         );
-        errdefer alloc.free(owned_incidents);
+        errdefer mem_utils.free(alloc, owned_incidents);
         for (incidents_value.array.items, 0..) |incident_value, index| {
             if (incident_value != .object or incident_value.object.count() != 2) {
                 return error.InvalidUsageSnapshot;
@@ -3113,7 +3114,7 @@ fn parseSnapshotFields(alloc: Allocator, value: std.json.Value) !Snapshot {
         }
         break :blk owned_incidents;
     };
-    errdefer if (incidents.len > 0) alloc.free(incidents);
+    errdefer if (incidents.len > 0) mem_utils.free(alloc, incidents);
 
     const snapshot = Snapshot{
         .billing = billing,
@@ -3420,7 +3421,7 @@ fn addOptionalCounter(first: ?u64, second: ?u64) error{UsageOverflow}!?u64 {
 
 pub fn dupeSnapshotOwned(alloc: Allocator, source: Snapshot) !Snapshot {
     const models = try alloc.alloc(ModelAggregate, source.models.len);
-    errdefer alloc.free(models);
+    errdefer mem_utils.free(alloc, models);
     var copied_models: usize = 0;
     errdefer for (models[0..copied_models]) |*model| model.deinit(alloc);
     for (source.models, 0..) |model, index| {
@@ -3429,7 +3430,7 @@ pub fn dupeSnapshotOwned(alloc: Allocator, source: Snapshot) !Snapshot {
     }
 
     const pending = try alloc.alloc(PendingGeneration, source.pending.len);
-    errdefer alloc.free(pending);
+    errdefer mem_utils.free(alloc, pending);
     var copied_pending: usize = 0;
     errdefer for (pending[0..copied_pending]) |*generation| generation.deinit(alloc);
     for (source.pending, 0..) |generation, index| {
@@ -3441,7 +3442,7 @@ pub fn dupeSnapshotOwned(alloc: Allocator, source: Snapshot) !Snapshot {
         usage_report.GenerationFact,
         source.publication_backlog.len,
     );
-    errdefer alloc.free(publication_backlog);
+    errdefer mem_utils.free(alloc, publication_backlog);
     var copied_publications: usize = 0;
     errdefer for (publication_backlog[0..copied_publications]) |*fact| {
         fact.deinit(alloc);
@@ -3452,7 +3453,7 @@ pub fn dupeSnapshotOwned(alloc: Allocator, source: Snapshot) !Snapshot {
     }
 
     const incidents = try alloc.dupe(usage_report.Incident, source.incidents);
-    errdefer alloc.free(incidents);
+    errdefer mem_utils.free(alloc, incidents);
 
     return .{
         .billing = source.billing,
@@ -5001,7 +5002,7 @@ const TestGenerationUsageProvider = struct {
         return switch (self.outcome) {
             .found => blk: {
                 const id = try alloc.dupe(u8, input.generation_id);
-                errdefer alloc.free(id);
+                errdefer mem_utils.free(alloc, id);
                 const model = try alloc.dupe(u8, "provider/model");
                 break :blk .{ .found = .{
                     .id = id,
