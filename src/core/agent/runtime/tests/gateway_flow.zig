@@ -3465,6 +3465,73 @@ test "image context overflow keeps one recovery and preserves the current image"
     }
 }
 
+test "retained tool images stay out of the measured text estimate" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(result_dir);
+
+    // A payload that dominates the request body makes the text-vs-image
+    // pricing gap unambiguous.
+    const payload = "AAAA" ** 4096;
+    const tool_images = [_]types.ToolImage{.{ .data = @constCast(payload), .mime_type = @constCast("image/png") }};
+    const model = "provider/tool-image-measurement";
+    const calls = [_]ToolCall{toolCall("call-1", "read_file", "{\"path\":\"a.png\"}")};
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .tool_calls = &calls },
+        .{ .content = "done" },
+    });
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.available_capability_overrides = &.{.{ .model = model, .capabilities = .{
+        .context_window = 1_000_000,
+        .image_input_support = .native,
+        .supports_vision = true,
+        .supports_file_input = true,
+    } }};
+    hooks.capability_overrides = hooks.available_capability_overrides;
+    hooks.permission_decisions = &.{.once};
+    hooks.exec_plans = &.{.{ .result = .{
+        .model_output = "captured image",
+        .tool_result_memory = .{ .tool_images = &tool_images },
+    } }};
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.tool_result_dir = result_dir;
+    var job = fixture.job();
+    job.model = @constCast(model);
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    const body = gateway.request_bodies.items[1];
+    // Sanity: the real serializer really embedded the payload.
+    try std.testing.expect(std.mem.find(u8, body, payload[0..64]) != null);
+
+    const measurement_request = agent_stream_provider.RequestData{
+        .model = model,
+        .messages = &.{.{ .role = .tool, .content = "captured image", .tool_result_memory = .{ .tool_images = &tool_images } }},
+        .tool_choice = .none,
+        .provider_options = .{},
+    };
+    const measured = try prompt_context.measureProviderRequest(alloc, body, measurement_request);
+    try std.testing.expect(measured.image_identity != null);
+
+    var raw_estimator = token_estimate.StreamingEstimator{};
+    raw_estimator.consume(body);
+    const raw_text_tokens: usize = @intCast(@min(raw_estimator.estimate(), std.math.maxInt(usize)));
+    // The payload dominates the body, so the image-aware estimate is a small
+    // fraction of the raw text estimate.
+    try std.testing.expect(measured.estimated_input_tokens * 4 < raw_text_tokens);
+
+    // Without the tool-image signal the same body is priced as pure text: the
+    // phantom estimate that drove premature compaction.
+    const blind_request = agent_stream_provider.RequestData{ .model = model, .messages = &.{}, .tool_choice = .none, .provider_options = .{} };
+    const blind = try prompt_context.measureProviderRequest(alloc, body, blind_request);
+    try std.testing.expectEqual(raw_text_tokens, blind.estimated_input_tokens);
+}
+
 test "cancelled automatic compaction is retried by the next prompt" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

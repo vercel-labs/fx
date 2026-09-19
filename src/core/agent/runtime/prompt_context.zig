@@ -282,7 +282,9 @@ const MessageContent = struct {
 
 const CostMessage = struct {
     role: []const u8 = "",
+    type: []const u8 = "",
     content: MessageContent = .{},
+    output: MessageContent = .{},
 };
 
 const CostRequest = struct {
@@ -297,7 +299,13 @@ pub const MeasurementError = error{ OutOfMemory, InvalidRequestMeasurement };
 pub fn measureProviderRequest(alloc: Allocator, body: []const u8, request: stream_provider.RequestData) MeasurementError!RequestCost {
     const has_images = image_input: {
         if (request.verified_images) |images| if (images.len != 0) break :image_input true;
-        for (request.messages) |message| if (message.images.len != 0) break :image_input true;
+        for (request.messages) |message| {
+            if (message.images.len != 0) break :image_input true;
+            // Retained tool images serialize as follow-up user-message file
+            // parts, so they never appear in message.images. Count them as
+            // image input or their base64 payloads are priced as text.
+            if (message.tool_result_memory) |memory| if (memory.tool_images.len != 0) break :image_input true;
+        }
         break :image_input false;
     };
     if (!has_images) {
@@ -315,14 +323,29 @@ pub fn measureProviderRequest(alloc: Allocator, body: []const u8, request: strea
     };
     defer parsed.deinit();
     if (parsed.value.prompt != null and parsed.value.input != null) return error.InvalidRequestMeasurement;
-    const messages = parsed.value.prompt orelse parsed.value.input orelse return error.InvalidRequestMeasurement;
+    const messages = parsed.value.prompt orelse parsed.value.input orelse {
+        // Unrecognized envelope (e.g. chat-completions "messages" bodies):
+        // degrade to the conservative text estimate rather than fail the
+        // request over a shape this measurer does not know.
+        const tokens = textTokens(body);
+        return .{ .serialized_bytes = body.len, .text_tokens = tokens, .estimated_input_tokens = tokens };
+    };
     var estimator = token_estimate.StreamingEstimator{};
     var identity = std.crypto.hash.sha2.Sha256.init(.{});
     var cursor: usize = 0;
     var found_image = false;
     for (messages) |message| {
-        if (!std.mem.eql(u8, message.role, "user")) continue;
-        for (message.content.parts) |part| {
+        // Retained tool images never land in user-message content on
+        // input-style bodies: the responses protocol writes them as
+        // input_image parts inside function_call_output items, which carry no
+        // role. Scan both carriers.
+        const parts = if (std.mem.eql(u8, message.role, "user"))
+            message.content.parts
+        else if (parsed.value.input != null and std.mem.eql(u8, message.type, "function_call_output"))
+            message.output.parts
+        else
+            continue;
+        for (parts) |part| {
             const payload = if (parsed.value.input != null and std.mem.eql(u8, part.type, "input_image"))
                 part.image_url orelse return error.InvalidRequestMeasurement
             else if (parsed.value.prompt != null and std.mem.eql(u8, part.type, "file") and
@@ -713,6 +736,65 @@ test "provider request image accounting preserves text and tool payloads" {
     const non_image = try measureProviderRequest(std.testing.allocator, file_text, measurement_test_request(true));
     try std.testing.expectEqual(textTokens(file_text), non_image.text_tokens);
     try std.testing.expectEqual(@as(?[32]u8, null), non_image.image_identity);
+}
+
+test "provider request measurement prices retained tool images as image input" {
+    const body =
+        \\{"prompt":[{"role":"tool","content":[{"type":"tool-result","toolCallId":"call_1","output":{"type":"content","value":[{"type":"text","text":"capture"}]}}]},{"role":"user","content":[{"type":"text","text":"Attached image(s) from the tool result."},{"type":"file","mediaType":"image/png","data":{"type":"data","data":"AAAABBBBCCCCDDDD"}}]}]}
+    ;
+    var request = measurement_test_request(false);
+    request.messages = &.{.{
+        .role = .tool,
+        .content = "capture",
+        .tool_result_memory = .{
+            .tool_images = &.{.{ .data = @constCast("AAAABBBBCCCCDDDD"), .mime_type = @constCast("image/png") }},
+        },
+    }};
+    const measured = try measureProviderRequest(std.testing.allocator, body, request);
+    try std.testing.expect(measured.image_identity != null);
+    const without_image_payload =
+        \\{"prompt":[{"role":"tool","content":[{"type":"tool-result","toolCallId":"call_1","output":{"type":"content","value":[{"type":"text","text":"capture"}]}}]},{"role":"user","content":[{"type":"text","text":"Attached image(s) from the tool result."},{"type":"file","mediaType":"image/png","data":{"type":"data","data":""}}]}]}
+    ;
+    try std.testing.expectEqual(textTokens(without_image_payload), measured.text_tokens);
+
+    // Tool images must not be priced as text: their encoded payload inflates
+    // the estimate by roughly bytes/4 phantom tokens.
+    const text_only = try measureProviderRequest(std.testing.allocator, body, measurement_test_request(false));
+    try std.testing.expect(text_only.estimated_input_tokens > measured.estimated_input_tokens);
+}
+
+test "provider request measurement excludes responses-protocol tool image payloads" {
+    // The responses protocol writes retained tool images as input_image parts
+    // inside function_call_output items, which carry no role.
+    const body =
+        \\{"input":[{"type":"function_call_output","call_id":"call_1","output":[{"type":"input_text","text":"capture"},{"type":"input_image","image_url":"data:image/png;base64,AAAABBBBCCCCDDDD"}]},{"role":"user","content":[{"type":"input_text","text":"next"}]}]}
+    ;
+    var request = measurement_test_request(false);
+    request.messages = &.{.{
+        .role = .tool,
+        .content = "capture",
+        .tool_result_memory = .{
+            .tool_images = &.{.{ .data = @constCast("AAAABBBBCCCCDDDD"), .mime_type = @constCast("image/png") }},
+        },
+    }};
+    const measured = try measureProviderRequest(std.testing.allocator, body, request);
+    try std.testing.expect(measured.image_identity != null);
+    const without_image_payload =
+        \\{"input":[{"type":"function_call_output","call_id":"call_1","output":[{"type":"input_text","text":"capture"},{"type":"input_image","image_url":""}]},{"role":"user","content":[{"type":"input_text","text":"next"}]}]}
+    ;
+    try std.testing.expectEqual(textTokens(without_image_payload), measured.text_tokens);
+}
+
+test "provider request measurement degrades to text estimate on unknown envelopes" {
+    // Chat-completions bodies carry a "messages" array this measurer does not
+    // parse. An image-bearing request must degrade to the conservative text
+    // estimate, never fail the request.
+    const body =
+        \\{"model":"fixture/model","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]}
+    ;
+    const measured = try measureProviderRequest(std.testing.allocator, body, measurement_test_request(true));
+    try std.testing.expectEqual(textTokens(body), measured.estimated_input_tokens);
+    try std.testing.expectEqual(@as(?[32]u8, null), measured.image_identity);
 }
 
 test "provider request image calibration uses exact usage plus text growth without compounding" {
