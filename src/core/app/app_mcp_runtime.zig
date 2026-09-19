@@ -953,6 +953,9 @@ pub const State = struct {
     menu_feedback: ?[]u8 = null,
     menu_add_form: MenuAddForm = .{},
     menu_argument_form: MenuArgumentForm = .{},
+    /// Main-thread only, like the menu fields: a startup summary notice is
+    /// owed once discovery settles with servers that need attention.
+    startup_health_notice_pending: bool = false,
     model_catalog_baseline_lock: std.Io.Mutex = .init,
     /// Server availability as of the previous model-catalog report, used to
     /// surface mid-session changes (authentication, reload, recovery) to the
@@ -1710,6 +1713,30 @@ pub const State = struct {
         var lease = self.acquire() orelse return;
         defer lease.deinit();
         lease.runtime.startDiscovery(registry);
+        // Main-thread only, like the menu fields: post one summary notice once
+        // startup discovery settles with servers that need attention.
+        self.startup_health_notice_pending = true;
+    }
+
+    /// Returns the one-shot startup summary notice once discovery has settled
+    /// with servers needing attention. Main-thread only, like the menu fields.
+    pub fn takeStartupHealthNotice(self: *State, alloc: Allocator) !?[]u8 {
+        if (!self.startup_health_notice_pending) return null;
+        var lease = self.acquire() orelse {
+            debug_trace.logf(
+                "mcp",
+                "dropping startup health notice: runtime unavailable",
+                .{},
+            );
+            self.startup_health_notice_pending = false;
+            return null;
+        };
+        defer lease.deinit();
+        if (lease.runtime.isDiscovering()) return null;
+        self.startup_health_notice_pending = false;
+        var snapshot = try lease.runtime.snapshotHealth(alloc, @intCast(@max(io_mod.milliTimestamp(), 0)));
+        defer snapshot.deinit(alloc);
+        return try mcp_health.renderStartupNotice(alloc, snapshot);
     }
 
     pub fn acquire(self: *State) ?Lease {
@@ -3344,4 +3371,31 @@ test "model catalog baseline reports removals" {
     defer if (removed) |notice| alloc.free(notice);
     try std.testing.expect(removed != null);
     try std.testing.expect(std.mem.find(u8, removed.?, "slack: removed") != null);
+}
+
+test "startup health notice is held during discovery and consumed once" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    const runtime = try alloc.create(mcp_runtime.McpRuntime);
+    runtime.* = mcp_runtime.McpRuntime.init(alloc);
+    state.installInitial(runtime);
+    defer state.deinit(alloc);
+
+    try std.testing.expect(!state.startup_health_notice_pending);
+    try std.testing.expectEqual(@as(?[]u8, null), try state.takeStartupHealthNotice(alloc));
+
+    state.startDiscovery(.{});
+    try std.testing.expect(state.startup_health_notice_pending);
+
+    // Zero configured servers settle quickly; until then the notice is held.
+    const deadline = io_mod.milliTimestamp() + 5_000;
+    var notice: ?[]u8 = null;
+    while (io_mod.milliTimestamp() < deadline) {
+        notice = try state.takeStartupHealthNotice(alloc);
+        if (!state.startup_health_notice_pending) break;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expect(!state.startup_health_notice_pending);
+    try std.testing.expectEqual(@as(?[]u8, null), notice);
+    try std.testing.expectEqual(@as(?[]u8, null), try state.takeStartupHealthNotice(alloc));
 }

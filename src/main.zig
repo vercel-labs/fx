@@ -1707,6 +1707,10 @@ const App = struct {
         return self.mcp.takeReloadCompletion();
     }
 
+    pub fn takeMcpStartupHealthNotice(self: *App) !?[]u8 {
+        return self.mcp.takeStartupHealthNotice(self.alloc);
+    }
+
     pub fn mcpReloadCompletionOrigin(self: *const App) app_mcp_runtime.PresentationOrigin {
         return self.mcp.reloadCompletionOrigin();
     }
@@ -2976,6 +2980,7 @@ const App = struct {
         }
         try app_commands.Handlers(App).collectMcpAuthenticationFacts(self);
         try app_commands.Handlers(App).collectMcpReloadFacts(self);
+        try app_commands.Handlers(App).collectMcpStartupHealthFacts(self);
         if (try self.mcp.refreshMenuHealth(self.alloc, @intCast(@max(io_mod.milliTimestamp(), 0)))) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }

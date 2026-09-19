@@ -394,6 +394,13 @@ pub fn Handlers(comptime App: type) type {
             };
         }
 
+        pub fn collectMcpStartupHealthFacts(app: *App) !void {
+            if (comptime !@hasDecl(App, "takeMcpStartupHealthNotice")) return;
+            const notice = (try app.takeMcpStartupHealthNotice()) orelse return;
+            defer app.alloc.free(notice);
+            try app.writeDomainNotice(.{ .topic = "mcp", .tone = .warning, .body = notice }, true);
+        }
+
         pub fn collectMcpReloadFacts(app: *App) !void {
             if (comptime !@hasDecl(App, "takeMcpReloadCompletion")) return;
             var completion = (try app.takeMcpReloadCompletion()) orelse return;

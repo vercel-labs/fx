@@ -432,6 +432,51 @@ fn writeOptionalCount(writer: *std.Io.Writer, count: ?usize) !void {
     if (count) |value| try writer.print("{d}", .{value}) else try writer.writeAll("unknown");
 }
 
+/// One-line startup notice naming servers that need attention once discovery
+/// settles, or null when nothing needs the user. Derived from the same
+/// classification as every other surface.
+pub fn renderStartupNotice(alloc: Allocator, snapshot: Snapshot) !?[]u8 {
+    var needs_auth: usize = 0;
+    var failed: usize = 0;
+    var first_auth: ?[]const u8 = null;
+    for (snapshot.servers) |server| {
+        switch (classify(server.connection, server.authentication, false)) {
+            .needs_auth => {
+                needs_auth += 1;
+                if (first_auth == null) first_auth = server.configured_name;
+            },
+            .failed => failed += 1,
+            .disabled, .connecting, .ready, .unavailable, .on_demand => {},
+        }
+    }
+    if (needs_auth == 0 and failed == 0) return null;
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.print("MCP startup: {d} server{s} need{s} attention", .{
+        needs_auth + failed,
+        if (needs_auth + failed == 1) "" else "s",
+        if (needs_auth + failed == 1) "s" else "",
+    });
+    if (needs_auth > 0) {
+        try out.writer.print(", {d} need{s} authentication", .{
+            needs_auth,
+            if (needs_auth == 1) "s" else "",
+        });
+    }
+    if (failed > 0) {
+        try out.writer.print(", {d} failed", .{failed});
+    }
+    try out.writer.writeByte('.');
+    if (first_auth) |name| {
+        var encoded = try text_utils.encodeTerminalSafe(alloc, name, 128);
+        defer encoded.deinit(alloc);
+        try out.writer.print(" Run /mcp auth {s} --open.", .{encoded.bytes});
+    }
+    try out.writer.writeAll(" Use /mcp list for details.");
+    return try out.toOwnedSlice();
+}
+
 test "required health blocks while optional health degrades" {
     var snapshots = [_]ServerSnapshot{emptyServerSnapshot()};
     snapshots[0].connection = .failed;
@@ -707,4 +752,36 @@ test "render prints the classified status next to the raw axes" {
     try std.testing.expect(std.mem.find(u8, output, "state=failed") != null);
     try std.testing.expect(std.mem.find(u8, output, "auth=required") != null);
     try std.testing.expect(std.mem.find(u8, output, "status=needs_auth") != null);
+}
+
+test "renderStartupNotice names needs-auth servers and stays quiet when healthy" {
+    const alloc = std.testing.allocator;
+    var healthy = emptyServerSnapshot();
+    healthy.connection = .ready;
+    var healthy_servers = [_]ServerSnapshot{healthy};
+    const quiet = try renderStartupNotice(alloc, .{ .captured_at_ms = 0, .servers = &healthy_servers });
+    try std.testing.expectEqual(@as(?[]u8, null), quiet);
+
+    var auth = emptyServerSnapshot();
+    auth.configured_name = @constCast("linear");
+    auth.connection = .failed;
+    auth.authentication = .required;
+    var broken = emptyServerSnapshot();
+    broken.configured_name = @constCast("down");
+    broken.connection = .failed;
+    var servers = [_]ServerSnapshot{ auth, broken };
+    const notice = (try renderStartupNotice(alloc, .{ .captured_at_ms = 0, .servers = &servers })).?;
+    defer alloc.free(notice);
+    try std.testing.expectEqualStrings(
+        "MCP startup: 2 servers need attention, 1 needs authentication, 1 failed. Run /mcp auth linear --open. Use /mcp list for details.",
+        notice,
+    );
+
+    var single_servers = [_]ServerSnapshot{broken};
+    const single = (try renderStartupNotice(alloc, .{ .captured_at_ms = 0, .servers = &single_servers })).?;
+    defer alloc.free(single);
+    try std.testing.expectEqualStrings(
+        "MCP startup: 1 server needs attention, 1 failed. Use /mcp list for details.",
+        single,
+    );
 }
