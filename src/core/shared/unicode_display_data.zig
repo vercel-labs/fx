@@ -251,6 +251,20 @@ pub const emoji_modifier_ranges = [_]Range{
     .{ .first = 0x1F3FB, .last = 0x1F3FF },
 };
 
+// Combining marks that terminals composite onto the preceding cell without
+// advancing the cursor. Currently covers the Thai block subset of general
+// categories Mn/Me: U+0E31, U+0E34-U+0E3A, U+0E47-U+0E4E. Spacing Thai
+// characters (consonants, lead vowels, and U+0E33 SARA AM) are intentionally
+// excluded because they occupy a cell. Intended to grow toward the full Mn/Me
+// set, script by script, each addition verified against the terminal
+// composition behavior. Sourced from:
+// https://www.unicode.org/Public/17.0.0/ucd/extracted/DerivedGeneralCategory.txt
+pub const combining_ranges = [_]Range{
+    .{ .first = 0x0E31, .last = 0x0E31 },
+    .{ .first = 0x0E34, .last = 0x0E3A },
+    .{ .first = 0x0E47, .last = 0x0E4E },
+};
+
 pub const variation_bases = [_]Range{
     .{ .first = 0x0023, .last = 0x0023 },
     .{ .first = 0x002A, .last = 0x002A },
