@@ -4167,10 +4167,19 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
         try out.writer.writeAll("}");
     }
     try out.writer.writeAll("],\"usage\":");
-    try std.json.Stringify.value(.{
-        .input_tokens = result.usage.input_tokens,
-        .output_tokens = result.usage.output_tokens,
-    }, .{}, &out.writer);
+    if (result.usage.cache_read_tokens == null and result.usage.cache_write_tokens == null) {
+        try std.json.Stringify.value(.{
+            .input_tokens = result.usage.input_tokens,
+            .output_tokens = result.usage.output_tokens,
+        }, .{}, &out.writer);
+    } else {
+        try std.json.Stringify.value(.{
+            .input_tokens = result.usage.input_tokens,
+            .output_tokens = result.usage.output_tokens,
+            .cache_read_tokens = result.usage.cache_read_tokens,
+            .cache_write_tokens = result.usage.cache_write_tokens,
+        }, .{}, &out.writer);
+    }
     if (result.error_code) |error_code| {
         try out.writer.writeAll(",\"error\":");
         try std.json.Stringify.value(error_code, .{}, &out.writer);

@@ -3276,18 +3276,20 @@ fn parseSseUsage(root: std.json.Value) types.Usage {
     const usage_value = root.object.get("usage") orelse return .{};
     if (usage_value != .object) return .{};
     return .{
-        .input_tokens = parseSseTokenTotal(usage_value, "inputTokens"),
-        .output_tokens = parseSseTokenTotal(usage_value, "outputTokens"),
+        .input_tokens = parseSseTokenField(usage_value, "inputTokens", "total"),
+        .output_tokens = parseSseTokenField(usage_value, "outputTokens", "total"),
+        .cache_read_tokens = parseSseTokenField(usage_value, "inputTokens", "cacheRead"),
+        .cache_write_tokens = parseSseTokenField(usage_value, "inputTokens", "cacheWrite"),
     };
 }
 
-fn parseSseTokenTotal(usage_value: std.json.Value, key: []const u8) ?u64 {
+fn parseSseTokenField(usage_value: std.json.Value, section_key: []const u8, field_key: []const u8) ?u64 {
     if (usage_value != .object) return null;
-    const token_value = usage_value.object.get(key) orelse return null;
-    if (token_value != .object) return null;
-    const total_value = token_value.object.get("total") orelse return null;
-    if (total_value != .integer or total_value.integer < 0) return null;
-    return @intCast(total_value.integer);
+    const section_value = usage_value.object.get(section_key) orelse return null;
+    if (section_value != .object) return null;
+    const field_value = section_value.object.get(field_key) orelse return null;
+    if (field_value != .integer or field_value.integer < 0) return null;
+    return @intCast(field_value.integer);
 }
 
 const SseBillingParseError = std.mem.Allocator.Error || error{InvalidSseBilling};
@@ -4288,6 +4290,47 @@ test "consumeSseStream ignores malformed finish usage totals" {
     try std.testing.expectEqual(types.ProviderFinishReason.stop, completion.finish_reason.?);
     try std.testing.expect(completion.usage.input_tokens == null);
     try std.testing.expect(completion.usage.output_tokens == null);
+}
+
+test "consumeSseStream captures prompt cache usage fields" {
+    const payload =
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"usage\":{\"inputTokens\":{\"total\":29648,\"noCache\":592,\"cacheRead\":29056,\"cacheWrite\":0},\"outputTokens\":{\"total\":97}}}\n" ++
+        "\n";
+
+    var reader = std.Io.Reader.fixed(payload);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+
+    var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
+    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+
+    try std.testing.expectEqual(@as(?u64, 29648), completion.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 97), completion.usage.output_tokens);
+    try std.testing.expectEqual(@as(?u64, 29056), completion.usage.cache_read_tokens);
+    try std.testing.expectEqual(@as(?u64, 0), completion.usage.cache_write_tokens);
+}
+
+test "consumeSseStream leaves cache usage unset when the provider omits it" {
+    const payload =
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"usage\":{\"inputTokens\":{\"total\":21},\"outputTokens\":{\"total\":8}}}\n" ++
+        "\n";
+
+    var reader = std.Io.Reader.fixed(payload);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+
+    var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
+    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+
+    try std.testing.expectEqual(@as(?u64, 21), completion.usage.input_tokens);
+    try std.testing.expect(completion.usage.cache_read_tokens == null);
+    try std.testing.expect(completion.usage.cache_write_tokens == null);
 }
 
 test "consumeSseStream preserves provider error detail" {

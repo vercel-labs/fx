@@ -58,7 +58,7 @@ pub const top_level_specs = [_]TopLevelSpec{
             "The prompt may be passed as arguments or piped on stdin when no prompt args are given.",
             "TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw assistant Markdown.",
             "Operational progress and diagnostics are written to stderr. JSON `output` keeps accumulated assistant Markdown; `final_output` contains only the completed final response, or an empty string when absent.",
-            "JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. Nested usage and dollar spend are excluded.",
+            "JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. Prompt cache_read_tokens and cache_write_tokens appear when the provider reports them. Nested usage and dollar spend are excluded.",
             "--system replaces only the built-in base prompt for this request; tool, skill, project, and runtime context still apply.",
             "With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.",
         },

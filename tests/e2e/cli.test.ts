@@ -412,7 +412,7 @@ Options:
 The prompt may be passed as arguments or piped on stdin when no prompt args are given.
 TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw assistant Markdown.
 Operational progress and diagnostics are written to stderr. JSON \`output\` keeps accumulated assistant Markdown; \`final_output\` contains only the completed final response, or an empty string when absent.
-JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. Nested usage and dollar spend are excluded.
+JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. Prompt cache_read_tokens and cache_write_tokens appear when the provider reports them. Nested usage and dollar spend are excluded.
 --system replaces only the built-in base prompt for this request; tool, skill, project, and runtime context still apply.
 With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.
 `;
@@ -4250,6 +4250,36 @@ describe("cli: ask success", () => {
       name: "reports exact provider totals",
       reportedUsage: { inputTokens: { total: 17 }, outputTokens: { total: 23 } },
       expectedUsage: { input_tokens: 17, output_tokens: 23 },
+      toolLoop: false,
+      json: true,
+    },
+    {
+      name: "reports prompt cache totals when the provider returns them",
+      reportedUsage: {
+        inputTokens: { total: 29648, noCache: 592, cacheRead: 29056, cacheWrite: 0 },
+        outputTokens: { total: 97 },
+      },
+      expectedUsage: {
+        input_tokens: 29648,
+        output_tokens: 97,
+        cache_read_tokens: 29056,
+        cache_write_tokens: 0,
+      },
+      toolLoop: false,
+      json: true,
+    },
+    {
+      name: "emits the unreported cache count as null when only reads are returned",
+      reportedUsage: {
+        inputTokens: { total: 29648, noCache: 592, cacheRead: 29056 },
+        outputTokens: { total: 97 },
+      },
+      expectedUsage: {
+        input_tokens: 29648,
+        output_tokens: 97,
+        cache_read_tokens: 29056,
+        cache_write_tokens: null,
+      },
       toolLoop: false,
       json: true,
     },
