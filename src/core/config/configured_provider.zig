@@ -28,7 +28,7 @@ pub const ParseError = Allocator.Error || error{
     InvalidModelMetadata,
 };
 
-pub const Protocol = enum { @"openai-chat-completions" };
+pub const Protocol = enum { @"openai-chat-completions", @"openai-responses" };
 pub const ToolChoiceMode = enum { omit, send };
 
 /// Describes a credential slot, never a credential value. Resolution belongs at
@@ -60,6 +60,13 @@ pub const Definition = struct {
     /// Caller owns the returned URL. base_url is already a validated API prefix.
     pub fn chat_url(self: Definition, alloc: Allocator) Allocator.Error![]u8 {
         return std.mem.concat(alloc, u8, &.{ self.base_url, "/chat/completions" });
+    }
+
+    /// Caller owns the returned URL. base_url is already a validated API prefix.
+    /// Only meaningful for the openai-responses protocol; chat-completions
+    /// definitions must keep using chat_url.
+    pub fn responses_url(self: Definition, alloc: Allocator) Allocator.Error![]u8 {
+        return std.mem.concat(alloc, u8, &.{ self.base_url, "/responses" });
     }
 
     /// Borrowed metadata; absence and unspecified fields remain unknown.
@@ -165,7 +172,13 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
     try validate_id(id);
     try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata" });
     const protocol = try required(value, "protocol");
-    if (protocol != .string or !std.mem.eql(u8, protocol.string, "openai-chat-completions")) return error.InvalidProtocol;
+    if (protocol != .string) return error.InvalidProtocol;
+    const parsed_protocol: Protocol = if (std.mem.eql(u8, protocol.string, "openai-chat-completions"))
+        .@"openai-chat-completions"
+    else if (std.mem.eql(u8, protocol.string, "openai-responses"))
+        .@"openai-responses"
+    else
+        return error.InvalidProtocol;
     const url = try required(value, "base_url");
     if (url != .string) return error.InvalidBaseUrl;
     const normalized = try validate_url(url.string);
@@ -198,7 +211,7 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
     errdefer if (owned_reviewer) |model_id| alloc.free(model_id);
     return .{
         .id = owned_id,
-        .protocol = .@"openai-chat-completions",
+        .protocol = parsed_protocol,
         .base_url = owned_url,
         .auth = owned_auth,
         .tool_choice_mode = mode,
@@ -474,6 +487,24 @@ test "configured provider allocation failures release partial registry and URLs"
 }
 
 const test_required_fields = "\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com/v1\",\"auth\":{\"type\":\"none\"}";
+
+test "configured provider parses the responses protocol with its own endpoint" {
+    const alloc = std.testing.allocator;
+    var registry = try Registry.parse_json(alloc,
+        \\{"spark":{"protocol":"openai-responses","base_url":"https://api.meta.ai/v1/","auth":{"type":"bearer","env":"MODEL_API_KEY"}}}
+    );
+    defer registry.deinit(alloc);
+    const definition = registry.get("spark").?;
+    try std.testing.expect(definition.protocol == .@"openai-responses");
+    const url = try definition.responses_url(alloc);
+    defer alloc.free(url);
+    try std.testing.expectEqualStrings("https://api.meta.ai/v1/responses", url);
+    var chat_registry = try Registry.parse_json(alloc,
+        \\{"spark":{"protocol":"openai-chat-completions","base_url":"https://api.meta.ai/v1/","auth":{"type":"bearer","env":"MODEL_API_KEY"}}}
+    );
+    defer chat_registry.deinit(alloc);
+    try std.testing.expect(!std.mem.eql(u8, &definition.binding_identity(), &chat_registry.get("spark").?.binding_identity()));
+}
 
 test "configured provider invalid schemas fail explicitly" {
     const cases = [_]struct { json: []const u8, err: ParseError }{

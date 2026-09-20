@@ -69,6 +69,29 @@ fx provider local
 FX_PROVIDER=openrouter FX_MODEL=openai/gpt-4.1 fx ask "review this change"
 ```
 
+Endpoints that speak the OpenAI Responses API (for example Meta's Model API at `https://api.meta.ai/v1`, which serves Muse Spark) use `"protocol": "openai-responses"` instead. The Responses protocol keeps the model's encrypted reasoning across turns, which Chat Completions does not:
+
+```jsonc
+// ~/.fx/settings.json
+{
+  "providers": {
+    "meta": {
+      "protocol": "openai-responses",
+      "base_url": "https://api.meta.ai/v1",
+      "auth": { "type": "bearer", "env": "MODEL_API_KEY" },
+      "model_metadata": {
+        "muse-spark-1.3": { "context_window": 1048576, "max_output_tokens": 131072, "supports_tool_use": true, "supports_vision": true }
+      }
+    }
+  },
+  "models": { "meta": "muse-spark-1.3" }
+}
+```
+
+```bash
+MODEL_API_KEY='<your-model-api-key>' fx provider meta
+```
+
 See [Custom model connections](https://fx.sh/docs/configure-fx/custom-model-connections) for connection JSON, model metadata, and behavior details.
 
 ## Gateway provider routing

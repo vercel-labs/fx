@@ -3,6 +3,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { completion, toolCompletion, createConfiguredProviderFixture as fixture } from "./fixtures/chat-completions";
+import { responsesCompletion, responsesToolCall, createResponsesProviderFixture as responsesFixture } from "./fixtures/responses";
 import { stripTrailingRuntimeOverlay as withoutTailOverlay } from "./conditional-guidance-oracle";
 
 async function withReasoning(response: Response, ...deltas: Record<string, unknown>[]) {
@@ -127,8 +128,34 @@ describe("configured providers", () => {
     } finally { f.close(); }
   }, 25000);
 
-  test("terminal usage may repeat an empty matching finished choice", async () => {
-    const f = fixture(async body => {
+  test("responses protocol posts to /responses and replays encrypted reasoning", async () => {
+    let calls = 0;
+    const f = responsesFixture(body => {
+      calls++;
+      if (calls === 1) return responsesToolCall(body.model, "read_file", { path: "note.txt" });
+      return responsesCompletion(body.model, "read complete");
+    });
+    try {
+      writeFileSync(join(f.workspace, "note.txt"), "fixture contents");
+      const result = await runFx(["ask", "--json", "--no-save", "Read note.txt"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (result.code !== 0) throw new Error(`fx ask failed: ${result.stdout} ${result.stderr}; paths=${f.requests.map(r => r.path).join(",")}`);
+      expect(JSON.parse(result.stdout).output).toBe("read complete");
+      expect(f.requests).toHaveLength(2);
+      expect(f.requests.every(request => request.path === "/v1/responses")).toBe(true);
+      expect(f.requests.every(request => request.authorization === "Bearer meta-test-key")).toBe(true);
+      const first = f.requests[0].body;
+      expect(first.model).toBe("muse-spark-1.3");
+      expect(first.store).toBe(false);
+      expect(first.stream).toBe(true);
+      expect(first.include).toEqual(["reasoning.encrypted_content"]);
+      const replayed = JSON.stringify(f.requests[1].body.input);
+      expect(replayed).toContain('"encrypted_content":"opaque-reasoning"');
+      const toolResult = f.requests[1].body.input.find((item: any) => item.type === "function_call_output");
+      expect(toolResult.output).toContain("fixture contents");
+    } finally { f.close(); }
+  }, 25000);
+
+  test("terminal usage may repeat an empty matching finished choice", async () => {    const f = fixture(async body => {
       const response = completion(body.model);
       const wire = (await response.text()).replace('"choices":[]', '"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":"stop"}]');
       return new Response(wire, { headers: response.headers });
