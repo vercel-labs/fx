@@ -69,6 +69,31 @@ fx provider local
 FX_PROVIDER=openrouter FX_MODEL=openai/gpt-4.1 fx ask "review this change"
 ```
 
+Meta's Model API (serving Muse Spark) is OpenAI Chat Completions compatible, so it connects the same way with an API key:
+
+```jsonc
+// ~/.fx/settings.json
+{
+  "providers": {
+    "meta": {
+      "protocol": "openai-chat-completions",
+      "base_url": "https://api.meta.ai/v1",
+      "auth": { "type": "bearer", "env": "MODEL_API_KEY" },
+      "model_metadata": {
+        "muse-spark-1.3": { "context_window": 1048576, "max_output_tokens": 131072, "supports_tool_use": true, "supports_vision": true }
+      }
+    }
+  },
+  "models": { "meta": "muse-spark-1.3" }
+}
+```
+
+```bash
+MODEL_API_KEY='<your-model-api-key>' fx provider meta
+```
+
+Create a key in the [Model API dashboard](https://dev.meta.ai/docs/authentication) and keep it in the environment; it never goes in the config file.
+
 See [Custom model connections](https://fx.sh/docs/configure-fx/custom-model-connections) for connection JSON, model metadata, and behavior details.
 
 ## Gateway provider routing
