@@ -462,27 +462,22 @@ test "event loop distinguishes requested exit from input closure" {
         .commit_frame = rejectUnexpectedEventLoopCommit,
     };
 
-    try std.testing.expectEqual(
-        ExitCause.input_closed,
-        try run(
-            EventLoopClosedTerminal{ .poll_result = .{ .readable = true } },
-            &should_exit,
-            8,
-            callbacks,
-        ),
-    );
-    try std.testing.expect(!should_exit);
-
-    try std.testing.expectEqual(
-        ExitCause.input_closed,
-        try run(
-            EventLoopClosedTerminal{ .poll_result = .{ .hung_up = true } },
-            &should_exit,
-            8,
-            callbacks,
-        ),
-    );
-    try std.testing.expect(!should_exit);
+    for ([_]shell_runtime.PollResult{
+        .{ .readable = true },
+        .{ .hung_up = true },
+        .{ .has_error = true },
+    }) |poll_result| {
+        try std.testing.expectEqual(
+            ExitCause.input_closed,
+            try run(
+                EventLoopClosedTerminal{ .poll_result = poll_result },
+                &should_exit,
+                8,
+                callbacks,
+            ),
+        );
+        try std.testing.expect(!should_exit);
+    }
 }
 
 test "event loop treats a failed final commit after hangup as a clean close" {
