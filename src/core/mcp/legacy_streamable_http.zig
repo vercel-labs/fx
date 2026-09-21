@@ -15,17 +15,19 @@ pub const Version = enum {
     v2025_11_25,
     v2025_06_18,
     v2025_03_26,
+    v2024_11_05,
 
     pub fn string(self: Version) []const u8 {
         return switch (self) {
             .v2025_11_25 => "2025-11-25",
             .v2025_06_18 => "2025-06-18",
             .v2025_03_26 => "2025-03-26",
+            .v2024_11_05 => "2024-11-05",
         };
     }
 
     pub fn sendsProtocolHeader(self: Version) bool {
-        return self != .v2025_03_26;
+        return self != .v2025_03_26 and self != .v2024_11_05;
     }
 
     pub fn allowsPollingClose(self: Version) bool {
@@ -37,6 +39,7 @@ pub const supported_versions = [_]Version{
     .v2025_11_25,
     .v2025_06_18,
     .v2025_03_26,
+    .v2024_11_05,
 };
 pub const preferred_version = supported_versions[0];
 
@@ -1312,11 +1315,21 @@ test "legacy Streamable HTTP initialization selects only committed versions" {
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-06-18\"}}",
         ),
     );
+    // Servers deployed against the original spec revision echo 2024-11-05
+    // in the initialize result; the transport accepts it so the negotiation
+    // ladder can settle on it.
+    try std.testing.expectEqual(
+        Version.v2024_11_05,
+        try initializedVersion(
+            std.testing.allocator,
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\"}}",
+        ),
+    );
     try std.testing.expectError(
         error.McpUnsupportedProtocolVersion,
         initializedVersion(
             std.testing.allocator,
-            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\"}}",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2023-09-30\"}}",
         ),
     );
 }
