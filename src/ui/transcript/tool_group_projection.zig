@@ -1476,6 +1476,52 @@ test "grouped subagent status keeps the vertical continuation for middle rows" {
     );
 }
 
+test "completed subagent retains final statusline in single and grouped calls" {
+    const alloc = std.testing.allocator;
+
+    // Single completed subagent call in compact mode
+    {
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● Subagent completed · inspect auth\n  openai/gpt-5.5 · high · 12k/256k 4%\n", .class = .tool_status } },
+        };
+        const details = [_]ToolDetailRecord{
+            .{ .entry_id = 1, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .outcome = .completed },
+        };
+        var projection = try build(alloc, &entries, &details, 120);
+        defer projection.deinit(alloc);
+
+        try std.testing.expectEqualStrings(
+            "● 1 tool call · 1 subagent\n" ++
+                "└ Subagent completed · inspect auth\n" ++
+                "  openai/gpt-5.5 · high · 12k/256k 4%",
+            projection.entry_actions.items[0].override.bytes,
+        );
+    }
+
+    // Grouped completed subagent calls (multiple subagents)
+    {
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● Subagent completed · first check\n  openai/gpt-5.5 · high · 12k/256k 4%\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = "● Subagent completed · second check\n  openai/gpt-5.5 · high · 18k/256k 7%\n", .class = .tool_status } },
+        };
+        const details = [_]ToolDetailRecord{
+            .{ .entry_id = 1, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .outcome = .completed },
+            .{ .entry_id = 2, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .outcome = .completed },
+        };
+        var projection = try build(alloc, &entries, &details, 120);
+        defer projection.deinit(alloc);
+
+        try std.testing.expectEqualStrings(
+            "● 2 tool calls · 2 subagent\n" ++
+                "├ Subagent completed · first check\n" ++
+                "│ openai/gpt-5.5 · high · 12k/256k 4%\n" ++
+                "└ Subagent completed · second check\n" ++
+                "  openai/gpt-5.5 · high · 18k/256k 7%",
+            projection.entry_actions.items[0].override.bytes,
+        );
+    }
+}
+
 test "small minimal tool groups surface canonical action targets" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{

@@ -107,6 +107,15 @@ pub const ManagedExecutionResult = struct {
     body: []u8,
     /// The final status model is owned by the result allocator.
     final_status: ?types.SubagentStatus = null,
+
+    pub fn deinit(self: *ManagedExecutionResult, alloc: Allocator) void {
+        alloc.free(self.body);
+        if (self.final_status) |fs| {
+            alloc.free(@constCast(fs.model));
+            if (fs.session_title) |title| alloc.free(@constCast(title));
+        }
+        self.* = undefined;
+    }
 };
 
 pub const ApprovalResolveOptions = struct {
@@ -344,12 +353,19 @@ pub const Runtime = struct {
                             );
                             break :blk result;
                         },
-                        .completed => |completed| break :blk self.completeManagedResult(
-                            alloc,
-                            completed.child_id,
-                            operation_id,
-                            completed.observation,
-                        ),
+                        .completed => |completed| {
+                            var result = try self.completeManagedResult(
+                                alloc,
+                                completed.child_id,
+                                operation_id,
+                                completed.observation,
+                            );
+                            if (self.resolveChildStatus(alloc, completed.child_id, completed.observation.metrics, effectiveDefaults(options.defaults, request.override(), resolved_model), options.model_capability_resolver)) |child_status| {
+                                defer alloc.free(@constCast(child_status.model));
+                                attachStatusPresentation(alloc, &result, child_status);
+                            }
+                            break :blk result;
+                        },
                     }
                 }
             },
@@ -747,7 +763,7 @@ pub const Runtime = struct {
                             const pending_text = try std.fmt.allocPrint(alloc, "{s}\nchild_id={s} work_id={s}", .{ model_contract.steering_pending_result, child_id, work_id });
                             defer alloc.free(pending_text);
                             var pending = try self.encodeManaged(alloc, .{ .ok = true, .pending = true, .result = pending_text });
-                            if (status.sink != null) attachStatusPresentation(alloc, &pending, status.current(observation.metrics));
+                            attachStatusPresentation(alloc, &pending, status.current(observation.metrics));
                             return pending;
                         }
                     }
@@ -756,7 +772,7 @@ pub const Runtime = struct {
                 .idle, .finished, .interrupted => {},
             }
             var result = try self.completeManagedResult(alloc, child_id, work_id, observation);
-            if (status.sink != null) attachStatusPresentation(alloc, &result, status.current(observation.metrics));
+            attachStatusPresentation(alloc, &result, status.current(observation.metrics));
             self.removeYielded(child_id, work_id);
             return result;
         }
@@ -777,11 +793,16 @@ pub const Runtime = struct {
         for (self.yielded.items) |*item| {
             if (item.delivered or item.result != null or !std.mem.eql(u8, item.child_id, child.id)) continue;
             if (!std.mem.eql(u8, item.work_id, child.last_work_id orelse return error.StaleWork)) return error.StaleWork;
-            item.result = try self.completeManagedResult(self.alloc, child.id, item.work_id, .{
+            var result = try self.completeManagedResult(self.alloc, child.id, item.work_id, .{
                 .phase = child.phase,
                 .outcome = child.last_outcome,
                 .failure = child.last_failure,
             });
+            if (self.resolveChildStatus(self.alloc, child.id, .{}, null, null)) |child_status| {
+                defer self.alloc.free(@constCast(child_status.model));
+                attachStatusPresentation(self.alloc, &result, child_status);
+            }
+            item.result = result;
         }
     }
 
@@ -791,11 +812,29 @@ pub const Runtime = struct {
         for (self.yielded.items, 0..) |item, index| {
             if (!std.mem.eql(u8, item.child_id, child_id) or !std.mem.eql(u8, item.work_id, work_id)) continue;
             const stored = item.result orelse return null;
-            const result = ManagedExecutionResult{ .success = stored.success, .body = try alloc.dupe(u8, stored.body) };
+            var final_status: ?types.SubagentStatus = null;
+            if (stored.final_status) |fs| {
+                final_status = .{
+                    .model = try alloc.dupe(u8, fs.model),
+                    .effort = fs.effort,
+                    .input_tokens = fs.input_tokens,
+                    .context_window = fs.context_window,
+                    .session_title = if (fs.session_title) |title| try alloc.dupe(u8, title) else null,
+                };
+            }
+            const result = ManagedExecutionResult{
+                .success = stored.success,
+                .body = try alloc.dupe(u8, stored.body),
+                .final_status = final_status,
+            };
             _ = self.yielded.orderedRemove(index);
             self.alloc.free(item.child_id);
             self.alloc.free(item.work_id);
             self.alloc.free(stored.body);
+            if (stored.final_status) |fs| {
+                self.alloc.free(@constCast(fs.model));
+                if (fs.session_title) |title| self.alloc.free(@constCast(title));
+            }
             return result;
         }
         return null;
@@ -823,7 +862,12 @@ pub const Runtime = struct {
             if (item.result == null) {
                 const state = try self.managed.wait(item.child_id, .{ .clock = .awake, .raw = .fromMilliseconds(0) });
                 if (state.phase == .running or state.phase == .awaiting_approval) continue;
-                item.result = try self.completeManagedResult(self.alloc, item.child_id, item.work_id, state);
+                var result = try self.completeManagedResult(self.alloc, item.child_id, item.work_id, state);
+                if (self.resolveChildStatus(self.alloc, item.child_id, state.metrics, null, null)) |child_status| {
+                    defer self.alloc.free(@constCast(child_status.model));
+                    attachStatusPresentation(self.alloc, &result, child_status);
+                }
+                item.result = result;
                 debug_trace.eventf("subagent", "steering_result_captured", .{}, "child_id={s} work_id={s} phase={s} result_bytes={d}", .{ item.child_id, item.work_id, @tagName(state.phase), item.result.?.body.len });
             }
             try results.append(arena, .{
@@ -869,7 +913,13 @@ pub const Runtime = struct {
             _ = self.yielded.orderedRemove(index);
             self.alloc.free(item.child_id);
             self.alloc.free(item.work_id);
-            if (item.result) |result| self.alloc.free(result.body);
+            if (item.result) |result| {
+                self.alloc.free(result.body);
+                if (result.final_status) |fs| {
+                    self.alloc.free(@constCast(fs.model));
+                    if (fs.session_title) |title| self.alloc.free(@constCast(title));
+                }
+            }
             return;
         }
     }
@@ -912,7 +962,13 @@ pub const Runtime = struct {
         }
         for (self.yielded.items) |item| {
             if (!item.delivered) self.managed.cancelAndJoin(item.child_id);
-            if (item.result) |result| self.alloc.free(result.body);
+            if (item.result) |result| {
+                self.alloc.free(result.body);
+                if (result.final_status) |fs| {
+                    self.alloc.free(@constCast(fs.model));
+                    if (fs.session_title) |title| self.alloc.free(@constCast(title));
+                }
+            }
             debug_trace.eventf("subagent", "steering_continuation_released", .{}, "child_id={s} work_id={s} delivered={} reason=parent_turn_end", .{ item.child_id, item.work_id, item.delivered });
             self.alloc.free(item.child_id);
             self.alloc.free(item.work_id);
@@ -961,26 +1017,28 @@ pub const Runtime = struct {
         };
     }
 
-    fn startStatusPublisher(
+    fn resolveChildStatus(
         self: *Runtime,
         alloc: Allocator,
         child_id: []const u8,
-        fallback: Defaults,
-        sink: ?ProgressSink,
+        metrics: live_metrics.Snapshot,
+        fallback: ?Defaults,
         model_capability_resolver: ?model_capabilities.Resolver,
-    ) Allocator.Error!StatusPublisher {
+    ) ?types.SubagentStatus {
         var model: []u8 = undefined;
         var effort: types.ReasoningEffort = undefined;
         if (self.sessions.loadReadOnly(alloc, child_id)) |loaded| {
             var state = loaded;
             defer state.deinit(alloc);
-            model = try alloc.dupe(u8, state.preferences.model);
+            model = alloc.dupe(u8, state.preferences.model) catch return null;
             effort = state.preferences.effort;
         } else |err| {
             debug_trace.eventf("subagent", "status_publisher_fallback", .{}, "child_id={s} reason=session_load_failed error={s}", .{ child_id, @errorName(err) });
-            model = try alloc.dupe(u8, fallback.model);
-            effort = fallback.effort;
+            const defaults = fallback orelse return null;
+            model = alloc.dupe(u8, defaults.model) catch return null;
+            effort = defaults.effort;
         }
+        errdefer alloc.free(model);
         var context_window: ?u32 = null;
         if (model_capability_resolver) |resolver| {
             var resolve_arena = std.heap.ArenaAllocator.init(alloc);
@@ -990,11 +1048,29 @@ pub const Runtime = struct {
             } else |_| {}
         }
         return .{
-            .sink = sink,
             .model = model,
-            .owns_model = true,
             .effort = effort,
+            .input_tokens = metrics.input_tokens,
             .context_window = context_window,
+        };
+    }
+
+    fn startStatusPublisher(
+        self: *Runtime,
+        alloc: Allocator,
+        child_id: []const u8,
+        fallback: Defaults,
+        sink: ?ProgressSink,
+        model_capability_resolver: ?model_capabilities.Resolver,
+    ) Allocator.Error!StatusPublisher {
+        const resolved = self.resolveChildStatus(alloc, child_id, .{}, fallback, model_capability_resolver) orelse
+            return error.OutOfMemory;
+        return .{
+            .sink = sink,
+            .model = resolved.model,
+            .owns_model = true,
+            .effort = resolved.effort,
+            .context_window = resolved.context_window,
         };
     }
 };
@@ -1037,11 +1113,16 @@ fn attachStatusPresentation(
     status: types.SubagentStatus,
 ) void {
     const model = alloc.dupe(u8, status.model) catch return;
+    if (result.final_status) |old| {
+        alloc.free(@constCast(old.model));
+        if (old.session_title) |title| alloc.free(@constCast(title));
+    }
     result.final_status = .{
         .model = model,
         .effort = status.effort,
         .input_tokens = status.input_tokens,
         .context_window = status.context_window,
+        .session_title = if (status.session_title) |title| alloc.dupe(u8, title) catch null else null,
     };
 }
 
@@ -1131,10 +1212,12 @@ test "subagent admission preserves an undelivered result before advancing its ch
     child.last_work_id = @constCast("new-work");
     try runtime.capturePriorYielded(child);
     try std.testing.expectEqualStrings(original, runtime.yielded.items[0].result.?.body);
-    const captured = (try runtime.takeCapturedResult(alloc, "frozen-child", "old-work")).?;
-    defer alloc.free(captured.body);
+    var captured = (try runtime.takeCapturedResult(alloc, "frozen-child", "old-work")).?;
+    defer captured.deinit(alloc);
     try std.testing.expect(captured.success);
     try std.testing.expectEqualStrings(original, captured.body);
+    try std.testing.expect(captured.final_status != null);
+    try std.testing.expectEqualStrings("test", captured.final_status.?.model);
     try std.testing.expect((try runtime.takeCapturedResult(alloc, "frozen-child", "old-work")) == null);
     try runtime.retainYielded("frozen-child", "old-work", 4096, 64);
     try std.testing.expectError(error.StaleWork, runtime.capturePriorYielded(child));
@@ -1261,8 +1344,8 @@ test "subagent feedback waits for admitted work to install its worker" {
         fixture.release.set(io_mod.getIo());
         if (first_thread) |thread| thread.join();
         if (second_thread) |thread| thread.join();
-        if (first.result) |result| alloc.free(result.body);
-        if (second.result) |result| alloc.free(result.body);
+        if (first.result) |*result| result.deinit(alloc);
+        if (second.result) |*result| result.deinit(alloc);
     }
     first_thread = try std.Thread.spawn(.{}, Call.run, .{&first});
     // Hold result registration after durable admission, before Slot publication.

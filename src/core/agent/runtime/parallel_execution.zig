@@ -301,6 +301,26 @@ pub fn parallelHookFormatError(ctx: *anyopaque, alloc: Allocator, tool_name: []c
     return exec_ctx.hooks.format_tool_execution_error(exec_ctx.hooks.ctx, alloc, tool_name, err);
 }
 
+fn duplicateSubagentCompletion(
+    alloc: Allocator,
+    status_opt: ?types.SubagentStatus,
+) Allocator.Error!?types.SubagentStatus {
+    const status = status_opt orelse return null;
+    const model = try alloc.dupe(u8, status.model);
+    errdefer alloc.free(model);
+    const session_title = if (status.session_title) |title|
+        try alloc.dupe(u8, title)
+    else
+        null;
+    return .{
+        .model = model,
+        .effort = status.effort,
+        .input_tokens = status.input_tokens,
+        .context_window = status.context_window,
+        .session_title = session_title,
+    };
+}
+
 fn duplicateParallelToolResult(alloc: Allocator, call: ToolCall, execution: ToolExecutionResult) Allocator.Error!ParallelToolResult {
     const call_id = try alloc.dupe(u8, call.id);
     errdefer alloc.free(call_id);
@@ -333,6 +353,7 @@ fn duplicateParallelToolResult(alloc: Allocator, call: ToolCall, execution: Tool
         .inner_usage = execution.inner_usage,
     };
     errdefer freeOwnedToolExecutionResult(alloc, duplicated_execution);
+    duplicated_execution.subagent_completion = try duplicateSubagentCompletion(alloc, execution.subagent_completion);
     if (execution.status_detail) |detail| {
         duplicated_execution.status_detail = try alloc.dupe(u8, detail);
     }
@@ -386,6 +407,10 @@ fn freeOwnedToolExecutionResult(alloc: Allocator, result: ToolExecutionResult) v
     freeContextNotices(alloc, result.context_notices);
     if (result.command_result_json) |value| alloc.free(value);
     if (result.tool_result_memory) |memory| types.freeToolResultMemory(alloc, memory);
+    if (result.subagent_completion) |completion| {
+        alloc.free(@constCast(completion.model));
+        if (completion.session_title) |title| alloc.free(@constCast(title));
+    }
 }
 
 fn duplicateContextNotices(alloc: Allocator, notices: []const []const u8) Allocator.Error![]const []const u8 {
@@ -741,6 +766,13 @@ fn checkParallelResultDuplicationAllocationFailures(alloc: Allocator) !void {
             .stored_output_bytes = 8,
             .model_view_covers_full_file = true,
         },
+        .subagent_completion = .{
+            .model = "openai/gpt-5.5",
+            .effort = types.ReasoningEffort.literal("high"),
+            .input_tokens = 12_000,
+            .context_window = 100_000,
+            .session_title = "reviewer",
+        },
     };
     const duplicated = try duplicateParallelToolResult(
         alloc,
@@ -749,6 +781,12 @@ fn checkParallelResultDuplicationAllocationFailures(alloc: Allocator) !void {
     );
     defer freeParallelToolResult(alloc, duplicated);
     try std.testing.expectEqual(execution.model_content_kind, duplicated.execution.model_content_kind);
+    const subagent = duplicated.execution.subagent_completion.?;
+    try std.testing.expectEqualStrings("openai/gpt-5.5", subagent.model);
+    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), subagent.effort);
+    try std.testing.expectEqual(@as(u64, 12_000), subagent.input_tokens);
+    try std.testing.expectEqual(@as(?u32, 100_000), subagent.context_window);
+    try std.testing.expectEqualStrings("reviewer", subagent.session_title.?);
     const memory = duplicated.execution.tool_result_memory.?;
     try std.testing.expectEqualStrings("image-result-handle", memory.tool_image_handle.?);
     try std.testing.expectEqual(@as(usize, 1), memory.tool_images.len);
