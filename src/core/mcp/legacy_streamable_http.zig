@@ -689,7 +689,12 @@ fn postCore(alloc: Allocator, options: OperationOptions) !OperationResponse {
         return rejection;
     }
     if (options.expected_notification) {
-        if (response.head.status != .accepted) return error.UnexpectedHttpStatus;
+        // The spec says servers SHOULD answer notifications with 202 Accepted,
+        // but deployed streamable-HTTP servers also return 200 OK and 204 No
+        // Content. Treat all three as "received".
+        if (response.head.status != .accepted and
+            response.head.status != .ok and
+            response.head.status != .no_content) return error.UnexpectedHttpStatus;
         return .{ .body = &.{} };
     }
     if (response.head.status == .not_found and options.session_id != null) {
