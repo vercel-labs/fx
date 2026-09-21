@@ -84,6 +84,7 @@ afterEach(async () => {
 
 type RootOptions = {
   mode?:
+    | `task_${string}`
     | "normal"
     | "progress"
     | "stall_operation"
@@ -383,6 +384,50 @@ async function waitForTtyAskExit(
 }
 
 describe("modern MCP stdio compatibility", () => {
+  for (const mode of ["task_complete", "task_failed", "task_cancelled", "task_timeout", "task_stall_get", "task_input"] as const) {
+    test(`async MCP stdio ${mode} polls without replaying the tool`, async () => {
+      const root = createRoot(mode, MODERN_FIXTURE, { mode, operationTimeoutMs: mode === "task_timeout" || mode === "task_stall_get" ? 300 : 5_000 });
+      gateway = startToolGateway("Async stdio observed.");
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Call the async MCP tool."], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway), timeoutMs: 15_000,
+      });
+      expect(result.code).toBe(0);
+      expect(result.stderr).toBe("Selecting MCP tool mcp_fixture_echo\nMCP: mcp_fixture_echo\n");
+      expect(gateway.requests).toHaveLength(3);
+      const wire = readWire(root.wireLogPath);
+      expect(wire.filter((entry) => entry.message.method === "tools/call")).toHaveLength(1);
+      expect(wire.some((entry) => entry.message.method === "tasks/get")).toBe(true);
+      expect(wire.some((entry) => entry.message.method === "notifications/cancelled")).toBe(false);
+      if (mode === "task_complete") expect(gateway.requests[2]!.body).toContain("ASYNC_TASK_RESULT");
+      if (mode === "task_failed") expect(gateway.requests[2]!.body).toContain("TASK_PROTOCOL_FAILURE");
+      if (mode === "task_cancelled") expect(gateway.requests[2]!.body).toContain("cancelled by the server");
+      if (mode === "task_timeout" || mode === "task_stall_get" || mode === "task_input") {
+        expect(wire.at(-1)!.message.method).toBe("tasks/cancel");
+      }
+    }, 20_000);
+  }
+
+  for (const mode of ["task_input", "task_mrtr"] as const) {
+    test.skipIf(!tmuxAvailable())(`async MCP stdio ${mode} uses validated input without replaying a task`, async () => {
+      const root = createRoot(mode, MODERN_FIXTURE, { mode, expectedElicitation: "both" });
+      gateway = startToolGateway("Async stdio input accepted.");
+      const stderrPath = join(root.root, "stderr.log");
+      tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 110, height: 32, stderrPath, env: fixtureEnv(root, gateway) });
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Call the async MCP tool.");
+      await tui.waitForText("MCP server fixture requests confirmed", 20_000);
+      await tui.sendKeys("1");
+      await tui.waitForText("Current values:", 20_000);
+      await tui.sendKeys("1");
+      await tui.waitForText("Async stdio input accepted.", 20_000);
+      const wire = readWire(root.wireLogPath);
+      expect(wire.filter((entry) => entry.message.method === "tools/call")).toHaveLength(mode === "task_mrtr" ? 2 : 1);
+      expect(wire.filter((entry) => entry.message.method === "tasks/update")).toHaveLength(mode === "task_mrtr" ? 0 : 1);
+      expect(gateway.requests[2]!.body).toContain("ASYNC_TASK_RESULT");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    }, 35_000);
+  }
+
   for (const version of ["2025-11-25", "2025-06-18", "2024-11-05"] as const) {
     test(`default MCP v1 starts ${version} stdio without a discovery probe or process restart`, async () => {
       const root = createRoot(`default-v1-${version}`, LEGACY_FIXTURE, { legacyVersion: version });
@@ -2697,7 +2742,11 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
         for (const entry of wire) {
           const meta = entry.message.params?._meta as Record<string, unknown>;
           expect(meta["io.modelcontextprotocol/protocolVersion"]).toBe("2026-07-28");
-          expect(meta["io.modelcontextprotocol/clientCapabilities"]).toEqual({});
+          expect(meta["io.modelcontextprotocol/clientCapabilities"]).toEqual(
+            entry.message.method === "tools/call"
+              ? { extensions: { "io.modelcontextprotocol/tasks": {} } }
+              : {},
+          );
         }
       } else {
         expect(new Set(wire.map((entry) => entry.pid)).size).toBe(2);

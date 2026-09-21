@@ -4325,7 +4325,7 @@ describe("acp: model-independent", () => {
         expect(calls[1]?.params?.arguments).toEqual(calls[0]?.params?.arguments);
         expect(calls[1]?.params?._meta?.[
           "io.modelcontextprotocol/clientCapabilities"
-        ]).toEqual({ elicitation: { form: {} } });
+        ]).toEqual({ elicitation: { form: {} }, extensions: { "io.modelcontextprotocol/tasks": {} } });
       } finally {
         await client?.close();
         if (existsSync(pidPath)) await expectMcpProcessExited(pidPath);

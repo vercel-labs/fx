@@ -5224,6 +5224,96 @@ test "legacy initialize advertises elicitation only for negotiated supported mod
     try std.testing.expect(std.mem.find(u8, old, "\"elicitation\"") == null);
 }
 
+test {
+    _ = @import("tasks.zig");
+    _ = @import("streamable_http.zig");
+}
+
+test "MCP tasks deduplicate input preserve numbers and recheck cancellation and authority" {
+    const alloc = std.testing.allocator;
+    const script =
+        \\polls=0
+        \\updates=0
+        \\metadata='"taskId":"job","createdAt":"2026-07-28T00:00:00Z","lastUpdatedAt":"2026-07-28T00:00:01Z","ttlMs":null,"pollIntervalMs":0'
+        \\while IFS= read -r line; do
+        \\  id=${line#*'"id":'}
+        \\  id=${id%%,*}
+        \\  case "$line" in
+        \\    *'"method":"server/discover"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}}}}\n' "$id" ;;
+        \\    *'"method":"tools/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","ttlMs":60000,"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+        \\    *'"method":"tools/call"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"task","status":"working",%s}}\n' "$id" "$metadata" ;;
+        \\    *'"method":"tasks/get"'*)
+        \\      polls=$((polls + 1))
+        \\      if [ "$polls" -le 2 ]; then
+        \\        printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","status":"input_required",%s,"inputRequests":{"confirm":{"method":"elicitation/create","params":{"message":"Continue?","requestedSchema":{"type":"object","properties":{"confirmed":{"type":"boolean"}},"required":["confirmed"]}}}}}}\n' "$id" "$metadata"
+        \\      else
+        \\        printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","status":"completed",%s,"result":{"content":[{"type":"text","text":"async success"}],"structuredContent":{"precise":12345678901234567890.123456789,"updates":%s}}}}\n' "$id" "$metadata" "$updates"
+        \\      fi ;;
+        \\    *'"method":"tasks/update"'*)
+        \\      updates=$((updates + 1))
+        \\      printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete"}}\n' "$id" ;;
+        \\    *'"method":"tasks/cancel"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete"}}\n' "$id" ;;
+        \\  esac
+        \\done
+    ;
+    const Responder = struct {
+        const Mode = enum { accept, cancel, revoke };
+        mode: Mode,
+        server: *McpServer,
+        cancel_flag: *std.atomic.Value(bool),
+        calls: usize = 0,
+        finishes: usize = 0,
+        outcome: ?tool_mcp_runtime.ContinuationTerminal = null,
+
+        fn respond(raw: *anyopaque, allocator: Allocator, origin: tool_mcp_runtime.InputOrigin, required: tool_mcp_runtime.InputRequired) ![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expect(origin.request_generation > mrtr.max_tool_rounds);
+            try std.testing.expect(required.request_state_json == null);
+            switch (self.mode) {
+                .accept => {},
+                .cancel => self.cancel_flag.store(true, .release),
+                .revoke => _ = self.server.authority_id.fetchAdd(1, .acq_rel),
+            }
+            return allocator.dupe(u8, "{\"confirm\":{\"action\":\"accept\",\"content\":{\"confirmed\":true}}}");
+        }
+
+        fn finish(raw: *anyopaque, _: Allocator, _: tool_mcp_runtime.InputOrigin, outcome: tool_mcp_runtime.ContinuationTerminal) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.finishes += 1;
+            self.outcome = outcome;
+        }
+    };
+    for ([_]Responder.Mode{ .accept, .cancel, .revoke }) |mode| {
+        var runtime = McpRuntime.init(alloc);
+        defer runtime.deinit();
+        try runtime.addServer(try shellMcpConfigForTest(alloc, "tasks", script));
+        runtime.connectAll(.{});
+        const server = runtime.servers.items[0];
+        try std.testing.expectEqual(ServerState.ready, server.state.load(.acquire));
+        var cancelled = std.atomic.Value(bool).init(false);
+        var responder = Responder{ .mode = mode, .server = server, .cancel_flag = &cancelled };
+        const outcome = runtime.callToolByNameWithOptions(alloc, "mcp_tasks_echo", "{}", tool_result_limits.default_max_tool_result_bytes, .{
+            .cancel_flag = &cancelled,
+            .input_responder = .{ .context = &responder, .capabilities = .{ .form = true }, .callback = Responder.respond, .continuation_terminal = Responder.finish },
+        });
+        switch (mode) {
+            .accept => {
+                var result = (try outcome).?;
+                defer result.deinit(alloc);
+                try std.testing.expectEqual(tool_mcp_runtime.CallStatus.success, result.status);
+                try std.testing.expect(std.mem.find(u8, result.model_output, "12345678901234567890.123456789") != null);
+                try std.testing.expect(std.mem.find(u8, result.model_output, "\"updates\":1") != null);
+            },
+            .cancel => try std.testing.expectError(error.Cancelled, outcome),
+            .revoke => try std.testing.expectError(error.McpAdvertisedToolChanged, outcome),
+        }
+        try std.testing.expectEqual(@as(usize, 1), responder.calls);
+        try std.testing.expectEqual(@as(usize, 1), responder.finishes);
+        try std.testing.expectEqual(if (mode == .accept) tool_mcp_runtime.ContinuationTerminal.completed else .abandoned, responder.outcome.?);
+    }
+}
+
 test "modern request builders share required request metadata" {
     const alloc = std.testing.allocator;
     const metadata = try std.fmt.allocPrint(
@@ -5255,10 +5345,14 @@ test "modern request builders share required request metadata" {
 
     const call = try buildToolCallRequestForProtocol(alloc, 2, "echo", "{\"text\":\"hi\"}", .modern, null, null, .{});
     defer alloc.free(call);
+    var task_metadata: std.Io.Writer.Allocating = .init(alloc);
+    defer task_metadata.deinit();
+    try task_metadata.writer.writeAll("\"_meta\":");
+    try protocol_messages.writeModernTaskMetadata(&task_metadata.writer, null, .{});
     const expected_call = try std.fmt.allocPrint(
         alloc,
         "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{{{s},\"name\":\"echo\",\"arguments\":{{\"text\":\"hi\"}}}}}}",
-        .{metadata},
+        .{task_metadata.written()},
     );
     defer alloc.free(expected_call);
     try std.testing.expectEqualStrings(expected_call, call);

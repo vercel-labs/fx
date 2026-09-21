@@ -56,6 +56,14 @@ fx ask "explain the changes in this repository"
 
 Inside the shell, run `/help` to browse interactive commands.
 
+MCP servers using protocol `2026-07-28` can execute tool calls asynchronously
+through the [Tasks extension](https://tasks.extensions.modelcontextprotocol.io/specification/2026-07-28/tasks).
+fx polls at the server's suggested interval, collects the final tool result, and handles input
+requests through the same elicitation UI as synchronous calls. Cancelling the
+call or reaching its configured `operation_timeout_ms` sends a best-effort task
+cancellation. Tasks stay attached to the active call; task handles are not saved
+for recovery after fx exits.
+
 ## Documentation
 
 Visit [fx.sh/docs](https://fx.sh/docs) for the full manual: sessions, models, custom model connections, permissions, configuration, skills, MCP, subagents, embedding, and the complete CLI and slash command references. Agents can read any page as Markdown by appending `.md` to its URL, or fetch [llms-full.txt](https://fx.sh/llms-full.txt) for everything in one file.
