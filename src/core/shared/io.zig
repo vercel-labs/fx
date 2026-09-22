@@ -1196,6 +1196,22 @@ test "readFileToEndSized: file over cap returns error.StreamTooLong" {
     }
 }
 
+test "readFileToEndSized: stale size detects file growth" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTempFile(tmp.dir, "sized-growth.txt", "0123456789");
+
+    var file = try tmp.dir.openFile(getIo(), "sized-growth.txt", .{});
+    defer file.close(getIo());
+    if (readFileToEndSized(alloc, &file, 5, 100)) |data| {
+        defer alloc.free(data);
+        try std.testing.expect(false);
+    } else |err| {
+        try std.testing.expectEqual(error.StreamTooLong, err);
+    }
+}
+
 test "readFileToEndSized: repeated reads return full content" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
