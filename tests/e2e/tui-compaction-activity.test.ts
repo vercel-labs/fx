@@ -735,28 +735,38 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         active = undefined;
 
         phase = "resume";
+        const requestsBeforeResume = gateway.requestCount();
         resumed = await TmuxSession.create({
           cmd: command(sessionId), cwd: workspace, env, isolated: true, remainOnExit: true,
           stderrPath: resumedStderr, width: 110, height: 36, startupWaitMs: 0,
         });
+        // The kill left a recovering turn behind, so resume asks before retrying it.
+        await resumed.waitForPane((pane) =>
+          pane.includes("fx quit unexpectedly while this response was recovering"), 15_000);
+        await resumed.waitForStableComposer(10_000);
+        expect(gateway.requestCount()).toBe(requestsBeforeResume);
+        await resumed.sendText("continue");
         const recoveryScreen = await resumed.waitForPane((pane) =>
           pane.includes("RECOVERY_SAVED_TURN_67e") || pane.includes("InvalidContextHistoryStart"), 15_000);
-        expect(recoveryScreen).toContain("RECOVERY_SAVED_TURN_67e");
-        const resumeRequest = gateway.requests.at(-1)?.body ?? "";
-        expect(resumeRequest).toContain("STEER_LATE_67e");
-        expect(resumeRequest).toContain('"type":"file"');
         await resumed.waitForStableComposer(10_000);
         if (injectedStaleCheckpoint) {
-          expect(recoveryScreen).toContain("InvalidContextHistoryStart");
-          expect(recoveryScreen).toContain("New messages are blocked");
-          const requestsBeforeBlockedPrompt = gateway.requestCount();
+          // The stale checkpoint fails validation before any request is sent,
+          // stays unsaved, and blocks later messages the same way.
+          expect(recoveryScreen).not.toContain("RECOVERY_SAVED_TURN_67e");
+          expect(gateway.requestCount()).toBe(requestsBeforeResume);
           await resumed.sendText("go on");
-          const blockedScreen = await resumed.waitForPane((pane) => pane.includes("SessionCommitFailed"), 10_000);
+          const blockedScreen = await resumed.waitForPane((pane) =>
+            pane.split("InvalidContextHistoryStart").length > 2, 10_000);
           expect(blockedScreen).not.toContain("DuplicateImageId");
-          expect(gateway.requestCount()).toBe(requestsBeforeBlockedPrompt);
+          expect(gateway.requestCount()).toBe(requestsBeforeResume);
+          expect(existsSync(recoveryPath)).toBe(true);
           expect(savedFrames(eventsPath).filter((frame) => frame.event?.turn_completed).length).toBe(completedAtKill);
         } else {
+          expect(recoveryScreen).toContain("RECOVERY_SAVED_TURN_67e");
           expect(recoveryScreen).not.toContain("InvalidContextHistoryStart");
+          const resumeRequest = gateway.requests.at(-1)?.body ?? "";
+          expect(resumeRequest).toContain("STEER_LATE_67e");
+          expect(resumeRequest).toContain('"type":"file"');
           phase = "followup";
           const requestsBeforeFollowup = gateway.requestCount();
           await resumed.sendText("RECOVERY_FOLLOWUP_REQUEST_67e");
