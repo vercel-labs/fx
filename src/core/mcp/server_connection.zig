@@ -284,7 +284,7 @@ pub fn legacyWireForHttpVersion(version: legacy_streamable_http.Version) ?elicit
     return switch (version) {
         .v2025_11_25 => .legacy_mcp_2025_11,
         .v2025_06_18 => .legacy_mcp_2025_06,
-        .v2025_03_26 => null,
+        .v2025_03_26, .v2024_11_05 => null,
     };
 }
 
