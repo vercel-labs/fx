@@ -308,7 +308,12 @@ fn parseCatalog(
         if (!std.mem.eql(u8, api_backend, "responses")) continue;
         const raw_id = try requiredString(object, "model");
         try validateModelId(raw_id);
-        const modality_object = try findModalityModel(modality_models.array.items, raw_id) orelse
+        // The subscription catalog publishes Grok 4.7 Fast as its own model id.
+        // Fast is the service-tier control on the base model, same as Codex, so
+        // listing the variant would offer normal/fast again on an already fast
+        // model. The public modality list also omits it.
+        if (isBuildFastVariant(raw_id)) continue;
+        const modality_object = try findExactModalityModel(modality_models.array.items, raw_id) orelse
             return error.InvalidGrokModelCatalog;
         if (!try stringArrayContains(modality_object, "output_modalities", "text")) continue;
 
@@ -368,7 +373,13 @@ fn appendProviderReasoningEfforts(
     }
 }
 
-fn findModalityModel(
+const build_fast_suffix = "-build-fast";
+
+fn isBuildFastVariant(model_id: []const u8) bool {
+    return model_id.len > build_fast_suffix.len and std.mem.endsWith(u8, model_id, build_fast_suffix);
+}
+
+fn findExactModalityModel(
     models: []const std.json.Value,
     model_id: []const u8,
 ) !?std.json.ObjectMap {
@@ -496,6 +507,31 @@ test "Grok catalog rejects missing provider-owned capability metadata" {
         \\{"data":[{"id":"current","model":"current","api_backend":"responses","context_window":500000,"supports_reasoning_effort":false,"reasoning_efforts":[]}]}
     ;
     try expectCatalogParseError(error.InvalidGrokModelCatalog, valid_subscription, missing_modalities);
+}
+
+test "Grok catalog keeps the base model and omits the build-fast service variant" {
+    const alloc = std.testing.allocator;
+    const subscription_json =
+        \\{"data":[
+        \\  {"id":"grok-4.7","model":"grok-4.7","api_backend":"responses","context_window":500000,"max_completion_tokens":1000000,"supports_reasoning_effort":true,"reasoning_efforts":[{"value":"xhigh"},{"value":"high"},{"value":"medium"},{"value":"low"}]},
+        \\  {"id":"grok-4.7-build-fast","model":"grok-4.7-build-fast","api_backend":"responses","context_window":500000,"max_completion_tokens":1000000,"supports_reasoning_effort":true,"reasoning_efforts":[{"value":"xhigh"},{"value":"high"},{"value":"medium"},{"value":"low"}]},
+        \\  {"id":"orphan-build-fast","model":"orphan-build-fast","api_backend":"responses","context_window":500000,"supports_reasoning_effort":false,"reasoning_efforts":[]}
+        \\]}
+    ;
+    const modalities_json =
+        \\{"models":[
+        \\  {"id":"grok-4.7","input_modalities":["text","image"],"output_modalities":["text"]}
+        \\]}
+    ;
+    var catalog = try parseCatalog(alloc, subscription_json, modalities_json);
+    defer model_catalog.freeModelCatalog(alloc, &catalog);
+
+    try std.testing.expectEqual(@as(usize, 1), catalog.items.len);
+    try std.testing.expectEqualStrings("grok-4.7", catalog.items[0].id);
+    try std.testing.expect(catalog.items[0].has_vision);
+    try std.testing.expect(catalog.items[0].supports_fast_mode);
+    try std.testing.expectEqual(@as(usize, 4), catalog.items[0].reasoning_efforts.items.len);
+    try std.testing.expectEqual(@as(u32, 500_000), catalog.items[0].context_window);
 }
 
 test "Grok catalog URLs use provider-owned subscription and modality endpoints" {
