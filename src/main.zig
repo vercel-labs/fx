@@ -737,6 +737,13 @@ const App = struct {
         try NotificationAppRuntime.configure(self);
     }
 
+    pub fn activeSessionChanged(self: *App, change: app_session_runtime.ActiveSessionChange) void {
+        HerdrAppRuntime.reportSession(self, SessionAppRuntime.activeSessionId(self), switch (change) {
+            .fresh => .new,
+            .resumed => .resumed,
+        });
+    }
+
     pub fn rebindAfterInit(self: *App) void {
         SessionAppRuntime.rebindSubagentHost(self);
     }

@@ -1344,8 +1344,17 @@ test "persistence in-place initialization preserves empty ownership" {
     try std.testing.expect(persistence.resume_handoff_intent == .none);
 }
 
+/// How the durable active session changed. Hosts that track the session
+/// outside fx, such as a terminal multiplexer, observe it through an optional
+/// `App.activeSessionChanged`.
+pub const ActiveSessionChange = enum { fresh, resumed };
+
 pub fn Runtime(comptime App: type) type {
     return struct {
+        fn notifyActiveSessionChanged(app: *App, change: ActiveSessionChange) void {
+            if (comptime @hasDecl(App, "activeSessionChanged")) app.activeSessionChanged(change);
+        }
+
         pub fn captureImageAttachment(
             app: *App,
             attachment: *types.ImageAttachment,
@@ -1515,6 +1524,7 @@ pub fn Runtime(comptime App: type) type {
             app.total_input_tokens = 0;
             app.total_output_tokens = 0;
             app.total_web_search_requests = 0;
+            notifyActiveSessionChanged(app, .fresh);
         }
 
         fn beginFreshJsHostSession(app: *App) !void {
@@ -1974,6 +1984,7 @@ pub fn Runtime(comptime App: type) type {
             try hydrateResumedSession(app, active.state, &display, notice);
             active.releaseHydrationHistory(app.alloc);
             enableSessionStores(app);
+            notifyActiveSessionChanged(app, .resumed);
         }
 
         /// Record whether restored history references shell execution handles
