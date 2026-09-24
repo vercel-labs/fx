@@ -99,8 +99,11 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .login,
         .token = "login",
-        .usage = "login [vercel|codex|grok]",
+        .usage = "login [vercel|codex [--device-code]|grok]",
         .summary = "Sign in to Vercel or a selected provider",
+        .options = &.{
+            .{ .flag = "--device-code", .description = "Use headless device authorization for Codex" },
+        },
     },
     .{
         .kind = .logout,

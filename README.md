@@ -38,6 +38,7 @@ Sign in with one of:
 
 - `fx login`: Vercel AI Gateway
 - `fx login codex`: ChatGPT subscription (OpenAI Codex OAuth)
+- `fx login codex --device-code`: ChatGPT subscription from a remote or headless machine
 - `fx login grok`: Grok subscription (xAI OAuth)
 - `fx setup`: AI Gateway API key
 

@@ -235,10 +235,47 @@ const LocalSurfaceOptions = struct {
     format: output_contracts.OutputFormat = .text,
 };
 
+const LoginOptions = struct {
+    provider: model_provider.ProviderId = .gateway,
+    codex_mode: chatgpt_oauth.LoginMode = .browser,
+};
+
+fn parseLoginOptions(rest: []const [:0]const u8) !LoginOptions {
+    if (rest.len == 0) return .{};
+    const provider = provider_catalog.parse(rest[0]) orelse return error.InvalidLoginProviderArgs;
+    if (rest.len == 1) return .{ .provider = provider };
+    if (rest.len != 2 or
+        !std.mem.eql(u8, rest[1], "--device-code") or
+        provider != .codex)
+    {
+        return error.InvalidLoginProviderArgs;
+    }
+    return .{ .provider = provider, .codex_mode = .device_code };
+}
+
 fn parseLoginProvider(rest: []const [:0]const u8) !?model_provider.ProviderId {
     if (rest.len == 0) return null;
     if (rest.len != 1) return error.InvalidLoginProviderArgs;
     return provider_catalog.parse(rest[0]) orelse error.InvalidLoginProviderArgs;
+}
+
+test "login options preserve browser default and select Codex device authorization" {
+    const default_options = try parseLoginOptions(&.{});
+    try std.testing.expect(default_options.provider.eql(.gateway));
+    try std.testing.expectEqual(chatgpt_oauth.LoginMode.browser, default_options.codex_mode);
+
+    const browser_args = [_][:0]const u8{"codex"};
+    const browser = try parseLoginOptions(&browser_args);
+    try std.testing.expect(browser.provider.eql(.codex));
+    try std.testing.expectEqual(chatgpt_oauth.LoginMode.browser, browser.codex_mode);
+
+    const device_args = [_][:0]const u8{ "codex", "--device-code" };
+    const device = try parseLoginOptions(&device_args);
+    try std.testing.expect(device.provider.eql(.codex));
+    try std.testing.expectEqual(chatgpt_oauth.LoginMode.device_code, device.codex_mode);
+
+    const invalid_args = [_][:0]const u8{ "grok", "--device-code" };
+    try std.testing.expectError(error.InvalidLoginProviderArgs, parseLoginOptions(&invalid_args));
 }
 
 fn selectCatalogModel(
@@ -797,10 +834,15 @@ fn activateProviderSelection(
     };
 }
 
-fn runProviderLogin(alloc: Allocator, cfg: Config, provider: model_provider.ProviderId) !void {
-    switch (provider) {
+fn runProviderLogin(alloc: Allocator, cfg: Config, options: LoginOptions) !void {
+    switch (options.provider) {
         .gateway => try login_flow.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
-        .codex => try chatgpt_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
+        .codex => try chatgpt_oauth.runLogin(
+            alloc,
+            cfg.gateway_provider.oauth_transport,
+            cfg.url_opener,
+            options.codex_mode,
+        ),
         .grok => try grok_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
         .configured => return error.ConfiguredProviderUsesEnvironmentAuth,
     }
@@ -888,7 +930,7 @@ fn activateProviderSelectionFallible(
 
     var performed_login: ?model_provider.ProviderId = null;
     if (cfg.auth_mode == .local and prepared_credential == null and provider_catalog.find(target).subscription and caller == .provider_command) {
-        runProviderLogin(alloc, cfg, target) catch |err| {
+        runProviderLogin(alloc, cfg, .{ .provider = target }) catch |err| {
             try writeProviderLoginFailure(alloc, deps, target, caller, err);
             return false;
         };
@@ -1123,8 +1165,8 @@ fn runNonInteractiveWithDeps(
         .pr => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .pull_request),
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
-            const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx login [vercel|codex|grok]\n");
+            const login_options = parseLoginOptions(rest) catch {
+                try writeStderr(deps, "usage: fx login [vercel|codex [--device-code]|grok]\n");
                 return .handled_failure;
             };
             if (cfg.auth_mode == .host_managed) {
@@ -1132,8 +1174,8 @@ fn runNonInteractiveWithDeps(
                 return .handled_success;
             }
             // Preserve the original `fx login` behavior for scripts and users.
-            const login_provider = maybe_login_provider orelse .gateway;
-            runProviderLogin(alloc, cfg, login_provider) catch |err| {
+            const login_provider = login_options.provider;
+            runProviderLogin(alloc, cfg, login_options) catch |err| {
                 try writeProviderLoginFailure(alloc, deps, login_provider, .provider_login, err);
                 return .handled_failure;
             };
