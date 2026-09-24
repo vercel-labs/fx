@@ -731,10 +731,12 @@ const App = struct {
     }
 
     pub fn configureNotifications(self: *App) !void {
-        // Register herdr hooks before NotificationAppRuntime.configure freezes
-        // the lifecycle runtime (its call to freeze() is the sole freeze site).
-        try HerdrAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
+        HerdrAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
         try NotificationAppRuntime.configure(self);
+    }
+
+    pub fn syncForegroundActivity(self: *App, activity: app_worker_runtime.ForegroundActivity) void {
+        HerdrAppRuntime.syncActivity(self, activity);
     }
 
     pub fn activeSessionChanged(self: *App, change: app_session_runtime.ActiveSessionChange) void {
@@ -861,7 +863,7 @@ const App = struct {
         shutdown_trace.mark("terminal_released");
 
         self.auth.stopProviderPreparation();
-        // Client.deinit releases the herdr pane (clear agent + label) when enabled.
+        // Client.deinit releases the herdr pane when enabled.
         self.herdr.deinit();
         self.stopStream();
         self.worker.requestShutdown();
@@ -923,7 +925,7 @@ const App = struct {
         // not write to the profile directory.
         const was_interactive = self.terminal.raw_enabled or self.terminal.signal_handler_installed;
         self.auth.stopProviderPreparation();
-        // Client.deinit releases the herdr pane (clear agent + label) when enabled.
+        // Client.deinit releases the herdr pane when enabled.
         self.herdr.deinit();
         self.stopStream();
         shutdown_trace.mark("stop_stream");
@@ -1401,7 +1403,6 @@ const App = struct {
         );
         errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
         try self.worker.admitInteractivePrompt(std.heap.c_allocator, queued);
-        HerdrAppRuntime.reportWorking(self);
         return true;
     }
 
@@ -1444,7 +1445,6 @@ const App = struct {
         );
         errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
         try self.worker.enqueuePrompt(std.heap.c_allocator, queued);
-        HerdrAppRuntime.reportWorking(self);
         return true;
     }
 
@@ -1604,7 +1604,6 @@ const App = struct {
             .history = history,
             .unversioned_history_count = self.session.unversionedHistoryEnd(),
         });
-        HerdrAppRuntime.reportWorking(self);
         return true;
     }
 

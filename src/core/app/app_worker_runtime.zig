@@ -89,6 +89,22 @@ pub const AssistantTextDrainResult = enum {
     blocked,
 };
 
+/// What the interactive session is doing, recomputed on every worker sync.
+/// Hosts that mirror it outside fx, such as a terminal multiplexer, observe
+/// it through an optional `App.syncForegroundActivity`.
+pub const ForegroundActivity = enum {
+    idle,
+    working,
+    awaiting_approval,
+    awaiting_answer,
+
+    fn resolve(approval_active: bool, question_active: bool, worker_busy: bool) ForegroundActivity {
+        if (approval_active) return .awaiting_approval;
+        if (question_active) return .awaiting_answer;
+        return if (worker_busy) .working else .idle;
+    }
+};
+
 /// Writes one full-detail record for an admitted route recovery transition.
 /// The footer status is transient; this preserves retry and failure history
 /// in the ctrl+o full transcript's detail section.
@@ -789,6 +805,13 @@ pub fn Runtime(comptime App: type) type {
                 (snapshot.processing or
                     worker_events_pending or
                     snapshot.queued_count > 0);
+            if (comptime @hasDecl(App, "syncForegroundActivity")) {
+                app.syncForegroundActivity(ForegroundActivity.resolve(
+                    app.approval_prompt.isActive(),
+                    app.question_prompt.isActive(),
+                    snapshot.processing or visible_worker_active,
+                ));
+            }
             const awaiting_tool_terminal = snapshot.cancel_requested and
                 activeToolStatusCount(presenter) > 0;
             if (!modal_active and
@@ -1915,6 +1938,7 @@ const FakeApp = struct {
     attention_count: usize = 0,
     last_attention_turn_id: u64 = 0,
     last_attention_kind: ?@import("../hooks/hooks.zig").AttentionKind = null,
+    foreground_activity: ?ForegroundActivity = null,
     persisted_finishes: std.ArrayList(types.FinishedPrompt) = .empty,
     finish_persistence_error: ?anyerror = null,
 
@@ -2004,6 +2028,10 @@ const FakeApp = struct {
         self.attention_count += 1;
         self.last_attention_turn_id = turn_id;
         self.last_attention_kind = kind;
+    }
+
+    fn syncForegroundActivity(self: *FakeApp, activity: ForegroundActivity) void {
+        self.foreground_activity = activity;
     }
 };
 
@@ -3037,6 +3065,49 @@ test "core.app_worker_runtime syncState preserves already visible processing act
     try std.testing.expectEqual(@as(u64, 8), app.stream.token_progress.input_tokens);
     try std.testing.expectEqual(@as(u64, 13), app.stream.token_progress.output_tokens);
     try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
+}
+
+test "core.app_worker_runtime syncState reports foreground activity through prompts and turns" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    const presenter = NoopBridge.lifecyclePresenter(&app);
+
+    Runtime(FakeApp).syncState(&app, presenter);
+    try std.testing.expectEqual(ForegroundActivity.idle, app.foreground_activity.?);
+
+    app.worker.processing = true;
+    Runtime(FakeApp).syncState(&app, presenter);
+    try std.testing.expectEqual(ForegroundActivity.working, app.foreground_activity.?);
+
+    app.worker.pending_question = true;
+    app.question_prompt.active = true;
+    Runtime(FakeApp).syncState(&app, presenter);
+    try std.testing.expectEqual(ForegroundActivity.awaiting_answer, app.foreground_activity.?);
+
+    app.approval_prompt.force_active = true;
+    Runtime(FakeApp).syncState(&app, presenter);
+    try std.testing.expectEqual(ForegroundActivity.awaiting_approval, app.foreground_activity.?);
+
+    // Answering both prompts returns a still-running turn to working.
+    app.approval_prompt.force_active = false;
+    app.worker.pending_question = false;
+    Runtime(FakeApp).syncState(&app, presenter);
+    try std.testing.expectEqual(ForegroundActivity.working, app.foreground_activity.?);
+
+    app.worker.processing = false;
+    Runtime(FakeApp).syncState(&app, presenter);
+    try std.testing.expectEqual(ForegroundActivity.idle, app.foreground_activity.?);
+}
+
+test "core.app_worker_runtime syncState keeps a visible turn working until its queued follow-up starts" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    app.stream.active = true;
+    app.worker.queued_count = 1;
+    Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
+
+    try std.testing.expectEqual(ForegroundActivity.working, app.foreground_activity.?);
 }
 
 test "core.app_worker_runtime syncState preserves activity when cancellation continues the turn" {

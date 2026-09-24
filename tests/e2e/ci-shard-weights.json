@@ -38,6 +38,7 @@
   { "file": "tui-file-picker.test.ts", "weight": 100 },
   { "file": "tui-full-transcript-brutal.test.ts", "weight": 36 },
   { "file": "tui-gateway-stream-lifecycle.test.ts", "weight": 178 },
+  { "file": "tui-herdr.test.ts", "weight": 12 },
   { "file": "tui-input-line-delete.test.ts", "weight": 12 },
   { "file": "tui-input-navigation.test.ts", "weight": 112 },
   { "file": "tui-interrupt-recovery.test.ts", "weight": 9 },
