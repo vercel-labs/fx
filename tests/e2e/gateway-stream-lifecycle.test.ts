@@ -8614,6 +8614,110 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
+  for (const fixture of [
+    {
+      name: "empty stop",
+      requests: 3,
+      notice: "The provider returned an empty response",
+      events: [],
+      finish: "stop",
+      outputTokens: 0,
+    },
+    {
+      name: "hidden-reasoning length",
+      requests: 1,
+      notice: "The provider hit its output limit before producing an answer",
+      events: [
+        { type: "reasoning-start", id: "r1" },
+        { type: "reasoning-delta", id: "r1", delta: "Considering the final reply." },
+        { type: "reasoning-end", id: "r1" },
+      ],
+      finish: "length",
+      outputTokens: 131072,
+    },
+  ]) {
+    test(`answerless ${fixture.name} completion fails without inventing an answer`, async () => {
+      const root = createFixtureRoot("empty-completion");
+      const tracePath = join(root.root, "trace.log");
+      const gateway = startGateway(() =>
+        fakeGatewaySse([
+          ...fixture.events,
+          {
+            type: "finish",
+            finishReason: { unified: fixture.finish, raw: fixture.finish },
+            usage: { inputTokens: { total: 12 }, outputTokens: { total: fixture.outputTokens } },
+          },
+        ])
+      );
+      try {
+        const result = await runFx(
+          ["ask", "--json", "--auto", "--no-save", "Return the fixture response."],
+          {
+            cwd: root.workspace,
+            env: fixtureEnv(root, gateway, tracePath),
+            timeoutMs: 30_000,
+          },
+        );
+        const json = parseAskJson(result.stdout);
+        const trace = readFileSync(tracePath, "utf8");
+
+        expect(result.code).toBe(1);
+        expect(json.exit_code).toBe(1);
+        expect(json.final_output).toBe("");
+        expect(`${result.stdout}\n${result.stderr}`).not.toContain("Done.");
+        expect(result.stderr).toContain(fixture.notice);
+        // Empty stops retry twice; an exhausted output budget is never resent.
+        expect(gateway.requestCount()).toBe(fixture.requests);
+        expect(trace).toContain("event=empty_provider_completion");
+        expect(trace).toContain("action=fail");
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    });
+  }
+
+  test("answerless completion recovers when the retry returns an answer", async () => {
+    const root = createFixtureRoot("empty-completion-recovered");
+    const tracePath = join(root.root, "trace.log");
+    const recoveredText = "Recovered after an empty response.";
+    let requestIndex = 0;
+    const gateway = startGateway(() =>
+      requestIndex++ === 0
+        ? fakeGatewaySse([
+          {
+            type: "finish",
+            finishReason: { unified: "stop", raw: "stop" },
+            usage: { inputTokens: { total: 12 }, outputTokens: { total: 0 } },
+          },
+        ])
+        : fakeGatewayFinalText(recoveredText)
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Return the fixture response."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 30_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      const trace = readFileSync(tracePath, "utf8");
+
+      expect(result.code).toBe(0);
+      expect(json.exit_code).toBe(0);
+      expect(json.output).toBe(recoveredText);
+      expect(json.final_output).toBe(recoveredText);
+      expect(`${result.stdout}\n${result.stderr}`).not.toContain("Done.");
+      expect(gateway.requestCount()).toBe(2);
+      expect(trace).toContain("action=retry");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test(
     "quiet HTTP 200 stream remains open through a valid provider finish",
     async () => {

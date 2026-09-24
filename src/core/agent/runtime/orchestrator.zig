@@ -201,7 +201,9 @@ fn continue_pending_subagent(
 ) !bool {
     const wait = deps.wait_for_subagent orelse return false;
     if (!try wait(deps.ctx, turn_id, step_id)) return false;
-    try suffix.append(arena, .{ .role = .assistant, .content = try arena.dupe(u8, text), .provider_replay = replay, .standalone_response = true });
+    if (text.len > 0 or replay != null) {
+        try suffix.append(arena, .{ .role = .assistant, .content = try arena.dupe(u8, text), .provider_replay = replay, .standalone_response = true });
+    }
     const steered = try append_immediate_steering_after_cancel(deps, arena, suffix, turn_id, "");
     debug_trace.eventf("agent", "subagent_parent_continuation", .{ .turn_id = turn_id }, "steering_consumed={} retained_messages={d}", .{ steered, suffix.items.len });
     try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
@@ -224,11 +226,13 @@ fn append_pending_steering_after_assistant(
         .none, .handoff, .interrupt => return false,
     };
 
-    try within_turn_suffix.append(arena, .{
-        .role = .assistant,
-        .content = assistant_text,
-        .provider_replay = provider_replay,
-    });
+    if (assistant_text.len > 0 or provider_replay != null) {
+        try within_turn_suffix.append(arena, .{
+            .role = .assistant,
+            .content = assistant_text,
+            .provider_replay = provider_replay,
+        });
+    }
     try append_steering_guidance(arena, within_turn_suffix, guidance, origin);
     return true;
 }
@@ -2952,6 +2956,12 @@ fn providerExecutedResult(call: ToolCall) ?ToolExecutionResult {
     };
 }
 
+fn reportCompletionUsage(deps: *const AgentRuntimeDeps, usage: types.Usage) void {
+    const report_fn = deps.report_usage orelse return;
+    if (usage.input_tokens == null and usage.output_tokens == null) return;
+    report_fn(deps.ctx, usage);
+}
+
 fn reportProviderExecutedUsage(
     deps: *const AgentRuntimeDeps,
     calls: []const ToolCall,
@@ -4474,6 +4484,136 @@ fn wait_for_recovery_deadline(
 fn recoveryPauseRequested(config: Config) bool {
     const flag = config.recovery_pause_flag orelse return false;
     return flag.load(.seq_cst);
+}
+
+/// Consecutive empty completions retried before the turn fails visibly.
+const max_empty_completion_retries: usize = 2;
+const empty_completion_diagnostic = "empty response";
+const empty_completion_notice =
+    "The provider returned an empty response, so there is no answer to show. Retry the request, or switch models if this keeps happening.";
+const empty_length_completion_notice =
+    "The provider hit its output limit before producing an answer. Retry with lower reasoning effort or a narrower request.";
+
+/// Next step for a settled completion that may carry no answer.
+const EmptyCompletionAction = enum {
+    /// Visible text or tool calls: handle the completion normally.
+    none,
+    /// Ask once for a summary of silent tool work.
+    nudge,
+    /// Retry the same request through model-response recovery.
+    retry,
+    /// Send no further request for this answer. Pending steering or subagent
+    /// work continues the turn, a retained stop-hook answer completes it, and
+    /// otherwise the turn fails. fx never invents an answer.
+    finish,
+};
+
+/// How an answerless step ended once no further request was due.
+const AnswerlessSettlement = enum { steering, subagent, retained, fail };
+
+const EmptyCompletionEvidence = struct {
+    disposition: types.ProviderCompletionDisposition,
+    tool_call_count: usize,
+    assistant_text: []const u8,
+    nudge_available: bool,
+    /// A retained stop-hook answer or an owed subagent result can settle the
+    /// turn, so another request would only repeat the silence.
+    continuation_pending: bool,
+    retries_used: usize,
+};
+
+/// Read after the request's parent-turn delivery is acknowledged: a subagent
+/// result sent with this request is no longer owed. An owed result can
+/// continue the turn only when another step is allowed.
+fn emptyCompletionContinuationPending(
+    deps: *const AgentRuntimeDeps,
+    stop_state: *const CommonStopState,
+    can_continue: bool,
+) bool {
+    if (stop_state.retained_candidate != null) return true;
+    return can_continue and subagentResultOwed(deps);
+}
+
+fn subagentResultOwed(deps: *const AgentRuntimeDeps) bool {
+    const pending = deps.has_pending_subagent orelse return false;
+    return pending(deps.ctx);
+}
+
+/// Pure policy for completions without visible text or tool calls. The
+/// caller owns every effect: retrying, nudging, or finalizing the turn.
+fn emptyCompletionAction(evidence: EmptyCompletionEvidence) EmptyCompletionAction {
+    if (evidence.tool_call_count > 0) return .none;
+    if (std.mem.trim(u8, evidence.assistant_text, " \t\r\n").len > 0) return .none;
+    return switch (evidence.disposition) {
+        .completed => if (evidence.nudge_available)
+            .nudge
+        else if (evidence.continuation_pending or
+            evidence.retries_used >= max_empty_completion_retries)
+            .finish
+        else
+            .retry,
+        // A retry would spend the same exhausted output budget again.
+        .length_limited => .finish,
+        .interrupted, .provider_failure, .invalid_completion => .none,
+    };
+}
+
+test "emptyCompletionAction retries, nudges, or finishes only answerless completions" {
+    const base: EmptyCompletionEvidence = .{
+        .disposition = .completed,
+        .tool_call_count = 0,
+        .assistant_text = "",
+        .nudge_available = false,
+        .continuation_pending = false,
+        .retries_used = 0,
+    };
+    try std.testing.expectEqual(EmptyCompletionAction.retry, emptyCompletionAction(base));
+
+    var blank = base;
+    blank.assistant_text = " \n\t";
+    try std.testing.expectEqual(EmptyCompletionAction.retry, emptyCompletionAction(blank));
+
+    var answered = base;
+    answered.assistant_text = "answer";
+    try std.testing.expectEqual(EmptyCompletionAction.none, emptyCompletionAction(answered));
+
+    var tools = base;
+    tools.tool_call_count = 1;
+    try std.testing.expectEqual(EmptyCompletionAction.none, emptyCompletionAction(tools));
+
+    var nudge = base;
+    nudge.nudge_available = true;
+    nudge.retries_used = max_empty_completion_retries;
+    try std.testing.expectEqual(EmptyCompletionAction.nudge, emptyCompletionAction(nudge));
+
+    var last_retry = base;
+    last_retry.retries_used = max_empty_completion_retries - 1;
+    try std.testing.expectEqual(EmptyCompletionAction.retry, emptyCompletionAction(last_retry));
+
+    var exhausted = base;
+    exhausted.retries_used = max_empty_completion_retries;
+    try std.testing.expectEqual(EmptyCompletionAction.finish, emptyCompletionAction(exhausted));
+
+    var continuing = base;
+    continuing.continuation_pending = true;
+    try std.testing.expectEqual(EmptyCompletionAction.finish, emptyCompletionAction(continuing));
+    continuing.nudge_available = true;
+    try std.testing.expectEqual(EmptyCompletionAction.nudge, emptyCompletionAction(continuing));
+
+    var length = base;
+    length.disposition = .length_limited;
+    length.nudge_available = true;
+    try std.testing.expectEqual(EmptyCompletionAction.finish, emptyCompletionAction(length));
+
+    var truncated_answer = length;
+    truncated_answer.assistant_text = "partial";
+    try std.testing.expectEqual(EmptyCompletionAction.none, emptyCompletionAction(truncated_answer));
+
+    for ([_]types.ProviderCompletionDisposition{ .interrupted, .provider_failure, .invalid_completion }) |disposition| {
+        var owned_elsewhere = base;
+        owned_elsewhere.disposition = disposition;
+        try std.testing.expectEqual(EmptyCompletionAction.none, emptyCompletionAction(owned_elsewhere));
+    }
 }
 
 fn providerFailureReplaySafe(
@@ -7148,11 +7288,16 @@ fn processQueuedPromptLoop(
         var context_overflow_recovery: ContextOverflowRecoveryState = .ready;
         var recovery_has_unexecuted_tool_start = false;
         var successful_recovery_strategy: ?model_response_recovery.Strategy = null;
+        // Empty retries happen within one step, so every step, including one
+        // continued by steering or a subagent result, gets its own budget.
+        var empty_completion_retries: usize = 0;
         defer {
             if (recovery_has_unexecuted_tool_start and finalization.outcome != .paused) {
                 settle_deferred_tool_starts(deps, &stream_ctx, arena, turn_id, config.cancel_flag);
             }
         }
+        const empty_nudge_available = !continuation_injected and silent_tool_steps >= 2;
+        const can_continue_turn = agent_steps.allowsStep(config.agent_step_limit, step + 1);
 
         while (true) {
             if (reset_stream_for_next_attempt) {
@@ -8689,13 +8834,7 @@ fn processQueuedPromptLoop(
                             },
                         );
                         if (can_retry) {
-                            if (deps.report_usage) |report_fn| {
-                                if (attempt_completion.usage.input_tokens != null or
-                                    attempt_completion.usage.output_tokens != null)
-                                {
-                                    report_fn(deps.ctx, attempt_completion.usage);
-                                }
-                            }
+                            reportCompletionUsage(deps, attempt_completion.usage);
                             stream_ctx.drop_staged_response_language_candidate();
                             stream_result.deinit(arena);
                             stream_result_set = false;
@@ -8722,13 +8861,26 @@ fn processQueuedPromptLoop(
                 try copyLatestStopPartial(arena, stop_state, partial_assistant);
             }
 
+            // An answerless completion is a provider failure, not an answer.
+            const empty_retry = streamSucceeded(stream_result) and
+                emptyCompletionAction(.{
+                    .disposition = attempt_disposition,
+                    .tool_call_count = attempt_completion.tool_calls.len,
+                    .assistant_text = partial_assistant,
+                    .nudge_available = empty_nudge_available,
+                    .continuation_pending = emptyCompletionContinuationPending(deps, stop_state, can_continue_turn),
+                    .retries_used = empty_completion_retries,
+                }) == .retry;
             var attempt_failure_diagnostic: ?types.ModelFailureDiagnostic = null;
             if (streamSucceeded(stream_result) and
                 (attempt_disposition == .interrupted or
-                    attempt_disposition == .provider_failure))
+                    attempt_disposition == .provider_failure or
+                    empty_retry))
             {
                 const finish_reason = attempt_completion.finish_reason;
-                const cause: model_response_recovery.FailureCause = if (attempt_completion.provider_failure_cause == .gateway_stream_timeout)
+                const cause: model_response_recovery.FailureCause = if (empty_retry)
+                    .provider_unavailable
+                else if (attempt_completion.provider_failure_cause == .gateway_stream_timeout)
                     .provider_stream_timeout
                 else if (attempt_completion.provider_failure_cause == .rate_limited)
                     .rate_limited
@@ -8738,13 +8890,23 @@ fn processQueuedPromptLoop(
                     .content_filter
                 else
                     .provider_unavailable;
-                const diagnostic = try providerCompletionDiagnostic(
-                    arena,
-                    attempt_completion,
-                    defaultRecoveryDiagnosticText(cause),
-                );
+                const diagnostic = if (empty_retry)
+                    types.ModelFailureDiagnostic.init(empty_completion_diagnostic)
+                else
+                    try providerCompletionDiagnostic(
+                        arena,
+                        attempt_completion,
+                        defaultRecoveryDiagnosticText(cause),
+                    );
                 attempt_failure_diagnostic = diagnostic;
                 latest_recovery_diagnostic = diagnostic;
+                if (empty_retry) {
+                    debug_trace.eventf("agent", "empty_provider_completion", step_ctx, "action=retry finish_reason={s} retries_used={d} streamed_bytes={d}", .{
+                        finish_reason.?.label(),
+                        empty_completion_retries,
+                        stream_ctx.streamed_output_bytes,
+                    });
+                }
                 const non_retryable = attempt_completion.provider_failure_cause == .non_retryable;
                 // Interrupted streams and provider-error completions carry
                 // progress evidence; bare HTTP status failures (5xx, 429) and
@@ -8769,7 +8931,8 @@ fn processQueuedPromptLoop(
                         .delivery = .possibly_sent,
                         .attempts = .{ .consumed = semantic_attempt + 1, .limit = semantic_limit },
                         .pacing = retry_pacing,
-                        .output = if (partial_assistant.len > 0) .partial else .none,
+                        // Whitespace from an empty completion is not output to continue.
+                        .output = if (!empty_retry and partial_assistant.len > 0) .partial else .none,
                         .tool = effectiveRecoveryToolEvidence(
                             preserved_tool_evidence,
                             attempt_completion,
@@ -8783,6 +8946,7 @@ fn processQueuedPromptLoop(
                         .recovery_elapsed_ns = recoveryElapsedNs(recovery_started_at_ms),
                     });
                 if (attempt_disposition == .provider_failure or
+                    empty_retry or
                     attempt_completion.provider_failure_cause == .gateway_stream_timeout)
                 {
                     traceRouteFailure(
@@ -8909,6 +9073,10 @@ fn processQueuedPromptLoop(
                         // Probes and connectivity waits are not provider
                         // attempts: nothing billable was sent.
                         if (decision.reserve_provider_attempt) semantic_attempt += 1;
+                        if (empty_retry) {
+                            empty_completion_retries += 1;
+                            reportCompletionUsage(deps, attempt_completion.usage);
+                        }
                         recovery_strategy = decision.strategy;
                         recovery_cause = cause;
                         retry_pacing = decision.next_pacing;
@@ -9257,8 +9425,19 @@ fn processQueuedPromptLoop(
             );
             recovery_has_unexecuted_tool_start = false;
         }
+        reportCompletionUsage(deps, completion.usage);
+        const empty_action = emptyCompletionAction(.{
+            .disposition = disposition,
+            .tool_call_count = completion.tool_calls.len,
+            .assistant_text = partial_assistant,
+            .nudge_available = empty_nudge_available,
+            .continuation_pending = emptyCompletionContinuationPending(deps, stop_state, can_continue_turn),
+            .retries_used = empty_completion_retries,
+        });
+        // `.retry` here means no retry was scheduled for this completion.
+        const answerless = empty_action == .retry or empty_action == .finish;
         const finish_reason = completion.finish_reason.?;
-        if (successful_recovery_strategy != null) {
+        if (successful_recovery_strategy != null and !answerless) {
             try pushAutoRecoveredStatus(deps, semantic_attempt, semantic_limit);
         }
         latest_recovery_diagnostic = null;
@@ -9269,11 +9448,97 @@ fn processQueuedPromptLoop(
         recovery_started_at_ms = null;
         recovery_last_progress = null;
         recovery_no_progress_streak = 0;
+        const terminal_provider_completion = isTerminalProviderExecutedCompletion(completion);
+        const final_provider_replay = if (terminal_provider_completion or filtered_provider_calls.removed > 0)
+            try deps.agent_stream_provider.projectReplay(arena, provider_replay, &.{}, true, !terminal_provider_completion)
+        else
+            provider_replay;
 
-        if (deps.report_usage) |report_fn| {
-            if (completion.usage.input_tokens != null or completion.usage.output_tokens != null) {
-                report_fn(deps.ctx, completion.usage);
+        if (answerless) {
+            const length_limited = disposition == .length_limited;
+            const reasoning_replay = try deps.agent_stream_provider.projectReplay(arena, final_provider_replay, &.{}, false, true);
+            const settlement: AnswerlessSettlement = settlement: {
+                if (can_continue_turn and try append_pending_steering_after_assistant(
+                    deps,
+                    arena,
+                    &within_turn_suffix,
+                    turn_id,
+                    "",
+                    reasoning_replay,
+                    config.origin,
+                    if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model,
+                )) break :settlement .steering;
+                if (can_continue_turn and disposition == .completed) {
+                    // The subagent wait can block, so no retry status may linger.
+                    if (subagentResultOwed(deps)) {
+                        try clearAutoRetryStatusIfNeeded(deps, successful_recovery_strategy != null);
+                    }
+                    if (try continue_pending_subagent(
+                        deps,
+                        arena,
+                        &within_turn_suffix,
+                        turn_id,
+                        step_ctx.step_id,
+                        "",
+                        reasoning_replay,
+                    )) break :settlement .subagent;
+                }
+                break :settlement if (stop_state.retained_candidate != null) .retained else .fail;
+            };
+            debug_trace.eventf("agent", "empty_provider_completion", step_ctx, "action={s} finish_reason={s} retries_used={d} streamed_bytes={d}", .{
+                @tagName(settlement),
+                finish_reason.label(),
+                empty_completion_retries,
+                stream_ctx.streamed_output_bytes,
+            });
+            switch (settlement) {
+                .steering => {
+                    try clearAutoRetryStatusIfNeeded(deps, successful_recovery_strategy != null);
+                    continue;
+                },
+                .subagent => continue,
+                .retained => {
+                    try clearAutoRetryStatusIfNeeded(deps, successful_recovery_strategy != null);
+                    stop_state.terminal_materializing = true;
+                    try finishCommonAssistantTerminal(
+                        deps,
+                        finalization,
+                        arena,
+                        job,
+                        within_turn_suffix.items,
+                        &summary_accumulator,
+                        try runtime_finalization.stopTerminalText(arena, stop_state.retained_candidate, null),
+                        .completed,
+                        if (length_limited) .length_limited else null,
+                        &finish_trace,
+                        "assistant",
+                        null,
+                    );
+                },
+                .fail => {
+                    try pushTerminalAutoRetryStatusIfNeeded(
+                        deps,
+                        successful_recovery_strategy != null,
+                        semantic_attempt,
+                        semantic_limit,
+                        types.ModelFailureDiagnostic.init(empty_completion_diagnostic),
+                    );
+                    try finishFailedTurnWithNotice(
+                        deps,
+                        finalization,
+                        arena,
+                        job,
+                        within_turn_suffix.items,
+                        &summary_accumulator,
+                        stop_state,
+                        &finish_trace,
+                        if (length_limited) empty_length_completion_notice else empty_completion_notice,
+                        "empty_completion",
+                        if (length_limited) .length_limited else null,
+                    );
+                },
             }
+            return;
         }
 
         if (disposition == .completed and completion.tool_calls.len > 0) {
@@ -9387,11 +9652,6 @@ fn processQueuedPromptLoop(
         );
         try runtime_telemetry.traceReturnedToolCalls(arena, step_ctx, completion.tool_calls);
         try runtime_assistant_stream.emitProviderLengthNotice(deps, arena, disposition);
-        const terminal_provider_completion = isTerminalProviderExecutedCompletion(completion);
-        const final_provider_replay = if (terminal_provider_completion or filtered_provider_calls.removed > 0)
-            try deps.agent_stream_provider.projectReplay(arena, provider_replay, &.{}, true, !terminal_provider_completion)
-        else
-            provider_replay;
 
         if (disposition == .length_limited and completion.tool_calls.len > 0) {
             const assistant_text = try runtime_assistant_stream.finishLengthLimitedToolCallCompletion(deps, arena, completion, stream_ctx.raw_text.items.len);
@@ -9455,15 +9715,7 @@ fn processQueuedPromptLoop(
         }
 
         if (completion.tool_calls.len == 0) {
-            const has_content =
-                std.mem.trim(u8, partial_assistant, " \t\r\n").len > 0;
-            const needs_continuation =
-                disposition == .completed and
-                !continuation_injected and
-                silent_tool_steps >= 2 and
-                !has_content;
-
-            if (needs_continuation) {
+            if (empty_action == .nudge) {
                 continuation_injected = true;
                 const continuation_prompt = "Summarize what you just did.";
                 debug_trace.logf("agent", "injecting continuation after {d} silent tool steps omitted_assistant_bytes={d} preserved_provider_state={s}", .{
@@ -9482,11 +9734,11 @@ fn processQueuedPromptLoop(
                 continue;
             }
 
-            const raw_final = if (has_content) partial_assistant else "Done.";
-            const final_text = try runtime_assistant_stream.normalizeAssistantTextForDisplay(arena, raw_final);
-            const rendered = if (final_text.len > 0) final_text else "Done.";
-            const history_text = try arena.dupe(u8, raw_final);
-            const history_replay = if (has_content) final_provider_replay else try deps.agent_stream_provider.projectReplay(arena, final_provider_replay, &.{}, false, true);
+            // Other answerless completions were settled above.
+            std.debug.assert(empty_action == .none);
+            const rendered = try runtime_assistant_stream.normalizeAssistantTextForDisplay(arena, partial_assistant);
+            const history_text = try arena.dupe(u8, partial_assistant);
+            const history_replay = final_provider_replay;
 
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
                 try append_pending_steering_after_assistant(
@@ -9508,9 +9760,6 @@ fn processQueuedPromptLoop(
                 try continue_pending_subagent(deps, arena, &within_turn_suffix, turn_id, step_ctx.step_id, history_text, history_replay)) continue;
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
-                if (!has_content) {
-                    try deps.push_text(deps.ctx, .{ .operational = rendered });
-                }
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
 
                 const persisted_text = try runtime_finalization.stopTerminalText(
@@ -9548,9 +9797,6 @@ fn processQueuedPromptLoop(
             });
             stop_state.retained_candidate = history_text;
             stop_state.latest_partial = null;
-            if (!has_content) {
-                try deps.push_text(deps.ctx, .{ .operational = rendered });
-            }
             try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
 
             var stop_outcome = runtime_lifecycle.dispatchStopCheckpoint(
@@ -12196,6 +12442,7 @@ fn processQueuedPromptLoop(
                 &finish_trace,
                 repeated_malformed_arguments_notice,
                 "repeated_malformed_tool_arguments",
+                null,
             );
             return;
         }
@@ -12278,13 +12525,13 @@ fn processQueuedPromptLoop(
                 &finish_trace,
                 repeated_shell_execution_failure_notice,
                 "repeated_shell_execution_failure",
+                null,
             );
             return;
         }
         if (terminal_provider_completion) {
             const raw_final = completion.content.?;
-            const final_text = try runtime_assistant_stream.normalizeAssistantTextForDisplay(arena, raw_final);
-            const rendered = if (final_text.len > 0) final_text else "Done.";
+            const rendered = try runtime_assistant_stream.normalizeAssistantTextForDisplay(arena, raw_final);
 
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
                 try append_pending_steering_after_assistant(
@@ -12431,6 +12678,7 @@ fn processQueuedPromptLoop(
         &finish_trace,
         config.step_limit_notice,
         "step_limit",
+        null,
     );
 }
 
@@ -12445,6 +12693,7 @@ fn finishFailedTurnWithNotice(
     finish_trace: *PromptFinishTrace,
     notice: []const u8,
     trace_outcome: []const u8,
+    disposition: ?types.ProviderCompletionDisposition,
 ) !void {
     try deps.push_text(deps.ctx, .{ .operational = notice });
     try deps.push_text(deps.ctx, .{ .operational = "\n" });
@@ -12464,7 +12713,7 @@ fn finishFailedTurnWithNotice(
             summary_accumulator,
             assistant_text,
             .failed,
-            null,
+            disposition,
             finish_trace,
             trace_outcome,
             null,
@@ -12483,7 +12732,7 @@ fn finishFailedTurnWithNotice(
     } };
     types.setHistoryTurnSummary(&turn, completed_summary);
     try deps.propagate_history_turn(deps.ctx, turn);
-    try finalization.finish(.failed, null, .{
+    try finalization.finish(.failed, disposition, .{
         .turn = try types.dupeHistoryTurn(std.heap.c_allocator, turn),
         .summary = completed_summary,
     });

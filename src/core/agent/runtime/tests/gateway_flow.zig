@@ -53,6 +53,7 @@ const countText = test_support.countText;
 const countNeedle = test_support.countNeedle;
 const readTraceFile = test_support.readTraceFile;
 const logIndex = test_support.logIndex;
+const textContains = test_support.textContains;
 const toolCall = test_support.toolCall;
 
 const vision_and_read_file_tools = [_]tool_dispatch.Tool{
@@ -8282,10 +8283,14 @@ test "processQueuedPrompt no-tool length bypasses silent-tool continuation" {
 
     try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
     try std.testing.expectEqual(@as(usize, 2), hooks.executed_names.items.len);
-    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
     try std.testing.expectEqual(types.ProviderCompletionDisposition.length_limited, hooks.finalized_disposition.?);
     try std.testing.expectEqual(@as(usize, 1), hooks.finalization_count);
-    try std.testing.expectEqualStrings("Done.", hooks.finish_assistant_text.?);
+    // The failed turn keeps its executed tools and states why no answer exists.
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expectEqual(@as(usize, 2), hooks.history_turns.items[0].assistant.execution.tool_steps.len);
+    try std.testing.expect(std.mem.find(u8, hooks.finish_assistant_text.?, "output limit before producing an answer") != null);
+    try std.testing.expect(!textContains(&hooks, "Done."));
 }
 
 test "processQueuedPrompt non-ok gateway response trims and clips HTTP detail" {

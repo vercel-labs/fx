@@ -305,6 +305,7 @@ pub fn Bindings(comptime App: type) type {
                 .finalize_turn = agentFinalizeTurn,
                 .take_steering_boundary = if (comptime @hasDecl(@TypeOf(app.worker), "takeSteeringBoundary")) agentTakeSteeringBoundary else null,
                 .wait_for_subagent = if (comptime supportsSubagentSteering()) waitForSubagent else null,
+                .has_pending_subagent = if (comptime supportsSubagentSteering()) hasPendingSubagent else null,
                 .prepare_parent_turn_context = if (comptime supportsSubagentSteering()) prepareSubagentContext else null,
                 .acknowledge_parent_turn_context = if (comptime supportsSubagentSteering()) acknowledgeSubagentContext else null,
                 .append_runtime_context = agentAppendRuntimeContext,
@@ -793,6 +794,12 @@ pub fn Bindings(comptime App: type) type {
                 debug_trace.eventf("subagent", "wait_phase_publication_failed", .{ .turn_id = turn_id, .step_id = step_id }, "error={s}", .{@errorName(err)});
             };
             return host.waitYielded(&app.worker);
+        }
+
+        fn hasPendingSubagent(ctx: *anyopaque) bool {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            const host = app.session_persistence.subagent_host orelse return false;
+            return host.hasPendingYielded();
         }
 
         fn prepareSubagentContext(ctx: *anyopaque, arena: Allocator) !?agent_runtime.PreparedParentTurnContext {
