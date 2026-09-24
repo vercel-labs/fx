@@ -242,6 +242,7 @@ pub const McpServerConfig = struct {
     headers: []McpHttpHeader = &.{},
     header_env: []McpHttpHeaderEnv = &.{},
     bearer_token_env: ?[]u8 = null,
+    optional_bearer_token_env: ?[]u8 = null,
     auth: ?McpAuthConfig = null,
     allow_stored_credentials: bool = false,
     enabled: bool = true,
@@ -273,6 +274,7 @@ pub const McpServerConfig = struct {
         freeHttpHeaders(alloc, self.headers);
         freeHttpHeaderEnv(alloc, self.header_env);
         if (self.bearer_token_env) |value| alloc.free(value);
+        if (self.optional_bearer_token_env) |value| alloc.free(value);
         if (self.auth) |*auth| auth.deinit(alloc);
         self.* = undefined;
     }

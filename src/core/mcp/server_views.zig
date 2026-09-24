@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_mod = @import("../shared/io.zig");
 const server_connection = @import("server_connection.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
@@ -164,8 +165,13 @@ pub fn snapshotServerHealth(
 }
 
 pub fn configuredAuthenticationState(server: *const McpServer) health.AuthenticationState {
+    const optional_bearer_present = if (server.config.optional_bearer_token_env) |env_name|
+        if (io_mod.getenv(env_name)) |token| token.len > 0 else false
+    else
+        false;
     return if (server.config.auth != null or
         server.config.bearer_token_env != null or
+        optional_bearer_present or
         server.config.header_env.len > 0)
         .configured
     else

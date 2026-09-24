@@ -997,11 +997,16 @@ fn parseServerEntry(
         const bearer_token_env = try parseOptionalOwnedString(alloc, object, "bearer_token_env");
         errdefer if (bearer_token_env) |field| mem_utils.free(alloc, field);
         if (bearer_token_env) |field| if (!isValidEnvName(field)) return failServerConfig(error.McpConfigInvalidBearerEnvironment);
+        const optional_bearer_token_env = try parseOptionalOwnedString(alloc, object, "optional_bearer_token_env");
+        errdefer if (optional_bearer_token_env) |field| mem_utils.free(alloc, field);
+        if (optional_bearer_token_env) |field| if (!isValidEnvName(field)) return failServerConfig(error.McpConfigInvalidBearerEnvironment);
+        if (bearer_token_env != null and optional_bearer_token_env != null) return failServerConfig(error.McpConfigInvalidBearerEnvironment);
         var auth = parseProfileAuth(alloc, object) catch |err| switch (err) {
             error.OutOfMemory => return failServerConfig(error.OutOfMemory),
             else => return failServerConfig(error.McpConfigInvalidOAuth),
         };
         errdefer if (auth) |*field| field.deinit(alloc);
+        if (optional_bearer_token_env != null and auth != null) return failServerConfig(error.McpConfigInvalidBearerEnvironment);
         const owned_name = try alloc.dupe(u8, name);
         errdefer mem_utils.free(alloc, owned_name);
         const owned_url = try alloc.dupe(u8, url_value.string);
@@ -1016,8 +1021,9 @@ fn parseServerEntry(
             .headers = headers,
             .header_env = header_env,
             .bearer_token_env = bearer_token_env,
+            .optional_bearer_token_env = optional_bearer_token_env,
             .auth = auth,
-            .allow_stored_credentials = policy.allow_stored_credentials,
+            .allow_stored_credentials = policy.allow_stored_credentials and optional_bearer_token_env == null,
             .enabled = enabled,
             .workspace_admission = policy.workspace_admission,
             .startup_timeout_ms = timeouts.startup_ms,

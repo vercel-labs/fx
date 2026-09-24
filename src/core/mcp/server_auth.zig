@@ -88,12 +88,11 @@ pub fn buildResolvedHeaders(alloc: Allocator, server: *McpServer) !ResolvedHeade
         credentials.access_token
     else if (server.config.bearer_token_env) |env_name|
         io_mod.getenv(env_name) orelse return error.McpBearerEnvironmentMissing
+    else if (server.config.optional_bearer_token_env) |env_name|
+        nonEmptyOptionalBearer(io_mod.getenv(env_name))
     else
         null;
-    const authorization = if (bearer) |token|
-        try mcp_auth.bearerHeaderAlloc(alloc, token)
-    else
-        null;
+    const authorization = if (bearer) |token| try mcp_auth.bearerHeaderAlloc(alloc, token) else null;
     errdefer if (authorization) |value| {
         @memset(value, 0);
         alloc.free(value);
@@ -110,6 +109,17 @@ pub fn buildResolvedHeaders(alloc: Allocator, server: *McpServer) !ResolvedHeade
         .headers = try headers.toOwnedSlice(alloc),
         .authorization = authorization,
     };
+}
+
+fn nonEmptyOptionalBearer(value: ?[]const u8) ?[]const u8 {
+    const token = value orelse return null;
+    return if (token.len == 0) null else token;
+}
+
+test "optional bearer credentials fall back to anonymous only when absent or empty" {
+    try std.testing.expect(nonEmptyOptionalBearer(null) == null);
+    try std.testing.expect(nonEmptyOptionalBearer("") == null);
+    try std.testing.expectEqualStrings("key", nonEmptyOptionalBearer("key").?);
 }
 
 pub fn refreshResolvedHeaders(alloc: Allocator, server: *McpServer) !void {

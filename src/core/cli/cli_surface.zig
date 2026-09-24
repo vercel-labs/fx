@@ -42,6 +42,7 @@ const context_contract = @import("../workspace/context_contract.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mcp_command_provider = @import("../mcp/command_provider.zig");
+const anysearch_preset = @import("../mcp/anysearch_preset.zig");
 const mcp_health = @import("../mcp/health.zig");
 const project_config = @import("../mcp/project_config.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
@@ -2401,6 +2402,7 @@ fn runTopLevelMcp(
         defer result.deinit(alloc);
         if (result.warning) |warning| try writeMcpProfileWarning(alloc, deps, warning);
         const name = switch (intent) {
+            .anysearch => anysearch_preset.name,
             .local => |local| local.name,
             .http => |http| http.name,
         };
@@ -2488,6 +2490,48 @@ fn runTopLevelMcp(
             rest[1],
             result.profile_path,
         );
+        return .handled_success;
+    }
+    if (std.mem.eql(u8, operation, "search")) {
+        var tokens: std.ArrayList([]const u8) = .empty;
+        defer tokens.deinit(alloc);
+        for (rest[1..]) |token| try tokens.append(alloc, token);
+        const input = anysearch_preset.parseSearchInput(tokens.items) catch {
+            try writeStderr(deps, "usage: fx mcp search QUERY [--max-results 1..10]\n");
+            return .handled_failure;
+        };
+        const arguments = try anysearch_preset.searchArgumentsJson(alloc, input);
+        defer alloc.free(arguments);
+        var loaded = loadMcpCommandRuntime(alloc, cfg, deps) catch |err| {
+            try writeMcpOperationFailure(alloc, deps, "search", err);
+            return .handled_failure;
+        };
+        defer loaded.deinit(alloc);
+        const runtime = loaded.runtime orelse {
+            try writeMcpOperationFailure(alloc, deps, "search", error.McpServerNotFound);
+            return .handled_failure;
+        };
+        runtime.connectAll(cfg.tool_set.registry);
+        var result = (runtime.callToolByName(
+            alloc,
+            anysearch_preset.search_tool_name,
+            arguments,
+            32 * 1024,
+        ) catch |err| {
+            try writeMcpOperationFailure(alloc, deps, "search", err);
+            return .handled_failure;
+        }) orelse {
+            try writeMcpOperationFailure(alloc, deps, "search", error.McpToolNotFound);
+            return .handled_failure;
+        };
+        defer result.deinit(alloc);
+        if (result.status != .success) {
+            try writeStderr(deps, result.model_output);
+            try writeStderr(deps, "\n");
+            return .handled_failure;
+        }
+        try writeStdout(deps, result.model_output);
+        try writeStdout(deps, "\n");
         return .handled_success;
     }
     if (std.mem.eql(u8, operation, "list")) {
@@ -2718,7 +2762,7 @@ fn writeMcpProfileMutationSuccess(
 fn writeMcpAddUsage(deps: RunDeps) !void {
     return writeStderr(
         deps,
-        "usage: fx mcp add NAME COMMAND [ARGS...] | fx mcp add --transport http NAME URL\n",
+        "usage: fx mcp add NAME COMMAND [ARGS...] | fx mcp add --transport http NAME URL | fx mcp add --preset anysearch\n",
     );
 }
 
@@ -5778,6 +5822,7 @@ fn captureMcpProfileAddForTest(
 ) anyerror!mcp_command_provider.ProfileAddResult {
     mcp_profile_add_calls_for_test += 1;
     switch (intent) {
+        .anysearch => return error.TestUnexpectedResult,
         .local => |local| {
             try std.testing.expectEqualStrings("fixture", local.name);
             try std.testing.expectEqualStrings("node", local.command);
