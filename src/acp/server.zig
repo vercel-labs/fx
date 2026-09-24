@@ -276,6 +276,7 @@ pub const ServerState = struct {
     configured_model: []u8 = &.{},
     process_model_override: bool = false,
     process_provider_override: bool = false,
+    process_effort_override: bool = false,
     permission_mode: types.PermissionMode = .ask,
     permission_rules: types.PermissionRuleSet = .{},
     agent_step_limit: usize = 0,
@@ -283,6 +284,7 @@ pub const ServerState = struct {
     context_limits: config_runtime.context_limits.Values = .{},
     fast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
+    configured_effort: types.ReasoningEffort = .auto,
     first_call_tool_choice: types.ToolChoice = .auto,
     context_enabled: bool = true,
     session_titles: bool = true,
@@ -1995,6 +1997,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.context_limits.applyCommandLine(state.cfg.context_limit_overrides);
     state.fast_mode = startup.fast_mode and
         (state.cfg.model_override == null or startup.fast_mode_source != .compiled_default);
+    state.configured_effort = startup.effort;
     state.effort = startup.effort;
     state.first_call_tool_choice = startup.first_call_tool_choice;
     state.context_enabled = startup.context_enabled;
@@ -2045,6 +2048,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
                 .message = "Invalid reasoning effort",
             });
         if (!try applyEffortOverride(state, alloc, msg, effort)) return;
+        state.process_effort_override = true;
     }
 
     if (state.cfg.fast_override) |fast| {
