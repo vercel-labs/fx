@@ -1676,8 +1676,7 @@ pub const Store = struct {
             return error.InvalidSessionMetadata;
         }
         return .{
-            .provider = model_provider.parse(metadata.value.provider) orelse
-                return error.InvalidSessionMetadata,
+            .provider = metadata.value.provider,
             .model = try alloc.dupe(u8, metadata.value.model),
             .effort = core_types.ReasoningEffort.parse(metadata.value.effort) orelse
                 return error.InvalidSessionMetadata,
