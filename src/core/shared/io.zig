@@ -121,6 +121,20 @@ test "non-Darwin process I/O keeps the original vtable" {
     try std.testing.expect(selected.vtable == original.vtable);
 }
 
+test "fullSyncFile flushes a written file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try tmp.dir.createFile(getIo(), "journal", .{ .read = true });
+    defer file.close(getIo());
+    try file.writePositionalAll(getIo(), "committed turn\n", 0);
+    try fullSyncFile(file);
+
+    var buf: [32]u8 = undefined;
+    const n = try file.readPositionalAll(getIo(), &buf, 0);
+    try std.testing.expectEqualStrings("committed turn\n", buf[0..n]);
+}
+
 test "openDirAbsoluteNoFollow rejects unsafe path components" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -630,6 +644,25 @@ pub fn syncVerifiedDir(dir: std.Io.Dir) !void {
             else => return error.DirectorySyncFailed,
         }
     }
+}
+
+/// Sync `file` through the drive's write cache. On macOS `fsync` only hands
+/// data to the drive, which may still lose or reorder it after a power loss or
+/// kernel panic, so this asks for `F_FULLFSYNC` first. File systems without
+/// full-sync support, and other platforms, use the ordinary file sync.
+pub fn fullSyncFile(file: std.Io.File) !void {
+    if (comptime builtin.os.tag.isDarwin()) {
+        while (true) {
+            const rc = std.c.fcntl(file.handle, std.c.F.FULLFSYNC);
+            if (rc != -1) return;
+            switch (std.c.errno(rc)) {
+                .INTR => continue,
+                .INVAL, .OPNOTSUPP, .NOTTY => break,
+                else => return error.FileSyncFailed,
+            }
+        }
+    }
+    try file.sync(getIo());
 }
 
 fn openOrCreateVerifiedPrivateChild(parent: std.Io.Dir, name: []const u8) !VerifiedDir {

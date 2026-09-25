@@ -166,7 +166,7 @@ pub const ConversationWriter = struct {
             const frame = frames.next(frame_arena.allocator()) catch |err| switch (err) {
                 error.TruncatedEventFrame => {
                     try file.setLength(io_mod.getIo(), offset);
-                    try file.sync(io_mod.getIo());
+                    try io_mod.fullSyncFile(file);
                     writer.committed_bytes = offset;
                     break;
                 },
@@ -223,7 +223,7 @@ pub const ConversationWriter = struct {
                 .{ truncate_from, writer.committed_bytes - truncate_from },
             );
             try file.setLength(io_mod.getIo(), truncate_from);
-            try file.sync(io_mod.getIo());
+            try io_mod.fullSyncFile(file);
             writer.clearPendingToolCalls();
             writer.committed_bytes = truncate_from;
             writer.last_seq = open_turn_prior_seq;
@@ -554,7 +554,7 @@ pub const ConversationWriter = struct {
         if (comptime builtin.is_test) {
             return self.test_sync_ops.sync_file(self.test_sync_ops.ctx, self.file);
         }
-        try self.file.sync(io_mod.getIo());
+        try io_mod.fullSyncFile(self.file);
     }
 
     fn rollbackAppend(self: *ConversationWriter, original: anyerror) anyerror {
