@@ -561,6 +561,10 @@ fn modernRequestInfo(value: std.json.Value) !RequestInfo {
         "name"
     else if (std.mem.eql(u8, method, "resources/read"))
         "uri"
+    else if (std.mem.eql(u8, method, "tasks/get") or
+        std.mem.eql(u8, method, "tasks/update") or
+        std.mem.eql(u8, method, "tasks/cancel"))
+        "taskId"
     else
         null;
     const name = if (identity_field) |field| blk: {
@@ -1360,6 +1364,21 @@ test "modern MCP request headers include feature identities" {
             .body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"prompts/get\",\"params\":{\"_meta\":" ++ meta ++ ",\"name\":\"review\",\"arguments\":{}}}",
             .method = "prompts/get",
             .name = "review",
+        },
+        .{
+            .body = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tasks/get\",\"params\":{\"_meta\":" ++ meta ++ ",\"taskId\":\"job\"}}",
+            .method = "tasks/get",
+            .name = "job",
+        },
+        .{
+            .body = "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tasks/update\",\"params\":{\"_meta\":" ++ meta ++ ",\"taskId\":\"job\",\"inputResponses\":{}}}",
+            .method = "tasks/update",
+            .name = "job",
+        },
+        .{
+            .body = "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tasks/cancel\",\"params\":{\"_meta\":" ++ meta ++ ",\"taskId\":\"job\"}}",
+            .method = "tasks/cancel",
+            .name = "job",
         },
     };
     for (cases) |case| {

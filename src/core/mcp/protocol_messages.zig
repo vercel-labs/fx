@@ -73,7 +73,7 @@ pub fn buildToolCallRequestForProtocol(
     try out.writer.writeAll(",\"method\":\"tools/call\",\"params\":{");
     if (protocol == .modern) {
         try out.writer.writeAll("\"_meta\":");
-        try writeModernRequestMetadataWithProgress(&out.writer, progress_token, capabilities);
+        try writeModernTaskMetadata(&out.writer, progress_token, capabilities);
         try out.writer.writeAll(",");
     } else if (progress_token) |token| {
         try out.writer.print("\"_meta\":{{\"progressToken\":{d}}},", .{token});
@@ -102,6 +102,23 @@ pub fn writeModernRequestMetadataWithProgress(
     progress_token: ?u64,
     capabilities: elicitation.Capabilities,
 ) !void {
+    return writeModernMetadata(writer, progress_token, capabilities, false);
+}
+
+pub fn writeModernTaskMetadata(
+    writer: *std.Io.Writer,
+    progress_token: ?u64,
+    capabilities: elicitation.Capabilities,
+) !void {
+    return writeModernMetadata(writer, progress_token, capabilities, true);
+}
+
+fn writeModernMetadata(
+    writer: *std.Io.Writer,
+    progress_token: ?u64,
+    capabilities: elicitation.Capabilities,
+    tasks: bool,
+) !void {
     try writer.writeAll("{\"io.modelcontextprotocol/protocolVersion\":\"");
     try writer.writeAll(modern_protocol_version);
     try writer.writeAll("\",\"io.modelcontextprotocol/clientInfo\":{\"name\":\"fx\",\"version\":");
@@ -119,6 +136,10 @@ pub fn writeModernRequestMetadataWithProgress(
             try writer.writeAll("\"url\":{}");
         }
         try writer.writeByte('}');
+    }
+    if (tasks) {
+        if (capabilities.any()) try writer.writeByte(',');
+        try writer.writeAll("\"extensions\":{\"io.modelcontextprotocol/tasks\":{}}");
     }
     try writer.writeByte('}');
     if (progress_token) |token| {

@@ -25,6 +25,7 @@ const buildCancellationNotification = protocol_messages.buildCancellationNotific
 const featureProtocol = protocol_messages.featureProtocol;
 const stdio_dispatcher = @import("stdio_dispatcher.zig");
 const tool_result = @import("tool_result.zig");
+const task_runtime = @import("task_runtime.zig");
 const Allocator = std.mem.Allocator;
 const mcp_response_frame_overhead_bytes: usize = 16 * 1024;
 const lockRwSharedUntil = controlled_lock.rwSharedUntil;
@@ -132,7 +133,7 @@ pub const Operations = struct {
         defer if (result_owned) owned_result.deinit(arena);
         const required = owned_result.input_required orelse
             return error.McpInvalidInputRequired;
-        if (continuation_round >= 8) {
+        if (continuation_round >= mrtr.max_tool_rounds) {
             return .{
                 .model_output = try tool_result_limits.prepareModelOutput(
                     arena,
@@ -437,6 +438,9 @@ pub const Operations = struct {
             };
             defer arena.free(response);
 
+            if (outcome.protocol == .modern) {
+                if (try self.taskContext(server, snapshot, options, max_tool_result_bytes).follow(arena, response, operation_deadline.?)) |result| return result;
+            }
             const result = tool_result.extract(arena, .{
                 .server_name = server.config.name,
                 .tool_name = snapshot.prefixed_name,
@@ -674,6 +678,19 @@ pub const Operations = struct {
         return if (responder) |value| value.capabilities else .{};
     }
 
+    fn taskContext(self: Operations, server: *McpServer, snapshot: *const ToolCallSnapshot, options: tool_mcp_runtime.CallOptions, max_tool_result_bytes: usize) task_runtime.Context {
+        return .{
+            .runtime_alloc = self.lifecycle.alloc,
+            .runtime_generation = self.generation,
+            .catalog_mutex = self.lifecycle.catalog_mutex,
+            .server = server,
+            .snapshot = snapshot,
+            .options = options,
+            .max_frame_bytes = mcpResponseFrameCap(max_tool_result_bytes),
+            .max_tool_result_bytes = max_tool_result_bytes,
+        };
+    }
+
     fn callToolHttp(
         self: Operations,
         alloc: Allocator,
@@ -846,7 +863,10 @@ pub const Operations = struct {
             },
             else => |e| return e,
         };
-        errdefer response.deinit(alloc);
+        defer response.deinit(alloc);
+        server.connection_lock.unlockShared(io_mod.getIo());
+        connection_locked = false;
+        if (try self.taskContext(server, snapshot, options, max_tool_result_bytes).follow(alloc, response.body, deadline)) |result| return result;
         const result = try tool_result.extract(alloc, .{
             .server_name = server.config.name,
             .tool_name = snapshot.prefixed_name,
@@ -855,7 +875,6 @@ pub const Operations = struct {
             .protocol = .modern,
             .output_schema_json = snapshot.output_schema_json,
         });
-        response.deinit(alloc);
         return result;
     }
 

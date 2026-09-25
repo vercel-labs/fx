@@ -1,10 +1,12 @@
 import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+import { taskFixture } from "./mcp-tasks.mjs";
 
 const protocolVersion = "2026-07-28";
 const wireLogPath = process.env.FX_MCP_WIRE_LOG;
 const pidPath = process.env.FX_MCP_PID_PATH;
 const resultText = process.env.FX_MCP_RESULT_TEXT ?? "MODERN_MCP_TOOL_RESULT";
 const mode = process.env.FX_MCP_MODE ?? "normal";
+const taskResponse = taskFixture(mode);
 const crashMarkerPath = process.env.FX_MCP_CRASH_MARKER;
 const recoveryFailureMarkerPath = crashMarkerPath
   ? `${crashMarkerPath}.recovery-failed`
@@ -77,7 +79,7 @@ function hasModernMetadata(message) {
   const meta = message.params?._meta;
   const capabilities = meta?.["io.modelcontextprotocol/clientCapabilities"];
   const advertiseElicitation = ["tools/call", "resources/read", "prompts/get"]
-    .includes(message.method);
+    .includes(message.method) || message.method.startsWith("tasks/");
   const expectedCapabilities = advertiseElicitation && expectedElicitation === "form"
     ? { elicitation: { form: {} } }
     : advertiseElicitation && expectedElicitation === "url"
@@ -85,6 +87,9 @@ function hasModernMetadata(message) {
       : advertiseElicitation && expectedElicitation === "both"
         ? { elicitation: { form: {}, url: {} } }
         : {};
+  if (message.method === "tools/call" || message.method.startsWith("tasks/")) {
+    expectedCapabilities.extensions = { "io.modelcontextprotocol/tasks": {} };
+  }
   return meta?.["io.modelcontextprotocol/protocolVersion"] === protocolVersion &&
     meta?.["io.modelcontextprotocol/clientInfo"]?.name === "fx" &&
     typeof meta?.["io.modelcontextprotocol/clientInfo"]?.version === "string" &&
@@ -162,6 +167,12 @@ function handle(message) {
   }
   if (!hasModernMetadata(message)) {
     invalidMetadata(message);
+    return;
+  }
+  if (mode === "task_stall_get" && message.method === "tasks/get") return;
+  const asyncResult = taskResponse(message);
+  if (asyncResult) {
+    send(asyncResult);
     return;
   }
 

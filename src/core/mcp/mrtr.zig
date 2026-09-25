@@ -6,6 +6,8 @@ const elicitation = @import("elicitation.zig");
 
 const Allocator = std.mem.Allocator;
 
+pub const max_tool_rounds = 8;
+
 pub const Limits = struct {
     max_requests: usize = 32,
     max_name_bytes: usize = 256,

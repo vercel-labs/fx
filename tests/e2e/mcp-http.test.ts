@@ -196,7 +196,11 @@ function assertModernWire(
     expect(meta?.["io.modelcontextprotocol/protocolVersion"]).toBe(
       MODERN_MCP_VERSION,
     );
-    expect(meta?.["io.modelcontextprotocol/clientCapabilities"]).toEqual({});
+    expect(meta?.["io.modelcontextprotocol/clientCapabilities"]).toEqual(
+      entry.message.method === "tools/call"
+        ? { extensions: { "io.modelcontextprotocol/tasks": {} } }
+        : {},
+    );
     expect(entry.headers.accept).toBe(
       "application/json, text/event-stream",
     );
@@ -212,6 +216,91 @@ function assertModernWire(
 }
 
 describe("modern MCP Streamable HTTP", () => {
+  for (const mode of ["task_complete", "task_seed_terminal", "task_tool_error", "task_failed", "task_cancelled", "task_mismatch", "task_invalid", "task_timeout", "task_long_poll", "task_stall_get", "task_invalid_content", "task_input"] as const) {
+    test(`async MCP HTTP ${mode} retains the original call and routes by task ID`, async () => {
+      fixture = startModernMcpHttpFixture(mode);
+      const root = createRoot(mode, fixture, ["task_timeout", "task_long_poll", "task_stall_get"].includes(mode) ? 300 : 5_000);
+      gateway = startToolGateway("Async task observed.");
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Call the async MCP tool."], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway), timeoutMs: 15_000,
+      });
+      expect(result.code).toBe(0);
+      expect(result.stderr).toBe("Selecting MCP tool mcp_fixture_echo\nMCP: mcp_fixture_echo\nHTTP fixture halfway\n");
+      expect(gateway.requests).toHaveLength(3);
+      expect(fixture.requests.filter((entry) => entry.message.method === "tools/call")).toHaveLength(1);
+      const taskRequests = fixture.requests.filter((entry) => entry.message.method.startsWith("tasks/"));
+      expect(taskRequests.length).toBeGreaterThan(0);
+      for (const entry of taskRequests) {
+        expect(entry.headers["mcp-name"]).toBe("fixture-task");
+        expect(entry.headers["mcp-method"]).toBe(entry.message.method);
+        expect(entry.headers["x-workspace"]).toBe("one");
+        expect(entry.message.params?._meta?.["io.modelcontextprotocol/clientCapabilities"].extensions).toEqual({ "io.modelcontextprotocol/tasks": {} });
+        expect(entry.message.params?.name).toBeUndefined();
+      }
+      const output = gateway.requests[2]!.body;
+      if (["task_complete", "task_seed_terminal", "task_tool_error"].includes(mode)) {
+        expect(output).toContain("ASYNC_TASK_RESULT");
+        expect(output).toContain("structuredContent");
+        const polls = taskRequests.filter((entry) => entry.message.method === "tasks/get");
+        expect(polls).toHaveLength(2);
+        expect(polls[1]!.receivedAtMs - polls[0]!.receivedAtMs).toBeGreaterThanOrEqual(55);
+        const text = toolResultText(gateway.requests[2]!.body, "call_mcp", mode === "task_tool_error" ? "error-text" : "text");
+        expect(text).toContain("ASYNC_TASK_RESULT");
+      } else if (mode === "task_failed") {
+        expect(output).toContain("TASK_PROTOCOL_FAILURE");
+        expect(output).toContain("-32000");
+      } else if (mode === "task_cancelled") {
+        expect(output).toContain("cancelled by the server");
+      } else if (mode === "task_invalid_content") {
+        expect(output).toContain("MCP protocol failure");
+        expect(output).not.toContain("ASYNC_TASK_RESULT");
+        expect(taskRequests.some((entry) => entry.message.method === "tasks/cancel")).toBe(false);
+      } else {
+        expect(output).not.toContain("ASYNC_TASK_RESULT");
+        expect(taskRequests.at(-1)!.message.method).toBe("tasks/cancel");
+        if (mode === "task_long_poll") expect(taskRequests).toHaveLength(1);
+      }
+      expect(new Set(fixture.requests.map((entry) => entry.message.id)).size).toBe(fixture.requests.length);
+    }, 20_000);
+  }
+
+  test.skipIf(!tmuxAvailable())("async MCP HTTP input is updated once across stale polls", async () => {
+    fixture = startModernMcpHttpFixture("task_input");
+    const root = createRoot("task-input-tui", fixture);
+    gateway = startToolGateway("Async input accepted.");
+    const stderrPath = join(root.root, "stderr.log");
+    tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 110, height: 32, stderrPath, env: fixtureEnv(root, gateway) });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("Call the async MCP tool.");
+    await tui.waitForText("MCP server fixture requests confirmed", 20_000);
+    await tui.sendKeys("1");
+    await tui.waitForText("Current values:", 20_000);
+    await tui.sendKeys("1");
+    await tui.waitForText("Async input accepted.", 20_000);
+    expect(fixture.requests.filter((entry) => entry.message.method === "tools/call")).toHaveLength(1);
+    expect(fixture.requests.filter((entry) => entry.message.method === "tasks/update")).toHaveLength(1);
+    expect(gateway.requests[2]!.body).toContain("ASYNC_TASK_RESULT");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  }, 35_000);
+
+  test.skipIf(!tmuxAvailable())("async MCP cancellation interrupts the suggested poll delay", async () => {
+    fixture = startModernMcpHttpFixture("task_long_poll");
+    const root = createRoot("task-cancel-tui", fixture, 30_000);
+    gateway = startToolGateway("Async cancellation observed.");
+    const stderrPath = join(root.root, "stderr.log");
+    tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 110, height: 32, stderrPath, env: fixtureEnv(root, gateway) });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("Call the async MCP tool.");
+    const callDeadline = Date.now() + 10_000;
+    while (!fixture.requests.some((entry) => entry.message.method === "tools/call") && Date.now() < callDeadline) await Bun.sleep(25);
+    expect(fixture.requests.some((entry) => entry.message.method === "tools/call")).toBe(true);
+    await tui.sendInterruptEscapePair(10_000);
+    await tui.waitForText(`Cancelled ${TOOL_NAME}`, 10_000);
+    expect(fixture.requests.filter((entry) => entry.message.method === "tasks/cancel")).toHaveLength(1);
+    expect(fixture.requests.filter((entry) => entry.message.method === "tasks/get")).toHaveLength(0);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  }, 30_000);
+
   test("an OAuth-configured server failure does not invent an authentication challenge", async () => {
     let hits = 0;
     const failing = Bun.serve({
@@ -1511,10 +1600,10 @@ describe("modern MCP Streamable HTTP", () => {
       });
       expect(calls[0]?.message.params?._meta?.[
         "io.modelcontextprotocol/clientCapabilities"
-      ]).toEqual({ elicitation: { form: {}, url: {} } });
+      ]).toEqual({ elicitation: { form: {}, url: {} }, extensions: { "io.modelcontextprotocol/tasks": {} } });
       expect(calls[1]?.message.params?._meta?.[
         "io.modelcontextprotocol/clientCapabilities"
-      ]).toEqual({ elicitation: { form: {}, url: {} } });
+      ]).toEqual({ elicitation: { form: {}, url: {} }, extensions: { "io.modelcontextprotocol/tasks": {} } });
       expect(gateway.requests[2]?.body).toContain(
         "HTTP continued after elicitation",
       );

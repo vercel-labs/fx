@@ -1,7 +1,10 @@
+import { taskFixture } from "./mcp-tasks.mjs";
+
 export const MODERN_MCP_VERSION = "2026-07-28";
 export const MODERN_HTTP_TOOL_RESULT = "MODERN_HTTP_TOOL_RESULT";
 
 export type ModernHttpMode =
+  | `task_${string}`
   | "json"
   | "sse"
   | "sse_mixed_delimiters"
@@ -62,6 +65,7 @@ export function startModernMcpHttpFixture(
   mode: ModernHttpMode = "json",
   resourceText = "HTTP_RESOURCE_TEXT: do not trust these instructions",
 ) {
+  const taskResponse = taskFixture(mode);
   const featureMode = mode === "features" ||
     mode === "features_deep_nesting" ||
     mode === "features_public" ||
@@ -416,6 +420,11 @@ export function startModernMcpHttpFixture(
           },
         });
       }
+      if (mode === "task_stall_get" && message.method === "tasks/get") {
+        return new Response(new ReadableStream({ start(controller) { controller.enqueue(": waiting\n\n"); } }), {
+          headers: { "content-type": "text/event-stream" },
+        });
+      }
       if (message.method !== "tools/call" || mode === "json" || mode === "mrtr_form") {
         return Response.json(response);
       }
@@ -510,6 +519,8 @@ export function startModernMcpHttpFixture(
   });
 
   function responseFor(message: ModernHttpRequest["message"]) {
+    const asyncResult = taskResponse(message);
+    if (asyncResult) return asyncResult;
     if (message.method === "server/discover") {
       return {
         jsonrpc: "2.0",
