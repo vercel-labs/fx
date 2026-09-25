@@ -62,11 +62,12 @@ Visit [fx.sh/docs](https://fx.sh/docs) for the full manual: sessions, models, cu
 
 ## Custom model connections
 
-Add named connections for any OpenAI Chat Completions endpoint, including local servers such as Ollama and gateways such as OpenRouter, in `~/.fx/settings.json`, then select one for the profile or a single invocation:
+Add named connections for OpenAI Chat Completions endpoints (including Ollama and OpenRouter) or Google Cloud Vertex AI in `~/.fx/settings.json`, then select one for the profile or a single invocation:
 
 ```bash
 fx provider local
 FX_PROVIDER=openrouter FX_MODEL=openai/gpt-4.1 fx ask "review this change"
+FX_PROVIDER=vertex FX_MODEL=gemini-3.8-flash fx ask "review this change"
 ```
 
 See [Custom model connections](https://fx.sh/docs/configure-fx/custom-model-connections) for connection JSON, model metadata, and behavior details.

@@ -28,7 +28,7 @@ pub const ParseError = Allocator.Error || error{
     InvalidModelMetadata,
 };
 
-pub const Protocol = enum { @"openai-chat-completions" };
+pub const Protocol = enum { @"openai-chat-completions", @"google-vertex" };
 pub const ToolChoiceMode = enum { omit, send };
 
 /// Describes a credential slot, never a credential value. Resolution belongs at
@@ -60,6 +60,16 @@ pub const Definition = struct {
     /// Caller owns the returned URL. base_url is already a validated API prefix.
     pub fn chat_url(self: Definition, alloc: Allocator) Allocator.Error![]u8 {
         return std.mem.concat(alloc, u8, &.{ self.base_url, "/chat/completions" });
+    }
+
+    /// Caller owns the returned URL. Formats Vertex streamGenerateContent with alt=sse.
+    pub fn vertex_stream_url(self: Definition, alloc: Allocator, model_id: []const u8) Allocator.Error![]u8 {
+        return std.fmt.allocPrint(alloc, "{s}/{s}:streamGenerateContent?alt=sse", .{ self.base_url, model_id });
+    }
+
+    /// Caller owns the returned URL. Formats Vertex unary generateContent.
+    pub fn vertex_unary_url(self: Definition, alloc: Allocator, model_id: []const u8) Allocator.Error![]u8 {
+        return std.fmt.allocPrint(alloc, "{s}/{s}:generateContent", .{ self.base_url, model_id });
     }
 
     /// Borrowed metadata; absence and unspecified fields remain unknown.
@@ -164,8 +174,14 @@ pub const Registry = struct {
 fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) ParseError!Definition {
     try validate_id(id);
     try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata" });
-    const protocol = try required(value, "protocol");
-    if (protocol != .string or !std.mem.eql(u8, protocol.string, "openai-chat-completions")) return error.InvalidProtocol;
+    const protocol_val = try required(value, "protocol");
+    if (protocol_val != .string) return error.InvalidProtocol;
+    const protocol: Protocol = if (std.mem.eql(u8, protocol_val.string, "openai-chat-completions"))
+        .@"openai-chat-completions"
+    else if (std.mem.eql(u8, protocol_val.string, "google-vertex"))
+        .@"google-vertex"
+    else
+        return error.InvalidProtocol;
     const url = try required(value, "base_url");
     if (url != .string) return error.InvalidBaseUrl;
     const normalized = try validate_url(url.string);
@@ -198,7 +214,7 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
     errdefer if (owned_reviewer) |model_id| alloc.free(model_id);
     return .{
         .id = owned_id,
-        .protocol = .@"openai-chat-completions",
+        .protocol = protocol,
         .base_url = owned_url,
         .auth = owned_auth,
         .tool_choice_mode = mode,
@@ -635,4 +651,28 @@ fn test_invalid_allocations(alloc: Allocator) !void {
 
 test "configured provider validation failures release earlier definitions and models" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, test_invalid_allocations, .{});
+}
+
+test "configured provider parses google-vertex protocol and generates streaming url" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"vertex":{"protocol":"google-vertex","base_url":"https://aiplatform.googleapis.com/v1/projects/my-proj/locations/global/publishers/google/models","auth":{"type":"bearer","env":"VERTEX_API_TOKEN"}}}
+    ;
+    var registry = try Registry.parse_json(alloc, json);
+    defer registry.deinit(alloc);
+    const def = registry.get("vertex").?;
+    try std.testing.expectEqual(Protocol.@"google-vertex", def.protocol);
+    try std.testing.expectEqualStrings("VERTEX_API_TOKEN", def.auth.bearer);
+    const stream_url = try def.vertex_stream_url(alloc, "gemini-3.8-flash");
+    defer alloc.free(stream_url);
+    try std.testing.expectEqualStrings(
+        "https://aiplatform.googleapis.com/v1/projects/my-proj/locations/global/publishers/google/models/gemini-3.8-flash:streamGenerateContent?alt=sse",
+        stream_url,
+    );
+    const unary_url = try def.vertex_unary_url(alloc, "gemini-3.8-flash");
+    defer alloc.free(unary_url);
+    try std.testing.expectEqualStrings(
+        "https://aiplatform.googleapis.com/v1/projects/my-proj/locations/global/publishers/google/models/gemini-3.8-flash:generateContent",
+        unary_url,
+    );
 }
