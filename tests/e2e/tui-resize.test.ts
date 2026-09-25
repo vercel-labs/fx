@@ -1484,6 +1484,154 @@ async function runRapidSkillResizeAttempt(
 }
 
 describe.skipIf(SKIP)("tui: resize", () => {
+  for (const mode of ["choose-tree", "copy-mode"] as const) {
+    test(
+      `tmux ${mode} survives settled resize without auto closing`,
+      async () => {
+        const root = realpathSync(mkdtempSync(join(tmpdir(), `fx-resize-${mode}-`)));
+        tempDirs.push(root);
+        const tracePath = join(root, "trace.log");
+        const stderrPath = join(root, "stderr.log");
+        writeFileSync(stderrPath, "");
+        // Never change the developer's tmux prefix, bindings, or server state.
+        const socketName = `fx-resize-${mode}-${process.pid}-${Date.now()}`;
+        const tmux = (...args: string[]) => execFileSync(
+          "tmux",
+          ["-L", socketName, ...args],
+          { encoding: "utf8", stdio: "pipe" },
+        ).trim();
+        let client: ReturnType<typeof Bun.spawn> | undefined;
+        try {
+          // Isolate configuration too: the shared helper expects window index 0.
+          tmux("-f", "/dev/null", "new-session", "-d", "-s", "bootstrap", "sleep 120");
+          session = await createResizeSession({
+            isolated: true,
+            socketName,
+            width: 120,
+            height: 40,
+            stderrPath,
+            remainOnExit: true,
+            env: {
+              HOME: join(root, "home"),
+              AI_GATEWAY_API_KEY: undefined,
+              VERCEL_OIDC_TOKEN: undefined,
+              FX_AUTO_UPGRADE: "0",
+              FX_TRACE_LOG: tracePath,
+              FX_TRACE_SCOPES: "frame_schedule,frame_diff,frame_commit,scroll,resize",
+              NO_COLOR: "1",
+            },
+          });
+          const active = session;
+          tmux("kill-session", "-t", "bootstrap");
+          await active.waitForComposer(10_000);
+          const pane = tmux("display-message", "-p", "-t", active.name, "#{pane_id}");
+          const format = (value: string) =>
+            tmux("display-message", "-p", "-t", pane, value);
+          const waitForFormat = async (value: string, expected: string) => {
+            const deadline = Date.now() + 5_000;
+            let actual = "";
+            while (Date.now() < deadline) {
+              actual = format(value);
+              if (actual === expected) return;
+              await Bun.sleep(10);
+            }
+            throw new Error(`tmux ${value}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+          };
+          const waitForSettledResize = (afterLine: number) =>
+            waitForCommittedTraceAttempt(
+              tracePath,
+              afterLine,
+              (attempt) => attemptHasReason(attempt, "resize") &&
+                attemptLine(attempt, "tmux_clear_history_complete") !== undefined,
+              10_000,
+            );
+          tmux("set-option", "-g", "prefix", "C-a");
+          tmux("bind-key", "-T", "prefix", "s", "choose-tree", "-Zs");
+          tmux("bind-key", "-T", "prefix", "[", "copy-mode");
+          tmux("set-option", "-g", "status", "off");
+          client = Bun.spawn(["tmux", "-L", socketName, "attach-session", "-t", active.name], {
+            env: { ...process.env, TMUX: undefined, TERM: "xterm-256color" },
+            terminal: {
+              cols: 120,
+              rows: 40,
+              data() {}, // Drain client output; pane and trace helpers own assertions.
+            },
+          });
+          await waitForFormat("#{session_attached}", "1");
+          const terminal = client.terminal!;
+
+          const beforeSplit = readTraceLines(tracePath).length - 1;
+          tmux("split-window", "-v", "-d", "-t", pane, "sleep 120");
+          tmux("select-pane", "-t", pane);
+          await waitForSettledResize(beforeSplit);
+          await active.waitForComposer(10_000);
+          expect(format("#{window_zoomed_flag}")).toBe("0");
+          const draft = `draft survives ${mode}`;
+          terminal.write(draft);
+          await active.waitForText(draft, 5_000);
+
+          const beforeMode = readTraceLines(tracePath).length - 1;
+          // send-keys bypasses the client's prefix table. These are real PTY
+          // keystrokes, so choose-tree -Zs also exercises its implicit zoom.
+          terminal.write(mode === "choose-tree" ? "\x01s" : "\x01[");
+          const paneMode = mode === "choose-tree" ? "tree-mode" : "copy-mode";
+          await waitForFormat("#{pane_mode}", paneMode);
+          if (mode === "choose-tree") {
+            expect(format("#{window_zoomed_flag}")).toBe("1");
+          } else {
+            terminal.resize(100, 32);
+          }
+          const settled = await waitForSettledResize(beforeMode);
+          expect(attemptLine(settled, "tmux_clear_history_complete")).toBeDefined();
+          expect(format("#{pane_mode}")).toBe(paneMode);
+          expect(format("#{pane_in_mode}")).toBe("1");
+          // Also catch a delayed mode exit after the committed frame.
+          await Bun.sleep(250);
+          expect(format("#{pane_mode}")).toBe(paneMode);
+
+          // Leave intentionally, then prove neither the prefix nor the quit key
+          // leaked into the composer and that ordinary editing still works.
+          const beforeExit = readTraceLines(tracePath).length - 1;
+          terminal.write("q");
+          await waitForFormat("#{pane_in_mode}", "0");
+          if (mode === "choose-tree") {
+            await waitForFormat("#{window_zoomed_flag}", "0");
+            await waitForSettledResize(beforeExit);
+          }
+          await waitForSettledFooter(active);
+          terminal.write(" usable!");
+          terminal.write("\x7f");
+          const grid = (await active.waitForPane(
+            (text) => text.split("\n").some((line) =>
+              isInputRow(line) && line.trimEnd().endsWith(`${draft} usable`)
+            ),
+            5_000,
+          )).split("\n");
+          expect(findFooter(grid)).not.toBeNull();
+          expect(format("#{window_zoomed_flag}")).toBe("0");
+          expect(active.isPaneAlive()).toBe(true);
+          expect(client.exitCode).toBeNull();
+          expectEmptyStderr(stderrPath);
+        } finally {
+          try {
+            if (client) {
+              try {
+                client.kill("SIGKILL");
+                await client.exited;
+              } finally {
+                client.terminal?.close();
+              }
+            }
+          } finally {
+            // afterEach still owns the TmuxSession fixture and temporary files.
+            try { tmux("kill-server"); } catch {}
+          }
+        }
+      },
+      60_000,
+    );
+  }
+
   test(
     "welcome header starts at the first terminal row",
     async () => {

@@ -56,6 +56,9 @@ fx ask "explain the changes in this repository"
 
 Inside the shell, run `/help` to browse interactive commands.
 
+In tmux, use your usual prefix bindings to switch sessions or enter copy mode.
+fx preserves those tmux views while resizing, including when the switcher zooms a split pane.
+
 ## Documentation
 
 Visit [fx.sh/docs](https://fx.sh/docs) for the full manual: sessions, models, custom model connections, permissions, configuration, skills, MCP, subagents, embedding, and the complete CLI and slash command references. Agents can read any page as Markdown by appending `.md` to its URL, or fetch [llms-full.txt](https://fx.sh/llms-full.txt) for everything in one file.
