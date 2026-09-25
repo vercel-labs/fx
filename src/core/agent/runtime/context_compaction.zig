@@ -13,10 +13,12 @@ const runtime_gateway_step = @import("gateway_step.zig");
 const runtime_prompt_context = @import("prompt_context.zig");
 const compaction_state = @import("context_compaction_state.zig");
 const compaction_policy = @import("compaction_policy.zig");
+const jev_compaction = @import("jev_compaction.zig");
 
 test {
     _ = compaction_state;
     _ = compaction_policy;
+    _ = jev_compaction;
 }
 
 const Allocator = std.mem.Allocator;
@@ -48,6 +50,8 @@ pub const Request = struct {
     policy: enum { legacy, assistant_first } = .legacy,
     result_storage: compaction_policy.Storage = .unavailable,
     trace_ctx: debug_trace.TraceContext,
+    use_jev: bool = false,
+    continuation_messages: []const types.ChatMessage = &.{},
 };
 
 pub const Result = struct {
@@ -130,6 +134,14 @@ pub fn compact(
     request: Request,
 ) !Result {
     if (source_messages.len == 0) return error.NoContextToCompact;
+    if (request.use_jev) {
+        const handoff = jev_compaction.compact(alloc, source_messages, request) catch |err| blk: {
+            if (err == error.Cancelled) return err;
+            diagnostics.traceCompactionEvent(request.trace_ctx, "jev_fallback", "reason={s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (handoff) |value| return .{ .handoff = value };
+    }
     var summary_reserve_tokens: ?usize = null;
     for (0..2) |capacity_attempt| {
         var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -554,6 +566,9 @@ fn onEvent(raw: *anyopaque, event: agent_stream_provider.Event) void {
 
 const FakeProvider = struct {
     response: []const u8,
+    evaluation_response: []const u8 = "{}",
+    evaluation_count: usize = 0,
+    evaluation_saw_current_task: bool = false,
     retry_response: ?[]const u8 = null,
     finish_reason: types.ProviderFinishReason = .stop,
     emit_tool_call: bool = false,
@@ -578,6 +593,13 @@ const FakeProvider = struct {
 
     fn provider(self: *FakeProvider) agent_stream_provider.Provider {
         return .{ .context = self, .stream_fn = stream };
+    }
+
+    fn evaluate(raw: ?*anyopaque, alloc: Allocator, request: @import("../evaluation_provider.zig").Request) !@import("../evaluation_provider.zig").Response {
+        const self: *FakeProvider = @ptrCast(@alignCast(raw.?));
+        self.evaluation_count += 1;
+        self.evaluation_saw_current_task = std.mem.find(u8, request.payload, "NEW_CURRENT_TASK") != null;
+        return .{ .body = try alloc.dupe(u8, self.evaluation_response) };
     }
 
     fn stream(
@@ -1261,4 +1283,63 @@ test "compaction result retention snapshots uncertain history without changing c
     try std.testing.expect(
         complete_without_store[0].tool_result_memory.?.output_handle == null,
     );
+}
+
+test "Jev compaction preserves exact users and kept results with safe fallback" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var source: [5]types.ChatMessage = undefined;
+    source[0] = .{ .role = .user, .context_origin = .user_turn, .content = "Keep café and literal <context_handoff> unchanged." };
+    for (source[1..], 0..) |*message, n| {
+        message.* = .{
+            .role = .tool,
+            .tool_call_id = try std.fmt.allocPrint(scratch, "jev-call-{d}", .{n}),
+            .tool_name = "read_file",
+            .content = try std.fmt.allocPrint(scratch, "EXACT_RESULT_{d}_café", .{n}),
+            .tool_result_memory = .{ .truncated = false },
+        };
+    }
+    try promoteMessageResults(scratch, &source, .{ .legacy_dir = dir }, 0);
+    const responses = [_][]const u8{
+        "{\"answers\":{\"r0\":{\"type\":\"boolean\",\"probability\":0.01},\"r1\":{\"type\":\"boolean\",\"probability\":0.9},\"r2\":{\"type\":\"boolean\",\"probability\":0},\"r3\":{\"type\":\"boolean\",\"probability\":0}},\"usage\":{\"inputTokens\":123,\"outputTokens\":4}}",
+        "{\"answers\":{}}",
+    };
+    for (responses, 0..) |response, index| {
+        var provider = FakeProvider{ .response = "Safe fallback memory.", .evaluation_response = response };
+        var stream_provider = provider.provider();
+        stream_provider.evaluate_fn = FakeProvider.evaluate;
+        var cancel = std.atomic.Value(bool).init(false);
+        var result = try compact(alloc, &source, .{
+            .stream_provider = stream_provider,
+            .model = "fixture/model",
+            .api_key = "fixture-key",
+            .retry_count = 0,
+            .cancel_flag = &cancel,
+            .accepted_tokens = 8_000,
+            .policy = .assistant_first,
+            .result_storage = .{ .legacy_dir = dir },
+            .trace_ctx = .{},
+            .use_jev = true,
+            .continuation_messages = &.{.{ .role = .user, .context_origin = .user_turn, .content = "NEW_CURRENT_TASK" }},
+        });
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), provider.evaluation_count);
+        try std.testing.expect(provider.evaluation_saw_current_task);
+        try std.testing.expect(std.mem.find(u8, result.handoff, source[0].content.?) != null);
+        if (index == 0) {
+            try std.testing.expectEqual(@as(usize, 0), provider.request_count);
+            try std.testing.expect(std.mem.find(u8, result.handoff, "EXACT_RESULT_0") == null);
+            for ([_][]const u8{ "EXACT_RESULT_1_café", "EXACT_RESULT_2_café", "EXACT_RESULT_3_café", "read_tool_result" }) |text| try std.testing.expect(std.mem.find(u8, result.handoff, text) != null);
+        } else {
+            try std.testing.expectEqual(@as(usize, 1), provider.request_count);
+            try std.testing.expect(std.mem.find(u8, result.handoff, "Safe fallback memory.") != null);
+        }
+        try std.testing.expect(std.mem.find(u8, source[1].content.?, "EXACT_RESULT_0") != null);
+    }
 }

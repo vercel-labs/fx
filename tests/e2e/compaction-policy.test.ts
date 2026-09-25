@@ -100,3 +100,79 @@ for (const userHeavy of [false, true]) test(`automatic compaction preserves task
     else { writeFileSync(join(root, "requests.json"), JSON.stringify(bodies, null, 2)); console.error(`compaction evidence retained: ${root}`); }
   }
 }, 90_000);
+
+const { TmuxSession, fakeShellRun, tmuxAvailable } = await import("./tmux-helpers");
+const { readdirSync } = await import("node:fs");
+
+test.skipIf(!tmuxAvailable())("Jev native transport commits extractive memory and resumes the built binary", async () => {
+  const root = mkdtempSync(join(tmpdir(), "fx-jev-")), home = join(root, "home"), cwd = join(root, "workspace");
+  mkdirSync(join(home, ".fx"), { recursive: true }); mkdirSync(cwd);
+  const model = "fixture/jev";
+  writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({ model, auto_upgrade: false, yolo_acknowledged: true, permission_mode: "full-access" }));
+  let calls = 0, summaries = 0, evaluations = 0;
+  const gateway = startDynamicFakeGateway((raw: string) => {
+    const request = JSON.parse(raw);
+    if (request.toolChoice?.type === "none" && request.tools?.length === 0) {
+      summaries++;
+      return fakeGatewayFinalText("FALLBACK_SHOULD_NOT_BE_USED");
+    }
+    calls++;
+    if (calls <= 16) return fakeShellRun(`jev-result-${calls}`, `printf 'EXACT_JEV_RESULT_${calls}_café\\n'; python3 -c "print('old tool data ' * 800)"`);
+    return fakeGatewayFinalText(`JEV_VISIBLE_DONE_${calls}`);
+  }, { models: [{ id: model, type: "language", tags: ["tool-use"], context_window: 128000, max_tokens: 8192 }] });
+  const evaluator = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    expect(request.headers.get("ai-model-id")).toBe("typesafe-ai/jev");
+    expect(request.headers.get("authorization")).toBe("Bearer synthetic-compaction-evaluation");
+    expect(request.headers.get("x-vercel-ai-gateway-team")).toBe("personal-evaluation-team");
+    const body = await request.json() as any;
+    expect(body.providerOptions.gateway.zeroDataRetention).toBe(true);
+    expect(body.state).toContain("EXACT_JEV_RESULT_1");
+    evaluations++;
+    return Response.json({ answers: Object.fromEntries(Object.keys(body.questions).map((key, i) => [key, { type: "boolean", probability: i === 1 ? 0.99 : 0.01 }])), usage: { inputTokens: 123, outputTokens: 5 } });
+  }});
+  let tui: InstanceType<typeof TmuxSession> | undefined;
+  let passed = false;
+  try {
+    tui = await TmuxSession.create({ cwd, env: {
+      HOME: home, TMPDIR: root, AI_GATEWAY_API_KEY: "synthetic-jev", FX_JEV_GATEWAY_API_KEY: "synthetic-compaction-evaluation", FX_JEV_GATEWAY_TEAM: "personal-evaluation-team", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
+      FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_MODEL: model, FX_PERMISSION_MODE: "full-access",
+      FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      FX_EXPERIMENT_JEV_COMPACTION: "1", FX_E2E_JEV_URL: `http://127.0.0.1:${evaluator.port}/evaluate`,
+      FX_TRACE_LOG: join(root, "trace.log"), FX_TRACE_SCOPES: "quality,context_compaction",
+    }});
+    await tui.waitForComposer(20000);
+    for (const [prompt, expected] of [["Keep café and the original constraint unchanged.", 17], ["Continue the task.", 18], ["Remember the latest request.", 19]] as const) {
+      await tui.sendText(prompt); await tui.waitForText(`JEV_VISIBLE_DONE_${expected}`, 30000); await tui.waitForComposer(20000);
+    }
+    const sessionId = readdirSync(join(home, ".fx/sessions"), { withFileTypes: true }).find(e => e.isDirectory())!.name;
+    const log = join(home, ".fx/sessions", sessionId, "events.jsonl");
+    const before = readFileSync(log);
+    await tui.sendText("/compact");
+    const end = Date.now() + 20000;
+    let checkpoint: any;
+    while (Date.now() < end) {
+      checkpoint = readFileSync(log, "utf8").trim().split("\n").map(x => JSON.parse(x)).find(x => x.event?.context_checkpoint);
+      if (checkpoint) break;
+      await Bun.sleep(30);
+    }
+    expect(checkpoint).toBeDefined();
+    expect(evaluations).toBe(1); expect(summaries).toBe(0);
+    const handoff = checkpoint.event.context_checkpoint.summary;
+    expect(handoff).toContain("Keep café and the original constraint unchanged.");
+    expect(handoff.includes('"output_delta":"EXACT_JEV_RESULT_2_café')).toBe(true);
+    expect(handoff.includes('"output_delta":"EXACT_JEV_RESULT_1_café')).toBe(false);
+    expect(handoff).toContain("read_tool_result");
+    expect(readFileSync(log).subarray(0, before.length).equals(before)).toBe(true);
+    await tui.waitForComposer(20000);
+    await tui.sendText("Continue after Jev compaction."); await tui.waitForText("JEV_VISIBLE_DONE_20", 20000);
+    expect(gateway.requests.every(r => r.headers.get("authorization") === "Bearer synthetic-jev")).toBe(true);
+    expect(gateway.requests.every(r => r.headers.get("x-vercel-ai-gateway-team") !== "personal-evaluation-team")).toBe(true);
+    expect(readFileSync(join(root, "trace.log"), "utf8")).not.toContain("synthetic-compaction-evaluation");
+    passed = true;
+  } finally {
+    await tui?.kill(); gateway.stop(); evaluator.stop(true);
+    if (passed) rmSync(root, { recursive: true, force: true });
+    else console.error(`Jev E2E evidence retained: ${root}`);
+  }
+}, 120000);

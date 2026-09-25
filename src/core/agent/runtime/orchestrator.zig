@@ -6419,6 +6419,8 @@ pub fn compactContextTransaction(
             .usage = deps.usage,
             .usage_allocator = deps.usage_allocator,
             .policy = if (request.result_storage == .unavailable) .legacy else .assistant_first,
+            .use_jev = if (io_mod.getenv("FX_EXPERIMENT_JEV_COMPACTION")) |value| std.mem.eql(u8, value, "1") else false,
+            .continuation_messages = request.continuation.request.messages,
             .result_storage = request.result_storage,
             .trace_ctx = request.trace_ctx,
         },
