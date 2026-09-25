@@ -604,13 +604,14 @@ pub const Cursor = struct {
     }
 };
 
+/// Opens the cache without waiting on a special file such as a FIFO; any
+/// target that is not one regular file is unsafe, and callers rebuild from
+/// the log.
 fn openCacheFile(dir: *io_mod.VerifiedDir, mode: std.Io.Dir.OpenFileOptions.Mode) !std.Io.File {
-    var file = try dir.dir.openFile(io_mod.getIo(), file_name, .{
-        .mode = mode,
-        .allow_directory = false,
-        .follow_symlinks = false,
-        .resolve_beneath = true,
-    });
+    var file = io_mod.openExistingRegularFile(dir.dir, file_name, mode) catch |err| switch (err) {
+        error.DurablePathUnsafe => return error.HistoryCacheUnsafe,
+        else => return err,
+    };
     errdefer file.close(io_mod.getIo());
     const stat = try file.stat(io_mod.getIo());
     if (stat.kind != .file or stat.nlink != 1) return error.HistoryCacheUnsafe;
@@ -678,6 +679,26 @@ fn encodeDecodeRoundtrip(alloc: Allocator, envelope: session_event.ConversationE
     try encodeFramePayload(&again, alloc, decoded, 42, 128, 0xdeadbeef);
     try std.testing.expectEqualSlices(u8, payload.items, again.items);
 }
+
+test "the history cache is never opened when it is a FIFO" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ root, file_name });
+    if (mkfifo(path, 0o600) != 0) return error.SkipZigTest;
+    var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .follow_symlinks = false }) };
+    defer dir.close();
+    // A blocking open of the FIFO would wait for a writer that never comes;
+    // an unsafe cache is rebuilt from the log instead.
+    for ([_]std.Io.Dir.OpenFileOptions.Mode{ .read_only, .read_write }) |mode| {
+        try std.testing.expectError(error.HistoryCacheUnsafe, openCacheFile(&dir, mode));
+    }
+}
+
+extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
 
 test "history snapshot codec round trips every event kind" {
     const alloc = std.testing.allocator;

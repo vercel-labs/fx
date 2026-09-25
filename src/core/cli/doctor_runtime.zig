@@ -375,6 +375,7 @@ fn appendSessionDiagnosticChecks(
             .commit_intent_pending,
             .oversized_legacy_snapshot,
             .projection_missing,
+            .projection_invalid,
             .projection_stale,
             .canonical_log_large,
             .canonical_log_compaction_overdue,
@@ -385,7 +386,6 @@ fn appendSessionDiagnosticChecks(
             .missing_authority,
             .invalid_authority,
             .invalid_commit_intent,
-            .projection_invalid,
             .commit_watermark_missing,
             .commit_watermark_invalid,
             .commit_watermark_mismatched,
@@ -460,6 +460,13 @@ fn recoveryActionForSessionDiagnostic(
         => "rerun migration with --allow-large only after verifying the legacy snapshot",
 
         .projection_missing,
+        .projection_invalid,
+        => std.fmt.bufPrint(
+            buffer,
+            "the conversation is intact in its log; from its workspace, run fx --resume {s} once to rewrite its summary",
+            .{session_id},
+        ),
+
         .projection_stale,
         => "open the session detail or resume it to rebuild projections",
 
@@ -472,7 +479,6 @@ fn recoveryActionForSessionDiagnostic(
             .{session_id},
         ),
 
-        .projection_invalid,
         .canonical_state_invalid,
         .invalid_commit_intent,
         => std.fmt.bufPrint(
@@ -886,6 +892,31 @@ test "session doctor renders precise watermark and compaction diagnostics" {
         checks.items[1].detail,
         "growth_bytes=512 growth_frames=9",
     ) != null);
+}
+
+test "session doctor warns that a lost summary is rebuilt on resume" {
+    const alloc = std.testing.allocator;
+    var checks: std.ArrayList(Check) = .empty;
+    defer {
+        for (checks.items) |*entry| entry.deinit(alloc);
+        checks.deinit(alloc);
+    }
+    var unused_store: session_store.Store = undefined;
+    const diagnostics = [_]session_store.DoctorDiagnostic{
+        .{ .session_id = @constCast("missing-summary"), .kind = .projection_missing },
+        .{ .session_id = @constCast("invalid-summary"), .kind = .projection_invalid },
+    };
+
+    try appendSessionDiagnosticChecks(&checks, alloc, &unused_store, &diagnostics);
+
+    // The conversation is intact in its log, so neither session fails.
+    try std.testing.expectEqual(@as(usize, 2), checks.items.len);
+    for (checks.items, diagnostics) |check, diagnostic| {
+        try std.testing.expectEqual(CheckStatus.warn, check.status);
+        var expected_buffer: [128]u8 = undefined;
+        const expected = try std.fmt.bufPrint(&expected_buffer, "run fx --resume {s} once", .{diagnostic.session_id});
+        try std.testing.expect(std.mem.find(u8, check.detail, expected) != null);
+    }
 }
 
 fn writeDoctorFixtureFile(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !void {

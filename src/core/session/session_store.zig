@@ -475,12 +475,8 @@ fn validateUsageRecoveryMarker(
     recovery: *const io_mod.VerifiedDir,
     session_id: []const u8,
 ) !?i64 {
-    var marker = recovery.dir.openFile(io_mod.getIo(), session_id, .{
-        .mode = .read_only,
-        .allow_directory = false,
-        .follow_symlinks = false,
-        .resolve_beneath = true,
-    }) catch |err| switch (err) {
+    // A special file, such as a FIFO, is rejected before it is opened.
+    var marker = io_mod.openExistingRegularFile(recovery.dir, session_id, .read_only) catch |err| switch (err) {
         error.FileNotFound => return error.UsageRecoveryMarkerNotFound,
         else => return error.InvalidUsageRecoveryIndex,
     };
@@ -592,13 +588,11 @@ pub const Store = struct {
             else => return err,
         };
         if (path_stat.kind != .file) return error.InvalidRememberedSession;
-        var file = directory.dir.openFile(io_mod.getIo(), &name, .{
-            .mode = .read_only,
-            .allow_directory = false,
-            .follow_symlinks = false,
-            .resolve_beneath = true,
-        }) catch |err| switch (err) {
+        // The file may be swapped after the stat, so the open itself never
+        // waits on a special file.
+        var file = io_mod.openExistingReadOnlyRegularFile(directory.dir, &name, .no_follow) catch |err| switch (err) {
             error.FileNotFound => return null,
+            error.DurablePathUnsafe => return error.InvalidRememberedSession,
             else => return err,
         };
         defer file.close(io_mod.getIo());
@@ -1201,10 +1195,15 @@ pub const Store = struct {
     /// candidates in the order and with the workspace filter of the index
     /// page `fx session last` reads. A listed session whose stale schema-v3
     /// log failed to replay in this listing is skipped without a second replay
-    /// and counted as unreadable. A candidate that disappears or
+    /// and counted as unreadable. A session without resumable content (no
+    /// turns, checkpoint, or managed children) that another process has open,
+    /// such as a fresh one in another terminal, is passed over without waiting
+    /// for its lock; one nobody holds, such as a first turn cut off by a
+    /// crash, is still resumed. When nothing else can be resumed, such a
+    /// session is still reported as busy. A candidate that disappears or
     /// moves to another workspace between selection and open yields to the
     /// next newest, up to `max_latest_selection_retries`. Every other
-    /// failure, including a busy session, is returned.
+    /// failure, including a busy session with resumable content, is returned.
     fn resumeLatestByDiscovery(
         self: Store,
         alloc: Allocator,
@@ -1225,6 +1224,7 @@ pub const Store = struct {
         );
         defer catalog.deinit(alloc);
         var vanished: usize = 0;
+        var passed_busy: usize = 0;
         var unreadable = catalog.skipped_invalid;
         for (catalog.summaries.items) |summary| {
             const summary_workspace = summary.workspace_root orelse continue;
@@ -1234,7 +1234,10 @@ pub const Store = struct {
                 unreadable += 1;
                 continue;
             }
-            if (self.resumeLatestCandidate(alloc, summary.id, workspace_root, options)) |loaded| {
+            const empty = !summary.hasResumableContent();
+            var candidate_options = options;
+            if (empty) candidate_options.log.session_lock_deadline_ms = 0;
+            if (self.resumeLatestCandidate(alloc, summary.id, workspace_root, candidate_options)) |loaded| {
                 return loaded;
             } else |err| switch (err) {
                 error.SessionNotFound, error.FileNotFound, error.SessionTargetChanged => {
@@ -1242,12 +1245,22 @@ pub const Store = struct {
                     vanished += 1;
                     if (vanished == max_latest_selection_retries) return err;
                 },
+                error.SessionBusy => if (empty) {
+                    debug_trace.logf("session", "latest selection passed over busy empty id={s}", .{summary.id});
+                    passed_busy += 1;
+                } else {
+                    logDiscoveryError(.workspace_writable_last, summary.id, null, null, err);
+                    return err;
+                },
                 else => {
                     logDiscoveryError(.workspace_writable_last, summary.id, null, null, err);
                     return err;
                 },
             }
         }
+        // The user may have suspended that fx, so say it is busy rather than
+        // that nothing is saved.
+        if (passed_busy > 0) return session_log.failLoadedWritableSession(error.SessionBusy);
         if (unreadable > 0) return session_log.failLoadedWritableSession(error.NoReadableSessions);
         return session_log.failLoadedWritableSession(error.NoSavedSessions);
     }
@@ -1609,7 +1622,9 @@ pub const Store = struct {
             if (event_stat.kind != .file or event_stat.nlink != 1) return error.SessionPathUnsafe;
             return;
         }
-        var candidate = try classifyReadOnlyCandidate(alloc, session_dir, session_id);
+        // A session listing shows must stay openable, including one recovered
+        // from its committed log after its manifest was lost.
+        var candidate = try discovery.classifyOrRecoverReadOnlyCandidate(alloc, session_dir, session_id, null);
         candidate.deinit(alloc);
     }
 
@@ -1891,7 +1906,7 @@ pub const Store = struct {
     }
 
     /// Listing's read of one session: a schema-v3 session whose projection is
-    /// stale, missing, or unreadable is summarized from its committed log. The
+    /// stale, missing, or invalid is summarized from its committed log. The
     /// caller owns the candidate. No directory handle escapes this read.
     pub fn readOnlyCandidate(
         self: Store,
@@ -1904,16 +1919,7 @@ pub const Store = struct {
         }
         var dir = try self.openSessionDir(session_id);
         defer dir.close();
-        const classified = if (cancelled) |stop|
-            discovery.classifyReadOnlyCandidateCancellable(alloc, &dir, session_id, stop)
-        else
-            classifyReadOnlyCandidate(alloc, &dir, session_id);
-        var candidate = classified catch |err| switch (err) {
-            // A missing or undecodable manifest; every other failure is
-            // reported, not recovered.
-            error.SessionNotFound, error.InvalidSessionFormat => (try discovery.recoverSchemaV3Candidate(alloc, &dir, session_id, cancelled)) orelse return err,
-            else => return err,
-        };
+        var candidate = try discovery.classifyOrRecoverReadOnlyCandidate(alloc, &dir, session_id, cancelled);
         errdefer candidate.deinit(alloc);
         try discovery.summarizeStaleProjection(alloc, &dir, &candidate, cancelled);
         return candidate;
@@ -1932,8 +1938,6 @@ pub const Store = struct {
         return discovery.classifyFencedLegacyCandidate(alloc, &dir, session_id, cancelled);
     }
 
-    /// Invalidates the derived resume catalog after managed child ownership
-    /// changes. The relationship index remains the canonical authority.
     /// Returns owned IDs for every readable ordinary session. Caller frees each
     /// ID and the list with the allocator passed here.
     pub fn listSubagentControlSessionIds(
@@ -4640,6 +4644,25 @@ fn testDurableState(
     };
 }
 
+/// A fixture state with one saved turn. Latest selection passes over a busy
+/// session only when it has no resumable content.
+fn testDurableStateWithTurn(
+    alloc: Allocator,
+    id: []const u8,
+    workspace_root: []const u8,
+) !session_codec.DurableSessionState {
+    var state = try testDurableState(alloc, id, workspace_root);
+    errdefer state.deinit(alloc);
+    const history = try alloc.alloc(session.HistoryTurn, 1);
+    errdefer alloc.free(history);
+    history[0] = try session.dupeHistoryTurn(alloc, .{ .assistant = .{
+        .user = .{ .text = @constCast("saved request") },
+        .assistant = @constCast("saved response"),
+    } });
+    state.history = history;
+    return state;
+}
+
 fn makeSessionDir(alloc: Allocator, store: Store, id: []const u8) !void {
     const dir = try sessionDirPath(alloc, store.sessions_dir, id);
     defer alloc.free(dir);
@@ -6051,8 +6074,10 @@ test "latest selection skips a bounded number of vanished candidates" {
         empty_control.barrier_completed_count.load(.seq_cst),
     );
 
+    // Each has a turn, so an injected SessionBusy is returned rather than
+    // passing over an empty session.
     for ([_][]const u8{ "vanish-a", "vanish-b", "vanish-c", "vanish-d" }) |id| {
-        var state = try testDurableState(alloc, id, ctx.workspace);
+        var state = try testDurableStateWithTurn(alloc, id, ctx.workspace);
         defer state.deinit(alloc);
         var writable = try ctx.store.startWritableSession(alloc, state);
         writable.deinit(alloc);
@@ -7934,10 +7959,194 @@ test "a schema-v3 session with a lost manifest lists and resumes from its commit
             defer saved.deinit(alloc);
             try std.testing.expectEqual(recoverable, saved.contains("recover"));
         }
+        // Doctor agrees with listing: a recovered session is a warning whose
+        // repair is to resume it, not a lost conversation.
+        {
+            var inspection = try ctx.store.inspectForDoctorBounded(alloc, 10);
+            defer inspection.deinit(alloc);
+            const reported: ?DoctorIssueKind = for (inspection.diagnostics.items) |diagnostic| {
+                if (std.mem.eql(u8, diagnostic.session_id, "recover")) break diagnostic.kind;
+            } else null;
+            const expected: DoctorIssueKind = switch (mutation) {
+                .missing => .projection_missing,
+                .bad => .projection_invalid,
+                .unsupported => .canonical_state_invalid,
+                .missing_behind_fence => .authority_transition_pending,
+            };
+            try std.testing.expectEqual(@as(?DoctorIssueKind, expected), reported);
+        }
+        // The detail view opens what listing shows.
+        if (recoverable) {
+            var capability = try ctx.store.openSubagentControlCapabilityReadOnly(alloc, "recover", .{});
+            capability.deinit();
+            var detail = try ctx.store.loadReadOnlyAdmissionDetail(alloc, "recover", .{});
+            defer detail.deinit(alloc);
+            try std.testing.expectEqual(@as(i64, 50), detail.summary.updated_at_ms);
+        }
         var resumed = try ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{});
         defer resumed.deinit(alloc);
         try std.testing.expectEqualStrings(if (recoverable) "recover" else "older", resumed.active_id);
     }
+}
+
+test "doctor reports a lost manifest of a managed child as invalid, since it cannot be resumed" {
+    const alloc = std.testing.allocator;
+    // Older releases marked a child only with a file under subagent/.
+    const Marking = enum { first_event, owner_marker, legacy_control };
+    for (std.enums.values(Marking)) |marking| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var ctx = try initTempStore(alloc, &tmp);
+        defer ctx.deinit(alloc);
+        try writeSchemaV3Fixture(alloc, ctx.store, "kid", .{
+            .projected_workspace = ctx.workspace,
+            .workspace = ctx.workspace,
+            .updated_at_ms = 50,
+            .stale_projection = false,
+            .subagent_child = marking == .first_event,
+        });
+        {
+            var dir = try ctx.store.openSessionDir("kid");
+            defer dir.close();
+            try dir.dir.deleteFile(std.testing.io, "session.json");
+            if (marking != .first_event) try dir.dir.createDir(std.testing.io, "subagent", .fromMode(0o700));
+            switch (marking) {
+                .first_event => {},
+                .owner_marker => try dir.dir.writeFile(std.testing.io, .{ .sub_path = "subagent/owner.json", .data = "{}", .flags = .{ .permissions = .fromMode(0o600) } }),
+                .legacy_control => try dir.dir.writeFile(std.testing.io, .{ .sub_path = "subagent/control.json", .data = "{\"parent_id\":\"parent\"}", .flags = .{ .permissions = .fromMode(0o600) } }),
+            }
+        }
+        // The warning's advice, `fx --resume <id>`, is refused for a child.
+        var inspection = try ctx.store.inspectForDoctorBounded(alloc, 10);
+        defer inspection.deinit(alloc);
+        const reported: ?DoctorIssueKind = for (inspection.diagnostics.items) |diagnostic| {
+            if (std.mem.eql(u8, diagnostic.session_id, "kid")) break diagnostic.kind;
+        } else null;
+        try std.testing.expectEqual(@as(?DoctorIssueKind, .canonical_state_invalid), reported);
+    }
+}
+
+test "latest resume passes over an empty session that another terminal has open" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    var conversation = try testDurableStateWithTurn(alloc, "conversation", ctx.workspace);
+    defer conversation.deinit(alloc);
+    var conversation_writable = try ctx.store.startWritableSession(alloc, conversation);
+    conversation_writable.deinit(alloc);
+    // Committing a turn stamps the conversation with the current time, so the
+    // empty session is made unmistakably newer.
+    var fresh = try testDurableState(alloc, "fresh", ctx.workspace);
+    defer fresh.deinit(alloc);
+    fresh.updated_at_ms = std.math.maxInt(i64);
+    var fresh_writable = try ctx.store.startWritableSession(alloc, fresh);
+    fresh_writable.deinit(alloc);
+
+    var fresh_dir = try ctx.store.openSessionDir("fresh");
+    defer fresh_dir.close();
+    {
+        var lock = try io_mod.acquireTimedAdvisoryLock(&fresh_dir, "session.lock", 2000);
+        defer lock.release();
+        // The newer session has no turns and is held elsewhere, so it is passed
+        // over without the usual wait for its lock.
+        const started_ms = io_mod.milliTimestamp();
+        var resumed = try ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{});
+        defer resumed.deinit(alloc);
+        try std.testing.expectEqualStrings("conversation", resumed.active_id);
+        try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1000);
+    }
+    // With nothing else to resume, the held session is reported as busy, not
+    // as missing.
+    {
+        try tmp.dir.createDirPath(io_mod.getIo(), "alone");
+        const alone = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "alone");
+        defer alloc.free(alone);
+        var alone_state = try testDurableState(alloc, "alone-fresh", alone);
+        defer alone_state.deinit(alloc);
+        var alone_writable = try ctx.store.startWritableSession(alloc, alone_state);
+        alone_writable.deinit(alloc);
+        var alone_dir = try ctx.store.openSessionDir("alone-fresh");
+        defer alone_dir.close();
+        var lock = try io_mod.acquireTimedAdvisoryLock(&alone_dir, "session.lock", 2000);
+        defer lock.release();
+        try std.testing.expectError(error.SessionBusy, ctx.store.resumeTargetForWrite(alloc, .last, alone, .{}));
+    }
+    // Once nobody holds it, it is the session to resume: a first turn cut off
+    // by a crash leaves no turns either.
+    var resumed = try ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{});
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqualStrings("fresh", resumed.active_id);
+}
+
+test "a read-only listing saves the index only after replaying a committed log" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    try writeSchemaV3Fixture(alloc, ctx.store, "current", .{
+        .projected_workspace = ctx.workspace,
+        .workspace = ctx.workspace,
+        .updated_at_ms = 30,
+        .stale_projection = false,
+    });
+    var reader = try Store.initReadOnlyFromHome(alloc, ctx.home, ctx.workspace);
+    defer reader.deinit(alloc);
+    // Nothing needed a replay, so the listing writes nothing.
+    {
+        var catalog = try catalog_cache.listActionableCatalogReadOnly(reader, alloc);
+        defer catalog.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), catalog.summaries.items.len);
+    }
+    try std.testing.expect(!catalog_cache.catalogFileExists(ctx.store.canonical_root.sessions));
+
+    // A stale manifest is replayed once, and the index keeps the replayed row
+    // for later listings.
+    try writeSchemaV3Fixture(alloc, ctx.store, "stale", .{
+        .projected_workspace = "/old-workspace",
+        .workspace = ctx.workspace,
+        .updated_at_ms = 50,
+    });
+    {
+        var catalog = try catalog_cache.listActionableCatalogReadOnly(reader, alloc);
+        defer catalog.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 2), catalog.summaries.items.len);
+        try std.testing.expectEqualStrings("stale", catalog.summaries.items[0].id);
+        try std.testing.expectEqualStrings(ctx.workspace, catalog.summaries.items[0].workspace_root.?);
+    }
+    var saved = try catalog_cache.Loaded.load(alloc, ctx.store.canonical_root.sessions, null);
+    defer saved.deinit(alloc);
+    try std.testing.expect(saved.contains("stale"));
+    try std.testing.expect(saved.contains("current"));
+
+    // The next listing reuses the saved row, so nothing is replayed and the
+    // index is not rewritten.
+    const sessions = ctx.store.canonical_root.sessions.?;
+    const before = try sessions.dir.statFile(std.testing.io, ".resume-catalog", .{ .follow_symlinks = false });
+    {
+        var catalog = try catalog_cache.listActionableCatalogReadOnly(reader, alloc);
+        defer catalog.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 2), catalog.summaries.items.len);
+    }
+    const after = try sessions.dir.statFile(std.testing.io, ".resume-catalog", .{ .follow_symlinks = false });
+    try std.testing.expectEqual(before.inode, after.inode);
+}
+
+test "a FIFO usage recovery marker is rejected without blocking" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/fifo-session", .{root});
+    if (mkfifo(path, 0o600) != 0) return error.SkipZigTest;
+    var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .follow_symlinks = false }) };
+    defer dir.close();
+    // A blocking open of the FIFO would wait for a writer that never comes.
+    try std.testing.expectError(error.InvalidUsageRecoveryIndex, validateUsageRecoveryMarker(&dir, "fifo-session"));
 }
 
 test "a FIFO in a session never blocks listing or latest resume" {
@@ -8218,13 +8427,13 @@ test "writable last returns busy for the selected target" {
     var ctx = try initTempStore(alloc, &tmp);
     defer ctx.deinit(alloc);
 
-    var older = try testDurableState(alloc, "older-available", ctx.workspace);
+    var older = try testDurableStateWithTurn(alloc, "older-available", ctx.workspace);
     defer older.deinit(alloc);
     older.updated_at_ms = 100;
     var older_writable = try ctx.store.startWritableSession(alloc, older);
     older_writable.deinit(alloc);
 
-    var selected = try testDurableState(alloc, "newer-busy", ctx.workspace);
+    var selected = try testDurableStateWithTurn(alloc, "newer-busy", ctx.workspace);
     defer selected.deinit(alloc);
     selected.updated_at_ms = 200;
     var selected_writable = try ctx.store.startWritableSession(alloc, selected);
