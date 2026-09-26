@@ -1294,6 +1294,24 @@ pub const Store = struct {
         return state;
     }
 
+    /// Returns caller-owned preferences without replaying canonical history.
+    /// Older storage formats retain the ordinary read-only load semantics.
+    pub fn loadReadOnlyPreferences(
+        self: Store,
+        alloc: Allocator,
+        session_id: []const u8,
+    ) !session_codec.DurableSessionPreferences {
+        try validateSessionId(session_id);
+        var session_dir = try self.openSessionDir(session_id);
+        defer session_dir.close();
+        if (try session_log.hasConversationMetadata(alloc, &session_dir)) {
+            return self.loadConversationPreferences(alloc, &session_dir, session_id);
+        }
+        var state = try self.loadReadOnly(alloc, session_id);
+        defer state.deinit(alloc);
+        return state.preferences.dupe(alloc);
+    }
+
     /// Replays complete canonical conversation turns without retaining the archive.
     /// The visitor borrows each turn only for the duration of append().
     pub fn visitConversationHistory(
@@ -1702,11 +1720,10 @@ pub const Store = struct {
             return error.InvalidSessionMetadata;
         }
         return .{
-            .provider = model_provider.parse(metadata.value.provider) orelse
-                return error.InvalidSessionMetadata,
-            .model = try alloc.dupe(u8, metadata.value.model),
+            .provider = metadata.value.provider,
             .effort = core_types.ReasoningEffort.parse(metadata.value.effort) orelse
                 return error.InvalidSessionMetadata,
+            .model = try alloc.dupe(u8, metadata.value.model),
             .fast_mode = metadata.value.fast_mode,
         };
     }
@@ -8489,6 +8506,10 @@ test "exact legacy read does not create state" {
     var loaded = try ctx.store.loadReadOnly(alloc, "legacy-detail");
     defer loaded.deinit(alloc);
     try std.testing.expectEqualStrings("legacy-detail", loaded.id);
+    var preferences = try ctx.store.loadReadOnlyPreferences(alloc, "legacy-detail");
+    defer preferences.deinit(alloc);
+    try std.testing.expectEqualStrings(loaded.preferences.model, preferences.model);
+    try std.testing.expectEqual(loaded.preferences.effort, preferences.effort);
     const session_dir = try sessionDirPath(
         alloc,
         ctx.store.sessions_dir,
