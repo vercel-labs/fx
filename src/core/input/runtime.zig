@@ -49,8 +49,9 @@ pub const Runtime = struct {
     kill_ring: kill_ring.State = .{},
     edit_history: edit_history.State = .{},
     vertical_navigation: vertical_navigation.State = .{},
-    /// Set while the Ctrl+P model picker borrows the composer as its query
-    /// box. Holds the draft the composer is restored to when the picker closes.
+    /// Set while the Ctrl+P model picker borrows the composer: first as the
+    /// catalog's query box, then for its inline effort and fast stages. Holds
+    /// the draft the composer is restored to when that flow ends.
     model_picker_draft: ?composer_stash.State = null,
 
     pub fn deinit(self: *Runtime, alloc: Allocator) void {
