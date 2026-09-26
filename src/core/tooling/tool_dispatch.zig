@@ -339,22 +339,6 @@ pub const ValidateFn = *const fn (DispatchContext, ToolInput) DispatchError!?[]u
 /// Function pointer that executes a validated and allowed tool input.
 pub const CallFn = *const fn (DispatchContext, ToolInput) DispatchError!ToolResult;
 
-/// Optional Core adapter selected by a registered tool descriptor when the
-/// ordinary decode/validate/call path needs a focused lifecycle wrapper.
-pub const AuthorizedCallAdapterFn = *const fn (
-    DispatchContext,
-    Registry,
-    message.ToolCall,
-) DispatchError!AuthorizedDispatchResult;
-
-/// Optional Core mapper selected by a registered tool descriptor after an
-/// authorized call has produced its structured dispatch result.
-pub const AuthorizedResultMapperFn = *const fn (
-    Allocator,
-    AuthorizedDispatchResult,
-    *?[]u8,
-) Allocator.Error!AuthorizedDispatchResult;
-
 pub const RunCommandCompatibility = struct {
     matches: *const fn ([]const u8) bool,
     /// Returns success or failure text owned by `ctx.allocator`.
@@ -484,8 +468,6 @@ pub const Tool = struct {
     captured_command_action: ?[]const u8 = null,
     captured_command_fn: ?CapturedCommandFn = null,
     process_local_fn: ?ProcessLocalFn = null,
-    authorized_call_adapter: ?AuthorizedCallAdapterFn = null,
-    authorized_result_mapper: ?AuthorizedResultMapperFn = null,
     cancel_if_requested_after_call: bool = false,
     run_command_compatibility: ?RunCommandCompatibility = null,
     take_file_mutation_input_fn: ?TakeFileMutationInputFn = null,
@@ -892,29 +874,7 @@ pub fn dispatchAuthorizedToolCall(
     ctx: DispatchContext,
     registry: Registry,
     call: message.ToolCall,
-    status_detail: *?[]u8,
 ) DispatchError!AuthorizedDispatchResult {
-    const tool = registry.lookup(call.name) orelse return .{
-        .status = .failure,
-        .body = try std.fmt.allocPrint(ctx.allocator, "unknown tool: {s}", .{call.name}),
-    };
-    const result = if (tool.authorized_call_adapter) |adapter|
-        try adapter(ctx, registry, call)
-    else
-        try dispatchAuthorizedToolCallDefault(ctx, registry, call);
-    if (tool.authorized_result_mapper) |mapper| {
-        return mapper(ctx.allocator, result, status_detail) catch |err| {
-            result.deinit(ctx.allocator);
-            return err;
-        };
-    }
-    return result;
-}
-
-/// Runs the ordinary authorized decode/validate/call path without consulting a
-/// descriptor's lifecycle adapter. Focused adapters use this to wrap one call
-/// without recursively selecting themselves again.
-pub fn dispatchAuthorizedToolCallDefault(ctx: DispatchContext, registry: Registry, call: message.ToolCall) DispatchError!AuthorizedDispatchResult {
     const validated = try decodeAndValidateRegisteredToolCall(ctx, registry, call);
     switch (validated) {
         .not_registered => return .{ .status = .failure, .body = try std.fmt.allocPrint(ctx.allocator, "unknown tool: {s}", .{call.name}) },

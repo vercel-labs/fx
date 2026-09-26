@@ -700,17 +700,15 @@ test "parallel skill admission binds identities preserves denies and isolates fa
                 const selected = request.call.resolved_skill orelse return error.MissingSkillBinding;
                 try std.testing.expectEqualStrings("allowed-name", selected.skill.name);
             }
-            var detail: ?[]u8 = null;
             const result = try tool_dispatch.dispatchAuthorizedToolCall(.{
                 .allocator = request.result_allocator,
                 .workspace_root = self.workspace_root,
                 .execution_authority = request.authority,
                 .resolved_skill = request.call.resolved_skill,
-            }, self.registry, request.call, &detail);
+            }, self.registry, request.call);
             return .{
                 .status = if (result.status == .success) .success else .failure,
                 .model_output = result.body,
-                .status_detail = detail,
             };
         }
     };
