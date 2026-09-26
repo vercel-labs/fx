@@ -2,10 +2,12 @@ const std = @import("std");
 const mcp_contract = @import("mcp_contract.zig");
 const project_config = @import("project_config.zig");
 const streamable_http = @import("streamable_http.zig");
+const anysearch_preset = @import("anysearch_preset.zig");
 
 const Allocator = std.mem.Allocator;
 
 pub const AddIntent = union(enum) {
+    anysearch: void,
     local: struct {
         name: []const u8,
         command: []const u8,
@@ -70,6 +72,10 @@ pub fn removeProfileServerUnavailable(
 
 pub fn parseAddIntent(tokens: []const []const u8) AddIntentError!AddIntent {
     if (tokens.len == 0) return error.McpAddUsage;
+    if (std.mem.eql(u8, tokens[0], "--preset")) {
+        if (tokens.len != 2 or !std.mem.eql(u8, tokens[1], anysearch_preset.name)) return error.McpAddUsage;
+        return .{ .anysearch = {} };
+    }
     if (std.mem.eql(u8, tokens[0], "--transport")) {
         if (tokens.len != 4 or !std.mem.eql(u8, tokens[1], "http")) {
             return error.McpAddUsage;
@@ -250,6 +256,7 @@ test "MCP command provider delegates requests and returns owned display text" {
 test "MCP add intent parses local and HTTP argv without allocation" {
     const local = try parseAddIntent(&.{ "fixture", "node", "server.js", "--stdio" });
     switch (local) {
+        .anysearch => return error.TestUnexpectedResult,
         .local => |intent| {
             try std.testing.expectEqualStrings("fixture", intent.name);
             try std.testing.expectEqualStrings("node", intent.command);
@@ -260,12 +267,20 @@ test "MCP add intent parses local and HTTP argv without allocation" {
 
     const remote = try parseAddIntent(&.{ "--transport", "http", "docs", "https://example.test/mcp" });
     switch (remote) {
+        .anysearch => return error.TestUnexpectedResult,
         .local => return error.TestUnexpectedResult,
         .http => |intent| {
             try std.testing.expectEqualStrings("docs", intent.name);
             try std.testing.expectEqualStrings("https://example.test/mcp", intent.url);
         },
     }
+}
+
+test "MCP AnySearch preset is selected without a URL or local adapter" {
+    const preset = try parseAddIntent(&.{ "--preset", "anysearch" });
+    try std.testing.expect(preset == .anysearch);
+    try std.testing.expectError(error.McpAddUsage, parseAddIntent(&.{ "--preset", "unknown" }));
+    try std.testing.expectError(error.McpAddUsage, parseAddIntent(&.{ "--preset", "anysearch", "extra" }));
 }
 
 test "MCP add intent rejects invalid syntax names and URLs" {

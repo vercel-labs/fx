@@ -12,6 +12,7 @@ const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const elicitation = @import("../core/mcp/elicitation.zig");
 const streamable_http = @import("../core/mcp/streamable_http.zig");
+const anysearch_preset = @import("../core/mcp/anysearch_preset.zig");
 const profile_paths = @import("../core/shared/profile_paths.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 
@@ -21,7 +22,7 @@ const CommandResult = command_provider_contract.Result;
 const McpServerConfig = mcp_contract.McpServerConfig;
 const McpTransport = mcp_contract.McpTransport;
 
-const add_usage = "usage: /mcp add <name> <command> [args...] or /mcp add --transport http <name> <url>";
+const add_usage = "usage: /mcp add <name> <command> [args...] or /mcp add --transport http <name> <url> or /mcp add --preset anysearch";
 const profile_lock_deadline_ms: u64 = 2_000;
 
 pub const command_provider = command_provider_contract.Provider{ .handle_fn = handleCommand };
@@ -310,6 +311,7 @@ fn handleCommand(alloc: Allocator, rest: []const u8, command_request: CommandReq
             );
         };
         const name = switch (intent) {
+            .anysearch => anysearch_preset.name,
             .local => |local| local.name,
             .http => |http| http.name,
         };
@@ -831,6 +833,20 @@ fn addProfileServerToPath(
     intent: command_provider_contract.AddIntent,
 ) !?project_config.ProfileDiagnostic {
     const next = switch (intent) {
+        .anysearch => blk: {
+            const owned_name = try alloc.dupe(u8, anysearch_preset.name);
+            errdefer alloc.free(owned_name);
+            const owned_url = try alloc.dupe(u8, anysearch_preset.endpoint);
+            errdefer alloc.free(owned_url);
+            const owned_env = try alloc.dupe(u8, anysearch_preset.api_key_env);
+            break :blk McpServerConfig{
+                .name = owned_name,
+                .transport = .http,
+                .url = owned_url,
+                .optional_bearer_token_env = owned_env,
+                .allow_stored_credentials = false,
+            };
+        },
         .local => |local| try configFromCommandParts(alloc, local.name, local.command, local.args),
         .http => |http| blk: {
             const owned_name = try alloc.dupe(u8, http.name);
@@ -1080,6 +1096,10 @@ fn renderConfigJson(alloc: Allocator, configs: []const McpServerConfig) ![]u8 {
         }
         if (config.bearer_token_env) |env_name| {
             try out.writer.writeAll(",\"bearer_token_env\":");
+            try std.json.Stringify.value(env_name, .{}, &out.writer);
+        }
+        if (config.optional_bearer_token_env) |env_name| {
+            try out.writer.writeAll(",\"optional_bearer_token_env\":");
             try std.json.Stringify.value(env_name, .{}, &out.writer);
         }
         if (config.auth) |auth| {
@@ -1802,7 +1822,7 @@ test "built-in MCP command rejects invalid remote add forms without mutation" {
         defer result.deinit(alloc);
         try expectLine(
             result,
-            "usage: /mcp add <name> <command> [args...] or /mcp add --transport http <name> <url>",
+            add_usage,
             false,
         );
     }
@@ -2220,6 +2240,26 @@ test "remote config keeps credential references and OAuth policy without secrets
     try std.testing.expectEqual(@as(?u16, null), auth.callback_port);
 }
 
+test "optional bearer environment parses and conflicts with required bearer environment" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"mcp":{"anysearch":{"type":"http","url":"https://api.anysearch.com/mcp","optional_bearer_token_env":"ANYSEARCH_API_KEY"}}}
+    ;
+    var configs = try loadConfigFromJson(alloc, json);
+    defer freeConfigs(alloc, &configs);
+    try std.testing.expectEqualStrings("ANYSEARCH_API_KEY", configs.items[0].optional_bearer_token_env.?);
+    try std.testing.expect(configs.items[0].bearer_token_env == null);
+    try std.testing.expect(!configs.items[0].allow_stored_credentials);
+    try std.testing.expectError(error.McpConfigInvalidBearerEnvironment, loadConfigFromJson(
+        alloc,
+        "{\"mcp\":{\"bad\":{\"type\":\"http\",\"url\":\"https://api.example.com/mcp\",\"bearer_token_env\":\"REQUIRED\",\"optional_bearer_token_env\":\"OPTIONAL\"}}}",
+    ));
+    try std.testing.expectError(error.McpConfigInvalidBearerEnvironment, loadConfigFromJson(
+        alloc,
+        "{\"mcp\":{\"bad\":{\"type\":\"http\",\"url\":\"https://api.example.com/mcp\",\"optional_bearer_token_env\":\"OPTIONAL\",\"oauth\":{\"client_id\":\"fx\"}}}}",
+    ));
+}
+
 test "remote config keeps a pinned OAuth callback port" {
     const alloc = std.testing.allocator;
     const json =
@@ -2493,6 +2533,32 @@ test "addProfileServerToPath roundtrips local replacement and remove" {
     var after = try loadConfigFromPath(alloc, path);
     defer freeConfigs(alloc, &after);
     try std.testing.expectEqual(@as(usize, 0), after.items.len);
+}
+
+test "AnySearch preset persists a remote server with optional bearer environment" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const path = try configPathFromHome(alloc, home);
+    defer alloc.free(path);
+
+    _ = try addProfileServerToPath(
+        alloc,
+        path,
+        try command_provider_contract.parseAddIntent(&.{ "--preset", "anysearch" }),
+    );
+    var configs = try loadConfigFromPath(alloc, path);
+    defer freeConfigs(alloc, &configs);
+    try std.testing.expectEqual(@as(usize, 1), configs.items.len);
+    try std.testing.expectEqualStrings("anysearch", configs.items[0].name);
+    try std.testing.expectEqual(McpTransport.http, configs.items[0].transport);
+    try std.testing.expectEqualStrings("https://api.anysearch.com/mcp", try configs.items[0].remoteUrl());
+    try std.testing.expect(configs.items[0].bearer_token_env == null);
+    try std.testing.expectEqualStrings("ANYSEARCH_API_KEY", configs.items[0].optional_bearer_token_env.?);
+    try std.testing.expect(!configs.items[0].allow_stored_credentials);
 }
 
 test "profile mutation preserves canonical files with suspicious sibling maps" {
