@@ -976,14 +976,32 @@ fn writeWithheldAttachmentNotice(
     );
     if (attachment.inline_data == null) {
         if (attachment.snapshot_path) |path| {
-            try writer.print(
-                " It is saved at {s}. Downscale or crop it to at most {d} pixels per side, then read the smaller file.]\n",
-                .{ path, limit },
-            );
+            try writer.print(" It is saved at {s}", .{path});
+            // Snapshots are named .bin, which hides the type from tools
+            // that choose a decoder by file name.
+            if (mediaTypeExtension(attachment.media_type)) |extension| {
+                if (!std.mem.endsWith(u8, path, extension)) {
+                    try writer.print("; copy it to a name ending in {s} if a tool needs the extension", .{extension});
+                }
+            }
+            try writer.print(". Downscale or crop it to at most {d} pixels per side, then read the smaller file.]\n", .{limit});
             return;
         }
     }
     try writer.print(" Ask for a copy at most {d} pixels per side.]\n", .{limit});
+}
+
+fn mediaTypeExtension(media_type: []const u8) ?[]const u8 {
+    const extensions = [_]struct { []const u8, []const u8 }{
+        .{ "image/png", ".png" },
+        .{ "image/jpeg", ".jpg" },
+        .{ "image/gif", ".gif" },
+        .{ "image/webp", ".webp" },
+    };
+    for (extensions) |entry| {
+        if (std.mem.eql(u8, media_type, entry[0])) return entry[1];
+    }
+    return null;
 }
 
 /// Leaves attachments over the model pixel limit out of a request and tells
@@ -3452,7 +3470,7 @@ test "requests leave out attachments over the model pixel limit and name their s
     try std.testing.expectEqual(@as(usize, 2), projected[0].images[0].id);
     const expected = try std.fmt.allocPrint(
         arena,
-        "[Image #1 not sent: image/jpeg is 3420x2224 pixels, over the 2000-pixel limit per side. It is saved at {s}. Downscale or crop it to at most 2000 pixels per side, then read the smaller file.]\ncompare [Image #1] and [Image #2]",
+        "[Image #1 not sent: image/jpeg is 3420x2224 pixels, over the 2000-pixel limit per side. It is saved at {s}; copy it to a name ending in .jpg if a tool needs the extension. Downscale or crop it to at most 2000 pixels per side, then read the smaller file.]\ncompare [Image #1] and [Image #2]",
         .{wide_path},
     );
     try std.testing.expectEqualStrings(expected, projected[0].content.?);
