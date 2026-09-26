@@ -5336,8 +5336,18 @@ pub fn Runtime(comptime App: type) type {
                     if (owner.state.usage) |usage| app.session.usage.markClean(usage);
                 }
             }
+            const context_tokens = if (comptime @hasField(App, "context_input_tokens")) blk: {
+                var tokens = session_runtime.estimateContextHistoryTokens(prepared);
+                if (active_prefix) |prefix| {
+                    const turn = [_]types.HistoryTurn{.{ .assistant = prefix }};
+                    tokens +|= session_runtime.estimateContextHistoryTokens(&turn);
+                }
+                break :blk tokens;
+            } else 0;
             app.session.commitCompactedHistory(app.alloc, prepared);
             prepared_owned = false;
+            if (comptime @hasField(App, "context_input_tokens")) app.context_input_tokens = context_tokens;
+            if (comptime @hasField(App, "context_output_baseline")) app.context_output_baseline = app.stream.token_progress.output_tokens;
         }
 
         pub fn commitPermissionState(
@@ -5961,6 +5971,7 @@ const TestApp = struct {
     selected_model: std.ArrayList(u8) = .empty,
     effort: types.ReasoningEffort = .auto,
     fast_mode: bool = false,
+    context_input_tokens: ?u64 = null,
     total_input_tokens: u64 = 0,
     total_output_tokens: u64 = 0,
     total_web_search_requests: u64 = 0,
@@ -6504,7 +6515,9 @@ test "js-host compaction store failure preserves live history and revision" {
         .removed_turn_count = 1,
         .compaction_count = 1,
     };
+    app.context_input_tokens = 9000;
     try std.testing.expectError(error.SessionRevisionConflict, Runtime(TestApp).commitContextCompaction(&app, summary, null, null));
+    try std.testing.expectEqual(@as(?u64, 9000), app.context_input_tokens);
     try std.testing.expectEqualStrings("old reply", app.session.agent.history.items[0].assistant.assistant);
     try std.testing.expectEqualStrings("revision-1", app.session_persistence.js_host_session.?.revision.?);
     try std.testing.expect(fake.committed_state == null);
@@ -6512,6 +6525,9 @@ test "js-host compaction store failure preserves live history and revision" {
     try Runtime(TestApp).commitContextCompaction(&app, summary, null, null);
     try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
     try std.testing.expect(app.session.agent.history.items[0] == .compacted_summary);
+    try std.testing.expectEqual(@as(?u64, session_runtime.estimateContextHistoryTokens(app.session.agent.history.items)), app.context_input_tokens);
+    try std.testing.expect(app.context_input_tokens.? > 0);
+    try std.testing.expect(app.context_input_tokens.? < 9000);
     try std.testing.expectEqualStrings("revision-next", app.session_persistence.js_host_session.?.revision.?);
     try std.testing.expectEqualStrings("revision-1", fake.expected_revision.?);
     try std.testing.expectEqualStrings(summary.summary, fake.committed_state.?.history[0].compacted_summary.summary);

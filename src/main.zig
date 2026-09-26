@@ -584,7 +584,10 @@ const App = struct {
     diff_entries: std.ArrayList(@import("core/output/diff.zig").DiffEntry) = .empty,
     next_diff_id: u32 = 1,
 
-    statusline_context: bool = false,
+    statusline_context: bool = true,
+    /// Context estimate at the latest request or usage boundary, not lifetime usage.
+    context_input_tokens: ?u64 = null,
+    context_output_baseline: u64 = 0,
     statusline_session: bool = false,
     /// Resolved `session_titles` preference: generate a model-written session
     /// title from the first prompt of a fresh session.
@@ -4404,6 +4407,7 @@ test {
     _ = @import("core/app/input_interrupt_runtime.zig");
     _ = @import("ui/footer/render_input.zig");
     _ = @import("ui/footer/surface_frame.zig");
+    _ = @import("ui/render.zig");
     _ = @import("ui/render_request.zig");
     _ = @import("core/app/app_runtime_setup.zig");
     _ = @import("core/app/app_session_runtime.zig");

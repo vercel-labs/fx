@@ -520,6 +520,8 @@ pub const WorkerEvent = union(enum) {
     command_output_complete: ?types.ToolLifecycleId,
     tool_lifecycle: types.ToolLifecycleEvent,
     turn_token_update: types.TurnTokenProgress,
+    /// Context size at the current request boundary, before streamed output.
+    context_token_update: u64,
     turn_phase_update: types.TurnPhaseUpdate,
     diff_block: diff_mod.DiffEntryPayload,
     context_compaction: ContextCompaction,
@@ -4048,6 +4050,7 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
             .tool_lifecycle = try dupeToolLifecycleEvent(alloc, lifecycle),
         },
         .turn_token_update => |update| .{ .turn_token_update = update },
+        .context_token_update => |tokens| .{ .context_token_update = tokens },
         .turn_phase_update => |update| .{ .turn_phase_update = update },
         .diff_block => |payload| blk: {
             const preview = try alloc.dupe(u8, payload.preview);

@@ -2176,6 +2176,21 @@ pub fn prepareCompactedHistory(
     return next.toOwnedSlice(alloc);
 }
 
+test "compacted context estimate includes the summary and retained turn" {
+    const summary: HistoryTurn = .{ .compacted_summary = .{
+        .summary = @constCast("Compacted facts and decisions stay in the next request."),
+        .removed_turn_count = 2,
+        .compaction_count = 1,
+    } };
+    const recent: HistoryTurn = .{ .assistant = .{
+        .user = .{ .text = @constCast("recent question") },
+        .assistant = @constCast("recent answer"),
+    } };
+    const summary_tokens = estimateContextHistoryTokens(&.{summary});
+    try std.testing.expect(summary_tokens > 0);
+    try std.testing.expectEqual(summary_tokens + estimateContextHistoryTokens(&.{recent}), estimateContextHistoryTokens(&.{ summary, recent }));
+}
+
 test "retained context history replacement is allocation-failure atomic" {
     const Fixture = struct {
         fn run(alloc: Allocator) !void {
@@ -3524,6 +3539,13 @@ fn formatToolResultEvidenceLine(arena: Allocator, result: core_types.PersistedTo
         return std.fmt.allocPrint(arena, "- {s} {s} ({d} stored bytes, handle={s})", .{ result.tool_name, @tagName(result.status), result.stored_output_bytes, handle });
     }
     return std.fmt.allocPrint(arena, "- {s} {s} ({d} stored bytes)", .{ result.tool_name, @tagName(result.status), result.stored_output_bytes });
+}
+
+/// Approximate tokens in the active history, including compacted summaries.
+pub fn estimateContextHistoryTokens(history: []const HistoryTurn) u64 {
+    var total: u64 = 0;
+    for (history) |turn| total +|= estimateHistoryTurnTokens(turn);
+    return total;
 }
 
 fn estimateHistoryTurnTokens(turn: HistoryTurn) usize {

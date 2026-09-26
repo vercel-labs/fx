@@ -499,6 +499,11 @@ type ToolPayloadHoldState = HoldState & {
   finish?: () => void;
 };
 
+function statuslineContextTokens(pane: string): number | null {
+  const match = pane.match(/(?:^| · )(\d+)(k?) tokens(?:\s|$)/m);
+  return match ? Number.parseInt(match[1]!, 10) * (match[2] === "k" ? 1000 : 1) : null;
+}
+
 function streamingOutputTokens(scrollback: string): number | null {
   const matches = [...scrollback.matchAll(
     /^• Generating \(\d+(?:h\d+m\d+s|m\d+s|s)\) \(↑\d+(?:\.\d)?k? ↓(\d+(?:\.\d)?k?)\)$/gm,
@@ -1898,6 +1903,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         "reasoning tokens should advance while hidden from the transcript",
       );
       expect(queuedGateway.requests).toHaveLength(1);
+      const initialStatus = await session!.waitForPane(
+        (pane) => statuslineContextTokens(pane) !== null,
+        TIMEOUT,
+      );
+      const initialContextTokens = statuslineContextTokens(initialStatus)!;
 
       hold.sendContent?.();
       const streamingPane = await waitForScrollback(
@@ -1923,6 +1933,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(streamingOutputTokens(laterStreamingPane)).toBeGreaterThan(
         firstOutputTokens,
       );
+      const liveStatus = await session!.waitForPane(
+        (pane) => (statuslineContextTokens(pane) ?? 0) > initialContextTokens,
+        TIMEOUT,
+      );
+      expect(statuslineContextTokens(liveStatus)).toBeGreaterThan(initialContextTokens);
 
       hold.finish?.();
       await session!.waitForText(finalSentinel, TIMEOUT);

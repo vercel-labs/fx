@@ -157,7 +157,7 @@ pub const StartupState = struct {
     /// empty keeps the reviewer's compiled default.
     review_model: []u8 = &.{},
     first_call_tool_choice: types.ToolChoice = .auto,
-    statusline_context: bool = false,
+    statusline_context: bool = true,
     statusline_session: bool = false,
     statusline_workspace: bool = false,
     session_title_generation: bool = true,
@@ -652,7 +652,7 @@ fn loadStartupStateFromOwnedWorkspace(
         }
         state.provider_order = owned_order;
     }
-    state.statusline_context = settings.statusline_context orelse false;
+    state.statusline_context = settings.statusline_context orelse true;
     state.statusline_session = settings.statusline_session orelse false;
     state.statusline_workspace = settings.statusline_workspace orelse false;
     state.session_title_generation = settings.session_titles orelse true;

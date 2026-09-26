@@ -875,7 +875,13 @@ pub fn Runtime(comptime App: type) type {
                 items.git_branch = identity.git_branch;
             }
             if (app.statusline_context) {
-                items.context_used = app.total_input_tokens;
+                items.context_used = if (comptime @hasField(App, "context_input_tokens") and @hasField(App, "context_output_baseline")) blk: {
+                    const base = app.context_input_tokens orelse break :blk 0;
+                    break :blk base +| (if (app.stream.active)
+                        app.stream.token_progress.output_tokens -| app.context_output_baseline
+                    else
+                        0);
+                } else app.total_input_tokens;
                 items.context_total = model_capabilities.resolveForApp(App, app, visible_model).context_window;
             }
             if (comptime @hasField(App, "statusline_session")) {
@@ -3558,6 +3564,8 @@ const CoordinatorTestApp = struct {
     fast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
     statusline_context: bool = false,
+    context_input_tokens: ?u64 = null,
+    context_output_baseline: u64 = 0,
     total_input_tokens: u64 = 0,
     intrinsic_fast_model: ?[]const u8 = null,
     gateway_metadata_model: ?[]const u8 = null,
@@ -4000,7 +4008,8 @@ test "core.app_render_runtime projects Opus 4.8 one million token context to foo
         .alloc = alloc,
         .shell = .{},
         .statusline_context = true,
-        .total_input_tokens = 43_000,
+        .total_input_tokens = 250_000,
+        .context_input_tokens = 43_000,
     };
     defer app.deinit();
 
@@ -4024,7 +4033,19 @@ test "core.app_render_runtime projects Opus 4.8 one million token context to foo
         100,
         &buf,
     );
-    try std.testing.expectEqualStrings("ask · opus 4.8 · 43k/1000k 4%", line);
+    try std.testing.expectEqualStrings("ask · opus 4.8 · 43k tokens", line);
+    app.stream.active = true;
+    app.context_output_baseline = 500;
+    app.stream.token_progress.output_tokens = 1_200;
+    const streaming = Runtime(CoordinatorTestApp).buildStatuslineItems(&app, "anthropic/claude-opus-4.8");
+    try std.testing.expectEqual(@as(u64, 43_700), streaming.context_used);
+    app.stream.active = false;
+    app.context_input_tokens = 2_000; // The compacted summary still occupies context.
+    const compacted = Runtime(CoordinatorTestApp).buildStatuslineItems(&app, "anthropic/claude-opus-4.8");
+    try std.testing.expectEqual(@as(u64, 2_000), compacted.context_used);
+    app.context_input_tokens = 8_000;
+    const next_request = Runtime(CoordinatorTestApp).buildStatuslineItems(&app, "anthropic/claude-opus-4.8");
+    try std.testing.expectEqual(@as(u64, 8_000), next_request.context_used);
 }
 
 test "core.app_render_runtime uses Gateway context window from resolved capabilities" {
@@ -4034,6 +4055,7 @@ test "core.app_render_runtime uses Gateway context window from resolved capabili
         .shell = .{},
         .statusline_context = true,
         .total_input_tokens = 12_000,
+        .context_input_tokens = 12_000,
         .gateway_metadata_model = "provider/new-long-context",
         .gateway_metadata = .{ .context_window = 750_000 },
     };

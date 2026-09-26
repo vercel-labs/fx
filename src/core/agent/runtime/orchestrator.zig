@@ -7679,6 +7679,11 @@ fn processQueuedPromptLoop(
                 diagnostics.traceCompactionFailure(step_ctx, .overflow_recovery_incomplete, "estimated_tokens={d}", .{if (request_cost_for_attempt) |cost| cost.estimated_input_tokens else 0});
                 return error.ContextCapacityExceeded;
             }
+            if (request_cost_for_attempt) |cost| {
+                deps.push_event(deps.ctx, .{ .context_token_update = @intCast(cost.estimated_input_tokens) }) catch |err| {
+                    debug_trace.logf("agent", "context token publication failed err={s}", .{@errorName(err)});
+                };
+            }
             summary_accumulator.prepareTokenRequest();
             runtime_assistant_stream.pushTokenProgressUpdate(&stream_ctx, .changed) catch |progress_err| {
                 debug_trace.logf("agent", "token progress publication failed source=gateway_prepare err={s}", .{@errorName(progress_err)});
