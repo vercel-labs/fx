@@ -1,3 +1,4 @@
+const interactive_host_runtime = @import("core/app/interactive_host_runtime.zig");
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
@@ -553,6 +554,7 @@ const App = struct {
     question_prompt: QuestionPrompt = .{},
 
     should_exit: bool = false,
+    interaction_host: interactive_host_runtime.Runtime = .{},
     input_runtime: InputRuntime = .{},
     terminal_input_runtime: TerminalInputRuntime = .{},
     submission: input_submit_runtime.State = .{},
@@ -611,6 +613,7 @@ const App = struct {
         launch: *cli_surface.InteractiveLaunch,
         auth_mode: credentials.AuthMode,
     ) !Self {
+        try interactive_host_runtime.secureInherited();
         var app = Self{
             .alloc = alloc,
             .auth = undefined,
@@ -944,6 +947,7 @@ const App = struct {
         SessionAppRuntime.finalizePersistence(self);
         shutdown_trace.mark("persistence_finalized");
         self.worker.deinit(std.heap.c_allocator);
+        self.interaction_host.deinit(self.alloc);
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
         self.prompt_history.deinit(self.alloc);
@@ -1288,6 +1292,7 @@ const App = struct {
         has_prior_turns: bool,
         skill_tokens: []const registered_entities.SkillTokenSpan,
     ) !void {
+        try self.interaction_host.beginPrompt(self.alloc, user.text);
         _ = try self.shell.writeUserPromptCard(
             self.alloc,
             &self.metrics,
@@ -3002,6 +3007,7 @@ const App = struct {
 
     pub fn loopCollectFacts(ctx: *anyopaque) !void {
         const self: *App = @ptrCast(@alignCast(ctx));
+        try self.interaction_host.collect(App, self);
         if (!try WorkerAppRuntime.authorizeInteractiveAdmission(self)) return;
 
         if (comptime !host_target.is_wasm) {
@@ -3152,7 +3158,12 @@ const App = struct {
         if (self.terminal_input_runtime.native_clear_probe.active()) return;
         _ = self.admitPendingResizeSignal("post_input");
         InputAppRuntime.prepareFilePicker(self);
+        const semantic_change = self.shell.render_requests.hasReason(.first_frame) or
+            self.shell.render_requests.hasReason(.transcript) or
+            self.shell.render_requests.hasReason(.footer) or
+            self.shell.render_requests.hasReason(.modal);
         try self.flushRequestedFrame();
+        try self.interaction_host.publish(App, self, semantic_change);
     }
 
     pub fn admitPendingApprovalResize(self: *App) bool {

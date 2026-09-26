@@ -1,3 +1,4 @@
+export { createRemoteView as createFxView } from "./remote-terminal.js";
 import {
   createFxAgent as createWasmAgent,
   createFxTerminal as createWasmTerminal,
