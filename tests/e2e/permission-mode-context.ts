@@ -18,12 +18,12 @@ export function expectPermissionModeContext(
     text: typeof message.content === "string" ? message.content : "",
   }));
   const expected = permissionModeContext[mode];
-  const matching = messages.filter((message) => message.text === expected);
+  const matching = messages.filter((message) => message.text.includes(expected));
 
   expect(matching).toHaveLength(1);
   for (const [candidateMode, context] of Object.entries(permissionModeContext)) {
     if (candidateMode === mode) continue;
-    expect(messages.some((message) => message.text === context)).toBe(false);
+    expect(messages.some((message) => message.text.includes(context))).toBe(false);
   }
   expect(matching[0]!.role).toBe("system");
 }

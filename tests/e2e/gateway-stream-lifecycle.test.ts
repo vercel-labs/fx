@@ -1143,12 +1143,12 @@ describe("gateway stream lifecycle", () => {
       expect(findUnavailableCapabilityReferences(oracleRequest)).toEqual([]);
       expect(customProviderGuidanceState(oracleRequest)).toEqual({
         providerToolIndices: [13],
-        guidanceMessageIndices: [1],
+        guidanceMessageIndices: [0],
       });
       expect(request.prompt[0]?.role).toBe("system");
-      expect(request.prompt[1]?.role).toBe("system");
+      expect(request.prompt.filter((message) => message.role === "system")).toHaveLength(1);
       expectOnlyLeadingSystemMessages(gateway.requests[0]!.body);
-      expect(contentText(request.prompt[1]?.content)).toBe(WEB_SEARCH_GUIDANCE);
+      expect(contentText(request.prompt[0]?.content)).toContain(WEB_SEARCH_GUIDANCE);
       expect(toolByName(oracleRequest, "shell")?.description).toBe(
         "Run every command with shell.run. Fast commands complete in one call; commands still running after yield_time_ms return one owned session_id and remain available across turns. Use shell.interact with that exact session_id: omit chars to observe, or provide chars to send exact input and then observe. Use shell.stop only when termination is requested. output_delta is always terminal-safe; unsafe bytes are escaped while full_output_handle retains exact output, so do not run a separate command merely to test output safety or shell usability. Never detach with &, nohup, setsid, or double-forking.",
       );
@@ -1580,7 +1580,7 @@ describe("gateway stream lifecycle", () => {
           expect(request.body).not.toContain("cacheControl");
           const captured = parseGatewayRequest(request.body);
           expect(findUnavailableCapabilityReferences(captured)).toEqual([]);
-          expect(customProviderGuidanceState(captured).guidanceMessageIndices).toEqual([1]);
+          expect(customProviderGuidanceState(captured).guidanceMessageIndices).toEqual([0]);
         }
         const initial = parseGatewayRequest(gateway.requests[0]!.body);
         const continuing = parseGatewayRequest(gateway.requests[1]!.body);
@@ -1589,7 +1589,7 @@ describe("gateway stream lifecycle", () => {
         );
         expect(
           continuing.prompt?.filter((message) =>
-            message.role === "system" && contentText(message.content) === WEB_SEARCH_GUIDANCE
+            message.role === "system" && contentText(message.content).includes(WEB_SEARCH_GUIDANCE)
           ),
         ).toHaveLength(1);
       } finally {
@@ -3007,23 +3007,17 @@ describe("gateway stream lifecycle", () => {
         contentText(message.content)
       );
       const firstText = firstTexts.join("\n");
-      const availableIndex = firstTexts.findIndex((text) =>
-        text.includes("<available_skills>")
-      );
-      const rulesIndex = firstTexts.findIndex((text) =>
-        text.includes("RULES SENTINEL")
-      );
-      const turnIndex = firstTexts.findIndex((text) =>
-        text.includes("<fx-turn-context>")
-      );
+      const systemEntries = first.prompt.filter((message) => message.role === "system");
+      expect(systemEntries).toHaveLength(1);
+      const mergedSystemText = contentText(systemEntries[0]!.content);
+      const availableIndex = mergedSystemText.indexOf("<available_skills>");
+      const rulesIndex = mergedSystemText.indexOf("RULES SENTINEL");
+      const turnIndex = mergedSystemText.indexOf("<fx-turn-context>");
 
       expect(availableIndex).toBeGreaterThan(-1);
       expect(rulesIndex).toBeGreaterThan(availableIndex);
       expect(turnIndex).toBeGreaterThan(rulesIndex);
-      expect(first.prompt[rulesIndex].role).toBe("system");
-      expect(first.prompt[rulesIndex].providerOptions).toBeUndefined();
-      expect(first.prompt[turnIndex].role).toBe("system");
-      expect(first.prompt[turnIndex].providerOptions).toBeUndefined();
+      expect(systemEntries[0]!.providerOptions).toBeUndefined();
       expect(firstText).toContain(
         "dynamic-context&lt;workspace&gt;&#x0a;injected_workspace",
       );

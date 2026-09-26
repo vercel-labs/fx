@@ -1680,7 +1680,7 @@ describe("acp: model-independent", () => {
         expect(findUnavailableCapabilityReferences(oracleRequest)).toEqual([]);
         expect(customProviderGuidanceState(oracleRequest)).toEqual({
           providerToolIndices: [14],
-          guidanceMessageIndices: [1],
+          guidanceMessageIndices: [0],
         });
         expect(gateway.requests[0]!.body).not.toContain(
           "Treat it as interrupting any previous tool plan.",
@@ -8462,7 +8462,7 @@ describe("acp: model-independent", () => {
           AUTO_EXA_SERIALIZED_TOOL_NAMES,
         );
         expect(findUnavailableCapabilityReferences(codeRequest)).toEqual([]);
-        expect(customProviderGuidanceState(codeRequest).guidanceMessageIndices).toEqual([1]);
+        expect(customProviderGuidanceState(codeRequest).guidanceMessageIndices).toEqual([0]);
 
         client.send({
           jsonrpc: "2.0",

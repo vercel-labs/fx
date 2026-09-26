@@ -347,6 +347,15 @@ fn buildGatewayRequestBodyValidated(
             if (budget) |active| try active.check();
             continue;
         }
+        if (message.role == .system) {
+            const run = system_message_run(messages[i..]);
+            if (run > 1) {
+                try write_merged_system_message(alloc, &out.writer, messages[i .. i + run], budget);
+                if (budget) |active| try active.check();
+                i += run;
+                continue;
+            }
+        }
         const verified_images = if (verified_image_override) |override|
             if (override.message_index == i) override.images else null
         else
@@ -725,6 +734,36 @@ fn write_tool_result_part(scratch_alloc: std.mem.Allocator, writer: *std.Io.Writ
     }
     try std.json.Stringify.value(content, .{}, writer);
     try writer.writeAll("}}");
+}
+
+/// Counts the consecutive run of system messages at the front of `messages`.
+fn system_message_run(messages: []const ChatMessage) usize {
+    var len: usize = 0;
+    while (len < messages.len and messages[len].role == .system) len += 1;
+    return len;
+}
+
+/// Writes a system run as one message with contents joined by blank lines.
+/// Providers that render server-side chat templates reject any system message
+/// after the first, so the run must reach the wire as a single message.
+fn write_merged_system_message(
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    run: []const ChatMessage,
+    budget: ?BuildBudget,
+) !void {
+    var joined: std.Io.Writer.Allocating = .init(alloc);
+    defer joined.deinit();
+    for (run) |message| {
+        if (budget) |active| try active.check();
+        const content = message.content orelse continue;
+        if (content.len == 0) continue;
+        if (joined.written().len > 0) try joined.writer.writeAll("\n\n");
+        try joined.writer.writeAll(content);
+    }
+    try writer.writeAll("{\"role\":\"system\",\"content\":");
+    try std.json.Stringify.value(joined.written(), .{}, writer);
+    try writer.writeByte('}');
 }
 
 fn writeChatMessageJsonInner(
@@ -1457,8 +1496,8 @@ test "Gateway automatic caching preserves transient context and grouped tool res
     try std.testing.expect(!options.get("xai").?.object.get("parallelToolCalls").?.bool);
     try std.testing.expect(std.mem.find(u8, body, "cacheControl") == null);
     const prompt = parsed.value.object.get("prompt").?.array.items;
-    try std.testing.expectEqualStrings("runtime context", prompt[1].object.get("content").?.string);
-    const results = prompt[4].object.get("content").?.array.items;
+    try std.testing.expectEqualStrings("stable instructions\n\nruntime context", prompt[0].object.get("content").?.string);
+    const results = prompt[3].object.get("content").?.array.items;
     try std.testing.expectEqual(@as(usize, 2), results.len);
     try std.testing.expectEqualStrings("A", results[0].object.get("output").?.object.get("value").?.string);
     try std.testing.expectEqualStrings("B", results[1].object.get("output").?.object.get("value").?.string);
@@ -1549,6 +1588,34 @@ test "gateway request rejects system messages after conversation" {
         error.InvalidGatewayHistory,
         buildGatewayRequestBody(std.testing.allocator, "[]", &messages),
     );
+}
+
+test "gateway request merges the leading system run into one wire message" {
+    const alloc = std.testing.allocator;
+    const messages = [_]ChatMessage{
+        .{ .role = .system, .content = "base prompt" },
+        .{ .role = .system, .content = "project context" },
+        .{ .role = .system, .content = "runtime context" },
+        .{ .role = .user, .content = "question" },
+    };
+
+    const body = try buildGatewayRequestBody(alloc, "[]", &messages);
+    defer alloc.free(body);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "\"role\":\"system\""));
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const prompt = parsed.value.object.get("prompt").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), prompt.len);
+    try std.testing.expectEqualStrings("base prompt\n\nproject context\n\nruntime context", prompt[0].object.get("content").?.string);
+    try std.testing.expectEqualStrings("user", prompt[1].object.get("role").?.string);
+
+    const single = [_]ChatMessage{
+        .{ .role = .system, .content = "base prompt" },
+        .{ .role = .user, .content = "question" },
+    };
+    const single_body = try buildGatewayRequestBody(alloc, "[]", &single);
+    defer alloc.free(single_body);
+    try std.testing.expect(std.mem.find(u8, single_body, "{\"role\":\"system\",\"content\":\"base prompt\"}") != null);
 }
 
 test "pending tool review closes the exact assistant step with synthetic pending results" {

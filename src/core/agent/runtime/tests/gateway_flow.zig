@@ -373,7 +373,9 @@ fn expectRootFieldAbsent(gateway: *const FakeGateway, index: usize, field: []con
     try std.testing.expect(parsed.value.object.get(field) == null);
 }
 
-fn expectGatewayPromptStringEntry(gateway: *const FakeGateway, index: usize, entry_index: usize, expected: []const u8) !void {
+/// Asserts prompt[entry_index] is a string entry containing each needle in
+/// order. Used for the merged system message that carries the context sections.
+fn expectGatewayPromptStringEntryContainsInOrder(gateway: *const FakeGateway, index: usize, entry_index: usize, needles: []const []const u8) !void {
     const alloc = std.testing.allocator;
     try std.testing.expect(index < gateway.request_bodies.items.len);
 
@@ -386,7 +388,12 @@ fn expectGatewayPromptStringEntry(gateway: *const FakeGateway, index: usize, ent
     try std.testing.expect(entry == .object);
     const content = entry.object.get("content") orelse return error.TestExpectedPromptMessageMissing;
     try std.testing.expect(content == .string);
-    try std.testing.expectEqualStrings(expected, content.string);
+    var offset: usize = 0;
+    for (needles) |needle| {
+        const found = std.mem.indexOfPos(u8, content.string, offset, needle) orelse
+            return error.TestExpectedPromptMessageMissing;
+        offset = found + needle.len;
+    }
 }
 
 fn expectGatewayToolResultOutput(
@@ -5052,8 +5059,10 @@ test "processQueuedPrompt prepares each origin skill catalog with its supplied m
         try std.testing.expectEqualStrings(case.model, gateway.request_models.items[0]);
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, gateway.request_bodies.items[0], .{});
         defer parsed.deinit();
-        const catalog = parsed.value.object.get("prompt").?.array.items[1].object.get("content").?.string;
-        try std.testing.expect(std.mem.find(u8, catalog, "<available_skills>") != null);
+        const merged = parsed.value.object.get("prompt").?.array.items[0].object.get("content").?.string;
+        const catalog_start = std.mem.find(u8, merged, "<available_skills>") orelse return error.SkillCatalogMissing;
+        const catalog_end = std.mem.find(u8, merged[catalog_start..], "</available_skills>") orelse return error.SkillCatalogMissing;
+        const catalog = merged[catalog_start..][0 .. catalog_end + "</available_skills>".len];
         try std.testing.expect(catalog.len <= @as(usize, case.context_window) * 2 / 100 * 4);
         for (names) |name| {
             const entry = try std.fmt.allocPrint(scratch.allocator(), "- {s}: ", .{name});
@@ -5108,16 +5117,21 @@ test "processQueuedPrompt keeps supplied system prompt components in stable orde
     try runFakePrompt(&gateway, &hooks, config, job);
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
-    const first_roles = [_]types.ChatRole{ .system, .system, .system, .system, .system, .system, .system, .system, .user, .assistant, .user };
-    const second_roles = [_]types.ChatRole{ .system, .system, .system, .system, .system, .system, .system, .system, .user, .assistant, .user, .assistant, .tool };
+    const first_roles = [_]types.ChatRole{ .system, .user, .assistant, .user };
+    const second_roles = [_]types.ChatRole{ .system, .user, .assistant, .user, .assistant, .tool };
     try expectGatewayPromptRoles(&gateway, 0, &first_roles);
     try expectGatewayPromptRoles(&gateway, 1, &second_roles);
     inline for (&.{ @as(usize, 0), @as(usize, 1) }) |request_index| {
-        try expectGatewayPromptStringEntry(&gateway, request_index, 0, "base guidance-order prompt");
-        try expectGatewayPromptStringEntry(&gateway, request_index, 1, "custom tool guidance unique needle");
+        try expectGatewayPromptStringEntryContainsInOrder(&gateway, request_index, 0, &.{
+            "base guidance-order prompt",
+            "custom tool guidance unique needle",
+            "skills guidance-order section",
+            config.host_instructions,
+            "model guidance-order overlay",
+            "static guidance-order context",
+            "transient guidance-order context",
+        });
         try expectGatewayPromptTextCount(&gateway, request_index, "skills guidance-order section", 1);
-        try expectGatewayPromptStringEntry(&gateway, request_index, 3, config.host_instructions);
-        try expectGatewayPromptStringEntry(&gateway, request_index, 4, "model guidance-order overlay");
         try expectGatewayPromptTextCount(&gateway, request_index, "custom tool guidance unique needle", 1);
         try expectGatewayPromptTextCount(&gateway, request_index, "host guidance-order instructions", 1);
         try expectGatewayPromptTextCount(&gateway, request_index, "model guidance-order overlay", 1);
@@ -5158,9 +5172,16 @@ test "processQueuedPrompt omits an empty custom tool guidance message" {
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
-    const roles = [_]types.ChatRole{ .system, .system, .user };
+    const roles = [_]types.ChatRole{ .system, .user };
     try expectGatewayPromptRoles(&gateway, 0, &roles);
-    try expectGatewayPromptStringEntry(&gateway, 0, 0, "system");
+    // The merged system entry carries the remaining sections with no blank
+    // gap where the empty guidance message would have sat.
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, gateway.request_bodies.items[0], .{});
+    defer parsed.deinit();
+    const merged = parsed.value.object.get("prompt").?.array.items[0].object.get("content").?.string;
+    try std.testing.expect(std.mem.startsWith(u8, merged, "system\n\n"));
+    try std.testing.expect(std.mem.find(u8, merged, "\n\n\n") == null);
+    try std.testing.expect(!std.mem.endsWith(u8, merged, "\n\n"));
 }
 
 test "processQueuedPrompt refreshes runtime overlay each step and preserves turn suffix" {
@@ -5188,8 +5209,8 @@ test "processQueuedPrompt refreshes runtime overlay each step and preserves turn
     try expectBodyContains(&gateway, 1, "Checking.");
     try expectBodyContains(&gateway, 1, "\"toolName\":\"read_file\"");
     try expectBodyContains(&gateway, 1, "\"value\":\"ok\"");
-    const first_request_roles = [_]types.ChatRole{ .system, .system, .system, .user };
-    const second_request_roles = [_]types.ChatRole{ .system, .system, .system, .user, .assistant, .tool };
+    const first_request_roles = [_]types.ChatRole{ .system, .user };
+    const second_request_roles = [_]types.ChatRole{ .system, .user, .assistant, .tool };
     try expectGatewayPromptRoles(&gateway, 0, &first_request_roles);
     try expectGatewayPromptRoles(&gateway, 1, &second_request_roles);
     const second_request_order = [_][]const u8{ "runtime overlay step two", "user prompt", "Checking.", "\"value\":\"ok\"" };
@@ -5373,8 +5394,8 @@ test "processQueuedPrompt projects history exactly once into each gateway reques
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
-    const first_request_roles = [_]types.ChatRole{ .system, .system, .user, .assistant, .user };
-    const second_request_roles = [_]types.ChatRole{ .system, .system, .user, .assistant, .user, .assistant, .tool };
+    const first_request_roles = [_]types.ChatRole{ .system, .user, .assistant, .user };
+    const second_request_roles = [_]types.ChatRole{ .system, .user, .assistant, .user, .assistant, .tool };
     try expectGatewayPromptRoles(&gateway, 0, &first_request_roles);
     try expectGatewayPromptRoles(&gateway, 1, &second_request_roles);
     for (0..gateway.request_bodies.items.len) |i| {
@@ -5403,7 +5424,7 @@ test "processQueuedPrompt keeps completed history before the final current user 
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
-    const expected_roles = [_]types.ChatRole{ .system, .system, .system, .user, .assistant, .user };
+    const expected_roles = [_]types.ChatRole{ .system, .user, .assistant, .user };
     try expectGatewayPromptRoles(&gateway, 0, &expected_roles);
     try expectGatewayPromptTextCount(&gateway, 0, "prior user structural needle", 1);
     try expectGatewayPromptTextCount(&gateway, 0, "prior assistant structural needle", 1);
@@ -6153,7 +6174,7 @@ test "processQueuedPrompt retries post-tool provider error without synthetic rec
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
-    const retry_roles = [_]types.ChatRole{ .system, .system, .user, .assistant, .tool };
+    const retry_roles = [_]types.ChatRole{ .system, .user, .assistant, .tool };
     try expectGatewayPromptRoles(&gateway, 2, &retry_roles);
     try expectBodyNotContains(&gateway, 2, "network_recovery");
     try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
