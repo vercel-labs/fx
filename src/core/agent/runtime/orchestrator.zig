@@ -3244,7 +3244,7 @@ fn finishPendingParallelCancelled(
             // parallel run is deinitialized after this scope, while history
             // keeps prepared.memory.
             prepared.memory = try types.dupeToolResultMemory(arena, prepared.memory);
-            try runtime_execution_memory.retainToolImages(arena, config, call, &prepared);
+            try runtime_execution_memory.retainToolImages(arena, provisional_alloc, config, call, &prepared);
             _ = try provisional_statuses.finishExecutedCall(
                 deps,
                 provisional_alloc,
@@ -7335,7 +7335,13 @@ fn processQueuedPromptLoop(
                     break;
                 }
             }
-            const materialized_messages = if (request_capabilities.image_input_support == .native) try runtime_execution_memory.materializeToolImages(overlay_arena, config, result_request_messages) else result_request_messages;
+            const materialized_messages = if (request_capabilities.image_input_support == .native)
+                try image_attachments.withholdOversizedAttachments(
+                    overlay_arena,
+                    try runtime_execution_memory.materializeToolImages(overlay_arena, config, result_request_messages),
+                )
+            else
+                result_request_messages;
             const image_projection = try runtime_gateway_step.projectToolImageMessages(overlay_arena, materialized_messages, request_capabilities.image_input_support, vision_policy.route == .fallback, config.max_tool_result_bytes);
             const request_messages = try with_replyable_conversation_tail(overlay_arena, image_projection.messages);
             if (request_messages.ptr != image_projection.messages.ptr) {
@@ -11947,7 +11953,7 @@ fn processQueuedPromptLoop(
                 &prepared.memory,
                 execution.tool_result_memory,
             );
-            try runtime_execution_memory.retainToolImages(arena, config, tool_call, &prepared);
+            try runtime_execution_memory.retainToolImages(arena, stream_ctx.alloc, config, tool_call, &prepared);
             runtime_execution_memory.finalizeCommandReplay(
                 arena,
                 tool_call,

@@ -23,6 +23,34 @@ export function equivalentPngEncodings(): Buffer[] {
   });
 }
 
+// A decodable solid gray RGB PNG with a small byte size at any pixel size.
+export function solidPng(width: number, height: number): Buffer {
+  const stride = width * 3 + 1;
+  const pixels = Buffer.alloc(stride * height, 0x80);
+  for (let y = 0; y < height; y++) pixels[y * stride] = 0;
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0); header.writeUInt32BE(height, 4);
+  header[8] = 8; header[9] = 2;
+  return Buffer.concat([
+    Buffer.from("89504e470d0a1a0a", "hex"),
+    pngChunk("IHDR", header), pngChunk("IDAT", deflateSync(pixels)), pngChunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+// A JPEG signature and frame header: enough for type and pixel-size checks.
+export function jpegHeader(width: number, height: number): Buffer {
+  const header = Buffer.from("ffd8ffc0001108000000000301220002110103110100", "hex");
+  header.writeUInt16BE(height, 7);
+  header.writeUInt16BE(width, 9);
+  return header;
+}
+
+// Pixel size of a PNG, read from its header.
+export function pngPixelSize(png: Buffer): { width: number; height: number } {
+  assert.ok(png.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex")), "expected a PNG");
+  return { width: png.readUInt32BE(16), height: png.readUInt32BE(20) };
+}
+
 function pngChunk(type: string, data: Buffer): Buffer {
   const tag = Buffer.from(type), length = Buffer.alloc(4), checksum = Buffer.alloc(4);
   length.writeUInt32BE(data.length);

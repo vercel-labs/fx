@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
 import { contentText } from "./conditional-guidance-oracle";
+import { pngPixelSize, solidPng } from "./fixtures/image-encoding";
 import {
   fakeGatewayFinalText,
   fakeGatewayToolCall,
@@ -136,6 +137,7 @@ type RootOptions = {
   resourcesSubscribe?: boolean;
   resourceTtlMs?: number;
   captureEnvironment?: boolean;
+  image?: Buffer;
 };
 
 function createRoot(
@@ -151,6 +153,8 @@ function createRoot(
   const launchLogPath = join(root, "mcp-launches.txt");
   const invalidationReleasePath = join(root, "mcp-invalidation-release");
   const environmentCapturePath = join(root, "mcp-environment.json");
+  const imagePath = join(root, "mcp-image.png");
+  if (options.image) writeFileSync(imagePath, options.image);
   const command = options.recordLaunchAttempts
     ? [
       "/bin/sh",
@@ -187,6 +191,7 @@ function createRoot(
             FX_MCP_PID_PATH: join(root, "mcp.pid"),
             FX_MCP_PROTOCOL_VERSION: "2026-07-28",
             FX_MCP_MODE: options.mode ?? "normal",
+            FX_MCP_IMAGE_PATH: options.image ? imagePath : undefined,
             FX_MCP_PROTOCOL_ERROR_MESSAGE: options.protocolErrorMessage,
             FX_MCP_CRASH_MARKER: join(root, "mcp-crashed"),
             FX_MCP_RECOVERY_READY_PATH: join(root, "mcp-recovery-ready"),
@@ -2133,6 +2138,37 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       await expectFixtureProcessesExited(readWire(root.wireLogPath));
     }, 30_000);
   }
+
+  test("MCP images over the model pixel limit are downscaled with a notice", async () => {
+    const root = createRoot("wide-image-output", MODERN_FIXTURE, { mode: "image_result", image: solidPng(3420, 2224) });
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("image_select", "mcp_select_tool", { name: TOOL_NAME }),
+      fakeGatewayToolCall("image_call", TOOL_NAME, { text: "screenshot" }),
+      fakeGatewayFinalText("Wide image result observed."),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use", "vision", "file-input"] }] });
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Get an image from the fixture"], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway),
+      timeoutMs: 20_000,
+    });
+    expect(result.code).toBe(0);
+    const request = JSON.parse(gateway.requests.at(-1)!.body);
+    const part = request.prompt.flatMap((message: { content?: unknown[] }) => message.content ?? [])
+      .find((value: { type?: string; toolCallId?: string }) => value.type === "tool-result" && value.toolCallId === "image_call");
+    expect(part).toBeDefined();
+    expect(part.output.type).toBe("content");
+    expect(part.output.value.find((value: { type: string }) => value.type === "text").text).toContain(
+      "[Image downscaled from 3420x2224 to 2000x1301 pixels to fit the 2000-pixel limit per side. Multiply coordinates in this image by 1.71 to get original pixels.]",
+    );
+    const files = request.prompt
+      .filter((message: { role?: string; content?: unknown }) => message.role === "user" && Array.isArray(message.content))
+      .flatMap((message: { content: Array<Record<string, unknown>> }) => message.content)
+      .filter((entry: Record<string, unknown>) => entry.type === "file");
+    expect(files).toHaveLength(1);
+    const sent = Buffer.from((files[0].data as { data: string }).data, "base64");
+    expect(pngPixelSize(sent)).toEqual({ width: 2000, height: 1301 });
+    await expectFixtureProcessesExited(readWire(root.wireLogPath));
+  }, 30_000);
 
   for (const action of ["resource_read", "prompt_get"] as const) {
     test(`MCP ${action} carries images through the shared result path`, async () => {
