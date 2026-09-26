@@ -1709,6 +1709,20 @@ pub const SessionRuntime = struct {
         };
     }
 
+    pub fn initIntoWithProviders(
+        self: *SessionRuntime,
+        max_history_turns: usize,
+        providers: generation_usage_provider.Set,
+    ) void {
+        inline for (std.meta.fields(SessionRuntime)) |field| {
+            if (comptime std.mem.eql(u8, field.name, "usage") or
+                std.mem.eql(u8, field.name, "max_history_turns")) continue;
+            @field(self.*, field.name) = field.defaultValue().?;
+        }
+        self.usage.initIntoFreshWithProviders(providers);
+        self.max_history_turns = max_history_turns;
+    }
+
     pub fn deinit(self: *SessionRuntime, alloc: Allocator) void {
         self.clearWebFetchArtifacts();
         self.usage.configurePublicationSink(null);
@@ -2065,6 +2079,18 @@ pub const SessionRuntime = struct {
         self.conversation_language = language;
     }
 };
+
+test "session initIntoWithProviders preserves runtime defaults without copying usage scratch arrays" {
+    var actual: SessionRuntime = undefined;
+    @memset(std.mem.asBytes(&actual), 0xa5);
+    actual.initIntoWithProviders(17, .{});
+
+    var expected = SessionRuntime.initWithProviders(17, .{});
+    @memset(std.mem.asBytes(&expected.usage.active_sequences), 0xa5);
+    @memset(std.mem.asBytes(&expected.usage.incidents), 0xa5);
+
+    try std.testing.expectEqualDeep(expected, actual);
+}
 
 fn appendHistoryCopies(
     alloc: Allocator,

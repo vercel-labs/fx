@@ -119,6 +119,14 @@ pub const State = struct {
     file_completion_window_start: usize = 0,
     file_picker_episode_seen: bool = false,
 
+    pub fn initInto(self: *State) void {
+        inline for (std.meta.fields(State)) |field| {
+            if (comptime std.mem.eql(u8, field.name, "file_completion")) continue;
+            @field(self.*, field.name) = field.defaultValue().?;
+        }
+        self.file_completion.initInto();
+    }
+
     pub fn deinit(self: *State, alloc: Allocator) void {
         self.file_completion.deinit(alloc);
         self.model_picker_pending_model.deinit(alloc);
