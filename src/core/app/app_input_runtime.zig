@@ -8831,6 +8831,21 @@ fn setRoutingModelMenuReady(app: *RoutingFakeApp, model_ids: []const []const u8)
     }
 }
 
+/// Fixture model that offers both effort and Fast mode choices.
+const routing_staged_model = "test/staged-model";
+const routing_staged_efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("future-tier")};
+
+/// Stashes `draft` behind the Ctrl+P catalog and picks the staged fixture
+/// model, leaving its inline effort stage open in the borrowed composer.
+fn enterRoutingShortcutEffortStage(app: *RoutingFakeApp, draft: []const u8, cursor: usize) !void {
+    app.setGatewayControls(routing_staged_model, &routing_staged_efforts, true);
+    try app.input_runtime.textReplacementState().replace(app.alloc, draft);
+    app.input_runtime.edit_state.cursor = cursor;
+    try feedRoutingBytes(app, "\x10");
+    try setRoutingModelMenuReady(app, &.{routing_staged_model});
+    try Runtime(RoutingFakeApp).handleByte(app, '\r', 4096, 100);
+}
+
 test "app_input_runtime ctrl+p opens the model catalog and escape restores the draft" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
@@ -8857,20 +8872,12 @@ test "app_input_runtime ctrl+p catalog enter offers the effort and fast stages b
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    const model = "anthropic/claude-opus-4.8";
-    const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("future-tier")};
-    app.setGatewayControls(model, &efforts, true);
-    try app.input_runtime.textReplacementState().replace(alloc, "draft survives");
-    app.input_runtime.edit_state.cursor = 3;
-
-    try feedRoutingBytes(&app, "\x10");
-    try setRoutingModelMenuReady(&app, &.{model});
-    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+    try enterRoutingShortcutEffortStage(&app, "draft survives", 3);
 
     // The shortcut continues into the same effort stage `/model` offers,
     // keeping the draft stashed while the stages borrow the composer.
     try std.testing.expect(!app.model_cache.menu.active);
-    try std.testing.expectEqualStrings("/model " ++ model ++ " ", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqualStrings("/model " ++ routing_staged_model ++ " ", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(picker_state.ModelPickerStage.effort, app.input_runtime.picker.model_picker_stage);
     try std.testing.expect(app.input_runtime.model_picker_draft != null);
     try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
@@ -8885,9 +8892,9 @@ test "app_input_runtime ctrl+p catalog enter offers the effort and fast stages b
     try feedRoutingBytes(&app, "normal");
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 
-    try std.testing.expectEqualStrings(model, app.selected_model.items);
+    try std.testing.expectEqualStrings(routing_staged_model, app.selected_model.items);
     try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
-    try std.testing.expectEqual(types.ReasoningEffort.literal("future-tier"), app.last_preference_effort.?);
+    try std.testing.expectEqual(routing_staged_efforts[0], app.last_preference_effort.?);
     try std.testing.expectEqual(false, app.last_preference_fast_mode.?);
     try std.testing.expectEqual(picker_state.ModelPickerStage.model, app.input_runtime.picker.model_picker_stage);
     try std.testing.expect(!app.input_runtime.picker.hasPendingModelPickerSelection());
@@ -8902,15 +8909,7 @@ test "app_input_runtime ctrl+p inline stages back out to the draft without chang
     for ([_]Exit{ .escape, .ctrl_p, .clear_line }) |exit| {
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
-        const model = "anthropic/claude-opus-4.8";
-        const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("future-tier")};
-        app.setGatewayControls(model, &efforts, true);
-        try app.input_runtime.textReplacementState().replace(alloc, "keep me");
-        app.input_runtime.edit_state.cursor = 2;
-
-        try feedRoutingBytes(&app, "\x10");
-        try setRoutingModelMenuReady(&app, &.{model});
-        try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+        try enterRoutingShortcutEffortStage(&app, "keep me", 2);
         try std.testing.expectEqual(picker_state.ModelPickerStage.effort, app.input_runtime.picker.model_picker_stage);
 
         switch (exit) {
@@ -9071,14 +9070,7 @@ test "app_input_runtime image attach is skipped while ctrl+p inline stages borro
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    const model = "anthropic/claude-opus-4.8";
-    const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("future-tier")};
-    app.setGatewayControls(model, &efforts, true);
-    try app.input_runtime.textReplacementState().replace(alloc, "draft");
-
-    try feedRoutingBytes(&app, "\x10");
-    try setRoutingModelMenuReady(&app, &.{model});
-    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+    try enterRoutingShortcutEffortStage(&app, "draft", "draft".len);
     try std.testing.expect(!app.model_cache.menu.active);
     try std.testing.expect(app.input_runtime.model_picker_draft != null);
     const notices_before = app.notice_write_count;
@@ -9088,7 +9080,7 @@ test "app_input_runtime image attach is skipped while ctrl+p inline stages borro
     // Skipped before the clipboard is read: no image and no clipboard notice.
     try std.testing.expectEqual(@as(usize, 0), app.pending_images.items.len);
     try std.testing.expectEqual(notices_before, app.notice_write_count);
-    try std.testing.expectEqualStrings("/model " ++ model ++ " ", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqualStrings("/model " ++ routing_staged_model ++ " ", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(picker_state.ModelPickerStage.effort, app.input_runtime.picker.model_picker_stage);
     try std.testing.expect(app.input_runtime.model_picker_draft != null);
 }

@@ -2955,7 +2955,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
     "Ctrl+P opens the model picker and returns the draft untouched",
     async () => {
       const fixture = createModelsMenuFixture();
-      const currentModel = "anthropic/claude-opus-4.8";
+      const currentModel = "private-team/staged-model";
       const selectedModel = "private-team/plain-model";
       gateway = startFakeGateway([], {
         models: [
@@ -3042,7 +3042,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       // stages /model offers, and the draft returns once the model applies.
       await session.sendKeys("C-p");
       await waitForModelsMenu(session, 2);
-      await session.sendLiteralText("opus");
+      await session.sendLiteralText("staged");
       // The transcript already names the plain model; only its catalog row
       // must be filtered out.
       await session.waitForPane(
