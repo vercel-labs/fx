@@ -616,6 +616,8 @@ const App = struct {
             .auth = undefined,
             .usage_dashboard = undefined,
             .session_persistence = undefined,
+            .input_runtime = undefined,
+            .session = undefined,
             .shell = TranscriptRuntime.init(),
             .lifecycle_runtime = hooks.Runtime.init(alloc),
             .terminal_client = terminal_client_runtime.Runtime.init(if (comptime host_target.is_wasm)
@@ -636,6 +638,15 @@ const App = struct {
         );
         usage_dashboard_runtime.Runtime.initInto(&app.usage_dashboard, std.heap.c_allocator);
         app_session_runtime.Persistence.initInto(&app.session_persistence);
+        InputRuntime.initInto(&app.input_runtime);
+        SessionRuntime.initIntoWithProviders(
+            &app.session,
+            max_history_turns,
+            if (comptime host_profile.generation_usage)
+                builtin_providers.native.deferredUsageProviders()
+            else
+                .{},
+        );
         if (comptime host_profile.js_host_workspace) {
             app.workspace_host = js_host_workspace.Runtime.init(alloc) catch |err| blk: {
                 if (err != error.WorkspaceUnavailable) {

@@ -423,6 +423,30 @@ pub const Usage = struct {
         return usage;
     }
 
+    pub fn initIntoFreshWithProviders(
+        self: *Usage,
+        providers: generation_usage.Set,
+    ) void {
+        inline for (std.meta.fields(Usage)) |field| {
+            if (comptime std.mem.eql(u8, field.name, "active_sequences") or
+                std.mem.eql(u8, field.name, "incidents") or
+                std.mem.eql(u8, field.name, "billing") or
+                std.mem.eql(u8, field.name, "api_duration_complete") or
+                std.mem.eql(u8, field.name, "wall_duration_complete") or
+                std.mem.eql(u8, field.name, "code_complete") or
+                std.mem.eql(u8, field.name, "reasoning_tokens") or
+                std.mem.eql(u8, field.name, "request_count")) continue;
+            @field(self.*, field.name) = field.defaultValue().?;
+        }
+        self.billing = .complete;
+        self.api_duration_complete = true;
+        self.wall_duration_complete = true;
+        self.code_complete = true;
+        self.reasoning_tokens = 0;
+        self.request_count = 0;
+        self.generation_usage_providers = providers;
+    }
+
     pub fn initLegacy() Usage {
         return .{
             .billing = .legacy,
@@ -2322,6 +2346,18 @@ pub const Usage = struct {
         self.publication_backlog = .empty;
     }
 };
+
+test "usage initIntoFreshWithProviders preserves fresh defaults without copying scratch arrays" {
+    var actual: Usage = undefined;
+    @memset(std.mem.asBytes(&actual), 0xa5);
+    actual.initIntoFreshWithProviders(.{});
+
+    var expected = Usage.initFreshWithProviders(.{});
+    @memset(std.mem.asBytes(&expected.active_sequences), 0xa5);
+    @memset(std.mem.asBytes(&expected.incidents), 0xa5);
+
+    try std.testing.expectEqualDeep(expected, actual);
+}
 
 const ReconciliationAuthority = struct {
     provider: model_provider.ProviderId,

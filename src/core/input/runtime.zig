@@ -53,6 +53,14 @@ pub const Runtime = struct {
     /// box. Holds the draft the composer is restored to when the picker closes.
     model_picker_draft: ?composer_stash.State = null,
 
+    pub fn initInto(self: *Runtime) void {
+        inline for (std.meta.fields(Runtime)) |field| {
+            if (comptime std.mem.eql(u8, field.name, "picker")) continue;
+            @field(self.*, field.name) = field.defaultValue().?;
+        }
+        self.picker.initInto();
+    }
+
     pub fn deinit(self: *Runtime, alloc: Allocator) void {
         input_reset.resetPendingTextScalarWithTrace(&self.text_scalar, "shutdown");
         self.paste.deinit(alloc);
@@ -201,4 +209,16 @@ test "runtime owns product input state without terminal mechanics" {
     try std.testing.expectEqualStrings("draft", runtime.edit_state.input.items);
     try std.testing.expect(!@hasField(Runtime, "terminal_action_decoder"));
     try std.testing.expect(!@hasField(Runtime, "terminal_cursor_probe"));
+}
+
+test "runtime initInto preserves defaults without copying file picker scratch buffers" {
+    var actual: Runtime = undefined;
+    @memset(std.mem.asBytes(&actual), 0xa5);
+    actual.initInto();
+
+    var expected: Runtime = .{};
+    @memset(expected.picker.file_completion.raw_query[0..], 0xa5);
+    @memset(expected.picker.file_completion.lookup_query[0..], 0xa5);
+
+    try std.testing.expectEqualDeep(expected, actual);
 }

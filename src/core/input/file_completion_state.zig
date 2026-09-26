@@ -102,6 +102,14 @@ pub const State = struct {
     prepared: ?Snapshot = null,
     presented: ?Snapshot = null,
 
+    pub fn initInto(self: *State) void {
+        inline for (std.meta.fields(State)) |field| {
+            if (comptime std.mem.eql(u8, field.name, "raw_query") or
+                std.mem.eql(u8, field.name, "lookup_query")) continue;
+            @field(self.*, field.name) = field.defaultValue().?;
+        }
+    }
+
     pub fn deinit(self: *State, alloc: std.mem.Allocator) void {
         if (self.prepared) |*value| value.deinit(alloc);
         if (self.presented) |*value| value.deinit(alloc);
