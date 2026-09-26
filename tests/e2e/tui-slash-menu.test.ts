@@ -2955,7 +2955,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
     "Ctrl+P opens the model picker and returns the draft untouched",
     async () => {
       const fixture = createModelsMenuFixture();
-      const currentModel = "anthropic/claude-opus-4.8";
+      const currentModel = "private-team/staged-model";
       const selectedModel = "private-team/plain-model";
       gateway = startFakeGateway([], {
         models: [
@@ -3020,8 +3020,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         5_000,
       );
 
-      // Enter on a filtered row applies the model directly and still returns
-      // the draft instead of seeding the inline /model stages.
+      // A model without effort or Fast options applies on Enter and returns
+      // the draft.
       await session.sendKeys("C-p");
       await waitForModelsMenu(session, 2);
       await session.sendLiteralText("plain");
@@ -3037,6 +3037,48 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       const settings = JSON.parse(readFileSync(fixture.settingsPath, "utf8")) as { models?: { gateway?: string } };
       expect(settings.models?.gateway).toBe(selectedModel);
+
+      // A model with effort and Fast options continues into the same inline
+      // stages /model offers, and the draft returns once the model applies.
+      await session.sendKeys("C-p");
+      await waitForModelsMenu(session, 2);
+      await session.sendLiteralText("staged");
+      // The transcript already names the plain model; only its catalog row
+      // must be filtered out.
+      await session.waitForPane(
+        (current) =>
+          current.includes(currentModel) &&
+          !current.split("\n").some((line) => line.includes(selectedModel) && !line.includes("Switched to")),
+        5_000,
+      );
+      await session.sendKeys("Enter");
+      await session.waitForPane(
+        (current) => composerContains(current, `/model ${currentModel}`) && current.includes("xhigh"),
+        5_000,
+      );
+      pane = await session.capturePane();
+      expect(composerContains(pane, "hello drXaft")).toBe(false);
+      await session.sendLiteralText("xhigh");
+      await session.sendKeys("Enter");
+      await session.waitForPane(
+        (current) => composerContains(current, `/model ${currentModel} xhigh`) && current.includes("normal"),
+        5_000,
+      );
+      await session.sendLiteralText("normal");
+      await session.sendKeys("Enter");
+      await session.waitForText(`* Switched to ${currentModel}`, 5_000);
+      await session.waitForPane((current) => composerContains(current, "hello drXaft"), 5_000);
+      pane = await session.capturePane();
+      expect(composerContains(pane, "/model")).toBe(false);
+
+      const staged = JSON.parse(readFileSync(fixture.settingsPath, "utf8")) as {
+        models?: { gateway?: string };
+        effort?: string;
+        fast_mode?: boolean;
+      };
+      expect(staged.models?.gateway).toBe(currentModel);
+      expect(staged.effort).toBe("xhigh");
+      expect(staged.fast_mode).toBe(false);
       expect(session.isAlive()).toBe(true);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
 
