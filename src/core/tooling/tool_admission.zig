@@ -17,6 +17,7 @@ const permission_auto_classifier = @import("../permissions/auto_classifier.zig")
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const terminal_contracts = @import("../terminal/contracts.zig");
 const terminal_managed_observer = @import("../terminal/managed_observer.zig");
+const permission_hook = @import("../permissions/permission_hook.zig");
 const permission_prompter = @import("../permissions/permission_prompter.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const permissions = @import("../permissions/permissions.zig");
@@ -77,6 +78,9 @@ pub const Input = struct {
     worker: *WorkerRuntime,
     mcp_review_schema_json: ?[]const u8 = null,
     permission_prompter: ?permission_prompter.Prompter = null,
+    /// Profile hook that may answer an open prompt when the prompter accepts a
+    /// concurrent answer. It is never consulted for any other decision.
+    permission_hook: ?permission_hook.Binding = null,
     advertised_dynamic_tool_names: []const []const u8,
     mcp_runtime: tool_mcp_runtime.RuntimeCapabilities,
     context_limits: context_limits.Values = .{},
@@ -1788,8 +1792,9 @@ fn requestFileMutationPermissionOutcomeFromAdmission(
                 &prepared.review
             else
                 return error.RequestProjectionTooLarge;
-            var response = prompter.request(
-                std.heap.c_allocator,
+            var response = requestHumanPermission(
+                input,
+                prompter,
                 request_view,
                 call,
                 review,
@@ -1991,8 +1996,9 @@ fn promptPermissionOutcome(
         try exactApprovalLocalGrants(input, arena, call, &.{}, .ordinary)
     else
         null;
-    var response = prompter.request(
-        std.heap.c_allocator,
+    var response = requestHumanPermission(
+        input,
+        prompter,
         request,
         call,
         null,
@@ -2013,6 +2019,31 @@ fn promptPermissionOutcome(
     return outcome;
 }
 
+/// Opens the human prompt. When a permission hook is bound and the prompter
+/// accepts a concurrent answer, the hook races the open prompt and is stopped
+/// before this returns.
+fn requestHumanPermission(
+    input: Input,
+    prompter: permission_prompter.Prompter,
+    request: permission_request.PermissionRequest,
+    call: ToolCall,
+    review: ?*const diff_mod.FileReview,
+    grant_offer: ?[]const PermissionGrant,
+) anyerror!permission_request.OwnedPermissionResponse {
+    const alloc = std.heap.c_allocator;
+    if (comptime !permission_hook.supported) {
+        return prompter.request(alloc, request, call, review, grant_offer);
+    } else {
+        const binding = input.permission_hook orelse
+            return prompter.request(alloc, request, call, review, grant_offer);
+        const answerable = prompter.answerable_request_fn orelse
+            return prompter.request(alloc, request, call, review, grant_offer);
+        var race = permission_hook.Race.init(binding, call);
+        defer race.finish();
+        return answerable(prompter.context, alloc, request, review, race.responder());
+    }
+}
+
 fn requestWorkerPermission(
     raw: *anyopaque,
     alloc: Allocator,
@@ -2025,10 +2056,69 @@ fn requestWorkerPermission(
     return worker.requestPermissionBlockingWithReview(alloc, request, review);
 }
 
+fn requestAnswerableWorkerPermission(
+    raw: *anyopaque,
+    alloc: Allocator,
+    request: permission_request.PermissionRequest,
+    review: ?*const diff_mod.FileReview,
+    responder: permission_prompter.Responder,
+) anyerror!permission_request.OwnedPermissionResponse {
+    const worker: *WorkerRuntime = @ptrCast(@alignCast(raw));
+    var observation = WorkerPromptObservation{ .responder = responder };
+    return worker.requestPermissionBlockingObserved(
+        alloc,
+        request,
+        review,
+        observation.observer(),
+    ) catch |err| switch (err) {
+        error.PermissionRegistrationFailed,
+        error.PermissionCapacityExceeded,
+        => unreachable,
+        else => |request_err| return request_err,
+    };
+}
+
+/// Hands the registered worker prompt to a second responder, which answers
+/// through the same submission path as the terminal UI.
+const WorkerPromptObservation = struct {
+    responder: permission_prompter.Responder,
+
+    fn observer(self: *WorkerPromptObservation) WorkerRuntime.PermissionRequestObserver {
+        return .{ .context = @ptrCast(self), .observe_fn = observe };
+    }
+
+    fn observe(
+        raw: *anyopaque,
+        worker: *WorkerRuntime,
+        request: permission_request.PermissionRequest,
+    ) error{
+        OutOfMemory,
+        PermissionRegistrationFailed,
+        PermissionCapacityExceeded,
+    }!void {
+        const self: *WorkerPromptObservation = @ptrCast(@alignCast(raw));
+        self.responder.open_fn(self.responder.context, request, .{
+            .context = @ptrCast(worker),
+            .request_id = request.id,
+            .submit_fn = submitWorkerAnswer,
+        });
+    }
+};
+
+fn submitWorkerAnswer(
+    raw: *anyopaque,
+    request_id: u64,
+    response: permission_request.OwnedPermissionResponse,
+) bool {
+    const worker: *WorkerRuntime = @ptrCast(@alignCast(raw));
+    return worker.submitPermissionResponse(request_id, response) == .accepted;
+}
+
 pub fn workerPrompter(worker: *WorkerRuntime) permission_prompter.Prompter {
     return .{
         .context = @ptrCast(worker),
         .request_fn = requestWorkerPermission,
+        .answerable_request_fn = requestAnswerableWorkerPermission,
     };
 }
 

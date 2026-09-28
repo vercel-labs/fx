@@ -12,6 +12,7 @@ const model_provider = @import("model_provider.zig");
 const model_preferences = @import("model_preferences.zig");
 const configured_provider = @import("configured_provider.zig");
 const update_target = @import("../upgrade/update_target.zig");
+const permission_hook = @import("../permissions/permission_hook.zig");
 pub const context_limits = @import("context_limits.zig");
 
 const Allocator = std.mem.Allocator;
@@ -204,6 +205,8 @@ pub const ConfigDiagnosticCause = enum {
     retired_skill_match_fuzzy,
     invalid_context_limits,
     invalid_additional_directories,
+    invalid_permission_hook,
+    ignored_workspace_permission_hook,
 };
 
 pub const ConfigDiagnostic = struct {
@@ -238,6 +241,15 @@ pub fn writeDiagnosticMetadata(writer: *std.Io.Writer, diagnostic: ConfigDiagnos
             .{workspace_access.max_additional_directories},
         );
     }
+    if (diagnostic.cause == .ignored_workspace_permission_hook) {
+        try writer.writeAll("; permission_hook is read only from the top level of ~/.fx/settings.json; this workspace entry is ignored and the top-level hook, if any, still applies");
+    }
+    if (diagnostic.cause == .invalid_permission_hook) {
+        try writer.print(
+            "; permission_hook is disabled; set it only at the top level of ~/.fx/settings.json as {{\"command\": [\"/absolute/program\", ...], \"timeout_ms\": {d}..{d}}} with at most {d} arguments",
+            .{ permission_hook.min_timeout_ms, permission_hook.max_timeout_ms, permission_hook.max_command_args },
+        );
+    }
 }
 
 pub const DetailedSettings = struct {
@@ -249,12 +261,15 @@ pub const DetailedSettings = struct {
     prompt_history_store_allowed: bool = true,
     additional_directories: ?[][]u8 = null,
     additional_directory_sources: ?[][]u8 = null,
+    /// Top-level profile hook. A malformed entry disables only the hook.
+    permission_hook: ?permission_hook.Config = null,
 
     pub fn deinit(self: *DetailedSettings, alloc: Allocator) void {
         self.settings.deinit(alloc);
         self.permission_sources.deinit(alloc);
         if (self.additional_directories) |paths| freeStringSlice(alloc, paths);
         if (self.additional_directory_sources) |paths| freeStringSlice(alloc, paths);
+        if (self.permission_hook) |*config| config.deinit(alloc);
         if (self.diagnostics.len > 0) {
             for (self.diagnostics) |*diagnostic| diagnostic.deinit(alloc);
             alloc.free(self.diagnostics);
@@ -382,6 +397,8 @@ fn loadMergedSettingsDetailedWithOptionalHome(
     errdefer if (additional_directories) |paths| freeStringSlice(alloc, paths);
     var additional_directory_sources: ?[][]u8 = null;
     errdefer if (additional_directory_sources) |paths| freeStringSlice(alloc, paths);
+    var profile_permission_hook: ?permission_hook.Config = null;
+    errdefer if (profile_permission_hook) |*config| config.deinit(alloc);
     const detailed_merge_state: DetailedSettingsMergeState = .{
         .settings = &settings,
         .sources = &sources,
@@ -504,6 +521,13 @@ fn loadMergedSettingsDetailedWithOptionalHome(
                 .cause = .legacy_workspace_preferences,
             });
         }
+        if (parsed.value.object.get(permission_hook.setting_key)) |value| {
+            profile_permission_hook = permission_hook.parseConfig(alloc, value) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                try appendPermissionHookDiagnostic(alloc, &diagnostics, .invalid_permission_hook);
+                break :blk null;
+            };
+        }
         try mergeDetailedSettingsLayer(
             alloc,
             &detailed_merge_state,
@@ -525,6 +549,9 @@ fn loadMergedSettingsDetailedWithOptionalHome(
                 if (workspace_value != .object) {
                     try diagnostics.append(alloc, .{ .layer = .user, .cause = .malformed_settings });
                 } else {
+                    if (workspace_value.object.contains(permission_hook.setting_key)) {
+                        try appendPermissionHookDiagnostic(alloc, &diagnostics, .ignored_workspace_permission_hook);
+                    }
                     if (workspace_value.object.get("additional_directories")) |value| {
                         const parsed_directories = parseAdditionalDirectories(
                             alloc,
@@ -616,7 +643,20 @@ fn loadMergedSettingsDetailedWithOptionalHome(
         .prompt_history_store_allowed = prompt_history_store_allowed,
         .additional_directories = additional_directories,
         .additional_directory_sources = additional_directory_sources,
+        .permission_hook = profile_permission_hook,
     };
+}
+
+fn appendPermissionHookDiagnostic(
+    alloc: Allocator,
+    diagnostics: *std.ArrayList(ConfigDiagnostic),
+    cause: ConfigDiagnosticCause,
+) !void {
+    try diagnostics.append(alloc, .{
+        .layer = .user,
+        .cause = cause,
+        .setting_key = try alloc.dupe(u8, permission_hook.setting_key),
+    });
 }
 
 const ParsedAdditionalDirectories = struct {
@@ -773,6 +813,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "yolo_acknowledged",
         "permission",
         "additional_directories",
+        permission_hook.setting_key,
     }) |profile_key| {
         if (std.mem.eql(u8, key, profile_key)) return true;
     }
@@ -4362,4 +4403,120 @@ test "theme setting rejects non-string values" {
     var parsed = try parseSettingsJson(std.testing.allocator, "{\"theme\":\"cursor-light\"}");
     defer parsed.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("cursor-light", parsed.theme.?);
+}
+
+fn countUserDiagnostics(diagnostics: []const ConfigDiagnostic, cause: ConfigDiagnosticCause) usize {
+    var count: usize = 0;
+    for (diagnostics) |diagnostic| {
+        if (diagnostic.layer == .user and diagnostic.cause == cause) count += 1;
+    }
+    return count;
+}
+
+test "permission hook loads only from the top-level profile" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDir(std.testing.io, "workspace", .default_dir);
+
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+
+    const settings_fixture = try std.fmt.allocPrint(
+        alloc,
+        "{{\"permission_hook\":{{\"command\":[\"/usr/local/bin/approve\",\"--fx\"],\"timeout_ms\":60000}},\"workspaces\":{{\"{s}\":{{\"permission_hook\":{{\"command\":[\"/tmp/workspace-hook\"]}}}}}}}}\n",
+        .{workspace_root},
+    );
+    defer alloc.free(settings_fixture);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", settings_fixture);
+    try writeFixtureFile(
+        tmp.dir,
+        "workspace/.fx.json",
+        "{\"permission_hook\":{\"command\":[\"/tmp/project-hook\"]},\"max_agent_steps\":17}\n",
+    );
+
+    var detailed = try loadMergedSettingsDetailedFromHome(alloc, home_root, workspace_root);
+    defer detailed.deinit(alloc);
+
+    const hook = detailed.permission_hook orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 2), hook.command.len);
+    try std.testing.expectEqualStrings("/usr/local/bin/approve", hook.command[0]);
+    try std.testing.expectEqualStrings("--fx", hook.command[1]);
+    try std.testing.expectEqual(@as(u32, 60_000), hook.timeout_ms);
+    try std.testing.expectEqual(@as(?usize, 17), detailed.settings.max_agent_steps);
+    try expectIgnoredProjectKey(detailed.diagnostics, "permission_hook");
+    try std.testing.expectEqual(@as(usize, 0), countUserDiagnostics(detailed.diagnostics, .invalid_permission_hook));
+    try std.testing.expectEqual(@as(usize, 1), countUserDiagnostics(detailed.diagnostics, .ignored_workspace_permission_hook));
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    for (detailed.diagnostics) |diagnostic| {
+        if (diagnostic.cause == .ignored_workspace_permission_hook) try writeDiagnosticMetadata(&out.writer, diagnostic);
+    }
+    try std.testing.expect(std.mem.find(u8, out.written(), "top-level hook, if any, still applies") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "is disabled") == null);
+}
+
+test "a relative permission hook command is rejected" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDir(std.testing.io, "workspace", .default_dir);
+
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+
+    try writeFixtureFile(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"permission_hook\":{\"command\":[\"./approve.sh\"]}}\n",
+    );
+
+    var detailed = try loadMergedSettingsDetailedFromHome(alloc, home_root, workspace_root);
+    defer detailed.deinit(alloc);
+
+    try std.testing.expect(detailed.permission_hook == null);
+    try std.testing.expectEqual(@as(usize, 1), countUserDiagnostics(detailed.diagnostics, .invalid_permission_hook));
+}
+
+test "a malformed permission hook disables only the hook" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDir(std.testing.io, "workspace", .default_dir);
+
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+
+    try writeFixtureFile(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"permission_mode\":\"ask\",\"permission\":{\"bash\":\"deny\"},\"permission_hook\":{\"command\":\"approve --fx\"}}\n",
+    );
+
+    var detailed = try loadMergedSettingsDetailedFromHome(alloc, home_root, workspace_root);
+    defer detailed.deinit(alloc);
+
+    try std.testing.expect(detailed.permission_hook == null);
+    try std.testing.expectEqual(@as(usize, 1), countUserDiagnostics(detailed.diagnostics, .invalid_permission_hook));
+    try std.testing.expectEqual(@as(usize, 0), countUserDiagnostics(detailed.diagnostics, .malformed_settings));
+    try std.testing.expectEqual(types.PermissionMode.ask, detailed.settings.permission_mode.?);
+    try std.testing.expect(detailed.settings.has_permission_rules);
+    try std.testing.expectEqual(@as(usize, 1), detailed.settings.permission_rules.rules.len);
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    for (detailed.diagnostics) |diagnostic| {
+        if (diagnostic.cause == .invalid_permission_hook) try writeDiagnosticMetadata(&out.writer, diagnostic);
+    }
+    try std.testing.expect(std.mem.find(u8, out.written(), "permission_hook is disabled") != null);
 }
