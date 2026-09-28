@@ -15,6 +15,7 @@ const record_tape = @import("../workspace/record_tape.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const update_target = @import("../upgrade/update_target.zig");
 const notification_sound = @import("../notifications/sound.zig");
+const permission_hook = @import("../permissions/permission_hook.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const types = @import("../shared/types.zig");
 const ui_render = @import("../../ui/render.zig");
@@ -166,6 +167,7 @@ pub const StartupState = struct {
     notification_max: bool = false,
     theme_monitor_enabled: bool = false,
     theme: ?[]const u8 = null,
+    permission_hook: ?permission_hook.Config = null,
 
     pub fn deinit(self: *StartupState, alloc: Allocator) void {
         self.workspace_access.deinit(alloc);
@@ -185,6 +187,7 @@ pub const StartupState = struct {
             alloc.free(self.config_diagnostics);
         }
         if (self.theme) |value| alloc.free(value);
+        if (self.permission_hook) |*config| config.deinit(alloc);
         self.* = .{ .agent_step_limit = self.agent_step_limit };
     }
 
@@ -294,6 +297,12 @@ pub const StartupState = struct {
     pub fn takeReviewModel(self: *StartupState) []u8 {
         const value = self.review_model;
         self.review_model = &.{};
+        return value;
+    }
+
+    pub fn takePermissionHook(self: *StartupState) ?permission_hook.Config {
+        const value = self.permission_hook;
+        self.permission_hook = null;
         return value;
     }
 };
@@ -593,6 +602,8 @@ fn loadStartupStateFromOwnedWorkspace(
     if (hasProcessModelOverride()) state.model_source = .process_override;
     state.config_diagnostics = detailed.diagnostics;
     detailed.diagnostics = &.{};
+    state.permission_hook = detailed.permission_hook;
+    detailed.permission_hook = null;
     state.prompt_history_enabled = settings.prompt_history_enabled orelse true;
     state.prompt_history_store_allowed = detailed.prompt_history_store_allowed;
     state.credential_source_preference = settings.credential_source;

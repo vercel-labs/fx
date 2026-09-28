@@ -93,6 +93,52 @@ FX_PROVIDER_ORDER=vertex FX_PROVIDER_STRICT=1 fx
 
 Slugs are the gateway's provider identifiers (letters, digits, dashes, for example `anthropic`, `bedrock`, `vertexAnthropic`), listed on the [models page](https://vercel.com/ai-gateway/models). An empty `provider_order` in a higher-precedence layer clears a list set by a lower one. Routing applies to gateway requests only; custom model connections ignore it.
 
+## Permission hook
+
+A command you configure can answer the permission prompt fx shows in the interactive terminal, for example an approval app on your phone. fx opens its prompt as usual and runs the command at the same time; the first answer wins. The command can allow that exact action once or deny it. It cannot approve anything fx would not have asked you about, and a configured deny is resolved before any prompt opens.
+
+```jsonc
+// ~/.fx/settings.json (top level only; ignored in .fx.json and workspaces overrides)
+{
+  "permission_hook": {
+    "command": ["/usr/local/bin/approve-fx"], // argv, run without a shell
+    "timeout_ms": 300000                      // 1000 to 3600000, default 300000
+  }
+}
+```
+
+`command[0]` must be an absolute path, and the command starts in `/`, never in the workspace, so neither a relative path nor the working directory can pull the program or its modules from the repository. It inherits fx's environment, including `PATH` and any credentials fx was started with, so name interpreters and helpers by absolute path too. It reads one JSON document on stdin:
+
+```json
+{
+  "version": 1,
+  "event": "permission_request",
+  "request_id": 7,
+  "session_id": "…",
+  "workspace_root": "/path/to/workspace",
+  "origin": "session",
+  "tool": { "name": "shell", "call_id": "call_1", "arguments": { "action": "run", "command": "npm publish" } },
+  "prompt": { "label": "shell.run npm publish", "command": "# shell.run profile=user shell=/bin/zsh\nnpm publish", "explanation": null, "tool_arguments_preview": null, "file": null },
+  "choices": ["allow", "deny"]
+}
+```
+
+`prompt` carries the label, command and explanation the terminal prompt shows. For file writes and edits, `prompt.file` carries the `kind` (`write` or `edit`), the `intent`, the `path`, the `external_tree` root for a change outside the workspace (otherwise `null`), the `additions` and `deletions` counts, and a preview of at most 6 `lines`, each with an `op` and its `text`. `truncated` is `true` when the preview leaves lines out; the terminal can show you the full review.
+
+It answers on stdout and exits 0:
+
+```json
+{ "decision": "allow" }
+{ "decision": "deny", "reason": "Denied from my phone" }
+{ "decision": "none" }
+```
+
+A deny reason is passed to the model. Anything else is no answer and leaves the prompt with you: a missing or non-executable command, a non-zero exit, a crash, output over 64 KiB, invalid JSON, an unknown decision, or running past `timeout_ms`. fx does not run the command when the request would be larger than 1 MiB or the tool arguments are not JSON. The command's stderr is discarded.
+
+The command runs in its own process group. If it is still running when the prompt closes or the timeout passes, fx kills that group and reaps the command. fx does not promise to stop processes the command leaves running after it exits, or any it moves out of its group, for example with `setsid`. If such a process holds stdin without reading it, fx stops waiting to finish writing the request; the unread input is released when that process exits. An answer from the command is recorded in the transcript as an ordinary one-time approval or deny.
+
+The hook runs only for prompts in the interactive terminal. It never runs in full access, for `fx ask`, for ACP clients, or for subagent approvals. A malformed `permission_hook` disables only the hook and is reported by `fx doctor`; one inside a `workspaces` override is reported and ignored.
+
 ## Themes
 
 fx ships with `fx-dark` and `fx-light` and follows your terminal's light or dark mode. Pin a variant with `FX_THEME=light` or `FX_THEME=dark`, or drop a VS Code format theme at `~/.fx/themes/<name>.json` and select it with the `theme` setting or `FX_THEME=<name>` per launch. Without an explicitly selected theme, diff markers and edit counts stay monochrome; selecting any theme adds its diff marker colors. See [Configuration](https://fx.sh/docs/configure-fx/configuration) for all environment variables.
