@@ -207,6 +207,13 @@ try {
     expect(result.toolResultSent, "browser host tool result did not reach the next model step");
     expect(result.skillSent, "browser host-provided skill instructions were omitted");
   });
+  await runCase("configured provider", "transport=mock&configured-provider=1&autorun=say%20hello&model=sdk%2Fchrome-model", (result) => {
+    expect(result.stopReason === "end_turn", `unexpected stop reason ${result.stopReason}`);
+    expect(result.chunks.join("") === "custom browser", `unexpected custom reply ${JSON.stringify(result.chunks)}`);
+    expect(result.customRoute && result.customModel === "sdk/chrome-model", "browser did not use its custom Chat Completions route");
+    expect(result.fetchCalls === 1 && result.customAuthPresent === false, "browser sent an unexpected custom-provider request or credential");
+    expect(result.redirectBlocked, "browser custom-provider fetch allowed redirects");
+  });
   await runCase("unsupported UI", "force-unsupported=1", (result) => {
     expect(result.state === "unsupported", `unexpected state ${result.state}`);
   });

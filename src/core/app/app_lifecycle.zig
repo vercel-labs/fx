@@ -8,6 +8,7 @@ const host = @import("../hosts/host.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
+const configured_provider = @import("../config/configured_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
@@ -447,16 +448,49 @@ pub fn loadLibfxStartupState(
     workspace_root: []const u8,
     model: []const u8,
     default_agent_step_limit: usize,
-) Allocator.Error!StartupState {
+    provider_json: ?[]const u8,
+    provider_credential: ?[]const u8,
+) !StartupState {
     const owned_workspace = try alloc.dupe(u8, workspace_root);
     errdefer alloc.free(owned_workspace);
     const selected_model = try alloc.dupe(u8, model);
     errdefer alloc.free(selected_model);
     const configured_model = try alloc.dupe(u8, model);
+    errdefer alloc.free(configured_model);
+
+    var registry: configured_provider.Registry = .{};
+    if (provider_json) |json| registry = try configured_provider.Registry.parse_json(alloc, json);
+    errdefer if (provider_json != null) registry.deinit(alloc);
+    if (provider_json != null and registry.definitions.len != 1) return error.InvalidConfiguredProvider;
+    const provider: model_provider.ProviderId = if (provider_json != null)
+        try (model_provider.parse(registry.definitions[0].id) orelse return error.InvalidConfiguredProvider).bind(registry)
+    else
+        .gateway;
+    var credential: ?credentials.Credential = null;
+    if (provider_json != null) {
+        const definition = registry.definitions[0];
+        const token: []u8 = switch (definition.auth) {
+            .none => blk: {
+                if (provider_credential != null) return error.UnexpectedConfiguredProviderCredential;
+                break :blk &.{};
+            },
+            .bearer => blk: {
+                const value = provider_credential orelse return error.MissingConfiguredProviderCredential;
+                if (value.len == 0 or value.len > 16 * 1024) return error.InvalidConfiguredProviderCredential;
+                for (value) |byte| if (byte <= 0x20 or byte >= 0x7f) return error.InvalidConfiguredProviderCredential;
+                break :blk try alloc.dupe(u8, value);
+            },
+        };
+        credential = .{ .source = .configured, .token = token };
+    }
+    errdefer if (credential) |*value| value.deinit(alloc);
     return .{
         .workspace_root = owned_workspace,
         .selected_model = selected_model,
         .configured_model = configured_model,
+        .configured_providers = registry,
+        .provider = provider,
+        .credential = credential,
         .permission_mode = .auto,
         .agent_step_limit = default_agent_step_limit,
         .context_enabled = false,
@@ -464,6 +498,33 @@ pub fn loadLibfxStartupState(
         .prompt_history_enabled = false,
         .prompt_history_store_allowed = false,
     };
+}
+
+test "libfx configured startup owns its route and accepts no-auth explicitly" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:11434/v1","auth":{"type":"none"},"model_metadata":{"local-model":{"supports_tool_use":true}}}}
+    ;
+    var state = try loadLibfxStartupState(alloc, "/workspace", "local-model", 64, json, null);
+    defer state.deinit(alloc);
+    try std.testing.expect(state.provider == .configured);
+    try std.testing.expectEqualStrings("local", state.provider.label());
+    try std.testing.expectEqual(types.CredentialSource.configured, state.credential.?.source);
+    try std.testing.expectEqual(@as(usize, 0), state.credential.?.token.len);
+    try std.testing.expect(!state.context_enabled);
+    try std.testing.expectError(error.UnexpectedConfiguredProviderCredential, loadLibfxStartupState(alloc, "/workspace", "local-model", 64, json, "token"));
+}
+
+test "libfx configured bearer startup validates credential before ownership transfer" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"remote":{"protocol":"openai-chat-completions","base_url":"https://models.example/v1","auth":{"type":"bearer","env":"FX_LIBFX_PROVIDER_KEY"}}}
+    ;
+    try std.testing.expectError(error.MissingConfiguredProviderCredential, loadLibfxStartupState(alloc, "/workspace", "remote-model", 64, json, null));
+    try std.testing.expectError(error.InvalidConfiguredProviderCredential, loadLibfxStartupState(alloc, "/workspace", "remote-model", 64, json, "bad token"));
+    var state = try loadLibfxStartupState(alloc, "/workspace", "remote-model", 64, json, "fixture-token");
+    defer state.deinit(alloc);
+    try std.testing.expectEqualStrings("fixture-token", state.credential.?.token);
 }
 
 pub fn loadCatalogStartupStateWithAuthMode(

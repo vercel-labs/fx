@@ -37,8 +37,9 @@ const checkpoint = await agent.checkpoint();
 await agent.close();
 ```
 
-`apiKey` is required. `model` is optional and defaults to fx's built-in model.
-Agent configuration uses named options; `env` is reserved for
+`apiKey` is required for the default Vercel AI Gateway connection. `model`
+is optional for Gateway and defaults to fx's built-in model. Agent
+configuration uses named options; `env` is reserved for
 `createFxTerminal()`. The canonical model configuration groups the model ID
 and model-specific options:
 
@@ -48,6 +49,45 @@ const agent = await createFxAgent({
   model: { id: "anthropic/claude-opus-5.5-fast", effort: "low", fast: true },
 });
 ```
+
+For a custom Chat Completions-compatible endpoint, provide a connection instead
+of `apiKey`. The host supplies its credential explicitly; libfx neither reads
+`~/.fx` nor sends a request through AI Gateway for this connection:
+
+```js
+const agent = await createFxAgent({
+  model: { id: "provider/model" },
+  provider: {
+    id: "custom",
+    protocol: "openai-chat-completions",
+    baseUrl: "https://api.example.com/v1",
+    auth: { type: "bearer", token: process.env.PROVIDER_API_KEY },
+    modelMetadata: {
+      "provider/model": { supportsToolUse: true },
+    },
+  },
+});
+```
+
+Replace `provider/model` and `https://api.example.com/v1` with the model ID and
+base URL accepted by your endpoint. Keep the metadata key in sync with the model
+ID. `provider.id` names the connection and must be unique to its endpoint and
+credential authority. Local endpoints can use
+`auth: { type: "none" }` and loopback HTTP; remote endpoints require HTTPS.
+`toolChoiceMode: "omit" | "send"` and per-model `maxOutputTokens` and
+`supportsVision` metadata are optional. The metadata is host-supplied, so
+verify it against the chosen model. This is the only protocol supported for
+custom connections; proprietary provider protocols need separate adapters.
+The host must not take `baseUrl` from an untrusted chat message. Custom requests use the supplied `fetch`, disable redirects, and
+reject unexpected endpoints.
+
+A custom connection requires an explicit `model` and cannot be mixed with
+`apiKey` or `gatewayChatUrl`. Named reasoning effort, `fast: true`, and
+Gateway-executed `web_search` are unavailable on this route; ordinary host
+tools still work. `listModels()` continues to list Gateway models, not this
+connection's metadata. Supply the same connection and credential again when
+restoring a checkpoint; the checkpoint contains neither configuration nor
+secrets. Do not restore a checkpoint into a different user's credential scope.
 
 A string `model` remains supported as shorthand. Top-level `effort` and
 `fast` are deprecated but remain supported with a string model or no model;

@@ -439,8 +439,9 @@ pub fn selectCredentialForProvider(
 pub fn prepareCredentialForProvider(state: *ServerState, provider: model_provider.ProviderId) !?credentials.Credential {
     if (state.cfg.auth_mode == .host_managed) return null;
     const now_ms = io_mod.milliTimestamp();
+    const keep_embedded_credential = provider == .configured and state.cfg.minimal_kernel and state.cfg.libfx_provider_json != null;
     if (state.active_session) |active| {
-        if (provider != .configured and credentialMatchesProvider(active.credential_source, provider) and
+        if ((provider != .configured or keep_embedded_credential) and credentialMatchesProvider(active.credential_source, provider) and
             credentialReadyAt(
                 active.credential_source,
                 active.api_key,
@@ -448,7 +449,7 @@ pub fn prepareCredentialForProvider(state: *ServerState, provider: model_provide
                 now_ms,
             )) return null;
     }
-    if (provider != .configured and credentialMatchesProvider(state.credential_source, provider) and
+    if ((provider != .configured or keep_embedded_credential) and credentialMatchesProvider(state.credential_source, provider) and
         credentialReadyAt(
             state.credential_source,
             state.api_key,
@@ -489,6 +490,18 @@ test "ACP credential preparation preserves the existing borrowed credential" {
     try std.testing.expectEqualStrings("active-token", borrowed);
     try std.testing.expect(state.api_key.ptr == borrowed.ptr);
     try std.testing.expectEqual(types.CredentialSource.configured, state.credential_source.?);
+}
+
+test "libfx reuses its explicit configured credential instead of reading a profile" {
+    var state: ServerState = undefined;
+    state.cfg.auth_mode = .local;
+    state.cfg.minimal_kernel = true;
+    state.cfg.libfx_provider_json = "explicit";
+    state.active_session = null;
+    state.credential_source = .configured;
+    state.credential_refresh_after_ms = null;
+    state.api_key = &.{};
+    try std.testing.expect((try prepareCredentialForProvider(&state, model_provider.parse("local").?)) == null);
 }
 
 pub fn streamProviderFor(
@@ -1826,6 +1839,8 @@ fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_
             state.cfg.workspace_root_override orelse "/",
             state.cfg.model_override orelse state.cfg.default_model,
             state.cfg.default_agent_step_limit,
+            state.cfg.libfx_provider_json,
+            state.cfg.libfx_provider_credential,
         );
     }
     if (state.cfg.home_override) |home_dir| {
@@ -1922,7 +1937,10 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         state.process_model_override = startup.model_source == .process_override;
     }
     state.provider = startup.provider;
-    state.process_provider_override = config_runtime.providerEnvOverride() != null;
+    state.process_provider_override = if (state.cfg.minimal_kernel)
+        state.cfg.libfx_provider_json != null
+    else
+        config_runtime.providerEnvOverride() != null;
     state.configured_providers.deinit(alloc);
     state.configured_providers = startup.configured_providers;
     startup.configured_providers = .{};

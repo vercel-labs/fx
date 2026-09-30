@@ -26,6 +26,27 @@ for (let index = 0; index < 1000; index += 1) {
 const afterFds = fdCount();
 if (beforeFds !== null && afterFds !== null) assert.ok(afterFds - beforeFds < 4, `fd leak: ${beforeFds} -> ${afterFds}`);
 
+const customCore = {
+  home: process.cwd(), workspaceRoot: process.cwd(), model: "local-model",
+  providerJson: JSON.stringify({ local: {
+    protocol: "openai-chat-completions", base_url: "http://127.0.0.1:11434/v1", auth: { type: "none" },
+  } }),
+};
+for (const options of [
+  { ...customCore, providerJson: "{}" },
+  { ...customCore, providerJson: "not JSON" },
+  { ...customCore, providerCredential: "unexpected-key" },
+  { ...customCore, apiKey: "wrong-route-key" },
+  { ...customCore, providerJson: JSON.stringify({ local: {
+    protocol: "openai-chat-completions", base_url: "http://remote.example/v1", auth: { type: "none" },
+  } }) },
+]) {
+  assert.throws(() => addon.createCore(options), (error) => error.code === "LIBFX_INVALID_ARGUMENT");
+}
+const isolated = addon.createCore(customCore);
+addon.closeCore(isolated);
+addon.destroyCore(isolated);
+
 const runtimeLimitProbe = Array.from({ length: 64 }, () => addon.createCore({
   apiKey: "runtime-limit-key",
   home: process.cwd(),

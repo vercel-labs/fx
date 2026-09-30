@@ -2,6 +2,8 @@ const std = @import("std");
 const build_options = @import("build_options");
 const acp_server = @import("acp/server.zig");
 const js_host_stream_provider = @import("gateway/js_host_stream_provider.zig");
+const host_chat_completions = @import("gateway/host_chat_completions.zig");
+const configured_provider = @import("core/config/configured_provider.zig");
 const context_contract = @import("core/workspace/context_contract.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const provider_set = @import("core/gateway/provider_set.zig");
@@ -30,6 +32,27 @@ pub const panic = @import("core/hosts/wasm_panic.zig").panic;
 pub fn main(init: std.process.Init) !void {
     io_mod.setIo(init.io);
     io_mod.setEnvironMap(init.environ_map);
+    const provider_json = io_mod.getenv("FX_LIBFX_PROVIDER_JSON");
+    var registry: configured_provider.Registry = .{};
+    if (provider_json) |json| {
+        registry = try configured_provider.Registry.parse_json(std.heap.c_allocator, json);
+        if (registry.definitions.len != 1) {
+            registry.deinit(std.heap.c_allocator);
+            return error.InvalidConfiguredProvider;
+        }
+    }
+    defer if (provider_json != null) registry.deinit(std.heap.c_allocator);
+    var providers = js_host_provider_set;
+    var configured_context: host_chat_completions.Context = undefined;
+    if (provider_json != null) {
+        configured_context = .{
+            .definition = &registry.definitions[0],
+            .transport = js_host_stream_provider.transport(),
+        };
+        providers.definitions = registry.definitions;
+        providers.configured_context = &configured_context;
+        providers.configured_fn = host_chat_completions.bundle;
+    }
     try acp_server.run(std.heap.c_allocator, .{
         .default_model = builtin_gateway.default_model,
         .default_agent_step_limit = agent_steps.default_max_agent_steps,
@@ -37,7 +60,7 @@ pub fn main(init: std.process.Init) !void {
         .gateway_chat_url = builtin_gateway.default_chat_url,
         .gateway_models_path = builtin_gateway.models_path,
         .gateway_provider = js_host_gateway_provider,
-        .provider_set = js_host_provider_set,
+        .provider_set = providers,
         .secret_store = host.unavailable_secret_store,
         .prompt_policy = .{ .system_prompt = "" },
         .ignored_list_entries = &.{},
@@ -51,6 +74,8 @@ pub fn main(init: std.process.Init) !void {
         .context_registry = .{ .default_provider = context_contract.empty_provider },
         .mode_registry = builtin_modes.registry,
         .credential_override = io_mod.getenv("AI_GATEWAY_API_KEY"),
+        .libfx_provider_json = provider_json,
+        .libfx_provider_credential = io_mod.getenv("FX_LIBFX_PROVIDER_KEY"),
         .model_override = io_mod.getenv("FX_MODEL"),
         .effort_override = io_mod.getenv("FX_EFFORT"),
         .fast_override = fastOverrideFromEnv(io_mod.getenv("FX_FAST")),

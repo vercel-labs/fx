@@ -28,6 +28,10 @@ pub fn provider() stream_provider.Provider {
     return host_stream_provider.provider(@constCast(&provider_context));
 }
 
+pub fn transport() host_stream_provider.Transport {
+    return provider_context.transport;
+}
+
 fn open(_: ?*anyopaque, method: []const u8, url: []const u8, headers: []const u8, body: []const u8) !i32 {
     const handle = fx_http_stream_open(method.ptr, method.len, url.ptr, url.len, headers.ptr, headers.len, body.ptr, body.len);
     if (handle < 0) return error.HostStreamFailed;

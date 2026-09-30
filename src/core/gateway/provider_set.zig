@@ -56,7 +56,8 @@ pub const Set = struct {
     codex: Bundle,
     grok: Bundle,
     definitions: []const @import("../config/configured_provider.zig").Definition = &.{},
-    configured_fn: ?*const fn (*const @import("../config/configured_provider.zig").Definition) Bundle = null,
+    configured_context: ?*anyopaque = null,
+    configured_fn: ?*const fn (?*anyopaque, *const @import("../config/configured_provider.zig").Definition) Bundle = null,
 
     pub fn select(self: Set, provider: model_provider.ProviderId) Bundle {
         return switch (provider) {
@@ -67,7 +68,7 @@ pub const Set = struct {
                 const factory = self.configured_fn orelse break :blk .{};
                 const registry = @import("../config/configured_provider.zig").Registry{ .definitions = self.definitions };
                 const bound = provider.bind(registry) catch break :blk .{};
-                break :blk factory(registry.get(bound.label()).?);
+                break :blk factory(self.configured_context, registry.get(bound.label()).?);
             },
         };
     }

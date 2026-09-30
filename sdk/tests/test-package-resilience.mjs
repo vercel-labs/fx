@@ -309,7 +309,7 @@ async function installedWorkerMain() {
       apiKey: "test-placeholder",
     }));
     assert.equal(factoryError.code, "LIBFX_NATIVE_UNAVAILABLE");
-    assert.match(factoryError.message, /expected API version 3/);
+    assert.match(factoryError.message, /expected API version 4/);
     console.log(JSON.stringify({ mode: config.mode, info, factoryError: errorRecord(factoryError) }));
     return;
   }

@@ -11,6 +11,9 @@ const io_mod = @import("core/shared/io.zig");
 const fetch_state = @import("napi_fetch_state.zig");
 const streamable_http = @import("core/mcp/streamable_http.zig");
 const host_stream_provider = @import("gateway/host_stream_provider.zig");
+const host_chat_completions = @import("gateway/host_chat_completions.zig");
+const configured_provider = @import("core/config/configured_provider.zig");
+const secret = @import("core/auth/secret.zig");
 const oauth_transport = @import("core/auth/oauth_transport.zig");
 const builtin_gateway = @import("builtins/gateway.zig");
 const builtin_modes = @import("builtins/modes.zig");
@@ -480,9 +483,13 @@ const Runtime = struct {
     alloc: Allocator,
     fetch: FetchBridge = .{},
     stream_context: host_stream_provider.ProviderContext = undefined,
+    configured_context: host_chat_completions.Context = undefined,
+    configured_registry: configured_provider.Registry = .{},
+    configured_json: ?[]u8 = null,
+    configured_credential: ?[]u8 = null,
     input: InputQueue = .{},
     output: OutputQueue = .{},
-    credential: []u8,
+    credential: ?[]u8,
     model: ?[]u8,
     effort: ?[]u8,
     fast: ?bool,
@@ -517,13 +524,18 @@ const Runtime = struct {
             .oauth_transport = oauth_transport.unavailable_provider,
             .chat_url = builtin_gateway.provider.chat_url,
         };
-        const providers = provider_set.gateway_only(.{
+        var providers = provider_set.gateway_only(.{
             .presentation = builtin_gateway.provider_bundle.presentation,
             .auth_strategy = .vercel,
             .fallback_model_capabilities_fn = builtin_gateway.provider_bundle.fallback_model_capabilities_fn,
             .agent_stream = host_stream_provider.provider(&self.stream_context),
             .model_catalog = @import("gateway/host_model_catalog.zig").provider(&self.stream_context.transport),
         });
+        if (self.configured_json != null) {
+            providers.definitions = self.configured_registry.definitions;
+            providers.configured_context = &self.configured_context;
+            providers.configured_fn = host_chat_completions.bundle;
+        }
         acp_server.runWithTransport(
             self.alloc,
             .{
@@ -547,6 +559,8 @@ const Runtime = struct {
                 .context_registry = .{ .default_provider = context_contract.empty_provider },
                 .mode_registry = builtin_modes.registry,
                 .credential_override = self.credential,
+                .libfx_provider_json = self.configured_json,
+                .libfx_provider_credential = self.configured_credential,
                 .model_override = self.model,
                 .effort_override = self.effort,
                 .fast_override = self.fast,
@@ -582,7 +596,12 @@ const Runtime = struct {
         self.fetch.deinit();
         self.input.deinit(self.alloc);
         self.output.deinit(self.alloc);
-        self.alloc.free(self.credential);
+        if (self.credential) |credential| secret.zeroAndFree(self.alloc, credential);
+        if (self.configured_credential) |credential| secret.zeroAndFree(self.alloc, credential);
+        if (self.configured_json) |json| {
+            self.configured_registry.deinit(self.alloc);
+            self.alloc.free(json);
+        }
         if (self.model) |model| self.alloc.free(model);
         if (self.effort) |effort| self.alloc.free(effort);
         self.alloc.free(self.home);
@@ -741,6 +760,8 @@ const CreateError = error{
     JavaScriptException,
     TooManyRuntimes,
     InvalidApiKey,
+    InvalidProvider,
+    InvalidProviderCredential,
     InvalidModel,
     InvalidEffort,
     InvalidFast,
@@ -756,19 +777,51 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
     if (!claimRuntimeSlot()) return error.TooManyRuntimes;
     errdefer releaseRuntimeSlot();
     const alloc = std.heap.c_allocator;
-    const credential = getNamedString(env, options, "apiKey", alloc, max_api_key_bytes) catch |err| switch (err) {
+    const provider_json = getNamedString(env, options, "providerJson", alloc, 1024 * 1024) catch |err| switch (err) {
+        error.JavaScriptException => return error.JavaScriptException,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidProvider,
+    };
+    errdefer if (provider_json) |json| alloc.free(json);
+    var registry: configured_provider.Registry = .{};
+    if (provider_json) |json| {
+        registry = configured_provider.Registry.parse_json(alloc, json) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidProvider,
+        };
+        if (registry.definitions.len != 1) {
+            registry.deinit(alloc);
+            return error.InvalidProvider;
+        }
+    }
+    errdefer if (provider_json != null) registry.deinit(alloc);
+    const provider_credential = getNamedString(env, options, "providerCredential", alloc, 16 * 1024) catch |err| switch (err) {
+        error.JavaScriptException => return error.JavaScriptException,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidProviderCredential,
+    };
+    errdefer if (provider_credential) |token| secret.zeroAndFree(alloc, token);
+    if (provider_json) |_| {
+        switch (registry.definitions[0].auth) {
+            .none => if (provider_credential != null) return error.InvalidProviderCredential,
+            .bearer => if (provider_credential == null or provider_credential.?.len == 0) return error.InvalidProviderCredential,
+        }
+    } else if (provider_credential != null) return error.InvalidProviderCredential;
+    const api_key = getNamedString(env, options, "apiKey", alloc, max_api_key_bytes) catch |err| switch (err) {
         error.JavaScriptException => return error.JavaScriptException,
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidApiKey,
     };
-    const api_key = credential orelse return error.InvalidApiKey;
-    errdefer alloc.free(api_key);
+    errdefer if (api_key) |token| secret.zeroAndFree(alloc, token);
+    if (api_key == null and provider_json == null) return error.InvalidApiKey;
+    if (api_key != null and provider_json != null) return error.InvalidProvider;
     const model = getNamedString(env, options, "model", alloc, max_model_bytes) catch |err| switch (err) {
         error.JavaScriptException => return error.JavaScriptException,
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidModel,
     };
     errdefer if (model) |value| alloc.free(value);
+    if (provider_json != null and model == null) return error.InvalidModel;
     const effort = getNamedString(env, options, "effort", alloc, max_effort_bytes) catch |err| switch (err) {
         error.JavaScriptException => return error.JavaScriptException,
         error.OutOfMemory => return error.OutOfMemory,
@@ -810,6 +863,9 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
     runtime.* = .{
         .alloc = alloc,
         .credential = api_key,
+        .configured_json = provider_json,
+        .configured_credential = provider_credential,
+        .configured_registry = registry,
         .model = model,
         .effort = effort,
         .fast = fast,
@@ -828,6 +884,10 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
         .next_fn = FetchBridge.next,
         .close_fn = FetchBridge.close,
     });
+    if (runtime.configured_json != null) runtime.configured_context = .{
+        .definition = &runtime.configured_registry.definitions[0],
+        .transport = runtime.stream_context.transport,
+    };
     runtime.thread = std.Thread.spawn(.{}, Runtime.run, .{runtime}) catch return error.ThreadFailed;
     return runtime;
 }
@@ -837,6 +897,8 @@ fn throwCreateError(env: c.napi_env, err: CreateError) c.napi_value {
         error.JavaScriptException => null,
         error.TooManyRuntimes => throw(env, "LIBFX_NATIVE_LIMIT", "too many active native runtimes"),
         error.InvalidApiKey => throw(env, "LIBFX_INVALID_ARGUMENT", "apiKey is required and must be a bounded string"),
+        error.InvalidProvider => throw(env, "LIBFX_INVALID_ARGUMENT", "providerJson must be one valid configured provider"),
+        error.InvalidProviderCredential => throw(env, "LIBFX_INVALID_ARGUMENT", "providerCredential must match provider auth"),
         error.InvalidModel => throw(env, "LIBFX_INVALID_ARGUMENT", "model must be a bounded string"),
         error.InvalidEffort => throw(env, "LIBFX_INVALID_ARGUMENT", "effort must be a bounded string"),
         error.InvalidFast => throw(env, "LIBFX_INVALID_ARGUMENT", "fast must be a boolean"),
@@ -1136,7 +1198,7 @@ fn exportFunction(env: c.napi_env, exports: c.napi_value, name: [*:0]const u8, c
 export fn napi_register_module_v1(env: c.napi_env, exports: c.napi_value) callconv(.c) c.napi_value {
     ensureThreadedIo();
     var api_version: c.napi_value = undefined;
-    if (!statusOk(env, c.napi_create_uint32(env, 3, &api_version), "could not create API version")) return null;
+    if (!statusOk(env, c.napi_create_uint32(env, 4, &api_version), "could not create API version")) return null;
     if (!statusOk(env, c.napi_set_named_property(env, exports, "libfxApiVersion", api_version), "could not export API version")) return null;
     if (!exportFunction(env, exports, "createCore", createCore)) return null;
     if (!exportFunction(env, exports, "takeCoreReadyFd", takeCoreReadyFd)) return null;

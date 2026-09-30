@@ -41,6 +41,10 @@ pub const Config = struct {
     /// and session defaults untouched.
     fast_override: ?bool = null,
     credential_override: ?[]const u8 = null,
+    /// Bounded, non-secret provider definition owned by the embedding runtime.
+    libfx_provider_json: ?[]const u8 = null,
+    /// Borrowed explicit credential; null for an unauthenticated connection.
+    libfx_provider_credential: ?[]const u8 = null,
     home_override: ?[]const u8 = null,
     workspace_root_override: ?[]const u8 = null,
     log_file: ?[]const u8 = null,

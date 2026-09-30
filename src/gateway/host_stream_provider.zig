@@ -16,19 +16,19 @@ pub const Transport = struct {
     next_fn: *const fn (?*anyopaque, i32, []u8) i32,
     close_fn: *const fn (?*anyopaque, i32) void,
 
-    fn open(self: Transport, method: []const u8, url: []const u8, headers: []const u8, body: []const u8) !i32 {
+    pub fn open(self: Transport, method: []const u8, url: []const u8, headers: []const u8, body: []const u8) !i32 {
         return self.open_fn(self.context, method, url, headers, body);
     }
 
-    fn status(self: Transport, handle: i32, status_out: *u16) i32 {
+    pub fn status(self: Transport, handle: i32, status_out: *u16) i32 {
         return self.status_fn(self.context, handle, status_out);
     }
 
-    fn next(self: Transport, handle: i32, out: []u8) i32 {
+    pub fn next(self: Transport, handle: i32, out: []u8) i32 {
         return self.next_fn(self.context, handle, out);
     }
 
-    fn close(self: Transport, handle: i32) void {
+    pub fn close(self: Transport, handle: i32) void {
         self.close_fn(self.context, handle);
     }
 };
@@ -277,7 +277,7 @@ const EventBridge = struct {
     }
 };
 
-fn failureKind(status: std.http.Status) stream_provider.FailureKind {
+pub fn failureKind(status: std.http.Status) stream_provider.FailureKind {
     return switch (status) {
         .bad_request => .invalid_request,
         .unauthorized => .unauthorized,
@@ -296,13 +296,13 @@ fn pulse(value: ?stream_provider.CooperativePulse) !void {
     if (value) |callback| try callback.pulse();
 }
 
-fn deadlineExpired(deadline: ?std.Io.Clock.Timestamp) bool {
+pub fn deadlineExpired(deadline: ?std.Io.Clock.Timestamp) bool {
     const value = deadline orelse return false;
     const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
     return !std.Io.Clock.Timestamp.compare(now, .lt, value);
 }
 
-fn readBody(
+pub fn readBody(
     alloc: Allocator,
     transport: Transport,
     handle: i32,
@@ -331,7 +331,7 @@ fn readBody(
     return out.toOwnedSlice(alloc);
 }
 
-const HostStreamReader = struct {
+pub const HostStreamReader = struct {
     transport: Transport = undefined,
     handle: i32 = -1,
     cancel_flag: *std.atomic.Value(bool) = undefined,
@@ -343,7 +343,7 @@ const HostStreamReader = struct {
     buffer: [16 * 1024]u8 = undefined,
     interface: std.Io.Reader = undefined,
 
-    fn init(
+    pub fn init(
         self: *@This(),
         transport: Transport,
         handle: i32,

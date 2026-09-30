@@ -84,6 +84,91 @@ function normalizeFast(value) {
   return value;
 }
 
+const customProviderCredentialSlot = "FX_LIBFX_PROVIDER_KEY";
+
+function providerObject(value, name, fields) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`${name} must be an object`);
+  }
+  for (const field of Object.keys(value)) {
+    if (!fields.includes(field)) throw new TypeError(`unsupported ${name} option: ${field}`);
+  }
+  return value;
+}
+
+function providerModelId(value, name) {
+  boundedString(value, name, maxModelBytes, true);
+  if (value.trim() !== value || /[\x00-\x1f\x7f]/.test(value)) throw new TypeError(`${name} is invalid`);
+  return value;
+}
+
+function normalizeConfiguredProvider(value) {
+  const provider = providerObject(value, "provider", ["id", "protocol", "baseUrl", "auth", "toolChoiceMode", "modelMetadata"]);
+  const id = boundedString(provider.id, "provider.id", 64, true);
+  if (!/^[A-Za-z][A-Za-z0-9_-]*$/.test(id) || /^(gateway|codex|grok)$/i.test(id)) {
+    throw new TypeError("provider.id must be a non-reserved connection name");
+  }
+  if (provider.protocol !== "openai-chat-completions") throw new TypeError("unsupported provider.protocol");
+  const baseUrl = boundedString(provider.baseUrl, "provider.baseUrl", 2048, true);
+  let url;
+  try { url = new URL(baseUrl); } catch { throw new TypeError("provider.baseUrl must be a valid URL"); }
+  if (url.username || url.password || url.search || url.hash || /[\\\s]/.test(baseUrl)) {
+    throw new TypeError("provider.baseUrl must not contain credentials, a query, a fragment, or whitespace");
+  }
+  const loopback = url.hostname === "127.0.0.1" || url.hostname === "[::1]" || url.hostname === "localhost";
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) {
+    throw new TypeError("provider.baseUrl requires HTTPS or loopback HTTP");
+  }
+  const auth = providerObject(provider.auth, "provider.auth", ["type", "token"]);
+  if (auth.type !== "none" && auth.type !== "bearer") throw new TypeError("unsupported provider.auth.type");
+  if (auth.type === "none" && Object.hasOwn(auth, "token")) {
+    throw new TypeError("provider.auth.token is not allowed with auth.type none");
+  }
+  const token = auth.type === "bearer" ? boundedString(auth.token, "provider.auth.token", 16 * 1024, true) : undefined;
+  if (token !== undefined && /[^\x21-\x7e]/.test(token)) throw new TypeError("provider.auth.token must contain visible ASCII only");
+  const toolChoiceMode = provider.toolChoiceMode ?? "omit";
+  if (toolChoiceMode !== "omit" && toolChoiceMode !== "send") throw new TypeError("unsupported provider.toolChoiceMode");
+  const modelMetadata = provider.modelMetadata === undefined ? {} : provider.modelMetadata;
+  if (!modelMetadata || typeof modelMetadata !== "object" || Array.isArray(modelMetadata)) {
+    throw new TypeError("provider.modelMetadata must be an object");
+  }
+  if (Object.keys(modelMetadata).length > 256) throw new RangeError("provider.modelMetadata exceeds the 256-model limit");
+  const metadata = Object.create(null);
+  for (const [modelId, raw] of Object.entries(modelMetadata)) {
+    providerModelId(modelId, "provider.modelMetadata model ID");
+    const entry = providerObject(raw, `provider.modelMetadata[${modelId}]`, ["contextWindow", "maxOutputTokens", "supportsToolUse", "supportsVision"]);
+    const fields = {};
+    for (const [jsName, wireName] of [["contextWindow", "context_window"], ["maxOutputTokens", "max_output_tokens"]]) {
+      if (entry[jsName] !== undefined) {
+        if (!Number.isInteger(entry[jsName]) || entry[jsName] < 1 || entry[jsName] > 0xffffffff) {
+          throw new TypeError(`${jsName} must be a positive uint32`);
+        }
+        fields[wireName] = entry[jsName];
+      }
+    }
+    if (fields.context_window !== undefined && fields.max_output_tokens !== undefined && fields.max_output_tokens >= fields.context_window) {
+      throw new TypeError("maxOutputTokens must be smaller than contextWindow");
+    }
+    for (const [jsName, wireName] of [["supportsToolUse", "supports_tool_use"], ["supportsVision", "supports_vision"]]) {
+      if (entry[jsName] !== undefined) {
+        if (typeof entry[jsName] !== "boolean") throw new TypeError(`${jsName} must be a boolean`);
+        fields[wireName] = entry[jsName];
+      }
+    }
+    metadata[modelId] = fields;
+  }
+  const definition = { [id]: {
+    protocol: provider.protocol,
+    base_url: baseUrl,
+    auth: auth.type === "none" ? { type: "none" } : { type: "bearer", env: customProviderCredentialSlot },
+    tool_choice_mode: toolChoiceMode,
+    model_metadata: metadata,
+  } };
+  const providerJson = JSON.stringify(definition);
+  if (encoder.encode(providerJson).length > 1024 * 1024) throw new RangeError("provider definition exceeds the 1 MiB limit");
+  return { providerJson, providerCredential: token, providerEndpoint: new URL(`${baseUrl.replace(/\/$/, "")}/chat/completions`).href };
+}
+
 export function normalizeAgentOptions(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new TypeError("createFxAgent() options must be an object");
@@ -92,7 +177,27 @@ export function normalizeAgentOptions(value) {
   if (Object.hasOwn(options, "env")) {
     throw new TypeError("createFxAgent() does not accept env; pass apiKey and model directly");
   }
-  options.apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, true);
+  const configured = options.provider === undefined ? null : normalizeConfiguredProvider(options.provider);
+  if (configured) {
+    if (options.apiKey !== undefined || options.gatewayChatUrl !== undefined) {
+      throw new TypeError("custom provider cannot be mixed with apiKey or gatewayChatUrl");
+    }
+    options.providerJson = configured.providerJson;
+    options.providerCredential = configured.providerCredential;
+    options.providerEndpoint = configured.providerEndpoint;
+    options.provider = {
+      ...options.provider,
+      auth: { ...options.provider.auth },
+      modelMetadata: options.provider.modelMetadata === undefined ? undefined : Object.fromEntries(
+        Object.entries(options.provider.modelMetadata).map(([id, metadata]) => [id, { ...metadata }]),
+      ),
+    };
+  } else {
+    delete options.providerJson;
+    delete options.providerCredential;
+    delete options.providerEndpoint;
+    options.apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, true);
+  }
   if (options.model !== null && typeof options.model === "object" && !Array.isArray(options.model)) {
     if (Object.hasOwn(options, "effort") || Object.hasOwn(options, "fast")) {
       throw new TypeError("model options cannot be mixed with top-level effort or fast");
@@ -107,15 +212,35 @@ export function normalizeAgentOptions(value) {
     options.effort = normalizeEffort(model.effort);
     options.fast = normalizeFast(model.fast);
   } else {
-    options.model = boundedString(options.model, "model", maxModelBytes, false);
+    options.model = boundedString(options.model, "model", maxModelBytes, configured !== null);
     options.effort = normalizeEffort(options.effort);
     options.fast = normalizeFast(options.fast);
   }
-  validateGatewayChatUrl(options.gatewayChatUrl);
+  if (configured) {
+    providerModelId(options.model, "model.id");
+    const effort = options.effort?.toLowerCase();
+    if (effort && !["auto", "adaptive", "default"].includes(effort)) {
+      const error = new Error(`Reasoning effort is not available for model "${options.model}"`);
+      Object.assign(error, { code: "LIBFX_MODEL_UNSUPPORTED_EFFORT", model: options.model, capability: "effort" });
+      throw error;
+    }
+    if (options.fast === true) {
+      const error = new Error(`Fast mode is not available for model "${options.model}"`);
+      Object.assign(error, { code: "LIBFX_MODEL_UNSUPPORTED_FAST", model: options.model, capability: "fast" });
+      throw error;
+    }
+  } else {
+    validateGatewayChatUrl(options.gatewayChatUrl);
+  }
   return options;
 }
 
 function agentEnvironment(options) {
+  if (options.providerJson) return {
+    FX_MODEL: options.model,
+    FX_LIBFX_PROVIDER_JSON: options.providerJson,
+    ...(options.providerCredential === undefined ? {} : { FX_LIBFX_PROVIDER_KEY: options.providerCredential }),
+  };
   return {
     AI_GATEWAY_API_KEY: options.apiKey,
     ...(options.model === undefined ? {} : { FX_MODEL: options.model }),
@@ -1513,6 +1638,9 @@ function base64ToBytes(value) {
 export async function createFxAgent(options = {}) {
   options = normalizeAgentOptions(options);
   const hostTools = normalizeHostTools(options.tools);
+  if (options.providerJson && hostTools.descriptors.some((tool) => tool.providerExecuted)) {
+    throw new TypeError("provider-executed tools are available only with Vercel AI Gateway");
+  }
   const instructions = normalizeInstructions(options.instructions);
   const initialCheckpoint = checkpointBytes(options.checkpoint);
   const pending = new Map();
@@ -1547,7 +1675,12 @@ export async function createFxAgent(options = {}) {
           throw new DOMException("Aborted", "AbortError");
         }
         if (!hostFetch) throw new TypeError("fetch is unavailable");
-        const response = await hostFetch(input, init);
+        if (options.providerJson) {
+          if (new URL(input?.url ?? input).href !== options.providerEndpoint) {
+            throw new TypeError("configured provider requested an unexpected endpoint");
+          }
+        }
+        const response = await hostFetch(input, options.providerJson ? { ...init, redirect: "error" } : init);
         const headers = response.headers;
         emit("transport.response", {
           attempt,

@@ -20,7 +20,7 @@ import {
 
 export { encodeXtermKeyEvent, fxSdkApiVersion, listModels, supportsJspi, xtermAdapter };
 export const libfxApiVersion = 2;
-const nativeCoreApiVersion = 3;
+const nativeCoreApiVersion = 4;
 
 const fetchOperationStale = 0;
 const fetchOperationApplied = 1;
@@ -346,9 +346,11 @@ export async function getBackendInfo(value = {}) {
 }
 
 function createNativeCoreRuntime(addon, options) {
-  const { apiKey, model, effort, fast, gatewayChatUrl } = options;
+  const { apiKey, model, effort, fast, gatewayChatUrl, providerJson, providerCredential } = options;
   const core = addon.createCore({
-    apiKey,
+    ...(apiKey === undefined ? {} : { apiKey }),
+    ...(providerJson === undefined ? {} : { providerJson }),
+    ...(providerCredential === undefined ? {} : { providerCredential }),
     home: options.home ?? homedir(),
     workspaceRoot: options.workspaceRoot ?? process.cwd(),
     ...(model === undefined ? {} : { model }),
@@ -532,7 +534,8 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
         return await native.backend[nativeMethod](runtimeOptions);
       } catch (error) {
         nativeError = error;
-        if (backend === "native" || error?.code === "LIBFX_MODEL_UNSUPPORTED_FAST" ||
+        if (backend === "native" || error?.code === "LIBFX_INVALID_ARGUMENT" ||
+          error?.code === "LIBFX_MODEL_UNSUPPORTED_FAST" ||
           error?.code === "LIBFX_MODEL_UNSUPPORTED_EFFORT") throw error;
       }
     }

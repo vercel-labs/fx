@@ -110,7 +110,7 @@ fx builds as a native binary or WebAssembly. Applications embedding fx can provi
 | `createFxAgent()` | Embed the agent core in a JavaScript host with `fx-core.wasm`. |
 | `createFxTerminal()` | Embed the interactive terminal with `fx-term.wasm`. |
 
-The SDK is published to npm as [libfx](https://www.npmjs.com/package/libfx). See the [WebAssembly SDK](sdk/README.md) and the runnable Node.js, browser, Next.js, and Nuxt [examples](examples/README.md). The WebAssembly SDK is experimental.
+The SDK is published to npm as [libfx](https://www.npmjs.com/package/libfx). `createFxAgent()` accepts an explicit Chat Completions-compatible connection alongside its default AI Gateway route, without reading the CLI's saved profile. See the [libfx API and custom connection example](sdk/README.md) and the runnable Node.js, browser, Next.js, and Nuxt [examples](examples/README.md). The WebAssembly SDK is experimental.
 
 ## Slack workspace installation
 

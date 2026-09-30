@@ -71,7 +71,7 @@ The native kernel installs host-stream and host model-catalog providers. It does
 
 | Export | Purpose |
 | --- | --- |
-| `libfxApiVersion` | Checks compatibility with the JavaScript loader. Currently `3`. Low-level `createCore` backends must declare this exact version. |
+| `libfxApiVersion` | Checks compatibility with the JavaScript loader. Currently `4`. Low-level `createCore` backends must declare this exact version. |
 | `createCore(options)` | Allocates a runtime and readiness socketpair, then starts its ACP thread. |
 | `takeCoreReadyFd(handle)` | Transfers the readiness reader descriptor to JavaScript exactly once. The caller owns its close. |
 | `writeCore(handle, buffer)` | Appends bytes to the bounded input queue. |
@@ -89,7 +89,7 @@ The native kernel installs host-stream and host model-catalog providers. It does
 
 This ABI is internal. Consumers should use `createFxAgent()` from `sdk/node.js`; exposing the primitive functions keeps the native boundary small and testable.
 
-The addon ABI version is independent of the public JavaScript API version, which remains `2`. Only low-level core addons must declare version `3`.
+The addon ABI version is independent of the public JavaScript API version, which remains `2`. Only low-level core addons must declare version `4`. Older addons cannot accept custom provider options and must be rejected before `createCore` runs.
 
 Response operations return numeric outcomes: `0` means the operation was stale and ignored, `1` means it was applied, and `2` means a response push encountered bounded backpressure. Stale callbacks never mutate a newer fetch. The addon does not write ambient diagnostics for these outcomes; the JavaScript adapter observes the numeric result and owns any explicit host reporting.
 
@@ -140,7 +140,7 @@ The native core is intentionally more restricted than the native `fx` CLI. Its A
 
 As a result, the model receives no native tool advertisement, cannot launch commands, cannot read workspace files through fx tools, cannot start ACP-provided MCP servers, and cannot access the native secret store. `home` and `workspaceRoot` still provide identity and session context to shared ACP code, but they do not grant a tool capability by themselves.
 
-Agent creation does not fetch the model catalog unless the host sets a named reasoning `effort` or enables `fast`; those overrides are validated against the catalog at creation. When a prompt needs model capabilities or context capacity, the shared resolver obtains the catalog through the supplied host fetch and caches its metadata for that agent. Initial model-visible system context comes only from the host's explicit `instructions`, including text assembled by the MCP and skills adapters.
+Gateway agent creation does not fetch the model catalog unless the host sets a named reasoning `effort` or enables `fast`; those overrides are validated against the catalog at creation. When a Gateway prompt needs model capabilities or context capacity, the shared resolver obtains the catalog through the supplied host fetch and caches its metadata for that agent. A custom Chat Completions connection instead uses the explicit immutable model metadata supplied by its JavaScript host. Its bounded provider definition and optional bearer credential are scoped to one native core; the addon still sends every request through the host fetch bridge and never reads `~/.fx` to resolve the connection. An unauthenticated connection carries `.configured` authority with no secret and sends no Authorization header. Initial model-visible system context comes only from the host's explicit `instructions`, including text assembled by the MCP and skills adapters.
 
 Host-stream requests do not opt into the Gateway extended-time header. Live paired testing showed that header caused a recurring multi-second pre-header tail for embedded requests. Session identity and affinity headers remain enabled. The shared JavaScript fetch edge retries a thrown host transport error at most once, before any response reaches the Agent. Cancellation prevents the retry, and a second failure keeps the existing rejection behavior.
 
@@ -157,7 +157,7 @@ Accepted endpoints are:
 
 URLs with embedded credentials or fragments are rejected. Arbitrary HTTPS hosts, non-loopback HTTP hosts, and other schemes are rejected. Loopback HTTP exists only for local development and deterministic tests.
 
-Keep the validation in `sdk/fx-sdk.js`, `src/napi_core_main.zig`, and `streamable_http.validateEndpoint()` aligned. Loosening only one layer creates inconsistent behavior and may create a server-side request forgery path for callers using the low-level addon directly.
+Keep Gateway validation in `sdk/fx-sdk.js`, `src/napi_core_main.zig`, and `streamable_http.validateEndpoint()` aligned. A configured Chat Completions connection is a distinct route: `configured_provider.validate_url()` accepts HTTPS or loopback HTTP, and both the SDK and the low-level addon validate its definition before starting a core. Do not loosen `gatewayChatUrl` to smuggle a different provider through Gateway routing. Only trusted application configuration may select an endpoint; an embedding server must not accept the model URL from untrusted prompt text. The SDK disallows redirects and checks the outbound URL against the configured route before invoking host fetch.
 
 ## Resource limits and backpressure
 

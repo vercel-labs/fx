@@ -30,6 +30,7 @@ const scripts = [
   "test-agent-step-limit.mjs",
   "test-agent-effort.mjs",
   "test-agent-fast.mjs",
+  "test-agent-configured-provider.mjs",
   "test-agent-images.mjs",
   "test-agent-tool-start.mjs",
   "test-agent-reserved-tool-names.mjs",

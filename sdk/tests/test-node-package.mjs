@@ -68,6 +68,12 @@ try {
     const checkpoint = await agent.checkpoint();
     await agent.close();
     if (!(checkpoint instanceof Uint8Array) || checkpoint.length === 0) throw new Error("empty checkpoint");
+    const custom = await createFxAgent({ backend: "native", model: "local-model", provider: {
+      id: "local", protocol: "openai-chat-completions", baseUrl: "http://127.0.0.1:11434/v1", auth: { type: "none" },
+    } });
+    const customCheckpoint = await custom.checkpoint();
+    await custom.close();
+    if (!(customCheckpoint instanceof Uint8Array) || customCheckpoint.length === 0) throw new Error("empty custom checkpoint");
     console.log(JSON.stringify(Object.keys(libfx).sort()));
   `);
   await writeFile(join(consumerDir, "cjs.cjs"), `
@@ -86,6 +92,12 @@ try {
       const checkpoint = await agent.checkpoint();
       await agent.close();
       if (!(checkpoint instanceof Uint8Array) || checkpoint.length === 0) throw new Error("empty checkpoint");
+      const custom = await createFxAgent({ backend: "native", model: "local-model", provider: {
+        id: "local", protocol: "openai-chat-completions", baseUrl: "http://127.0.0.1:11434/v1", auth: { type: "none" },
+      } });
+      const customCheckpoint = await custom.checkpoint();
+      await custom.close();
+      if (!(customCheckpoint instanceof Uint8Array) || customCheckpoint.length === 0) throw new Error("empty custom checkpoint");
       console.log(JSON.stringify(Object.keys(libfx).sort()));
     })();
   `);

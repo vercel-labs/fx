@@ -42,7 +42,7 @@ await writeFile(highLevelAgentPath, `
 // Complete the fixture directory before a runtime caches its module-resolution entries.
 const coreOnlyPath = resolve(dir, "core-only.mjs");
 await writeFile(coreOnlyPath, `
-  export const libfxApiVersion = 3;
+  export const libfxApiVersion = 4;
   export function createCore() { throw new Error("unused createCore"); }
 `);
 const incompatiblePath = resolve(dir, "incompatible.mjs");
@@ -55,14 +55,14 @@ const versionFixtures = [
     export function createCore() { throw new Error("missing-version createCore invoked"); }
   `],
   ["unequal-version", `
-    export const libfxApiVersion = 4;
+    export const libfxApiVersion = 3;
     export function createCore() { throw new Error("unequal-version createCore invoked"); }
   `],
 ];
 for (const [name, source] of versionFixtures) await writeFile(resolve(dir, `${name}.mjs`), source);
 const matchingVersionPath = resolve(dir, "matching-version.mjs");
 await writeFile(matchingVersionPath, `
-  export const libfxApiVersion = 3;
+  export const libfxApiVersion = 4;
   export function createCore() {
     const error = new Error("matching-version createCore invoked");
     error.code = "MATCHING_VERSION_INVOKED";

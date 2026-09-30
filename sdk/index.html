@@ -76,6 +76,7 @@
     const forceUnsupported = params.has("force-unsupported");
     const hostToolEnabled = params.has("host-tool");
     const hostSkillEnabled = params.has("host-skill");
+    const configuredProvider = params.has("configured-provider");
     const blobPrompt = params.has("blob-prompt");
     const crossRealmBlob = params.has("blob-iframe");
     const blobPng = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=";
@@ -167,6 +168,20 @@
       return mockFetch(url, init);
     }
     async function mockFetch(url, init) {
+      if (configuredProvider) {
+        test.fetchCalls++;
+        test.customRoute = new URL(url).pathname === "/fake-connection/v1/chat/completions" && init.method === "POST";
+        if (!test.customRoute) throw new Error(`unexpected configured-provider fetch: ${init.method} ${new URL(url).pathname}`);
+        test.redirectBlocked = init.redirect === "error";
+        test.customAuthPresent = new Headers(init.headers).has("authorization");
+        const body = JSON.parse(new TextDecoder().decode(init.body));
+        test.customModel = body.model;
+        return new Response([
+          `data: ${JSON.stringify({ id: "browser-custom", model: body.model, choices: [{ index: 0, delta: { role: "assistant", content: "custom browser" }, finish_reason: null }] })}`,
+          `data: ${JSON.stringify({ id: "browser-custom", model: body.model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}`,
+          "data: [DONE]", "",
+        ].join("\n\n"), { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
       if (init.method === "GET" && String(url).endsWith("/v1/models")) {
         return Response.json({ object: "list", data: [
           { id: "sdk/catalog-alpha", type: "language", released: 2, tags: ["tool-use"] },
@@ -336,8 +351,19 @@
           wasm: location.hostname === "localhost" || location.hostname === "127.0.0.1"
             ? "../zig-out/bin/fx-core.wasm"
             : "./fx-core.wasm",
-          apiKey: localStorage.getItem("FX_API_KEY") || "sdk-test-key",
-          ...(initialModel ? { model: initialModel } : {}),
+          ...(configuredProvider ? {
+            model: { id: initialModel || "sdk/chrome-model" },
+            provider: {
+              id: "browser-custom",
+              protocol: "openai-chat-completions",
+              baseUrl: `${location.origin}/fake-connection/v1`,
+              auth: { type: "none" },
+              modelMetadata: { [initialModel || "sdk/chrome-model"]: { contextWindow: 32768 } },
+            },
+          } : {
+            apiKey: localStorage.getItem("FX_API_KEY") || "sdk-test-key",
+            ...(initialModel ? { model: initialModel } : {}),
+          }),
           fetch: dispatchFetch,
           onEvent: observe,
           onPermission: resolvePermission,
