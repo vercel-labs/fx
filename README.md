@@ -63,6 +63,8 @@ fx preserves those tmux views while resizing, including when the switcher zooms 
 
 Visit [fx.sh/docs](https://fx.sh/docs) for the full manual: sessions, models, custom model connections, permissions, configuration, skills, MCP, subagents, embedding, and the complete CLI and slash command references. Agents can read any page as Markdown by appending `.md` to its URL, or fetch [llms-full.txt](https://fx.sh/llms-full.txt) for everything in one file.
 
+For an optional built-in remote search preset, see the [AnySearch integration guide](docs/anysearch-mcp.md).
+
 ## Custom model connections
 
 Add named connections for any OpenAI Chat Completions endpoint, including local servers such as Ollama and gateways such as OpenRouter, in `~/.fx/settings.json`, then select one for the profile or a single invocation:

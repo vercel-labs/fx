@@ -3729,6 +3729,7 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
         if (effective_args.len < 2) return false;
         return std.mem.eql(u8, effective_args[1], "auth") or
             std.mem.eql(u8, effective_args[1], "list") or
+            std.mem.eql(u8, effective_args[1], "search") or
             std.mem.eql(u8, effective_args[1], "logout");
     }
     return std.mem.eql(u8, command, "slack") or
@@ -3766,7 +3767,7 @@ test "credential-reading commands use early threaded io without full entry confi
 }
 
 test "MCP credential commands use early threaded io" {
-    for ([_][:0]const u8{ "auth", "list", "logout" }) |operation| {
+    for ([_][:0]const u8{ "auth", "list", "search", "logout" }) |operation| {
         try std.testing.expect(needsEarlyThreadedIo(&.{
             @as([:0]const u8, "mcp"),
             operation,
