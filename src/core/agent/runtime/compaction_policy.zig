@@ -192,7 +192,7 @@ pub fn prepare(alloc: Allocator, source: []const types.ChatMessage, storage: Sto
             for (message.tool_calls) |call| {
                 const argument = try store_artifact(alloc, storage, "arguments", call.arguments_json);
                 const info = try std.fmt.allocPrint(alloc, "Tool call (not a completion result): name={s}; id={s}; original_arguments={s}; argument_excerpt={s}", .{ call.name, call.id, argument.handle, prefix(call.arguments_json, 256) });
-                try messages.append(alloc, .{ .role = .assistant, .content = info });
+                try messages.append(alloc, .{ .role = .assistant, .content = info, .tool_call_id = call.id, .tool_name = call.name });
                 try original.writer.print("### {s}\n", .{info});
             }
         } else if (message.role == .tool) {
