@@ -947,8 +947,12 @@ pub const Runtime = struct {
         child_id: []const u8,
         work_id: []const u8,
     ) !?[]u8 {
-        var state = self.sessions.loadReadOnly(alloc, child_id) catch return null;
-        defer state.deinit(alloc);
+        // The caller may be a turn arena: decoded history and replay scratch
+        // must be released independently, with only the result copied out.
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        var state = self.sessions.loadReadOnly(scratch.allocator(), child_id) catch return null;
+        defer state.deinit(scratch.allocator());
         const text = assistantTextForWork(state.history, work_id) orelse return null;
         return @as(?[]u8, try alloc.dupe(u8, text));
     }
@@ -973,13 +977,16 @@ pub const Runtime = struct {
         sink: ?ProgressSink,
         model_capability_resolver: ?model_capabilities.Resolver,
     ) Allocator.Error!StatusPublisher {
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
         var model: []u8 = undefined;
         var effort: types.ReasoningEffort = undefined;
-        if (self.sessions.loadReadOnly(alloc, child_id)) |loaded| {
-            var state = loaded;
-            defer state.deinit(alloc);
-            model = try alloc.dupe(u8, state.preferences.model);
-            effort = state.preferences.effort;
+        // Progress only needs preferences, not the child's replayed history.
+        if (self.sessions.loadReadOnlyPreferences(scratch.allocator(), child_id)) |loaded| {
+            var preferences = loaded;
+            defer preferences.deinit(scratch.allocator());
+            model = try alloc.dupe(u8, preferences.model);
+            effort = preferences.effort;
         } else |err| {
             debug_trace.eventf("subagent", "status_publisher_fallback", .{}, "child_id={s} reason=session_load_failed error={s}", .{ child_id, @errorName(err) });
             model = try alloc.dupe(u8, fallback.model);
@@ -987,9 +994,7 @@ pub const Runtime = struct {
         }
         var context_window: ?u32 = null;
         if (model_capability_resolver) |resolver| {
-            var resolve_arena = std.heap.ArenaAllocator.init(alloc);
-            defer resolve_arena.deinit();
-            if (resolver.resolve(resolve_arena.allocator(), model)) |caps| {
+            if (resolver.resolve(scratch.allocator(), model)) |caps| {
                 context_window = caps.context_window;
             } else |_| {}
         }
@@ -1096,6 +1101,97 @@ fn checkYieldedOwnership(alloc: Allocator) !void {
 
 test "subagent yielded identity is owned and allocation failures do not leak" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkYieldedOwnership, .{});
+}
+
+test "subagent session reads do not retain scratch in the caller arena" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var sessions = try session_store.Store.initFromHome(alloc, home, home);
+    defer sessions.deinit(alloc);
+    const large_text = try alloc.alloc(u8, 1024 * 1024);
+    defer alloc.free(large_text);
+    @memset(large_text, 'x');
+    var history = [_]types.HistoryTurn{
+        .{ .assistant = .{ .user = .{ .text = @constCast("old task"), .work_id = @constCast("old-work") }, .assistant = large_text } },
+        .{ .assistant = .{ .user = .{ .text = @constCast("new task"), .work_id = @constCast("target-work") }, .assistant = @constCast("SMALL_RESULT") } },
+    };
+    var loaded = try sessions.startWritableSession(alloc, .{
+        .id = @constCast("memory-probe-child"),
+        .origin_workspace_root = @constCast(home),
+        .workspace_root = @constCast(home),
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .preferences = .{ .model = @constCast("child-model"), .effort = .auto, .fast_mode = false },
+        .history = &history,
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+    });
+    defer loaded.deinit(alloc);
+    // Status must observe persisted preference changes, not initial defaults.
+    _ = try loaded.appendEvent(alloc, .{ .preferences_changed = .{
+        .model = @constCast("updated-child-model"),
+        .effort = types.ReasoningEffort.literal("high"),
+    } }, 2);
+    var runtime = Runtime{ .alloc = alloc, .sessions = &sessions, .root_id = undefined, .host_authority = undefined, .child_runner = undefined, .approvals = undefined, .authority_resolver = undefined, .managed = undefined };
+    const fallback = Defaults{ .provider = .gateway, .model = "fallback", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") };
+    var turn = std.heap.ArenaAllocator.init(alloc);
+    defer turn.deinit();
+    var first_capacity: usize = 0;
+    var result_ns: i128 = 0;
+    var status_ns: i128 = 0;
+    for (0..16) |i| {
+        const result_start = io_mod.nanoTimestamp();
+        const result = (try runtime.managedResultText(turn.allocator(), loaded.active_id, "target-work")).?;
+        result_ns += io_mod.nanoTimestamp() - result_start;
+        // Keep returned data alive across subsequent reads, as the parent does.
+        try std.testing.expectEqualStrings("SMALL_RESULT", result);
+        const status_start = io_mod.nanoTimestamp();
+        var status = try runtime.startStatusPublisher(turn.allocator(), loaded.active_id, fallback, null, null);
+        status_ns += io_mod.nanoTimestamp() - status_start;
+        try std.testing.expectEqualStrings("updated-child-model", status.model);
+        try std.testing.expectEqual(types.ReasoningEffort.literal("high"), status.effort);
+        status.deinit(turn.allocator());
+        try std.testing.expectEqualStrings("SMALL_RESULT", result);
+        if (i == 0) first_capacity = turn.queryCapacity();
+    }
+    const benchmark = std.testing.environ.getAlloc(alloc, "FX_SUBAGENT_READ_BENCH") catch null;
+    defer if (benchmark) |value| alloc.free(value);
+    if (benchmark != null) {
+        std.debug.print("SUBAGENT_READ_BENCH history_bytes={d} reads=16 arena_after_1={d} arena_after_16={d} result_ns={d} status_ns={d}\n", .{ large_text.len, first_capacity, turn.queryCapacity(), result_ns, status_ns });
+    }
+    // Only the tiny result and model strings belong in the caller arena.
+    try std.testing.expect(turn.queryCapacity() < 64 * 1024);
+    // Preferences must fit even when there is no room to decode the history.
+    var preference_buffer: [64 * 1024]u8 = undefined;
+    var preference_allocator = std.heap.FixedBufferAllocator.init(&preference_buffer);
+    var preferences = try sessions.loadReadOnlyPreferences(preference_allocator.allocator(), loaded.active_id);
+    defer preferences.deinit(preference_allocator.allocator());
+    try std.testing.expectEqualStrings("updated-child-model", preferences.model);
+    try std.testing.expect((try runtime.managedResultText(turn.allocator(), loaded.active_id, "missing-work")) == null);
+    try std.testing.expect((try runtime.managedResultText(turn.allocator(), "missing-child", "target-work")) == null);
+    const Resolver = struct {
+        fn resolve(_: *anyopaque, scratch: Allocator, _: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
+            const bytes = scratch.alloc(u8, 1024 * 1024) catch return error.Cancelled;
+            @memset(bytes, 'x');
+            return .{ .context_window = 128_000 };
+        }
+    };
+    var context: u8 = 0;
+    var resolved_status = try runtime.startStatusPublisher(turn.allocator(), loaded.active_id, fallback, null, .{ .ctx = &context, .resolve_fn = Resolver.resolve });
+    defer resolved_status.deinit(turn.allocator());
+    try std.testing.expectEqual(@as(?u32, 128_000), resolved_status.context_window);
+    try std.testing.expect(turn.queryCapacity() < 64 * 1024);
+    var fallback_status = try runtime.startStatusPublisher(turn.allocator(), "missing-child", fallback, null, null);
+    defer fallback_status.deinit(turn.allocator());
+    try std.testing.expectEqualStrings(fallback.model, fallback_status.model);
+    var no_space: [0]u8 = .{};
+    var failing = std.heap.FixedBufferAllocator.init(&no_space);
+    try std.testing.expectError(error.OutOfMemory, runtime.managedResultText(failing.allocator(), loaded.active_id, "target-work"));
+    try std.testing.expectError(error.OutOfMemory, runtime.startStatusPublisher(failing.allocator(), loaded.active_id, fallback, null, null));
 }
 
 test "subagent admission preserves an undelivered result before advancing its child" {
