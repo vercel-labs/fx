@@ -1424,7 +1424,12 @@ pub fn Bindings(comptime App: type) type {
 
         fn agentReportUsage(ctx: *anyopaque, usage: types.Usage) void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            if (usage.input_tokens) |input| app.total_input_tokens = input;
+            if (usage.input_tokens) |input| {
+                app.total_input_tokens = input;
+                app_worker_runtime.Runtime(App).pushEvent(app, .{ .context_token_update = input +| (usage.output_tokens orelse 0) }) catch |err| {
+                    debug_trace.logf("agent", "context token publication failed err={s}", .{@errorName(err)});
+                };
+            }
             if (usage.output_tokens) |output| app.total_output_tokens = output;
         }
 
@@ -2804,7 +2809,7 @@ test "subagent status renderer honors session and parent workspace toggles" {
     };
 
     try std.testing.expectEqualStrings(
-        "gpt-5.5 · high · reviewer · 12k/100k 12% · ~/fx (feature/status)",
+        "gpt-5.5 · high · reviewer · ~/fx (feature/status) · 12k tokens",
         renderer.render(&buf, status),
     );
 

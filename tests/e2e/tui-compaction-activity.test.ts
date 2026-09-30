@@ -274,7 +274,8 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         f.summaryHold.release(HANDOFF);
         await until(() => f.durable() > 0, "acknowledged checkpoint");
         if (trigger === "manual") {
-          await terminal.waitForPane((pane) => !ACTIVITY.test(pane) && hasEmptyComposer(pane), 10_000);
+          const compactedPane = await terminal.waitForPane((pane) => !ACTIVITY.test(pane) && hasEmptyComposer(pane), 10_000);
+          expect(compactedPane).toMatch(/\d+(?:k)? tokens/);
           expect(f.counts().ordinary).toBe(f.seedTurns);
           expect(f.counts().summaries).toBeGreaterThan(1);
         } else {

@@ -390,6 +390,7 @@ pub fn Runtime(comptime App: type) type {
                 .full_detail_record,
                 .command_output,
                 .turn_token_update,
+                .context_token_update,
                 .turn_phase_update,
                 .diff_block,
                 .restore_failed_prompt,
@@ -1154,6 +1155,13 @@ pub fn Runtime(comptime App: type) type {
                     .turn_token_update => |update| {
                         applyTurnTokenProgress(app, update);
                     },
+                    .context_token_update => |tokens| {
+                        if (comptime @hasField(App, "context_input_tokens") and @hasField(App, "context_output_baseline")) {
+                            app.context_input_tokens = tokens;
+                            app.context_output_baseline = app.stream.token_progress.output_tokens;
+                            app.shell.render_requests.request(.footer);
+                        }
+                    },
                     .turn_phase_update => |update| {
                         applyTurnPhase(app, update);
                     },
@@ -1901,6 +1909,8 @@ const FakeApp = struct {
     question_prompt: FakeQuestionPrompt = .{},
     input_runtime: InputRuntime = .{},
     stream: types.StreamState = .{},
+    context_input_tokens: ?u64 = null,
+    context_output_baseline: u64 = 0,
     shell: FakeShell = .{},
     pacer: FakePacer = .{},
     subagents: FakeSubagents = .{},
@@ -2426,6 +2436,24 @@ test "core.app_worker_runtime applies turn token input as absolute set" {
 
     try std.testing.expectEqual(@as(u64, 10), app.stream.token_progress.input_tokens);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+}
+
+test "core.app_worker_runtime anchors live context updates to streamed output" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    app.worker.processing = true;
+    app.stream.active = true;
+    app.stream.token_progress.output_tokens = 30;
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .context_token_update = 1000 });
+    try tickNoop(&app);
+    try std.testing.expectEqual(@as(?u64, 1000), app.context_input_tokens);
+    try std.testing.expectEqual(@as(u64, 30), app.context_output_baseline);
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .turn_token_update = .{ .output_tokens = 45 } });
+    try tickNoop(&app);
+    try std.testing.expectEqual(@as(u64, 45), app.stream.token_progress.output_tokens);
 }
 
 test "core.app_worker_runtime applies turn token output as an absolute snapshot" {
