@@ -6,6 +6,7 @@ const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
 const secret = @import("../core/auth/secret.zig");
 const types = @import("../core/shared/types.zig");
+const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_client = @import("client.zig");
 const versions = @import("../core/gateway/provider_versions.zig");
 const version_lookup = @import("provider_versions.zig");
@@ -308,8 +309,12 @@ fn parseCatalog(
         if (!std.mem.eql(u8, api_backend, "responses")) continue;
         const raw_id = try requiredString(object, "model");
         try validateModelId(raw_id);
-        const modality_object = try findModalityModel(modality_models.array.items, raw_id) orelse
-            return error.InvalidGrokModelCatalog;
+        // The subscription proxy and the modality endpoint publish independently,
+        // so a newly launched model can appear in one before the other.
+        const modality_object = try findModalityModel(modality_models.array.items, raw_id) orelse {
+            debug_trace.logf("model_catalog", "grok_model_omitted reason=missing_modalities model={s}", .{raw_id});
+            continue;
+        };
         if (!try stringArrayContains(modality_object, "output_modalities", "text")) continue;
 
         const id = try alloc.dupe(u8, raw_id);
@@ -489,13 +494,24 @@ test "Grok catalog rejects missing provider-owned capability metadata" {
     for (cases) |subscription| {
         try expectCatalogParseError(error.InvalidGrokModelCatalog, subscription, modalities);
     }
-    const missing_modalities =
-        \\{"models":[{"id":"other","input_modalities":["text"],"output_modalities":["text"]}]}
+}
+
+test "Grok catalog omits subscription models the modality endpoint does not list yet" {
+    const alloc = std.testing.allocator;
+    const subscription_json =
+        \\{"data":[
+        \\  {"id":"current","model":"current","api_backend":"responses","context_window":500000,"supports_reasoning_effort":false,"reasoning_efforts":[]},
+        \\  {"id":"launched","model":"launched","api_backend":"responses","context_window":500000,"supports_reasoning_effort":false,"reasoning_efforts":[]}
+        \\]}
     ;
-    const valid_subscription =
-        \\{"data":[{"id":"current","model":"current","api_backend":"responses","context_window":500000,"supports_reasoning_effort":false,"reasoning_efforts":[]}]}
+    const modalities_json =
+        \\{"models":[{"id":"current","input_modalities":["text"],"output_modalities":["text"]}]}
     ;
-    try expectCatalogParseError(error.InvalidGrokModelCatalog, valid_subscription, missing_modalities);
+    var catalog = try parseCatalog(alloc, subscription_json, modalities_json);
+    defer model_catalog.freeModelCatalog(alloc, &catalog);
+
+    try std.testing.expectEqual(@as(usize, 1), catalog.items.len);
+    try std.testing.expectEqualStrings("current", catalog.items[0].id);
 }
 
 test "Grok catalog URLs use provider-owned subscription and modality endpoints" {
