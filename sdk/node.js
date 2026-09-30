@@ -492,6 +492,7 @@ function createNativeCoreRuntime(addon, options) {
 
   return {
     exited,
+    defaultModel: addon.defaultModel,
     get error() { return outputError; },
     write(data) { addon.writeCore(core, Buffer.from(data)); },
     closeStdin() { addon.closeCore(core); },

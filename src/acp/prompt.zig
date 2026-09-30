@@ -21,6 +21,7 @@ const image_attachments = @import("../core/images/image_attachments.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const server = @import("server.zig");
+const host_model_metadata = @import("model_metadata.zig");
 const sessions = @import("sessions.zig");
 const client_instructions = @import("client_instructions.zig");
 const agent_runtime = @import("../core/agent/agent_runtime.zig");
@@ -102,6 +103,10 @@ pub const TerminalOutcome = union(enum) {
 
 fn promptInputFailure(err: anyerror) anyerror!TerminalOutcome {
     return switch (err) {
+        error.InvalidModelMetadata => .{ .rpc_error = .{
+            .code = ErrorCode.invalid_params,
+            .message = "Invalid selected model metadata",
+        } },
         error.OutOfMemory => err,
         error.UnsupportedPromptImage => .{ .rpc_error = .{
             .code = ErrorCode.invalid_params,
@@ -719,9 +724,13 @@ pub fn handlePrompt(
         }
     }
     const next_image_id = (try image_attachments.calculate_next_image_id(prior_image_catalog)).next_id;
-    var prompt_input = parsePromptInputWithFirstImageId(alloc, params, next_image_id) catch |err|
+    var prompt_input = (if (state.host_metadata_enabled)
+        parseHostPromptInput(alloc, params, next_image_id)
+    else
+        parsePromptInputWithFirstImageId(alloc, params, next_image_id)) catch |err|
         return promptInputFailure(err);
     defer prompt_input.deinit(alloc);
+    if (state.host_metadata_enabled) server.adoptHostModelMetadata(state, state.alloc, &prompt_input.model_metadata_update);
     if (prompt_input.pending_images.len > 0) {
         if (session.store == null and session.wasm_state == null) {
             // libfx kernel session: images stay in memory and ride the kernel
@@ -1210,6 +1219,7 @@ const PendingPromptImage = struct {
 const ParsedPromptInput = struct {
     text: []u8,
     continue_recovery: bool = false,
+    model_metadata_update: host_model_metadata.Update = .unchanged,
     targets: []context_contract.ApplicableTarget = &.{},
     omissions: []context_contract.ContextOmissionInput = &.{},
     omission_summary: ?context_contract.ContextOmissionSummary = null,
@@ -1270,6 +1280,7 @@ const ParsedPromptInput = struct {
     }
 
     fn deinit(self: *ParsedPromptInput, alloc: Allocator) void {
+        self.model_metadata_update.deinit(alloc);
         alloc.free(self.text);
         for (self.targets) |target| alloc.free(@constCast(target.path));
         if (self.targets.len > 0) alloc.free(self.targets);
@@ -1297,6 +1308,14 @@ fn parsePromptInputWithFirstImageId(
     params_json: []const u8,
     first_image_id: usize,
 ) !ParsedPromptInput {
+    return parsePromptInputImpl(alloc, params_json, first_image_id, false);
+}
+
+fn parseHostPromptInput(alloc: Allocator, params_json: []const u8, first_image_id: usize) !ParsedPromptInput {
+    return parsePromptInputImpl(alloc, params_json, first_image_id, true);
+}
+
+fn parsePromptInputImpl(alloc: Allocator, params_json: []const u8, first_image_id: usize, accept_metadata: bool) !ParsedPromptInput {
     if (first_image_id == 0) return error.InvalidImageId;
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, params_json, .{}) catch
         return .{ .text = try alloc.dupe(u8, "") };
@@ -1437,6 +1456,7 @@ fn parsePromptInputWithFirstImageId(
     result.omissions = try omissions.toOwnedSlice(alloc);
     result.pending_images = try pending_images.toOwnedSlice(alloc);
     result.omission_summary = omission_summary.finish();
+    if (accept_metadata) result.model_metadata_update = try host_model_metadata.Update.parse(alloc, parsed.value.object.get("modelMetadata"), io_mod.milliTimestamp());
     return result;
 }
 
@@ -1667,7 +1687,8 @@ fn persistUsageCheckpoint(
 
 fn modelCatalogUnavailable(raw_ctx: *anyopaque) bool {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    return ctx.state.capability_resolver.state == .failed;
+    const session = if (ctx.state.active_session) |*active| active else return false;
+    return server.modelCatalogUnavailable(ctx.state, session.model);
 }
 
 fn resolveModelCapabilities(
@@ -1678,6 +1699,7 @@ fn resolveModelCapabilities(
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = if (ctx.state.active_session) |*active| active else return .{};
     const bundle = ctx.state.cfg.provider_set.select(session.provider);
+    if (ctx.state.host_metadata.available(model, bundle.fallbackModelCapabilities(model), io_mod.milliTimestamp())) |provided| return provided;
     return ctx.state.capability_resolver.resolve(
         ctx.state.alloc,
         bundle.model_catalog orelse return bundle.fallbackModelCapabilities(model),
@@ -1739,7 +1761,8 @@ fn availableModelCapabilities(
 ) model_capabilities.Capabilities {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = if (ctx.state.active_session) |*active| active else return .{};
-    return ctx.state.capability_resolver.available(
+    return server.availableModelCapabilities(
+        ctx.state,
         model,
         ctx.state.cfg.provider_set.select(session.provider).fallbackModelCapabilities(model),
     );

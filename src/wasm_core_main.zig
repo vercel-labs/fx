@@ -27,6 +27,14 @@ comptime {
 
 pub const panic = @import("core/hosts/wasm_panic.zig").panic;
 
+export fn fx_default_model_ptr() usize {
+    return @intFromPtr(builtin_gateway.default_model.ptr);
+}
+
+export fn fx_default_model_len() usize {
+    return builtin_gateway.default_model.len;
+}
+
 pub fn main(init: std.process.Init) !void {
     io_mod.setIo(init.io);
     io_mod.setEnvironMap(init.environ_map);

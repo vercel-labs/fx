@@ -619,6 +619,19 @@ node benchmarks/libfx/bench-competitive.mjs --server /tmp/libfx-bench-server --p
 Build the SDK artifacts and install the pinned Pi package first, as shown in
 `.github/workflows/bench.yml`. Raw per-prompt samples remain in the output directory.
 
+The catalog benchmark uses immediate deterministic responses and preserves raw
+creation-to-first-text samples for 200 and 10,000 models. It checks complete
+discovery, one catalog download across fresh agents, selected metadata bounded
+within 4 KiB for its fixtures, and a stale refresh that remains pending while a
+reply completes. With 100 samples, warm creation-to-first-text p95 for the large
+catalog must stay within 5 ms of the small catalog on the same runner. The libfx
+runtime CI job runs and checks this benchmark on Node and Bun with both backends.
+
+```sh
+node benchmarks/libfx/bench-catalog.mjs --backend native --samples 100 --check
+node --experimental-wasm-jspi benchmarks/libfx/bench-catalog.mjs --backend wasm --samples 100 --check
+```
+
 ## Before Marking a PR Ready
 
 Minimum checklist:

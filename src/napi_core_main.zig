@@ -1138,6 +1138,9 @@ export fn napi_register_module_v1(env: c.napi_env, exports: c.napi_value) callco
     var api_version: c.napi_value = undefined;
     if (!statusOk(env, c.napi_create_uint32(env, 3, &api_version), "could not create API version")) return null;
     if (!statusOk(env, c.napi_set_named_property(env, exports, "libfxApiVersion", api_version), "could not export API version")) return null;
+    var default_model: c.napi_value = undefined;
+    if (!statusOk(env, c.napi_create_string_utf8(env, builtin_gateway.default_model.ptr, builtin_gateway.default_model.len, &default_model), "could not create default model")) return null;
+    if (!statusOk(env, c.napi_set_named_property(env, exports, "defaultModel", default_model), "could not export default model")) return null;
     if (!exportFunction(env, exports, "createCore", createCore)) return null;
     if (!exportFunction(env, exports, "takeCoreReadyFd", takeCoreReadyFd)) return null;
     if (!exportFunction(env, exports, "writeCore", writeCore)) return null;

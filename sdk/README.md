@@ -206,9 +206,41 @@ const models = await listModels({
 });
 ```
 
-`listModels()` performs one bounded Gateway request and returns sorted, unique
-language-model IDs. It accepts the same optional `fetch` override as the Agent
-API.
+`listModels()` returns sorted, unique language-model IDs from a bounded Gateway
+catalog. The default transport shares that catalog across discovery and agents
+in the same loaded SDK module. The complete list remains available when an agent
+uses only its selected model's metadata. A first required lookup on a cold
+instance still loads the catalog.
+
+Cached catalogs are fresh for five minutes and usable for up to one hour. A
+usable snapshot serves requests immediately; agents refresh stale data after
+first text, turn completion, or failed agent creation. Concurrent lookups share
+one request, and a cancelled waiter does not cancel another agent's lookup.
+Credentials, team, endpoint, and transport scopes stay separate.
+
+A custom `fetch` callback keeps catalog data local to each agent by default.
+Set `cacheModels: true` on discovery and agent options to share it when the same
+callback and authorization headers identify the same connection. Keep sharing
+disabled when the callback changes its authorization through ambient request
+state. `cacheModels: false` also disables sharing on the default transport.
+
+On a serverless host, pass `onBackgroundTask(promise)` to register refresh work
+with the host's request lifecycle. For a Vercel function:
+
+```js
+import { waitUntil } from "@vercel/functions";
+import { createFxAgent } from "libfx";
+
+const agent = await createFxAgent({
+  apiKey: process.env.AI_GATEWAY_API_KEY,
+  model,
+  onBackgroundTask: waitUntil,
+});
+```
+
+Function instances maintain independent memory caches. Preloading one instance
+does not guarantee that a later HTTP request reaches that instance. Model
+metadata stays outside conversation checkpoints and model-visible context.
 
 ## JavaScript tools and instructions
 

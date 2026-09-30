@@ -28,9 +28,17 @@ try {
   assert.match(sdk, new RegExp(`from "\\./${manifest.wasmModule.file.replaceAll(".", "\\.")}";`));
   assert.doesNotMatch(sdk, /from "\.\/wasm-module\.js";/);
 
+  const modelCatalog = await readFile(join(temp, manifest.modelCatalog.file));
+  assert.equal(digest(modelCatalog), manifest.modelCatalog.sha256);
+  assert.equal(modelCatalog.byteLength, manifest.modelCatalog.bytes);
+  assert.match(sdk, new RegExp(`from "\\./${manifest.modelCatalog.file.replaceAll(".", "\\.")}";`));
+  assert.doesNotMatch(sdk, /from "\.\/model-catalog\.js";/);
+
   const vercel = JSON.parse(await readFile(join(temp, "vercel.json"), "utf8"));
   const header = vercel.headers.find(({ source }) => source === `/${manifest.wasmModule.file}`);
   assert.deepEqual(header?.headers, [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }]);
+  assert.deepEqual(vercel.headers.find(({ source }) => source === `/${manifest.modelCatalog.file}`)?.headers,
+    [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }]);
   console.log("terminal demo package passed: shared Wasm module is hashed, rewritten, and immutable");
 } finally {
   await rm(temp, { recursive: true, force: true });

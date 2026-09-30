@@ -1798,7 +1798,8 @@ pub fn sendActiveSessionUsageUpdate(state: *server.ServerState, alloc: Allocator
     const active = if (state.active_session) |*session| session else return;
     const usage = active.session_rt.usage.liveContextSnapshot() orelse return;
     const provider_bundle = state.cfg.provider_set.select(active.provider);
-    const capabilities = state.capability_resolver.available(
+    const capabilities = server.availableModelCapabilities(
+        state,
         active.model,
         provider_bundle.fallbackModelCapabilities(active.model),
     );

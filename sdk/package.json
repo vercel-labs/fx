@@ -40,6 +40,7 @@
     "node.cjs",
     "fx-sdk.js",
     "wasm-module.js",
+    "model-catalog.js",
     "core-output.js",
     "mcp.js",
     "skills.js",

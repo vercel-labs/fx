@@ -336,7 +336,10 @@ fn addWasmArtifact(
             .strip = true,
         }),
     });
-    if (surface == .core) wasm_exe.stack_size = 1024 * 1024;
+    if (surface == .core) {
+        wasm_exe.stack_size = 1024 * 1024;
+        wasm_exe.root_module.export_symbol_names = &.{ "fx_default_model_ptr", "fx_default_model_len" };
+    }
     wasm_exe.root_module.addImport("build_options", wasm_options.createModule());
 
     const install_wasm = b.addInstallArtifact(wasm_exe, .{});

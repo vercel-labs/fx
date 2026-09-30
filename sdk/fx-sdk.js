@@ -1,5 +1,6 @@
 import { CoreOutput, maxCoreMessageBytes } from "./core-output.js";
 import { loadModule } from "./wasm-module.js";
+import { cancelResponseBody, createCatalogReader, maxModelBytes } from "./model-catalog.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -9,12 +10,9 @@ const workspaceCommandLimit = 64 * 1024;
 const workspaceOutputLimit = 64 * 1024;
 const maxInstructionsBytes = 64 * 1024;
 const maxApiKeyBytes = 64 * 1024;
-const maxModelBytes = 1024;
 // Matches the kernel's ReasoningEffort.max_name_bytes.
 const maxEffortBytes = 64;
 const maxUrlBytes = 16 * 1024;
-const maxModelCatalogBytes = 4 * 1024 * 1024;
-const maxModelCatalogEntries = 10_000;
 const streamReadsPerTaskYield = 32;
 const transportActivityIntervalMs = 250;
 const maxUnreadEventBytes = 1024 * 1024;
@@ -92,6 +90,8 @@ export function normalizeAgentOptions(value) {
   if (Object.hasOwn(options, "env")) {
     throw new TypeError("createFxAgent() does not accept env; pass apiKey and model directly");
   }
+  if (options.cacheModels !== undefined && typeof options.cacheModels !== "boolean") throw new TypeError("cacheModels must be a boolean");
+  if (options.onBackgroundTask !== undefined && typeof options.onBackgroundTask !== "function") throw new TypeError("onBackgroundTask must be a function");
   options.apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, true);
   if (options.model !== null && typeof options.model === "object" && !Array.isArray(options.model)) {
     if (Object.hasOwn(options, "effort") || Object.hasOwn(options, "fast")) {
@@ -138,88 +138,27 @@ function agentRpcError(response) {
   return error;
 }
 
-async function cancelResponseBody(response) {
-  try {
-    await response.body?.cancel();
-  } catch {}
-}
-
-async function readBoundedResponseText(response, limit) {
-  const declared = Number(response.headers.get("content-length"));
-  if (Number.isFinite(declared) && declared > limit) {
-    await cancelResponseBody(response);
-    throw new RangeError(`model catalog exceeds the ${limit} byte libfx limit`);
-  }
-  if (!response.body) {
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes.length > limit) throw new RangeError(`model catalog exceeds the ${limit} byte libfx limit`);
-    return strictDecoder.decode(bytes);
-  }
-
-  const reader = response.body.getReader();
-  const chunks = [];
-  let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (!value?.length) continue;
-    total += value.length;
-    if (total > limit) {
-      try {
-        await reader.cancel();
-      } catch {}
-      throw new RangeError(`model catalog exceeds the ${limit} byte libfx limit`);
-    }
-    chunks.push(value);
-  }
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return strictDecoder.decode(bytes);
-}
-
 export async function listModels(options = {}) {
   if (!options || typeof options !== "object" || Array.isArray(options)) {
     throw new TypeError("listModels() options must be an object");
   }
   const apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, true);
-  const fetchModels = options.fetch ?? globalThis.fetch?.bind(globalThis);
+  const source = options.fetch ?? globalThis.fetch;
+  const fetchModels = options.fetch ?? source?.bind(globalThis);
   if (typeof fetchModels !== "function") throw new TypeError("fetch is unavailable");
-  const response = await fetchModels("https://ai-gateway.vercel.sh/coding-agent/v1/models", {
-    method: "GET",
-    headers: { authorization: `Bearer ${apiKey}` },
+  if (options.cacheModels !== undefined && typeof options.cacheModels !== "boolean") throw new TypeError("cacheModels must be a boolean");
+  if (options.onBackgroundTask !== undefined && typeof options.onBackgroundTask !== "function") throw new TypeError("onBackgroundTask must be a function");
+  const reader = createCatalogReader(fetchModels, {
+    identity: source, shared: options.cacheModels ?? options.fetch === undefined,
+    onBackgroundTask: options.onBackgroundTask,
   });
-  if (!response.ok) {
-    await cancelResponseBody(response);
-    throw new Error(`model catalog request failed with HTTP ${response.status}`);
-  }
-
-  let catalog;
   try {
-    catalog = JSON.parse(await readBoundedResponseText(response, maxModelCatalogBytes));
-  } catch (error) {
-    if (error instanceof RangeError) throw error;
-    throw new TypeError("model catalog response is malformed");
-  }
-  if (!catalog || typeof catalog !== "object" || !Array.isArray(catalog.data)) {
-    throw new TypeError("model catalog response is malformed");
-  }
-  if (catalog.data.length > maxModelCatalogEntries) {
-    throw new RangeError(`model catalog exceeds the ${maxModelCatalogEntries} entry libfx limit`);
-  }
-
-  const ids = new Set();
-  for (const entry of catalog.data) {
-    if (!entry || typeof entry !== "object") continue;
-    if (typeof entry.type === "string" && entry.type.toLowerCase() !== "language") continue;
-    if (typeof entry.id !== "string" || entry.id.length === 0) continue;
-    if (encoder.encode(entry.id).length > maxModelBytes) continue;
-    ids.add(entry.id);
-  }
-  return [...ids].sort();
+    const ids = await reader.models("https://ai-gateway.vercel.sh/coding-agent/v1/models", {
+      method: "GET", headers: { authorization: `Bearer ${apiKey}` },
+    });
+    reader.refresh();
+    return ids;
+  } finally { reader.release(); }
 }
 
 function validWorkspacePath(path) {
@@ -1190,6 +1129,10 @@ async function instantiate(options) {
   const module = await loadModule(options.wasm);
   const instance = await WebAssembly.instantiate(module, runtime.imports);
   runtime.setInstance(instance);
+  if (typeof instance.exports.fx_default_model_ptr === "function") {
+    runtime.defaultModel = decoder.decode(new Uint8Array(instance.exports.memory.buffer,
+      instance.exports.fx_default_model_ptr(), instance.exports.fx_default_model_len()));
+  }
   const start = WebAssembly.promising(instance.exports._start);
   start().then(
     () => {
@@ -1519,13 +1462,26 @@ export async function createFxAgent(options = {}) {
   let nextId = 1;
   let sessionId = null;
   let activeTurn = null;
+  let lastMetadataRevision = null;
+  let catalogWasObserved = false;
   let closing = false;
   let coreExitError = null;
   const isCurrentTurn = (turn) => turn && activeTurn === turn && !turn.cancelled && !closing;
   const emit = (type, detail = {}) => {
     try { options.onEvent?.({ type, timestamp: performance.now(), ...detail }); } catch {}
   };
-  const hostFetch = options.fetch ?? globalThis.fetch?.bind(globalThis);
+  const fetchIdentity = options.fetch ?? globalThis.fetch;
+  const hostFetch = options.fetch ?? fetchIdentity?.bind(globalThis);
+  const catalogUrl = "https://ai-gateway.vercel.sh/coding-agent/v1/models";
+  const catalogInit = { method: "GET", headers: { authorization: `Bearer ${options.apiKey}` } };
+  const catalog = createCatalogReader(hostFetch, {
+    identity: fetchIdentity, shared: options.cacheModels ?? options.fetch === undefined,
+    onBackgroundTask(task) {
+      try { options.onBackgroundTask?.(task); }
+      catch (error) { emit("catalog.refresh.error", { reason: "background_hook", error: error?.name ?? "Error" }); }
+    },
+  });
+  const selectedMetadata = () => catalog.metadata(catalogUrl, catalogInit, options.model ?? runtime.defaultModel);
   const transportFetch = async (input, init = {}) => {
     const method = String(init.method ?? input?.method ?? "GET").toUpperCase();
     let endpoint = String(input?.url ?? input);
@@ -1547,7 +1503,11 @@ export async function createFxAgent(options = {}) {
           throw new DOMException("Aborted", "AbortError");
         }
         if (!hostFetch) throw new TypeError("fetch is unavailable");
-        const response = await hostFetch(input, init);
+        if (method === "GET" && endpoint === catalogUrl) catalogWasObserved = true;
+        const response = method === "GET" && endpoint === catalogUrl
+          ? await catalog.fetch(input, init)
+          : await hostFetch(input, init);
+        if (method === "POST" && (response.status === 401 || response.status === 403)) catalog.invalidate(catalogUrl, catalogInit);
         const headers = response.headers;
         emit("transport.response", {
           attempt,
@@ -1646,12 +1606,31 @@ export async function createFxAgent(options = {}) {
   const runtime = options.runtimeFactory
     ? await options.runtimeFactory(runtimeOptions)
     : await instantiate(runtimeOptions);
-  emit("runtime.ready");
+  emit("runtime.ready", { model: options.model ?? runtime.defaultModel });
   const send = (message) => {
     if (closing) throw new Error("fx agent is closing");
+    let nextMetadataRevision = lastMetadataRevision;
+    let metadataDelivered = false;
+    if (message.method === "session/prompt") {
+      const metadata = selectedMetadata();
+      const revision = metadata ? `${metadata.model}\0${metadata.revision}` : null;
+      if (revision !== lastMetadataRevision || (!metadata && catalogWasObserved)) {
+        message.params.modelMetadata = metadata;
+        nextMetadataRevision = revision;
+        metadataDelivered = true;
+      }
+    }
     emit("acp.send", { message });
     if (message.method === "session/prompt" && activeTurn?.cancelled) throw new Error("Cancelled");
-    runtime.write(`${JSON.stringify(message)}\n`);
+    const serialized = JSON.stringify(message);
+    if (message.method === "session/prompt" && encoder.encode(serialized).length > maxPromptFrameBytes) {
+      throw new RangeError("prompt exceeds the libfx frame limit");
+    }
+    runtime.write(`${serialized}\n`);
+    if (metadataDelivered) {
+      lastMetadataRevision = nextMetadataRevision;
+      catalogWasObserved = false;
+    }
     if (message.method === "session/prompt") activeTurn?.promptWritten();
   };
   const request = (method, params = {}) => new Promise((resolve, reject) => {
@@ -1671,7 +1650,11 @@ export async function createFxAgent(options = {}) {
   runtime.setLineHandler((message, size) => {
     emit("acp.receive", { message });
     if (message.method === "session/update") {
-      if (message.params.sessionId === sessionId) return activeTurn?.push(message.params.update, size);
+      if (message.params.sessionId === sessionId) {
+        const update = message.params.update;
+        if (update.sessionUpdate === "agent_message_chunk" && update.content?.text && !update.content.text.startsWith("[context]")) catalog.refresh();
+        return activeTurn?.push(update, size);
+      }
       return;
     }
     void handleControlMessage(message).catch((error) => runtime.abort(error));
@@ -1708,12 +1691,12 @@ export async function createFxAgent(options = {}) {
     if (message.error) waiter.reject(agentRpcError(message.error)); else waiter.resolve(message.result);
   }
   try {
+    const initialMetadata = selectedMetadata();
+    lastMetadataRevision = initialMetadata ? `${initialMetadata.model}\0${initialMetadata.revision}` : null;
     await request("initialize", {
       protocolVersion: 1,
       clientCapabilities: {
-        ...(hostTools.descriptors.length || instructions
-          ? { libfx: { tools: hostTools.descriptors, instructions } }
-          : {}),
+        libfx: { tools: hostTools.descriptors, instructions, modelMetadata: true, initialModelMetadata: initialMetadata },
       },
     });
 
@@ -1730,6 +1713,8 @@ export async function createFxAgent(options = {}) {
     try { runtime.abortHostEffects(); } catch {}
     try { runtime.closeStdin(); } catch {}
     try { await runtime.exited; } catch {}
+    catalog.refresh();
+    catalog.release();
     throw error;
   }
 
@@ -1747,13 +1732,14 @@ export async function createFxAgent(options = {}) {
       return base64ToBytes(response.checkpoint);
     },
     async close() {
-      if (closing) { await runtime.exited; return; }
+      if (closing) { await runtime.exited; catalog.release(); return; }
       const turn = activeTurn;
       turn?.cancel();
       if (turn) await turn.result.catch(() => {});
       closing = true;
       runtime.closeStdin();
       await runtime.exited;
+      catalog.release();
     },
   };
   return agent;
@@ -2017,6 +2003,7 @@ export async function createFxAgent(options = {}) {
         throw error;
       })
       .finally(() => {
+        catalog.refresh();
         finished = true;
         resumeOutput?.();
         resumeOutput = null;

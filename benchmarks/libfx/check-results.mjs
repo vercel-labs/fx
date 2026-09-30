@@ -21,6 +21,25 @@ for (const runtime of ["node", "bun"]) {
     check(report.warm?.prompt_to_first_text_ms?.count >= 100, `${label} ${backend} warm benchmark needs 100 samples`);
     check(report.streams?.length === 3 && report.streams.every((item) => item.samples >= 30), `${label} ${backend} stream benchmark needs 30 samples per case`);
   }
+  for (const backend of ["native", "wasm"]) {
+    const catalog = await read(`catalog-${runtime}-${backend}.json`);
+    check(catalog.samples >= 100 && catalog.failures?.length === 0, `${label} ${backend} catalog benchmark needs 100 valid samples`);
+    check(catalog.stale_refresh_did_not_block_first_text === true, `${label} ${backend} catalog refresh blocked first text`);
+    check(catalog.cohorts?.length === 2 && catalog.cohorts[0].catalog_entries === 200 && catalog.cohorts[1].catalog_entries === 10000, `${label} ${backend} catalog sizes are invalid`);
+    for (const cohort of catalog.cohorts ?? []) {
+      check(cohort.discovered_models === cohort.catalog_entries, `${label} ${backend} catalog discovery omitted models`);
+      check(cohort.catalog_requests === 1, `${label} ${backend} catalog must be shared across fresh Agents`);
+      check(cohort.generation_requests === 2 * (catalog.samples + catalog.warmups), `${label} ${backend} catalog benchmark made extra generation requests`);
+      check(cohort.fresh?.samples?.length === catalog.samples && cohort.reused?.samples?.length === catalog.samples, `${label} ${backend} catalog samples are incomplete`);
+      check(validNumber(cohort.fresh?.catalog_observed_bytes?.max) && cohort.fresh.catalog_observed_bytes.max <= 4096, `${label} ${backend} Agent received a full catalog instead of selected metadata`);
+      const timings = cohort.fresh?.create_to_first_text_ms;
+      check(timings?.count === catalog.samples && [timings?.p50, timings?.p95, timings?.p99].every(validNumber), `${label} ${backend} catalog first-text timings are invalid`);
+    }
+    if (catalog.cohorts?.length === 2) {
+      check(catalog.cohorts[1].fresh.create_to_first_text_ms.p95 <= catalog.cohorts[0].fresh.create_to_first_text_ms.p95 + 5,
+        `${label} ${backend} warm first-text p95 grew by more than 5ms with catalog size`);
+    }
+  }
   const nativeWarm = nativeRuntime.warm.prompt_to_first_text_ms.p50;
   const wasmWarm = wasmRuntime.warm.prompt_to_first_text_ms.p50;
   if (!validNumber(nativeWarm) || !validNumber(wasmWarm)) throw new Error(`${label} warm timings are invalid`);

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { strict as assert } from "node:assert";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,6 +14,7 @@ for (const invalid of [[], [NaN], [Infinity], [null], [-1]]) assert.throws(() =>
 const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
 const benchmark = fileURLToPath(new URL("../../benchmarks/libfx/bench-fx.mjs", import.meta.url));
 const runtimeBenchmark = fileURLToPath(new URL("../../benchmarks/libfx/bench-runtime.mjs", import.meta.url));
+const catalogBenchmark = fileURLToPath(new URL("../../benchmarks/libfx/bench-catalog.mjs", import.meta.url));
 const capacityBenchmark = fileURLToPath(new URL("../../benchmarks/libfx/bench-capacity.mjs", import.meta.url));
 const benchmarkCheck = fileURLToPath(new URL("../../benchmarks/libfx/check-results.mjs", import.meta.url));
 const runtime = process.versions.bun ? "bun" : "node";
@@ -62,6 +63,20 @@ for (const backend of ["native", "wasm"]) {
     { chunks: 16, bytes: 65_536, samples: 1 },
   ]);
 
+  const catalogResult = spawnSync(command, [
+    ...(runtime === "node" && backend === "wasm" ? ["--experimental-wasm-jspi"] : []),
+    catalogBenchmark, "--backend", backend, "--samples", "2", "--check",
+  ], { cwd: repoRoot, encoding: "utf8", timeout: 20_000 });
+  assert.equal(catalogResult.status, 0, `${runtime} ${backend} catalog benchmark failed:\n${catalogResult.stderr}`);
+  const catalogReport = JSON.parse(catalogResult.stdout);
+  assert.deepEqual(catalogReport.failures, []);
+  assert.deepEqual(catalogReport.cohorts.map(row => row.discovered_models), [200, 10000]);
+  for (const row of catalogReport.cohorts) {
+    assert.equal(row.catalog_requests, 1);
+    assert.equal(row.fresh.create_to_first_text_ms.count, 2);
+    assert.ok(row.fresh.catalog_observed_bytes.max <= 4096);
+  }
+
   const capacityResult = spawnSync(command, [
     ...(runtime === "node" ? ["--expose-gc"] : []),
     ...(runtime === "node" && backend === "wasm" ? ["--experimental-wasm-jspi"] : []),
@@ -88,6 +103,14 @@ try {
       await write(`runtime-${runtimeName}-${backend}.json`, {
         warm: { prompt_to_first_text_ms: { count: 100, p50: warmP50 } },
         streams: [{ samples: 30 }, { samples: 30 }, { samples: 30 }],
+      });
+      await write(`catalog-${runtimeName}-${backend}.json`, {
+        samples: 100, warmups: 3, failures: [], stale_refresh_did_not_block_first_text: true,
+        cohorts: [200, 10000].map(catalog_entries => ({
+          catalog_entries, discovered_models: catalog_entries, catalog_requests: 1, generation_requests: 206,
+          fresh: { create_to_first_text_ms: { count: 100, p50: 1, p95: 2, p99: 3 }, catalog_observed_bytes: { max: 512 }, samples: Array(100).fill({}) },
+          reused: { samples: Array(100).fill({}) },
+        })),
       });
       await write(`bridge-${runtimeName}-${backend}.json`, {
         samples: Array.from({ length: 100 }, () => ({ tool_round_trip_ms: bridgeMs })),
@@ -117,6 +140,23 @@ try {
   }
   const passed = spawnSync(command, [benchmarkCheck, "--dir", checkDir], { encoding: "utf8" });
   assert.equal(passed.status, 0, passed.stderr || passed.stdout);
+
+  const catalogName = "catalog-node-native.json";
+  const validCatalog = JSON.parse(await readFile(resolve(checkDir, catalogName), "utf8"));
+  for (const [mutate, error] of [
+    [report => { report.cohorts[0].catalog_requests = 2; }, /catalog must be shared/],
+    [report => { report.cohorts[1].fresh.catalog_observed_bytes.max = 5000; }, /full catalog instead of selected metadata/],
+    [report => { report.cohorts[1].fresh.create_to_first_text_ms.p95 = 8; }, /grew by more than 5ms/],
+    [report => { report.stale_refresh_did_not_block_first_text = false; }, /refresh blocked first text/],
+  ]) {
+    const invalidCatalog = structuredClone(validCatalog);
+    mutate(invalidCatalog);
+    await write(catalogName, invalidCatalog);
+    const invalid = spawnSync(command, [benchmarkCheck, "--dir", checkDir], { encoding: "utf8" });
+    assert.notEqual(invalid.status, 0);
+    assert.match(invalid.stderr, error);
+  }
+  await write(catalogName, validCatalog);
 
   await write("runtime-node-native.json", {
     warm: { prompt_to_first_text_ms: { count: 100, p50: 5 } },

@@ -7,6 +7,7 @@ const host_target = @import("../core/hosts/target.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const sessions = @import("sessions.zig");
+const host_model_metadata = @import("model_metadata.zig");
 const prompt_handler = @import("prompt.zig");
 const prompt_test_controls = @import("prompt_test_controls.zig");
 const app_lifecycle = @import("../core/app/app_lifecycle.zig");
@@ -310,6 +311,8 @@ pub const ServerState = struct {
     subagent_store: ?session_store.Store = null,
     subagent_host: ?*subagent_tool_host.Runtime = null,
     capability_resolver: gateway_provider.CapabilityResolver = .{},
+    host_metadata_enabled: bool = false,
+    host_metadata: host_model_metadata.Snapshot = .{},
     terminate_connection: bool = false,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{}),
@@ -354,6 +357,7 @@ pub const ServerState = struct {
         self.host_tools.deinit();
         if (self.host_instructions.len > 0) self.alloc.free(self.host_instructions);
         self.capability_resolver.deinit(self.alloc);
+        self.host_metadata.deinit(self.alloc);
         var pending = self.pending_outbound.valueIterator();
         while (pending.next()) |entry| {
             if (entry.response) |*response| response.deinit(self.alloc);
@@ -1878,9 +1882,12 @@ const InitializeRequest = struct {
     client_elicitation: elicitation.Capabilities = .{},
     host_tools: host_tool_runtime.Runtime = .{},
     host_instructions: []u8 = &.{},
+    host_metadata_enabled: bool = false,
+    host_metadata: host_model_metadata.Snapshot = .{},
 
     fn deinit(self: *InitializeRequest, alloc: Allocator) void {
         self.host_tools.deinit();
+        self.host_metadata.deinit(alloc);
         if (self.host_instructions.len > 0) alloc.free(self.host_instructions);
         self.* = .{};
     }
@@ -1906,6 +1913,7 @@ fn parseInitializeRequest(
     var request = InitializeRequest{
         .terminal_ui = acp_types.fxMetaBool(parsed.value.object, "terminal") orelse true,
     };
+    errdefer request.deinit(alloc);
     const capabilities = parsed.value.object.get("clientCapabilities") orelse
         return request;
     if (capabilities != .object) return request;
@@ -1931,7 +1939,15 @@ fn parseInitializeRequest(
                 libfx.object.get("tools"),
                 libfx_provider_tool_registry,
             );
-            errdefer request.host_tools.deinit();
+            if (libfx.object.get("modelMetadata")) |supported| {
+                if (supported != .bool) return error.InvalidInitializeParams;
+                request.host_metadata_enabled = supported.bool;
+            }
+            if (request.host_metadata_enabled) {
+                if (libfx.object.get("initialModelMetadata")) |profile| {
+                    if (profile != .null) request.host_metadata = try host_model_metadata.Snapshot.parse(alloc, profile, io_mod.milliTimestamp());
+                }
+            }
             if (libfx.object.get("instructions")) |instructions| {
                 if (instructions != .string or instructions.string.len > 64 * 1024) {
                     return error.InvalidInitializeParams;
@@ -1955,6 +1971,12 @@ test "ACP initialize owns libfx tools and instructions" {
     try std.testing.expectEqual(@as(usize, 1), request.host_tools.tools.len);
     try std.testing.expectEqualStrings("lookup", request.host_tools.tools[0].name);
     try std.testing.expectEqualStrings("Be concise.", request.host_instructions);
+}
+
+test "libfx initialize releases selected metadata when later fields are invalid" {
+    try std.testing.expectError(error.InvalidInitializeParams, parseInitializeRequest(std.testing.allocator,
+        \\{"protocolVersion":1,"clientCapabilities":{"libfx":{"modelMetadata":true,"initialModelMetadata":{"model":"catalog/model","revision":"1","validForMs":1000,"data":[{"id":"catalog/model","type":"language","reasoning_options":[{"type":"effort","values":["high"]}]}]},"instructions":false}}}
+    , true));
 }
 
 test "ACP initialize accepts registered provider-executed libfx tools" {
@@ -2207,6 +2229,11 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         );
     }
 
+    state.host_metadata_enabled = request.host_metadata_enabled;
+    state.host_metadata.deinit(alloc);
+    state.host_metadata = request.host_metadata;
+    request.host_metadata = .{};
+
     if (state.cfg.effort_override) |raw| {
         const effort = types.ReasoningEffort.parse(raw) orelse
             return state.writer.writeError(alloc, msg.id, .{
@@ -2261,7 +2288,9 @@ fn applyEffortOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Mess
     const bundle = state.cfg.provider_set.select(state.provider);
     const fallback = bundle.fallbackModelCapabilities(state.selected_model);
     var capabilities: model_capabilities.Capabilities = undefined;
-    if (state.cfg.minimal_kernel and state.capability_resolver.state == .idle) {
+    if (state.host_metadata.available(state.selected_model, fallback, io_mod.milliTimestamp())) |provided| {
+        capabilities = provided;
+    } else if (state.cfg.minimal_kernel and state.capability_resolver.state == .idle) {
         // libfx cores skip the startup catalog resolve; explicit effort and
         // fast overrides are the creation-time consumers that need it.
         const catalog_provider = catalogProviderFor(state, state.provider) orelse return true;
@@ -2284,7 +2313,7 @@ fn applyEffortOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Mess
     }
     // A failed catalog lookup cannot name the supported set; the turn-time
     // capability check remains the backstop.
-    if (state.capability_resolver.state == .failed) return true;
+    if (modelCatalogUnavailable(state, state.selected_model)) return true;
 
     const rejection = effortOverrideRejection(alloc, capabilities, effort, state.selected_model) catch {
         try state.writer.writeError(alloc, msg.id, .{
@@ -2381,7 +2410,9 @@ fn applyFastOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Messag
     const bundle = state.cfg.provider_set.select(state.provider);
     const fallback = bundle.fallbackModelCapabilities(state.selected_model);
     var capabilities: model_capabilities.Capabilities = undefined;
-    if (state.cfg.minimal_kernel and state.capability_resolver.state == .idle) {
+    if (state.host_metadata.available(state.selected_model, fallback, io_mod.milliTimestamp())) |provided| {
+        capabilities = provided;
+    } else if (state.cfg.minimal_kernel and state.capability_resolver.state == .idle) {
         // Shares the effort override's one-shot catalog resolve: creation is
         // the only point that can reject before any turn runs.
         const catalog_provider = catalogProviderFor(state, state.provider) orelse return true;
@@ -2404,7 +2435,7 @@ fn applyFastOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Messag
     }
     // A failed catalog lookup cannot confirm a fast path; the turn-time
     // capability gate remains the backstop.
-    if (state.capability_resolver.state == .failed) return true;
+    if (modelCatalogUnavailable(state, state.selected_model)) return true;
 
     const rejection = fastOverrideRejection(alloc, capabilities, state.selected_model) catch {
         try state.writer.writeError(alloc, msg.id, .{
@@ -2812,6 +2843,29 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
     }
     try out.writer.writeAll("]}");
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
+}
+
+pub fn modelCatalogUnavailable(state: *const ServerState, model: []const u8) bool {
+    if (state.host_metadata.available(model, .{}, io_mod.milliTimestamp()) != null) return false;
+    return state.capability_resolver.state == .failed;
+}
+
+pub fn availableModelCapabilities(state: *const ServerState, model: []const u8, fallback: model_capabilities.Capabilities) model_capabilities.Capabilities {
+    if (state.host_metadata.available(model, fallback, io_mod.milliTimestamp())) |provided| return provided;
+    return state.capability_resolver.available(model, fallback);
+}
+
+pub fn adoptHostModelMetadata(state: *ServerState, alloc: Allocator, update: *host_model_metadata.Update) void {
+    if (update.* == .unchanged) return;
+    if (state.host_metadata.model.len > 0) debug_trace.logf("catalog", "dropping selected model metadata reason=host_update model={s}", .{state.host_metadata.model});
+    state.host_metadata.deinit(alloc);
+    if (update.* == .replace) {
+        state.host_metadata = update.replace;
+        update.* = .unchanged;
+    }
+    if (state.capability_resolver.catalog.items.len > 0) debug_trace.logf("catalog", "dropping embedded catalog after host update entries={d}", .{state.capability_resolver.catalog.items.len});
+    state.capability_resolver.deinit(alloc);
+    state.capability_resolver = .{};
 }
 
 pub fn refreshModelCatalogForOptions(state: *ServerState) !void {

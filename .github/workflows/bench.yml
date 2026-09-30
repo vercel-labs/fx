@@ -150,6 +150,10 @@ jobs:
           node --experimental-wasm-jspi benchmarks/libfx/bench-bridge.mjs --backend wasm --samples 100 > benchmarks/results/libfx/bridge-node-wasm.json
           bun benchmarks/libfx/bench-bridge.mjs --backend native --samples 100 > benchmarks/results/libfx/bridge-bun-native.json
           bun benchmarks/libfx/bench-bridge.mjs --backend wasm --samples 100 > benchmarks/results/libfx/bridge-bun-wasm.json
+          node --expose-gc benchmarks/libfx/bench-catalog.mjs --backend native --samples 100 --check > benchmarks/results/libfx/catalog-node-native.json
+          node --expose-gc --experimental-wasm-jspi benchmarks/libfx/bench-catalog.mjs --backend wasm --samples 100 --check > benchmarks/results/libfx/catalog-node-wasm.json
+          bun benchmarks/libfx/bench-catalog.mjs --backend native --samples 100 --check > benchmarks/results/libfx/catalog-bun-native.json
+          bun benchmarks/libfx/bench-catalog.mjs --backend wasm --samples 100 --check > benchmarks/results/libfx/catalog-bun-wasm.json
           node benchmarks/libfx/bench-runtime.mjs --backend native --warm-samples 100 --stream-samples 30 > benchmarks/results/libfx/runtime-node-native.json
           node --experimental-wasm-jspi benchmarks/libfx/bench-runtime.mjs --backend wasm --warm-samples 100 --stream-samples 30 > benchmarks/results/libfx/runtime-node-wasm.json
           bun benchmarks/libfx/bench-runtime.mjs --backend native --warm-samples 100 --stream-samples 30 > benchmarks/results/libfx/runtime-bun-native.json
