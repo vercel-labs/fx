@@ -131,6 +131,8 @@ Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`
 
 `skill_symlink_authorities` is an array of absolute directories that symlinked skills may resolve into, such as an app bundle or `/nix/store`. It is read at startup, a workspace override replaces the global list, and its entries are combined with the colon-separated `FX_SKILL_SYMLINK_AUTHORITIES` environment variable.
 
+`fx acp --model <id>` and `fx acp --effort <level>` apply process-local overrides to new and loaded ACP sessions. They do not update `~/.fx/settings.json`; omit the flags to return to the configured or saved session preferences.
+
 Runtime state lives under `~/.fx/`:
 
 * `~/.fx/sessions/<session-id>/session.json`
