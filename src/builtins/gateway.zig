@@ -2876,6 +2876,7 @@ fn parseModelCatalogEntry(alloc: std.mem.Allocator, entry: std.json.Value) !?Mod
         .context_window = context_window,
         .max_tokens = max_tokens,
         .web_search_price = web_search_price,
+        .pricing = @import("../core/config/model_pricing.zig").parse(entry.object.get("pricing")),
     };
 }
 

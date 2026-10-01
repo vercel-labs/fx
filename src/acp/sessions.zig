@@ -2095,7 +2095,7 @@ pub fn sendActiveSessionUsageUpdate(state: *server.ServerState, alloc: Allocator
         &out.writer,
         usage.used,
         context_window,
-        usage.complete_cost,
+        active.session_rt.usage.billingSnapshot(),
     );
     try out.writer.writeAll("}");
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());

@@ -39,6 +39,25 @@ pub const Availability = enum {
     legacy,
 };
 
+/// Credential-free settled billing and separate pending token estimates. Token
+/// counters exclude pending requests; `billing` describes session coverage.
+pub const BillingSnapshot = struct {
+    estimated_token_cost: ?f64 = null,
+    estimated_requests: usize = 0,
+    unestimated_requests: usize = 0,
+    billing: Availability,
+    pending_requests: usize,
+    active_requests: usize,
+    total_cost: f64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    reasoning_tokens: ?u64,
+    request_count: ?u64,
+    billable_web_search_calls: u64,
+};
+
 /// Billing consequence of one logical Gateway invocation across retries.
 pub const DeliveryOutcome = enum {
     /// Delivery was proven not to create a billable generation.
@@ -90,6 +109,7 @@ const ProfilePublicationBatch = struct {
 /// One admitted provider invocation. `begin` durably reserves it before network I/O;
 /// every successful reservation must terminate through `fail` or `complete`.
 pub const InvocationObservation = struct {
+    estimated_token_cost: ?f64 = null,
     usage: ?*Usage,
     sequence: u64 = 0,
     started_at_ms: i64,
@@ -208,6 +228,7 @@ pub const InvocationObservation = struct {
                     self.elapsedMs(),
                     delivery,
                     reference,
+                    self.estimated_token_cost,
                 );
                 if (!accepted) return;
                 debug_trace.logf(
@@ -265,6 +286,7 @@ pub const ModelAggregate = struct {
 };
 
 pub const PendingGeneration = struct {
+    estimated_token_cost: ?f64 = null,
     id: []u8,
     sequence: u64,
     provider: model_provider.ProviderId = .gateway,
@@ -301,6 +323,7 @@ pub const PendingGeneration = struct {
             .credential_identity = self.credential_identity,
             .account_id = account_id,
             .observed_at_ms = self.observed_at_ms,
+            .estimated_token_cost = self.estimated_token_cost,
         };
     }
 };
@@ -612,6 +635,7 @@ pub const Usage = struct {
         duration_ms: u64,
         outcome: DeliveryOutcome,
         reference: stream_provider.DeferredUsageReference,
+        estimated_token_cost: ?f64,
     ) !bool {
         self.checkpoint_mutex.lockUncancelable(io_mod.getIo());
         errdefer self.checkpoint_mutex.unlock(io_mod.getIo());
@@ -633,6 +657,19 @@ pub const Usage = struct {
             self.scheduleProfilePublicationDrain();
             return false;
         };
+        if (accepted) {
+            self.mutex.lockUncancelable(io_mod.getIo());
+            for (self.pending.items) |*pending| {
+                if (pending.sequence == sequence) {
+                    pending.estimated_token_cost = if (estimated_token_cost) |cost|
+                        if (std.math.isFinite(cost) and cost >= 0) cost else null
+                    else
+                        null;
+                    break;
+                }
+            }
+            self.mutex.unlock(io_mod.getIo());
+        }
         _ = try self.persistCheckpointForContinuationLocked();
         self.checkpoint_mutex.unlock(io_mod.getIo());
         return accepted;
@@ -1603,6 +1640,36 @@ pub const Usage = struct {
         complete_cost: ?f64,
     };
 
+    /// Copies counters under the ledger lock without allocating, joining a
+    /// worker, or starting reconciliation. Safe to read during a provider call.
+    pub fn billingSnapshot(self: *Usage) BillingSnapshot {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        var estimated: f64 = 0;
+        var estimated_requests: usize = 0;
+        for (self.pending.items) |pending| if (pending.estimated_token_cost) |amount| {
+            estimated += amount;
+            estimated_requests += 1;
+        };
+        if (!std.math.isFinite(estimated)) estimated_requests = 0;
+        return .{
+            .estimated_token_cost = if (estimated_requests > 0) estimated else null,
+            .estimated_requests = estimated_requests,
+            .unestimated_requests = self.pending.items.len - estimated_requests,
+            .billing = if (self.active_sequence_count > 0) .incomplete else self.billing,
+            .pending_requests = self.pending.items.len,
+            .active_requests = self.active_sequence_count,
+            .total_cost = self.total_cost,
+            .input_tokens = self.input_tokens,
+            .output_tokens = self.output_tokens,
+            .cache_read_tokens = self.cache_read_tokens,
+            .cache_write_tokens = self.cache_write_tokens,
+            .reasoning_tokens = self.reasoning_tokens,
+            .request_count = self.request_count,
+            .billable_web_search_calls = self.billable_web_search_calls,
+        };
+    }
+
     /// Returns the latest provider-reported context usage. This state is
     /// intentionally runtime-only: a restored billing aggregate cannot prove
     /// how much context the next model request currently occupies.
@@ -2273,7 +2340,8 @@ pub const Usage = struct {
                 generation.credential_source != saved.credential_source or
                 !optionalCredentialIdentitiesEqual(generation.credential_identity, saved.credential_identity) or
                 !optionalStringsEqual(generation.account_id, saved.account_id) or
-                generation.observed_at_ms != saved.observed_at_ms)
+                generation.observed_at_ms != saved.observed_at_ms or
+                generation.estimated_token_cost != saved.estimated_token_cost)
             {
                 return false;
             }
@@ -2476,6 +2544,9 @@ fn validateSnapshotContract(snapshot: Snapshot, allow_legacy_cache: bool) !bool 
         return error.InvalidUsageSnapshot;
     }
     for (snapshot.pending, 0..) |generation, index| {
+        if (generation.estimated_token_cost) |amount| {
+            if (!std.math.isFinite(amount) or amount < 0) return error.InvalidUsageSnapshot;
+        }
         try validateGenerationId(generation.id);
         try validateOrigin(generation.origin);
         if (generation.team) |team| try validateTeam(team);
@@ -2620,7 +2691,7 @@ pub fn snapshotEql(first: Snapshot, second: Snapshot) bool {
         }
     }
     for (first.pending, second.pending) |left, right| {
-        if (left.observed_at_ms != right.observed_at_ms) return false;
+        if (left.observed_at_ms != right.observed_at_ms or left.estimated_token_cost != right.estimated_token_cost) return false;
     }
     for (first.publication_backlog, second.publication_backlog) |left, right| {
         if (!usage_report.GenerationFact.eql(left, right)) return false;
@@ -2752,7 +2823,7 @@ pub fn writeSnapshot(writer: *std.Io.Writer, snapshot: Snapshot) !void {
 /// session event stream.
 pub fn writeRichSnapshot(writer: *std.Io.Writer, snapshot: Snapshot) !void {
     try validateSnapshot(snapshot);
-    try writer.writeAll("{\"schema_version\":3,\"billing\":");
+    try writer.writeAll("{\"schema_version\":4,\"billing\":");
     try std.json.Stringify.value(@tagName(snapshot.billing), .{}, writer);
     try writer.print(
         ",\"api_duration_complete\":{s},\"wall_duration_complete\":{s},\"code_complete\":{s},\"next_sequence\":{d},\"settled_through_sequence\":{d},\"api_duration_ms\":{d},\"wall_duration_ms\":{d},\"total_cost\":{d},\"input_tokens\":{d},\"output_tokens\":{d},\"cache_read_tokens\":{d},\"cache_write_tokens\":{d},\"reasoning_tokens\":",
@@ -2827,6 +2898,10 @@ pub fn writeRichSnapshot(writer: *std.Io.Writer, snapshot: Snapshot) !void {
         } else {
             try writer.writeAll("null");
         }
+        try writer.writeAll(",\"estimated_token_cost\":");
+        if (pending.estimated_token_cost) |amount| {
+            try writer.print("{d}", .{amount});
+        } else try writer.writeAll("null");
         try writer.writeByte('}');
     }
     try writer.writeAll("],\"publication_backlog\":[");
@@ -2912,7 +2987,7 @@ fn isUnversionedSnapshot(value: std.json.Value) bool {
 }
 
 pub fn supports_snapshot_schema(schema_version: u64) bool {
-    return schema_version == 2 or schema_version == 3;
+    return schema_version == 2 or schema_version == 3 or schema_version == 4;
 }
 
 fn parseSnapshotFields(alloc: Allocator, value: std.json.Value) !Snapshot {
@@ -3099,12 +3174,13 @@ fn parsePendingGenerations(
         if (pending_entry != .object) return error.InvalidUsageSnapshot;
         const provider_scoped = pending_entry.object.contains("provider");
         const has_observed_at = pending_entry.object.contains("observed_at_ms");
-        const expected_pending_fields: usize = if (provider_scoped)
+        const authority_fields: usize = if (provider_scoped)
             if (has_observed_at) 9 else 8
         else if (has_observed_at)
             5
         else
             4;
+        const expected_pending_fields = authority_fields + @intFromBool(pending_entry.object.contains("estimated_token_cost"));
         if (pending_entry.object.count() != expected_pending_fields) {
             return error.InvalidUsageSnapshot;
         }
@@ -3157,6 +3233,10 @@ fn parsePendingGenerations(
             .credential_identity = credential_identity,
             .account_id = account_id,
             .observed_at_ms = observed_at_ms,
+            .estimated_token_cost = if (pending_entry.object.get("estimated_token_cost")) |price|
+                if (price == .null) null else try parseNonNegativeNumber(price)
+            else
+                null,
         };
         count += 1;
     }
@@ -3608,6 +3688,112 @@ fn exactUsageOrigin(provider: model_provider.ProviderId) []const u8 {
         .grok => "exact/grok",
         .configured => "exact/configured",
     };
+}
+
+test "pending token estimates survive reload and are replaced by confirmed charges" {
+    const alloc = std.testing.allocator;
+    var usage = Usage.initFresh();
+    defer usage.deinit(alloc);
+    const id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    var observation = try InvocationObservation.begin(&usage);
+    observation.estimated_token_cost = 0.0123;
+    try observation.complete(alloc, .{ .generation_id = id }, testGatewayUsageOutcome(id, false));
+    // A repeated completion must not add the estimate again.
+    try observation.complete(alloc, .{ .generation_id = id }, testGatewayUsageOutcome(id, false));
+    const pending = usage.billingSnapshot();
+    try std.testing.expectEqual(@as(?f64, 0.0123), pending.estimated_token_cost);
+    try std.testing.expectEqual(@as(usize, 1), pending.estimated_requests);
+    try std.testing.expectEqual(@as(f64, 0), pending.total_cost);
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    try writeRichSnapshot(&encoded.writer, snapshot);
+    var json = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+    defer json.deinit();
+    var decoded = try parseSnapshotValue(alloc, json.value);
+    defer decoded.deinit(alloc);
+    var restored = Usage.initFresh();
+    defer restored.deinit(alloc);
+    try restored.restore(alloc, decoded, io_mod.milliTimestamp());
+    try std.testing.expectEqual(@as(?f64, 0.0123), restored.billingSnapshot().estimated_token_cost);
+    const record: GenerationRecord = .{
+        .id = id,
+        .model = "provider/model",
+        .created_at_ms = 1_700_000_000_000,
+        .total_cost = 0.007,
+        .input_tokens = 130,
+        .output_tokens = 25,
+        .cache_read_tokens = 20,
+        .cache_write_tokens = 10,
+        .reasoning_tokens = 5,
+        .billable_web_search_calls = 0,
+    };
+    try restored.applyGeneration(alloc, record);
+    try restored.applyGeneration(alloc, record);
+    const settled = restored.billingSnapshot();
+    try std.testing.expectEqual(@as(f64, 0.007), settled.total_cost);
+    try std.testing.expectEqual(@as(?f64, null), settled.estimated_token_cost);
+    try std.testing.expectEqual(@as(usize, 0), settled.estimated_requests);
+    try std.testing.expectEqual(@as(?u64, 1), settled.request_count);
+
+    json.value.object.getPtr("pending").?.array.items[0].object.getPtr("estimated_token_cost").?.* = .{ .float = -1 };
+    try std.testing.expectError(error.InvalidGenerationRecord, parseSnapshotValue(alloc, json.value));
+}
+
+test "billing snapshot retains confirmed totals through pending and incomplete calls" {
+    const alloc = std.testing.allocator;
+    var usage = Usage.initFresh();
+    defer usage.deinit(alloc);
+    const first = try InvocationObservation.begin(&usage);
+    try std.testing.expectEqual(Availability.incomplete, usage.billingSnapshot().billing);
+    try std.testing.expectEqual(@as(usize, 1), usage.billingSnapshot().active_requests);
+    try first.complete(alloc, .{
+        .generation_id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        .billing = .{
+            .created_at_ms = 1_700_000_000_000,
+            .model = "provider/model",
+            .total_cost = 0.0123,
+            .input_tokens = 130,
+            .output_tokens = 25,
+            .cache_read_tokens = 20,
+            .cache_write_tokens = 10,
+            .reasoning_tokens = 5,
+            .billable_web_search_calls = 2,
+        },
+    }, .{ .exact = .gateway });
+    const confirmed = usage.billingSnapshot();
+    try std.testing.expectEqual(Availability.complete, confirmed.billing);
+    try std.testing.expectEqual(@as(usize, 0), confirmed.active_requests);
+    try std.testing.expectEqual(@as(?u64, 1), confirmed.request_count);
+    try std.testing.expectEqual(@as(u64, 130), confirmed.input_tokens);
+    try std.testing.expectEqual(@as(u64, 25), confirmed.output_tokens);
+    try std.testing.expectEqual(@as(u64, 20), confirmed.cache_read_tokens);
+    try std.testing.expectEqual(@as(u64, 10), confirmed.cache_write_tokens);
+    try std.testing.expectEqual(@as(?u64, 5), confirmed.reasoning_tokens);
+    try std.testing.expectEqual(@as(u64, 2), confirmed.billable_web_search_calls);
+
+    const second = try InvocationObservation.begin(&usage);
+    const id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAW";
+    try second.complete(alloc, .{ .generation_id = id }, testGatewayUsageOutcome(id, false));
+    const pending = usage.billingSnapshot();
+    try std.testing.expectEqual(Availability.pending, pending.billing);
+    try std.testing.expectEqual(@as(usize, 1), pending.pending_requests);
+    try std.testing.expectEqual(confirmed.total_cost, pending.total_cost);
+    try std.testing.expectEqual(confirmed.input_tokens, pending.input_tokens);
+
+    const third = try InvocationObservation.begin(&usage);
+    try third.fail(.possibly_billed_without_identity);
+    const incomplete = usage.billingSnapshot();
+    try std.testing.expectEqual(Availability.incomplete, incomplete.billing);
+    try std.testing.expectEqual(@as(usize, 1), incomplete.pending_requests);
+    try std.testing.expectEqual(confirmed.total_cost, incomplete.total_cost);
+    try std.testing.expectEqual(@as(usize, 0), incomplete.active_requests);
+
+    var legacy = Usage.initLegacy();
+    defer legacy.deinit(alloc);
+    try std.testing.expectEqual(Availability.legacy, legacy.billingSnapshot().billing);
+    try std.testing.expectEqual(@as(?u64, null), legacy.billingSnapshot().request_count);
 }
 
 test "live context usage keeps the newest completed provider observation" {

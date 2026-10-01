@@ -3286,6 +3286,9 @@ fn parseSseUsage(root: std.json.Value) types.Usage {
     if (usage_value != .object) return .{};
     return .{
         .input_tokens = parseSseTokenTotal(usage_value, "inputTokens"),
+        .uncached_input_tokens = parseSseTokenDetail(usage_value, "inputTokens", "noCache"),
+        .cache_read_tokens = parseSseTokenDetail(usage_value, "inputTokens", "cacheRead"),
+        .cache_write_tokens = parseSseTokenDetail(usage_value, "inputTokens", "cacheWrite"),
         .output_tokens = parseSseTokenTotal(usage_value, "outputTokens"),
         .reasoning_tokens = parseSseTokenDetail(usage_value, "outputTokens", "reasoning"),
     };

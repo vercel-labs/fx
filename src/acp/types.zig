@@ -2,6 +2,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const jsonrpc = @import("jsonrpc.zig");
 const core_types = @import("../core/shared/types.zig");
+const session_usage = @import("../core/session/session_usage.zig");
 const io_mod = @import("../core/shared/io.zig");
 
 const Allocator = std.mem.Allocator;
@@ -295,7 +296,7 @@ pub fn writeInitializeResponse(w: *std.Io.Writer, capabilities: AgentCapabilitie
     try w.writeAll("\"sessionCapabilities\":{\"list\":{},\"resume\":{},\"close\":{}");
     if (capabilities.system_prompt) try w.writeAll(",\"systemPrompt\":{}");
     try w.writeByte('}');
-    try w.print(",\"_meta\":{{\"fx\":{{\"steering\":{s}}}}}", .{if (capabilities.steering) "true" else "false"});
+    try w.print(",\"_meta\":{{\"fx\":{{\"steering\":{s},\"sessionUsage\":true}}}}", .{if (capabilities.steering) "true" else "false"});
     try w.writeAll("},\"agentInfo\":{\"name\":\"fx\",\"title\":\"fx\",\"version\":");
     try writeJsonStr(build_options.app_version, w);
     try w.writeAll("},");
@@ -344,6 +345,7 @@ pub fn writePromptResponseWithUsage(
     w: *std.Io.Writer,
     reason: StopReason,
     usage: core_types.Usage,
+    billing: ?session_usage.BillingSnapshot,
 ) !void {
     try w.writeAll("{\"stopReason\":");
     try writeJsonStr(reason.jsonString(), w);
@@ -363,7 +365,9 @@ pub fn writePromptResponseWithUsage(
             try w.print(":{d}", .{value});
         }
     }
-    try w.writeAll("}}");
+    try w.writeByte('}');
+    if (billing) |snapshot| try writeUsageMetadata(w, snapshot);
+    try w.writeByte('}');
 }
 
 pub fn writeAvailableCommandsUpdate(w: *std.Io.Writer, commands_json: []const u8) !void {
@@ -380,12 +384,46 @@ pub fn writeSessionInfoUpdate(w: *std.Io.Writer, title: []const u8, updated_at: 
     try w.writeAll("}");
 }
 
-pub fn writeUsageUpdate(w: *std.Io.Writer, used: u64, size: u64, complete_cost: ?f64) !void {
+pub fn writeUsageUpdate(w: *std.Io.Writer, used: u64, size: u64, billing: session_usage.BillingSnapshot) !void {
     try w.print("{{\"sessionUpdate\":\"usage_update\",\"used\":{d},\"size\":{d}", .{ used, size });
-    if (complete_cost) |amount| {
+    if (billing.billing == .complete) {
+        try w.print(",\"cost\":{{\"amount\":{d},\"currency\":\"USD\"}}", .{billing.total_cost});
+    }
+    try writeUsageMetadata(w, billing);
+    try w.writeAll("}");
+}
+
+fn writeUsageMetadata(w: *std.Io.Writer, billing: session_usage.BillingSnapshot) !void {
+    try w.writeAll(",\"_meta\":{\"fx\":{\"usage\":");
+    try writeSessionUsage(w, billing);
+    try w.writeAll("}}");
+}
+
+/// Serializes settled totals separately from session billing completeness.
+/// Input includes cache tokens; output includes reasoning tokens.
+pub fn writeSessionUsage(w: *std.Io.Writer, billing: session_usage.BillingSnapshot) !void {
+    try w.writeAll("{\"billing\":");
+    try writeJsonStr(@tagName(billing.billing), w);
+    try w.print(",\"pendingRequests\":{d},\"activeRequests\":{d},\"confirmed\":{{\"cost\":{{\"amount\":{d},\"currency\":\"USD\"}}", .{
+        billing.pending_requests,
+        billing.active_requests,
+        billing.total_cost,
+    });
+    try w.print(",\"inputTokens\":{d},\"outputTokens\":{d},\"cacheReadTokens\":{d},\"cacheWriteTokens\":{d},\"billableWebSearchCalls\":{d}", .{
+        billing.input_tokens,
+        billing.output_tokens,
+        billing.cache_read_tokens,
+        billing.cache_write_tokens,
+        billing.billable_web_search_calls,
+    });
+    if (billing.reasoning_tokens) |value| try w.print(",\"reasoningTokens\":{d}", .{value});
+    if (billing.request_count) |value| try w.print(",\"requests\":{d}", .{value});
+    try w.writeAll("},\"estimated\":{\"source\":\"gateway_catalog\",\"scope\":\"tokens\"");
+    try w.print(",\"requests\":{d},\"unpricedRequests\":{d}", .{ billing.estimated_requests, billing.unestimated_requests });
+    if (billing.estimated_token_cost) |amount| {
         try w.print(",\"cost\":{{\"amount\":{d},\"currency\":\"USD\"}}", .{amount});
     }
-    try w.writeAll("}");
+    try w.writeAll("}}");
 }
 
 test "writeAgentMessageChunk produces valid json" {
@@ -533,6 +571,7 @@ test "writeInitializeResponse contains required fields" {
     try std.testing.expectEqual(@as(usize, 0), session_capabilities.get("systemPrompt").?.object.count());
     const fx_meta = agent_capabilities.get("_meta").?.object.get("fx").?.object;
     try std.testing.expect(fx_meta.get("steering").?.bool);
+    try std.testing.expect(fx_meta.get("sessionUsage").?.bool);
 }
 
 test "writeInitializeResponse withholds MCP transports a host rejects" {
@@ -576,11 +615,40 @@ test "writeUsageUpdate omits unproven cost" {
     const alloc = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try writeUsageUpdate(&out.writer, 8, 128_000, null);
-    try std.testing.expectEqualStrings(
-        "{\"sessionUpdate\":\"usage_update\",\"used\":8,\"size\":128000}",
-        out.writer.buffered(),
-    );
+    var usage = session_usage.Usage.initFresh();
+    defer usage.deinit(alloc);
+    var billing = usage.billingSnapshot();
+    billing.billing = .pending;
+    billing.pending_requests = 1;
+    billing.total_cost = 0.0123;
+    try writeUsageUpdate(&out.writer, 8, 128_000, billing);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("cost") == null);
+    const meta = parsed.value.object.get("_meta").?.object.get("fx").?.object.get("usage").?.object;
+    try std.testing.expectEqualStrings("pending", meta.get("billing").?.string);
+    try std.testing.expectEqual(@as(i64, 1), meta.get("pendingRequests").?.integer);
+    const cost = meta.get("confirmed").?.object.get("cost").?.object;
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0123), cost.get("amount").?.float, 1e-12);
+}
+
+test "writeSessionUsage preserves unknown reasoning and request counts" {
+    const alloc = std.testing.allocator;
+    var usage = session_usage.Usage.initFresh();
+    defer usage.deinit(alloc);
+    var billing = usage.billingSnapshot();
+    billing.billing = .legacy;
+    billing.reasoning_tokens = null;
+    billing.request_count = null;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeSessionUsage(&out.writer, billing);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+    defer parsed.deinit();
+    const confirmed = parsed.value.object.get("confirmed").?.object;
+    try std.testing.expect(confirmed.get("reasoningTokens") == null);
+    try std.testing.expect(confirmed.get("requests") == null);
+    try std.testing.expectEqualStrings("legacy", parsed.value.object.get("billing").?.string);
 }
 
 test "writeSessionUpdate wraps update with sessionId" {

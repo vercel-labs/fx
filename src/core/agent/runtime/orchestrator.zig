@@ -7520,6 +7520,7 @@ fn processQueuedPromptLoop(
                 .pending_status = &pending_auto_retry_status,
             };
             var model_request = agent_stream_provider.ModelRequest{
+                .pricing = request_capabilities.pricing,
                 .credential = if (job.credential_source == .host_managed)
                     .host_managed
                 else

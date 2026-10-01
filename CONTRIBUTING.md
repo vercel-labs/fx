@@ -383,8 +383,8 @@ progress are not delivered to operations yet.
 
 ## ACP Embedding
 
-`fx acp` extends ACP v1 for clients that embed it. Extensions are read and
-written under `_meta.fx`.
+`fx acp` extends ACP v1 for clients that embed it. Extension metadata is read
+and written under `_meta.fx`; extension methods use the `_fx/` prefix.
 
 * **Client MCP tools stay loaded:** tool schemas from servers in `mcpServers`
   are advertised on every turn within the `mcp_selected_schema_bytes` budget.
@@ -426,6 +426,93 @@ written under `_meta.fx`.
   project servers. Set `_meta.fx.profileMcpServers` to `true` on a session
   request to add the user's `~/.fx/mcp.json` servers. Request entries win name
   collisions, and profile entries win over project entries.
+
+### Session usage
+
+`initialize` advertises `agentCapabilities._meta.fx.sessionUsage: true`.
+Send `_fx/session/usage` with `{"sessionId":"<active-session-id>"}` to read
+the active session's billing snapshot, including during a prompt. The response
+contains `sessionId` and `usage`:
+
+```json
+{
+  "billing": "pending",
+  "pendingRequests": 1,
+  "activeRequests": 0,
+  "confirmed": {
+    "cost": { "amount": 0.0123, "currency": "USD" },
+    "inputTokens": 130,
+    "outputTokens": 25,
+    "cacheReadTokens": 20,
+    "cacheWriteTokens": 10,
+    "reasoningTokens": 5,
+    "requests": 1,
+    "billableWebSearchCalls": 0
+  },
+  "estimated": {
+    "source": "gateway_catalog",
+    "scope": "tokens",
+    "requests": 1,
+    "unpricedRequests": 0,
+    "cost": { "amount": 0.0007185, "currency": "USD" }
+  }
+}
+```
+
+`confirmed` contains cumulative settled records, even when later requests
+are pending. Input tokens include cache reads and writes; output tokens
+include reasoning. Do not add those breakdowns to the totals again.
+`reasoningTokens` and `requests` are omitted when the ledger cannot prove
+them. Confirmed costs come from provider billing records.
+These totals follow fx's session ledger; cosmetic title-generation calls
+are not included.
+
+`estimated.cost` covers only pending generations with enough token data and
+Gateway catalog pricing. Add it to `confirmed.cost` for an estimated session
+total, and label that total as estimated. Settlement removes each generation's
+estimate and replaces it with its confirmed charge, so the combined amount can
+decrease. Never add estimates to the confirmed ledger or accumulate successive
+snapshots.
+
+Estimates use USD-per-token catalog rates for uncached input, cache reads,
+cache writes, and output. Reasoning is already included in output. Context
+tiers use inclusive minimum and exclusive maximum bounds against total input
+tokens; fast requests require fast rates. Unknown counters are not zero: fx
+requires a complete input breakdown or enough data to derive the remainder.
+`estimated.requests` counts priced pending generations; `unpricedRequests`
+counts the remaining pending generations. `estimated.cost` is omitted when
+none can be priced. A known zero estimate is included.
+
+Catalog estimates exclude tool fees, regional surcharges, and provider-specific
+discounts. Routing can also change the final price. Each estimate is computed
+from the request's model and rates at completion and saved with the pending
+generation, so changing models or loading a session preserves earlier estimates.
+The rich usage checkpoint uses schema 4 and still reads schemas 2 and 3. Older
+fx builds may reject schema 4 checkpoints; preserve session files before
+downgrading. Requests without a recoverable generation ID remain unpriced.
+
+`billing` is `complete` when the ledger covers its tracked billable invocations,
+`pending` when known generations await settlement, `incomplete` when billing
+coverage is uncertain or an invocation is active, and `legacy` for sessions
+that predate usage accounting. `pendingRequests` counts known generations
+awaiting settlement; `activeRequests` counts in-flight provider invocations.
+An incomplete session can have no pending requests, for example after a
+response without a recoverable generation identity. Zero confirmed cost
+does not mean the session was free unless billing is complete.
+
+The same snapshot appears in `_meta.fx.usage` on prompt responses and
+`usage_update` notifications. Standard `usage_update.cost` remains absent
+until billing is complete. Prompt response `usage` still contains the
+current turn's reported token counters, which can cover a different set of
+requests than the settled session totals. Missing provider counters are not
+proof of zero usage.
+
+Usage queries read existing state without starting provider requests or
+reconciliation. Poll to observe background settlement after a prompt; it
+does not send a new notification by itself. Queries work without context
+window metadata and after `session/load` or `session/resume`, but require
+the exact active session ID. Existing session persistence owns the ledger;
+clients do not need to read profile files.
 
 ## Permissions and Auto Mode
 

@@ -17,6 +17,7 @@ const types = @import("../../shared/types.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Request = struct {
+    pricing: ?@import("../../config/model_pricing.zig").Pricing = null,
     stream_provider: agent_stream_provider.Provider,
     cooperative_pulse: ?agent_stream_provider.CooperativePulse = null,
     credential: agent_stream_provider.CredentialLease,
@@ -89,6 +90,7 @@ pub fn complete(alloc: Allocator, request: Request) Error!Outcome {
             .credential = request.credential,
             .session_id = request.session_id,
             .model = request.model,
+            .pricing = request.pricing,
             .retry_count = request.retry_count,
             .instructions = if (conversation) |sent| sent.instructions else &instructions,
             .messages = messages,
@@ -255,6 +257,7 @@ pub const CompactorCaller = struct {
             } },
             .session_id = self.session_id,
             .model = call.model,
+            .pricing = self.capabilities_fn(self.capabilities_context, call.model).pricing,
             .retry_count = self.retry_count,
             .cancel_flag = call.cancel_flag,
             .provider_options = options,

@@ -69,6 +69,7 @@ const AcpMethod = enum {
     session_resume,
     session_close,
     session_list,
+    session_usage,
     session_remove,
     session_prompt,
     session_set_config_option,
@@ -89,6 +90,7 @@ const AcpMethod = enum {
         if (std.mem.eql(u8, method, "session/resume")) return .session_resume;
         if (std.mem.eql(u8, method, "session/close")) return .session_close;
         if (std.mem.eql(u8, method, "session/list")) return .session_list;
+        if (std.mem.eql(u8, method, "_fx/session/usage")) return .session_usage;
         if (std.mem.eql(u8, method, "session/remove")) return .session_remove;
         if (std.mem.eql(u8, method, "session/prompt")) return .session_prompt;
         if (std.mem.eql(u8, method, "session/set_config_option")) return .session_set_config_option;
@@ -106,6 +108,7 @@ const AcpMethod = enum {
             .initialize,
             .request_cancel,
             .session_cancel,
+            .session_usage,
             .session_set_mode,
             .session_new,
             .session_load,
@@ -1405,6 +1408,7 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
             .session_new => sessions.handleNewWasmSession(state, alloc, msg),
             .session_load => sessions.handleLoadWasmSession(state, alloc, msg),
             .session_list => sessions.handleListWasmSessions(state, alloc, msg),
+            .session_usage => handleSessionUsage(state, alloc, msg),
             .session_remove => sessions.handleRemoveWasmSession(state, alloc, msg),
             .session_prompt => startPrompt(state, alloc, msg),
             .session_set_config_option => handleSetConfigOption(state, alloc, msg),
@@ -1426,6 +1430,7 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         .session_resume => sessions.handleResumeSession(state, alloc, msg),
         .session_close => handleCloseSession(state, alloc, msg),
         .session_list => sessions.handleListSessions(state, alloc, msg),
+        .session_usage => handleSessionUsage(state, alloc, msg),
         .session_prompt => startPrompt(state, alloc, msg),
         .session_set_config_option => handleSetConfigOption(state, alloc, msg),
         .session_set_mode => handleSetMode(state, alloc, msg),
@@ -1813,6 +1818,20 @@ fn requireActiveSessionTarget(
     return requireParsedActiveSessionTarget(state, alloc, msg.id, parsed.value);
 }
 
+fn handleSessionUsage(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
+    if (!try requireActiveSessionTarget(state, alloc, msg)) return;
+    const active = &state.active_session.?;
+    const billing = active.session_rt.usage.billingSnapshot();
+    var response: std.Io.Writer.Allocating = .init(alloc);
+    defer response.deinit();
+    try response.writer.writeAll("{\"sessionId\":");
+    try jsonrpc.writeJsonStr(active.session_id, &response.writer);
+    try response.writer.writeAll(",\"usage\":");
+    try acp_types.writeSessionUsage(&response.writer, billing);
+    try response.writer.writeByte('}');
+    try state.writer.writeResponse(alloc, msg.id, response.written());
+}
+
 fn notificationTargetsActiveSession(
     state: *const ServerState,
     alloc: Allocator,
@@ -1873,6 +1892,7 @@ fn publishPromptOutcome(active: *ActivePrompt, outcome: prompt_handler.TerminalO
                 &response.writer,
                 stop_reason,
                 usage,
+                if (active.state.active_session) |*session| session.session_rt.usage.billingSnapshot() else null,
             );
             try active.state.writer.writeResponse(active.alloc, active.msg.id, response.writer.buffered());
         },
@@ -3148,6 +3168,7 @@ test "ACP method parser classifies request dispatch methods" {
     try std.testing.expectEqual(AcpMethod.session_resume, AcpMethod.parse("session/resume"));
     try std.testing.expectEqual(AcpMethod.session_close, AcpMethod.parse("session/close"));
     try std.testing.expectEqual(AcpMethod.session_list, AcpMethod.parse("session/list"));
+    try std.testing.expectEqual(AcpMethod.session_usage, AcpMethod.parse("_fx/session/usage"));
     try std.testing.expectEqual(AcpMethod.session_prompt, AcpMethod.parse("session/prompt"));
     try std.testing.expectEqual(AcpMethod.session_set_config_option, AcpMethod.parse("session/set_config_option"));
     try std.testing.expectEqual(AcpMethod.session_set_mode, AcpMethod.parse("session/set_mode"));
@@ -3166,6 +3187,7 @@ test "ACP method parser classifies request dispatch methods" {
 test "ACP prompt gate policy keeps lifecycle interruption responsive" {
     try std.testing.expect(!AcpMethod.initialize.waitsForActivePrompt());
     try std.testing.expect(!AcpMethod.session_cancel.waitsForActivePrompt());
+    try std.testing.expect(!AcpMethod.session_usage.waitsForActivePrompt());
     try std.testing.expect(!AcpMethod.session_new.waitsForActivePrompt());
     try std.testing.expect(!AcpMethod.session_load.waitsForActivePrompt());
     try std.testing.expect(!AcpMethod.session_resume.waitsForActivePrompt());

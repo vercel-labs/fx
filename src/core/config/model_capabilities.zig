@@ -38,6 +38,7 @@ pub const ImageInputSupport = enum {
 };
 
 pub const GatewayMetadata = struct {
+    pricing: ?@import("model_pricing.zig").Pricing = null,
     supports_reasoning: bool = false,
     reasoning_efforts: ReasoningEffortOptions = .{},
     supports_fast_mode: bool = false,
@@ -52,6 +53,7 @@ pub const GatewayMetadata = struct {
 };
 
 pub const Capabilities = struct {
+    pricing: ?@import("model_pricing.zig").Pricing = null,
     supports_reasoning: bool = false,
     reasoning_efforts: ReasoningEffortOptions = .{},
     supports_fast_mode: bool = false,
@@ -86,6 +88,7 @@ pub const Resolver = struct {
 pub fn mergeCapabilities(capabilities_value: Capabilities, gateway_metadata: ?GatewayMetadata) Capabilities {
     var capabilities = capabilities_value;
     if (gateway_metadata) |metadata| {
+        capabilities.pricing = metadata.pricing;
         capabilities.supports_reasoning = metadata.supports_reasoning or metadata.reasoning_efforts.len > 0;
         capabilities.reasoning_efforts = metadata.reasoning_efforts;
         capabilities.supports_fast_mode = metadata.supports_fast_mode;

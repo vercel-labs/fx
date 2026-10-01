@@ -9,6 +9,7 @@ fn optionalPositiveU32(value: u32) ?u32 {
 
 pub fn fromCatalogEntry(entry: model_catalog.ModelCatalogEntry) model_capabilities.GatewayMetadata {
     return .{
+        .pricing = entry.pricing,
         .supports_reasoning = entry.has_reasoning,
         .reasoning_efforts = .fromSlice(entry.reasoning_efforts.items),
         .supports_fast_mode = entry.supports_fast_mode,

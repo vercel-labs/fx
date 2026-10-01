@@ -216,6 +216,7 @@ pub fn validate_prompt_lanes(
 /// Borrowed typed request. Providers own validation, wire serialization,
 /// endpoint selection, headers, HTTP, and stream reduction.
 pub const ModelRequest = struct {
+    pricing: ?@import("../config/model_pricing.zig").Pricing = null,
     credential: types.CredentialLease,
     session_id: ?[]const u8 = null,
     model: []const u8,

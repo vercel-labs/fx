@@ -462,7 +462,7 @@ test "recovery copy classifies accounting without changing normal resume" {
     defer alloc.free(valid_bytes);
     var future = try std.json.parseFromSlice(std.json.Value, alloc, valid_bytes, .{});
     defer future.deinit();
-    future.value.object.getPtr("snapshot").?.object.getPtr("schema_version").?.* = .{ .integer = 4 };
+    future.value.object.getPtr("snapshot").?.object.getPtr("schema_version").?.* = .{ .integer = 5 };
     var future_bytes: std.Io.Writer.Allocating = .init(alloc);
     defer future_bytes.deinit();
     try std.json.Stringify.value(future.value, .{}, &future_bytes.writer);

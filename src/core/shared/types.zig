@@ -1572,6 +1572,7 @@ test "provider replay projection preserves matching origin and excludes other ro
 }
 
 pub const Usage = struct {
+    uncached_input_tokens: ?u64 = null,
     input_tokens: ?u64 = null,
     output_tokens: ?u64 = null,
     cache_read_tokens: ?u64 = null,

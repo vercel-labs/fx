@@ -312,6 +312,7 @@ fn traceCatalogLoadOutcome(
 }
 
 pub const ModelCatalogEntry = struct {
+    pricing: ?@import("../config/model_pricing.zig").Pricing = null,
     id: []u8,
     model_type: []u8,
     released: i64 = 0,
@@ -371,6 +372,7 @@ fn cloneModelCatalogEntry(alloc: std.mem.Allocator, entry: ModelCatalogEntry) !M
     try reasoning_efforts.appendSlice(alloc, entry.reasoning_efforts.items);
 
     var cloned = ModelCatalogEntry{
+        .pricing = entry.pricing,
         .id = id,
         .model_type = model_type,
         .released = entry.released,

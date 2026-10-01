@@ -76,13 +76,18 @@ pub fn streamModelCompletion(
         return err;
     };
     defer result.deinit(request_alloc);
-    const observation = admission.observation orelse
+    var observation = admission.observation orelse
         return agent_stream_provider.failResult(error.ProviderAdmissionMissing);
 
     recordProviderResultMetric(request.model, started_at_ms, result, request.trace_ctx);
     switch (result) {
         .failed => try observation.fail(.unbilled),
         .completed => |completed| {
+            if (completed.usage == .deferred and completed.usage.deferred.provider == .gateway and
+                !completed.completion.delivery_ambiguous and !completed.completion.generation_metadata_invalid)
+            {
+                if (request.pricing) |pricing| observation.estimated_token_cost = pricing.estimate(completed.completion.usage, request.provider_options.fast);
+            }
             try observation.complete(
                 usage_allocator,
                 completed.completion,
