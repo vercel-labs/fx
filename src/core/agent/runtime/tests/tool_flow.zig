@@ -58,6 +58,7 @@ const countText = test_support.countText;
 const countNeedle = test_support.countNeedle;
 const readTraceFile = test_support.readTraceFile;
 const logIndex = test_support.logIndex;
+const logContains = test_support.logContains;
 const textContains = test_support.textContains;
 const toolCall = test_support.toolCall;
 
@@ -153,13 +154,6 @@ fn expectGrantListsEqual(
             actual_grant.target_path,
         );
     }
-}
-
-fn logContains(hooks: *const FakeAgentRuntimeDeps, needle: []const u8) bool {
-    for (hooks.log.items) |entry| {
-        if (std.mem.find(u8, entry, needle) != null) return true;
-    }
-    return false;
 }
 
 const FailingApplicableContext = struct {

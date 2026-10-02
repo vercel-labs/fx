@@ -39,6 +39,7 @@ const countNeedle = test_support.countNeedle;
 const readTraceFile = test_support.readTraceFile;
 const textContains = test_support.textContains;
 const logIndex = test_support.logIndex;
+const logContains = test_support.logContains;
 const toolCall = test_support.toolCall;
 
 const PostTurnEndFinalizationCapture = struct {
@@ -205,6 +206,280 @@ test "processQueuedPrompt pauses tool calls without finish proof" {
     try std.testing.expectEqual(@as(usize, 0), hooks.finish_event_count);
     try std.testing.expectEqual(@as(usize, 0), hooks.history_turns.items.len);
     try std.testing.expectEqual(types.TurnPresentationOutcome.paused, hooks.finalized_outcome.?);
+}
+
+test "processQueuedPrompt never presents an empty provider completion as a completed answer" {
+    const alloc = std.testing.allocator;
+    const reasoning = [_][]const u8{"Checking whether the branch state is final before replying."};
+    const call_one = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const call_two = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
+    const spent: types.Usage = .{ .input_tokens = 1_000, .output_tokens = 7 };
+    const empty_stop = FakeCompletion{ .finish_reason = .stop, .usage = spent };
+    const empty_other = FakeCompletion{ .finish_reason = .other, .usage = spent };
+    const blank_stop = FakeCompletion{ .content = " \n\t", .finish_reason = .stop, .usage = spent };
+    // The reported shape: every output token went to hidden reasoning.
+    const empty_length = FakeCompletion{
+        .reasoning_chunks = &reasoning,
+        .finish_reason = .length,
+        .usage = .{ .input_tokens = 256_916, .output_tokens = 131_072 },
+    };
+    const empty_notice = "The provider returned an empty response";
+    const Case = struct {
+        name: []const u8,
+        /// Every completion is requested exactly once.
+        completions: []const FakeCompletion,
+        disposition: ?types.ProviderCompletionDisposition = null,
+        notice: []const u8 = empty_notice,
+    };
+    const cases = [_]Case{
+        // The first request plus two bounded retries.
+        .{ .name = "stop", .completions = &.{ empty_stop, empty_stop, empty_stop } },
+        .{ .name = "other", .completions = &.{ empty_other, empty_other, empty_other } },
+        .{ .name = "whitespace stop", .completions = &.{ blank_stop, blank_stop, blank_stop } },
+        // A retry would spend the same exhausted output budget again.
+        .{
+            .name = "length after hidden reasoning",
+            .completions = &.{empty_length},
+            .disposition = .length_limited,
+            .notice = "hit its output limit before producing an answer",
+        },
+        // Two silent tool steps, the summary nudge, then the bounded retries.
+        .{ .name = "empty after silent-tool continuation", .completions = &.{
+            .{ .tool_calls = &call_one },
+            .{ .tool_calls = &call_two },
+            empty_stop,
+            empty_stop,
+            empty_stop,
+            empty_stop,
+        } },
+    };
+
+    for (cases) |case| {
+        errdefer std.debug.print("empty provider completion case: {s}\n", .{case.name});
+        var gateway = FakeGateway.init(alloc, case.completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+        try std.testing.expectEqual(case.completions.len, gateway.request_bodies.items.len);
+        try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+        try std.testing.expectEqual(case.disposition, hooks.finalized_disposition);
+        try std.testing.expect(textContains(&hooks, case.notice));
+        try std.testing.expect(std.mem.find(u8, hooks.finish_assistant_text.?, case.notice) != null);
+        // fx must never fabricate an answer the provider did not produce.
+        try std.testing.expect(!textContains(&hooks, "Done."));
+        // Answerless attempts still spent tokens, so each one is reported.
+        var spent_output: u64 = 0;
+        for (case.completions) |completion| spent_output += completion.usage.output_tokens orelse 0;
+        try std.testing.expectEqual(spent_output, hooks.reported_output_tokens);
+    }
+}
+
+test "processQueuedPrompt completes with a retained Stop answer when the continuation is empty" {
+    const alloc = std.testing.allocator;
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .content = "candidate" },
+        .{ .finish_reason = .stop },
+    });
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    var fixture = PromptFixture{};
+    var lifecycle_runtime = lifecycle_hooks.Runtime.init(alloc);
+    defer lifecycle_runtime.deinit();
+    var handler = StopTestHandler{
+        .alloc = alloc,
+        .action = .{ .continue_once = "verify the answer" },
+    };
+    defer handler.deinit();
+    const view = try registerStopTestHandler(&lifecycle_runtime, &handler);
+
+    try runFakePromptWithLifecycle(
+        &gateway,
+        &deps,
+        fixture.config(),
+        fixture.job(),
+        testLifecycleContext(view, alloc, fixture.workspace_root),
+    );
+
+    // The retained answer settles the turn, so the silence is not retried.
+    try std.testing.expectEqual(@as(usize, 1), handler.calls);
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, deps.finalized_outcome.?);
+    try std.testing.expectEqualStrings("candidate", deps.finish_presentation_text.?);
+    try std.testing.expect(!logContains(&deps, "empty response"));
+    try std.testing.expect(!textContains(&deps, "Done."));
+
+    var follow_gateway = FakeGateway.init(alloc, &.{.{ .content = "follow-up" }});
+    defer follow_gateway.deinit();
+    var follow_deps = FakeAgentRuntimeDeps.init(alloc);
+    defer follow_deps.deinit();
+    var follow_fixture = PromptFixture{};
+    var follow_job = follow_fixture.job();
+    follow_job.history = deps.history_turns.items;
+    try runFakePrompt(&follow_gateway, &follow_deps, follow_fixture.config(), follow_job);
+    try expectBodyContains(&follow_gateway, 0, "candidate");
+    try expectBodyNotContains(&follow_gateway, 0, "\"content\":[]");
+}
+
+test "processQueuedPrompt waits for a running subagent instead of retrying an empty completion" {
+    const alloc = std.testing.allocator;
+    const empty_stop = FakeCompletion{ .finish_reason = .stop };
+    var gateway = FakeGateway.init(alloc, &.{
+        // The child is still running, so the parent waits instead of retrying.
+        empty_stop,
+        // The request that delivers the result is ordinary work: retry its silence.
+        empty_stop,
+        .{ .content = "Answer with the subagent result" },
+    });
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.pending_subagent_results = 1;
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try expectBodyNotContains(&gateway, 0, "SUBAGENT_RESULT_OK");
+    try expectBodyContains(&gateway, 1, "SUBAGENT_RESULT_OK");
+    try std.testing.expectEqual(@as(usize, 0), hooks.pending_subagent_results);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+    try std.testing.expectEqualStrings("Answer with the subagent result", hooks.finish_assistant_text.?);
+    try std.testing.expect(logContains(&hooks, "empty response"));
+    // The answerless step adds no empty assistant message to the next request.
+    try expectBodyNotContains(&gateway, 1, "\"content\":[]");
+}
+
+test "processQueuedPrompt clears a recovery status before waiting on a subagent" {
+    const alloc = std.testing.allocator;
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .status = .service_unavailable },
+        .{ .finish_reason = .stop },
+        .{ .content = "Answer after the wait" },
+    });
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.pending_subagent_results = 1;
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    // The wait can block for the whole child run, so the retry status is gone first.
+    try std.testing.expect(hooks.route_recovery_clears_at_subagent_wait.? > 0);
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+    try std.testing.expectEqualStrings("Answer after the wait", hooks.finish_assistant_text.?);
+}
+
+test "processQueuedPrompt retries an empty completion on the last step despite a running subagent" {
+    const alloc = std.testing.allocator;
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .finish_reason = .stop },
+        .{ .content = "Answer within the step limit" },
+    });
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.pending_subagent_results = 1;
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.agent_step_limit = 1;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    // No further step can receive the result, so the silence is retried.
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+    try std.testing.expectEqualStrings("Answer within the step limit", hooks.finish_assistant_text.?);
+}
+
+test "processQueuedPrompt hands exhausted empty completions to pending steering" {
+    const alloc = std.testing.allocator;
+    const empty_stop = FakeCompletion{ .finish_reason = .stop };
+    var gateway = FakeGateway.init(alloc, &.{
+        empty_stop,
+        empty_stop,
+        empty_stop,
+        // The steered request gets its own bounded retry.
+        empty_stop,
+        .{ .content = "Steered answer" },
+    });
+    defer gateway.deinit();
+    const steering = [_][]const u8{"narrow the scope"};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    // Step-top boundary is take 1; the answerless terminal boundary is take 2.
+    hooks.steering_messages = &steering;
+    hooks.steering_take_at = 2;
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 5), gateway.request_bodies.items.len);
+    try expectBodyContainsInOrder(&gateway, 3, &.{ "user_steering", "narrow the scope" });
+    try expectBodyNotContains(&gateway, 3, "\"content\":[]");
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+    try std.testing.expectEqualStrings("Steered answer", hooks.finish_assistant_text.?);
+    try std.testing.expect(!textContains(&hooks, "The provider returned an empty response"));
+    // The retry status from the exhausted request does not linger.
+    try std.testing.expect(hooks.route_recovery_clear_count > 0);
+}
+
+test "processQueuedPrompt retries an empty provider completion and presents the recovered answer" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .finish_reason = .stop },
+        .{ .content = "Recovered answer" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+    try std.testing.expectEqualStrings("Recovered answer", hooks.finish_assistant_text.?);
+    try std.testing.expect(!textContains(&hooks, "Done."));
+    try std.testing.expect(logContains(&hooks, "empty response"));
+    try std.testing.expect(logContains(&hooks, "recovered"));
+}
+
+test "processQueuedPrompt fails visibly after consecutive empty provider completions" {
+    const alloc = std.testing.allocator;
+    const call = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &call },
+        .{ .finish_reason = .stop },
+        .{ .finish_reason = .stop },
+        .{ .finish_reason = .stop },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    // One tool step, then the first empty completion plus two bounded retries.
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(@as(?types.ProviderCompletionDisposition, null), hooks.finalized_disposition);
+    try std.testing.expect(textContains(&hooks, "The provider returned an empty response"));
+    try std.testing.expect(!textContains(&hooks, "Done."));
+    // The failed turn keeps the executed tool and never persists a fabricated answer.
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items[0].assistant.execution.tool_steps.len);
+    try std.testing.expect(std.mem.find(u8, hooks.finish_assistant_text.?, "empty response") != null);
 }
 
 test "processQueuedPrompt preserves finish precedence over malformed argument recovery" {
