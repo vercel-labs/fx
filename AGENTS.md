@@ -10,7 +10,7 @@ Before reporting the work as ready:
 
 1. Build succeeds.
 2. Focused tests for the changed path pass locally.
-3. The **Full CI** run for the exact current commit passes on every required Linux and macOS runner.
+3. **CI** passes for the exact current commit, including the **macOS arm64** check. See **CI on Pull Requests**.
 4. Run the built binary locally and drive at least one real interaction that exercises the change end to end.
 5. Confirm the process did not abort, stderr is clean, and the behavior matches what you are about to tell the user.
 
@@ -216,7 +216,7 @@ Do not bypass the permission system for new tools.
 
 * Zig unit tests go inside the source file they test, using `test "description" { ... }` blocks.
 
-* Run the narrowest relevant tests while developing. The complete `zig build test` suite runs in ReleaseSafe in **Full CI** after the feature branch is pushed, and it must pass before the draft PR is marked ready.
+* Run the narrowest relevant tests while developing. The complete `zig build test` suite runs in ReleaseSafe in **CI** after the feature branch is pushed, and it must pass before the draft PR is marked ready.
 
 * Use `std.testing.expect`, `std.testing.expectEqual`, `std.testing.expectEqualStrings` for assertions.
 
@@ -272,20 +272,25 @@ Assign the label when the PR is opened and keep it accurate when the PR changes.
 
 Keep PR titles as clean imperative sentences, such as `Restore feedback report file clipboard`. Do not add bracketed prefixes such as `[bug]`, `[feature]`, or `[improvement]`. Type belongs in the label, not the title.
 
-## Full CI on Feature Branches
+## CI on Pull Requests
 
 Do not run the complete deterministic test suite locally as the default development loop. Run the focused test for the changed path, build the binary, and exercise that path with `./zig-out/bin/fx`.
 
-After the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. `.github/workflows/full-ci.yml` runs the following on all four supported native runner architectures:
+After the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. Linux is the gate for every change because most fx behavior is identical on every platform:
 
-* `ubuntu-24.04` (x86_64)
-* `ubuntu-24.04-arm` (aarch64)
-* `macos-15-intel` (x86_64)
-* `macos-15` (aarch64)
+* `.github/workflows/ci.yml` runs on Linux x86_64. It checks formatting, the PGSO corpus, the public surface, and the compactor boundary, then runs the ReleaseSafe unit tests. It builds fx once, smoke-tests it, and shares that binary with four duration-balanced E2E shards and the MCP conformance baseline. Checked-in weights assign every E2E file to exactly one shard, and files inside each shard run sequentially in separate Bun processes so terminal fixtures and process state cannot leak between files. A failed file receives one retry after its tmux server is reset. A file that passes only on retry gets a warning annotation; investigate it as a possible race. The SDK jobs build WASM and the Node-API addons once and run the complete package qualification. `Build & Test` passes only when the unit tests and every SDK job pass, because Publish libfx relies on that result instead of qualifying the package again.
+* `.github/workflows/binary-size.yml` builds each release target on its native runner, reports the size change, and smoke-tests every target's binary. See **Binary Size Observability**.
+* `.github/workflows/bench.yml` enforces the startup latency budget. See **Benchmarks**.
 
-The native matrix builds, tests, and smoke-tests ReleaseSafe on every platform; formatting, the public-surface audit, and the compactor boundary check run in those ReleaseSafe jobs. The E2E matrix runs four duration-balanced, isolated ReleaseSafe shards per platform with Bun and tmux. Checked-in weights assign every test file to exactly one shard on each platform, and files inside each shard run sequentially in separate Bun processes so terminal fixtures and process state cannot leak between files. A failed file receives one bounded retry after its tmux server is reset. Live model evals remain separate because they require credentials and are not deterministic.
+Linux jobs install Zig through `.github/actions/setup-zig`, which restores the Zig cache that runs on `main` save with `.github/actions/save-zig-cache`. Pull requests never save a Zig cache through these actions, so they cannot push `main`'s entries out of the repository's cache quota. The PGSO workflow keeps its own cache through `.github/actions/setup-pgso`.
 
-A Full CI result is valid only when it belongs to the exact current commit and all four `Full suite (...)` jobs succeed. Each platform aggregate requires its ReleaseSafe native check plus all four ReleaseSafe E2E shards. Do not mark the draft PR ready or request review from a stale, partial, queued, cancelled, skipped, or failed run. If Full CI fails, make the smallest repair, rerun the focused local proof, push the new commit to the same draft PR, and wait for Full CI on the new exact commit. After CI passes, run the final ship gate and mark the PR ready only when it reports `SHIP` for that exact commit.
+macOS runs only when a change can behave differently there. `.github/workflows/macos.yml` uses `scripts/detect-macos-need.sh` to check the diff. The macOS arm64 unit tests and the E2E files in `tests/e2e/macos-platform-tests.json` run when the change touches a Zig file with a macOS, BSD, or Linux code path, `build.zig`, the macOS signing script, the native SDK addon, a listed E2E file, a shared E2E helper that reads the platform, or the macOS checks themselves. A Linux-only branch counts because macOS takes its other path; a Windows-only branch does not. The listed E2E files run in two weighted shards that share one macOS build. Native SDK addon changes also build and load the addon on macOS. If the detector cannot read the change, the `macOS arm64` check fails instead of passing. To request macOS for any other change, add the `ci:macos` label or run `gh workflow run macos.yml --ref <branch>`. When the change does not need macOS, the `macOS arm64` check passes without starting a macOS runner. Every E2E file that branches on `process.platform` or `platform()` being `darwin` or `linux` must appear in `tests/e2e/macos-platform-tests.json`, and `tests/e2e/ci-shards.test.ts` enforces that.
+
+The macOS arm64 PGSO workflow runs on a pull request only when the PGSO pipeline changes: `scripts/pgso/` other than `corpus.json`, the `setup-pgso` action, or `.github/workflows/pgso-macos-arm64.yml`. To qualify any other change, run `gh workflow run pgso-macos-arm64.yml --ref <branch>`. The stable release always runs it.
+
+Live model evals and the live ACP suite need credentials and are not deterministic, so they run only on request. Run the live ACP suite with `gh workflow run ci.yml --ref <branch> -f acp_live=true`.
+
+A CI result is valid only when it belongs to the exact current commit and `Build & Test`, `E2E (deterministic)`, `Shellcheck`, `Startup Latency`, and `macOS arm64` all succeed. Do not mark the draft PR ready or request review from a stale, partial, queued, cancelled, skipped, or failed run. If CI fails, make the smallest repair, rerun the focused local proof, push the new commit to the same draft PR, and wait for CI on the new exact commit. After CI passes, run the final ship gate and mark the PR ready only when it reports `SHIP` for that exact commit.
 
 ## Reproducing Render Bugs
 
@@ -341,6 +346,8 @@ Startup latency benchmarks live in `benchmarks/` and run in CI via `.github/work
 
 The CI workflow builds a ReleaseSafe binary, measures six CLI paths with hyperfine, and enforces per-command latency budgets. PRs that exceed a budget fail the check. On `main`, results are uploaded to Vercel Blob for historical tracking.
 
+The long-turn memory and libfx runtime benchmarks run only on request. Start them with `gh workflow run bench.yml --ref <branch> -f long_turn_memory=true` or `-f libfx_runtime=true`.
+
 The startup benchmark uses `FX_BENCH=1`, an environment variable that runs through arg parsing and CLI dispatch, then exits before TTY initialization. This lives in `src/core/app/app_entry_runtime.zig`.
 
 Current raw wall-clock contract:
@@ -361,7 +368,11 @@ Every pull request runs `.github/workflows/binary-size.yml` across Linux x86_64,
 Linux arm64, macOS x86_64, and macOS arm64. Each matrix job builds the pull
 request merge commit and its base commit as stripped ReleaseSafe binaries on
 the same native runner, then reports the exact byte and MiB delta plus ELF or
-Mach-O section changes.
+Mach-O section changes. The base binary is cached by base commit, so later
+pushes to the same pull request reuse it until the base branch moves. Every job
+also smoke-tests the pull request binary with `scripts/smoke-binary.sh`. These
+are release-style builds, and the Linux arm64 and macOS binaries run nowhere
+else on a pull request.
 
 Each platform check is informational. An increase of at least 52,429 bytes
 (0.050000 MiB) emits a warning and retains that platform's binaries for
@@ -382,21 +393,11 @@ Do not document intended behavior as if it already exists.
 
 ## Releasing
 
-Releases use a two-workflow pipeline. The maintainer controls the changelog voice and format.
+Releases are prepared by hand in a release PR. The maintainer controls the changelog voice and format.
 
-### Automated flow (preferred)
+### Preparing a release
 
-1. Go to **Actions > Prepare Release** on GitHub
-2. Select the bump type (`patch`, `minor`, or `major`) and run the workflow
-3. The workflow bumps the version, feeds the actual `git diff` to an LLM to draft the changelog, and opens a PR
-4. Review the PR — edit the AI-drafted changelog if needed — then merge
-5. The existing `release.yml` detects the version change and handles build, publish, tagging, and the GitHub Release
-
-The `prepare-release.yml` workflow uses the Vercel AI Gateway (`AI_GATEWAY_API_KEY` secret) to generate the changelog from the real code diff, not from commit messages or PR descriptions.
-
-### Manual flow
-
-To prepare a release by hand:
+To prepare a release:
 
 1. Create a branch (e.g. `prepare-v0.3.0`)
 2. Bump `pub const version` in `src/main.zig`
@@ -408,7 +409,7 @@ When the PR merges, CI compares the version tag to what exists in git. If the ta
 
 ### Writing the changelog
 
-Whether automated or manual, the changelog is public product copy. Describe observable user behavior, not the engineering process behind it. Use the diff, commits, and merged pull requests as research evidence only.
+The changelog is public product copy. Describe observable user behavior, not the engineering process behind it. Use the diff, commits, and merged pull requests as research evidence only.
 
 Public changelog entries must:
 
@@ -470,5 +471,5 @@ The canonical repository is `vercel-labs/fx` on GitHub. All URLs, links, and ref
 1. Run `zig fmt --check src/` and the focused tests for the changed path.
 2. Build and exercise the change locally with `./zig-out/bin/fx`.
 3. Push a clean checkpoint commit and open a draft PR immediately.
-4. Require **Full CI** and the final ship gate to pass on the exact current commit across all four native runners.
+4. Require **CI**, including the **macOS arm64** check, and the final ship gate to pass on the exact current commit.
 5. Update docs if behavior changed.

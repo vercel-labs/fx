@@ -39,11 +39,13 @@ zig build run
 
 Keep the local development loop focused: run the narrowest test that covers the changed path, build fx, and exercise the change using `./zig-out/bin/fx`. The installed `fx` on `PATH` is not valid development evidence.
 
-Once the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. The **Full CI** workflow runs the complete deterministic suite on native Linux x86_64, Linux aarch64, macOS x86_64, and macOS aarch64 runners. The native matrix builds, tests, and smoke-tests ReleaseSafe on every platform; formatting, the public-surface audit, and the compactor boundary check run in those ReleaseSafe jobs. Four duration-balanced, isolated ReleaseSafe E2E shards per platform use checked-in weights to assign every Bun test file once; files inside each shard run sequentially in separate Bun processes so terminal fixtures and process state cannot leak between files. A failed file receives one bounded retry after tmux is reset.
+Once the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. **CI** runs the complete deterministic suite on Linux x86_64, which is the gate for every change. It checks formatting, the PGSO corpus, the public surface, and the compactor boundary, runs the ReleaseSafe unit tests, and builds fx once for the E2E jobs. Four duration-balanced E2E shards use checked-in weights to assign every Bun test file once, and files inside each shard run sequentially in separate Bun processes so terminal fixtures and process state cannot leak between files. A failed file receives one retry after tmux is reset, and a file that passes only on retry gets a warning annotation.
 
-Standard PR CI reports ReleaseSafe Build & Test and deterministic E2E results. Do not mark the draft PR ready until all four Full CI jobs and the final ship gate have succeeded for the exact current commit. Each platform aggregate requires its ReleaseSafe native check and all four ReleaseSafe E2E shards. A result from an older commit does not count. Live model evals are separate from this gate because they require credentials and are not deterministic.
+macOS checks run only when a change can behave differently on macOS: a Zig file with a macOS, BSD, or Linux code path, `build.zig`, the macOS signing script, the native SDK addon, an E2E file listed in `tests/e2e/macos-platform-tests.json`, or a shared E2E helper that reads the platform. Add the `ci:macos` label or run `gh workflow run macos.yml --ref <branch>` to request them for any other change. The `macOS arm64` check passes without a macOS runner when the change does not need one.
 
-Changes to `build.zig` or `scripts/pgso/` also run the native macOS arm64 PGSO candidate workflow. That lane produces retained size, behavior, and performance evidence but does not alter any release artifact or update channel. Its pinned toolchain, local reproduction command, corpus exclusions, and failure rules are documented in [`scripts/pgso/README.md`](scripts/pgso/README.md).
+Do not mark the draft PR ready until `Build & Test`, `E2E (deterministic)`, `Shellcheck`, `Startup Latency`, `macOS arm64`, and the final ship gate have succeeded for the exact current commit. A result from an older commit does not count. Live model evals are separate from this gate because they require credentials and are not deterministic.
+
+Changes to the PGSO pipeline also run the native macOS arm64 PGSO candidate workflow: `scripts/pgso/` other than `corpus.json`, the `setup-pgso` action, or the PGSO workflow. Run it on any other branch with `gh workflow run pgso-macos-arm64.yml --ref <branch>`. That lane produces retained size, behavior, and performance evidence but does not alter any release artifact or update channel. Its pinned toolchain, local reproduction command, corpus exclusions, and failure rules are documented in [`scripts/pgso/README.md`](scripts/pgso/README.md).
 
 Every pull request also receives informational ReleaseSafe binary-size
 comparisons for Linux x86_64, Linux arm64, macOS x86_64, and macOS arm64. Each
@@ -51,7 +53,8 @@ comparison builds the pull request merge commit and base commit on the same
 native runner, reports exact file and ELF or Mach-O section deltas, and emits a
 warning at increases of 52,429 bytes (0.050000 MiB) or more. The warning requests
 investigation but does not replace the full PGSO release gate or reject a valid
-feature solely for adding code.
+feature solely for adding code. The same jobs smoke-test each release-style
+binary; the Linux arm64 and macOS binaries run nowhere else on a pull request.
 
 ## Pull Requests
 
@@ -604,6 +607,10 @@ CI uses `--runs 100` with a reduced warmup and skips the build step because the
 workflow builds ReleaseSafe first. Results are written to
 `benchmarks/results/` (gitignored).
 
+The libfx runtime and long-turn memory jobs run only on request. Start them by
+dispatching **Benchmarks** with `libfx_runtime` or `long_turn_memory` set, for
+example `gh workflow run bench.yml --ref <branch> -f libfx_runtime=true`.
+
 The libfx runtime job measures cold startup, warm prompts, host-tool calls,
 stream throughput, and Agent cleanup. Its direct Pi comparison uses an external
 Zig HTTP server, Pi 0.84.4, and three alternating 100-sample rounds. On Bun,
@@ -629,5 +636,5 @@ Minimum checklist:
 1. Run `zig fmt --check src/` and the focused tests for the changed path.
 2. Run `zig build`, then exercise the change with `./zig-out/bin/fx`.
 3. Push the feature branch and open a draft PR immediately.
-4. Require all four **Full CI** jobs and the final ship gate to pass for the exact current commit before marking the PR ready.
+4. Require **CI**, including the **macOS arm64** check, and the final ship gate to pass for the exact current commit before marking the PR ready.
 5. Update `README.md` if user-facing behavior changed.

@@ -90,7 +90,7 @@ sdk_package_dir="$(mktemp -d)"
 node sdk/scripts/package-term-demo.mjs "$sdk_package_dir"
 ```
 
-Do not commit `zig-out/`, `sdk/dist/`, or other generated artifacts. Run `git diff --check` before creating a checkpoint. The repository-level build, binary exercise, and Full CI ship gates still apply.
+Do not commit `zig-out/`, `sdk/dist/`, or other generated artifacts. Run `git diff --check` before creating a checkpoint. The repository-level build, binary exercise, and CI ship gates still apply.
 
 ## Code review rules
 

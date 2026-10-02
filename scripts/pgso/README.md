@@ -161,7 +161,8 @@ manual branch head with its exact main ancestor, dispatch the
 **Benchmarks** workflow on the comparison branch with `pgso_control_artifact`
 and `pgso_candidate_artifact` set to the two qualified aggregate artifact IDs.
 The main control may come from the dedicated PGSO workflow or the Release
-workflow that invokes it. Both artifacts must have completed qualification.
+workflow that invokes it. Release runs keep their aggregate evidence for 90
+days, so the last release can serve as the control. Both artifacts must have completed qualification.
 The candidate must come from the dedicated PGSO workflow. For source-only PRs,
 run that workflow manually on the PR branch. Its manifest source must match the
 run head, and GitHub's immutable SHA comparison must prove that exact control

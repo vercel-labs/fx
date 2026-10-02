@@ -83,11 +83,26 @@ jobs:
           fi
           cat "$evidence_dir/head-sections.txt"
 
+      # These are release-style builds, and the Linux arm64 and macOS binaries
+      # run nowhere else on a pull request.
+      - name: Smoke test native binary
+        env:
+          AI_GATEWAY_API_KEY: ""
+          VERCEL_OIDC_TOKEN: ""
+        run: scripts/smoke-binary.sh "$RUNNER_TEMP/fx-binary-size-evidence/head-fx"
+
+      - name: Restore base binary
+        id: base-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/fx-binary-size-base-bin
+          key: binary-size-base-v1-${{ matrix.target }}-zig-0.16.0-${{ env.BASE_SHA }}
+
       - name: Build base binary
+        if: steps.base-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           set -euo pipefail
-          evidence_dir="$RUNNER_TEMP/fx-binary-size-evidence"
           base_worktree="$RUNNER_TEMP/fx-binary-size-base"
           cleanup() {
             git worktree remove --force "$base_worktree" >/dev/null 2>&1 || true
@@ -103,7 +118,22 @@ jobs:
               --cache-dir "$RUNNER_TEMP/fx-base-cache" \
               --global-cache-dir "$RUNNER_TEMP/fx-global-cache"
           )
-          cp "$base_worktree/zig-out/bin/fx" "$evidence_dir/base-fx"
+          mkdir -p "$RUNNER_TEMP/fx-binary-size-base-bin"
+          cp "$base_worktree/zig-out/bin/fx" "$RUNNER_TEMP/fx-binary-size-base-bin/fx"
+
+      - name: Save base binary
+        if: steps.base-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/fx-binary-size-base-bin
+          key: binary-size-base-v1-${{ matrix.target }}-zig-0.16.0-${{ env.BASE_SHA }}
+
+      - name: Measure base binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence_dir="$RUNNER_TEMP/fx-binary-size-evidence"
+          cp "$RUNNER_TEMP/fx-binary-size-base-bin/fx" "$evidence_dir/base-fx"
           file "$evidence_dir/base-fx" > "$evidence_dir/base-file.txt"
           cat "$evidence_dir/base-file.txt"
           grep -Eq "$EXPECTED_FILE" "$evidence_dir/base-file.txt"

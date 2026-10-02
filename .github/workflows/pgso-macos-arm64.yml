@@ -1,7 +1,15 @@
 name: macOS arm64 PGSO candidate
 
+# Pull requests run PGSO only when the PGSO pipeline itself changes. Dispatch
+# this workflow on any branch to qualify other changes; the stable release
+# always runs it.
 on:
   workflow_call:
+    inputs:
+      evidence-retention-days:
+        description: Days to keep the qualified aggregate evidence
+        type: number
+        default: 14
     outputs:
       artifact-id:
         description: Qualified PGSO evidence artifact ID
@@ -9,11 +17,10 @@ on:
   workflow_dispatch:
   pull_request:
     paths:
-      - build.zig
       - scripts/pgso/**
+      - "!scripts/pgso/corpus.json"
       - .github/actions/setup-pgso/**
       - .github/workflows/pgso-macos-arm64.yml
-      - .github/workflows/release.yml
 
 concurrency:
   group: pgso-macos-arm64-${{ github.ref }}
@@ -488,4 +495,4 @@ jobs:
           overwrite: true
           path: ${{ runner.temp }}/fx-pgso-aggregate
           if-no-files-found: error
-          retention-days: 14
+          retention-days: ${{ inputs.evidence-retention-days || 14 }}

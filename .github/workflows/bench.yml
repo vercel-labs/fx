@@ -3,6 +3,14 @@ name: Benchmarks
 on:
   workflow_dispatch:
     inputs:
+      long_turn_memory:
+        description: Run the long-turn memory benchmark
+        type: boolean
+        default: false
+      libfx_runtime:
+        description: Run the libfx runtime benchmark
+        type: boolean
+        default: false
       signed_run:
         description: Successful main Release validation run to compare (no signing credentials used)
         type: string
@@ -20,7 +28,7 @@ on:
   pull_request:
 
 concurrency:
-  group: bench-${{ github.ref }}${{ (inputs.pgso_control_artifact != '' || inputs.pgso_candidate_artifact != '') && '-pgso-artifacts' || '' }}
+  group: bench-${{ github.event_name == 'workflow_dispatch' && 'dispatch-' || '' }}${{ github.ref }}${{ (inputs.pgso_control_artifact != '' || inputs.pgso_candidate_artifact != '') && '-pgso-artifacts' || '' }}
   cancel-in-progress: true
 
 permissions:
@@ -35,9 +43,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        id: zig
+        uses: ./.github/actions/setup-zig
         with:
           version: "0.16.0"
+          cache-key: bench-ReleaseSafe
 
       - name: Build (ReleaseSafe)
         run: zig build -Doptimize=ReleaseSafe
@@ -77,8 +87,14 @@ jobs:
           path: ${{ runner.temp }}/tui-performance.json
           if-no-files-found: warn
 
+      - name: Save Zig cache
+        uses: ./.github/actions/save-zig-cache
+        with:
+          cache-key: ${{ steps.zig.outputs.cache-key }}
+          cache-hit: ${{ steps.zig.outputs.cache-hit }}
+
   long-turn-memory:
-    if: inputs.signed_run == '' && inputs.pgso_control_artifact == '' && inputs.pgso_candidate_artifact == ''
+    if: github.event_name == 'workflow_dispatch' && inputs.long_turn_memory && inputs.signed_run == '' && inputs.pgso_control_artifact == '' && inputs.pgso_candidate_artifact == ''
     name: Long-turn memory
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -86,9 +102,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        id: zig
+        uses: ./.github/actions/setup-zig
         with:
           version: "0.16.0"
+          cache-key: bench-ReleaseSafe
 
       - name: Build (ReleaseSafe)
         run: zig build -Doptimize=ReleaseSafe
@@ -111,16 +129,18 @@ jobs:
           if-no-files-found: warn
 
   libfx-ttft:
-    if: inputs.signed_run == '' && inputs.pgso_control_artifact == '' && inputs.pgso_candidate_artifact == ''
+    if: github.event_name == 'workflow_dispatch' && inputs.libfx_runtime && inputs.signed_run == '' && inputs.pgso_control_artifact == '' && inputs.pgso_candidate_artifact == ''
     name: libfx Runtime
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        id: zig
+        uses: ./.github/actions/setup-zig
         with:
           version: "0.16.0"
+          cache-key: bench-ReleaseSafe
 
       - name: Setup Node
         uses: actions/setup-node@v4

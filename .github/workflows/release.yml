@@ -154,6 +154,10 @@ jobs:
       actions: read
       contents: read
     uses: ./.github/workflows/pgso-macos-arm64.yml
+    with:
+      # Keep release evidence long enough to serve as the main control for
+      # manual PGSO comparisons.
+      evidence-retention-days: 90
 
   sign-macos-arm64:
     needs: [check-version, build-macos-arm64]

@@ -230,13 +230,6 @@ jobs:
         with:
           node-version: "24.18.0"
 
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: "1.4.2"
-
-      - name: Install package test runner
-        run: npm install --global pnpm@11.1.1
-
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: libfx-native-*
@@ -295,43 +288,13 @@ jobs:
             console.log(`validated ${report.name}@${report.version}: ${report.files.length} files, ${report.size} bytes packed`);
           '
 
-      - name: Test installed package and diagnostics
+      # Pull request CI runs the full package qualification (Next, resilience,
+      # every module format). Publishing only proves this exact archive installs
+      # and runs on each backend.
+      - name: Smoke test the installed package
         run: |
-          node --experimental-wasm-jspi sdk/tests/test-node-bundled-assets.mjs
-          node --experimental-wasm-jspi sdk/tests/test-node-async-assets.mjs sdk/dist/libfx
           node sdk/tests/test-packed-example.mjs libfx-package.tgz native esm
-          node --no-experimental-require-module sdk/tests/test-packed-example.mjs libfx-package.tgz native cjs
           node --experimental-wasm-jspi sdk/tests/test-packed-example.mjs libfx-package.tgz wasm esm
-          node --experimental-wasm-jspi --no-experimental-require-module sdk/tests/test-packed-example.mjs libfx-package.tgz wasm cjs
-          node --experimental-wasm-jspi sdk/tests/test-backend-info.mjs
-          node sdk/tests/test-term-demo-package.mjs
-
-      - name: Test package recovery and lifecycle boundaries
-        run: |
-          node sdk/tests/test-package-resilience.mjs --package libfx-package.tgz \
-            --cheap-cycles 100 --tool-workflows 20 --duration-ms 5000 --concurrency 4 \
-            --json-out "${{ runner.temp }}/libfx-package-evidence/resilience.json"
-
-      - name: Test Next development, production and isolated output
-        env:
-          LIBFX_TEST_ARTIFACT_ROOT: ${{ runner.temp }}/libfx-package-evidence
-        run: |
-          node sdk/tests/test-next-package.mjs libfx-package.tgz
-          node sdk/tests/test-next-package.mjs libfx-package.tgz --webpack
-          node sdk/tests/test-next-package.mjs libfx-package.tgz --next15
-
-      - name: Retain package qualification evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: libfx-package-evidence
-          path: |
-            ${{ runner.temp }}/libfx-package-evidence/resilience.json
-            ${{ runner.temp }}/libfx-package-evidence/libfx-next-*/*.log
-            ${{ runner.temp }}/libfx-package-evidence/libfx-next-*/results.json
-            ${{ runner.temp }}/libfx-package-evidence/libfx-trace-*/*.log
-            ${{ runner.temp }}/libfx-package-evidence/libfx-trace-*/results.json
-          if-no-files-found: ignore
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -391,16 +354,14 @@ jobs:
     needs: [metadata, publish]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ needs.metadata.outputs.sha }}
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "24.18.0"
-      - run: npm install --global pnpm@11.1.1
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: libfx-package
+      # A byte-identical registry archive is the package that already passed
+      # the smoke test above, so comparing bytes is the whole verification.
       - name: Download and compare the immutable registry version
         env:
           LIBFX_VERSION: ${{ needs.metadata.outputs.version }}
@@ -410,25 +371,3 @@ jobs:
           npm pack "libfx@${LIBFX_VERSION}" --ignore-scripts --registry=https://registry.npmjs.org/ --json > /tmp/libfx-registry-pack.json
           mv "$(jq -r '.[0].filename' /tmp/libfx-registry-pack.json)" libfx-registry.tgz
           cmp libfx-package.tgz libfx-registry.tgz
-      - name: Test the registry package in Node and Next
-        env:
-          LIBFX_TEST_ARTIFACT_ROOT: ${{ runner.temp }}/libfx-registry-evidence
-        run: |
-          node sdk/tests/test-packed-example.mjs libfx-registry.tgz native esm
-          node --no-experimental-require-module sdk/tests/test-packed-example.mjs libfx-registry.tgz native cjs
-          node --experimental-wasm-jspi sdk/tests/test-packed-example.mjs libfx-registry.tgz wasm esm
-          node --experimental-wasm-jspi --no-experimental-require-module sdk/tests/test-packed-example.mjs libfx-registry.tgz wasm cjs
-          node sdk/tests/test-next-package.mjs libfx-registry.tgz
-          node sdk/tests/test-next-package.mjs libfx-registry.tgz --webpack
-          node sdk/tests/test-next-package.mjs libfx-registry.tgz --next15
-      - name: Retain registry qualification evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: libfx-registry-evidence
-          path: |
-            ${{ runner.temp }}/libfx-registry-evidence/libfx-next-*/*.log
-            ${{ runner.temp }}/libfx-registry-evidence/libfx-next-*/results.json
-            ${{ runner.temp }}/libfx-registry-evidence/libfx-trace-*/*.log
-            ${{ runner.temp }}/libfx-registry-evidence/libfx-trace-*/results.json
-          if-no-files-found: ignore

@@ -1,13 +1,23 @@
 name: CI
 
+# Linux is the gate for every change. Behavior that can differ on macOS runs in
+# .github/workflows/macos.yml only when a change needs it.
+
 on:
   workflow_dispatch:
+    inputs:
+      acp_live:
+        description: Also run the full ACP suite with live model calls
+        type: boolean
+        default: false
   push:
     branches: [main]
   pull_request:
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # A manual dispatch gets its own group so it cannot cancel the push run on
+  # main.
+  group: ci-${{ github.event_name == 'workflow_dispatch' && 'dispatch-' || '' }}${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -24,7 +34,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        id: zig
+        uses: ./.github/actions/setup-zig
         with:
           version: "0.16.0"
           cache-key: ci-unit-${{ matrix.optimize }}
@@ -41,6 +52,9 @@ jobs:
       - name: Check compactor boundary
         run: ./scripts/check-compactor-boundary.sh
 
+      - name: Test CI and release scripts
+        run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos scripts.tests.test_detect_macos_need -q
+
       - name: Build
         run: zig build -Doptimize=${{ matrix.optimize }}
 
@@ -52,37 +66,171 @@ jobs:
           trap 'printf "Unit tests elapsed: %ss\n" "$((SECONDS - started_at))"' EXIT
           timeout "${TEST_TIMEOUT_SECONDS}s" zig build test -Doptimize=${{ matrix.optimize }}
 
+      - name: Save Zig cache
+        uses: ./.github/actions/save-zig-cache
+        with:
+          cache-key: ${{ steps.zig.outputs.cache-key }}
+          cache-hit: ${{ steps.zig.outputs.cache-hit }}
+
+  # The SDK jobs are part of this required check because Publish libfx relies
+  # on them instead of rerunning the package qualification before publishing.
   zig:
     name: Build & Test
     if: ${{ always() }}
-    needs: zig_mode
+    needs: [zig_mode, sdk-node-wasm, sdk-node-napi, sdk-bun, sdk-browser-wasm]
     runs-on: ubuntu-latest
     steps:
-      - name: Require ReleaseSafe
+      - name: Require unit tests and every SDK job
         env:
-          MATRIX_RESULT: ${{ needs.zig_mode.result }}
-        run: test "$MATRIX_RESULT" = success
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          printf '%s\n' "$RESULTS"
+          jq -e 'length == 5 and all(.[]; . == "success")' <<<"$RESULTS"
 
-  sdk-node-wasm:
-    name: SDK (Node + WASM)
-    runs-on: ubuntu-latest
+  build:
+    name: Build fx (ReleaseSafe)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      AI_GATEWAY_API_KEY: ""
+      VERCEL_OIDC_TOKEN: ""
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        id: zig
+        uses: ./.github/actions/setup-zig
         with:
           version: "0.16.0"
+          cache-key: ci-build-ReleaseSafe
+
+      # Other runners execute this binary, and their CPUs can differ from this
+      # one. A native build can emit instructions such as AVX-512 that those
+      # runners lack, so target the baseline CPU like the release builds do.
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe -Dcpu=baseline
+
+      - name: Smoke test fresh binary
+        run: scripts/smoke-binary.sh zig-out/bin/fx
+
+      - name: Share the binary with E2E jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: fx-linux-x86_64
+          path: zig-out/bin/fx
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Save Zig cache
+        uses: ./.github/actions/save-zig-cache
+        with:
+          cache-key: ${{ steps.zig.outputs.cache-key }}
+          cache-hit: ${{ steps.zig.outputs.cache-hit }}
+
+  sdk-wasm:
+    name: SDK build (WASM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        id: zig
+        uses: ./.github/actions/setup-zig
+        with:
+          version: "0.16.0"
+          cache-key: ci-sdk-wasm
+
+      - name: Build WASM surfaces (ReleaseSmall)
+        run: |
+          zig build fx-core-wasm -Dwasm-surface=core -Doptimize=ReleaseSmall
+          zig build fx-term-wasm -Dwasm-surface=term -Doptimize=ReleaseSmall
+
+      - name: Share WASM surfaces with SDK jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-wasm
+          path: |
+            zig-out/bin/fx-core.wasm
+            zig-out/bin/fx-term.wasm
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Save Zig cache
+        uses: ./.github/actions/save-zig-cache
+        with:
+          cache-key: ${{ steps.zig.outputs.cache-key }}
+          cache-hit: ${{ steps.zig.outputs.cache-hit }}
+
+  sdk-napi:
+    name: SDK build (N-API, ${{ matrix.platform }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            target_flags: -Dtarget=x86_64-linux-gnu.2.34 -Dcpu=baseline
+          - platform: linux-arm64
+            target_flags: -Dtarget=aarch64-linux-gnu.2.34 -Dcpu=baseline
+          - platform: darwin-x64
+            target_flags: -Dtarget=x86_64-macos -Dcpu=baseline
+          - platform: darwin-arm64
+            target_flags: -Dtarget=aarch64-macos -Dcpu=baseline
+    steps:
+      - uses: actions/checkout@v4
+
+      # build.zig locates node_api.h through the node on PATH.
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Setup Zig
+        id: zig
+        uses: ./.github/actions/setup-zig
+        with:
+          version: "0.16.0"
+          cache-key: ci-sdk-napi-${{ matrix.platform }}
+
+      - name: Build N-API addon (ReleaseSafe)
+        run: |
+          zig build libfx-napi -Dnapi-surface=core -Doptimize=ReleaseSafe ${{ matrix.target_flags }}
+          mkdir -p native-addons
+          cp zig-out/lib/libfx.node native-addons/libfx.${{ matrix.platform }}.node
+
+      - name: Share the addon with SDK jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-napi-${{ matrix.platform }}
+          path: native-addons/libfx.${{ matrix.platform }}.node
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Save Zig cache
+        uses: ./.github/actions/save-zig-cache
+        with:
+          cache-key: ${{ steps.zig.outputs.cache-key }}
+          cache-hit: ${{ steps.zig.outputs.cache-hit }}
+
+  sdk-node-wasm:
+    name: SDK (Node + WASM)
+    needs: sdk-wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: "24"
 
-      - name: Build WASM surfaces (ReleaseSmall)
-        run: |
-          zig build -Dwasm-surface=core -Doptimize=ReleaseSmall
-          zig build -Dwasm-surface=term -Doptimize=ReleaseSmall
+      - name: Download WASM surfaces
+        uses: actions/download-artifact@v4
+        with:
+          name: sdk-wasm
+          path: zig-out/bin
 
       - name: Install terminal test dependencies
         run: npm ci --prefix sdk/node
@@ -99,22 +247,26 @@ jobs:
 
   sdk-node-napi:
     name: SDK (Node + N-API)
+    needs: sdk-napi
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: "0.16.0"
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: "24"
 
-      - name: Build N-API addon (ReleaseSafe)
-        run: zig build -Dnapi-surface=core -Doptimize=ReleaseSafe
+      - name: Download Linux addon
+        uses: actions/download-artifact@v4
+        with:
+          name: sdk-napi-linux-x64
+          path: native-addons
+
+      - name: Install the addon
+        run: |
+          mkdir -p zig-out/lib
+          cp native-addons/libfx.linux-x64.node zig-out/lib/libfx.node
 
       - name: Test Node + N-API
         run: npm run --prefix sdk test:node-napi
@@ -129,14 +281,10 @@ jobs:
 
   sdk-bun:
     name: SDK (Bun + N-API/WASM)
+    needs: [sdk-wasm, sdk-napi]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: "0.16.0"
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -148,11 +296,23 @@ jobs:
         with:
           bun-version: "1.4.2"
 
-      - name: Build SDK artifacts
+      - name: Download WASM surfaces
+        uses: actions/download-artifact@v4
+        with:
+          name: sdk-wasm
+          path: zig-out/bin
+
+      - name: Download native addons
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sdk-napi-*
+          path: native-addons
+          merge-multiple: true
+
+      - name: Install the Linux addon
         run: |
-          zig build libfx-napi -Dnapi-surface=core -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-gnu.2.34 -Dcpu=baseline
-          zig build -Dwasm-surface=core -Doptimize=ReleaseSmall
-          zig build -Dwasm-surface=term -Doptimize=ReleaseSmall
+          mkdir -p zig-out/lib
+          cp native-addons/libfx.linux-x64.node zig-out/lib/libfx.node
 
       - name: Install terminal test dependencies
         run: npm ci --prefix sdk/node
@@ -191,20 +351,6 @@ jobs:
               node sdk/tests/test-host-tools.mjs native
               node sdk/tests/test-host-tool-cancel.mjs native
             '
-
-      - name: Build foreign addons for package qualification
-        run: |
-          mkdir -p native-addons
-          cp zig-out/lib/libfx.node native-addons/libfx.linux-x64.node
-          prefix="$(mktemp -d "$RUNNER_TEMP/libfx-linux-arm64.XXXXXX")"
-          zig build libfx-napi -Dnapi-surface=core -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-gnu.2.34 -Dcpu=baseline --prefix "$prefix"
-          cp "$prefix/lib/libfx.node" native-addons/libfx.linux-arm64.node
-          prefix="$(mktemp -d "$RUNNER_TEMP/libfx-darwin-x64.XXXXXX")"
-          zig build libfx-napi -Dnapi-surface=core -Doptimize=ReleaseSafe -Dtarget=x86_64-macos -Dcpu=baseline --prefix "$prefix"
-          cp "$prefix/lib/libfx.node" native-addons/libfx.darwin-x64.node
-          prefix="$(mktemp -d "$RUNNER_TEMP/libfx-darwin-arm64.XXXXXX")"
-          zig build libfx-napi -Dnapi-surface=core -Doptimize=ReleaseSafe -Dtarget=aarch64-macos -Dcpu=baseline --prefix "$prefix"
-          cp "$prefix/lib/libfx.node" native-addons/libfx.darwin-arm64.node
 
       - name: Test Node package and backend diagnostics
         run: |
@@ -253,14 +399,10 @@ jobs:
 
   sdk-browser-wasm:
     name: SDK (Browser + WASM)
+    needs: sdk-wasm
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: "0.16.0"
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -271,10 +413,11 @@ jobs:
         id: setup-chrome
         uses: browser-actions/setup-chrome@v2
 
-      - name: Build WASM surfaces (ReleaseSmall)
-        run: |
-          zig build -Dwasm-surface=core -Doptimize=ReleaseSmall
-          zig build -Dwasm-surface=term -Doptimize=ReleaseSmall
+      - name: Download WASM surfaces
+        uses: actions/download-artifact@v4
+        with:
+          name: sdk-wasm
+          path: zig-out/bin
 
       - name: Test Browser + WASM
         env:
@@ -282,23 +425,152 @@ jobs:
         run: npm run --prefix sdk test:browser-wasm
 
   e2e_mode:
-    name: E2E (deterministic, ${{ matrix.optimize }})
-    runs-on: ubuntu-latest
+    name: E2E (deterministic, shard ${{ matrix.shard.label }})
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        optimize: [ReleaseSafe]
+        shard:
+          - index: 0
+            label: "1/4"
+          - index: 1
+            label: "2/4"
+          - index: 2
+            label: "3/4"
+          - index: 3
+            label: "4/4"
+    env:
+      AI_GATEWAY_API_KEY: ""
+      VERCEL_OIDC_TOKEN: ""
+      FX_REQUIRE_TMUX: "1"
+      SHARD_INDEX: ${{ matrix.shard.index }}
+      SHARD_COUNT: 4
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download fx
+        uses: actions/download-artifact@v4
+        with:
+          name: fx-linux-x86_64
+          path: zig-out/bin
+
+      - name: Restore executable mode
+        run: chmod +x zig-out/bin/fx
+
+      # Some E2E files build their own Zig fixtures.
+      - name: Setup Zig
+        id: zig
+        uses: ./.github/actions/setup-zig
+        with:
+          version: "0.16.0"
+          cache-key: ci-e2e-fixtures
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+
+      - name: Install E2E system dependencies
+        timeout-minutes: 17
+        run: |
+          missing=()
+          command -v tmux >/dev/null 2>&1 || missing+=(tmux)
+          command -v zsh >/dev/null 2>&1 || missing+=(zsh)
+          if [ "${#missing[@]}" -gt 0 ]; then
+            retry() {
+              local attempt
+              for attempt in 1 2; do
+                if "$@"; then
+                  return 0
+                fi
+                if [ "$attempt" -lt 2 ]; then
+                  printf 'Dependency install attempt %s failed; retrying in 5s\n' "$attempt" >&2
+                  sleep 5
+                fi
+              done
+              return 1
+            }
+            # The Azure mirror can stall after APT has already fetched release
+            # metadata from the direct Ubuntu fallback. Prefer that fallback
+            # for the whole update when the runner's mirror list provides it.
+            if [ -f /etc/apt/apt-mirrors.txt ] &&
+              grep -Eq '^https?://(archive|ports)\.ubuntu\.com/' /etc/apt/apt-mirrors.txt
+            then
+              sudo sed -i '/:\/\/azure\..*ubuntu\.com\//d' /etc/apt/apt-mirrors.txt
+            fi
+            retry sudo timeout --kill-after=15s 4m apt-get \
+              -o Acquire::Retries=3 \
+              -o Acquire::http::Timeout=30 \
+              -o Acquire::https::Timeout=30 \
+              update
+            retry sudo timeout --kill-after=15s 3m apt-get \
+              -o Dpkg::Use-Pty=0 \
+              install -y "${missing[@]}"
+          fi
+          printf 'set-option -g history-limit 100000\n' > "$HOME/.tmux.conf"
+          tmux -V
+          zsh --version
+
+      - name: Install E2E dependencies
+        run: bun install --frozen-lockfile
+        working-directory: tests/e2e
+
+      - name: Run deterministic E2E shard
+        working-directory: tests/e2e
+        run: |
+          selected=()
+          selection_file="$RUNNER_TEMP/fx-e2e-shard-${SHARD_INDEX}.txt"
+          bun ci-shards.ts \
+            --shard-count "$SHARD_COUNT" \
+            --shard-index "$SHARD_INDEX" > "$selection_file"
+          while IFS= read -r test_file; do
+            selected+=("$test_file")
+          done < "$selection_file"
+
+          test "${#selected[@]}" -gt 0
+          printf 'Running E2E shard %s/%s (%s files):\n' "$((SHARD_INDEX + 1))" "$SHARD_COUNT" "${#selected[@]}"
+          printf '  %s\n' "${selected[@]}"
+          ./ci-run-files.sh "${selected[@]}"
+
+      - name: Save Zig cache
+        if: matrix.shard.index == 0
+        uses: ./.github/actions/save-zig-cache
+        with:
+          cache-key: ${{ steps.zig.outputs.cache-key }}
+          cache-hit: ${{ steps.zig.outputs.cache-hit }}
+
+  e2e_conformance:
+    name: E2E (MCP conformance)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      AI_GATEWAY_API_KEY: ""
+      VERCEL_OIDC_TOKEN: ""
+      FX_SOUND: "0"
     steps:
       - uses: actions/checkout@v4
 
+      - name: Download fx
+        uses: actions/download-artifact@v4
+        with:
+          name: fx-linux-x86_64
+          path: zig-out/bin
+
+      - name: Restore executable mode
+        run: chmod +x zig-out/bin/fx
+
+      # The client-request-state scenario builds a Zig dispatcher fixture.
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        id: zig
+        uses: ./.github/actions/setup-zig
         with:
           version: "0.16.0"
-          cache-key: ci-e2e-${{ matrix.optimize }}
-
-      - name: Build
-        run: zig build -Doptimize=${{ matrix.optimize }}
+          cache-key: ci-mcp-fixtures
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -310,161 +582,37 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Install e2e deps
-        run: bun install
+      - name: Install E2E dependencies
+        run: bun install --frozen-lockfile
         working-directory: tests/e2e
 
       - name: Install isolated MCP conformance package
         run: npm ci
         working-directory: tests/e2e/conformance
 
-      - name: Install tmux
-        run: |
-          if ! command -v tmux >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y tmux
-          fi
-
-      - name: Run CLI tests
-        run: bun test cli.test.ts
-        working-directory: tests/e2e
-
-      - name: Run ACP tests (no-key subset)
-        run: bun test acp.test.ts
-        working-directory: tests/e2e
-
-      - name: Run legacy stdio MCP tool lifecycle test
-        run: bun test gateway-stream-lifecycle.test.ts --test-name-pattern "selected dynamic MCP review cautions with zero sends and clears exactly once"
-        working-directory: tests/e2e
-
-      - name: Run stdio MCP dispatcher lifecycle tests
-        run: bun test mcp-stdio.test.ts
-        working-directory: tests/e2e
-
-      - name: Run modern MCP Streamable HTTP tests
-        run: bun test mcp-http.test.ts
-        working-directory: tests/e2e
-
-      - name: Run legacy MCP remote compatibility tests
-        run: bun test mcp-legacy-remote.test.ts
-        working-directory: tests/e2e
-
       - name: Run isolated MCP conformance baseline
         run: npm test
         working-directory: tests/e2e/conformance
-        env:
-          FX_SOUND: "0"
 
-      - name: Run persistence tests
-        run: bun test config-persistence.test.ts session-recovery.test.ts prompt-history.test.ts
-        working-directory: tests/e2e
-
-      - name: Run gateway lifecycle recovery regressions
-        run: bun test ./gateway-stream-lifecycle.test.ts --test-name-pattern "saved malformed recovery resumes without re-executing the historical call|OS filesystem access denial reaches the next gateway request"
-        working-directory: tests/e2e
-
-      - name: Run lean Auto Mode reliability contract
-        run: bun test auto-mode-reliability.test.ts
-        working-directory: tests/e2e
-        env:
-          AI_GATEWAY_API_KEY: ""
-          VERCEL_OIDC_TOKEN: ""
-          FX_REQUIRE_TMUX: "1"
-
-      - name: Run Vision route and headless SIGINT regressions
-        run: |
-          bun test vision-route-fake-gateway.test.ts
-          bun test ./tui-command-permissions.test.ts --test-name-pattern "fx ask SIGINT during classifier wait terminates before decision or execution"
-        working-directory: tests/e2e
-        env:
-          AI_GATEWAY_API_KEY: ""
-          VERCEL_OIDC_TOKEN: ""
-
-      - name: Run TUI input line deletion regression
-        run: |
-          tmux -V
-          bun test tui-input-line-delete.test.ts
-        working-directory: tests/e2e
-        env:
-          AI_GATEWAY_API_KEY: ""
-          VERCEL_OIDC_TOKEN: ""
-          FX_REQUIRE_TMUX: "1"
-
-      - name: Run multiline input navigation TUI tests
-        run: |
-          tmux -V
-          bun test tui-input-navigation.test.ts
-        working-directory: tests/e2e
-        env:
-          AI_GATEWAY_API_KEY: ""
-          VERCEL_OIDC_TOKEN: ""
-          FX_REQUIRE_TMUX: "1"
-
-      - name: Run valid question recovery TUI regression
-        run: |
-          tmux -V
-          bun test ./tui-decision-prompts.test.ts --test-name-pattern "valid serialized ask control with matching identity opens the question and continues"
-        working-directory: tests/e2e
-        env:
-          AI_GATEWAY_API_KEY: ""
-          VERCEL_OIDC_TOKEN: ""
-          FX_REQUIRE_TMUX: "1"
-
-      - name: Run streamed lifecycle, direct-write, and command scrollback regressions
-        run: |
-          tmux -V
-          bun test tui-gateway-stream-lifecycle.test.ts tui-direct-write-audit.test.ts
-          bun test ./tui-command-permissions.test.ts --test-name-pattern "TUI preserves completed transcript when a later auto-approved command starts|TUI isolates approved foreground commands from terminal ownership"
-        working-directory: tests/e2e
-        env:
-          AI_GATEWAY_API_KEY: ""
-          VERCEL_OIDC_TOKEN: ""
-          FX_REQUIRE_TMUX: "1"
+      - name: Save Zig cache
+        uses: ./.github/actions/save-zig-cache
+        with:
+          cache-key: ${{ steps.zig.outputs.cache-key }}
+          cache-hit: ${{ steps.zig.outputs.cache-hit }}
 
   e2e:
     name: E2E (deterministic)
     if: ${{ always() }}
-    needs: e2e_mode
+    needs: [e2e_mode, e2e_conformance]
     runs-on: ubuntu-latest
     steps:
-      - name: Require ReleaseSafe
+      - name: Require every shard and the conformance baseline
         env:
-          MATRIX_RESULT: ${{ needs.e2e_mode.result }}
-        run: test "$MATRIX_RESULT" = success
-
-  cross-target:
-    name: Cross-target Compile (${{ matrix.name }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: linux-x86_64
-            target: x86_64-linux
-          - name: linux-aarch64
-            target: aarch64-linux
-          - name: macos-x86_64
-            target: x86_64-macos
-          - name: macos-aarch64
-            target: aarch64-macos
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: "0.16.0"
-          cache-key: ci-cross-target-${{ matrix.name }}
-
-      - name: Build target
-        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
-
-      - name: Report binary size
+          SHARD_RESULT: ${{ needs.e2e_mode.result }}
+          CONFORMANCE_RESULT: ${{ needs.e2e_conformance.result }}
         run: |
-          bytes=$(stat -c%s zig-out/bin/fx)
-          mib=$(awk -v b="$bytes" 'BEGIN { printf "%.2f", b / 1048576 }')
-          echo "${{ matrix.name }}: $bytes bytes ($mib MiB)"
-          echo "${{ matrix.name }}: $bytes bytes ($mib MiB)" >> "$GITHUB_STEP_SUMMARY"
+          test "$SHARD_RESULT" = success
+          test "$CONFORMANCE_RESULT" = success
 
   lint-scripts:
     name: Shellcheck
@@ -478,29 +626,32 @@ jobs:
             benchmarks/startup.sh
             scripts/check-compactor-boundary.sh
             scripts/check-public-surface.sh
+            scripts/detect-macos-need.sh
+            scripts/smoke-binary.sh
+            tests/e2e/ci-run-files.sh
           )
-          bash -n "${scripts[@]}"
+          # bash -n parses only its first argument, so check each script.
+          for script in "${scripts[@]}"; do
+            bash -n "$script"
+          done
           shellcheck "${scripts[@]}"
 
-  e2e_acp_full_mode:
-    name: E2E ACP (full, ${{ matrix.optimize }})
+  e2e_acp_live:
+    name: E2E ACP (live models)
+    if: github.event_name == 'workflow_dispatch' && inputs.acp_live
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    strategy:
-      fail-fast: false
-      matrix:
-        optimize: [ReleaseSafe]
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        id: zig
+        uses: ./.github/actions/setup-zig
         with:
           version: "0.16.0"
-          cache-key: ci-acp-full-${{ matrix.optimize }}
+          cache-key: ci-unit-ReleaseSafe
 
       - name: Build
-        run: zig build -Doptimize=${{ matrix.optimize }}
+        run: zig build -Doptimize=ReleaseSafe
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -516,14 +667,3 @@ jobs:
         working-directory: tests/e2e
         env:
           AI_GATEWAY_API_KEY: ${{ secrets.AI_GATEWAY_API_KEY }}
-
-  e2e-acp-full:
-    name: E2E ACP (full)
-    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-    needs: e2e_acp_full_mode
-    runs-on: ubuntu-latest
-    steps:
-      - name: Require ReleaseSafe
-        env:
-          MATRIX_RESULT: ${{ needs.e2e_acp_full_mode.result }}
-        run: test "$MATRIX_RESULT" = success

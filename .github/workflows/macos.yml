@@ -1,0 +1,218 @@
+name: macOS
+
+# Linux CI covers everything that behaves the same on every platform. These
+# checks run only for changes that can behave differently on macOS; see
+# scripts/detect-macos-need.sh. Add the ci:macos label or dispatch this
+# workflow to request them for any other change.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      sdk_native:
+        description: Also build and load the libfx Node-API addon
+        type: boolean
+        default: false
+
+concurrency:
+  group: macos-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    name: Detect macOS need
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      needed: ${{ steps.detect.outputs.needed }}
+      sdk_native: ${{ steps.detect.outputs.sdk_native }}
+    steps:
+      # A dispatch diffs the branch against main, so it runs at least the checks
+      # its pull request run would.
+      - uses: actions/checkout@v4
+        with:
+          # 0 is falsy in expressions, so the dispatch case must come last.
+          fetch-depth: ${{ github.event_name != 'workflow_dispatch' && 2 || 0 }}
+
+      - name: Decide whether this change needs macOS
+        id: detect
+        env:
+          MACOS_REQUESTED: ${{ github.event_name == 'workflow_dispatch' && 'manual dispatch' || (contains(github.event.pull_request.labels.*.name, 'ci:macos') && 'ci:macos label' || '') }}
+          SDK_NATIVE_REQUESTED: ${{ github.event_name == 'workflow_dispatch' && inputs.sdk_native || false }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            base="$(git merge-base origin/main HEAD)"
+            scripts/detect-macos-need.sh "$base" HEAD
+          else
+            # The pull request merge commit's first parent is the base branch.
+            scripts/detect-macos-need.sh HEAD^1 HEAD
+          fi
+
+  unit:
+    name: macOS arm64 unit tests
+    needs: detect
+    if: needs.detect.outputs.needed == 'true'
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      AI_GATEWAY_API_KEY: ""
+      VERCEL_OIDC_TOKEN: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+          use-cache: false
+
+      - name: Test signing and release routing
+        run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos -q
+
+      - name: Run unit tests
+        run: zig build test -Doptimize=ReleaseSafe
+
+  build:
+    name: macOS arm64 build
+    needs: detect
+    if: needs.detect.outputs.needed == 'true'
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      AI_GATEWAY_API_KEY: ""
+      VERCEL_OIDC_TOKEN: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+          use-cache: false
+
+      # Both E2E shards run this binary on other runners, so build for the
+      # baseline CPU rather than the build runner's.
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe -Dcpu=baseline
+
+      - name: Smoke test fresh binary
+        run: scripts/smoke-binary.sh zig-out/bin/fx
+
+      - name: Share the binary with the E2E shards
+        uses: actions/upload-artifact@v4
+        with:
+          name: fx-macos-arm64
+          path: zig-out/bin/fx
+          retention-days: 1
+          if-no-files-found: error
+
+  e2e:
+    name: macOS arm64 platform E2E (shard ${{ matrix.shard.label }})
+    needs: [detect, build]
+    if: needs.detect.outputs.needed == 'true'
+    runs-on: macos-15
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - index: 0
+            label: "1/2"
+          - index: 1
+            label: "2/2"
+    env:
+      AI_GATEWAY_API_KEY: ""
+      VERCEL_OIDC_TOKEN: ""
+      FX_REQUIRE_TMUX: "1"
+      SHARD_INDEX: ${{ matrix.shard.index }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download the shared binary
+        uses: actions/download-artifact@v4
+        with:
+          name: fx-macos-arm64
+          path: zig-out/bin
+
+      - name: Restore the executable bit
+        run: chmod +x zig-out/bin/fx
+
+      # Some E2E fixtures build small Zig helpers.
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+          use-cache: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+
+      - name: Install E2E system dependencies
+        run: |
+          command -v tmux >/dev/null 2>&1 || brew install tmux
+          printf 'set-option -g history-limit 100000\n' > "$HOME/.tmux.conf"
+          tmux -V
+          zsh --version
+
+      - name: Install E2E dependencies
+        run: bun install --frozen-lockfile
+        working-directory: tests/e2e
+
+      - name: Run this shard of the macOS platform E2E files
+        working-directory: tests/e2e
+        shell: bash
+        run: |
+          bun ci-shards.ts --shard-count 2 --shard-index "$SHARD_INDEX" \
+            --only macos-platform-tests.json > "$RUNNER_TEMP/fx-macos-shard.txt"
+          files=()
+          while IFS= read -r test_file; do
+            files+=("$test_file")
+          done < "$RUNNER_TEMP/fx-macos-shard.txt"
+          test "${#files[@]}" -gt 0
+          printf 'Running %s macOS platform E2E files:\n' "${#files[@]}"
+          printf '  %s\n' "${files[@]}"
+          ./ci-run-files.sh "${files[@]}"
+
+      - name: Setup Node
+        if: needs.detect.outputs.sdk_native == 'true' && matrix.shard.index == 0
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Build and load the native SDK addon
+        if: needs.detect.outputs.sdk_native == 'true' && matrix.shard.index == 0
+        run: |
+          zig build libfx-napi -Dnapi-surface=core -Doptimize=ReleaseSafe
+          npm run --prefix sdk test:node-napi
+
+  macos:
+    name: macOS arm64
+    if: ${{ always() }}
+    needs: [detect, unit, build, e2e]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require macOS results when the change needs them
+        env:
+          DETECT_RESULT: ${{ needs.detect.result }}
+          NEEDED: ${{ needs.detect.outputs.needed }}
+          UNIT_RESULT: ${{ needs.unit.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          E2E_RESULT: ${{ needs.e2e.result }}
+        run: |
+          test "$DETECT_RESULT" = success
+          if [ "$NEEDED" != true ]; then
+            echo "No macOS-specific change; nothing to require."
+            exit 0
+          fi
+          test "$UNIT_RESULT" = success
+          test "$BUILD_RESULT" = success
+          test "$E2E_RESULT" = success

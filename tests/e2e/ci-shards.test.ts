@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildShardPlan, selectShard } from "./ci-shards";
+import { buildShardPlan, restrictToFiles, selectShard } from "./ci-shards";
 
 const files = ["a.test.ts", "b.test.ts", "c.test.ts", "d.test.ts"];
 
@@ -129,5 +129,54 @@ describe("CI shard planner", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("macOS platform E2E list", () => {
+  const listed: unknown = JSON.parse(
+    readFileSync(join(import.meta.dir, "macos-platform-tests.json"), "utf8"),
+  );
+  const rootTests = readdirSync(import.meta.dir).filter((name) => name.endsWith(".test.ts"));
+
+  test("names existing root E2E files once, in sorted order", () => {
+    expect(Array.isArray(listed)).toBe(true);
+    const names = listed as string[];
+    expect(names.length).toBeGreaterThan(0);
+    for (const name of names) expect(rootTests).toContain(name);
+    expect(names).toEqual([...new Set(names)].sort());
+  });
+
+  test("includes every E2E file that branches on the platform", () => {
+    const platformBranch = /\bplatform(\(\))?\s*[!=]==\s*["'](darwin|linux)["']/;
+    const missing = rootTests.filter((name) =>
+      platformBranch.test(readFileSync(join(import.meta.dir, name), "utf8")) &&
+      !(listed as string[]).includes(name)
+    );
+    expect(missing).toEqual([]);
+  });
+
+  test("plans the listed files with their checked-in weights", () => {
+    const manifest = [
+      { file: "a.test.ts", weight: 9 },
+      { file: "b.test.ts", weight: 7 },
+      { file: "c.test.ts", weight: 5 },
+      { file: "d.test.ts", weight: 3 },
+    ];
+
+    const restricted = restrictToFiles(files, manifest, ["d.test.ts", "b.test.ts", "c.test.ts"]);
+    const plan = buildShardPlan(restricted.files, restricted.manifest, 2);
+
+    expect(plan).toEqual({
+      shards: [["b.test.ts"], ["c.test.ts", "d.test.ts"]],
+      totals: [7, 8],
+    });
+  });
+
+  test("rejects empty, unknown, and duplicate listed files", () => {
+    const manifest = files.map((file) => ({ file, weight: 1 }));
+
+    expect(() => restrictToFiles(files, manifest, [])).toThrow("non-empty array");
+    expect(() => restrictToFiles(files, manifest, ["z.test.ts"])).toThrow("not a discovered test");
+    expect(() => restrictToFiles(files, manifest, ["a.test.ts", "a.test.ts"])).toThrow("duplicate");
   });
 });

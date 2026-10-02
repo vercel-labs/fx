@@ -1,0 +1,20 @@
+[
+  "cli.test.ts",
+  "file-tool-permissions.test.ts",
+  "gateway-stream-lifecycle.test.ts",
+  "mcp-auth.test.ts",
+  "oauth-keychain-migration.test.ts",
+  "sessions-v2.test.ts",
+  "terminal-host.test.ts",
+  "tui-auth-source-selection.test.ts",
+  "tui-command-permissions.test.ts",
+  "tui-full-transcript-brutal.test.ts",
+  "tui-interrupt-recovery.test.ts",
+  "tui-performance.test.ts",
+  "tui-resume-brutal.test.ts",
+  "tui-resume.test.ts",
+  "tui-slash-extra.test.ts",
+  "tui-terminal-tool.test.ts",
+  "vision-route-fake-gateway.test.ts",
+  "yolo-permission-mode.test.ts"
+]
