@@ -37,6 +37,7 @@ pub fn snapshotServerHealthBeforeDiscoveryPublication(
         authentication,
         server.config.name,
         null,
+        null,
     );
     return .{
         .configured_name = configured_name,
@@ -111,6 +112,7 @@ pub fn snapshotServerHealth(
         authentication,
         server.config.name,
         server.last_error,
+        server.refresh_failure,
     );
     errdefer if (failure) |value| mem_utils.free(alloc, value);
     return .{
@@ -240,6 +242,7 @@ pub fn healthFailureForState(
     authentication: health.AuthenticationState,
     name: []const u8,
     last_error: ?[]const u8,
+    refresh_failure: ?@import("mcp_auth.zig").RefreshFailure,
 ) Allocator.Error!?[]u8 {
     switch (health.classify(connection, authentication, false)) {
         .disabled => {
@@ -251,6 +254,14 @@ pub fn healthFailureForState(
         .needs_auth => {
             const safe_name = try terminalSafeOwned(alloc, name, 256);
             defer alloc.free(safe_name);
+            if (refresh_failure) |failure| {
+                var reason: [256]u8 = undefined;
+                return @as(?[]u8, try std.fmt.allocPrint(
+                    alloc,
+                    "{s} Run /mcp auth {s} --open.",
+                    .{ failure.diagnostics.failure_message(&reason, failure.err), safe_name },
+                ));
+            }
             return @as(?[]u8, try std.fmt.allocPrint(
                 alloc,
                 "Authentication is required or the saved credentials lack access; run /mcp auth {s} --open and check server permissions.",

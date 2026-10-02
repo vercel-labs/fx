@@ -58,6 +58,12 @@ fx ask "explain the changes in this repository"
 
 Inside the shell, run `/help` to browse interactive commands.
 
+If an MCP server fails to connect, run `/mcp list` for details. Credential refresh
+failures include the error name, request or response stage, HTTP status when
+available, and recognized OAuth error code. `/trace` includes the same failure
+details even when `FX_TRACE` is off. Refresh diagnostics omit response bodies,
+error descriptions, and credentials.
+
 In tmux, use your usual prefix bindings to switch sessions or enter copy mode.
 fx preserves those tmux views while resizing, including when the switcher zooms a split pane.
 

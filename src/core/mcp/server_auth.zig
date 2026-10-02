@@ -317,14 +317,20 @@ pub fn refreshSharedCredentials(
         return error.McpAuthenticationRequired;
     }
 
+    var diagnostics: mcp_auth.RefreshDiagnostics = .{};
     var refreshed = mcp_auth.refreshCredentials(alloc, source.credentials, .{
         .deadline = control.deadline,
         .cancel_flag = control.cancel_flag,
         .lifecycle_cancel_flag = control.lifecycle_cancel_flag,
+        .diagnostics = &diagnostics,
     }) catch |err| {
         if (err == error.Cancelled or err == error.McpRequestTimedOut) return err;
         var auth_message: [512]u8 = undefined;
-        server.setFailed(alloc, authRecoveryMessage(&auth_message, "MCP credential refresh failed.", server.config.name));
+        var reason: [256]u8 = undefined;
+        server.set_refresh_failed(alloc, authRecoveryMessage(&auth_message, diagnostics.failure_message(&reason, err), server.config.name), .{
+            .diagnostics = diagnostics,
+            .err = err,
+        });
         if (err == error.McpRefreshRejected) markReauthenticationRequired(server, source.generation);
         return err;
     };

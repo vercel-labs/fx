@@ -115,6 +115,7 @@ pub const Server = struct {
     reload_pending: std.atomic.Value(bool) = .init(false),
     state: atomic_value.Value(ServerState) = .init(.disconnected),
     last_error: ?[]u8 = null,
+    refresh_failure: ?mcp_auth.RefreshFailure = null,
     /// Counts setFailed calls so a caller can tell whether a failure was
     /// recorded after it read the count. Guarded by status_lock.
     failure_serial: u64 = 0,
@@ -252,10 +253,19 @@ pub const Server = struct {
     }
 
     pub fn setFailed(self: *Server, alloc: Allocator, msg: []const u8) void {
+        self.set_failure(alloc, msg, null);
+    }
+
+    pub fn set_refresh_failed(self: *Server, alloc: Allocator, msg: []const u8, failure: mcp_auth.RefreshFailure) void {
+        self.set_failure(alloc, msg, failure);
+    }
+
+    fn set_failure(self: *Server, alloc: Allocator, msg: []const u8, failure: ?mcp_auth.RefreshFailure) void {
         self.status_lock.lockUncancelable(io_mod.getIo());
         defer self.status_lock.unlock(io_mod.getIo());
         if (self.last_error) |old| alloc.free(old);
         self.last_error = alloc.dupe(u8, msg) catch null;
+        self.refresh_failure = failure;
         self.failure_serial +%= 1;
         self.state.store(.failed, .release);
     }
@@ -271,6 +281,7 @@ pub const Server = struct {
         defer self.status_lock.unlock(io_mod.getIo());
         if (self.last_error) |value| alloc.free(value);
         self.last_error = null;
+        self.refresh_failure = null;
         self.state.store(.ready, .release);
         self.last_successful_discovery_ms = observed_at_ms;
     }
@@ -423,6 +434,7 @@ pub fn detachConnection(server: *Server) DetachedConnection {
     server.resource_read_cache = .empty;
     server.state.store(.disconnected, .release);
     server.last_error = null;
+    server.refresh_failure = null;
     server.instructions = null;
     server.stdio_protocol = .unselected;
     server.negotiated_protocol_version = "";
@@ -506,6 +518,8 @@ pub fn publishConnection(server: *Server, connected: *Server) void {
     server.state.store(connected.state.load(.acquire), .release);
     server.last_error = connected.last_error;
     connected.last_error = null;
+    server.refresh_failure = connected.refresh_failure;
+    connected.refresh_failure = null;
     server.instructions = connected.instructions;
     connected.instructions = null;
     server.stdio_protocol = connected.stdio_protocol;

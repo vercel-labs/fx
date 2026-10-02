@@ -862,7 +862,7 @@ pub const McpRuntime = struct {
                         .disabled => .disabled,
                         .ready => .ready,
                         .failed => .failed,
-                    }, serverAuthenticationState(server), server.config.name, server.last_error);
+                    }, serverAuthenticationState(server), server.config.name, server.last_error, server.refresh_failure);
                     defer if (failure) |message| self.alloc.free(message);
                     return try std.fmt.allocPrint(self.alloc, "Required MCP server '{s}' failed to start: {s}", .{ safe_name, failure orelse "Check the trusted profile configuration and retry." });
                 }
@@ -7664,15 +7664,43 @@ test "MCP authentication guidance requires an observed challenge" {
 
 test "MCP authentication failure text names the server" {
     const alloc = std.testing.allocator;
-    const output = (try healthFailureForState(alloc, false, .failed, .required, "linear", null)).?;
+    const output = (try healthFailureForState(alloc, false, .failed, .required, "linear", null, null)).?;
     defer alloc.free(output);
     try std.testing.expect(std.mem.find(u8, output, "/mcp auth linear --open") != null);
     try std.testing.expect(std.mem.find(u8, output, "<name>") == null);
 }
 
+test "refresh diagnostics survive authentication classification without raw server errors" {
+    const alloc = std.testing.allocator;
+    const output = (try healthFailureForState(alloc, false, .failed, .required, "fixture", "raw-server-secret", .{
+        .diagnostics = .{ .stage = .response, .http_status = .bad_request, .oauth_error = .invalid_grant },
+        .err = error.McpRefreshRejected,
+    })).?;
+    defer alloc.free(output);
+    try std.testing.expectEqualStrings(
+        "MCP credential refresh failed (McpRefreshRejected; stage=response; HTTP 400; OAuth invalid_grant). Run /mcp auth fixture --open.",
+        output,
+    );
+}
+
+test "refresh diagnostics clear when a server recovers or another failure replaces them" {
+    const alloc = std.testing.allocator;
+    var server: McpServer = .{ .config = .{ .name = @constCast("fixture") } };
+    defer if (server.last_error) |message| alloc.free(message);
+    const failure: mcp_auth.RefreshFailure = .{ .diagnostics = .{}, .err = error.ConnectionRefused };
+    server.set_refresh_failed(alloc, "refresh failed", failure);
+    try std.testing.expect(server.refresh_failure != null);
+    server.setFailed(alloc, "different failure");
+    try std.testing.expect(server.refresh_failure == null);
+    server.set_refresh_failed(alloc, "refresh failed", failure);
+    server.setReady(alloc, 123);
+    try std.testing.expect(server.refresh_failure == null);
+    try std.testing.expect(server.last_error == null);
+}
+
 test "MCP connection diagnostics retain the cause and mask sensitive values" {
     const alloc = std.testing.allocator;
-    const output = (try healthFailureForState(alloc, false, .failed, .configured, "docs", "HTTP 500 TOKEN=example-secret")).?;
+    const output = (try healthFailureForState(alloc, false, .failed, .configured, "docs", "HTTP 500 TOKEN=example-secret", null)).?;
     defer alloc.free(output);
     try std.testing.expect(std.mem.find(u8, output, "HTTP 500") != null);
     try std.testing.expect(std.mem.find(u8, output, "example-secret") == null);

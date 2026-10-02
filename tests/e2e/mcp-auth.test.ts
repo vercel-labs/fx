@@ -195,6 +195,7 @@ function startAuthFixture(
   options: {
     wrongState?: boolean;
     rejectRefresh?: boolean;
+    refreshResponse?: { status: number; body: string };
     authorizationMetadataContentType?: string;
     transport?: "http" | "sse";
     rejectToolAuth?: boolean;
@@ -523,6 +524,12 @@ function startAuthFixture(
               }),
               { headers: { "content-type": "application/json" } },
             );
+          }
+          if (options.refreshResponse) {
+            return new Response(options.refreshResponse.body, {
+              status: options.refreshResponse.status,
+              headers: { "content-type": "application/json" },
+            });
           }
           if (options.rejectRefresh) {
             return Response.json(
@@ -4087,6 +4094,125 @@ describe("MCP remote authentication lifecycle", () => {
     },
     30_000,
   );
+
+  for (const scenario of [
+    {
+      name: "terminal rejection",
+      status: 400,
+      body: JSON.stringify({ error: "invalid_grant", error_description: REFRESH_INITIAL, access_token: ACCESS_INITIAL }),
+      expected: "McpRefreshRejected; stage=response; HTTP 400; OAuth invalid_grant",
+    },
+    {
+      name: "transient failure",
+      status: 503,
+      body: JSON.stringify({ error: "server_error", error_description: REFRESH_INITIAL }),
+      expected: "McpRefreshUnavailable; stage=response; HTTP 503; OAuth server_error",
+    },
+    {
+      name: "unrecognized OAuth code",
+      status: 400,
+      body: JSON.stringify({ error: REFRESH_INITIAL, error_description: ACCESS_INITIAL }),
+      expected: "McpRefreshUnavailable; stage=response; HTTP 400",
+    },
+    {
+      name: "invalid token response",
+      status: 200,
+      body: JSON.stringify({ token_type: "Bearer", error_description: REFRESH_INITIAL }),
+      expected: "InvalidOAuthResponse; stage=response; HTTP 200",
+    },
+    {
+      name: "OAuth error in an HTTP 200 response",
+      status: 200,
+      body: JSON.stringify({ error: "invalid_grant", error_description: REFRESH_INITIAL }),
+      expected: "InvalidOAuthResponse; stage=response; HTTP 200; OAuth invalid_grant",
+    },
+    {
+      name: "oversized response",
+      status: 503,
+      body: JSON.stringify({ error: "server_error", error_description: REFRESH_INITIAL, padding: "x".repeat(256 * 1024) }),
+      expected: "McpAuthDocumentTooLarge; stage=response; HTTP 503",
+    },
+  ]) test(`MCP refresh diagnostics preserve ${scenario.name} without response secrets`, async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { refreshResponse: scenario });
+    const root = createRoot(auth);
+    seedExpiredCredentials(root, auth);
+    const result = await runFx(["mcp", "list", "--connect"], {
+      cwd: root.workspace,
+      env: baseEnv(root),
+      timeoutMs: 15_000,
+    });
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toContain(scenario.expected);
+    expect(result.stdout).toContain("Run /mcp auth fixture --open.");
+    for (const secret of [ACCESS_INITIAL, REFRESH_INITIAL]) {
+      expect(result.stdout).not.toContain(secret);
+      expect(readFileSync(root.trace, "utf8")).not.toContain(secret);
+    }
+    expect(auth.refreshes).toBe(1);
+    expect(upstream.requests).toHaveLength(0);
+  }, 20_000);
+
+  test("MCP refresh diagnostics identify request failures before a response", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const credentialPath = seedExpiredCredentials(root, auth);
+    const saved = JSON.parse(readFileSync(credentialPath, "utf8"));
+    saved.credentials[0].token_endpoint = `http://127.0.0.1:${unusedCallbackPort()}/token`;
+    writeFileSync(credentialPath, JSON.stringify(saved), { mode: 0o600 });
+    const result = await runFx(["mcp", "list", "--connect"], {
+      cwd: root.workspace,
+      env: baseEnv(root),
+      timeoutMs: 15_000,
+    });
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toContain("ConnectionRefused; stage=request");
+    expect(result.stdout).not.toContain("; HTTP");
+    expect(auth.refreshes).toBe(0);
+    expect(upstream.requests).toHaveLength(0);
+  }, 20_000);
+
+  test.skipIf(!tmuxAvailable())("MCP refresh diagnostics appear in trace reports with FX_TRACE off", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, {
+      refreshResponse: {
+        status: 400,
+        body: JSON.stringify({ error: "invalid_grant", error_description: REFRESH_INITIAL, access_token: ACCESS_INITIAL }),
+      },
+    });
+    const root = createRoot(auth);
+    seedExpiredCredentials(root, auth);
+    for (const name of ["osascript", "pbcopy", "xclip", "wl-copy"]) {
+      const path = join(root.bin, name);
+      writeFileSync(path, "#!/bin/sh\nexit 1\n");
+      chmodSync(path, 0o700);
+    }
+    tui = await TmuxSession.create({
+      cmd: FX_BIN,
+      cwd: root.workspace,
+      env: { ...baseEnv(root), TMPDIR: root.root, FX_TRACE: "0", FX_TRACE_LOG: undefined },
+      stderrPath: root.stderr,
+      width: 120,
+      height: 35,
+    });
+    await tui.waitForText("MCP startup:", 15_000);
+    await tui.waitForComposer(15_000);
+    await tui.sendText("/trace");
+    await tui.waitForText("Trace saved at", 10_000);
+    const reportName = readdirSync(root.root).find((name) => name.startsWith("fx-trace-") && name.endsWith(".md"));
+    expect(reportName).toBeDefined();
+    const report = readFileSync(join(root.root, reportName!), "utf8");
+    expect(report).toContain("FX_TRACE: off");
+    expect(report).toContain("McpRefreshRejected; stage=response; HTTP 400; OAuth invalid_grant");
+    for (const secret of [ACCESS_INITIAL, REFRESH_INITIAL]) expect(report).not.toContain(secret);
+    expect(readFileSync(root.stderr, "utf8")).toBe("");
+    expect(tui.paneStatus().dead).toBe(false);
+    await tui.sendText("/quit");
+    expect(await tui.waitForSessionEnd()).toBe(true);
+  }, 45_000);
 
   test(
     "expired refresh rejection does not send or replay an MCP operation",

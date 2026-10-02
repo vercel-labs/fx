@@ -26,6 +26,7 @@ pub const RefreshControl = struct {
     deadline: std.Io.Clock.Timestamp,
     cancel_flag: ?*std.atomic.Value(bool) = null,
     lifecycle_cancel_flag: ?*const std.atomic.Value(bool) = null,
+    diagnostics: ?*RefreshDiagnostics = null,
 
     pub fn cancellation(self: RefreshControl) operation_control.CancellationSources {
         return .{
@@ -33,6 +34,56 @@ pub const RefreshControl = struct {
             .runtime = self.lifecycle_cancel_flag,
         };
     }
+};
+
+pub const RefreshDiagnostics = struct {
+    const OAuthError = enum {
+        invalid_request,
+        invalid_client,
+        invalid_grant,
+        unauthorized_client,
+        unsupported_grant_type,
+        invalid_scope,
+        invalid_target,
+        access_denied,
+        server_error,
+        temporarily_unavailable,
+    };
+
+    stage: enum { request, response } = .request,
+    http_status: ?std.http.Status = null,
+    oauth_error: ?OAuthError = null,
+
+    fn capture_response(self: *RefreshDiagnostics, alloc: Allocator, response: HttpResponse) void {
+        self.stage = .response;
+        self.http_status = response.status;
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, response.body, .{}) catch return;
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+        const value = parsed.value.object.get("error") orelse return;
+        if (value != .string) return;
+        self.oauth_error = std.meta.stringToEnum(OAuthError, value.string);
+    }
+
+    pub fn failure_message(self: RefreshDiagnostics, buffer: []u8, err: anyerror) []const u8 {
+        var writer: std.Io.Writer = .fixed(buffer);
+        writer.print("MCP credential refresh failed ({s}; stage={s}", .{
+            @errorName(err), @tagName(self.stage),
+        }) catch return @errorName(err);
+        if (self.http_status) |status| {
+            writer.print("; HTTP {d}", .{@intFromEnum(status)}) catch return @errorName(err);
+        }
+        if (self.oauth_error) |code| {
+            writer.print("; OAuth {s}", .{@tagName(code)}) catch return @errorName(err);
+        }
+        writer.writeAll(").") catch return @errorName(err);
+        return writer.buffered();
+    }
+};
+
+pub const RefreshFailure = struct {
+    diagnostics: RefreshDiagnostics,
+    err: anyerror,
 };
 
 pub const Challenge = struct {
@@ -830,6 +881,7 @@ pub fn refreshCredentials(
     credentials: Credentials,
     control: RefreshControl,
 ) !Credentials {
+    if (control.diagnostics) |diagnostics| diagnostics.* = .{};
     const cancellation = control.cancellation();
     if (cancellation.cancelled()) return error.Cancelled;
     const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
@@ -840,9 +892,10 @@ pub fn refreshCredentials(
     const Operation = struct {
         alloc: Allocator,
         credentials: Credentials,
+        diagnostics: ?*RefreshDiagnostics,
 
         fn run(self: @This()) anyerror!Credentials {
-            return refreshCredentialsCore(self.alloc, self.credentials);
+            return refreshCredentialsCore(self.alloc, self.credentials, self.diagnostics);
         }
     };
     const Event = union(enum) {
@@ -873,6 +926,7 @@ pub fn refreshCredentials(
     select.concurrent(.refresh, Operation.run, .{Operation{
         .alloc = alloc,
         .credentials = credentials,
+        .diagnostics = control.diagnostics,
     }}) catch |err| {
         select.cancelDiscard();
         return err;
@@ -915,6 +969,7 @@ pub fn refreshCredentials(
 fn refreshCredentialsCore(
     alloc: Allocator,
     credentials: Credentials,
+    diagnostics: ?*RefreshDiagnostics,
 ) !Credentials {
     const refresh_token = credentials.refresh_token orelse
         return error.McpRefreshTokenMissing;
@@ -944,8 +999,10 @@ fn refreshCredentialsCore(
         form_writer.written(),
         "application/x-www-form-urlencoded",
         auth.headers(),
+        diagnostics,
     );
     defer response.deinit(alloc);
+    if (diagnostics) |value| value.capture_response(alloc, response);
     if (response.status != .ok) {
         // Only OAuth's terminal grant rejection means re-authenticate; a 429
         // or 5xx from the token endpoint is transient and retries as-is.
@@ -1280,7 +1337,7 @@ fn slack_bridge_config(alloc: Allocator, endpoint: []const u8, client_config: Cl
     if (!std.mem.eql(u8, endpoint, resource)) return null;
     const url = try std.fmt.allocPrint(alloc, "{s}/api/slack/install/config?flow=auth", .{origin});
     defer alloc.free(url);
-    var response = try request(alloc, .GET, url, null, null, &.{});
+    var response = try request(alloc, .GET, url, null, null, &.{}, null);
     defer response.deinit(alloc);
     if (response.status != .ok) return error.SlackBridgeUnavailable;
     try validateJsonContentType(response.content_type);
@@ -1522,6 +1579,7 @@ fn requestAutomatedAuthorization(
         null,
         null,
         &.{},
+        null,
     );
     defer response.deinit(alloc);
     if (response.status.class() != .redirect) {
@@ -1820,7 +1878,7 @@ fn discoverResourceMetadata(
 ) !ResourceMetadata {
     if (challenged_url) |url| {
         try validateOAuthUrlForResource(url, resource);
-        var response = try request(alloc, .GET, url, null, null, &.{});
+        var response = try request(alloc, .GET, url, null, null, &.{}, null);
         defer response.deinit(alloc);
         if (response.status != .ok) return error.ProtectedResourceMetadataUnavailable;
         try validateJsonContentType(response.content_type);
@@ -1830,7 +1888,7 @@ fn discoverResourceMetadata(
     const urls = try protectedResourceMetadataUrls(alloc, resource);
     defer freeStrings(alloc, urls);
     for (urls) |url| {
-        var response = request(alloc, .GET, url, null, null, &.{}) catch continue;
+        var response = request(alloc, .GET, url, null, null, &.{}, null) catch continue;
         defer response.deinit(alloc);
         if (response.status != .ok) continue;
         try validateJsonContentType(response.content_type);
@@ -1846,7 +1904,7 @@ fn discoverAuthorizationMetadata(
     const urls = try authorizationMetadataUrls(alloc, issuer);
     defer freeStrings(alloc, urls);
     for (urls) |url| {
-        var response = request(alloc, .GET, url, null, null, &.{}) catch continue;
+        var response = request(alloc, .GET, url, null, null, &.{}, null) catch continue;
         defer response.deinit(alloc);
         if (response.status != .ok) continue;
         try validateJsonContentType(response.content_type);
@@ -1922,6 +1980,7 @@ fn resolveClientRegistration(
         payload.written(),
         "application/json",
         &.{},
+        null,
     );
     defer response.deinit(alloc);
     if (response.status != .created and response.status != .ok) {
@@ -2114,6 +2173,7 @@ fn exchangeAuthorizationCode(
         form_writer.written(),
         "application/x-www-form-urlencoded",
         auth.headers(),
+        null,
     );
     defer response.deinit(alloc);
     if (response.status != .ok) return error.TokenExchangeFailed;
@@ -2194,6 +2254,7 @@ fn revokeToken(
         form_writer.written(),
         "application/x-www-form-urlencoded",
         auth.headers(),
+        null,
     );
     defer response.deinit(alloc);
     if (response.status != .ok) return error.TokenRevocationFailed;
@@ -2206,6 +2267,7 @@ fn request(
     payload: ?[]const u8,
     content_type: ?[]const u8,
     extra_headers: []const std.http.Header,
+    diagnostics: ?*RefreshDiagnostics,
 ) !HttpResponse {
     const uri = std.Uri.parse(url) catch return error.InvalidMcpAuthEndpoint;
     if (!isSecureOrLoopback(uri) or uri.user != null or
@@ -2239,6 +2301,10 @@ fn request(
         try http_request.sendBodiless();
     }
     var response = try http_request.receiveHead(&.{});
+    if (diagnostics) |value| {
+        value.stage = .response;
+        value.http_status = response.head.status;
+    }
     const location = if (response.head.location) |value|
         try alloc.dupe(u8, value)
     else
@@ -3088,6 +3154,70 @@ test "interactive callback wait observes caller and lifecycle cancellation" {
         );
         try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
     }
+}
+
+test "refresh diagnostics retain only recognized OAuth codes from untrusted responses" {
+    const cases = [_]struct { body: []const u8, code: ?RefreshDiagnostics.OAuthError }{
+        .{ .body = "{\"error\":\"invalid_grant\",\"error_description\":\"refresh-token-secret\",\"access_token\":\"access-token-secret\"}", .code = .invalid_grant },
+        .{ .body = "{\"error\":\"server_error\"}", .code = .server_error },
+        .{ .body = "{\"error\":\"refresh-token-secret\\u001b[2J\"}", .code = null },
+        .{ .body = "{\"error\":123}", .code = null },
+        .{ .body = "{\"error_description\":\"refresh-token-secret\"}", .code = null },
+        .{ .body = "[\"refresh-token-secret\"]", .code = null },
+        .{ .body = "not JSON: refresh-token-secret", .code = null },
+    };
+    for (cases) |case| {
+        var diagnostics: RefreshDiagnostics = .{};
+        diagnostics.capture_response(std.testing.allocator, .{
+            .status = .bad_request,
+            .body = @constCast(case.body),
+            .location = null,
+            .content_type = null,
+        });
+        try std.testing.expectEqual(.response, diagnostics.stage);
+        try std.testing.expectEqual(std.http.Status.bad_request, diagnostics.http_status.?);
+        try std.testing.expectEqual(case.code, diagnostics.oauth_error);
+        var buffer: [256]u8 = undefined;
+        const message = diagnostics.failure_message(&buffer, error.McpRefreshRejected);
+        try std.testing.expect(std.mem.find(u8, message, "HTTP 400") != null);
+        try std.testing.expect(std.mem.find(u8, message, "secret") == null);
+        try std.testing.expect(std.mem.findScalar(u8, message, 0x1b) == null);
+    }
+}
+
+test "refresh diagnostics distinguish request failures from response parsing failures" {
+    var buffer: [256]u8 = undefined;
+    var diagnostics: RefreshDiagnostics = .{};
+    try std.testing.expectEqualStrings(
+        "MCP credential refresh failed (ConnectionRefused; stage=request).",
+        diagnostics.failure_message(&buffer, error.ConnectionRefused),
+    );
+    diagnostics.capture_response(std.testing.allocator, .{
+        .status = .ok,
+        .body = @constCast("not JSON"),
+        .location = null,
+        .content_type = null,
+    });
+    try std.testing.expectEqualStrings(
+        "MCP credential refresh failed (InvalidTokenResponse; stage=response; HTTP 200).",
+        diagnostics.failure_message(&buffer, error.InvalidTokenResponse),
+    );
+    diagnostics = .{ .stage = .response, .http_status = .bad_request, .oauth_error = .invalid_grant };
+    try std.testing.expectEqualStrings(
+        "MCP credential refresh failed (McpRefreshRejected; stage=response; HTTP 400; OAuth invalid_grant).",
+        diagnostics.failure_message(&buffer, error.McpRefreshRejected),
+    );
+    diagnostics = .{};
+    diagnostics.capture_response(std.testing.allocator, .{
+        .status = .ok,
+        .body = @constCast("{\"error\":\"invalid_grant\"}"),
+        .location = null,
+        .content_type = null,
+    });
+    try std.testing.expectEqualStrings(
+        "MCP credential refresh failed (InvalidOAuthResponse; stage=response; HTTP 200; OAuth invalid_grant).",
+        diagnostics.failure_message(&buffer, error.InvalidOAuthResponse),
+    );
 }
 
 test "refresh rejection is final only for invalid_grant" {
