@@ -901,10 +901,19 @@ pub const Reducer = struct {
             .output_tokens = try token_count(fields, "completion_tokens"),
         };
         const incoming_total = try token_count(fields, "total_tokens");
-        const usage = types.Usage{
+        var usage = types.Usage{
             .input_tokens = incoming.input_tokens orelse self.usage.input_tokens,
             .output_tokens = incoming.output_tokens orelse self.usage.output_tokens,
+            .cache_read_tokens = cache_read_count(fields) orelse self.usage.cache_read_tokens,
         };
+        // Cache reads are a subset of prompt_tokens. A breakdown that exceeds
+        // the prompt total is provider metadata fx cannot trust, not a stream
+        // failure, so it is dropped instead of rejecting the response.
+        if (usage.cache_read_tokens) |cached| {
+            if (usage.input_tokens) |input| if (cached > input) {
+                usage.cache_read_tokens = null;
+            };
+        }
         const total = incoming_total orelse self.usage_total;
         var final_fields = self.usage_final_fields;
         if (final) {
@@ -1031,6 +1040,23 @@ fn token_count(fields: std.json.ObjectMap, key: []const u8) Error!?u64 {
     return std.math.cast(u64, try integer(value)) orelse error.InvalidChunk;
 }
 
+/// Prompt-cache reads reported inside `usage`: OpenAI-compatible providers
+/// use `prompt_tokens_details.cached_tokens`; DeepSeek also reports
+/// `prompt_cache_hit_tokens`. Both count tokens already included in
+/// `prompt_tokens`. The breakdown is optional metadata, so a missing or
+/// malformed value yields null and never fails the stream.
+fn cache_read_count(fields: std.json.ObjectMap) ?u64 {
+    if (non_null(fields, "prompt_tokens_details")) |details| if (details == .object) {
+        if (optional_count(details.object, "cached_tokens")) |tokens| return tokens;
+    };
+    return optional_count(fields, "prompt_cache_hit_tokens");
+}
+
+fn optional_count(fields: std.json.ObjectMap, key: []const u8) ?u64 {
+    const value = non_null(fields, key) orelse return null;
+    return std.math.cast(u64, integer(value) catch return null);
+}
+
 fn append_bounded(alloc: Allocator, destination: *std.ArrayList(u8), text: []const u8, limit: usize, failure: Error) Error!void {
     if (text.len > limit - destination.items.len) return failure;
     try destination.appendSlice(alloc, text);
@@ -1154,6 +1180,57 @@ test "chat completions preserves structured reasoning sequence with opaque signa
     try std.testing.expectEqualStrings("opaque-signature", details[0].object.get("signature").?.string);
     try std.testing.expectEqualStrings("opaque-encrypted-data", details[1].object.get("data").?.string);
     try std.testing.expectEqualStrings("reasoning-1", details[1].object.get("id").?.string);
+}
+
+fn test_cache_read_tokens(usage: []const u8) !?u64 {
+    const alloc = std.testing.allocator;
+    var reducer = try Reducer.init(alloc, test_request(), .{});
+    defer reducer.deinit();
+    try test_accept(&reducer, test_text);
+    const terminal = try std.fmt.allocPrint(alloc, "{{\"choices\":[],\"usage\":{s}}}", .{usage});
+    defer alloc.free(terminal);
+    try test_accept(&reducer, test_stop);
+    try test_accept(&reducer, terminal);
+    try test_accept(&reducer, "[DONE]");
+    var result = try reducer.finish(false);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 100), result.completed.completion.usage.input_tokens);
+    return result.completed.completion.usage.cache_read_tokens;
+}
+
+test "chat completions usage reports prompt cache reads from either provider shape" {
+    // OpenAI-compatible details, DeepSeek hit/miss counters, and both at once.
+    try std.testing.expectEqual(@as(?u64, 80), try test_cache_read_tokens("{\"prompt_tokens\":100,\"completion_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":80}}"));
+    try std.testing.expectEqual(@as(?u64, 64), try test_cache_read_tokens("{\"prompt_tokens\":100,\"completion_tokens\":5,\"prompt_cache_hit_tokens\":64,\"prompt_cache_miss_tokens\":36}"));
+    try std.testing.expectEqual(@as(?u64, 90), try test_cache_read_tokens("{\"prompt_tokens\":100,\"completion_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":90},\"prompt_cache_hit_tokens\":90,\"prompt_cache_miss_tokens\":10}"));
+    try std.testing.expectEqual(@as(?u64, 0), try test_cache_read_tokens("{\"prompt_tokens\":100,\"completion_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":0}}"));
+}
+
+test "chat completions usage treats absent or untrustworthy cache reads as unreported" {
+    for ([_][]const u8{
+        "{\"prompt_tokens\":100,\"completion_tokens\":5}",
+        "{\"prompt_tokens\":100,\"completion_tokens\":5,\"prompt_tokens_details\":null}",
+        "{\"prompt_tokens\":100,\"completion_tokens\":5,\"prompt_tokens_details\":{\"audio_tokens\":0}}",
+        "{\"prompt_tokens\":100,\"completion_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":\"80\"}}",
+        "{\"prompt_tokens\":100,\"completion_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":-1}}",
+        "{\"prompt_tokens\":100,\"completion_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":101}}",
+        "{\"prompt_tokens\":100,\"completion_tokens\":5,\"prompt_cache_hit_tokens\":120}",
+    }) |usage| {
+        try std.testing.expectEqual(@as(?u64, null), try test_cache_read_tokens(usage));
+    }
+}
+
+test "chat completions carries progress cache reads into a final usage without a breakdown" {
+    const alloc = std.testing.allocator;
+    var reducer = try Reducer.init(alloc, test_request(), .{});
+    defer reducer.deinit();
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"prompt_tokens_details\":{\"cached_tokens\":8}}}");
+    try test_accept(&reducer, test_stop);
+    try test_accept(&reducer, "{\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3}}");
+    try test_accept(&reducer, "[DONE]");
+    var result = try reducer.finish(false);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 8), result.completed.completion.usage.cache_read_tokens);
 }
 
 test "chat completions cumulative usage advances to final counts without double counting" {
