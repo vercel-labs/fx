@@ -127,7 +127,9 @@ pub const Client = struct {
 };
 
 /// Registers before the notification provider freezes the lifecycle runtime.
-/// Only the interactive foreground worker receives the resume observer.
+/// The shared terminal status provider owns the worker's single foreground
+/// observer and forwards resume and settle events to `foreground_working` and
+/// `foreground_settled` while Otty is enabled.
 pub fn Hooks(comptime App: type) type {
     return struct {
         pub fn configure(app: *App) !void {
@@ -144,19 +146,14 @@ pub fn Hooks(comptime App: type) type {
                 .ctx = app,
                 .run = attention_required,
             });
-            app.worker.foreground_observer = .{
-                .context = app,
-                .working = foreground_working,
-                .settled = foreground_settled,
-            };
         }
 
-        fn foreground_working(raw: *anyopaque) void {
+        pub fn foreground_working(raw: *anyopaque) void {
             const app: *App = @ptrCast(@alignCast(raw));
             app.otty.report(.processing, app_session_runtime.Runtime(App).activeSessionId(app));
         }
 
-        fn foreground_settled(raw: *anyopaque, outcome: types.TurnPresentationOutcome) void {
+        pub fn foreground_settled(raw: *anyopaque, outcome: types.TurnPresentationOutcome) void {
             const app: *App = @ptrCast(@alignCast(raw));
             app.otty.report(outcome_state(outcome), app_session_runtime.Runtime(App).activeSessionId(app));
         }

@@ -67,6 +67,12 @@ Run `fx` inside [Otty](https://otty.sh) with its CLI on `PATH` to report process
 
 Set `FX_OTTY=0` to disable reporting for a run. This custom-agent integration provides badges and notifications, not Otty History, Fork, or automatic resume. Otty's per-tab badge and notification settings still apply.
 
+## cmux integration
+
+Run `fx` inside [cmux](https://cmux.com) to show running, waiting for input, idle, and error states in the workspace sidebar automatically, with a notification when fx needs your input. Reports include only lifecycle state and the kind of prompt that is waiting, never prompts or tool output. Reporting is best-effort and does not block your conversation if cmux is unavailable.
+
+Set `FX_CMUX=0` to disable reporting for a run. This integration provides a sidebar status and notifications, not cmux session restore. cmux's notification settings still apply.
+
 ## Documentation
 
 Visit [fx.sh/docs](https://fx.sh/docs) for the full manual: sessions, models, custom model connections, permissions, configuration, skills, MCP, subagents, embedding, and the complete CLI and slash command references. Agents can read any page as Markdown by appending `.md` to its URL, or fetch [llms-full.txt](https://fx.sh/llms-full.txt) for everything in one file.

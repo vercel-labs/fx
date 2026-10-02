@@ -406,7 +406,7 @@ const App = struct {
         Self,
         builtin_hooks.notifications.provider(Self),
     );
-    const HerdrAppRuntime = builtin_hooks.Runtime(Self);
+    const TerminalStatusAppRuntime = builtin_hooks.Runtime(Self);
     const RenderAppRuntime = app_render_runtime.Runtime(Self);
     const SessionAppRuntime = app_session_runtime.Runtime(Self);
     const UpgradeAppRuntime = app_upgrade_runtime.Runtime(Self);
@@ -536,7 +536,8 @@ const App = struct {
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
     notifications: builtin_hooks.notifications.State = .{},
-    herdr: builtin_hooks.Client = .{},
+    herdr: builtin_hooks.HerdrClient = .{},
+    cmux: builtin_hooks.CmuxClient = .{},
     otty: builtin_hooks.otty.Client = .{},
 
     session: SessionRuntime = SessionRuntime.initWithProviders(
@@ -745,10 +746,12 @@ const App = struct {
     }
 
     pub fn configureNotifications(self: *App) !void {
-        // Register terminal integrations before the notification provider freezes
-        // the lifecycle runtime.
-        try HerdrAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
+        // Register terminal status hooks (Otty, herdr, cmux) before
+        // NotificationAppRuntime.configure freezes the lifecycle runtime (its
+        // call to freeze() is the sole freeze site). Otty initializes first so
+        // the shared foreground observer can include it.
         try builtin_hooks.otty.Hooks(App).configure(self);
+        try TerminalStatusAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
         try NotificationAppRuntime.configure(self);
     }
 
@@ -871,6 +874,8 @@ const App = struct {
         self.auth.stopProviderPreparation();
         // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
+        // Client.deinit clears the cmux sidebar status when enabled.
+        self.cmux.deinit();
         self.stopStream();
         self.worker.requestShutdown();
         SessionAppRuntime.requestPersistenceShutdown(self);
@@ -936,6 +941,8 @@ const App = struct {
         self.auth.stopProviderPreparation();
         // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
+        // Client.deinit clears the cmux sidebar status when enabled.
+        self.cmux.deinit();
         self.stopStream();
         shutdown_trace.mark("stop_stream");
 
@@ -1414,7 +1421,7 @@ const App = struct {
         );
         errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
         try self.worker.admitInteractivePrompt(std.heap.c_allocator, queued);
-        HerdrAppRuntime.reportWorking(self);
+        TerminalStatusAppRuntime.reportWorking(self);
         return true;
     }
 
@@ -1457,7 +1464,7 @@ const App = struct {
         );
         errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
         try self.worker.enqueuePrompt(std.heap.c_allocator, queued);
-        HerdrAppRuntime.reportWorking(self);
+        TerminalStatusAppRuntime.reportWorking(self);
         return true;
     }
 
@@ -1617,7 +1624,7 @@ const App = struct {
             .history = history,
             .unversioned_history_count = self.session.unversionedHistoryEnd(),
         });
-        HerdrAppRuntime.reportWorking(self);
+        TerminalStatusAppRuntime.reportWorking(self);
         return true;
     }
 
