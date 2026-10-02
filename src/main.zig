@@ -537,6 +537,7 @@ const App = struct {
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
     notifications: builtin_hooks.notifications.State = .{},
     herdr: builtin_hooks.Client = .{},
+    otty: builtin_hooks.otty.Client = .{},
 
     session: SessionRuntime = SessionRuntime.initWithProviders(
         max_history_turns,
@@ -744,9 +745,10 @@ const App = struct {
     }
 
     pub fn configureNotifications(self: *App) !void {
-        // Register herdr hooks before NotificationAppRuntime.configure freezes
-        // the lifecycle runtime (its call to freeze() is the sole freeze site).
+        // Register terminal integrations before the notification provider freezes
+        // the lifecycle runtime.
         try HerdrAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
+        try builtin_hooks.otty.Hooks(App).configure(self);
         try NotificationAppRuntime.configure(self);
     }
 
@@ -885,6 +887,7 @@ const App = struct {
         WorkerAppRuntime.settleFinishedPromptsForShutdown(self) catch |err| {
             SessionAppRuntime.recordShutdownFailure(self, err);
         };
+        self.otty.deinit();
         // The dashboard loader reads the profile usage ledger that
         // persistence flushes; stop it first.
         self.usage_dashboard.deinit();
@@ -950,6 +953,7 @@ const App = struct {
         WorkerAppRuntime.settleFinishedPromptsForShutdown(self) catch |err| {
             SessionAppRuntime.recordShutdownFailure(self, err);
         };
+        self.otty.deinit();
         self.terminal_client.deinit();
         self.managed_executions.deinit();
         self.model_cache.deinit();
@@ -4948,6 +4952,7 @@ test {
     _ = @import("core/tooling/tool_runtime.zig");
     _ = @import("core/tooling/tool_specs.zig");
     _ = @import("builtins/commands.zig");
+    _ = @import("builtins/hooks/otty.zig");
     _ = @import("builtins/mcp.zig");
     _ = @import("builtins/modes.zig");
     _ = @import("builtins/tools.zig");

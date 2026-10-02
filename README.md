@@ -61,6 +61,12 @@ Inside the shell, run `/help` to browse interactive commands.
 In tmux, use your usual prefix bindings to switch sessions or enter copy mode.
 fx preserves those tmux views while resizing, including when the switcher zooms a split pane.
 
+## Otty integration
+
+Run `fx` inside [Otty](https://otty.sh) with its CLI on `PATH` to report processing, waiting for input, completion, and errors automatically. Install the CLI from Otty Settings → Shell → Install CLI. Reports include only lifecycle state, fx's process ID, and session ID, never prompts or tool output. Reporting is best-effort and does not block your conversation if Otty is unavailable.
+
+Set `FX_OTTY=0` to disable reporting for a run. This custom-agent integration provides badges and notifications, not Otty History, Fork, or automatic resume. Otty's per-tab badge and notification settings still apply.
+
 ## Documentation
 
 Visit [fx.sh/docs](https://fx.sh/docs) for the full manual: sessions, models, custom model connections, permissions, configuration, skills, MCP, subagents, embedding, and the complete CLI and slash command references. Agents can read any page as Markdown by appending `.md` to its URL, or fetch [llms-full.txt](https://fx.sh/llms-full.txt) for everything in one file.

@@ -711,6 +711,9 @@ pub fn Runtime(comptime App: type) type {
         ) void {
             const snapshot = app.worker.snapshotState(app.alloc) catch return;
             defer snapshot.deinit(app.alloc);
+            if (comptime @hasField(App, "otty")) {
+                app.otty.sync_session(app_session_runtime.Runtime(App).activeSessionId(app));
+            }
 
             const was_approval_active = app.approval_prompt.isActive();
             const worker_pending_request = if (snapshot.pending_permission_request) |*request|
@@ -728,6 +731,13 @@ pub fn Runtime(comptime App: type) type {
             const child_pending_request: ?permission_request.PermissionRequest =
                 if (owned_child_pending) |*pending| pending.request.view() else null;
             const pending_request = worker_pending_request orelse child_pending_request;
+            if (comptime @hasField(App, "otty")) {
+                app.otty.sync_child_approval(
+                    child_pending_request != null,
+                    worker_pending_request != null,
+                    app_session_runtime.Runtime(App).activeSessionId(app),
+                );
+            }
             const management_active = if (comptime @hasField(
                 @TypeOf(app.approval_prompt),
                 "rule_management",
