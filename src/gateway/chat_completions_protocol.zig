@@ -514,6 +514,23 @@ fn flush_tool_image_follow_up(
     pending_images.clearRetainingCapacity();
 }
 
+/// Writes a consecutive system run as one message with contents joined by
+/// blank lines. Providers that render server-side chat templates reject any
+/// system message after the first, so the run must reach the wire as one.
+fn write_merged_system_message(writer: *std.Io.Writer, alloc: Allocator, run: []const types.ChatMessage) !void {
+    var joined: std.Io.Writer.Allocating = .init(alloc);
+    defer joined.deinit();
+    for (run) |message| {
+        const content = message.content orelse continue;
+        if (content.len == 0) continue;
+        if (joined.written().len > 0) try joined.writer.writeAll("\n\n");
+        try joined.writer.writeAll(content);
+    }
+    try writer.writeAll("{\"role\":\"system\",\"content\":");
+    try std.json.Stringify.value(joined.written(), .{}, writer);
+    try writer.writeByte('}');
+}
+
 fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provider.RequestData, options: Options, functions: []const Function, projection: *const tool_call_ids.Projection) !void {
     try writer.writeAll("{\"model\":");
     try std.json.Stringify.value(request.model, .{}, writer);
@@ -528,10 +545,26 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
     defer pending_images.deinit(alloc);
     const lanes = [_][]const types.ChatMessage{ request.instructions, request.messages };
     for (lanes) |lane| {
-        for (lane) |message| {
+        var message_index: usize = 0;
+        while (message_index < lane.len) {
+            const message = lane[message_index];
             // Source validation rejects empty assistants; only stripped replay can leave one here.
-            if (message.role == .assistant and message.content == null and message.tool_calls.len == 0 and message.provider_replay == null) continue;
+            if (message.role == .assistant and message.content == null and message.tool_calls.len == 0 and message.provider_replay == null) {
+                message_index += 1;
+                continue;
+            }
             if (message.role != .tool) try flush_tool_image_follow_up(writer, alloc, &count, &pending_names, &pending_images);
+            if (message.role == .system) {
+                var run_end = message_index + 1;
+                while (run_end < lane.len and lane[run_end].role == .system) run_end += 1;
+                if (run_end - message_index > 1) {
+                    if (count != 0) try writer.writeByte(',');
+                    count += 1;
+                    try write_merged_system_message(writer, alloc, lane[message_index..run_end]);
+                    message_index = run_end;
+                    continue;
+                }
+            }
             if (count != 0) try writer.writeByte(',');
             count += 1;
             try writer.writeAll("{\"role\":");
@@ -569,6 +602,7 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
                     try pending_images.appendSlice(alloc, tool_images);
                 }
             }
+            message_index += 1;
         }
         // Lane boundary: flush before the next lane starts.
         try flush_tool_image_follow_up(writer, alloc, &count, &pending_names, &pending_images);
@@ -1223,12 +1257,12 @@ test "chat completions replay-only assistant supports silent-tool continuation a
             var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
             defer parsed.deinit();
             const messages = parsed.value.object.get("messages").?.array.items;
-            try std.testing.expectEqual(@as(usize, 4), messages.len);
-            try std.testing.expect(messages[2].object.get("content").? == .null);
-            try std.testing.expectEqualStrings("inspect", messages[2].object.get("reasoning").?.string);
-            try std.testing.expect(messages[2].object.get("tool_calls") == null);
-            try std.testing.expect(messages[2].object.get(association_field) == null);
-            try std.testing.expectEqualStrings("Summarize what you just did.", messages[3].object.get("content").?.string);
+            try std.testing.expectEqual(@as(usize, 3), messages.len);
+            try std.testing.expect(messages[1].object.get("content").? == .null);
+            try std.testing.expectEqualStrings("inspect", messages[1].object.get("reasoning").?.string);
+            try std.testing.expect(messages[1].object.get("tool_calls") == null);
+            try std.testing.expect(messages[1].object.get(association_field) == null);
+            try std.testing.expectEqualStrings("Summarize what you just did.", messages[2].object.get("content").?.string);
             var continuation = try Reducer.init(alloc, request, .{});
             defer continuation.deinit();
             try test_accept(&continuation, test_text);
@@ -1273,7 +1307,7 @@ test "chat completions stripped replay-only rows are omitted without changing ca
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
         defer parsed.deinit();
         const messages = parsed.value.object.get("messages").?.array.items;
-        try std.testing.expectEqual(request.instructions.len + 1, messages.len);
+        try std.testing.expectEqual(@as(usize, if (with_instructions) 2 else 1), messages.len);
         try std.testing.expectEqualStrings("user", messages[messages.len - 1].object.get("role").?.string);
         try std.testing.expectEqualStrings("Summarize what you just did.", messages[messages.len - 1].object.get("content").?.string);
         try std.testing.expect(std.mem.find(u8, body, "reasoning_details") == null);
@@ -1335,7 +1369,7 @@ test "chat completions replay preserves sequence protected IDs affinity and cano
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
     const messages = parsed.value.object.get("messages").?.array.items;
-    const assistant = messages[2].object;
+    const assistant = messages[1].object;
     const details = assistant.get("reasoning_details").?.array.items;
     try std.testing.expectEqual(@as(usize, 3), details.len);
     try std.testing.expectEqualStrings("first", details[0].object.get("text").?.string);
@@ -1343,7 +1377,7 @@ test "chat completions replay preserves sequence protected IDs affinity and cano
     try std.testing.expectEqualStrings("second", details[1].object.get("text").?.string);
     try std.testing.expectEqualStrings("nested", details[2].object.get("extra").?.object.get("signature").?.string);
     try std.testing.expectEqualStrings("functions/read:0", assistant.get("tool_calls").?.array.items[0].object.get("id").?.string);
-    try std.testing.expectEqualStrings("functions/read:0", messages[3].object.get("tool_call_id").?.string);
+    try std.testing.expectEqualStrings("functions/read:0", messages[2].object.get("tool_call_id").?.string);
     try std.testing.expect(assistant.get(association_field) == null);
     try std.testing.expectEqualStrings("inspect", assistant.get("reasoning").?.string);
     try std.testing.expectEqualStrings("carefully", assistant.get("reasoning_content").?.string);
@@ -1779,7 +1813,7 @@ test "chat completions exact text wire preserves instruction order and opaque mo
     const alloc = std.testing.allocator;
     const body = try build_request(alloc, test_request(), .{});
     defer alloc.free(body);
-    try std.testing.expectEqualStrings("{\"model\":\"opaque/local-model:8b\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":[{\"role\":\"system\",\"content\":\"first\"},{\"role\":\"system\",\"content\":\"second\"},{\"role\":\"user\",\"content\":\"hi\"}]}", body);
+    try std.testing.expectEqualStrings("{\"model\":\"opaque/local-model:8b\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":[{\"role\":\"system\",\"content\":\"first\\n\\nsecond\"},{\"role\":\"user\",\"content\":\"hi\"}]}", body);
     const again = try build_request(alloc, test_request(), .{});
     defer alloc.free(again);
     try std.testing.expectEqualStrings(body, again);
@@ -1848,10 +1882,10 @@ test "chat completions history correlation preserves canonical IDs and JSON stri
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
     const messages = parsed.value.object.get("messages").?.array.items;
-    const wire_call = messages[2].object.get("tool_calls").?.array.items[0].object;
+    const wire_call = messages[1].object.get("tool_calls").?.array.items[0].object;
     const wire_id = wire_call.get("id").?.string;
     try std.testing.expect(std.mem.startsWith(u8, wire_id, "fx_"));
-    try std.testing.expectEqualStrings(wire_id, messages[3].object.get("tool_call_id").?.string);
+    try std.testing.expectEqualStrings(wire_id, messages[2].object.get("tool_call_id").?.string);
     try std.testing.expectEqualStrings(call.arguments_json, wire_call.get("function").?.object.get("arguments").?.string);
     try std.testing.expectEqualStrings("functions/read:0", call.id);
     try std.testing.expectEqualStrings(call.id, request.messages[1].tool_call_id.?);
@@ -1941,19 +1975,19 @@ test "chat completions merges parallel tool images into one follow up after the 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
     const messages = parsed.value.object.get("messages").?.array.items;
-    // two instructions + user + assistant + tool + tool + merged follow-up + user
-    try std.testing.expectEqual(@as(usize, 8), messages.len);
+    // merged instruction + user + assistant + tool + tool + merged follow-up + user
+    try std.testing.expectEqual(@as(usize, 7), messages.len);
+    try std.testing.expectEqualStrings("tool", messages[3].object.get("role").?.string);
     try std.testing.expectEqualStrings("tool", messages[4].object.get("role").?.string);
-    try std.testing.expectEqualStrings("tool", messages[5].object.get("role").?.string);
-    const follow_up = messages[6].object;
+    const follow_up = messages[5].object;
     try std.testing.expectEqualStrings("user", follow_up.get("role").?.string);
     const parts = follow_up.get("content").?.array.items;
     try std.testing.expectEqual(@as(usize, 3), parts.len);
     try std.testing.expectEqualStrings("text", parts[0].object.get("type").?.string);
     try std.testing.expectEqualStrings("data:image/png;base64,aGVsbG8", parts[1].object.get("image_url").?.object.get("url").?.string);
     try std.testing.expectEqualStrings("data:image/jpeg;base64,d29ybGQ", parts[2].object.get("image_url").?.object.get("url").?.string);
-    try std.testing.expectEqualStrings("user", messages[7].object.get("role").?.string);
-    try std.testing.expectEqualStrings("thanks", messages[7].object.get("content").?.string);
+    try std.testing.expectEqualStrings("user", messages[6].object.get("role").?.string);
+    try std.testing.expectEqualStrings("thanks", messages[6].object.get("content").?.string);
 }
 
 test "chat completions withholds images from denied tool results" {
@@ -1970,8 +2004,8 @@ test "chat completions withholds images from denied tool results" {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
     const messages = parsed.value.object.get("messages").?.array.items;
-    // two instructions + user + assistant + tool — no image follow-up for a denied call.
-    try std.testing.expectEqual(@as(usize, 5), messages.len);
+    // merged instruction + user + assistant + tool — no image follow-up for a denied call.
+    try std.testing.expectEqual(@as(usize, 4), messages.len);
     for (messages) |message| {
         const content = message.object.get("content") orelse continue;
         if (content != .array) continue;
