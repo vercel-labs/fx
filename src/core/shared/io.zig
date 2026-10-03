@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const darwin_process_spawn = @import("darwin_process_spawn.zig");
+const darwin_signal_connect = @import("darwin_signal_connect.zig");
 
 pub const RawEnviron = [*:null]const ?[*:0]const u8;
 
@@ -20,7 +21,7 @@ pub fn setIo(zio: std.Io) void {
 }
 
 fn process_io_for(comptime os_tag: std.Target.Os.Tag, zio: std.Io) std.Io {
-    return if (os_tag == .macos) darwin_process_spawn.wrap(zio) else zio;
+    return if (os_tag == .macos) darwin_signal_connect.wrap(darwin_process_spawn.wrap(zio)) else zio;
 }
 
 pub fn getIo() std.Io {
@@ -62,7 +63,7 @@ pub fn openDirAbsoluteNoFollow(path: []const u8, options: std.Io.Dir.OpenOptions
     return result;
 }
 
-test "Darwin process I/O replaces only processSpawn with stable storage" {
+test "Darwin process I/O wraps spawn and IP connect with stable storage" {
     const original = std.testing.io;
     const selected = process_io_for(.macos, original);
     const selected_again = process_io_for(.macos, original);
@@ -70,7 +71,7 @@ test "Darwin process I/O replaces only processSpawn with stable storage" {
     try std.testing.expect(selected.userdata == original.userdata);
     try std.testing.expect(selected.vtable == selected_again.vtable);
     inline for (@typeInfo(std.Io.VTable).@"struct".fields) |field| {
-        if (comptime std.mem.eql(u8, field.name, "processSpawn")) {
+        if (comptime std.mem.eql(u8, field.name, "processSpawn") or std.mem.eql(u8, field.name, "netConnectIp")) {
             try std.testing.expect(@field(selected.vtable, field.name) != @field(original.vtable, field.name));
         } else {
             try std.testing.expectEqual(@field(original.vtable, field.name), @field(selected.vtable, field.name));
