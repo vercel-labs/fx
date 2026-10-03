@@ -209,6 +209,21 @@ describe("configured providers", () => {
     } finally { f.close(); }
   }, 25000);
 
+  test("returns an unknown model tool name as a failed tool result", async () => {
+    const f = fixture(body => body.messages.some((message: any) => message.role === "tool")
+      ? completion(body.model, "recovered after unknown tool")
+      : toolCompletion(body.model, "unknown_tool", {}));
+    try {
+      const result = await runFx(["ask", "--json", "--no-save", "Inspect the workspace"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(JSON.parse(result.stdout).output).toBe("recovered after unknown tool");
+      expect(f.requests).toHaveLength(2);
+      const returned = f.requests[1].body.messages.find((message: any) => message.role === "tool");
+      expect(returned.tool_call_id).toBe("call-local");
+      expect(returned.content).toContain("Unsupported tool: unknown_tool");
+    } finally { f.close(); }
+  }, 25000);
+
   test("saved sessions resume the named connection and reject endpoint rebinding", async () => {
     const f = fixture();
     try {
