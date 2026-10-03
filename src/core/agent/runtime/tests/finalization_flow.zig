@@ -49,6 +49,9 @@ const PostTurnEndFinalizationCapture = struct {
     outcomes: [8]types.TurnPresentationOutcome = undefined,
     dispositions: [8]?types.ProviderCompletionDisposition = undefined,
     finish_event_attempts: [8]usize = undefined,
+    /// Each call's final reply, cut to the buffer; null when it had none.
+    finals: [8][64]u8 = undefined,
+    final_lens: [8]?usize = undefined,
     deps: ?*FakeAgentRuntimeDeps = null,
 
     fn run(raw: *anyopaque, input: lifecycle_hooks.PostTurnEndInput) lifecycle_hooks.HandlerError!void {
@@ -68,6 +71,17 @@ const PostTurnEndFinalizationCapture = struct {
             deps.finish_event_attempt_count
         else
             0;
+        self.final_lens[index] = null;
+        if (input.final_text) |text| {
+            const len = @min(text.len, self.finals[index].len);
+            @memcpy(self.finals[index][0..len], text[0..len]);
+            self.final_lens[index] = len;
+        }
+    }
+
+    fn final(self: *const PostTurnEndFinalizationCapture, index: usize) ?[]const u8 {
+        const len = self.final_lens[index] orelse return null;
+        return self.finals[index][0..len];
     }
 };
 
@@ -2211,6 +2225,57 @@ test "TurnFinalizationGuard skips PostTurnEnd when terminal finalization fails" 
     try std.testing.expectEqual(TurnFinalizationGuard.State.fatal, finalization.state);
     try std.testing.expectEqual(@as(usize, 1), deps.finalization_count);
     try std.testing.expectEqual(@as(usize, 0), hook_capture.calls);
+}
+
+test "TurnFinalizationGuard gives PostTurnEnd the reply that completed the turn" {
+    const alloc = std.testing.allocator;
+    var hook_capture = PostTurnEndFinalizationCapture{};
+    var hook_runtime = lifecycle_hooks.Runtime.init(alloc);
+    defer hook_runtime.deinit();
+    try hook_runtime.registerPostTurnEnd(.{
+        .name = "capture",
+        .ctx = &hook_capture,
+        .run = PostTurnEndFinalizationCapture.run,
+    });
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    const runtime_deps = deps.deps();
+    const view = hook_runtime.freeze();
+
+    const cases = [_]struct {
+        outcome: types.TurnPresentationOutcome,
+        presentation: ?[]const u8,
+        expected: ?[]const u8,
+    }{
+        .{ .outcome = .completed, .presentation = "Earlier reply.\nanswer", .expected = "Earlier reply.\nanswer" },
+        .{ .outcome = .completed, .presentation = null, .expected = "answer" },
+        .{ .outcome = .failed, .presentation = null, .expected = null },
+    };
+    for (cases, 0..) |case, index| {
+        var finalization = TurnFinalizationGuard.init(
+            &runtime_deps,
+            @intCast(index + 1),
+            testLifecycleContext(view, alloc, "/tmp/workspace"),
+        );
+        defer finalization.deinit();
+        const finished = try types.dupeFinishedPrompt(std.heap.c_allocator, .{
+            .turn = .{ .assistant = .{
+                .user = .{ .text = @constCast("prompt") },
+                .assistant = @constCast("answer"),
+            } },
+            .presentation_text = case.presentation,
+        });
+        try finalization.finish(case.outcome, null, finished);
+    }
+
+    try std.testing.expectEqual(cases.len, hook_capture.calls);
+    for (cases, 0..) |case, index| {
+        if (case.expected) |expected| {
+            try std.testing.expectEqualStrings(expected, hook_capture.final(index) orelse return error.TestExpectedEqual);
+        } else {
+            try std.testing.expect(hook_capture.final(index) == null);
+        }
+    }
 }
 
 test "TurnFinalizationGuard runs PostTurnEnd after failed finish prompt publication" {

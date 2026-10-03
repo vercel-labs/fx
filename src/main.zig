@@ -411,6 +411,7 @@ const App = struct {
         builtin_hooks.notifications.provider(Self),
     );
     const HerdrAppRuntime = builtin_hooks.Runtime(Self);
+    const ParentReportAppRuntime = builtin_hooks.parent_report.Runtime(Self);
     const RenderAppRuntime = app_render_runtime.Runtime(Self);
     const SessionAppRuntime = app_session_runtime.Runtime(Self);
     const UpgradeAppRuntime = app_upgrade_runtime.Runtime(Self);
@@ -541,6 +542,7 @@ const App = struct {
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
     notifications: builtin_hooks.notifications.State = .{},
     herdr: builtin_hooks.Client = .{},
+    parent_report: builtin_hooks.parent_report.Client = .{},
 
     session: SessionRuntime = SessionRuntime.initWithProviders(
         max_history_turns,
@@ -633,6 +635,9 @@ const App = struct {
             else
                 shell_process_provider.provider,
         };
+        // Claims an inherited report channel before anything starts other
+        // programs, which must not inherit it.
+        app.parent_report.initFromEnv();
         auth_runtime.Runtime.initIntoWithMode(
             &app.auth,
             app_api_key_validator,
@@ -748,9 +753,11 @@ const App = struct {
     }
 
     pub fn configureNotifications(self: *App) !void {
-        // Register herdr hooks before NotificationAppRuntime.configure freezes
-        // the lifecycle runtime (its call to freeze() is the sole freeze site).
+        // Register herdr and parent-report hooks before
+        // NotificationAppRuntime.configure freezes the lifecycle runtime (its
+        // call to freeze() is the sole freeze site).
         try HerdrAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
+        try ParentReportAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
         try NotificationAppRuntime.configure(self);
     }
 
@@ -873,6 +880,7 @@ const App = struct {
         self.auth.stopProviderPreparation();
         // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
+        self.parent_report.deinit();
         self.stopStream();
         self.worker.requestShutdown();
         SessionAppRuntime.requestPersistenceShutdown(self);
@@ -937,6 +945,7 @@ const App = struct {
         self.auth.stopProviderPreparation();
         // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
+        self.parent_report.deinit();
         self.stopStream();
         shutdown_trace.mark("stop_stream");
 
@@ -1414,7 +1423,10 @@ const App = struct {
             false,
         );
         errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
+        var report = self.parent_report.beginSubmit();
+        defer report.end();
         try self.worker.admitInteractivePrompt(std.heap.c_allocator, queued);
+        report.reported(prompt);
         HerdrAppRuntime.reportWorking(self);
         return true;
     }
@@ -1457,7 +1469,10 @@ const App = struct {
             user_prompt_already_presented,
         );
         errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
+        var report = self.parent_report.beginSubmit();
+        defer report.end();
         try self.worker.enqueuePrompt(std.heap.c_allocator, queued);
+        if (recovery_checkpoint == null) report.reported(prompt) else report.working();
         HerdrAppRuntime.reportWorking(self);
         return true;
     }
@@ -3186,6 +3201,7 @@ const App = struct {
         );
         try self.routeTerminalInputIngress(terminal_input);
         try WorkerAppRuntime.tick(self, app_callbacks.Bindings(App).workerEventHandlers(self));
+        ParentReportAppRuntime.tick(self);
         const now_ns = io_mod.nanoTimestamp();
         if (!self.approval_prompt.isActive() and !self.question_prompt.isActive() and !self.auth.apiKeyEntryActive()) {
             try self.pacer.tick(self.alloc, now_ns, self.pacerCallbacks());

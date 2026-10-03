@@ -29,6 +29,7 @@ pub const PostTurnEndCheckpoint = struct {
     turn_id: u64,
     outcome: types.TurnPresentationOutcome,
     provider_disposition: ?types.ProviderCompletionDisposition,
+    final_text: ?[]const u8 = null,
 };
 
 pub const AttentionRequiredCheckpoint = struct {
@@ -359,6 +360,7 @@ pub fn dispatchPostTurnEndCheckpoint(
         },
         .outcome = checkpoint.outcome,
         .provider_disposition = checkpoint.provider_disposition,
+        .final_text = checkpoint.final_text,
     });
 }
 

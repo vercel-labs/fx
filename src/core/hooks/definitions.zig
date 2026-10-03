@@ -187,6 +187,9 @@ pub const PostTurnEndInput = struct {
     invocation: Invocation,
     outcome: types.TurnPresentationOutcome,
     provider_disposition: ?types.ProviderCompletionDisposition = null,
+    /// The reply that completed the turn, as presented. Null when the turn
+    /// did not complete. Valid only during the call.
+    final_text: ?[]const u8 = null,
 };
 
 pub const PostTurnEndHandler = struct {

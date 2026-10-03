@@ -134,10 +134,18 @@ pub const TurnFinalizationGuard = struct {
         self.state = .emitted;
         self.outcome = outcome;
 
+        // The event below hands `finished_prompt` to another thread, so the
+        // hooks get their own copy of the reply.
+        const final_text = if (self.lifecycle.view.hasPostTurnEnd())
+            finalReplyCopy(self.turn_id, outcome, finished_prompt)
+        else
+            null;
+        defer if (final_text) |text| std.heap.c_allocator.free(text);
         defer lifecycle_runtime.dispatchPostTurnEndCheckpoint(self.lifecycle, .{
             .turn_id = self.turn_id,
             .outcome = outcome,
             .provider_disposition = disposition,
+            .final_text = final_text,
         });
 
         if (finished_prompt) |finished| {
@@ -147,6 +155,25 @@ pub const TurnFinalizationGuard = struct {
         }
     }
 };
+
+/// A copy of the reply that completed the turn, as presented, or null when
+/// the turn did not complete. Caller owns it.
+fn finalReplyCopy(
+    turn_id: u64,
+    outcome: types.TurnPresentationOutcome,
+    finished_prompt: ?types.FinishedPrompt,
+) ?[]u8 {
+    if (outcome != .completed) return null;
+    const finished = finished_prompt orelse return null;
+    const text = switch (finished.turn) {
+        .assistant => |turn| finished.presentation_text orelse turn.assistant,
+        .interrupted, .compacted_summary => return null,
+    };
+    return std.heap.c_allocator.dupe(u8, text) catch {
+        debug_trace.logf("agent", "turn end hooks get no final reply turn_id={d} bytes={d} err=OutOfMemory", .{ turn_id, text.len });
+        return null;
+    };
+}
 
 pub const TerminalText = struct {
     history: []const u8,

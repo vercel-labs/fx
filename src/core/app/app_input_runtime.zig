@@ -12361,6 +12361,56 @@ test "app_input_runtime submits multi-question answers in entry order" {
     );
 }
 
+test "app_input_runtime answers from the parent fx submit like local answers" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    const options = [_]types.QuestionOption{
+        .{ .label = "Red", .description = null },
+        .{ .label = "Blue", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{
+        .{ .question = "Pick a color", .options = &options },
+    };
+    try app.question_prompt.syncFrom(alloc, &entries);
+
+    const answers = [_][]const u8{"Blue"};
+    try input_question_runtime.QuestionRuntime(RoutingFakeApp).submitQuestionAnswers(&app, &answers);
+
+    try std.testing.expectEqual(@as(usize, 1), app.worker.submitted_question_count);
+    try std.testing.expectEqualStrings(
+        "Blue",
+        app.worker.submitted_question_answers[0][0..app.worker.submitted_question_answer_lens[0]],
+    );
+    try std.testing.expect(!app.question_prompt.isActive());
+    try std.testing.expect(!app.worker.cancel_requested);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(app.transcript.items, "Pick a color"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(app.transcript.items, "Blue"));
+}
+
+test "app_input_runtime an approval answer from the parent fx applies like a local choice" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
+    const request_id = app.approval_prompt.request.?.id;
+    const approval_runtime = input_approval_runtime.ApprovalRuntime(RoutingFakeApp);
+
+    // An answer for a request the prompt no longer shows applies nothing.
+    try std.testing.expect(!try approval_runtime.submitParentPermission(&app, request_id + 1, .once, null));
+    try std.testing.expectEqual(@as(?ToolPermissionDecision, null), app.worker.submitted_permission);
+    try std.testing.expect(app.approval_prompt.isActive());
+
+    try std.testing.expect(try approval_runtime.submitParentPermission(&app, request_id, .deny, "use yarn"));
+    try std.testing.expectEqual(@as(?ToolPermissionDecision, .deny), app.worker.submitted_permission);
+    try std.testing.expectEqualStrings(
+        "use yarn",
+        app.worker.submitted_permission_feedback[0..app.worker.submitted_permission_feedback_len],
+    );
+    try std.testing.expect(!app.approval_prompt.isActive());
+    try std.testing.expect(app.shell.render_requests.hasReason(.modal));
+}
+
 const FakeSubmitApp = struct {
     pub const input_byte_limit: usize = 4096;
 

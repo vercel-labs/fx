@@ -2,13 +2,15 @@
 //!
 //! The Herdr provider reports semantic foreground state for interactive work.
 //! Notification hooks live in `notifications` and keep sound policy outside
-//! the Core hook harness.
+//! the Core hook harness. `parent_report` reports to the fx that launched
+//! this one in a sub-engine terminal.
 
 const std = @import("std");
 const hooks = @import("../core/hooks/hooks.zig");
 const herdr = @import("hooks/herdr.zig");
 
 pub const notifications = @import("hooks/notifications.zig");
+pub const parent_report = @import("hooks/parent_report.zig");
 pub const Client = herdr.Client;
 
 pub fn Runtime(comptime App: type) type {

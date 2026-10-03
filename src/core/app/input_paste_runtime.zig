@@ -295,6 +295,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
                     };
                     app.input_runtime.paste.finishHandled();
                     app.shell.render_requests.request(.footer);
+                    if (comptime @hasField(App, "parent_report")) app.parent_report.reportPasted();
                 },
                 .approval_amendment => {
                     if (comptime @hasField(App, "approval_prompt")) {

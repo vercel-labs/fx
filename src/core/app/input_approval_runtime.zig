@@ -185,7 +185,7 @@ pub fn ApprovalRuntime(comptime App: type) type {
                 try submitRuleManagementChoice(app, decision);
                 return;
             }
-            if (try submitSubagentPermissionChoice(app, decision)) return;
+            if (try submitSubagentPermission(app, .{ .choice = decision })) return;
             var affirmative_claimed = false;
             if (decision != .deny and
                 app.approval_prompt.request.?.file != null)
@@ -235,15 +235,48 @@ pub fn ApprovalRuntime(comptime App: type) type {
                 releaseApprovalAffirmative(app);
             };
             const request_id = app.approval_prompt.request.?.id;
-            var response = try app.approval_prompt.decision.materializeResponse(
+            const response = try app.approval_prompt.decision.materializeResponse(
                 app.alloc,
                 decision,
             );
-            var response_submitted = false;
-            errdefer if (!response_submitted) response.deinit();
-            const result = app.worker.submitPermissionResponse(request_id, response);
-            response_submitted = true;
-            switch (result) {
+            submitWorkerPermissionResponse(app, request_id, response);
+        }
+
+        /// Applies an answer the parent fx sent for the approval this fx
+        /// shows, the way a local choice is applied. The parent's user
+        /// reviewed the request on the parent's screen, so the local
+        /// file-approval confirmation does not apply. Returns false, and
+        /// applies nothing, when the prompt no longer shows `request_id`.
+        pub fn submitParentPermission(
+            app: *App,
+            request_id: u64,
+            decision: ToolPermissionDecision,
+            feedback: ?[]const u8,
+        ) !bool {
+            const request = app.approval_prompt.request orelse return false;
+            if (request.id != request_id or app.approval_prompt.rule_management != null) return false;
+            const owned_feedback = if (feedback) |text| try app.alloc.dupe(u8, text) else null;
+            var response = permission_request.OwnedPermissionResponse.init(app.alloc, decision, owned_feedback);
+            const routed = submitSubagentPermission(app, .{ .given = &response }) catch |err| {
+                response.deinit();
+                return err;
+            };
+            if (routed) {
+                response.deinit();
+                return true;
+            }
+            submitWorkerPermissionResponse(app, request_id, response);
+            return true;
+        }
+
+        /// Gives `response` to the worker for `request_id`, which takes
+        /// ownership of it, and clears the prompt once the worker accepts.
+        fn submitWorkerPermissionResponse(
+            app: *App,
+            request_id: u64,
+            response: permission_request.OwnedPermissionResponse,
+        ) void {
+            switch (app.worker.submitPermissionResponse(request_id, response)) {
                 .accepted => {
                     clearApprovalPromptAfterSubmission(app);
                     app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
@@ -326,10 +359,17 @@ pub fn ApprovalRuntime(comptime App: type) type {
             }
         }
 
-        fn submitSubagentPermissionChoice(
-            app: *App,
-            decision: ToolPermissionDecision,
-        ) !bool {
+        const SubagentResponse = union(enum) {
+            /// Built from the prompt's decision state, as for a local choice.
+            choice: ToolPermissionDecision,
+            /// Given whole, as the parent fx's answer is. Stays the caller's.
+            given: *const permission_request.OwnedPermissionResponse,
+        };
+
+        /// Resolves the prompt's request through the subagent host when a
+        /// subagent asked. Returns false when the request is not a
+        /// subagent's, so the response belongs to the worker.
+        fn submitSubagentPermission(app: *App, source: SubagentResponse) !bool {
             if (comptime !@hasField(App, "session_persistence")) return false;
             const host = app_session_runtime.Runtime(App).subagentHost(app) orelse {
                 debug_trace.logf("subagent", "approval response ignored reason=host_unavailable", .{});
@@ -357,11 +397,12 @@ pub fn ApprovalRuntime(comptime App: type) type {
                 );
                 return false;
             }
-            var response = try app.approval_prompt.decision.materializeResponse(
-                app.alloc,
-                decision,
-            );
-            defer response.deinit();
+            var materialized: ?permission_request.OwnedPermissionResponse = switch (source) {
+                .choice => |decision| try app.approval_prompt.decision.materializeResponse(app.alloc, decision),
+                .given => null,
+            };
+            defer if (materialized) |*owned| owned.deinit();
+            const response: *const permission_request.OwnedPermissionResponse = if (materialized) |*owned| owned else source.given;
             const resolved = host.resolveApproval(.{
                 .request_id = pending.request_id,
                 .child_id = pending.child_id,
@@ -386,7 +427,7 @@ pub fn ApprovalRuntime(comptime App: type) type {
                 debug_trace.logf(
                     "subagent",
                     "approval response accepted request_id={s} child_id={s} decision={s}",
-                    .{ pending.request_id, pending.child_id, @tagName(decision) },
+                    .{ pending.request_id, pending.child_id, @tagName(response.decision) },
                 );
                 clearApprovalPromptAfterSubmission(app);
                 requestActiveSurfaceFrame(app);

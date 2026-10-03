@@ -87,11 +87,28 @@ pub fn QuestionRuntime(comptime App: type) type {
             for (app.question_prompt.entries.items) |entry| {
                 labels.appendAssumeCapacity(entry.answer.?);
             }
+            try submitAnswers(app, labels.items);
+        }
 
+        /// Submits `answers`, one per question in order, as if the user had
+        /// chosen them here: the parent fx answered the batch this fx shows.
+        /// `answers` only needs to live for the call.
+        pub fn submitQuestionAnswers(app: *App, answers: []const []const u8) !void {
+            const entries = app.question_prompt.entries.items;
+            std.debug.assert(answers.len == entries.len);
+            for (entries, answers) |*entry, answer| entry.answer = answer;
+            // Entries must not keep borrowed answers past this call.
+            errdefer for (app.question_prompt.entries.items) |*entry| {
+                entry.answer = null;
+            };
+            try submitAnswers(app, answers);
+        }
+
+        fn submitAnswers(app: *App, labels: []const []const u8) !void {
             if (!isRouteRecoveryPrompt(app) and !isMcpElicitationPrompt(app)) {
                 try finalizeQuestionTranscript(app, false);
             }
-            try app.worker.submitQuestionBatchAnswer(std.heap.c_allocator, labels.items);
+            try app.worker.submitQuestionBatchAnswer(std.heap.c_allocator, labels);
             app.question_prompt.resetAfterSubmission(app.alloc);
             app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
             app.shell.render_requests.request(.modal);
