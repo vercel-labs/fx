@@ -869,9 +869,13 @@ while :; do sleep 1; done
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(corpus, { recursive: true });
       writeFileSync(join(home, ".fx", "settings.json"), "{}");
-      for (let index = 0; index < 30_000; index += 1) {
+      // The search must still be running when the second Escape lands, about
+      // half a second after it starts. Linux searches 30,000 files in about a
+      // third of a second, so it needs a larger corpus than macOS.
+      const corpusFiles = process.platform === "darwin" ? 30_000 : 120_000;
+      for (let index = 0; index < corpusFiles; index += 1) {
         writeFileSync(
-          join(corpus, `candidate-${String(index).padStart(5, "0")}.txt`),
+          join(corpus, `candidate-${String(index).padStart(6, "0")}.txt`),
           "ordinary corpus text\n",
         );
       }
@@ -920,13 +924,17 @@ while :; do sleep 1; done
       await waitForTrace(tracePath, "finish processing queued=0", TIMEOUT);
 
       const trace = readTrace(tracePath);
-      const completedTool = trace.split("\n").find((line) =>
+      const traceLines = trace.split("\n");
+      const completedToolIndex = traceLines.findIndex((line) =>
         line.includes("event=after_tool_execution") &&
         line.includes(`call_id=${callId}`) &&
         line.includes("name=grep_files") &&
         line.includes("result_kind=model_output")
       );
-      expect(completedTool).toBeDefined();
+      expect(completedToolIndex).toBeGreaterThanOrEqual(0);
+      const cancelIndex = traceLines.findIndex((line) => line.includes("event=cancel_requested"));
+      expect(cancelIndex).toBeGreaterThanOrEqual(0);
+      expect(cancelIndex).toBeLessThan(completedToolIndex);
       await session.waitForText(`Searched ${pattern}`, TIMEOUT);
       const scrollback = await session.captureFullScrollback();
       expect(scrollback).toContain(`Searched ${pattern}`);
