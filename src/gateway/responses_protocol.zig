@@ -868,6 +868,8 @@ pub const Reducer = struct {
     provider_failure_detail: ?[]u8 = null,
     provider_failure_cause: ?types.ProviderFailureCause = null,
     terminal_seen: bool = false,
+    response_started: bool = false,
+    failure_status: ?u16 = null,
     text_parts: std.AutoHashMapUnmanaged(TextKey, TextPart) = .empty,
     last_text_key: ?TextKey = null,
     text_bytes: usize = 0,
@@ -919,6 +921,10 @@ pub const Reducer = struct {
         defer parsed.deinit();
         if (parsed.value != .object) return false;
         const event_type = stringField(parsed.value.object, "type") orelse return false;
+        if (std.mem.eql(u8, event_type, "response.created") or std.mem.eql(u8, event_type, "response.in_progress")) {
+            self.response_started = true;
+            return false;
+        }
 
         if (std.mem.eql(u8, event_type, "response.output_item.added")) {
             const output_index = try optional_index(parsed.value.object, "output_index") orelse return false;
@@ -1059,7 +1065,14 @@ pub const Reducer = struct {
             }
             return true;
         } else if (std.mem.eql(u8, event_type, "error")) {
-            try self.accept_failure(alloc, parsed.value.object);
+            self.failure_status = valid_failure_status(parsed.value.object.get("status")) orelse
+                valid_failure_status(parsed.value.object.get("status_code"));
+            const error_value = parsed.value.object.get("error");
+            const fields = if (error_value != null and error_value.? == .object)
+                error_value.?.object
+            else
+                parsed.value.object;
+            try self.accept_failure(alloc, fields);
             self.terminal_seen = true;
             self.finish_reason = .provider_error;
             return true;
@@ -1153,8 +1166,16 @@ pub const Reducer = struct {
         return &self.message_items.items[low];
     }
 
+    fn valid_failure_status(value: ?std.json.Value) ?u16 {
+        const status = value orelse return null;
+        if (status != .integer or status.integer < 400 or status.integer > 599) return null;
+        return @intCast(status.integer);
+    }
+
     fn accept_failure(self: *Reducer, alloc: std.mem.Allocator, fields: std.json.ObjectMap) !void {
         const code = stringField(fields, "code") orelse "provider_error";
+        if (std.mem.eql(u8, code, "previous_response_not_found")) return error.PreviousResponseNotFound;
+        if (std.mem.eql(u8, code, "websocket_connection_limit_reached")) return error.WebSocketConnectionLimitReached;
         const message = stringField(fields, "message") orelse "Provider response failed";
         const bounded_code = types.ModelFailureDiagnostic.init(code);
         const bounded_message = types.ModelFailureDiagnostic.init(message);
@@ -2742,6 +2763,228 @@ test "Responses usage projection retains optional cached and reasoning detail" {
     try std.testing.expectEqual(@as(?u64, 5), usage.cache_read_tokens);
     try std.testing.expectEqual(@as(?u64, 2), usage.cache_write_tokens);
     try std.testing.expectEqual(@as(?u64, 3), usage.reasoning_tokens);
+}
+
+test "Responses protocol distinguishes exact WebSocket recovery rejections" {
+    const cases = [_]struct { code: []const u8, failure: anyerror }{
+        .{ .code = "previous_response_not_found", .failure = error.PreviousResponseNotFound },
+        .{ .code = "websocket_connection_limit_reached", .failure = error.WebSocketConnectionLimitReached },
+    };
+    for (cases) |case| {
+        inline for ([_][]const u8{
+            "{{\"type\":\"error\",\"error\":{{\"code\":\"{s}\",\"message\":\"rejected\"}}}}",
+            "{{\"type\":\"error\",\"code\":\"{s}\",\"message\":\"rejected\"}}",
+            "{{\"type\":\"response.failed\",\"response\":{{\"status\":\"failed\",\"error\":{{\"code\":\"{s}\",\"message\":\"rejected\"}}}}}}",
+        }) |format| {
+            var stream = ToolRecordTest.init(std.testing.allocator);
+            defer stream.deinit();
+            const event = try std.fmt.allocPrint(stream.alloc, format, .{case.code});
+            defer stream.alloc.free(event);
+            try std.testing.expectError(case.failure, stream.apply(event));
+            try std.testing.expect(!stream.reducer.terminal_seen);
+            try std.testing.expect(!stream.reducer.response_started);
+        }
+    }
+}
+
+test "Responses protocol recovery rejection codes require exact matching" {
+    for ([_][]const u8{
+        "Previous_response_not_found",
+        "previous_response_not_found ",
+        "previous_response_not_found_extra",
+        "prefix_previous_response_not_found",
+        "Websocket_connection_limit_reached",
+        "websocket_connection_limit_reached ",
+        "websocket_connection_limit_reached_extra",
+        "prefix_websocket_connection_limit_reached",
+        "invalid_prompt",
+    }) |code| {
+        var stream = ToolRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        const event = try std.json.Stringify.valueAlloc(stream.alloc, .{
+            .type = "error",
+            .@"error" = .{ .code = code, .message = "previous_response_not_found websocket_connection_limit_reached" },
+        }, .{});
+        defer stream.alloc.free(event);
+        try stream.apply(event);
+        const completion = try stream.finish();
+        defer stream.freeCompletion(completion);
+        try std.testing.expectEqual(types.ProviderFinishReason.provider_error, completion.finish_reason.?);
+        try std.testing.expectEqual(types.ProviderFailureCause.non_retryable, completion.provider_failure_cause.?);
+        try std.testing.expect(std.mem.startsWith(u8, completion.provider_failure_detail.?, code));
+    }
+}
+
+test "Responses protocol response start survives subsequent provider rejection" {
+    for ([_][]const u8{ "response.created", "response.in_progress" }) |event_type| {
+        var stream = ToolRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        try std.testing.expect(!stream.reducer.response_started);
+        try stream.apply("{\"type\":\"response.queued\"}");
+        try std.testing.expect(!stream.reducer.response_started);
+        const event = try std.json.Stringify.valueAlloc(stream.alloc, .{
+            .type = event_type,
+            .response = .{ .id = "resp_started" },
+        }, .{});
+        defer stream.alloc.free(event);
+        try stream.apply(event);
+        try std.testing.expect(stream.reducer.response_started);
+        try std.testing.expect(!stream.reducer.terminal_seen);
+        try stream.apply("{\"type\":\"response.queued\"}");
+        try stream.apply(event);
+        try stream.apply("{\"type\":\"error\",\"status\":429,\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"too many requests\"}}");
+        try std.testing.expect(stream.reducer.response_started);
+        try std.testing.expectEqual(@as(?u16, 429), stream.reducer.failure_status);
+        const completion = try stream.finish();
+        defer stream.freeCompletion(completion);
+        try std.testing.expectEqual(types.ProviderFinishReason.provider_error, completion.finish_reason.?);
+        try std.testing.expectEqual(types.ProviderFailureCause.rate_limited, completion.provider_failure_cause.?);
+    }
+}
+
+test "Responses protocol response start ignores lookalikes and events after termination" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    for ([_][]const u8{
+        "{\"type\":\"response.created_extra\"}",
+        "{\"type\":\"Response.created\"}",
+        "{\"type\":\"response.in_progress \"}",
+        "{\"type\":\"response.queued\",\"response\":{\"status\":\"in_progress\"}}",
+    }) |event| {
+        try stream.apply(event);
+        try std.testing.expect(!stream.reducer.response_started);
+    }
+    try stream.apply("{\"type\":\"error\",\"code\":\"server_error\",\"message\":\"rejected before start\"}");
+    try stream.apply("{\"type\":\"response.created\"}");
+    try stream.apply("{\"type\":\"response.in_progress\"}");
+    try std.testing.expect(!stream.reducer.response_started);
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqualStrings("server_error: rejected before start", completion.provider_failure_detail.?);
+}
+
+test "Responses protocol wrapped HTTP status uses valid outer integer precedence" {
+    const cases = [_]struct { fields: []const u8, status: u16 }{
+        .{ .fields = "\"status\":400", .status = 400 },
+        .{ .fields = "\"status\":401", .status = 401 },
+        .{ .fields = "\"status\":429", .status = 429 },
+        .{ .fields = "\"status\":503", .status = 503 },
+        .{ .fields = "\"status\":599", .status = 599 },
+        .{ .fields = "\"status_code\":400", .status = 400 },
+        .{ .fields = "\"status_code\":599", .status = 599 },
+        .{ .fields = "\"status\":401,\"status_code\":503", .status = 401 },
+        .{ .fields = "\"status\":399,\"status_code\":429", .status = 429 },
+        .{ .fields = "\"status\":600,\"status_code\":503", .status = 503 },
+        .{ .fields = "\"status\":\"401\",\"status_code\":429", .status = 429 },
+        .{ .fields = "\"status\":401.0,\"status_code\":503", .status = 503 },
+        .{ .fields = "\"status\":null,\"status_code\":503", .status = 503 },
+    };
+    for (cases) |case| {
+        for ([_][]const u8{
+            "\"code\":\"server_error\",\"message\":\"temporarily unavailable\"",
+            "\"error\":{\"code\":\"server_error\",\"message\":\"temporarily unavailable\",\"status\":418}",
+        }) |failure_fields| {
+            var stream = ToolRecordTest.init(std.testing.allocator);
+            defer stream.deinit();
+            const event = try std.fmt.allocPrint(stream.alloc, "{{\"type\":\"error\",{s},{s}}}", .{ case.fields, failure_fields });
+            defer stream.alloc.free(event);
+            try stream.apply(event);
+            try std.testing.expectEqual(@as(?u16, case.status), stream.reducer.failure_status);
+            const completion = try stream.finish();
+            defer stream.freeCompletion(completion);
+            try std.testing.expectEqual(types.ProviderFinishReason.provider_error, completion.finish_reason.?);
+            try std.testing.expectEqual(@as(?types.ProviderFailureCause, null), completion.provider_failure_cause);
+            try std.testing.expectEqualStrings("server_error: temporarily unavailable", completion.provider_failure_detail.?);
+        }
+    }
+}
+
+test "Responses protocol invalid wrapped HTTP status preserves code based outcomes" {
+    const cases = [_]struct { code: []const u8, cause: ?types.ProviderFailureCause, failure: ?anyerror = null }{
+        .{ .code = "server_error", .cause = null },
+        .{ .code = "rate_limit_exceeded", .cause = .rate_limited },
+        .{ .code = "invalid_prompt", .cause = .non_retryable },
+        .{ .code = "previous_response_not_found", .cause = null, .failure = error.PreviousResponseNotFound },
+        .{ .code = "websocket_connection_limit_reached", .cause = null, .failure = error.WebSocketConnectionLimitReached },
+    };
+    for ([_][]const u8{
+        "",
+        ",\"status\":399",
+        ",\"status\":600",
+        ",\"status\":-1",
+        ",\"status\":9223372036854775807",
+        ",\"status\":\"429\"",
+        ",\"status\":429.0",
+        ",\"status\":true",
+        ",\"status\":null",
+        ",\"status\":{}",
+        ",\"status\":[]",
+        ",\"status_code\":399",
+        ",\"status_code\":600",
+        ",\"status_code\":\"503\"",
+        ",\"status_code\":503.0",
+        ",\"status_code\":false",
+        ",\"status_code\":null",
+        ",\"status_code\":{}",
+        ",\"status_code\":[]",
+        ",\"status\":399,\"status_code\":600",
+    }) |status_fields| {
+        for (cases) |case| {
+            var stream = ToolRecordTest.init(std.testing.allocator);
+            defer stream.deinit();
+            const event = try std.fmt.allocPrint(stream.alloc, "{{\"type\":\"error\"{s},\"error\":{{\"code\":\"{s}\",\"message\":\"rejected\",\"status\":401,\"status_code\":503}}}}", .{ status_fields, case.code });
+            defer stream.alloc.free(event);
+            if (case.failure) |failure| {
+                try std.testing.expectError(failure, stream.apply(event));
+                try std.testing.expectEqual(@as(?u16, null), stream.reducer.failure_status);
+                continue;
+            }
+            try stream.apply(event);
+            try std.testing.expectEqual(@as(?u16, null), stream.reducer.failure_status);
+            const completion = try stream.finish();
+            defer stream.freeCompletion(completion);
+            try std.testing.expectEqual(types.ProviderFinishReason.provider_error, completion.finish_reason.?);
+            try std.testing.expectEqual(case.cause, completion.provider_failure_cause);
+            const detail = try std.fmt.allocPrint(stream.alloc, "{s}: rejected", .{case.code});
+            defer stream.alloc.free(detail);
+            try std.testing.expectEqualStrings(detail, completion.provider_failure_detail.?);
+        }
+    }
+}
+
+test "Responses protocol HTTP status is only captured from error events" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply("{\"type\":\"response.created\",\"status\":401,\"status_code\":429}");
+    try std.testing.expect(stream.reducer.response_started);
+    try std.testing.expectEqual(@as(?u16, null), stream.reducer.failure_status);
+    try stream.apply("{\"type\":\"response.failed\",\"status\":503,\"status_code\":429,\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"terminal failure\",\"status\":401}}}");
+    try std.testing.expectEqual(@as(?u16, null), stream.reducer.failure_status);
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqual(types.ProviderFinishReason.provider_error, completion.finish_reason.?);
+    try std.testing.expectEqual(@as(?types.ProviderFailureCause, null), completion.provider_failure_cause);
+    try std.testing.expectEqualStrings("server_error: terminal failure", completion.provider_failure_detail.?);
+}
+
+test "Responses protocol wrapped HTTP status retains bounded UTF8 provider detail" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    const event = try std.json.Stringify.valueAlloc(stream.alloc, .{
+        .type = "error",
+        .status_code = 503,
+        .@"error" = .{ .code = "server_error", .message = "é" ** 512 },
+    }, .{});
+    defer stream.alloc.free(event);
+    try stream.apply(event);
+    try std.testing.expectEqual(@as(?u16, 503), stream.reducer.failure_status);
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqual(types.ProviderFinishReason.provider_error, completion.finish_reason.?);
+    try std.testing.expectEqual(@as(?types.ProviderFailureCause, null), completion.provider_failure_cause);
+    try std.testing.expect(completion.provider_failure_detail.?.len <= types.ModelFailureDiagnostic.max_bytes);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(completion.provider_failure_detail.?));
+    try std.testing.expect(std.mem.startsWith(u8, completion.provider_failure_detail.?, "server_error: é"));
 }
 
 test "Responses protocol owns one subscription billing projection" {

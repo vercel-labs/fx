@@ -72,6 +72,7 @@ const js_host_workspace = @import("core/hosts/js_host_workspace.zig");
 const host_target = @import("core/hosts/target.zig");
 const native_host = @import("core/hosts/native.zig");
 const debug_trace = @import("core/shared/debug_trace.zig");
+const openai_codex = @import("gateway/openai_codex.zig");
 const display_width = @import("core/shared/display_width.zig");
 const file_index_mod = @import("core/workspace/file_index.zig");
 const mcp_command_provider = @import("core/mcp/command_provider.zig");
@@ -3480,7 +3481,10 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
             });
             defer threaded.deinit();
             io_mod.setIo(threaded.io());
-            defer debug_trace.shutdown();
+            defer {
+                debug_trace.shutdown();
+                openai_codex.shutdownWebSockets();
+            }
             debug_trace.configureFromEnv(processAllocator(), ".");
             try terminal_host.run(
                 processAllocator(),
@@ -3561,6 +3565,7 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
         });
         if (early_threaded) |*threaded| io_mod.setIo(threaded.io());
     }
+    defer openai_codex.shutdownWebSockets();
 
     const before = try app_entry_runtime.runBeforeInteractive(alloc, cli_args, cfg);
     switch (before) {
@@ -4102,6 +4107,7 @@ test "session reset traces and clears active paste state" {
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.paste.decision_bytes);
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
     debug_trace.shutdown();
+    openai_codex.shutdownWebSockets();
 
     var trace_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
     defer trace_file.close(io_mod.getIo());
@@ -4859,6 +4865,9 @@ test {
     _ = @import("core/auth/provider_catalog.zig");
     _ = @import("gateway/openai_codex_models.zig");
     _ = @import("gateway/openai_codex.zig");
+    _ = @import("gateway/websocket_transport.zig");
+    _ = @import("gateway/codex_websocket_session.zig");
+    _ = @import("gateway/openai_codex_websocket.zig");
     _ = @import("gateway/responses_protocol.zig");
     _ = @import("gateway/openai_codex_permission_reviewer.zig");
     _ = @import("core/auth/grok_session.zig");

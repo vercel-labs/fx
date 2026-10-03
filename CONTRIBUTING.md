@@ -39,6 +39,20 @@ zig build run
 
 Keep the local development loop focused: run the narrowest test that covers the changed path, build fx, and exercise the change using `./zig-out/bin/fx`. The installed `fx` on `PATH` is not valid development evidence.
 
+Use `-Dtest-filter` to select Zig tests by name. For example:
+
+```bash
+zig build test -Doptimize=ReleaseSafe -Dtest-filter=WebSocket
+```
+
+The filter applies to the product and session test suites. Omit it when running the complete suite; Full CI remains unfiltered.
+
+Loopback network fixtures must wake a blocked listener before joining its accept thread. Shutting down the listener alone does not release `accept` on macOS.
+
+Tmux fixtures run their POSIX launch observer through `/bin/sh`, regardless of the user's default shell. Keep the observer as the pane process so process ownership and captured exit status remain reliable.
+
+Coordinate streaming-output phases with file barriers. Before capturing a scrolled viewport, wait for both the accepted scroll and its committed frame; release the next output phase only after capturing the baseline.
+
 Once the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. The **Full CI** workflow runs the complete deterministic suite on native Linux x86_64, Linux aarch64, macOS x86_64, and macOS aarch64 runners. The native matrix builds, tests, and smoke-tests ReleaseSafe on every platform; formatting, the public-surface audit, and the compactor boundary check run in those ReleaseSafe jobs. Four duration-balanced, isolated ReleaseSafe E2E shards per platform use checked-in weights to assign every Bun test file once; files inside each shard run sequentially in separate Bun processes so terminal fixtures and process state cannot leak between files. A failed file receives one bounded retry after tmux is reset.
 
 Standard PR CI reports ReleaseSafe Build & Test and deterministic E2E results. Do not mark the draft PR ready until all four Full CI jobs and the final ship gate have succeeded for the exact current commit. Each platform aggregate requires its ReleaseSafe native check and all four ReleaseSafe E2E shards. A result from an older commit does not count. Live model evals are separate from this gate because they require credentials and are not deterministic.

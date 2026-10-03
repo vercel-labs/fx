@@ -3011,6 +3011,8 @@ test.skipIf(!tmuxAvailable())(
     const stderrPath = join(root, "stderr.log");
     const tapePath = join(root, "stream-scroll.fxtape");
     const tracePath = join(root, "trace.log");
+    const phaseOneComplete = join(workspace, "phase-one.complete");
+    const phaseTwoRelease = join(workspace, "phase-two.release");
     const phaseTwoComplete = join(workspace, "phase-two.complete");
     mkdirSync(join(home, ".fx"), { recursive: true });
     mkdirSync(workspace);
@@ -3022,7 +3024,8 @@ test.skipIf(!tmuxAvailable())(
 
     const lineMarker = "STREAM_SCROLL_INLINE";
     const doneMarker = "STREAM_SCROLL_INLINE_DONE";
-    const command = `zsh -lc 'for i in {1..80}; do printf "${lineMarker} %03d\\n" "$i"; done; sleep 2; for i in {81..160}; do printf "${lineMarker} %03d\\n" "$i"; done; : > ${shellQuote(phaseTwoComplete)}'`;
+    // File barriers control output phases; the child sleep only polls its release.
+    const command = `zsh -lc 'for i in {1..80}; do printf "${lineMarker} %03d\\n" "$i"; done; : > ${shellQuote(phaseOneComplete)}; while [ ! -f ${shellQuote(phaseTwoRelease)} ]; do sleep 0.02; done; for i in {81..160}; do printf "${lineMarker} %03d\\n" "$i"; done; : > ${shellQuote(phaseTwoComplete)}'`;
     const gateway = startFakeGateway([
       fakeShellRun("stream-scroll-handoff", command),
       fakeGatewayFinalText(doneMarker),
@@ -3051,6 +3054,7 @@ test.skipIf(!tmuxAvailable())(
           !pane.includes(`${lineMarker} 001`),
         TIMEOUT,
       );
+      await waitForCondition(() => existsSync(phaseOneComplete), "first output phase");
       const scrollActions = [
         ["1b", "5b", "3c", "36", "34", "3b", "31", "3b", "31", "4d"],
         ["1b", "5b", "3c", "36", "35", "3b", "31", "3b", "31", "4d"],
@@ -3090,10 +3094,15 @@ test.skipIf(!tmuxAvailable())(
         },
         "viewer alternate-scroll trace",
       );
+      const pageTraceStart = statSync(tracePath).size;
       await active.sendHexBytes(["1b", "5b", "35", "7e"]);
       await waitForCondition(
-        () => readFileSync(tracePath, "utf8").includes("unit=page"),
-        "viewer page trace",
+        () => {
+          const appended = readFileSync(tracePath).subarray(pageTraceStart).toString("utf8");
+          const scroll = appended.indexOf("scroll depth=full direction=up unit=page");
+          return scroll >= 0 && appended.slice(scroll).includes("[frame_commit] wire_frame");
+        },
+        "committed viewer page frame",
       );
       const readingBefore = await active.capturePaneGrid();
       expect(readingBefore.join("\n")).toContain("full detail · ctrl+o close");
@@ -3102,6 +3111,7 @@ test.skipIf(!tmuxAvailable())(
       );
       expect(readingBefore.join("\n")).not.toContain("ctrl+o to view");
 
+      writeFileSync(phaseTwoRelease, "release\n");
       await waitForCondition(() => existsSync(phaseTwoComplete), "second output phase");
       await waitForCondition(() => gateway.requests.length >= 2, "post-command gateway request");
       const readingAfter = await active.capturePaneGrid();

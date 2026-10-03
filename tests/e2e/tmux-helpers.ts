@@ -666,7 +666,7 @@ export class TmuxSession {
     const gatedLaunch = remainOnExit || minimumHistoryLines !== undefined;
     const tmuxCommand = gatedLaunch
       ? `tmux wait-for ${shellQuote(startGate)} && exec ${observedCmd}`
-      : observedCmd;
+      : `exec ${observedCmd}`;
     const tmuxPrefix = resolvedSocketName ? ["-L", resolvedSocketName] : [];
     const setupSessionName = `${name}-setup`;
     const killSetupSession = () => {
@@ -757,6 +757,8 @@ export class TmuxSession {
           "-y",
           String(height),
           ...sessionEnvArgs,
+          "/bin/sh",
+          "-c",
           tmuxCommand,
           ...launchSuffix,
         ],

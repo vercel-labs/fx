@@ -16,6 +16,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createConnection, createServer, type Socket as NodeSocket } from "node:net";
 import { FX_BIN, REPO_ROOT, runFx, providerVersionTestEnv } from "../evals/eval-helpers";
 import { fakeResponsesTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 import { readTapeFrames } from "./render-lab/tape";
@@ -330,7 +331,14 @@ async function startFx(
   cwd?: string,
   resumeId?: string,
   launchArgs: string[] = [],
+  options: { preserveSessionTitles?: boolean } = {},
 ): Promise<TmuxSession> {
+  if (envOverrides.FX_CODEX_TRANSPORT === "websocket" && !options.preserveSessionTitles) {
+    // Ordinary transport fixtures isolate conversation calls from cosmetic titles.
+    const settingsPath = join(testHome, ".fx", "settings.json");
+    const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+    writeFileSync(settingsPath, JSON.stringify({ ...settings, session_titles: false }) + "\n", { mode: 0o600 });
+  }
   return TmuxSession.create({
     cmd: [FX_BIN, ...launchArgs, ...(resumeId ? ["--resume", `'${resumeId}'`] : [])].join(" "),
     cwd,
@@ -978,6 +986,399 @@ function startFakeCodexToolLoop(options: {
     stop() { server.stop(true); },
   };
 }
+
+interface CodexWebSocketRequest {
+  type: "response.create";
+  model: string;
+  input: unknown[];
+  instructions?: string;
+  previous_response_id?: string;
+  store?: boolean;
+}
+
+interface CodexWebSocketEnvelope {
+  connectionId: number;
+  requestId: number;
+  isTitle: boolean;
+  body: CodexWebSocketRequest;
+}
+
+function isCodexWebSocketRequest(value: unknown): value is CodexWebSocketRequest {
+  return typeof value === "object" && value !== null &&
+    "type" in value && value.type === "response.create" &&
+    "model" in value && typeof value.model === "string" &&
+    "input" in value && Array.isArray(value.input) &&
+    (!("instructions" in value) || typeof value.instructions === "string") &&
+    (!("previous_response_id" in value) || typeof value.previous_response_id === "string") &&
+    (!("store" in value) || typeof value.store === "boolean");
+}
+
+interface CodexWebSocketFixtureOptions {
+  holdRequests?: number[];
+  closeOnOpen?: number;
+  closeAfterMessage?: number;
+  closeAfterFirstMessage?: number;
+  closeAfterCompletion?: boolean;
+  toolThenCloseRequests?: number[];
+  disconnectRequests?: number[];
+  withheldUpgrades?: number[];
+  withheldPongs?: number[];
+  titleText?: string;
+  serveSse?: boolean;
+  rejectPreviousOnce?: boolean;
+  toolRoundTrip?: boolean;
+  reasoningState?: boolean;
+  rejectUpgradeWithSse?: boolean;
+  upgradeRejections?: Array<{ status: number; authorization?: string }>;
+  acceptedAuthorization?: string;
+  rejection?: {
+    code: "previous_response_not_found" | "websocket_connection_limit_reached" | "wrapped_status";
+    requests: number[];
+    progress?: "content" | "reasoning" | "tool-start" | "message-start" | "response.created";
+    status?: number;
+    statusField?: "status" | "status_code";
+  };
+  terminalFailureOnRequest?: number;
+  beforeCompletion?: (requestNumber: number, envelope: CodexWebSocketEnvelope) => void | Promise<void>;
+}
+
+function startFakeCodexWebSocket(options: CodexWebSocketFixtureOptions = {}) {
+  const requests: string[] = [];
+  const closeCodes: number[] = [];
+  const envelopes: CodexWebSocketEnvelope[] = [];
+  const upgrades: Array<{ connectionId: number; authorization: string | null }> = [];
+  const withheldPongs: Array<{ connectionId: number; payload: string }> = [];
+  const disconnectedConnections: number[] = [];
+  const disconnectProgress = new Set<number>();
+  const disconnectPongWaiters = new Map<string, { requestId: number; resolve: () => void }>();
+  let upgradeRequests = 0;
+  let sseRequests = 0;
+  let httpResponseRequests = 0;
+  let rejectedPrevious = false;
+  const changes = new Set<() => void>();
+  function notify() { for (const changed of changes) changed(); }
+  function waitForFixture(predicate: () => boolean): Promise<void> {
+    if (predicate()) return Promise.resolve();
+    const { promise, resolve } = Promise.withResolvers<void>();
+    function changed() {
+      if (!predicate()) return;
+      changes.delete(changed);
+      resolve();
+    }
+    changes.add(changed);
+    return promise;
+  }
+  const accessToken = chatgptAccessToken("acct_websocket");
+  const server = Bun.serve<{ opened: boolean; connectionId: number }>({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request, server) {
+      const path = new URL(request.url).pathname;
+      if (path === "/models") {
+        return Response.json({ models: [
+          ...["gpt-5.6-sol", "gpt-5.6-luna"].map(slug => ({
+            slug, visibility: "list", supported_in_api: true,
+            supported_reasoning_levels: [{ effort: "high" }],
+            additional_speed_tiers: [], input_modalities: ["text"], context_window: 272000,
+          })),
+        ] });
+      }
+      if (path === "/responses") {
+        if (request.headers.get("upgrade")?.toLowerCase() === "websocket") {
+          upgradeRequests += 1;
+          const authorization = request.headers.get("authorization");
+          upgrades.push({ connectionId: upgradeRequests, authorization });
+          notify();
+          const rejection = options.upgradeRejections?.[0];
+          if (rejection && (rejection.authorization === undefined || rejection.authorization === authorization)) {
+            options.upgradeRejections!.shift();
+            return new Response("fixture upgrade rejected", { status: rejection.status });
+          }
+          if (options.acceptedAuthorization !== undefined && authorization !== options.acceptedAuthorization) {
+            return new Response("fixture credentials rejected", { status: 401 });
+          }
+          if (options.rejectUpgradeWithSse) return new Response("upgrade unavailable", { status: 426 });
+          if (options.withheldUpgrades?.includes(upgradeRequests)) {
+            return Promise.withResolvers<Response>().promise;
+          }
+          if (server.upgrade(request, {
+            data: { opened: true, connectionId: upgradeRequests },
+            headers: { "x-fixture-connection-id": String(upgradeRequests) },
+          })) return;
+        } else {
+          httpResponseRequests += 1;
+          if (options.rejectUpgradeWithSse || options.serveSse) {
+            requests.push(await request.text());
+            sseRequests += 1;
+            const completed = {
+              type: "response.completed",
+              response: {
+                id: `resp_sse_${sseRequests}`,
+                status: "completed",
+                usage: { input_tokens: 5, output_tokens: 2 },
+              },
+            };
+            return new Response(
+              `data: ${JSON.stringify({ type: "response.output_text.delta", delta: `CODEX_SSE_FALLBACK_${sseRequests}` })}\n\n` +
+                `data: ${JSON.stringify(completed)}\n\n`,
+              { headers: { "content-type": "text/event-stream" } },
+            );
+          }
+        }
+      }
+      return new Response("not found", { status: 404 });
+    },
+    websocket: {
+      open(ws) {
+        if (options.closeOnOpen !== undefined) ws.close(options.closeOnOpen, "fixture close");
+      },
+      async message(ws, message) {
+        const payload = String(message);
+        requests.push(payload);
+        const parsed: unknown = JSON.parse(payload);
+        if (!isCodexWebSocketRequest(parsed)) throw new Error("Invalid fixture response.create envelope");
+        const requestNumber = requests.length;
+        const isTitle = parsed.instructions?.includes(TITLE_GENERATION_MARKER) ?? false;
+        const envelope = { connectionId: ws.data.connectionId, requestId: requestNumber, isTitle, body: parsed };
+        envelopes.push(envelope);
+        notify();
+        const rejection = options.rejection;
+        if (rejection?.requests.includes(requestNumber)) {
+          if (rejection.progress === "content") {
+            ws.send(JSON.stringify({ type: "response.output_text.delta", delta: "CODEX_PARTIAL_CONTENT" }));
+          } else if (rejection.progress === "reasoning") {
+            ws.send(JSON.stringify({ type: "response.reasoning_summary_text.delta", delta: "CODEX_PARTIAL_REASONING" }));
+          } else if (rejection.progress === "tool-start") {
+            ws.send(JSON.stringify({
+              type: "response.output_item.added",
+              output_index: 0,
+              item: { type: "function_call", call_id: "call_rejected", name: "read_file" },
+            }));
+          } else if (rejection.progress === "message-start") {
+            ws.send(JSON.stringify({
+              type: "response.output_item.added",
+              output_index: 0,
+              item: { type: "message", id: "msg_started", role: "assistant", content: [] },
+            }));
+          } else if (rejection.progress === "response.created") {
+            ws.send(JSON.stringify({ type: "response.created", response: { id: "resp_started", status: "in_progress" } }));
+          }
+          ws.send(JSON.stringify({
+            type: "error",
+            ...(rejection.status === undefined ? {} : { [rejection.statusField ?? "status"]: rejection.status }),
+            error: { code: rejection.code, message: `CODEX_REJECTION_${rejection.code}` },
+          }));
+          return;
+        }
+        if (options.terminalFailureOnRequest === requestNumber) {
+          ws.send(JSON.stringify({ type: "response.output_text.delta", delta: "CODEX_TERMINAL_PARTIAL" }));
+          ws.send(JSON.stringify({
+            type: "response.failed",
+            response: {
+              id: "resp_failed_must_not_continue",
+              status: "failed",
+              error: { code: "invalid_prompt", message: "CODEX_TERMINAL_REJECTED" },
+              usage: { input_tokens: 5, output_tokens: 2 },
+            },
+          }));
+          return;
+        }
+        if (options.rejectPreviousOnce && parsed.previous_response_id && !rejectedPrevious) {
+          rejectedPrevious = true;
+          ws.send(JSON.stringify({
+            type: "error",
+            error: { code: "previous_response_not_found", message: "Previous response was not found." },
+          }));
+          return;
+        }
+        if (options.toolRoundTrip && requestNumber === 1) {
+          ws.send(JSON.stringify({
+            type: "response.output_item.added",
+            output_index: 0,
+            item: { type: "function_call", call_id: "call_phase3", name: "read_file" },
+          }));
+          ws.send(JSON.stringify({
+            type: "response.function_call_arguments.done",
+            output_index: 0,
+            arguments: '{"path":"README.md"}',
+          }));
+          ws.send(JSON.stringify({
+            type: "response.completed",
+            response: { id: "resp_websocket_1", status: "completed", usage: { input_tokens: 5, output_tokens: 2 } },
+          }));
+          return;
+        }
+        if (options.toolThenCloseRequests?.includes(requestNumber)) {
+          ws.send(JSON.stringify({ type: "response.output_text.delta", delta: "CODEX_PARTIAL_TOOL" }));
+          ws.send(JSON.stringify({
+            type: "response.output_item.added",
+            output_index: 1,
+            item: { type: "function_call", call_id: "call_1", name: "read_file" },
+          }));
+          ws.send(JSON.stringify({
+            type: "response.function_call_arguments.delta",
+            output_index: 1,
+            delta: '{"path":"README.md"}',
+          }));
+          ws.close(1011, "fixture close");
+          return;
+        }
+        if (options.disconnectRequests?.includes(requestNumber)) {
+          const progress = Promise.withResolvers<void>();
+          const nonce = `fixture-disconnect-${ws.data.connectionId}-${requestNumber}`;
+          disconnectPongWaiters.set(nonce, { requestId: requestNumber, resolve: progress.resolve });
+          ws.send(JSON.stringify({ type: "response.output_text.delta", delta: "CODEX_PARTIAL_EOF\n" }));
+          ws.ping(nonce);
+          // The echoed pong proves native code consumed the preceding text frame.
+          await progress.promise;
+          await options.beforeCompletion?.(requestNumber, envelope);
+          const peer = proxyConnections.get(ws.data.connectionId);
+          if (!peer) throw new Error("Missing raw TCP peer for fixture disconnect");
+          // End TCP without a WebSocket close; native POSIX fixtures cover RST.
+          disconnectedConnections.push(ws.data.connectionId);
+          peer.destroy();
+          ws.terminate();
+          return;
+        }
+        if (options.closeAfterMessage !== undefined) {
+          ws.close(options.closeAfterMessage, "fixture close");
+          return;
+        }
+        if (options.closeAfterFirstMessage !== undefined && requestNumber === 1) {
+          ws.close(options.closeAfterFirstMessage, "fixture first-message close");
+          return;
+        }
+        if (options.holdRequests?.includes(requestNumber)) return;
+        await options.beforeCompletion?.(requestNumber, envelope);
+        if (options.reasoningState) {
+          ws.send(JSON.stringify({
+            type: "response.output_item.done",
+            output_index: 0,
+            item: { type: "reasoning", id: `reasoning_${requestNumber}`, encrypted_content: "opaque" },
+          }));
+        }
+        const text = isTitle ? options.titleText : `CODEX_WEBSOCKET_OK_${requestNumber}`;
+        if (text !== undefined) {
+          ws.send(JSON.stringify({ type: "response.output_text.delta", output_index: options.reasoningState ? 1 : 0, delta: text }));
+        }
+        ws.send(JSON.stringify({
+          type: "response.completed",
+          response: { id: isTitle ? `resp_title_${requestNumber}` : `resp_websocket_${requestNumber}`, status: "completed", usage: { input_tokens: 5, output_tokens: text === undefined ? 0 : 2 } },
+        }));
+        if (options.closeAfterCompletion) ws.close(1000, "fixture completed");
+      },
+      close(_ws, code) {
+        closeCodes.push(code);
+      },
+      pong(_ws, data) {
+        const nonce = Buffer.from(data).toString();
+        const progress = disconnectPongWaiters.get(nonce);
+        if (!progress) return;
+        disconnectPongWaiters.delete(nonce);
+        disconnectProgress.add(progress.requestId);
+        progress.resolve();
+        notify();
+      },
+    },
+  });
+  // Bun/uWebSockets automatically answers client pings. Filter actual server
+  // pong frames on a raw TCP hop; a no-op ping callback would not stall health.
+  // The same hop can end TCP without sending a WebSocket close frame.
+  const proxyConnections = new Map<number, NodeSocket>();
+  const proxySockets = new Set<NodeSocket>();
+  const proxyReady = Promise.withResolvers<void>();
+  const rawProxy = options.withheldPongs?.length || options.disconnectRequests?.length ? createServer(socket => {
+    const upstream = createConnection({ host: "127.0.0.1", port: server.port! });
+    proxySockets.add(socket);
+    proxySockets.add(upstream);
+    let incoming = Buffer.alloc(0);
+    let upgraded = false;
+    let connectionId = 0;
+    socket.pipe(upstream);
+    upstream.on("data", chunk => {
+      incoming = Buffer.concat([incoming, chunk]);
+      if (!upgraded) {
+        const end = incoming.indexOf("\r\n\r\n");
+        if (end < 0) return;
+        const header = incoming.subarray(0, end + 4);
+        connectionId = Number(header.toString().match(/x-fixture-connection-id:\s*(\d+)/i)?.[1] ?? 0);
+        upgraded = true;
+        if (connectionId !== 0) proxyConnections.set(connectionId, socket);
+        socket.write(header);
+        incoming = incoming.subarray(end + 4);
+      }
+      if (connectionId === 0) {
+        // Non-upgrade HTTP responses have no WebSocket frames to filter.
+        socket.write(incoming);
+        incoming = Buffer.alloc(0);
+      }
+      while (incoming.length >= 2) {
+        const shortLength = incoming[1] & 0x7f;
+        const headerLength = shortLength === 126 ? 4 : shortLength === 127 ? 10 : 2;
+        if (incoming.length < headerLength) break;
+        const length = shortLength === 126 ? incoming.readUInt16BE(2)
+          : shortLength === 127 ? Number(incoming.readBigUInt64BE(2)) : shortLength;
+        if (incoming.length < headerLength + length) break;
+        const complete = incoming.subarray(0, headerLength + length);
+        if ((incoming[0] & 0x0f) === 10 && options.withheldPongs?.includes(connectionId)) {
+          withheldPongs.push({ connectionId, payload: complete.subarray(headerLength).toString("hex") });
+          notify();
+        } else {
+          socket.write(complete);
+        }
+        incoming = incoming.subarray(headerLength + length);
+      }
+    });
+    upstream.on("error", () => socket.destroy());
+    upstream.on("close", () => {
+      socket.destroy();
+      proxySockets.delete(upstream);
+    });
+    socket.on("error", () => upstream.destroy());
+    socket.on("close", () => {
+      upstream.destroy();
+      proxyConnections.delete(connectionId);
+      proxySockets.delete(socket);
+    });
+  }) : undefined;
+  if (rawProxy) {
+    rawProxy.once("error", proxyReady.reject);
+    rawProxy.listen(0, "127.0.0.1", proxyReady.resolve);
+  } else {
+    proxyReady.resolve();
+  }
+  return {
+    accessToken,
+    requests,
+    envelopes,
+    upgrades,
+    closeCodes,
+    withheldPongs,
+    disconnectedConnections,
+    ready: proxyReady.promise,
+    waitForEnvelopes(count: number) { return waitForFixture(() => envelopes.length >= count); },
+    waitForUpgrades(count: number) { return waitForFixture(() => upgrades.length >= count); },
+    waitForWithheldPong() { return waitForFixture(() => withheldPongs.length > 0); },
+    waitForDisconnectProgress(requestId: number) { return waitForFixture(() => disconnectProgress.has(requestId)); },
+    get upgradeRequests() { return upgradeRequests; },
+    get sseRequests() { return sseRequests; },
+    get httpResponseRequests() { return httpResponseRequests; },
+    get responsesUrl() {
+      const address = rawProxy?.address();
+      if (address === null || typeof address === "string") {
+        throw new Error("Await fixture.ready before using its raw TCP endpoint");
+      }
+      return `http://127.0.0.1:${address?.port ?? server.port}/responses`;
+    },
+    modelsUrl: `http://127.0.0.1:${server.port}/models`,
+    stop() {
+      for (const socket of proxySockets) socket.destroy();
+      rawProxy?.close();
+      server.stop(true);
+    },
+  };
+}
+
 
 function startFakeCodexCapacityLoop() {
   const bodies: string[] = [];
@@ -5740,6 +6141,1421 @@ test("direct provider tool identities obey the session boundary before execution
     }
   }
 }, 60_000);
+
+test(
+  "Codex WebSocket streams a completion through the freshly built binary",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-"));
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket({ reasoningState: true });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
+        { mode: 0o600 },
+      );
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Use the WebSocket transport."],
+        {
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: "gateway-websocket-sentinel",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_AUTO_UPGRADE: "0",
+            FX_CODEX_TRANSPORT: "websocket",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+            FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(result.stdout).toContain("CODEX_WEBSOCKET_OK");
+      expect(codex.requests).toHaveLength(1);
+      expect(codex.requests[0]).toContain('"type":"response.create"');
+      expect(codex.requests[0]).not.toContain('"stream"');
+      expect(gateway.requests).toHaveLength(0);
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
+test(
+  "Codex WebSocket policy close is not retried as a transport failure",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-policy-close-"));
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket({ closeOnOpen: 1008 });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
+        { mode: 0o600 },
+      );
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Reject this request by policy."],
+        {
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: "gateway-websocket-policy-sentinel",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_AUTO_UPGRADE: "0",
+            FX_CODEX_TRANSPORT: "websocket",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+            FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+      expect(result.code).toBe(1);
+      expect(`${result.stdout}\n${result.stderr}`).toContain("WebSocketPolicyClosed");
+      expect(codex.requests).toHaveLength(0);
+      expect(codex.upgradeRequests).toBe(1);
+      expect(gateway.requests).toHaveLength(0);
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
+test(
+  "Codex WebSocket continues a completed tool call with only its result",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-tool-continuation-"));
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket({ toolRoundTrip: true });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol", permission_mode: "yolo" }) + "\n",
+        { mode: 0o600 },
+      );
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Read README.md, then report success."],
+        {
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: "gateway-websocket-tool-continuation-sentinel",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_AUTO_UPGRADE: "0",
+            FX_CODEX_TRANSPORT: "websocket",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+            FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(codex.upgradeRequests).toBe(1);
+      expect(codex.requests).toHaveLength(2);
+      expect(codex.requests[1]).toContain('"previous_response_id":"resp_websocket_1"');
+      expect(codex.requests[1]).toContain('"type":"function_call_output"');
+      expect(codex.requests[1]).not.toContain("Read README.md, then report success.");
+      expect(gateway.requests).toHaveLength(0);
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
+test(
+  "Codex WebSocket close after response.create never replays the turn",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-post-send-close-"));
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket({ closeAfterMessage: 1011 });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
+        { mode: 0o600 },
+      );
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Do not replay this request."],
+        {
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: "gateway-websocket-post-send-close-sentinel",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_AUTO_UPGRADE: "0",
+            FX_CODEX_TRANSPORT: "websocket",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+            FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+      expect(result.code).toBe(1);
+      expect(`${result.stdout}\n${result.stderr}`).toContain("WebSocketClosedBeforeCompletion");
+      expect(codex.requests).toHaveLength(1);
+      expect(codex.upgradeRequests).toBe(1);
+      expect(codex.httpResponseRequests).toBe(0);
+      expect(gateway.requests).toHaveLength(0);
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "Codex WebSocket uses full context when persisted tool evidence changes history",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-tool-turn-continuation-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket({ toolRoundTrip: true, reasoningState: true });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol", permission_mode: "yolo" }) + "\n",
+        { mode: 0o600 },
+      );
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_CODEX_TRANSPORT: "websocket",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Read README.md for the first Phase 3 turn.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_2", TIMEOUT);
+      await session.sendText("Complete the next Phase 3 turn without replay.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_3", TIMEOUT);
+
+      expect(codex.upgradeRequests).toBe(1);
+      expect(codex.requests).toHaveLength(3);
+      expect(codex.requests[1]).toContain('"previous_response_id":"resp_websocket_1"');
+      expect(codex.requests[1]).toContain('"type":"function_call_output"');
+      expect(codex.requests[2]).not.toContain("previous_response_id");
+      expect(codex.requests[2]).toContain("Complete the next Phase 3 turn without replay.");
+      expect(codex.requests[2]).toContain("Read README.md for the first Phase 3 turn.");
+      expect(codex.requests[2]).toContain('"type":"function_call_output"');
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
+
+tmuxTest(
+  "Codex WebSocket tool stream close retains partial output without replay and recovers fresh",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-tool-close-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket({ toolThenCloseRequests: [2] });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+        provider: "codex", codex_model: "gpt-5.6-sol",
+      }) + "\n", { mode: 0o600 });
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_CODEX_TRANSPORT: "websocket",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Seed the failed-tool conversation.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_1", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Do not replay this partial tool request.");
+      await session.waitForText("WebSocketClosedBeforeCompletion", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      const partial = await session.captureFullScrollback();
+      expect(partial).toContain("CODEX_PARTIAL_TOOL");
+      expect(partial.includes(codex.accessToken)).toBe(false);
+      expect(codex.envelopes.map(({ requestId, connectionId }) => ({ requestId, connectionId })))
+        .toEqual([{ requestId: 1, connectionId: 1 }, { requestId: 2, connectionId: 1 }]);
+      expect(codex.envelopes[1].body.previous_response_id).toBe("resp_websocket_1");
+      expect(codex.httpResponseRequests).toBe(0);
+      await session.sendText("Complete independently after the partial tool failure.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_3", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      expect(codex.envelopes.map(envelope => envelope.connectionId)).toEqual([1, 1, 2]);
+      expect(codex.envelopes.map(envelope => envelope.requestId)).toEqual([1, 2, 3]);
+      expect(codex.envelopes[2].body.previous_response_id).toBeUndefined();
+      const fullInput = JSON.stringify(codex.envelopes[2].body.input);
+      expect(fullInput).toContain("Seed the failed-tool conversation.");
+      expect(fullInput).toContain("CODEX_WEBSOCKET_OK_1");
+      expect(fullInput).toContain("CODEX_PARTIAL_TOOL");
+      expect(fullInput).toContain("Complete independently after the partial tool failure.");
+      expect(await session.captureFullScrollback()).toContain("CODEX_PARTIAL_TOOL");
+      expect(codex.upgradeRequests).toBe(2);
+      expect(codex.httpResponseRequests).toBe(0);
+      expect(gateway.requests).toHaveLength(0);
+      expect(session.isAlive()).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "Codex WebSocket overlapping title and conversation keep consumers and continuation isolated",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-title-overlap-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const titleText = "Isolated Codex title";
+    const titleGate = Promise.withResolvers<void>();
+    const conversationGate = Promise.withResolvers<void>();
+    const codex = startFakeCodexWebSocket({
+      titleText,
+      beforeCompletion(requestNumber, envelope) {
+        if (requestNumber <= 2) return envelope.isTitle ? titleGate.promise : conversationGate.promise;
+      },
+    });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      // Use the native cosmetic-title model for both callers, so they genuinely
+      // compete for the same identity's one retained lane.
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+        provider: "codex", codex_model: "gpt-5.6-luna", session_titles: true,
+        statusLine: { session: true },
+      }) + "\n", { mode: 0o600 });
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_CODEX_TRANSPORT: "websocket",
+        FX_CODEX_WEBSOCKET_MAX_LANES: "1",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      }, undefined, undefined, [], { preserveSessionTitles: true });
+      await session.waitForComposer(TIMEOUT);
+      const firstPrompt = "Keep the overlapping title answer out of this conversation.";
+      await session.sendText(firstPrompt);
+      await codex.waitForEnvelopes(2);
+      expect(codex.envelopes).toHaveLength(2);
+      expect(codex.envelopes.map(envelope => envelope.requestId)).toEqual([1, 2]);
+      const title = codex.envelopes.find(envelope => envelope.isTitle)!;
+      const conversation = codex.envelopes.find(envelope => !envelope.isTitle)!;
+      expect(title).toBeDefined();
+      expect(conversation).toBeDefined();
+      expect(title.connectionId).not.toBe(conversation.connectionId);
+      expect(codex.envelopes.every(envelope => envelope.body.model === "gpt-5.6-luna")).toBe(true);
+      expect(title.body.previous_response_id).toBeUndefined();
+      expect(conversation.body.previous_response_id).toBeUndefined();
+      expect(JSON.stringify(title.body)).toContain(TITLE_GENERATION_MARKER);
+      expect(JSON.stringify(conversation.body.input)).toContain(firstPrompt);
+      const conversationText = `CODEX_WEBSOCKET_OK_${conversation.requestId}`;
+      expect(await session.captureFullScrollback()).not.toContain(conversationText);
+
+      // Complete the cosmetic consumer first, while generation remains held.
+      titleGate.resolve();
+      await session.waitForText(titleText, TIMEOUT);
+      expect(await session.captureFullScrollback()).not.toContain(conversationText);
+      const sessionsDir = join(home, ".fx", "sessions");
+      const sessionIds = readdirSync(sessionsDir).filter(id => existsSync(join(sessionsDir, id, "session.json")));
+      expect(sessionIds).toHaveLength(1);
+      const manifestPath = join(sessionsDir, sessionIds[0], "session.json");
+      expect(JSON.parse(readFileSync(manifestPath, "utf8")).title).toBe(titleText);
+      conversationGate.resolve();
+      await session.waitForText(conversationText, TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      const historyPath = join(sessionsDir, sessionIds[0], "events.jsonl");
+      const history = readFileSync(historyPath, "utf8");
+      expect(history).toContain(conversationText);
+      expect(history).not.toContain(titleText);
+      expect(history).not.toContain(TITLE_GENERATION_MARKER);
+
+      const secondPrompt = "Continue only the completed conversation, not its title.";
+      await session.sendText(secondPrompt);
+      await session.waitForText("CODEX_WEBSOCKET_OK_3", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      expect(codex.envelopes).toHaveLength(3);
+      const next = codex.envelopes[2];
+      expect(next.isTitle).toBe(false);
+      const nextInput = JSON.stringify(next.body.input);
+      expect(nextInput).toContain(secondPrompt);
+      // Either caller may win the retained lane. A temporary conversation
+      // must re-send full history; a retained one may use only its own ID.
+      if (next.body.previous_response_id === undefined) {
+        expect(nextInput).toContain(firstPrompt);
+        expect(nextInput).toContain(conversationText);
+      } else {
+        expect(next.connectionId).toBe(conversation.connectionId);
+        expect(next.body.previous_response_id).toBe(`resp_websocket_${conversation.requestId}`);
+        expect(nextInput).not.toContain(firstPrompt);
+        expect(nextInput).not.toContain(conversationText);
+      }
+      expect(next.body.previous_response_id).not.toBe(`resp_title_${title.requestId}`);
+      expect(nextInput).not.toContain(titleText);
+      expect(nextInput).not.toContain(TITLE_GENERATION_MARKER);
+
+      const thirdPrompt = "Now continue the independently retained conversation.";
+      await session.sendText(thirdPrompt);
+      await session.waitForText("CODEX_WEBSOCKET_OK_4", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      expect(codex.envelopes.map(envelope => envelope.requestId)).toEqual([1, 2, 3, 4]);
+      const continuation = codex.envelopes[3];
+      expect(continuation.connectionId).toBe(next.connectionId);
+      expect(continuation.body.previous_response_id).toBe("resp_websocket_3");
+      expect(JSON.stringify(continuation.body.input)).toContain(thirdPrompt);
+      expect(JSON.stringify(continuation.body.input)).not.toContain(secondPrompt);
+      expect(JSON.stringify(continuation.body.input)).not.toContain("CODEX_WEBSOCKET_OK_3");
+      expect(codex.upgradeRequests).toBe(2);
+      expect(codex.httpResponseRequests).toBe(0);
+      expect(gateway.requests).toHaveLength(0);
+      expect(JSON.parse(readFileSync(manifestPath, "utf8")).title).toBe(titleText);
+      expect(readFileSync(historyPath, "utf8")).not.toContain(titleText);
+      expect((await session.captureFullScrollback()).includes(codex.accessToken)).toBe(false);
+      expect(session.isAlive()).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      titleGate.resolve();
+      conversationGate.resolve();
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "Codex WebSocket reuses one socket for sequential interactive turns",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-reuse-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket({ reasoningState: true });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
+        { mode: 0o600 },
+      );
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_CODEX_TRANSPORT: "websocket",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Complete the first retained-socket turn.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_1", TIMEOUT);
+      await session.sendText("Complete the second retained-socket turn.");
+      const secondDeadline = Date.now() + TIMEOUT;
+      while (codex.requests.length < 2) {
+        if (Date.now() >= secondDeadline) throw new Error("Second Codex WebSocket request did not arrive");
+        await Bun.sleep(25);
+      }
+      await session.waitForText("CODEX_WEBSOCKET_OK_2", TIMEOUT);
+      expect(codex.upgradeRequests).toBe(1);
+      expect(codex.requests).toHaveLength(2);
+      expect(codex.requests.every((request) => request.includes('"type":"response.create"'))).toBe(true);
+      expect(codex.requests[1]).toContain("Complete the second retained-socket turn.");
+      expect(codex.requests[1]).not.toContain("Complete the first retained-socket turn.");
+      expect(codex.requests[1]).not.toContain("CODEX_WEBSOCKET_OK_1");
+      expect(codex.requests[1]).toContain('"previous_response_id":"resp_websocket_1"');
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "Codex WebSocket withheld matching pong reconnects within the health budget before sending",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-pong-stall-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket({ withheldPongs: [1] });
+    try {
+      await codex.ready;
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+        provider: "codex", codex_model: "gpt-5.6-sol",
+      }) + "\n", { mode: 0o600 });
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_CODEX_TRANSPORT: "websocket",
+        FX_CODEX_WEBSOCKET_CONNECT_TIMEOUT_MS: "1000",
+        // Native socket health expiry cannot be advanced by Bun fake timers.
+        FX_CODEX_WEBSOCKET_EVENT_IDLE_TIMEOUT_MS: "60000",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Seed the retained socket whose next pong is withheld.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_1", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      const startedAt = Date.now();
+      await session.sendText("Reconnect before delivering this next generation.");
+      await codex.waitForWithheldPong();
+      await session.waitForText("CODEX_WEBSOCKET_OK_2", 6_000);
+      await session.waitForComposer(TIMEOUT);
+      // Fixed 2s health + 1s setup, with scheduling/rendering margin; never 60s.
+      expect(Date.now() - startedAt).toBeLessThan(6_000);
+      expect(codex.withheldPongs.map(pong => pong.connectionId)).toEqual([1]);
+      expect(codex.envelopes.map(envelope => envelope.connectionId)).toEqual([1, 2]);
+      expect(codex.envelopes.map(envelope => envelope.requestId)).toEqual([1, 2]);
+      expect(codex.envelopes[1].body.previous_response_id).toBeUndefined();
+      const fullInput = JSON.stringify(codex.envelopes[1].body.input);
+      expect(fullInput).toContain("Seed the retained socket whose next pong is withheld.");
+      expect(fullInput).toContain("CODEX_WEBSOCKET_OK_1");
+      expect(fullInput).toContain("Reconnect before delivering this next generation.");
+      expect(codex.upgradeRequests).toBe(2);
+      expect(codex.httpResponseRequests).toBe(0);
+      expect(gateway.requests).toHaveLength(0);
+      expect((await session.captureFullScrollback()).includes(codex.accessToken)).toBe(false);
+      expect(session.isAlive()).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "Codex WebSocket idle expiry reconnects with full conversation history",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-idle-expiry-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket();
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
+        { mode: 0o600 },
+      );
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_CODEX_TRANSPORT: "websocket",
+        FX_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS: "100",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Remember the idle expiry conversation.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_1", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      // The separate native process uses the platform clock; Bun fake timers cannot advance its idle TTL.
+      await Bun.sleep(200);
+      await session.sendText("Recall the preceding turn after idle expiry.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_2", TIMEOUT);
+      expect(codex.upgradeRequests).toBe(2);
+      expect(codex.requests).toHaveLength(2);
+      const envelope = JSON.parse(codex.requests[1]);
+      expect(envelope.previous_response_id).toBeUndefined();
+      expect(JSON.stringify(envelope.input)).toContain("Remember the idle expiry conversation.");
+      expect(JSON.stringify(envelope.input)).toContain("CODEX_WEBSOCKET_OK_1");
+      expect(JSON.stringify(envelope.input)).toContain("Recall the preceding turn after idle expiry.");
+      expect(codex.httpResponseRequests).toBe(0);
+      expect(session.isAlive()).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "Codex WebSocket stalled upgrade setup timeout falls back once and latches SSE",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-setup-timeout-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const tracePath = join(home, "transport.log");
+    const codex = startFakeCodexWebSocket({ withheldUpgrades: [1], serveSse: true });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+        provider: "codex", codex_model: "gpt-5.6-sol",
+      }) + "\n", { mode: 0o600 });
+      session = await startFx(home, stderrPath, gateway, undefined, tracePath, {
+        FX_MODEL: undefined,
+        FX_CODEX_TRANSPORT: "websocket",
+        // This measures the separate native process's real handshake clock.
+        FX_CODEX_WEBSOCKET_CONNECT_TIMEOUT_MS: "100",
+        FX_TRACE_SCOPES: "stream,codex.ws",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Fall back only after the withheld upgrade setup expires.");
+      await codex.waitForUpgrades(1);
+      await session.waitForText("CODEX_SSE_FALLBACK_1", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      expect(codex.envelopes).toHaveLength(0);
+      expect(codex.httpResponseRequests).toBe(1);
+      expect(readFileSync(tracePath, "utf8")).toContain("error=WebSocketConnectTimeout");
+      await session.sendText("Keep SSE latched after the genuine setup failure.");
+      await session.waitForText("CODEX_SSE_FALLBACK_2", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      expect(codex.upgradeRequests).toBe(1);
+      expect(codex.envelopes).toHaveLength(0);
+      expect(codex.sseRequests).toBe(2);
+      expect(codex.httpResponseRequests).toBe(2);
+      expect(codex.requests).toHaveLength(2);
+      expect(codex.requests[0]).toContain("Fall back only after the withheld upgrade setup expires.");
+      expect(codex.requests[1]).toContain("Keep SSE latched after the genuine setup failure.");
+      expect(gateway.requests).toHaveLength(0);
+      expect((await session.captureFullScrollback()).includes(codex.accessToken)).toBe(false);
+      expect(readFileSync(tracePath, "utf8").includes(codex.accessToken)).toBe(false);
+      expect(session.isAlive()).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "Codex WebSocket handshake failure falls back once and latches SSE",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-fallback-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket({ rejectUpgradeWithSse: true });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
+        { mode: 0o600 },
+      );
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_CODEX_TRANSPORT: "websocket",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Fall back after the rejected WebSocket upgrade.");
+      await session.waitForText("CODEX_SSE_FALLBACK_1", TIMEOUT);
+      await session.sendText("Keep using SSE after the fallback latch is armed.");
+      await session.waitForText("CODEX_SSE_FALLBACK_2", TIMEOUT);
+      expect(codex.upgradeRequests).toBe(1);
+      expect(codex.sseRequests).toBe(2);
+      expect(codex.requests).toHaveLength(2);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "Codex WebSocket reconnects before delivery when the retained socket closes",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-reconnect-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket({ closeAfterCompletion: true });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
+        { mode: 0o600 },
+      );
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_CODEX_TRANSPORT: "websocket",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Complete before the retained socket closes.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_1", TIMEOUT);
+      await session.sendText("Reconnect without replaying either turn.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_2", TIMEOUT);
+      expect(codex.upgradeRequests).toBe(2);
+      expect(codex.requests).toHaveLength(2);
+      expect(codex.requests[1]).toContain("Complete before the retained socket closes.");
+      expect(codex.requests[1]).toContain("Reconnect without replaying either turn.");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "Codex WebSocket retries full context when continuation state is missing",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-continuation-recovery-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket({ rejectPreviousOnce: true });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
+        { mode: 0o600 },
+      );
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_CODEX_TRANSPORT: "websocket",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Complete the first continuation-recovery turn.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_1", TIMEOUT);
+      await session.sendText("Recover the second continuation-recovery turn.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_3", TIMEOUT);
+
+      expect(codex.upgradeRequests).toBe(2);
+      expect(codex.requests).toHaveLength(3);
+      expect(codex.requests[1]).toContain('"previous_response_id":"resp_websocket_1"');
+      expect(codex.requests[1]).not.toContain("Complete the first continuation-recovery turn.");
+      expect(codex.requests[2]).not.toContain("previous_response_id");
+      expect(codex.requests[2]).toContain("Complete the first continuation-recovery turn.");
+      expect(codex.requests[2]).toContain("CODEX_WEBSOCKET_OK_1");
+      expect(codex.requests[2]).toContain("Recover the second continuation-recovery turn.");
+      expect(codex.envelopes.map((envelope) => envelope.connectionId)).toEqual([1, 1, 2]);
+      expect(codex.envelopes[2].body.store).toBe(false);
+      expect(codex.httpResponseRequests).toBe(0);
+      expect(gateway.requests).toHaveLength(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
+test(
+  "Codex WebSocket connection-limit rejection before any continuation recovers once",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-initial-limit-"));
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket({
+      rejection: { code: "websocket_connection_limit_reached", requests: [1] },
+    });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+        provider: "codex", codex_model: "gpt-5.6-sol", session_titles: false,
+      }) + "\n", { mode: 0o600 });
+      const prompt = "Recover a connection-limit rejection on the first generation.";
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", prompt], {
+        cwd: home,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "gateway-websocket-initial-limit-sentinel",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_MODEL: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_AUTO_UPGRADE: "0",
+          FX_CODEX_TRANSPORT: "websocket",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+          FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+        },
+        timeoutMs: TIMEOUT,
+      });
+      expect(result.code, result.stdout + result.stderr).toBe(0);
+      expect(result.signal).toBeNull();
+      expect(result.timedOut).toBe(false);
+      expect(JSON.parse(result.stdout).output).toBe("CODEX_WEBSOCKET_OK_2");
+      expect(result.stderr).toBe("");
+      expect(codex.envelopes.map((envelope) => envelope.connectionId)).toEqual([1, 2]);
+      expect(codex.envelopes.map((envelope) => envelope.body.previous_response_id)).toEqual([undefined, undefined]);
+      expect(codex.envelopes[1].body.input).toEqual(codex.envelopes[0].body.input);
+      expect(JSON.stringify(codex.envelopes[1].body.input)).toContain(prompt);
+      expect(codex.envelopes[1].body.store).toBe(false);
+      expect(codex.upgradeRequests).toBe(2);
+      expect(codex.httpResponseRequests).toBe(0);
+      expect(gateway.requests).toHaveLength(0);
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "Codex WebSocket connection-limit rejection recovers once with fresh full context",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-limit-recovery-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket({
+      rejection: { code: "websocket_connection_limit_reached", requests: [2] },
+    });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+        provider: "codex", codex_model: "gpt-5.6-sol",
+      }) + "\n", { mode: 0o600 });
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_CODEX_TRANSPORT: "websocket",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Remember the connection-limit first turn.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_1", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Recover the connection-limit second turn.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_3", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      expect(codex.envelopes.map((envelope) => envelope.connectionId)).toEqual([1, 1, 2]);
+      expect(codex.envelopes.map((envelope) => envelope.requestId)).toEqual([1, 2, 3]);
+      expect(codex.envelopes[1].body.previous_response_id).toBe("resp_websocket_1");
+      expect(codex.envelopes[2].body.previous_response_id).toBeUndefined();
+      expect(codex.envelopes[2].body.store).toBe(false);
+      expect(JSON.stringify(codex.envelopes[2].body.input)).toContain("Remember the connection-limit first turn.");
+      expect(JSON.stringify(codex.envelopes[2].body.input)).toContain("CODEX_WEBSOCKET_OK_1");
+      expect(JSON.stringify(codex.envelopes[2].body.input)).toContain("Recover the connection-limit second turn.");
+      expect(codex.upgradeRequests).toBe(2);
+      expect(codex.httpResponseRequests).toBe(0);
+      expect(gateway.requests).toHaveLength(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
+for (const code of ["previous_response_not_found", "websocket_connection_limit_reached"] as const) {
+  const errorName = code === "previous_response_not_found"
+    ? "PreviousResponseNotFound"
+    : "WebSocketConnectionLimitReached";
+  tmuxTest(`Codex WebSocket ${code} rejects a second recovery without replay`, async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-repeated-rejection-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket({ rejection: { code, requests: [2, 3] } });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+        provider: "codex", codex_model: "gpt-5.6-sol",
+      }) + "\n", { mode: 0o600 });
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_CODEX_TRANSPORT: "websocket",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Seed the repeated-rejection conversation.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_1", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Reject recovery twice, not forever.");
+      await session.waitForText(errorName, TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      expect(codex.envelopes.map((envelope) => envelope.connectionId)).toEqual([1, 1, 2]);
+      expect(codex.envelopes[1].body.previous_response_id).toBe("resp_websocket_1");
+      expect(codex.envelopes[2].body.previous_response_id).toBeUndefined();
+      expect(JSON.stringify(codex.envelopes[2].body.input)).toContain("Seed the repeated-rejection conversation.");
+      expect(await session.captureFullScrollback()).not.toContain("CODEX_WEBSOCKET_OK_4");
+      expect(codex.upgradeRequests).toBe(2);
+      expect(codex.httpResponseRequests).toBe(0);
+      expect(gateway.requests).toHaveLength(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      codex.stop();
+    }
+  }, 60_000);
+
+  for (const progress of ["content", "reasoning", "tool-start", "message-start", "response.created"] as const) {
+    tmuxTest(`Codex WebSocket ${code} after ${progress} retains progress without replay`, async () => {
+      home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-progress-rejection-"));
+      stderrPath = join(home, "stderr.log");
+      writeFileSync(stderrPath, "");
+      gateway = startFakeGateway([]);
+      const codex = startFakeCodexWebSocket({ rejection: { code, requests: [2], progress } });
+      try {
+        writeSeededChatGptLogin(home, codex.accessToken);
+        writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+          provider: "codex", codex_model: "gpt-5.6-sol",
+        }) + "\n", { mode: 0o600 });
+        session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+          FX_MODEL: undefined,
+          FX_CODEX_TRANSPORT: "websocket",
+          FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+          FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+        });
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText("Seed the no-replay conversation.");
+        await session.waitForText("CODEX_WEBSOCKET_OK_1", TIMEOUT);
+        await session.waitForComposer(TIMEOUT);
+        const prompt = "Preserve this rejected turn without generating it twice.";
+        await session.sendText(prompt);
+        await session.waitForText(errorName, TIMEOUT);
+        await session.waitForComposer(TIMEOUT);
+        const transcript = await session.captureFullScrollback();
+        expect(transcript).toContain("CODEX_WEBSOCKET_OK_1");
+        expect(transcript).toContain(prompt);
+        if (progress === "content") expect(transcript).toContain("CODEX_PARTIAL_CONTENT");
+        expect(transcript).not.toContain("CODEX_WEBSOCKET_OK_3");
+        const rejectedTurn = codex.envelopes.filter((envelope) => JSON.stringify(envelope.body.input).includes(prompt));
+        expect(rejectedTurn).toHaveLength(1);
+        expect(rejectedTurn[0].body.type).toBe("response.create");
+        expect(rejectedTurn[0].body.previous_response_id).toBe("resp_websocket_1");
+        expect(codex.envelopes.map((envelope) => envelope.connectionId)).toEqual([1, 1]);
+        expect(codex.upgradeRequests).toBe(1);
+        if (progress === "reasoning") {
+          await session.sendText("Complete an independent turn after the reasoning rejection.");
+          await session.waitForText("CODEX_WEBSOCKET_OK_3", TIMEOUT);
+          await session.waitForComposer(TIMEOUT);
+          expect(codex.envelopes.map((envelope) => envelope.connectionId)).toEqual([1, 1, 2]);
+          expect(codex.envelopes[2].body.previous_response_id).toBeUndefined();
+          expect(JSON.stringify(codex.envelopes[2].body.input)).toContain("CODEX_WEBSOCKET_OK_1");
+          expect(codex.upgradeRequests).toBe(2);
+        }
+        expect(codex.httpResponseRequests).toBe(0);
+        expect(gateway.requests).toHaveLength(0);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        codex.stop();
+      }
+    }, 60_000);
+  }
+}
+
+tmuxTest(
+  "Codex WebSocket upgrade 401 refreshes credentials on a new socket without SSE latching",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-upgrade-auth-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    chatgptOauth = startFakeChatGptOAuth();
+    const codex = startFakeCodexWebSocket({
+      upgradeRejections: [{ status: 401 }],
+      acceptedAuthorization: `Bearer ${chatgptOauth.accessToken}`,
+    });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+        provider: "codex", codex_model: "gpt-5.6-sol",
+      }) + "\n", { mode: 0o600 });
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        ...chatgptOauth.env,
+        FX_MODEL: undefined,
+        FX_CODEX_TRANSPORT: "websocket",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Refresh the rejected WebSocket credentials.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_1", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Keep using WebSocket after credential refresh.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_2", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      expect(chatgptOauth.requests.filter((request) =>
+        request.path === "/chatgpt/token" && request.body?.includes('"grant_type":"refresh_token"'),
+      ).length).toBe(1);
+      expect(codex.upgrades.map((upgrade) => upgrade.connectionId)).toEqual([1, 2]);
+      // Compare booleans so a failed assertion never prints authorization headers.
+      expect(codex.upgrades[0].authorization === `Bearer ${codex.accessToken}`).toBe(true);
+      expect(codex.upgrades[1].authorization === `Bearer ${chatgptOauth.accessToken}`).toBe(true);
+      expect(codex.accessToken === chatgptOauth.accessToken).toBe(false);
+      expect(codex.envelopes.map((envelope) => envelope.connectionId)).toEqual([2, 2]);
+      expect(codex.envelopes[0].body.previous_response_id).toBeUndefined();
+      expect(codex.envelopes[1].body.previous_response_id).toBe("resp_websocket_1");
+      expect(codex.httpResponseRequests).toBe(0);
+      expect(gateway.requests).toHaveLength(0);
+      const transcript = await session.captureFullScrollback();
+      expect(transcript.includes(codex.accessToken)).toBe(false);
+      expect(transcript.includes(chatgptOauth.accessToken)).toBe(false);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
+for (const { status, statusField, cause } of [
+  { status: 429, statusField: "status", cause: "Rate limited" },
+  { status: 503, statusField: "status_code", cause: "Provider unavailable" },
+] as const) {
+  tmuxTest(`Codex WebSocket wrapped ${status} reaches core recovery without adapter retries`, async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-wrapped-status-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    let release!: () => void;
+    const heldCompletion = new Promise<void>((resolve) => { release = resolve; });
+    const codex = startFakeCodexWebSocket({
+      rejection: { code: "wrapped_status", requests: [1], status, statusField },
+      beforeCompletion: () => heldCompletion,
+    });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+        provider: "codex", codex_model: "gpt-5.6-sol",
+      }) + "\n", { mode: 0o600 });
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_CODEX_TRANSPORT: "websocket",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText(`Recover the wrapped ${status} rejection through core.`);
+      await session.waitForText(cause, TIMEOUT);
+      release();
+      await session.waitForText("CODEX_WEBSOCKET_OK_2", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      expect(codex.envelopes.map((envelope) => envelope.connectionId)).toEqual([1, 2]);
+      expect(codex.envelopes[1].body.previous_response_id).toBeUndefined();
+      expect(codex.envelopes[1].body.input).toEqual(codex.envelopes[0].body.input);
+      expect(codex.upgradeRequests).toBe(2);
+      expect(codex.httpResponseRequests).toBe(0);
+      expect(gateway.requests).toHaveLength(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      release();
+      codex.stop();
+    }
+  }, 60_000);
+
+  tmuxTest(`Codex WebSocket wrapped ${status} after message-start never replays accepted generation`, async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-message-status-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket({
+      rejection: { code: "wrapped_status", requests: [1], progress: "message-start", status, statusField },
+    });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+        provider: "codex", codex_model: "gpt-5.6-sol",
+      }) + "\n", { mode: 0o600 });
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_CODEX_TRANSPORT: "websocket",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText(`Do not replay the accepted message before wrapped ${status}.`);
+      await session.waitForText("WebSocketProviderRejectedAfterProgress", TIMEOUT);
+      expect(codex.envelopes).toHaveLength(1);
+      expect(codex.upgradeRequests).toBe(1);
+      expect(codex.httpResponseRequests).toBe(0);
+      expect(gateway.requests).toHaveLength(0);
+      await session.sendKeys("C-u");
+      await session.sendText("Complete a separate turn after the accepted message rejection.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_2", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      expect(codex.envelopes.map((envelope) => envelope.connectionId)).toEqual([1, 2]);
+      expect(codex.envelopes[1].body.previous_response_id).toBeUndefined();
+      expect(JSON.stringify(codex.envelopes[1].body.input)).toContain("Complete a separate turn");
+      expect(codex.httpResponseRequests).toBe(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      codex.stop();
+    }
+  }, 60_000);
+}
+
+tmuxTest(
+  "Codex WebSocket terminal provider-error response ID never seeds continuation",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-terminal-failure-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket({ terminalFailureOnRequest: 2 });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+        provider: "codex", codex_model: "gpt-5.6-sol",
+      }) + "\n", { mode: 0o600 });
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_CODEX_TRANSPORT: "websocket",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Seed the terminal failure conversation.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_1", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Keep the terminal provider-error partial answer.");
+      await session.waitForText("CODEX_TERMINAL_REJECTED", TIMEOUT);
+      await session.sendKeys("C-u");
+      await session.waitForComposer(TIMEOUT);
+      expect(await session.captureFullScrollback()).toContain("CODEX_TERMINAL_PARTIAL");
+      expect(codex.envelopes).toHaveLength(2);
+      await session.sendText("Continue independently after the rejected completion.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_3", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      expect(codex.envelopes.map((envelope) => envelope.connectionId)).toEqual([1, 1, 2]);
+      expect(codex.envelopes[2].body.previous_response_id).toBeUndefined();
+      expect(JSON.stringify(codex.envelopes[2].body.input)).toContain("Seed the terminal failure conversation.");
+      expect(JSON.stringify(codex.envelopes[2].body.input)).toContain("CODEX_WEBSOCKET_OK_1");
+      expect(JSON.stringify(codex.envelopes[2].body.input)).toContain("Continue independently after the rejected completion.");
+      expect(codex.upgradeRequests).toBe(2);
+      expect(codex.httpResponseRequests).toBe(0);
+      expect(gateway.requests).toHaveLength(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "Codex WebSocket poisons a failed stream and recovers on the next turn",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-poison-recovery-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket({ closeAfterFirstMessage: 1011 });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
+        { mode: 0o600 },
+      );
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_CODEX_TRANSPORT: "websocket",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Fail this retained-socket turn once.");
+      await session.waitForText("WebSocketClosedBeforeCompletion", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      expect(codex.envelopes).toHaveLength(1);
+      expect(codex.envelopes[0].requestId).toBe(1);
+      expect(codex.envelopes[0].connectionId).toBe(1);
+      expect(codex.httpResponseRequests).toBe(0);
+      await session.sendText("Recover on a fresh socket.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_2", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      expect(codex.upgradeRequests).toBe(2);
+      expect(codex.requests).toHaveLength(2);
+      expect(codex.requests[0]).toContain("Fail this retained-socket turn once.");
+      expect(codex.requests[1]).toContain("Recover on a fresh socket.");
+      expect(codex.envelopes.map(envelope => envelope.connectionId)).toEqual([1, 2]);
+      expect(codex.envelopes.map(envelope => envelope.requestId)).toEqual([1, 2]);
+      expect(codex.envelopes[1].body.previous_response_id).toBeUndefined();
+      expect(codex.httpResponseRequests).toBe(0);
+      expect(gateway.requests).toHaveLength(0);
+      expect((await session.captureFullScrollback()).includes(codex.accessToken)).toBe(false);
+      expect(session.isAlive()).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "Codex WebSocket abrupt post-send EOF retains partial output without replay and recovers fresh",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-read-no-replay-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const disconnectGate = Promise.withResolvers<void>();
+    const codex = startFakeCodexWebSocket({
+      disconnectRequests: [2],
+      beforeCompletion(requestNumber) {
+        if (requestNumber === 2) return disconnectGate.promise;
+      },
+    });
+    try {
+      await codex.ready;
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+        provider: "codex", codex_model: "gpt-5.6-sol",
+      }) + "\n", { mode: 0o600 });
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_CODEX_TRANSPORT: "websocket",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Seed the abrupt-read-failure conversation.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_1", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Retain this partial answer without replaying its generation.");
+      await codex.waitForEnvelopes(2);
+      await codex.waitForDisconnectProgress(2);
+      disconnectGate.resolve();
+      await session.waitForText("EndOfStream", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      expect(codex.envelopes.map(envelope => envelope.requestId)).toEqual([1, 2]);
+      expect(codex.envelopes.map(envelope => envelope.connectionId)).toEqual([1, 1]);
+      expect(codex.envelopes[1].body.previous_response_id).toBe("resp_websocket_1");
+      expect(codex.disconnectedConnections).toEqual([1]);
+      expect(codex.httpResponseRequests).toBe(0);
+      const partial = await session.captureFullScrollback();
+      expect(partial).toContain("CODEX_PARTIAL_EOF");
+      expect(partial.includes(codex.accessToken)).toBe(false);
+      expect(session.isAlive()).toBe(true);
+      await session.sendText("Complete a new independent turn after the abrupt failure.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_3", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      expect(codex.envelopes.map(envelope => envelope.requestId)).toEqual([1, 2, 3]);
+      expect(codex.envelopes.map(envelope => envelope.connectionId)).toEqual([1, 1, 2]);
+      expect(codex.envelopes[2].body.previous_response_id).toBeUndefined();
+      const fullInput = JSON.stringify(codex.envelopes[2].body.input);
+      expect(fullInput).toContain("Seed the abrupt-read-failure conversation.");
+      expect(fullInput).toContain("CODEX_WEBSOCKET_OK_1");
+      expect(fullInput).toContain("CODEX_PARTIAL_EOF");
+      expect(fullInput).toContain("Complete a new independent turn after the abrupt failure.");
+      expect(await session.captureFullScrollback()).toContain("CODEX_PARTIAL_EOF");
+      expect(codex.upgradeRequests).toBe(2);
+      expect(codex.httpResponseRequests).toBe(0);
+      expect(gateway.requests).toHaveLength(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      disconnectGate.resolve();
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "Codex WebSocket post-send idle timeout never replays through core",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-idle-no-replay-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket({ holdRequests: [1] });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+        provider: "codex", codex_model: "gpt-5.6-sol",
+      }) + "\n", { mode: 0o600 });
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_CODEX_TRANSPORT: "websocket",
+        // Bun fake timers cannot advance the separate native process's idle clock.
+        FX_CODEX_WEBSOCKET_EVENT_IDLE_TIMEOUT_MS: "100",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Do not replay this ambiguous generation.");
+      await session.waitForText("Timeout", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      expect(codex.requests).toHaveLength(1);
+      expect(codex.httpResponseRequests).toBe(0);
+      expect(session.isAlive()).toBe(true);
+      await session.sendText("Run a new independent turn.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_2", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      expect(codex.requests).toHaveLength(2);
+      expect(codex.envelopes[1].connectionId).not.toBe(codex.envelopes[0].connectionId);
+      expect(codex.envelopes[1].body.previous_response_id).toBeUndefined();
+      expect(codex.httpResponseRequests).toBe(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "Codex WebSocket evicts a retained socket after its configured maximum age",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-age-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket();
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
+        { mode: 0o600 },
+      );
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_CODEX_TRANSPORT: "websocket",
+        FX_CODEX_WEBSOCKET_MAX_CONNECTION_AGE_MS: "1",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Complete on the initial short-lived socket.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_1", TIMEOUT);
+      await Bun.sleep(20);
+      await session.sendText("Complete after connection-age eviction.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_2", TIMEOUT);
+      expect(codex.upgradeRequests).toBe(2);
+      expect(codex.requests).toHaveLength(2);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "Codex WebSocket cancellation unblocks a stalled upgrade",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-upgrade-cancel-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket({ withheldUpgrades: [1] });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
+        { mode: 0o600 },
+      );
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_CODEX_TRANSPORT: "websocket",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Cancel a stalled WebSocket upgrade.");
+      await codex.waitForUpgrades(1);
+      const cancelledAt = Date.now();
+      await session.sendKeys("C-c");
+      await session.waitForComposer(2_000);
+      expect(Date.now() - cancelledAt).toBeLessThan(2_000);
+      expect(session.isAlive()).toBe(true);
+      expect(codex.upgradeRequests).toBe(1);
+      expect(codex.requests).toHaveLength(0);
+      expect(codex.envelopes).toHaveLength(0);
+      expect(codex.httpResponseRequests).toBe(0);
+      await session.sendText("Complete after cancelling the stalled upgrade.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_1", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      expect(codex.upgradeRequests).toBe(2);
+      expect(codex.envelopes).toHaveLength(1);
+      expect(codex.envelopes[0].requestId).toBe(1);
+      expect(codex.envelopes[0].connectionId).toBe(2);
+      expect(codex.envelopes[0].body.previous_response_id).toBeUndefined();
+      expect(JSON.stringify(codex.envelopes[0].body.input)).toContain("Complete after cancelling the stalled upgrade.");
+      expect(codex.httpResponseRequests).toBe(0);
+      expect(gateway.requests).toHaveLength(0);
+      expect((await session.captureFullScrollback()).includes(codex.accessToken)).toBe(false);
+      expect(session.isAlive()).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
+
+tmuxTest(
+  "Codex WebSocket cancellation unblocks an idle response",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-cancel-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket({ holdRequests: [1] });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
+        { mode: 0o600 },
+      );
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_CODEX_TRANSPORT: "websocket",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Wait for a held WebSocket response.");
+      await codex.waitForEnvelopes(1);
+      const cancelledAt = Date.now();
+      await session.sendKeys("C-c");
+      await session.waitForComposer(2_000);
+      expect(Date.now() - cancelledAt).toBeLessThan(2_000);
+      expect(session.isAlive()).toBe(true);
+      expect(codex.requests).toHaveLength(1);
+      expect(codex.upgradeRequests).toBe(1);
+      expect(codex.envelopes[0].requestId).toBe(1);
+      expect(codex.envelopes[0].connectionId).toBe(1);
+      expect(codex.httpResponseRequests).toBe(0);
+      await session.sendText("Complete after cancelling the held response.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_2", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      expect(codex.envelopes.map(envelope => envelope.connectionId)).toEqual([1, 2]);
+      expect(codex.envelopes.map(envelope => envelope.requestId)).toEqual([1, 2]);
+      expect(codex.envelopes[1].body.previous_response_id).toBeUndefined();
+      expect(JSON.stringify(codex.envelopes[1].body.input)).toContain("Complete after cancelling the held response.");
+      expect(codex.upgradeRequests).toBe(2);
+      expect(codex.httpResponseRequests).toBe(0);
+      expect(gateway.requests).toHaveLength(0);
+      expect((await session.captureFullScrollback()).includes(codex.accessToken)).toBe(false);
+      expect(session.isAlive()).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
 
 test(
   "ChatGPT tool loops round-trip encrypted reasoning without Gateway leakage",

@@ -23,6 +23,8 @@ const NapiSurface = enum {
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const test_filter = b.option([]const u8, "test-filter", "Run unit tests matching a substring");
+    const test_filters: []const []const u8 = if (test_filter) |filter| &.{filter} else &.{};
     const pgso_artifact = b.option(
         PgsoArtifact,
         "pgso-artifact",
@@ -80,6 +82,7 @@ pub fn build(b: *std.Build) void {
 
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
+        .filters = test_filters,
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
     run_exe_tests.step.dependOn(b.getInstallStep());
@@ -91,7 +94,7 @@ pub fn build(b: *std.Build) void {
     run_exe_tests.setEnvironmentVariable("FX_TEST_SOURCE_ROOT", b.pathFromRoot("src"));
 
     // The session manager's own tests, as fx compiles it (no hooks).
-    const session_manager_tests = b.addTest(.{ .root_module = session_manager });
+    const session_manager_tests = b.addTest(.{ .root_module = session_manager, .filters = test_filters });
 
     const run_session_manager_tests = b.addRunArtifact(session_manager_tests);
     const session_manager_test_step = b.step("test-session-manager", "Run the session manager's tests");

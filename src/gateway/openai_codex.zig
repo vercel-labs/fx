@@ -8,6 +8,7 @@ const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
 const responses_protocol = @import("responses_protocol.zig");
+const codex_websocket = @import("openai_codex_websocket.zig");
 const sse_stream = @import("sse.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 
@@ -24,6 +25,41 @@ const max_tool_arguments_bytes: usize = 4 * 1024 * 1024;
 const max_provider_state_bytes: usize = 4 * 1024 * 1024;
 const transfer_buffer_bytes: usize = 256 * 1024;
 const connect_timeout_ms: i64 = 30_000;
+const transport_env = "FX_CODEX_TRANSPORT";
+
+const Transport = enum { sse, websocket };
+var sse_fallback_active = std.atomic.Value(bool).init(false);
+
+fn selectedTransport() !Transport {
+    const value = io_mod.getenv(transport_env) orelse return .sse;
+    if (std.mem.eql(u8, value, "sse") or std.mem.eql(u8, value, "auto")) return .sse;
+    if (std.mem.eql(u8, value, "websocket")) {
+        return if (sse_fallback_active.load(.seq_cst)) .sse else .websocket;
+    }
+    return error.InvalidOpenAICodexTransport;
+}
+
+fn allowsSseFallback(err: anyerror, delivery: gateway_client.DeliveryCertainty.State) bool {
+    if (delivery != .definitely_unsent) return false;
+    return gateway_client.isConnectivityFailure(err) or gateway_client.isRetryableGatewayError(err) or
+        switch (err) {
+            error.TlsInitializationFailed,
+            error.ConnectionSetupTimedOut,
+            error.WebSocketConnectTimeout,
+            error.WebSocketUpgradeRejected,
+            error.ReadFailed,
+            error.WriteFailed,
+            error.WouldBlock,
+            error.EndOfStream,
+            => true,
+            else => false,
+        };
+}
+
+fn armSseFallback(err: anyerror) void {
+    sse_fallback_active.store(true, .seq_cst);
+    debug_trace.logf("stream", "Codex WebSocket transport disabled for this process error={s}", .{@errorName(err)});
+}
 
 const CodexLimits = struct {
     aggregate_bytes: usize = max_sse_aggregate_bytes,
@@ -34,11 +70,26 @@ const CodexLimits = struct {
     provider_state_bytes: usize = max_provider_state_bytes,
 };
 
+fn codexStreamLimits(limits: CodexLimits) responses_protocol.StreamLimits {
+    return .{
+        .aggregate_bytes = limits.aggregate_bytes,
+        .events = limits.events,
+        .tool_calls = limits.tool_calls,
+        .tool_identity_bytes = limits.tool_identity_bytes,
+        .tool_arguments_bytes = limits.tool_arguments_bytes,
+        .provider_state_bytes = limits.provider_state_bytes,
+    };
+}
+
 pub const agent_stream_provider = stream_provider.Provider{
     .stream_fn = streamCompletion,
     .build_request_fn = buildRequestForProvider,
     .project_replay_fn = responses_protocol.selectReplayParts,
 };
+
+pub fn shutdownWebSockets() void {
+    codex_websocket.shutdown();
+}
 
 fn validateModel(model: []const u8) !void {
     if (model.len == 0 or model.len > 1024) return error.InvalidOpenAICodexModel;
@@ -51,6 +102,61 @@ pub fn buildRequest(
     alloc: Allocator,
     request: stream_provider.RequestData,
 ) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try writeResponseRequestStart(&out.writer, alloc, request, null);
+    try out.writer.writeAll(",\"store\":false,\"stream\":true");
+    try out.writer.writeByte('}');
+    return out.toOwnedSlice();
+}
+
+fn buildWebSocketRequest(
+    alloc: Allocator,
+    request: stream_provider.RequestData,
+) ![]u8 {
+    const input = try buildRequestInput(alloc, request);
+    defer alloc.free(input);
+    return buildWebSocketRequestWithInput(alloc, request, input, null);
+}
+
+fn buildWebSocketRequestWithInput(
+    alloc: Allocator,
+    request: stream_provider.RequestData,
+    input: []const u8,
+    previous_response_id: ?[]const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try writeResponseRequestStartWithInput(&out.writer, alloc, request, "response.create", input);
+    try out.writer.writeAll(",\"store\":false");
+    if (previous_response_id) |response_id| {
+        try out.writer.writeAll(",\"previous_response_id\":");
+        try std.json.Stringify.value(response_id, .{}, &out.writer);
+    }
+    try out.writer.writeByte('}');
+    return out.toOwnedSlice();
+}
+
+/// Writes the fields shared by SSE and WebSocket Responses envelopes. The
+/// caller owns the opening and closing JSON object delimiters.
+fn writeResponseRequestStart(
+    writer: *std.Io.Writer,
+    alloc: Allocator,
+    request: stream_provider.RequestData,
+    websocket_type: ?[]const u8,
+) !void {
+    const input = try buildRequestInput(alloc, request);
+    defer alloc.free(input);
+    return writeResponseRequestStartWithInput(writer, alloc, request, websocket_type, input);
+}
+
+fn writeResponseRequestStartWithInput(
+    writer: *std.Io.Writer,
+    alloc: Allocator,
+    request: stream_provider.RequestData,
+    websocket_type: ?[]const u8,
+    input: []const u8,
+) !void {
     try request.validatePrompt();
     try validateModel(request.model);
     const budget: image_attachments.CaptureBudget = if (request.budget) |value|
@@ -58,9 +164,14 @@ pub fn buildRequest(
     else
         .{};
     try budget.check();
-    const projected = try types.projectProviderReplay(alloc, request.messages, .{ .provider = .codex, .model = request.model });
-    defer if (projected) |messages| alloc.free(messages);
-    if (projected != null) debug_trace.logf("gateway", "provider_replay_omitted provider=codex reason=source_mismatch", .{});
+    try writer.writeByte('{');
+    if (websocket_type) |value| {
+        try writer.writeAll("\"type\":");
+        try std.json.Stringify.value(value, .{}, writer);
+        try writer.writeByte(',');
+    }
+    try writer.writeAll("\"model\":");
+    try std.json.Stringify.value(request.model, .{}, writer);
 
     var instructions: std.Io.Writer.Allocating = .init(alloc);
     defer instructions.deinit();
@@ -72,15 +183,10 @@ pub fn buildRequest(
     }
     if (instructions.written().len == 0) try instructions.writer.writeAll("You are a helpful assistant.");
 
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    const writer = &out.writer;
-    try writer.writeAll("{\"model\":");
-    try std.json.Stringify.value(request.model, .{}, writer);
-    try writer.writeAll(",\"store\":false,\"stream\":true,\"instructions\":");
+    try writer.writeAll(",\"instructions\":");
     try std.json.Stringify.value(instructions.written(), .{}, writer);
     try writer.writeAll(",\"input\":[");
-    try writeResponsesInput(writer, std.heap.c_allocator, projected orelse request.messages, request.verified_images, budget);
+    try writer.writeAll(input);
     try writer.writeByte(']');
 
     _ = try responses_protocol.writeTools(writer, alloc, request.tools);
@@ -112,8 +218,42 @@ pub fn buildRequest(
     }
     // The ChatGPT Codex endpoint chooses the model's output limit and rejects
     // the public Responses API max_output_tokens parameter.
-    try writer.writeByte('}');
+}
+
+fn buildRequestInput(alloc: Allocator, request: stream_provider.RequestData) ![]u8 {
+    try request.validatePrompt();
+    try validateModel(request.model);
+    const budget: image_attachments.CaptureBudget = if (request.budget) |value|
+        .{ .deadline = value.deadline, .cancel_flag = value.cancel_flag }
+    else
+        .{};
+    try budget.check();
+    const projected = try types.projectProviderReplay(alloc, request.messages, .{ .provider = .codex, .model = request.model });
+    defer if (projected) |messages| alloc.free(messages);
+    if (projected != null) debug_trace.logf("gateway", "provider_replay_omitted provider=codex reason=source_mismatch", .{});
+    return buildResponseInput(alloc, projected orelse request.messages, request.verified_images, budget);
+}
+
+fn buildResponseInput(
+    alloc: Allocator,
+    messages: []const types.ChatMessage,
+    images: ?[]const image_attachments.VerifiedSnapshot,
+    budget: image_attachments.CaptureBudget,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try writeResponsesInput(&out.writer, alloc, messages, images, budget);
     return out.toOwnedSlice();
+}
+
+fn buildDurableResponseInput(
+    alloc: Allocator,
+    messages: []const types.ChatMessage,
+) ![]u8 {
+    const projected = try alloc.dupe(types.ChatMessage, messages);
+    defer alloc.free(projected);
+    for (projected) |*message| message.provider_replay = null;
+    return buildResponseInput(alloc, projected, null, .{});
 }
 
 fn buildRequestForProvider(
@@ -164,6 +304,7 @@ fn streamCompletion(
         .alloc = alloc,
         .request = request,
         .payload = payload,
+        .transport = if (request.credential.credentialSource() == .host_managed) .sse else try selectedTransport(),
     };
     return (if (request.deadline) |deadline|
         gateway_client.runBoundedHttpOperation(
@@ -176,18 +317,36 @@ fn streamCompletion(
     else
         operation.run()) catch |err| {
         if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
-        request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(err, request.delivery.load());
+        const delivery = request.delivery.load();
+        // A sent socket generation may be billed even when no event arrived.
+        request.attempt_evidence.network_failure = if (operation.transport == .websocket and delivery == .possibly_sent)
+            null
+        else
+            gateway_client.networkFailureEvidence(err, delivery);
         return err;
     };
+}
+
+fn admitCodexTransport(admission: stream_provider.Admission) !void {
+    try admission.admit();
 }
 
 const PreparedStreamOperation = struct {
     alloc: Allocator,
     request: stream_provider.ModelRequest,
     payload: []const u8,
+    transport: Transport,
 
     pub fn run(self: *@This()) !stream_provider.Result {
-        return streamPrepared(self.alloc, self.request, self.payload);
+        if (self.transport == .websocket) {
+            if (streamWebSocketPrepared(self.alloc, self.request)) |result| return result else |err| {
+                if (self.request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
+                if (!allowsSseFallback(err, self.request.delivery.load())) return err;
+                armSseFallback(err);
+                self.transport = .sse;
+            }
+        }
+        return streamPreparedWithAdmission(self.alloc, self.request, self.payload, !self.request.attempt_evidence.provider_admitted);
     }
 };
 
@@ -228,6 +387,15 @@ pub fn streamPrepared(
     alloc: Allocator,
     request: stream_provider.ModelRequest,
     payload: []const u8,
+) !stream_provider.Result {
+    return streamPreparedWithAdmission(alloc, request, payload, true);
+}
+
+fn streamPreparedWithAdmission(
+    alloc: Allocator,
+    request: stream_provider.ModelRequest,
+    payload: []const u8,
+    should_admit: bool,
 ) !stream_provider.Result {
     if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
     var auth_headers = try requestAuthHeaders(alloc, request.credential);
@@ -271,7 +439,7 @@ pub fn streamPrepared(
         .clock = .awake,
         .raw = .fromMilliseconds(connect_timeout_ms),
     });
-    try request.admission.admit();
+    if (should_admit) try admitCodexTransport(request.admission);
     var opened = try gateway_client.openBoundedPost(
         alloc,
         request.cancel_flag,
@@ -313,7 +481,7 @@ pub fn streamPrepared(
     var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
     var events = request.events;
-    var completion = try consumeSse(
+    const completion = try consumeSse(
         alloc,
         reader,
         &events,
@@ -325,6 +493,15 @@ pub fn streamPrepared(
         request.content_capture_limit,
         .{},
     );
+    return finishCodexCompletion(alloc, request.model, completion);
+}
+
+fn finishCodexCompletion(
+    alloc: Allocator,
+    model: []const u8,
+    reduced: types.ModelCompletion,
+) !stream_provider.Result {
+    var completion = reduced;
     errdefer {
         var owned = stream_provider.Result{ .completed = .{
             .completion = completion,
@@ -339,7 +516,7 @@ pub fn streamPrepared(
         completion.billing = try responses_protocol.buildSubscriptionBilling(
             alloc,
             .codex,
-            request.model,
+            model,
             @max(io_mod.milliTimestamp(), 0),
             completion.usage,
         ) orelse break :usage .{ .unavailable = .possibly_billed };
@@ -350,6 +527,63 @@ pub fn streamPrepared(
         .usage = usage_outcome,
         .ownership = .owned,
     } };
+}
+
+const PreparedCodexTransport = struct {
+    account_id: []u8,
+    authorization: []u8,
+    endpoint: []const u8,
+
+    fn deinit(self: *PreparedCodexTransport, alloc: Allocator) void {
+        alloc.free(self.account_id);
+        secret.zeroAndFree(alloc, self.authorization);
+        self.* = undefined;
+    }
+};
+
+fn prepareCodexTransport(
+    alloc: Allocator,
+    request: stream_provider.ModelRequest,
+) !PreparedCodexTransport {
+    // The experimental socket transport requires a directly leased token.
+    // Host-managed credentials remain on the host-aware HTTP path.
+    var auth_headers = try requestAuthHeaders(alloc, request.credential);
+    errdefer auth_headers.deinit(alloc);
+    const account_id = auth_headers.account_id orelse return error.CodexSubscriptionCredentialRequired;
+    const authorization = auth_headers.authorization orelse return error.CodexSubscriptionCredentialRequired;
+    const request_endpoint = if (io_mod.getenv(e2e_endpoint_env)) |override| endpoint: {
+        if (!gateway_client.isLoopbackHttpUrl(override)) return error.InvalidE2EOpenAICodexEndpoint;
+        break :endpoint override;
+    } else endpoint;
+    return .{
+        .account_id = account_id,
+        .authorization = authorization,
+        .endpoint = request_endpoint,
+    };
+}
+
+fn streamWebSocketPrepared(
+    alloc: Allocator,
+    request: stream_provider.ModelRequest,
+) !stream_provider.Result {
+    if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+    var prepared = try prepareCodexTransport(alloc, request);
+    defer prepared.deinit(alloc);
+
+    const result = try codex_websocket.stream(alloc, request, .{
+        .endpoint = prepared.endpoint,
+        .authorization = prepared.authorization,
+        .account_id = prepared.account_id,
+        .failure_kind = failureKind,
+    }, .{
+        .build_input = buildRequestInput,
+        .build_request = buildWebSocketRequestWithInput,
+        .build_durable_input = buildDurableResponseInput,
+    }, codexStreamLimits(.{}));
+    return switch (result) {
+        .completed => |completed| finishCodexCompletion(alloc, request.model, completed.completion),
+        else => result,
+    };
 }
 
 const EventBridge = struct {
@@ -412,14 +646,7 @@ fn consumeSse(
         .on_reasoning = on_reasoning_chunk,
         .on_tool_input = on_tool_input_chunk,
     };
-    const stream_limits = responses_protocol.StreamLimits{
-        .aggregate_bytes = limits.aggregate_bytes,
-        .events = limits.events,
-        .tool_calls = limits.tool_calls,
-        .tool_identity_bytes = limits.tool_identity_bytes,
-        .tool_arguments_bytes = limits.tool_arguments_bytes,
-        .provider_state_bytes = limits.provider_state_bytes,
-    };
+    const stream_limits = codexStreamLimits(limits);
     while (sse.next(alloc, reader, cancel_flag) catch |err| return mapReducerError(err)) |json_text| {
         if (std.mem.eql(u8, json_text, "[DONE]")) break;
         if (reducer.applyJson(
@@ -439,12 +666,54 @@ fn mapReducerError(err: anyerror) anyerror {
     return switch (err) {
         error.EventTooLarge => error.OpenAICodexSseEventTooLarge,
         error.InvalidEvent => error.InvalidOpenAICodexSseEvent,
+        error.PreviousResponseNotFound => error.PreviousResponseNotFound,
+        error.ResponseFailed => error.OpenAICodexResponseFailed,
         error.StreamIncomplete => error.OpenAICodexStreamIncomplete,
         error.ToolCallLimitExceeded => error.OpenAICodexToolCallLimitExceeded,
         error.ToolArgumentsTooLarge => error.OpenAICodexToolArgumentsTooLarge,
         error.ResourceLimitExceeded => error.OpenAICodexResourceLimitExceeded,
         else => err,
     };
+}
+
+test "OpenAI Codex WebSocket SSE fallback requires unsent connectivity failure" {
+    for ([_]anyerror{
+        error.UnknownHostName,
+        error.ConnectionRefused,
+        error.ConnectionResetByPeer,
+        error.TlsInitializationFailed,
+        error.ConnectionSetupTimedOut,
+        error.WebSocketConnectTimeout,
+        error.WebSocketUpgradeRejected,
+        error.ReadFailed,
+        error.WriteFailed,
+        error.WouldBlock,
+        error.EndOfStream,
+    }) |err| {
+        try std.testing.expect(allowsSseFallback(err, .definitely_unsent));
+        try std.testing.expect(!allowsSseFallback(err, .possibly_sent));
+    }
+    for ([_]anyerror{
+        error.Timeout,
+        error.Cancelled,
+        error.OutOfMemory,
+        error.ProviderAdmissionMissing,
+        error.ProviderAdmissionRepeated,
+        error.InvalidOpenAICodexTransport,
+        error.InvalidOpenAICodexSseEvent,
+        error.WebSocketPolicyClosed,
+        error.WebSocketProtocolViolation,
+        error.WebSocketInvalidUtf8,
+        error.WebSocketUnexpectedBinary,
+        error.WebSocketMessageTooLarge,
+        error.WebSocketAcceptInvalid,
+        error.WebSocketConnectionLimitReached,
+        error.PreviousResponseNotFound,
+        error.WebSocketProviderRejectedAfterProgress,
+    }) |err| {
+        try std.testing.expect(!allowsSseFallback(err, .definitely_unsent));
+        try std.testing.expect(!allowsSseFallback(err, .possibly_sent));
+    }
 }
 
 test "OpenAI Codex request uses Responses input and converts AI SDK tool schemas" {
@@ -463,15 +732,18 @@ test "OpenAI Codex request uses Responses input and converts AI SDK tool schemas
         },
         .{ .role = .tool, .tool_call_id = "call_1", .tool_name = "read_file", .content = "contents" },
     };
-    const body = try buildRequest(std.testing.allocator, .{
+    const request: stream_provider.RequestData = .{
         .model = "gpt-5.4",
         .instructions = &instructions,
         .messages = &messages,
         .tools = .{ .additional_functions = &.{read_file_schema} },
         .tool_choice = .auto,
         .provider_options = .{ .reasoning = types.ReasoningEffort.literal("high"), .fast = true },
-    });
+    };
+    const body = try buildRequest(std.testing.allocator, request);
     defer std.testing.allocator.free(body);
+    const websocket_body = try buildWebSocketRequest(std.testing.allocator, request);
+    defer std.testing.allocator.free(websocket_body);
 
     try std.testing.expect(std.mem.find(u8, body, "\"model\":\"gpt-5.4\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"instructions\":\"Be concise.\"") != null);
@@ -481,6 +753,10 @@ test "OpenAI Codex request uses Responses input and converts AI SDK tool schemas
     try std.testing.expect(std.mem.find(u8, body, "\"reasoning\":{\"effort\":\"high\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"service_tier\":\"priority\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"max_output_tokens\"") == null);
+    try std.testing.expect(std.mem.find(u8, websocket_body, "\"type\":\"response.create\"") != null);
+    try std.testing.expect(std.mem.find(u8, websocket_body, "\"encrypted_content\":\"opaque\"") != null);
+    try std.testing.expect(std.mem.find(u8, websocket_body, "\"parameters\":{\"type\":\"object\",\"properties\":{}}") != null);
+    try std.testing.expect(std.mem.find(u8, websocket_body, "\"reasoning\":{\"effort\":\"high\"") != null);
 }
 
 fn makeSizedProviderState(alloc: Allocator, size: usize) ![]u8 {
@@ -724,6 +1000,112 @@ test "OpenAI Codex SSE maps text reasoning tools and usage" {
     try std.testing.expect(completion.provider_state_json != null);
     try std.testing.expect(std.mem.find(u8, completion.provider_state_json.?, "\"encrypted_content\":\"opaque\"") != null);
     try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, completion.finish_reason.?);
+}
+
+test "OpenAI Codex SSE and WebSocket reducers preserve callback order and completion data" {
+    const raw_events = [_][]const u8{
+        "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\"}}",
+        "{\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":0,\"delta\":\"thinking\"}",
+        "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[],\"encrypted_content\":\"opaque\"}}",
+        "{\"type\":\"response.output_text.delta\",\"output_index\":1,\"delta\":\"hello\"}",
+        "{\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\"}}",
+        "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":2,\"delta\":\"{\\\"path\\\":\\\"README.md\\\"}\"}",
+        "{\"type\":\"response.completed\",\"response\":{\"id\":\"response_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":4}}}",
+    };
+    const Capture = struct {
+        events: std.Io.Writer.Allocating = .init(std.testing.allocator),
+        failed: bool = false,
+
+        fn deinit(self: *@This()) void {
+            self.events.deinit();
+        }
+
+        fn emit(raw: *anyopaque, event: stream_provider.Event) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const writer = &self.events.writer;
+            switch (event) {
+                .content_delta => |value| {
+                    writer.print("content:{s}|", .{value}) catch {
+                        self.failed = true;
+                    };
+                },
+                .reasoning_delta => |value| {
+                    writer.print("reasoning:{s}|", .{value}) catch {
+                        self.failed = true;
+                    };
+                },
+                .tool_started => |tool| {
+                    writer.print("tool:{s}:{s}|", .{ tool.id, tool.name }) catch {
+                        self.failed = true;
+                    };
+                },
+                .tool_input_delta => |value| {
+                    writer.print("input:{s}|", .{value}) catch {
+                        self.failed = true;
+                    };
+                },
+            }
+        }
+    };
+
+    var sse_body: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer sse_body.deinit();
+    for (raw_events) |raw_event| try sse_body.writer.print("data: {s}\n\n", .{raw_event});
+    var sse_capture: Capture = .{};
+    defer sse_capture.deinit();
+    var sse_events = stream_provider.EventSink{ .context = &sse_capture, .emit_fn = Capture.emit };
+    var sse_reader: std.Io.Reader = .fixed(sse_body.written());
+    var sse_cancelled = std.atomic.Value(bool).init(false);
+    const sse_completion = try consumeSse(
+        std.testing.allocator,
+        &sse_reader,
+        &sse_events,
+        EventBridge.content,
+        EventBridge.toolStart,
+        EventBridge.reasoning,
+        EventBridge.toolInput,
+        &sse_cancelled,
+        null,
+        .{},
+    );
+    defer freeOpenAICodexTestCompletion(sse_completion);
+
+    var websocket_capture: Capture = .{};
+    defer websocket_capture.deinit();
+    var websocket_events = stream_provider.EventSink{ .context = &websocket_capture, .emit_fn = Capture.emit };
+    var websocket_cancelled = std.atomic.Value(bool).init(false);
+    var websocket_reducer = responses_protocol.Reducer.init(std.testing.allocator);
+    defer websocket_reducer.deinit(std.testing.allocator);
+    const stream_limits = codexStreamLimits(.{});
+    for (raw_events) |raw_event| {
+        if (try websocket_reducer.applyJson(std.testing.allocator, raw_event, .{
+            .context = &websocket_events,
+            .on_content = EventBridge.content,
+            .on_tool_start = EventBridge.toolStart,
+            .on_reasoning = EventBridge.reasoning,
+            .on_tool_input = EventBridge.toolInput,
+        }, &websocket_cancelled, null, stream_limits)) break;
+    }
+    const websocket_completion = try websocket_reducer.finish(
+        std.testing.allocator,
+        &websocket_cancelled,
+        stream_limits,
+    );
+    defer freeOpenAICodexTestCompletion(websocket_completion);
+
+    try std.testing.expect(!sse_capture.failed);
+    try std.testing.expect(!websocket_capture.failed);
+    try std.testing.expectEqualStrings(sse_capture.events.written(), websocket_capture.events.written());
+    try std.testing.expectEqualStrings(sse_completion.content.?, websocket_completion.content.?);
+    try std.testing.expectEqualStrings(sse_completion.generation_id.?, websocket_completion.generation_id.?);
+    try std.testing.expectEqualStrings(sse_completion.provider_state_json.?, websocket_completion.provider_state_json.?);
+    try std.testing.expectEqual(sse_completion.usage.input_tokens, websocket_completion.usage.input_tokens);
+    try std.testing.expectEqual(sse_completion.usage.output_tokens, websocket_completion.usage.output_tokens);
+    try std.testing.expectEqual(sse_completion.finish_reason, websocket_completion.finish_reason);
+    try std.testing.expectEqual(@as(usize, 1), websocket_completion.tool_calls.len);
+    try std.testing.expectEqualStrings(sse_completion.tool_calls[0].id, websocket_completion.tool_calls[0].id);
+    try std.testing.expectEqualStrings(sse_completion.tool_calls[0].name, websocket_completion.tool_calls[0].name);
+    try std.testing.expectEqualStrings(sse_completion.tool_calls[0].arguments_json, websocket_completion.tool_calls[0].arguments_json);
 }
 
 fn consumeOpenAICodexTestSse(sse_text: []const u8, limits: CodexLimits) !types.ModelCompletion {

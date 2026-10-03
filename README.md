@@ -43,6 +43,10 @@ Sign in with one of:
 
 fx loads Grok models from your subscription's live catalog, so new supported models appear without a static model list. Public xAI metadata enriches image support but does not filter subscription models.
 
+Codex uses HTTP streaming by default, including when `FX_CODEX_TRANSPORT` is unset, `sse`, or `auto`. To opt into the experimental WebSocket transport, start fx with `FX_CODEX_TRANSPORT=websocket`. Host-managed credentials continue to use HTTP. A connectivity failure before request delivery or an HTTP 426 upgrade rejection switches the turn and the rest of the process to HTTP. Cancellation, caller deadlines, protocol errors, and other HTTP rejections do not trigger that fallback. fx never automatically replays a request whose delivery is uncertain.
+
+WebSocket sessions retain compatible connections and continuation state. Before generation starts, a rejected continuation or a connection-limit rejection can retry once on a fresh connection with the full input. Once a response starts or an output item is accepted, fx does not retry that rejection, even if no text has arrived. Concurrent requests use separate ordered lanes rather than sharing one response stream. Each session identity retains at most four lanes by default, and the process retains at most 32 lanes across identities. Set `FX_CODEX_WEBSOCKET_MAX_LANES` or `FX_CODEX_WEBSOCKET_MAX_SLOTS` to a positive integer to choose different limits. Idle connections expire after five minutes by default; set `FX_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS` to a positive number of milliseconds to change that limit.
+
 Then start the interactive shell from a project:
 
 ```bash
