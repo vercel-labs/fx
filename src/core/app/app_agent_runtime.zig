@@ -92,6 +92,21 @@ pub fn Runtime(comptime App: type) type {
             return null;
         }
 
+        const TurnWorkspace = struct {
+            root: []const u8,
+            access_scope: ?workspace_access.AccessScope,
+        };
+
+        /// A host workspace owns the root that tools, turns, and project
+        /// context use; otherwise the app's local workspace does.
+        fn turnWorkspace(app: *const App) TurnWorkspace {
+            if (appHostWorkspaceInfo(app)) |info| return .{
+                .root = info.root(),
+                .access_scope = workspace_access.AccessScope.primaryOnly(info.root()),
+            };
+            return .{ .root = app.workspace_root, .access_scope = appAccessScope(app) };
+        }
+
         fn modelVisibleProjectContext(app: *App) []const u8 {
             if (comptime @hasField(App, "context_enabled")) {
                 if (!app.context_enabled) return "";
@@ -174,10 +189,7 @@ pub fn Runtime(comptime App: type) type {
             authority: ?ToolAuthorityView,
         ) tool_runtime.Context {
             const host_workspace = appHostWorkspaceInfo(app);
-            const workspace_root = if (host_workspace) |info|
-                info.root()
-            else
-                app.workspace_root;
+            const workspace = turnWorkspace(app);
             const agent_settings = app.worker.effectiveAgentTurnSettings();
             const permission_snapshot = if (authority) |snapshot|
                 worker_runtime.PermissionSnapshot{
@@ -206,11 +218,8 @@ pub fn Runtime(comptime App: type) type {
             else
                 provider_set.Bundle.Capabilities{};
             var ctx: tool_runtime.Context = .{
-                .workspace_root = workspace_root,
-                .access_scope = if (host_workspace != null)
-                    workspace_access.AccessScope.primaryOnly(workspace_root)
-                else
-                    appAccessScope(app),
+                .workspace_root = workspace.root,
+                .access_scope = workspace.access_scope,
                 .ignored_list_entries = ignored_list_entries,
                 .max_list_entries = max_list_entries,
                 .max_read_file_bytes = max_read_file_bytes,
@@ -889,21 +898,15 @@ pub fn Runtime(comptime App: type) type {
             _ = gateway_chat_url;
             const permission_snapshot = app_permission_runtime.Runtime(App).livePermissionSnapshot(app);
             const host_workspace = appHostWorkspaceInfo(app);
-            const workspace_root = if (host_workspace) |info|
-                info.root()
-            else
-                app.workspace_root;
+            const workspace = turnWorkspace(app);
             try app.contextRegistry().appendDefaultTransient(.{
-                .workspace_root = workspace_root,
+                .workspace_root = workspace.root,
                 .host_workspace = if (host_workspace) |info| .{
                     .root = info.root(),
                     .cwd = info.cwd(),
                     .home = info.home(),
                 } else null,
-                .access_scope = if (host_workspace != null)
-                    workspace_access.AccessScope.primaryOnly(workspace_root)
-                else
-                    appAccessScope(app),
+                .access_scope = workspace.access_scope,
                 .interactive = true,
                 .permission_mode = permission_snapshot.mode,
                 .stale_shell_handles = app.session.has_stale_shell_handles,
@@ -914,9 +917,10 @@ pub fn Runtime(comptime App: type) type {
             app.context_snapshot.deinit(app.alloc);
             if (!app.context_enabled) return;
 
+            const workspace = turnWorkspace(app);
             app.context_snapshot = app.contextRegistry().gatherDefaultSnapshot(app.alloc, .{
-                .workspace_root = app.workspace_root,
-                .access_scope = appAccessScope(app),
+                .workspace_root = workspace.root,
+                .access_scope = workspace.access_scope,
                 .targets = targets,
                 .context_limits = if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
             }) catch |err| {
@@ -1246,6 +1250,7 @@ pub fn Runtime(comptime App: type) type {
             session_child_capability: ?*session_child_store.SessionChildCapability,
         ) agent_runtime.Config {
             const prompt_policy = app.promptPolicy();
+            const workspace = turnWorkspace(app);
             return .{
                 .system_prompt = prompt_policy.system_prompt,
                 .model_prompt_overlay = prompt_policy.modelPromptOverlay(job.model),
@@ -1277,8 +1282,8 @@ pub fn Runtime(comptime App: type) type {
                 .provider_order = if (job.provider == .gateway) job.agent_settings.provider_order else &.{},
                 .provider_strict = job.provider == .gateway and job.agent_settings.provider_strict,
                 .first_call_tool_choice = job.agent_settings.first_call_tool_choice,
-                .workspace_root = app.workspace_root,
-                .access_scope = appAccessScope(app),
+                .workspace_root = workspace.root,
+                .access_scope = workspace.access_scope,
                 .origin = if (app.session_persistence.writable) |writable|
                     if (writable.external_prompt_origin == .persistent_child) .subagent else .root
                 else
@@ -1566,9 +1571,14 @@ const RefreshContextApp = struct {
     context_notice_tone: ?types.NoticeTone = null,
     context_notice_visibility: ?types.NoticeVisibility = null,
     session: session_runtime.SessionRuntime = .{ .max_history_turns = 8 },
+    host_info: ?js_host_workspace.Info = null,
 
     fn contextRegistry(self: *const RefreshContextApp) context_contract.Registry {
         return self.context_registry;
+    }
+
+    fn workspaceHostInfo(self: *const RefreshContextApp) ?*const js_host_workspace.Info {
+        return if (self.host_info) |*info| info else null;
     }
 
     fn deinit(self: *RefreshContextApp) void {
@@ -2518,6 +2528,62 @@ test "app agent runtime refreshes enabled project context through registry" {
     try std.testing.expectEqualStrings("fresh context notice", app.context_notices.items);
     try std.testing.expectEqual(types.NoticeTone.warning, app.context_notice_tone.?);
     try std.testing.expectEqual(types.NoticeVisibility.full_only, app.context_notice_visibility.?);
+}
+
+const TestHostWorkspace = struct {
+    pub fn workspaceAvailable() i32 {
+        return 1;
+    }
+
+    pub fn workspaceInfo(out_ptr: [*]u8, out_cap: usize) i32 {
+        const json = "{\"version\":1,\"root\":\"/workspace\",\"cwd\":\"/workspace\",\"home\":\"/home/visitor\",\"git\":false,\"ephemeral\":true,\"permission\":\"allow-sandboxed\"}";
+        if (json.len > out_cap) return -3;
+        @memcpy(out_ptr[0..json.len], json);
+        return json.len;
+    }
+};
+
+test "app agent runtime turn workspace prefers the host workspace root" {
+    const alloc = std.testing.allocator;
+    var app = RefreshContextApp{
+        .alloc = alloc,
+        .workspace_root = "/",
+        .context_enabled = true,
+        .context_snapshot = .{},
+        .context_registry = fresh_context_registry,
+    };
+    defer app.deinit();
+
+    const local = Runtime(RefreshContextApp).turnWorkspace(&app);
+    try std.testing.expectEqualStrings("/", local.root);
+    try std.testing.expect(local.access_scope == null);
+
+    app.host_info = try js_host_workspace.Adapter(TestHostWorkspace).loadInfo(alloc);
+    const hosted = Runtime(RefreshContextApp).turnWorkspace(&app);
+    try std.testing.expectEqualStrings("/workspace", hosted.root);
+    const scope = hosted.access_scope orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("/workspace", scope.primary_directory);
+    try std.testing.expectEqual(@as(usize, 0), scope.additional_directories.len);
+}
+
+test "app agent runtime gathers project context from the host workspace root" {
+    const alloc = std.testing.allocator;
+    refresh_gather_calls = 0;
+    var app = RefreshContextApp{
+        .alloc = alloc,
+        .workspace_root = "/",
+        .context_enabled = true,
+        .context_snapshot = .{},
+        .context_registry = fresh_context_registry,
+        .host_info = try js_host_workspace.Adapter(TestHostWorkspace).loadInfo(alloc),
+    };
+    defer app.deinit();
+
+    try Runtime(RefreshContextApp).refreshProjectContext(&app, &.{});
+
+    try std.testing.expectEqual(@as(usize, 1), refresh_gather_calls);
+    const contribution = app.context_snapshot.contribution orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("fresh:/workspace", contribution.content);
 }
 
 test "app agent runtime clears disabled project context without gathering" {

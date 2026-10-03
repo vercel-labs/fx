@@ -415,8 +415,12 @@ const App = struct {
     const WorkerAppRuntime = app_worker_runtime.Runtime(Self);
     const WorkspaceAppRuntime = app_workspace_runtime.Runtime(Self);
 
-    pub fn contextRegistry(_: *const Self) context_contract.Registry {
-        return default_context_registry;
+    pub fn contextRegistry(self: *const Self) context_contract.Registry {
+        var registry = default_context_registry;
+        if (comptime host_profile.js_host_workspace) {
+            registry.instruction_files = self.workspace_host.instructionFiles();
+        }
+        return registry;
     }
 
     pub fn workspaceHostInfo(self: *const Self) ?*const js_host_workspace.Info {

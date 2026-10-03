@@ -16,6 +16,7 @@ The SDK has two WebAssembly surfaces and one shared JavaScript host layer:
 | Native and WebAssembly capability policy | `src/core/hosts/runtime_profile.zig` |
 | Host-backed terminal session persistence | `src/core/app/app_session_runtime.zig` and `sdk/fx-sdk.js` |
 | Browser workspace contract and `shell.run` bridge | `src/core/hosts/js_host_workspace.zig` and `src/tools/shell/browser_shell.zig` |
+| Browser workspace AGENTS.md reads | `src/core/hosts/js_host_workspace.zig`, `src/builtins/context.zig`, and `sdk/fx-sdk.js` |
 | Browser device login, OAuth session persistence, and URL opening | `src/core/auth/js_host_auth.zig`, `src/core/auth/oauth_session.zig`, and `src/core/hosts/js_host_url_opener.zig` |
 | WASI target, optimization mode, threading, and artifact names | `build.zig` |
 | Core browser fixture and its automation contract | `sdk/index.html` and `sdk/tests/test-core-browser.mjs` |
@@ -32,6 +33,7 @@ Do not treat the demos or this file as the implementation contract. When prose a
 - Treat JavaScript host stores as durable contracts. Session and OAuth snapshots are opaque bytes with optimistic revisions. Preserve `FX_SESSION_REVISION_CONFLICT` and `FX_OAUTH_SESSION_REVISION_CONFLICT`. Persist configuration only after fx accepts it, and do not collapse prompt-history outcomes into generic success.
 - Preserve cancellation and lifecycle behavior. Fetch cancellation must reach the host `AbortSignal`; terminal subscriptions must be released exactly once; `abort()` must settle `exited` and must not leave input or resize listeners attached.
 - The WebAssembly runtime is not the native runtime. Keep native tools disabled. The optional workspace host may expose only completion-only `shell.run` through its typed boundary and permission policy. Its schema is exactly `{ action: "run", command }`; native profiles, TTYs, and managed running handles are unavailable. Any additional capability requires its own typed host boundary, permission review where applicable, and coverage on the affected surface.
+- The optional workspace `readFile` boundary serves only project instruction loading. Keep it limited to absolute `AGENTS.md` paths inside the workspace root or home, with UTF-8 validation, the 1 MiB copy limit, and the shared abort path. It is not a model-callable file tool. A workspace without `readFile` must report the omitted instructions rather than skip them silently.
 - Keep workspace version 1 constrained to an ephemeral, non-git workspace whose normalized `cwd` equals `root`. Preserve command and output limits, the 30-second maximum deadline, and Ctrl+C cancellation through the shared host-effect abort path.
 - `window.__fxCoreTest` and `document.body.dataset.state` are test interfaces for the core debugger. If either changes intentionally, update the browser test in the same change.
 - The live demos may pass a locally stored credential into the WebAssembly environment. Never print, serialize into artifacts, or add test assertions containing that credential.
@@ -46,6 +48,7 @@ Do not treat the demos or this file as the implementation contract. When prose a
 | Terminal adapter, input encoding, resize, cleanup, config, or prompt history | Terminal build and the headless terminal suite |
 | Terminal session persistence or browser device login | Terminal build plus `sdk/tests/test-term-session-resume.mjs` or `sdk/tests/test-term-login.mjs` |
 | Browser workspace metadata, permissions, execution, limits, or cancellation | Terminal build plus `sdk/node/test-term-workspace.mjs` |
+| Browser workspace AGENTS.md reads | Terminal build plus `sdk/node/test-term-agents-md.mjs` |
 | `encodeXtermKeyEvent()` or `xtermAdapter()` only | `sdk/node/test-xterm-adapter.mjs` |
 | Core debugger query behavior or automation state | `sdk/tests/test-core-browser.mjs` |
 | Terminal demo asset references, integrity, or cache policy | Package into a fresh temporary directory and inspect the generated HTML, manifest, and headers |

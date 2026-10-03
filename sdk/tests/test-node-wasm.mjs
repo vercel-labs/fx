@@ -13,6 +13,7 @@ const termScripts = [
   "test-term-features.mjs",
   "test-term-history.mjs",
   "test-term-workspace.mjs",
+  "test-term-agents-md.mjs",
 ];
 const commands = [
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-wasm-jspi-tier-up.mjs", import.meta.url))]],

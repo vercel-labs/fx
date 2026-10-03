@@ -57,6 +57,7 @@ pub const OmissionReason = enum {
     non_regular,
     symlink,
     selection_cap,
+    host_unreadable,
 
     pub fn label(self: OmissionReason) []const u8 {
         return switch (self) {
@@ -68,8 +69,55 @@ pub const OmissionReason = enum {
             .non_regular => "non-regular rule file",
             .symlink => "symlinked rule file",
             .selection_cap => "selection cap",
+            .host_unreadable => "host cannot read instruction files",
         };
     }
+};
+
+/// One project instruction file read through a host. `bytes` is owned by the
+/// allocator passed to `InstructionFileReader.read` and holds the first
+/// `@min(total_bytes, max_bytes)` bytes.
+pub const InstructionFile = struct {
+    bytes: []u8,
+    total_bytes: u64,
+};
+
+pub const InstructionFileError = Allocator.Error || error{
+    /// The host has no instruction file access.
+    HostUnreadable,
+    /// The host failed, timed out, or returned malformed or non-UTF-8 content.
+    Unreadable,
+    /// The path is outside what the host allows fx to read.
+    UnsafePath,
+};
+
+/// Reads project instruction files (AGENTS.md) through an embedding host.
+pub const InstructionFileReader = struct {
+    read_fn: *const fn (Allocator, path: []const u8, max_bytes: usize) InstructionFileError!?InstructionFile,
+    /// Largest prefix one read copies; callers never request more.
+    max_read_bytes: usize,
+
+    /// Returns null when the file does not exist. The read may block on the host.
+    pub fn read(self: InstructionFileReader, alloc: Allocator, path: []const u8, max_bytes: usize) InstructionFileError!?InstructionFile {
+        return self.read_fn(alloc, path, max_bytes);
+    }
+};
+
+/// Where the default provider finds project instruction files.
+pub const InstructionFiles = union(enum) {
+    /// The local filesystem, with HOME taken from the environment.
+    filesystem,
+    /// A host workspace. `home` is an absolute host path borrowed from the
+    /// composing host for the lifetime of the registry that carries it.
+    host: struct {
+        home: []const u8,
+        reader: InstructionFileReader,
+    },
+    /// A host workspace exists but cannot read instruction files. The provider
+    /// reports the omission instead of silently skipping AGENTS.md.
+    host_unreadable,
+    /// No workspace exists, so there are no instruction files to read.
+    none,
 };
 
 pub const ContextOmissionInput = struct {
@@ -133,6 +181,8 @@ pub const InitialContextInput = struct {
     /// Internal request reconstruction only; ordinary gathers retain their work limits.
     bounded_reconstruction: bool = false,
     context_limits: context_limits.Values = .{},
+    /// Assigned by `Registry` from its composition when routed through it.
+    instruction_files: InstructionFiles = .filesystem,
 };
 
 pub const LaterContextInput = struct {
@@ -142,6 +192,8 @@ pub const LaterContextInput = struct {
     delivered_sources: []const []const u8,
     evaluated_endpoints: []const []const u8,
     context_limits: context_limits.Values = .{},
+    /// Assigned by `Registry` from its composition when routed through it.
+    instruction_files: InstructionFiles = .filesystem,
 };
 
 /// Owns provider-produced context bytes and delivery-state additions. The
@@ -302,6 +354,9 @@ pub fn selectNoApplicableProjectContext(_: Allocator, _: LaterContextInput) Prov
 
 pub const Registry = struct {
     default_provider: Provider,
+    /// Every gather and selection routed through this registry reads project
+    /// instruction files from this source, so later context matches startup.
+    instruction_files: InstructionFiles = .filesystem,
 
     pub fn defaultProvider(self: Registry) Provider {
         return self.default_provider;
@@ -309,7 +364,9 @@ pub const Registry = struct {
 
     pub fn gatherDefaultSnapshot(self: Registry, alloc: Allocator, input: InitialContextInput) ProviderError!GatheredContextSnapshot {
         const provider = self.defaultProvider();
-        var gathered = try provider.gatherProjectContext(alloc, input);
+        var routed = input;
+        routed.instruction_files = self.instruction_files;
+        var gathered = try provider.gatherProjectContext(alloc, routed);
         errdefer gathered.deinit(alloc);
 
         var snapshot: GatheredContextSnapshot = .{
@@ -339,7 +396,9 @@ pub const Registry = struct {
     }
 
     pub fn selectDefaultApplicableContext(self: Registry, alloc: Allocator, input: LaterContextInput) ProviderError!ProviderContext {
-        return self.defaultProvider().selectApplicableProjectContext(alloc, input);
+        var routed = input;
+        routed.instruction_files = self.instruction_files;
+        return self.defaultProvider().selectApplicableProjectContext(alloc, routed);
     }
 
     pub fn appendDefaultStatic(self: Registry, input: StaticContextInput, alloc: Allocator, messages: *std.ArrayList(types.ChatMessage)) ProviderError!void {
@@ -792,6 +851,51 @@ test "context registry routes the default provider" {
     try std.testing.expectEqualStrings("test.default_context", contribution.provider_id);
     try std.testing.expectEqualStrings("project:/workspace", messages.items[0].content.?);
     try std.testing.expectEqualStrings("runtime:/workspace", messages.items[1].content.?);
+}
+
+test "registry routes its instruction file source to gathers and later selections" {
+    const Fixture = struct {
+        var gathered: ?std.meta.Tag(InstructionFiles) = null;
+        var selected: ?std.meta.Tag(InstructionFiles) = null;
+
+        fn gather(_: Allocator, input: InitialContextInput) ProviderError!ProviderContext {
+            gathered = std.meta.activeTag(input.instruction_files);
+            return .{};
+        }
+
+        fn select(_: Allocator, input: LaterContextInput) ProviderError!ProviderContext {
+            selected = std.meta.activeTag(input.instruction_files);
+            return .{};
+        }
+
+        fn appendStatic(_: StaticContextInput, _: Allocator, _: *std.ArrayList(types.ChatMessage)) ProviderError!void {}
+
+        fn appendTransient(_: TransientContextInput, _: Allocator, _: *std.ArrayList(types.ChatMessage)) ProviderError!void {}
+    };
+
+    const registry = Registry{
+        .default_provider = .{
+            .id = "test.instruction_files",
+            .gather_project_context_fn = Fixture.gather,
+            .select_applicable_project_context_fn = Fixture.select,
+            .append_static_fn = Fixture.appendStatic,
+            .append_transient_fn = Fixture.appendTransient,
+        },
+        .instruction_files = .host_unreadable,
+    };
+    const alloc = std.testing.allocator;
+    var snapshot = try registry.gatherDefaultSnapshot(alloc, .{ .workspace_root = "/workspace", .instruction_files = .filesystem });
+    defer snapshot.deinit(alloc);
+    var later = try registry.selectDefaultApplicableContext(alloc, .{
+        .workspace_root = "/workspace",
+        .targets = &.{},
+        .delivered_sources = &.{},
+        .evaluated_endpoints = &.{},
+    });
+    defer later.deinit(alloc);
+
+    try std.testing.expectEqual(@as(?std.meta.Tag(InstructionFiles), .host_unreadable), Fixture.gathered);
+    try std.testing.expectEqual(@as(?std.meta.Tag(InstructionFiles), .host_unreadable), Fixture.selected);
 }
 
 test "gathered context snapshot duplicates provenance and content ownership" {

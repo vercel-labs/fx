@@ -7,6 +7,10 @@ const strictDecoder = new TextDecoder("utf-8", { fatal: true });
 const workspaceInfoLimit = 4 * 1024;
 const workspaceCommandLimit = 64 * 1024;
 const workspaceOutputLimit = 64 * 1024;
+// Matches max_instruction_file_bytes and max_instruction_path_bytes in js_host_workspace.zig.
+const workspaceInstructionFileLimit = 1024 * 1024;
+const workspaceInstructionPathLimit = 4 * 1024;
+const workspaceReadTimeoutMs = 10_000;
 const maxInstructionsBytes = 64 * 1024;
 const maxApiKeyBytes = 64 * 1024;
 const maxModelBytes = 1024;
@@ -253,12 +257,24 @@ function validWorkspacePath(path) {
   return path.slice(1).split("/").every((part) => part && part !== "." && part !== "..");
 }
 
+function workspacePathInside(root, path) {
+  return root === "/" ? path.startsWith("/") : path === root || path.startsWith(`${root}/`);
+}
+
+// fx only reads AGENTS.md files below the workspace root or the host home.
+function workspaceInstructionPathAllowed(info, path) {
+  return validWorkspacePath(path) && path.endsWith("/AGENTS.md") &&
+    (workspacePathInside(info.root, path) || workspacePathInside(info.home, path));
+}
+
 function prepareWorkspaceAdapter(workspace) {
   if (workspace == null) return { present: false, valid: false };
   try {
     const info = workspace.info;
     const permission = workspace.permission;
+    const readFile = workspace.readFile;
     if (!info || typeof workspace.exec !== "function" || info.version !== 1 ||
+      (readFile !== undefined && typeof readFile !== "function") ||
       !validWorkspacePath(info.root) || !validWorkspacePath(info.cwd) ||
       !validWorkspacePath(info.home) || info.cwd !== info.root ||
       info.gitAvailable !== false || info.ephemeral !== true ||
@@ -273,6 +289,7 @@ function prepareWorkspaceAdapter(workspace) {
       git: false,
       ephemeral: true,
       permission,
+      instruction_files: typeof readFile === "function",
     };
     const encoded = encoder.encode(JSON.stringify(value));
     if (encoded.length > workspaceInfoLimit) return { present: true, valid: false };
@@ -493,7 +510,7 @@ function createRuntime(options) {
   const inboundAttachments = new Map();
   const outboundAttachments = new Map();
   let nextOutboundAttachment = 1;
-  const workspaceExecs = new Set();
+  const workspaceOperations = new Set();
   const workspace = prepareWorkspaceAdapter(options.workspace);
   const args = ["fx", ...(options.args || [])];
   const env = Object.entries(options.env || {}).map(([key, value]) => `${key}=${value}`);
@@ -1047,32 +1064,13 @@ function createRuntime(options) {
     }
     if (command.includes("\0")) return Promise.resolve(-4);
 
-    const controller = new AbortController();
-    let resolveAbort;
-    const aborted = new Promise((resolve) => { resolveAbort = resolve; });
-    const state = {
-      controller,
-      status: null,
-      abort(status) {
-        if (this.status !== null) return;
-        this.status = status;
-        resolveAbort(status);
-        controller.abort(new DOMException(
-          status === -5 ? "workspace command timed out" : "workspace command aborted",
-          status === -5 ? "TimeoutError" : "AbortError",
-        ));
-      },
-    };
-    workspaceExecs.add(state);
-    const timer = setTimeout(() => state.abort(-5), timeoutMs);
-    const execution = Promise.resolve().then(() => workspace.adapter.exec({
+    return runWorkspaceOperation(timeoutMs, "workspace command", (signal) => workspace.adapter.exec({
       command,
       cwd: workspace.info.cwd,
-      signal: controller.signal,
+      signal,
       timeoutMs,
       outputLimitBytes: workspaceOutputLimit,
-    })).then((value) => {
-      if (state.status !== null) return state.status;
+    }), (value) => {
       if (!value || !Number.isInteger(value.exitCode) || value.exitCode < -0x80000000 ||
         value.exitCode > 0x7fffffff || typeof value.stdout !== "string" ||
         typeof value.stderr !== "string") return -1;
@@ -1106,6 +1104,81 @@ function createRuntime(options) {
       view.setUint32(24, stderr.length, true);
       view.setUint32(28, copied < stdout.length + stderr.length ? 1 : 0, true);
       return 0;
+    });
+  }
+
+  function workspaceReadFile(pathPtr, pathLen, outPtr, outCap, resultPtr) {
+    if (!workspace.present || (workspace.valid && typeof workspace.adapter.readFile !== "function")) {
+      return Promise.resolve(-2);
+    }
+    if (!workspace.valid) return Promise.resolve(-4);
+    const pathBytes = checkedBytes(pathPtr, pathLen);
+    if (!pathBytes || !checkedBytes(outPtr, outCap) || !checkedBytes(resultPtr, 8) ||
+      pathLen > workspaceInstructionPathLimit || outCap > workspaceInstructionFileLimit) {
+      return Promise.resolve(-4);
+    }
+    let path;
+    try {
+      path = strictDecoder.decode(pathBytes);
+    } catch {
+      return Promise.resolve(-4);
+    }
+    if (!workspaceInstructionPathAllowed(workspace.info, path)) return Promise.resolve(-4);
+
+    return runWorkspaceOperation(workspaceReadTimeoutMs, "workspace read", (signal) => workspace.adapter.readFile({
+      path,
+      signal,
+    }), (value) => {
+      if (value == null) return -6;
+      let content;
+      if (typeof value === "string") {
+        content = encoder.encode(value);
+      } else if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
+        content = value instanceof ArrayBuffer
+          ? new Uint8Array(value)
+          : new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+        try {
+          strictDecoder.decode(content);
+        } catch {
+          return -7;
+        }
+      } else {
+        return -1;
+      }
+      if (content.length > 0xffffffff) return -1;
+      const copied = Math.min(content.length, outCap);
+      // Reacquire views: memory may have grown while the host read was pending.
+      bytes(outPtr, copied).set(content.subarray(0, copied));
+      const view = new DataView(memory().buffer, resultPtr, 8);
+      view.setUint32(0, content.length, true);
+      view.setUint32(4, copied, true);
+      return 0;
+    });
+  }
+
+  // Runs one host workspace effect under a deadline and the shared Ctrl+C
+  // abort path. `finish` maps the host value to an ABI status.
+  function runWorkspaceOperation(timeoutMs, label, start, finish) {
+    const controller = new AbortController();
+    let resolveAbort;
+    const aborted = new Promise((resolve) => { resolveAbort = resolve; });
+    const state = {
+      status: null,
+      abort(status) {
+        if (this.status !== null) return;
+        this.status = status;
+        resolveAbort(status);
+        controller.abort(new DOMException(
+          status === -5 ? `${label} timed out` : `${label} aborted`,
+          status === -5 ? "TimeoutError" : "AbortError",
+        ));
+      },
+    };
+    workspaceOperations.add(state);
+    const timer = setTimeout(() => state.abort(-5), timeoutMs);
+    const execution = Promise.resolve().then(() => start(controller.signal)).then((value) => {
+      if (state.status !== null) return state.status;
+      return finish(value);
     }).catch((error) => {
       if (state.status !== null) return state.status;
       if (error?.name === "TimeoutError") return -5;
@@ -1114,7 +1187,7 @@ function createRuntime(options) {
     });
     return Promise.race([execution, aborted]).finally(() => {
       clearTimeout(timer);
-      workspaceExecs.delete(state);
+      workspaceOperations.delete(state);
     });
   }
 
@@ -1122,7 +1195,7 @@ function createRuntime(options) {
     pendingHostToolResult = null;
     streams.forEach((state) => state.controller.abort(abortReason));
     httpRequests.forEach((controller) => controller.abort(abortReason));
-    workspaceExecs.forEach((state) => state.abort(-3));
+    workspaceOperations.forEach((state) => state.abort(-3));
   }
 
   const unavailable = () => 52;
@@ -1177,6 +1250,7 @@ function createRuntime(options) {
     fx_workspace_available() { return workspace.present ? 1 : 0; },
     fx_workspace_info: workspaceInfo,
     fx_workspace_exec: new WebAssembly.Suspending(workspaceExec),
+    fx_workspace_read_file: new WebAssembly.Suspending(workspaceReadFile),
     fx_http_stream_open: streamOpen,
     fx_http_stream_status: new WebAssembly.Suspending(streamStatus),
     fx_http_stream_next: new WebAssembly.Suspending(streamNext),

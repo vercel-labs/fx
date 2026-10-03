@@ -1,5 +1,7 @@
 const std = @import("std");
 const command_contract = @import("../execution/command_contract.zig");
+const context_contract = @import("../workspace/context_contract.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
@@ -9,6 +11,11 @@ pub const max_command_bytes: usize = 64 * 1024;
 const max_output_bytes: usize = 64 * 1024;
 pub const min_timeout_ms: u32 = 1;
 pub const max_timeout_ms: u32 = 30_000;
+/// Largest instruction file prefix one host read copies into fx. Matches the
+/// SDK's `workspaceInstructionFileLimit`.
+const max_instruction_file_bytes: usize = 1024 * 1024;
+const max_instruction_path_bytes: usize = 4 * 1024;
+const instruction_file_name = "AGENTS.md";
 
 const ResultRecord = extern struct {
     exit_code: i32,
@@ -21,8 +28,14 @@ const ResultRecord = extern struct {
     flags: u32,
 };
 
+const ReadRecord = extern struct {
+    total_bytes: u32,
+    copied_bytes: u32,
+};
+
 comptime {
     std.debug.assert(@sizeOf(ResultRecord) == 32);
+    std.debug.assert(@sizeOf(ReadRecord) == 8);
 }
 
 extern "fx" fn fx_workspace_available() i32;
@@ -34,6 +47,16 @@ extern "fx" fn fx_workspace_exec(
     output_ptr: [*]u8,
     output_cap: usize,
     result_ptr: *ResultRecord,
+) i32;
+/// Copies up to `out_cap` bytes of one instruction file. Status codes: 0
+/// copied, -1 host failure, -2 no instruction file access, -3 aborted,
+/// -4 rejected path, -5 deadline, -6 missing, -7 invalid UTF-8.
+extern "fx" fn fx_workspace_read_file(
+    path_ptr: [*]const u8,
+    path_len: usize,
+    out_ptr: [*]u8,
+    out_cap: usize,
+    result_ptr: *ReadRecord,
 ) i32;
 
 const ImportedHost = struct {
@@ -61,6 +84,16 @@ const ImportedHost = struct {
             output_cap,
             result_ptr,
         );
+    }
+
+    fn workspaceReadFile(
+        path_ptr: [*]const u8,
+        path_len: usize,
+        out_ptr: [*]u8,
+        out_cap: usize,
+        result_ptr: *ReadRecord,
+    ) i32 {
+        return fx_workspace_read_file(path_ptr, path_len, out_ptr, out_cap, result_ptr);
     }
 };
 
@@ -110,6 +143,7 @@ pub const Info = struct {
     git_available: bool,
     ephemeral: bool,
     permission: Permission,
+    instruction_files: bool,
 
     pub fn root(self: *const Info) []const u8 {
         return self.path(self.root_span);
@@ -137,6 +171,7 @@ const JsonInfo = struct {
     git: bool,
     ephemeral: bool,
     permission: []const u8,
+    instruction_files: bool = false,
 };
 
 pub fn Adapter(comptime Host: type) type {
@@ -200,6 +235,7 @@ pub fn Adapter(comptime Host: type) type {
                 .git_available = false,
                 .ephemeral = true,
                 .permission = permission,
+                .instruction_files = value.instruction_files,
             };
             var offset: usize = 0;
             info.root_span = copyPath(&info.storage, &offset, value.root) orelse return error.InvalidContract;
@@ -292,6 +328,43 @@ pub fn Adapter(comptime Host: type) type {
             formatted.command_result = metadata;
             return formatted;
         }
+
+        /// Reads one AGENTS.md through the host. Returns null when it is
+        /// missing; returned bytes are owned by the caller through `alloc`.
+        fn readInstructionFile(
+            alloc: Allocator,
+            path: []const u8,
+            max_bytes: usize,
+        ) context_contract.InstructionFileError!?context_contract.InstructionFile {
+            if (path.len > max_instruction_path_bytes or
+                !validAbsolutePath(path) or
+                !std.mem.eql(u8, std.fs.path.basename(path), instruction_file_name)) return error.UnsafePath;
+
+            const buffer = try alloc.alloc(u8, @min(max_bytes, max_instruction_file_bytes));
+            errdefer alloc.free(buffer);
+            var record: ReadRecord = undefined;
+            const status = Host.workspaceReadFile(path.ptr, path.len, buffer.ptr, buffer.len, &record);
+            switch (status) {
+                0 => {},
+                -6 => {
+                    alloc.free(buffer);
+                    return null;
+                },
+                -2 => return error.HostUnreadable,
+                -4 => return error.UnsafePath,
+                else => {
+                    // Abort, deadline, host failure, and invalid UTF-8 all read as unreadable.
+                    debug_trace.logf("workspace", "instruction_read_failed status={d} path=\"{f}\"", .{ status, std.zig.fmtString(path) });
+                    return error.Unreadable;
+                },
+            }
+            const expected_bytes = @min(@as(u64, record.total_bytes), buffer.len);
+            if (record.copied_bytes != expected_bytes) return error.Unreadable;
+            return .{
+                .bytes = try alloc.realloc(buffer, record.copied_bytes),
+                .total_bytes = record.total_bytes,
+            };
+        }
     };
 }
 
@@ -314,6 +387,20 @@ pub fn HostRuntime(comptime Host: type) type {
         pub fn executor(self: *const @This()) ?Executor {
             if (!self.available()) return null;
             return Adapter(Host).executor();
+        }
+
+        /// Where the context provider reads AGENTS.md. A `.host` value borrows
+        /// `home` from this runtime, which must outlive it.
+        pub fn instructionFiles(self: *const @This()) context_contract.InstructionFiles {
+            const metadata = self.info() orelse return .none;
+            if (!metadata.instruction_files) return .host_unreadable;
+            return .{ .host = .{
+                .home = metadata.home(),
+                .reader = .{
+                    .read_fn = Adapter(Host).readInstructionFile,
+                    .max_read_bytes = max_instruction_file_bytes,
+                },
+            } };
         }
     };
 }
@@ -385,6 +472,10 @@ const FakeInfoHost = struct {
         _: usize,
         _: *ResultRecord,
     ) i32 {
+        return -2;
+    }
+
+    fn workspaceReadFile(_: [*]const u8, _: usize, _: [*]u8, _: usize, _: *ReadRecord) i32 {
         return -2;
     }
 };
@@ -657,4 +748,119 @@ test "workspace exec rejects invalid output ranges utf8 and truncation records" 
         error.InvalidWorkspaceResult,
         Adapter(FakeExecHost).execute(std.testing.allocator, "pwd", "/workspace", 1000),
     );
+}
+
+test "workspace info reports instruction file access only when the host offers it" {
+    defer FakeInfoHost.info_json = valid_info_json;
+    FakeInfoHost.info_json = valid_info_json;
+    const legacy = try HostRuntime(FakeInfoHost).init(std.testing.allocator);
+    try std.testing.expect(!legacy.info().?.instruction_files);
+    try std.testing.expectEqual(std.meta.Tag(context_contract.InstructionFiles).host_unreadable, std.meta.activeTag(legacy.instructionFiles()));
+
+    FakeInfoHost.info_json =
+        "{\"version\":1,\"root\":\"/workspace\",\"cwd\":\"/workspace\",\"home\":\"/home/visitor\",\"git\":false,\"ephemeral\":true,\"permission\":\"allow-sandboxed\",\"instruction_files\":true}";
+    const readable = try HostRuntime(FakeInfoHost).init(std.testing.allocator);
+    switch (readable.instructionFiles()) {
+        .host => |files| try std.testing.expectEqualStrings("/home/visitor", files.home),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const absent: HostRuntime(FakeInfoHost) = .{};
+    try std.testing.expectEqual(std.meta.Tag(context_contract.InstructionFiles).none, std.meta.activeTag(absent.instructionFiles()));
+}
+
+const FakeReadHost = struct {
+    var status: i32 = 0;
+    var content: []const u8 = "";
+    var total_bytes: ?u32 = null;
+    var copied_override: ?u32 = null;
+    var calls: usize = 0;
+    var last_out_cap: usize = 0;
+
+    fn workspaceReadFile(_: [*]const u8, _: usize, out_ptr: [*]u8, out_cap: usize, result_ptr: *ReadRecord) i32 {
+        calls += 1;
+        last_out_cap = out_cap;
+        if (status != 0) return status;
+        const copied = @min(content.len, out_cap);
+        @memcpy(out_ptr[0..copied], content[0..copied]);
+        result_ptr.* = .{
+            .total_bytes = total_bytes orelse @intCast(content.len),
+            .copied_bytes = copied_override orelse @intCast(copied),
+        };
+        return 0;
+    }
+
+    fn reset() void {
+        status = 0;
+        content = "";
+        total_bytes = null;
+        copied_override = null;
+        calls = 0;
+        last_out_cap = 0;
+    }
+};
+
+test "instruction file reads copy a bounded prefix and report the full size" {
+    const alloc = std.testing.allocator;
+    FakeReadHost.reset();
+    FakeReadHost.content = "0123456789";
+
+    const file = (try Adapter(FakeReadHost).readInstructionFile(alloc, "/workspace/AGENTS.md", 4)).?;
+    defer alloc.free(file.bytes);
+    try std.testing.expectEqualStrings("0123", file.bytes);
+    try std.testing.expectEqual(@as(u64, 10), file.total_bytes);
+    try std.testing.expectEqual(@as(usize, 4), FakeReadHost.last_out_cap);
+
+    const whole = (try Adapter(FakeReadHost).readInstructionFile(alloc, "/workspace/AGENTS.md", max_instruction_file_bytes + 10)).?;
+    defer alloc.free(whole.bytes);
+    try std.testing.expectEqualStrings("0123456789", whole.bytes);
+    try std.testing.expectEqual(max_instruction_file_bytes, FakeReadHost.last_out_cap);
+}
+
+test "instruction file reads map host statuses without leaking" {
+    const alloc = std.testing.allocator;
+    defer FakeReadHost.reset();
+    FakeReadHost.reset();
+    FakeReadHost.status = -6;
+    try std.testing.expect(try Adapter(FakeReadHost).readInstructionFile(alloc, "/workspace/AGENTS.md", 64) == null);
+
+    FakeReadHost.status = -2;
+    try std.testing.expectError(error.HostUnreadable, Adapter(FakeReadHost).readInstructionFile(alloc, "/workspace/AGENTS.md", 64));
+    FakeReadHost.status = -4;
+    try std.testing.expectError(error.UnsafePath, Adapter(FakeReadHost).readInstructionFile(alloc, "/workspace/AGENTS.md", 64));
+    for ([_]i32{ -1, -3, -5, -7, 3 }) |status| {
+        FakeReadHost.status = status;
+        try std.testing.expectError(error.Unreadable, Adapter(FakeReadHost).readInstructionFile(alloc, "/workspace/AGENTS.md", 64));
+    }
+
+    FakeReadHost.reset();
+    FakeReadHost.content = "rule";
+    FakeReadHost.copied_override = 3;
+    try std.testing.expectError(error.Unreadable, Adapter(FakeReadHost).readInstructionFile(alloc, "/workspace/AGENTS.md", 64));
+    FakeReadHost.copied_override = null;
+    FakeReadHost.total_bytes = 2;
+    try std.testing.expectError(error.Unreadable, Adapter(FakeReadHost).readInstructionFile(alloc, "/workspace/AGENTS.md", 64));
+}
+
+test "instruction file reads reject unsafe paths before the host import" {
+    const alloc = std.testing.allocator;
+    FakeReadHost.reset();
+    const long_path = try alloc.alloc(u8, max_instruction_path_bytes + 1);
+    defer alloc.free(long_path);
+    @memset(long_path, 'a');
+    long_path[0] = '/';
+    @memcpy(long_path[long_path.len - "/AGENTS.md".len ..], "/AGENTS.md");
+
+    const unsafe = [_][]const u8{
+        "workspace/AGENTS.md",
+        "/workspace/../AGENTS.md",
+        "/workspace/README.md",
+        "/workspace/AGENTS.md/",
+        "/workspace/\x00/AGENTS.md",
+        long_path,
+    };
+    for (unsafe) |path| {
+        try std.testing.expectError(error.UnsafePath, Adapter(FakeReadHost).readInstructionFile(alloc, path, 64));
+    }
+    try std.testing.expectEqual(@as(usize, 0), FakeReadHost.calls);
 }
