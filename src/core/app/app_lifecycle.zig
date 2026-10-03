@@ -1181,6 +1181,7 @@ fn leaveAlternateScreens(terminal: *TerminalState, shell: *TranscriptRuntime, me
         .file_approval => _ = leaveApprovalScreen(terminal, shell, metrics) catch {},
         .full_transcript => _ = leaveFullTranscriptScreen(terminal, shell, metrics) catch {},
         .catalog_menu => _ = leaveCatalogMenuScreen(terminal, shell, metrics) catch {},
+        .child_view => _ = leaveChildViewScreen(terminal, shell, metrics) catch {},
     }
 }
 
@@ -1356,6 +1357,14 @@ pub fn enterCatalogMenuScreen(terminal: *TerminalState, shell: *TranscriptRuntim
 
 pub fn leaveCatalogMenuScreen(terminal: *TerminalState, shell: *TranscriptRuntime, metrics: *Metrics) !void {
     try leaveAlternateScreen(terminal, shell, metrics, .catalog_menu);
+}
+
+pub fn enterChildViewScreen(terminal: *TerminalState, shell: *TranscriptRuntime, metrics: *Metrics) !void {
+    try enterAlternateScreen(terminal, shell, metrics, .child_view);
+}
+
+pub fn leaveChildViewScreen(terminal: *TerminalState, shell: *TranscriptRuntime, metrics: *Metrics) !void {
+    try leaveAlternateScreen(terminal, shell, metrics, .child_view);
 }
 
 pub fn openFullTranscript(

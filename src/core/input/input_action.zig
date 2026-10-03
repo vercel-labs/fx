@@ -92,6 +92,8 @@ pub const Action = union(enum) {
     toggle_permission_mode,
     open_all_sessions,
     open_model_catalog,
+    /// Ctrl+T: the subagent picker.
+    open_child_view,
     insert_newline,
     paste_start,
     paste_end,

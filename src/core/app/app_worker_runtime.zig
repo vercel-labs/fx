@@ -9,6 +9,7 @@ const command_output_content = @import("../tooling/command_output_content.zig");
 const io_mod = @import("../shared/io.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const child_agents_runtime = @import("../child_agents/runtime.zig");
+const app_child_view_runtime = @import("app_child_view_runtime.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const shared_theme = @import("../shared/theme.zig");
 const types = @import("../shared/types.zig");
@@ -750,7 +751,8 @@ pub fn Runtime(comptime App: type) type {
             // A sub-engine child's prompt comes last, and waits while a
             // question is shown.
             var owned_sub_engine_pending: ?permission_request.OwnedPermissionRequest =
-                if (worker_pending_request == null and child_pending_request == null and !app.question_prompt.isActive())
+                if (worker_pending_request == null and child_pending_request == null and !app.question_prompt.isActive() and
+                !app_child_view_runtime.active(app))
                     if (child_agents_runtime.ofApp(app)) |children| children.pendingPermission(app.alloc) catch null else null
                 else
                     null;
@@ -814,7 +816,8 @@ pub fn Runtime(comptime App: type) type {
                     app.question_prompt.discard(app.alloc, "worker_cleared");
                     app.shell.render_requests.request(.modal);
                 }
-            } else if (!app.approval_prompt.isActive()) {
+            } else if (!app.approval_prompt.isActive() and !app_child_view_runtime.active(app)) {
+                // In the live view a child's prompts show on its own screen.
                 if (child_agents_runtime.ofApp(app)) |children| presentChildQuestions(app, children);
             }
 

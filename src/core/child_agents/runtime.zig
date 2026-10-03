@@ -117,8 +117,23 @@ pub const Delivery = enum {
     exited,
 };
 
+/// A child as the live view holds it. It goes stale once the child is
+/// stopped, even if a new child takes its name.
+pub const Handle = struct {
+    slot: usize,
+    id: sub_engine.Id,
+};
+
+/// A copy of a child's screen, and the version it had.
+pub const Screen = struct {
+    grid: engine.Grid,
+    version: u64,
+};
+
 pub const Status = struct {
     name: []u8,
+    /// Null only for a child stopped while the call ran.
+    handle: ?Handle = null,
     state: labels_mod.State,
     blocked_reason: ?labels_mod.BlockedReason,
     exit: ?sub_engine.Exit,
@@ -232,6 +247,8 @@ pub const Runtime = struct {
     lock: std.Io.Mutex = .init,
     table: core.Table = .{},
     screens: [max_children]?engine.Grid = [_]?engine.Grid{null} ** max_children,
+    /// Bumped whenever a screen changes, so the live view repaints only then.
+    versions: [max_children]u64 = [_]u64{0} ** max_children,
     pool: ?*sub_engine.Pool = null,
     /// Each child's open prompt as main knows it.
     prompts: [max_children]PromptSlot = [_]PromptSlot{.{}} ** max_children,
@@ -485,11 +502,88 @@ pub const Runtime = struct {
             for (statuses.items) |status| status.deinit(gpa);
             statuses.deinit(gpa);
         }
-        for (&self.table.slots) |*slot| {
+        for (&self.table.slots, 0..) |*slot, index| {
             const child = &(slot.* orelse continue);
-            try statuses.append(gpa, try statusOf(self, gpa, child));
+            var status = try statusOf(self, gpa, child);
+            if (child.id) |id| status.handle = .{ .slot = index, .id = id };
+            statuses.append(gpa, status) catch |err| {
+                status.deinit(gpa);
+                return err;
+            };
         }
         return statuses.toOwnedSlice(gpa);
+    }
+
+    /// A copy of the child's screen if it changed since version `after`,
+    /// else null; always a copy when `after` is null. `error.Gone` once the
+    /// child exited or was stopped.
+    pub fn screen(self: *Runtime, gpa: Allocator, handle: Handle, after: ?u64) error{ Gone, OutOfMemory }!?Screen {
+        self.lockTable();
+        defer self.unlockTable();
+        const child = self.childAt(handle.slot, handle.id) orelse return error.Gone;
+        if (child.exit != null) return error.Gone;
+        const grid = &(self.screens[handle.slot] orelse return error.Gone);
+        const version = self.versions[handle.slot];
+        if (after == version) return null;
+        var copy = try grid.clone(gpa);
+        // `clone` copies the cells only; the view also needs the insertion
+        // point.
+        copy.cursor_row = grid.cursor_row;
+        copy.cursor_col = grid.cursor_col;
+        copy.cursor_visible = grid.cursor_visible;
+        return .{ .grid = copy, .version = version };
+    }
+
+    /// Types the user's raw keys into the child, as a terminal would. The
+    /// main agent's messages may arrive in between. `QueueFull` means the
+    /// child stopped reading its input; the keys are dropped.
+    pub fn keys(self: *Runtime, handle: Handle, bytes: []const u8) error{ Gone, QueueFull, OutOfMemory }!void {
+        {
+            self.lockTable();
+            defer self.unlockTable();
+            const child = self.childAt(handle.slot, handle.id) orelse return error.Gone;
+            if (child.exit != null) return error.Gone;
+        }
+        self.pool.?.write(handle.id, bytes) catch |err| return switch (err) {
+            error.NotFound, error.Ended, error.WriteFailed => error.Gone,
+            error.QueueFull, error.OutOfMemory => |e| e,
+        };
+    }
+
+    /// How many children other than the one `except` names wait on a
+    /// permission or question prompt.
+    pub fn blockedOthers(self: *Runtime, except: Handle) usize {
+        self.lockTable();
+        defer self.unlockTable();
+        var count: usize = 0;
+        for (&self.table.slots, 0..) |*slot, index| {
+            const child = &(slot.* orelse continue);
+            if (index == except.slot and std.meta.eql(child.id, except.id)) continue;
+            if (child.exit == null and child.labels.state == .blocked) count += 1;
+        }
+        return count;
+    }
+
+    /// Resizes every child's terminal and screen. Children launched later
+    /// start at this size.
+    pub fn resize(self: *Runtime, cols: u16, rows: u16) void {
+        if (cols == 0 or rows == 0) return;
+        self.lockTable();
+        defer self.unlockTable();
+        if (cols == self.config.cols and rows == self.config.rows) return;
+        self.config.cols = cols;
+        self.config.rows = rows;
+        for (&self.screens, &self.versions) |*slot, *version| {
+            const grid = &(slot.* orelse continue);
+            grid.resize(cols, rows) catch |err| {
+                debug_trace.logf("child_agents", "screen resize failed cols={d} rows={d} err={s}", .{ cols, rows, @errorName(err) });
+            };
+            version.* +%= 1;
+        }
+        const pool = self.pool orelse return;
+        pool.resize(cols, rows) catch |err| {
+            debug_trace.logf("child_agents", "terminal resize failed cols={d} rows={d} err={s}", .{ cols, rows, @errorName(err) });
+        };
     }
 
     /// Closes the child named `name` and frees its name. Its session stays
@@ -683,6 +777,7 @@ pub const Runtime = struct {
                 return;
             };
             defer result.deinit(self.gpa);
+            self.versions[slot] +%= 1;
             for (result.replies.items) |reply| replies.appendSlice(self.gpa, reply.bytes) catch return;
         }
         // The pool lets the sink write; terminal queries need their answers.
@@ -1092,6 +1187,35 @@ test "a launch cancelled during its delivery leaves no child" {
     try testing.expectEqual(@as(usize, 0), statuses.len);
 }
 
+test "blockedOthers counts the other children waiting on a prompt" {
+    const prompt = try labels_mod.encode(testing.allocator, .{ .prompt = .{ .number = 1, .reason = .permission, .body = .{
+        .permission = .{ .id = 1, .label = "shell" },
+    } } });
+    defer testing.allocator.free(prompt);
+    const body = try std.mem.concat(testing.allocator, u8, &.{
+        "say '{\"event\":\"state\",\"state\":\"idle\"}'\nturn 4 'done'\nsay '",
+        std.mem.trimEnd(u8, prompt, "\n"),
+        "'\nsleep 30",
+    });
+    defer testing.allocator.free(body);
+    var fake = try FakeChild.create(body);
+    defer fake.deinit();
+    var runtime = try fake.runtime();
+    defer runtime.deinit();
+
+    const launched = try runtime.launch(testing.allocator, "a1", "task", .{}, null);
+    defer launched.status.deinit(testing.allocator);
+    const statuses = try runtime.list(testing.allocator);
+    defer freeStatuses(testing.allocator, statuses);
+    const handle = statuses[0].handle.?;
+    var waited: u32 = 0;
+    while (runtime.blockedOthers(.{ .slot = handle.slot + 1, .id = handle.id }) == 0) : (waited += 20) {
+        if (waited >= 3000) return error.TestExpectedBlockedChild;
+        sleepMs(20);
+    }
+    try testing.expectEqual(@as(usize, 0), runtime.blockedOthers(handle));
+}
+
 test "a child takes its task and later messages, and wait returns once each turn ends" {
     var fake = try FakeChild.create(
         \\say '{"event":"session","id":"sess-1"}'
@@ -1404,4 +1528,70 @@ test "a message to a child waiting on a prompt is refused, not typed" {
     defer freeStatuses(testing.allocator, waited.children);
     try testing.expectEqual(labels_mod.State.blocked, waited.children[0].state);
     try testing.expectError(error.Blocked, runtime.send("a1", "answer it for me", "", null));
+}
+
+fn echoedKey(runtime: *Runtime) !bool {
+    return screenHas(runtime, "got x");
+}
+
+fn reportedSize(runtime: *Runtime) !bool {
+    return screenHas(runtime, "size 20 60");
+}
+
+// The fake child polls its size: bash 5 runs no WINCH trap while `read`
+// waits, and the bash 3.2 macOS ships takes no fractional timeouts.
+test "the live view copies a child's screen, types into it and resizes it" {
+    var fake = try FakeChild.create(
+        \\say '{"event":"state","state":"idle"}'
+        \\turn 4 'done'
+        \\last=$(stty size)
+        \\while true; do
+        \\  IFS= read -r -n1 -t 1 c && printf 'got %s\r\n' "$c"
+        \\  size=$(stty size)
+        \\  [ "$size" = "$last" ] || { last=$size; printf 'size %s\r\n' "$size"; }
+        \\done
+    );
+    defer fake.deinit();
+    var runtime = try fake.runtime();
+    defer runtime.deinit();
+    const launched = try runtime.launch(testing.allocator, "a1", "task", .{}, null);
+    launched.status.deinit(testing.allocator);
+    const waited = try runtime.wait(testing.allocator, &.{"a1"}, 5000, null);
+    freeStatuses(testing.allocator, waited.children);
+    const statuses = try runtime.list(testing.allocator);
+    const handle = statuses[0].handle.?;
+    freeStatuses(testing.allocator, statuses);
+
+    var first = (try runtime.screen(testing.allocator, handle, null)).?;
+    defer first.grid.deinit();
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    try first.grid.rowTextTrimmed(1, &text);
+    try testing.expectEqualStrings("fake child", text.items);
+    // Nothing changed, so there is nothing to copy.
+    try testing.expect(try runtime.screen(testing.allocator, handle, first.version) == null);
+
+    try runtime.keys(handle, "x");
+    try pollUntil(&runtime, echoedKey);
+    // "fake child", "working" and "got x" each end a line.
+    var typed = (try runtime.screen(testing.allocator, handle, first.version)).?;
+    defer typed.grid.deinit();
+    try testing.expectEqual(@as(u16, 4), typed.grid.cursor_row);
+    try testing.expectEqual(@as(u16, 1), typed.grid.cursor_col);
+
+    runtime.resize(60, 20);
+    try pollUntil(&runtime, reportedSize);
+    var resized = (try runtime.screen(testing.allocator, handle, first.version)).?;
+    defer resized.grid.deinit();
+    try testing.expectEqual(@as(u16, 60), resized.grid.cols);
+    try testing.expectEqual(@as(u16, 20), resized.grid.rows);
+
+    const stopped = try runtime.stop(testing.allocator, "a1");
+    stopped.deinit(testing.allocator);
+    try testing.expectError(error.Gone, runtime.screen(testing.allocator, handle, null));
+    try testing.expectError(error.Gone, runtime.keys(handle, "y"));
+    // A new child with the old name is another child.
+    const again = try runtime.launch(testing.allocator, "a1", "task", .{}, null);
+    again.status.deinit(testing.allocator);
+    try testing.expectError(error.Gone, runtime.screen(testing.allocator, handle, null));
 }

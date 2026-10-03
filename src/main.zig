@@ -71,6 +71,7 @@ const js_host_url_opener = @import("core/hosts/js_host_url_opener.zig");
 const js_host_workspace = @import("core/hosts/js_host_workspace.zig");
 const host_target = @import("core/hosts/target.zig");
 const child_agents_runtime = @import("core/child_agents/runtime.zig");
+const app_child_view_runtime = @import("core/app/app_child_view_runtime.zig");
 const self_exe = @import("core/shared/self_exe.zig");
 const native_host = @import("core/hosts/native.zig");
 const debug_trace = @import("core/shared/debug_trace.zig");
@@ -414,6 +415,7 @@ const App = struct {
     );
     const HerdrAppRuntime = builtin_hooks.Runtime(Self);
     const ParentReportAppRuntime = builtin_hooks.parent_report.Runtime(Self);
+    const ChildViewAppRuntime = app_child_view_runtime.Runtime(Self);
     const RenderAppRuntime = app_render_runtime.Runtime(Self);
     const SessionAppRuntime = app_session_runtime.Runtime(Self);
     const UpgradeAppRuntime = app_upgrade_runtime.Runtime(Self);
@@ -548,6 +550,7 @@ const App = struct {
     /// The children of the subagent tool with sub-engine children, when
     /// `--subagents-v2` is on.
     child_agents: ?child_agents_runtime.Runtime = null,
+    child_view: app_child_view_runtime.State = .{},
 
     session: SessionRuntime = SessionRuntime.initWithProviders(
         max_history_turns,
@@ -877,6 +880,8 @@ const App = struct {
     /// Closes every child of the subagent tool. Their sessions stay saved.
     fn stopChildAgents(self: *App) void {
         if (comptime host_target.is_wasm) return;
+        self.child_view.deinit();
+        self.child_view = .{};
         if (self.child_agents) |*children| children.deinit();
         self.child_agents = null;
     }
@@ -1192,6 +1197,8 @@ const App = struct {
     }
 
     fn flushRequestedFrame(self: *App) !void {
+        // The live view paints itself; main's frames wait until it closes.
+        if (app_child_view_runtime.active(self)) return;
         try RenderAppRuntime.flushRequestedFrame(self);
     }
 
@@ -2908,6 +2915,7 @@ const App = struct {
     }
 
     fn handleTerminalInputByte(self: *App, byte: u8) !void {
+        if (try ChildViewAppRuntime.handleByte(self, byte)) return;
         try InputAppRuntime.handleTerminalByteAcrossSessionTransition(
             self,
             byte,
@@ -3229,6 +3237,7 @@ const App = struct {
         try self.routeTerminalInputIngress(terminal_input);
         try WorkerAppRuntime.tick(self, app_callbacks.Bindings(App).workerEventHandlers(self));
         ParentReportAppRuntime.tick(self);
+        try ChildViewAppRuntime.tick(self);
         const now_ns = io_mod.nanoTimestamp();
         if (!self.approval_prompt.isActive() and !self.question_prompt.isActive() and !self.auth.apiKeyEntryActive()) {
             try self.pacer.tick(self.alloc, now_ns, self.pacerCallbacks());

@@ -269,6 +269,7 @@ pub fn controlByteFeatureAction(byte: u8) ?InputEscapeAction {
     return switch (byte) {
         15 => .toggle_full_transcript,
         16 => .open_model_catalog,
+        20 => .open_child_view,
         else => null,
     };
 }

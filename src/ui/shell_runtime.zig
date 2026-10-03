@@ -59,6 +59,8 @@ pub const AlternateScreenOwner = enum {
     file_approval,
     full_transcript,
     catalog_menu,
+    /// The subagent picker and a child's live view, which paint themselves.
+    child_view,
 };
 
 pub const TerminalState = struct {

@@ -72,6 +72,7 @@ const input_submit_runtime = @import("input_submit_runtime.zig");
 const input_approval_runtime = @import("input_approval_runtime.zig");
 const input_question_runtime = @import("input_question_runtime.zig");
 const input_full_transcript_runtime = @import("input_full_transcript_runtime.zig");
+const app_child_view_runtime = @import("app_child_view_runtime.zig");
 const input_selection_runtime = @import("input_selection_runtime.zig");
 const input_limit_feedback = @import("input_limit_feedback.zig");
 const app_upgrade_runtime = @import("app_upgrade_runtime.zig");
@@ -1194,6 +1195,7 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                     }
                 },
+                .open_child_view => try app_child_view_runtime.Runtime(App).open(app),
                 .open_model_catalog => {
                     if (comptime @hasField(App, "model_cache")) {
                         // A second Ctrl+P backs out of the shortcut's flow
