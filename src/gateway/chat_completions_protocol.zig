@@ -630,6 +630,7 @@ const Tool = struct {
     id: ?[]u8 = null,
     name: std.ArrayList(u8) = .empty,
     arguments: std.ArrayList(u8) = .empty,
+    arguments_seen: bool = false,
 
     fn deinit(self: *Tool, alloc: Allocator) void {
         if (self.id) |id| alloc.free(id);
@@ -872,6 +873,7 @@ pub const Reducer = struct {
                     try append_bounded(self.alloc, &tool.name, fragment, @min(max_name_bytes, self.limits.identity_bytes), error.IdentityTooLarge);
                 }
                 if (non_null(function, "arguments")) |arguments| try append_bounded(self.alloc, &tool.arguments, try string(arguments), self.limits.arguments_bytes, error.ArgumentsTooLarge);
+                if (non_null(function, "arguments") != null) tool.arguments_seen = true;
             }
         }
     }
@@ -938,7 +940,6 @@ pub const Reducer = struct {
         for (self.tools.items) |tool| {
             if (tool.id == null) return error.InvalidToolCallId;
             try validate_name(tool.name.items);
-            try validate_arguments(self.alloc, tool.arguments.items);
         }
         const provider_state = self.reasoning_state() catch |err| switch (err) {
             error.WriteFailed => return error.OutOfMemory,
@@ -962,9 +963,25 @@ pub const Reducer = struct {
             errdefer self.alloc.free(id);
             const name = try tool.name.toOwnedSlice(self.alloc);
             errdefer self.alloc.free(name);
-            const arguments = try tool.arguments.toOwnedSlice(self.alloc);
+            const raw_arguments = tool.arguments.items;
+            if (!tool.arguments_seen) return error.InvalidToolArguments;
+            const argument_integrity = try types.ToolArgumentIntegrity.classifyFunctionInput(self.alloc, raw_arguments);
+            const argument_diagnostic = if (argument_integrity == .malformed_json)
+                try types.ToolArgumentDiagnostic.diagnose(self.alloc, raw_arguments)
+            else
+                null;
+            const arguments = if (argument_integrity == .valid)
+                try tool.arguments.toOwnedSlice(self.alloc)
+            else
+                try self.alloc.dupe(u8, "{}");
             errdefer self.alloc.free(arguments);
-            try calls.append(self.alloc, .{ .id = id, .name = name, .arguments_json = arguments });
+            try calls.append(self.alloc, .{
+                .id = id,
+                .name = name,
+                .arguments_json = arguments,
+                .argument_integrity = argument_integrity,
+                .argument_diagnostic = argument_diagnostic,
+            });
         }
         const content = if (self.content.items.len != 0) try self.content.toOwnedSlice(self.alloc) else null;
         errdefer if (content) |text| self.alloc.free(text);
@@ -2170,7 +2187,11 @@ test "chat completions malformed and nonobject final arguments never become tool
         try std.json.Stringify.value(arguments, .{}, &out.writer);
         try out.writer.writeAll("}}]}}]}");
         try test_accept(&reducer, out.written());
-        try std.testing.expectError(error.InvalidToolArguments, test_finish(&reducer, test_tools_finish));
+        var result = try test_finish(&reducer, test_tools_finish);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), result.completed.completion.tool_calls.len);
+        try std.testing.expectEqualStrings("{}", result.completed.completion.tool_calls[0].arguments_json);
+        try std.testing.expect(result.completed.completion.tool_calls[0].argument_integrity != .valid);
         try std.testing.expectError(error.StreamClosed, reducer.finish(false));
     }
 }
