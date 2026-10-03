@@ -10,6 +10,8 @@ pub const max_message_bytes: usize = 64 * 1024;
 pub const max_messages: usize = 64;
 pub const max_queued_bytes: usize = 1024 * 1024;
 
+const max_input_id_bytes: usize = 128;
+
 pub const EnqueueError = Allocator.Error || error{
     EmptySteeringMessage,
     SteeringMessageTooLarge,
@@ -17,18 +19,33 @@ pub const EnqueueError = Allocator.Error || error{
     SteeringNotActive,
 };
 
+/// A libfx input id that is malformed or already queued.
+const InputError = EnqueueError || error{InvalidInputId};
+
 const Entry = struct {
     text: []u8,
     /// The ACP `session/prompt` request that carried the text, answered when
     /// the turn that absorbed it ends. libfx steering carries no request.
     request_id: ?RequestId = null,
+    /// The libfx input id a journaled session records the text under.
+    input_id: ?[]u8 = null,
 };
 
 /// Steering drained at one boundary, allocated in the caller's allocator.
 pub const Drained = struct {
     texts: [][]u8,
     request_ids: []?RequestId,
+    input_ids: []?[]u8 = &.{},
 };
+
+/// A libfx input id: 1 to 128 letters, digits, `.`, `_`, or `-`.
+pub fn validInputId(id: []const u8) bool {
+    if (id.len == 0 or id.len > max_input_id_bytes) return false;
+    for (id) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '.' and byte != '_' and byte != '-') return false;
+    }
+    return true;
+}
 
 /// Requests to answer when a turn ends. Allocated in the caller's allocator.
 pub const Finished = struct {
@@ -62,6 +79,28 @@ pub const Runtime = struct {
         return self.enqueueRequest(alloc, text, null);
     }
 
+    /// Queues a libfx input under `input_id`, which no queued entry may share.
+    pub fn enqueueInput(self: *Runtime, alloc: Allocator, text: []const u8, input_id: []const u8) InputError!void {
+        if (!validInputId(input_id)) return error.InvalidInputId;
+        return self.enqueueEntry(alloc, text, null, input_id);
+    }
+
+    /// Removes the queued input `input_id`. False when it is not queued: the
+    /// turn already took it for a model request, or it never arrived.
+    pub fn withdraw(self: *Runtime, alloc: Allocator, input_id: []const u8) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.messages.items, 0..) |entry, index| {
+            const id = entry.input_id orelse continue;
+            if (!std.mem.eql(u8, id, input_id)) continue;
+            const removed = self.messages.orderedRemove(index);
+            self.queued_bytes -= removed.text.len;
+            freeEntry(alloc, removed);
+            return true;
+        }
+        return false;
+    }
+
     /// Queues text for the running turn. A supplied request ID is copied and
     /// reported by `finishTurn`.
     pub fn enqueueRequest(
@@ -70,6 +109,20 @@ pub const Runtime = struct {
         text: []const u8,
         request_id: ?RequestId,
     ) EnqueueError!void {
+        return self.enqueueEntry(alloc, text, request_id, null) catch |err| switch (err) {
+            // Only an input id can be invalid, and none is given here.
+            error.InvalidInputId => unreachable,
+            else => |other| other,
+        };
+    }
+
+    fn enqueueEntry(
+        self: *Runtime,
+        alloc: Allocator,
+        text: []const u8,
+        request_id: ?RequestId,
+        input_id: ?[]const u8,
+    ) InputError!void {
         if (text.len == 0) return error.EmptySteeringMessage;
         if (text.len > max_message_bytes) return error.SteeringMessageTooLarge;
 
@@ -81,12 +134,19 @@ pub const Runtime = struct {
         {
             return error.SteeringQueueFull;
         }
+        if (input_id) |id| {
+            for (self.messages.items) |entry| {
+                if (entry.input_id) |queued| if (std.mem.eql(u8, queued, id)) return error.InvalidInputId;
+            }
+        }
         try self.messages.ensureUnusedCapacity(alloc, 1);
         try self.absorbed.ensureTotalCapacity(alloc, self.absorbed.items.len + self.messages.items.len + 1);
         const owned = try alloc.dupe(u8, text);
         errdefer alloc.free(owned);
+        const owned_input = if (input_id) |id| try alloc.dupe(u8, id) else null;
+        errdefer if (owned_input) |id| alloc.free(id);
         const owned_id = if (request_id) |id| try dupeRequestId(alloc, id) else null;
-        self.messages.appendAssumeCapacity(.{ .text = owned, .request_id = owned_id });
+        self.messages.appendAssumeCapacity(.{ .text = owned, .request_id = owned_id, .input_id = owned_input });
         self.queued_bytes += owned.len;
     }
 
@@ -109,30 +169,31 @@ pub const Runtime = struct {
         errdefer result_alloc.free(texts);
         const request_ids = try result_alloc.alloc(?RequestId, count);
         errdefer result_alloc.free(request_ids);
+        const input_ids = try result_alloc.alloc(?[]u8, count);
+        errdefer result_alloc.free(input_ids);
         var copied: usize = 0;
         errdefer for (0..copied) |index| {
             result_alloc.free(texts[index]);
             if (request_ids[index]) |id| freeRequestId(result_alloc, id);
+            if (input_ids[index]) |id| result_alloc.free(id);
         };
         for (self.messages.items, 0..) |entry, index| {
             texts[index] = try result_alloc.dupe(u8, entry.text);
-            request_ids[index] = null;
-            if (entry.request_id) |id| {
-                request_ids[index] = dupeRequestId(result_alloc, id) catch |err| {
-                    result_alloc.free(texts[index]);
-                    return err;
-                };
-            }
+            errdefer result_alloc.free(texts[index]);
+            input_ids[index] = if (entry.input_id) |id| try result_alloc.dupe(u8, id) else null;
+            errdefer if (input_ids[index]) |id| result_alloc.free(id);
+            request_ids[index] = if (entry.request_id) |id| try dupeRequestId(result_alloc, id) else null;
             copied += 1;
         }
         // Capacity for every queued request was reserved at enqueue.
         for (self.messages.items) |entry| {
             backing.free(entry.text);
+            if (entry.input_id) |id| backing.free(id);
             if (entry.request_id) |id| self.absorbed.appendAssumeCapacity(id);
         }
         self.messages.clearRetainingCapacity();
         self.queued_bytes = 0;
-        return .{ .texts = texts, .request_ids = request_ids };
+        return .{ .texts = texts, .request_ids = request_ids, .input_ids = input_ids };
     }
 
     /// Stops accepting steering for the finished turn and reports which
@@ -193,10 +254,7 @@ pub const Runtime = struct {
                 .{ self.messages.items.len, self.queued_bytes, reason },
             );
         }
-        for (self.messages.items) |entry| {
-            alloc.free(entry.text);
-            if (entry.request_id) |id| freeRequestId(alloc, id);
-        }
+        for (self.messages.items) |entry| freeEntry(alloc, entry);
         self.messages.clearRetainingCapacity();
         freeRequestIdItems(alloc, self.absorbed.items);
         self.absorbed.clearRetainingCapacity();
@@ -216,6 +274,14 @@ pub fn freeDrained(alloc: Allocator, drained: Drained) void {
     if (drained.texts.len > 0) alloc.free(drained.texts);
     for (drained.request_ids) |maybe_id| if (maybe_id) |id| freeRequestId(alloc, id);
     if (drained.request_ids.len > 0) alloc.free(drained.request_ids);
+    for (drained.input_ids) |maybe_id| if (maybe_id) |id| alloc.free(id);
+    if (drained.input_ids.len > 0) alloc.free(drained.input_ids);
+}
+
+fn freeEntry(alloc: Allocator, entry: Entry) void {
+    alloc.free(entry.text);
+    if (entry.request_id) |id| freeRequestId(alloc, id);
+    if (entry.input_id) |id| alloc.free(id);
 }
 
 fn dupeRequestId(alloc: Allocator, id: RequestId) Allocator.Error!RequestId {
@@ -302,4 +368,29 @@ test "steering runtime reports absorbed and dropped prompt requests when a turn 
     try std.testing.expectError(error.SteeringNotActive, runtime.enqueueRequest(alloc, "late", .{ .integer = 8 }));
     try std.testing.expectEqual(@as(usize, 0), runtime.messages.items.len);
     try std.testing.expectEqual(@as(usize, 0), runtime.absorbed.items.len);
+}
+
+test "libfx steering withdraws a queued input until the turn takes it" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    runtime.open(alloc);
+
+    try std.testing.expectError(error.InvalidInputId, runtime.enqueueInput(alloc, "text", "bad id"));
+    try runtime.enqueueInput(alloc, "use tabs", "in_1");
+    try runtime.enqueueInput(alloc, "skip tests", "in_2");
+    try std.testing.expectError(error.InvalidInputId, runtime.enqueueInput(alloc, "again", "in_2"));
+    try runtime.enqueueInput(alloc, "be brief", "in_3");
+    try std.testing.expect(runtime.withdraw(alloc, "in_2"));
+    try std.testing.expect(!runtime.withdraw(alloc, "in_2"));
+    try std.testing.expectEqual(@as(usize, "use tabs".len + "be brief".len), runtime.queued_bytes);
+
+    const drained = try runtime.takeAll(alloc, alloc, false);
+    defer freeDrained(alloc, drained);
+    try std.testing.expectEqual(@as(usize, 2), drained.texts.len);
+    try std.testing.expectEqualStrings("in_1", drained.input_ids[0].?);
+    try std.testing.expectEqualStrings("be brief", drained.texts[1]);
+    try std.testing.expectEqualStrings("in_3", drained.input_ids[1].?);
+    // Taken for a model request: too late to withdraw.
+    try std.testing.expect(!runtime.withdraw(alloc, "in_1"));
 }

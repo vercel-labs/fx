@@ -12,6 +12,10 @@ const js_host_tools = if (host_target.is_wasm)
     @import("../core/hosts/js_host_tools.zig")
 else
     struct {};
+const js_host_journal = if (host_target.is_wasm)
+    @import("../core/hosts/js_host_journal.zig")
+else
+    struct {};
 const js_host_steering = if (host_target.is_wasm)
     @import("../core/hosts/js_host_steering.zig")
 else
@@ -43,6 +47,9 @@ const session_codec = @import("../core/session/session_codec.zig");
 const session_log = @import("../core/session/session_log.zig");
 const session_store = @import("../core/session/session_store.zig");
 const session_adapter = @import("../core/session/session_adapter.zig");
+const libfx_journal = @import("libfx_journal.zig");
+const journal_events = @import("../core/agent/runtime/journal.zig");
+const libfx_steering = @import("libfx_steering.zig");
 const session_child_store = @import("../core/session/session_child_store.zig");
 const session_runtime = @import("../core/session/session.zig");
 const session_usage = @import("../core/session/session_usage.zig");
@@ -522,6 +529,33 @@ fn activeToolSet(state: *const server.ServerState) tool_set_contract.ToolSet {
     return tool_call_presentation.activeToolSet(state);
 }
 
+/// Runs again, through the host, the calls of a resumed turn the host asked
+/// to run again, as the turn's tools run.
+const ResumeRerun = struct {
+    ctx: *AcpContext,
+    cancel_flag: *std.atomic.Value(bool),
+    max_result_bytes: usize,
+    call_ids: []const []const u8,
+
+    pub fn rerun(self: ResumeRerun, call: types.ToolCall) bool {
+        for (self.call_ids) |id| {
+            if (!std.mem.eql(u8, id, call.id)) continue;
+            const tool = self.ctx.toolRegistry().lookup(call.name) orelse return false;
+            return tool.executor_kind == .host and !tool.provider_executed;
+        }
+        return false;
+    }
+
+    /// Null when the turn is cancelled or handed off, or no host can run it.
+    pub fn run(self: ResumeRerun, alloc: Allocator, call: types.ToolCall) !?tool_dispatch.ToolResult {
+        const provider = hostToolProvider(self.ctx.state) orelse return null;
+        return provider.call(alloc, call.name, call.id, call.arguments_json, self.max_result_bytes, self.cancel_flag) catch |err| switch (err) {
+            error.Cancelled => null,
+            else => |other| other,
+        };
+    }
+};
+
 fn hostToolProvider(state: *server.ServerState) ?tool_dispatch.HostToolProvider {
     if (state.host_tools.tools.len == 0) return null;
     if (comptime host_target.is_wasm) return js_host_tools.provider();
@@ -535,6 +569,7 @@ fn callHostTool(
     raw_state: *anyopaque,
     alloc: Allocator,
     name: []const u8,
+    call_id: []const u8,
     arguments_json: []const u8,
     max_result_bytes: usize,
     cancel_flag: ?*std.atomic.Value(bool),
@@ -563,6 +598,8 @@ fn callHostTool(
     ) catch return error.OutOfMemory;
     params.writer.writeAll(",\"name\":") catch return error.OutOfMemory;
     std.json.Stringify.value(name, .{}, &params.writer) catch return error.OutOfMemory;
+    params.writer.writeAll(",\"toolCallId\":") catch return error.OutOfMemory;
+    std.json.Stringify.value(call_id, .{}, &params.writer) catch return error.OutOfMemory;
     params.writer.writeAll(",\"input\":") catch return error.OutOfMemory;
     params.writer.writeAll(arguments_json) catch return error.OutOfMemory;
     params.writer.writeByte('}') catch return error.OutOfMemory;
@@ -770,6 +807,14 @@ pub fn handlePrompt(
             prior_image_catalog = merged;
         }
     }
+    // A journaled session's open turn carries the images it was given.
+    if (session.journal) |journal| {
+        if (journal.pending_resume) |pending| {
+            const merged = try session_runtime.merge_image_catalog_history_turn(alloc, prior_image_catalog, pending.interruptedTurn());
+            types.freeImageAttachmentSlice(alloc, prior_image_catalog);
+            prior_image_catalog = merged;
+        }
+    }
     const next_image_id = (try image_attachments.calculate_next_image_id(prior_image_catalog)).next_id;
     var prompt_input = parsePromptInputWithFirstImageId(
         alloc,
@@ -845,7 +890,47 @@ pub fn handlePrompt(
 
     var recovery_checkpoint: ?session_codec.RecoveryCheckpoint = null;
     defer if (recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
-    if (prompt_input.continue_recovery) {
+    if (session.journal) |*journal| {
+        session.session_write_mutex.lockUncancelable(io_mod.getIo());
+        defer session.session_write_mutex.unlock(io_mod.getIo());
+        try journal.endUnplaced(alloc, state.alloc, session.session_id);
+    }
+    if (prompt_input.continue_recovery and session.journal != null) {
+        // A journaled libfx session resumes the turn its journal left open.
+        const journal = &session.journal.?;
+        const pending = journal.pending_resume orelse return .{
+            .rpc_error = .{
+                .code = ErrorCode.invalid_params,
+                .message = "No interrupted turn to resume",
+            },
+        };
+        // Inputs the crashed turn accepted and never placed go to the model
+        // with the resume, and its first progress places them.
+        const inputs = journal.takePendingInputs();
+        defer journal_events.freePendingInputs(state.alloc, inputs);
+        recovery_checkpoint = try libfx_journal.resumeCheckpoint(alloc, pending, inputs);
+        const answered_step = journal.pending_resume_answered;
+        {
+            session.session_write_mutex.lockUncancelable(io_mod.getIo());
+            defer session.session_write_mutex.unlock(io_mod.getIo());
+            const ids = try alloc.alloc([]const u8, inputs.len);
+            defer alloc.free(ids);
+            for (inputs, ids) |input, *id| id.* = input.id;
+            try journal.notePlaced(state.alloc, ids);
+        }
+        journal.dropPendingResume(state.alloc);
+        // Calls the crash left running that the host asked to run again do
+        // so before the turn continues, and their results replace the answer
+        // that they may have partly run.
+        if (answered_step) |step| if (prompt_input.rerun_call_ids.len > 0) {
+            _ = try libfx_journal.rerunCalls(alloc, &recovery_checkpoint.?, step, ResumeRerun{
+                .ctx = &ctx,
+                .cancel_flag = &session.cancel_flag,
+                .max_result_bytes = session.max_tool_result_bytes,
+                .call_ids = prompt_input.rerun_call_ids,
+            });
+        };
+    } else if (prompt_input.continue_recovery) {
         const writable = if (session.writable) |*value| value else return .{
             .rpc_error = .{
                 .code = ErrorCode.invalid_params,
@@ -859,11 +944,36 @@ pub fn handlePrompt(
             },
         };
         recovery_checkpoint = try checkpoint.dupe(alloc);
+    } else if (session.journal) |*journal| {
+        // A new prompt instead of a resume ends the open turn as interrupted.
+        if (journal.pending_resume) |pending| {
+            try persistAcpHistoryTurn(alloc, session, pending.interruptedTurn(), null);
+            journal.dropPendingResume(state.alloc);
+        }
     } else if (session.writable) |*writable| {
         if (writable.conversation_writer.turn_open) {
             const checkpoint = writable.state.recovery_checkpoint orelse
                 return error.InvalidRecoveryCheckpoint;
             try persistAcpHistoryTurn(alloc, session, checkpoint.interruptedTurn(), null);
+        }
+    }
+
+    if (session.journal) |*journal| {
+        session.session_write_mutex.lockUncancelable(io_mod.getIo());
+        defer session.session_write_mutex.unlock(io_mod.getIo());
+        journal.barrier_next_progress = true;
+        // A new turn's first progress records the host's id for it; a
+        // resumed turn keeps the id it started with.
+        journal.nameNextTurn(prompt_input.turn_id);
+        // A follow-up's turn places it in its first progress, a barrier. The
+        // web core records its acceptance only now.
+        if (prompt_input.input_id) |input_id| {
+            if (!prompt_input.input_accepted) try journal.append(alloc, session.session_id, .{ .input_accepted = .{
+                .id = input_id,
+                .text = prompt_input.text,
+                .kind = .follow_up,
+            } });
+            try journal.placeFollowUp(state.alloc, input_id);
         }
     }
 
@@ -992,10 +1102,23 @@ pub fn handlePrompt(
     }, agent_config, job) catch |err| {
         if (err == error.NonInteractivePermissionRequired) {
             ctx.stop_reason = .refused;
+        } else if (err == error.Cancelled and session.cancel_flag.load(.seq_cst)) {
+            // A cancel that arrived while a journal barrier was pending ends
+            // the turn as interrupted, as a cancel anywhere else does.
+            ctx.stop_reason = .cancelled;
+            // If the commit fails, the turn still ends below.
+            commitCancelledJournalTurn(alloc, state.alloc, session, &prompt_input) catch |commit_err| {
+                debug_trace.logf("session", "event=libfx_journal_interrupted_commit_failed err={s}", .{@errorName(commit_err)});
+            };
         } else {
+            // The turn's own failure is the one to report.
+            endJournalTurn(alloc, state.alloc, session) catch |end_err| {
+                debug_trace.logf("session", "event=libfx_journal_turn_end_failed err={s} turn_err={s}", .{ @errorName(end_err), @errorName(err) });
+            };
             return promptExecutionFailure(err);
         }
     };
+    try endJournalTurn(alloc, state.alloc, session);
     prompt_input.retainImageSnapshots();
     completeAcpTitleTask(state, session, alloc);
     try sessions.sendActiveSessionInfoUpdate(state, alloc);
@@ -1306,6 +1429,15 @@ const PendingPromptImage = struct {
 const ParsedPromptInput = struct {
     text: []u8,
     continue_recovery: bool = false,
+    /// The follow-up this prompt runs, which its first progress places.
+    input_id: ?[]u8 = null,
+    /// The host's id for the turn this prompt starts.
+    turn_id: ?[]u8 = null,
+    /// Calls a resumed turn's crash left running that the host asked to run
+    /// again instead of leaving them to the model.
+    rerun_call_ids: [][]u8 = &.{},
+    /// Whether the host already recorded the follow-up as accepted.
+    input_accepted: bool = false,
     targets: []context_contract.ApplicableTarget = &.{},
     omissions: []context_contract.ContextOmissionInput = &.{},
     omission_summary: ?context_contract.ContextOmissionSummary = null,
@@ -1380,6 +1512,10 @@ const ParsedPromptInput = struct {
 
     fn deinit(self: *ParsedPromptInput, alloc: Allocator) void {
         alloc.free(self.text);
+        if (self.input_id) |id| alloc.free(id);
+        if (self.turn_id) |id| alloc.free(id);
+        for (self.rerun_call_ids) |id| alloc.free(id);
+        if (self.rerun_call_ids.len > 0) alloc.free(self.rerun_call_ids);
         for (self.targets) |target| alloc.free(@constCast(target.path));
         if (self.targets.len > 0) alloc.free(self.targets);
         for (self.omissions) |omission| alloc.free(@constCast(omission.source));
@@ -1445,6 +1581,29 @@ fn takePromptImageAttachment(
     return bytes;
 }
 
+/// At most this many calls of a resumed turn run again; a turn's response
+/// makes no more calls than its batch limit.
+const max_rerun_calls = 128;
+const max_call_id_bytes = 256;
+
+/// The call ids in `value`, a JSON array of strings, owned by the caller.
+/// Anything else, and ids that are empty or too long, are left out.
+fn ownedCallIds(alloc: Allocator, value: std.json.Value) Allocator.Error![][]u8 {
+    if (value != .array) return &.{};
+    var ids: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (ids.items) |id| alloc.free(id);
+        ids.deinit(alloc);
+    }
+    for (value.array.items) |item| {
+        if (ids.items.len == max_rerun_calls) break;
+        if (item != .string or item.string.len == 0 or item.string.len > max_call_id_bytes) continue;
+        try ids.append(alloc, try alloc.dupe(u8, item.string));
+    }
+    if (ids.items.len == 0) return &.{};
+    return ids.toOwnedSlice(alloc);
+}
+
 fn parsePromptInputWithFirstImageId(
     alloc: Allocator,
     params_json: []const u8,
@@ -1459,6 +1618,16 @@ fn parsePromptInputWithFirstImageId(
     if (parsed.value != .object) return .{ .text = try alloc.dupe(u8, "") };
 
     const continue_recovery = acp_types.fxMetaBool(parsed.value.object, "continueRecovery") orelse false;
+    const input_id: ?[]const u8 = if (acp_types.fxMetaField(parsed.value.object, "inputId")) |value|
+        if (value == .string and libfx_steering.validInputId(value.string)) value.string else null
+    else
+        null;
+    const input_accepted = acp_types.fxMetaBool(parsed.value.object, "inputAccepted") orelse false;
+    const turn_id: ?[]const u8 = if (acp_types.fxMetaField(parsed.value.object, "turnId")) |value|
+        if (value == .string and libfx_steering.validInputId(value.string)) value.string else null
+    else
+        null;
+    const rerun_value = acp_types.fxMetaField(parsed.value.object, "rerun");
 
     const prompt_arr = parsed.value.object.get("prompt") orelse
         return .{ .text = try alloc.dupe(u8, ""), .continue_recovery = continue_recovery };
@@ -1585,8 +1754,12 @@ fn parsePromptInputWithFirstImageId(
     var result = ParsedPromptInput{
         .text = try alloc.dupe(u8, text_buf.items),
         .continue_recovery = continue_recovery,
+        .input_accepted = input_accepted,
     };
     errdefer result.deinit(alloc);
+    if (input_id) |id| result.input_id = try alloc.dupe(u8, id);
+    if (turn_id) |id| result.turn_id = try alloc.dupe(u8, id);
+    if (rerun_value) |value| result.rerun_call_ids = try ownedCallIds(alloc, value);
     result.targets = try targets.toOwnedSlice(alloc);
     result.omissions = try omissions.toOwnedSlice(alloc);
     result.pending_images = try pending_images.toOwnedSlice(alloc);
@@ -1679,12 +1852,22 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .publish_committed_file_handoff = publishCommittedFileHandoff,
         .publish_deferred_tool_completion = publishDeferredToolCompletion,
         .propagate_history_turn = propagateHistoryTurn,
-        .append_turn_piece = if (session.v2 != null) appendTurnPiece else null,
+        .append_turn_piece = if (session.v2 != null)
+            appendTurnPiece
+        else if (session.journal != null)
+            appendJournalToolIntent
+        else
+            null,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
         .recovery_checkpoint = if (session.writable != null)
             .{
                 .set = setRecoveryCheckpoint,
                 .clear = clearRecoveryCheckpoint,
+            }
+        else if (session.journal != null)
+            .{
+                .set = setJournalProgress,
+                .clear = clearJournalProgress,
             }
         else
             null,
@@ -1725,8 +1908,13 @@ fn takeSteeringBoundary(
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const close_if_empty = kind == .finalizing;
     if (comptime host_target.is_wasm) {
-        const messages = try js_host_steering.takeAll(arena);
-        if (messages.len > 0) return .{ .continue_turn = messages };
+        const taken = try js_host_steering.takeAll(arena);
+        if (taken.len > 0) {
+            try acceptHostSteering(ctx, taken);
+            const texts = try arena.alloc([]u8, taken.len);
+            for (taken, texts) |entry, *text| text.* = entry.text;
+            return .{ .continue_turn = texts };
+        }
         if (close_if_empty) js_host_steering.close();
         return if (kind == .cancelled) .interrupt else .none;
     }
@@ -1738,6 +1926,7 @@ fn takeSteeringBoundary(
     // the connection reader, which must never wait on work that needs it.
     const drained = try server.takeSteering(ctx.state, arena, close_if_empty and kernel);
     if (drained.texts.len == 0) return if (kind == .cancelled) .interrupt else .none;
+    try noteJournalPlacement(ctx, drained.input_ids);
     // libfx replays steering when it is queued; ACP replays it on delivery.
     if (!kernel) {
         for (drained.texts, drained.request_ids) |text, request_id| {
@@ -1745,6 +1934,33 @@ fn takeSteeringBoundary(
         }
     }
     return .{ .continue_turn = drained.texts };
+}
+
+/// A journaled session's next progress places the inputs a boundary took.
+fn noteJournalPlacement(ctx: *AcpContext, input_ids: []const ?[]u8) !void {
+    const session = if (ctx.state.active_session) |*value| value else return;
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const journal = if (session.journal) |*value| value else return;
+    for (input_ids) |maybe_id| {
+        const id = maybe_id orelse continue;
+        try journal.notePlaced(ctx.state.alloc, &.{id});
+    }
+}
+
+/// The web core takes steering from the host at a boundary, so a journaled
+/// session records each input as accepted when it arrives, and the next
+/// progress places it in the same barrier.
+fn acceptHostSteering(ctx: *AcpContext, taken: []const js_host_steering.Taken) !void {
+    const session = if (ctx.state.active_session) |*value| value else return;
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const journal = if (session.journal) |*value| value else return;
+    for (taken) |entry| {
+        const id = entry.id orelse continue;
+        try journal.append(ctx.alloc, session.session_id, .{ .input_accepted = .{ .id = id, .text = entry.text } });
+        try journal.notePlaced(ctx.state.alloc, &.{id});
+    }
 }
 
 fn publishSteeringReplay(ctx: *AcpContext, text: []const u8, request_id: ?jsonrpc.RequestId) !void {
@@ -2431,6 +2647,95 @@ fn appendTurnPiece(raw_ctx: *anyopaque, progress: agent_runtime.TurnProgress) !v
     };
 }
 
+/// `AgentRuntimeDeps.append_turn_piece` for a journaled libfx session. The
+/// orchestrator calls it before any call in a batch runs: the calls reach the
+/// journal first, and a batch with a call fx runs itself waits until the host
+/// holds them, so no such call starts without a durable intent. Finished
+/// pieces travel in `turn_progress` instead.
+fn appendJournalToolIntent(raw_ctx: *anyopaque, progress: agent_runtime.TurnProgress) !void {
+    if (progress.running_calls.len == 0) return;
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const session = if (ctx.state.active_session) |*value| value else return error.SessionPersistenceUnavailable;
+    {
+        session.session_write_mutex.lockUncancelable(io_mod.getIo());
+        defer session.session_write_mutex.unlock(io_mod.getIo());
+        const journal = if (session.journal) |*value| value else return error.SessionPersistenceUnavailable;
+        try journal.append(ctx.alloc, session.session_id, .{ .tool_intent = progress.running_calls });
+    }
+    const registry = ctx.toolRegistry();
+    for (progress.running_calls) |call| {
+        const tool = registry.lookup(call.name) orelse continue;
+        // Every call fx runs itself waits for its intent to be stored; a
+        // call the provider runs has no effect here to guard.
+        if (!tool.provider_executed) return flushJournal(ctx.state, ctx.alloc, session.session_id);
+    }
+}
+
+/// Waits until the host holds every journal event sent so far.
+fn flushJournal(state: *server.ServerState, alloc: Allocator, session_id: []const u8) !void {
+    if (comptime host_target.is_wasm) return js_host_journal.flush();
+    const outbound_id = (server.beginOutboundRequest(state, .journal) catch
+        return error.JournalFlushFailed) orelse return error.JournalFlushFailed;
+    var awaiting = true;
+    errdefer if (awaiting) {
+        server.cancelOutboundRequest(state, outbound_id);
+        if (server.awaitOutboundResponse(state, outbound_id, .journal)) |owned| {
+            var abandoned = owned;
+            abandoned.deinit(state.alloc);
+        }
+    };
+    var params: std.Io.Writer.Allocating = .init(alloc);
+    defer params.deinit();
+    try params.writer.writeAll("{\"sessionId\":");
+    try jsonrpc.writeJsonStr(session_id, &params.writer);
+    try params.writer.writeByte('}');
+    state.writer.writeRequest(alloc, .{ .integer = @intCast(outbound_id) }, "libfx/journal_flush", params.written()) catch
+        return error.JournalFlushFailed;
+    var response = server.awaitOutboundResponse(state, outbound_id, .journal) orelse return error.JournalFlushFailed;
+    awaiting = false;
+    defer response.deinit(state.alloc);
+    if (response.cancelled) return error.Cancelled;
+    if (response.error_json != null or response.result_json == null) return error.JournalFlushFailed;
+}
+
+/// Ends a journaled turn in the journal as it ended in the session. One that
+/// failed left no history entry, so its progress is cleared: resuming is for
+/// turns a stopped process left open. Inputs it took and never placed are
+/// settled. `session_alloc` owns the journal's state.
+fn endJournalTurn(alloc: Allocator, session_alloc: Allocator, session: *server.ActiveSessionState) !void {
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const journal = if (session.journal) |*value| value else return;
+    if (journal.progress_open) {
+        debug_trace.logf("session", "event=libfx_journal_turn_closed reason=ended_without_commit", .{});
+        try journal.clearProgress(alloc, session.session_id);
+    }
+    try journal.endUnplaced(alloc, session_alloc, session.session_id);
+    if (journal.takeCancelledProgress()) |checkpoint| {
+        var unused = checkpoint;
+        unused.deinit(session_alloc);
+    }
+}
+
+/// Commits the turn whose barrier a cancel interrupted as interrupted, from
+/// the progress that barrier held, to the session and its journal. A turn
+/// with finished steps was already committed on its way out.
+fn commitCancelledJournalTurn(alloc: Allocator, session_alloc: Allocator, session: *server.ActiveSessionState, prompt_input: *ParsedPromptInput) !void {
+    var cancelled = cancelled: {
+        session.session_write_mutex.lockUncancelable(io_mod.getIo());
+        defer session.session_write_mutex.unlock(io_mod.getIo());
+        const journal = if (session.journal) |*value| value else return;
+        var checkpoint = journal.takeCancelledProgress() orelse return;
+        if (!journal.progress_open) {
+            checkpoint.deinit(session_alloc);
+            return;
+        }
+        break :cancelled checkpoint;
+    };
+    defer cancelled.deinit(session_alloc);
+    try persistAcpHistoryTurn(alloc, session, cancelled.interruptedTurn(), prompt_input);
+}
+
 fn sessionChildCapability(session: *server.ActiveSessionState) ?*session_child_store.SessionChildCapability {
     if (session.writable) |*writable| return writable.childCapability() catch null;
     if (session.v2) |v2| return v2.childCapability() catch null;
@@ -2448,6 +2753,7 @@ fn persistAcpHistoryTurn(
     var prepared = try session.session_rt.prepareHistoryEntry(alloc, turn);
     var prepared_owned = true;
     defer if (prepared_owned) types.freeHistoryTurn(alloc, prepared);
+    if (session.journal) |*journal| try journal.append(alloc, session.session_id, .{ .turn_committed = prepared });
     if (comptime host_target.is_wasm) {
         session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
         prepared_owned = false;
@@ -2564,6 +2870,7 @@ fn commitContextCompaction(
             }
         }
     }
+    if (session.journal) |*journal| try journal.append(ctx.alloc, session.session_id, .{ .history_replaced = prepared });
     session.session_rt.commitCompactedHistory(ctx.alloc, prepared);
     prepared_owned = false;
 }
@@ -2604,6 +2911,48 @@ fn clearRecoveryCheckpoint(raw_ctx: *anyopaque) !void {
         .{ .recovery_checkpoint_cleared = .{} },
         io_mod.milliTimestamp(),
     );
+}
+
+/// `recovery_checkpoint.set` for a journaled libfx session: the open turn
+/// so far reaches the host before each model request.
+/// The first progress of a turn is a barrier: it holds the prompt, or a
+/// resumed turn's answers for calls a crash left running.
+fn setJournalProgress(raw_ctx: *anyopaque, checkpoint: session_codec.RecoveryCheckpoint) !void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const session = if (ctx.state.active_session) |*value| value else return error.SessionPersistenceUnavailable;
+    const barrier = barrier: {
+        session.session_write_mutex.lockUncancelable(io_mod.getIo());
+        defer session.session_write_mutex.unlock(io_mod.getIo());
+        const journal = if (session.journal) |*value| value else return error.SessionPersistenceUnavailable;
+        try journal.appendProgress(ctx.alloc, ctx.state.alloc, session.session_id, checkpoint, session.model);
+        const barrier = journal.barrier_next_progress;
+        journal.barrier_next_progress = false;
+        break :barrier barrier;
+    };
+    if (barrier) flushJournal(ctx.state, ctx.alloc, session.session_id) catch |err| {
+        // The turn commits from this progress as interrupted.
+        if (err == error.Cancelled) try keepCancelledProgress(ctx.state.alloc, session, checkpoint);
+        return err;
+    };
+}
+
+fn keepCancelledProgress(session_alloc: Allocator, session: *server.ActiveSessionState, checkpoint: session_codec.RecoveryCheckpoint) !void {
+    var owned = try checkpoint.dupe(session_alloc);
+    errdefer owned.deinit(session_alloc);
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const journal = if (session.journal) |*value| value else return error.SessionPersistenceUnavailable;
+    if (journal.cancelled_progress) |*old| old.deinit(session_alloc);
+    journal.cancelled_progress = owned;
+}
+
+fn clearJournalProgress(raw_ctx: *anyopaque) !void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const session = if (ctx.state.active_session) |*value| value else return error.SessionPersistenceUnavailable;
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const journal = if (session.journal) |*value| value else return error.SessionPersistenceUnavailable;
+    try journal.clearProgress(ctx.alloc, session.session_id);
 }
 
 /// Stores grants on the active ACP session without persisting them.
@@ -3596,6 +3945,19 @@ test "parsePromptInput accepts explicit recovery continuation metadata" {
     defer result.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), result.text.len);
     try std.testing.expect(result.continue_recovery);
+    try std.testing.expectEqual(@as(usize, 0), result.rerun_call_ids.len);
+}
+
+test "parsePromptInput keeps the call ids a resume runs again and drops the rest" {
+    const alloc = std.testing.allocator;
+    const params =
+        "{\"sessionId\":\"s1\",\"prompt\":[],\"_meta\":{\"fx\":{\"continueRecovery\":true,\"rerun\":[\"call-1\",7,\"\",\"call-2\"]}}}";
+    var result = try parsePromptInput(alloc, params);
+    defer result.deinit(alloc);
+    try std.testing.expect(result.continue_recovery);
+    try std.testing.expectEqual(@as(usize, 2), result.rerun_call_ids.len);
+    try std.testing.expectEqualStrings("call-1", result.rerun_call_ids[0]);
+    try std.testing.expectEqualStrings("call-2", result.rerun_call_ids[1]);
 }
 
 test "parsePromptInput accepts image blocks as owned pending images" {

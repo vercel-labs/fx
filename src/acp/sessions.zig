@@ -52,13 +52,47 @@ const Allocator = std.mem.Allocator;
 const ErrorCode = jsonrpc.ErrorCode;
 const writeJsonStr = jsonrpc.writeJsonStr;
 
+/// The session id a `libfx/new` request names, or null when it names none.
+/// The id reaches gateway headers, so it must pass the session layout rules.
+/// Caller owns the returned slice.
+fn requestedLibfxSessionId(alloc: Allocator, params_raw: ?[]const u8) error{ InvalidSessionId, OutOfMemory }!?[]u8 {
+    const raw = params_raw orelse return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidSessionId,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidSessionId;
+    const value = parsed.value.object.get("sessionId") orelse return null;
+    switch (value) {
+        .null => return null,
+        .string => |id| {
+            session_store_paths.validateSessionId(id) catch return error.InvalidSessionId;
+            return try alloc.dupe(u8, id);
+        },
+        else => return error.InvalidSessionId,
+    }
+}
+
 pub fn handleNewLibfxSession(
     state: *server.ServerState,
     alloc: Allocator,
     msg: *jsonrpc.Message,
 ) !void {
+    // Checked before the active session is released, so a bad request
+    // leaves it in place.
+    const requested = requestedLibfxSessionId(alloc, msg.params_raw) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidSessionId => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Invalid sessionId",
+        }),
+    };
+    var requested_owned = requested != null;
+    defer if (requested_owned) alloc.free(requested.?);
     try server.releaseActiveSession(state);
-    const session_id = try session_store.generateSessionId(alloc);
+    requested_owned = false;
+    const session_id = requested orelse try session_store.generateSessionId(alloc);
     var session_id_owned = true;
     defer if (session_id_owned) alloc.free(session_id);
     const model = try alloc.dupe(u8, state.selected_model);
@@ -3465,4 +3499,33 @@ test "ACP same-session restore retires the replaced MCP runtime after active use
     if (restore.err) |err| return err;
     try std.testing.expect(retired_before_destroy);
     try std.testing.expect(!completed_while_leased);
+}
+
+test "libfx/new uses a valid host session id and generates one when none is named" {
+    const alloc = std.testing.allocator;
+    const id = (try requestedLibfxSessionId(alloc, "{\"sessionId\":\"wrun_01M3X0485FF9GX5ZA6FWMGR503\"}")).?;
+    defer alloc.free(id);
+    try std.testing.expectEqualStrings("wrun_01M3X0485FF9GX5ZA6FWMGR503", id);
+    try std.testing.expect((try requestedLibfxSessionId(alloc, null)) == null);
+    try std.testing.expect((try requestedLibfxSessionId(alloc, "{}")) == null);
+    try std.testing.expect((try requestedLibfxSessionId(alloc, "{\"sessionId\":null}")) == null);
+}
+
+test "libfx/new rejects a session id that is not header and path safe" {
+    const alloc = std.testing.allocator;
+    const bad = [_][]const u8{
+        "{\"sessionId\":\"\"}",
+        "{\"sessionId\":\"..\"}",
+        "{\"sessionId\":\"a/b\"}",
+        "{\"sessionId\":\"a b\"}",
+        "{\"sessionId\":\"a\\r\\nx-injected: 1\"}",
+        "{\"sessionId\":42}",
+        "[]",
+        "{",
+    };
+    for (bad) |params| {
+        try std.testing.expectError(error.InvalidSessionId, requestedLibfxSessionId(alloc, params));
+    }
+    const long = "{\"sessionId\":\"" ++ "a" ** 256 ++ "\"}";
+    try std.testing.expectError(error.InvalidSessionId, requestedLibfxSessionId(alloc, long));
 }

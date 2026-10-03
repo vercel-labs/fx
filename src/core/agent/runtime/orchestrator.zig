@@ -9855,7 +9855,8 @@ fn processQueuedPromptLoop(
                 .none => false,
                 .read_only => root_action_permission_mode == .auto or
                     root_action_permission_mode == .yolo,
-                .subagent => true,
+                // Each call is reviewed before the group starts.
+                .subagent, .host => true,
             };
             const parallel_candidate_len = if (parallel_permission_eligible)
                 parallel_group.len

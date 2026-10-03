@@ -2820,7 +2820,7 @@ const running_type = "tool_running";
 /// The text of the message whose calls are running (D51).
 const running_assistant_type = "assistant_running";
 /// What the model reads for a call that was running when its turn ended.
-const unfinished_tool_output = "fx stopped while this tool was running, so it may have partly run. Check its effects before running it again.";
+pub const unfinished_tool_output = "fx stopped while this tool was running, so it may have partly run. Check its effects before running it again.";
 const blob_ref_key = "$blob";
 const blob_ref_prefix = "{\"" ++ blob_ref_key ++ "\":\"";
 

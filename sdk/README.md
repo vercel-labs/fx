@@ -33,7 +33,6 @@ for await (const event of turn) {
 }
 
 console.log(await turn.result); // { stopReason, usage }
-const checkpoint = await agent.checkpoint();
 await agent.close();
 ```
 
@@ -285,9 +284,36 @@ for await (const event of turn) {
 }
 ```
 
+`steer()` resolves to `{ id }`, and the returned promise carries the same `id`
+at once. Until the model sees a steer, `turn.withdraw(id)` takes it back and
+resolves to `withdrawn`; after that it resolves to `already_placed`. With
+[persistence](#persistence), a steer resolves only once its acceptance is stored, a model request
+carries it only after that, and a withdrawal resolves once it is stored, so a
+crash never loses a steer the call reported as accepted: `agent.resume()`
+delivers one the model had not seen yet. The web core accepts a steer when it
+takes it at the next boundary, so there `steer()` resolves then, and a steer
+still queued when the turn ends rejects.
+
+`agent.followUp(input)` queues text to run as its own turn once the current
+turn ends, or at once when none is running, instead of failing with
+`a prompt is already in progress`. It returns a promise for that turn; the
+promise carries the follow-up's `id` and `accepted`, which resolves `{ id }`
+once it is stored. With persistence, a follow-up survives a crash. After a
+restore, the follow-ups the session held have no caller, so each waits for
+`agent.resume()`: every call continues the open turn first, then starts the
+next held follow-up, and returns `null` once none is left. Follow-ups this
+agent queues run on their own and do not wait behind held ones. Call `resume()`
+until it returns `null` whenever a session opens, before this agent queues
+follow-ups of its own: one queued during a resumed turn starts when that turn
+ends, and `resume()` throws while it runs. A follow-up whose turn ends before
+libfx records its first `turn_progress` is withdrawn, and one that ends after
+it is recorded like any other turn, so a follow-up never runs twice. `close()`
+rejects follow-ups that have not started; the session's records still hold them.
+
 Cancelling a steered turn drops any guidance that has not reached a safe
 boundary and releases its queue. Applied guidance is part of the same history
 turn, so an idle `checkpoint()` includes the full steered conversation.
+
 `checkpoint()` returns opaque, bounded, versioned bytes. Concurrent calls run
 one at a time, and a call still waiting for an earlier one fails the same way a
 direct call would if a prompt starts or the agent closes first. A newer libfx
@@ -308,6 +334,164 @@ agent-creation options and are not stored in a checkpoint: recreate the agent
 with new `model.effort`, `model.fast`, or `model.ultrafast` values to change
 them, the same path as switching models.
 
+### Persistence
+
+Pass a store as `persistence`, and libfx records the session as it runs, so a
+new agent can continue it after the process running it stops. libfx writes
+opaque records and checkpoints to the store and reads them back. The store
+never parses them, and libfx never sees how they are stored.
+
+```js
+import { createFxAgent, createMemoryPersistence } from "libfx";
+
+const persistence = createMemoryPersistence();
+const agent = await createFxAgent({ apiKey, model, persistence, sessionId: "support-42" });
+```
+
+A store is an object with these methods:
+
+```ts
+interface Persistence {
+  load(): Promise<{
+    checkpoint?: { data: Uint8Array; through: string };
+    journal?: Iterable<JournalRecord> | AsyncIterable<JournalRecord>;
+  }>;
+  append(input: { expected: string | null; idempotencyKey: string; data: Uint8Array }): Promise<{ cursor: string }>;
+  saveCheckpoint?(input: { through: string; data: Uint8Array }): Promise<void>;
+}
+
+interface JournalRecord {
+  cursor: string;
+  data: Uint8Array;
+}
+```
+
+`append()` stores one record and resolves to its cursor, a string the store
+chooses that places the record after the ones before it. The session's records
+are its journal. libfx sends records one at a time, in order, and `expected`
+is the cursor of the last record the agent knows of, or `null` for a new
+session. Reject the append with an `FxFencedError` when `expected` is not the
+cursor of the last stored record, so that a second agent writing the same
+session stops the first instead of interleaving with it. `idempotencyKey` is
+unique to each write, so a store that retries a write can return the stored
+record's cursor instead of storing it twice.
+
+`createFxAgent()` calls `load()` once. Resolve to the latest checkpoint, if any,
+and the records stored after it, oldest first, each with its cursor. Resolve to
+`{}` for a session with nothing stored. libfx skips any record the checkpoint
+already covers.
+
+libfx waits for the store only where a crash could otherwise lose work or
+repeat it: the first record of each turn, which holds the prompt, is stored
+before the model sees it, and a response's tool calls are stored before any of
+them starts. Other appends are not waited for, so a turn's `result` can settle
+before its last records land, and `agent.close()` waits for every append. If
+`append` rejects, libfx stops the current turn at once: it starts no further
+model request or tool call and writes nothing more. The turn fails with an
+error whose `code` is `FX_JOURNAL_APPEND_FAILED` and whose `cause` is your
+error, and the agent refuses later prompts. When no turn was left to report
+the failure, `close()` rejects with it. A model request the turn started while
+the failed append was in flight can still complete.
+
+When the store has `saveCheckpoint()`, libfx saves a checkpoint after a turn
+ends once the records stored since the last checkpoint reach
+`checkpointAfterBytes` (default 1 MiB). `through` is the cursor of the last
+record the checkpoint covers, so `load()` can return that checkpoint and only
+the records after it, and the cost of opening a session stays bounded as its
+history grows. libfx takes a checkpoint only while no turn is running. A saved
+checkpoint emits a `checkpoint.save` event. A failed save emits
+`checkpoint.error` and changes nothing: the records still restore the session,
+and the next turn's end tries again. Deleting the records a checkpoint covers
+is up to the store.
+
+The records a load reads, after libfx drops the older progress of an open
+turn, must fit in 4 MiB of JSON, a checkpoint in 4 MiB, and the history in
+1,024 turns. Otherwise `createFxAgent()` rejects with an error whose `code` is
+`FX_JOURNAL_TOO_LARGE`. libfx refuses records that repeat, skip, or do not
+parse, and `createFxAgent()` rejects with the reason and the `code`
+`FX_JOURNAL_INVALID`. For records written by a newer libfx, it rejects with an
+`FxJournalVersionError`, whose `code` is `FX_JOURNAL_VERSION`. Each libfx
+release resumes the sessions and checkpoints that the release before it saved,
+so upgrade the processes that read a session before the ones that write it.
+
+AI Gateway keys session affinity and prompt caching to the session's id. libfx
+picks a new id for each agent unless you pass `sessionId`, so give a restored
+session the id it had before. An id is 1 to 255 letters, digits, `.`, `_`, or
+`-`. `agent.sessionId` is the id the agent uses.
+
+If the last process stopped during a turn, `agent.resume()` continues that
+turn with no new input and returns it, like `prompt()`. The model is told
+"Resuming from unexpected session interruption.". A tool call that was
+running does not run again: it comes back answered with an error saying it may
+have partly run, and the model decides whether to check its effects, call it
+again, or ask the user. A turn that fails or is cancelled ends in the journal
+as it does in the agent, so only a stopped process leaves one to resume.
+`resume()` returns `null` when the session holds no open turn and no held
+follow-up, so a host can call it until it does every time it opens a session:
+
+```js
+const agent = await createFxAgent({ apiKey, model, persistence, sessionId, tools });
+for (let turn = agent.resume(); turn; turn = agent.resume()) {
+  for await (const event of turn) console.log(event);
+  await turn.result;
+}
+```
+
+When your host knows a call never ran, such as one it handed to another
+process before the call did anything, pass `resume({ onAmbiguous })`. libfx
+calls `onAmbiguous({ callId, name, input })` once for each call the turn left
+running, and each call it returns `"rerun"` for runs again under the same call
+id before the turn continues. Every other call keeps the answer that it may
+have partly run.
+
+Calling `prompt()` instead ends the open turn as interrupted and starts a new
+one.
+
+Give a prompt a `turnId` when the same request can reach libfx more than once,
+such as from a queue that delivers it again after a crash. When the open turn
+has that id, `prompt(input, { turnId })` continues it as `resume()` does, and
+takes `onAmbiguous` the same way. When
+the session's last turn ended with that id, it returns a turn that has already
+ended, with the stop reason `end_turn`, without calling the model. Any other id
+starts a new turn. A turn id is 1 to 128 letters, digits, `.`, `_`, or `-`.
+Without one, libfx names the turn. `turn.id` is the turn's id, and each tool
+call receives it.
+
+To move a running session to another process, call
+`turn.cancel({ reason: "handoff" })`. The turn stops at once, like any
+cancellation, but libfx stores nothing more, so the journal keeps the turn
+open and the agent that opens the session next continues it with `resume()`.
+The handed-off agent then refuses `prompt()`, `resume()`, and `followUp()`;
+close it. A handoff needs persistence.
+
+Pass `persistence` instead of a `checkpoint` option; the two cannot be
+combined. Like a checkpoint, persistence holds conversation history only:
+resupply models, credentials, instructions, tools, MCP clients, and skill
+records when you create the agent. A resumed turn continues under the tools the
+new agent has. `createMemoryPersistence()` keeps the records and the latest
+checkpoint in memory as `persistence.records` and `persistence.checkpoint`,
+which suits tests and hosts that copy them to their own storage. It fences an
+append whose `expected` cursor is not its last record's, and returns the stored
+cursor for a repeated `idempotencyKey`. `FxFencedError` is exported by `libfx`;
+its `code` is `FX_FENCED`, which a store of your own can use for the same case.
+`FxJournalVersionError` is exported by `libfx` too.
+
+### Workflow Worlds and other stores
+
+libfx depends on no storage package. A store maps its methods onto the storage
+your app already uses, such as a database table, a Durable Object, or a
+Workflow World. `sdk/tests/world-persistence.mjs` in the fx repository is a
+store over a World: each record and checkpoint is a `step_created` event in
+one World run, and a record's cursor is its event slot. A World commits a write
+at the next free slot rather than refusing it, so that store also keeps the
+cursor each record continued, reads only the unbroken chain of records, and
+fences a write that lands after another writer's record for the same cursor.
+
+libfx does not schedule turns. To run each turn in a fresh function
+invocation, enqueue it with your app's queue, such as `World.queue()`, and in
+the handler create the agent with the same `persistence` and `sessionId`, then
+call `prompt(input, { turnId })` or `resume()`.
+
 ## Models
 
 Model discovery is explicit and does not create an Agent or load native or Wasm
@@ -324,6 +508,21 @@ const models = await listModels({
 `listModels()` performs one bounded Gateway request and returns sorted, unique
 language-model IDs. It accepts the same optional `fetch` override as the Agent
 API.
+
+An agent reads the AI Gateway model catalog to learn what its model supports,
+such as image input, reasoning effort, and output limits, and those details
+shape every request. It fetches the catalog through your `fetch`. If that
+request fails, for example behind a proxy that only forwards chat requests,
+the agent cannot confirm the model's capabilities and refuses image prompts.
+Pass `modelCatalog` to supply the catalog instead: the entries from
+`https://ai-gateway.vercel.sh/coding-agent/v1/models`, either the response's
+`{ data }` or the array, or only the entries for the models you use. The agent
+then makes no catalog request, so every process that receives the same
+entries builds the same requests:
+
+```js
+const agent = await createFxAgent({ apiKey, model, modelCatalog });
+```
 
 ## JavaScript tools and instructions
 
@@ -364,6 +563,29 @@ call host code or require a separate provider key; their `tool_start` and
 `tool_end` events, results, and checkpoint history use the same turn contract.
 Their built-in permission policy is enforced when the request is projected, as
 there is no local call-time effect to approve.
+
+`tools` may also be an object keyed by tool name, such as
+`tools: { lookup, save }`, where each value is a descriptor without `name`.
+A descriptor that does include `name` must match its key.
+
+When one model response calls several tools, the native backend runs them at
+the same time and returns their results to the model in the order it called
+them. Mark a tool `writes: true` when its calls must not overlap others: it
+starts after every earlier call in the response finishes, and later calls
+wait for it. WebAssembly runs calls one at a time. Every call still goes
+through its own permission check before any of them starts.
+
+`execute` receives `{ signal, turnId, callId }`. `turnId` is the turn's id and
+`callId` is the model's id for the call. Both stay the same after a restore, so
+a tool with an external effect can use them as an idempotency key.
+
+With persistence, libfx stores the calls of a response before any of them
+starts, so no call runs without a record that it was about to. If the process
+stops while calls are running, `resume()` answers each of them with an error
+saying it may have partly run, so the model checks before calling it again,
+unless `onAmbiguous` has the call run again.
+When a tool rejects with an empty message, the model receives a non-empty error
+so the provider does not refuse the conversation.
 
 For ordinary tools, the JavaScript host is the authority for effects. The same
 descriptors, schemas, cancellation, results, and events are used by N-API and

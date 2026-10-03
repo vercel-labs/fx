@@ -164,13 +164,28 @@ jobs:
         run: bun sdk/tests/test-node-wasm.mjs
 
       - name: Test Bun benchmark path
-        run: bun sdk/tests/test-libfx-benchmark.mjs
+        run: |
+          bun sdk/tests/test-libfx-benchmark.mjs
+          bun sdk/tests/test-durable-harness.mjs
+
+      - name: Test libfx on a World
+        run: |
+          world_root="$(mktemp -d "$RUNNER_TEMP/libfx-world.XXXXXX")"
+          npm install --prefix "$world_root" --no-audit --no-fund @workflow/world@5.0.0-beta.39 @workflow/world-local@5.0.0-beta.48
+          node sdk/tests/test-world-persistence.mjs "$world_root" native
+          node --experimental-wasm-jspi sdk/tests/test-world-persistence.mjs "$world_root" wasm
+          bun sdk/tests/test-world-persistence.mjs "$world_root" native
+          bun sdk/tests/test-world-persistence.mjs "$world_root" wasm
 
       - name: Test Bun cross-backend integrations
         run: |
           bun sdk/tests/test-agent-bootstrap.mjs auto
           bun sdk/tests/test-checkpoint.mjs native wasm
           bun sdk/tests/test-checkpoint.mjs wasm native
+          bun sdk/tests/test-journal.mjs native wasm
+          bun sdk/tests/test-journal.mjs wasm native
+          bun sdk/tests/test-tool-contract.mjs native
+          bun sdk/tests/test-tool-contract.mjs wasm
           bun sdk/tests/test-host-tools.mjs native
           bun sdk/tests/test-host-tools.mjs wasm
           bun sdk/tests/test-host-tool-cancel.mjs native

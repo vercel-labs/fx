@@ -46,7 +46,7 @@ const agent = await createFxAgent({
   apiKey: "sdk-test-key",
   model: "sdk/core-model",
 });
-assert.deepEqual(Object.keys(agent).sort(), ["checkpoint", "close", "prompt"]);
+assert.deepEqual(Object.keys(agent).sort(), ["checkpoint", "close", "followUp", "prompt", "resume", "sessionId"]);
 
 const turn = agent.prompt([
   { type: "text", text: "say hello" },

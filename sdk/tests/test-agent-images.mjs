@@ -336,6 +336,36 @@ for (const resizeImage of [undefined, (image) => image]) {
   await agent.close();
 }
 
+// A proxy that refuses the catalog request leaves image support unknown, so
+// an image-capable model refuses images. With `modelCatalog`, the same model
+// takes the image and the catalog is never requested.
+{
+  const model = "sdk/proxied-vision-model";
+  const refusing = mockGateway();
+  const fetch405 = async (url, init = {}) => (String(init.method ?? "GET").toUpperCase() === "GET"
+    ? new Response("", { status: 405 })
+    : refusing.fetch(url, init));
+  const blocked = await createFxAgent({ ...baseOptions, fetch: fetch405, model });
+  const refused = blocked.prompt([{ type: "image", data: pngData, mimeType: "image/png" }]);
+  await assert.rejects(refused.result, /Image prompts are unavailable for the selected model/);
+  await blocked.close();
+
+  const gateway = mockGateway();
+  const modelCatalog = [{ id: model, type: "language", tags: ["tool-use", "vision", "file-input"] }];
+  const agent = await createAgent(gateway, { model, modelCatalog });
+  const result = await runPrompt(agent, [
+    { type: "text", text: "what is in this image?" },
+    { type: "image", data: pngData, mimeType: "image/png" },
+  ]);
+  assert.equal(result.stopReason, "end_turn");
+  assert.equal(gateway.state.catalogFetches, 0, "the supplied catalog replaces the request");
+  assert.equal(fileParts(gateway.state.chatBodies[0]).length, 1);
+  await agent.close();
+
+  await assert.rejects(createAgent(mockGateway(), { modelCatalog: [{ name: "no id" }] }), /needs a string id/);
+  await assert.rejects(createAgent(mockGateway(), { modelCatalog: "catalog" }), /modelCatalog must be/);
+}
+
 // Checkpoint/restore round-trips prompt images inside the checkpoint bound:
 // the restored agent re-sends the same bytes on the next turn.
 {

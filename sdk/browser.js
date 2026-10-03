@@ -1,6 +1,9 @@
 import {
   createFxAgent as createWasmAgent,
   createFxTerminal as createWasmTerminal,
+  createMemoryPersistence,
+  FxFencedError,
+  FxJournalVersionError,
   encodeXtermKeyEvent,
   fxSdkApiVersion,
   listModels,
@@ -8,7 +11,7 @@ import {
   xtermAdapter,
 } from "./fx-sdk.js";
 
-export { encodeXtermKeyEvent, fxSdkApiVersion, listModels, supportsJspi, xtermAdapter };
+export { createMemoryPersistence, encodeXtermKeyEvent, FxFencedError, FxJournalVersionError, fxSdkApiVersion, listModels, supportsJspi, xtermAdapter };
 export const libfxApiVersion = 2;
 
 const defaultCoreWasm = new URL("./fx-core.wasm", import.meta.url).href;

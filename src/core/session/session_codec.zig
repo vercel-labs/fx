@@ -2320,6 +2320,21 @@ fn parseProviderReplay(alloc: Allocator, value: std.json.Value) !?types.Provider
     return try types.dupeProviderReplay(alloc, replay);
 }
 
+/// Writes `calls` as the JSON array durable history stores them in.
+pub fn writeToolCalls(writer: *std.Io.Writer, calls: []const session.ToolCall) !void {
+    try writer.writeByte('[');
+    for (calls, 0..) |tool_call, index| {
+        if (index > 0) try writer.writeByte(',');
+        try writeExecutionToolCall(writer, tool_call, .durable);
+    }
+    try writer.writeByte(']');
+}
+
+/// Parses the array `writeToolCalls` writes. The caller owns the result.
+pub fn parseToolCallArray(alloc: Allocator, value: std.json.Value) ![]session.ToolCall {
+    return parseToolCalls(alloc, value);
+}
+
 fn parseToolCalls(alloc: Allocator, value: std.json.Value) ![]session.ToolCall {
     if (value != .array) return error.InvalidSessionFormat;
     if (value.array.items.len == 0) return &.{};
