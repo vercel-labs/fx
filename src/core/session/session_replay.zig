@@ -272,29 +272,19 @@ test "cancelled event reads release work before reading another frame" {
 }
 
 /// Reads the child identity only when the first event ends within
-/// `max_bytes` of the log start. A real first event arrives in one positional
-/// read, so the cost never grows with the log; a longer or unterminated first
-/// line fails with `error.TruncatedEventFrame`.
+/// `max_bytes` of the log start. Reading stops at that bound, so the cost
+/// never grows with the log; a longer or unterminated first line fails with
+/// `error.TruncatedEventFrame`, and an empty log with
+/// `error.InvalidSessionFormat`.
 pub fn readSubagentChildIdentityWithin(
     alloc: Allocator,
     file: std.Io.File,
-    max_bytes: usize,
+    max_bytes: u64,
 ) !bool {
-    const buffer = try alloc.alloc(u8, max_bytes);
-    defer alloc.free(buffer);
-    var filled: usize = 0;
-    const line_end: ?usize = while (filled < buffer.len) {
-        const count = try file.readPositional(io_mod.getIo(), &.{buffer[filled..]}, filled);
-        if (count == 0) break null;
-        const start = filled;
-        filled += count;
-        if (std.mem.findScalar(u8, buffer[start..filled], '\n')) |newline| break start + newline + 1;
-    } else null;
-    const end = line_end orelse {
-        if (filled == 0) return error.InvalidSessionFormat;
-        return error.TruncatedEventFrame;
-    };
-    var envelope = try decodeSessionStarted(alloc, buffer[0..end]);
+    const first = try readLineAt(alloc, file, 0, max_bytes) orelse
+        return error.InvalidSessionFormat;
+    defer alloc.free(first.bytes);
+    var envelope = try decodeSessionStarted(alloc, first.bytes);
     defer envelope.deinit(alloc);
     return envelope.event.session_started.subagent_child;
 }

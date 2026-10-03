@@ -340,25 +340,51 @@ test "read-only opens accept a file that a concurrent atomic replacement unlinks
     const Replacer = struct {
         dir: std.Io.Dir,
         stop: std.atomic.Value(bool) = .init(false),
+        failed: std.atomic.Value(bool) = .init(false),
+        renames: std.atomic.Value(usize) = .init(0),
+        renames_before_opens: usize = 0,
 
         fn run(self: *@This()) void {
             while (!self.stop.load(.acquire)) {
-                self.dir.writeFile(getIo(), .{ .sub_path = "next", .data = "v" }) catch return;
-                self.dir.rename("next", self.dir, "target", getIo()) catch return;
+                self.replace() catch {
+                    self.failed.store(true, .release);
+                    return;
+                };
+                _ = self.renames.fetchAdd(1, .release);
+            }
+        }
+
+        fn replace(self: *@This()) !void {
+            try self.dir.writeFile(getIo(), .{ .sub_path = "next", .data = "v" });
+            try self.dir.rename("next", self.dir, "target", getIo());
+        }
+
+        /// Opens only while replacement is under way, and keeps opening, within
+        /// a bound, until a rename lands during the opens. Some lookups see
+        /// the replaced file after its last link is gone.
+        fn openWhileReplaced(self: *@This()) !void {
+            while (self.renames.load(.acquire) == 0 and !self.failed.load(.acquire)) {
+                std.Thread.yield() catch {};
+            }
+            self.renames_before_opens = self.renames.load(.acquire);
+            var opens: usize = 0;
+            while (opens < 5000 or
+                (self.renames.load(.acquire) == self.renames_before_opens and opens < 1_000_000)) : (opens += 1)
+            {
+                var file = try openExistingRegularFile(self.dir, "target", .read_only);
+                file.close(getIo());
             }
         }
     };
     var replacer: Replacer = .{ .dir = tmp.dir };
     const thread = try std.Thread.spawn(.{}, Replacer.run, .{&replacer});
-    defer {
-        replacer.stop.store(true, .release);
-        thread.join();
-    }
-    // Some lookups see the replaced file after its last link is gone.
-    for (0..5000) |_| {
-        var file = try openExistingRegularFile(tmp.dir, "target", .read_only);
-        file.close(getIo());
-    }
+    const opened = replacer.openWhileReplaced();
+    replacer.stop.store(true, .release);
+    thread.join();
+    try opened;
+    // The race was exercised: the replacer never failed and renamed during the opens.
+    try std.testing.expect(!replacer.failed.load(.acquire));
+    try std.testing.expect(replacer.renames.load(.acquire) > replacer.renames_before_opens);
 }
 
 test "read-only regular file policy accepts hardlinks while durable policy rejects" {

@@ -216,12 +216,9 @@ pub fn capture(
     if (initial.size == 0) return .{ .invalid = "empty" };
     if (initial.size > max_sidecar_bytes) return .{ .invalid = "oversized" };
 
-    var file = session_dir.dir.openFile(io_mod.getIo(), sidecar_file, .{
-        .mode = .read_only,
-        .allow_directory = false,
-        .follow_symlinks = false,
-        .resolve_beneath = true,
-    }) catch |err| {
+    // The file may be swapped after the stat, so the open itself never waits
+    // on a special file.
+    var file = io_mod.openExistingRegularFile(session_dir.dir, sidecar_file, .read_only) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         if (err == error.FileNotFound) return .missing;
         return .{ .invalid = @errorName(err) };
