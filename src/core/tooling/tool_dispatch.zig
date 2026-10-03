@@ -166,9 +166,12 @@ pub const ToolResult = union(enum) {
 
 pub const ModelContentKind = enum { ordinary, complete_skill };
 
+/// Arguments: context, allocator, tool name, the model's call id, arguments
+/// JSON, result limit, and cancel flag.
 pub const HostToolProviderFn = *const fn (
     *anyopaque,
     Allocator,
+    []const u8,
     []const u8,
     []const u8,
     usize,
@@ -183,6 +186,7 @@ pub const HostToolProvider = struct {
         self: HostToolProvider,
         alloc: Allocator,
         name: []const u8,
+        call_id: []const u8,
         arguments_json: []const u8,
         max_result_bytes: usize,
         cancel_flag: ?*std.atomic.Value(bool),
@@ -191,6 +195,7 @@ pub const HostToolProvider = struct {
             self.context,
             alloc,
             name,
+            call_id,
             arguments_json,
             max_result_bytes,
             cancel_flag,
@@ -453,6 +458,13 @@ pub const Tool = struct {
     /// never reaches a call-time permission check, so advertisement is its only
     /// enforcement point and requires an already-settled allow.
     provider_executed: bool = false,
+    /// A host tool whose calls may run beside neighboring calls of other such
+    /// tools. A host tool that declares `writes` leaves it unset and runs
+    /// alone. Concurrency never changes a call's permission review.
+    host_concurrent: bool = false,
+    /// A host tool declared `replay: "never"`. With a journal, its calls
+    /// start only after the journal holds their intent.
+    host_replay_never: bool = false,
     executor_kind: ExecutorKind = .read_file,
     activity_kind: core_types.ToolActivityKind = .read,
     requires_approval: bool = false,

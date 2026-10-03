@@ -96,7 +96,7 @@ if (process.argv[2] !== "--installed") {
     model: "packed/model",
   });
   try {
-    assert.deepEqual(Object.keys(agent).sort(), ["checkpoint", "close", "prompt"]);
+    assert.deepEqual(Object.keys(agent).sort(), ["checkpoint", "close", "followUp", "prompt", "resume", "sessionId"]);
     const turn = agent.prompt("hello");
     let text = "";
     for await (const event of turn) if (event.type === "text_delta") text += event.delta;

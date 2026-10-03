@@ -50,6 +50,8 @@ const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const agent_checkpoint = @import("../core/agent/runtime/checkpoint.zig");
 const host_attachments = @import("../core/hosts/host_attachments.zig");
 const libfx_steering = @import("libfx_steering.zig");
+const journal_events = @import("../core/agent/runtime/journal.zig");
+const libfx_journal = @import("libfx_journal.zig");
 const tool_call_identities = @import("tool_call_identities.zig");
 
 const Allocator = std.mem.Allocator;
@@ -78,6 +80,9 @@ const AcpMethod = enum {
     libfx_restore,
     libfx_new,
     libfx_steer,
+    libfx_withdraw,
+    libfx_follow_up,
+    libfx_journal_open,
     mcp_message,
     unknown,
 
@@ -98,6 +103,9 @@ const AcpMethod = enum {
         if (std.mem.eql(u8, method, "libfx/restore")) return .libfx_restore;
         if (std.mem.eql(u8, method, "libfx/new")) return .libfx_new;
         if (std.mem.eql(u8, method, "libfx/steer")) return .libfx_steer;
+        if (std.mem.eql(u8, method, "libfx/withdraw")) return .libfx_withdraw;
+        if (std.mem.eql(u8, method, "libfx/follow_up")) return .libfx_follow_up;
+        if (std.mem.eql(u8, method, "libfx/journal_open")) return .libfx_journal_open;
         if (std.mem.eql(u8, method, "mcp/message")) return .mcp_message;
         return .unknown;
     }
@@ -114,6 +122,8 @@ const AcpMethod = enum {
             .session_close,
             .libfx_new,
             .libfx_steer,
+            .libfx_withdraw,
+            .libfx_follow_up,
             => false,
             .session_list,
             .session_remove,
@@ -121,6 +131,7 @@ const AcpMethod = enum {
             .session_set_config_option,
             .libfx_checkpoint,
             .libfx_restore,
+            .libfx_journal_open,
             .mcp_message,
             .unknown,
             => true,
@@ -129,7 +140,7 @@ const AcpMethod = enum {
 
     fn isLibfx(self: AcpMethod) bool {
         return switch (self) {
-            .libfx_checkpoint, .libfx_restore, .libfx_new, .libfx_steer => true,
+            .libfx_checkpoint, .libfx_restore, .libfx_new, .libfx_steer, .libfx_withdraw, .libfx_follow_up, .libfx_journal_open => true,
             else => false,
         };
     }
@@ -157,6 +168,8 @@ pub const OutboundKind = enum {
     host_tool,
     /// MCP over ACP request to a client-served MCP server.
     mcp_message,
+    /// libfx journal flush: the host answers once it holds every event.
+    journal,
 };
 
 pub const OutboundResponse = struct {
@@ -238,6 +251,8 @@ pub const ActiveSessionState = struct {
     cancel_flag: std.atomic.Value(bool),
     pending_prompt_id: ?jsonrpc.RequestId,
     steering: libfx_steering.Runtime = .{},
+    /// Set when the host passed a journal; every state change is sent to it.
+    journal: ?libfx_journal.Journal = null,
 
     pub fn retainGrant(self: *ActiveSessionState, alloc: Allocator, tool_name: []const u8, target_path: []const u8) !void {
         for (self.session_grants) |grant| {
@@ -694,6 +709,7 @@ fn destroyActiveSession(state: *ServerState) void {
     if (active.client_system_prompt.len > 0) state.alloc.free(active.client_system_prompt);
     active.tool_identities.deinit(state.alloc);
     active.steering.deinit(state.alloc);
+    if (active.journal) |*journal| journal.deinit(state.alloc);
     types.freePermissionGrantSlice(state.alloc, active.session_grants);
     if (comptime !host_target.is_wasm) {
         if (active.mcp) |runtime| {
@@ -1418,6 +1434,9 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
             .libfx_restore => handleKernelRestore(state, alloc, msg),
             .libfx_new => sessions.handleNewLibfxSession(state, alloc, msg),
             .libfx_steer => handleKernelSteer(state, alloc, msg),
+            .libfx_withdraw => handleKernelWithdraw(state, alloc, msg),
+            .libfx_follow_up => handleKernelFollowUp(state, alloc, msg),
+            .libfx_journal_open => handleKernelJournalOpen(state, alloc, msg),
             else => state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.method_not_found,
                 .message = "Method not available in the web core yet",
@@ -1438,6 +1457,9 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         .libfx_restore => handleKernelRestore(state, alloc, msg),
         .libfx_new => sessions.handleNewLibfxSession(state, alloc, msg),
         .libfx_steer => handleKernelSteer(state, alloc, msg),
+        .libfx_withdraw => handleKernelWithdraw(state, alloc, msg),
+        .libfx_follow_up => handleKernelFollowUp(state, alloc, msg),
+        .libfx_journal_open => handleKernelJournalOpen(state, alloc, msg),
         .initialize,
         .request_cancel,
         .session_cancel,
@@ -1511,6 +1533,63 @@ fn activeLibfxSession(
     const active = if (state.active_session) |*session| session else return null;
     if (!std.mem.eql(u8, active.session_id, session_id.string)) return null;
     return active;
+}
+
+/// Queues libfx steering. A journaled input is recorded as accepted under
+/// the session write mutex, which every progress that places an input also
+/// takes, so its acceptance always reaches the host first.
+fn queueLibfxSteering(
+    state: *ServerState,
+    alloc: Allocator,
+    active: *ActiveSessionState,
+    text: []const u8,
+    input_id: ?[]const u8,
+) !void {
+    const id = input_id orelse return active.steering.enqueue(state.alloc, text);
+    active.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer active.session_write_mutex.unlock(io_mod.getIo());
+    try active.steering.enqueueInput(state.alloc, text, id);
+    const journal = if (active.journal) |*value| value else return;
+    journal.append(alloc, active.session_id, .{ .input_accepted = .{ .id = id, .text = text } }) catch |err| {
+        _ = active.steering.withdraw(state.alloc, id);
+        return err;
+    };
+}
+
+/// Takes back a libfx steer the running turn has not handed to the model:
+/// `withdrawn`, recorded in the journal, or `already_placed`.
+fn handleKernelWithdraw(
+    state: *ServerState,
+    alloc: Allocator,
+    msg: *const jsonrpc.Message,
+) !void {
+    var parsed = libfxSessionId(alloc, msg) catch return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "Invalid libfx withdraw params",
+    });
+    defer parsed.deinit();
+    const active = activeLibfxSession(state, parsed.value) orelse
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Unknown libfx session",
+        });
+    const id = parsed.value.object.get("id") orelse
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Missing input id",
+        });
+    if (id != .string or !libfx_steering.validInputId(id.string)) return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "Invalid input id",
+    });
+    const withdrawn = withdrawn: {
+        active.session_write_mutex.lockUncancelable(io_mod.getIo());
+        defer active.session_write_mutex.unlock(io_mod.getIo());
+        if (!active.steering.withdraw(state.alloc, id.string)) break :withdrawn false;
+        if (active.journal) |*journal| try journal.append(alloc, active.session_id, .{ .input_withdrawn = id.string });
+        break :withdrawn true;
+    };
+    try state.writer.writeResponse(alloc, msg.id, if (withdrawn) "{\"result\":\"withdrawn\"}" else "{\"result\":\"already_placed\"}");
 }
 
 pub fn takeSteering(
@@ -1670,11 +1749,154 @@ fn handleKernelRestore(
         }),
     };
     defer alloc.free(bytes);
+    // A journaled session's history changes only through its journal.
+    if (active.journal != null) return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_request,
+        .message = "A journaled libfx session cannot restore a checkpoint",
+    });
     active.session_rt.agent.restoreCheckpoint(alloc, bytes) catch
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
             .message = "Invalid or non-fresh libfx checkpoint",
         });
+    try state.writer.writeResponse(alloc, msg.id, "null");
+}
+
+/// Opens a new libfx session's journal from the events its host stored,
+/// passed as one JSON array attachment. No attachment is an empty journal.
+fn handleKernelJournalOpen(
+    state: *ServerState,
+    alloc: Allocator,
+    msg: *const jsonrpc.Message,
+) !void {
+    var parsed = libfxSessionId(alloc, msg) catch return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "Invalid libfx journal params",
+    });
+    defer parsed.deinit();
+    const active = activeLibfxSession(state, parsed.value) orelse
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Unknown libfx session",
+        });
+    const invalid: jsonrpc.RpcError = .{
+        .code = ErrorCode.invalid_params,
+        .message = "Invalid libfx journal",
+    };
+    const too_large: jsonrpc.RpcError = .{
+        .code = ErrorCode.invalid_params,
+        .message = "libfx journal is too large",
+    };
+    var events: ?[]u8 = null;
+    defer if (events) |bytes| alloc.free(bytes);
+    if (parsed.value.object.get("journalAttachment")) |reference| {
+        const attachment = host_attachments.idFromJson(reference) orelse
+            return state.writer.writeError(alloc, msg.id, invalid);
+        const store = state.cfg.host_attachments orelse return state.writer.writeError(alloc, msg.id, invalid);
+        events = store.take(alloc, attachment, libfx_journal.max_load_bytes) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.AttachmentUnavailable => return state.writer.writeError(alloc, msg.id, invalid),
+            error.AttachmentTooLarge => return state.writer.writeError(alloc, msg.id, too_large),
+        };
+    }
+
+    const config_hash: ?[]const u8 = if (parsed.value.object.get("configHash")) |value| switch (value) {
+        .string => |hash| if (hash.len > 0 and hash.len <= journal_events.max_config_hash_bytes) hash else return state.writer.writeError(alloc, msg.id, invalid),
+        .null => null,
+        else => return state.writer.writeError(alloc, msg.id, invalid),
+    } else null;
+
+    active.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer active.session_write_mutex.unlock(io_mod.getIo());
+    if (active.journal != null) return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_request,
+        .message = "libfx journal is already open",
+    });
+    const journal, const opened = libfx_journal.open(
+        alloc,
+        state.alloc,
+        &state.writer,
+        &active.session_rt,
+        events orelse "[]",
+        config_hash,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.AgentNotFresh => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = "A libfx journal opens only on a new session",
+        }),
+        error.UnsupportedJournalVersion => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "libfx journal was written by a newer fx",
+        }),
+        error.OutOfOrderJournalEvent => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "libfx journal events are out of order",
+        }),
+        error.JournalTooLarge => return state.writer.writeError(alloc, msg.id, too_large),
+        error.JournalTooManyTurns => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = std.fmt.comptimePrint("libfx journal holds more than {d} turns", .{journal_events.max_history_turns}),
+        }),
+        error.InvalidJournal => return state.writer.writeError(alloc, msg.id, invalid),
+    };
+    active.journal = journal;
+    // The host runs the follow-ups the journal held, after any resume.
+    const follow_ups = active.journal.?.takeFollowUps();
+    defer journal_events.freePendingInputs(state.alloc, follow_ups);
+    var response: std.Io.Writer.Allocating = .init(alloc);
+    defer response.deinit();
+    try response.writer.print("{{\"turns\":{d},\"resumable\":{s},\"configMatches\":{s},\"followUps\":[", .{
+        opened.turns,
+        if (opened.resumable) "true" else "false",
+        if (opened.config_matches) "true" else "false",
+    });
+    for (follow_ups, 0..) |follow_up, index| {
+        if (index > 0) try response.writer.writeByte(',');
+        try response.writer.writeAll("{\"id\":");
+        try writeJsonStr(follow_up.id, &response.writer);
+        try response.writer.writeAll(",\"text\":");
+        try writeJsonStr(follow_up.text, &response.writer);
+        try response.writer.writeByte('}');
+    }
+    try response.writer.writeAll("]}");
+    try state.writer.writeResponse(alloc, msg.id, response.written());
+}
+
+/// Records a follow-up the host queued behind the running turn, so a journal
+/// keeps it across a crash. The host runs it; its turn places it.
+fn handleKernelFollowUp(
+    state: *ServerState,
+    alloc: Allocator,
+    msg: *const jsonrpc.Message,
+) !void {
+    var parsed = libfxSessionId(alloc, msg) catch return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "Invalid libfx follow-up params",
+    });
+    defer parsed.deinit();
+    const active = activeLibfxSession(state, parsed.value) orelse
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Unknown libfx session",
+        });
+    const id = parsed.value.object.get("id");
+    const text = parsed.value.object.get("text");
+    const valid_id = if (id) |value| value == .string and libfx_steering.validInputId(value.string) else false;
+    const valid_text = if (text) |value| value == .string and value.string.len > 0 and value.string.len <= libfx_steering.max_message_bytes else false;
+    if (!valid_id or !valid_text) return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "A follow-up needs a valid id and 1 byte to 64 KiB of text",
+    });
+    {
+        active.session_write_mutex.lockUncancelable(io_mod.getIo());
+        defer active.session_write_mutex.unlock(io_mod.getIo());
+        if (active.journal) |*journal| try journal.append(alloc, active.session_id, .{ .input_accepted = .{
+            .id = id.?.string,
+            .text = text.?.string,
+            .kind = .follow_up,
+        } });
+    }
     try state.writer.writeResponse(alloc, msg.id, "null");
 }
 
@@ -1702,18 +1924,29 @@ fn handleKernelSteer(
         .code = ErrorCode.invalid_params,
         .message = "Invalid steering text",
     });
-    active.steering.enqueue(state.alloc, text.string) catch |err| {
+    const input_id: ?[]const u8 = if (parsed.value.object.get("id")) |value| switch (value) {
+        .string => |id| id,
+        .null => null,
+        else => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Invalid input id",
+        }),
+    } else null;
+    queueLibfxSteering(state, alloc, active, text.string, input_id) catch |err| {
         return state.writer.writeError(alloc, msg.id, .{
             .code = switch (err) {
                 error.SteeringQueueFull, error.SteeringNotActive => ErrorCode.invalid_request,
-                else => ErrorCode.invalid_params,
+                error.EmptySteeringMessage, error.SteeringMessageTooLarge, error.InvalidInputId => ErrorCode.invalid_params,
+                else => ErrorCode.internal_error,
             },
             .message = switch (err) {
                 error.EmptySteeringMessage => "Steering text cannot be empty",
                 error.SteeringMessageTooLarge => "Steering text exceeds the 64 KiB libfx limit",
                 error.SteeringQueueFull => "Steering queue is full",
                 error.SteeringNotActive => "No prompt is running",
+                error.InvalidInputId => "Invalid or repeated input id",
                 error.OutOfMemory => "Failed to queue steering text",
+                else => "Failed to record steering in the journal",
             },
         });
     };

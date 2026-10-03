@@ -87,6 +87,18 @@ pub const Runtime = struct {
 
             const description_value = entry.object.get("description") orelse return error.InvalidHostTool;
             const schema_value = entry.object.get("inputSchema") orelse return error.InvalidHostTool;
+            // A tool that writes is a fence: earlier calls finish before it
+            // starts, and later calls wait for it.
+            const writes = if (entry.object.get("writes")) |value_| switch (value_) {
+                .bool => |declared| declared,
+                else => return error.InvalidHostTool,
+            } else false;
+            const replay_never = if (entry.object.get("replay")) |value_| replay: {
+                if (value_ != .string) return error.InvalidHostTool;
+                if (std.mem.eql(u8, value_.string, "never")) break :replay true;
+                if (std.mem.eql(u8, value_.string, "safe")) break :replay false;
+                return error.InvalidHostTool;
+            } else false;
             if (description_value != .string or schema_value != .object) return error.InvalidHostTool;
             if (description_value.string.len > max_description_bytes) {
                 return error.HostToolDescriptionTooLarge;
@@ -121,6 +133,8 @@ pub const Runtime = struct {
                 .description = "",
                 .model_schema = .{ .name = name, .description = "" },
                 .model_visible = false,
+                .host_concurrent = !writes,
+                .host_replay_never = replay_never,
                 .executor_kind = .host,
                 .activity_kind = .command,
                 .action_label = "Running",
@@ -217,6 +231,7 @@ fn call(
     return provider.call(
         ctx.allocator,
         ctx.tool_call_name,
+        ctx.tool_call_id,
         input.as(RawInput).json,
         ctx.max_tool_result_bytes,
         ctx.cancel_flag,
@@ -343,6 +358,24 @@ test "host tool runtime bounds descriptions at 64 KiB" {
             try std.testing.expectError(error.HostToolDescriptionTooLarge, Runtime.init(alloc, parsed.value));
         }
     }
+}
+
+test "host tools run concurrently unless they declare writes" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\[{"name":"read","description":"Read","inputSchema":{}},
+        \\ {"name":"write","description":"Write","inputSchema":{},"writes":true}]
+    , .{});
+    defer parsed.deinit();
+    var runtime = try Runtime.init(std.testing.allocator, parsed.value);
+    defer runtime.deinit();
+    try std.testing.expect(runtime.tools[0].host_concurrent);
+    try std.testing.expect(!runtime.tools[1].host_concurrent);
+
+    const invalid = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\[{"name":"write","description":"Write","inputSchema":{},"writes":"yes"}]
+    , .{});
+    defer invalid.deinit();
+    try std.testing.expectError(error.InvalidHostTool, Runtime.init(std.testing.allocator, invalid.value));
 }
 
 test "host tool runtime rejects duplicate and invalid names" {

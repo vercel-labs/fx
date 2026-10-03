@@ -33,6 +33,8 @@ const maxPendingAttachments = 8;
 const maxOutboundAttachments = 4;
 // Matches the core's kernel checkpoint limit (max_checkpoint_bytes).
 const maxCheckpointBytes = 4 * 1024 * 1024;
+// Matches the core's journal load limit (journal.max_load_bytes).
+const maxJournalBytes = 4 * 1024 * 1024;
 // The core's ACP reader drops frames over 8 MiB without a request id to answer
 // (jsonrpc frame_resource_byte_limit), so the SDK must never emit one. The
 // envelope allowance covers the method key and request id.
@@ -134,7 +136,527 @@ export function normalizeAgentOptions(value) {
   if (options.resizeImage !== undefined && typeof options.resizeImage !== "function") {
     throw new TypeError("resizeImage must be a function");
   }
+  if (options.sessionId !== undefined && options.sessionId !== null && !validSessionId(options.sessionId)) {
+    throw new TypeError(`sessionId must be ${sessionIdRule}`);
+  }
+  // A separate key, so normalizing these options again reads the caller's value.
+  if (options.modelCatalog !== undefined) options.modelCatalogBody = modelCatalogBody(options.modelCatalog);
+  if (options.journal !== undefined) {
+    const journal = options.journal;
+    if (!journal || typeof journal !== "object" ||
+      typeof journal.append !== "function" || typeof journal.load !== "function") {
+      throw new TypeError("journal must be an object with append() and load()");
+    }
+    if (options.checkpoint !== undefined) {
+      throw new TypeError("journal cannot be combined with checkpoint");
+    }
+  }
+  if (options.world !== undefined) {
+    validateWorld(options.world);
+    if (options.journal !== undefined) throw new TypeError("world cannot be combined with journal");
+    if (options.checkpoint !== undefined) throw new TypeError("world cannot be combined with checkpoint");
+  }
+  if (options.wakeAfterSeconds !== undefined) {
+    if (options.world === undefined) throw new TypeError("wakeAfterSeconds needs world");
+    validateWakeAfterSeconds(options.wakeAfterSeconds);
+  }
   return options;
+}
+
+/**
+ * Another writer took over the session after this agent loaded it. A journal
+ * rejects the append with this error; the agent stops its turn at once and
+ * makes no further effect or write. Check `code === "FX_FENCED"` when the
+ * error may come from another copy of libfx.
+ */
+export class FxFencedError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "FxFencedError";
+    this.code = "FX_FENCED";
+  }
+}
+
+/** The journal was written by a newer libfx than this one. */
+export class FxJournalVersionError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "FxJournalVersionError";
+    this.code = "FX_JOURNAL_VERSION";
+  }
+}
+
+// A journal this libfx cannot open: more than one load holds
+// (FX_JOURNAL_TOO_LARGE), or events that do not fold (FX_JOURNAL_INVALID).
+function journalLoadError(message, code, cause) {
+  const error = new Error(message, cause === undefined ? undefined : { cause });
+  error.code = code;
+  return error;
+}
+
+// The core's libfx/journal_open errors, by their exact message. The journal
+// tests open a journal for each, so rewording one fails them, except the size
+// limit: libfx refuses a journal over it before the core sees one, so that
+// entry is a backstop.
+const journalOpenErrorCodes = new Map([
+  ["Invalid libfx journal", "FX_JOURNAL_INVALID"],
+  ["libfx journal events are out of order", "FX_JOURNAL_INVALID"],
+  ["libfx journal is too large", "FX_JOURNAL_TOO_LARGE"],
+  ["libfx journal holds more than 1024 turns", "FX_JOURNAL_TOO_LARGE"],
+]);
+
+/**
+ * The turn the journal left open started under other instructions, tools or
+ * model than this agent has, so `resume()` will not continue it. `prompt()`
+ * ends it as interrupted instead.
+ */
+export class FxConfigMismatchError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "FxConfigMismatchError";
+    this.code = "FX_CONFIG_MISMATCH";
+  }
+}
+
+/**
+ * A journal that keeps events in memory, for tests and for hosts that copy
+ * them elsewhere. `events` is the stored list, oldest first. An append that
+ * does not continue the stored events is rejected, so a second agent cannot
+ * write the same journal.
+ */
+export function createMemoryJournal(events = []) {
+  if (!Array.isArray(events)) throw new TypeError("events must be an array");
+  const stored = [...events];
+  const lastSeq = () => stored.at(-1)?.seq ?? 0;
+  return {
+    events: stored,
+    async append(batch) {
+      const expected = lastSeq() + 1;
+      if (batch[0]?.seq !== expected) {
+        throw new FxFencedError(`another agent appended to this journal: expected seq ${expected}, received ${batch[0]?.seq}`);
+      }
+      stored.push(...batch);
+    },
+    async load() {
+      return { events: stored.slice() };
+    },
+  };
+}
+
+// World storage. A session `createFxAgent({ world })` keeps is a World run,
+// and each journal append is one `step_created` event in it, so the run's
+// event log holds the session. The World is the app's, such as
+// `createWorld()` from `@workflow/world-vercel`; libfx imports no Workflow
+// package.
+const worldJournalStep = "libfx.journal";
+// A heartbeat is a step of its own: Worlds accept only their event types.
+const worldHeartbeatStep = "libfx.heartbeat";
+const worldJournalFormat = "libfx-journal-v1";
+// A run names its workflow and deployment; nothing executes these runs.
+const worldWorkflowName = "libfx";
+// The queue topic of that workflow's runs (`getQueueTopicPrefix`).
+const worldQueueName = `__wkf_workflow_${worldWorkflowName}`;
+const defaultWakeAfterSeconds = 300;
+// Event ids are `evnt_` followed by the slot, zero-padded to 26 digits.
+const worldEventId = /^[a-z]+_(\d{26})$/;
+// Failures a later delivery of the same wake would repeat, by code, so an
+// error from another copy of libfx counts too.
+const permanentWorldOpenFailures = new Set(["FX_CONFIG_MISMATCH", "FX_JOURNAL_TOO_LARGE", "FX_JOURNAL_INVALID"]);
+
+// A ULID: 48 bits of time, then 80 random bits, in Crockford base32.
+function worldUlid(now = Date.now()) {
+  const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+  let time = "";
+  for (let rest = now, index = 0; index < 10; index += 1, rest = Math.floor(rest / 32)) time = alphabet[rest % 32] + time;
+  let random = "";
+  for (const byte of crypto.getRandomValues(new Uint8Array(16))) random += alphabet[byte % 32];
+  return time + random;
+}
+
+function validateWorld(world) {
+  if (!world?.events || typeof world.events.create !== "function" || typeof world.events.list !== "function" || typeof world.queue !== "function") {
+    throw new TypeError("world must be a Workflow World with events.create(), events.list() and queue()");
+  }
+}
+
+function validateWakeAfterSeconds(value) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    throw new TypeError("wakeAfterSeconds must be a positive number");
+  }
+}
+
+// Fencing reads the slot from the id, so an id in another form stops the
+// write rather than letting it pass unchecked.
+function worldSlot(event) {
+  const match = worldEventId.exec(String(event?.eventId ?? ""));
+  if (!match) throw new Error(`the World returned event id ${JSON.stringify(event?.eventId ?? null)}, which libfx cannot read a slot from`);
+  return Number(match[1]);
+}
+
+// An event's payload travels as bytes, the form every World stores: here,
+// UTF-8 JSON, which no World's own format prefix starts like.
+function worldPayload(value) {
+  return encoder.encode(JSON.stringify(value));
+}
+
+function worldPayloadOf(bytes) {
+  if (!(bytes instanceof Uint8Array)) return null;
+  try {
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    return null;
+  }
+}
+
+function worldBatch(event) {
+  if (event?.eventType !== "step_created" || event.eventData?.stepName !== worldJournalStep) return null;
+  const input = worldPayloadOf(event.eventData.input);
+  if (input?.format !== worldJournalFormat || !Array.isArray(input.events) || input.events.length === 0) return null;
+  return input.events;
+}
+
+// Whether a turn is open after `events`: progress or a tool intent opens one;
+// a commit or a cleared turn closes it; compaction leaves it as it was.
+function worldTurnOpenAfter(open, events) {
+  for (const event of events) {
+    if (event.type === "turn_progress" || event.type === "tool_intent") open = true;
+    else if (event.type === "turn_committed" || event.type === "turn_progress_cleared") open = false;
+  }
+  return open;
+}
+
+// Whether the journal holds follow-ups no turn has run: accepted, and never
+// placed by a progress or withdrawn.
+function worldHoldsFollowUps(events) {
+  const waiting = new Set();
+  for (const event of events) {
+    if (event.type === "input_accepted" && event.data?.kind === "follow_up") waiting.add(event.data.id);
+    else if (event.type === "input_withdrawn") waiting.delete(event.data?.id);
+    else if (event.type === "turn_progress") for (const id of event.inputs ?? []) waiting.delete(id);
+  }
+  return waiting.size > 0;
+}
+
+// The journal events a run holds. A batch counts only if it continues the
+// events before it; a fenced writer's late batch repeats a seq and is skipped.
+function worldJournalEvents(events) {
+  const journalEvents = [];
+  for (const event of events) {
+    const batch = worldBatch(event);
+    if (batch && batch[0].seq === journalEvents.length + 1) journalEvents.push(...batch);
+  }
+  return journalEvents;
+}
+
+async function readWorldRun(world, runId) {
+  const events = [];
+  let cursor;
+  for (;;) {
+    const page = await world.events.list({
+      runId,
+      pagination: { sortOrder: "asc", limit: 1000, ...(cursor ? { cursor } : {}) },
+      resolveData: "all",
+    });
+    events.push(...page.data);
+    if (!page.hasMore) break;
+    cursor = page.cursor;
+  }
+  return events;
+}
+
+// The journal of a World session. `sessionId` opens that run; without it,
+// `load()` creates one, and its id becomes the agent's `sessionId`.
+// `wakeAfterSeconds` bounds how long an open turn may go without a write:
+// the agent writes a heartbeat while a turn is open, so the queue route
+// takes the turn over only once its process has stopped.
+// `onWakeFailed(error)` hears once when the World cannot queue a wake, as
+// outside a deployment; the session is kept, and only an automatic resume
+// after a crash is lost.
+function worldJournal(world, sessionId, wakeAfterSeconds = defaultWakeAfterSeconds, onWakeFailed = () => {}) {
+  const wakeAfterMs = wakeAfterSeconds * 1000;
+  // At least 100 ms, so a short test timeout does not turn into a write loop.
+  const heartbeatMs = Math.max(100, wakeAfterMs / 3);
+
+  let runId = sessionId ?? null;
+  // Slots this process has seen. Slots are dense, so this is the last one.
+  let eventCount = 0;
+  let previous = Promise.resolve();
+  let fenced = null;
+  // The seq the next journal batch starts at.
+  let nextSeq = 1;
+  let turnOpen = false;
+  // Whether this process queued a wake for the open turn, and whether the
+  // World refused one.
+  let wakeQueued = false;
+  let wakeUnavailable = false;
+  let lastWriteAt = 0;
+  let heartbeat = null;
+  let closed = false;
+
+  const queueWake = (delaySeconds) => Promise.resolve()
+    .then(() => world.queue(worldQueueName, { runId }, { delaySeconds }))
+    .catch((error) => {
+      wakeUnavailable = true;
+      onWakeFailed(error);
+    });
+  // Step ids are `step_` and a ULID, the form Worlds accept.
+  const stepId = () => `step_${worldUlid()}`;
+
+  function fence(message) {
+    fenced = new FxFencedError(message);
+    stopHeartbeat();
+    return fenced;
+  }
+
+  // Writes one event at the slot after the last one this process has seen.
+  // A World never refuses a write for a taken slot: it commits at the next
+  // free one and reports what it skipped, some Worlds with the new event
+  // too. When a skipped event is another writer's batch starting at `seq`,
+  // that batch continues the journal and this process's view is stale, so it
+  // stops writing; load skips whatever it wrote after the other batch.
+  async function commit(request, seq) {
+    if (fenced) throw fenced;
+    const result = await world.events.create(runId, request, { eventCount });
+    lastWriteAt = Date.now();
+    const slot = worldSlot(result.event);
+    const expected = eventCount + 1;
+    eventCount = slot;
+    if (slot === expected) return;
+    const reported = Array.isArray(result.events) ? result.events : await readWorldRun(world, runId);
+    const skipped = reported.filter((event) => {
+      const other = worldSlot(event);
+      return other >= expected && other < slot;
+    });
+    if (skipped.some((event) => worldBatch(event)?.[0].seq === seq)) {
+      throw fence(`another process wrote to session ${runId}; this one has stopped`);
+    }
+  }
+
+  function serialize(task) {
+    const done = previous.then(task);
+    previous = done.catch(() => {});
+    return done;
+  }
+
+  function startHeartbeat() {
+    if (heartbeat) return;
+    heartbeat = setInterval(() => {
+      if (Date.now() - lastWriteAt < heartbeatMs) return;
+      // A failed heartbeat is not retried here; the next one or the next
+      // append writes again, and a fence stops both.
+      serialize(() => (turnOpen && !fenced
+        ? commit({ eventType: "step_created", correlationId: stepId(), eventData: { stepName: worldHeartbeatStep, input: worldPayload({}) } }, nextSeq)
+        : undefined)).catch(() => {});
+    }, heartbeatMs);
+    heartbeat.unref?.();
+  }
+
+  function stopHeartbeat() {
+    if (!heartbeat) return;
+    clearInterval(heartbeat);
+    heartbeat = null;
+  }
+
+  async function write(batch) {
+    const open = worldTurnOpenAfter(turnOpen, batch);
+    const wake = open && !wakeQueued && !wakeUnavailable;
+    // A unique step id per write: a write that died partway can leave its id
+    // taken in some Worlds, and must not block the write that replaces it.
+    const step = commit({
+      eventType: "step_created",
+      correlationId: stepId(),
+      eventData: { stepName: worldJournalStep, input: worldPayload({ format: worldJournalFormat, events: batch }) },
+    }, batch[0].seq);
+    // The wake rides alongside the turn's first write, so it costs no extra
+    // round trip; without it no one resumes the turn if this process stops.
+    // A wake the World refuses does not fail the write.
+    await Promise.all([step, wake ? queueWake(wakeAfterSeconds) : undefined]);
+    nextSeq = batch.at(-1).seq + 1;
+    turnOpen = open;
+    if (open) {
+      wakeQueued = true;
+      startHeartbeat();
+    } else {
+      wakeQueued = false;
+      stopHeartbeat();
+    }
+  }
+
+  return {
+    async load() {
+      if (runId === null) {
+        // The client names a new run, as Workflow's `start()` does; a World
+        // that embeds its own metadata in the id mints it.
+        const created = `wrun_${typeof world.createRunId === "function" ? world.createRunId({}) : worldUlid()}`;
+        await world.events.create(created, {
+          eventType: "run_created",
+          ...(world.specVersion === undefined ? {} : { specVersion: world.specVersion }),
+          eventData: { deploymentId: worldWorkflowName, workflowName: worldWorkflowName, input: worldPayload({ format: worldJournalFormat }) },
+        });
+        // Nobody else knows the new run, so there is nothing to read back.
+        // Should the World have added events of its own, the first write
+        // finds them and continues after them.
+        const started = await world.events.create(created, {
+          eventType: "run_started",
+          ...(world.specVersion === undefined ? {} : { specVersion: world.specVersion }),
+        }, { eventCount: 1 });
+        runId = created;
+        eventCount = worldSlot(started.event);
+        return { events: [], sessionId: runId };
+      }
+      let events = await readWorldRun(world, runId);
+      // A run takes steps once it has started; one whose creator stopped
+      // before starting it is started here.
+      if (!events.some((event) => event.eventType === "run_started")) {
+        await world.events.create(runId, {
+          eventType: "run_started",
+          ...(world.specVersion === undefined ? {} : { specVersion: world.specVersion }),
+        }, { eventCount: events.length });
+        events = await readWorldRun(world, runId);
+      }
+      eventCount = events.length;
+      const journalEvents = worldJournalEvents(events);
+      nextSeq = journalEvents.length + 1;
+      turnOpen = worldTurnOpenAfter(false, journalEvents);
+      return { events: journalEvents, sessionId: runId };
+    },
+    append(batch) {
+      if (closed) return Promise.reject(new Error("the session's journal is closed"));
+      // Each write states the slot it expects, so writes go out in call order.
+      return serialize(() => write(batch));
+    },
+    // The agent closed: no more heartbeats, so a turn it left open, such as
+    // one handed off, goes silent and the queue route resumes it.
+    close() {
+      closed = true;
+      stopHeartbeat();
+    },
+  };
+}
+
+/**
+ * The queue route for sessions `createFxAgent({ world })` keeps, for example
+ * `export const POST = worldHandler({ world, createAgent })` in
+ * `app/.well-known/workflow/v1/flow/route.js`. Resumes the session a queue
+ * message names when its open turn, or a follow-up it holds, has gone
+ * `wakeAfterSeconds` without a write; checks again later while the owner is
+ * still writing; does nothing once no work is left.
+ *
+ * `createAgent({ sessionId })` builds the agent the app builds, with the same
+ * tools, instructions and model, for that session.
+ */
+export function worldHandler({ world, createAgent, wakeAfterSeconds = defaultWakeAfterSeconds } = {}) {
+  validateWorld(world);
+  if (typeof createAgent !== "function") throw new TypeError("createAgent must be a function");
+  validateWakeAfterSeconds(wakeAfterSeconds);
+  const wakeAfterMs = wakeAfterSeconds * 1000;
+  return async (request) => {
+    let message;
+    try {
+      message = await request.json();
+    } catch {
+      return new Response("invalid queue message", { status: 400 });
+    }
+    const target = message?.runId;
+    if (typeof target !== "string") return new Response("queue message has no runId", { status: 400 });
+
+    const events = await readWorldRun(world, target);
+    const journalEvents = worldJournalEvents(events);
+    if (!worldTurnOpenAfter(false, journalEvents) && !worldHoldsFollowUps(journalEvents)) return new Response(null, { status: 204 });
+    const lastAt = Math.max(0, ...events.map((event) => new Date(event.createdAt).getTime()).filter(Number.isFinite));
+    const silentMs = Date.now() - lastAt;
+    if (silentMs < wakeAfterMs) {
+      // The owner wrote recently and may still be running the turn.
+      await world.queue(worldQueueName, { runId: target }, { delaySeconds: Math.max(1, Math.ceil((wakeAfterMs - silentMs) / 1000)) });
+      return new Response(null, { status: 204 });
+    }
+
+    let agent = null;
+    try {
+      agent = await createAgent({ sessionId: target });
+      // An agent on another run would answer the wake and strand this one.
+      if (agent.sessionId !== target) throw new TypeError("createAgent({ sessionId }) must open that session");
+      // The open turn first, then each follow-up the journal held.
+      for (let turn = agent.resume(); turn; turn = agent.resume()) {
+        for await (const _ of turn) {}
+        await turn.result;
+      }
+    } catch (error) {
+      // Asking again will not change these: a deployment with other tools,
+      // instructions or model cannot resume the turn, and this libfx cannot
+      // open a journal that is too large or does not fold. A config
+      // mismatch waits for the session's next prompt, which ends the turn
+      // as interrupted.
+      if (!permanentWorldOpenFailures.has(error?.code)) throw error;
+      return new Response(`session ${target} was not resumed: ${error.message}`, { status: 200 });
+    } finally {
+      await agent?.close();
+    }
+    return new Response(null, { status: 204 });
+  };
+}
+
+// Marks the turn `agent.resume()` starts; never a caller-visible option.
+const resumeTurn = Symbol("libfx.resume");
+// Carries the follow-up a turn runs: `{ id, accepted }`.
+const followUpInput = Symbol("libfx.followUp");
+
+function journalAppendError(cause) {
+  const error = new Error("libfx journal append failed", { cause });
+  error.code = "FX_JOURNAL_APPEND_FAILED";
+  return error;
+}
+
+// What shapes a turn: instructions, model, and each tool's name,
+// description, schema, replay policy and whether it writes. A turn the
+// journal left open continues only under the same hash.
+async function configHashOf(instructions, model, tools) {
+  const text = JSON.stringify({
+    instructions: instructions ?? null,
+    model: model ?? null,
+    tools: tools.map((tool) => [
+      tool.name,
+      tool.description ?? null,
+      tool.inputSchema ?? null,
+      tool.replay ?? null,
+      tool.writes ?? null,
+    ]),
+  });
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", encoder.encode(text)));
+  return [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+// Restoring an open turn needs only its newest progress, so an older one's
+// state is left out of a load (data: null). A load then grows with the
+// session's committed turns, not with every step of every turn.
+function withoutSupersededProgress(events) {
+  const kept = new Array(events.length);
+  let superseded = false;
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    const type = event?.type;
+    kept[index] = superseded && type === "turn_progress" && event.data != null ? { ...event, data: null } : event;
+    if (type === "turn_progress" || type === "turn_committed" || type === "turn_progress_cleared") superseded = true;
+  }
+  return kept;
+}
+
+// A session id reaches gateway headers; the core applies the same rule.
+function validSessionId(id) {
+  return typeof id === "string" && /^[A-Za-z0-9._-]{1,255}$/.test(id) &&
+    id !== "." && id !== ".." && id.toLowerCase() !== "v2";
+}
+const sessionIdRule = "1 to 255 letters, digits, '.', '_' or '-'";
+
+function journalLoaded(loaded) {
+  if (!loaded || typeof loaded !== "object" || !Array.isArray(loaded.events)) {
+    throw new TypeError("journal.load() must resolve to { events: [] }");
+  }
+  const sessionId = loaded.sessionId ?? null;
+  if (sessionId !== null && !validSessionId(sessionId)) {
+    throw new TypeError(`journal.load() sessionId must be ${sessionIdRule}`);
+  }
+  return { events: loaded.events, sessionId };
 }
 
 function agentEnvironment(options) {
@@ -764,7 +1286,7 @@ function createRuntime(options) {
     steeringBytes = 0;
   }
 
-  function queueSteering(text) {
+  function queueSteering(text, id = "") {
     if (!steeringOpen) throw new Error("no prompt is running");
     const value = encoder.encode(text);
     if (value.length === 0) throw new TypeError("steering text cannot be empty");
@@ -774,19 +1296,33 @@ function createRuntime(options) {
     if (steering.length >= maxSteeringMessages || value.length > maxSteeringQueueBytes - steeringBytes) {
       throw new Error("steering queue is full");
     }
-    steering.push(value);
+    steering.push({ id, value });
     steeringBytes += value.length;
   }
 
+  // The core takes queued steering at a boundary; until then it can be withdrawn.
+  function withdrawSteering(id) {
+    const index = steering.findIndex((entry) => entry.id === id);
+    if (index < 0) return false;
+    steeringBytes -= steering[index].value.length;
+    steering.splice(index, 1);
+    return true;
+  }
+
+  // Each message is its input id, a newline, then the text.
   function steeringTake(outputPtr, outputCap) {
-    const value = steering[0];
-    if (!value) return 0;
+    const entry = steering[0];
+    if (!entry) return 0;
     const output = checkedBytes(outputPtr, outputCap);
-    if (!output || value.length > output.length) return -1;
-    output.subarray(0, value.length).set(value);
+    const id = encoder.encode(entry.id);
+    const length = id.length + 1 + entry.value.length;
+    if (!output || length > output.length) return -1;
+    output.set(id, 0);
+    output[id.length] = 10;
+    output.set(entry.value, id.length + 1);
     steering.shift();
-    steeringBytes -= value.length;
-    return value.length;
+    steeringBytes -= entry.value.length;
+    return length;
   }
 
   function writeAttachment(id, data) {
@@ -821,14 +1357,20 @@ function createRuntime(options) {
     return id;
   }
 
+  // Resolves once the agent's journal holds every event the core sent.
+  function journalFlush() {
+    if (typeof options.journalFlush !== "function") return -1;
+    return Promise.resolve().then(() => options.journalFlush()).then(() => 0, () => -1);
+  }
+
   let pendingHostToolResult = null;
-  function hostToolCall(namePtr, nameLen, argumentsPtr, argumentsLen, outputPtr, outputCap, statusPtr) {
+  function hostToolCall(namePtr, nameLen, argumentsPtr, argumentsLen, outputPtr, outputCap, statusPtr, callIdPtr, callIdLen) {
     pendingHostToolResult = null;
     if (typeof options.hostToolExecutor !== "function") return -1;
     if (options.traceWasi) console.error("fx host tool call start");
     let input;
     try { input = JSON.parse(text(argumentsPtr, argumentsLen)); } catch { return -1; }
-    return Promise.resolve(options.hostToolExecutor(text(namePtr, nameLen), input)).then((result) => {
+    return Promise.resolve(options.hostToolExecutor(text(namePtr, nameLen), input, undefined, text(callIdPtr, callIdLen))).then((result) => {
       if (options.traceWasi) console.error("fx host tool call settled", result.cancelled, result.isError);
       if (result.cancelled) return -2;
       const output = encoder.encode(result.content);
@@ -1183,6 +1725,7 @@ function createRuntime(options) {
     fx_http_stream_close(handle) { const state = streams.get(handle); state?.controller.abort(abortReason); streams.delete(handle); },
     fx_http_request: new WebAssembly.Suspending(httpRequest),
     fx_host_tool_call: new WebAssembly.Suspending(hostToolCall),
+    fx_journal_flush: new WebAssembly.Suspending(journalFlush),
     fx_host_tool_result_read(offset, ptr, cap) {
       if (!pendingHostToolResult || offset < 0 || offset > pendingHostToolResult.length) return -1;
       const chunk = pendingHostToolResult.subarray(offset, offset + cap);
@@ -1232,6 +1775,7 @@ function createRuntime(options) {
     closeStdin() { steeringOpen = false; clearSteering(); stdin.close(); },
     openSteering() { clearSteering(); steeringOpen = true; },
     steer: queueSteering,
+    withdrawSteering,
     closeSteering() { steeringOpen = false; clearSteering(); },
     abortHostEffects,
     abort(error) {
@@ -1616,16 +2160,30 @@ function normalizeSteeringInput(input) {
   return text;
 }
 
-function normalizeHostTools(value) {
+// `tools` is an array of descriptors, or an object of descriptors keyed by
+// name. With a journal, every tool libfx runs declares whether a call that
+// may have started can run again (`replay`).
+function normalizeHostTools(value, { journaled = false } = {}) {
   if (value === undefined) return { descriptors: [], executors: new Map() };
-  if (!Array.isArray(value)) throw new TypeError("tools must be an array");
-  if (value.length > 64) throw new RangeError("tools cannot contain more than 64 entries");
+  let entries;
+  if (Array.isArray(value)) {
+    entries = value;
+  } else if (value && typeof value === "object") {
+    entries = Object.entries(value).map(([key, tool]) => {
+      if (!tool || typeof tool !== "object") throw new TypeError(`tool ${key} must be an object`);
+      if (tool.name !== undefined && tool.name !== key) throw new TypeError(`tool ${key} has a different name: ${tool.name}`);
+      return { ...tool, name: key };
+    });
+  } else {
+    throw new TypeError("tools must be an array or an object");
+  }
+  if (entries.length > 64) throw new RangeError("tools cannot contain more than 64 entries");
   const descriptors = [];
   const executors = new Map();
   const names = new Set();
-  for (const [index, tool] of value.entries()) {
+  for (const [index, tool] of entries.entries()) {
     if (!tool || typeof tool !== "object") throw new TypeError(`tool ${index} must be an object`);
-    const { name, description, inputSchema, execute, providerExecuted } = tool;
+    const { name, description, inputSchema, execute, providerExecuted, replay, writes } = tool;
     if (typeof name !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(name)) {
       throw new TypeError(`tool ${index} has an invalid name`);
     }
@@ -1641,6 +2199,13 @@ function normalizeHostTools(value) {
     }
     if (typeof description !== "string") throw new TypeError(`tool ${name} requires a description`);
     if (typeof execute !== "function") throw new TypeError(`tool ${name} requires execute()`);
+    if (replay !== undefined && replay !== "safe" && replay !== "never") {
+      throw new TypeError(`tool ${name} replay must be "safe" or "never"`);
+    }
+    if (journaled && replay === undefined) {
+      throw new TypeError(`tool ${name} needs replay: "safe" or "never" when a journal is set`);
+    }
+    if (writes !== undefined && typeof writes !== "boolean") throw new TypeError(`tool ${name} writes must be a boolean`);
     if (!inputSchema || typeof inputSchema !== "object" || Array.isArray(inputSchema)) {
       throw new TypeError(`tool ${name} requires an object inputSchema`);
     }
@@ -1648,10 +2213,39 @@ function normalizeHostTools(value) {
     try { schema = JSON.parse(JSON.stringify(inputSchema)); } catch {
       throw new TypeError(`tool ${name} inputSchema must be JSON-serializable`);
     }
-    descriptors.push({ name, description, inputSchema: schema });
+    descriptors.push({
+      name,
+      description,
+      inputSchema: schema,
+      ...(replay === undefined ? {} : { replay }),
+      ...(writes === undefined ? {} : { writes }),
+    });
     executors.set(name, execute);
   }
   return { descriptors, executors };
+}
+
+// The model catalog a host supplies, as the response body the core would
+// otherwise fetch: `{ data }` as AI Gateway returns it, or the entries alone.
+function modelCatalogBody(value) {
+  const entries = Array.isArray(value) ? value : value?.data;
+  if (!Array.isArray(entries)) throw new TypeError("modelCatalog must be an array of catalog entries or { data: [...] }");
+  if (entries.length > maxModelCatalogEntries) {
+    throw new RangeError(`modelCatalog exceeds the ${maxModelCatalogEntries} entry libfx limit`);
+  }
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object" || typeof entry.id !== "string" || entry.id === "") {
+      throw new TypeError("each modelCatalog entry needs a string id");
+    }
+  }
+  let body;
+  try { body = JSON.stringify({ object: "list", data: entries }); } catch {
+    throw new TypeError("modelCatalog must be JSON-serializable");
+  }
+  if (encoder.encode(body).length > maxModelCatalogBytes) {
+    throw new RangeError(`modelCatalog exceeds the ${maxModelCatalogBytes} byte libfx limit`);
+  }
+  return body;
 }
 
 function normalizeInstructions(value) {
@@ -1724,7 +2318,7 @@ function base64ToBytes(value) {
 
 export async function createFxAgent(options = {}) {
   options = normalizeAgentOptions(options);
-  const hostTools = normalizeHostTools(options.tools);
+  const hostTools = normalizeHostTools(options.tools, { journaled: options.journal !== undefined || options.world !== undefined });
   const instructions = normalizeInstructions(options.instructions);
   const initialCheckpoint = checkpointBytes(options.checkpoint);
   // Checked before the core starts, and with the core's message, so both
@@ -1739,17 +2333,165 @@ export async function createFxAgent(options = {}) {
   let closing = false;
   let coreExitError = null;
   const isCurrentTurn = (turn) => turn && activeTurn === turn && !turn.cancelled && !closing;
+  // Events go to the host in the order the core sends them. Events that
+  // arrive together share one append, and an append starts without waiting
+  // for earlier ones, so a remote journal adds one round trip to a turn
+  // rather than one per append. The host stores calls in call order.
+  const journal = options.world !== undefined
+    ? worldJournal(options.world, options.sessionId ?? null, options.wakeAfterSeconds, (error) => {
+      emit("journal.wake_failed", { error: error instanceof Error ? error.name : "Error", message: error?.message ?? "" });
+    })
+    : options.journal ?? null;
+  let resumable = false;
+  let openTurnConfigMismatch = false;
+  // Follow-ups waiting for the turn ahead of them, oldest first.
+  const followUps = [];
+  // A follow-up this agent queued starts when the turn ahead of it ends, ahead
+  // of any the journal held: those have no caller, so each waits for
+  // `resume()` to start it, oldest first.
+  const runNextFollowUp = (resuming = false) => {
+    if (activeTurn || closing || journalFailure) return;
+    const index = followUps.findIndex((entry) => (entry.held === true) === resuming);
+    if (index < 0) return;
+    const [next] = followUps.splice(index, 1);
+    let turn;
+    try {
+      turn = normalizeTurn(startTurn(next.text, { [followUpInput]: { id: next.id, accepted: next.accepted } }));
+    } catch (error) {
+      next.rejectTurn?.(error);
+      return;
+    }
+    next.resolveTurn?.(turn);
+  };
+  let journalQueue = [];
+  let journalFlushScheduled = false;
+  const journalPending = new Set();
+  let journalFailure = null;
+  // Set by `turn.cancel({ reason: "handoff" })`: the journal keeps the open
+  // turn for another agent, so this one stores nothing more.
+  let handedOff = false;
+  const handedOffError = () => new Error("this agent handed its session off; open it again to continue");
+  // Input events (`accepted:<id>`, `withdrawn:<id>`) once stored, and the
+  // steer and withdraw calls waiting for them.
+  const durableInputs = new Set();
+  const inputWaiters = new Map();
+  const waitForInput = (key) => {
+    if (durableInputs.delete(key)) return Promise.resolve();
+    if (journalFailure) return Promise.reject(journalFailure);
+    return new Promise((resolve, reject) => {
+      const waiters = inputWaiters.get(key) ?? [];
+      waiters.push({ resolve, reject });
+      inputWaiters.set(key, waiters);
+    });
+  };
+  const settleInputs = (batch) => {
+    for (const event of batch) {
+      if (event.type !== "input_accepted" && event.type !== "input_withdrawn") continue;
+      const key = `${event.type === "input_accepted" ? "accepted" : "withdrawn"}:${event.data?.id}`;
+      durableInputs.add(key);
+      for (const waiter of inputWaiters.get(key) ?? []) waiter.resolve();
+      inputWaiters.delete(key);
+    }
+  };
+  const rejectInputWaiters = (keys, error) => {
+    for (const key of keys) {
+      for (const waiter of inputWaiters.get(key) ?? []) waiter.reject(error);
+      inputWaiters.delete(key);
+    }
+  };
+  // close() reports a failure no turn or prompt call has reported yet.
+  let journalFailureReported = false;
+  const reportJournalFailure = () => {
+    journalFailureReported = true;
+    return journalFailure;
+  };
+  const queueJournalEvents = (events) => {
+    if (journalFailure || !Array.isArray(events) || events.length === 0) return;
+    if (handedOff) {
+      // The agent that opens the session next decides about these inputs.
+      const dropped = events
+        .filter((event) => event?.type === "input_accepted" || event?.type === "input_withdrawn")
+        .map((event) => `${event.type === "input_accepted" ? "accepted" : "withdrawn"}:${event.data?.id}`);
+      rejectInputWaiters(dropped, handedOffError());
+      return;
+    }
+    journalQueue.push(...events);
+    // A turn notes a new config right before its first progress, a barrier:
+    // the two go out in one write instead of two in a row.
+    if (events.every((event) => event?.type === "session_config")) return;
+    if (journalFlushScheduled) return;
+    journalFlushScheduled = true;
+    queueMicrotask(flushJournal);
+  };
+  function flushJournal() {
+    journalFlushScheduled = false;
+    if (journalFailure || journalQueue.length === 0) return;
+    const batch = journalQueue;
+    journalQueue = [];
+    emit("journal.append", { events: batch.length });
+    let appended;
+    try {
+      appended = Promise.resolve(journal.append(batch));
+    } catch (error) {
+      appended = Promise.reject(error);
+    }
+    const settled = appended.then(() => {
+      settleInputs(batch);
+    }, (error) => {
+      // Later events would leave a gap after the failed batch.
+      journalQueue = [];
+      if (journalFailure) return;
+      journalFailure = journalAppendError(error);
+      emit("journal.error", { error: error instanceof Error ? error.name : "Error" });
+      rejectInputWaiters([...inputWaiters.keys()], journalFailure);
+      // Nothing the turn does from here can be saved, and after a fence the
+      // session has another owner: stop the turn and its effects now.
+      activeTurn?.cancel();
+    }).finally(() => journalPending.delete(settled));
+    journalPending.add(settled);
+  }
+  // The journal's own work, such as a heartbeat, ends with the agent: once,
+  // after the last append settles.
+  let journalClosed = null;
+  function closeJournal() {
+    journalClosed ??= journalSettled().catch(() => {}).then(() => {
+      if (typeof journal.close === "function") return journal.close();
+    });
+    return journalClosed;
+  }
+  async function journalSettled() {
+    for (;;) {
+      if (journalFlushScheduled || journalQueue.length > 0) flushJournal();
+      if (journalPending.size === 0) break;
+      await Promise.all([...journalPending]);
+    }
+    if (journalFailure) throw journalFailure;
+  }
   const emit = (type, detail = {}) => {
     try { options.onEvent?.({ type, timestamp: performance.now(), ...detail }); } catch {}
   };
+  // `checkpoint` is deprecated in favor of `journal`; each use is reported once.
+  const deprecatedUses = new Set();
+  const deprecated = (api) => {
+    if (deprecatedUses.has(api)) return;
+    deprecatedUses.add(api);
+    emit("deprecated", { api, replacement: "journal" });
+  };
+  if (options.checkpoint !== undefined) deprecated("checkpoint");
   const hostFetch = options.fetch ?? globalThis.fetch?.bind(globalThis);
   const transportFetch = async (input, init = {}) => {
     const method = String(init.method ?? input?.method ?? "GET").toUpperCase();
     let endpoint = String(input?.url ?? input);
+    let path = null;
     try {
       const url = new URL(endpoint);
       endpoint = `${url.origin}${url.pathname}`;
+      path = url.pathname;
     } catch {}
+    // A supplied catalog answers the core's catalog request without the network.
+    if (options.modelCatalogBody && method === "GET" && path === "/coding-agent/v1/models") {
+      return new Response(options.modelCatalogBody, { status: 200, headers: { "content-type": "application/json" } });
+    }
     for (let attemptIndex = 0; attemptIndex < 2; attemptIndex++) {
       const startedAt = performance.now();
       const attempt = activeTurn ? ++activeTurn.transportAttempts : attemptIndex + 1;
@@ -1793,7 +2535,7 @@ export async function createFxAgent(options = {}) {
     }
     throw new Error("transport retry exhausted");
   };
-  const executeHostTool = async (name, input, requestedSessionId) => {
+  const executeHostTool = async (name, input, requestedSessionId, toolCallId) => {
     const execute = hostTools.executors.get(name);
     const turn = requestedSessionId === undefined || requestedSessionId === sessionId
       ? activeTurn
@@ -1811,7 +2553,9 @@ export async function createFxAgent(options = {}) {
       if (!execute) throw new Error(`unknown host tool: ${String(name)}`);
       const execution = Promise.resolve().then(() => {
         if (controller.signal.aborted || !isCurrentTurn(turn)) return;
-        return execute(input, { signal: controller.signal });
+        // The model's call id is stable across restores of a journaled
+        // session, so a tool can use it as an idempotency key.
+        return execute(input, { signal: controller.signal, toolCallId: String(toolCallId ?? "") });
       });
       const value = await Promise.race([execution, aborted]);
       if (!controller.signal.aborted) {
@@ -1837,6 +2581,8 @@ export async function createFxAgent(options = {}) {
       controller.signal.removeEventListener("abort", onAbort);
       turn.toolControllers.delete(controller);
     }
+    // Providers reject an empty error result, which would end the session.
+    if (isError && content === "") content = `Tool ${String(name)} failed without a message`;
     return { content, isError, rich, cancelled: controller.signal.aborted || !isCurrentTurn(turn) };
   };
   emit("runtime.start");
@@ -1846,6 +2592,7 @@ export async function createFxAgent(options = {}) {
     args: ["acp"],
     env: agentEnvironment(options),
     hostToolExecutor: executeHostTool,
+    journalFlush: () => journalSettled(),
     onTransportChunk(byteLength) {
       const turn = activeTurn;
       if (!isCurrentTurn(turn) || !Number.isSafeInteger(byteLength) || byteLength <= 0) return;
@@ -1900,7 +2647,8 @@ export async function createFxAgent(options = {}) {
     if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) throw new Error("fx returned an invalid checkpoint");
     return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   }
-  const sendPrompt = (blocks) => {
+  const sendPrompt = (blocks, resuming = false, followUp = null) => {
+    if (resuming) return request("session/prompt", { sessionId, prompt: [], _meta: { fx: { continueRecovery: true } } });
     const images = blocks.filter((block) => block.type === "image" && block.bytes !== undefined);
     const ids = images.length ? attachBytes(images.map((block) => block.bytes)) : [];
     let next = 0;
@@ -1910,10 +2658,15 @@ export async function createFxAgent(options = {}) {
       ...(block.sourceRef === undefined ? {} : { sourceRef: block.sourceRef }),
       ...(block.bytes === undefined ? {} : { _meta: { fx: { attachment: ids[next++] } } }),
     });
-    return request("session/prompt", { sessionId, prompt });
+    // A follow-up's turn places it; the core records it as accepted first
+    // when the host could not.
+    const meta = followUp ? { _meta: { fx: { inputId: followUp.id, inputAccepted: followUp.accepted } } } : {};
+    return request("session/prompt", { sessionId, prompt, ...meta });
   };
   runtime.exited.then((code) => {
     closing = true;
+    // An agent whose core exited writes nothing more.
+    if (journal) void closeJournal().catch(() => {});
     const error = runtime.error ?? new Error(`fx-core exited with code ${code} before completing the ACP request`);
     coreExitError = error;
     activeTurn?.failImagePrep(error);
@@ -1923,6 +2676,12 @@ export async function createFxAgent(options = {}) {
   });
   runtime.setLineHandler((message, size) => {
     emit("acp.receive", { message });
+    if (message.method === "libfx/journal_append") {
+      if (journal && message.params?.sessionId === sessionId) {
+        queueJournalEvents(message.params.events);
+      }
+      return;
+    }
     if (message.method === "session/update") {
       if (message.params.sessionId === sessionId) return activeTurn?.push(message.params.update, size);
       return;
@@ -1943,11 +2702,22 @@ export async function createFxAgent(options = {}) {
       send({ jsonrpc: "2.0", id: message.id, result: optionId ? { outcome: { outcome: "selected", optionId } } : { outcome: { outcome: "cancelled" } } });
       return;
     }
+    if (message.method === "libfx/journal_flush") {
+      // Every append the core sent before this request is already queued.
+      let failure = null;
+      try { await journalSettled(); } catch (error) { failure = error; }
+      if (closing) return;
+      send(failure
+        ? { jsonrpc: "2.0", id: message.id, error: { code: -32000, message: failure.message } }
+        : { jsonrpc: "2.0", id: message.id, result: {} });
+      return;
+    }
     if (message.method === "libfx/tool_call") {
       const { content, isError, rich, cancelled } = await executeHostTool(
         message.params?.name,
         message.params?.input,
         message.params?.sessionId,
+        message.params?.toolCallId,
       );
       if (cancelled || closing) return;
       const response = { jsonrpc: "2.0", id: message.id, result: { content, isError, ...(rich ? { contentType: "rich" } : {}) } };
@@ -1974,11 +2744,41 @@ export async function createFxAgent(options = {}) {
       },
     });
 
-    const sessionResult = await request("libfx/new");
+    // A journal may name its session; the id stays the same across restores,
+    // so gateway session affinity and caching survive them.
+    const loaded = journal ? journalLoaded(await journal.load()) : null;
+    const requestedSessionId = options.sessionId ?? loaded?.sessionId ?? null;
+    if (loaded?.sessionId && options.sessionId && loaded.sessionId !== options.sessionId) {
+      throw new TypeError("sessionId does not match the journal's session");
+    }
+    const sessionResult = await request("libfx/new", requestedSessionId === null ? {} : { sessionId: requestedSessionId });
     sessionId = sessionResult.sessionId;
     if (initialCheckpoint) {
       const [checkpointAttachment] = attachBytes([initialCheckpoint]);
       await request("libfx/restore", { sessionId, checkpointAttachment });
+    }
+    if (journal) {
+      const { events } = loaded;
+      const params = { sessionId, configHash: await configHashOf(instructions, options.model, hostTools.descriptors) };
+      if (events.length > 0) {
+        const bytes = encoder.encode(JSON.stringify(withoutSupersededProgress(events)));
+        if (bytes.byteLength > maxJournalBytes) throw journalLoadError("libfx journal is too large", "FX_JOURNAL_TOO_LARGE");
+        [params.journalAttachment] = attachBytes([bytes]);
+      }
+      const opened = await request("libfx/journal_open", params).catch((error) => {
+        const message = error?.message ?? "";
+        if (/newer fx/.test(message)) throw new FxJournalVersionError(message);
+        const code = journalOpenErrorCodes.get(message);
+        if (code) throw journalLoadError(message, code, error);
+        throw error;
+      });
+      resumable = opened?.resumable === true;
+      openTurnConfigMismatch = resumable && opened?.configMatches === false;
+      // Follow-ups the journal holds, as accepted; each waits for `resume()`.
+      for (const held of Array.isArray(opened?.followUps) ? opened.followUps : []) {
+        followUps.push({ id: held.id, text: held.text, accepted: true, held: true });
+      }
+      emit("journal.open", { events: events.length, turns: opened?.turns, resumable });
     }
   } catch (error) {
     closing = true;
@@ -1989,12 +2789,91 @@ export async function createFxAgent(options = {}) {
   }
 
   const agent = {
+    // The session's id: for a World session, its run id.
+    get sessionId() {
+      return sessionId;
+    },
     prompt(input, promptOptions = {}) {
       if (closing) throw new Error("fx agent is closed");
+      if (journalFailure) throw reportJournalFailure();
+      if (handedOff) throw handedOffError();
       if (activeTurn) throw new Error("a prompt is already in progress for this session");
+      // A new prompt ends a turn the last process left open as interrupted.
+      resumable = false;
       return normalizeTurn(startTurn(input, promptOptions));
     },
+    /**
+     * Continues the turn the last process left open, with no new input, and
+     * returns it; returns null when the journal holds no open turn. The
+     * model is told the session was interrupted; calls that were running
+     * come back answered as possibly run.
+     */
+    resume(promptOptions = {}) {
+      if (closing) throw new Error("fx agent is closed");
+      if (journalFailure) throw reportJournalFailure();
+      if (handedOff) throw handedOffError();
+      if (activeTurn) throw new Error("a prompt is already in progress for this session");
+      if (resumable) {
+        if (openTurnConfigMismatch) {
+          throw new FxConfigMismatchError("the open turn started under other instructions, tools or model; prompt() ends it as interrupted");
+        }
+        resumable = false;
+        return normalizeTurn(startTurn(null, { ...promptOptions, [resumeTurn]: true }));
+      }
+      // With no open turn, the follow-ups the journal held are the work left.
+      const next = followUps.find((entry) => entry.held);
+      if (!next) return null;
+      let started = null;
+      const resolveTurn = next.resolveTurn;
+      next.resolveTurn = (turn) => {
+        started = turn;
+        resolveTurn?.(turn);
+      };
+      runNextFollowUp(true);
+      return started;
+    },
+    /**
+     * Queues `input` to run as its own turn after the current one, or at once
+     * when no turn is running. Returns a promise for that turn, carrying the
+     * follow-up's `id` and `accepted`, which resolves `{ id }` once a
+     * journal holds it.
+     */
+    followUp(input) {
+      if (closing) return Promise.reject(new Error("fx agent is closed"));
+      if (journalFailure) return Promise.reject(reportJournalFailure());
+      if (handedOff) return Promise.reject(handedOffError());
+      let text;
+      try { text = normalizeSteeringInput(input); } catch (error) { return Promise.reject(error); }
+      const id = `in_${crypto.randomUUID()}`;
+      const entry = { id, text, accepted: false };
+      const started = new Promise((resolve, reject) => { entry.resolveTurn = resolve; entry.rejectTurn = reject; });
+      let accepted;
+      if (journal && activeTurn && typeof runtime.steer !== "function") {
+        // The native core records it now, ahead of the turn that will run it.
+        entry.accepted = true;
+        accepted = request("libfx/follow_up", { sessionId, id, text })
+          .then(() => waitForInput(`accepted:${id}`))
+          .then(() => ({ id }), (error) => {
+            const index = followUps.indexOf(entry);
+            if (index >= 0) followUps.splice(index, 1);
+            entry.rejectTurn(error);
+            throw error;
+          });
+      } else {
+        // Its own turn records it with the first progress, a barrier; it is
+        // accepted once that is stored.
+        accepted = started.then(() => (journal ? waitForInput(`accepted:${id}`) : undefined)).then(() => ({ id }));
+      }
+      followUps.push(entry);
+      void accepted.catch(() => {});
+      queueMicrotask(runNextFollowUp);
+      started.id = id;
+      started.accepted = accepted;
+      return started;
+    },
+    /** Deprecated: pass a `journal` instead. */
     checkpoint() {
+      deprecated("checkpoint");
       // One checkpoint runs at a time: each holds an outbound attachment until
       // it is taken, and the native table holds only a few. An idle call still
       // sends its request before returning, ahead of a later prompt(). The slot
@@ -2011,13 +2890,30 @@ export async function createFxAgent(options = {}) {
       return run;
     },
     async close() {
-      if (closing) { await runtime.exited; return; }
+      if (closing) {
+        await runtime.exited;
+        if (journal) await closeJournal();
+        return;
+      }
       const turn = activeTurn;
       turn?.cancel();
       if (turn) await turn.result.catch(() => {});
       closing = true;
+      // A journal keeps these; the next `resume()` runs them.
+      for (const entry of followUps.splice(0)) entry.rejectTurn?.(new Error("fx agent closed before the follow-up ran"));
       runtime.closeStdin();
       await runtime.exited;
+      // Every append the session started has landed, or close reports why.
+      if (journal) {
+        let failure = null;
+        try {
+          await journalSettled();
+        } catch {
+          if (!journalFailureReported) failure = reportJournalFailure();
+        }
+        await closeJournal();
+        if (failure) throw failure;
+      }
     },
   };
   return agent;
@@ -2068,8 +2964,9 @@ export async function createFxAgent(options = {}) {
     }));
     void result.catch(() => {});
     return {
-      cancel() { rawTurn.cancel(); },
+      cancel(cancelOptions) { rawTurn.cancel(cancelOptions); },
       steer(input) { return rawTurn.steer(normalizeSteeringInput(input)); },
+      withdraw(id) { return rawTurn.withdraw(id); },
       [Symbol.asyncIterator]() {
         const iterator = (async function* () {
           for await (const update of rawTurn) {
@@ -2111,7 +3008,9 @@ export async function createFxAgent(options = {}) {
 
   function startTurn(input, promptOptions) {
     const resizeImage = options.resizeImage;
-    const normalized = normalizePromptInput(input, { deferImageLimits: resizeImage !== undefined });
+    const resuming = promptOptions[resumeTurn] === true;
+    const followUp = promptOptions[followUpInput] ?? null;
+    const normalized = resuming ? [] : normalizePromptInput(input, { deferImageLimits: resizeImage !== undefined });
     const hasPixels = normalized.some((block) => block.type === "image" && block.data !== undefined);
     // Blob reads and resizeImage run before the prompt frame is sent.
     const asyncImages = hasPixels && (resizeImage !== undefined ||
@@ -2138,6 +3037,51 @@ export async function createFxAgent(options = {}) {
     const promptStarted = asyncImages ? new Promise((resolve) => { resolvePromptStart = resolve; }) : null;
     let pendingSteeringCount = 0;
     let pendingSteeringBytes = 0;
+    // This turn's steers: whether each reached the core, or was withdrawn first.
+    const steers = new Map();
+    const withdrawnSteer = (id) => Object.assign(new Error("steer was withdrawn"), { code: "FX_STEER_WITHDRAWN", id });
+    const startSteer = (id, text) => {
+      if (finished || cancelled || activeTurn !== turn) {
+        return Promise.reject(new Error("no prompt is running"));
+      }
+      if (closing) return Promise.reject(coreExitError ?? new Error("fx agent is closing"));
+      const local = { sent: false, withdrawn: false };
+      steers.set(id, local);
+      const apply = () => {
+        if (local.withdrawn) return Promise.resolve({ id, withdrawn: true });
+        if (finished || cancelled || activeTurn !== turn) {
+          return Promise.reject(new Error("no prompt is running"));
+        }
+        if (closing) return Promise.reject(coreExitError ?? new Error("fx agent is closing"));
+        try {
+          local.sent = true;
+          const accepted = () => (journal ? waitForInput(`accepted:${id}`) : Promise.resolve());
+          if (typeof runtime.steer === "function") {
+            runtime.steer(text, id);
+            void turn.push({
+              sessionUpdate: "user_message_chunk",
+              content: { type: "text", text },
+            });
+            // The web core accepts it when it takes it at the next boundary.
+            return accepted().then(() => ({ id }), (error) => (error?.code === "FX_STEER_WITHDRAWN" ? { id, withdrawn: true } : Promise.reject(error)));
+          }
+          return request("libfx/steer", { sessionId, text, id }).then(accepted).then(() => ({ id }));
+        } catch (error) {
+          return Promise.reject(error);
+        }
+      };
+      if (!resolvePromptStart) return apply();
+      const bytes = encoder.encode(text).length;
+      if (pendingSteeringCount >= maxSteeringMessages || bytes > maxSteeringQueueBytes - pendingSteeringBytes) {
+        return Promise.reject(new Error("steering queue is full"));
+      }
+      pendingSteeringCount++;
+      pendingSteeringBytes += bytes;
+      return promptStarted.then((started) => {
+        if (coreExitError && !cancelled) throw coreExitError;
+        return started === true ? apply() : Promise.reject(started instanceof Error ? started : new Error("no prompt is running"));
+      }).finally(() => { pendingSteeringCount--; pendingSteeringBytes -= bytes; });
+    };
     const toolControllers = new Set();
     let finished = false;
     let cancelled = false;
@@ -2171,44 +3115,44 @@ export async function createFxAgent(options = {}) {
         resolvePromptStart?.(true);
         resolvePromptStart = null;
       },
+      // Resolves `{ id }` once the steer is accepted: in a journaled session,
+      // once its acceptance is stored. The promise carries `id` at once.
       steer(text) {
-        if (finished || cancelled || activeTurn !== turn) {
-          return Promise.reject(new Error("no prompt is running"));
-        }
-        if (closing) return Promise.reject(coreExitError ?? new Error("fx agent is closing"));
-        const apply = () => {
-          if (finished || cancelled || activeTurn !== turn) {
-            return Promise.reject(new Error("no prompt is running"));
-          }
-          if (closing) return Promise.reject(coreExitError ?? new Error("fx agent is closing"));
-          try {
-            if (typeof runtime.steer === "function") {
-              runtime.steer(text);
-              void turn.push({
-                sessionUpdate: "user_message_chunk",
-                content: { type: "text", text },
-              });
-              return Promise.resolve();
-            }
-            return request("libfx/steer", { sessionId, text });
-          } catch (error) {
-            return Promise.reject(error);
-          }
-        };
-        if (!resolvePromptStart) return apply();
-        const bytes = encoder.encode(text).length;
-        if (pendingSteeringCount >= maxSteeringMessages || bytes > maxSteeringQueueBytes - pendingSteeringBytes) {
-          return Promise.reject(new Error("steering queue is full"));
-        }
-        pendingSteeringCount++;
-        pendingSteeringBytes += bytes;
-        return promptStarted.then((started) => {
-          if (coreExitError && !cancelled) throw coreExitError;
-          return started === true ? apply() : Promise.reject(started instanceof Error ? started : new Error("no prompt is running"));
-        }).finally(() => { pendingSteeringCount--; pendingSteeringBytes -= bytes; });
+        const id = `in_${crypto.randomUUID()}`;
+        const steered = startSteer(id, text).then((value) => value ?? { id });
+        steered.id = id;
+        return steered;
       },
-      cancel() {
+      // 'withdrawn' when the model never saw the steer, else 'already_placed'.
+      withdraw(id) {
+        const local = steers.get(id);
+        if (!local) return Promise.resolve("already_placed");
+        if (!local.sent) {
+          local.withdrawn = true;
+          return Promise.resolve("withdrawn");
+        }
+        if (typeof runtime.withdrawSteering === "function") {
+          if (!runtime.withdrawSteering(id)) return Promise.resolve("already_placed");
+          local.withdrawn = true;
+          rejectInputWaiters([`accepted:${id}`], withdrawnSteer(id));
+          return Promise.resolve("withdrawn");
+        }
+        return request("libfx/withdraw", { sessionId, id }).then(async (response) => {
+          if (response?.result !== "withdrawn") return "already_placed";
+          if (journal) await waitForInput(`withdrawn:${id}`);
+          return "withdrawn";
+        });
+      },
+      cancel(cancelOptions = {}) {
+        const reason = cancelOptions?.reason;
+        if (reason !== undefined && reason !== "handoff") throw new TypeError('cancel() reason must be "handoff" when given');
+        if (reason === "handoff" && !journal) throw new TypeError("a handoff needs a journal to keep the turn in");
         if (finished || cancelled) return;
+        if (reason === "handoff") {
+          handedOff = true;
+          // The journal keeps queued follow-ups for the next agent.
+          for (const entry of followUps.splice(0)) entry.rejectTurn?.(handedOffError());
+        }
         cancelled = true;
         cancelImagePrep?.();
         cancelImagePrep = null;
@@ -2271,21 +3215,32 @@ export async function createFxAgent(options = {}) {
           resolvePromptStart = null;
           return { stopReason: "cancelled" };
         }
-        return sendPrompt(prepared);
+        return sendPrompt(prepared, false, followUp);
       });
     } else {
-      try { response = sendPrompt(prompt); } catch (error) { response = Promise.reject(error); }
+      try { response = sendPrompt(prompt, resuming, followUp); } catch (error) { response = Promise.reject(error); }
     }
+    // Appends after a turn's first progress are lazy, so the result does not
+    // wait for them; `close()` does. A failure already seen fails the turn.
     turn.result = response
-      .then((value) => ({ stopReason: cancelled ? "cancelled" : value.stopReason, usage: value.usage }))
-      .catch((error) => {
+      .then((value) => {
+        if (journalFailure) throw reportJournalFailure();
+        return { stopReason: cancelled ? "cancelled" : value.stopReason, usage: value.usage };
+      })
+      .catch(async (error) => {
         cancelImagePrep = null;
         rejectImagePrep = null;
         resolvePromptStart?.(error);
         resolvePromptStart = null;
+        // A failed append is why the core stopped, including when the turn
+        // was cancelled because of it; report the host's error.
+        if (journalFailure) {
+          terminalError = reportJournalFailure();
+          throw terminalError;
+        }
         if (cancelled && error.message === "Cancelled") return { stopReason: "cancelled" };
         terminalError = error;
-        throw error;
+        throw terminalError;
       })
       .finally(() => {
         finished = true;
@@ -2293,6 +3248,16 @@ export async function createFxAgent(options = {}) {
         resumeOutput = null;
         signal?.removeEventListener("abort", abort);
         if (activeTurn === turn) activeTurn = null;
+        // A steer still queued when the turn ends never reached the model.
+        if (typeof runtime.withdrawSteering === "function") {
+          const untaken = [...steers.keys()].filter((id) => runtime.withdrawSteering(id));
+          rejectInputWaiters(untaken.map((id) => `accepted:${id}`), new Error("the turn ended before it took the steer"));
+        }
+        for (const id of steers.keys()) {
+          durableInputs.delete(`accepted:${id}`);
+          durableInputs.delete(`withdrawn:${id}`);
+        }
+        queueMicrotask(runNextFollowUp);
         runtime.closeSteering?.();
         toolControllers.clear();
         if (discardedBytes) emit("output.discarded", { reason: "cancelled", bytes: discardedBytes });
