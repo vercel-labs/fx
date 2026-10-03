@@ -22,6 +22,7 @@ fn questionPanelRowCount(
     const entry = projection.current_entry orelse return 1;
     const question_width = questionTextWidth(row_budget);
     var count: usize = 2 + wrappedTextLineCount(entry.question, question_width, question_width);
+    if (projection.child_name != null) count += 1;
     for (entry.options, 0..) |opt, index| {
         count +|= questionOptionLineCount(entry, opt, index, row_budget);
     }
@@ -53,6 +54,8 @@ pub fn composeQuestionPanelText(
     };
 
     // The question is its own header; batch progress lives in the hint row.
+    // A child's questions first say which child asks.
+    if (projection.child_name) |name| try writeQuestionPanelChildTitle(&out.writer, name, row_budget);
     try writeQuestionPanelQuestion(&out.writer, entry.question, row_budget);
     try out.writer.writeByte('\n');
 
@@ -87,6 +90,17 @@ fn writeQuestionPanelQuestion(
         first = false;
         start = line.next_start;
     }
+}
+
+/// One row, clipped to the width. Child names are lowercase ASCII.
+fn writeQuestionPanelChildTitle(writer: *std.Io.Writer, name: []const u8, row_budget: usize) !void {
+    var buffer: [64]u8 = undefined;
+    const title = std.fmt.bufPrint(&buffer, "Subagent {s} asks", .{name}) catch "Subagent asks";
+    try writer.writeAll("  ");
+    try writer.writeAll(ui_render.bold_style);
+    try writer.writeAll(title[0..@min(title.len, questionTextWidth(row_budget))]);
+    try writer.writeAll(ui_render.reset_style);
+    try writer.writeByte('\n');
 }
 
 fn questionTextWidth(row_budget: usize) usize {
@@ -682,6 +696,22 @@ fn expectQuestionPanelRowsMatch(
 
     const measured_rows = try questionPanelRowsForLayout(std.testing.allocator, projection, width);
     try std.testing.expectEqual(serialized_rows, measured_rows);
+}
+
+test "a child's question panel says which child asks" {
+    var prompt = question_prompt.QuestionPrompt{};
+    defer prompt.deinit(std.testing.allocator);
+    const options = [_]types.QuestionOption{ .{ .label = "red" }, .{ .label = "blue" } };
+    const entries = [_]types.QuestionBatchEntry{.{ .question = "Pick a color", .options = &options }};
+    try prompt.syncFromChild(std.testing.allocator, &entries, "a3");
+
+    const text = try composeQuestionPanelText(std.testing.allocator, prompt.projection().?, 80);
+    defer std.testing.allocator.free(text);
+    var start: usize = 0;
+    try std.testing.expect(std.mem.indexOf(u8, nextPanelLine(text, &start), "Subagent a3 asks") != null);
+    try std.testing.expect(std.mem.indexOf(u8, nextPanelLine(text, &start), "Pick a color") != null);
+    try expectQuestionPanelRowsMatch(&prompt, 80);
+    try expectQuestionPanelRowsMatch(&prompt, 8);
 }
 
 test "compose question resolutions emits answered summary block" {

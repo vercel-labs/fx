@@ -160,7 +160,33 @@ pub fn encodeAnswer(gpa: Allocator, answer: Answer, max_line: usize) AnswerError
         }, options, &out.writer),
     };
     written catch return error.OutOfMemory;
-    const json = out.written();
+    return finishLine(gpa, out.written(), max_line);
+}
+
+/// One line carrying the parent's root-user context, without its newline.
+/// The child reviews its own actions against it, since its prompts come from
+/// the parent's model rather than the user. Caller owns it.
+pub fn encodeContext(gpa: Allocator, context: []const u8, max_line: usize) AnswerError![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    std.json.Stringify.value(.{ .kind = "context", .text = context }, .{}, &out.writer) catch return error.OutOfMemory;
+    return finishLine(gpa, out.written(), max_line);
+}
+
+/// The context a context line carries, in `arena`. Null for any other line.
+pub fn parseContext(arena: Allocator, line: []const u8) error{OutOfMemory}!?[]const u8 {
+    const Wire = struct { kind: []const u8, text: ?[]const u8 = null };
+    const wire = std.json.parseFromSliceLeaky(Wire, arena, line, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    if (!std.mem.eql(u8, wire.kind, "context")) return null;
+    return wire.text;
+}
+
+/// Copies `json` into a line the parser accepts: valid UTF-8, at most
+/// `max_line` bytes.
+fn finishLine(gpa: Allocator, json: []const u8, max_line: usize) AnswerError![]u8 {
     const line = if (std.unicode.utf8ValidateSlice(json))
         try gpa.dupe(u8, json)
     else
@@ -521,6 +547,23 @@ test "answers go to the child and back unchanged" {
     }
     try testing.expectError(error.AnswerTooLong, encodeAnswer(testing.allocator, cases[0], 16));
     try testing.expectError(error.InvalidLine, parseAnswer(arena, "{\"kind\":\"permission\",\"prompt\":1,\"decision\":\"maybe\"}"));
+}
+
+test "a context line reaches the child and is never taken for an answer" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const context = "current_request: fix the \"build\"\n";
+    const line = try encodeContext(testing.allocator, context, 16 * 1024);
+    defer testing.allocator.free(line);
+    try testing.expectEqualStrings(context, (try parseContext(arena, line)).?);
+    try testing.expectError(error.InvalidLine, parseAnswer(arena, line));
+
+    const answer = try encodeAnswer(testing.allocator, .{ .prompt = 1, .reply = .{ .questions = null } }, 16 * 1024);
+    defer testing.allocator.free(answer);
+    try testing.expectEqual(@as(?[]const u8, null), try parseContext(arena, answer));
+    try testing.expectEqual(@as(?[]const u8, null), try parseContext(arena, "not json"));
+    try testing.expectError(error.AnswerTooLong, encodeContext(testing.allocator, context, 8));
 }
 
 test "the tracker numbers prompts and takes one answer, for the open prompt only" {

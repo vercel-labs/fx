@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
+const child_agents_runtime = @import("../child_agents/runtime.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
@@ -97,6 +98,7 @@ const ResumeInvocation = struct {
 const resume_id_alias_prefix = "--resume-";
 pub const upgrade_relaunch_arg = "--upgrade-relaunch";
 pub const sessions_v2_arg = "--sessions-v2";
+pub const subagents_v2_arg = "--subagents-v2";
 
 pub const UpgradeRelaunch = struct {
     previous_revision: ?[]u8 = null,
@@ -139,6 +141,8 @@ pub const LaunchModifiers = struct {
     provider_strict_override: ?bool = null,
     /// `--sessions-v2`: keep this process's sessions in the v2 store.
     sessions_v2: bool = false,
+    /// `--subagents-v2`: offer the subagent tool with sub-engine children.
+    subagents_v2: bool = false,
 
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {
         if (self.context_limit_overrides.len > 0) alloc.free(self.context_limit_overrides);
@@ -234,6 +238,9 @@ pub const Config = struct {
     context_registry: context_contract.Registry,
     mode_registry: mode_registry.Registry,
     tool_set: tool_set_contract.ToolSet,
+    /// `tool_set` with the subagent tool of sub-engine children, for
+    /// `--subagents-v2`. Null where that tool is unavailable.
+    subagents_v2_tool_set: ?tool_set_contract.ToolSet = null,
     inspect_mcp_profile_config: mcp_contract.InspectProfileConfigFn,
     inspect_mcp_local_config: mcp_health.InspectLocalConfigFn =
         mcp_health.inspectLocalConfigUnavailable,
@@ -417,11 +424,14 @@ fn parseGlobalLaunchArgs(
     errdefer if (provider_order_override) |order| freeProviderOrderOverride(alloc, order);
     var provider_strict_override: ?bool = null;
     var sessions_v2 = false;
+    var subagents_v2 = false;
 
     var index: usize = 0;
     while (index < args.len) {
         const arg = args[index];
-        if (std.mem.eql(u8, arg, sessions_v2_arg)) {
+        if (std.mem.eql(u8, arg, subagents_v2_arg)) {
+            subagents_v2 = true;
+        } else if (std.mem.eql(u8, arg, sessions_v2_arg)) {
             sessions_v2 = true;
         } else if (std.mem.eql(u8, arg, "--context-limit")) {
             index += 1;
@@ -516,6 +526,7 @@ fn parseGlobalLaunchArgs(
             .provider_order_override = provider_order_override,
             .provider_strict_override = provider_strict_override,
             .sessions_v2 = sessions_v2,
+            .subagents_v2 = subagents_v2,
         },
     };
 }
@@ -554,7 +565,8 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
             !std.mem.eql(u8, arg, "--no-ultrafast") and
             !std.mem.eql(u8, arg, "--provider-strict") and
             !std.mem.eql(u8, arg, "--no-provider-strict") and
-            !std.mem.eql(u8, arg, sessions_v2_arg))
+            !std.mem.eql(u8, arg, sessions_v2_arg) and
+            !std.mem.eql(u8, arg, subagents_v2_arg))
         {
             return args[index..];
         }
@@ -1121,7 +1133,8 @@ fn runNonInteractiveWithDeps(
         },
         .ask => |rest| {
             try writeMcpProfileWarningIfPresent(alloc, cfg, deps);
-            const exit_code = try cli_ask.run(alloc, rest, workflowConfigWithLaunchModifiers(cfg, global_args.modifiers), cfg.context_registry, cfg.tool_set);
+            const ask_cfg = workflowConfigWithLaunchModifiers(cfg, global_args.modifiers);
+            const exit_code = try cli_ask.run(alloc, rest, ask_cfg, cfg.context_registry, askToolSet(cfg, ask_cfg));
             return if (exit_code == 0) .handled_success else .handled_failure;
         },
         .acp => |rest| {
@@ -1157,6 +1170,7 @@ fn runNonInteractiveWithDeps(
                 .model_override = acp_opts.model,
                 .ultrafast_override = acp_opts.ultrafast_override orelse global_args.modifiers.ultrafast_override,
                 .log_file = acp_opts.log_file,
+                .subagents_v2 = child_agents_runtime.enabled(global_args.modifiers.subagents_v2),
             });
             return .handled_success;
         },
@@ -1984,11 +1998,11 @@ fn runGithubWorkflow(
 
     const workflow_cfg = workflowConfigWithLaunchModifiers(cfg, launch_modifiers);
     if (!opts.create) {
-        const exit_code = try cli_ask.runPrompt(alloc, prompt, opts.auto_permission, workflow_cfg, cfg.context_registry, cfg.tool_set);
+        const exit_code = try cli_ask.runPrompt(alloc, prompt, opts.auto_permission, workflow_cfg, cfg.context_registry, askToolSet(cfg, workflow_cfg));
         return if (exit_code == 0) .handled_success else .handled_failure;
     }
 
-    const run_result = try cli_ask.runPromptCapture(alloc, prompt, opts.auto_permission, workflow_cfg, cfg.context_registry, cfg.tool_set);
+    const run_result = try cli_ask.runPromptCapture(alloc, prompt, opts.auto_permission, workflow_cfg, cfg.context_registry, askToolSet(cfg, workflow_cfg));
     defer run_result.deinit(alloc);
     if (run_result.exit_code != 0) return .handled_failure;
 
@@ -3573,7 +3587,15 @@ fn workflowConfigWithLaunchModifiers(
     result.additional_directories = modifiers.additional_directories;
     result.saved_directories_suppressed = modifiers.saved_directories_suppressed;
     result.sessions_v2 = modifiers.sessions_v2;
+    result.subagents_v2 = cfg.subagents_v2_tool_set != null and child_agents_runtime.enabled(modifiers.subagents_v2);
     return result;
+}
+
+/// The tool set an ask run advertises: with the subagent tool of sub-engine
+/// children when its config offers them.
+fn askToolSet(cfg: Config, ask_cfg: @import("cli_ask.zig").Config) tool_set_contract.ToolSet {
+    if (ask_cfg.subagents_v2) return cfg.subagents_v2_tool_set.?;
+    return cfg.tool_set;
 }
 
 fn commandSupportsWorkspaceModifiers(command: Command) bool {

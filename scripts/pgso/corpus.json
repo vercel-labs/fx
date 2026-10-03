@@ -126,6 +126,7 @@
     {"name": "verify-tui-slash-commands", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-slash-commands.test.ts"], "test_file": "tui-slash-commands.test.ts"},
     {"name": "verify-tui-slash-extra", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-slash-extra.test.ts"], "test_file": "tui-slash-extra.test.ts"},
     {"name": "verify-tui-slash-menu", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-slash-menu.test.ts"], "test_file": "tui-slash-menu.test.ts"},
+    {"name": "verify-tui-subagents-v2", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-subagents-v2.test.ts"], "test_file": "tui-subagents-v2.test.ts"},
     {"name": "verify-ultrafast-fake-gateway", "argv": ["bun", "test", "--max-concurrency", "1", "./ultrafast-fake-gateway.test.ts"], "test_file": "ultrafast-fake-gateway.test.ts"},
     {"name": "verify-web-fetch-permission-progress", "argv": ["bun", "test", "--max-concurrency", "1", "./web-fetch-permission-progress.test.ts"], "test_file": "web-fetch-permission-progress.test.ts", "requires_tmux": false},
     {"name": "verify-web-search-permission-progress", "argv": ["bun", "test", "--max-concurrency", "1", "./web-search-permission-progress.test.ts"], "test_file": "web-search-permission-progress.test.ts", "requires_tmux": false},

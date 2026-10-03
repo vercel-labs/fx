@@ -48,6 +48,9 @@ pub const Config = struct {
     home_override: ?[]const u8 = null,
     workspace_root_override: ?[]const u8 = null,
     log_file: ?[]const u8 = null,
+    /// Offer the subagent tool with sub-engine children, launching this fx
+    /// binary. The caller resolves `--subagents-v2` and FX_SUBAGENTS_V2.
+    subagents_v2: bool = false,
     context_limit_overrides: []const config_runtime.context_limits.Override = &.{},
     additional_directories: []const []const u8 = &.{},
     saved_directories_suppressed: bool = false,

@@ -17,6 +17,7 @@ const command_replay_store = @import("../session/command_replay_store.zig");
 const command_runner = @import("../execution/command_runner.zig");
 const managed_execution = @import("../execution/managed_execution.zig");
 const subagent_tool_provider = @import("../subagent/tool_provider.zig");
+const child_agents = @import("../child_agents/runtime.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const web_fetch_runtime = @import("web_fetch_runtime.zig");
 const web_fetch_artifacts = @import("../session/web_fetch_artifacts.zig");
@@ -281,6 +282,9 @@ pub const DispatchContext = struct {
     captured_command_host: command_environment.Host = .native,
     run_command_backend: ?RunCommandBackend = null,
     subagent_provider: ?subagent_tool_provider.Provider = null,
+    /// The children of this fx, for the subagent tool with sub-engine
+    /// children.
+    child_agents: ?child_agents.Host = null,
     vision_provider: ?VisionProvider = null,
     host_tool_provider: ?HostToolProvider = null,
     ask_question_ctx: ?*anyopaque = null,
@@ -421,6 +425,7 @@ pub const RuntimeProviderKind = enum {
     none,
     run_command,
     subagent,
+    child_agents,
     vision,
 };
 

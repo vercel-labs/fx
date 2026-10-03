@@ -68,6 +68,9 @@ pub fn subagentAction(
         else => return null,
     } else outer;
     const action = tool_args.optionalStringArg(args, "action") orelse return null;
+    if (std.meta.stringToEnum(ChildAgentAction, action)) |child_action| {
+        return childAgentAction(alloc, scratch, args, child_action, state);
+    }
     const named = std.mem.eql(u8, action, "message");
     if (!named and !std.mem.eql(u8, action, "run")) return null;
     if (state == .feedback and !named) return null;
@@ -100,6 +103,96 @@ pub fn subagentAction(
     else
         try std.fmt.allocPrint(alloc, "· {s}", .{preview});
     return .{ .label = label, .detail = detail };
+}
+
+/// The actions of the subagent tool that runs each child as a full fx. It
+/// shares the `subagent` name with the run and message tool.
+const ChildAgentAction = enum { launch, send, wait, read, list, stop };
+
+const ChildAgentVerbs = struct {
+    /// Lowercase, as in "Failed to send to c1".
+    base: []const u8,
+    active: []const u8,
+    done: []const u8,
+};
+
+fn childAgentVerbs(action: ChildAgentAction) ChildAgentVerbs {
+    return switch (action) {
+        .launch => .{ .base = "launch", .active = "Launching", .done = "Launched" },
+        .send => .{ .base = "send to", .active = "Sending to", .done = "Sent to" },
+        .wait => .{ .base = "wait on", .active = "Waiting on", .done = "Waited on" },
+        .read => .{ .base = "read", .active = "Reading", .done = "Read" },
+        .list => .{ .base = "list", .active = "Listing", .done = "Listed" },
+        .stop => .{ .base = "stop", .active = "Stopping", .done = "Stopped" },
+    };
+}
+
+/// A row that names the action and the child, such as "Launched c1" with
+/// the task as its detail. Requests without a child name have no row.
+fn childAgentAction(
+    alloc: Allocator,
+    scratch: Allocator,
+    args: std.json.ObjectMap,
+    action: ChildAgentAction,
+    state: SubagentActionState,
+) Allocator.Error!?SubagentAction {
+    const target = switch (action) {
+        .launch, .send, .read, .stop => blk: {
+            const raw = tool_args.optionalStringArg(args, "name") orelse return null;
+            break :blk (try text_utils.encodeTerminalSafe(scratch, raw, 64)).bytes;
+        },
+        .wait => try waitTargets(scratch, args),
+        .list => "subagents",
+    };
+    const raw_detail: []const u8 = switch (action) {
+        .launch => tool_args.optionalStringArg(args, "task") orelse "",
+        .send => tool_args.optionalStringArg(args, "message") orelse "",
+        .read => tool_args.optionalStringArg(args, "what") orelse "",
+        .wait, .list, .stop => "",
+    };
+    const preview = try subagentPreview(scratch, raw_detail);
+    const verbs = childAgentVerbs(action);
+    const label = switch (state) {
+        .identity => try std.fmt.allocPrint(alloc, "{c}{s} {s}", .{ std.ascii.toUpper(verbs.base[0]), verbs.base[1..], target }),
+        .active, .pending => try std.fmt.allocPrint(alloc, "{s} {s}", .{ verbs.active, target }),
+        .completed => try std.fmt.allocPrint(alloc, "{s} {s}", .{ verbs.done, target }),
+        .feedback => return null,
+        .stopped => |reason| if (std.mem.eql(u8, reason, "Failed"))
+            try std.fmt.allocPrint(alloc, "Failed to {s} {s}", .{ verbs.base, target })
+        else
+            try std.fmt.allocPrint(alloc, "{s} {s} {s}", .{ reason, verbs.base, target }),
+    };
+    errdefer alloc.free(label);
+    const detail = if (preview.len == 0)
+        try alloc.dupe(u8, "")
+    else
+        try std.fmt.allocPrint(alloc, "· {s}", .{preview});
+    return .{ .label = label, .detail = detail };
+}
+
+/// The children a wait names: up to three, then a count of the rest.
+fn waitTargets(scratch: Allocator, args: std.json.ObjectMap) Allocator.Error![]const u8 {
+    const shown_names = 3;
+    const names = switch (args.get("names") orelse return "all subagents") {
+        .array => |array| array.items,
+        else => return "all subagents",
+    };
+    if (names.len == 0) return "all subagents";
+    var out: std.Io.Writer.Allocating = .init(scratch);
+    var shown: usize = 0;
+    for (names[0..@min(names.len, shown_names)]) |value| {
+        const raw = switch (value) {
+            .string => |text| text,
+            else => continue,
+        };
+        if (shown > 0) out.writer.writeAll(", ") catch return error.OutOfMemory;
+        const name = try text_utils.encodeTerminalSafe(scratch, raw, 64);
+        out.writer.writeAll(name.bytes) catch return error.OutOfMemory;
+        shown += 1;
+    }
+    if (shown == 0) return "all subagents";
+    if (names.len > shown_names) out.writer.print(" and {d} more", .{names.len - shown_names}) catch return error.OutOfMemory;
+    return out.written();
 }
 
 fn subagentPreview(alloc: Allocator, raw: []const u8) Allocator.Error![]u8 {
@@ -205,6 +298,38 @@ test "subagent rows project request identity state and bounded safe previews" {
     try std.testing.expect(long.len <= 120);
     try std.testing.expect(text_utils.isTerminalSafe(long));
     try std.testing.expect(std.mem.endsWith(u8, long, "..."));
+}
+
+test "child agent rows name the action and the child" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { args: []const u8, state: SubagentActionState, label: []const u8, detail: []const u8 }{
+        .{ .args = "{\"request\":{\"action\":\"launch\",\"name\":\"c1\",\"task\":\" Summarize\\n README.md \"}}", .state = .active, .label = "Launching c1", .detail = "· Summarize README.md" },
+        .{ .args = "{\"action\":\"launch\",\"name\":\"c1\",\"task\":\"Summarize\"}", .state = .completed, .label = "Launched c1", .detail = "· Summarize" },
+        .{ .args = "{\"action\":\"launch\",\"name\":\"c1\",\"task\":\"Summarize\"}", .state = .identity, .label = "Launch c1", .detail = "· Summarize" },
+        .{ .args = "{\"action\":\"send\",\"name\":\"c1\",\"message\":\"Also count lines\"}", .state = .completed, .label = "Sent to c1", .detail = "· Also count lines" },
+        .{ .args = "{\"action\":\"send\",\"name\":\"c1\",\"message\":\"x\"}", .state = .{ .stopped = "Failed" }, .label = "Failed to send to c1", .detail = "· x" },
+        .{ .args = "{\"action\":\"wait\",\"names\":[\"c1\",\"c2\"]}", .state = .active, .label = "Waiting on c1, c2", .detail = "" },
+        .{ .args = "{\"action\":\"wait\",\"names\":[\"a\",\"b\",\"c\",\"d\",\"e\"]}", .state = .completed, .label = "Waited on a, b, c and 2 more", .detail = "" },
+        .{ .args = "{\"action\":\"wait\"}", .state = .completed, .label = "Waited on all subagents", .detail = "" },
+        .{ .args = "{\"action\":\"read\",\"name\":\"c1\",\"what\":\"final\"}", .state = .completed, .label = "Read c1", .detail = "· final" },
+        .{ .args = "{\"action\":\"list\"}", .state = .completed, .label = "Listed subagents", .detail = "" },
+        .{ .args = "{\"action\":\"stop\",\"name\":\"c1\"}", .state = .{ .stopped = "Denied" }, .label = "Denied stop c1", .detail = "" },
+    };
+    for (cases) |case| {
+        const action = (try subagentAction(alloc, .{ .id = "child", .name = "subagent", .arguments_json = case.args }, case.state)).?;
+        defer action.deinit(alloc);
+        try std.testing.expectEqualStrings(case.label, action.label);
+        try std.testing.expectEqualStrings(case.detail, action.detail);
+    }
+    // A row needs the child's name, and delivery feedback belongs to the
+    // message action.
+    for ([_][]const u8{ "{\"action\":\"launch\",\"task\":\"x\"}", "{\"action\":\"stop\",\"name\":5}" }) |args| {
+        try std.testing.expectEqual(@as(?SubagentAction, null), try subagentAction(alloc, .{ .id = "child", .name = "subagent", .arguments_json = args }, .active));
+    }
+    try std.testing.expectEqual(@as(?SubagentAction, null), try subagentAction(alloc, .{ .id = "child", .name = "subagent", .arguments_json = "{\"action\":\"send\",\"name\":\"c1\",\"message\":\"x\"}" }, .{ .feedback = .queued }));
+    const unsafe = (try subagentAction(alloc, .{ .id = "child", .name = "subagent", .arguments_json = "{\"action\":\"wait\",\"names\":[\"a\\u001b[2J\",7]}" }, .active)).?;
+    defer unsafe.deinit(alloc);
+    try std.testing.expect(text_utils.isTerminalSafe(unsafe.label));
 }
 
 test "subagent failure labels trust structured terminal codes only" {

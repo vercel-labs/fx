@@ -85,7 +85,8 @@ pub fn describeToolCall(
 pub fn activeToolSet(state: *const server.ServerState) tool_set_contract.ToolSet {
     if (state.host_tools.tools.len > 0) return state.host_tools.toolSet();
     if (comptime host_target.is_wasm) return tool_set_contract.empty;
-    return if (state.cfg.allow_native_tools) builtin_tools.advertisement_set else tool_set_contract.empty;
+    if (!state.cfg.allow_native_tools) return tool_set_contract.empty;
+    return if (state.child_agents != null) builtin_tools.subagents_v2_set else builtin_tools.advertisement_set;
 }
 
 pub fn activeToolRegistry(state: *const server.ServerState) tool_dispatch.Registry {

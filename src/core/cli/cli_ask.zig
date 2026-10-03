@@ -32,6 +32,8 @@ const image_attachments = @import("../images/image_attachments.zig");
 const hooks = @import("../hooks/hooks.zig");
 const notification_sound = @import("../notifications/sound.zig");
 const io_mod = @import("../shared/io.zig");
+const self_exe = @import("../shared/self_exe.zig");
+const child_agents_runtime = @import("../child_agents/runtime.zig");
 const session_title_generation = @import("../session/session_title_generation.zig");
 const compactor = @import("../compactor/compactor.zig");
 const config_runtime = @import("../config/config_runtime.zig");
@@ -259,6 +261,9 @@ pub const Config = struct {
     saved_directories_suppressed: bool = false,
     /// `fx --sessions-v2 ask`; resolved with FX_SESSIONS_V2 by the adapter.
     sessions_v2: bool = false,
+    /// Offer the subagent tool with sub-engine children. The caller resolves
+    /// the flag and passes the matching tool set.
+    subagents_v2: bool = false,
 };
 
 fn runAskChild(
@@ -611,6 +616,8 @@ const AskContext = struct {
     managed_executions: managed_execution.Runtime,
     ephemeral_command_replay: command_replay_store.EphemeralStore,
     subagent_host: ?*subagent_tool_host.Runtime = null,
+    /// The children of the subagent tool with sub-engine children.
+    child_agents: ?child_agents_runtime.Runtime = null,
     loaded_skills: app_runtime_setup.LoadedSkills = .{},
     store: ?session_store.Store = null,
     writable: ?session_store.LoadedWritableSession = null,
@@ -770,6 +777,8 @@ const AskContext = struct {
     }
 
     fn deinit(self: *AskContext) void {
+        if (self.child_agents) |*children| children.deinit();
+        self.child_agents = null;
         if (self.subagent_host) |subagent_host| subagent_host.deinit();
         self.subagent_host = null;
         if (self.v2_children) |children| {
@@ -1221,6 +1230,7 @@ const AskContext = struct {
             .permission_rules = self.permission_rules,
             .tool_registry = self.toolRegistry(),
             .subagent_host = self.subagent_host,
+            .child_agents = if (self.child_agents) |*children| children else null,
             .subagent_caller_id = self.activeSessionId(),
             .auto_classifier = self.admissionAutoClassifier(),
             .worker = &self.worker,
@@ -1744,6 +1754,11 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     defer if (owned_resumed_model) |model| alloc.free(model);
     var ctx = AskContext.init(alloc, cfg, options.deps, startup.workspace_root);
     defer ctx.deinit();
+    if (cfg.subagents_v2) {
+        const program = try self_exe.pathForPeerReexec(alloc);
+        defer alloc.free(program);
+        ctx.child_agents = try child_agents_runtime.Runtime.init(alloc, io_mod.getIo(), .{ .program = program });
+    }
     if (options.save_session) {
         _ = try ctx.session.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
         ctx.session.attachProfileUsagePublisher(alloc);
@@ -2039,7 +2054,8 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     var tool_projection = try buildAskGatewayToolProjection(alloc, ctx.cfg.mode_registry, options.deps.tool_set, ctx.mode_id, .{
         .permission_mode = ctx.permission_mode,
         .permission_rules = ctx.permission_rules,
-        .subagent_available = ctx.subagent_host != null,
+        .subagent_available = ctx.child_agents != null or
+            (ctx.subagent_host != null and !child_agents_runtime.isChild()),
     }, session_child_capability != null);
     defer tool_projection.deinit(alloc);
 

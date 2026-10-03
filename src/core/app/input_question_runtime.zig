@@ -8,6 +8,8 @@ const input_limit_rejection = @import("../input/input_limit_rejection.zig");
 const question_ui = @import("../../ui/footer/question_ui.zig");
 const question_freeform_layout = @import("../../ui/footer/question_freeform_layout.zig");
 const input_interrupt_runtime = @import("input_interrupt_runtime.zig");
+const child_agents_runtime = @import("../child_agents/runtime.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 
 pub fn QuestionRuntime(comptime App: type) type {
     return struct {
@@ -57,6 +59,7 @@ pub fn QuestionRuntime(comptime App: type) type {
         }
 
         pub fn cancelQuestionPrompt(app: *App) !void {
+            if (try finishChildQuestions(app, null, "cancelled_child")) return;
             const route_recovery = isRouteRecoveryPrompt(app);
             const mcp_elicitation = isMcpElicitationPrompt(app);
             interrupt.traceInterruptRequested(app, "input_question");
@@ -87,6 +90,7 @@ pub fn QuestionRuntime(comptime App: type) type {
             for (app.question_prompt.entries.items) |entry| {
                 labels.appendAssumeCapacity(entry.answer.?);
             }
+            if (try finishChildQuestions(app, labels.items, "answered_child")) return;
             try submitAnswers(app, labels.items);
         }
 
@@ -112,6 +116,21 @@ pub fn QuestionRuntime(comptime App: type) type {
             app.question_prompt.resetAfterSubmission(app.alloc);
             app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
             app.shell.render_requests.request(.modal);
+        }
+
+        /// Answers, or with null cancels, a sub-engine child's questions that
+        /// main shows. Their child's turn goes on, and main's transcript and
+        /// turn are left alone. False when main shows its own questions.
+        fn finishChildQuestions(app: *App, answers: ?[]const []const u8, reason: []const u8) !bool {
+            const children = child_agents_runtime.ofApp(app) orelse return false;
+            if (children.presentedQuestions() == null) return false;
+            children.answerQuestions(answers) catch |err| {
+                debug_trace.logf("child_agents", "child questions answer failed err={s}", .{@errorName(err)});
+            };
+            app.question_prompt.discard(app.alloc, reason);
+            app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
+            app.shell.render_requests.request(.modal);
+            return true;
         }
 
         pub fn rerenderQuestionBlock(app: *App) !void {

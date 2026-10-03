@@ -30,6 +30,7 @@ const execution_router = @import("../execution/router.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const subagent_model_contract = @import("../subagent/model_contract.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
+const child_agents = @import("../child_agents/runtime.zig");
 const subagent_tool_provider = @import("../subagent/tool_provider.zig");
 const session_runtime = @import("../session/session.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
@@ -159,6 +160,8 @@ pub const Context = struct {
     tool_registry: tool_dispatch.Registry = .{},
     host_tool_provider: ?tool_dispatch.HostToolProvider = null,
     subagent_host: ?*subagent_tool_host.Runtime = null,
+    /// The children for the subagent tool with sub-engine children.
+    child_agents: ?*child_agents.Runtime = null,
     subagent_caller_id: ?[]const u8 = null,
     permission_mode: PermissionMode,
     permission_grants: []const PermissionGrant,
@@ -881,6 +884,16 @@ fn executeRegisteredTool(
         .subagent => dispatch_ctx.subagent_provider = .{
             .context = &subagent_provider,
             .execute_fn = executeSubagentProvider,
+        },
+        .child_agents => if (ctx.child_agents) |runtime| {
+            dispatch_ctx.child_agents = .{ .runtime = runtime, .settings = .{
+                .provider = ctx.provider.label(),
+                .model = ctx.model,
+                .effort = ctx.effort.label(),
+                .permission_mode = @tagName(ctx.permission_mode),
+                .cwd = ctx.workspace_root,
+                .root_context = ctx.root_user_intent_context,
+            } };
         },
     }
     dispatch_ctx.mcp_execution_error_sink = &mcp_execution_error;

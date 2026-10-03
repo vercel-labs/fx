@@ -94,6 +94,7 @@ pub const Config = struct {
     context_registry: context_contract.Registry,
     mode_registry: mode_registry.Registry,
     tool_set: tool_set_contract.ToolSet,
+    subagents_v2_tool_set: ?tool_set_contract.ToolSet = null,
     inspect_mcp_profile_config: mcp_contract.InspectProfileConfigFn,
     inspect_mcp_local_config: mcp_health.InspectLocalConfigFn =
         mcp_health.inspectLocalConfigUnavailable,
@@ -499,6 +500,7 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
         .context_registry = cfg.context_registry,
         .mode_registry = cfg.mode_registry,
         .tool_set = cfg.tool_set,
+        .subagents_v2_tool_set = cfg.subagents_v2_tool_set,
         .inspect_mcp_profile_config = cfg.inspect_mcp_profile_config,
         .inspect_mcp_local_config = cfg.inspect_mcp_local_config,
         .load_mcp_runtime = cfg.load_mcp_runtime,

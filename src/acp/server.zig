@@ -4,6 +4,8 @@ const acp_runner = @import("../core/cli/acp_runner.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const io_mod = @import("../core/shared/io.zig");
 const host_target = @import("../core/hosts/target.zig");
+const child_agents_runtime = @import("../core/child_agents/runtime.zig");
+const self_exe = @import("../core/shared/self_exe.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const sessions = @import("sessions.zig");
@@ -323,6 +325,9 @@ pub const ServerState = struct {
     /// A v2 session's children (D22), borrowed by `subagent_host`.
     subagent_v2_children: ?*subagent_child_state.V2Children = null,
     subagent_host: ?*subagent_tool_host.Runtime = null,
+    /// The children of the subagent tool with sub-engine children, when the
+    /// config offers them.
+    child_agents: ?child_agents_runtime.Runtime = null,
     /// Open for the whole connection when sessions are on v2.
     sessions_v2: ?session_adapter.Store = null,
     /// v2 was asked for; with no store, sessions are unavailable rather
@@ -347,6 +352,10 @@ pub const ServerState = struct {
 
     pub fn deinit(self: *ServerState) void {
         reapActivePrompt(self, true);
+        if (comptime !host_target.is_wasm) {
+            if (self.child_agents) |*children| children.deinit();
+            self.child_agents = null;
+        }
         self.managed_executions.deinit();
         self.terminal_client.deinit();
         closeActiveSession(self) catch |err| {
@@ -901,6 +910,11 @@ pub fn runWithTransport(
         .lifecycle_view = lifecycle_view,
     };
     defer state.deinit();
+    if (comptime !host_target.is_wasm) if (cfg.subagents_v2) {
+        const program = try self_exe.pathForPeerReexec(alloc);
+        defer alloc.free(program);
+        state.child_agents = try child_agents_runtime.Runtime.init(alloc, io_mod.getIo(), .{ .program = program });
+    };
     // One backend per process; the wasm host stays on v1.
     if (comptime !host_target.is_wasm) if (session_adapter.enabled(false)) {
         state.sessions_v2_requested = true;

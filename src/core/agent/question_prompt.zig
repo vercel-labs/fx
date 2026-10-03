@@ -103,6 +103,8 @@ pub const Projection = struct {
     current_entry: ?EntryProjection,
     current_index: usize,
     entry_count: usize,
+    /// The sub-engine child that asks, null for main's own questions.
+    child_name: ?[]const u8 = null,
 
     pub fn isFreeformSelected(self: Projection) bool {
         const entry = self.current_entry orelse return false;
@@ -116,6 +118,8 @@ pub const QuestionPrompt = struct {
     active: bool = false,
     entries: std.ArrayList(OwnedQuestionEntry) = .empty,
     current_index: u8 = 0,
+    /// The sub-engine child that asks this batch, null for main's own. Owned.
+    child_name: ?[]u8 = null,
 
     pub fn deinit(self: *QuestionPrompt, alloc: Allocator) void {
         self.discard(alloc, "deinit");
@@ -145,12 +149,14 @@ pub const QuestionPrompt = struct {
             .current_entry = current_entry,
             .current_index = current_index,
             .entry_count = self.entries.items.len,
+            .child_name = self.child_name,
         };
     }
 
     pub fn discard(self: *QuestionPrompt, alloc: Allocator, reason: []const u8) void {
         self.active = false;
         self.current_index = 0;
+        self.clearChildName(alloc);
         for (self.entries.items, 0..) |*entry, entry_index| {
             traceDraftDiscard(entry, entry_index, reason);
             entry.deinit(alloc);
@@ -161,6 +167,7 @@ pub const QuestionPrompt = struct {
     pub fn resetAfterSubmission(self: *QuestionPrompt, alloc: Allocator) void {
         self.active = false;
         self.current_index = 0;
+        self.clearChildName(alloc);
         for (self.entries.items, 0..) |*entry, entry_index| {
             const confirmed_freeform = if (entry.confirmed_choice_index) |choice_index|
                 choice_index < entry.options.items.len and
@@ -194,7 +201,18 @@ pub const QuestionPrompt = struct {
         alloc: Allocator,
         entries: []const types.QuestionBatchEntry,
     ) !void {
-        return self.syncFromOptions(alloc, entries, true);
+        return self.syncFromOptions(alloc, entries, true, null);
+    }
+
+    /// Rebuild the prompt from a sub-engine child's batch, labeled with the
+    /// child's name.
+    pub fn syncFromChild(
+        self: *QuestionPrompt,
+        alloc: Allocator,
+        entries: []const types.QuestionBatchEntry,
+        child_name: []const u8,
+    ) !void {
+        return self.syncFromOptions(alloc, entries, true, child_name);
     }
 
     /// Rebuild the prompt without the synthetic freeform slot.
@@ -203,7 +221,7 @@ pub const QuestionPrompt = struct {
         alloc: Allocator,
         entries: []const types.QuestionBatchEntry,
     ) !void {
-        return self.syncFromOptions(alloc, entries, false);
+        return self.syncFromOptions(alloc, entries, false, null);
     }
 
     fn syncFromOptions(
@@ -211,9 +229,12 @@ pub const QuestionPrompt = struct {
         alloc: Allocator,
         entries: []const types.QuestionBatchEntry,
         append_freeform: bool,
+        child_name: ?[]const u8,
     ) !void {
-        if (self.active and self.matches(entries, append_freeform)) return;
+        if (self.active and self.matches(entries, append_freeform) and sameChild(self.child_name, child_name)) return;
 
+        const name_copy: ?[]u8 = if (child_name) |name| try alloc.dupe(u8, name) else null;
+        errdefer if (name_copy) |copy| alloc.free(copy);
         self.discard(alloc, "prompt_replaced");
         try self.entries.ensureTotalCapacity(alloc, entries.len);
         for (entries) |incoming| {
@@ -264,7 +285,18 @@ pub const QuestionPrompt = struct {
                 .choice_index = if (incoming.submission == .input) @intCast(incoming.options.len) else 0,
             });
         }
+        self.child_name = name_copy;
         self.active = true;
+    }
+
+    fn clearChildName(self: *QuestionPrompt, alloc: Allocator) void {
+        if (self.child_name) |name| alloc.free(name);
+        self.child_name = null;
+    }
+
+    fn sameChild(current: ?[]const u8, incoming: ?[]const u8) bool {
+        if (current == null or incoming == null) return current == null and incoming == null;
+        return std.mem.eql(u8, current.?, incoming.?);
     }
 
     fn matches(self: QuestionPrompt, entries: []const types.QuestionBatchEntry, append_freeform: bool) bool {
@@ -797,6 +829,38 @@ test "question prompt projects only borrowed immutable live state" {
 
     prompt.discard(std.testing.allocator, "test_cleanup");
     try std.testing.expectEqual(@as(?Projection, null), prompt.projection());
+}
+
+test "a child's question batch carries the child's name until main's own replaces it" {
+    const alloc = std.testing.allocator;
+    var prompt = QuestionPrompt{};
+    defer prompt.deinit(alloc);
+    const options = [_]types.QuestionOption{ .{ .label = "red" }, .{ .label = "blue" } };
+    const entries = [_]types.QuestionBatchEntry{.{ .question = "Pick a color", .options = &options }};
+
+    try prompt.syncFromChild(alloc, &entries, "a3");
+    try std.testing.expectEqualStrings("a3", prompt.projection().?.child_name.?);
+    // The same batch from main is a different prompt, not a no-op.
+    try prompt.syncFrom(alloc, &entries);
+    try std.testing.expectEqual(@as(?[]const u8, null), prompt.projection().?.child_name);
+
+    try prompt.syncFromChild(alloc, &entries, "b4");
+    try std.testing.expectEqualStrings("b4", prompt.projection().?.child_name.?);
+    prompt.resetAfterSubmission(alloc);
+    try std.testing.expectEqual(@as(?[]u8, null), prompt.child_name);
+}
+
+fn checkChildQuestionSyncAllocationFailures(alloc: Allocator) !void {
+    var prompt = QuestionPrompt{};
+    defer prompt.deinit(alloc);
+    const options = [_]types.QuestionOption{ .{ .label = "One" }, .{ .label = "Two" } };
+    const entries = [_]types.QuestionBatchEntry{.{ .question = "Choose?", .options = &options }};
+    try prompt.syncFromChild(alloc, &entries, "a3");
+    try prompt.syncFrom(alloc, &entries);
+}
+
+test "a child's question batch frees its name on allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkChildQuestionSyncAllocationFailures, .{});
 }
 
 fn checkQuestionPromptSyncAllocationFailures(alloc: Allocator) !void {

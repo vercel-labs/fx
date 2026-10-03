@@ -8,6 +8,7 @@ const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
 const io_mod = @import("../shared/io.zig");
 const permission_request = @import("../permissions/permission_request.zig");
+const child_agents_runtime = @import("../child_agents/runtime.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const shared_theme = @import("../shared/theme.zig");
 const types = @import("../shared/types.zig");
@@ -705,6 +706,25 @@ pub fn Runtime(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
+        /// Shows the oldest child's questions while main has none of its own.
+        fn presentChildQuestions(app: *App, children: *child_agents_runtime.Runtime) void {
+            if (app.worker.snapshotPendingQuestionBatch(app.alloc) catch return) |own| {
+                own.deinit(app.alloc);
+                return;
+            }
+            var pending = (children.presentQuestions(app.alloc) catch return) orelse return;
+            defer pending.deinit();
+            app.question_prompt.syncFromChild(app.alloc, pending.entries, pending.child_name) catch |err| {
+                children.dropPresentedQuestions();
+                debug_trace.logf("child_agents", "child questions not shown err={s}", .{@errorName(err)});
+                return;
+            };
+            app.shell.render_requests.request(.modal);
+            if (comptime @hasDecl(App, "dispatchAttentionRequired")) {
+                app.dispatchAttentionRequired(app.worker.activeTurnId(), .question);
+            }
+        }
+
         pub fn syncState(
             app: *App,
             presenter: activity_runtime.LifecyclePresenter,
@@ -727,7 +747,17 @@ pub fn Runtime(comptime App: type) type {
             defer if (owned_child_pending) |*pending| pending.deinit(app.alloc);
             const child_pending_request: ?permission_request.PermissionRequest =
                 if (owned_child_pending) |*pending| pending.request.view() else null;
-            const pending_request = worker_pending_request orelse child_pending_request;
+            // A sub-engine child's prompt comes last, and waits while a
+            // question is shown.
+            var owned_sub_engine_pending: ?permission_request.OwnedPermissionRequest =
+                if (worker_pending_request == null and child_pending_request == null and !app.question_prompt.isActive())
+                    if (child_agents_runtime.ofApp(app)) |children| children.pendingPermission(app.alloc) catch null else null
+                else
+                    null;
+            defer if (owned_sub_engine_pending) |*pending| pending.deinit(app.alloc);
+            const sub_engine_pending_request: ?permission_request.PermissionRequest =
+                if (owned_sub_engine_pending) |*pending| pending.view() else null;
+            const pending_request = worker_pending_request orelse child_pending_request orelse sub_engine_pending_request;
             const management_active = if (comptime @hasField(
                 @TypeOf(app.approval_prompt),
                 "rule_management",
@@ -768,13 +798,24 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
 
+            const presented_child_questions = if (child_agents_runtime.ofApp(app)) |children| children.presentedQuestions() else null;
             if (app.question_prompt.isActive()) {
-                if (app.worker.snapshotPendingQuestionBatch(app.alloc) catch return) |question_snapshot| {
+                if (presented_child_questions) |id| {
+                    // Main's own approval comes first; the child's questions
+                    // stay pending and are shown again later.
+                    if (worker_pending_request != null or !child_agents_runtime.ofApp(app).?.ownsPrompt(id)) {
+                        child_agents_runtime.ofApp(app).?.dropPresentedQuestions();
+                        app.question_prompt.discard(app.alloc, "child_prompt_closed");
+                        app.shell.render_requests.request(.modal);
+                    }
+                } else if (app.worker.snapshotPendingQuestionBatch(app.alloc) catch return) |question_snapshot| {
                     question_snapshot.deinit(app.alloc);
                 } else {
                     app.question_prompt.discard(app.alloc, "worker_cleared");
                     app.shell.render_requests.request(.modal);
                 }
+            } else if (!app.approval_prompt.isActive()) {
+                if (child_agents_runtime.ofApp(app)) |children| presentChildQuestions(app, children);
             }
 
             const modal_active = app.approval_prompt.isActive() or app.question_prompt.isActive();
@@ -1078,6 +1119,9 @@ pub fn Runtime(comptime App: type) type {
                         };
                         if (pending_question) |question_snapshot| {
                             defer question_snapshot.deinit(app.alloc);
+                            // Main's own questions replace a child's, which
+                            // is shown again later.
+                            if (child_agents_runtime.ofApp(app)) |children| children.dropPresentedQuestions();
                             const was_active = app.question_prompt.isActive();
                             app.question_prompt.syncFrom(app.alloc, question_snapshot.entries) catch |err| {
                                 try retainClaimedEventAndSuffix(app, &batch, "assistant_text_drain_blocked");

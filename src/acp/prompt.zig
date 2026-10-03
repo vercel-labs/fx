@@ -7,6 +7,7 @@ const credentials = @import("../core/auth/credentials.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
+const child_agents_runtime = @import("../core/child_agents/runtime.zig");
 const session_title_generation = @import("../core/session/session_title_generation.zig");
 const js_host_tools = if (host_target.is_wasm)
     @import("../core/hosts/js_host_tools.zig")
@@ -450,6 +451,7 @@ const AcpContext = struct {
             .permission_reviewer_provider = self.state.cfg.provider_set.select(session.provider).permission_reviewer,
             .auto_classifier = self.auto_classifier,
             .subagent_host = self.state.subagent_host,
+            .child_agents = if (self.state.child_agents) |*children| children else null,
             .subagent_caller_id = session.session_id,
             .worker = &self.state.worker,
             .permission_prompter = if (self.state.initialized) .{
@@ -872,7 +874,8 @@ pub fn handlePrompt(
     var tool_projection = try state.cfg.mode_registry.buildModelToolProjection(alloc, activeToolSet(state), captured_mode, .{
         .permission_mode = captured_permission_mode,
         .permission_rules = session.permission_rules,
-        .subagent_available = state.subagent_host != null,
+        .subagent_available = state.child_agents != null or
+            (state.subagent_host != null and !child_agents_runtime.isChild()),
     });
     defer tool_projection.deinit(alloc);
 

@@ -13,6 +13,7 @@ const app_session_runtime = @import("app_session_runtime.zig");
 const app_render_runtime = @import("app_render_runtime.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const permission_request = @import("../permissions/permission_request.zig");
+const child_agents_runtime = @import("../child_agents/runtime.zig");
 const session = @import("../session/session.zig");
 const interaction_state = @import("../../ui/footer/interaction_state.zig");
 const approval_prompt = @import("../permissions/approval_prompt.zig");
@@ -239,7 +240,7 @@ pub fn ApprovalRuntime(comptime App: type) type {
                 app.alloc,
                 decision,
             );
-            submitWorkerPermissionResponse(app, request_id, response);
+            submitPermissionResponse(app, request_id, response);
         }
 
         /// Applies an answer the parent fx sent for the approval this fx
@@ -265,25 +266,45 @@ pub fn ApprovalRuntime(comptime App: type) type {
                 response.deinit();
                 return true;
             }
-            submitWorkerPermissionResponse(app, request_id, response);
+            submitPermissionResponse(app, request_id, response);
             return true;
         }
 
-        /// Gives `response` to the worker for `request_id`, which takes
-        /// ownership of it, and clears the prompt once the worker accepts.
-        fn submitWorkerPermissionResponse(
+        /// Answers `request_id` with `response`, taking ownership of it: the
+        /// sub-engine child that owns the prompt gets it, otherwise the
+        /// worker does. Clears the prompt once the answer is accepted.
+        fn submitPermissionResponse(
             app: *App,
             request_id: u64,
             response: permission_request.OwnedPermissionResponse,
         ) void {
+            if (child_agents_runtime.ofApp(app)) |children| {
+                if (children.ownsPrompt(request_id)) {
+                    var owned = response;
+                    defer owned.deinit();
+                    const child_decision: @import("../child_agents/labels.zig").Decision = switch (owned.decision) {
+                        .once => .once,
+                        .always => .always,
+                        else => .deny,
+                    };
+                    children.answerPermission(request_id, child_decision, owned.feedback) catch |err| {
+                        debug_trace.logf("child_agents", "approval answer failed request_id={d} err={s}", .{ request_id, @errorName(err) });
+                        return;
+                    };
+                    clearAcceptedApproval(app);
+                    return;
+                }
+            }
             switch (app.worker.submitPermissionResponse(request_id, response)) {
-                .accepted => {
-                    clearApprovalPromptAfterSubmission(app);
-                    app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
-                    requestActiveSurfaceFrame(app);
-                },
+                .accepted => clearAcceptedApproval(app),
                 .stale, .no_pending => {},
             }
+        }
+
+        fn clearAcceptedApproval(app: *App) void {
+            clearApprovalPromptAfterSubmission(app);
+            app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
+            requestActiveSurfaceFrame(app);
         }
 
         fn submitRuleManagementChoice(
@@ -439,6 +460,20 @@ pub fn ApprovalRuntime(comptime App: type) type {
         }
 
         pub fn cancelApprovalOperation(app: *App) !void {
+            // Dismissing a sub-engine child's prompt denies it; the child
+            // goes on.
+            if (app.approval_prompt.request) |request| {
+                if (child_agents_runtime.ofApp(app)) |children| {
+                    if (children.ownsPrompt(request.id)) {
+                        children.answerPermission(request.id, .deny, null) catch |err| {
+                            debug_trace.logf("child_agents", "approval dismissal failed request_id={d} err={s}", .{ request.id, @errorName(err) });
+                        };
+                        clearApprovalPrompt(app, "child_approval_dismissed");
+                        requestActiveSurfaceFrame(app);
+                        return;
+                    }
+                }
+            }
             if (app_session_runtime.Runtime(App).subagentHost(app)) |host| {
                 if (try host.pendingApprovalRequest(app.alloc)) |loaded| {
                     var pending = loaded;

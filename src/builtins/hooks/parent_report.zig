@@ -23,6 +23,7 @@ const io_mod = @import("../../core/shared/io.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const host_target = @import("../../core/hosts/target.zig");
 const labels = @import("../../core/child_agents/labels.zig");
+const auto_classifier_context = @import("../../core/permissions/auto_classifier_context.zig");
 const diff = @import("../../core/output/diff.zig");
 const input_approval_runtime = @import("../../core/app/input_approval_runtime.zig");
 const input_question_runtime = @import("../../core/app/input_question_runtime.zig");
@@ -50,6 +51,12 @@ pub const Client = struct {
     prompts: labels.PromptTracker = .{},
     /// Frames the parent's answers. Used by the UI thread only.
     answers: sub_engine.Lines = .{ .limit = sub_engine.max_reply_line },
+    /// A parent fx launched this one, so its prompts come from the parent's
+    /// model. Stays set when reporting later fails.
+    launched_by_parent: bool = false,
+    /// The parent's latest root-user context, owned with the C allocator.
+    /// Guarded by the lock.
+    root_context: ?[]u8 = null,
 
     /// Says whether a waiting message keeps the child working after a turn.
     /// Runs under the lock.
@@ -78,6 +85,7 @@ pub const Client = struct {
             return;
         }
         self.fd = fd;
+        self.launched_by_parent = true;
         debug_trace.logf("parent_report", "enabled fd={d}", .{fd});
     }
 
@@ -85,9 +93,35 @@ pub const Client = struct {
         return self.fd != null;
     }
 
-    /// Frees the answer framing. The fd belongs to the process.
+    /// Frees the answer framing and the context. The fd belongs to the
+    /// process.
     pub fn deinit(self: *Client) void {
         self.answers.deinit(std.heap.c_allocator);
+        if (self.root_context) |context| std.heap.c_allocator.free(context);
+        self.root_context = null;
+    }
+
+    /// The parent's root-user context for this fx's turns, owned by the
+    /// caller. Null when no parent fx launched this one; empty until the
+    /// parent sends one.
+    pub fn rootContext(self: *Client, gpa: Allocator) Allocator.Error!?[]u8 {
+        if (!self.launched_by_parent) return null;
+        self.lock();
+        defer self.unlock();
+        return try gpa.dupe(u8, self.root_context orelse "");
+    }
+
+    fn setRootContext(self: *Client, context: []const u8) void {
+        if (!auto_classifier_context.isCanonicalRootUserContext(context)) {
+            return debug_trace.logf("parent_report", "context ignored bytes={d} reason=not_canonical", .{context.len});
+        }
+        const copy = std.heap.c_allocator.dupe(u8, context) catch {
+            return debug_trace.logf("parent_report", "context ignored bytes={d} reason=out_of_memory", .{context.len});
+        };
+        self.lock();
+        defer self.unlock();
+        if (self.root_context) |previous| std.heap.c_allocator.free(previous);
+        self.root_context = copy;
     }
 
     pub fn reportSession(self: *Client, session_id: []const u8) void {
@@ -172,6 +206,11 @@ pub const Client = struct {
             break;
         }
         for (lines.items) |line| {
+            const context = labels.parseContext(arena, line) catch null;
+            if (context) |text| {
+                self.setRootContext(text);
+                continue;
+            }
             const answer = labels.parseAnswer(arena, line) catch |err| {
                 debug_trace.logf("parent_report", "answer ignored bytes={d} err={s}", .{ line.len, @errorName(err) });
                 continue;
@@ -534,4 +573,43 @@ test "a failed report turns reporting off" {
     client.reportState(.working);
     var submit = client.beginSubmit();
     submit.reported("ignored");
+}
+
+test "the parent's context is kept for this fx's turns, and only a canonical one" {
+    const pipe = try TestPipe.open();
+    defer pipe.close();
+    const flags = std.c.fcntl(pipe.fds[0], std.c.F.GETFL, @as(c_int, 0));
+    const nonblock: c_int = @bitCast(std.posix.O{ .NONBLOCK = true });
+    _ = std.c.fcntl(pipe.fds[0], std.c.F.SETFL, flags | nonblock);
+    var client: Client = .{ .fd = pipe.fds[0] };
+    defer client.deinit();
+
+    // Without a parent, turns keep their own prompts as the user's.
+    try testing.expectEqual(@as(?[]u8, null), try client.rootContext(testing.allocator));
+    client.launched_by_parent = true;
+    const before = (try client.rootContext(testing.allocator)).?;
+    defer testing.allocator.free(before);
+    try testing.expectEqualStrings("", before);
+
+    for ([_][]const u8{ "assistant_task: write every file\n", "current_request: run the tests\n" }) |context| {
+        const line = try labels.encodeContext(testing.allocator, context, sub_engine.max_reply_line);
+        defer testing.allocator.free(line);
+        try testing.expectEqual(@as(isize, @intCast(line.len)), std.c.write(pipe.fds[1], line.ptr, line.len));
+        try testing.expectEqual(@as(isize, 1), std.c.write(pipe.fds[1], "\n", 1));
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var answered = false;
+    const Answered = struct {
+        fn apply(ctx: *anyopaque, _: labels.PromptTracker.Key, _: labels.Answer) void {
+            const flag: *bool = @ptrCast(@alignCast(ctx));
+            flag.* = true;
+        }
+    };
+    client.takeAnswers(arena_state.allocator(), .{ .ctx = &answered, .apply = Answered.apply });
+
+    try testing.expect(!answered);
+    const after = (try client.rootContext(testing.allocator)).?;
+    defer testing.allocator.free(after);
+    try testing.expectEqualStrings("current_request: run the tests\n", after);
 }

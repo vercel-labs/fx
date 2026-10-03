@@ -17,6 +17,7 @@ const capability_retrieval = @import("../core/tooling/capability_retrieval.zig")
 const permission_gate = @import("../core/permissions/permission_gate.zig");
 const ask_user_question_impl = @import("../tools/agent/ask_user_question.zig");
 const subagent_impl = @import("../tools/agent/subagent.zig");
+const child_agents_impl = @import("../tools/agent/child_agents.zig");
 const vision_impl = @import("../tools/agent/vision.zig");
 const edit_file_impl = @import("../tools/filesystem/edit_file.zig");
 const glob_files_impl = @import("../tools/filesystem/glob_files.zig");
@@ -214,6 +215,49 @@ const subagent_model_request_properties = [_]model_tool_schema.Property{.{
     .json_type = .object,
     .shape = &.{ .object = &subagent_model_action_union },
 }};
+const child_agents_description =
+    "Run up to 10 named fx children, each a full fx in its own hidden terminal in this workspace. launch starts one child and types its task; send types a message into a ready child. Children work in parallel and keep their own sessions. wait blocks until any named child (or any child, when names is omitted) is settled: idle with every message handled, or exited. Only the user answers a child's permission and question prompts. Where this fx shows them on its screen, wait keeps waiting while the user answers; elsewhere wait returns the blocked child. Do not call wait again for a child that stays blocked: stop it, or tell the user. read returns a child's final reply, its messages, or its screen as text. list shows every child; stop closes one and returns its session ID. When to use: split independent work across children, or keep a long task running while you continue. When NOT to use: a single quick lookup you can do yourself. Do not poll with read or list; use wait.";
+
+const child_agents_name_property = model_tool_schema.Property{ .name = "name", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = child_agents_impl.max_name_bytes }, .description = "The child's name: lowercase letters, digits and hyphens, starting with a letter. Unique among running children." };
+
+const child_agents_action_schemas = [_]model_tool_schema.ObjectSchema{
+    .{ .properties = &.{
+        .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"launch"} } },
+        child_agents_name_property,
+        .{ .name = "task", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = child_agents_impl.max_text_bytes }, .description = "The complete task, typed into the child as its first message." },
+        .{ .name = "model", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = child_agents_impl.max_model_bytes }, .description = "Optional model for this child. Inherits this fx's model when omitted." },
+        .{ .name = "effort", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = types.ReasoningEffort.max_name_bytes }, .description = "Optional reasoning effort for this child. Inherits this fx's effort when omitted." },
+    }, .required = &.{ "action", "name", "task" }, .additional_properties = false },
+    .{ .properties = &.{
+        .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"send"} } },
+        child_agents_name_property,
+        .{ .name = "message", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = child_agents_impl.max_text_bytes }, .description = "Typed into the child as its next message. A busy child queues it. A child waiting on a prompt refuses it with blocked." },
+    }, .required = &.{ "action", "name", "message" }, .additional_properties = false },
+    .{ .properties = &.{
+        .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"wait"} } },
+        .{ .name = "names", .json_type = .array, .bounds = &.{ .max_items = 10 }, .shape = &.{ .array_values = .{ .json_type = .string } }, .description = "Children to wait on. Omit to wait on every child." },
+        .{ .name = "timeout_ms", .json_type = .integer, .bounds = &.{ .minimum = 0, .maximum = child_agents_impl.max_wait_ms }, .description = std.fmt.comptimePrint("How long to wait. Defaults to {d}. On timeout the result reports each child's current state.", .{child_agents_impl.default_wait_ms}) },
+    }, .required = &.{"action"}, .additional_properties = false },
+    .{ .properties = &.{
+        .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"read"} } },
+        child_agents_name_property,
+        .{ .name = "what", .json_type = .string, .shape = &.{ .enum_values = &.{ "final", "messages", "screen" } }, .description = "final: the last turn's final reply. messages: what was typed into the child. screen: its terminal as text." },
+    }, .required = &.{ "action", "name", "what" }, .additional_properties = false },
+    .{ .properties = &.{
+        .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"list"} } },
+    }, .required = &.{"action"}, .additional_properties = false },
+    .{ .properties = &.{
+        .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"stop"} } },
+        child_agents_name_property,
+    }, .required = &.{ "action", "name" }, .additional_properties = false },
+};
+
+const child_agents_request_properties = [_]model_tool_schema.Property{.{
+    .name = "request",
+    .json_type = .object,
+    .shape = &.{ .object = &.{ .one_of = &child_agents_action_schemas } },
+}};
+
 const vision_description =
     "Inspect authorized images attached by the user or local image paths supplied in the conversation, and return structured factual evidence. Pass exactly one source: image_ids for attached images, or paths for local images. When to use: read visible text, UI state, objects, layout, or other visual details needed for the task. When NOT to use: inspect paths the user did not supply, infer details not visible in an image, or repeat evidence already available in the conversation.";
 const read_tool_result_description =
@@ -630,6 +674,36 @@ pub const subagent = ToolSpec{
     .irreversible_fn = subagent_impl.isIrreversible,
 };
 
+/// The subagent tool with sub-engine children, which `--subagents-v2` offers
+/// in place of `subagent`.
+pub const child_agents = ToolSpec{
+    .name = "subagent",
+    .description = child_agents_description,
+    .model_schema = .{
+        .name = "subagent",
+        .description = child_agents_description,
+        .input_schema = .{
+            .properties = &child_agents_request_properties,
+            .required = &.{"request"},
+            .additional_properties = false,
+        },
+    },
+    .executor_kind = .subagent,
+    .activity_kind = .subagent,
+    .requires_approval = false,
+    .action_label = "Managing",
+    .completed_action_label = "Managed",
+    .label_arg_kind = .none,
+    .label_arg_default = "subagents",
+    .permission_target_kind = .none,
+    .decode = child_agents_impl.decode,
+    .validate = child_agents_impl.validate,
+    .call = child_agents_impl.call,
+    .runtime_provider = .child_agents,
+    .reads_only_fn = child_agents_impl.readsOnly,
+    .irreversible_fn = child_agents_impl.isIrreversible,
+};
+
 pub const mcp_select_tool = ToolSpec{
     .name = "mcp_select_tool",
     .internal = true,
@@ -893,6 +967,22 @@ pub fn isReadOnlyToolName(name: []const u8) bool {
 
 pub const advertisement_set = tool_set_contract.ToolSet{
     .registry = registry,
+    .order = advertisement_order[0..],
+    .read_only_tool_names = read_only_tool_names[0..],
+};
+
+/// `all` with the subagent tool of sub-engine children in place of
+/// `subagent`.
+const all_subagents_v2 = blk: {
+    var tools = all;
+    for (&tools) |*tool| {
+        if (std.mem.eql(u8, tool.name, "subagent")) tool.* = child_agents;
+    }
+    break :blk tools;
+};
+
+pub const subagents_v2_set = tool_set_contract.ToolSet{
+    .registry = .{ .tools = all_subagents_v2[0..] },
     .order = advertisement_order[0..],
     .read_only_tool_names = read_only_tool_names[0..],
 };
