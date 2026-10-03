@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
+const git_command = @import("git_command.zig");
 const ignored_dirs = @import("ignored_dirs.zig");
 const io_mod = @import("../shared/io.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
@@ -51,7 +52,7 @@ pub const DirectoryResult = struct {
 };
 
 pub fn discover(arena: Allocator, workspace_root: []const u8, options: Options) !Result {
-    return discoverWithStop(arena, workspace_root, options, null, trustedGitExecutable());
+    return discoverWithStop(arena, workspace_root, options, null, git_command.trustedExecutable());
 }
 
 pub fn discoverCancellable(
@@ -60,7 +61,7 @@ pub fn discoverCancellable(
     options: Options,
     stop_requested: *std.atomic.Value(bool),
 ) !Result {
-    return discoverWithStop(arena, workspace_root, options, stop_requested, trustedGitExecutable());
+    return discoverWithStop(arena, workspace_root, options, stop_requested, git_command.trustedExecutable());
 }
 
 pub fn discoverDirectoriesCancellable(
@@ -69,7 +70,7 @@ pub fn discoverDirectoriesCancellable(
     options: Options,
     stop_requested: *std.atomic.Value(bool),
 ) !DirectoryResult {
-    return discoverDirectoriesWithStop(arena, workspace_root, options, stop_requested, trustedGitExecutable());
+    return discoverDirectoriesWithStop(arena, workspace_root, options, stop_requested, git_command.trustedExecutable());
 }
 
 fn discoverWithStop(
@@ -176,20 +177,25 @@ fn hasGitMetadata(alloc: Allocator, workspace_root: []const u8) !bool {
     return false;
 }
 
-fn gitTrackedFilesArgv(git_executable: []const u8) [5][]const u8 {
-    return .{ git_executable, "--no-optional-locks", "ls-files", "-z", "--cached" };
+const tracked_files_args = [_][]const u8{ "ls-files", "-z", "--cached" };
+const tracked_and_other_files_args = [_][]const u8{ "ls-files", "-z", "--cached", "--others", "--exclude-standard" };
+const other_files_args = [_][]const u8{ "ls-files", "-z", "--others", "--exclude-standard" };
+const ignored_directories_args = [_][]const u8{ "ls-files", "-z", "--others", "--ignored", "--directory", "--exclude-standard" };
+
+fn gitTrackedFilesArgv(git_executable: []const u8) git_command.Argv(tracked_files_args.len) {
+    return git_command.argv(git_executable, &tracked_files_args);
 }
 
-fn gitTrackedAndOtherFilesArgv(git_executable: []const u8) [7][]const u8 {
-    return .{ git_executable, "--no-optional-locks", "ls-files", "-z", "--cached", "--others", "--exclude-standard" };
+fn gitTrackedAndOtherFilesArgv(git_executable: []const u8) git_command.Argv(tracked_and_other_files_args.len) {
+    return git_command.argv(git_executable, &tracked_and_other_files_args);
 }
 
-fn gitOtherFilesArgv(git_executable: []const u8) [6][]const u8 {
-    return .{ git_executable, "--no-optional-locks", "ls-files", "-z", "--others", "--exclude-standard" };
+fn gitOtherFilesArgv(git_executable: []const u8) git_command.Argv(other_files_args.len) {
+    return git_command.argv(git_executable, &other_files_args);
 }
 
-fn gitIgnoredDirectoriesArgv(git_executable: []const u8) [8][]const u8 {
-    return .{ git_executable, "--no-optional-locks", "ls-files", "-z", "--others", "--ignored", "--directory", "--exclude-standard" };
+fn gitIgnoredDirectoriesArgv(git_executable: []const u8) git_command.Argv(ignored_directories_args.len) {
+    return git_command.argv(git_executable, &ignored_directories_args);
 }
 
 fn gitRawList(
@@ -229,9 +235,12 @@ fn runGitRawList(
     stdout_limit: usize,
     stop_requested: ?*std.atomic.Value(bool),
 ) ![]u8 {
+    var environment = try git_command.readOnlyEnvironment(arena, null);
+    defer environment.deinit();
     const run_options: std.process.RunOptions = .{
         .argv = argv,
         .cwd = .{ .path = workspace_root },
+        .environ_map = &environment,
         .stdout_limit = std.Io.Limit.limited(stdout_limit),
         .stderr_limit = std.Io.Limit.limited(1024),
     };
@@ -255,28 +264,6 @@ fn runGitRawList(
             return error.GitFileListFailed;
         },
     }
-}
-
-fn trustedGitExecutable() ?[]const u8 {
-    const candidates = switch (builtin.os.tag) {
-        .windows => &[_][]const u8{
-            "C:\\Program Files\\Git\\cmd\\git.exe",
-            "C:\\Program Files\\Git\\bin\\git.exe",
-        },
-        else => &[_][]const u8{
-            "/usr/bin/git",
-            "/bin/git",
-            "/usr/local/bin/git",
-            "/opt/homebrew/bin/git",
-            "/opt/local/bin/git",
-            "/run/current-system/sw/bin/git",
-        },
-    };
-    for (candidates) |candidate| {
-        const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), candidate, .{ .follow_symlinks = true }) catch continue;
-        if (stat.kind == .file) return candidate;
-    }
-    return null;
 }
 
 fn runCancellable(
@@ -635,50 +622,52 @@ fn containsPath(files: []const []const u8, needle: []const u8) bool {
     return false;
 }
 
+fn expectHardenedGitArgv(expected_tail: []const []const u8, argv: []const []const u8) !void {
+    const tail_start = 1 + git_command.global_options.len;
+    try std.testing.expectEqualStrings("git", argv[0]);
+    try std.testing.expectEqualSlices([]const u8, &git_command.global_options, argv[1..tail_start]);
+    try std.testing.expectEqual(expected_tail.len, argv.len - tail_start);
+    for (expected_tail, argv[tail_start..]) |want, got| try std.testing.expectEqualStrings(want, got);
+}
+
 test "workspace file provider tracked git argv uses nul-separated cached files" {
     const argv = gitTrackedFilesArgv("git");
-
-    try std.testing.expectEqualStrings("git", argv[0]);
-    try std.testing.expectEqualStrings("--no-optional-locks", argv[1]);
-    try std.testing.expectEqualStrings("ls-files", argv[2]);
-    try std.testing.expectEqualStrings("-z", argv[3]);
-    try std.testing.expectEqualStrings("--cached", argv[4]);
+    try expectHardenedGitArgv(&.{ "ls-files", "-z", "--cached" }, &argv);
 }
 
 test "workspace file provider optional untracked git argv includes exclude-standard" {
     const argv = gitTrackedAndOtherFilesArgv("git");
-
-    try std.testing.expectEqualStrings("git", argv[0]);
-    try std.testing.expectEqualStrings("--no-optional-locks", argv[1]);
-    try std.testing.expectEqualStrings("ls-files", argv[2]);
-    try std.testing.expectEqualStrings("-z", argv[3]);
-    try std.testing.expectEqualStrings("--cached", argv[4]);
-    try std.testing.expectEqualStrings("--others", argv[5]);
-    try std.testing.expectEqualStrings("--exclude-standard", argv[6]);
+    try expectHardenedGitArgv(&.{ "ls-files", "-z", "--cached", "--others", "--exclude-standard" }, &argv);
 }
 
 test "workspace file provider untracked git argv uses others exclude-standard" {
     const argv = gitOtherFilesArgv("git");
-
-    try std.testing.expectEqualStrings("git", argv[0]);
-    try std.testing.expectEqualStrings("--no-optional-locks", argv[1]);
-    try std.testing.expectEqualStrings("ls-files", argv[2]);
-    try std.testing.expectEqualStrings("-z", argv[3]);
-    try std.testing.expectEqualStrings("--others", argv[4]);
-    try std.testing.expectEqualStrings("--exclude-standard", argv[5]);
+    try expectHardenedGitArgv(&.{ "ls-files", "-z", "--others", "--exclude-standard" }, &argv);
 }
 
 test "workspace directory provider asks Git only for ignored directory roots" {
     const argv = gitIgnoredDirectoriesArgv("git");
+    try expectHardenedGitArgv(&.{ "ls-files", "-z", "--others", "--ignored", "--directory", "--exclude-standard" }, &argv);
+}
 
-    try std.testing.expectEqualStrings("git", argv[0]);
-    try std.testing.expectEqualStrings("--no-optional-locks", argv[1]);
-    try std.testing.expectEqualStrings("ls-files", argv[2]);
-    try std.testing.expectEqualStrings("-z", argv[3]);
-    try std.testing.expectEqualStrings("--others", argv[4]);
-    try std.testing.expectEqualStrings("--ignored", argv[5]);
-    try std.testing.expectEqualStrings("--directory", argv[6]);
-    try std.testing.expectEqualStrings("--exclude-standard", argv[7]);
+test "workspace discovery does not run programs named by repository config" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const trap = try git_command.createTrapRepositoryForTest(alloc, &tmp);
+    defer trap.deinit(alloc);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var stop_requested = std.atomic.Value(bool).init(false);
+    const options: Options = .{ .include_hidden = true, .include_untracked = true, .git_worktree_is_authoritative = true };
+
+    const files = try discoverCancellable(arena_state.allocator(), trap.root, options, &stop_requested);
+    try std.testing.expectEqual(Source.git, files.source);
+    try std.testing.expect(containsPath(files.files, "tracked.txt"));
+    const directories = try discoverDirectoriesCancellable(arena_state.allocator(), trap.root, options, &stop_requested);
+    try std.testing.expectEqual(Source.git, directories.source);
+    try std.testing.expect(!trap.markerExists());
 }
 
 test "workspace directory provider parses only ignored directory entries" {

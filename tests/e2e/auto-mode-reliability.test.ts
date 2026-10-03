@@ -983,6 +983,244 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
+    "read-only git inspection does not run programs named by repository config",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.root, "repository-program-ran");
+      const hooks = join(root.root, "repository-hooks");
+      mkdirSync(hooks, { recursive: true });
+      const hook = join(hooks, "post-index-change");
+      writeFileSync(hook, `#!/bin/sh\necho hook >> ${JSON.stringify(marker)}\n`);
+      chmodSync(hook, 0o755);
+      runGit(root.workspace, ["init", "--quiet", "--initial-branch=main"]);
+      writeFileSync(join(root.workspace, ".gitattributes"), "*.txt filter=trap\n");
+      writeFileSync(join(root.workspace, "tracked.txt"), "tracked\n");
+      runGit(root.workspace, ["add", "."]);
+      runGit(root.workspace, [
+        "-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
+        "commit", "--quiet", "-m", "initial",
+      ]);
+      const settings: Array<[string, string]> = [
+        ["core.fsmonitor", `echo fsmonitor >> ${JSON.stringify(marker)}; false`],
+        ["core.hooksPath", hooks],
+        ["filter.trap.clean", `sh -c 'echo filter >> ${JSON.stringify(marker)}; cat'`],
+        ["filter.trap.required", "true"],
+      ];
+      for (const [key, value] of settings) runGit(root.workspace, ["config", key, value]);
+
+      // Exercise both traps with unprotected reads before checking fx.
+      writeFileSync(join(root.workspace, "tracked.txt"), "changed for control\n");
+      runGit(root.workspace, ["status", "--short"]);
+      expect(readFileSync(marker, "utf8")).toContain("fsmonitor");
+      runGit(root.workspace, ["-c", "core.fsmonitor=", "diff", "--stat"]);
+      expect(readFileSync(marker, "utf8")).toContain("filter");
+      rmSync(marker);
+      writeFileSync(join(root.workspace, "tracked.txt"), "changed for fx\n");
+
+      const gateway = startGateway([
+        cleanCommandCall("git status --short", "inspect_status"),
+        cleanCommandCall("git diff --stat", "inspect_diff"),
+        cleanCommandCall("git log --oneline", "inspect_log"),
+        (body) => {
+          expect(toolResultText(body, "inspect_log")).toContain("initial");
+          return fakeGatewayFinalText("inspection complete");
+        },
+      ]);
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Inspect the repository."],
+        {
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway),
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(result.stdout).toContain("inspection complete");
+      const calls = JSON.parse(result.stdout.trim()).tool_calls as Array<{
+        command_result?: { command: string; exit_code: number };
+      }>;
+      expect(calls.map((call) => [call.command_result?.command, call.command_result?.exit_code])).toEqual([
+        ["git status --short", 0], ["git diff --stat", 0], ["git log --oneline", 0],
+      ]);
+      expect(gateway.classifierRequests).toHaveLength(0);
+      expect(existsSync(marker)).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "read-only git log ignores a repository pretty format that verifies signatures",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.root, "signature-program-ran");
+      const verifier = join(root.root, "signature-verifier");
+      writeFileSync(verifier, `#!/bin/sh\necho verified >> ${JSON.stringify(marker)}\nexit 1\n`);
+      chmodSync(verifier, 0o755);
+      runGit(root.workspace, ["init", "--quiet", "--initial-branch=main"]);
+      runGit(root.workspace, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.com", "commit", "--quiet", "--allow-empty", "-m", "initial"]);
+      const tree = runGit(root.workspace, ["rev-parse", "HEAD^{tree}"]).trim();
+      const parent = runGit(root.workspace, ["rev-parse", "HEAD"]).trim();
+      const raw = join(root.root, "signed-commit");
+      writeFileSync(raw, [
+        `tree ${tree}`, `parent ${parent}`,
+        "author Fixture <fixture@example.com> 1700000000 +0000",
+        "committer Fixture <fixture@example.com> 1700000000 +0000",
+        "gpgsig -----BEGIN PGP SIGNATURE-----",
+        " ", " -----END PGP SIGNATURE-----", "", "signed fixture", "",
+      ].join("\n"));
+      const signed = runGit(root.workspace, ["hash-object", "-t", "commit", "-w", raw]).trim();
+      runGit(root.workspace, ["update-ref", "HEAD", signed]);
+      runGit(root.workspace, ["config", "format.pretty", "format:%h %G? %s"]);
+      runGit(root.workspace, ["config", "gpg.program", verifier]);
+
+      // The old pinned log argv still runs the repo-selected verifier.
+      runGit(root.workspace, ["--no-pager", "-c", "core.fsmonitor=", "log", "--no-show-signature", "-n", "3"]);
+      expect(readFileSync(marker, "utf8")).toContain("verified");
+      rmSync(marker);
+
+      const gateway = startGateway([cleanCommandCall("git log -n 3", "inspect_log"), fakeGatewayFinalText("log done")]);
+      const result = await runFx(["ask", "--quiet", "--json", "--no-save", "Inspect the recent commits."], {
+        cwd: root.workspace, env: gatewayEnv(root, gateway), timeoutMs: TIMEOUT,
+      });
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(JSON.parse(result.stdout.trim()).tool_calls[0]?.command_result?.exit_code).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(0);
+      expect(existsSync(marker)).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "read-only git diff cannot launch a submodule's external diff program",
+    async () => {
+      const root = createIsolatedRoot();
+      const sub = join(root.root, "source-submodule");
+      mkdirSync(sub);
+      runGit(sub, ["init", "--quiet", "--initial-branch=main"]);
+      writeFileSync(join(sub, "sub.txt"), "first\n");
+      runGit(sub, ["add", "sub.txt"]);
+      runGit(sub, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.com", "commit", "--quiet", "-m", "first"]);
+      runGit(root.workspace, ["init", "--quiet", "--initial-branch=main"]);
+      runGit(root.workspace, ["-c", "protocol.file.allow=always", "submodule", "add", "--quiet", sub, "sub"]);
+      runGit(root.workspace, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.com", "commit", "--quiet", "-am", "add submodule"]);
+      const nested = join(root.workspace, "sub");
+      writeFileSync(join(nested, "sub.txt"), "second\n");
+      runGit(nested, ["add", "sub.txt"]);
+      runGit(nested, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.com", "commit", "--quiet", "-m", "second"]);
+      const marker = join(root.root, "nested-diff-program-ran");
+      const driver = join(root.root, "nested-diff-driver");
+      writeFileSync(driver, `#!/bin/sh\necho nested-diff >> ${JSON.stringify(marker)}\n`);
+      chmodSync(driver, 0o755);
+      runGit(root.workspace, ["config", "diff.submodule", "diff"]);
+      runGit(nested, ["config", "diff.external", driver]);
+
+      runGit(root.workspace, ["--no-pager", "--no-optional-locks", "diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=dirty"]);
+      expect(readFileSync(marker, "utf8")).toContain("nested-diff");
+      rmSync(marker);
+
+      const gateway = startGateway([cleanCommandCall("git diff", "inspect_diff"), fakeGatewayFinalText("diff done")]);
+      const result = await runFx(["ask", "--quiet", "--json", "--no-save", "Inspect the submodule change."], {
+        cwd: root.workspace, env: gatewayEnv(root, gateway), timeoutMs: TIMEOUT,
+      });
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(JSON.parse(result.stdout.trim()).tool_calls[0]?.command_result?.exit_code).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(0);
+      expect(existsSync(marker)).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "read-only git diff does not run repository text converters or external diff programs",
+    async () => {
+      for (const kind of ["textconv", "external"] as const) {
+        const root = createIsolatedRoot();
+        const marker = join(root.root, `${kind}-program-ran`);
+        const driver = join(root.root, `${kind}-driver`);
+        writeFileSync(driver, `#!/bin/sh\necho ${kind} >> ${JSON.stringify(marker)}\ncat "$1"\n`);
+        chmodSync(driver, 0o755);
+        runGit(root.workspace, ["init", "--quiet", "--initial-branch=main"]);
+        writeFileSync(join(root.workspace, ".gitattributes"), "*.txt diff=trap\n");
+        writeFileSync(join(root.workspace, "tracked.txt"), "first\n");
+        runGit(root.workspace, ["add", "."]);
+        runGit(root.workspace, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.com", "commit", "--quiet", "-m", "initial"]);
+        writeFileSync(join(root.workspace, "tracked.txt"), "second\n");
+        runGit(root.workspace, ["config", kind === "textconv" ? "diff.trap.textconv" : "diff.external", driver]);
+
+        // Both controls run on ordinary diff, not just a hypothetical flag.
+        runGit(root.workspace, ["diff"]);
+        expect(readFileSync(marker, "utf8")).toContain(kind);
+        rmSync(marker);
+
+        const gateway = startGateway([cleanCommandCall("git diff", "inspect_diff"), fakeGatewayFinalText("diff done")]);
+        const result = await runFx(["ask", "--quiet", "--json", "--no-save", "Inspect the change."], {
+          cwd: root.workspace, env: gatewayEnv(root, gateway), timeoutMs: TIMEOUT,
+        });
+        expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+        expect(JSON.parse(result.stdout.trim()).tool_calls[0]?.command_result?.exit_code).toBe(0);
+        expect(gateway.classifierRequests).toHaveLength(0);
+        expect(existsSync(marker)).toBe(false);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "read-only git inspection cannot fetch a missing blob through repository transport config",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.root, "lazy-fetch-program-ran");
+      const driver = join(root.root, "transport-driver");
+      writeFileSync(driver, `#!/bin/sh\necho transport >> ${JSON.stringify(marker)}\nexit 1\n`);
+      chmodSync(driver, 0o755);
+      runGit(root.workspace, ["init", "--quiet", "--initial-branch=main"]);
+      writeFileSync(join(root.workspace, "tracked.txt"), "blob that will go missing\n");
+      runGit(root.workspace, ["add", "tracked.txt"]);
+      runGit(root.workspace, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.com", "commit", "--quiet", "-m", "missing blob"]);
+      const oid = runGit(root.workspace, ["hash-object", "tracked.txt"]).trim();
+      runGit(root.workspace, ["config", "remote.origin.url", "ssh://example.invalid/no-repo.git"]);
+      runGit(root.workspace, ["config", "remote.origin.promisor", "true"]);
+      runGit(root.workspace, ["config", "core.sshCommand", driver]);
+      rmSync(join(root.workspace, ".git", "objects", oid.slice(0, 2), oid.slice(2)));
+
+      const control = Bun.spawnSync(["/usr/bin/git", "log", "--stat"], {
+        cwd: root.workspace,
+        env: { ...process.env, GIT_ALLOW_PROTOCOL: "ssh", GIT_NO_LAZY_FETCH: "0" },
+        stdout: "pipe", stderr: "pipe",
+      });
+      expect(control.exitCode).not.toBe(0);
+      expect(readFileSync(marker, "utf8")).toContain("transport");
+      rmSync(marker);
+
+      const gateway = startGateway([
+        cleanCommandCall("git log --stat", "inspect_log"), fakeGatewayFinalText("log done"),
+        fakeGatewayToolCall("search", "grep_files", { pattern: "blob" }), fakeGatewayFinalText("search done"),
+        fakeGatewayFinalText("drafted"),
+      ]);
+      const environment = gatewayEnv(root, gateway);
+      const result = await runFx(["ask", "--quiet", "--json", "--no-save", "Inspect the missing blob."], {
+        cwd: root.workspace, env: environment, timeoutMs: TIMEOUT,
+      });
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      const executed = JSON.parse(result.stdout.trim()).tool_calls[0]?.command_result;
+      expect(executed?.command).toBe("git log --stat");
+      expect(typeof executed?.exit_code).toBe("number");
+      const searched = await runFx(["ask", "--quiet", "--json", "--no-save", "Search tracked files."], {
+        cwd: root.workspace, env: environment, timeoutMs: TIMEOUT,
+      });
+      expect(searched.code, searched.stderr).toBe(0);
+      expect(JSON.parse(searched.stdout.trim()).tool_calls[0]?.name).toBe("grep_files");
+      const drafted = await runFx(["pr"], { cwd: root.workspace, env: environment, timeoutMs: TIMEOUT });
+      expect(drafted.code, drafted.stderr).toBe(0);
+      expect(drafted.stdout).toContain("drafted");
+      expect(gateway.classifierRequests).toHaveLength(0);
+      expect(existsSync(marker)).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "git pull post-merge hook remains reviewer owned",
     async () => {
       const root = createIsolatedRoot();
