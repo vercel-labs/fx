@@ -217,7 +217,8 @@ function startAuthFixture(
     slackBridgeClientId?: string;
     slackBridgeStatus?: number;
     slackBridgeScopes?: unknown;
-    challengeScope?: string;
+    challengeScope?: string | null;
+    metadataScopes?: string[];
     rejectCodeExchange?: boolean;
     resourceAtOrigin?: boolean;
   } = {},
@@ -283,7 +284,7 @@ function startAuthFixture(
           return new Response("", {
             status: 401,
             headers: {
-              "www-authenticate": options.omitScopes
+              "www-authenticate": options.omitScopes || options.challengeScope === null
                 ? `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource${resourcePath}"`
                 : `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource${resourcePath}", scope="${options.challengeScope ?? "tools.read"}"`,
             },
@@ -450,7 +451,7 @@ function startAuthFixture(
           ],
           ...(options.omitScopes
             ? {}
-            : { scopes_supported: ["tools.read", "tools.call", "offline_access"] }),
+            : { scopes_supported: options.metadataScopes ?? ["tools.read", "tools.call", "offline_access"] }),
         });
       }
       if (url.pathname === "/.well-known/oauth-authorization-server") {
@@ -1169,7 +1170,15 @@ describe("MCP remote authentication lifecycle", () => {
     }, 20_000);
   }
 
-  for (const scopes of [undefined, [], [""], ["tools.read im:history"], ["bad<scope"], ["x".repeat(257)]]) {
+  for (const scopes of [
+    undefined,
+    [],
+    [""],
+    ["tools.read im:history"],
+    ["bad<scope"],
+    ["x".repeat(257)],
+    Array.from({ length: 65 }, (_, index) => `tools.read.${index}`),
+  ]) {
     test(`personal Slack rejects invalid shared scopes: ${JSON.stringify(scopes)}`, async () => {
       upstream = startModernMcpHttpFixture("json");
       auth = startAuthFixture(upstream.url, { slackBridgeClientId: FX_SLACK_CLIENT_ID, slackBridgeScopes: scopes });
@@ -1401,6 +1410,51 @@ describe("MCP remote authentication lifecycle", () => {
     expect(existsSync(credentialPath)).toBe(false);
     expect(auth.revocations).toBe(2);
   }, 30_000);
+
+  for (const source of ["challenge", "metadata"] as const) {
+    test(`MCP OAuth accepts more than 64 scopes from ${source}`, async () => {
+      const scopes = Array.from({ length: 128 }, (_, index) => `tools.read.${index}`);
+      upstream = startModernMcpHttpFixture("json");
+      auth = startAuthFixture(upstream.url, {
+        challengeScope: source === "challenge" ? scopes.join(" ") : null,
+        metadataScopes: scopes,
+      });
+      const root = createRoot(auth);
+      const profilePath = join(root.home, ".fx", "mcp.json");
+      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+      delete profile.mcp.fixture.oauth.scopes;
+      writeFileSync(profilePath, JSON.stringify(profile));
+      const env = { ...baseEnv(root), AI_GATEWAY_API_KEY: undefined };
+
+      const authenticated = await runFx(["mcp", "auth", "fixture"], {
+        cwd: root.workspace,
+        env,
+        timeoutMs: 20_000,
+      });
+      expect(authenticated).toMatchObject({ code: 0, stderr: "" });
+      expect(authenticated.stdout).toContain("Authenticated MCP server 'fixture'");
+      expect(auth.authorizationRequests).toBe(1);
+      expect(auth.tokenExchanges).toBe(1);
+      expect(await waitForFileText(root.callbackLog, "Authorization complete", 5_000)).toBe(true);
+      const authorization = new URL(readFileSync(root.openLog, "utf8").trim());
+      const requestedScopes = [...scopes, "offline_access"].join(" ");
+      expect(authorization.searchParams.get("scope")).toBe(requestedScopes);
+      const credentials = JSON.parse(readFileSync(
+        join(root.home, ".fx", "mcp-credentials", "credentials.json"),
+        "utf8",
+      ));
+      expect(credentials.credentials[0].scope).toBe(requestedScopes);
+
+      const loggedOut = await runFx(["mcp", "logout", "fixture"], {
+        cwd: root.workspace,
+        env,
+        timeoutMs: 20_000,
+      });
+      expect(loggedOut.code).toBe(0);
+      expect(loggedOut.stderr).toBe("");
+      expect(auth.revocations).toBe(2);
+    }, 30_000);
+  }
 
   test("pinned localhost callback reuses one port without aborting", async () => {
     upstream = startModernMcpHttpFixture("json");

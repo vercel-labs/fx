@@ -19,7 +19,9 @@ pub const expiry_skew_ms: i64 = 60 * 1000;
 pub const max_scope_reauthorizations: u8 = 2;
 const request_timeout_seconds: i64 = 30;
 const callback_io_timeout_seconds: i64 = 30;
-const max_scope_tokens: usize = 64;
+// Bound untrusted scope lists without rejecting providers with large catalogs.
+const max_scope_tokens: usize = 1024;
+const max_slack_bridge_scope_tokens: usize = 64;
 const max_scope_token_bytes: usize = 256;
 
 pub const RefreshControl = struct {
@@ -1294,7 +1296,7 @@ fn slack_bridge_config(alloc: Allocator, endpoint: []const u8, client_config: Cl
     if (!std.mem.eql(u8, config.redirect_uri, slack_callback_url)) return error.InvalidSlackBridgeConfiguration;
     if (!std.mem.eql(u8, configured_client, config.client_id)) return error.InvalidSlackBridgeConfiguration;
     const scopes = config.user_scopes orelse return error.InvalidSlackBridgeConfiguration;
-    if (scopes.len == 0 or scopes.len > max_scope_tokens) return error.InvalidSlackBridgeConfiguration;
+    if (scopes.len == 0 or scopes.len > max_slack_bridge_scope_tokens) return error.InvalidSlackBridgeConfiguration;
     for (scopes) |scope| {
         if (scope.len == 0 or scope.len > max_scope_token_bytes) return error.InvalidSlackBridgeConfiguration;
         for (scope) |byte| {
@@ -2866,6 +2868,67 @@ test "scope policy unions prior and challenged scopes without duplicates" {
     try std.testing.expectEqualStrings(
         "tools.read tools.call tools.admin offline_access",
         scope,
+    );
+}
+
+test "scope policy accepts metadata catalogs with more than 64 scopes" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var metadata_scopes: [128][]const u8 = undefined;
+    for (&metadata_scopes, 0..) |*scope, index| {
+        scope.* = try std.fmt.allocPrint(arena.allocator(), "tools.read.{d}", .{index});
+    }
+    const scope = (try requestedScope(alloc, &.{}, null, &metadata_scopes, null, true)).?;
+    defer alloc.free(scope);
+    var tokens = std.mem.tokenizeScalar(u8, scope, ' ');
+    for (metadata_scopes) |expected| {
+        try std.testing.expectEqualStrings(expected, tokens.next().?);
+    }
+    try std.testing.expectEqualStrings("offline_access", tokens.next().?);
+    try std.testing.expect(tokens.next() == null);
+}
+
+test "scope policy bounds unique scopes including offline access" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var configured: [max_scope_tokens + 1][]const u8 = undefined;
+    for (configured[0..max_scope_tokens], 0..) |*scope, index| {
+        scope.* = try std.fmt.allocPrint(arena.allocator(), "tools.read.{d}", .{index});
+    }
+    configured[max_scope_tokens] = "offline_access";
+
+    const scope = (try requestedScope(alloc, configured[0..max_scope_tokens], null, &.{}, null, false)).?;
+    defer alloc.free(scope);
+    var tokens = std.mem.tokenizeScalar(u8, scope, ' ');
+    for (configured[0..max_scope_tokens]) |expected| {
+        try std.testing.expectEqualStrings(expected, tokens.next().?);
+    }
+    try std.testing.expect(tokens.next() == null);
+    // A duplicate at the limit must not consume an additional slot.
+    const deduplicated = (try requestedScope(alloc, configured[0..max_scope_tokens], null, &.{}, configured[0], false)).?;
+    defer alloc.free(deduplicated);
+    try std.testing.expectEqualStrings(scope, deduplicated);
+    try std.testing.expectError(
+        error.TooManyOAuthScopes,
+        requestedScope(alloc, &configured, null, &.{}, null, false),
+    );
+    try std.testing.expectError(
+        error.TooManyOAuthScopes,
+        requestedScope(alloc, configured[0..max_scope_tokens], null, &.{}, null, true),
+    );
+}
+
+test "scope policy still rejects invalid and oversized tokens" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(
+        error.InvalidOAuthScope,
+        requestedScope(alloc, &.{"tools.\"read"}, null, &.{}, null, false),
+    );
+    try std.testing.expectError(
+        error.InvalidOAuthScope,
+        requestedScope(alloc, &.{"x" ** (max_scope_token_bytes + 1)}, null, &.{}, null, false),
     );
 }
 

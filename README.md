@@ -161,6 +161,20 @@ ACP clients can keep their MCP tools loaded on every turn, steer a running turn,
 
 The SDK is published to npm as [libfx](https://www.npmjs.com/package/libfx). See the [WebAssembly SDK](sdk/README.md) and the runnable Node.js, browser, Next.js, and Nuxt [examples](examples/README.md). The WebAssembly SDK is experimental.
 
+## Authenticate MCP servers
+
+Run `fx mcp auth datadog` from your terminal, or `/mcp auth datadog` in an fx
+session, to authorize a configured Datadog MCP server. Keep fx running while you
+complete authorization in your browser. Replace `datadog` with another configured
+server name when connecting a different service.
+
+MCP OAuth supports up to 1,024 unique scopes, including previously saved scopes
+and `offline_access` when requested. fx selects scopes from the server's
+authentication challenge, configured OAuth scopes, or protected-resource metadata
+in that order, without truncating the selected list. Requests beyond this limit
+fail with `TooManyOAuthScopes` before the browser opens. Slack's fx.sh bridge keeps
+its separate limit of 64 shared scopes.
+
 ## Connect your Slack account
 
 Run `/mcp add slack` in an fx session, or `fx mcp add slack` from your terminal.
