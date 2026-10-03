@@ -7,6 +7,7 @@ import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { CoreOutput } from "./core-output.js";
 import { loadModule, withModuleFailure } from "./wasm-module.js";
+import { fetchCleanupAction, cleanupTimeoutMs, cleanupByteLimit } from "./fetch-cleanup.js";
 import {
   createFxAgent as createWasmAgent,
   createFxTerminal as createWasmTerminal,
@@ -383,76 +384,154 @@ function createNativeCoreRuntime(addon, options) {
   let settled = false;
   let fetchState = null;
   const exited = new Promise((resolve) => { exitedResolve = resolve; });
+  function refreshFetch(state) {
+    if (settled) return;
+    if (typeof addon.coreFetchDisposition !== "function") {
+      state.active = addon.coreFetchActive(core, state.handle);
+      return;
+    }
+    // One native lock observes consumption and retirement together.
+    const disposition = addon.coreFetchDisposition(core, state.handle);
+    if (disposition !== 0 && disposition !== 1 && disposition !== 2) {
+      throw new Error(`invalid native fetch disposition ${disposition}`);
+    }
+    state.consumed ||= disposition === 2;
+    state.active = disposition === 1;
+  }
+  function cleanupAction(state) {
+    return fetchCleanupAction({ ...state, alive: !settled,
+      age: state.drainStarted === null ? 0 : performance.now() - state.drainStarted });
+  }
+  function beginDrain(state) {
+    if (state.drainStarted !== null) return;
+    state.drainStarted = performance.now();
+    state.timer = setTimeout(() => state.controller.abort(), cleanupTimeoutMs);
+  }
   const abortHostEffects = () => {
-    fetchState?.controller.abort();
-    try { addon.abortCoreFetch(core); } catch {}
+    if (fetchState) {
+      fetchState.canceled = true;
+      fetchState.controller.abort();
+    }
+    if (!settled) { try { addon.abortCoreFetch(core); } catch {} }
   };
   const finish = (code, error) => {
     if (settled) return;
+    const state = fetchState;
+    if (state) {
+      refreshFetch(state);
+      state.closing = true;
+      state.failed ||= code !== 0 || error !== undefined;
+    }
     settled = true;
     outputError = error;
     output.close();
-    abortHostEffects();
-    try { addon.destroyCore(core); } catch {}
-    readySocket.destroy();
-    void readyClosed.then(() => exitedResolve(code));
+    const destroy = () => {
+      try { addon.destroyCore(core); } catch {}
+      readySocket.destroy();
+      void readyClosed.then(() => exitedResolve(code));
+    };
+    if (state && cleanupAction(state) === "drain") {
+      beginDrain(state);
+      void state.done.then(destroy);
+    } else {
+      if (state && cleanupAction(state) !== "done") state.controller.abort();
+      destroy();
+    }
   };
   const pumpFetch = async (request, body) => {
     const controller = new AbortController();
-    const state = { handle: request.handle, controller };
+    let complete, reader;
+    const state = { handle: request.handle, controller, consumed: false, active: true,
+      canceled: false, failed: false, closing: false, eof: false, discarded: 0,
+      drainStarted: null, timer: null, done: new Promise(resolve => { complete = resolve; }) };
     fetchState = state;
+    let onAbort;
+    const aborted = new Promise((_, reject) => {
+      onAbort = () => reject(new DOMException("Aborted", "AbortError"));
+      controller.signal.addEventListener("abort", onAbort, { once: true });
+    });
+    void aborted.catch(() => {});
+    const wait = task => Promise.race([task, aborted]);
     try {
-      const response = await (options.fetch ?? globalThis.fetch)(request.url, {
+      const responseTask = Promise.resolve().then(() => (options.fetch ?? globalThis.fetch)(request.url, {
         method: request.method,
         headers: new Headers(JSON.parse(request.headers).map(({ name, value }) => [name, value])),
         body: body.length ? body : undefined,
         signal: controller.signal,
+      })).then(response => {
+        if (controller.signal.aborted) {
+          void response.body?.cancel().catch(() => {});
+          throw new DOMException("Aborted", "AbortError");
+        }
+        return response;
       });
-      const started = addon.startCoreFetchResponse(core, state.handle, response.status);
-      if (started === fetchOperationStale) return;
-      if (started !== fetchOperationApplied) throw new Error(`invalid native fetch start result ${started}`);
-      if (response.body) {
-        for await (const chunk of response.body) {
-          const buffer = Buffer.from(chunk);
-          options.onTransportChunk?.(buffer.length);
-          let offset = 0;
-          while (offset < buffer.length) {
-            const end = Math.min(offset + 64 * 1024, buffer.length);
-            const pushed = addon.pushCoreFetchResponse(core, state.handle, buffer.subarray(offset, end));
-            if (pushed === fetchOperationApplied) {
-              offset = end;
-              continue;
-            }
-            if (pushed === fetchOperationStale) return;
-            if (pushed !== fetchOperationBackpressure) throw new Error(`invalid native fetch push result ${pushed}`);
-            await new Promise((resolve) => setTimeout(resolve, 2));
+      const response = await wait(responseTask);
+      if (settled && !state.consumed) throw new DOMException("Aborted", "AbortError");
+      const started = settled ? fetchOperationStale : addon.startCoreFetchResponse(core, state.handle, response.status);
+      if (started !== fetchOperationApplied && started !== fetchOperationStale) throw new Error(`invalid native fetch start result ${started}`);
+      state.active = started === fetchOperationApplied;
+      reader = response.body?.getReader();
+      while (reader) {
+        refreshFetch(state);
+        const action = cleanupAction(state);
+        if (action === "abort") { controller.abort(); throw new DOMException("Aborted", "AbortError"); }
+        if (action === "drain") beginDrain(state);
+        const { done, value } = await wait(reader.read());
+        if (done) break;
+        const buffer = Buffer.from(value);
+        options.onTransportChunk?.(buffer.length);
+        let offset = 0;
+        while (offset < buffer.length) {
+          refreshFetch(state);
+          const next = cleanupAction(state);
+          if (next === "drain") {
+            beginDrain(state);
+            state.discarded += buffer.length - offset;
+            if (state.discarded >= cleanupByteLimit) controller.abort();
+            break;
           }
+          if (next !== "forward") { controller.abort(); throw new DOMException("Aborted", "AbortError"); }
+          const end = Math.min(offset + 64 * 1024, buffer.length);
+          const pushed = addon.pushCoreFetchResponse(core, state.handle, buffer.subarray(offset, end));
+          if (pushed === fetchOperationApplied) { offset = end; continue; }
+          if (pushed === fetchOperationStale) {
+            refreshFetch(state);
+            if (cleanupAction(state) === "drain") continue;
+            controller.abort(); throw new DOMException("Aborted", "AbortError");
+          }
+          if (pushed !== fetchOperationBackpressure) throw new Error(`invalid native fetch push result ${pushed}`);
+          await wait(new Promise(resolve => setTimeout(resolve, 2)));
         }
       }
-      const finished = addon.finishCoreFetch(core, state.handle);
-      if (finished !== fetchOperationApplied && finished !== fetchOperationStale) {
-        throw new Error(`invalid native fetch finish result ${finished}`);
+      state.eof = true;
+      if (!settled && state.active) {
+        const finished = addon.finishCoreFetch(core, state.handle);
+        if (finished !== fetchOperationApplied && finished !== fetchOperationStale) throw new Error(`invalid native fetch finish result ${finished}`);
       }
     } catch (error) {
-      if (error?.name !== "AbortError" || !controller.signal.aborted) {
-        try {
-          if (addon.coreFetchActive(core, state.handle)) addon.failCoreFetch(core, state.handle);
-        } catch {}
+      if (!settled && !controller.signal.aborted) {
+        state.failed = true;
+        try { if (addon.coreFetchActive(core, state.handle)) addon.failCoreFetch(core, state.handle); } catch {}
       }
     } finally {
-      if (fetchState === state) {
-        fetchState = null;
-        queueMicrotask(drainReady);
+      clearTimeout(state.timer);
+      controller.signal.removeEventListener("abort", onAbort);
+      if (reader) {
+        if (!state.eof) { try { void reader.cancel().catch(() => {}); } catch {} }
+        try { reader.releaseLock(); } catch {}
       }
+      complete();
+      if (fetchState === state) { fetchState = null; queueMicrotask(drainReady); }
     }
   };
   function drainReady() {
     if (settled) return;
     try {
       if (fetchState) {
-        if (!fetchState.controller.signal.aborted && !addon.coreFetchActive(core, fetchState.handle)) {
-          fetchState.controller.abort();
-        }
+        refreshFetch(fetchState);
+        const action = cleanupAction(fetchState);
+        if (action === "drain") beginDrain(fetchState);
+        if (action === "abort") fetchState.controller.abort();
       } else {
         // The core hands over JSON metadata and the raw request body separately.
         const fetchRequest = addon.takeCoreFetch(core);
@@ -546,7 +625,8 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
       } catch (error) {
         nativeError = error;
         if (backend === "native" || error?.code === "LIBFX_MODEL_UNSUPPORTED_FAST" ||
-          error?.code === "LIBFX_MODEL_UNSUPPORTED_EFFORT") throw error;
+          error?.code === "LIBFX_MODEL_UNSUPPORTED_EFFORT" ||
+          typeof error?.code === "string" && error.code.startsWith("LIBFX_MODEL_METADATA_")) throw error;
       }
     }
     if (backend === "native") {

@@ -41,6 +41,7 @@
     "fx-sdk.js",
     "wasm-module.js",
     "core-output.js",
+    "fetch-cleanup.js",
     "mcp.js",
     "skills.js",
     "skills-node.js",

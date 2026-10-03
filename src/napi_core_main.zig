@@ -357,6 +357,8 @@ const FetchBridge = struct {
     response: std.ArrayList(u8) = .empty,
     response_offset: usize = 0,
     phase: fetch_state.Phase = .idle,
+    // Logical consumption survives HTTP EOF, close, and normal runtime shutdown.
+    last_consumed_handle: ?fetch_state.Handle = null,
     next_handle: fetch_state.Handle = 1,
     status: u16 = 0,
     ready: ?*ReadyNotifier = null,
@@ -495,6 +497,24 @@ const FetchBridge = struct {
         self.ready.?.notify();
     }
 
+    fn markConsumed(raw: ?*anyopaque, handle: i32) void {
+        const self: *FetchBridge = @ptrCast(@alignCast(raw.?));
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const consumed = fetch_state.consumed_after(self.phase, self.last_consumed_handle, .{ .consumed = handle });
+        if (consumed == self.last_consumed_handle) return;
+        self.last_consumed_handle = consumed;
+        self.ready.?.notify();
+    }
+
+    fn disposition(self: *FetchBridge, handle: fetch_state.Handle) fetch_state.Disposition {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return fetch_state.disposition(self.phase, self.last_consumed_handle, handle);
+    }
+
     fn startResponse(self: *FetchBridge, handle: fetch_state.Handle, status: u16) FetchOperationResult {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
@@ -559,9 +579,11 @@ const FetchBridge = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const decision = fetch_state.decide(self.phase, .cancel);
+        self.last_consumed_handle = fetch_state.consumed_after(self.phase, self.last_consumed_handle, .cancel);
         self.clearPendingRequest();
         self.phase = decision.phase;
         self.wake.broadcast(io);
+        self.ready.?.notify();
     }
 
     fn shutdown(self: *FetchBridge) void {
@@ -676,6 +698,7 @@ const Runtime = struct {
         ) catch {
             self.exit_code.store(1, .seq_cst);
         };
+        self.fetch.shutdown();
         self.exited.store(true, .seq_cst);
         self.ready.notify();
     }
@@ -949,6 +972,7 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
         .status_fn = FetchBridge.statusFn,
         .next_fn = FetchBridge.next,
         .close_fn = FetchBridge.close,
+        .consumed_fn = FetchBridge.markConsumed,
     });
     runtime.thread = std.Thread.spawn(.{}, Runtime.run, .{runtime}) catch return error.ThreadFailed;
     return runtime;
@@ -1236,6 +1260,18 @@ fn coreFetchActive(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.n
     return value;
 }
 
+fn coreFetchDisposition(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argv: [2]c.napi_value = undefined;
+    const runtime_handle = runtimeHandleArg(env, info, &argv) orelse return null;
+    const fetch_handle = fetch_handle_arg(env, argv[1]) orelse return null;
+    const runtime = lockRuntime(env, runtime_handle) orelse return null;
+    defer unlockRuntime(runtime_handle);
+    const disposition = runtime.fetch.disposition(fetch_handle);
+    var value: c.napi_value = undefined;
+    if (!statusOk(env, c.napi_create_int32(env, @intFromEnum(disposition), &value), "could not query fetch disposition")) return null;
+    return value;
+}
+
 fn startCoreFetchResponse(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
     var argv: [3]c.napi_value = undefined;
     const runtime_handle = runtimeHandleArg(env, info, &argv) orelse return null;
@@ -1346,6 +1382,7 @@ export fn napi_register_module_v1(env: c.napi_env, exports: c.napi_value) callco
     if (!exportFunction(env, exports, "discardCoreAttachments", discardCoreAttachments)) return null;
     if (!exportFunction(env, exports, "takeCoreFetch", takeCoreFetch)) return null;
     if (!exportFunction(env, exports, "coreFetchActive", coreFetchActive)) return null;
+    if (!exportFunction(env, exports, "coreFetchDisposition", coreFetchDisposition)) return null;
     if (!exportFunction(env, exports, "startCoreFetchResponse", startCoreFetchResponse)) return null;
     if (!exportFunction(env, exports, "pushCoreFetchResponse", pushCoreFetchResponse)) return null;
     if (!exportFunction(env, exports, "finishCoreFetch", finishCoreFetch)) return null;

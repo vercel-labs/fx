@@ -17,6 +17,7 @@ const scripts = [
   "test-agent-request-context.mjs",
   "test-agent-transport-retry.mjs",
   "test-native-core-stream.mjs",
+  "test-native-core-http-cleanup.mjs",
   "test-native-core-fetch-failure.mjs",
   "test-native-core-image-framing.mjs",
   "test-native-host-tool-frame-limit.mjs",

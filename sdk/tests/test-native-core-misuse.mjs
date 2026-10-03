@@ -18,6 +18,7 @@ if (!ambientTraceChild) {
   delete process.env.FX_TRACE_STDERR;
 }
 const addon = require(addonPath);
+assert.equal(typeof addon.coreFetchDisposition, "function", "rebuild libfx.node with coreFetchDisposition before running this suite");
 
 if (ambientTraceChild) {
   const traceCore = addon.createCore({
@@ -47,6 +48,7 @@ for (const [name, args] of [
   ["discardCoreAttachments", []],
   ["takeCoreFetch", []],
   ["coreFetchActive", []],
+  ["coreFetchDisposition", []],
   ["startCoreFetchResponse", []],
   ["pushCoreFetchResponse", []],
   ["finishCoreFetch", []],
@@ -88,6 +90,7 @@ for (const fakeHandle of [null, undefined, {}, Buffer.alloc(0), 0, "handle"]) {
     () => addon.coreExited(fakeHandle),
     (error) => error instanceof TypeError || error.code === "LIBFX_INVALID_ARGUMENT" || error.code === "LIBFX_NAPI",
   );
+  assert.throws(() => addon.coreFetchDisposition(fakeHandle, 1), { name: "TypeError" });
 }
 
 const core = addon.createCore({ apiKey: "misuse-test-key", home: "/tmp", workspaceRoot: "/tmp" });
@@ -126,6 +129,7 @@ assert.throws(
   () => addon.coreExited(core),
   (error) => error.code === "LIBFX_NATIVE_CLOSED",
 );
+assert.throws(() => addon.coreFetchDisposition(core, 1), (error) => error.code === "LIBFX_NATIVE_CLOSED");
 
 const lifecycleCore = addon.createCore({
   apiKey: "lifecycle-test-key",
@@ -209,13 +213,28 @@ try {
   const futureHandle = firstHandle + 1;
   assert.equal(addon.coreFetchActive(lifecycleCore, firstHandle), true);
   assert.equal(addon.coreFetchActive(lifecycleCore, futureHandle), false);
+  assert.equal(addon.coreFetchDisposition(lifecycleCore, firstHandle), 1, "the exact live handle must be active");
+  assert.equal(addon.coreFetchDisposition(lifecycleCore, futureHandle), 0, "a different positive handle must be retired, never active or consumed");
+  assert.equal(addon.coreFetchDisposition(lifecycleCore, 0x7fffffff), 0, "the maximum positive int32 handle must remain exact");
+  assert.throws(() => addon.coreFetchDisposition(lifecycleCore), {
+    name: "TypeError", code: "LIBFX_INVALID_ARGUMENT", message: "missing required argument",
+  });
+  for (const invalidHandle of [0, -1, 1.5, NaN, Infinity, -Infinity, 0x80000000, 0x100000000 + firstHandle, null, undefined, {}, String(firstHandle), 1n]) {
+    assert.throws(() => addon.coreFetchDisposition(lifecycleCore, invalidHandle), {
+      name: "TypeError", code: "LIBFX_INVALID_ARGUMENT",
+    });
+  }
   assert.equal(addon.startCoreFetchResponse(lifecycleCore, futureHandle, 200), 0);
   assert.equal(addon.coreFetchActive(lifecycleCore, firstHandle), true, "stale start must not mutate the active handle");
+  assert.equal(addon.coreFetchDisposition(lifecycleCore, firstHandle), 1, "invalid or stale handles must not mutate the live disposition");
   assert.equal(addon.startCoreFetchResponse(lifecycleCore, firstHandle, 200), 1);
   assert.equal(addon.pushCoreFetchResponse(lifecycleCore, firstHandle, Buffer.alloc(8 * 1024 * 1024 + 1)), 2);
   assert.equal(addon.pushCoreFetchResponse(lifecycleCore, firstHandle, responseBytes("first")), 1);
   assert.equal(addon.finishCoreFetch(lifecycleCore, firstHandle), 1);
   assert.equal((await Promise.race([waitForResponse(firstPrompt), timeout("first prompt result")])).result.stopReason, "end_turn");
+  assert.equal(addon.coreFetchActive(lifecycleCore, firstHandle), false);
+  assert.equal(addon.coreFetchDisposition(lifecycleCore, firstHandle), 2, "logical consumption must survive the normal fetch close");
+  assert.equal(addon.coreFetchDisposition(lifecycleCore, futureHandle), 0, "consumption must not grant a future handle");
 
   const secondPrompt = sendPrompt(sessionId, "second low-level prompt");
   const secondFetch = await Promise.race([takeFetch(), timeout("second host fetch")]);
@@ -227,13 +246,19 @@ try {
   assert.equal(addon.finishCoreFetch(lifecycleCore, firstHandle), 0);
   assert.equal(addon.failCoreFetch(lifecycleCore, firstHandle), 0);
   assert.equal(addon.coreFetchActive(lifecycleCore, secondHandle), true, "stale operations must not mutate the newer handle");
+  assert.equal(addon.coreFetchDisposition(lifecycleCore, secondHandle), 1, "the next handle must not inherit earlier consumption");
+  assert.equal(addon.coreFetchDisposition(lifecycleCore, firstHandle), 2, "the previous exact consumed identity must survive until replaced");
   assert.equal(addon.startCoreFetchResponse(lifecycleCore, secondHandle, 200), 1);
   assert.equal(addon.pushCoreFetchResponse(lifecycleCore, secondHandle, responseBytes("second")), 1);
   assert.equal(addon.finishCoreFetch(lifecycleCore, secondHandle), 1);
   assert.equal((await Promise.race([waitForResponse(secondPrompt), timeout("second prompt result")])).result.stopReason, "end_turn");
+  assert.equal(addon.coreFetchDisposition(lifecycleCore, firstHandle), 0, "new consumption replaces only the previous consumed identity");
+  assert.equal(addon.coreFetchDisposition(lifecycleCore, secondHandle), 2);
+  assert.equal(addon.coreFetchDisposition(lifecycleCore, secondHandle + 1), 0);
 
   for (const [name, args] of [
     ["coreFetchActive", [lifecycleCore, 0]],
+    ["coreFetchDisposition", [lifecycleCore, 0]],
     ["startCoreFetchResponse", [lifecycleCore, 0, 200]],
     ["pushCoreFetchResponse", [lifecycleCore, 0, Buffer.alloc(0)]],
     ["finishCoreFetch", [lifecycleCore, 0]],
@@ -244,6 +269,18 @@ try {
       code: "LIBFX_INVALID_ARGUMENT",
     });
   }
+
+  addon.closeCore(lifecycleCore);
+  await Promise.race([(async () => {
+    while (!addon.coreExited(lifecycleCore)) await new Promise((resolveWait) => setTimeout(resolveWait, 2));
+  })(), timeout("normal core close")]);
+  assert.equal(addon.coreExitCode(lifecycleCore), 0);
+  assert.equal(addon.coreFetchActive(lifecycleCore, secondHandle), false);
+  assert.equal(addon.coreFetchDisposition(lifecycleCore, secondHandle), 2, "normal core shutdown must retain the exact consumed identity");
+  assert.equal(addon.coreFetchDisposition(lifecycleCore, secondHandle + 1), 0);
+  addon.abortCoreFetch(lifecycleCore);
+  assert.equal(addon.coreFetchDisposition(lifecycleCore, secondHandle), 0, "explicit cancellation must revoke consumption even after normal close");
+  assert.equal(addon.coreFetchActive(lifecycleCore, secondHandle), false);
 } finally {
   addon.closeCore(lifecycleCore);
   addon.destroyCore(lifecycleCore);
@@ -272,4 +309,4 @@ try {
   rmSync(traceDir, { recursive: true, force: true });
 }
 
-console.log("native core misuse passed: argument, handle, stale, ambient trace isolation, backpressure, and closed-handle checks are enforced");
+console.log("native core misuse passed: argument, exact-handle disposition, consumed persistence, cancellation revocation, stale, ambient trace isolation, backpressure, and closed-handle checks are enforced");
