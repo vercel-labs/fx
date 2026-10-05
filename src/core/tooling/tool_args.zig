@@ -23,6 +23,29 @@ pub fn normalizeCompositeObjectValue(
     value.* = decoded;
 }
 
+/// The largest nested request object fx will decode from its JSON text.
+pub const max_request_wrapper_bytes: usize = 64 * 1024;
+
+/// Returns the object a tool should read its fields from: the nested
+/// `request` object when the call wraps its fields, the arguments object
+/// itself otherwise. A nested object parameter sometimes arrives as the JSON
+/// text of that object, and text that does not decode to a bounded object
+/// returns null so the caller reports its own shape problem.
+pub fn requestObject(
+    alloc: std.mem.Allocator,
+    args: std.json.ObjectMap,
+) std.mem.Allocator.Error!?std.json.ObjectMap {
+    const wrapper = args.get("request") orelse return args;
+    if (wrapper == .object) return wrapper.object;
+    if (wrapper != .string or wrapper.string.len > max_request_wrapper_bytes) return null;
+    const decoded = std.json.parseFromSliceLeaky(std.json.Value, alloc, wrapper.string, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    if (decoded != .object) return null;
+    return decoded.object;
+}
+
 pub fn requiredStringArg(args: std.json.ObjectMap, key: []const u8) ![]const u8 {
     const value = args.get(key) orelse return error.InvalidToolArguments;
     if (value != .string) return error.InvalidToolArguments;
@@ -129,6 +152,41 @@ test "null placeholder reads treat textual nulls as absent" {
     try std.testing.expectEqualStrings("echo null", nullablePlaceholderStringArg(args, "command").?);
     try std.testing.expectEqualStrings("nullify", nullablePlaceholderStringArg(args, "dir").?);
     try std.testing.expectEqualStrings("null", optionalStringArg(args, "cwd").?);
+}
+
+test "request wrapper reads the nested object from objects and from JSON text" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const flat = try requestObject(arena, try parseToolArgsObject(arena, "{\"action\":\"run\"}"));
+    try std.testing.expectEqualStrings("run", flat.?.get("action").?.string);
+
+    const wrapped = try requestObject(
+        arena,
+        try parseToolArgsObject(arena, "{\"request\":{\"action\":\"run\"}}"),
+    );
+    try std.testing.expectEqualStrings("run", wrapped.?.get("action").?.string);
+
+    const encoded = try requestObject(
+        arena,
+        try parseToolArgsObject(arena, "{\"request\":\"{\\\"action\\\":\\\"run\\\"}\"}"),
+    );
+    try std.testing.expectEqualStrings("run", encoded.?.get("action").?.string);
+
+    try std.testing.expect((try requestObject(arena, try parseToolArgsObject(arena, "{\"request\":\"run\"}"))) == null);
+    try std.testing.expect((try requestObject(arena, try parseToolArgsObject(arena, "{\"request\":\"[]\"}"))) == null);
+    try std.testing.expect((try requestObject(arena, try parseToolArgsObject(arena, "{\"request\":3}"))) == null);
+
+    const filler = try arena.alloc(u8, max_request_wrapper_bytes + 8);
+    @memset(filler, 'a');
+    const inner = try std.fmt.allocPrint(arena, "{{\"command\":\"{s}\"}}", .{filler});
+    const oversized = try std.json.Stringify.valueAlloc(
+        arena,
+        .{ .request = inner },
+        .{},
+    );
+    try std.testing.expect((try requestObject(arena, try parseToolArgsObject(arena, oversized))) == null);
 }
 
 test "composite object normalization preserves objects and decodes JSON strings" {

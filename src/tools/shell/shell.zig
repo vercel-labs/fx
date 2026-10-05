@@ -115,7 +115,7 @@ fn decode_input(
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
-    var raw = std.json.parseFromSliceLeaky(
+    const raw = std.json.parseFromSliceLeaky(
         std.json.Value,
         arena,
         args_json,
@@ -125,29 +125,36 @@ fn decode_input(
         else => return null,
     };
     if (raw != .object) return null;
-    const raw_action = raw.object.get("action") orelse return null;
+    // A call that wraps its fields sends them inside request, and some models
+    // send that object as its JSON text. Both describe the same action. Fields
+    // beside request stay unresolved here so the correction path reports them.
+    var object = if (raw.object.count() == 1)
+        (try tool_args.requestObject(arena, raw.object)) orelse return null
+    else
+        raw.object;
+    const raw_action = object.get("action") orelse return null;
     if (raw_action != .string) return null;
     const action = std.meta.stringToEnum(Action, raw_action.string) orelse
         return null;
-    elideKnownNullFields(&raw.object);
+    elideKnownNullFields(&object);
 
     var correction_scratch: ActionFieldCorrectionScratch = .{};
     defer correction_scratch.deinit(ctx.allocator);
     if (try actionFieldCorrection(
         ctx.allocator,
         action,
-        raw.object,
+        object,
         &correction_scratch,
     ) != null) return null;
-    normalizeCompositeArgument(arena, &raw, "shell") catch |err| switch (err) {
+    normalizeCompositeArgument(arena, &object, "shell") catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
     };
-    var input = std.json.parseFromValueLeaky(Input, arena, raw, .{}) catch |err| switch (err) {
+    var input = std.json.parseFromValueLeaky(Input, arena, .{ .object = object }, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
     };
-    if (raw.object.get("yield_time_ms") == null) {
+    if (object.get("yield_time_ms") == null) {
         input.yield_time_ms = defaultYieldTime(action);
     }
     if (argument_problem(input) != null) return null;
@@ -371,10 +378,10 @@ fn argument_problem(input: Input) ?[]const u8 {
 
 fn normalizeCompositeArgument(
     alloc: Allocator,
-    root: *std.json.Value,
+    root: *std.json.ObjectMap,
     field_name: []const u8,
 ) !void {
-    const value = root.object.getPtr(field_name) orelse return;
+    const value = root.getPtr(field_name) orelse return;
     try tool_args.normalizeCompositeObjectValue(alloc, value);
 }
 
@@ -1940,7 +1947,6 @@ test "shell request correction suggests only unambiguous repairs without executi
         .{ .input = "{\"command\":\"sleep 30\",\"timeout_ms\":\"40000\",\"yield_time_ms\":\"30000\"}", .retry = "{\"action\":\"run\",\"command\":\"sleep 30\",\"yield_time_ms\":30000,\"timeout_ms\":40000}" },
         .{ .input = "{\"request\":{\"command\":\"sleep 30\"},\"yield_time_ms\":\"30000\"}", .retry = "{\"action\":\"run\",\"command\":\"sleep 30\",\"yield_time_ms\":30000}" },
         .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"background\":null}", .retry = "{\"action\":\"run\",\"command\":\"true\"}" },
-        .{ .input = "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"true\\\"}\"}", .retry = "{\"action\":\"run\",\"command\":\"true\"}" },
         .{ .input = "{\"action\":\"interact\",\"session_id\":\"shell-3\",\"yield_time_ms\":\"1000\",\"unused\":null}", .retry = "{\"action\":\"interact\",\"yield_time_ms\":1000,\"session_id\":\"shell-3\"}" },
         .{ .input = "{\"command\":\"true\",\"tty\":true}", .retry = null },
         .{ .input = "{}", .retry = null },
@@ -2865,4 +2871,66 @@ test "shell run result carries a snapshot fallback notice once" {
     const second = try attachSnapshotNotice(alloc, .{ .success = try alloc.dupe(u8, "{\"state\":\"completed\"}") });
     defer second.deinit(alloc);
     try std.testing.expectEqualStrings("{\"state\":\"completed\"}", second.success);
+}
+
+test "shell decode accepts a request object sent as JSON text" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        args_json: []const u8,
+        command: []const u8,
+    }{
+        .{
+            .args_json = "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"echo hi\\\"}\"}",
+            .command = "echo hi",
+        },
+        .{
+            .args_json = "{\"request\":{\"action\":\"run\",\"command\":\"echo hi\"}}",
+            .command = "echo hi",
+        },
+        .{
+            .args_json = "{\"action\":\"run\",\"command\":\"echo hi\"}",
+            .command = "echo hi",
+        },
+        .{
+            .args_json = "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"echo hi\\\",\\\"shell\\\":{\\\"kind\\\":\\\"executable\\\",\\\"path\\\":\\\"/bin/bash\\\"},\\\"tty\\\":true}\"}",
+            .command = "echo hi",
+        },
+    };
+    for (cases) |case| {
+        const result = try decode(.{ .allocator = alloc }, case.args_json);
+        switch (result) {
+            .input => |input| {
+                defer input.deinit(alloc);
+                const value = input.as(OwnedInput).value;
+                try std.testing.expectEqualStrings(case.command, value.command.?);
+                if (std.mem.indexOf(u8, case.args_json, "tty") != null) {
+                    try std.testing.expectEqualStrings("/bin/bash", value.shell.?.path);
+                }
+            },
+            .failure => |failure| {
+                defer alloc.free(failure);
+                return error.TestUnexpectedResult;
+            },
+        }
+    }
+}
+
+test "shell decode still reports a request that carries no object" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{
+        "{\"request\":\"run\"}",
+        "{\"request\":\"[]\"}",
+        "{\"request\":{\"command\":\"echo hi\"}}",
+    }) |args_json| {
+        const result = try decode(.{ .allocator = alloc }, args_json);
+        switch (result) {
+            .input => |input| {
+                input.deinit(alloc);
+                return error.TestUnexpectedResult;
+            },
+            .failure => |failure| {
+                defer alloc.free(failure);
+            },
+        }
+    }
 }

@@ -4902,6 +4902,45 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
+  test("shell runs once when a wrapped request arrives as JSON text", async () => {
+    const root = createFixtureRoot("shell-encoded-request");
+    const marker = join(root.workspace, "executions.txt");
+    const command = "printf 'once\\n' >> executions.txt; printf ENCODED_REQUEST_OK";
+    let step = 0;
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall("encoded_request", "shell", {
+            request: JSON.stringify({ action: "run", command, profile: "clean" }),
+          });
+        case 1: {
+          expect(existsSync(marker)).toBe(true);
+          expect(shellResult(body, "encoded_request")).toMatchObject({
+            state: "completed", exit_code: 0, output_delta: "ENCODED_REQUEST_OK",
+          });
+          return fakeGatewayFinalText("ENCODED_REQUEST_COMPLETE");
+        }
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+    try {
+      const result = await runFx(["ask", "--json", "--yolo", "Run the marker command once."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, join(root.root, "trace.log")),
+        timeoutMs: 15_000,
+      });
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).output).toContain("ENCODED_REQUEST_COMPLETE");
+      expect(readFileSync(marker, "utf8")).toBe("once\n");
+      expect(gateway.requestCount()).toBe(2);
+      expect(result.stderr).not.toMatch(/panic|error:|error\./i);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test("shell request correction stops repeated failures after both batch results", async () => {
     const root = createFixtureRoot("shell-correction-repeat");
     const tracePath = join(root.root, "trace.log");
