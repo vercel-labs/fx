@@ -26,12 +26,12 @@ await writeFile(replacedWasm, "not WebAssembly");
 await writeFile(stableWasm, await readFile(coreWasm));
 await writeFile(dependencyAddon, `
   import "./missing-dependency.mjs";
-  export const libfxApiVersion = 3;
+  export const libfxApiVersion = 4;
   export function createCore() { throw new Error("dependency addon factory invoked"); }
 `);
 
 const matchingCore = {
-  libfxApiVersion: 3,
+  libfxApiVersion: 4,
   createCore() { assert.fail("backend probing must not create a core"); },
 };
 const matchingTerminal = {
@@ -82,7 +82,7 @@ try {
   });
   assert.equal(incompatible.backend, "unavailable");
   assert.equal(incompatible.attempts[0].reason.code, "LIBFX_NATIVE_API_MISMATCH");
-  assert.match(incompatible.attempts[0].reason.message, /expected API version 3/);
+  assert.match(incompatible.attempts[0].reason.message, /expected API version 4/);
 
   const disabled = await getBackendInfo({ backend: "native", nativeAddon: false });
   assert.equal(disabled.backend, "unavailable");

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { createConfiguredProviderFixture, completion as configuredCompletion } from "./fixtures/chat-completions";
+import { createConfiguredProviderFixture, completion as configuredCompletion, toolCompletion as configuredToolCompletion } from "./fixtures/chat-completions";
 import {
   existsSync,
   mkdirSync,
@@ -213,7 +213,17 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
 
   serialTest("configured provider interactive chat and compaction stay on the local connection", async () => {
     let replies = 0;
-    const fixture = createConfiguredProviderFixture(body => configuredCompletion(body.model, body.tools?.length ? `local reply ${++replies}` : "provider summary"));
+    let read = false;
+    const fixture = createConfiguredProviderFixture(body => {
+      if (!body.tools?.length) return configuredCompletion(body.model, "provider summary");
+      // The first turn reads a file, so compaction has work to summarize.
+      if (!read) {
+        read = true;
+        return configuredToolCompletion(body.model, "read_file", { path: "notes.txt" }, "local-read");
+      }
+      return configuredCompletion(body.model, `local reply ${++replies}`);
+    });
+    writeFileSync(join(fixture.workspace, "notes.txt"), "notes\n");
     fixture.settings.providers.local.model_metadata["local-model"].context_window = 65536;
     fixture.settings.providers.local.model_metadata["local-model"].max_output_tokens = 4096;
     fixture.save();
@@ -226,7 +236,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await session.waitForText(`local reply ${turn}`, TIMEOUT);
         await session.waitForComposer(TIMEOUT);
       }
-      expect(fixture.requests).toHaveLength(5);
+      expect(fixture.requests).toHaveLength(6);
       await session.sendText("/status");
       await session.waitForText(`provider_endpoint=${fixture.settings.providers.local.base_url}`, TIMEOUT);
       await session.waitForComposer(TIMEOUT);
@@ -243,7 +253,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await Bun.sleep(25);
       }
       if (!committed) throw new Error(`compaction did not commit; requests=${JSON.stringify(fixture.requests.map(request => ({ bytes: JSON.stringify(request.body).length, tools: request.body.tools?.length, messageBytes: JSON.stringify(request.body.messages).length })))}\n${(await session.captureFullScrollback()).slice(-1500)}`);
-      expect(fixture.requests.length).toBeGreaterThanOrEqual(6);
+      expect(fixture.requests.length).toBeGreaterThanOrEqual(7);
       expect(fixture.requests.every(request => request.authorization === null && request.path === "/v1/chat/completions")).toBe(true);
       const scrollback = await session.captureFullScrollbackEscapes();
       expect(scrollback).toContain("local reply");

@@ -250,6 +250,7 @@ test "selection deletion wins and picker policy respects empty boundaries" {
         "provider/model",
         0,
         false,
+        false,
         .effort,
     );
     _ = fixture.edit.beginSelection(2);

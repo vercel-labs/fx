@@ -1,4 +1,5 @@
 const std = @import("std");
+const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const command_environment = @import("../execution/command_environment.zig");
 
 const io_mod = @import("../shared/io.zig");
@@ -71,10 +72,12 @@ pub const PermissionEngine = struct {
     }
 
     pub fn formatPermissionsNoticeBody(self: PermissionEngine, alloc: std.mem.Allocator, workspace_root: []const u8) ![]u8 {
+        const live = try liveSessionGrants(alloc, self.grants.items);
+        defer alloc.free(live);
         return (output_contracts.PermissionsSnapshot{
             .workspace_root = workspace_root,
             .mode = self.mode,
-            .grants = self.grants.items,
+            .grants = live,
             .rules = self.rules,
         }).renderInteractiveBody(alloc);
     }
@@ -1181,6 +1184,8 @@ pub fn sessionGrantAllowed(grants: []const types.PermissionGrant, tool_name: []c
         if (!permissionPatternMatchesTool(grant.tool_name, permission, tool_name)) continue;
         if (std.mem.eql(u8, permission, "bash")) {
             if (!std.mem.eql(u8, grant.target_path, pattern)) continue;
+            // A shell refresh resets remembered command approvals.
+            if (!shell_snapshot.processOwner().shellGrantCurrent(grant.target_path)) continue;
         } else if (!permissionPatternMatchesTarget(grant.target_path, pattern)) continue;
         return true;
     }
@@ -1411,12 +1416,40 @@ pub fn formatPermissionsStatus(
     grants: []const types.PermissionGrant,
     rules: types.PermissionRuleSet,
 ) ![]u8 {
+    const live = try liveSessionGrants(alloc, grants);
+    defer alloc.free(live);
     return (output_contracts.PermissionsSnapshot{
         .workspace_root = workspace_root,
         .mode = mode,
-        .grants = grants,
+        .grants = live,
         .rules = rules,
     }).renderText(alloc);
+}
+
+/// Reports whether a remembered session grant still applies. A shell refresh
+/// retires the shell command grants made before it.
+pub fn sessionGrantIsLive(grant: types.PermissionGrant) bool {
+    if (!std.mem.eql(u8, permissionNameForTool(grant.tool_name), "bash")) return true;
+    return shell_snapshot.processOwner().shellGrantCurrent(grant.target_path);
+}
+
+pub fn liveSessionGrantCount(grants: []const types.PermissionGrant) usize {
+    var count: usize = 0;
+    for (grants) |grant| {
+        if (sessionGrantIsLive(grant)) count += 1;
+    }
+    return count;
+}
+
+/// Copies the grants that still apply, for display. Caller frees the slice;
+/// the grant strings stay borrowed.
+fn liveSessionGrants(alloc: std.mem.Allocator, grants: []const types.PermissionGrant) ![]types.PermissionGrant {
+    var live: std.ArrayList(types.PermissionGrant) = .empty;
+    errdefer live.deinit(alloc);
+    for (grants) |grant| {
+        if (sessionGrantIsLive(grant)) try live.append(alloc, grant);
+    }
+    return live.toOwnedSlice(alloc);
 }
 
 pub fn permissionNameForTool(tool_name: []const u8) []const u8 {
@@ -1986,6 +2019,10 @@ test "isToolAllowed remains exact match only" {
 }
 
 test "sessionGrantAllowed maps tool categories and matches command grants exactly" {
+    // Command grants are current only in the snapshot epoch they were made
+    // in, so start from a fresh process owner.
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
     const grants = [_]types.PermissionGrant{
         .{ .tool_name = @constCast("bash"), .target_path = @constCast("git status") },
         .{ .tool_name = @constCast("edit"), .target_path = @constCast("/tmp/workspace/src/*") },
@@ -2001,6 +2038,8 @@ test "sessionGrantAllowed maps tool categories and matches command grants exactl
 }
 
 test "session command grants treat wildcard bytes literally" {
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
     const grants = [_]types.PermissionGrant{
         .{ .tool_name = @constCast("bash"), .target_path = @constCast("printf '*?'") },
     };
@@ -3319,4 +3358,31 @@ test "file target evaluator propagates only operational failures" {
         ),
     );
     try std.testing.expect(failing.has_induced_failure);
+}
+
+test "a shell refresh resets remembered command grants only" {
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    const command = "@fx-terminal-env:user:8:/bin/zsh::npm test";
+    const grants = [_]types.PermissionGrant{
+        .{ .tool_name = @constCast("bash"), .target_path = @constCast(command) },
+        .{ .tool_name = @constCast("edit"), .target_path = @constCast("/tmp/workspace/**") },
+    };
+    try std.testing.expect(sessionGrantAllowed(&grants, "run_command", command));
+    try std.testing.expect(sessionGrantAllowed(&grants, "edit_file", "/tmp/workspace/a.zig"));
+
+    shell_snapshot.processOwner().markDirty(.user_reload);
+    try std.testing.expect(!sessionGrantAllowed(&grants, "run_command", command));
+    try std.testing.expect(sessionGrantAllowed(&grants, "edit_file", "/tmp/workspace/a.zig"));
+
+    // Listings and counts show only the grants that still apply.
+    try std.testing.expectEqual(@as(usize, 1), liveSessionGrantCount(&grants));
+    const listing = try formatPermissionsStatus(std.testing.allocator, "/tmp/workspace", .ask, &grants, .{});
+    defer std.testing.allocator.free(listing);
+    try std.testing.expect(std.mem.find(u8, listing, " - bash -> ") == null);
+    try std.testing.expect(std.mem.find(u8, listing, " - edit -> ") != null);
+
+    shell_snapshot.processOwner().recordShellGrant(command);
+    try std.testing.expect(sessionGrantAllowed(&grants, "run_command", command));
+    try std.testing.expectEqual(@as(usize, 2), liveSessionGrantCount(&grants));
 }

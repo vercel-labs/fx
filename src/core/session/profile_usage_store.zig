@@ -220,10 +220,28 @@ fn absorbRecord(index: *RecordIndex, alloc: Allocator, record: ParsedRecord) !vo
     }
 }
 
-fn absorbBytes(index: *RecordIndex, alloc: Allocator, bytes: []const u8) !void {
+/// Lines parsed between checks of the abandon flag. A full parse of a large
+/// ledger takes hundreds of milliseconds; process exit should not wait for it.
+const abandon_check_lines: usize = 256;
+
+/// Parses whole ledger lines into `index`. When `abandoned` is set, it is
+/// checked every `abandon_check_lines` lines and ends the parse early.
+fn absorbBytes(
+    index: *RecordIndex,
+    alloc: Allocator,
+    bytes: []const u8,
+    abandoned: ?*const std.atomic.Value(bool),
+) !void {
     var lines = std.mem.splitScalar(u8, bytes, '\n');
+    var parsed: usize = 0;
     while (lines.next()) |line| {
         if (line.len == 0) continue;
+        if (abandoned) |flag| {
+            if (parsed % abandon_check_lines == 0 and flag.load(.acquire)) {
+                return error.UsageLockAbandoned;
+            }
+        }
+        parsed += 1;
         index.record_count += 1;
         if (index.record_count > max_records or line.len > max_record_bytes) {
             return error.UsageCapacityExceeded;
@@ -408,7 +426,9 @@ pub const Store = struct {
             compacted_before_append,
         );
         self.noteAppendedRecords(append_bytes.written(), next_length, compacted_before_append);
-        if (compact_after) {
+        // The append is committed; compaction can wait for a later append
+        // rather than hold up process exit with a full rewrite.
+        if (compact_after and !self.lock_abandoned.load(.acquire)) {
             if (file) |open_file| {
                 open_file.close(io_mod.getIo());
                 file = null;
@@ -446,7 +466,7 @@ pub const Store = struct {
             const read_count = try file.readPositionalAll(io_mod.getIo(), bytes, 0);
             if (read_count != byte_len) return error.UsageReadFailed;
             if (bytes[bytes.len - 1] != '\n') return error.UsageStoreIncomplete;
-            try absorbBytes(&fresh, self.index_alloc, bytes);
+            try absorbBytes(&fresh, self.index_alloc, bytes, &self.lock_abandoned);
             fresh.boundary = boundary;
             fresh.captureTailSample(bytes);
         }
@@ -470,7 +490,7 @@ pub const Store = struct {
         const read_count = file.readPositionalAll(io_mod.getIo(), bytes, start) catch return false;
         if (read_count != tail_len) return false;
         if (bytes.len == 0 or bytes[bytes.len - 1] != '\n') return false;
-        absorbBytes(index, self.index_alloc, bytes) catch return false;
+        absorbBytes(index, self.index_alloc, bytes, &self.lock_abandoned) catch return false;
         index.boundary = boundary;
         index.captureTailSample(bytes);
         index.incremental_absorbs += 1;
@@ -490,7 +510,7 @@ pub const Store = struct {
             return;
         }
         const index = &(self.index orelse return);
-        absorbBytes(index, self.index_alloc, written) catch {
+        absorbBytes(index, self.index_alloc, written, null) catch {
             self.invalidateIndex();
             return;
         };
@@ -734,7 +754,7 @@ pub const Store = struct {
 
         var index: RecordIndex = .{};
         defer index.deinit(alloc);
-        try absorbBytes(&index, alloc, bytes);
+        try absorbBytes(&index, alloc, bytes, null);
         return index.toLoaded(alloc);
     }
 
@@ -2018,6 +2038,42 @@ test "abandoning the profile usage lock ends a wait on another holder" {
 
     try std.testing.expectEqual(@as(?anyerror, error.UsageLockAbandoned), worker.result);
     var loaded = try holder.load(alloc);
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), loaded.facts.len);
+}
+
+test "abandoning the profile usage lock stops a ledger parse that already holds the lock" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var writer = try Store.initFromHome(alloc, home);
+    defer writer.deinit(alloc);
+    var exiting = try Store.initFromHome(alloc, home);
+    defer exiting.deinit(alloc);
+
+    var first = try makeTestFact(alloc, "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV", 1000, 10);
+    defer first.deinit(alloc);
+    var second = try makeTestFact(alloc, "gen_01ARZ3NDEKTSV4RRFFQ69G5FAW", 2000, 20);
+    defer second.deinit(alloc);
+    try std.testing.expectEqual(AppendOutcome.appended, try writer.appendFact(alloc, first));
+
+    // Process exit abandons the lock after this store took it, so the append
+    // reaches its first full parse of the ledger with the flag already set.
+    const AbandonAfterLock = struct {
+        fn tryLock(ctx: ?*anyopaque, file: std.Io.File) anyerror!bool {
+            const abandoned: *std.atomic.Value(bool) = @ptrCast(@alignCast(ctx.?));
+            const locked = try file.tryLock(io_mod.getIo(), .exclusive);
+            if (locked) abandoned.store(true, .release);
+            return locked;
+        }
+    };
+    exiting.lock_ops = .{ .ctx = &exiting.lock_abandoned, .try_lock = AbandonAfterLock.tryLock };
+
+    try std.testing.expectError(error.UsageLockAbandoned, exiting.appendFact(alloc, second));
+    try std.testing.expect(exiting.index == null);
+    var loaded = try writer.load(alloc);
     defer loaded.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), loaded.facts.len);
 }

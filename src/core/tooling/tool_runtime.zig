@@ -47,6 +47,7 @@ const tool_dispatch = @import("tool_dispatch.zig");
 const tool_specs = @import("tool_specs.zig");
 const tool_result_errors = @import("tool_result_errors.zig");
 const tool_result_limits = @import("tool_result_limits.zig");
+const compactor = @import("../compactor/compactor.zig");
 const file_mutation_execution = @import("file_mutation_execution.zig");
 const tool_mcp_registry = @import("tool_mcp_registry.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
@@ -120,6 +121,8 @@ pub const Context = struct {
     max_read_file_line_len: usize,
     max_command_output_bytes: usize,
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
+    /// Passed to subagent turns. See `Config.auto_compact_percent`.
+    auto_compact_percent: u8 = compactor.default_percent,
     api_key: []const u8,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
     gateway_team: ?[]const u8 = null,
@@ -146,6 +149,7 @@ pub const Context = struct {
     gateway_models_path: []const u8 = "/v1/models",
     agent_step_limit: usize,
     fast_mode: bool = false,
+    ultrafast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
     /// Borrowed gateway provider routing inherited by subagent turns. Never
     /// applied to tool-internal provider requests (vision, web search), which
@@ -1039,6 +1043,34 @@ pub fn snapshotMcpDefinition(ctx: Context, arena: Allocator, name: []const u8, k
     const runtime = ctx.mcp_ctx orelse return .unavailable;
     const snapshot = ctx.mcp_snapshot_tool orelse return .unavailable;
     return snapshot(runtime, arena, name, known, ctx.permission_rules, ctx.context_limits, ctx.mcp_access);
+}
+
+/// Resolves the exact exposed name of a live MCP tool the model called
+/// without selecting it. Returns null for unknown, denied, inaccessible, or
+/// oversized definitions. The result is allocated in `arena`.
+pub fn resolveUnselectedMcpTool(ctx: Context, arena: Allocator, name: []const u8) !?tool_mcp_runtime.SelectedTool {
+    const runtime_context = ctx.mcp_ctx orelse return null;
+    const schema_fn = ctx.mcp_tool_schema orelse return null;
+    const projection = (schema_fn(
+        runtime_context,
+        arena,
+        name,
+        ctx.permission_rules,
+        ctx.context_limits,
+        ctx.mcp_access,
+        runtimeCancelFlag(ctx),
+    ) catch |err| switch (err) {
+        error.OutOfMemory, error.Cancelled => return err,
+        else => return null,
+    }) orelse return null;
+    return switch (projection) {
+        .selected => |payload| .{
+            .name = name,
+            .schema_json = payload.model_output,
+            .mcp_binding = payload.mcp_binding,
+        },
+        .rejected => null,
+    };
 }
 
 fn refreshChangedMcpTool(ctx: Context, arena: Allocator, name: []const u8) !ToolExecutionResult {
@@ -2170,6 +2202,7 @@ fn executeSubagentProvider(
             .model = ctx.model,
             .effort = ctx.effort,
             .fast_mode = ctx.fast_mode,
+            .ultrafast_mode = ctx.ultrafast_mode,
             .conversation_language = ctx.session.languageSnapshot(),
         },
         .max_result_bytes = ctx.max_tool_result_bytes,
@@ -7477,7 +7510,7 @@ test "vision parsed record transfer allocation failure releases the parsed owner
     );
 }
 
-test "vision authorized catalog retains historical access outside budgeted model history" {
+test "vision authorized catalog retains historical access outside compacted model history" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7489,6 +7522,11 @@ test "vision authorized catalog retains historical access outside budgeted model
             .user = .{ .text = @constCast("historical turn"), .images = source_images },
             .assistant = @constCast("historical answer"),
         } },
+        .{ .compacted_summary = .{
+            .summary = @constCast("historical turn inspected an image"),
+            .removed_turn_count = 1,
+            .compaction_count = 1,
+        } },
         .{ .assistant = .{
             .user = .{ .text = @constCast("newer turn without images") },
             .assistant = @constCast("newer answer"),
@@ -7496,17 +7534,19 @@ test "vision authorized catalog retains historical access outside budgeted model
     };
     const catalog = try session_runtime.collect_image_catalog(alloc, &history, &.{});
     defer types.freeImageAttachmentSlice(alloc, catalog);
-    var budget_arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer budget_arena_state.deinit();
-    var budgeted_messages: std.ArrayList(ChatMessage) = .empty;
-    try session_runtime.appendHistoryChatMessagesBudgeted(
-        budget_arena_state.allocator(),
-        &budgeted_messages,
+    var context_arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer context_arena_state.deinit();
+    var context_messages: std.ArrayList(ChatMessage) = .empty;
+    try session_runtime.appendActiveContextHistoryChatMessages(
+        context_arena_state.allocator(),
+        &context_messages,
         &history,
-        .{ .max_tokens = 1 },
+        1,
     );
-    for (budgeted_messages.items) |message| {
+    try std.testing.expect(context_messages.items.len > 0);
+    for (context_messages.items) |message| {
         try std.testing.expectEqual(@as(usize, 0), message.images.len);
+        if (message.content) |content| try std.testing.expect(std.mem.find(u8, content, "historical answer") == null);
     }
 
     const provider_json = try visionProviderSuccess(alloc, &.{41});

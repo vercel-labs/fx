@@ -28,6 +28,14 @@ pub fn resolveSkillsHome(alloc: Allocator) Allocator.Error!?[]u8 {
     };
 }
 
+/// The managed skills directory under the configured HOME, or null without
+/// one. The caller owns the returned path.
+pub fn resolveManagedSkillsDir(alloc: Allocator) Allocator.Error!?[]u8 {
+    const home = (try resolveSkillsHome(alloc)) orelse return null;
+    defer alloc.free(home);
+    return try profile_paths.managedSkillsDir(alloc, home);
+}
+
 pub fn loadSkills(
     alloc: Allocator,
     workspace_root: []const u8,

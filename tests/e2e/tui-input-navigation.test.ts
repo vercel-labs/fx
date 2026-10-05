@@ -322,7 +322,7 @@ tmuxTest(
     await waitForExactComposerRow(active, "┃ /");
 
     await active.sendKeys("Enter");
-    await active.waitForText("Commands 34", READY_TIMEOUT);
+    await active.waitForText("Commands 36", READY_TIMEOUT);
     await active.sendKeys("Escape");
     await active.waitForPane(
       (pane) => hasEmptyComposer(pane) && !pane.includes("enter open"),
@@ -748,6 +748,81 @@ tmuxTest(
     await active.sendHexBytes(hexSeq("\x1b[127;3u"));
     await active.waitForPane((pane) => pane.includes("foo-"), READY_TIMEOUT);
     expect(active.isAlive()).toBe(true);
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
+  "composer accepts keypad digits, operators, navigation, and Enter",
+  async () => {
+    const active = await startFx(80, 24, true);
+
+    // Kitty reports keypad keys as dedicated codes: KP_1, KP_6, KP_DIVIDE,
+    // KP_SUBTRACT. Every one of them must reach the composer.
+    await active.sendHexBytes(hexSeq("\x1b[57400u"));
+    await active.sendHexBytes(hexSeq("\x1b[57405u"));
+    await active.sendHexBytes(hexSeq("\x1b[57410u"));
+    await active.sendHexBytes(hexSeq("\x1b[57412u"));
+    await waitForActiveFooter(active, (footer) => footer === "┃ 16/-");
+
+    // Keypad Left moves the caret instead of dropping the key.
+    await active.sendHexBytes(hexSeq("\x1b[57417u"));
+    await typeLiteral(active, "9");
+    await waitForActiveFooter(active, (footer) => footer === "┃ 16/9-");
+
+    // Keypad Delete deletes forward.
+    await active.sendHexBytes(hexSeq("\x1b[57426u"));
+    await waitForActiveFooter(active, (footer) => footer === "┃ 16/9");
+
+    // A keypad slash opens the slash menu when it is the first character.
+    await active.sendKeys("C-u");
+    await active.sendHexBytes(hexSeq("\x1b[57410u"));
+    await active.waitForPane(
+      (pane) =>
+        pane
+          .split("\n")
+          .some((line) =>
+            !isComposerLine(line) && line.trimStart().startsWith("/")
+          ),
+      READY_TIMEOUT,
+    );
+
+    // Keypad Enter submits the message.
+    await active.sendKeys("C-u");
+    await typeLiteral(active, "zz-numpad-enter");
+    await active.sendHexBytes(hexSeq("\x1b[57414u"));
+    await active.waitForPane(
+      (pane) => pane.includes("history prompt complete"),
+      READY_TIMEOUT,
+    );
+
+    expect(active.isAlive()).toBe(true);
+    expectCleanStderr();
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
+  "composer accepts legacy application-keypad SS3 keys",
+  async () => {
+    const active = await startFx(80, 24, true);
+
+    // A terminal left in keypad application mode reports `ESC O <byte>`.
+    await active.sendHexBytes(hexSeq("\x1bOp")); // KP_0
+    await active.sendHexBytes(hexSeq("\x1bOy")); // KP_9
+    await active.sendHexBytes(hexSeq("\x1bOo")); // KP_DIVIDE
+    await active.sendHexBytes(hexSeq("\x1bOm")); // KP_SUBTRACT
+    await waitForActiveFooter(active, (footer) => footer === "┃ 09/-");
+
+    // Keypad Enter submits under the same encoding.
+    await active.sendHexBytes(hexSeq("\x1bOM"));
+    await active.waitForPane(
+      (pane) => pane.includes("history prompt complete"),
+      READY_TIMEOUT,
+    );
+
+    expect(active.isAlive()).toBe(true);
+    expectCleanStderr();
   },
   TIMEOUT,
 );
@@ -1801,7 +1876,7 @@ tmuxTest(
       READY_TIMEOUT,
     );
     await active.resizeWindow(80, 24, 300);
-    await active.waitForText("Commands 34", READY_TIMEOUT);
+    await active.waitForText("Commands 36", READY_TIMEOUT);
     expect(gateway?.requests).toHaveLength(0);
     expectCleanStderr();
   },

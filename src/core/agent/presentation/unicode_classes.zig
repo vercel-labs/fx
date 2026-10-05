@@ -15,7 +15,11 @@
 
 const std = @import("std");
 
-const Range = struct { first: u21, last: u21 };
+const SourceRange = struct { first: u21, last: u21 };
+const PackedRange = packed struct(u32) {
+    first: u21,
+    span: u11,
+};
 
 /// CommonMark punctuation: any code point in general category P* or S*.
 pub fn isPunctuationOrSymbol(cp: u21) bool {
@@ -30,7 +34,7 @@ pub fn isWhitespace(cp: u21) bool {
     return containsCodepoint(&space_ranges, cp);
 }
 
-fn containsCodepoint(ranges: []const Range, cp: u21) bool {
+fn containsCodepoint(ranges: []const PackedRange, cp: u21) bool {
     var lo: usize = 0;
     var hi: usize = ranges.len;
     while (lo < hi) {
@@ -38,7 +42,7 @@ fn containsCodepoint(ranges: []const Range, cp: u21) bool {
         const range = ranges[mid];
         if (cp < range.first) {
             hi = mid;
-        } else if (cp > range.last) {
+        } else if (cp > range.first + range.span) {
             lo = mid + 1;
         } else {
             return true;
@@ -47,7 +51,18 @@ fn containsCodepoint(ranges: []const Range, cp: u21) bool {
     return false;
 }
 
-const space_ranges = [_]Range{
+fn packRanges(comptime source: []const SourceRange) [source.len]PackedRange {
+    var encoded: [source.len]PackedRange = undefined;
+    for (source, 0..) |range, index| {
+        encoded[index] = .{
+            .first = range.first,
+            .span = @intCast(range.last - range.first),
+        };
+    }
+    return encoded;
+}
+
+const source_space_ranges = [_]SourceRange{
     .{ .first = 0x00A0, .last = 0x00A0 },
     .{ .first = 0x1680, .last = 0x1680 },
     .{ .first = 0x2000, .last = 0x200A },
@@ -56,7 +71,9 @@ const space_ranges = [_]Range{
     .{ .first = 0x3000, .last = 0x3000 },
 };
 
-const punctuation_ranges = [_]Range{
+const space_ranges = packRanges(&source_space_ranges);
+
+const source_punctuation_ranges = [_]SourceRange{
     .{ .first = 0x00A1, .last = 0x00A9 },
     .{ .first = 0x00AB, .last = 0x00AC },
     .{ .first = 0x00AE, .last = 0x00B1 },
@@ -410,6 +427,8 @@ const punctuation_ranges = [_]Range{
     .{ .first = 0x1FBFA, .last = 0x1FBFA },
 };
 
+const punctuation_ranges = packRanges(&source_punctuation_ranges);
+
 test "flanking classes follow Unicode general categories" {
     try std.testing.expect(isPunctuationOrSymbol(0x2014)); // em dash, Pd
     try std.testing.expect(isPunctuationOrSymbol(0x201C)); // left double quote, Pi
@@ -425,4 +444,16 @@ test "flanking classes follow Unicode general categories" {
     try std.testing.expect(isPunctuationOrSymbol('*') and !isPunctuationOrSymbol('a'));
     try std.testing.expect(isWhitespace(0x00A0) and isWhitespace(0x3000) and isWhitespace(0x2003));
     try std.testing.expect(isWhitespace(' ') and isWhitespace('\t') and !isWhitespace(0x200B));
+}
+
+test "packed flanking ranges preserve generated endpoints" {
+    try std.testing.expectEqual(@as(usize, 4), @sizeOf(PackedRange));
+    for (source_space_ranges, space_ranges) |source, encoded| {
+        try std.testing.expectEqual(source.first, encoded.first);
+        try std.testing.expectEqual(source.last, @as(u21, encoded.first) + encoded.span);
+    }
+    for (source_punctuation_ranges, punctuation_ranges) |source, encoded| {
+        try std.testing.expectEqual(source.first, encoded.first);
+        try std.testing.expectEqual(source.last, @as(u21, encoded.first) + encoded.span);
+    }
 }

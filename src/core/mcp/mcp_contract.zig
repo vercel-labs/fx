@@ -235,9 +235,18 @@ pub const McpServerConfig = struct {
     source: ConfigSource = .profile,
     scope: ConfigScope = .profile,
     required: bool = false,
+    /// Advertise this server's tool schemas on every model turn instead of
+    /// loading them on demand through capability search.
+    always_loaded: bool = false,
+    /// Host-issued registration for a server the host serves over its own
+    /// connection. Such a server speaks modern MCP through the runtime's
+    /// message carrier; `url` is only a placeholder.
+    acp_server_id: ?[]const u8 = null,
     transport: McpTransport = .stdio,
     command: ?[]const u8 = null,
     args: []const []const u8 = &.{},
+    /// Working directory for a stdio server; null inherits fx's own.
+    cwd: ?[]const u8 = null,
     url: ?[]const u8 = null,
     env: []McpEnvVar = &.{},
     headers: []McpHttpHeader = &.{},
@@ -269,7 +278,9 @@ pub const McpServerConfig = struct {
         alloc.free(self.name);
         if (self.command) |command| alloc.free(command);
         freeOwnedStrings(alloc, self.args);
+        if (self.cwd) |cwd| alloc.free(cwd);
         if (self.url) |url| alloc.free(url);
+        if (self.acp_server_id) |server_id| alloc.free(server_id);
         freeEnvVars(alloc, self.env);
         freeHttpHeaders(alloc, self.headers);
         freeHttpHeaderEnv(alloc, self.header_env);

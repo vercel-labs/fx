@@ -343,6 +343,10 @@ pub fn Bindings(comptime App: type) type {
                         null
                 else
                     null,
+                .append_turn_piece = if (comptime @hasField(App, "session_persistence"))
+                    if (app.session_persistence.v2 != null) agentAppendTurnPiece else null
+                else
+                    null,
                 .propagate_grant = agentPropagateGrant,
                 .push_event = agentPushEvent,
                 .push_text = agentPushText,
@@ -383,7 +387,7 @@ pub fn Bindings(comptime App: type) type {
                     @hasField(@TypeOf(app.session_persistence), "writable"))
                 {
                     app.session.usage.configureCheckpointSink(
-                        if (app.session_persistence.writable != null)
+                        if (app.session_persistence.writable != null or app.session_persistence.v2 != null)
                             .{
                                 .context = @ptrCast(app),
                                 .allocator = app.alloc,
@@ -928,6 +932,18 @@ pub fn Bindings(comptime App: type) type {
 
         fn agentResolveModelCapabilities(ctx: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
             const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime runtime_profile.allows(App, .cooperative_agent)) {
+                if (app.worker.effectiveAgentTurnSettings().ultrafast_mode) {
+                    if (app.worker.isCancelRequested()) return error.Cancelled;
+                    app.ensureModelCache();
+                    // A host abort can settle the fetch before queued input reaches the worker.
+                    app.cooperativeTransportPulse() catch |err| {
+                        debug_trace.logf("gateway", "model catalog transport pulse failed err={s}", .{@errorName(err)});
+                        return error.Cancelled;
+                    };
+                    if (app.worker.isCancelRequested()) return error.Cancelled;
+                }
+            }
             if (comptime @hasDecl(App, "resolveModelCapabilitiesForRequest")) {
                 return app.resolveModelCapabilitiesForRequest(model);
             }
@@ -1208,6 +1224,11 @@ pub fn Bindings(comptime App: type) type {
         fn agentClearRecoveryCheckpoint(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app_session_runtime.Runtime(App).clearRecoveryCheckpoint(app);
+        }
+
+        fn agentAppendTurnPiece(ctx: *anyopaque, progress: agent_runtime.TurnProgress) anyerror!void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try app_session_runtime.Runtime(App).appendTurnPiece(app, progress);
         }
 
         fn agentPersistUsageCheckpoint(
@@ -2478,6 +2499,72 @@ test "agent deps use request-time model capability resolution when available" {
 
     try std.testing.expectEqual(@as(usize, 1), app.capability_request_count);
     try std.testing.expect(model_capabilities.reasoningEffortSupported(capabilities, types.ReasoningEffort.literal("future-tier")));
+}
+
+test "cooperative Ultrafast capability resolution uses active request settings and honors cancellation" {
+    const App = struct {
+        pub const host_profile = runtime_profile.wasm;
+        worker: worker_runtime.WorkerRuntime = .{},
+        warmups: usize = 0,
+        pulses: usize = 0,
+        resolutions: usize = 0,
+        eligible: bool = true,
+        cancel_on_pulse: bool = false,
+        fail_pulse: bool = false,
+
+        pub fn ensureModelCache(self: *@This()) void {
+            self.warmups += 1;
+        }
+
+        pub fn cooperativeTransportPulse(self: *@This()) error{PulseFailed}!void {
+            self.pulses += 1;
+            if (self.cancel_on_pulse) self.worker.requestCancel();
+            if (self.fail_pulse) return error.PulseFailed;
+        }
+
+        pub fn resolveModelCapabilitiesForRequest(self: *@This(), _: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
+            self.resolutions += 1;
+            return .{ .supports_ultrafast_mode = self.eligible and self.warmups > 0 };
+        }
+    };
+    const Case = struct {
+        configured: bool = false,
+        active: ?bool = null,
+        eligible: bool = true,
+        cancel_before: bool = false,
+        cancel_on_pulse: bool = false,
+        fail_pulse: bool = false,
+        warmups: usize = 0,
+        cancelled: bool = false,
+    };
+    for ([_]Case{
+        .{},
+        .{ .configured = true, .active = false },
+        .{ .active = true, .warmups = 1 },
+        .{ .configured = true, .warmups = 1, .eligible = false },
+        .{ .active = true, .cancel_before = true, .cancelled = true },
+        .{ .active = true, .cancel_on_pulse = true, .warmups = 1, .cancelled = true },
+        .{ .active = true, .fail_pulse = true, .warmups = 1, .cancelled = true },
+    }) |case| {
+        var app: App = .{ .eligible = case.eligible, .cancel_on_pulse = case.cancel_on_pulse, .fail_pulse = case.fail_pulse };
+        defer app.worker.deinit(std.testing.allocator);
+        app.worker.agent_turn_settings.ultrafast_mode = case.configured;
+        if (case.active) |active| app.worker.setActiveAgentTurnSettings(.{ .ultrafast_mode = active });
+        if (case.cancel_before) app.worker.requestCancel();
+        const resolver = Bindings(App).modelCapabilityResolver(&app);
+        if (case.cancelled) {
+            try std.testing.expectError(error.Cancelled, resolver.resolve(std.testing.allocator, "openai/test"));
+            try std.testing.expectEqual(@as(usize, 0), app.resolutions);
+        } else {
+            const capabilities = try resolver.resolve(std.testing.allocator, "openai/test");
+            try std.testing.expectEqual(@as(usize, 1), app.resolutions);
+            if (case.configured and !case.eligible) {
+                try std.testing.expectError(error.UltrafastUnavailable, model_capabilities.resolveUltrafastProviderOptions(capabilities, .gateway, "openai/test", .auto, false, true));
+            }
+        }
+        try std.testing.expectEqual(case.warmups, app.warmups);
+        try std.testing.expectEqual(case.warmups, app.pulses);
+    }
 }
 
 test "agent deps record rejected tool calls in feedback diagnostics" {

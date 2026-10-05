@@ -1,6 +1,8 @@
 const std = @import("std");
 const domain = @import("domain.zig");
 const io_mod = @import("../shared/io.zig");
+const session_adapter = @import("../session/session_adapter.zig");
+const session_codec = @import("../session/session_codec.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const session_store = @import("../session/session_store.zig");
 const types = @import("../shared/types.zig");
@@ -44,7 +46,9 @@ pub const Kind = union(enum) {
     persistent: PersistentIdentity,
 };
 pub const Phase = enum { idle, running, awaiting_approval, interrupted, finished };
-pub const Outcome = enum { completed, failed, cancelled, interrupted };
+/// `lost`: the work never reached the child's log before a crash; only a
+/// v2 parent's reopen repair records it (D33).
+pub const Outcome = enum { completed, failed, cancelled, interrupted, lost };
 
 pub const ActiveWork = struct {
     id: []u8,
@@ -408,27 +412,58 @@ pub const Registry = struct {
     }
 };
 
+/// Where a parent keeps its children: v1's `children.json` beside its
+/// session, or its v2 log (D22). One backend per process.
+pub const Backend = union(enum) {
+    v1: *session_store.Store,
+    v2: *V2Children,
+};
+
+/// Held across a load, a change and its save.
+pub const Lock = union(enum) {
+    v1: io_mod.TimedAdvisoryLock,
+    v2: *std.Io.Mutex,
+
+    pub fn release(self: *Lock) void {
+        switch (self.*) {
+            .v1 => |*lock| lock.release(),
+            .v2 => |mutex| mutex.unlock(io_mod.getIo()),
+        }
+    }
+};
+
 pub const Store = struct {
-    sessions: *session_store.Store,
+    backend: Backend,
     parent_id: []const u8,
     options: session_child_store.Options = .{},
 
-    pub fn acquireLock(self: Store, alloc: Allocator) !io_mod.TimedAdvisoryLock {
-        var capability = try self.sessions.openSubagentControlCapabilityWritable(
+    pub fn acquireLock(self: Store, alloc: Allocator) !Lock {
+        const sessions = switch (self.backend) {
+            .v2 => |children| {
+                children.lock.lockUncancelable(io_mod.getIo());
+                return .{ .v2 = &children.lock };
+            },
+            .v1 => |value| value,
+        };
+        var capability = try sessions.openSubagentControlCapabilityWritable(
             alloc,
             self.parent_id,
             self.options,
         );
         defer capability.deinit();
-        return capability.acquireTimedAdvisoryLock(
+        return .{ .v1 = try capability.acquireTimedAdvisoryLock(
             .subagent_control,
             lock_file,
             lock_deadline_ms,
-        );
+        ) };
     }
 
     pub fn load(self: Store, alloc: Allocator) !Registry {
-        var capability = try self.sessions.openSubagentControlCapabilityReadOnly(
+        const sessions = switch (self.backend) {
+            .v2 => |children| return children.load(alloc),
+            .v1 => |value| value,
+        };
+        var capability = try sessions.openSubagentControlCapabilityReadOnly(
             alloc,
             self.parent_id,
             self.options,
@@ -452,10 +487,14 @@ pub const Store = struct {
         if (!std.mem.eql(u8, registry.parent_id, self.parent_id)) {
             return error.InvalidParentId;
         }
+        const sessions = switch (self.backend) {
+            .v2 => |children| return children.save(alloc, registry),
+            .v1 => |value| value,
+        };
         const bytes = try renderRegistry(alloc, registry);
         defer alloc.free(bytes);
         if (bytes.len > max_state_bytes) return error.StateTooLarge;
-        var capability = try self.sessions.openSubagentControlCapabilityWritable(
+        var capability = try sessions.openSubagentControlCapabilityWritable(
             alloc,
             self.parent_id,
             self.options,
@@ -475,12 +514,17 @@ pub const Store = struct {
         alloc: Allocator,
         child_id: []const u8,
     ) !void {
+        // A v2 child's own first line says it is one (`role: child`).
+        const sessions = switch (self.backend) {
+            .v2 => return,
+            .v1 => |value| value,
+        };
         var bytes: std.Io.Writer.Allocating = .init(alloc);
         defer bytes.deinit();
         try bytes.writer.writeAll("{\"schema_version\":1,\"parent_id\":");
         try std.json.Stringify.value(self.parent_id, .{}, &bytes.writer);
         try bytes.writer.writeAll("}");
-        var capability = try self.sessions.openSubagentControlCapabilityWritable(
+        var capability = try sessions.openSubagentControlCapabilityWritable(
             alloc,
             child_id,
             self.options,
@@ -495,6 +539,258 @@ pub const Store = struct {
         entry.deinit(alloc);
     }
 };
+
+/// A parent's children in its v2 log (D22). The log is the record, and this
+/// copy is the truth while this process holds the parent, the only one that
+/// can append to it. Loaded on first use; each save appends what changed.
+/// Unfinished work's message and evidence live only here, as v1 drops them
+/// on restart too (`Registry.interruptActive`).
+pub const V2Children = struct {
+    alloc: Allocator,
+    parent: *session_adapter.Session,
+    /// The parent's workspace, borrowed; children share it.
+    workspace: []const u8,
+    /// Held across a load, a change and its save, as v1's `children.lock`.
+    lock: std.Io.Mutex = .init,
+    /// Guards `registry` and `seeds`, so an unlocked load never sees a swap.
+    state: std.Io.Mutex = .init,
+    registry: ?Registry = null,
+    /// Settings for children with no log yet, from their admission; taken
+    /// when their work first opens them (D34). Keys and models owned.
+    seeds: std.StringArrayHashMapUnmanaged(ChildSeed) = .empty,
+
+    pub const ChildSeed = struct {
+        preferences: session_codec.DurableSessionPreferences,
+        language: types.ConversationLanguage,
+    };
+
+    pub fn init(alloc: Allocator, parent: *session_adapter.Session, workspace: []const u8) V2Children {
+        return .{ .alloc = alloc, .parent = parent, .workspace = workspace };
+    }
+
+    pub fn deinit(self: *V2Children) void {
+        if (self.registry) |*registry| registry.deinit(self.alloc);
+        for (self.seeds.keys(), self.seeds.values()) |key, seed| {
+            self.alloc.free(key);
+            self.alloc.free(seed.preferences.model);
+        }
+        self.seeds.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    /// Remembers the settings a new child starts with, replacing older ones.
+    pub fn rememberSeed(self: *V2Children, child_id: []const u8, seed: ChildSeed) !void {
+        self.state.lockUncancelable(io_mod.getIo());
+        defer self.state.unlock(io_mod.getIo());
+        var owned = seed;
+        owned.preferences.model = try self.alloc.dupe(u8, seed.preferences.model);
+        errdefer self.alloc.free(owned.preferences.model);
+        if (self.seeds.getPtr(child_id)) |existing| {
+            self.alloc.free(existing.preferences.model);
+            existing.* = owned;
+            return;
+        }
+        const key = try self.alloc.dupe(u8, child_id);
+        errdefer self.alloc.free(key);
+        try self.seeds.put(self.alloc, key, owned);
+    }
+
+    /// A copy of the seed for `child_id`, or null. Free its model.
+    pub fn seedFor(self: *V2Children, alloc: Allocator, child_id: []const u8) !?ChildSeed {
+        self.state.lockUncancelable(io_mod.getIo());
+        defer self.state.unlock(io_mod.getIo());
+        const seed = self.seeds.get(child_id) orelse return null;
+        var copy = seed;
+        copy.preferences.model = try alloc.dupe(u8, seed.preferences.model);
+        return copy;
+    }
+
+    fn load(self: *V2Children, alloc: Allocator) !Registry {
+        self.state.lockUncancelable(io_mod.getIo());
+        defer self.state.unlock(io_mod.getIo());
+        return (try self.currentLocked()).clone(alloc);
+    }
+
+    fn save(self: *V2Children, alloc: Allocator, next: Registry) !void {
+        self.state.lockUncancelable(io_mod.getIo());
+        defer self.state.unlock(io_mod.getIo());
+        const current = try self.currentLocked();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const lines = try planLines(arena.allocator(), current.*, next);
+        var copy = try next.clone(self.alloc);
+        errdefer copy.deinit(self.alloc);
+        try self.parent.appendChildLines(lines);
+        current.deinit(self.alloc);
+        self.registry = copy;
+    }
+
+    fn currentLocked(self: *V2Children) !*Registry {
+        if (self.registry == null) {
+            const children = try self.parent.children(self.alloc);
+            defer session_adapter.freeChildren(self.alloc, children);
+            self.registry = try registryFromChildren(self.alloc, self.parent.id(), children);
+        }
+        return &self.registry.?;
+    }
+};
+
+/// fx's data on a `child_spawned` line: who the child is and which request
+/// started the work. Every spawn repeats it, since the fold keeps the newest.
+const SpawnData = struct {
+    /// A named child's name; null for a one-off.
+    agent: ?[]const u8 = null,
+    fingerprint: []const u8,
+};
+
+/// fx's data on a `child_finished` line.
+const FinishData = struct {
+    failure: ?[]const u8 = null,
+};
+
+/// Pure: the registry a v2 parent's folded children describe. The
+/// manager's reopen repair has finished every open item, so an open one
+/// here means another writer and is refused. Instructions live in each
+/// child's own `prefs` (D34), read when its work runs.
+fn registryFromChildren(alloc: Allocator, parent_id: []const u8, folded: []const session_adapter.Child) !Registry {
+    var registry = try Registry.init(alloc, parent_id);
+    errdefer registry.deinit(alloc);
+    if (folded.len > max_children) return error.StateTooLarge;
+    if (folded.len == 0) return registry;
+    const children = try alloc.alloc(Child, folded.len);
+    var built: usize = 0;
+    errdefer {
+        for (children[0..built]) |*child| child.deinit(alloc);
+        alloc.free(children);
+    }
+    var generation: u64 = 0;
+    for (folded) |entry| {
+        children[built] = try childFromFolded(alloc, entry);
+        built += 1;
+        generation = @max(generation, entry.seq);
+    }
+    registry.children = children;
+    registry.generation = generation;
+    return registry;
+}
+
+fn childFromFolded(alloc: Allocator, entry: session_adapter.Child) !Child {
+    if (entry.open) return error.InvalidState;
+    const outcome = entry.outcome orelse return error.InvalidState;
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
+    const spawn = std.json.parseFromSliceLeaky(SpawnData, sa, entry.spawn_data orelse return error.InvalidState, options) catch return error.InvalidState;
+    const finish = if (entry.finish_data) |raw|
+        std.json.parseFromSliceLeaky(FinishData, sa, raw, options) catch return error.InvalidState
+    else
+        FinishData{};
+    const last_outcome = fxOutcome(outcome);
+    if (finish.failure != null and last_outcome != .failed) return error.InvalidState;
+    const fingerprint = try parseFingerprint(spawn.fingerprint);
+
+    const id = try alloc.dupe(u8, entry.id);
+    errdefer alloc.free(id);
+    const work_id = try alloc.dupe(u8, entry.work_id);
+    errdefer alloc.free(work_id);
+    var kind: Kind = .one_off;
+    if (spawn.agent) |agent| {
+        if (!domain.validAgentName(agent)) return error.InvalidState;
+        kind = .{ .persistent = .{ .agent = try alloc.dupe(u8, agent), .instructions = &.{} } };
+    }
+    return .{
+        .id = id,
+        .kind = kind,
+        .phase = switch (last_outcome) {
+            .interrupted, .lost => .interrupted,
+            .completed, .failed, .cancelled => switch (kind) {
+                .one_off => .finished,
+                .persistent => .idle,
+            },
+        },
+        .work_generation = entry.seq,
+        .last_work_id = work_id,
+        .last_request_fingerprint = fingerprint,
+        .last_outcome = last_outcome,
+        .last_failure = if (finish.failure) |text| types.ModelFailureDiagnostic.init(text) else null,
+    };
+}
+
+/// Pure: the child lines that take the log from `old` to `next` (D22). A
+/// change of phase alone writes nothing. For each child a finish comes
+/// before a spawn, so new work on a finished child is one legal batch.
+fn planLines(arena: Allocator, old: Registry, next: Registry) ![]session_adapter.ChildLine {
+    var lines: std.ArrayList(session_adapter.ChildLine) = .empty;
+    for (old.children) |before| {
+        if (findChild(next, before.id) == null) return error.InvalidState;
+    }
+    for (next.children) |after| {
+        const before_work: ?[]const u8 = if (findChild(old, after.id)) |before| activeId(before) else null;
+        const after_work = activeId(after);
+        if (before_work) |work_id| {
+            if (after_work == null or !std.mem.eql(u8, after_work.?, work_id)) {
+                const last = after.last_work_id orelse return error.InvalidState;
+                if (!std.mem.eql(u8, last, work_id)) return error.InvalidState;
+                try lines.append(arena, .{ .finished = .{
+                    .child = after.id,
+                    .work_id = work_id,
+                    .outcome = try v2Outcome(after.last_outcome orelse return error.InvalidState),
+                    .data = if (after.last_failure) |failure| try stringifyAlloc(arena, FinishData{ .failure = failure.view() }) else null,
+                } });
+            }
+        }
+        if (after_work) |work_id| {
+            if (before_work == null or !std.mem.eql(u8, before_work.?, work_id)) {
+                const fingerprint = std.fmt.bytesToHex(after.active.?.request_fingerprint, .lower);
+                try lines.append(arena, .{ .spawned = .{
+                    .child = after.id,
+                    .work_id = work_id,
+                    .data = try stringifyAlloc(arena, SpawnData{ .agent = after.agentName(), .fingerprint = &fingerprint }),
+                } });
+            }
+        }
+    }
+    return lines.toOwnedSlice(arena);
+}
+
+fn findChild(registry: Registry, child_id: []const u8) ?Child {
+    for (registry.children) |child| {
+        if (std.mem.eql(u8, child.id, child_id)) return child;
+    }
+    return null;
+}
+
+fn activeId(child: Child) ?[]const u8 {
+    return if (child.active) |active| active.id else null;
+}
+
+fn stringifyAlloc(arena: Allocator, value: anytype) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try std.json.Stringify.value(value, .{}, &out.writer);
+    return out.written();
+}
+
+fn fxOutcome(outcome: session_adapter.ChildOutcome) Outcome {
+    return switch (outcome) {
+        .ok => .completed,
+        .failed => .failed,
+        .cancelled => .cancelled,
+        .interrupted => .interrupted,
+        .lost => .lost,
+    };
+}
+
+/// Only the manager's reopen repair records `lost` (D22).
+fn v2Outcome(outcome: Outcome) !session_adapter.ChildOutcome {
+    return switch (outcome) {
+        .completed => .ok,
+        .failed => .failed,
+        .cancelled => .cancelled,
+        .interrupted => .interrupted,
+        .lost => error.InvalidState,
+    };
+}
 
 /// Listing check: reuses discovery's validated identity and every child
 /// marker. A legacy session without a metadata-level bit falls back to its
@@ -1082,4 +1378,208 @@ test "persistent state derives create continue busy and terminal transitions" {
         "Audit security only.",
         replaced.instructions(),
     );
+}
+
+fn testWork(alloc: Allocator, id: []const u8, fingerprint_byte: u8) !ActiveWork {
+    const owned_id = try alloc.dupe(u8, id);
+    errdefer alloc.free(owned_id);
+    return .{
+        .id = owned_id,
+        .message = try alloc.dupe(u8, "do the work"),
+        .request_fingerprint = [_]u8{fingerprint_byte} ** 32,
+        .created_at_ms = 1,
+    };
+}
+
+fn advance(alloc: Allocator, old: *Registry, next: Registry) void {
+    old.deinit(alloc);
+    old.* = next;
+}
+
+test "a v2 registry change writes only the child lines it implies (D22)" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const parent_id = "01J00000000000000000000000";
+    const one_off = "01J00000000000000000000001";
+    const named = "01J00000000000000000000002";
+    var old = try Registry.init(alloc, parent_id);
+    defer old.deinit(alloc);
+
+    // A new one-off child: one spawn, without a name.
+    var next = try old.clone(alloc);
+    var first = try testWork(alloc, "work-1", 0xab);
+    defer first.deinit(alloc);
+    try next.appendOneOff(alloc, one_off, first);
+    var lines = try planLines(a, old, next);
+    try std.testing.expectEqual(@as(usize, 1), lines.len);
+    try std.testing.expectEqualStrings(one_off, lines[0].spawned.child);
+    try std.testing.expectEqualStrings("work-1", lines[0].spawned.work_id);
+    const spawn = try std.json.parseFromSliceLeaky(SpawnData, a, lines[0].spawned.data.?, .{});
+    try std.testing.expect(spawn.agent == null);
+    try std.testing.expectEqualStrings("ab" ** 32, spawn.fingerprint);
+    advance(alloc, &old, next);
+
+    // A change of phase alone writes nothing.
+    next = try old.clone(alloc);
+    next.children[0].phase = .awaiting_approval;
+    lines = try planLines(a, old, next);
+    try std.testing.expectEqual(@as(usize, 0), lines.len);
+    advance(alloc, &old, next);
+
+    // A failure: one finish that carries its text.
+    next = try old.clone(alloc);
+    try next.finish(alloc, one_off, "work-1", .failed, types.ModelFailureDiagnostic.init("boom"));
+    lines = try planLines(a, old, next);
+    try std.testing.expectEqual(@as(usize, 1), lines.len);
+    try std.testing.expectEqual(session_adapter.ChildOutcome.failed, lines[0].finished.outcome);
+    const finish = try std.json.parseFromSliceLeaky(FinishData, a, lines[0].finished.data.?, .{});
+    try std.testing.expectEqualStrings("boom", finish.failure.?);
+    advance(alloc, &old, next);
+
+    // A named child: its spawn carries its name.
+    next = try old.clone(alloc);
+    var second = try testWork(alloc, "work-2", 0xcd);
+    defer second.deinit(alloc);
+    try next.appendPersistent(alloc, named, "reviewer", "Be brief.", second);
+    lines = try planLines(a, old, next);
+    try std.testing.expectEqual(@as(usize, 1), lines.len);
+    try std.testing.expectEqualStrings("reviewer", (try std.json.parseFromSliceLeaky(SpawnData, a, lines[0].spawned.data.?, .{})).agent.?);
+    advance(alloc, &old, next);
+
+    // Its finish and its next work in one save: the finish comes first.
+    next = try old.clone(alloc);
+    try next.finish(alloc, named, "work-2", .completed, null);
+    var third = try testWork(alloc, "work-3", 0xef);
+    defer third.deinit(alloc);
+    _ = try next.startPersistentWork(alloc, "reviewer", null, third);
+    lines = try planLines(a, old, next);
+    try std.testing.expectEqual(@as(usize, 2), lines.len);
+    try std.testing.expectEqualStrings("work-2", lines[0].finished.work_id);
+    try std.testing.expectEqual(session_adapter.ChildOutcome.ok, lines[0].finished.outcome);
+    try std.testing.expect(lines[0].finished.data == null);
+    try std.testing.expectEqualStrings("work-3", lines[1].spawned.work_id);
+    advance(alloc, &old, next);
+
+    // A child never disappears, and only the manager records `lost`.
+    var empty = try Registry.init(alloc, parent_id);
+    defer empty.deinit(alloc);
+    try std.testing.expectError(error.InvalidState, planLines(a, old, empty));
+    var lost = try old.clone(alloc);
+    defer lost.deinit(alloc);
+    try lost.finish(alloc, named, "work-3", .completed, null);
+    lost.children[1].last_outcome = .lost;
+    try std.testing.expectError(error.InvalidState, planLines(a, old, lost));
+}
+
+test "a v2 parent's folded children rebuild the registry v1 would hold (D22)" {
+    const alloc = std.testing.allocator;
+    const parent_id = "01J00000000000000000000000";
+    const fingerprint = "ab" ** 32;
+    var folded = [_]session_adapter.Child{
+        .{ .id = @constCast("01J00000000000000000000001"), .work_id = @constCast("w1"), .open = false, .outcome = .ok, .spawn_data = @constCast("{\"fingerprint\":\"" ++ fingerprint ++ "\",\"later\":1}"), .finish_data = null, .seq = 5 },
+        .{ .id = @constCast("01J00000000000000000000002"), .work_id = @constCast("w2"), .open = false, .outcome = .failed, .spawn_data = @constCast("{\"agent\":\"reviewer\",\"fingerprint\":\"" ++ fingerprint ++ "\"}"), .finish_data = @constCast("{\"failure\":\"boom\"}"), .seq = 9 },
+        .{ .id = @constCast("01J00000000000000000000003"), .work_id = @constCast("w3"), .open = false, .outcome = .lost, .spawn_data = @constCast("{\"agent\":\"writer\",\"fingerprint\":\"" ++ fingerprint ++ "\"}"), .finish_data = null, .seq = 7 },
+    };
+    var registry = try registryFromChildren(alloc, parent_id, &folded);
+    defer registry.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 9), registry.generation);
+    try std.testing.expectEqual(@as(usize, 3), registry.children.len);
+    const one_off = registry.children[0];
+    try std.testing.expect(one_off.kind == .one_off);
+    try std.testing.expectEqual(Phase.finished, one_off.phase);
+    try std.testing.expectEqual(Outcome.completed, one_off.last_outcome.?);
+    try std.testing.expectEqualStrings("w1", one_off.last_work_id.?);
+    try std.testing.expectEqual([_]u8{0xab} ** 32, one_off.last_request_fingerprint.?);
+    try std.testing.expectEqual(@as(u64, 5), one_off.work_generation);
+    try std.testing.expect(one_off.active == null);
+    const failed = registry.children[1];
+    try std.testing.expectEqualStrings("reviewer", failed.agentName().?);
+    try std.testing.expectEqualStrings("", failed.instructions());
+    try std.testing.expectEqual(Phase.idle, failed.phase);
+    try std.testing.expectEqualStrings("boom", failed.last_failure.?.view());
+    // A named child lost before its first turn can take new work (D33).
+    const lost = registry.children[2];
+    try std.testing.expectEqual(Phase.interrupted, lost.phase);
+    try std.testing.expectEqual(Outcome.lost, lost.last_outcome.?);
+
+    // Open work, an unreadable spawn, or a failure on another outcome is refused.
+    var bad = folded[1];
+    bad.open = true;
+    try std.testing.expectError(error.InvalidState, registryFromChildren(alloc, parent_id, &.{bad}));
+    bad = folded[1];
+    bad.spawn_data = @constCast("{\"agent\":\"reviewer\"}");
+    try std.testing.expectError(error.InvalidState, registryFromChildren(alloc, parent_id, &.{bad}));
+    bad = folded[1];
+    bad.outcome = .ok;
+    try std.testing.expectError(error.InvalidState, registryFromChildren(alloc, parent_id, &.{bad}));
+    bad = folded[1];
+    bad.spawn_data = @constCast("{\"agent\":\"Bad Name\",\"fingerprint\":\"" ++ fingerprint ++ "\"}");
+    try std.testing.expectError(error.InvalidState, registryFromChildren(alloc, parent_id, &.{bad}));
+}
+
+test "v2 children live in the parent's log and come back after a reopen (D22)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var store = try session_adapter.Store.open(alloc, home);
+    defer store.deinit(alloc);
+    var model = "test-model".*;
+    const seed: session_adapter.Seed = .{
+        .preferences = .{ .model = &model, .effort = .auto, .fast_mode = false },
+        .language = types.ConversationLanguage.default(),
+        .permission_state = .{},
+    };
+    const parent = try session_adapter.Session.create(alloc, &store, "/w", .ask, seed);
+    var parent_open = true;
+    defer if (parent_open) parent.close();
+    try parent.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast("delegate") }, .assistant = @constCast("ok") } }, types.ConversationLanguage.default());
+    const parent_id = try alloc.dupe(u8, parent.id());
+    defer alloc.free(parent_id);
+    const child_id = "1786460757753-kid";
+    {
+        var children = V2Children.init(alloc, parent, "/w");
+        defer children.deinit();
+        const state_store = Store{ .backend = .{ .v2 = &children }, .parent_id = parent_id };
+        var lock = try state_store.acquireLock(alloc);
+        defer lock.release();
+        var registry = try state_store.load(alloc);
+        defer registry.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), registry.children.len);
+        var work = try testWork(alloc, "work-1", 0x11);
+        defer work.deinit(alloc);
+        try registry.appendPersistent(alloc, child_id, "reviewer", "", work);
+        try state_store.save(alloc, registry);
+        try registry.finish(alloc, child_id, "work-1", .completed, null);
+        try state_store.save(alloc, registry);
+        // A v2 child needs no marker file: its own first line says it is one.
+        try state_store.markChildSession(alloc, child_id);
+
+        try children.rememberSeed(child_id, .{ .preferences = seed.preferences, .language = seed.language });
+        var copy = (try children.seedFor(alloc, child_id)).?;
+        defer copy.preferences.deinit(alloc);
+        try std.testing.expectEqualStrings("test-model", copy.preferences.model);
+        try std.testing.expect((try children.seedFor(alloc, "1786460757753-none")) == null);
+    }
+    parent.close();
+    parent_open = false;
+
+    const reopened = try session_adapter.Session.resumeSession(alloc, &store, .{ .id = parent_id }, "/w", .ask);
+    defer reopened.close();
+    var children = V2Children.init(alloc, reopened, "/w");
+    defer children.deinit();
+    const state_store = Store{ .backend = .{ .v2 = &children }, .parent_id = parent_id };
+    var registry = try state_store.load(alloc);
+    defer registry.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), registry.children.len);
+    const child = registry.children[0];
+    try std.testing.expectEqualStrings(child_id, child.id);
+    try std.testing.expectEqualStrings("reviewer", child.agentName().?);
+    try std.testing.expectEqual(Phase.idle, child.phase);
+    try std.testing.expectEqualStrings("work-1", child.last_work_id.?);
+    try std.testing.expectEqual(Outcome.completed, child.last_outcome.?);
+    try std.testing.expectEqual([_]u8{0x11} ** 32, child.last_request_fingerprint.?);
 }

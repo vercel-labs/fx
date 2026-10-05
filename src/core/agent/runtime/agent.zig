@@ -17,6 +17,10 @@ pub const Agent = struct {
     /// calibrates from real usage instead of the raw serialization estimate.
     /// Plain value state: no allocation, no deinit work.
     request_token_calibration: ?RequestTokenCalibrationState = null,
+    /// Estimated tokens of the last request's instructions and tool
+    /// definitions, which compaction cannot shrink. Manual compaction sizes
+    /// its result with it.
+    request_fixed_tokens: ?usize = null,
 
     pub fn deinit(self: *Agent, alloc: Allocator) void {
         self.clearHistory(alloc);

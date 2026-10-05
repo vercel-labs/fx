@@ -13,6 +13,7 @@ const artifact_digest = @import("../session/artifact_digest.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const shell_resolver = @import("../terminal/shell_resolver.zig");
+const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const darwin_process_spawn = @import("../shared/darwin_process_spawn.zig");
 
 const Allocator = std.mem.Allocator;
@@ -36,6 +37,9 @@ pub const Config = struct {
     timeout_started_ms: ?i64 = null,
     command_artifact_capability: ?*session_child_store.SessionChildCapability = null,
     command_artifact_dir: ?[]const u8 = null,
+    /// Shell snapshot epoch of the remembered grant that admitted a `user`
+    /// profile command, or null when it was not admitted by a grant.
+    shell_grant_epoch: ?u64 = null,
 };
 
 pub const CallbackProjection = enum {
@@ -69,7 +73,7 @@ const natural_completion_live_ms: i64 = 10_000;
 /// own output is done and a detached process is still writing.
 const natural_completion_drain_max_bytes: usize = 2 * 1024 * 1024;
 pub const termination_settle_timeout_ms: i64 = 5_000;
-const supports_foreground_session = builtin.link_libc and
+pub const supports_foreground_session = builtin.link_libc and
     std.process.can_spawn and
     std.process.can_replace and
     builtin.os.tag != .windows and
@@ -228,13 +232,38 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
         std.process.exit(foreground_session_replace_failure_exit_code);
     };
     target.stdin = null;
-    target_input.writeStreamingAll(zio, script) catch |err| {
+    var script_writer: ?std.Thread = null;
+    if (script.len <= foreground_session_inline_script_bytes) {
+        target_input.writeStreamingAll(zio, script) catch |err| {
+            target_input.close(zio);
+            target.kill(zio);
+            writeForegroundSessionReplaceFailure(failure_nonce, err);
+            std.process.exit(foreground_session_replace_failure_exit_code);
+        };
         target_input.close(zio);
-        target.kill(zio);
-        writeForegroundSessionReplaceFailure(failure_nonce, err);
-        std.process.exit(foreground_session_replace_failure_exit_code);
-    };
-    target_input.close(zio);
+    } else {
+        // A large script can exceed the pipe buffer, and on macOS the target
+        // stays suspended until waitForForegroundTarget resumes it, so it is
+        // written while the target runs. The target already exec'd with the
+        // default SIGPIPE disposition; ignoring it here only keeps a target
+        // that stops reading from killing the supervisor.
+        const ignore_action: std.posix.Sigaction = .{
+            .handler = .{ .handler = std.posix.SIG.IGN },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.PIPE, &ignore_action, null);
+        script_writer = std.Thread.spawn(
+            .{},
+            writeForegroundTargetScript,
+            .{ target_input, script },
+        ) catch |err| {
+            target_input.close(zio);
+            target.kill(zio);
+            writeForegroundSessionReplaceFailure(failure_nonce, err);
+            std.process.exit(foreground_session_replace_failure_exit_code);
+        };
+    }
     const term = waitForForegroundTarget(
         &target,
         if (process_witness) |*witness| witness else null,
@@ -245,7 +274,21 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
         writeForegroundSessionReplaceFailure(failure_nonce, err);
         std.process.exit(foreground_session_replace_failure_exit_code);
     };
+    // The target has exited, so the writer finished or saw a broken pipe.
+    if (script_writer) |writer| writer.join();
     exitForegroundSessionSupervisor(term);
+}
+
+/// Scripts up to this size fit in any pipe buffer, so they are written before
+/// the target is resumed.
+const foreground_session_inline_script_bytes: usize = 4096;
+
+fn writeForegroundTargetScript(target_input: std.Io.File, script: []const u8) void {
+    const zio = io_mod.getIo();
+    target_input.writeStreamingAll(zio, script) catch |err| {
+        debug_trace.logf("core", "foreground session script write stopped err={s}", .{@errorName(err)});
+    };
+    target_input.close(zio);
 }
 
 fn recordForegroundSessionTermination(signal: std.posix.SIG) callconv(.c) void {
@@ -683,6 +726,14 @@ pub fn executeCommandInEnvironment(
     var effective_cfg = cfg;
     if (effective_cfg.timeout_started_ms == null) effective_cfg.timeout_started_ms = io_mod.milliTimestamp();
     try ExecutionControl.init(effective_cfg).check();
+    switch (environment) {
+        .user => |shell_path| if (snapshotEligible(shell_path, command)) {
+            if (try executeWithSnapshot(arena, scratch, effective_cfg, command, cwd, shell_path)) |result| {
+                return result;
+            }
+        },
+        else => {},
+    }
     const invocation = try shell_resolver.capturedInvocation(scratch, environment, command);
     debug_trace.logf(
         "core",
@@ -698,6 +749,115 @@ pub fn executeCommandInEnvironment(
         &invocation,
     );
 }
+
+fn snapshotEligible(shell_path: []const u8, command: []const u8) bool {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return false;
+    // A NUL cannot travel through the stdin script; keep today's argv path,
+    // which rejects it at spawn.
+    return shell_resolver.shellKind(shell_path) != null and
+        std.mem.findScalar(u8, command, 0) == null;
+}
+
+/// The result for a command whose remembered approval predates a shell
+/// refresh. Nothing ran; requesting the command again asks for approval.
+fn approvalResetResult(
+    arena: Allocator,
+    command: []const u8,
+    cwd: []const u8,
+) !command_contract.RunCommandResult {
+    debug_trace.logf("core", "command runner rejected stale shell approval", .{});
+    return formatOutputWithStatus(
+        arena,
+        command,
+        cwd,
+        .{ .exit_code = 126 },
+        "",
+        "fx did not run this command: the shell startup files changed after it was approved. Request it again to ask for approval.\n",
+        null,
+        false,
+    );
+}
+
+/// Runs a `user` profile command in a clean shell restored from the process
+/// snapshot. Returns null when the command must use full startup instead:
+/// no snapshot is available, or its replay failed before the command started.
+fn executeWithSnapshot(
+    arena: Allocator,
+    scratch: Allocator,
+    cfg: Config,
+    command: []const u8,
+    cwd: []const u8,
+    shell_path: []const u8,
+) !?command_contract.RunCommandResult {
+    const owner = shell_snapshot.processOwner();
+    const acquired = owner.acquire(shell_path, cwd, .{
+        .cancel_flag = cfg.cancel_flag,
+        .deadline_ms = ExecutionControl.init(cfg).deadlineMs(),
+    }) catch |err| return switch (err) {
+        error.Cancelled => error.CancelledBeforeExecution,
+        error.TimeoutExpired => error.TimeoutExpired,
+    };
+    const lease = switch (acquired) {
+        .snapshot => |value| value,
+        .full_startup => {
+            if (cfg.shell_grant_epoch) |epoch| {
+                if (epoch != owner.approvalEpoch()) return try approvalResetResult(arena, command, cwd);
+            }
+            return null;
+        },
+    };
+    defer lease.release();
+    const generation = lease.generation;
+    if (cfg.shell_grant_epoch) |epoch| {
+        if (epoch != generation.epoch) return try approvalResetResult(arena, command, cwd);
+    }
+
+    var nonce_raw: [foreground_session_failure_nonce_bytes]u8 = undefined;
+    io_mod.getIo().random(&nonce_raw);
+    const nonce = std.fmt.bytesToHex(nonce_raw, .lower);
+    const failure_marker = try std.mem.concat(scratch, u8, &.{
+        shell_resolver.snapshot_replay_failure_prefix,
+        &nonce,
+    });
+    const invocation = try shell_resolver.snapshotInvocation(scratch, generation.shell_path, failure_marker);
+    const script = try shell_resolver.snapshotScript(scratch, generation.replay, command);
+    debug_trace.logf(
+        "core",
+        "command runner snapshot generation={d} shell={s} replay_bytes={d}",
+        .{ generation.id, generation.shell_path, generation.replay.len },
+    );
+    const result = try executeProcessWithScript(
+        scratch,
+        cfg,
+        invocation.argv(),
+        cwd,
+        script,
+        &generation.environ,
+    );
+    if (snapshotReplayFailed(result, failure_marker)) {
+        // The replay stopped before the command started, so the command has
+        // not run. Fail this snapshot and let the caller run it once with
+        // full startup.
+        debug_trace.logf(
+            "core",
+            "command runner snapshot replay failed generation={d}; rerunning with full startup",
+            .{generation.id},
+        );
+        owner.markReplayFailed(generation);
+        return null;
+    }
+    return try formatCollectedOutput(arena, command, cwd, result);
+}
+
+fn snapshotReplayFailed(result: CollectedProcess, failure_marker: []const u8) bool {
+    return switch (result.status) {
+        .exit_code => |code| code == shell_snapshot_replay_failure_exit_code and
+            std.mem.find(u8, result.stderr, failure_marker) != null,
+        else => false,
+    };
+}
+
+const shell_snapshot_replay_failure_exit_code: i64 = 125;
 
 const ExecutionControl = struct {
     cancel_flag: ?*std.atomic.Value(bool),
@@ -1154,12 +1314,14 @@ fn executeProcessWithInput(
     );
 }
 
+/// `environ_map` replaces the inherited environment for the command when set.
 fn executeProcessWithScript(
     scratch: Allocator,
     cfg: Config,
     argv: []const []const u8,
     cwd: []const u8,
     script: []const u8,
+    environ_map: ?*const std.process.Environ.Map,
 ) !CollectedProcess {
     if (comptime supports_foreground_session) {
         return executeProcessWithDetachedSession(
@@ -1168,6 +1330,7 @@ fn executeProcessWithScript(
             argv,
             cwd,
             script,
+            environ_map,
         );
     }
     return executeProcessWithScriptUnisolated(
@@ -1176,6 +1339,7 @@ fn executeProcessWithScript(
         argv,
         cwd,
         script,
+        environ_map,
     );
 }
 
@@ -1190,6 +1354,7 @@ fn executeProcessWithDetachedSession(
     argv: []const []const u8,
     cwd: []const u8,
     script: []const u8,
+    environ_map: ?*const std.process.Environ.Map,
 ) !CollectedProcess {
     const executable = try foregroundSessionExecutable(scratch);
     var nonce_bytes: [foreground_session_failure_nonce_bytes]u8 = undefined;
@@ -1219,12 +1384,14 @@ fn executeProcessWithDetachedSession(
     try helper_argv.appendSlice(scratch, argv);
 
     const started_ms = io_mod.milliTimestamp();
+    // The supervisor passes its environment through to the target shell.
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = helper_argv.items,
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .pipe,
         .cwd = .{ .path = cwd },
+        .environ_map = environ_map,
     });
 
     var output = OutputCollector.init(scratch, cfg);
@@ -1286,6 +1453,53 @@ fn executeProcessWithDetachedSession(
         collected.source,
         cfg.force_cancel_flag != null,
     );
+}
+
+/// Starts `argv` in a new session through the foreground supervisor, so it
+/// has no controlling terminal: an interactive login shell can neither stop
+/// on nor draw over the terminal fx runs in. The target's stdin is empty;
+/// stdout and stderr are pipes. `child.stdin` stays open as the supervisor's
+/// lifeline: closing it ends the session. The caller owns the child and its
+/// process group.
+pub fn spawnDetachedSession(
+    scratch: Allocator,
+    argv: []const []const u8,
+    cwd: []const u8,
+    environ_map: ?*const std.process.Environ.Map,
+) !std.process.Child {
+    if (comptime !supports_foreground_session) return error.OperationUnsupported;
+    const executable = try foregroundSessionExecutable(scratch);
+    var helper_argv: std.ArrayList([]const u8) = .empty;
+    try helper_argv.appendSlice(scratch, &.{ executable, foreground_session_token, "none" });
+    try helper_argv.appendSlice(scratch, argv);
+    var child = try std.process.spawn(io_mod.getIo(), .{
+        .argv = helper_argv.items,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .cwd = .{ .path = cwd },
+        .environ_map = environ_map,
+    });
+    var phase: ForegroundSessionPhase = .pre_ready;
+    errdefer cleanupForegroundSessionChild(&child, phase);
+    try waitForForegroundSessionReady(&child, .{ .max_command_output_bytes = 0 });
+    phase = .group_ready;
+
+    const input = child.stdin orelse return error.SpawnFailed;
+    var nonce_bytes: [foreground_session_failure_nonce_bytes]u8 = undefined;
+    io_mod.getIo().random(&nonce_bytes);
+    const nonce = std.fmt.bytesToHex(nonce_bytes, .lower);
+    var control: [foreground_session_control_bytes]u8 = undefined;
+    @memcpy(control[0..nonce.len], &nonce);
+    control[foreground_session_release_index] = foreground_session_release_byte;
+    std.mem.writeInt(
+        u64,
+        control[foreground_session_script_length_index..][0..foreground_session_script_length_bytes],
+        0,
+        .little,
+    );
+    try input.writeStreamingAll(io_mod.getIo(), &control);
+    return child;
 }
 
 fn foregroundSessionExecutable(scratch: Allocator) ![]const u8 {
@@ -1389,6 +1603,7 @@ fn executeProcessWithScriptUnisolated(
     argv: []const []const u8,
     cwd: []const u8,
     script: []const u8,
+    environ_map: ?*const std.process.Environ.Map,
 ) !CollectedProcess {
     const started_ms = io_mod.milliTimestamp();
     var child = try std.process.spawn(io_mod.getIo(), .{
@@ -1398,6 +1613,7 @@ fn executeProcessWithScriptUnisolated(
         .stderr = .pipe,
         .cwd = .{ .path = cwd },
         .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
+        .environ_map = environ_map,
     });
 
     var output = OutputCollector.init(scratch, cfg);
@@ -1647,6 +1863,7 @@ fn executeRawBashWithResultCommand(
         &argv,
         cwd,
         execution_command,
+        null,
     );
     return formatCollectedOutput(alloc, result_command, cwd, result);
 }
@@ -1668,6 +1885,7 @@ fn executeRawInvocation(
         invocation.argv(),
         cwd,
         "",
+        null,
     );
     return formatCollectedOutput(alloc, command, cwd, result);
 }
@@ -1790,9 +2008,13 @@ test "zsh user profile reports natural SIGTERM after alias-safe startup" {
     try std.testing.expectEqual(@as(?i64, null), foreground.exit_code);
     try std.testing.expectEqual(@as(?u32, @intFromEnum(std.posix.SIG.TERM)), foreground.signal);
 
-    const debug_output = try readAbsoluteFile(arena, debug_log, 4096);
-    try std.testing.expect(std.mem.find(u8, debug_output, "builtin trap - TERM") != null);
+    // The startup files ran once into the snapshot. The aliased `builtin`
+    // could not intercept the alias-safe `\builtin eval` that runs the
+    // command, and the replayed TRAPDEBUG still observed it.
+    const debug_output = try readAbsoluteFile(arena, debug_log, 64 * 1024);
+    try std.testing.expect(std.mem.find(u8, debug_output, "builtin eval") != null);
     try std.testing.expect(std.mem.find(u8, debug_output, "kill -TERM $$") != null);
+    try std.testing.expect(std.mem.find(u8, signaled.output, "INTERCEPTED") == null);
 
     const trapped = try executeCommandInEnvironment(
         config,
@@ -1803,6 +2025,256 @@ test "zsh user profile reports natural SIGTERM after alias-safe startup" {
     );
     try std.testing.expectEqual(@as(?i64, 42), trapped.command_result.?.exit_code);
     try std.testing.expectEqual(@as(?u32, null), trapped.command_result.?.signal);
+}
+
+const SnapshotTestShell = struct { home: []const u8, workspace: []const u8, shell: []const u8 };
+
+fn writeSnapshotTestShell(
+    arena: Allocator,
+    tmp: *std.testing.TmpDir,
+    zshrc: []const u8,
+) !SnapshotTestShell {
+    return writeSnapshotTestShellFor(arena, tmp, "zsh", ".zshrc", zshrc);
+}
+
+/// Writes a wrapper named after the shell that pins HOME (and ZDOTDIR) to a
+/// temporary home holding `rc_name`.
+fn writeSnapshotTestShellFor(
+    arena: Allocator,
+    tmp: *std.testing.TmpDir,
+    shell_name: []const u8,
+    rc_name: []const u8,
+    rc: []const u8,
+) !SnapshotTestShell {
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try tmp.dir.createDirPath(io_mod.getIo(), "wrapper");
+    const home = try io_mod.dirRealpathAlloc(arena, tmp.dir, "home");
+    const workspace = try io_mod.dirRealpathAlloc(arena, tmp.dir, "workspace");
+    const wrapper_dir = try io_mod.dirRealpathAlloc(arena, tmp.dir, "wrapper");
+    const rc_path = try std.fs.path.join(arena, &.{ "home", rc_name });
+    try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = rc_path, .data = rc });
+    const source = try std.fmt.allocPrint(
+        arena,
+        "#!/bin/sh\nexport HOME={s}\nexport ZDOTDIR={s}\nexec /bin/{s} \"$@\"\n",
+        .{ try shellQuote(arena, home), try shellQuote(arena, home), shell_name },
+    );
+    const wrapper_path = try std.fs.path.join(arena, &.{ "wrapper", shell_name });
+    var wrapper = try tmp.dir.createFile(io_mod.getIo(), wrapper_path, .{ .truncate = true });
+    defer wrapper.close(io_mod.getIo());
+    try wrapper.writeStreamingAll(io_mod.getIo(), source);
+    try wrapper.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o700));
+    return .{
+        .home = home,
+        .workspace = workspace,
+        .shell = try std.fs.path.join(arena, &.{ wrapper_dir, shell_name }),
+    };
+}
+
+test "bash user profile commands reuse one startup-file snapshot" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/bash", .{}) catch
+        return error.SkipZigTest;
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try writeSnapshotTestShellFor(
+        arena,
+        &tmp,
+        "bash",
+        ".bash_profile",
+        "printf 'loaded\\n' >> \"$HOME/rc-loads.log\"\n" ++
+            "alias fxsnap_alias='printf alias-ok'\n" ++
+            "fxsnap_fn() { printf function-ok; }\n" ++
+            "export PATH=\"$HOME/marker-bin:$PATH\"\n" ++
+            "export FXSNAP_EXPORT=exported\n",
+    );
+
+    const config = Config{ .max_command_output_bytes = 64 * 1024 };
+    const first = try executeCommandInEnvironment(
+        config,
+        arena,
+        "fxsnap_alias; echo; fxsnap_fn; echo; echo $FXSNAP_EXPORT; " ++
+            "case :$PATH: in *:$HOME/marker-bin:*) echo path-ok;; esac; cat; echo stdin-closed",
+        paths.workspace,
+        .{ .user = paths.shell },
+    );
+    inline for (.{ "alias-ok", "function-ok", "exported", "path-ok", "stdin-closed" }) |expected| {
+        try std.testing.expect(std.mem.find(u8, first.output, expected) != null);
+    }
+    try std.testing.expect(std.mem.startsWith(u8, first.output, "exit_code=0\n"));
+
+    _ = try executeCommandInEnvironment(config, arena, "cd /; export FXSNAP_LEAK=1", paths.workspace, .{ .user = paths.shell });
+    const third = try executeCommandInEnvironment(
+        config,
+        arena,
+        "echo \"pwd=$PWD leak=${FXSNAP_LEAK-unset}\"; exit 7",
+        paths.workspace,
+        .{ .user = paths.shell },
+    );
+    const expected_pwd = try std.fmt.allocPrint(arena, "pwd={s} leak=unset", .{paths.workspace});
+    try std.testing.expect(std.mem.find(u8, third.output, expected_pwd) != null);
+    try std.testing.expectEqual(@as(?i64, 7), third.command_result.?.exit_code);
+
+    const loads_path = try std.fs.path.join(arena, &.{ paths.home, "rc-loads.log" });
+    try std.testing.expectEqualStrings("loaded\n", try readAbsoluteFile(arena, loads_path, 4096));
+}
+
+test "user profile commands reuse one startup-file snapshot" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Thousands of functions push the replay past the pipe buffer, so the
+    // supervisor must stream it while the shell reads.
+    const paths = try writeSnapshotTestShell(
+        arena,
+        &tmp,
+        "print -r -- loaded >> \"$HOME/rc-loads.log\"\n" ++
+            "alias fxsnap_alias='print -r -- alias-ok'\n" ++
+            "fxsnap_fn() { print -r -- function-ok; }\n" ++
+            "export PATH=\"$HOME/marker-bin:$PATH\"\n" ++
+            "export FXSNAP_EXPORT=exported\n" ++
+            "for i in {1..3000}; do eval \"fxsnap_bulk_$i() { print -r -- bulk-$i; }\"; done\n",
+    );
+
+    const config = Config{ .max_command_output_bytes = 64 * 1024 };
+    const first = try executeCommandInEnvironment(
+        config,
+        arena,
+        "fxsnap_alias; fxsnap_fn; print -r -- $FXSNAP_EXPORT; " ++
+            "case :$PATH: in *:$HOME/marker-bin:*) print -r -- path-ok;; esac; " ++
+            "fxsnap_bulk_2999; cat; print -r -- stdin-closed",
+        paths.workspace,
+        .{ .user = paths.shell },
+    );
+    inline for (.{ "alias-ok", "function-ok", "exported", "path-ok", "bulk-2999", "stdin-closed" }) |expected| {
+        try std.testing.expect(std.mem.find(u8, first.output, expected) != null);
+    }
+    try std.testing.expect(std.mem.startsWith(u8, first.output, "exit_code=0\n"));
+
+    _ = try executeCommandInEnvironment(
+        config,
+        arena,
+        "cd /; export FXSNAP_LEAK=1; alias fxsnap_new='print leaked'",
+        paths.workspace,
+        .{ .user = paths.shell },
+    );
+    const third = try executeCommandInEnvironment(
+        config,
+        arena,
+        "print -r -- \"pwd=$PWD leak=${FXSNAP_LEAK-unset}\"; " ++
+            "alias fxsnap_new >/dev/null 2>&1 || print -r -- alias-unset; exit 7",
+        paths.workspace,
+        .{ .user = paths.shell },
+    );
+    const expected_pwd = try std.fmt.allocPrint(arena, "pwd={s} leak=unset", .{paths.workspace});
+    try std.testing.expect(std.mem.find(u8, third.output, expected_pwd) != null);
+    try std.testing.expect(std.mem.find(u8, third.output, "alias-unset") != null);
+    try std.testing.expectEqual(@as(?i64, 7), third.command_result.?.exit_code);
+
+    const loads_path = try std.fs.path.join(arena, &.{ paths.home, "rc-loads.log" });
+    const loads = try readAbsoluteFile(arena, loads_path, 4096);
+    try std.testing.expectEqualStrings("loaded\n", loads);
+}
+
+test "user profile command with an approval from an earlier shell epoch does not run" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try writeSnapshotTestShell(arena, &tmp, "alias fxsnap_alias='print -r -- alias-ok'\n");
+    const marker_path = try std.fs.path.join(arena, &.{ paths.workspace, "ran.log" });
+    const command = try std.fmt.allocPrint(arena, "print -r -- ran >> {s}", .{try shellQuote(arena, marker_path)});
+
+    // The grant was checked under epoch 0; a refresh moved the shell to 1.
+    shell_snapshot.processOwner().markDirty(.user_reload);
+    const stale = try executeCommandInEnvironment(
+        .{ .max_command_output_bytes = 16 * 1024, .shell_grant_epoch = 0 },
+        arena,
+        command,
+        paths.workspace,
+        .{ .user = paths.shell },
+    );
+    try std.testing.expectEqual(@as(?i64, 126), stale.command_result.?.exit_code);
+    try std.testing.expect(std.mem.find(u8, stale.output, "changed after it was approved") != null);
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), marker_path, .{}) catch |err| {
+        try std.testing.expectEqual(error.FileNotFound, err);
+    };
+
+    const current = try executeCommandInEnvironment(
+        .{ .max_command_output_bytes = 16 * 1024, .shell_grant_epoch = shell_snapshot.processOwner().approvalEpoch() },
+        arena,
+        command,
+        paths.workspace,
+        .{ .user = paths.shell },
+    );
+    try std.testing.expectEqual(@as(?i64, 0), current.command_result.?.exit_code);
+    try std.testing.expectEqualStrings("ran\n", try readAbsoluteFile(arena, marker_path, 4096));
+}
+
+fn brokenReplayCapture(request: shell_snapshot.CaptureRequest) shell_snapshot.CaptureOutcome {
+    const generation = shell_snapshot.Generation.create() catch return .{ .failed = .out_of_memory };
+    const alloc = generation.arena.allocator();
+    generation.shell_path = alloc.dupe(u8, request.shell_path) catch {
+        generation.destroy();
+        return .{ .failed = .out_of_memory };
+    };
+    generation.replay = "fxsnap_broken() {\n";
+    generation.environ.put("PATH", "/usr/bin:/bin") catch {};
+    return .{ .ready = generation };
+}
+
+test "user profile command reruns once with full startup after a failed replay" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+    shell_snapshot.resetProcessOwnerForTest(brokenReplayCapture);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try writeSnapshotTestShell(
+        arena,
+        &tmp,
+        "print -r -- loaded >> \"$HOME/rc-loads.log\"\n",
+    );
+    const marker_path = try std.fs.path.join(arena, &.{ paths.workspace, "runs.log" });
+    const command = try std.fmt.allocPrint(arena, "print -r -- ran >> {s}; print -r -- done", .{try shellQuote(arena, marker_path)});
+    const config = Config{ .max_command_output_bytes = 16 * 1024 };
+
+    const result = try executeCommandInEnvironment(config, arena, command, paths.workspace, .{ .user = paths.shell });
+    try std.testing.expect(std.mem.startsWith(u8, result.output, "exit_code=0\n"));
+    try std.testing.expect(std.mem.find(u8, result.output, "done") != null);
+    try std.testing.expect(std.mem.find(u8, result.output, shell_resolver.snapshot_replay_failure_prefix) == null);
+    try std.testing.expectEqualStrings("ran\n", try readAbsoluteFile(arena, marker_path, 4096));
+
+    // Later commands fall back to full startup without retrying the replay.
+    _ = try executeCommandInEnvironment(config, arena, command, paths.workspace, .{ .user = paths.shell });
+    try std.testing.expectEqualStrings("ran\nran\n", try readAbsoluteFile(arena, marker_path, 4096));
+    const loads_path = try std.fs.path.join(arena, &.{ paths.home, "rc-loads.log" });
+    try std.testing.expectEqualStrings("loaded\nloaded\n", try readAbsoluteFile(arena, loads_path, 4096));
+    var notice_buffer: [256]u8 = undefined;
+    const notice = shell_snapshot.processOwner().takeUiNotice(&notice_buffer).?;
+    try std.testing.expect(std.mem.find(u8, notice, "could not be restored") != null);
 }
 
 fn formatOutput(alloc: Allocator, command: []const u8, cwd: []const u8, term: std.process.Child.Term, stdout_raw: []const u8, stderr_raw: []const u8, duration_ms: ?u64) !command_contract.RunCommandResult {
@@ -3533,6 +4005,7 @@ test "detached session preserves replacement failure with a zero output budget" 
             &argv,
             "/tmp",
             "",
+            null,
         ),
     );
 }

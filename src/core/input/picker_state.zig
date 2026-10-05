@@ -45,7 +45,7 @@ const InlinePickerSuppression = union(enum) {
     }
 };
 
-pub const model_picker_fast_options = [_][]const u8{ "normal", "fast" };
+pub const model_picker_speed_options = [_][]const u8{ "normal", "fast", "ultrafast" };
 
 /// `/login` and `/setup` are aliases of `/provider`: all open the same
 /// columnar picker. Typed text keeps whichever spelling the user wrote;
@@ -403,6 +403,7 @@ pub const State = struct {
         model: []const u8,
         effort_index: usize,
         fast_mode: bool,
+        ultrafast_mode: bool,
         stage: ModelPickerStage,
     ) Allocator.Error!void {
         const stable_model = try alloc.dupe(u8, model);
@@ -414,7 +415,7 @@ pub const State = struct {
         self.model_picker_stage = stage;
         self.model_picker_effort_index = effort_index;
         self.model_picker_effort_window_start = 0;
-        self.model_picker_fast_index = if (fast_mode) 1 else 0;
+        self.model_picker_fast_index = if (ultrafast_mode) 2 else if (fast_mode) 1 else 0;
         self.model_picker_fast_window_start = 0;
     }
 
@@ -438,8 +439,12 @@ pub const State = struct {
         return self.model_picker_effort_index;
     }
 
+    pub fn selectedModelPickerSpeed(self: *const State) []const u8 {
+        return model_picker_speed_options[self.model_picker_fast_index % model_picker_speed_options.len];
+    }
+
     pub fn selectedModelPickerFast(self: *const State) bool {
-        return self.model_picker_fast_index % model_picker_fast_options.len == 1;
+        return std.mem.eql(u8, self.selectedModelPickerSpeed(), "fast");
     }
 };
 
@@ -826,14 +831,16 @@ test "model picker flow accepts aliased pending model input" {
     var state: State = .{};
     defer state.deinit(alloc);
 
-    try state.beginModelPickerFlow(alloc, "openai/gpt-5", 2, false, .effort);
+    try state.beginModelPickerFlow(alloc, "openai/gpt-5", 2, false, false, .effort);
     const aliased_model = state.model_picker_pending_model.items;
-    try state.beginModelPickerFlow(alloc, aliased_model, 3, true, .fast);
+    try state.beginModelPickerFlow(alloc, aliased_model, 3, true, false, .fast);
 
     try std.testing.expectEqual(ModelPickerStage.fast, state.model_picker_stage);
     try std.testing.expectEqualStrings("openai/gpt-5", state.model_picker_pending_model.items);
     try std.testing.expectEqual(@as(usize, 3), state.selectedModelPickerEffortIndex());
-    try std.testing.expect(state.selectedModelPickerFast());
+    try std.testing.expectEqualStrings("fast", state.selectedModelPickerSpeed());
+    try state.beginModelPickerFlow(alloc, aliased_model, 3, false, true, .fast);
+    try std.testing.expectEqualStrings("ultrafast", state.selectedModelPickerSpeed());
 }
 
 test "model picker flow preserves state when allocation fails" {
@@ -841,7 +848,7 @@ test "model picker flow preserves state when allocation fails" {
     var state: State = .{};
     defer state.deinit(alloc);
 
-    try state.beginModelPickerFlow(alloc, "old", 2, false, .effort);
+    try state.beginModelPickerFlow(alloc, "old", 2, false, false, .effort);
 
     var failing = std.testing.FailingAllocator.init(alloc, .{
         .fail_index = 1,
@@ -856,6 +863,7 @@ test "model picker flow preserves state when allocation fails" {
             &large_model,
             5,
             true,
+            false,
             .fast,
         ),
     );

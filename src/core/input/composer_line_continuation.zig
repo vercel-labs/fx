@@ -120,6 +120,7 @@ test "line continuation records one edit and reconciles transient state" {
         "provider/model",
         2,
         true,
+        false,
         .effort,
     );
     fixture.picker.slash_completion_index = 3;
@@ -171,6 +172,7 @@ test "line continuation no-op only resets vertical navigation" {
         alloc,
         "provider/model",
         1,
+        false,
         false,
         .effort,
     );

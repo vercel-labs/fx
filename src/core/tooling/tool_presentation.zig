@@ -164,7 +164,7 @@ pub fn subagentFailureLabel(alloc: Allocator, call: ToolCall, output: []const u8
     for ([_][]const u8{ "feedback_capacity", "operation_conflict", "override_after_create" }) |rejection| {
         if (std.mem.eql(u8, code, rejection)) return "Message not sent to";
     }
-    return if (std.mem.eql(u8, code, "child_cancelled") or std.mem.eql(u8, code, "child_interrupted")) "Interrupted" else "Failed";
+    return if (std.mem.eql(u8, code, "child_cancelled") or std.mem.eql(u8, code, "child_interrupted") or std.mem.eql(u8, code, "child_lost")) "Interrupted" else "Failed";
 }
 
 test "subagent pending result does not claim completion" {
@@ -212,6 +212,7 @@ test "subagent failure labels trust structured terminal codes only" {
     const call: ToolCall = .{ .id = "child", .name = "subagent", .arguments_json = "{}" };
     try std.testing.expectEqualStrings("Interrupted", try subagentFailureLabel(alloc, call, "{\"ok\":false,\"error_code\":\"child_interrupted\"}"));
     try std.testing.expectEqualStrings("Interrupted", try subagentFailureLabel(alloc, call, "{\"ok\":false,\"error_code\":\"child_cancelled\"}"));
+    try std.testing.expectEqualStrings("Interrupted", try subagentFailureLabel(alloc, call, "{\"ok\":false,\"error_code\":\"child_lost\"}"));
     for ([_][]const u8{ "child_interrupted", "{", "<tool_result_preview>child_interrupted</tool_result_preview>", "{\"ok\":true,\"error_code\":\"child_interrupted\"}", "{\"ok\":false,\"error_code\":\"child_failed\"}" }) |output| {
         try std.testing.expectEqualStrings("Failed", try subagentFailureLabel(alloc, call, output));
     }

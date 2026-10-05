@@ -1064,6 +1064,9 @@ pub fn finishExecutedToolStatus(
                 advertised_dynamic_tool_names,
             );
             if (std.mem.eql(u8, call.name, "shell")) {
+                if (try tool_result_errors.isTerminalEndedFailure(arena, safe_result)) {
+                    break :blk try std.fmt.allocPrint(arena, "{s} · ended when fx exited", .{base});
+                }
                 if (try tool_result_errors.inspectTerminalActionFieldCorrection(
                     arena,
                     safe_result,

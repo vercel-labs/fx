@@ -270,7 +270,7 @@ pub const Writer = struct {
         }
     }
 
-    fn writeId(w: *std.Io.Writer, id: ?RequestId) !void {
+    pub fn writeId(w: *std.Io.Writer, id: ?RequestId) !void {
         if (id) |rid| {
             switch (rid) {
                 .integer => |n| try w.print("{d}", .{n}),

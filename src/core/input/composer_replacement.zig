@@ -353,7 +353,7 @@ test "bounded selection replacement preserves state on rejection" {
 
     _ = fixture.edit.beginSelection(2);
     _ = fixture.edit.extendSelection(6);
-    try fixture.picker.beginModelPickerFlow(alloc, "provider/model", 2, false, .effort);
+    try fixture.picker.beginModelPickerFlow(alloc, "provider/model", 2, false, false, .effort);
     fixture.picker.file_completion_index = 3;
     fixture.picker.file_completion_window_start = 1;
     fixture.vertical.preferred_column = 7;

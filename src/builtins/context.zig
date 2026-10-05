@@ -26,8 +26,39 @@ const StaticContextInput = context_contract.StaticContextInput;
 const TransientContextInput = context_contract.TransientContextInput;
 const workspace_access = @import("../core/workspace/workspace_access.zig");
 const sort_utils = @import("../core/shared/sort_utils.zig");
+const shell_resolver = @import("../core/terminal/shell_resolver.zig");
 
 pub const gateway_system_prompt = @embedFile("system_prompt.md");
+
+const terminal_identity = "You are fx, a local coding CLI assistant with tool access.";
+const terminal_rendering = "Write responses in GitHub-flavored Markdown, which fx renders in the terminal.";
+const terminal_table_emphasis = "Use bold sparingly, and never inside tables, since fx already bolds table headers.";
+
+/// The base prompt for hosts that present fx inside another application
+/// rather than a terminal. Only the terminal identity and rendering claims
+/// differ; a wording change in the base prompt fails the build here.
+pub const embedded_system_prompt = embedded: {
+    @setEvalBranchQuota(4_000_000);
+    var text: []const u8 = gateway_system_prompt;
+    text = replaceOnce(
+        text,
+        terminal_identity,
+        "You are fx, a coding agent with tool access. A client application hosts this conversation and displays your replies; do not describe yourself as running in a terminal.",
+    );
+    text = replaceOnce(text, terminal_rendering, "Write responses in GitHub-flavored Markdown, which the client application renders.");
+    text = replaceOnce(text, terminal_table_emphasis, "Use bold sparingly.");
+    const final = text[0..text.len].*;
+    break :embedded &final;
+};
+
+fn replaceOnce(comptime haystack: []const u8, comptime needle: []const u8, comptime replacement: []const u8) []const u8 {
+    const index = std.mem.find(u8, haystack, needle) orelse
+        @compileError("system prompt no longer contains: " ++ needle);
+    if (std.mem.find(u8, haystack[index + needle.len ..], needle) != null) {
+        @compileError("system prompt repeats: " ++ needle);
+    }
+    return haystack[0..index] ++ replacement ++ haystack[index + needle.len ..];
+}
 
 pub fn modelPromptOverlay(model: []const u8) ?[]const u8 {
     _ = model;
@@ -36,6 +67,7 @@ pub fn modelPromptOverlay(model: []const u8) ?[]const u8 {
 
 pub const prompt_policy = prompt_policy_contract.Policy{
     .system_prompt = gateway_system_prompt,
+    .embedded_system_prompt = embedded_system_prompt,
     .model_prompt_overlay_fn = modelPromptOverlay,
 };
 
@@ -2079,7 +2111,7 @@ fn buildTurnContextFragment(arena: Allocator, workspace_root: []const u8) ![]con
     const cwd = currentWorkingDirectory(arena) catch "(unavailable)";
     const os_text = try host.operatingSystemText(arena);
     const date_text = try todayUtcText(arena);
-    const shell = shellPath() orelse "(unknown)";
+    const shell = shellPath(arena) orelse "(unknown)";
     const home = homeDir() orelse "(unknown)";
     const git = collectGitInfo(arena, workspace_root) catch GitInfo{};
 
@@ -2153,7 +2185,17 @@ fn currentWorkingDirectory(arena: Allocator) ![]const u8 {
     return std.process.currentPathAlloc(io_mod.getIo(), arena);
 }
 
-fn shellPath() ?[]const u8 {
+/// Reports the shell the shell tool runs for the user profile, falling back to
+/// the environment when no login shell resolves (for example on Windows).
+fn shellPath(arena: Allocator) ?[]const u8 {
+    var login_shell_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const login_shell = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
+    if (shell_resolver.environment(arena, login_shell, .user)) |resolved| {
+        switch (resolved) {
+            .user => |path| return path,
+            else => {},
+        }
+    } else |_| {}
     return io_mod.getenv("SHELL") orelse io_mod.getenv("COMSPEC");
 }
 
@@ -2680,6 +2722,22 @@ test "git info reads branch from HEAD" {
     const info = try collectGitInfo(arena, workspace);
     try std.testing.expectEqualStrings("main", info.branch.?);
     try std.testing.expectEqual(GitWorktreeState.unknown, info.worktree);
+}
+
+test "turn context reports the shell tool's login shell" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const login_shell = shell_resolver.configuredLoginShellInto(&buffer) orelse
+        return error.SkipZigTest;
+    const expected = switch (try shell_resolver.environment(arena, login_shell, .user)) {
+        .user => |path| path,
+        else => return error.TestUnexpectedResult,
+    };
+    const fragment = try buildTurnContextFragment(arena, "/tmp");
+    const line = try std.fmt.allocPrint(arena, "shell_path: {s}\n", .{expected});
+    try std.testing.expect(std.mem.indexOf(u8, fragment, line) != null);
 }
 
 test "turn context keeps branch metadata inside its field" {
@@ -3263,6 +3321,25 @@ test "gateway_system_prompt: static guidance is capability-neutral" {
     try expectDefaultPromptDoesNotContain("Use task only for focused delegated work");
     try expectDefaultPromptContains("Persist until the task is handled");
     try expectDefaultPromptContains("memory or general knowledge");
+}
+
+test "embedded system prompt drops only terminal identity and rendering claims" {
+    // The only remaining mention is the instruction not to claim a terminal.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, embedded_system_prompt, "terminal"));
+    try std.testing.expect(std.mem.find(u8, embedded_system_prompt, terminal_identity) == null);
+    try std.testing.expect(std.mem.find(u8, embedded_system_prompt, terminal_rendering) == null);
+    try std.testing.expect(std.mem.find(u8, embedded_system_prompt, "bolds table headers") == null);
+    try std.testing.expect(std.mem.find(u8, embedded_system_prompt, "A client application hosts this conversation") != null);
+    try std.testing.expect(std.mem.find(u8, embedded_system_prompt, "which the client application renders") != null);
+    // Every other section is shared with the terminal prompt.
+    try std.testing.expect(std.mem.find(u8, embedded_system_prompt, "# Safety") != null);
+    try std.testing.expect(std.mem.find(u8, embedded_system_prompt, "# Tools and verification") != null);
+    try std.testing.expectEqual(
+        std.mem.count(u8, gateway_system_prompt, "\n"),
+        std.mem.count(u8, embedded_system_prompt, "\n"),
+    );
+    try std.testing.expectEqualStrings(embedded_system_prompt, prompt_policy.systemPromptFor(false));
+    try std.testing.expectEqualStrings(gateway_system_prompt, prompt_policy.systemPromptFor(true));
 }
 
 test "model prompt overlay is opt-in and transient guidance stays out of the base prompt" {

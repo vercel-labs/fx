@@ -5,6 +5,7 @@ const app_session_runtime = @import("app_session_runtime.zig");
 const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
 const acp_runner = @import("../cli/acp_runner.zig");
 const cli_surface = @import("../cli/cli_surface.zig");
+const config_runtime = @import("../config/config_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const process_provider = @import("../execution/process_provider.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
@@ -13,6 +14,7 @@ const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const io_mod = @import("../shared/io.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
+const session_adapter = @import("../session/session_adapter.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const context_contract = @import("../workspace/context_contract.zig");
@@ -288,6 +290,13 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
                 return .{ .exit = 1 };
             },
             else => {
+                // v2 names a storage fault (D29); v1 reports it as it always has.
+                if (session_adapter.enabled(launch.modifiers.sessions_v2)) {
+                    if (v2StorageFaultMessage(err)) |message| {
+                        writeStderr(deps, message);
+                        return .{ .exit = 1 };
+                    }
+                }
                 reportUnexpectedInteractiveError(deps, err);
                 return err;
             },
@@ -380,20 +389,30 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
         if (handoff_value) |value| {
             var handoff = value;
             defer handoff.deinit(alloc);
-            var argv = [_][]const u8{
-                request.executablePath(),
-                "resume",
-                handoff.session_id,
-                cli_surface.upgrade_relaunch_arg,
-                request.previousRevision() orelse "",
-            };
-            const argv_slice = if (request.previousRevision() == null) argv[0..4] else argv[0..5];
+            var argv: [6][]const u8 = undefined;
+            var argc: usize = 0;
+            argv[argc] = request.executablePath();
+            argc += 1;
+            // A v2 session resumes only with the flag that saved it.
+            if (handoff.sessions_v2) {
+                argv[argc] = cli_surface.sessions_v2_arg;
+                argc += 1;
+            }
+            for ([_][]const u8{ "resume", handoff.session_id, cli_surface.upgrade_relaunch_arg }) |arg| {
+                argv[argc] = arg;
+                argc += 1;
+            }
+            if (request.previousRevision()) |revision| {
+                argv[argc] = revision;
+                argc += 1;
+            }
+            const argv_slice = argv[0..argc];
             const replace_err = deps.replace_process(
                 deps.replace_ctx,
                 io_mod.getIo(),
                 .{ .argv = argv_slice },
             );
-            writeUpgradeRelaunchFailure(deps, replace_err, handoff.session_id);
+            writeUpgradeRelaunchFailure(deps, replace_err, handoff.session_id, handoff.sessions_v2);
         } else {
             writeStderr(
                 deps,
@@ -411,9 +430,10 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
                 &message_buffer,
                 handoff.session_id,
                 resume_handoff_columns,
+                handoff.sessions_v2,
             )
         else
-            formatResumeHandoff(&message_buffer, handoff.session_id)) catch return .returned;
+            formatResumeHandoff(&message_buffer, handoff.session_id, handoff.sessions_v2)) catch return .returned;
         deps.write_stdout(deps.stdout_ctx, message) catch {};
     }
     return .returned;
@@ -438,12 +458,13 @@ fn writeUpgradeRelaunchFailure(
     deps: RunDeps,
     err: std.process.ReplaceError,
     session_id: []const u8,
+    sessions_v2: bool,
 ) void {
     var buffer: [768]u8 = undefined;
     const message = std.fmt.bufPrint(
         &buffer,
-        "fx: upgrade installed, but relaunch failed: {s}\nContinue session with: fx --resume {s}\n",
-        .{ @errorName(err), session_id },
+        "fx: upgrade installed, but relaunch failed: {s}\nContinue session with: fx {s}--resume {s}\n",
+        .{ @errorName(err), if (sessions_v2) "--sessions-v2 " else "", session_id },
     ) catch "fx: upgrade installed, but relaunch failed; run `fx doctor`.\n";
     writeStderr(deps, message);
 }
@@ -514,16 +535,28 @@ fn writeRealStdout(_: ?*anyopaque, text: []const u8) !void {
     try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
 }
 
-fn formatResumeHandoff(buffer: []u8, session_id: []const u8) ![]const u8 {
+fn formatResumeHandoff(buffer: []u8, session_id: []const u8, sessions_v2: bool) ![]const u8 {
     return std.fmt.bufPrint(
         buffer,
-        "Continue session with: fx --resume {s}\n",
-        .{session_id},
+        "Continue session with: fx {s}--resume {s}\n",
+        .{ if (sessions_v2) "--sessions-v2 " else "", session_id },
     );
 }
 
 fn formatUnexpectedError(buffer: []u8, err: anyerror) ![]const u8 {
-    return std.fmt.bufPrint(buffer, "fx: {s}\n", .{@errorName(err)});
+    return std.fmt.bufPrint(buffer, "fx: {s}\n", .{config_runtime.modelNotSelectedMessage(err) orelse @errorName(err)});
+}
+
+/// A v2 session that cannot be written at startup, in one sentence; null
+/// for any other error.
+fn v2StorageFaultMessage(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.AccessDenied => "fx: this session cannot be opened for writing: permission denied. Check the permissions under ~/.fx/sessions/v2, then resume again.\n",
+        error.ReadOnlyFileSystem => "fx: this session cannot be opened for writing: the disk is read-only.\n",
+        error.NoSpaceLeft => "fx: this session cannot be saved: the disk is full. Free some space, then resume again.\n",
+        error.FileTooBig => "fx: this session cannot be saved: a file-size limit was reached.\n",
+        else => null,
+    };
 }
 
 fn reportUnexpectedInteractiveError(deps: RunDeps, err: anyerror) void {
@@ -538,7 +571,7 @@ fn writeStderr(deps: RunDeps, text: []const u8) void {
 
 fn tryWriteErrorMessage(deps: RunDeps, err: anyerror) void {
     writeStderr(deps, "fx: ");
-    writeStderr(deps, @errorName(err));
+    writeStderr(deps, config_runtime.modelNotSelectedMessage(err) orelse @errorName(err));
     writeStderr(deps, "\n");
 }
 
@@ -664,6 +697,7 @@ const TestCapture = struct {
     record_stderr_event: bool = false,
     record_stdout_event: bool = false,
     resume_handoff_id: ?[]const u8 = null,
+    resume_handoff_sessions_v2: bool = false,
     shutdown_failure: ?anyerror = null,
     raise_sigint_during_deinit: bool = false,
     upgrade_relaunch_path: ?[]const u8 = null,
@@ -804,7 +838,7 @@ const TestApp = struct {
                 self.deinit();
                 return .{ .failure = error.OutOfMemory };
             };
-            break :blk .{ .session_id = session_id };
+            break :blk .{ .session_id = session_id, .sessions_v2 = active_capture.?.resume_handoff_sessions_v2 };
         } else null;
         if (active_capture.?.raise_sigint_during_deinit) {
             _ = std.c.raise(std.posix.SIG.INT);
@@ -1027,6 +1061,26 @@ test "app entry bounds graceful-exit SIGINT suppression to handoff lifetime" {
 
     _ = std.c.raise(std.posix.SIG.INT);
     try std.testing.expectEqual(@as(usize, 1), test_sigint_count.load(.seq_cst));
+}
+
+test "a v2 handoff relaunches and hints with --sessions-v2" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.resume_handoff_id = "session-123";
+    capture.resume_handoff_sessions_v2 = true;
+    capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
+
+    const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
+
+    try std.testing.expectEqual(@as(u8, 1), outcome.exit);
+    try std.testing.expectEqual(@as(usize, 5), capture.replace_arg_count);
+    try std.testing.expectEqualStrings("/tmp/fx-upgraded", capture.replaceArg(0));
+    try std.testing.expectEqualStrings("--sessions-v2", capture.replaceArg(1));
+    try std.testing.expectEqualStrings("resume", capture.replaceArg(2));
+    try std.testing.expectEqualStrings("session-123", capture.replaceArg(3));
+    try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(4));
+    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "fx --sessions-v2 --resume session-123") != null);
 }
 
 test "app entry relaunches only after teardown with the validated handoff" {
@@ -1371,6 +1425,38 @@ test "app entry maps unavailable session state to one expected startup failure" 
         try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
         try expectEvents(&.{"init:none"});
     }
+}
+
+test "app entry names a v2 storage fault at startup, and v1 keeps the bare error" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        init_error: anyerror,
+        message: []const u8,
+    }{
+        .{ .init_error = error.AccessDenied, .message = "fx: this session cannot be opened for writing: permission denied. Check the permissions under ~/.fx/sessions/v2, then resume again.\n" },
+        .{ .init_error = error.ReadOnlyFileSystem, .message = "fx: this session cannot be opened for writing: the disk is read-only.\n" },
+        .{ .init_error = error.NoSpaceLeft, .message = "fx: this session cannot be saved: the disk is full. Free some space, then resume again.\n" },
+        .{ .init_error = error.FileTooBig, .message = "fx: this session cannot be saved: a file-size limit was reached.\n" },
+    };
+    for (cases) |case| {
+        var capture = TestCapture.init(.{ .interactive = .{ .modifiers = .{ .sessions_v2 = true } } });
+        defer capture.deinit();
+        capture.init_error = case.init_error;
+        capture.fail_unexpected_format = true;
+
+        const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
+
+        try std.testing.expectEqual(@as(u8, 1), outcome.exit);
+        try std.testing.expectEqualStrings(case.message, capture.stderr.written());
+    }
+
+    // Without the flag, v1 reports the bare error name as before.
+    if (session_adapter.enabled(false)) return error.SkipZigTest;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.init_error = error.AccessDenied;
+    try std.testing.expectError(error.AccessDenied, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
+    try std.testing.expectEqualStrings("fx: AccessDenied\n", capture.stderr.written());
 }
 
 test "app entry returns failure when terminal closure cannot save the session" {

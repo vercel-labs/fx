@@ -1,9 +1,11 @@
 const std = @import("std");
 const types = @import("../shared/types.zig");
+const model_provider = @import("model_provider.zig");
 
 pub const ResolvedProviderOptions = struct {
     reasoning: ?types.ReasoningEffort = null,
     fast: bool = false,
+    ultrafast: bool = false,
     parallel_tool_calls: ?bool = null,
     prompt_caching: bool = false,
     /// Borrowed gateway provider slugs in preference order. Empty leaves
@@ -41,6 +43,7 @@ pub const GatewayMetadata = struct {
     supports_reasoning: bool = false,
     reasoning_efforts: ReasoningEffortOptions = .{},
     supports_fast_mode: bool = false,
+    supports_ultrafast_mode: bool = false,
     supports_tool_use: bool = false,
     supports_vision: bool = false,
     supports_file_input: bool = false,
@@ -55,6 +58,7 @@ pub const Capabilities = struct {
     supports_reasoning: bool = false,
     reasoning_efforts: ReasoningEffortOptions = .{},
     supports_fast_mode: bool = false,
+    supports_ultrafast_mode: bool = false,
     intrinsic_fast: bool = false,
     supports_tool_use: bool = false,
     supports_vision: bool = false,
@@ -89,6 +93,7 @@ pub fn mergeCapabilities(capabilities_value: Capabilities, gateway_metadata: ?Ga
         capabilities.supports_reasoning = metadata.supports_reasoning or metadata.reasoning_efforts.len > 0;
         capabilities.reasoning_efforts = metadata.reasoning_efforts;
         capabilities.supports_fast_mode = metadata.supports_fast_mode;
+        capabilities.supports_ultrafast_mode = metadata.supports_ultrafast_mode;
         capabilities.supports_tool_use = metadata.supports_tool_use;
         capabilities.supports_vision = metadata.supports_vision;
         capabilities.supports_file_input = metadata.supports_file_input;
@@ -197,6 +202,37 @@ pub fn resolveProviderOptionsForCapabilities(
     }
     resolved.fast = fast_mode and capabilities.supports_fast_mode;
     return resolved;
+}
+
+/// Ultrafast is an explicit, catalog-verified OpenAI Gateway opt-in. Unlike Fast,
+/// unsupported or unknown capabilities must not silently downgrade before sending.
+pub fn resolveUltrafastProviderOptions(
+    capabilities: Capabilities,
+    provider: model_provider.ProviderId,
+    model: []const u8,
+    effort: types.ReasoningEffort,
+    fast_mode: bool,
+    ultrafast_mode: bool,
+) error{UltrafastUnavailable}!ResolvedProviderOptions {
+    var options = resolveProviderOptionsForCapabilities(capabilities, effort, fast_mode);
+    if (!ultrafast_mode) return options;
+    if (provider != .gateway or !std.mem.startsWith(u8, model, "openai/") or !capabilities.supports_ultrafast_mode) {
+        return error.UltrafastUnavailable;
+    }
+    options.fast = false;
+    options.ultrafast = true;
+    return options;
+}
+
+test "Ultrafast requires explicit opt-in and verified OpenAI Gateway capability" {
+    const caps = Capabilities{ .supports_fast_mode = true, .supports_ultrafast_mode = true };
+    const normal = try resolveUltrafastProviderOptions(caps, .gateway, "openai/gpt-6-astra", .auto, true, false);
+    try std.testing.expect(normal.fast and !normal.ultrafast);
+    const ultra = try resolveUltrafastProviderOptions(caps, .gateway, "openai/gpt-6-astra", .auto, true, true);
+    try std.testing.expect(ultra.ultrafast and !ultra.fast);
+    try std.testing.expectError(error.UltrafastUnavailable, resolveUltrafastProviderOptions(.{}, .gateway, "openai/gpt-6-astra", .auto, false, true));
+    try std.testing.expectError(error.UltrafastUnavailable, resolveUltrafastProviderOptions(caps, .codex, "openai/gpt-6-astra", .auto, false, true));
+    try std.testing.expectError(error.UltrafastUnavailable, resolveUltrafastProviderOptions(caps, .gateway, "anthropic/model", .auto, false, true));
 }
 
 test "capabilities infer intrinsic fast identity but not controls from model IDs" {

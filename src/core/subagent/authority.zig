@@ -191,7 +191,7 @@ pub const Snapshot = struct {
 };
 
 pub const Resolver = struct {
-    sessions: *session_store.Store,
+    backend: child_state.Backend,
     root_id: []const u8 = "",
     host: HostResolver,
     child_store_options: session_child_store.Options = .{},
@@ -204,7 +204,7 @@ pub const Resolver = struct {
         domain.validateId(child_id) catch return error.ChildNotAttached;
         domain.validateId(self.root_id) catch return error.ChildNotAttached;
         var store = child_state.Store{
-            .sessions = self.sessions,
+            .backend = self.backend,
             .parent_id = self.root_id,
             .options = self.child_store_options,
         };
@@ -562,7 +562,7 @@ test "authority capture permits registry access and rejects changed work" {
     defer state.deinit(alloc);
     var parent = try sessions.startWritableSession(alloc, state);
     defer parent.deinit(alloc);
-    const store = child_state.Store{ .sessions = &sessions, .parent_id = state.id };
+    const store = child_state.Store{ .backend = .{ .v1 = &sessions }, .parent_id = state.id };
 
     for (std.enums.values(Fixture.Change)) |change| {
         var registry = try child_state.Registry.init(alloc, state.id);
@@ -578,7 +578,7 @@ test "authority capture permits registry access and rejects changed work" {
         try store.save(alloc, registry);
         var fixture = Fixture{ .store = store, .change = change };
         var resolver = Resolver{
-            .sessions = &sessions,
+            .backend = .{ .v1 = &sessions },
             .root_id = state.id,
             .host = .{ .context = &fixture, .resolve_fn = Fixture.resolve },
         };

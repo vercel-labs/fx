@@ -7,32 +7,53 @@
 //! capture site before it reaches the ring.
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
+
+const trace_scope = "context_compaction";
+
+/// Records an informational compaction decision in the always-on ring and
+/// forwards the same event to the opt-in debug-trace log unchanged.
+pub fn info(ctx: debug_trace.TraceContext, comptime kind: Kind, comptime fmt: []const u8, args: anytype) void {
+    record(kind, ctx.turn_id, ctx.step_id, ctx.subagent_id, false, fmt, args);
+    debug_trace.eventf(trace_scope, @tagName(kind), ctx, fmt, args);
+}
+
+/// Same as `info` but marks the event as a failure so the trace report can
+/// surface it under Problems.
+pub fn failure(ctx: debug_trace.TraceContext, comptime kind: Kind, comptime fmt: []const u8, args: anytype) void {
+    record(kind, ctx.turn_id, ctx.step_id, ctx.subagent_id, true, fmt, args);
+    debug_trace.eventf(trace_scope, @tagName(kind), ctx, fmt, args);
+}
+
+/// Records a high-cadence compaction evaluation only when it changed the
+/// outcome; routine no-op evaluations still reach the debug-trace log but do
+/// not evict rarer events from the bounded ring.
+pub fn infoIf(recorded: bool, ctx: debug_trace.TraceContext, comptime kind: Kind, comptime fmt: []const u8, args: anytype) void {
+    if (recorded) record(kind, ctx.turn_id, ctx.step_id, ctx.subagent_id, false, fmt, args);
+    debug_trace.eventf(trace_scope, @tagName(kind), ctx, fmt, args);
+}
+
+/// Records a free-form compaction note (no turn context available at the
+/// call site) and forwards it to the debug-trace log unchanged.
+pub fn log(failed: bool, comptime fmt: []const u8, args: anytype) void {
+    record(.log, 0, 0, 0, failed, fmt, args);
+    debug_trace.logf(trace_scope, fmt, args);
+}
 
 pub const ring_capacity = 64;
 const max_detail_bytes = 512;
 
 pub const Kind = enum {
     log,
-    failed,
-    policy_selected,
     provider_start,
-    summary_skipped,
-    user_capacity_retry,
     provider_completed,
-    summary_cancelled,
     summary_transport_failed,
     summary_incomplete,
     summary_tool_call_rejected,
     summary_truncated,
-    summary_invalid_utf8,
-    empty_summary_retry,
-    summary_empty_exhausted,
     source_checkpointed,
     transaction_failed,
-    skipped_no_op,
-    capacity_exceeded_at_plan,
     credential_unauthorized,
-    candidate_over_capacity,
     committed,
     decision,
     overflow_without_compaction,
@@ -94,8 +115,8 @@ var ring: Ring = std.mem.zeroes(Ring);
 
 // Keep format specialization at the caller while sharing ring mutation without
 // adding another Event-sized stack copy.
-pub inline fn record(kind: Kind, turn_id: u64, step_id: u64, subagent_id: u64, failed: bool, comptime fmt: []const u8, args: anytype) void {
-    var event: Event = .{
+inline fn record(kind: Kind, turn_id: u64, step_id: u64, subagent_id: u64, failed: bool, comptime fmt: []const u8, args: anytype) void {
+    var recorded: Event = .{
         .timestamp_ms = io_mod.milliTimestamp(),
         .turn_id = turn_id,
         .step_id = step_id,
@@ -103,12 +124,12 @@ pub inline fn record(kind: Kind, turn_id: u64, step_id: u64, subagent_id: u64, f
         .failed = failed,
         .kind = kind,
     };
-    var writer: std.Io.Writer = .fixed(&event.detail_buf);
+    var writer: std.Io.Writer = .fixed(&recorded.detail_buf);
     writer.print(fmt, args) catch {
-        event.truncated = true;
+        recorded.truncated = true;
     };
-    event.detail_len = @intCast(writer.buffered().len);
-    append_recorded_event(&event);
+    recorded.detail_len = @intCast(writer.buffered().len);
+    append_recorded_event(&recorded);
 }
 
 noinline fn append_recorded_event(event: *const Event) void {

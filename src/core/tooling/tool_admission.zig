@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const vision_contracts = @import("../agent/runtime/vision_contracts.zig");
 const command_admission = @import("../permissions/command_admission.zig");
+const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const command_environment = @import("../execution/command_environment.zig");
 const command_effect = @import("../shell_command/command_effect.zig");
 const command_lex = @import("../shell_command/command_lex.zig");
@@ -1130,7 +1131,13 @@ fn resolveOrdinaryPermissionOutcome(
     if (permission_mode == .auto) {
         if (command_call) {
             const command = try runCommandContext(input, arena, call);
+            // A user-profile alias or function can redefine a routine name,
+            // so those commands go to review instead, as does every command
+            // while a failed capture hides which names are redefined.
             if (command.execution_mode == .captured and
+                !(command.environment == .user and
+                    (shell_snapshot.processOwner().definesAnyWord(command.command) or
+                        shell_snapshot.processOwner().startupNamesUnknown())) and
                 try command_effect.knownReversibleAutoCommand(
                     arena,
                     command.command,
@@ -1372,16 +1379,25 @@ fn requestPermissionOutcomeResolved(
             .yolo,
         ), vision_path_authority);
     }
+    // Detect startup-file edits before matching remembered shell approvals,
+    // so a refresh asks again instead of reusing an approval from before it.
+    const shell_grant_call = std.mem.eql(u8, permissions.permissionNameForTool(permission_name), "bash");
+    if (shell_grant_call) shell_snapshot.processOwner().checkStartupFiles();
+    // A reload changes what the command means, so earlier approvals do not
+    // cover it.
+    const grants_apply = !(shell_grant_call and shellCallRequestsReload(arena, call));
     var configured_ask = false;
     var all_targets_authorized_by_rule = true;
     var used_session_grant = false;
+    var grant_epoch: ?u64 = null;
     for (policy_targets) |target| {
         switch (try permissions.ruleDecisionFor(arena, input.permission_rules, input.workspace_root, permission_name, target.path, target_kind)) {
             .deny => return .{ .decision = .policy_denied },
             .allow => {},
             .ask => {
-                if (permissions.sessionGrantAllowed(local_grants, permission_name, target.path)) {
+                if (grants_apply and permissions.sessionGrantAllowed(local_grants, permission_name, target.path)) {
                     used_session_grant = true;
+                    if (shell_grant_call) grant_epoch = shell_snapshot.processOwner().shellGrantEpoch(target.path);
                     continue;
                 }
                 configured_ask = true;
@@ -1431,17 +1447,23 @@ fn requestPermissionOutcomeResolved(
     }
 
     if (all_targets_authorized_by_rule) {
-        return bindVisionPathExecutionAuthority(try permissionOutcomeForDecision(
+        return bindVisionPathExecutionAuthority(withShellGrantEpoch(try permissionOutcomeForDecision(
             input,
             arena,
             call,
             .once,
             if (used_session_grant) .session_grant else .configured_rule,
-        ), vision_path_authority);
+        ), grant_epoch), vision_path_authority);
     }
-    if (sessionGrantsAllowAll(local_grants, permission_name, policy_targets)) {
+    if (grants_apply and sessionGrantsAllowAll(local_grants, permission_name, policy_targets)) {
+        if (shell_grant_call and policy_targets.len > 0) {
+            grant_epoch = shell_snapshot.processOwner().shellGrantEpoch(policy_targets[0].path);
+        }
         return bindVisionPathExecutionAuthority(
-            try permissionOutcomeForDecision(input, arena, call, .once, .session_grant),
+            withShellGrantEpoch(
+                try permissionOutcomeForDecision(input, arena, call, .once, .session_grant),
+                grant_epoch,
+            ),
             vision_path_authority,
         );
     }
@@ -1927,6 +1949,32 @@ fn permissionOutcomeForDecision(
         return .{ .decision = .permission_required };
     };
     return shellPermissionOutcome(command_ctx, decision, source);
+}
+
+/// Reports whether a shell call asks to reload the user's startup files.
+fn shellCallRequestsReload(arena: Allocator, call: ToolCall) bool {
+    const value = std.json.parseFromSliceLeaky(std.json.Value, arena, call.arguments_json, .{}) catch return false;
+    if (value != .object) return false;
+    const request = value.object.get("request") orelse return false;
+    if (request != .object) return false;
+    const reload = request.object.get("reload") orelse return false;
+    return reload == .bool and reload.bool;
+}
+
+/// Binds the remembered grant's shell snapshot epoch to a shell admission.
+fn withShellGrantEpoch(
+    outcome: command_admission.PermissionOutcome,
+    grant_epoch: ?u64,
+) command_admission.PermissionOutcome {
+    var bound = outcome;
+    if (bound.execution_authority) |*authority| switch (authority.*) {
+        .run_command => |*command| switch (command.*) {
+            .shell_allowed => |*shell| shell.grant_epoch = grant_epoch,
+            .direct_only => {},
+        },
+        else => {},
+    };
+    return bound;
 }
 
 fn shellPermissionOutcome(
@@ -5674,7 +5722,103 @@ test "TTY admission fingerprints route and explicit shell startup" {
     ));
 }
 
+fn npmAliasSnapshotCapture(request: shell_snapshot.CaptureRequest) shell_snapshot.CaptureOutcome {
+    const generation = shell_snapshot.Generation.create() catch return .{ .failed = .out_of_memory };
+    const alloc = generation.arena.allocator();
+    generation.shell_path = alloc.dupe(u8, request.shell_path) catch {
+        generation.destroy();
+        return .{ .failed = .out_of_memory };
+    };
+    generation.names.put(alloc, "npm", {}) catch {
+        generation.destroy();
+        return .{ .failed = .out_of_memory };
+    };
+    return .{ .ready = generation };
+}
+
+test "routine commands that a user alias or function redefines go to review" {
+    shell_snapshot.resetProcessOwnerForTest(npmAliasSnapshotCapture);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    const lease = (try shell_snapshot.processOwner().acquire("/bin/zsh", "/tmp", .{})).snapshot;
+    lease.release();
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var fake = FakeAutoClassifier{};
+    const input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.withOverride(
+            @ptrCast(&fake),
+            FakeAutoClassifier.classify,
+        ),
+    );
+    const redefined = try requestPermissionOutcome(
+        input,
+        arena_state.allocator(),
+        .{ .id = "aliased", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"npm install 2>&1\"}" },
+        .auto,
+        &.{},
+    );
+    try std.testing.expectEqual(
+        command_admission.ShellAuthorizationSource.auto_classifier,
+        redefined.execution_authority.?.run_command.shell_allowed.source,
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+
+    const routine = try requestPermissionOutcome(
+        input,
+        arena_state.allocator(),
+        .{ .id = "routine", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"git status --short\"}" },
+        .auto,
+        &.{},
+    );
+    try std.testing.expectEqual(
+        command_admission.ShellAuthorizationSource.auto_mode,
+        routine.execution_authority.?.run_command.shell_allowed.source,
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
+fn failedSnapshotCapture(_: shell_snapshot.CaptureRequest) shell_snapshot.CaptureOutcome {
+    return .{ .failed = .too_large };
+}
+
+test "routine commands go to review while the snapshot has fallen back" {
+    shell_snapshot.resetProcessOwnerForTest(failedSnapshotCapture);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    try std.testing.expect((try shell_snapshot.processOwner().acquire("/bin/zsh", "/tmp", .{})) == .full_startup);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var fake = FakeAutoClassifier{};
+    const input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.withOverride(
+            @ptrCast(&fake),
+            FakeAutoClassifier.classify,
+        ),
+    );
+    const outcome = try requestPermissionOutcome(
+        input,
+        arena_state.allocator(),
+        .{ .id = "fallback", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"git status --short\"}" },
+        .auto,
+        &.{},
+    );
+    try std.testing.expectEqual(
+        command_admission.ShellAuthorizationSource.auto_classifier,
+        outcome.execution_authority.?.run_command.shell_allowed.source,
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
 test "known reversible auto commands bypass the reviewer" {
+    // An earlier test's snapshot could redefine a routine name.
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};

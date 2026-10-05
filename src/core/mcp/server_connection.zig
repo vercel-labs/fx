@@ -71,6 +71,8 @@ pub const Server = struct {
     config: McpServerConfig,
     session_generation: ?u64 = null,
     elicitation_capabilities: elicitation.Capabilities = .{},
+    /// Channel for a server with `config.acp_server_id`, bound by the runtime.
+    message_carrier: ?@import("message_carrier.zig").Carrier = null,
     completion_state: ?*legacy_url_completion.State = null,
     legacy_notifications: ?struct {
         context: *anyopaque,

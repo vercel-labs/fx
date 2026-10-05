@@ -1,8 +1,10 @@
 const std = @import("std");
+const acp_types = @import("types.zig");
 const builtin_tools = @import("../builtins/tools.zig");
 const mcp_contract = @import("../core/mcp/mcp_contract.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
 const streamable_http = @import("../core/mcp/streamable_http.zig");
+const message_carrier = @import("../core/mcp/message_carrier.zig");
 const elicitation = @import("../core/mcp/elicitation.zig");
 const tool_mcp_runtime = @import("../core/tooling/tool_mcp_runtime.zig");
 
@@ -27,7 +29,11 @@ pub const ParseError = Allocator.Error || error{
     MissingHeaders,
     InvalidHeaders,
     InvalidTransport,
+    MissingServerId,
+    InvalidServerId,
 };
+
+const max_server_id_bytes: usize = 256;
 
 pub const OwnedServerConfigs = struct {
     items: std.ArrayList(mcp_contract.McpServerConfig) = .empty,
@@ -105,12 +111,14 @@ pub fn prepare(
     configs: *OwnedServerConfigs,
     elicitation_capabilities: elicitation.Capabilities,
     legacy_url_completion_sink: ?tool_mcp_runtime.LegacyUrlCompletionSink,
+    host_channel: ?message_carrier.Carrier,
 ) Allocator.Error!Preparation {
     if (configs.items.items.len == 0) return .{ .ready = null };
 
     const runtime = try alloc.create(mcp_runtime.McpRuntime);
     runtime.* = mcp_runtime.McpRuntime.initWithElicitation(alloc, elicitation_capabilities);
     runtime.setLegacyUrlCompletionSink(legacy_url_completion_sink);
+    runtime.setMessageCarrier(host_channel);
     var runtime_owned = true;
     defer if (runtime_owned) {
         runtime.deinit();
@@ -172,6 +180,8 @@ pub fn parseErrorMessage(err: ParseError) []const u8 {
         error.MissingHeaders => "Each HTTP MCP server requires headers",
         error.InvalidHeaders => "MCP server headers must be valid unique name/value string entries",
         error.InvalidTransport => "Unsupported MCP server transport",
+        error.MissingServerId => "Each ACP MCP server requires serverId",
+        error.InvalidServerId => "MCP server serverId must be a non-empty string of at most 256 bytes",
     };
 }
 
@@ -192,6 +202,9 @@ noinline fn parseServerInto(
 
     if (object.get("type")) |transport_value| {
         if (transport_value != .string) return error.InvalidTransport;
+        if (std.mem.eql(u8, transport_value.string, "acp")) {
+            return parseAcpServerInto(out, alloc, object, name_value.string);
+        }
         const transport: mcp_contract.McpTransport =
             if (std.mem.eql(u8, transport_value.string, "http"))
                 .http
@@ -232,9 +245,50 @@ noinline fn parseServerInto(
         .source = .acp,
         .scope = .acp_session,
         .required = true,
+        .always_loaded = alwaysLoadedPreference(object),
         .command = owned_command,
         .args = owned_args,
         .env = owned_env,
+    };
+}
+
+/// A server the client supplies for a session is relevant to that session, so
+/// its tools stay advertised on every turn unless the client sets
+/// `_meta.fx.alwaysLoaded` to false.
+fn alwaysLoadedPreference(object: std.json.ObjectMap) bool {
+    return acp_types.fxMetaBool(object, "alwaysLoaded") orelse true;
+}
+
+/// MCP over ACP: the client serves this server over the ACP connection and
+/// answers each `mcp/message` request. Discovery waits for the first prompt,
+/// so a failure shows in the model's server catalog instead of failing setup.
+fn parseAcpServerInto(
+    out: *mcp_contract.McpServerConfig,
+    alloc: Allocator,
+    object: std.json.ObjectMap,
+    name: []const u8,
+) ParseError!void {
+    const server_id_value = object.get("serverId") orelse return error.MissingServerId;
+    if (server_id_value != .string or server_id_value.string.len == 0 or
+        server_id_value.string.len > max_server_id_bytes)
+    {
+        return error.InvalidServerId;
+    }
+    const owned_name = try alloc.dupe(u8, name);
+    errdefer alloc.free(owned_name);
+    const owned_server_id = try alloc.dupe(u8, server_id_value.string);
+    errdefer alloc.free(owned_server_id);
+    const owned_url = try message_carrier.placeholderUrl(alloc, server_id_value.string);
+
+    out.* = .{
+        .name = owned_name,
+        .source = .acp,
+        .scope = .acp_session,
+        .required = false,
+        .always_loaded = alwaysLoadedPreference(object),
+        .acp_server_id = owned_server_id,
+        .transport = .http,
+        .url = owned_url,
     };
 }
 
@@ -262,6 +316,7 @@ fn parseRemoteServerInto(
         .source = .acp,
         .scope = .acp_session,
         .required = true,
+        .always_loaded = alwaysLoadedPreference(object),
         .transport = transport,
         .url = owned_url,
         .headers = headers,
@@ -368,6 +423,25 @@ test "ACP MCP parser owns official stdio request fields" {
     try std.testing.expectEqualStrings("--flag", config.args[1]);
     try std.testing.expectEqualStrings("TOKEN", config.env[0].key);
     try std.testing.expectEqualStrings("secret", config.env[0].value);
+}
+
+test "ACP MCP parser keeps supplied servers loaded unless meta opts out" {
+    const alloc = std.testing.allocator;
+    var configs = try parse(alloc,
+        \\{"mcpServers":[
+        \\{"name":"default","command":"/bin/a","args":[],"env":[]},
+        \\{"name":"lazy","command":"/bin/b","args":[],"env":[],"_meta":{"fx":{"alwaysLoaded":false}}},
+        \\{"type":"http","name":"remote","url":"https://example.com/mcp","headers":[],"_meta":{"fx":{"alwaysLoaded":"no"}}},
+        \\{"type":"http","name":"remote_lazy","url":"https://example.com/mcp","headers":[],"_meta":{"fx":{"alwaysLoaded":false}}}
+        \\]}
+    );
+    defer configs.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 4), configs.items.items.len);
+    try std.testing.expect(configs.items.items[0].always_loaded);
+    try std.testing.expect(!configs.items.items[1].always_loaded);
+    try std.testing.expect(configs.items.items[2].always_loaded);
+    try std.testing.expect(!configs.items.items[3].always_loaded);
 }
 
 test "ACP MCP parser accepts an authoritative empty list" {

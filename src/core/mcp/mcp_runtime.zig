@@ -120,6 +120,7 @@ pub const PreviewNativeWorkspaceAuthorityFn = *const fn (
 
 const connection_control = @import("connection_control.zig");
 const operation_authority = @import("operation_authority.zig");
+const message_carrier_mod = @import("message_carrier.zig");
 const startupDeadline = connection_control.startupDeadline;
 
 const LegacyUrlWaiter = legacy_url_completion.Waiter;
@@ -216,6 +217,36 @@ const ServerAccessPrecommit = operation_authority.SendGuard;
 
 const OperationAccessGuard = operation_authority.Guard;
 
+const max_tool_display_title_bytes: usize = 200;
+
+/// Returns the owned MCP `title`, falling back to `annotations.title`, or null
+/// when neither is usable display text.
+fn toolDisplayTitle(alloc: Allocator, tool: McpTool) Allocator.Error!?[]u8 {
+    if (tool.title) |title| {
+        if (usableDisplayTitle(title)) |value| return try alloc.dupe(u8, value);
+    }
+    const annotations = tool.annotations_json orelse return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, annotations, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const title = parsed.value.object.get("title") orelse return null;
+    if (title != .string) return null;
+    const value = usableDisplayTitle(title.string) orelse return null;
+    return try alloc.dupe(u8, value);
+}
+
+/// Returns the displayable part of a server-provided tool title, or null when
+/// it has none.
+pub fn usableDisplayTitle(title: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, title, " \t\r\n");
+    if (trimmed.len == 0 or !std.unicode.utf8ValidateSlice(trimmed)) return null;
+    for (trimmed) |byte| if (byte < 0x20 or byte == 0x7f) return null;
+    return text_utils.utf8PrefixByBytes(trimmed, max_tool_display_title_bytes);
+}
+
 const authorizeLiveAccess = operation_authority.authorizeLiveAccess;
 const resolveLiveAuthority = operation_authority.resolveLiveAuthority;
 
@@ -231,6 +262,13 @@ const healthFailureForState = server_views.healthFailureForState;
 
 const DetachedTransport = server_connection.DetachedTransport;
 pub const McpServer = server_connection.Server;
+
+/// Process exit: SIGKILLs every stdio MCP child in the process at once and
+/// refuses later launches. Returns false when only a full teardown reaches
+/// every child; see `stdio_dispatcher.killAllForProcessExit`.
+pub fn killAllStdioChildrenForProcessExit() bool {
+    return stdio_dispatcher.killAllForProcessExit();
+}
 
 pub const McpRuntime = struct {
     alloc: Allocator,
@@ -249,6 +287,7 @@ pub const McpRuntime = struct {
     retiring: std.atomic.Value(bool) = .init(false),
     tool_registry: tool_dispatch.Registry = .{},
     legacy_elicitation_capabilities: elicitation.Capabilities = .{},
+    message_carrier: ?message_carrier_mod.Carrier = null,
     discovery_state: std.atomic.Value(DiscoveryState) = .init(.idle),
     discovery_cancel_requested: std.atomic.Value(bool) = .init(false),
     discovery_thread: ?std.Thread = null,
@@ -368,6 +407,45 @@ pub const McpRuntime = struct {
 
     pub fn legacyUrlCompletionRecorded(self: *McpRuntime, origin: tool_mcp_runtime.InputOrigin, id: []const u8) bool {
         return self.completions.legacyUrlCompletionRecorded(origin, id);
+    }
+
+    /// Installs the host channel for servers with `acp_server_id`. Must be
+    /// set before those servers are added.
+    pub fn setMessageCarrier(self: *McpRuntime, carrier: ?message_carrier_mod.Carrier) void {
+        self.message_carrier = carrier;
+    }
+
+    /// True when a configured server waits for `connectHostChannelServers`.
+    pub fn hasPendingHostChannelServers(self: *McpRuntime) bool {
+        self.server_mutex.lockSharedUncancelable(io_mod.getIo());
+        defer self.server_mutex.unlockShared(io_mod.getIo());
+        for (self.servers.items) |server| {
+            if (hostChannelPending(server)) return true;
+        }
+        return false;
+    }
+
+    /// A host-channel server is pending until it has connected or failed; a
+    /// cancelled attempt leaves it disconnected and eligible for the next turn.
+    fn hostChannelPending(server: *const McpServer) bool {
+        if (server.config.acp_server_id == null or !server.config.enabled) return false;
+        return server.startup_state.load(.acquire) != .complete or
+            server.state.load(.acquire) == .disconnected;
+    }
+
+    /// Connects servers served over the host's own connection. The host calls
+    /// this off the thread that reads that connection, because every
+    /// discovery request waits for a reply that thread must deliver.
+    pub fn connectHostChannelServers(self: *McpRuntime, tool_registry: tool_dispatch.Registry, cancel: *std.atomic.Value(bool)) !void {
+        const server_handles = try self.acquireServers();
+        defer self.releaseServers(server_handles);
+        if (self.retiring.load(.acquire)) return error.McpRuntimeRetired;
+        for (server_handles) |server| {
+            if (!hostChannelPending(server)) continue;
+            _ = server.startup_state.cmpxchgStrong(.complete, .idle, .acq_rel, .acquire);
+        }
+        self.connectAllControlled(tool_registry, cancel, null, .acp_host_channel);
+        for (server_handles) |server| try self.waitForServerStartup(server, cancel);
     }
 
     pub fn setLegacyUrlCompletionSink(
@@ -688,6 +766,7 @@ pub const McpRuntime = struct {
         server.owner_alloc = self.alloc;
         server.session_generation = self.generation;
         server.elicitation_capabilities = self.legacy_elicitation_capabilities;
+        server.message_carrier = self.message_carrier;
         server.completion_state = &self.completions;
         server.legacy_notifications = .{ .context = self, .callback = handleLegacyCompletionNotification };
     }
@@ -1417,7 +1496,7 @@ pub const McpRuntime = struct {
         var index_count: usize = 0;
         self.catalog_mutex.lockUncancelable(io_mod.getIo());
         for (server_handles) |server| {
-            switch (startup_admission.decide(server.config.enabled, server.config.required, server.config.workspace_admission, phase)) {
+            switch (startup_admission.decideServer(&server.config, phase)) {
                 .connect => if (server.startup_state.cmpxchgStrong(.idle, .loading, .acq_rel, .acquire) == null) {
                     jobs[index_count] = server;
                     index_count += 1;
@@ -1664,6 +1743,38 @@ pub const McpRuntime = struct {
         return null;
     }
 
+    pub const ToolIdentity = struct {
+        server: []u8,
+        /// The tool's name on its server, before fx exposes it to the model.
+        tool: []u8,
+        /// The server's display title, when it declares one.
+        title: ?[]u8 = null,
+
+        pub fn deinit(self: ToolIdentity, alloc: Allocator) void {
+            alloc.free(self.server);
+            alloc.free(self.tool);
+            if (self.title) |title| alloc.free(title);
+        }
+    };
+
+    /// Resolves an exposed MCP tool name to its server and original tool from
+    /// the published catalog, never by parsing the exposed name. Returns null
+    /// for names that are not published MCP tools. The caller owns the result.
+    pub fn toolIdentity(self: *McpRuntime, alloc: Allocator, name: []const u8) !?ToolIdentity {
+        self.catalog_mutex.lockSharedUncancelable(io_mod.getIo());
+        defer self.catalog_mutex.unlockShared(io_mod.getIo());
+        const match = self.lookupCallableTool(name) orelse return null;
+        const server_name = try alloc.dupe(u8, match.server.config.name);
+        errdefer alloc.free(server_name);
+        const tool_name = try alloc.dupe(u8, match.tool.original_name);
+        errdefer alloc.free(tool_name);
+        return .{
+            .server = server_name,
+            .tool = tool_name,
+            .title = try toolDisplayTitle(alloc, match.tool),
+        };
+    }
+
     fn lookupCallableTool(self: *McpRuntime, name: []const u8) ?struct { server: *McpServer, tool: McpTool } {
         for (self.servers.items) |server| {
             if (!server.isPublished() or (server.state.load(.acquire) != .ready and server.state.load(.acquire) != .failed)) continue;
@@ -1801,6 +1912,89 @@ pub const McpRuntime = struct {
             }
         }
         return names.toOwnedSlice(alloc);
+    }
+
+    pub const AlwaysLoadedTools = struct {
+        tools: []tool_mcp_runtime.SelectedTool,
+        /// Owned context notice naming tools the schema budget left unloaded.
+        notice: ?[]u8 = null,
+
+        pub fn deinit(self: *AlwaysLoadedTools, alloc: Allocator) void {
+            tool_mcp_runtime.freeSelectedTools(alloc, self.tools);
+            if (self.notice) |notice| alloc.free(notice);
+            self.* = undefined;
+        }
+    };
+
+    /// Projects every ready tool of servers configured as always loaded,
+    /// sharing one `mcp_selected_schema_bytes` budget in catalog order. Does
+    /// not connect or refresh a server. Tools past the budget stay reachable
+    /// through capability search. The caller owns the result.
+    pub fn snapshotAlwaysLoadedTools(
+        self: *McpRuntime,
+        alloc: Allocator,
+        permission_rules: types.PermissionRuleSet,
+        limits: context_limits.Values,
+        access: tool_mcp_runtime.Access,
+    ) !AlwaysLoadedTools {
+        var selected: std.ArrayList(tool_mcp_runtime.SelectedTool) = .empty;
+        errdefer {
+            for (selected.items) |tool| tool.deinit(alloc);
+            selected.deinit(alloc);
+        }
+        if (self.retiring.load(.acquire)) return .{ .tools = try selected.toOwnedSlice(alloc) };
+        var guard = OperationAccessGuard.init(self.alloc, access, self.generation) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return .{ .tools = try selected.toOwnedSlice(alloc) },
+        };
+        defer guard.deinit();
+
+        var remaining = limits.mcp_selected_schema_bytes.effectiveBytes();
+        var omitted: usize = 0;
+        {
+            self.catalog_mutex.lockSharedUncancelable(io_mod.getIo());
+            defer self.catalog_mutex.unlockShared(io_mod.getIo());
+            for (self.servers.items) |server| {
+                if (!server.config.always_loaded) continue;
+                if (!server.isPublished() or server.state.load(.acquire) != .ready) continue;
+                if (!tool_catalog.serverCatalogAvailable(server)) continue;
+                if (server.tool_subscription) |subscription| if (subscription.hasInvalidation()) continue;
+                for (server.tool_catalog.tools.items) |tool| {
+                    if (permissions.rulesDenyAllTargetsForPermission(permission_rules, tool.prefixed_name)) continue;
+                    if (!guard.allows(.{ .tool = tool.prefixed_name })) continue;
+                    if (omitted > 0) {
+                        omitted += 1;
+                        continue;
+                    }
+                    var projection = try selected_schema.project(alloc, tool, server.instructions, limits);
+                    const payload = switch (projection) {
+                        .selected, .rejected => |value| value,
+                    };
+                    if (projection == .rejected or payload.model_output.len > remaining) {
+                        if (projection == .selected) omitted += 1;
+                        projection.deinit(alloc);
+                        continue;
+                    }
+                    if (payload.notice) |notice| alloc.free(notice);
+                    errdefer alloc.free(payload.model_output);
+                    const name = try alloc.dupe(u8, tool.prefixed_name);
+                    errdefer alloc.free(name);
+                    try selected.append(alloc, .{
+                        .name = name,
+                        .schema_json = payload.model_output,
+                        .mcp_binding = self.bindingForTool(server, tool),
+                    });
+                    remaining -= payload.model_output.len;
+                }
+            }
+        }
+        const notice = if (omitted > 0) try std.fmt.allocPrint(
+            alloc,
+            "[context] {d} always-loaded MCP tool{s} exceeded the mcp_selected_schema_bytes budget and stay available through capability_search",
+            .{ omitted, if (omitted == 1) "" else "s" },
+        ) else null;
+        errdefer if (notice) |value| alloc.free(value);
+        return .{ .tools = try selected.toOwnedSlice(alloc), .notice = notice };
     }
 
     pub fn snapshotAccessView(
@@ -2559,6 +2753,36 @@ const renderPromptGetForModel = feature_result.renderPromptGetForModel;
 const renderCompletionForModel = feature_result.renderCompletionForModel;
 
 const currentAuthPartition = server_auth.currentAuthPartition;
+
+test "tool display title prefers the MCP title and falls back to annotations" {
+    const alloc = std.testing.allocator;
+    var title = "Evaluate JavaScript".*;
+    var annotations = "{\"title\":\"Annotated title\"}".*;
+    var control_title = "bad\x1btitle".*;
+    const base: McpTool = .{
+        .original_name = "browser_eval",
+        .prefixed_name = @constCast("mcp_mini_browser_eval"),
+        .description = @constCast(""),
+        .input_schema_json = @constCast("{}"),
+        .tags = &.{},
+    };
+
+    var with_title = base;
+    with_title.title = &title;
+    with_title.annotations_json = &annotations;
+    const primary = (try toolDisplayTitle(alloc, with_title)).?;
+    defer alloc.free(primary);
+    try std.testing.expectEqualStrings("Evaluate JavaScript", primary);
+
+    var annotated = base;
+    annotated.title = &control_title;
+    annotated.annotations_json = &annotations;
+    const fallback = (try toolDisplayTitle(alloc, annotated)).?;
+    defer alloc.free(fallback);
+    try std.testing.expectEqualStrings("Annotated title", fallback);
+
+    try std.testing.expect((try toolDisplayTitle(alloc, base)) == null);
+}
 
 test "operation deadline includes waiting for the connection lease" {
     const io = std.testing.io;

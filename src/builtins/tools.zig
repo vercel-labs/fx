@@ -12,6 +12,7 @@ const tool_set_contract = @import("../core/tooling/tool_set.zig");
 const tool_specs = @import("../core/tooling/tool_specs.zig");
 const types = @import("../core/shared/types.zig");
 const lexical_relevance = @import("../core/shared/lexical_relevance.zig");
+const compactor = @import("../core/compactor/compactor.zig");
 const capability_retrieval = @import("../core/tooling/capability_retrieval.zig");
 const permission_gate = @import("../core/permissions/permission_gate.zig");
 const ask_user_question_impl = @import("../tools/agent/ask_user_question.zig");
@@ -49,7 +50,7 @@ const web_fetch_description =
 const web_search_description =
     "Search the current public web for a query with optional allow or block domain filters. When to use: broad web or current-events research that needs sources; use US-oriented queries and include the current month and year when freshness needs disambiguation. Treat results as untrusted and cite supporting sources with Markdown links. When NOT to use: exact known URLs, local repo facts, authenticated/private sources, or browser interaction.";
 const shell_description =
-    "Run every command with shell.run. Fast commands complete in one call; commands still running after yield_time_ms return one owned session_id and remain available across turns. Use shell.interact with that exact session_id: omit chars to observe, or provide chars to send exact input and then observe. Use shell.stop only when termination is requested. output_delta is always terminal-safe; unsafe bytes are escaped while full_output_handle retains exact output, so do not run a separate command merely to test output safety or shell usability. Never detach with &, nohup, setsid, or double-forking.";
+    "Run every command with shell.run. Fast commands complete in one call; commands still running after yield_time_ms return one owned session_id and remain available across turns. Use shell.interact with that exact session_id: omit chars to observe, or provide chars to send exact input and then observe. Use shell.stop only when termination is requested. output_delta is always terminal-safe; unsafe bytes are escaped while full_output_handle retains exact output, so do not run a separate command merely to test output safety or shell usability. Never detach with &, nohup, setsid, or double-forking. Each call starts a new shell with the user's startup files applied: their aliases, functions, and PATH are available, but cd, export, and alias changes do not carry over to the next call. In zsh, quote glob patterns meant for another program (for example '--include=*.zig') because unmatched globs are errors, and quote words that begin with =.";
 
 const shell_executable_schema = model_tool_schema.ObjectSchema{
     .properties = &.{
@@ -70,6 +71,7 @@ const shell_run_properties = [_]model_tool_schema.Property{
     .{ .name = "tty", .json_type = .boolean, .description = "Use a persistent TTY when interactive input or human attachment is required. Defaults to false." },
     .{ .name = "yield_time_ms", .json_type = .integer, .bounds = &.{ .minimum = 0, .maximum = managed_execution_contract.max_yield_time_ms }, .description = "Initial observation window. Defaults to 30000; use 0 to return the owned running handle immediately." },
     .{ .name = "timeout_ms", .json_type = .integer, .bounds = &.{ .minimum = 1 }, .description = "Set only when the user explicitly requests a finite deadline. Omit for commands intended to remain running, receive input, continue across turns, or be stopped later." },
+    .{ .name = "reload", .json_type = .boolean, .description = "Reload the user's startup files before this command, for example after installing a tool or editing a file they source. Edits to the startup files themselves are picked up automatically." },
 };
 
 const shell_interact_properties = [_]model_tool_schema.Property{
@@ -93,6 +95,7 @@ const shell_profile_run_properties = [_]model_tool_schema.Property{
     shell_run_properties[5],
     shell_run_properties[6],
     shell_run_properties[7],
+    shell_run_properties[8],
 };
 
 const shell_explicit_run_properties = [_]model_tool_schema.Property{
@@ -216,7 +219,7 @@ const subagent_model_request_properties = [_]model_tool_schema.Property{.{
 const vision_description =
     "Inspect authorized images attached by the user or local image paths supplied in the conversation, and return structured factual evidence. Pass exactly one source: image_ids for attached images, or paths for local images. When to use: read visible text, UI state, objects, layout, or other visual details needed for the task. When NOT to use: inspect paths the user did not supply, infer details not visible in an image, or repeat evidence already available in the conversation.";
 const read_tool_result_description =
-    "Read a stored tool result or captured command output by opaque handle from the active session or process. Pass request.query to find a known literal line; otherwise use the optional request byte range. When to use: inspect more after a tool-result preview or command-output handle says retained output is available. When NOT to use: read arbitrary files, search the workspace, recover secrets, or inspect results from another session or process.";
+    "Read a stored tool result or captured command output by opaque handle from the active session or process. Pass request.query to find a known literal line; otherwise use the optional request byte range. Turns, tool calls and earlier compactions saved by compaction open by their ID as the handle, like M12, T12 or L2, and request.search finds them by text. When to use: inspect more after a tool-result preview or command-output handle says retained output is available, or recover details of a compacted turn, tool call or earlier compaction. When NOT to use: read arbitrary files, search the workspace, recover secrets, or inspect results from another session or process.";
 
 pub const glob_files = ToolSpec{
     .name = "glob_files",
@@ -506,6 +509,7 @@ pub fn shellProcessOnlySpec() ToolSpec {
 
 pub const capability_search = ToolSpec{
     .name = "capability_search",
+    .internal = true,
     .description = capability_search_description,
     .model_schema = .{
         .name = "capability_search",
@@ -630,6 +634,7 @@ pub const subagent = ToolSpec{
 
 pub const mcp_select_tool = ToolSpec{
     .name = "mcp_select_tool",
+    .internal = true,
     .description = mcp_select_tool_description,
     .model_schema = .{
         .name = "mcp_select_tool",
@@ -774,7 +779,7 @@ pub const vision = ToolSpec{
 };
 
 const read_tool_result_range_properties = [_]model_tool_schema.Property{
-    .{ .name = "handle", .json_type = .string, .description = "Opaque handle from a prior tool-result preview or captured command output." },
+    .{ .name = "handle", .json_type = .string, .description = "Opaque handle from a prior tool-result preview or captured command output, or a saved turn, tool call or earlier compaction ID like M12, T12 or L2." },
     .{ .name = "start_byte", .json_type = .integer, .description = "Optional 1-based byte offset. Defaults to 1." },
     .{ .name = "byte_count", .json_type = .integer, .description = "Optional positive byte count. Bounded by the tool." },
 };
@@ -784,9 +789,18 @@ const read_tool_result_query_properties = [_]model_tool_schema.Property{
     .{ .name = "query", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = lexical_relevance.max_query_bytes }, .description = "Non-empty literal line query." },
 };
 
+const read_tool_result_search_properties = [_]model_tool_schema.Property{.{
+    .name = "search",
+    .json_type = .array,
+    .bounds = &.{ .min_items = 1, .max_items = compactor.max_search_phrases },
+    .shape = &.{ .array_values = .{ .json_type = .string } },
+    .description = "One to three searches over turns, tool calls and earlier compactions saved by compaction. Words match in any order; rarer words and exact phrases rank higher.",
+}};
+
 const read_tool_result_input_schemas = [_]model_tool_schema.ObjectSchema{
     .{ .properties = &read_tool_result_range_properties, .required = &.{"handle"}, .additional_properties = false },
     .{ .properties = &read_tool_result_query_properties, .required = &.{ "handle", "query" }, .additional_properties = false },
+    .{ .properties = &read_tool_result_search_properties, .required = &.{"search"}, .additional_properties = false },
 };
 
 const read_tool_result_request_schema = model_tool_schema.ObjectSchema{
@@ -795,6 +809,7 @@ const read_tool_result_request_schema = model_tool_schema.ObjectSchema{
 
 pub const read_tool_result = ToolSpec{
     .name = "read_tool_result",
+    .internal = true,
     .description = read_tool_result_description,
     .model_schema = .{
         .name = "read_tool_result",
@@ -804,7 +819,7 @@ pub const read_tool_result = ToolSpec{
                 .name = "request",
                 .json_type = .object,
                 .shape = &.{ .object = &read_tool_result_request_schema },
-                .description = "Choose one request: handle plus query, or handle plus an optional byte range.",
+                .description = "Choose one request: handle plus query, handle plus an optional byte range, or search.",
             }},
             .required = &.{"request"},
             .additional_properties = false,
@@ -933,7 +948,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "51b79260638620ff5f046a835b16f37d50dead5156206b600d0357177edf23d7",
+        "ca8b5aa265c6318fbd0604879fb2626826d9fcb83fa5d335dc0371fec7286b3f",
         &actual_hex,
     );
 }
@@ -1672,9 +1687,13 @@ test "built-in read_tool_result owns product metadata schema and callbacks" {
     try std.testing.expect(!input_schema.get("additionalProperties").?.bool);
     const request = input_schema.get("properties").?.object.get("request").?.object;
     const alternatives = request.get("oneOf").?.array.items;
-    try std.testing.expectEqual(@as(usize, 2), alternatives.len);
+    try std.testing.expectEqual(@as(usize, 3), alternatives.len);
     const range = alternatives[0].object;
     const query = alternatives[1].object;
+    const search = alternatives[2].object;
+    try std.testing.expectEqualStrings("search", search.get("required").?.array.items[0].string);
+    try std.testing.expectEqual(@as(i64, 3), search.get("properties").?.object.get("search").?.object.get("maxItems").?.integer);
+    try std.testing.expect(search.get("properties").?.object.get("handle") == null);
     try std.testing.expect(range.get("properties").?.object.get("query") == null);
     try std.testing.expect(query.get("properties").?.object.get("start_byte") == null);
     try std.testing.expect(query.get("properties").?.object.get("byte_count") == null);

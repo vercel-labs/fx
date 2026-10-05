@@ -1,6 +1,7 @@
 const std = @import("std");
 const config_runtime = @import("../config/config_runtime.zig");
 const io_mod = @import("../shared/io.zig");
+const session_child_store = @import("session_child_store.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -37,9 +38,32 @@ pub const Store = struct {
     ready: bool = false,
     used_bytes: usize = 0,
     file_count: usize = 0,
+    /// A v2 session's store, owned: each download is a blob of the session
+    /// and its path is the blob's read-only file (D44, D49). The limits
+    /// count this process's downloads.
+    blobs: ?session_child_store.SessionChildCapability = null,
 
     pub fn init(alloc: Allocator, session_dir: []const u8) !Store {
         return initWithLimits(alloc, session_dir, .{});
+    }
+
+    /// A store over a v2 session's blobs; `session_id` names it for the
+    /// fetch cache.
+    pub fn initBlobs(alloc: Allocator, capability: *const session_child_store.SessionChildCapability, session_id: []const u8) !Store {
+        std.debug.assert(capability.holdsBlobs());
+        var owned = try capability.duplicate(alloc);
+        errdefer owned.deinit();
+        const dir = try alloc.dupe(u8, "");
+        errdefer alloc.free(dir);
+        const store_id = try std.fmt.allocPrint(alloc, "sessions-v2:{s}", .{session_id});
+        return .{
+            .allocator = alloc,
+            .dir = dir,
+            .store_id = store_id,
+            .limits = .{},
+            .ready = true,
+            .blobs = owned,
+        };
     }
 
     pub fn initWithLimits(alloc: Allocator, session_dir: []const u8, limits: Limits) !Store {
@@ -57,6 +81,7 @@ pub const Store = struct {
     }
 
     pub fn deinit(self: *Store) void {
+        if (self.blobs) |*capability| capability.deinit();
         self.allocator.free(self.dir);
         self.allocator.free(self.store_id);
         self.* = undefined;
@@ -68,11 +93,48 @@ pub const Store = struct {
 
     pub fn write(self: *Store, alloc: Allocator, mime_type: []const u8, bytes: []const u8) !Artifact {
         const ext = extensionForMime(mime_type);
+        if (self.blobs) |*capability| return self.writeBlob(alloc, capability, ext, mime_type, bytes);
         const handle = try makeHandle(alloc, ext);
         return try self.writeWithOwnedHandle(alloc, handle, mime_type, bytes);
     }
 
+    /// The download as a blob: `artifact-`, its hash and the extension name
+    /// it, and its path is the blob's own read-only file (D49).
+    fn writeBlob(
+        self: *Store,
+        alloc: Allocator,
+        capability: *session_child_store.SessionChildCapability,
+        ext: []const u8,
+        mime_type: []const u8,
+        bytes: []const u8,
+    ) !Artifact {
+        try self.reserve(bytes.len);
+        var committed = false;
+        errdefer if (!committed) self.rollback(bytes.len);
+        const hash = try capability.putBlob(bytes);
+        const handle = try std.fmt.allocPrint(alloc, "artifact-{s}.{s}", .{ &hash, ext });
+        errdefer alloc.free(handle);
+        const display_path = try capability.blobPath(alloc, .browser_artifacts, handle);
+        errdefer alloc.free(display_path);
+        const normalized_mime = try normalizedMime(alloc, mime_type);
+        committed = true;
+        return .{
+            .handle = handle,
+            .mime_type = normalized_mime,
+            .byte_count = bytes.len,
+            .display_path = display_path,
+        };
+    }
+
     pub fn read(self: *Store, alloc: Allocator, handle: []const u8, max_bytes: usize) ![]u8 {
+        if (self.blobs) |*capability| {
+            try validateHandle(handle);
+            return capability.readBlob(alloc, .browser_artifacts, handle, max_bytes) catch |err| switch (err) {
+                error.BlobNotFound => error.ArtifactNotFound,
+                error.BlobTooLarge => error.StreamTooLong,
+                else => err,
+            };
+        }
         if (!(try self.contains(handle))) return error.ArtifactNotFound;
         const path = try self.pathForHandle(alloc, handle);
         defer alloc.free(path);
@@ -86,6 +148,14 @@ pub const Store = struct {
 
     pub fn contains(self: *Store, handle: []const u8) !bool {
         try validateHandle(handle);
+        if (self.blobs) |*capability| {
+            const path = capability.blobPath(self.allocator, .browser_artifacts, handle) catch |err| return switch (err) {
+                error.BlobNotFound => false,
+                else => err,
+            };
+            self.allocator.free(path);
+            return true;
+        }
         var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), self.dir, .{ .iterate = true }) catch |err| switch (err) {
             error.FileNotFound => return false,
             else => return err,
@@ -358,6 +428,54 @@ test "web_fetch binary artifact write is byte exact" {
     const read_back = try store.read(alloc, artifact.handle, 1024);
     defer alloc.free(read_back);
     try std.testing.expectEqualSlices(u8, bytes, read_back);
+}
+
+test "web_fetch on a v2 session keeps a download as a blob the model opens by path (D44, D49)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const blob_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(blob_dir);
+    var memory = session_child_store.MemoryBlobsForTesting.initWithFiles(alloc, blob_dir);
+    defer memory.deinit();
+    var capability = try session_child_store.SessionChildCapability.initBlobs(alloc, memory.blobs(), "", .writable);
+    defer capability.deinit();
+
+    var store = try Store.initBlobs(alloc, &capability, "kYIGy8ik0H3K");
+    defer store.deinit();
+    try std.testing.expectEqualStrings("sessions-v2:kYIGy8ik0H3K", store.id());
+    const bytes = "%PDF-1.7\x00 binary \xff";
+    var artifact = try store.write(alloc, "application/pdf; charset=binary", bytes);
+    defer artifact.deinit(alloc);
+    try std.testing.expect(std.mem.startsWith(u8, artifact.handle, "artifact-"));
+    try std.testing.expect(std.mem.endsWith(u8, artifact.handle, ".pdf"));
+    try std.testing.expectEqualStrings("application/pdf", artifact.mime_type);
+    try std.testing.expectEqual(@as(usize, 1), memory.count());
+
+    // The path is the blob's own read-only file.
+    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), artifact.display_path, .{});
+    defer file.close(io_mod.getIo());
+    var buffer: [64]u8 = undefined;
+    const len = try file.readPositionalAll(io_mod.getIo(), &buffer, 0);
+    try std.testing.expectEqualSlices(u8, bytes, buffer[0..len]);
+    try std.testing.expectError(error.AccessDenied, std.Io.Dir.openFileAbsolute(io_mod.getIo(), artifact.display_path, .{ .mode = .read_write }));
+    const read_back = try store.read(alloc, artifact.handle, 1024);
+    defer alloc.free(read_back);
+    try std.testing.expectEqualSlices(u8, bytes, read_back);
+    try std.testing.expect(try store.contains(artifact.handle));
+    try std.testing.expect(!try store.contains("artifact-" ++ "0" ** 64 ++ ".pdf"));
+    try std.testing.expectError(error.ArtifactNotFound, store.read(alloc, "artifact-" ++ "0" ** 64 ++ ".pdf", 1024));
+
+    // The same download is the same blob; the limits still count.
+    var again = try store.write(alloc, "application/pdf", bytes);
+    defer again.deinit(alloc);
+    try std.testing.expectEqualStrings(artifact.handle, again.handle);
+    try std.testing.expectEqual(@as(usize, 1), memory.count());
+    var capped = try Store.initBlobs(alloc, &capability, "kYIGy8ik0H3K");
+    defer capped.deinit();
+    capped.limits = .{ .max_bytes = 4, .max_files = 4 };
+    try std.testing.expectError(error.ArtifactQuotaExceeded, capped.write(alloc, "application/pdf", bytes));
+    try std.testing.expectEqual(@as(usize, 0), capped.usedBytesForTest());
 }
 
 test "web_fetch artifact quota reconciles existing files on resume" {

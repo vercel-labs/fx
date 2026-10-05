@@ -269,7 +269,7 @@ fn rejectInvalidConversationEvent(comptime rule: []const u8) ConversationTransit
     return error.InvalidConversationEvent;
 }
 
-fn validateConversationEventShape(event: ConversationEvent, schema_version: u8) ConversationTransitionError!void {
+pub fn validateConversationEventShape(event: ConversationEvent, schema_version: u8) ConversationTransitionError!void {
     switch (event) {
         .user => |value| {
             try validateConversationText(value.text);
@@ -573,7 +573,7 @@ fn interruptedCommandReplayBytes(
     };
 }
 
-fn appendExecutionConversationEvents(
+pub fn appendExecutionConversationEvents(
     alloc: Allocator,
     events: *std.ArrayList(ConversationEvent),
     execution: types.ExecutionMemory,
@@ -735,6 +735,7 @@ pub const PreferencesChanged = struct {
     model: ?[]u8 = null,
     effort: ?types.ReasoningEffort = null,
     fast_mode: ?bool = null,
+    ultrafast_mode: ?bool = null,
 
     fn deinit(self: *PreferencesChanged, alloc: Allocator) void {
         if (self.model) |model| alloc.free(model);
@@ -1410,6 +1411,7 @@ fn applyDelta(
             if (payload.model) |model| proposed.preferences.model = model;
             if (payload.effort) |effort| proposed.preferences.effort = effort;
             if (payload.fast_mode) |fast_mode| proposed.preferences.fast_mode = fast_mode;
+            if (payload.ultrafast_mode) |ultrafast_mode| proposed.preferences.ultrafast_mode = ultrafast_mode;
             proposed.updated_at_ms = envelope.timestamp_ms;
             try session_codec.validateState(proposed);
             const model_copy = if (payload.model) |model|
@@ -1423,6 +1425,7 @@ fn applyDelta(
             if (payload.provider) |provider| current.preferences.provider = provider;
             if (payload.effort) |effort| current.preferences.effort = effort;
             if (payload.fast_mode) |fast_mode| current.preferences.fast_mode = fast_mode;
+            if (payload.ultrafast_mode) |ultrafast_mode| current.preferences.ultrafast_mode = ultrafast_mode;
             current.updated_at_ms = envelope.timestamp_ms;
         },
         .workspace_rebound => |payload| {
@@ -1527,7 +1530,7 @@ fn validateEnvelope(envelope: Envelope) !void {
             try session_codec.validateState(state);
         },
         .preferences_changed => |payload| {
-            if (payload.provider == null and payload.model == null and payload.effort == null and payload.fast_mode == null) {
+            if (payload.provider == null and payload.model == null and payload.effort == null and payload.fast_mode == null and payload.ultrafast_mode == null) {
                 return error.InvalidEventFrame;
             }
             if (payload.model) |model| {
@@ -1647,6 +1650,11 @@ fn writePayload(writer: *std.Io.Writer, event: Event) !void {
             if (payload.fast_mode) |fast_mode| {
                 if (wrote) try writer.writeByte(',');
                 try writer.print("\"fast_mode\":{s}", .{if (fast_mode) "true" else "false"});
+                wrote = true;
+            }
+            if (payload.ultrafast_mode) |ultrafast_mode| {
+                if (wrote) try writer.writeByte(',');
+                try writer.print("\"ultrafast_mode\":{s}", .{if (ultrafast_mode) "true" else "false"});
             }
             try writer.writeByte('}');
         },
@@ -1775,8 +1783,8 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
         },
         .preferences_changed => blk: {
             const object = try requireObject(value);
-            if (object.count() == 0 or object.count() > 4) return error.InvalidEventFrame;
-            try rejectUnknownKeys(object, &.{ "provider", "model", "effort", "fast_mode" });
+            if (object.count() == 0 or object.count() > 5) return error.InvalidEventFrame;
+            try rejectUnknownKeys(object, &.{ "provider", "model", "effort", "fast_mode", "ultrafast_mode" });
             const provider = if (object.get("provider")) |provider_value| provider_blk: {
                 break :provider_blk model_provider.parse_saved(provider_value) catch return error.InvalidEventFrame;
             } else null;
@@ -1788,11 +1796,13 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
             else
                 null;
             const fast_mode = if (object.get("fast_mode")) |_| try requireBool(object, "fast_mode") else null;
+            const ultrafast_mode = if (object.get("ultrafast_mode")) |_| try requireBool(object, "ultrafast_mode") else null;
             break :blk .{ .preferences_changed = .{
                 .provider = provider,
                 .model = model,
                 .effort = effort,
                 .fast_mode = fast_mode,
+                .ultrafast_mode = ultrafast_mode,
             } };
         },
         .workspace_rebound => blk: {
@@ -1898,10 +1908,6 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
             const bytes = try alloc.alloc(u8, decoded_len);
             errdefer alloc.free(bytes);
             std.base64.standard.Decoder.decode(bytes, encoded) catch return error.InvalidEventFrame;
-            const canonical = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
-            defer alloc.free(canonical);
-            const rendered = std.base64.standard.Encoder.encode(canonical, bytes);
-            if (!std.mem.eql(u8, rendered, encoded)) return error.InvalidEventFrame;
             break :blk .{ .state_replacement_chunk = .{
                 .replacement_id = try parseIdentifier(try requireString(object, "replacement_id")),
                 .chunk_index = try requireU64(object, "chunk_index"),
@@ -1925,6 +1931,18 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
             } };
         },
     };
+}
+
+test "replacement chunk decoding uses only decoded storage" {
+    const json = "{\"replacement_id\":\"" ++ "ab" ** 16 ++ "\",\"chunk_index\":0,\"raw_bytes\":1,\"chunk_sha256\":\"" ++ "00" ** 32 ++ "\",\"base64\":\"/w==\"}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    var storage: [1]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    const alloc = fixed.allocator();
+    var event = try parsePayload(alloc, .state_replacement_chunk, parsed.value);
+    defer event.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, "\xff", event.state_replacement_chunk.bytes);
 }
 
 fn readFrameLine(alloc: Allocator, source: *std.Io.Reader) ![]u8 {
@@ -1966,9 +1984,13 @@ fn writePreferences(
     try writeJsonString(writer, preferences.model);
     try writer.writeAll(",\"effort\":");
     try writeJsonString(writer, preferences.effort.label());
-    try writer.print(",\"fast_mode\":{s},\"provider\":", .{
+    try writer.print(",\"fast_mode\":{s}", .{
         if (preferences.fast_mode) "true" else "false",
     });
+    if (preferences.ultrafast_mode) {
+        try writer.writeAll(",\"ultrafast_mode\":true");
+    }
+    try writer.writeAll(",\"provider\":");
     try std.json.Stringify.value(preferences.provider, .{}, writer);
     try writer.writeByte('}');
 }

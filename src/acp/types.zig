@@ -18,6 +18,22 @@ pub fn generateMessageId(storage: *MessageIdBuffer) []const u8 {
 
 pub const protocol_version: u32 = 1;
 
+/// Returns the borrowed value at `_meta.fx.<key>` on an ACP params object.
+/// fx reads and writes its protocol extensions under that one namespace.
+pub fn fxMetaField(object: std.json.ObjectMap, key: []const u8) ?std.json.Value {
+    const meta = object.get("_meta") orelse return null;
+    if (meta != .object) return null;
+    const fx = meta.object.get("fx") orelse return null;
+    if (fx != .object) return null;
+    return fx.object.get(key);
+}
+
+/// Returns `_meta.fx.<key>` when it is a JSON boolean.
+pub fn fxMetaBool(object: std.json.ObjectMap, key: []const u8) ?bool {
+    const value = fxMetaField(object, key) orelse return null;
+    return if (value == .bool) value.bool else null;
+}
+
 pub fn writeModelRecoveryInfoUpdate(
     writer: *std.Io.Writer,
     status: ?core_types.RouteRecoveryStatus,
@@ -175,6 +191,28 @@ pub fn writeUserImageChunk(
     try w.writeAll("}}");
 }
 
+/// Host-facing identity of a tool call, sent as `_meta.fx.toolCall` so
+/// clients never need to match on tool names.
+pub const ToolCallMeta = struct {
+    /// fx's own discovery or bookkeeping step, which hosts may hide.
+    internal: bool = false,
+    /// The MCP server and its own tool name, for MCP tool calls.
+    mcp: ?struct { server: []const u8, tool: []const u8 } = null,
+};
+
+fn writeToolCallMeta(w: *std.Io.Writer, meta: ToolCallMeta) !void {
+    try w.writeAll(",\"_meta\":{\"fx\":{\"toolCall\":{\"internal\":");
+    try w.writeAll(if (meta.internal) "true" else "false");
+    if (meta.mcp) |mcp| {
+        try w.writeAll(",\"mcp\":{\"server\":");
+        try writeJsonStr(mcp.server, w);
+        try w.writeAll(",\"tool\":");
+        try writeJsonStr(mcp.tool, w);
+        try w.writeByte('}');
+    }
+    try w.writeAll("}}}");
+}
+
 pub fn writeToolCall(
     w: *std.Io.Writer,
     tool_call_id: []const u8,
@@ -183,6 +221,7 @@ pub fn writeToolCall(
     kind: ToolCallKind,
     status: ToolCallStatus,
     raw_input: ?std.json.Value,
+    meta: ToolCallMeta,
 ) !void {
     try w.writeAll("{\"sessionUpdate\":\"tool_call\",\"toolCallId\":");
     try writeJsonStr(tool_call_id, w);
@@ -198,6 +237,7 @@ pub fn writeToolCall(
         try w.writeAll(",\"rawInput\":");
         try std.json.Stringify.value(value, .{}, w);
     }
+    try writeToolCallMeta(w, meta);
     try w.writeAll("}");
 }
 
@@ -228,14 +268,34 @@ pub fn writeToolCallUpdateWithCommandResult(
     try w.writeAll("}");
 }
 
-pub fn writeInitializeResponse(w: *std.Io.Writer, image_prompts: bool) !void {
+pub const AgentCapabilities = struct {
+    image_prompts: bool,
+    /// Accepts client `mcpServers` on session setup.
+    mcp_servers: bool = true,
+    /// Accepts steering prompts through `session/prompt` during a turn.
+    steering: bool = false,
+    /// Accepts a client system prompt on `session/new` in append mode.
+    system_prompt: bool = false,
+    /// Serves `type: "acp"` MCP servers over this connection.
+    mcp_over_acp: bool = false,
+};
+
+pub fn writeInitializeResponse(w: *std.Io.Writer, capabilities: AgentCapabilities) !void {
+    const mcp_servers = if (capabilities.mcp_servers) "true" else "false";
     try w.writeAll("{\"protocolVersion\":");
     try w.print("{d}", .{protocol_version});
     try w.writeAll(",\"agentCapabilities\":{");
     try w.writeAll("\"loadSession\":true,");
-    try w.print("\"promptCapabilities\":{{\"image\":{s},\"audio\":false,\"embeddedContext\":true}},", .{if (image_prompts) "true" else "false"});
-    try w.writeAll("\"mcpCapabilities\":{\"http\":true,\"sse\":true},");
-    try w.writeAll("\"sessionCapabilities\":{\"list\":{},\"resume\":{},\"close\":{}}");
+    try w.print("\"promptCapabilities\":{{\"image\":{s},\"audio\":false,\"embeddedContext\":true}},", .{if (capabilities.image_prompts) "true" else "false"});
+    try w.print("\"mcpCapabilities\":{{\"http\":{s},\"sse\":{s},\"acp\":{s}}},", .{
+        mcp_servers,
+        mcp_servers,
+        if (capabilities.mcp_over_acp) "true" else "false",
+    });
+    try w.writeAll("\"sessionCapabilities\":{\"list\":{},\"resume\":{},\"close\":{}");
+    if (capabilities.system_prompt) try w.writeAll(",\"systemPrompt\":{}");
+    try w.writeByte('}');
+    try w.print(",\"_meta\":{{\"fx\":{{\"steering\":{s}}}}}", .{if (capabilities.steering) "true" else "false"});
     try w.writeAll("},\"agentInfo\":{\"name\":\"fx\",\"title\":\"fx\",\"version\":");
     try writeJsonStr(build_options.app_version, w);
     try w.writeAll("},");
@@ -246,6 +306,38 @@ pub fn writePromptResponse(w: *std.Io.Writer, reason: StopReason) !void {
     try w.writeAll("{\"stopReason\":");
     try writeJsonStr(reason.jsonString(), w);
     try w.writeAll("}");
+}
+
+/// How a steering `session/prompt` fared in the turn that received it.
+pub const SteeringDelivery = enum {
+    absorbed,
+    dropped,
+};
+
+/// Answers a steering prompt with its receiving turn's stop reason. Usage is
+/// reported once, on the response to the prompt that started the turn.
+pub fn writeSteeringPromptResponse(w: *std.Io.Writer, reason: StopReason, delivery: SteeringDelivery) !void {
+    try w.writeAll("{\"stopReason\":");
+    try writeJsonStr(reason.jsonString(), w);
+    try w.writeAll(",\"_meta\":{\"fx\":{\"steering\":");
+    try writeJsonStr(@tagName(delivery), w);
+    try w.writeAll("}}}");
+}
+
+/// Replays delivered steering where the agent inserted it into the turn.
+pub fn writeSteeringUserMessageChunk(
+    w: *std.Io.Writer,
+    message_id: []const u8,
+    text: []const u8,
+    request_id: ?jsonrpc.RequestId,
+) !void {
+    try w.writeAll("{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":");
+    try writeJsonStr(message_id, w);
+    try w.writeAll(",\"content\":{\"type\":\"text\",\"text\":");
+    try writeJsonStr(text, w);
+    try w.writeAll("},\"_meta\":{\"fx\":{\"steering\":{\"requestId\":");
+    try jsonrpc.Writer.writeId(w, request_id);
+    try w.writeAll("}}}}");
 }
 
 pub fn writePromptResponseWithUsage(
@@ -325,9 +417,13 @@ test "writeToolCall produces valid json" {
         .read,
         .pending,
         raw_input.value,
+        .{},
     );
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.writer.buffered(), .{});
     defer parsed.deinit();
+    const tool_call_meta = parsed.value.object.get("_meta").?.object.get("fx").?.object.get("toolCall").?.object;
+    try std.testing.expect(!tool_call_meta.get("internal").?.bool);
+    try std.testing.expect(tool_call_meta.get("mcp") == null);
 
     try std.testing.expectEqualStrings("call_001", parsed.value.object.get("toolCallId").?.string);
     try std.testing.expectEqualStrings("read_file", parsed.value.object.get("name").?.string);
@@ -413,7 +509,7 @@ test "writeInitializeResponse contains required fields" {
     const alloc = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try writeInitializeResponse(&out.writer, true);
+    try writeInitializeResponse(&out.writer, .{ .image_prompts = true, .steering = true, .system_prompt = true, .mcp_over_acp = true });
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.writer.buffered(), .{});
     defer parsed.deinit();
 
@@ -432,6 +528,39 @@ test "writeInitializeResponse contains required fields" {
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"close\":{}") != null);
     try std.testing.expect(mcp_capabilities.get("http").?.bool);
     try std.testing.expect(mcp_capabilities.get("sse").?.bool);
+    try std.testing.expect(mcp_capabilities.get("acp").?.bool);
+    const session_capabilities = agent_capabilities.get("sessionCapabilities").?.object;
+    try std.testing.expectEqual(@as(usize, 0), session_capabilities.get("systemPrompt").?.object.count());
+    const fx_meta = agent_capabilities.get("_meta").?.object.get("fx").?.object;
+    try std.testing.expect(fx_meta.get("steering").?.bool);
+}
+
+test "writeInitializeResponse withholds MCP transports a host rejects" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeInitializeResponse(&out.writer, .{ .image_prompts = false, .mcp_servers = false });
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.writer.buffered(), .{});
+    defer parsed.deinit();
+    const mcp_capabilities = parsed.value.object.get("agentCapabilities").?.object.get("mcpCapabilities").?.object;
+    try std.testing.expect(!mcp_capabilities.get("http").?.bool);
+    try std.testing.expect(!mcp_capabilities.get("sse").?.bool);
+}
+
+test "writeToolCall separates MCP server and tool identity" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeToolCall(&out.writer, "call_mcp", "mcp_mini_browser_eval", "Evaluate JavaScript", .other, .pending, null, .{
+        .mcp = .{ .server = "mini", .tool = "browser_eval" },
+    });
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.writer.buffered(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("Evaluate JavaScript", parsed.value.object.get("title").?.string);
+    const meta = parsed.value.object.get("_meta").?.object.get("fx").?.object.get("toolCall").?.object;
+    try std.testing.expect(!meta.get("internal").?.bool);
+    try std.testing.expectEqualStrings("mini", meta.get("mcp").?.object.get("server").?.string);
+    try std.testing.expectEqualStrings("browser_eval", meta.get("mcp").?.object.get("tool").?.string);
 }
 
 test "writeUserMessageChunk produces valid json" {

@@ -61,6 +61,9 @@ pub fn createToolSubscriptionWithResources(
             server.elicitation_capabilities.url,
     };
     if (!base_filters.any()) return null;
+    // Host-channel servers answer one request per exchange; list changes are
+    // picked up by catalog refresh instead of a long-lived subscription.
+    if (server.config.acp_server_id != null) return null;
     const subscription_generation = server.next_subscription_generation;
     server.next_subscription_generation = std.math.add(
         u64,

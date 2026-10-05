@@ -3,6 +3,8 @@ const agent_stream_provider = @import("../../stream_provider.zig");
 const builtin_tools = @import("../../../../builtins/tools.zig");
 const types = @import("../../../shared/types.zig");
 const token_estimate = @import("../../../shared/token_estimate.zig");
+const result_store = @import("../../../session/result_store.zig");
+const session_child_store = @import("../../../session/session_child_store.zig");
 const worker_runtime = @import("../../worker_runtime.zig");
 const session_runtime = @import("../../../session/session.zig");
 const session_codec = @import("../../../session/session_codec.zig");
@@ -12,6 +14,7 @@ const model_capabilities = @import("../../../config/model_capabilities.zig");
 const model_provider = @import("../../../config/model_provider.zig");
 const debug_trace = @import("../../../shared/debug_trace.zig");
 const image_attachments = @import("../../../images/image_attachments.zig");
+const png_downscale = @import("../../../images/png_downscale.zig");
 const io_mod = @import("../../../shared/io.zig");
 const runtime_deps = @import("../deps.zig");
 const runtime_tool_contracts = @import("../tool_contracts.zig");
@@ -66,6 +69,7 @@ const vision_read_and_terminal_tools = [_]tool_dispatch.Tool{
 };
 const terminal_advertised_names = [_][]const u8{"shell"};
 const terminal_advertised_functions = [_]model_tool_schema.FunctionSchema{builtin_tools.shell.model_schema};
+const test_image_base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
 const VisionAndReadExecutor = struct {
     vision: ExecuteDelegate,
@@ -435,10 +439,14 @@ fn expectGatewayPromptTextCount(gateway: *const FakeGateway, index: usize, needl
 }
 
 fn writeTestImagePath(alloc: Allocator, tmp: *std.testing.TmpDir) ![]u8 {
+    const size = try std.base64.standard.Decoder.calcSizeForSlice(test_image_base64);
+    const bytes = try alloc.alloc(u8, size);
+    defer alloc.free(bytes);
+    try std.base64.standard.Decoder.decode(bytes, test_image_base64);
     {
         var file = try tmp.dir.createFile(std.testing.io, "fixture-image.png", .{});
         defer file.close(std.testing.io);
-        try file.writeStreamingAll(std.testing.io, "\x89PNG\r\n\x1a\nfixture image bytes");
+        try file.writeStreamingAll(std.testing.io, bytes);
     }
     return io_mod.dirRealpathAlloc(alloc, tmp.dir, "fixture-image.png");
 }
@@ -2610,7 +2618,7 @@ test "processQueuedPrompt routes images natively only when vision and file input
         if (entry.expect_native) {
             try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
             try expectBodyContains(&gateway, 0, "\"type\":\"file\"");
-            try expectBodyContains(&gateway, 0, "iVBORw0KGgpmaXh0dXJlIGltYWdlIGJ5dGVz");
+            try expectBodyContains(&gateway, 0, test_image_base64);
             try expectBodyNotContains(&gateway, 0, "\"name\":\"vision\"");
             try std.testing.expectEqualStrings("Native route answer", hooks.finish_assistant_text.?);
         } else {
@@ -2619,7 +2627,7 @@ test "processQueuedPrompt routes images natively only when vision and file input
             try expectBodyNotContains(&gateway, 0, "\"type\":\"file\"");
             try expectBodyContains(&gateway, 0, "[Image #1]");
             try expectBodyContains(&gateway, 1, "\"type\":\"file\"");
-            try expectBodyContains(&gateway, 1, "iVBORw0KGgpmaXh0dXJlIGltYWdlIGJ5dGVz");
+            try expectBodyContains(&gateway, 1, test_image_base64);
             try expectBodyContains(&gateway, 2, "text route evidence");
             try std.testing.expectEqualStrings(model, gateway.request_models.items[0]);
             try std.testing.expectEqualStrings("google/gemini-2.5-flash", gateway.request_models.items[1]);
@@ -2843,18 +2851,17 @@ test "processQueuedPrompt omits Fast without catalog support" {
 
 test "processQueuedPrompt uses one available capability snapshot for compaction and output" {
     const alloc = std.testing.allocator;
-    const old_marker = "OLD_HISTORY_MUST_BE_PROJECTED_OUT";
-    const old_user = try alloc.alloc(u8, 48_000);
-    defer alloc.free(old_user);
-    @memset(old_user, 'u');
-    @memcpy(old_user[0..old_marker.len], old_marker);
-    const old_assistant = try alloc.alloc(u8, 48_000);
+    const old_marker = "OLD_ASSISTANT_TEXT_MUST_BE_SUMMARIZED";
+    const old_assistant = try alloc.alloc(u8, 96_000);
     defer alloc.free(old_assistant);
     @memset(old_assistant, 'a');
+    @memcpy(old_assistant[0..old_marker.len], old_marker);
+    var old_steps = [_]types.ToolExecutionStep{.{ .assistant = old_assistant }};
     var history = [_]HistoryTurn{
         .{ .assistant = .{
-            .user = .{ .text = old_user },
-            .assistant = old_assistant,
+            .user = .{ .text = @constCast("OLD_USER_REQUEST_KEPT_EXACTLY") },
+            .assistant = @constCast("OLD_FINAL_REPLY_KEPT_EXACTLY"),
+            .execution = .{ .tool_steps = &old_steps },
         } },
         .{ .assistant = .{
             .user = .{ .text = @constCast("NEW_HISTORY_USER") },
@@ -2869,8 +2876,7 @@ test "processQueuedPrompt uses one available capability snapshot for compaction 
         ),
     }};
     const completions = [_]FakeCompletion{
-        .{ .content = "Continue from the compacted history. NEW_HISTORY_USER received NEW_HISTORY_ASSISTANT." },
-        .{ .content = "The earlier assistant work is summarized." },
+        .{ .content = "Turn 1\nIn between: The earlier assistant work is summarized." },
         .{ .content = "Done" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
@@ -2885,19 +2891,23 @@ test "processQueuedPrompt uses one available capability snapshot for compaction 
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
     try std.testing.expectEqual(@as(usize, 0), hooks.capability_queries.items.len);
-    // The two older messages exceed the model's normal 16k input allowance.
-    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    // The older turn exceeds the model's normal 16k input allowance: one
+    // summary request, then the continued turn.
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
     try expectBodyContains(&gateway, 0, old_marker);
-    for (0..2) |index| {
-        try expectBodyNotContains(&gateway, index, "NEW_HISTORY_USER");
-        try expectBodyNotContains(&gateway, index, "NEW_HISTORY_ASSISTANT");
-        try expectBodyContains(&gateway, index, "\"maxOutputTokens\":16000");
-    }
-    try expectBodyContains(&gateway, 2, "context_handoff");
-    try expectBodyNotContains(&gateway, 2, old_marker);
-    try expectBodyContains(&gateway, 2, "NEW_HISTORY_USER");
-    try expectBodyContains(&gateway, 2, "NEW_HISTORY_ASSISTANT");
-    try expectBodyContains(&gateway, 2, "\"maxOutputTokens\":16000");
+    try expectBodyNotContains(&gateway, 0, "NEW_HISTORY_USER");
+    try expectBodyNotContains(&gateway, 0, "NEW_HISTORY_ASSISTANT");
+    try expectBodyContains(&gateway, 0, "\"maxOutputTokens\":16000");
+    try expectBodyContains(&gateway, 1, "compacted_conversation");
+    // The user message and final reply stay exact; the work in between is
+    // summarized.
+    try expectBodyContains(&gateway, 1, "User 1:\\nOLD_USER_REQUEST_KEPT_EXACTLY");
+    try expectBodyContains(&gateway, 1, "Assistant 1, in between:\\nThe earlier assistant work is summarized.");
+    try expectBodyContains(&gateway, 1, "Assistant 1, final reply:\\nOLD_FINAL_REPLY_KEPT_EXACTLY");
+    try expectBodyNotContains(&gateway, 1, old_marker);
+    try expectBodyContains(&gateway, 1, "NEW_HISTORY_USER");
+    try expectBodyContains(&gateway, 1, "NEW_HISTORY_ASSISTANT");
+    try expectBodyContains(&gateway, 1, "\"maxOutputTokens\":16000");
 }
 
 test "processQueuedPrompt compacts with the selected working model" {
@@ -2908,10 +2918,12 @@ test "processQueuedPrompt compacts with the selected working model" {
     const old_assistant = try alloc.alloc(u8, 48_000);
     defer alloc.free(old_assistant);
     @memset(old_assistant, 'a');
+    var old_steps = [_]types.ToolExecutionStep{.{ .assistant = old_assistant }};
     var history = [_]HistoryTurn{
         .{ .assistant = .{
             .user = .{ .text = old_user },
-            .assistant = old_assistant,
+            .assistant = @constCast("old final reply"),
+            .execution = .{ .tool_steps = &old_steps },
         } },
         .{ .assistant = .{
             .user = .{ .text = @constCast("recent user") },
@@ -2950,7 +2962,6 @@ test "processQueuedPrompt compacts with the selected working model" {
             .capabilities = .{ .context_window = 32_000, .max_output_tokens = 16_000 },
         }};
         const completions = [_]FakeCompletion{
-            .{ .content = "The earlier user request is preserved." },
             .{ .content = "The earlier assistant work is summarized." },
             .{ .content = "Done" },
         };
@@ -2968,7 +2979,7 @@ test "processQueuedPrompt compacts with the selected working model" {
 
         try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
-        try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
+        try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
         for (gateway.request_models.items) |model| try std.testing.expectEqualStrings(case.working_model, model);
         try std.testing.expectEqualStrings("Done", hooks.finish_assistant_text.?);
     }
@@ -2999,6 +3010,64 @@ test "processQueuedPrompt compacts with the selected working model" {
         ),
     );
     try std.testing.expectEqual(@as(usize, 0), unavailable_gateway.request_models.items.len);
+}
+
+test "compaction writes the summary with the least reasoning each model accepts" {
+    const alloc = std.testing.allocator;
+    const old_assistant = try alloc.alloc(u8, 96_000);
+    defer alloc.free(old_assistant);
+    @memset(old_assistant, 'a');
+    var old_steps = [_]types.ToolExecutionStep{.{ .assistant = old_assistant }};
+    var history = [_]HistoryTurn{
+        .{ .assistant = .{ .user = .{ .text = @constCast("older request") }, .assistant = @constCast("older answer"), .execution = .{ .tool_steps = &old_steps } } },
+        .{ .assistant = .{ .user = .{ .text = @constCast("recent request") }, .assistant = @constCast("recent answer") } },
+    };
+    const effort = types.ReasoningEffort.literal;
+    // This model cannot turn reasoning off, so low is the least it takes.
+    const primary_efforts = [_]types.ReasoningEffort{ effort("low"), effort("medium"), effort("high"), effort("xhigh"), effort("max") };
+    const fallback_efforts = [_]types.ReasoningEffort{ effort("none"), effort("low"), effort("high"), effort("xhigh") };
+    const model = "anthropic/claude-opus-5.5";
+    const overrides = [_]ModelCapabilityOverride{
+        .{ .model = model, .capabilities = .{ .context_window = 32_000, .max_output_tokens = 16_000, .reasoning_efforts = .fromSlice(&primary_efforts) } },
+        .{ .model = "openai/gpt-6-sol", .capabilities = .{ .context_window = 400_000, .max_output_tokens = 16_000, .reasoning_efforts = .fromSlice(&fallback_efforts) } },
+    };
+    // The conversation's model fails the summary, so the fallback writes it.
+    const completions = [_]FakeCompletion{
+        .{ .status = .bad_request, .err_body = "{\"error\":{\"message\":\"summary rejected\"}}" },
+        .{ .content = "The earlier assistant work is summarized." },
+        .{ .content = "Done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.available_capability_overrides = &overrides;
+    hooks.capability_overrides = &overrides;
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.effort = effort("xhigh");
+    // Strict routing is the user's choice, so the fallback keeps it too.
+    const only_bedrock = [_][]const u8{"bedrock"};
+    config.provider_order = &only_bedrock;
+    config.provider_strict = true;
+    var job = fixture.job();
+    job.model = @constCast(model);
+    job.history = &history;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try std.testing.expectEqualStrings(model, gateway.request_models.items[0]);
+    try expectBodyContains(&gateway, 0, "\"reasoning\":\"low\"");
+    try expectBodyNotContains(&gateway, 0, "xhigh");
+    try expectBodyContains(&gateway, 0, "\"only\":[\"bedrock\"]");
+    try std.testing.expectEqualStrings("openai/gpt-6-sol", gateway.request_models.items[1]);
+    try expectBodyContains(&gateway, 1, "\"reasoning\":\"none\"");
+    try expectBodyContains(&gateway, 1, "\"only\":[\"bedrock\"]");
+    // The conversation itself keeps its own effort.
+    try std.testing.expectEqualStrings(model, gateway.request_models.items[2]);
+    try expectBodyContains(&gateway, 2, "\"reasoning\":\"xhigh\"");
+    try std.testing.expectEqualStrings("Done", hooks.finish_assistant_text.?);
 }
 
 test "processQueuedPrompt projects bounded output limits into gateway requests" {
@@ -3057,7 +3126,7 @@ test "processQueuedPrompt semantically compacts history at eighty percent and co
         "{\"path\":\"first.txt\"}",
     )};
     const completions = [_]FakeCompletion{
-        .{ .content = "Finish after the verified read and return the result." },
+        .{ .content = "Turn 1\nIn between: Finish after the verified read and return the result." },
         .{ .tool_calls = &first_calls },
         .{ .content = "Automatic compaction complete." },
     };
@@ -3100,13 +3169,14 @@ test "processQueuedPrompt semantically compacts history at eighty percent and co
         .truncated = true,
     }};
     var restored_steps = [_]types.ToolExecutionStep{.{
+        .assistant = @constCast("AUTO_HISTORY_ASSISTANT_SENTINEL\n" ++ ("h" ** 150_000)),
         .tool_calls = &restored_calls,
         .tool_results = &restored_results,
     }};
     var history = [_]HistoryTurn{
         .{ .assistant = .{
             .user = .{ .text = @constCast("AUTO_HISTORY_USER_SENTINEL") },
-            .assistant = @constCast("AUTO_HISTORY_ASSISTANT_SENTINEL\n" ++ ("h" ** 150_000)),
+            .assistant = @constCast("AUTO_HISTORY_FINAL_SENTINEL"),
             .execution = .{ .tool_steps = &restored_steps },
         } },
         .{ .assistant = .{
@@ -3129,11 +3199,12 @@ test "processQueuedPrompt semantically compacts history at eighty percent and co
     ) != null);
     try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
     try expectBodyContains(&gateway, 0, "AUTO_HISTORY_ASSISTANT_SENTINEL");
-    try expectBodyContains(&gateway, 0, "Result handle:");
+    try expectBodyContains(&gateway, 1, "Assistant 1, final reply:\\nAUTO_HISTORY_FINAL_SENTINEL");
     try expectBodyContains(&gateway, 0, "AUTO_RESTORED_AVAILABLE_BYTES");
-    try expectBodyContains(&gateway, 0, "\"toolChoice\":{\"type\":\"none\"}");
-    try expectBodyContains(&gateway, 0, "\"tools\":[]");
-    try expectBodyContains(&gateway, 1, "context_handoff");
+    try expectBodyContains(&gateway, 0, "AUTO_COMPACTION_HOST_INSTRUCTIONS");
+    try expectNotesAfterConversation(&gateway, 0, 1);
+    try expectBodyContains(&gateway, 1, "compacted_conversation");
+    try expectBodyContains(&gateway, 1, "User 1:\\nAUTO_HISTORY_USER_SENTINEL");
     try std.testing.expect((try prompt_context.measureProviderRequest(alloc, gateway.request_bodies.items[1], .{
         .model = model,
         .messages = &.{},
@@ -3233,10 +3304,10 @@ test "processQueuedPrompt delivers steering queued during in-turn compaction wit
     try runFakePrompt(&gateway, &hooks, config, job);
 
     try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
-    try expectBodyContains(&gateway, 0, "\"toolChoice\":{\"type\":\"none\"}");
+    try expectNotesAfterConversation(&gateway, 0, 1);
     // The first post-compaction request already carries the steering guidance.
     // (Before the boundary fix it only appeared in the reply after it.)
-    try expectBodyContainsInOrder(&gateway, 1, &.{ "context_handoff", "user_steering", "STEER_DURING_COMPACT_SENTINEL" });
+    try expectBodyContainsInOrder(&gateway, 1, &.{ "compacted_conversation", "user_steering", "STEER_DURING_COMPACT_SENTINEL" });
     try expectBodyContains(&gateway, 2, "COMPACT_STEER_RESULT");
     try std.testing.expectEqualStrings("Steered answer after compaction.", hooks.finish_assistant_text.?);
     try std.testing.expectEqual(@as(usize, 2), hooks.history_turns.items.len);
@@ -3244,41 +3315,25 @@ test "processQueuedPrompt delivers steering queued during in-turn compaction wit
     try std.testing.expect(hooks.history_turns.items[1] == .assistant);
 }
 
-test "automatic compaction rejects fixed request overhead above its total target" {
-    const alloc = std.testing.allocator;
-    var gateway = FakeGateway.init(alloc, &.{
-        .{ .content = "The earlier task is complete." },
-        .{ .content = "Finished." },
-    });
-    defer gateway.deinit();
-    const model = "provider/fixed-compaction-overhead";
-    const overrides = [_]ModelCapabilityOverride{.{
-        .model = model,
-        .capabilities = .{ .context_window = 45_000 },
-    }};
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    hooks.available_capability_overrides = &overrides;
-    var fixture = PromptFixture{};
-    var config = fixture.config();
-    config.system_prompt = "fixed instruction " ** 10_000;
-    var job = fixture.job();
-    job.model = @constCast(model);
-    var history = [_]HistoryTurn{.{ .assistant = .{
-        .user = .{ .text = @constCast("earlier request") },
-        .assistant = @constCast("history " ** 30_000),
-    } }};
-    job.history = &history;
-
-    try std.testing.expectError(error.ContextCapacityExceeded, runFakePrompt(&gateway, &hooks, config, job));
-    try std.testing.expectEqual(@as(usize, 0), gateway.request_bodies.items.len);
-    for (hooks.history_turns.items) |turn| try std.testing.expect(turn != .compacted_summary);
+/// The compaction request `index` follows the agent's own request, so the
+/// provider can reuse what it cached: the same tools as the agent's request
+/// `agent_index` and its tool choice, then the notes request.
+fn expectNotesAfterConversation(gateway: *FakeGateway, index: usize, agent_index: usize) !void {
+    const body = gateway.request_bodies.items[index];
+    const agent = gateway.request_bodies.items[agent_index];
+    try std.testing.expect(std.mem.find(u8, body, "Write the compaction notes for the turns of the conversation above") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"toolChoice\":{\"type\":\"auto\"}") != null);
+    const tools_start = std.mem.find(u8, agent, "\"tools\":") orelse return error.TestUnexpectedResult;
+    const tools_end = std.mem.findPos(u8, agent, tools_start, ",\"toolChoice\"") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.find(u8, body, agent[tools_start..tools_end]) != null);
 }
 
-test "automatic compaction shrinks recent history to fit fixed instructions" {
+/// Compacts three turns, the oldest one large, behind a system prompt of
+/// `system_bytes`, and returns how many turns the checkpoint replaced.
+fn compactBehindSystemPrompt(comptime system_bytes: usize) !usize {
     const alloc = std.testing.allocator;
     var gateway = FakeGateway.init(alloc, &.{
-        .{ .content = "The earlier work is complete. Preserve the recent facts." },
+        .{ .content = "Turn 1\nIn between: The earlier work is complete. Preserve the recent facts." },
         .{ .content = "Continued after compaction." },
     });
     defer gateway.deinit();
@@ -3289,11 +3344,12 @@ test "automatic compaction shrinks recent history to fit fixed instructions" {
     hooks.available_capability_overrides = &overrides;
     var fixture = PromptFixture{};
     var config = fixture.config();
-    config.system_prompt = "i" ** 104_000;
+    config.system_prompt = "i" ** system_bytes;
     var job = fixture.job();
     job.model = @constCast(model);
+    var old_steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast("OLD_BUDGET_FACT " ++ ("h" ** 380_000)) }};
     var history = [_]HistoryTurn{
-        .{ .assistant = .{ .user = .{ .text = @constCast("older") }, .assistant = @constCast("OLD_BUDGET_FACT " ++ ("h" ** 380_000)) } },
+        .{ .assistant = .{ .user = .{ .text = @constCast("older") }, .assistant = @constCast("older done"), .execution = .{ .tool_steps = &old_steps } } },
         .{ .assistant = .{ .user = .{ .text = @constCast("middle") }, .assistant = @constCast("MIDDLE_BUDGET_FACT " ++ ("m" ** 8_000)) } },
         .{ .assistant = .{ .user = .{ .text = @constCast("recent") }, .assistant = @constCast("RECENT_BUDGET_FACT " ++ ("r" ** 8_000)) } },
     };
@@ -3301,11 +3357,26 @@ test "automatic compaction shrinks recent history to fit fixed instructions" {
     try runFakePrompt(&gateway, &hooks, config, job);
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
     try expectBodyContains(&gateway, 0, "OLD_BUDGET_FACT");
-    try expectBodyContains(&gateway, 0, "MIDDLE_BUDGET_FACT");
+    // The newest turn stays as it is, so it is never listed for notes. It is
+    // in the request only when the notes follow the conversation itself.
+    try expectBodyContains(&gateway, 0, "\\nTurn 1 (");
+    try expectBodyNotContains(&gateway, 0, "\\nTurn 3 (");
+    if (std.mem.find(u8, gateway.request_bodies.items[0], "of the conversation above") == null) try expectBodyNotContains(&gateway, 0, "RECENT_BUDGET_FACT");
+    try expectBodyContains(&gateway, 1, "compacted_conversation");
+    try expectBodyNotContains(&gateway, 1, "OLD_BUDGET_FACT");
     try expectBodyContains(&gateway, 1, "RECENT_BUDGET_FACT");
-    try expectBodyNotContains(&gateway, 1, "MIDDLE_BUDGET_FACT");
-    try std.testing.expectEqual(@as(usize, 2), hooks.history_turns.items.len);
     try std.testing.expect(hooks.history_turns.items[0] == .compacted_summary);
+    return hooks.history_turns.items[0].compacted_summary.removed_turn_count;
+}
+
+test "automatic compaction keeps the newest turns unchanged" {
+    try std.testing.expectEqual(@as(usize, 1), try compactBehindSystemPrompt(20_000));
+}
+
+test "a large fixed part of the request leaves less room for the kept turns" {
+    // The system prompt alone fills most of the room after compaction, so
+    // only the newest turn stays.
+    try std.testing.expectEqual(@as(usize, 2), try compactBehindSystemPrompt(104_000));
 }
 
 test "compaction remeasures its rebuilt continuation after calibrated preflight" {
@@ -3345,7 +3416,7 @@ test "compaction remeasures its rebuilt continuation after calibrated preflight"
     job.model = @constCast(model);
     try runFakePrompt(&gateway, &hooks, config, job);
     try std.testing.expectEqual(@as(usize, 6), gateway.request_bodies.items.len);
-    try expectBodyContains(&gateway, 5, "context_handoff");
+    try expectBodyContains(&gateway, 5, "compacted_conversation");
     const raw = try prompt_context.measureProviderRequest(alloc, gateway.request_bodies.items[5], .{ .model = model, .messages = &.{}, .tool_choice = .auto, .provider_options = .{} });
     try std.testing.expect(raw.estimated_input_tokens < 20_000);
     try std.testing.expectEqualStrings("Calibrated continuation completed.", hooks.finish_assistant_text.?);
@@ -3383,37 +3454,11 @@ test "compaction can summarize the newest exchange when fixed context prevents r
         if (with_older_history) job.history = &older;
         try runFakePrompt(&gateway, &hooks, config, job);
         try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
-        try expectBodyContains(&gateway, 1, "completed-large-write");
-        try expectBodyContains(&gateway, 2, "context_handoff");
+        try expectBodyContains(&gateway, 1, "[Tool call T1: write_file]");
+        try expectBodyContains(&gateway, 2, "compacted_conversation");
         try expectBodyNotContains(&gateway, 2, "x" ** 68_000);
         try std.testing.expectEqual(@as(usize, 1), hooks.successful_effect_count.load(.seq_cst));
     }
-}
-
-test "automatic compaction validates serialized handoff cost before committing" {
-    const alloc = std.testing.allocator;
-    var gateway = FakeGateway.init(alloc, &.{.{ .content = "\"" ** 10_000 }});
-    defer gateway.deinit();
-    const model = "provider/escaped-compaction-summary";
-    const overrides = [_]ModelCapabilityOverride{.{
-        .model = model,
-        .capabilities = .{ .context_window = 45_000 },
-    }};
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    hooks.available_capability_overrides = &overrides;
-    var fixture = PromptFixture{};
-    var job = fixture.job();
-    job.model = @constCast(model);
-    var history = [_]HistoryTurn{.{ .assistant = .{
-        .user = .{ .text = @constCast("earlier request") },
-        .assistant = @constCast("history " ** 19_000),
-    } }};
-    job.history = &history;
-
-    try std.testing.expectError(error.ContextCapacityExceeded, runFakePrompt(&gateway, &hooks, fixture.config(), job));
-    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
-    for (hooks.history_turns.items) |turn| try std.testing.expect(turn != .compacted_summary);
 }
 
 test "processQueuedPrompt compacts and retries one context overflow" {
@@ -3444,20 +3489,34 @@ test "processQueuedPrompt compacts and retries one context overflow" {
         var fixture = PromptFixture{};
         var job = fixture.job();
         job.model = @constCast(model);
+        var prior_calls = [_]ToolCall{toolCall("prior-read", "read_file", "{\"path\":\"notes.md\"}")};
+        var prior_results = [_]types.PersistedToolResult{.{
+            .tool_call_id = @constCast("prior-read"),
+            .tool_name = @constCast("read_file"),
+            .status = .success,
+            .output = @constCast("CONTEXT_OVERFLOW_PRIOR_TOOL_OUTPUT"),
+            .output_bytes = 34,
+            .stored_output_bytes = 34,
+        }};
+        var prior_steps = [_]types.ToolExecutionStep{.{ .tool_calls = &prior_calls, .tool_results = &prior_results }};
         var history = [_]HistoryTurn{.{ .assistant = .{
             .user = .{ .text = @constCast("CONTEXT_OVERFLOW_PRIOR_USER") },
             .assistant = @constCast("CONTEXT_OVERFLOW_PRIOR_ASSISTANT"),
+            .execution = .{ .tool_steps = &prior_steps },
         } }};
         job.history = &history;
 
         try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
         try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
-        try expectBodyContains(&gateway, 0, "CONTEXT_OVERFLOW_PRIOR_ASSISTANT");
+        try expectBodyContains(&gateway, 0, "CONTEXT_OVERFLOW_PRIOR_TOOL_OUTPUT");
         try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
         try expectBodyContains(&gateway, 1, "\"tools\":[]");
-        try expectBodyContains(&gateway, 2, "context_handoff");
-        try expectBodyNotContains(&gateway, 2, "CONTEXT_OVERFLOW_PRIOR_ASSISTANT");
+        try expectBodyContains(&gateway, 2, "compacted_conversation");
+        // The retry drops the tool output and keeps the prior turn's exact
+        // messages.
+        try expectBodyNotContains(&gateway, 2, "CONTEXT_OVERFLOW_PRIOR_TOOL_OUTPUT");
+        try expectBodyContains(&gateway, 2, "User 1:\\nCONTEXT_OVERFLOW_PRIOR_USER");
         try std.testing.expectEqual(@as(usize, 2), hooks.history_turns.items.len);
         try std.testing.expect(hooks.history_turns.items[0] == .compacted_summary);
         try std.testing.expect(hooks.history_turns.items[1] == .assistant);
@@ -3492,9 +3551,21 @@ test "processQueuedPrompt stops after one context overflow recovery" {
     var fixture = PromptFixture{};
     var job = fixture.job();
     job.model = @constCast(model);
+    // A tool call leaves work to summarize, so recovery asks the model.
+    var prior_calls = [_]ToolCall{toolCall("prior-read", "read_file", "{\"path\":\"notes.md\"}")};
+    var prior_results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("prior-read"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("notes"),
+        .output_bytes = 5,
+        .stored_output_bytes = 5,
+    }};
+    var prior_steps = [_]types.ToolExecutionStep{.{ .tool_calls = &prior_calls, .tool_results = &prior_results }};
     var history = [_]HistoryTurn{.{ .assistant = .{
         .user = .{ .text = @constCast("prior user") },
         .assistant = @constCast("prior assistant"),
+        .execution = .{ .tool_steps = &prior_steps },
     } }};
     job.history = &history;
 
@@ -3545,9 +3616,21 @@ test "image context overflow keeps one recovery and preserves the current image"
         job.model = @constCast("fixture/image");
         job.images = &images;
         job.authorized_image_catalog = &images;
+        // A tool call leaves work to summarize, so recovery asks the model.
+        var prior_calls = [_]ToolCall{toolCall("prior-read", "read_file", "{\"path\":\"notes.md\"}")};
+        var prior_results = [_]types.PersistedToolResult{.{
+            .tool_call_id = @constCast("prior-read"),
+            .tool_name = @constCast("read_file"),
+            .status = .success,
+            .output = @constCast("notes"),
+            .output_bytes = 5,
+            .stored_output_bytes = 5,
+        }};
+        var prior_steps = [_]types.ToolExecutionStep{.{ .tool_calls = &prior_calls, .tool_results = &prior_results }};
         var history = [_]HistoryTurn{.{ .assistant = .{
             .user = .{ .text = @constCast("prior request") },
             .assistant = @constCast("prior answer"),
+            .execution = .{ .tool_steps = &prior_steps },
         } }};
         job.history = &history;
         try runFakePrompt(&gateway, &hooks, fixture.config(), job);
@@ -3556,7 +3639,7 @@ test "image context overflow keeps one recovery and preserves the current image"
         try expectBodyContains(&gateway, 0, "\"type\":\"file\"");
         try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
         try expectBodyContains(&gateway, 2, "\"type\":\"file\"");
-        try expectBodyContains(&gateway, 2, "context_handoff");
+        try expectBodyContains(&gateway, 2, "compacted_conversation");
         if (repeated) {
             try std.testing.expectEqual(std.http.Status.bad_request, hooks.http_status.?);
             try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
@@ -3574,10 +3657,18 @@ test "retained tool images stay out of the measured text estimate" {
     const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(result_dir);
 
-    // A payload that dominates the request body makes the text-vs-image
+    // A valid image with a large encoded payload makes the text-vs-image
     // pricing gap unambiguous.
-    const payload = "AAAA" ** 4096;
-    const tool_images = [_]types.ToolImage{.{ .data = @constCast(payload), .mime_type = @constCast("image/png") }};
+    const image_len = try std.base64.standard.Decoder.calcSizeForSlice(test_image_base64);
+    const original = try alloc.alloc(u8, image_len);
+    defer alloc.free(original);
+    try std.base64.standard.Decoder.decode(original, test_image_base64);
+    const padded = try png_downscale.testPaddedPng(alloc, original, 12 * 1024);
+    defer alloc.free(padded);
+    const payload = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(padded.len));
+    defer alloc.free(payload);
+    _ = std.base64.standard.Encoder.encode(payload, padded);
+    const tool_images = [_]types.ToolImage{.{ .data = payload, .mime_type = @constCast("image/png") }};
     const model = "provider/tool-image-measurement";
     const calls = [_]ToolCall{toolCall("call-1", "read_file", "{\"path\":\"a.png\"}")};
     var gateway = FakeGateway.init(alloc, &.{
@@ -3652,10 +3743,12 @@ test "cancelled automatic compaction is retried by the next prompt" {
     var fixture = PromptFixture{};
     var config = fixture.config();
     config.tool_result_dir = result_dir;
+    var old_steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast("CANCELLED_AUTO_HISTORY_ASSISTANT\n" ++ ("h" ** 150_000)) }};
     var history = [_]HistoryTurn{
         .{ .assistant = .{
             .user = .{ .text = @constCast("CANCELLED_AUTO_HISTORY_USER") },
-            .assistant = @constCast("CANCELLED_AUTO_HISTORY_ASSISTANT\n" ++ ("h" ** 150_000)),
+            .assistant = @constCast("CANCELLED_AUTO_HISTORY_FINAL"),
+            .execution = .{ .tool_steps = &old_steps },
         } },
         .{ .assistant = .{
             .user = .{ .text = @constCast("CANCELLED_AUTO_RECENT_USER") },
@@ -3704,8 +3797,8 @@ test "cancelled automatic compaction is retried by the next prompt" {
 
     try std.testing.expectEqual(@as(usize, 2), follow_up_gateway.request_bodies.items.len);
     try expectBodyContains(&follow_up_gateway, 0, "CANCELLED_AUTO_HISTORY_ASSISTANT");
-    try expectBodyContains(&follow_up_gateway, 0, "\"toolChoice\":{\"type\":\"none\"}");
-    try expectBodyContains(&follow_up_gateway, 1, "context_handoff");
+    try expectNotesAfterConversation(&follow_up_gateway, 0, 1);
+    try expectBodyContains(&follow_up_gateway, 1, "compacted_conversation");
     try expectBodyNotContains(&follow_up_gateway, 1, "CANCELLED_AUTO_HISTORY_ASSISTANT");
     compacted_count = 0;
     for (hooks.history_turns.items) |turn| {
@@ -3724,9 +3817,11 @@ test "retained context automatic compaction archives oversized parallel results 
     const old_text = "OLDER_HISTORY_SENTINEL " ++ ("o" ** 52_000);
     const result_a = "RECENT_EXACT_A\n" ++ ("a" ** 13_000);
     const result_b = "RECENT_EXACT_B\n" ++ ("b" ** 13_000);
+    var old_steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast(old_text) }};
     const history = [_]HistoryTurn{.{ .assistant = .{
         .user = .{ .text = @constCast("previous work") },
-        .assistant = @constCast(old_text),
+        .assistant = @constCast("previous work done"),
+        .execution = .{ .tool_steps = &old_steps },
     } }};
     const calls = [_]ToolCall{
         toolCall("retained-a", "read_file", "{\"path\":\"a.txt\"}"),
@@ -3734,23 +3829,25 @@ test "retained context automatic compaction archives oversized parallel results 
     };
     var gateway = FakeGateway.init(alloc, &.{
         .{ .tool_calls = &calls },
-        .{ .content = "Earlier work established the project facts." },
+        .{ .content = "Turn 1\nIn between: Earlier work established the project facts." },
         .{ .content = "Continued from the observed results." },
     });
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
     const model = "provider/retained-context";
-    const old_tokens = prompt_context.estimateCompactionSourceTokens(&.{.{ .role = .assistant, .content = old_text }});
-    const recent_tokens = prompt_context.estimateCompactionSourceTokens(&.{ .{ .role = .tool, .content = result_a }, .{ .role = .tool, .content = result_b } });
+    const old_tokens = estimateTextTokens(old_text);
+    const recent_tokens = estimateTextTokens(result_a) + estimateTextTokens(result_b);
     const context_window = (old_tokens + recent_tokens / 2) * 5 / 4;
     const capabilities = [_]ModelCapabilityOverride{.{ .model = model, .capabilities = .{ .context_window = @intCast(context_window) } }};
     hooks.available_capability_overrides = &capabilities;
     hooks.permission_decisions = &.{ .once, .once };
     hooks.exec_plans = &.{ .{ .result = .{ .model_output = result_a } }, .{ .result = .{ .model_output = result_b } } };
+    var tool_store = try session_child_store.SessionChildCapability.initLegacyRoute(alloc, result_dir, .tool_results, .writable);
+    defer tool_store.deinit();
     var fixture = PromptFixture{};
     var config = fixture.config();
-    config.tool_result_dir = result_dir;
+    config.session_child_capability = &tool_store;
     var job = fixture.job();
     job.model = @constCast(model);
     job.history = @constCast(&history);
@@ -3759,14 +3856,13 @@ test "retained context automatic compaction archives oversized parallel results 
     const measurement_request = agent_stream_provider.RequestData{ .model = model, .messages = &.{}, .tool_choice = .none, .provider_options = .{} };
     try std.testing.expect((try prompt_context.measureProviderRequest(alloc, gateway.request_bodies.items[0], measurement_request)).estimated_input_tokens < context_window * 4 / 5);
     const continued_tokens = (try prompt_context.measureProviderRequest(alloc, gateway.request_bodies.items[2], measurement_request)).estimated_input_tokens;
-    // Oversized exchanges use original backing rather than bypassing the recent budget.
+    // An oversized newest exchange is compacted too; its results stay saved unchanged.
     try std.testing.expect(continued_tokens < context_window / 4);
     try expectBodyContains(&gateway, 1, "OLDER_HISTORY_SENTINEL");
     try expectBodyContains(&gateway, 1, "RECENT_EXACT_A");
     try expectBodyContains(&gateway, 1, "RECENT_EXACT_B");
-    try expectBodyContains(&gateway, 1, "Original result handle:");
-    try expectBodyContains(&gateway, 2, "context_handoff");
-    try expectBodyContains(&gateway, 2, "Original source archives:");
+    try expectBodyContains(&gateway, 2, "compacted_conversation");
+    try expectBodyContains(&gateway, 2, "Search them by text, or open one by its ID");
     try expectBodyNotContains(&gateway, 2, "a" ** 13_000);
     try expectBodyNotContains(&gateway, 2, "b" ** 13_000);
     try expectBodyNotContains(&gateway, 2, "OLDER_HISTORY_SENTINEL");
@@ -3779,6 +3875,14 @@ test "retained context automatic compaction archives oversized parallel results 
     try std.testing.expectEqualStrings(result_a, saved.tool_steps[0].tool_results[0].output);
     try std.testing.expectEqualStrings(result_b, saved.tool_steps[0].tool_results[1].output);
     for (gateway.request_models.items) |requested_model| try std.testing.expectEqualStrings(model, requested_model);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const first = try result_store.readByRangeManaged(arena_state.allocator(), &tool_store, "compacted-T1.txt", 1, 1 << 20);
+    const second = try result_store.readByRangeManaged(arena_state.allocator(), &tool_store, "compacted-T2.txt", 1, 1 << 20);
+    try std.testing.expect(std.mem.find(u8, first, "T1 read_file: a.txt\n") != null);
+    try std.testing.expect(std.mem.find(u8, first, result_a) != null);
+    try std.testing.expect(std.mem.find(u8, second, "T2 read_file: b.txt\n") != null);
+    try std.testing.expect(std.mem.find(u8, second, result_b) != null);
 }
 
 test "retained context compaction preserves recovered historical replay" {
@@ -3806,12 +3910,13 @@ test "retained context compaction preserves recovered historical replay" {
         .tool_results = &results,
         .provider_replay = .{ .source = .{ .provider = .gateway, .model = model }, .parts_json = state },
     }};
+    var old_steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast(old_text) }};
     var history = [_]HistoryTurn{
-        .{ .assistant = .{ .user = .{ .text = @constCast("earlier work") }, .assistant = @constCast(old_text) } },
+        .{ .assistant = .{ .user = .{ .text = @constCast("earlier work") }, .assistant = @constCast("earlier work done"), .execution = .{ .tool_steps = &old_steps } } },
         .{ .assistant = .{ .user = .{ .text = @constCast("recent work") }, .assistant = @constCast(""), .execution = .{ .tool_steps = &steps } } },
     };
-    const old_tokens = prompt_context.estimateCompactionSourceTokens(&.{.{ .role = .assistant, .content = old_text }});
-    const recent_tokens = prompt_context.estimateCompactionSourceTokens(&.{.{ .role = .tool, .content = recent_result }});
+    const old_tokens = estimateTextTokens(old_text);
+    const recent_tokens = estimateTextTokens(recent_result);
     const capabilities = [_]ModelCapabilityOverride{.{ .model = model, .capabilities = .{ .context_window = @intCast((old_tokens + recent_tokens / 2) * 5 / 4) } }};
     var gateway = FakeGateway.init(alloc, &.{
         .{ .content = "Earlier work established the project facts." },
@@ -3831,7 +3936,7 @@ test "retained context compaction preserves recovered historical replay" {
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try expectBodyContains(&gateway, 0, "OLDER_HISTORY_SENTINEL");
-    try expectBodyContains(&gateway, 1, "context_handoff");
+    try expectBodyContains(&gateway, 1, "compacted_conversation");
     try expectBodyContains(&gateway, 1, "RECENT_RECOVERED_RESULT");
     try expectBodyContains(&gateway, 1, "retained_reasoning");
     try expectBodyNotContains(&gateway, 1, "discarded_text");
@@ -3844,9 +3949,7 @@ test "compaction summarizes an oversized only recent exchange without repeating 
     const original_result = "RECENT_ONLY\n" ++ ("r" ** 10_000);
     var gateway = FakeGateway.init(alloc, &.{
         .{ .tool_calls = &.{toolCall("recent-only", "read_file", "{\"path\":\"large.txt\"}")} },
-        .{ .content = "The user requested a read of large.txt." },
-        .{ .content = "The read completed with RECENT_ONLY." },
-        .{ .content = "The remaining output contains repeated reference bytes." },
+        .{ .content = "Turn in progress\nIn between: The read completed with RECENT_ONLY." },
         .{ .content = "Completed from the observed result." },
     });
     defer gateway.deinit();
@@ -3861,11 +3964,16 @@ test "compaction summarizes an oversized only recent exchange without repeating 
     var job = fixture.job();
     job.model = @constCast(model);
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
-    try std.testing.expectEqual(@as(usize, 5), gateway.request_bodies.items.len);
-    for (1..4) |index| try expectBodyContains(&gateway, index, "\"toolChoice\":{\"type\":\"none\"}");
-    try expectBodyContains(&gateway, 4, "RECENT_ONLY");
-    try expectBodyNotContains(&gateway, 4, "r" ** 10_000);
-    try expectBodyContains(&gateway, 4, "context_handoff");
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
+    try expectBodyContains(&gateway, 1, "user prompt");
+    try expectBodyContains(&gateway, 2, "RECENT_ONLY");
+    try expectBodyNotContains(&gateway, 2, "r" ** 10_000);
+    try expectBodyContains(&gateway, 2, "compacted_conversation");
+    // The current request stays as the live user message and is not copied
+    // into the compacted user messages as well.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, gateway.request_bodies.items[2], "user prompt"));
+    try expectBodyNotContains(&gateway, 2, "User 1:");
     try std.testing.expectEqualStrings("Completed from the observed result.", hooks.finish_assistant_text.?);
     try std.testing.expectEqual(@as(usize, 1), hooks.successful_effect_count.load(.seq_cst));
     try std.testing.expectEqual(@as(usize, 2), hooks.history_turns.items.len);
@@ -3903,9 +4011,9 @@ test "automatic compaction summarizes a newest exchange larger than the input wi
     job.model = @constCast(model);
     try runFakePrompt(&gateway, &hooks, config, job);
     try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
-    try expectBodyContains(&gateway, 1, "Tool write_file (success)");
-    try expectBodyContains(&gateway, 1, "oversized-newest");
-    try expectBodyContains(&gateway, 2, "context_handoff");
+    try expectBodyContains(&gateway, 1, "[Tool call T1: write_file]");
+    try expectBodyContains(&gateway, 1, "[Tool result T1: write_file]");
+    try expectBodyContains(&gateway, 2, "compacted_conversation");
     try expectBodyNotContains(&gateway, 2, "x" ** 40_000);
     try std.testing.expectEqual(@as(usize, 1), hooks.successful_effect_count.load(.seq_cst));
     try std.testing.expectEqualStrings("Continued after the large write.", hooks.finish_assistant_text.?);
@@ -3929,7 +4037,7 @@ test "interruption after automatic compaction retains the recent and new executi
     const model = "provider/compaction-interruption";
     const overrides = [_]ModelCapabilityOverride{.{
         .model = model,
-        .capabilities = .{ .context_window = 28_000 },
+        .capabilities = .{ .context_window = 15_000 },
     }};
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
@@ -3947,7 +4055,7 @@ test "interruption after automatic compaction retains the recent and new executi
 
     var history = [_]HistoryTurn{.{ .assistant = .{
         .user = .{ .text = @constCast("earlier work") },
-        .assistant = @constCast("o" ** 80_000),
+        .assistant = @constCast("o" ** 40_000),
     } }};
     job.history = &history;
 
@@ -3984,7 +4092,7 @@ test "context overflow after automatic compaction retries with new execution" {
     const model = "provider/compaction-interruption";
     const overrides = [_]ModelCapabilityOverride{.{
         .model = model,
-        .capabilities = .{ .context_window = 28_000 },
+        .capabilities = .{ .context_window = 15_000 },
     }};
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
@@ -4002,7 +4110,7 @@ test "context overflow after automatic compaction retries with new execution" {
 
     var history = [_]HistoryTurn{.{ .assistant = .{
         .user = .{ .text = @constCast("earlier work") },
-        .assistant = @constCast("o" ** 80_000),
+        .assistant = @constCast("o" ** 40_000),
     } }};
     job.history = &history;
 
@@ -4019,7 +4127,7 @@ test "context overflow after automatic compaction retries with new execution" {
     try std.testing.expectEqualStrings("before-checkpoint", hooks.compaction_prefixes.items[0].?.assistant.execution.tool_steps[0].tool_calls[0].id);
 }
 
-test "compaction preserves an incomplete handle-free result when it cannot fit" {
+test "compaction summarizes a truncated result that has no saved copy" {
     const alloc = std.testing.allocator;
     const model = "provider/capacity-failure";
     const available_overrides = [_]ModelCapabilityOverride{.{
@@ -4031,7 +4139,11 @@ test "compaction preserves an incomplete handle-free result when it cannot fit" 
         "read_file",
         "{\"path\":\"capacity.txt\"}",
     )};
-    const completions = [_]FakeCompletion{.{ .tool_calls = &calls }};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "The read returned a truncated result that starts with ineligible result." },
+        .{ .content = "Done after compaction." },
+    };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -4045,24 +4157,17 @@ test "compaction preserves an incomplete handle-free result when it cannot fit" 
     var job = fixture.job();
     job.model = @constCast(model);
 
-    try std.testing.expectError(
-        error.IncompleteCompactionResult,
-        runFakePrompt(&gateway, &hooks, fixture.config(), job),
-    );
-    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    // The summarizer reads the result exactly as the model saw it.
+    try expectBodyContains(&gateway, 1, "ineligible result");
+    try expectBodyContains(&gateway, 1, "The tool calls will not be available later");
+    try expectBodyContains(&gateway, 2, "compacted_conversation");
+    try expectBodyNotContains(&gateway, 2, "x" ** 1024);
+    try expectBodyNotContains(&gateway, 2, "read_tool_result");
+    try std.testing.expectEqualStrings("Done after compaction.", hooks.finish_assistant_text.?);
     try std.testing.expectEqual(@as(usize, 1), hooks.successful_effect_count.load(.seq_cst));
-    try std.testing.expectEqual(@as(usize, 0), hooks.compaction_prefixes.items.len);
-    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finish_terminal_outcome.?);
-    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
-    try std.testing.expect(hooks.history_turns.items[0] == .assistant);
-    const execution = hooks.history_turns.items[0].assistant.execution;
-    try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
-    try std.testing.expectEqual(@as(usize, 1), execution.tool_steps[0].tool_results.len);
-    const retained = execution.tool_steps[0].tool_results[0];
-    try std.testing.expectEqualStrings("capacity_result_1", retained.tool_call_id);
-    try std.testing.expect(retained.truncated);
-    try std.testing.expect(retained.output_handle == null);
-    try std.testing.expect(std.mem.find(u8, retained.output, "ineligible result") != null);
+    try std.testing.expectEqual(@as(usize, 1), hooks.compaction_prefixes.items.len);
 }
 
 test "processQueuedPrompt resolves catalog capabilities for opaque effort" {
@@ -8898,4 +9003,10 @@ test "processQueuedPrompt keeps provider uncertainty without tool terminals afte
     }
     try std.testing.expectEqual(@as(usize, 1), settled);
     try expectFailedLifecycleContains(hooks.lifecycle_events.items, "local-read", "before tool call ran");
+}
+
+fn estimateTextTokens(text: []const u8) usize {
+    var estimator = token_estimate.StreamingEstimator{};
+    estimator.consume(text);
+    return @intCast(estimator.estimate());
 }

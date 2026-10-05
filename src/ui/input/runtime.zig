@@ -885,7 +885,7 @@ test "model picker flow stores pending model and selections" {
     var runtime = InputRuntime{};
     defer runtime.deinit(std.testing.allocator);
 
-    try runtime.picker.beginModelPickerFlow(std.testing.allocator, "openai/gpt-5", 4, true, .effort);
+    try runtime.picker.beginModelPickerFlow(std.testing.allocator, "openai/gpt-5", 4, true, false, .effort);
 
     try std.testing.expectEqual(picker_state.ModelPickerStage.effort, runtime.picker.model_picker_stage);
     try std.testing.expectEqualStrings("openai/gpt-5", runtime.picker.model_picker_pending_model.items);
@@ -897,10 +897,10 @@ test "model picker flow accepts aliased pending model slice" {
     var runtime = InputRuntime{};
     defer runtime.deinit(std.testing.allocator);
 
-    try runtime.picker.beginModelPickerFlow(std.testing.allocator, "anthropic/claude-opus-4.6", 2, false, .effort);
+    try runtime.picker.beginModelPickerFlow(std.testing.allocator, "anthropic/claude-opus-4.6", 2, false, false, .effort);
     const aliased_model = runtime.picker.model_picker_pending_model.items;
 
-    try runtime.picker.beginModelPickerFlow(std.testing.allocator, aliased_model, 3, true, .fast);
+    try runtime.picker.beginModelPickerFlow(std.testing.allocator, aliased_model, 3, true, false, .fast);
 
     try std.testing.expectEqual(picker_state.ModelPickerStage.fast, runtime.picker.model_picker_stage);
     try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", runtime.picker.model_picker_pending_model.items);
@@ -912,7 +912,7 @@ test "editing input clears model picker flow" {
     var runtime = InputRuntime{};
     defer runtime.deinit(std.testing.allocator);
 
-    try runtime.picker.beginModelPickerFlow(std.testing.allocator, "openai/gpt-5", 3, false, .fast);
+    try runtime.picker.beginModelPickerFlow(std.testing.allocator, "openai/gpt-5", 3, false, false, .fast);
     try runtime.edit_state.input.appendSlice(std.testing.allocator, "/model ");
     runtime.edit_state.cursor = runtime.edit_state.input.items.len;
 
@@ -928,7 +928,7 @@ test "preserving picker edit keeps effort flow" {
 
     try runtime.edit_state.input.appendSlice(std.testing.allocator, "/model openai/gpt-5 ");
     runtime.edit_state.cursor = runtime.edit_state.input.items.len;
-    try runtime.picker.beginModelPickerFlow(std.testing.allocator, "openai/gpt-5", 2, false, .effort);
+    try runtime.picker.beginModelPickerFlow(std.testing.allocator, "openai/gpt-5", 2, false, false, .effort);
 
     try runtime.insertionState().insertByte(std.testing.allocator, 'h', .preserve);
 
@@ -944,7 +944,7 @@ test "active model picker query tracks fast token start" {
 
     try runtime.edit_state.input.appendSlice(std.testing.allocator, "/model anthropic/claude-opus-4.6 high f");
     runtime.edit_state.cursor = runtime.edit_state.input.items.len;
-    try runtime.picker.beginModelPickerFlow(std.testing.allocator, "anthropic/claude-opus-4.6", 3, true, .fast);
+    try runtime.picker.beginModelPickerFlow(std.testing.allocator, "anthropic/claude-opus-4.6", 3, true, false, .fast);
 
     const query = runtime.picker.activeModelPickerQuery(&runtime.edit_state).?;
     try std.testing.expectEqual(picker_state.ModelPickerStage.fast, query.stage);
@@ -2156,6 +2156,109 @@ test "input escape parser preserves modified arrow intent" {
     try expectEscapeAction("[57353;5u", moveEscape(.visual_down, false));
     try expectEscapeAction("[57353;9u", moveEscape(.draft_end, false));
     try expectEscapeAction("[1;4D", moveEscape(.word_left, true));
+}
+
+test "input escape parser maps kitty keypad keys to their main-row characters" {
+    // Kitty reports keypad keys as dedicated codes: KP_0..KP_9 = 57399-57408.
+    try expectEscapeAction("[57399u", .{ .remapped_byte = '0' });
+    try expectEscapeAction("[57408u", .{ .remapped_byte = '9' });
+    try expectEscapeAction("[57400;1u", .{ .remapped_byte = '1' });
+    // Num Lock (bit 7) is a lock state, not a modifier.
+    try expectEscapeAction("[57400;129u", .{ .remapped_byte = '1' });
+    try expectEscapeAction("[57409u", .{ .remapped_byte = '.' });
+    try expectEscapeAction("[57410u", .{ .remapped_byte = '/' });
+    try expectEscapeAction("[57411u", .{ .remapped_byte = '*' });
+    try expectEscapeAction("[57412u", .{ .remapped_byte = '-' });
+    try expectEscapeAction("[57413u", .{ .remapped_byte = '+' });
+    try expectEscapeAction("[57415u", .{ .remapped_byte = '=' });
+    // Shift keeps the character; the main row has no text for the other
+    // modifiers, and Hyper/Meta must not start typing digits either.
+    try expectEscapeAction("[57412;2u", .{ .remapped_byte = '-' });
+    try expectEscapeAction("[57410;3u", .ignore);
+    try expectEscapeAction("[57410;5u", .ignore);
+    try expectEscapeAction("[57412;9u", .ignore);
+    try expectEscapeAction("[57412;17u", .ignore);
+    try expectEscapeAction("[57412;33u", .ignore);
+    try expectEscapeAction("\x1b[57412u", .ignore);
+    try expectEscapeAction("\x1b[57412;2u", .ignore);
+}
+
+test "input escape parser keeps keypad Enter, navigation, and Delete contracts" {
+    try expectEscapeAction("[57414u", .{ .remapped_byte = '\r' });
+    try expectEscapeAction("[57414;1u", .{ .remapped_byte = '\r' });
+    try expectEscapeAction("[57414;5u", .{ .remapped_byte = '\r' });
+    try expectEscapeAction("[57414;2u", .insert_newline);
+    try expectEscapeAction("[57414;3u", .insert_newline);
+    try expectEscapeAction("[57419;1u", .cursor_up);
+    try expectEscapeAction("[57420;1u", .cursor_down);
+    try expectEscapeAction("[57417;1u", .cursor_left);
+    try expectEscapeAction("[57418;1u", .cursor_right);
+    try expectEscapeAction("[57423;1u", .home);
+    try expectEscapeAction("[57424;1u", .end);
+    try expectEscapeAction("[57419;2u", moveEscape(.visual_up, true));
+    try expectEscapeAction("[57417;5u", moveEscape(.word_left, false));
+    try expectEscapeAction("[57421u", .page_up);
+    try expectEscapeAction("[57422u", .page_down);
+    try expectEscapeAction("[57426u", .delete_next);
+    try expectEscapeAction("[3;1~", .delete_next);
+    try expectEscapeAction("[57426;2u", .ignore);
+    try expectEscapeAction("[3;2~", .ignore);
+    try expectEscapeAction("[57426;3u", .delete_word_right);
+    try expectEscapeAction("[3;3~", .delete_word_right);
+    try expectEscapeAction("[57426;5u", .delete_word_right);
+    try expectEscapeAction("[3;5~", .delete_word_right);
+    try expectEscapeAction("[57426;9u", .delete_to_line_end);
+    try expectEscapeAction("[3;9~", .delete_to_line_end);
+    // Keypad keys with no main-row equivalent stay unmapped.
+    try expectEscapeAction("[57416u", .ignore);
+    try expectEscapeAction("[57425u", .ignore);
+    try expectEscapeAction("[57427u", .ignore);
+}
+
+test "input escape parser resolves keypad keys reported with an event type" {
+    // Ghostty can append the Kitty event type as a colon-qualified modifier.
+    try expectEscapeAction("[57412;1:1u", .{ .remapped_byte = '-' });
+    try expectEscapeAction("[57412;1:2u", .{ .remapped_byte = '-' });
+    try expectEscapeAction("[57412;1:3u", .ignore);
+    // A multi-digit event type stays non-actionable instead of collapsing to
+    // its last digit.
+    try expectEscapeAction("[57412;1:12u", .ignore);
+    // A colon-qualified report with no event type is not a press.
+    try expectEscapeAction("[57412;1:0u", .ignore);
+    try expectEscapeAction("[57414;1:0u", .ignore);
+    try expectEscapeAction("[57410;1:1u", .{ .remapped_byte = '/' });
+    try expectEscapeAction("[57414;1:1u", .{ .remapped_byte = '\r' });
+    try expectEscapeAction("[57419;1:1u", .cursor_up);
+}
+
+test "input escape parser decodes application-keypad SS3 keys" {
+    // A terminal left in keypad application mode reports `ESC O <byte>`.
+    try expectEscapeAction("Op", .{ .remapped_byte = '0' });
+    try expectEscapeAction("Oq", .{ .remapped_byte = '1' });
+    try expectEscapeAction("Ox", .{ .remapped_byte = '8' });
+    try expectEscapeAction("Oy", .{ .remapped_byte = '9' });
+    try expectEscapeAction("Ol", .{ .remapped_byte = ',' });
+    try expectEscapeAction("On", .{ .remapped_byte = '.' });
+    try expectEscapeAction("Oj", .{ .remapped_byte = '*' });
+    try expectEscapeAction("Ok", .{ .remapped_byte = '+' });
+    try expectEscapeAction("Om", .{ .remapped_byte = '-' });
+    try expectEscapeAction("Oo", .{ .remapped_byte = '/' });
+    try expectEscapeAction("OM", .{ .remapped_byte = '\r' });
+    try expectEscapeAction("OX", .{ .remapped_byte = '=' });
+    // Arrows, Home, and End keep their existing SS3 mapping.
+    try expectEscapeAction("OA", .cursor_up);
+    try expectEscapeAction("OB", .cursor_down);
+    try expectEscapeAction("OC", .cursor_right);
+    try expectEscapeAction("OD", .cursor_left);
+    try expectEscapeAction("OH", .home);
+    try expectEscapeAction("OF", .end);
+    // F1-F4 and the keypad bytes with no main-row equivalent stay unmapped.
+    try expectEscapeAction("OP", .ignore);
+    try expectEscapeAction("OQ", .ignore);
+    try expectEscapeAction("OR", .ignore);
+    try expectEscapeAction("OS", .ignore);
+    try expectEscapeAction("OE", .ignore);
+    try expectEscapeAction("OI", .ignore);
 }
 
 test "input escape parser preserves double escape meta behavior" {
@@ -4299,7 +4402,7 @@ test "line deletion no-op preserves input state and metadata" {
     try runtime.kill_ring.text.appendSlice(alloc, "existing kill");
     try appendPastedBlockForTest(&runtime, alloc, 7, "pasted");
     try appendImageBlockForTest(&runtime, &images, alloc, 8);
-    try runtime.picker.beginModelPickerFlow(alloc, "openai/gpt-5", 3, true, .effort);
+    try runtime.picker.beginModelPickerFlow(alloc, "openai/gpt-5", 3, true, false, .effort);
     runtime.picker.slash_completion_index = 4;
     runtime.picker.model_completion_index = 5;
     runtime.picker.file_completion_index = 6;
@@ -4356,7 +4459,7 @@ test "successful line deletion resets picker state and preserves history draft" 
     try primeComposerHistoryDraftForTest(&runtime, alloc, "draft");
     try runtime.textReplacementState().replace(alloc, "alpha\nleftMIDright\ngamma");
     runtime.edit_state.cursor = "alpha\nleftMID".len;
-    try runtime.picker.beginModelPickerFlow(alloc, "openai/gpt-5", 3, true, .fast);
+    try runtime.picker.beginModelPickerFlow(alloc, "openai/gpt-5", 3, true, false, .fast);
     runtime.picker.file_completion_index = 6;
     try std.testing.expect(try runtime.killRingState(null).delete(alloc, .line_start));
     try std.testing.expectEqual(picker_state.ModelPickerStage.model, runtime.picker.model_picker_stage);

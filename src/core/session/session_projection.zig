@@ -262,7 +262,8 @@ fn durablePreferencesEqual(
     return std.mem.eql(u8, left.model, right.model) and
         left.provider.same_authority(right.provider) and
         left.effort.eql(right.effort) and
-        left.fast_mode == right.fast_mode;
+        left.fast_mode == right.fast_mode and
+        left.ultrafast_mode == right.ultrafast_mode;
 }
 
 pub fn encodeCheckpoint(alloc: Allocator, checkpoint: Checkpoint) ![]u8 {
@@ -434,9 +435,13 @@ fn writePreferences(
     try writeJsonString(writer, preferences.model);
     try writer.writeAll(",\"effort\":");
     try writeJsonString(writer, preferences.effort.label());
-    try writer.print(",\"fast_mode\":{s},\"provider\":", .{
+    try writer.print(",\"fast_mode\":{s}", .{
         if (preferences.fast_mode) "true" else "false",
     });
+    if (preferences.ultrafast_mode) {
+        try writer.writeAll(",\"ultrafast_mode\":true");
+    }
+    try writer.writeAll(",\"provider\":");
     try std.json.Stringify.value(preferences.provider, .{}, writer);
     try writer.writeByte('}');
 }

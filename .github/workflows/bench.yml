@@ -110,6 +110,42 @@ jobs:
             ${{ runner.temp }}/long-turn-memory/stdout.json
           if-no-files-found: warn
 
+  shell-command-overhead:
+    if: inputs.signed_run == '' && inputs.pgso_control_artifact == '' && inputs.pgso_candidate_artifact == ''
+    name: Shell command overhead
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Build (ReleaseSafe)
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Run shell command overhead benchmark
+        run: python3 benchmarks/shell_command_overhead.py --binary ./zig-out/bin/fx --output ${{ runner.temp }}/shell-command-overhead --calls 100 --timeout 480
+
+      # The 60 ms per-call median budget is provisional, set from local macOS
+      # runs. Linux runners use bash as the login shell, so this job measures bash.
+      - name: Enforce shell command overhead budget
+        run: jq -e '.completed == true and .rc_loads == 1 and .per_call_ms.median <= 60 and .total_ms <= (.rc_delay_ms + 100*60 + 1000)' ${{ runner.temp }}/shell-command-overhead/measurements.json
+
+      - name: Upload shell command overhead evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shell-command-overhead-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/shell-command-overhead/measurements.json
+            ${{ runner.temp }}/shell-command-overhead/stderr.log
+            ${{ runner.temp }}/shell-command-overhead/stdout.json
+            ${{ runner.temp }}/shell-command-overhead/home/rc-loads.log
+          if-no-files-found: warn
+
   libfx-ttft:
     if: inputs.signed_run == '' && inputs.pgso_control_artifact == '' && inputs.pgso_candidate_artifact == ''
     name: libfx Runtime

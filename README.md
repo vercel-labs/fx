@@ -41,6 +41,8 @@ Sign in with one of:
 - `fx login grok`: Grok subscription (xAI OAuth)
 - `fx setup`: AI Gateway API key
 
+fx loads Grok models from your subscription's live catalog, so new supported models appear without a static model list. Public xAI metadata enriches image support but does not filter subscription models.
+
 Then start the interactive shell from a project:
 
 ```bash
@@ -56,6 +58,25 @@ fx ask "explain the changes in this repository"
 
 Inside the shell, run `/help` to browse interactive commands.
 
+In tmux, use your usual prefix bindings to switch sessions or enter copy mode.
+fx preserves those tmux views while resizing, including when the switcher zooms a split pane.
+
+## Images
+
+Paste an image, attach one with `fx ask --image PATH`, or ask fx to `read_file` a PNG, JPEG, GIF, or WebP. File-backed attachments retain the original image. Before each model request, it checks the complete image count and sends only images that fit: at most 8000 pixels per side with 20 or fewer images, or 2000 pixels per side with more than 20. The encoded per-image limit is 5 MiB.
+
+When a file-backed image cannot be sent, the model receives its source path and the reason. It can use an image tool already on your system, such as `sips` on macOS or `ffmpeg` on Linux, to save a smaller **new** file and read that copy. fx does not automatically install image tools or overwrite the original. If no usable file or tool is available, the model should ask you for a smaller copy or permission before installing software.
+
+## Shell commands
+
+Commands run in your login shell, zsh or bash, with your startup files applied, so your aliases, functions, and `PATH` work as they do in your terminal. fx runs the startup files once and restores their result for each command, so a slow `.zshrc` does not slow down every call.
+
+- fx reloads automatically when your zsh or bash startup files change, such as `.zshrc`, `.zprofile`, `.bash_profile`, or `.bashrc`. After changing a file they source, run `/shell reload`.
+- Each command starts fresh: `cd`, `export`, and alias changes do not carry over to the next one.
+- Tools that switch the environment by directory, such as direnv or mise hooks, apply the environment of the directory where fx captured the startup files, usually your workspace.
+- If the startup files cannot be captured, fx says so once and runs them for every command instead.
+- Terminals opened with `tty: true` run your full login shell and end when fx exits.
+
 ## Documentation
 
 Visit [fx.sh/docs](https://fx.sh/docs) for the full manual: sessions, models, custom model connections, permissions, configuration, skills, MCP, subagents, embedding, and the complete CLI and slash command references. Agents can read any page as Markdown by appending `.md` to its URL, or fetch [llms-full.txt](https://fx.sh/llms-full.txt) for everything in one file.
@@ -70,6 +91,32 @@ FX_PROVIDER=openrouter FX_MODEL=openai/gpt-4.1 fx ask "review this change"
 ```
 
 See [Custom model connections](https://fx.sh/docs/configure-fx/custom-model-connections) for connection JSON, model metadata, and behavior details.
+
+## Ultrafast mode
+
+Ultrafast mode is off by default. It requests OpenAI's higher-cost Gateway service tier with `openai.serviceTier: "ultrafast"` for models whose Gateway metadata advertises Ultra eligibility. `ultrafast_requested` in `fx status --json` and `/status` reports the request, not a guarantee that a provider served the tier.
+
+Set a profile default in `~/.fx/settings.json`:
+
+```jsonc
+{
+  "provider": "gateway",
+  "models": { "gateway": "openai/gpt-6-astra" },
+  "ultrafast_mode": true
+}
+```
+
+Use it explicitly in an interactive session, a one-shot request, or ACP:
+
+```bash
+fx --ultrafast
+fx ask --ultrafast "review this change"
+fx acp --ultrafast
+```
+
+Use `/ultrafast on`, `/ultrafast off`, or `/ultrafast status` in the shell. The Settings menu includes an Ultra mode row. `FX_ULTRAFAST=1` and `--ultrafast` are process-local opt-ins and are not persisted. `FX_ULTRAFAST=0`, `--no-ultrafast`, and `/ultrafast off` explicitly disable it. A resumed session keeps its saved request unless a higher-precedence explicit disable applies.
+
+Ultra mode is available only through the Vercel AI Gateway's OpenAI service tier. Gateway metadata currently marks Astra eligible. fx does not select Ultra automatically, and switching models clears an existing Ultra request. Subagents inherit the parent turn's request; an explicit parent disable and capability checks override an existing child preference. Background side calls, including titles, reviews, and compaction, do not use Ultra mode.
 
 ## Gateway provider routing
 
@@ -143,6 +190,19 @@ The hook runs only for prompts in the interactive terminal. It never runs in ful
 
 fx ships with `fx-dark` and `fx-light` and follows your terminal's light or dark mode. Pin a variant with `FX_THEME=light` or `FX_THEME=dark`, or drop a VS Code format theme at `~/.fx/themes/<name>.json` and select it with the `theme` setting or `FX_THEME=<name>` per launch. Without an explicitly selected theme, diff markers and edit counts stay monochrome; selecting any theme adds its diff marker colors. See [Configuration](https://fx.sh/docs/configure-fx/configuration) for all environment variables.
 
+## Context compaction
+
+When a conversation fills the model's context, fx compacts it so the work can continue. The newest few turns stay unchanged. Every compacted turn keeps your messages and the assistant's final reply word for word. The conversation's own model adds a short note on what the assistant did in between, and a line for each tool call: fx writes what the call was from the call itself, like `shell zig build test (failed, exit 1, 3120 bytes)`, and the model adds why it was used and what it showed. The model also keeps numbered entries for your rules, quoted word for word, and for facts, decisions, status and open questions, plus a list of the skills and MCP tools used. Entries are never rewritten: a later entry can say it replaces an earlier one, and a status entry can close an open entry it answers or finishes. At the next compaction, the one before it is saved whole with an ID like `L2`, and in its place the agent sees a short summary the model writes of all earlier compactions, plus their rules, status and open entries still in force, word for word. The turns of earlier compactions leave the agent's view however many compactions a session has; only those kept entries grow with it. In a session that is not saved, nothing can be stored, so earlier compactions stay in view. fx checks every new note and entry, and marks without removing one that names no source, quotes words you did not write, states a path, long number, version or quoted text found in none of the compacted turns and tool calls or the turns that stay after them, names an ID that does not exist, or calls a failed tool call a success; turns the model skipped, or a missing summary of earlier compactions, are asked for once more. Only when the compacted conversation would leave too little room to continue are its longest texts shortened to their start and end, each naming the saved turn that keeps it whole. Every compacted turn is saved word for word with an ID like `M3`, every tool call with its input and output as the model saw them, plus the handle of any full output saved separately, with an ID like `T12`, and every earlier compaction with an ID like `L2`. The agent can search them by text or open one by ID with `read_tool_result`; a search also says how many saved records hold all of its words, and which came first and last.
+
+Automatic compaction asks the model right after the conversation, exactly as the agent was about to send it and with the same settings, so the provider can reuse what it has cached. When that request does not fit or fails, and when you run `/compact` to compact now, fx writes the turns out in a separate request at the model's lowest reasoning; turns too large for one such request go oldest first, in as many requests as it takes. If a separate request fails or comes back empty on AI Gateway, fx retries it once with a model from another provider.
+
+Automatic compaction starts when a request reaches 80 percent of the model's usable input. Set `auto_compact_percent` in `~/.fx/settings.json` to any value from 10 to 80, or `FX_AUTO_COMPACT_PERCENT` for a single launch:
+
+```jsonc
+// ~/.fx/settings.json
+{ "auto_compact_percent": 60 }
+```
+
 ## Embed fx
 
 fx builds as a native binary or WebAssembly. Applications embedding fx can provide network transport, session storage, configuration, permission handling, and terminal I/O.
@@ -153,7 +213,30 @@ fx builds as a native binary or WebAssembly. Applications embedding fx can provi
 | `createFxAgent()` | Embed the agent core in a JavaScript host with `fx-core.wasm`. |
 | `createFxTerminal()` | Embed the interactive terminal with `fx-term.wasm`. |
 
+ACP clients can keep their MCP tools loaded on every turn, steer a running turn, supply a session system prompt, serve MCP servers over the ACP connection, and choose each session's workspace. See [ACP embedding](CONTRIBUTING.md#acp-embedding).
+
 The SDK is published to npm as [libfx](https://www.npmjs.com/package/libfx). See the [WebAssembly SDK](sdk/README.md) and the runnable Node.js, browser, Next.js, and Nuxt [examples](examples/README.md). The WebAssembly SDK is experimental.
+
+## Connect your Slack account
+
+Run `/mcp add slack` in an fx session, or `fx mcp add slack` from your terminal.
+The command saves Slack's MCP URL and the public fx Client ID to your profile,
+opens the fx.sh authorization flow, and connects Slack after you consent. Keep
+fx running while you authorize in a browser on the same computer. In an fx
+session, Slack's tools become available without a restart. The **Servers** tab
+in `/mcp` also offers **Add Slack** with the `s` key.
+
+You don't need to edit `~/.fx/mcp.json` or run `fx slack install` to connect your
+personal account. Workspace app approval may still be required. fx reports
+`Slack connected. You can now use Slack.` after the connection succeeds.
+
+Running the command again uses an existing working connection or starts
+missing authorization. It restores a missing fx Client ID and preserves other
+servers, timeouts, and explicit scope overrides. A conflicting Slack endpoint,
+Client ID, or authentication configuration stops setup with guidance instead of
+being overwritten. Use `/mcp auth slack --open` to reauthorize an existing
+configuration. Removing and re-adding the fx preset restores its configuration;
+it does not revoke credentials. Use `/mcp logout slack` to sign out.
 
 ## Slack workspace installation
 
@@ -174,7 +257,7 @@ live in the owner-only file `~/.fx/slack/installation.json`; no hosted database
 or background refresh service is created. An expired refresh token requires
 installation again. This workspace operation is separate from each employee's
 MCP user authorization. Employees connect their own account with
-`/mcp auth slack --open` in an fx session (or `fx mcp auth slack` from a terminal).
+`/mcp add slack` in an fx session (or `fx mcp add slack` from a terminal).
 For `https://mcp.slack.com/mcp`, the CLI recognizes the fx app by its public
 Client ID and uses the HTTPS callback for personal login. Changing that Client
 ID requires a CLI update. OAuth uses the canonical form of Slack's advertised

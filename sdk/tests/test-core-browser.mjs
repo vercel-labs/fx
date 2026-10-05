@@ -211,6 +211,102 @@ try {
     expect(result.state === "unsupported", `unexpected state ${result.state}`);
   });
 
+  // Exercise the public browser SDK without starting the demo's live transport.
+  {
+    const { targetId } = await command("Target.createTarget", { url: "about:blank" });
+    try {
+      const { sessionId } = await command("Target.attachToTarget", { targetId, flatten: true });
+      await command("Runtime.enable", {}, sessionId);
+      await command("Page.enable", {}, sessionId);
+      await command("Page.navigate", { url: `http://127.0.0.1:${port}/sdk/index.html?force-unsupported=1` }, sessionId);
+      await waitFor("window.__fxCoreTest?.state === 'unsupported'", sessionId);
+      const evaluated = await withTimeout(command("Runtime.evaluate", {
+        awaitPromise: true,
+        returnByValue: true,
+        expression: `(async () => {
+          const expect = ${expect.toString()};
+          const { createFxAgent } = await import('/sdk/browser.js');
+          const response = await fetch('/zig-out/bin/fx-core.wasm', { cache: 'no-store' });
+          expect(response.ok, 'local core WASM fetch failed: ' + response.status);
+          const wasm = await response.arrayBuffer();
+          const astra = 'openai/gpt-6-astra';
+          const sol = 'openai/gpt-5.6-sol';
+          const pricing = { input_cache_read: '0.000001', service_tiers: {
+            ultrafast: { input: '0.00006', output: '0.0003', input_cache_read: '0.000006' },
+          } };
+          const cases = [
+            { name: 'priced Sol true', model: sol, ultrafast: true },
+            { name: 'Astra false', model: astra, ultrafast: false },
+            { name: 'unpriced Sol rejection', model: sol, ultrafast: true, reject: true },
+          ];
+          const passed = [];
+          for (const scenario of cases) {
+            let agent;
+            let catalogFetches = 0;
+            const requests = [];
+            const fakeFetch = async (_url, init = {}) => {
+              const method = String(init.method ?? 'GET').toUpperCase();
+              if (method === 'GET') {
+                catalogFetches++;
+                return Response.json({ object: 'list', data: [
+                  { id: astra, type: 'language', owned_by: 'openai', pricing },
+                  { id: sol, type: 'language', owned_by: 'openai', ...(scenario.reject ? {} : { pricing }) },
+                ] });
+              }
+              expect(method === 'POST', scenario.name + ': unexpected method ' + method);
+              requests.push({ body: JSON.parse(new TextDecoder().decode(init.body)),
+                model: new Headers(init.headers).get('ai-language-model-id') });
+              const frames = [
+                { type: 'text-delta', delta: 'ok' },
+                { type: 'finish', finishReason: { unified: 'stop', raw: 'stop' },
+                  usage: { inputTokens: { total: 3 }, outputTokens: { total: 2 } },
+                  providerMetadata: { gateway: { serviceTier: 'ultrafast', cost: '0.00036' } } },
+              ];
+              return new Response(frames.map(frame => 'data: ' + JSON.stringify(frame) + '\\n\\n').join('') + 'data: [DONE]\\n\\n',
+                { headers: { 'content-type': 'text/event-stream' } });
+            };
+            try {
+              try {
+                agent = await createFxAgent({ wasm, apiKey: 'browser-ultrafast-test-key',
+                  model: { id: scenario.model, ultrafast: scenario.ultrafast }, fetch: fakeFetch });
+              } catch (error) {
+                if (!scenario.reject) throw error;
+                expect(error.code === 'LIBFX_MODEL_UNSUPPORTED_ULTRAFAST', 'unexpected rejection code: ' + error.code);
+                expect(error.model === sol && error.capability === 'ultrafast', 'rejection omitted Sol capability');
+                expect(/Ultrafast mode is not available/.test(error.message), 'unexpected rejection: ' + error.message);
+                expect(catalogFetches === 1 && requests.length === 0, 'unpriced Sol sent a completion POST');
+                passed.push(scenario.name);
+                continue;
+              }
+              expect(!scenario.reject, 'unpriced Sol creation unexpectedly succeeded');
+              expect(catalogFetches === (scenario.ultrafast ? 1 : 0), scenario.name + ': wrong creation fetch count');
+              const turn = agent.prompt('say ok');
+              let text = '';
+              for await (const event of turn) if (event.type === 'text_delta') text += event.delta;
+              expect((await turn.result).stopReason === 'end_turn' && text === 'ok', scenario.name + ': unexpected reply ' + text);
+              expect(requests.length === 1 && requests[0].model === scenario.model, scenario.name + ': wrong completion model/count');
+              const options = requests[0].body.providerOptions;
+              expect(options?.openai?.serviceTier === (scenario.ultrafast ? 'ultrafast' : undefined), scenario.name + ': wrong service tier');
+              expect(JSON.stringify(options?.gateway?.only) === (scenario.ultrafast ? '["openai"]' : undefined), scenario.name + ': wrong provider route');
+              expect(options?.gateway?.speed === undefined && options?.gateway?.fast === undefined, scenario.name + ': Fast leaked');
+              passed.push(scenario.name);
+            } finally {
+              await agent?.close();
+            }
+          }
+          return passed;
+        })()`,
+      }, sessionId), "browser Ultrafast case timed out", 15000);
+      expect(!evaluated.exceptionDetails, evaluated.result?.description || evaluated.exceptionDetails?.text || "browser Ultrafast exception");
+      expect(JSON.stringify(evaluated.result.value) === JSON.stringify([
+        "priced Sol true", "Astra false", "unpriced Sol rejection",
+      ]), `unexpected browser Ultrafast cases ${JSON.stringify(evaluated.result.value)}`);
+      console.log("browser core ultrafast routing and eligibility passed");
+    } finally {
+      await command("Target.closeTarget", { targetId });
+    }
+  }
+
   const { targetId } = await command("Target.createTarget", { url: "about:blank" });
   const { sessionId } = await command("Target.attachToTarget", { targetId, flatten: true });
   try {

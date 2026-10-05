@@ -728,7 +728,8 @@ function expectUserProfileTrace(tracePath: string) {
     "shell.run authority=shell_allowed source=yolo " +
       "route=approved_shell environment=user",
   );
-  expect(trace).toContain("command runner explicit environment=user shell=");
+  // The user profile runs through the process's captured startup files.
+  expect(trace).toContain("command runner snapshot generation=");
   expect(trace).not.toContain("authority=direct_only route=direct_read_only");
 }
 
@@ -2308,7 +2309,7 @@ describe("effect-aware command permissions", () => {
           "shell.run authority=shell_allowed source=auto_classifier " +
             "route=approved_shell environment=user",
         );
-        expect(trace).toContain("command runner explicit environment=user shell=");
+        expect(trace).toContain("command runner snapshot generation=");
         expect(trace).not.toContain("authority=direct_only route=direct_read_only");
         expectTraceOrder(trace, [
           "event=permission_decision turn_id=1 step_id=1 call_id=terminal_session_command",

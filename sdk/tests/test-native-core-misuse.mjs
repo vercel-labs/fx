@@ -41,6 +41,10 @@ for (const [name, args] of [
   ["writeCore", [{}]],
   ["closeCore", []],
   ["drainCore", []],
+  ["writeCoreAttachment", []],
+  ["writeCoreAttachment", [{}, 1]],
+  ["takeCoreAttachment", []],
+  ["discardCoreAttachments", []],
   ["takeCoreFetch", []],
   ["coreFetchActive", []],
   ["startCoreFetchResponse", []],
@@ -92,6 +96,30 @@ assert.throws(
   (error) => error.code === "LIBFX_NATIVE_BACKPRESSURE",
 );
 addon.writeCore(core, Buffer.alloc(0));
+// Attachments carry raw prompt images and checkpoints beside ACP frames.
+for (const id of [0, -1, 1.5, 2 ** 32, "1"]) {
+  assert.throws(() => addon.writeCoreAttachment(core, id, Buffer.from("x")), {
+    name: "TypeError",
+    code: "LIBFX_INVALID_ARGUMENT",
+  });
+}
+assert.throws(
+  () => addon.writeCoreAttachment(core, 1, Buffer.alloc(4 * 1024 * 1024 + 1)),
+  (error) => error.code === "LIBFX_INVALID_ARGUMENT",
+);
+addon.writeCoreAttachment(core, 1, Buffer.from("first"));
+assert.throws(
+  () => addon.writeCoreAttachment(core, 1, Buffer.from("again")),
+  (error) => error.code === "LIBFX_INVALID_ARGUMENT" && /already pending/.test(error.message),
+);
+for (let id = 2; id <= 8; id++) addon.writeCoreAttachment(core, id, Buffer.from("x"));
+assert.throws(
+  () => addon.writeCoreAttachment(core, 9, Buffer.from("x")),
+  (error) => error.code === "LIBFX_NATIVE_BACKPRESSURE",
+);
+addon.discardCoreAttachments(core);
+addon.writeCoreAttachment(core, 9, Buffer.from("after discard"));
+assert.equal(addon.takeCoreAttachment(core, 9), null, "inbound payloads are never handed back to JavaScript");
 addon.closeCore(core);
 addon.destroyCore(core);
 assert.throws(
@@ -136,8 +164,14 @@ const request = async (method, params = {}) => {
 };
 const takeFetch = async () => {
   for (;;) {
-    const bytes = addon.takeCoreFetch(lifecycleCore);
-    if (bytes) return JSON.parse(bytes.toString("utf8"));
+    const fetchRequest = addon.takeCoreFetch(lifecycleCore);
+    if (fetchRequest) {
+      // Metadata stays JSON; the body arrives as raw bytes beside it.
+      const metadata = JSON.parse(fetchRequest.request.toString("utf8"));
+      assert.equal(Object.hasOwn(metadata, "body"), false, "fetch metadata must not embed the body");
+      assert.ok(Buffer.isBuffer(fetchRequest.body), "fetch body must be a Buffer");
+      return { ...metadata, body: fetchRequest.body };
+    }
     await new Promise((resolveWait) => setTimeout(resolveWait, 2));
   }
 };
@@ -166,8 +200,10 @@ try {
   }))), 1);
   assert.equal(addon.finishCoreFetch(lifecycleCore, catalogFetch.handle), 1);
   const firstFetch = await Promise.race([takeFetch(), timeout("first host fetch")]);
+  assert.equal(catalogFetch.body.length, 0);
   assert.equal(firstFetch.method, "POST");
   assert.equal(firstFetch.url, "http://127.0.0.1:31337/chat");
+  assert.ok(Array.isArray(JSON.parse(firstFetch.body.toString("utf8")).prompt), "fetch body must be the raw model request");
   assert.ok(Number.isInteger(firstFetch.handle) && firstFetch.handle > 0, "fetch request must carry a positive handle");
   const firstHandle = firstFetch.handle;
   const futureHandle = firstHandle + 1;

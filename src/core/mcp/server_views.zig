@@ -224,6 +224,7 @@ pub fn snapshotServerModelSummary(
             deferred_for_ask,
         ),
         .tool_count = tool_count,
+        .always_loaded = server.config.always_loaded,
     };
 }
 

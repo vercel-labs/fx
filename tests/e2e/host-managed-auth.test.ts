@@ -80,6 +80,13 @@ describe("host-managed authentication", () => {
         }
         if (path === "/grok/models") {
           return Response.json({ data: [{
+            id: "grok-subscription-only",
+            model: "grok-subscription-only",
+            api_backend: "responses",
+            context_window: 1000000,
+            supports_reasoning_effort: false,
+            reasoning_efforts: [],
+          }, {
             id: "grok-4.20",
             model: "grok-4.20",
             api_backend: "responses",
@@ -168,6 +175,12 @@ describe("host-managed authentication", () => {
       });
       expect(models.code).toBe(0);
       expect(models.stderr).toBe("");
+      if (provider === "grok") {
+        expect(JSON.parse(models.stdout).ids).toEqual(["grok-subscription-only", "grok-4.20"]);
+        const settings = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
+        expect(settings.provider).toBe("grok");
+        expect(settings.models.grok).toBe("grok-subscription-only");
+      }
 
       const asked = await runFx(["ask", "--json", "--no-save", "Reply once."], {
         cwd: workspace,

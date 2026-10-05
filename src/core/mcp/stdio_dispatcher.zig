@@ -407,6 +407,8 @@ pub const StdioDispatcher = struct {
             self.pending.deinit();
             owner_allocator.destroy(self);
         }
+        registerForProcessExit(self);
+        errdefer unregisterForProcessExit(self);
 
         if (self.stderr != null) try self.startStderrDrain();
         self.reader_thread = try std.Thread.spawn(.{}, readerMain, .{self});
@@ -434,9 +436,11 @@ pub const StdioDispatcher = struct {
     ) void {
         std.debug.assert(self.docker_cleanup == null);
         self.docker_cleanup = cleanup;
+        requireProcessExitTeardown(self);
     }
 
     fn destroy(self: *StdioDispatcher) void {
+        unregisterForProcessExit(self);
         std.debug.assert(self.docker_cleanup == null);
         std.debug.assert(self.stderr_thread == null and self.stderr == null and self.stderr_wake == null);
         self.pending.deinit();
@@ -2022,6 +2026,148 @@ fn terminateChildGracefully(child_id: std.process.Child.Id) void {
     }
 }
 
+/// Every live stdio dispatcher, so process exit can kill all children at once
+/// instead of stopping servers one at a time and waiting for each killed child
+/// to be reaped. Guarded by `mutex`; lock it before any dispatcher's
+/// `state_mutex`.
+const ProcessExitKills = struct {
+    mutex: std.Io.Mutex = .init,
+    entries: [capacity]Entry = undefined,
+    len: usize = 0,
+    /// Launches between `beginChildLaunch` and `endChildLaunch`.
+    launching: usize = 0,
+    /// A dispatcher did not fit, so only a full teardown reaches every child.
+    overflowed: bool = false,
+    /// Set by `killAllForProcessExit`; no launch may begin afterwards.
+    closed: bool = false,
+
+    const capacity = 64;
+
+    const Entry = struct {
+        dispatcher: *StdioDispatcher,
+        /// Its docker container is removed only by the full teardown.
+        needs_teardown: bool = false,
+    };
+};
+
+var process_exit_kills: ProcessExitKills = .{};
+
+/// How long process exit waits for launches already under way to register.
+const process_exit_launch_settle_ms: i64 = 1_000;
+
+/// Marks the start of a stdio child launch. Fails once process exit has begun,
+/// so no child can start after `killAllForProcessExit` returns.
+pub fn beginChildLaunch() error{Cancelled}!void {
+    const io = io_mod.getIo();
+    process_exit_kills.mutex.lockUncancelable(io);
+    defer process_exit_kills.mutex.unlock(io);
+    if (process_exit_kills.closed) return error.Cancelled;
+    process_exit_kills.launching += 1;
+}
+
+/// Ends a launch begun by `beginChildLaunch`, after its dispatcher exists and
+/// any docker cleanup is installed, or after the launch failed.
+pub fn endChildLaunch() void {
+    const io = io_mod.getIo();
+    process_exit_kills.mutex.lockUncancelable(io);
+    defer process_exit_kills.mutex.unlock(io);
+    std.debug.assert(process_exit_kills.launching > 0);
+    process_exit_kills.launching -= 1;
+}
+
+fn registerForProcessExit(dispatcher: *StdioDispatcher) void {
+    const io = io_mod.getIo();
+    process_exit_kills.mutex.lockUncancelable(io);
+    defer process_exit_kills.mutex.unlock(io);
+    if (process_exit_kills.len == ProcessExitKills.capacity) {
+        process_exit_kills.overflowed = true;
+        debug_trace.logf(
+            "mcp",
+            "stdio child not tracked for process exit generation={d} capacity={d}",
+            .{ dispatcher.generation, ProcessExitKills.capacity },
+        );
+        return;
+    }
+    process_exit_kills.entries[process_exit_kills.len] = .{ .dispatcher = dispatcher };
+    process_exit_kills.len += 1;
+}
+
+fn requireProcessExitTeardown(dispatcher: *StdioDispatcher) void {
+    const io = io_mod.getIo();
+    process_exit_kills.mutex.lockUncancelable(io);
+    defer process_exit_kills.mutex.unlock(io);
+    for (process_exit_kills.entries[0..process_exit_kills.len]) |*entry| {
+        if (entry.dispatcher == dispatcher) entry.needs_teardown = true;
+    }
+}
+
+fn unregisterForProcessExit(dispatcher: *StdioDispatcher) void {
+    const io = io_mod.getIo();
+    process_exit_kills.mutex.lockUncancelable(io);
+    defer process_exit_kills.mutex.unlock(io);
+    const entries = process_exit_kills.entries[0..process_exit_kills.len];
+    for (entries, 0..) |entry, index| {
+        if (entry.dispatcher != dispatcher) continue;
+        entries[index] = entries[entries.len - 1];
+        process_exit_kills.len -= 1;
+        return;
+    }
+}
+
+/// Process exit: SIGKILLs the process group of every stdio child that may
+/// still run, without waiting for any to be reaped, and refuses later
+/// launches. Returns false without killing anything when only a full teardown
+/// reaches every child: a docker container needs its cleanup, a dispatcher did
+/// not fit, or a launch under way did not settle in time.
+pub fn killAllForProcessExit() bool {
+    const io = io_mod.getIo();
+    process_exit_kills.mutex.lockUncancelable(io);
+    defer process_exit_kills.mutex.unlock(io);
+    process_exit_kills.closed = true;
+    const deadline_ms = io_mod.milliTimestamp() + process_exit_launch_settle_ms;
+    while (process_exit_kills.launching > 0) {
+        if (io_mod.milliTimestamp() >= deadline_ms) {
+            debug_trace.logf(
+                "mcp",
+                "process exit fell back to stdio teardown reason=launch_unsettled launching={d}",
+                .{process_exit_kills.launching},
+            );
+            return false;
+        }
+        process_exit_kills.mutex.unlock(io);
+        io_mod.sleep(std.time.ns_per_ms);
+        process_exit_kills.mutex.lockUncancelable(io);
+    }
+    const entries = process_exit_kills.entries[0..process_exit_kills.len];
+    for (entries) |entry| {
+        if (!entry.needs_teardown) continue;
+        debug_trace.logf("mcp", "process exit fell back to stdio teardown reason=docker", .{});
+        return false;
+    }
+    if (process_exit_kills.overflowed) {
+        debug_trace.logf("mcp", "process exit fell back to stdio teardown reason=untracked_child", .{});
+        return false;
+    }
+    var killed: usize = 0;
+    for (entries) |entry| {
+        if (!entry.dispatcher.childMayBeRunning()) continue;
+        terminateChild(entry.dispatcher.child_id);
+        killed += 1;
+    }
+    debug_trace.logf("mcp", "process exit killed stdio children count={d}", .{killed});
+    return true;
+}
+
+fn resetProcessExitKillsForTest() void {
+    std.debug.assert(builtin.is_test);
+    const io = io_mod.getIo();
+    process_exit_kills.mutex.lockUncancelable(io);
+    defer process_exit_kills.mutex.unlock(io);
+    process_exit_kills.launching = 0;
+    process_exit_kills.overflowed = false;
+    process_exit_kills.closed = false;
+}
+
 test "classifyInbound separates responses notifications progress and requests" {
     const alloc = std.testing.allocator;
     const cases = [_]struct {
@@ -2901,6 +3047,78 @@ test "MCP abandoned shutdown kills an uncooperative child without grace waits" {
     const elapsed_ms = io_mod.milliTimestamp() - started_ms;
     try expectProcessReaped(fixture.pid);
     try std.testing.expect(elapsed_ms < shutdown_grace_ms);
+}
+
+const uncooperative_child_script =
+    \\trap '' TERM
+    \\while :; do sleep 1; done
+;
+
+test "process exit kills every stdio child at once without waiting to reap them" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    defer resetProcessExitKillsForTest();
+    const first = try createShellDispatcher(uncooperative_child_script);
+    defer first.dispatcher.deinitAbandoned();
+    const second = try createShellDispatcher(uncooperative_child_script);
+    defer second.dispatcher.deinitAbandoned();
+
+    const started_ms = io_mod.milliTimestamp();
+    try std.testing.expect(killAllForProcessExit());
+    const elapsed_ms = io_mod.milliTimestamp() - started_ms;
+
+    try expectProcessReaped(first.pid);
+    try expectProcessReaped(second.pid);
+    try std.testing.expect(elapsed_ms < immediate_drain_ms);
+}
+
+test "process exit refuses stdio launches that begin after it" {
+    defer resetProcessExitKillsForTest();
+    try std.testing.expect(killAllForProcessExit());
+    try std.testing.expectError(error.Cancelled, beginChildLaunch());
+}
+
+test "process exit leaves a docker-backed child to the full teardown" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    defer resetProcessExitKillsForTest();
+    const fixture = try createShellDispatcher(uncooperative_child_script);
+    defer fixture.dispatcher.deinitAbandoned();
+    requireProcessExitTeardown(fixture.dispatcher);
+
+    try std.testing.expect(!killAllForProcessExit());
+    try std.testing.expect(fixture.dispatcher.childMayBeRunning());
+    try std.posix.kill(fixture.pid, @enumFromInt(0));
+}
+
+test "process exit waits for a stdio launch under way before killing" {
+    defer resetProcessExitKillsForTest();
+    try beginChildLaunch();
+    const Launch = struct {
+        fn finish() void {
+            io_mod.sleep(20 * std.time.ns_per_ms);
+            endChildLaunch();
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Launch.finish, .{});
+    defer thread.join();
+
+    const started_ms = io_mod.milliTimestamp();
+    try std.testing.expect(killAllForProcessExit());
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms >= 20);
+}
+
+test "process exit falls back to the full teardown when a child was not tracked" {
+    defer resetProcessExitKillsForTest();
+    {
+        const io = io_mod.getIo();
+        process_exit_kills.mutex.lockUncancelable(io);
+        defer process_exit_kills.mutex.unlock(io);
+        process_exit_kills.overflowed = true;
+    }
+    try std.testing.expect(!killAllForProcessExit());
 }
 
 test "MCP normal shutdown gives a cooperative child TERM before forced cleanup" {

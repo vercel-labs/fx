@@ -1931,8 +1931,8 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expect(settled).not.toContain(APPLY_QUESTION);
       expect(existsSync(target)).toBe(false);
       expect(gateway.requests).toHaveLength(3);
-      expect(gateway.requests[1]!.body).toContain("Tool write_file (failure)");
-      expect(gateway.requests[2]!.body).toContain("context_handoff");
+      expect(gateway.requests[1]!.body).toContain("[Tool result T1: write_file]");
+      expect(gateway.requests[2]!.body).toContain("compacted_conversation");
       expectCleanStderr(stderrPath);
     },
     90_000,

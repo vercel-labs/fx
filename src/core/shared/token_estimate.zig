@@ -30,6 +30,13 @@ pub const StreamingEstimator = struct {
     }
 };
 
+/// Estimated tokens of one complete text.
+pub fn textTokens(text: []const u8) usize {
+    var estimator = StreamingEstimator{};
+    estimator.consume(text);
+    return @intCast(@min(estimator.estimate(), std.math.maxInt(usize)));
+}
+
 test "StreamingEstimator is invariant across chunk boundaries" {
     const text = "split 你好 inside words";
 

@@ -37,6 +37,18 @@ const tool_host = @import("tool_host.zig");
 
 const Allocator = std.mem.Allocator;
 
+// A parent disable caps resumed children too; durable child opt-ins cannot bypass it.
+fn childUltrafastMode(parent_requested: bool, child_preference: bool) bool {
+    return parent_requested and child_preference;
+}
+
+test "Ultrafast parent disable caps durable child opt-ins" {
+    try std.testing.expect(childUltrafastMode(true, true));
+    try std.testing.expect(!childUltrafastMode(false, true));
+    try std.testing.expect(!childUltrafastMode(true, false));
+    try std.testing.expect(!childUltrafastMode(false, false));
+}
+
 fn childModelCapabilityResolver(
     parent: ?model_capabilities.Resolver,
 ) ?model_capabilities.Resolver {
@@ -170,8 +182,10 @@ pub fn run(
         routed_config.tool_context.credential_source = credential.source;
         routed_config.tool_context.account_id = credential.accountId();
     }
+    const ultrafast_mode = childUltrafastMode(config.tool_context.ultrafast_mode, admission.ultrafast_mode);
     routed_config.tool_context.model = admission.model;
     routed_config.tool_context.provider = admission.provider;
+    routed_config.tool_context.ultrafast_mode = ultrafast_mode;
     routed_config.tool_context.provider_capabilities = config.provider_set.select(admission.provider).capabilities;
     debug_trace.logf(
         "subagent",
@@ -203,6 +217,11 @@ pub fn run(
         .subagent_id = trace_context.subagent_id,
     };
     defer if (context.refreshed_credential) |*credential| credential.deinit(turn.alloc);
+    turn.beginTurn() catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        turn.setFailureDiagnostic("turn_open_failed", @errorName(err));
+        return error.ProviderFailed;
+    };
     const recovery_checkpoint = turn.prepareRecoveryForActiveWork(arena) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         turn.setFailureDiagnostic("recovery_admission_failed", @errorName(err));
@@ -235,8 +254,10 @@ pub fn run(
         .grants = types.dupePermissionGrantSlice(arena, admission.grants) catch return error.OutOfMemory,
         .agent_settings = .{
             .max_tool_result_bytes = config.tool_context.max_tool_result_bytes,
+            .auto_compact_percent = config.tool_context.auto_compact_percent,
             .first_call_tool_choice = config.tool_context.first_call_tool_choice,
             .fast_mode = config.tool_context.fast_mode,
+            .ultrafast_mode = ultrafast_mode,
             .effort = admission.effort,
             .provider_order = if (admission.provider == .gateway) config.tool_context.provider_order else &.{},
             .provider_strict = admission.provider == .gateway and config.tool_context.provider_strict,
@@ -298,8 +319,10 @@ pub fn run(
             .custom_tool_guidance = config.custom_tool_guidance,
             .agent_step_limit = config.tool_context.agent_step_limit,
             .max_tool_result_bytes = config.tool_context.max_tool_result_bytes,
+            .auto_compact_percent = config.tool_context.auto_compact_percent,
             .cancel_flag = cancel,
             .fast_mode = config.tool_context.fast_mode,
+            .ultrafast_mode = ultrafast_mode,
             .effort = admission.effort,
             .provider_order = if (admission.provider == .gateway) config.tool_context.provider_order else &.{},
             .provider_strict = admission.provider == .gateway and config.tool_context.provider_strict,
@@ -419,9 +442,14 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .publish_committed_file_handoff = publishCommittedFileHandoff,
         .propagate_history_turn = propagateHistoryTurn,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
-        .recovery_checkpoint = .{
-            .set = setRecoveryCheckpoint,
-            .clear = clearRecoveryCheckpoint,
+        // v2 keeps no paused-response checkpoint (D31), so a v2 child, like
+        // a v2 root, offers the orchestrator no place to save one.
+        .recovery_checkpoint = switch (context.turn.loaded) {
+            .v1 => .{
+                .set = setRecoveryCheckpoint,
+                .clear = clearRecoveryCheckpoint,
+            },
+            .v2 => null,
         },
         .propagate_grant = discardGrant,
         .push_event = pushLiveEvent,

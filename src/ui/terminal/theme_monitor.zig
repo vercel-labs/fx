@@ -109,7 +109,7 @@ pub const Monitor = struct {
             return .pending;
         }
 
-        switch (classifyPrimaryDeviceAttributes(candidate)) {
+        switch (theme_protocol.classifyPrimaryDeviceAttributes(candidate)) {
             .pending => return .pending,
             .complete => {
                 self.candidate_len = 0;
@@ -288,36 +288,7 @@ pub const Monitor = struct {
 const dark_response = "\x1b[?997;1n";
 const light_response = "\x1b[?997;2n";
 const response_fence = "\x1b[?1;2c";
-const primary_device_attributes_prefix = "\x1b[?";
 const osc11_prefix = "\x1b]11;rgb:";
-
-const ResponseStatus = enum { invalid, pending, complete };
-
-fn classifyPrimaryDeviceAttributes(bytes: []const u8) ResponseStatus {
-    if (std.mem.startsWith(u8, primary_device_attributes_prefix, bytes)) return .pending;
-    if (!std.mem.startsWith(u8, bytes, primary_device_attributes_prefix)) return .invalid;
-
-    const parameters = bytes[primary_device_attributes_prefix.len..];
-    var expect_digit = true;
-    for (parameters, 0..) |byte, index| {
-        if (std.ascii.isDigit(byte)) {
-            expect_digit = false;
-            continue;
-        }
-        if (byte == ';' and !expect_digit) {
-            expect_digit = true;
-            continue;
-        }
-        if (byte == 'c') {
-            return if (!expect_digit and index + 1 == parameters.len)
-                .complete
-            else
-                .invalid;
-        }
-        return .invalid;
-    }
-    return .pending;
-}
 
 fn addMillis(now_ms: i64, duration_ms: i64) i64 {
     return std.math.add(i64, now_ms, duration_ms) catch std.math.maxInt(i64);

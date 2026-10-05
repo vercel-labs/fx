@@ -296,7 +296,7 @@ fn composeInfoRow(alloc: Allocator, row_index: u16, width: u16) !std.ArrayList(u
     return switch (row_index) {
         0 => composeFactRow(alloc, "Profile config", "~/.fx/mcp.json", width),
         1 => composeFactRow(alloc, "Project config", "<workspace>/.mcp.json", width),
-        2 => composeTextRow(alloc, "servers: a add · r reload · enter inspect", width, ui_render.dim_style, 2),
+        2 => composeTextRow(alloc, "servers: s add Slack · a add · r reload · enter inspect", width, ui_render.dim_style, 2),
         3 => composeTextRow(alloc, "project trust: p approve all · z reset", width, ui_render.dim_style, 2),
         4 => composeTextRow(alloc, "details: enter sign in · l logout · d remove", width, ui_render.dim_style, 2),
         5 => composeTextRow(alloc, "project details: a approve · x reject", width, ui_render.dim_style, 2),

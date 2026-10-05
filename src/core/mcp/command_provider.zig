@@ -6,6 +6,7 @@ const streamable_http = @import("streamable_http.zig");
 const Allocator = std.mem.Allocator;
 
 pub const AddIntent = union(enum) {
+    slack,
     local: struct {
         name: []const u8,
         command: []const u8,
@@ -70,6 +71,7 @@ pub fn removeProfileServerUnavailable(
 
 pub fn parseAddIntent(tokens: []const []const u8) AddIntentError!AddIntent {
     if (tokens.len == 0) return error.McpAddUsage;
+    if (tokens.len == 1 and std.mem.eql(u8, tokens[0], "slack")) return .slack;
     if (std.mem.eql(u8, tokens[0], "--transport")) {
         if (tokens.len != 4 or !std.mem.eql(u8, tokens[1], "http")) {
             return error.McpAddUsage;
@@ -194,6 +196,7 @@ pub const Display = union(enum) {
 pub const Result = struct {
     display: Display,
     reload: bool = false,
+    connect_slack: bool = false,
     report_reload: bool = false,
     project_action: ?project_config.ProjectMcpAction = null,
 
@@ -255,12 +258,12 @@ test "MCP add intent parses local and HTTP argv without allocation" {
             try std.testing.expectEqualStrings("node", intent.command);
             try std.testing.expectEqualSlices([]const u8, &.{ "server.js", "--stdio" }, intent.args);
         },
-        .http => return error.TestUnexpectedResult,
+        .http, .slack => return error.TestUnexpectedResult,
     }
 
     const remote = try parseAddIntent(&.{ "--transport", "http", "docs", "https://example.test/mcp" });
     switch (remote) {
-        .local => return error.TestUnexpectedResult,
+        .local, .slack => return error.TestUnexpectedResult,
         .http => |intent| {
             try std.testing.expectEqualStrings("docs", intent.name);
             try std.testing.expectEqualStrings("https://example.test/mcp", intent.url);
@@ -269,6 +272,8 @@ test "MCP add intent parses local and HTTP argv without allocation" {
 }
 
 test "MCP add intent rejects invalid syntax names and URLs" {
+    try std.testing.expect(try parseAddIntent(&.{"slack"}) == .slack);
+    try std.testing.expect(try parseAddIntent(&.{ "slack", "node" }) == .local);
     try std.testing.expectError(error.McpAddUsage, parseAddIntent(&.{}));
     try std.testing.expectError(error.McpAddUsage, parseAddIntent(&.{"only-name"}));
     try std.testing.expectError(

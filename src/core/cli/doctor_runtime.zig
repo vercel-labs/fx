@@ -7,6 +7,7 @@ const config_runtime = @import("../config/config_runtime.zig");
 const host = @import("../hosts/host.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const session_store = @import("../session/session_store.zig");
+const session_adapter = @import("../session/session_adapter.zig");
 const types = @import("../shared/types.zig");
 const model_provider = @import("../config/model_provider.zig");
 
@@ -51,17 +52,13 @@ pub const Snapshot = struct {
     }
 };
 
-const ResolvedModel = struct {
-    value: []const u8,
-    owned: ?[]u8 = null,
-};
-
 pub fn collect(
     alloc: Allocator,
     secret_store: host.SecretStore,
     default_model: []const u8,
     default_agent_step_limit: usize,
     mcp_config_diagnostic: mcp_contract.ProfileConfigDiagnostic,
+    sessions_v2: bool,
 ) !Snapshot {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
     debug_trace.configureFromEnv(alloc, workspace_root);
@@ -101,7 +98,7 @@ pub fn collect(
         try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
         try appendAuthCheck(&checks, alloc, snapshot.auth);
         try appendConfigLoadFailureCheck(&checks, alloc, "startup", "failed to resolve startup settings", err);
-        try appendStateChecks(&checks, alloc, snapshot.workspace_root);
+        try appendStateChecks(&checks, alloc, snapshot.workspace_root, sessions_v2);
         try appendGitCheck(&checks, alloc, snapshot.workspace_root);
         try appendGhCheck(&checks, alloc);
 
@@ -122,12 +119,17 @@ pub fn collect(
     try appendConfigDiagnosticChecks(&checks, alloc, detailed.diagnostics);
     try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
     try appendAuthCheck(&checks, alloc, snapshot.auth);
-    try appendResolvedStartupCheck(&snapshot, &checks, alloc, .{
-        .model = if (detailed.settings.models.get(snapshot.provider)) |model| @constCast(model) else null,
+    const selection = config_runtime.selectProviderModel(
+        default_model,
+        &detailed.settings,
+        null,
+        config_runtime.modelEnvOverride(),
+    );
+    try appendResolvedStartupCheck(&snapshot, &checks, alloc, selection, .{
         .permission_mode = detailed.settings.permission_mode,
         .max_agent_steps = detailed.settings.max_agent_steps,
-    }, default_model, default_agent_step_limit);
-    try appendStateChecks(&checks, alloc, snapshot.workspace_root);
+    }, default_agent_step_limit);
+    try appendStateChecks(&checks, alloc, snapshot.workspace_root, sessions_v2);
     try appendGitCheck(&checks, alloc, snapshot.workspace_root);
     try appendGhCheck(&checks, alloc);
 
@@ -189,6 +191,8 @@ fn configLayerRejected(
             .invalid_model_id,
             .retired_skill_match_fuzzy,
             .invalid_context_limits,
+            .invalid_ultrafast_mode_override,
+            .invalid_skill_symlink_authorities,
             => return true,
             .invalid_additional_directories,
             .invalid_permission_hook,
@@ -216,16 +220,23 @@ fn appendResolvedStartupCheck(
     snapshot: *Snapshot,
     checks: *std.ArrayList(Check),
     alloc: Allocator,
+    selection: config_runtime.ModelSelectionError!model_provider.ProviderSelection,
     settings: config_runtime.StartupStatusSettings,
-    default_model: []const u8,
     default_agent_step_limit: usize,
 ) !void {
-    const next_model = try resolveModel(alloc, default_model, settings.model);
-    if (snapshot.owned_model) |model| alloc.free(model);
-    snapshot.model = next_model.value;
-    snapshot.owned_model = next_model.owned;
     snapshot.permission_mode = try resolvePermissionMode(settings.permission_mode);
     snapshot.agent_step_limit = try resolveAgentStepLimit(default_agent_step_limit, settings.max_agent_steps);
+    if (snapshot.owned_model) |model| alloc.free(model);
+    snapshot.owned_model = null;
+    const selected = selection catch |err| {
+        // Startup refuses this provider, so no model would run.
+        snapshot.model = "";
+        try appendCheck(checks, alloc, "startup", .fail, config_runtime.modelNotSelectedMessage(err) orelse @errorName(err));
+        return;
+    };
+    const model = try alloc.dupe(u8, config_runtime.modelEnvOverride() orelse selected.model);
+    snapshot.model = model;
+    snapshot.owned_model = model;
 
     const detail = try std.fmt.allocPrint(
         alloc,
@@ -244,7 +255,8 @@ fn formatConfigLoadFailure(alloc: Allocator, prefix: []const u8, err: anyerror) 
     return std.fmt.allocPrint(alloc, "{s}: {s}", .{ prefix, @errorName(err) });
 }
 
-fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator, workspace_root: []const u8) !void {
+fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator, workspace_root: []const u8, sessions_v2: bool) !void {
+    if (sessions_v2) return appendV2StateChecks(checks, alloc);
     var store = session_store.Store.initReadOnly(alloc, workspace_root) catch |err| {
         const status: CheckStatus = if (err == error.HomeNotSet) .warn else .fail;
         const detail = try std.fmt.allocPrint(alloc, "failed to inspect workspace state: {s}", .{@errorName(err)});
@@ -288,6 +300,39 @@ fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator, workspace_
         summaries.items.len,
         if (summaries.items.len > 0) summaries.items[0].id else "",
     );
+}
+
+/// Doctor on v2 (D36): reports damaged sessions and removes side folders
+/// whose session is gone. Rebuilds nothing.
+fn appendV2StateChecks(checks: *std.ArrayList(Check), alloc: Allocator) !void {
+    var store = session_adapter.Store.openFromEnv(alloc) catch |err| {
+        const status: CheckStatus = if (err == error.HomeNotSet) .warn else .fail;
+        const detail = try std.fmt.allocPrint(alloc, "failed to inspect sessions v2: {s}", .{@errorName(err)});
+        try appendCheckOwned(checks, alloc, "state", status, detail);
+        return;
+    };
+    defer store.deinit(alloc);
+    var report = session_adapter.doctor(&store, alloc, default_session_diagnostics_limit, io_mod.milliTimestamp()) catch |err| {
+        const detail = try std.fmt.allocPrint(alloc, "failed to inspect sessions v2: {s}", .{@errorName(err)});
+        try appendCheckOwned(checks, alloc, "state", .fail, detail);
+        return;
+    };
+    defer report.deinit(alloc);
+    try appendCheck(checks, alloc, "state", .ok, "sessions v2");
+    for (report.damaged.items) |id| {
+        const detail = try std.fmt.allocPrint(alloc, "session {s} has a damaged log; `fx session recover {s}` copies its good turns", .{ id, id });
+        try appendCheckOwned(checks, alloc, "session", .warn, detail);
+    }
+    if (report.checked < report.sessions) try appendSessionDiagnosticsTruncatedCheck(checks, alloc, report.checked);
+    if (report.removed > 0) {
+        const detail = try std.fmt.allocPrint(alloc, "removed {d} terminal or side folder(s) whose session is gone", .{report.removed});
+        try appendCheckOwned(checks, alloc, "session", .ok, detail);
+    }
+    if (report.kept > 0) {
+        const detail = try std.fmt.allocPrint(alloc, "{d} terminal or side folder(s) whose session is gone could not be removed", .{report.kept});
+        try appendCheckOwned(checks, alloc, "session", .warn, detail);
+    }
+    try appendSessionsCountCheck(checks, alloc, report.sessions, report.latest orelse "");
 }
 
 fn appendSessionDiagnosticsTruncatedCheck(
@@ -505,20 +550,6 @@ fn appendGhCheck(checks: *std.ArrayList(Check), alloc: Allocator) !void {
         return;
     }
     try appendCheck(checks, alloc, "gh", .warn, "GitHub CLI not found in PATH; publish workflows unavailable");
-}
-
-fn resolveModel(alloc: Allocator, default_model: []const u8, configured: ?[]const u8) !ResolvedModel {
-    if (io_mod.getenv("FX_MODEL")) |model| {
-        const trimmed = std.mem.trim(u8, model, " \t\r\n");
-        if (trimmed.len > 0) return .{ .value = trimmed };
-    }
-
-    if (configured) |model| {
-        const owned = try alloc.dupe(u8, model);
-        return .{ .value = owned, .owned = owned };
-    }
-
-    return .{ .value = default_model };
 }
 
 fn resolvePermissionMode(configured: ?types.PermissionMode) !types.PermissionMode {
@@ -811,6 +842,33 @@ test "session count check preserves empty and latest details" {
     try std.testing.expectEqualStrings("sessions", checks.items[1].name);
     try std.testing.expectEqual(CheckStatus.ok, checks.items[1].status);
     try std.testing.expectEqualStrings("2 saved session(s); latest=session-2", checks.items[1].detail);
+}
+
+test "doctor startup check fails when the provider has no model to run" {
+    const alloc = std.testing.allocator;
+    var checks: std.ArrayList(Check) = .empty;
+    defer {
+        for (checks.items) |*entry| entry.deinit(alloc);
+        checks.deinit(alloc);
+    }
+    var snapshot = Snapshot{
+        .workspace_root = "",
+        .model = "default/model",
+        .permission_mode = config_runtime.default_permission_mode,
+        .agent_step_limit = 25,
+        .checks = &.{},
+    };
+
+    try appendResolvedStartupCheck(&snapshot, &checks, alloc, error.CodexModelNotSelected, .{ .max_agent_steps = 7 }, 25);
+    try std.testing.expectEqualStrings("", snapshot.model);
+    try std.testing.expectEqual(@as(usize, 7), snapshot.agent_step_limit);
+    try std.testing.expectEqual(CheckStatus.fail, checks.items[0].status);
+    try std.testing.expect(std.mem.startsWith(u8, checks.items[0].detail, "no Codex model is selected;"));
+
+    try appendResolvedStartupCheck(&snapshot, &checks, alloc, .{ .provider = .codex, .model = "gpt-saved" }, .{}, 25);
+    defer if (snapshot.owned_model) |model| alloc.free(model);
+    try std.testing.expectEqualStrings("gpt-saved", snapshot.model);
+    try std.testing.expectEqual(CheckStatus.ok, checks.items[1].status);
 }
 
 test "bounded doctor warnings use existing check stream" {

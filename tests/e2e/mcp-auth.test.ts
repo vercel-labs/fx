@@ -889,6 +889,152 @@ async function authorizePersonalFixture(activeAuth: AuthFixture, start: URL) {
 }
 
 describe("MCP remote authentication lifecycle", () => {
+  test("generic MCP auth missing a Client ID does not recommend Slack setup", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth, false);
+    const result = await runFx(["mcp", "auth", "fixture"], {
+      cwd: root.workspace,
+      env: { ...baseEnv(root), AI_GATEWAY_API_KEY: undefined },
+    });
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("ClientRegistrationUnavailable");
+    expect(result.stderr).not.toContain("/mcp add slack");
+    expect(existsSync(root.openLog)).toBe(false);
+    expect(auth.tokenExchanges).toBe(0);
+  });
+
+  for (const scenario of ["fresh", "missing-client", "denied"] as const) {
+    test(`Slack preset CLI connects from ${scenario} configuration`, async () => {
+      upstream = startModernMcpHttpFixture("json");
+      auth = startAuthFixture(upstream.url, { slackBridgeClientId: FX_SLACK_CLIENT_ID });
+      const root = createRoot(auth, false, "http", auth.url, false);
+      const profilePath = join(root.home, ".fx", "mcp.json");
+      const other = { type: "http", url: "https://example.test/mcp", enabled: false };
+      if (scenario === "fresh") rmSync(profilePath);
+      else writeFileSync(profilePath, JSON.stringify({ mcp: {
+        other, slack: { type: "http", url: auth.url, operation_timeout_ms: 1234 },
+      } }));
+      const origin = new URL(auth.url).origin;
+      const env = { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: origin, AI_GATEWAY_API_KEY: undefined };
+      const authentication = runFx(["mcp", "add", "slack"], { cwd: root.workspace, env, timeoutMs: 15_000 });
+      expect(await waitForFileText(root.openLog, "/api/slack/auth?", 5_000)).toBe(true);
+      const start = new URL(readFileSync(root.openLog, "utf8").trim());
+      expect(start.searchParams.get("client_id")).toBe(FX_SLACK_CLIENT_ID);
+      expect(start.searchParams.get("scope")).toBe("tools.read");
+      const body = await authorizePersonalFixture(auth, start);
+      if (scenario === "denied") { body.delete("code"); body.set("error", "access_denied"); }
+      const response = await fetch(`http://127.0.0.1:${start.searchParams.get("port")}/slack/oauth/callback`, {
+        method: "POST", headers: { origin }, body, redirect: "manual",
+      });
+      expect(response.status).toBe(303);
+      const result = await authentication;
+      expect(result.stderr).not.toMatch(/panic|abort|segmentation/i);
+      expect(result.stdout + result.stderr).not.toContain(ACCESS_INITIAL);
+      expect(result.stdout + result.stderr).not.toContain(REFRESH_INITIAL);
+      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+      expect(profile.mcp.slack.oauth).toEqual({ client_id: FX_SLACK_CLIENT_ID });
+      if (scenario !== "fresh") {
+        expect(profile.mcp.other.url).toBe(other.url);
+        expect(profile.mcp.other.enabled).toBe(false);
+        expect(profile.mcp.slack.operation_timeout_ms).toBe(1234);
+      }
+      if (scenario === "denied") {
+        expect(result.code).not.toBe(0);
+        expect(result.stderr).toContain("Authorization was declined");
+        expect(result.stdout).not.toContain("Slack connected");
+      } else {
+        expect(result.stderr).toBe("");
+        expect(result.code).toBe(0);
+        expect(result.stdout).toContain("Slack connected. You can now use Slack.");
+        rmSync(root.openLog);
+        const repeated = await runFx(["mcp", "add", "slack"], { cwd: root.workspace, env, timeoutMs: 15_000 });
+        expect(repeated.code).toBe(0);
+        expect(repeated.stdout).toContain("Slack is already connected");
+        expect(existsSync(root.openLog)).toBe(false);
+        expect(auth.tokenExchanges).toBe(1);
+        const removed = await runFx(["mcp", "remove", "slack"], { cwd: root.workspace, env });
+        expect(removed.code).toBe(0);
+        const restored = await runFx(["mcp", "add", "slack"], { cwd: root.workspace, env, timeoutMs: 15_000 });
+        expect(restored.code).toBe(0);
+        expect(JSON.parse(readFileSync(profilePath, "utf8")).mcp.slack.oauth.client_id).toBe(FX_SLACK_CLIENT_ID);
+        expect(auth.tokenExchanges).toBe(1);
+      }
+    }, 45_000);
+  }
+
+  for (const custom of [
+    { type: "http", url: "https://custom.example/mcp" },
+    { type: "http", oauth: { client_id: "another-app" } },
+    { type: "http", headers: { "X-Custom": "custom" } },
+    { type: "local", command: ["custom-slack"] },
+  ]) {
+    test(`Slack preset preserves custom configuration: ${JSON.stringify(custom)}`, async () => {
+      upstream = startModernMcpHttpFixture("json");
+      auth = startAuthFixture(upstream.url, { slackBridgeClientId: FX_SLACK_CLIENT_ID });
+      const root = createRoot(auth, false, "http", auth.url, false);
+      const profilePath = join(root.home, ".fx", "mcp.json");
+      const original = JSON.stringify({ mcp: { slack: { url: auth.url, ...custom } } });
+      writeFileSync(profilePath, original);
+      const result = await runFx(["mcp", "add", "slack"], {
+        cwd: root.workspace, env: { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: new URL(auth.url).origin },
+      });
+      expect(result.code).not.toBe(0);
+      expect(result.stderr).toContain("Slack has custom configuration");
+      expect(readFileSync(profilePath, "utf8")).toBe(original);
+      expect(existsSync(root.openLog)).toBe(false);
+      expect(auth.requests).toHaveLength(0);
+    });
+  }
+
+  for (const entry of ["command", "menu"] as const) {
+    test.skipIf(!tmuxAvailable())(`Slack preset ${entry} connects in the current session`, async () => {
+      upstream = startModernMcpHttpFixture("json");
+      auth = startAuthFixture(upstream.url, { slackBridgeClientId: FX_SLACK_CLIENT_ID });
+      const root = createRoot(auth, false, "http", auth.url, false);
+      rmSync(join(root.home, ".fx", "mcp.json"));
+      const origin = new URL(auth.url).origin;
+      gateway = startFakeGateway([
+        fakeGatewayToolCall("select_slack", "mcp_select_tool", { name: "mcp_slack_echo" }),
+        fakeGatewayToolCall("call_slack", "mcp_slack_echo", { text: "connected" }),
+        fakeGatewayFinalText("Slack tool call complete."),
+      ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+      tui = await TmuxSession.create({
+        isolated: true, cwd: root.workspace, width: 120, height: 34,
+        env: { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: origin, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+      });
+      await tui.waitForComposer(15_000);
+      if (entry === "menu") {
+        await tui.sendText("/mcp");
+        await tui.waitForText("[Servers]", 5_000);
+        await tui.sendKeys("s");
+      } else await tui.sendText("/mcp add slack");
+      expect(await waitForFileText(root.openLog, "/api/slack/auth?", 8_000)).toBe(true);
+      const start = new URL(readFileSync(root.openLog, "utf8").trim());
+      await tui.waitForComposer(5_000);
+      await tui.sendText("/mcp add slack");
+      await tui.waitForText("Slack authorization is already in progress.", 5_000);
+      const body = await authorizePersonalFixture(auth, start);
+      const response = await fetch(`http://127.0.0.1:${start.searchParams.get("port")}/slack/oauth/callback`, {
+        method: "POST", headers: { origin }, body, redirect: "manual",
+      });
+      expect(response.status).toBe(303);
+      const pane = await tui.waitForText("Slack connected. You can now use Slack.", 15_000);
+      expect(pane).not.toContain(ACCESS_INITIAL);
+      expect(tui.paneStatus().dead).toBe(false);
+      await tui.waitForComposer(5_000);
+      await tui.sendText("/mcp list");
+      const menu = await tui.waitForText("[Servers]", 10_000);
+      expect(menu).toMatch(/slack[\s\S]{0,120}Ready/);
+      await tui.sendKeys("Escape");
+      await tui.waitForComposer(5_000);
+      await tui.sendText("Use the connected Slack tool.");
+      await tui.waitForText("Slack tool call complete.", 15_000);
+      expect(upstream.requests.filter((request) => request.message.method === "tools/call")).toHaveLength(1);
+      expect(auth.tokenExchanges).toBe(1);
+    }, 40_000);
+  }
+
   for (const scenario of ["success", "reauth", "no-scopes", "extra-scopes", "denied", "issuer", "exchange", "save"] as const) {
     test(`personal Slack HTTPS bridge completes after persistence: ${scenario}`, async () => {
       const succeeds = ["success", "reauth", "no-scopes", "extra-scopes"].includes(scenario);

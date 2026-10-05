@@ -16,7 +16,7 @@ const Layout = types.Layout;
 const Metrics = types.Metrics;
 const TranscriptRuntime = transcript_runtime.TranscriptRuntime;
 
-const TmuxHistoryClearRunner = *const fn (Allocator, []const u8) anyerror!void;
+const TmuxHistoryClearRunner = *const fn (Allocator, []const []const u8) anyerror!void;
 var tmux_history_clear_test_runner: if (builtin.is_test) ?TmuxHistoryClearRunner else void = if (builtin.is_test) null else {};
 
 const supports_test_pty = switch (builtin.os.tag) {
@@ -305,11 +305,20 @@ fn tmuxScreenIsClear(alloc: Allocator, pane: []const u8) !bool {
 }
 
 fn runTmuxHistoryClear(alloc: Allocator, pane: []const u8) !void {
+    // clear-history also dismisses tmux pane modes. In particular, choose-tree
+    // zooms a split pane and triggers our resize reset while the chooser is open.
+    // Decide inside tmux, not with a separate client-side mode query. -C runs
+    // tmux commands, not a shell; only tmux's own pane_id enters command text.
+    // Keep the explicit target: nested commands need not inherit run-shell's -t.
+    const argv = [_][]const u8{
+        "tmux",                                          "run-shell", "-C", "-t", pane,
+        "#{?pane_in_mode,,clear-history -t #{pane_id}}",
+    };
     if (comptime builtin.is_test) {
-        if (tmux_history_clear_test_runner) |runner| return runner(alloc, pane);
+        if (tmux_history_clear_test_runner) |runner| return runner(alloc, &argv);
     }
     const result = try std.process.run(alloc, io_mod.getIo(), .{
-        .argv = &.{ "tmux", "clear-history", "-t", pane },
+        .argv = &argv,
     });
     defer alloc.free(result.stdout);
     defer alloc.free(result.stderr);
@@ -318,7 +327,7 @@ fn runTmuxHistoryClear(alloc: Allocator, pane: []const u8) !void {
 
 var tmux_history_clear_test_calls: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {};
 
-fn failTmuxHistoryClearForTest(_: Allocator, _: []const u8) !void {
+fn failTmuxHistoryClearForTest(_: Allocator, _: []const []const u8) !void {
     tmux_history_clear_test_calls += 1;
     return error.TestTmuxHistoryClearFailure;
 }
@@ -329,6 +338,28 @@ test "tmux history clear failure does not escape the reset boundary" {
     defer tmux_history_clear_test_runner = null;
 
     clearTmuxHistoryForPane(std.testing.allocator, "%1");
+
+    try std.testing.expectEqual(@as(usize, 1), tmux_history_clear_test_calls);
+}
+
+fn expectModeSafeTmuxHistoryClearForTest(_: Allocator, argv: []const []const u8) !void {
+    tmux_history_clear_test_calls += 1;
+    const expected = [_][]const u8{
+        "tmux",                                          "run-shell", "-C", "-t", "%42",
+        "#{?pane_in_mode,,clear-history -t #{pane_id}}",
+    };
+    try std.testing.expectEqual(expected.len, argv.len);
+    for (expected, argv) |want, actual| {
+        try std.testing.expectEqualStrings(want, actual);
+    }
+}
+
+test "tmux history clear preserves pane modes with a server-owned target" {
+    tmux_history_clear_test_calls = 0;
+    tmux_history_clear_test_runner = expectModeSafeTmuxHistoryClearForTest;
+    defer tmux_history_clear_test_runner = null;
+
+    try runTmuxHistoryClear(std.testing.allocator, "%42");
 
     try std.testing.expectEqual(@as(usize, 1), tmux_history_clear_test_calls);
 }

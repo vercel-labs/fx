@@ -14,9 +14,9 @@ pub const ResolveError = error{
 pub const Profile = command_environment.Profile;
 pub const Environment = command_environment.Environment;
 
-const ShellKind = enum { bash, zsh };
+pub const ShellKind = enum { bash, zsh };
 
-fn shellKind(path: []const u8) ?ShellKind {
+pub fn shellKind(path: []const u8) ?ShellKind {
     const basename = std.fs.path.basename(path);
     if (std.mem.eql(u8, basename, "bash")) return .bash;
     if (std.mem.eql(u8, basename, "zsh")) return .zsh;
@@ -36,7 +36,7 @@ fn supportedLoginShell(configured_login_shell: ?[]const u8) ResolveError![]const
 
 pub const Invocation = struct {
     path: []const u8,
-    values: [6][]const u8 = @splat(""),
+    values: [8][]const u8 = @splat(""),
     len: usize = 0,
 
     pub fn argv(self: *const Invocation) []const []const u8 {
@@ -215,6 +215,138 @@ pub fn capturedInvocation(
             return invocation;
         },
     }
+}
+
+/// Stderr marker, followed by a nonce, that a snapshot bootstrap writes with
+/// exit status 125 when the replay stopped before the command could start.
+pub const snapshot_replay_failure_prefix = "fx-shell-snapshot-replay-failed:";
+
+/// Builds the clean-shell argv for a snapshot run. The shell sources the
+/// replay and the command from stdin, so no snapshot text or command appears
+/// in argv. `failure_marker` reaches stderr, with exit status 125, only when
+/// the replay stopped before the command started.
+pub fn snapshotInvocation(
+    alloc: Allocator,
+    shell_path: []const u8,
+    failure_marker: []const u8,
+) (ResolveError || Allocator.Error)!Invocation {
+    const kind = shellKind(shell_path) orelse return error.UnsupportedShell;
+    var invocation = Invocation{ .path = shell_path };
+    invocation.append(shell_path);
+    switch (kind) {
+        .zsh => invocation.append("-f"),
+        .bash => {
+            invocation.append("--noprofile");
+            invocation.append("--norc");
+            invocation.append("-O");
+            invocation.append("expand_aliases");
+        },
+    }
+    var bootstrap: std.ArrayList(u8) = .empty;
+    errdefer bootstrap.deinit(alloc);
+    try bootstrap.appendSlice(
+        alloc,
+        "\\builtin source /dev/fd/0; __fx_snapshot_status=$?; " ++
+            "if [[ -z ${__fx_snapshot_restored-} ]]; then \\builtin printf '%s' ",
+    );
+    try appendShellWord(&bootstrap, alloc, failure_marker);
+    // Re-raise the common termination signals so the supervisor reports a
+    // signal, as it does when the shell runs the command directly.
+    try bootstrap.appendSlice(
+        alloc,
+        " >&2; \\builtin exit 125; fi; " ++
+            "case $__fx_snapshot_status in 129|130|137|143) " ++
+            "\\builtin kill -$((__fx_snapshot_status - 128)) $$;; esac; " ++
+            "\\builtin exit $__fx_snapshot_status",
+    );
+    invocation.setCommand(try bootstrap.toOwnedSlice(alloc));
+    return invocation;
+}
+
+/// Builds the stdin script for a snapshot run: the replay, the restored flag
+/// the bootstrap checks, and the command. The command is single-quoted so it
+/// is parsed only when `eval` runs, after the replayed aliases exist, and it
+/// runs with stdin from /dev/null so it cannot read the rest of the script.
+pub fn snapshotScript(
+    alloc: Allocator,
+    replay: []const u8,
+    command: []const u8,
+) Allocator.Error![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(alloc);
+    try output.appendSlice(alloc, replay);
+    if (replay.len != 0 and replay[replay.len - 1] != '\n') try output.append(alloc, '\n');
+    try output.appendSlice(alloc, "__fx_snapshot_restored=1\n\\builtin eval -- ");
+    try appendShellWord(&output, alloc, command);
+    try output.appendSlice(alloc, " </dev/null\n");
+    return output.toOwnedSlice(alloc);
+}
+
+/// Payload section markers written by `snapshotCaptureScript`. Each marker is
+/// followed by `:` and the capture nonce.
+pub const snapshot_marker_prefix = "FXSNAP:";
+
+const zsh_capture_script =
+    \\{
+    \\\builtin zmodload zsh/parameter 2>/dev/null
+    \\\builtin printf 'FXSNAP:@NONCE@:ENV\0'
+    \\/usr/bin/env -0
+    \\\builtin printf 'FXSNAP:@NONCE@:NAMES\0'
+    \\\builtin printf '%s\0' ${(k)aliases} ${(k)galiases} ${(k)saliases} ${(k)functions}
+    \\\builtin printf 'FXSNAP:@NONCE@:REPLAY\0'
+    \\\builtin typeset -p fpath
+    \\for __fx_snapshot_name in ${(ko)functions}; do
+    \\  case $__fx_snapshot_name in (_*|prompt_*|__fx_snapshot_*) continue;; esac
+    \\  \builtin functions -- $__fx_snapshot_name
+    \\done
+    \\\builtin alias -L
+    \\\builtin alias -sL
+    \\for __fx_snapshot_name in extendedglob globdots nullglob nomatch kshglob shglob globstarshort bareglobqual caseglob numericglobsort rcexpandparam shwordsplit ksharrays magicequalsubst equals braceccl rcquotes shortloops cshnullglob globsubst; do
+    \\  if [[ -o $__fx_snapshot_name ]]; then
+    \\    \builtin print -r -- "\\builtin setopt $__fx_snapshot_name"
+    \\  else
+    \\    \builtin print -r -- "\\builtin unsetopt $__fx_snapshot_name"
+    \\  fi
+    \\done
+    \\\builtin printf '\0FXSNAP:@NONCE@:END\0'
+    \\} 2>/dev/null
+;
+
+const bash_capture_script =
+    \\{
+    \\\builtin printf 'FXSNAP:@NONCE@:ENV\0'
+    \\/usr/bin/env -0
+    \\\builtin printf 'FXSNAP:@NONCE@:NAMES\0'
+    \\\builtin printf '%s\0' $(\builtin compgen -a) $(\builtin compgen -A function)
+    \\\builtin printf 'FXSNAP:@NONCE@:REPLAY\0'
+    \\for __fx_snapshot_name in $(\builtin compgen -A function); do
+    \\  case $__fx_snapshot_name in _*|__fx_snapshot_*) continue;; esac
+    \\  \builtin declare -f -- "$__fx_snapshot_name"
+    \\done
+    \\\builtin alias -p
+    \\for __fx_snapshot_name in extglob nullglob dotglob globstar nocaseglob failglob nocasematch globasciiranges; do
+    \\  \builtin shopt -p "$__fx_snapshot_name" 2>/dev/null
+    \\done
+    \\\builtin printf '\0FXSNAP:@NONCE@:END\0'
+    \\} 2>/dev/null
+;
+
+/// Builds the script a login shell runs once to capture its state as a
+/// NUL-delimited payload: exported environment, alias and function names, and
+/// a replay of functions, aliases, and selected options. Every section marker
+/// carries `nonce`, so output printed by the user's startup files cannot be
+/// mistaken for the payload. `nonce` must be ASCII hex.
+pub fn snapshotCaptureScript(
+    alloc: Allocator,
+    kind: ShellKind,
+    nonce: []const u8,
+) Allocator.Error![]u8 {
+    for (nonce) |byte| std.debug.assert(std.ascii.isHex(byte));
+    const template = switch (kind) {
+        .zsh => zsh_capture_script,
+        .bash => bash_capture_script,
+    };
+    return std.mem.replaceOwned(u8, alloc, template, "@NONCE@", nonce);
 }
 
 pub fn formatInvocationCommand(

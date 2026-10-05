@@ -400,7 +400,9 @@ pub fn recordSelectedDynamicTools(alloc: Allocator, tools: *std.ArrayList(agent_
     for (execution.selected_dynamic_tools) |selected| try recordSelectedDynamicTool(alloc, tools, selected);
 }
 
-fn recordSelectedDynamicTool(alloc: Allocator, tools: *std.ArrayList(agent_stream_provider.DynamicFunctionTool), selected: @import("../../tooling/tool_mcp_runtime.zig").SelectedTool) !void {
+/// Adds or replaces one selected MCP definition. The parsed schema is
+/// allocated in `alloc`, which must outlive every step that advertises it.
+pub fn recordSelectedDynamicTool(alloc: Allocator, tools: *std.ArrayList(agent_stream_provider.DynamicFunctionTool), selected: @import("../../tooling/tool_mcp_runtime.zig").SelectedTool) !void {
     const name = selected.name;
     const schema_json = selected.schema_json;
     const schema = try std.json.parseFromSliceLeaky(

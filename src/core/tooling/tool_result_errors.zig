@@ -58,6 +58,52 @@ pub fn terminalActionFieldCorrectionJson(
     return try out.toOwnedSlice();
 }
 
+/// Code of the shell failure for a terminal that ended with the fx process
+/// that started it. Such terminals are never reattached.
+pub const terminal_ended_error_code = "TerminalEnded";
+
+pub fn isTerminalEndedFailure(
+    alloc: Allocator,
+    output: []const u8,
+) Allocator.Error!bool {
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        output,
+        .{},
+    ) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => false,
+    };
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |value| value,
+        else => return false,
+    };
+    const error_value = switch (root.get("error") orelse return false) {
+        .object => |value| value,
+        else => return false,
+    };
+    const code = switch (error_value.get("code") orelse return false) {
+        .string => |value| value,
+        else => return false,
+    };
+    return std.mem.eql(u8, code, terminal_ended_error_code);
+}
+
+test "terminal ended failures are recognized only by their exact code" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try isTerminalEndedFailure(
+        alloc,
+        "{\"error\":{\"tool\":\"shell\",\"code\":\"TerminalEnded\"}}",
+    ));
+    try std.testing.expect(!try isTerminalEndedFailure(
+        alloc,
+        "{\"error\":{\"tool\":\"shell\",\"code\":\"TerminalSessionLost\"}}",
+    ));
+    try std.testing.expect(!try isTerminalEndedFailure(alloc, "TerminalEnded"));
+}
+
 pub fn inspectTerminalActionFieldCorrection(
     alloc: Allocator,
     output: []const u8,

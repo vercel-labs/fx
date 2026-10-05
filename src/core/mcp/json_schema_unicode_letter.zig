@@ -6,9 +6,11 @@
 //!
 //! Unicode data is used under https://www.unicode.org/license.txt.
 
-const Range = struct { first: u21, last: u21 };
+const std = @import("std");
 
-const ranges = [_]Range{
+const SourceRange = struct { first: u21, last: u21 };
+
+const source_ranges = [_]SourceRange{
     .{ .first = 0x41, .last = 0x5A },
     .{ .first = 0x61, .last = 0x7A },
     .{ .first = 0xAA, .last = 0xAA },
@@ -633,6 +635,35 @@ const ranges = [_]Range{
     .{ .first = 0x30000, .last = 0x3134A },
 };
 
+const PackedRange = packed struct(u32) {
+    first: u18,
+    span: u14,
+};
+
+const ranges = blk: {
+    @setEvalBranchQuota(10_000);
+    const max_span: u21 = std.math.maxInt(u14);
+    const count = count: {
+        var total: usize = 0;
+        for (source_ranges) |range| {
+            total += @as(usize, @intCast((range.last - range.first) / (max_span + 1))) + 1;
+        }
+        break :count total;
+    };
+    var encoded: [count]PackedRange = undefined;
+    var index: usize = 0;
+    for (source_ranges) |range| {
+        var first = range.first;
+        while (first <= range.last) {
+            const span: u14 = @intCast(@min(range.last - first, max_span));
+            encoded[index] = .{ .first = @intCast(first), .span = span };
+            index += 1;
+            first += @as(u21, span) + 1;
+        }
+    }
+    break :blk encoded;
+};
+
 pub fn contains(codepoint: u21) bool {
     var low: usize = 0;
     var high: usize = ranges.len;
@@ -641,7 +672,7 @@ pub fn contains(codepoint: u21) bool {
         const range = ranges[middle];
         if (codepoint < range.first) {
             high = middle;
-        } else if (codepoint > range.last) {
+        } else if (codepoint > @as(u21, range.first) + range.span) {
             low = middle + 1;
         } else {
             return true;
@@ -651,10 +682,34 @@ pub fn contains(codepoint: u21) bool {
 }
 
 test "Unicode letter ranges include representative scripts and exclude non-letters" {
-    const std = @import("std");
     try std.testing.expect(contains('A'));
     try std.testing.expect(contains('π'));
     try std.testing.expect(contains('界'));
     try std.testing.expect(!contains('1'));
     try std.testing.expect(!contains('!'));
+}
+
+test "packed Unicode letter ranges preserve every scalar classification" {
+    try std.testing.expectEqual(@as(usize, 4), @sizeOf(PackedRange));
+    for (0..0x110000) |raw| {
+        const codepoint: u21 = @intCast(raw);
+        try std.testing.expectEqual(containsSource(codepoint), contains(codepoint));
+    }
+}
+
+fn containsSource(codepoint: u21) bool {
+    var low: usize = 0;
+    var high: usize = source_ranges.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        const range = source_ranges[middle];
+        if (codepoint < range.first) {
+            high = middle;
+        } else if (codepoint > range.last) {
+            low = middle + 1;
+        } else {
+            return true;
+        }
+    }
+    return false;
 }

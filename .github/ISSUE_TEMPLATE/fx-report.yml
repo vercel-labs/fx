@@ -32,3 +32,5 @@ body:
       options:
         - label: I reviewed the information above and removed secrets and other sensitive data.
           required: true
+
+# AGENTS: Use the 'technical-writer' skill when writing the content for this issue.

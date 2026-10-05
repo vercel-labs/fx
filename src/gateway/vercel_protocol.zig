@@ -452,14 +452,21 @@ fn validatePendingToolReviewMessages(
 
 pub fn writeProviderOptions(writer: *std.Io.Writer, options: model_capabilities.ResolvedProviderOptions) !void {
     const routing = options.provider_order.len > 0;
-    const gateway_options = options.fast or options.prompt_caching or routing;
+    if (options.ultrafast and options.provider_strict and routing) {
+        var allows_openai = false;
+        for (options.provider_order) |provider| {
+            if (std.mem.eql(u8, provider, "openai")) allows_openai = true;
+        }
+        if (!allows_openai) return error.UltrafastProviderRestricted;
+    }
+    const gateway_options = options.fast or options.ultrafast or options.prompt_caching or routing;
     if (!gateway_options and options.parallel_tool_calls == null) return;
 
     try writer.writeAll(",\"providerOptions\":{");
     if (gateway_options) {
         try writer.writeAll("\"gateway\":{");
         var needs_comma = false;
-        if (options.fast) {
+        if (options.fast and !options.ultrafast) {
             try writer.writeAll("\"speed\":\"fast\"");
             needs_comma = true;
         }
@@ -468,7 +475,10 @@ pub fn writeProviderOptions(writer: *std.Io.Writer, options: model_capabilities.
             try writer.writeAll("\"caching\":\"auto\"");
             needs_comma = true;
         }
-        if (routing) {
+        if (options.ultrafast) {
+            if (needs_comma) try writer.writeByte(',');
+            try writer.writeAll("\"only\":[\"openai\"]");
+        } else if (routing) {
             if (needs_comma) try writer.writeByte(',');
             try writer.writeAll(if (options.provider_strict) "\"only\":[" else "\"order\":[");
             for (options.provider_order, 0..) |slug, index| {
@@ -479,6 +489,9 @@ pub fn writeProviderOptions(writer: *std.Io.Writer, options: model_capabilities.
         }
         try writer.writeByte('}');
     }
+    if (options.ultrafast) {
+        try writer.writeAll(",\"openai\":{\"serviceTier\":\"ultrafast\"}");
+    }
     if (options.parallel_tool_calls) |parallel_tool_calls| {
         if (gateway_options) try writer.writeByte(',');
         try writer.writeAll("\"xai\":{\"parallelToolCalls\":");
@@ -486,6 +499,16 @@ pub fn writeProviderOptions(writer: *std.Io.Writer, options: model_capabilities.
         try writer.writeByte('}');
     }
     try writer.writeByte('}');
+}
+
+test "Ultrafast serializes only the OpenAI tier and strict OpenAI routing" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeProviderOptions(&out.writer, .{ .ultrafast = true, .fast = true, .prompt_caching = true });
+    try std.testing.expect(std.mem.find(u8, out.written(), "\"openai\":{\"serviceTier\":\"ultrafast\"}") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "\"only\":[\"openai\"]") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "\"speed\"") == null);
+    try std.testing.expectError(error.UltrafastProviderRestricted, writeProviderOptions(&out.writer, .{ .ultrafast = true, .provider_strict = true, .provider_order = &.{"azure"} }));
 }
 
 pub fn validateToolMessageHistory(alloc: std.mem.Allocator, messages: []const ChatMessage) !void {

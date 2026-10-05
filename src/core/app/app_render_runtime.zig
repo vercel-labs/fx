@@ -539,7 +539,7 @@ pub fn Runtime(comptime App: type) type {
         var model_completions_buf: [32][]const u8 = undefined;
         var effort_picker_values_buf: [types.ReasoningEffort.max_options + 1]types.ReasoningEffort = undefined;
         var effort_picker_labels_buf: [types.ReasoningEffort.max_options + 1][]const u8 = undefined;
-        var fast_picker_labels_buf: [2][]const u8 = undefined;
+        var fast_picker_labels_buf: [3][]const u8 = undefined;
         var provider_picker_column: provider_picker_runtime.ColumnBuffer = .{};
         noinline fn footerContext(
             app: *App,
@@ -579,10 +579,16 @@ pub fn Runtime(comptime App: type) type {
                         picker_window_start = app.input_runtime.picker.model_picker_effort_window_start;
                     },
                     .fast => {
-                        for (picker_state.model_picker_fast_options, 0..) |option, i| fast_picker_labels_buf[i] = option;
-                        const count = picker_state.filterCompletionLabels(picker_query.query, fast_picker_labels_buf[0..], fast_picker_labels_buf[0..]);
+                        const count = input_completion_runtime.CompletionRuntime(App).speedPickerLabels(
+                            app,
+                            picker_query.query,
+                            &fast_picker_labels_buf,
+                        );
                         picker_items = fast_picker_labels_buf[0..count];
-                        picker_index = app.input_runtime.picker.model_picker_fast_index;
+                        picker_index = input_completion_runtime.CompletionRuntime(App).speedPickerIndex(
+                            app,
+                            picker_items,
+                        );
                         picker_window_start = app.input_runtime.picker.model_picker_fast_window_start;
                     },
                 }
@@ -702,6 +708,14 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
 
+            var statusline = buildStatuslineItems(app, visible_model);
+            statusline.ultrafast_indicator_active = if (pending_model != null)
+                visible_capabilities.supports_ultrafast_mode and std.mem.eql(u8, pendingPickerSpeed(model_query, app.input_runtime.picker.model_picker_fast_index), "ultrafast")
+            else if (comptime @hasField(@TypeOf(app.worker), "agent_turn_settings"))
+                app.worker.agent_turn_settings.ultrafast_mode
+            else
+                false;
+
             return .{
                 .slash_registry = app.slashRegistry(),
                 .stream = visible_stream,
@@ -709,7 +723,9 @@ pub fn Runtime(comptime App: type) type {
                 .pending_prompt_activity = pendingPromptActivityVisible(app),
                 .completed_assistant_presentation_tail = app.pacer.hasCompletedAssistantPresentationTail(),
                 .writing_response = app.pacer.hasPending(),
-                .has_api_key = app.auth.credentialSource() != null,
+                // A launch credential still loading must not flash "run /login".
+                .has_api_key = app.auth.credentialSource() != null or
+                    (if (comptime @hasDecl(@TypeOf(app.auth), "startupCredentialPending")) app.auth.startupCredentialPending() else false),
                 .model = visible_model,
                 .pending_images = app.pending_images.items,
                 .permission_mode = if (comptime @hasField(App, "permission_engine"))
@@ -837,10 +853,7 @@ pub fn Runtime(comptime App: type) type {
                 .esc_clear_armed = app.input_runtime.gestures.escapeClearArmed(),
                 .esc_interrupt_armed = app.input_runtime.gestures.escapeInterruptArmed(),
                 .question = app.question_prompt.projection(),
-                .statusline = buildStatuslineItems(
-                    app,
-                    visible_model,
-                ),
+                .statusline = statusline,
                 .activity = activityProjection(app),
                 .input = &app.input_runtime,
             };
@@ -886,15 +899,20 @@ pub fn Runtime(comptime App: type) type {
             return items;
         }
 
-        fn pendingPickerFastMode(query: ?picker_state.ModelPickerQuery, fast_index: usize) bool {
+        fn pendingPickerSpeed(query: ?picker_state.ModelPickerQuery, speed_index: usize) []const u8 {
             if (query) |picker_query| {
                 if (picker_query.stage == .fast) {
                     const typed = std.mem.trim(u8, picker_query.query, " \t");
-                    if (std.ascii.eqlIgnoreCase(typed, picker_state.model_picker_fast_options[0])) return false;
-                    if (std.ascii.eqlIgnoreCase(typed, picker_state.model_picker_fast_options[1])) return true;
+                    for (picker_state.model_picker_speed_options) |speed| {
+                        if (std.ascii.eqlIgnoreCase(typed, speed)) return speed;
+                    }
                 }
             }
-            return fast_index % picker_state.model_picker_fast_options.len == 1;
+            return picker_state.model_picker_speed_options[speed_index % picker_state.model_picker_speed_options.len];
+        }
+
+        fn pendingPickerFastMode(query: ?picker_state.ModelPickerQuery, speed_index: usize) bool {
+            return std.mem.eql(u8, pendingPickerSpeed(query, speed_index), "fast");
         }
 
         pub fn flushRequestedFrame(app: *App) !void {

@@ -95,6 +95,7 @@ pub const ModelMenuCatalogState = struct {
     source: ?credentials.Source = null,
     public_only_reason: ?credentials.CatalogPublicOnlyReason = null,
     private_models_hidden: bool = false,
+    from_profile_settings: bool = false,
     failure: ?Failure = null,
 
     pub const Failure = struct {
@@ -301,6 +302,7 @@ pub const Runtime = struct {
     cancel_requested: std.atomic.Value(bool) = .init(false),
     requested_access: ?model_catalog.AccessMetadata = null,
     outcome: CatalogOutcome = .{},
+    from_profile_settings: bool = false,
     menu: ModelMenu = .{},
 
     pub fn init(alloc: Allocator, models_path: []const u8) Self {
@@ -321,6 +323,7 @@ pub const Runtime = struct {
         provider: model_catalog.Provider,
         access: credentials.CatalogAccess,
     ) void {
+        self.from_profile_settings = provider.provider_id == .configured;
         if (!self.beginLoad(access, provider.refresh_interval_ms)) return;
 
         const owned_access = OwnedCatalogAccess.init(self.alloc, access) catch {
@@ -351,6 +354,7 @@ pub const Runtime = struct {
         provider: model_catalog.Provider,
         access: credentials.CatalogAccess,
     ) void {
+        self.from_profile_settings = provider.provider_id == .configured;
         if (!self.beginLoad(access, provider.refresh_interval_ms)) return;
 
         const result = model_catalog.fetchWithPublicFallback(provider, self.alloc, .{
@@ -417,7 +421,7 @@ pub const Runtime = struct {
                     loaded.* = .{ .access = requested_access };
                     self.outcome.last_failure = null;
                     if (self.menu.active) {
-                        self.menu.catalog_state = modelMenuCatalogState(self.outcome);
+                        self.menu.catalog_state = modelMenuCatalogState(self.outcome, self.from_profile_settings);
                     }
                     reused_public_catalog = true;
                 }
@@ -484,6 +488,7 @@ pub const Runtime = struct {
         model_catalog.freeModelCatalog(self.alloc, &self.catalog);
         self.catalog = .empty;
         self.outcome = .{};
+        self.from_profile_settings = false;
     }
 
     /// Installs a catalog that was completely fetched and validated before the
@@ -504,6 +509,7 @@ pub const Runtime = struct {
         self.outcome = .{ .loaded = .{
             .access = model_catalog.AccessMetadata.init(access),
         } };
+        self.from_profile_settings = false;
         self.state = .ready;
         self.completion_pending = true;
         self.last_attempt_ms = io_mod.milliTimestamp();
@@ -796,7 +802,7 @@ pub const Runtime = struct {
             },
             .ready => try hydrateMenuSnapshot(self.alloc, menu, self.catalog.items),
         }
-        menu.catalog_state = modelMenuCatalogState(self.outcome);
+        menu.catalog_state = modelMenuCatalogState(self.outcome, self.from_profile_settings);
     }
 };
 
@@ -804,7 +810,7 @@ fn boolLabel(value: bool) []const u8 {
     return if (value) "true" else "false";
 }
 
-fn modelMenuCatalogState(outcome: CatalogOutcome) ModelMenuCatalogState {
+fn modelMenuCatalogState(outcome: CatalogOutcome, from_profile_settings: bool) ModelMenuCatalogState {
     const access = if (outcome.last_failure) |failed|
         if (outcome.loaded == null or failed.anonymous_fallback_used)
             failed.access
@@ -825,6 +831,7 @@ fn modelMenuCatalogState(outcome: CatalogOutcome) ModelMenuCatalogState {
         .source = access.source,
         .public_only_reason = access.public_only_reason,
         .private_models_hidden = access.private_models_may_be_hidden,
+        .from_profile_settings = from_profile_settings,
         .failure = if (failure) |failed| .{
             .category = failed.category,
             .retryable = failed.retryable,
@@ -1450,6 +1457,7 @@ test "model menu owns resolved catalog state and filters without changing catalo
             .has_file_input = true,
             .has_web_search = true,
             .supports_fast_mode = true,
+            .supports_ultrafast_mode = true,
         },
         .{
             .id = @constCast("private/blue-hornbill"),
@@ -1472,6 +1480,7 @@ test "model menu owns resolved catalog state and filters without changing catalo
     try std.testing.expect(runtime.menu.itemAt(0).?.capabilities.supports_vision);
     try std.testing.expectEqual(@as(?u32, 256_000), runtime.menu.itemAt(0).?.capabilities.context_window);
     try std.testing.expect(runtime.menu.itemAt(1).?.capabilities.supports_fast_mode);
+    try std.testing.expect(runtime.menu.itemAt(1).?.capabilities.supports_ultrafast_mode);
     try std.testing.expect(runtime.menu.itemAt(1).?.capabilities.supports_file_input);
     try std.testing.expect(runtime.menu.itemAt(1).?.capabilities.supports_web_search);
 

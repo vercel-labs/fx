@@ -223,7 +223,18 @@ pub fn observe(
     };
 }
 
-pub fn syncOwned(ctx: Context) !void {
+pub const SyncOutcome = enum {
+    /// The requested terminal is indexed, or this owner has no such terminal.
+    indexed,
+    /// The requested terminal ended with the fx process that started it.
+    ended_with_owner,
+};
+
+/// Indexes this owner's terminals that the managed runtime does not know yet,
+/// which happens after resume. Listing reconciles them first, so a terminal
+/// whose owning fx process is gone reads as lost. Such terminals are never
+/// reattached or indexed; `requested_session_id` reports whether it is one.
+pub fn syncOwned(ctx: Context, requested_session_id: []const u8) !SyncOutcome {
     var catalog_authority = try reloadOwnerCatalogAuthority(ctx);
     defer catalog_authority.deinit();
     var listed = try execute(ctx, .{ .list = .{
@@ -237,10 +248,19 @@ pub fn syncOwned(ctx: Context) !void {
             else => return error.InvalidTerminalResult,
         },
     };
+    var outcome: SyncOutcome = .indexed;
     for (sessions) |facts| {
         if (facts.lifecycle == .closed or
             ctx.managed_runtime.backendFor(facts.session_id) != null)
         {
+            continue;
+        }
+        // This process starts and indexes its own terminals, so an unknown
+        // lost terminal belonged to an fx process instance that has exited.
+        if (facts.lifecycle == .lost) {
+            if (std.mem.eql(u8, facts.session_id, requested_session_id)) {
+                outcome = .ended_with_owner;
+            }
             continue;
         }
         var authority = try reloadAuthority(ctx, facts.session_id);
@@ -285,6 +305,7 @@ pub fn syncOwned(ctx: Context) !void {
             prepared.reservation_id,
         );
     }
+    return outcome;
 }
 
 fn resolveCompletedStatus(

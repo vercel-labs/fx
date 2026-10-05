@@ -123,6 +123,7 @@ test("resume writes a replay cache and replays identically with it corrupt or mi
     fakeGatewayFinalText("CACHE_CONTINUED_TURN"),
     fakeGatewayFinalText("CACHE_CORRUPTED_TURN"),
     fakeGatewayFinalText("CACHE_REBUILT_TURN"),
+    fakeGatewayFinalText("CACHE_UPGRADED_TURN"),
   ]);
   try {
     const id = await createSavedSession(fixture, gateway);
@@ -163,6 +164,19 @@ test("resume writes a replay cache and replays identically with it corrupt or mi
     expect(gateway.requests[3]!.body).toContain("CACHE_CORRUPTED_TURN");
     expect(existsSync(cachePath)).toBe(true);
     expect(statSync(cachePath).size).toBeGreaterThan(baselineSize);
+
+    const versionOffset = Buffer.byteLength("fx-history-cache\x1a\n");
+    const outdatedCache = readFileSync(cachePath);
+    expect(outdatedCache.readBigUInt64LE(versionOffset)).toBe(3n);
+    outdatedCache.writeBigUInt64LE(2n, versionOffset);
+    writeFileSync(cachePath, outdatedCache, { mode: 0o600 });
+    const upgraded = await continueSession(fixture, gateway, id);
+    expect(upgraded.code).toBe(0);
+    expect(upgraded.stderr).toBe("");
+    expect(JSON.parse(upgraded.stdout).output).toBe("CACHE_UPGRADED_TURN");
+    expect(gateway.requests[4]!.body).toContain("CACHE_REBUILT_TURN");
+    expect(gateway.requests[4]!.body).toContain("CACHE_BASELINE_TURN");
+    expect(readFileSync(cachePath).readBigUInt64LE(versionOffset)).toBe(3n);
   } finally {
     gateway.stop();
     rmSync(fixture.root, { recursive: true, force: true });

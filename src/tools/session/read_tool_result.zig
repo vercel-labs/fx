@@ -4,6 +4,7 @@ const command_replay_store = @import("../../core/session/command_replay_store.zi
 const session_child_store = @import("../../core/session/session_child_store.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
+const compactor = @import("../../core/compactor/compactor.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -20,6 +21,9 @@ pub const Input = struct {
             byte_count: usize = result_store.read_default_bytes,
         },
         query: []u8,
+        /// Searches every turn, tool call and earlier compaction saved by
+        /// context compaction.
+        search: [][]u8,
     } = .{ .range = .{} },
 
     pub fn deinit(self: *Input, alloc: Allocator) void {
@@ -27,6 +31,10 @@ pub const Input = struct {
         switch (self.selector) {
             .range => {},
             .query => |query| alloc.free(query),
+            .search => |phrases| {
+                for (phrases) |phrase| alloc.free(phrase);
+                alloc.free(phrases);
+            },
         }
         self.* = .{ .handle = &.{} };
     }
@@ -46,6 +54,7 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
         }
         break :blk request.object;
     } else parsed.value.object;
+    if (args.get("search")) |value| return decodeSearch(ctx.allocator, value);
     const handle_value = args.get("handle") orelse {
         return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result requires string field \"handle\"") };
     };
@@ -82,6 +91,34 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
     return .{ .input = .{ .ptr = input, .deinit_fn = inputDeinit } };
 }
 
+fn decodeSearch(alloc: Allocator, value: std.json.Value) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
+    const invalid = std.fmt.comptimePrint("read_tool_result field \"search\" must be 1 to {d} non-empty strings", .{compactor.max_search_phrases});
+    const items: []const std.json.Value = switch (value) {
+        .string => (&value)[0..1],
+        .array => |array| array.items,
+        else => return .{ .failure = try alloc.dupe(u8, invalid) },
+    };
+    if (items.len == 0 or items.len > compactor.max_search_phrases) return .{ .failure = try alloc.dupe(u8, invalid) };
+    for (items) |item| {
+        if (item != .string or std.mem.trim(u8, item.string, " \t\r\n").len == 0) return .{ .failure = try alloc.dupe(u8, invalid) };
+    }
+    const input = try alloc.create(Input);
+    errdefer alloc.destroy(input);
+    input.* = .{ .handle = &.{} };
+    const phrases = try alloc.alloc([]u8, items.len);
+    var copied: usize = 0;
+    errdefer {
+        for (phrases[0..copied]) |phrase| alloc.free(phrase);
+        alloc.free(phrases);
+    }
+    for (items, phrases) |item, *phrase| {
+        phrase.* = try alloc.dupe(u8, item.string);
+        copied += 1;
+    }
+    input.selector = .{ .search = phrases };
+    return .{ .input = .{ .ptr = input, .deinit_fn = inputDeinit } };
+}
+
 fn parsePositiveInteger(value: std.json.Value) ?i64 {
     if (value != .integer or value.integer < 1) return null;
     return value.integer;
@@ -105,8 +142,18 @@ fn classifyHandleNormalization(handle: []const u8) HandleNormalization {
 
 pub fn validate(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput) tool_dispatch.DispatchError!?[]u8 {
     const input = erased.as(Input);
+    if (input.selector == .search) return null;
     const normalization = classifyHandleNormalization(input.handle);
     if (normalization.trimmed.len == 0) return try ctx.allocator.dupe(u8, "read_tool_result field \"handle\" must not be empty");
+    var record_buffer: compactor.RecordFileBuffer = undefined;
+    if (compactor.recordFile(&record_buffer, normalization.trimmed)) |file| {
+        // A turn, tool call or earlier compaction saved by compaction, opened
+        // by its ID (M12, T12, L2).
+        const owned = try ctx.allocator.dupe(u8, file);
+        ctx.allocator.free(input.handle);
+        input.handle = owned;
+        return null;
+    }
     if (normalization.suffix.len > 0 or !std.mem.eql(u8, input.handle, normalization.trimmed)) {
         const owned = try std.mem.concat(ctx.allocator, u8, &.{ normalization.trimmed, normalization.suffix });
         ctx.allocator.free(input.handle);
@@ -117,6 +164,16 @@ pub fn validate(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolIn
 
 pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const input = erased.as(Input);
+    if (input.selector == .search) {
+        const capability = ctx.session_child_capability orelse return .{
+            .failure = try ctx.allocator.dupe(u8, "Nothing is saved: this session has no tool-result store."),
+        };
+        const queries: []const []const u8 = input.selector.search;
+        const output = compactor.search(ctx.allocator, result_store.compactorStore(capability), queries) catch |err| return .{
+            .failure = try std.fmt.allocPrint(ctx.allocator, "Searching saved turns, tool calls and earlier compactions failed: {s}", .{@errorName(err)}),
+        };
+        return .{ .success = output };
+    }
     if (result_store.isImageHandle(input.handle)) {
         const capability = ctx.session_child_capability orelse return .{
             .failure = try ctx.allocator.dupe(u8, "No active session image store is available."),
@@ -152,6 +209,7 @@ fn readOutput(ctx: tool_dispatch.DispatchContext, input: *Input) ![]u8 {
         const ordinary = switch (input.selector) {
             .query => |query| result_store.searchByQueryManaged(ctx.allocator, capability, input.handle, query),
             .range => |range| result_store.readByRangeManaged(ctx.allocator, capability, input.handle, range.start_byte, range.byte_count),
+            .search => unreachable,
         };
         return ordinary catch |err| switch (err) {
             error.ResultHandleNotFound => switch (input.selector) {
@@ -169,6 +227,7 @@ fn readOutput(ctx: tool_dispatch.DispatchContext, input: *Input) ![]u8 {
                     range.start_byte,
                     range.byte_count,
                 ),
+                .search => unreachable,
             },
             else => return err,
         };
@@ -190,6 +249,7 @@ fn readOutput(ctx: tool_dispatch.DispatchContext, input: *Input) ![]u8 {
                 range.start_byte,
                 range.byte_count,
             ),
+            .search => unreachable,
         };
     }
 
@@ -197,6 +257,7 @@ fn readOutput(ctx: tool_dispatch.DispatchContext, input: *Input) ![]u8 {
     return switch (input.selector) {
         .query => |query| result_store.searchByQuery(ctx.allocator, dir, input.handle, query),
         .range => |range| result_store.readByRange(ctx.allocator, dir, input.handle, range.start_byte, range.byte_count),
+        .search => unreachable,
     };
 }
 
@@ -234,6 +295,7 @@ test "read_tool_result decodes range and query inputs" {
             try std.testing.expectEqual(@as(usize, 9), range.byte_count);
         },
         .query => return error.TestUnexpectedDecodeFailure,
+        .search => return error.TestUnexpectedDecodeFailure,
     }
 
     const decoded_query = try decode(.{ .allocator = alloc }, "{\"handle\":\"h.txt\",\"query\":\"needle\"}");
@@ -247,6 +309,7 @@ test "read_tool_result decodes range and query inputs" {
     switch (typed_query.selector) {
         .query => |query| try std.testing.expectEqualStrings("needle", query),
         .range => return error.TestUnexpectedDecodeFailure,
+        .search => return error.TestUnexpectedDecodeFailure,
     }
 }
 
@@ -266,6 +329,7 @@ test "read_tool_result decodes nested model requests" {
     switch (typed.selector) {
         .query => |query| try std.testing.expectEqualStrings("needle", query),
         .range => return error.TestUnexpectedDecodeFailure,
+        .search => return error.TestUnexpectedDecodeFailure,
     }
 }
 
@@ -287,6 +351,7 @@ test "read_tool_result treats exact empty legacy query as range" {
             try std.testing.expectEqual(@as(usize, 9), range.byte_count);
         },
         .query => return error.TestUnexpectedDecodeFailure,
+        .search => return error.TestUnexpectedDecodeFailure,
     }
 }
 
@@ -348,6 +413,7 @@ test "read_tool_result admission treats an empty query as a range read" {
             try std.testing.expectEqual(@as(usize, 9), range.byte_count);
         },
         .query => return error.TestUnexpectedQuery,
+        .search => return error.TestUnexpectedQuery,
     }
 }
 
@@ -537,4 +603,65 @@ test "persisted provider search results remain readable" {
     const result = try call(.{ .allocator = alloc, .tool_result_dir = dir }, input);
     defer result.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, result.success, "historical provider search result") != null);
+}
+
+test "read_tool_result opens and searches turns and tool calls saved by compaction" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+    var capability = try session_child_store.SessionChildCapability.initLegacyRoute(alloc, dir, .tool_results, .writable);
+    defer capability.deinit();
+    const saved = [_]struct { []const u8, []const u8 }{
+        .{ "T12", "T12 shell: zig build test\nCall ID: c12\n\nResult:\nall tests passed\n" },
+        .{ "M3", "M3 turn: run the tests\nUser 3:\nrun the tests\n\nAssistant, final reply:\nThey pass.\n" },
+    };
+    for (saved) |record| {
+        const id, const content = record;
+        var name: compactor.RecordFileBuffer = undefined;
+        var entry = try capability.atomicReplace(alloc, .tool_results, compactor.recordFile(&name, id).?, content);
+        entry.deinit(alloc);
+    }
+    const ctx: tool_dispatch.DispatchContext = .{ .allocator = alloc, .session_child_capability = &capability };
+    const requests = [_]struct { []const u8, []const u8 }{
+        .{ "{\"request\":{\"handle\":\"T12\"}}", "T12" },
+        .{ "{\"request\":{\"handle\":\"t12\",\"query\":\"passed\"}}", "all tests passed" },
+        .{ "{\"request\":{\"handle\":\"M3\"}}", "They pass." },
+        .{ "{\"request\":{\"search\":[\"zig build\",\"missing phrase\"]}}", "[1] T12 shell" },
+        .{ "{\"request\":{\"search\":\"run the tests\"}}", "[1] M3 turn" },
+    };
+    for (requests) |request| {
+        const args, const expected = request;
+        const decoded = try decode(ctx, args);
+        const input = switch (decoded) {
+            .input => |value| value,
+            .failure => |text| {
+                alloc.free(text);
+                return error.TestUnexpectedDecodeFailure;
+            },
+        };
+        defer input.deinit(alloc);
+        if (try validate(ctx, input)) |text| {
+            alloc.free(text);
+            return error.TestUnexpectedValidationFailure;
+        }
+        const result = try call(ctx, input);
+        defer result.deinit(alloc);
+        switch (result) {
+            .success => |text| try std.testing.expect(std.mem.find(u8, text, expected) != null),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    for ([_][]const u8{
+        "{\"request\":{\"search\":[\"a\",\"b\",\"c\",\"d\"]}}",
+        "{\"request\":{\"search\":[]}}",
+        "{\"request\":{\"search\":[\" \"]}}",
+    }) |args| switch (try decode(ctx, args)) {
+        .failure => |text| alloc.free(text),
+        .input => |value| {
+            value.deinit(alloc);
+            return error.TestExpectedDecodeFailure;
+        },
+    };
 }

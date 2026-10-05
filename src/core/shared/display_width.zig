@@ -1,6 +1,41 @@
 const std = @import("std");
 const unicode_data = @import("unicode_display_data.zig");
 
+const PackedRange = packed struct(u32) {
+    first: u18,
+    span: u14,
+};
+
+fn packedRangeCount(comptime source: []const unicode_data.Range) comptime_int {
+    const max_span: u21 = std.math.maxInt(u14);
+    var count: usize = 0;
+    for (source) |range| {
+        count += @as(usize, @intCast((range.last - range.first) / (max_span + 1))) + 1;
+    }
+    return count;
+}
+
+fn packRanges(comptime source: []const unicode_data.Range) [packedRangeCount(source)]PackedRange {
+    const max_span: u21 = std.math.maxInt(u14);
+    var encoded: [packedRangeCount(source)]PackedRange = undefined;
+    var index: usize = 0;
+    for (source) |range| {
+        var first = range.first;
+        while (first <= range.last) {
+            const span: u14 = @intCast(@min(range.last - first, max_span));
+            encoded[index] = .{ .first = @intCast(first), .span = span };
+            index += 1;
+            first += @as(u21, span) + 1;
+        }
+    }
+    return encoded;
+}
+
+const wide_ranges = packRanges(&unicode_data.wide_ranges);
+const emoji_presentation_ranges = packRanges(&unicode_data.emoji_presentation_ranges);
+const emoji_modifier_ranges = packRanges(&unicode_data.emoji_modifier_ranges);
+const variation_bases = packRanges(&unicode_data.variation_bases);
+
 const RgiNode = packed struct(u32) {
     edge_start: u13,
     edge_len: u8,
@@ -213,10 +248,10 @@ pub noinline fn displayUnitAt(text: []const u8, index: usize) DisplayUnit {
 
     const first = decodeNextRune(text, index);
     const next_index = index + first.len;
-    if (next_index < text.len and isInRanges(first.codepoint, unicode_data.variation_bases[0..])) {
+    if (next_index < text.len and isInRanges(first.codepoint, &variation_bases)) {
         const selector = decodeNextRune(text, next_index);
         if (selector.codepoint == 0xfe0e) {
-            const cell_width: usize = if (isInRanges(first.codepoint, unicode_data.wide_ranges[0..])) 2 else 1;
+            const cell_width: usize = if (isInRanges(first.codepoint, &wide_ranges)) 2 else 1;
             return .{ .byte_len = first.len + selector.len, .cell_width = cell_width };
         }
         if (selector.codepoint == 0xfe0f) {
@@ -241,8 +276,8 @@ noinline fn runeWidth(codepoint: u21) usize {
     if (codepoint == 0) return 0;
     if (codepoint < 32 or (codepoint >= 0x7f and codepoint < 0xa0)) return 0;
     if (isZeroWidthContinuation(codepoint)) return 0;
-    if (isInRanges(codepoint, unicode_data.wide_ranges[0..]) or
-        isInRanges(codepoint, unicode_data.emoji_presentation_ranges[0..])) return 2;
+    if (isInRanges(codepoint, &wide_ranges) or
+        isInRanges(codepoint, &emoji_presentation_ranges)) return 2;
     return 1;
 }
 
@@ -355,7 +390,7 @@ fn isCombining(codepoint: u21) bool {
 
 fn isZeroWidthContinuation(codepoint: u21) bool {
     return isCombining(codepoint) or
-        isInRanges(codepoint, unicode_data.emoji_modifier_ranges[0..]) or
+        isInRanges(codepoint, &emoji_modifier_ranges) or
         codepoint == 0x200c or
         codepoint == 0x200d or
         (codepoint >= 0x200b and codepoint <= 0x200f) or
@@ -366,7 +401,24 @@ fn isZeroWidthContinuation(codepoint: u21) bool {
         (codepoint >= 0xe0100 and codepoint <= 0xe01ef);
 }
 
-fn isInRanges(codepoint: u21, ranges: []const unicode_data.Range) bool {
+fn isInRanges(codepoint: u21, ranges: []const PackedRange) bool {
+    var low: usize = 0;
+    var high = ranges.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        const range = ranges[middle];
+        if (codepoint < range.first) {
+            high = middle;
+        } else if (codepoint > @as(u21, range.first) + range.span) {
+            low = middle + 1;
+        } else {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn isInSourceRanges(codepoint: u21, ranges: []const unicode_data.Range) bool {
     var low: usize = 0;
     var high = ranges.len;
     while (low < high) {
@@ -421,6 +473,17 @@ fn findTrieChild(node_index: u32, codepoint: u21) ?u32 {
 
 test "RGI runtime lookup data stays within the measured size budget" {
     try std.testing.expect(@sizeOf(RgiData) <= 22_272);
+}
+
+test "packed display ranges preserve every scalar classification" {
+    try std.testing.expectEqual(@as(usize, 4), @sizeOf(PackedRange));
+    for (0..0x110000) |raw| {
+        const codepoint: u21 = @intCast(raw);
+        try std.testing.expectEqual(isInSourceRanges(codepoint, &unicode_data.wide_ranges), isInRanges(codepoint, &wide_ranges));
+        try std.testing.expectEqual(isInSourceRanges(codepoint, &unicode_data.emoji_presentation_ranges), isInRanges(codepoint, &emoji_presentation_ranges));
+        try std.testing.expectEqual(isInSourceRanges(codepoint, &unicode_data.emoji_modifier_ranges), isInRanges(codepoint, &emoji_modifier_ranges));
+        try std.testing.expectEqual(isInSourceRanges(codepoint, &unicode_data.variation_bases), isInRanges(codepoint, &variation_bases));
+    }
 }
 
 test "prefixByWidth avoids cutting emoji bytes" {

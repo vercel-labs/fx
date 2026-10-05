@@ -162,6 +162,20 @@ pub fn authenticatedPost(
     retry_policy: AuthRetryPolicy,
     producing_identity: ?*catalog_freshness.Digest,
 ) !streamable_http.PostResponse {
+    if (server.config.acp_server_id) |server_id| {
+        // Host-channel servers carry no HTTP headers or credentials.
+        const carrier = server.message_carrier orelse return error.McpTransportUnavailable;
+        // Every exchange shares the identity of an empty header set, so paged
+        // catalogs from one registration always match.
+        if (producing_identity) |identity| identity.* = try authIdentityForHeaders(request_alloc, &.{});
+        return .{ .body = try carrier.exchange(request_alloc, .{
+            .server_id = server_id,
+            .frame = initial_options.request_body,
+            .control = initial_options.control,
+            .precommit = initial_options.precommit,
+            .max_response_bytes = initial_options.max_response_bytes,
+        }) };
+    }
     var options = initial_options;
     var authorization_attempts: u8 = 0;
     while (true) {

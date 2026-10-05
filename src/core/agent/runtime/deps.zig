@@ -32,6 +32,19 @@ const ToolExecutionResult = tool_contracts.ToolExecutionResult;
 const TransportPublicationOutcome = tool_contracts.TransportPublicationOutcome;
 pub const LiveToolAuthority = tool_contracts.LiveToolAuthority;
 
+/// The turn so far: the user's message and every piece completed since.
+/// Borrowed only for the call; a sink copies or serializes what it keeps.
+pub const TurnProgress = struct {
+    user: types.UserTurn,
+    execution: types.ExecutionMemory,
+    /// Tool calls the model issued that have no result yet, in their saved
+    /// form, so a crash while they run leaves them in the session (D28).
+    running_calls: []const types.ToolCall = &.{},
+    /// The text of the message that issued `running_calls`, so a crash also
+    /// leaves what fx already showed (D51).
+    running_assistant: ?[]const u8 = null,
+};
+
 /// Borrows checkpoint slices only for the call. A sink must synchronously copy
 /// or serialize anything it retains, including when a save fails.
 pub const RecoveryCheckpointEffect = struct {
@@ -216,6 +229,10 @@ pub const AgentRuntimeDeps = struct {
     append_static_context: ?*const fn (ctx: *anyopaque, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(ChatMessage)) anyerror!void = null,
     validate_tool_call: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall) anyerror!ToolCallValidationResult = null,
     snapshot_mcp_definition: ?*const fn (*anyopaque, Allocator, []const u8, types.McpToolBinding) anyerror!@import("../../tooling/tool_mcp_runtime.zig").DefinitionSnapshot = null,
+    /// Resolves a model call naming a live MCP tool that this step did not
+    /// advertise. A returned definition is advertised before admission, so
+    /// the call runs under the normal MCP validation and permission path.
+    resolve_unselected_mcp_tool: ?*const fn (ctx: *anyopaque, arena: Allocator, name: []const u8) anyerror!?@import("../../tooling/tool_mcp_runtime.zig").SelectedTool = null,
     prepare_skill_call: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, locations: ?*const skill_contract.Locations) anyerror!skill_contract.CallPreparation = null,
     check_tool_availability: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall) anyerror!?[]const u8 = null,
     request_tool_permission: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?LiveToolAuthority, revalidation: ?tool_contracts.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8, mcp_review_schema_json: ?[]const u8) anyerror!command_admission.PermissionOutcome,
@@ -236,6 +253,9 @@ pub const AgentRuntimeDeps = struct {
     /// Call-scoped output for the exact error returned through compaction, never retained.
     compaction_failure: ?*?compaction_activity.ErrorProvenance = null,
     recovery_checkpoint: ?RecoveryCheckpointEffect = null,
+    /// Called at every model-request boundary with the turn so far, so each
+    /// completed piece is saved as it happens rather than at the turn's end.
+    append_turn_piece: ?*const fn (ctx: *anyopaque, progress: TurnProgress) anyerror!void = null,
     propagate_grant: *const fn (ctx: *anyopaque, tool_name: []const u8, target_path: []const u8) anyerror!void,
     push_event: *const fn (ctx: *anyopaque, event: WorkerEvent) anyerror!void,
     push_text: *const fn (ctx: *anyopaque, emission: TextEmission) anyerror!void,

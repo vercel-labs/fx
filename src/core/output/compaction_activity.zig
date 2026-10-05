@@ -3,7 +3,7 @@ const std = @import("std");
 /// Process-local identity, distinct from a turn: one turn can compact repeatedly.
 pub const OperationId = enum(u64) { _ };
 pub const Origin = enum { manual, automatic, provider_overflow };
-pub const Stage = enum { preparation, summary, validation, publication };
+pub const Stage = enum { preparation, summary, publication };
 pub const Publication = enum { not_published, committed, uncertain };
 pub const Outcome = enum { succeeded, no_op, busy, cancelled, failed };
 
@@ -163,7 +163,7 @@ test "compaction activity is bounded and rejects stale updates and dismissals" {
     const overflow = state.begin(.provider_overflow, 7, 60);
     try std.testing.expect(manual != auto and auto != overflow);
     try std.testing.expect(state.snapshot.revision > settled.revision);
-    state.settle(auto, failure(error.InvalidCompactionHandoff, .validation, false), 70);
+    state.settle(auto, failure(error.ConnectionTimedOut, .summary, false), 70);
     try std.testing.expect(!state.dismiss(manual, settled.revision));
     try std.testing.expectEqual(overflow, state.snapshot.operation.?.id);
     state.stopping(overflow);

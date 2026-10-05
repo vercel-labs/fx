@@ -12,6 +12,7 @@ const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const elicitation = @import("../core/mcp/elicitation.zig");
 const streamable_http = @import("../core/mcp/streamable_http.zig");
+const slack_preset = @import("../core/mcp/slack_preset.zig");
 const profile_paths = @import("../core/shared/profile_paths.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 
@@ -21,7 +22,7 @@ const CommandResult = command_provider_contract.Result;
 const McpServerConfig = mcp_contract.McpServerConfig;
 const McpTransport = mcp_contract.McpTransport;
 
-const add_usage = "usage: /mcp add <name> <command> [args...] or /mcp add --transport http <name> <url>";
+const add_usage = "usage: /" ++ @import("../core/slash_commands/command_specs.zig").mcp_add_usage;
 const profile_lock_deadline_ms: u64 = 2_000;
 
 pub const command_provider = command_provider_contract.Provider{ .handle_fn = handleCommand };
@@ -303,6 +304,7 @@ fn handleCommand(alloc: Allocator, rest: []const u8, command_request: CommandReq
             ),
         };
         const warning = addProfileServerToPath(alloc, config_path, intent) catch |err| {
+            if (err == error.SlackConfigurationConflict) return lineLiteral(alloc, slack_preset.configuration_conflict, false);
             return lineParts(
                 alloc,
                 &.{ "Failed to save MCP server config: ", @errorName(err), "." },
@@ -310,9 +312,20 @@ fn handleCommand(alloc: Allocator, rest: []const u8, command_request: CommandReq
             );
         };
         const name = switch (intent) {
+            .slack => "slack",
             .local => |local| local.name,
             .http => |http| http.name,
         };
+        if (intent == .slack) {
+            const message = "Connecting Slack. Keep fx running while you authorize in your browser.";
+            var result = if (warning) |value| result: {
+                const warning_text = try renderProfileWarning(alloc, value);
+                defer alloc.free(warning_text);
+                break :result try lineParts(alloc, &.{ warning_text, "\n", message }, true);
+            } else try lineLiteral(alloc, message, true);
+            result.connect_slack = true;
+            return result;
+        }
         if (warning) |value| {
             const warning_text = try renderProfileWarning(alloc, value);
             defer alloc.free(warning_text);
@@ -830,7 +843,9 @@ fn addProfileServerToPath(
     path: []const u8,
     intent: command_provider_contract.AddIntent,
 ) !?project_config.ProfileDiagnostic {
+    if (intent == .slack) return addSlackToPath(alloc, path);
     const next = switch (intent) {
+        .slack => unreachable,
         .local => |local| try configFromCommandParts(alloc, local.name, local.command, local.args),
         .http => |http| blk: {
             const owned_name = try alloc.dupe(u8, http.name);
@@ -845,6 +860,49 @@ fn addProfileServerToPath(
         },
     };
     return addOrReplaceServer(alloc, path, next);
+}
+
+fn addSlackToPath(alloc: Allocator, path: []const u8) !?project_config.ProfileDiagnostic {
+    var lock = try acquireProfileMutationLock(path);
+    defer lock.release();
+    var document = try loadProfileDocumentFromPath(alloc, path);
+    defer document.deinit(alloc);
+    if (!document.mutation_allowed) return error.McpConfigAmbiguousServerKey;
+    const endpoint = try slack_preset.endpoint_alloc(alloc);
+    defer alloc.free(endpoint);
+    for (document.configs.items) |*existing| {
+        if (!std.mem.eql(u8, existing.name, "slack")) continue;
+        if (existing.transport != .http or existing.url == null or
+            !std.mem.eql(u8, existing.url.?, endpoint) or
+            existing.headers.len > 0 or existing.header_env.len > 0 or existing.bearer_token_env != null)
+            return error.SlackConfigurationConflict;
+        if (existing.auth) |auth| {
+            if (auth.client_id) |id| {
+                if (!std.mem.eql(u8, id, slack_preset.client_id)) return error.SlackConfigurationConflict;
+            }
+            if (auth.resource != null or auth.issuer != null or auth.client_secret_env != null or auth.client_metadata_url != null)
+                return error.SlackConfigurationConflict;
+        }
+        if (existing.auth == null) existing.auth = .{};
+        if (existing.auth.?.client_id == null) existing.auth.?.client_id = try alloc.dupe(u8, slack_preset.client_id);
+        existing.enabled = true;
+        existing.allow_stored_credentials = true;
+        try saveConfigsToPath(alloc, path, document.configs.items);
+        return document.diagnostic;
+    }
+    var next = McpServerConfig{
+        .name = try alloc.dupe(u8, "slack"),
+        .transport = .http,
+        .allow_stored_credentials = true,
+    };
+    var owned = true;
+    errdefer if (owned) next.deinit(alloc);
+    next.url = try alloc.dupe(u8, endpoint);
+    next.auth = .{ .client_id = try alloc.dupe(u8, slack_preset.client_id) };
+    try document.configs.append(alloc, next);
+    owned = false;
+    try saveConfigsToPath(alloc, path, document.configs.items);
+    return document.diagnostic;
 }
 
 fn addOrReplaceServer(
@@ -1802,7 +1860,7 @@ test "built-in MCP command rejects invalid remote add forms without mutation" {
         defer result.deinit(alloc);
         try expectLine(
             result,
-            "usage: /mcp add <name> <command> [args...] or /mcp add --transport http <name> <url>",
+            add_usage,
             false,
         );
     }

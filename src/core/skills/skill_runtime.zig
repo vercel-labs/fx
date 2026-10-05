@@ -589,9 +589,64 @@ fn canonicalPathHasReadAuthority(
     canonical_path: []const u8,
 ) error{OutOfMemory}!bool {
     if (pathInsideReadAuthorities(read_authority, &.{}, canonical_path)) return true;
+    if (pathInsideConfiguredSymlinkAuthorities(canonical_path)) return true;
     const extra_authorities = try externalSymlinkAuthorities(alloc);
     defer freeExternalAuthorities(alloc, extra_authorities);
     return pathInsideReadAuthorities(read_authority, extra_authorities, canonical_path);
+}
+
+/// Process-wide copy of the profile `skill_symlink_authorities` setting. Like
+/// FX_SKILL_SYMLINK_AUTHORITIES, it applies to every skill authority check in
+/// the process, so startup configures it once beside other process-scoped
+/// state instead of threading it through every discovery and refresh caller.
+/// Entries are owned by `std.heap.c_allocator` and guarded by the mutex because
+/// a workspace switch can replace them while background work reads skills.
+var configured_symlink_authorities_mutex: std.Io.Mutex = .init;
+var configured_symlink_authorities: [][]u8 = &.{};
+
+/// Replaces the configured symlink authorities with canonical copies of
+/// `paths`. Relative entries and entries containing `..` components are
+/// skipped, matching FX_SKILL_SYMLINK_AUTHORITIES. Entries that cannot be
+/// canonicalized (for example a directory that does not exist yet) are kept
+/// verbatim so they start matching once the directory appears.
+pub fn setConfiguredSymlinkAuthorities(paths: []const []const u8) error{OutOfMemory}!void {
+    const alloc = std.heap.c_allocator;
+    var next: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (next.items) |item| alloc.free(item);
+        next.deinit(alloc);
+    }
+    for (paths) |path| {
+        if (!std.fs.path.isAbsolute(path) or pathContainsDotDot(path)) continue;
+        const canonical = io_mod.realpathAlloc(alloc, path) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => try alloc.dupe(u8, path),
+        };
+        next.append(alloc, canonical) catch |err| {
+            alloc.free(canonical);
+            return err;
+        };
+    }
+    const owned = try next.toOwnedSlice(alloc);
+
+    const zio = io_mod.getIo();
+    configured_symlink_authorities_mutex.lockUncancelable(zio);
+    const previous = configured_symlink_authorities;
+    configured_symlink_authorities = owned;
+    configured_symlink_authorities_mutex.unlock(zio);
+
+    for (previous) |item| alloc.free(item);
+    if (previous.len > 0) alloc.free(previous);
+}
+
+fn pathInsideConfiguredSymlinkAuthorities(canonical_path: []const u8) bool {
+    const zio = io_mod.getIo();
+    configured_symlink_authorities_mutex.lockUncancelable(zio);
+    defer configured_symlink_authorities_mutex.unlock(zio);
+    for (configured_symlink_authorities) |authority| {
+        if (pathing.pathInside(authority, canonical_path)) return true;
+    }
+    return false;
 }
 
 /// Parses FX_SKILL_SYMLINK_AUTHORITIES (colon-separated absolute paths) into
@@ -1841,10 +1896,12 @@ pub const RefreshAction = union(enum) {
     list,
     show: []u8,
     notice: []u8,
+    /// Reports discovery issues once the launch catalog lands.
+    startup_notice,
 
     pub fn deinit(self: *RefreshAction, alloc: Allocator) void {
         switch (self.*) {
-            .list => {},
+            .list, .startup_notice => {},
             .show => |value| alloc.free(value),
             .notice => |value| alloc.free(value),
         }
@@ -2301,10 +2358,12 @@ pub const Runtime = struct {
             list,
             show: []const u8,
             notice: []const u8,
+            startup_notice,
         },
     ) !void {
         const owned: RefreshAction = switch (action) {
             .list => .list,
+            .startup_notice => .startup_notice,
             .show => |value| .{ .show = try alloc.dupe(u8, value) },
             .notice => |value| .{ .notice = try alloc.dupe(u8, value) },
         };
@@ -3705,6 +3764,44 @@ test "skill refresh publishes one generation and coalesces one latest request" {
     try std.testing.expectEqual(@as(usize, 2), runtime.items.len);
 }
 
+test "an empty launch catalog fills from a refresh before its startup notice is due" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTempFile(
+        &tmp,
+        "home/.fx/skills/launch/SKILL.md",
+        "---\nname: launch\ndescription: discovered after the first frame\n---\nbody\n",
+    );
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    var runtime = Runtime{};
+    defer runtime.deinit(alloc);
+    const policy: skill_contract.RootPolicy = .{ .managed_root_source = .global_fx };
+
+    // The launch records only the managed directory, then refreshes into it.
+    try runtime.replaceLoaded(alloc, try std.fs.path.join(alloc, &.{ home, ".fx", "skills" }), &.{}, &.{});
+    const generation = try runtime.requestRefresh(alloc, home, home, policy);
+    try runtime.queueRefreshAction(alloc, generation, .startup_notice);
+    try std.testing.expectEqual(@as(usize, 0), runtime.items.len);
+    try std.testing.expect(runtime.takeReadyRefreshAction() == null);
+
+    var adopted = false;
+    for (0..100_000) |_| {
+        if (try runtime.pollRefresh(alloc, home, policy) == .adopted) adopted = true;
+        if (adopted and runtime.refresh_task == null) break;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    try std.testing.expect(adopted);
+    try std.testing.expectEqual(@as(usize, 1), runtime.items.len);
+    try std.testing.expectEqualStrings("launch", runtime.items[0].name);
+
+    var ready = runtime.takeReadyRefreshAction() orelse return error.MissingStartupNotice;
+    defer ready.deinit(alloc);
+    try std.testing.expect(ready.succeeded);
+    try std.testing.expect(ready.action == .startup_notice);
+}
+
 test "overlapping skill refresh actions retain only the latest bounded action" {
     const alloc = std.testing.allocator;
     var runtime = Runtime{};
@@ -5092,6 +5189,10 @@ test "linked metadata FIFO is rejected before descriptor open" {
     var writer = BlockedWriter{ .path = fifo_path_z };
     const writer_thread = try std.Thread.spawn(.{}, BlockedWriter.run, .{&writer});
     defer {
+        // The reader stays open until the join. The blocked writer wakes
+        // only while a reader exists, so a reader closed at once can be
+        // gone before the writer runs, and the join then never returns.
+        var reader: ?std.Io.File = null;
         if (!writer.finished.load(.seq_cst)) {
             const reader_fd = std.posix.openatZ(
                 std.posix.AT.FDCWD,
@@ -5099,12 +5200,10 @@ test "linked metadata FIFO is rejected before descriptor open" {
                 .{ .ACCMODE = .RDONLY, .NONBLOCK = true },
                 0,
             ) catch -1;
-            if (reader_fd >= 0) {
-                var reader = std.Io.File{ .handle = reader_fd, .flags = .{ .nonblocking = true } };
-                reader.close(io_mod.getIo());
-            }
+            if (reader_fd >= 0) reader = std.Io.File{ .handle = reader_fd, .flags = .{ .nonblocking = true } };
         }
         writer_thread.join();
+        if (reader) |file| file.close(io_mod.getIo());
     }
     while (!writer.started.load(.seq_cst)) std.Thread.yield() catch {};
     for (0..1000) |_| std.Thread.yield() catch {};
@@ -5845,6 +5944,71 @@ test "loadVisibleSkills discovers a linked candidate resolved via external symli
         .missing, .name_mismatch, .skipped => return error.TestExpectedCurrentSkill,
     };
     candidate.deinit();
+}
+
+test "loadVisibleSkills discovers a linked candidate through configured symlink authorities" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTempFile(
+        &tmp,
+        "external-store/configured-skill/SKILL.md",
+        "---\nname: configured-skill\ndescription: configured external link\n---\n\nCONFIGURED_BODY\n",
+    );
+    try createTempSymlinkOrSkip(
+        &tmp,
+        "../../../../external-store/configured-skill",
+        "home/workspace/.codex/skills/configured-skill",
+    );
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
+
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
+    defer alloc.free(workspace_root);
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    defer alloc.free(managed_root);
+    const external_authority = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external-store");
+    defer alloc.free(external_authority);
+    const dotdot_authority = try std.fs.path.join(alloc, &.{ external_authority, "..", "external-store" });
+    defer alloc.free(dotdot_authority);
+
+    const env = try TestEnviron.install(alloc);
+    defer env.deinit();
+
+    // Relative and `..` entries never grant authority, matching the env var.
+    try setConfiguredSymlinkAuthorities(&.{ "external-store", dotdot_authority });
+    defer setConfiguredSymlinkAuthorities(&.{}) catch {};
+    {
+        var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
+        defer discovery.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), discovery.skills.len);
+        try std.testing.expectEqual(SkillDiagnosticCause.linked_candidate_unavailable, discovery.diagnostics[0].cause);
+    }
+
+    try setConfiguredSymlinkAuthorities(&.{external_authority});
+    {
+        var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
+        defer discovery.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), discovery.skills.len);
+        try std.testing.expectEqualStrings("configured-skill", discovery.skills[0].name);
+        try std.testing.expectEqual(@as(usize, 0), discovery.diagnostics.len);
+
+        var candidate = switch (try openValidatedSkillCandidate(alloc, discovery.skills[0])) {
+            .current => |current| current,
+            .missing, .name_mismatch, .skipped => return error.TestExpectedCurrentSkill,
+        };
+        candidate.deinit();
+    }
+
+    try setConfiguredSymlinkAuthorities(&.{});
+    {
+        var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
+        defer discovery.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), discovery.skills.len);
+        try std.testing.expectEqual(SkillDiagnosticCause.linked_candidate_unavailable, discovery.diagnostics[0].cause);
+    }
 }
 
 test "loadVisibleSkills still rejects external symlinks without an authority" {

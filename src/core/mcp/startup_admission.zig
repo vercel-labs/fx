@@ -8,6 +8,9 @@ pub const Phase = enum {
     ask_startup,
     ask_deferred,
     acp_startup,
+    /// Servers the ACP client serves over its own connection, connected from
+    /// the prompt worker after session setup.
+    acp_host_channel,
 };
 
 pub const Decision = enum {
@@ -28,7 +31,7 @@ pub fn decide(
             .rejected => .disabled,
             .pending => .disabled,
             .approved => switch (phase) {
-                .all, .ask_startup, .acp_startup => .connect,
+                .all, .ask_startup, .acp_startup, .acp_host_channel => .connect,
                 .ask_deferred => .deferred,
             },
         };
@@ -37,8 +40,21 @@ pub fn decide(
         .all => .connect,
         .ask_startup => if (required) .connect else .deferred,
         .ask_deferred => if (required) .deferred else .connect,
-        .acp_startup => .connect,
+        .acp_startup, .acp_host_channel => .connect,
     };
+}
+
+/// Applies `decide` to one configured server. ACP session setup runs on the
+/// thread that reads the ACP connection, so servers served over that same
+/// connection wait for the `acp_host_channel` phase.
+pub fn decideServer(config: *const mcp_contract.McpServerConfig, phase: Phase) Decision {
+    const host_channel = config.acp_server_id != null;
+    switch (phase) {
+        .acp_startup => if (host_channel) return if (config.enabled) .deferred else .disabled,
+        .acp_host_channel => if (!host_channel) return .deferred,
+        else => {},
+    }
+    return decide(config.enabled, config.required, config.workspace_admission, phase);
 }
 
 test "startup admission keeps Ask required servers eager and optional servers deferred" {
@@ -52,6 +68,19 @@ test "startup admission keeps Ask required servers eager and optional servers de
     try testing.expectEqual(Decision.connect, decide(true, false, null, .ask_deferred));
     try testing.expectEqual(Decision.connect, decide(true, true, null, .acp_startup));
     try testing.expectEqual(Decision.connect, decide(true, false, null, .acp_startup));
+}
+
+test "ACP host-channel servers wait for the host-channel phase" {
+    const testing = @import("std").testing;
+    const host: mcp_contract.McpServerConfig = .{ .name = "browser", .transport = .http, .acp_server_id = "browser:1" };
+    const remote: mcp_contract.McpServerConfig = .{ .name = "remote", .transport = .http };
+    try testing.expectEqual(Decision.deferred, decideServer(&host, .acp_startup));
+    try testing.expectEqual(Decision.connect, decideServer(&host, .acp_host_channel));
+    try testing.expectEqual(Decision.connect, decideServer(&remote, .acp_startup));
+    try testing.expectEqual(Decision.deferred, decideServer(&remote, .acp_host_channel));
+    var disabled = host;
+    disabled.enabled = false;
+    try testing.expectEqual(Decision.disabled, decideServer(&disabled, .acp_startup));
 }
 
 test "disabled servers never enter a connection phase" {

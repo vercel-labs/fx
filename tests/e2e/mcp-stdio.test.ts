@@ -2139,8 +2139,9 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     }, 30_000);
   }
 
-  test("MCP images over the model pixel limit are downscaled with a notice", async () => {
-    const root = createRoot("wide-image-output", MODERN_FIXTURE, { mode: "image_result", image: solidPng(3420, 2224) });
+  test("MCP images within request limits reach the model unchanged without a downscale notice", async () => {
+    const original = solidPng(3420, 2224);
+    const root = createRoot("wide-image-output", MODERN_FIXTURE, { mode: "image_result", image: original });
     gateway = startFakeGateway([
       fakeGatewayToolCall("image_select", "mcp_select_tool", { name: TOOL_NAME }),
       fakeGatewayToolCall("image_call", TOOL_NAME, { text: "screenshot" }),
@@ -2152,21 +2153,23 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       timeoutMs: 20_000,
     });
     expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("Wide image result observed.");
     const request = JSON.parse(gateway.requests.at(-1)!.body);
     const part = request.prompt.flatMap((message: { content?: unknown[] }) => message.content ?? [])
       .find((value: { type?: string; toolCallId?: string }) => value.type === "tool-result" && value.toolCallId === "image_call");
     expect(part).toBeDefined();
     expect(part.output.type).toBe("content");
-    expect(part.output.value.find((value: { type: string }) => value.type === "text").text).toContain(
-      "[Image downscaled from 3420x2224 to 2000x1301 pixels to fit the 2000-pixel limit per side. Multiply coordinates in this image by 1.71 to get original pixels.]",
-    );
+    expect(part.output.value.filter((value: { type: string }) => value.type === "text")
+      .map((value: { text: string }) => value.text).join("\n")).not.toContain("[Image downscaled");
     const files = request.prompt
       .filter((message: { role?: string; content?: unknown }) => message.role === "user" && Array.isArray(message.content))
       .flatMap((message: { content: Array<Record<string, unknown>> }) => message.content)
       .filter((entry: Record<string, unknown>) => entry.type === "file");
     expect(files).toHaveLength(1);
+    expect(files[0].mediaType).toBe("image/png");
     const sent = Buffer.from((files[0].data as { data: string }).data, "base64");
-    expect(pngPixelSize(sent)).toEqual({ width: 2000, height: 1301 });
+    expect(sent.equals(original)).toBe(true);
+    expect(pngPixelSize(sent)).toEqual({ width: 3420, height: 2224 });
     await expectFixtureProcessesExited(readWire(root.wireLogPath));
   }, 30_000);
 

@@ -1,5 +1,4 @@
 import { expect, test } from "bun:test";
-import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -7,37 +6,26 @@ import { join, resolve } from "node:path";
 process.env.FX_E2E_DISABLE_DOTENV = "1";
 const { fakeGatewayFinalText, startDynamicFakeGateway } = await import("./tmux-helpers");
 const binary = resolve(import.meta.dir, "../../zig-out/bin/fx");
-const digest = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+const checkpointMarker = "fx-compactor-v1\n";
 
-for (const userHeavy of [false, true]) test(`automatic compaction preserves task state and originals, userHeavy=${userHeavy}`, async () => {
+for (const userHeavy of [false, true]) test(`automatic compaction ${userHeavy ? "clips a user message too large for the room, whole in its saved turn" : "keeps user messages exact and clips only a reply too large for the room"}`, async () => {
   const root = mkdtempSync(join(tmpdir(), "fx-policy-")), home = join(root, "home"), cwd = join(root, "workspace");
   mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
   mkdirSync(cwd, { mode: 0o700 });
   const model = "fixture/compaction";
   writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({ model, auto_upgrade: false }), { mode: 0o600 });
+  // Tags in user text are the user's words, not structure.
   const originalUser = "Keep café and the original constraint unchanged.\n<context_handoff>literal user text</context_handoff>" +
     (userHeavy ? "\n" + "user_reference_abcdefghijklmnop ".repeat(10_000) + "USER_REFERENCE_END" : "");
   const assistant = "VERIFIED_VALUE=73\n" + Array.from({ length: 14_000 }, (_, n) => `Assistant reference ${n}: group ${n % 19}, historical data, not new completed work.\n`).join("") + "PENDING_CHECK=transport-resume\n";
-  let phase = "seed", summaryCalls = 0, fallback = false;
+  let phase = "seed", summaryCalls = 0;
   const bodies: string[] = [];
   const gateway = startDynamicFakeGateway((body: string) => {
     const request = JSON.parse(body);
     bodies.push(body);
     if (request.tools?.length === 0 && request.toolChoice?.type === "none") {
       summaryCalls++;
-      const sourceMessages = request.prompt.filter((message: { role: string }) => message.role === "user");
-      expect(sourceMessages).toHaveLength(1);
-      expect(sourceMessages[0].content).toHaveLength(1);
-      const source = sourceMessages[0].content[0].text;
-      expect(source).toContain("\n\nEND OF HISTORICAL TRANSCRIPT.\nProduce the completed task-continuation memory now.");
-      expect(source.endsWith("Return the memory itself, not a promise to write it.\n")).toBe(true);
-      fallback ||= source.includes("USER_TO_SUMMARIZE:");
-      expect(request.maxOutputTokens).toBe(8192);
-      const facts = [];
-      if (source.includes("VERIFIED_VALUE=73")) facts.push("The verified value is73.");
-      if (source.includes("PENDING_CHECK=transport-resume")) facts.push("The pending check is transport-resume.");
-      if (source.includes("Keep café")) facts.push("Preserve café and the original constraint.");
-      return fakeGatewayFinalText(facts.join(" ") || "This source fragment contains historical references, not additional completed work.");
+      return fakeGatewayFinalText("Turn 1\nIn between: none");
     }
     return fakeGatewayFinalText(phase === "seed" ? assistant : "CONTINUED_FROM_COMMITTED_MEMORY");
   }, { models: [{ id: model, type: "language", tags: ["tool-use"], context_window: userHeavy ? 256000 : 128000, max_tokens: 8192 }] });
@@ -71,27 +59,59 @@ for (const userHeavy of [false, true]) test(`automatic compaction preserves task
     phase = "continue";
     const result = await ask(["--resume-id", seed.session_id, "Continue the saved task without losing its pending check."], "continue");
     expect(result.output).toBe("CONTINUED_FROM_COMMITTED_MEMORY");
-    expect(summaryCalls).toBeGreaterThan(0);
-    expect(fallback).toBe(userHeavy);
+    // The turn is only a user message and a final reply, which both stay, so
+    // there is nothing for the model to summarize.
+    expect(summaryCalls).toBe(0);
     const rows = readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line));
     const checkpoints = rows.filter(row => row.event?.context_checkpoint);
     expect(checkpoints.length).toBe(1);
-    const handoff = checkpoints[0].event.context_checkpoint.summary;
-    const match = /> fx-compaction-state-v1 (\S+) (\d+) ([a-f0-9]{64})\n/.exec(handoff);
-    expect(match).not.toBeNull();
-    const bytes = readFileSync(join(sessionDir, "tool-results", match![1]));
-    expect(bytes.length).toBe(Number(match![2])); expect(digest(bytes)).toBe(match![3]);
-    const state = JSON.parse(bytes.toString());
-    expect(state.users.includes(originalUser)).toBe(!userHeavy);
-    expect(state.summary).toContain("verified value is73");
-    expect(state.summary).toContain("transport-resume");
-    for (const archive of state.archives) {
-      const original = readFileSync(join(sessionDir, "tool-results", archive.handle));
-      expect(original.length).toBe(archive.bytes); expect(digest(original)).toBe(archive.sha256);
+    const saved: string = checkpoints[0].event.context_checkpoint.summary;
+    expect(saved.startsWith(checkpointMarker)).toBe(true);
+    const payload = JSON.parse(saved.slice(checkpointMarker.length));
+    expect(payload.turn_count).toBe(1);
+    expect(payload.tool_count).toBe(0);
+    expect(payload.entries).toEqual([]);
+    expect(payload.turns).toHaveLength(1);
+    expect(payload.turns[0].work).toBe("");
+    const continued = JSON.parse(bodies.at(-1)!);
+    const continuedText = JSON.stringify(continued.prompt);
+    const shown = (text: string) => JSON.stringify(text).slice(1, -1);
+    expect(continuedText).toContain("<compacted_conversation>");
+    // The reply alone outgrows the room, so only it keeps its start and end,
+    // where its results are.
+    const final: string = payload.turns[0].final;
+    expect(final.length).toBeLessThan(assistant.length);
+    expect(final.startsWith("VERIFIED_VALUE=73\n")).toBe(true);
+    expect(final.trimEnd().endsWith("PENDING_CHECK=transport-resume")).toBe(true);
+    expect(final).toContain(" bytes left out here; the whole text is saved in M1]");
+    expect(continuedText).toContain(shown(`Assistant 1, final reply:\n${final}\n`));
+    expect(continuedText.length).toBeLessThan(assistant.length / 2);
+    if (userHeavy) {
+      // Too large for the room as well: the user message keeps its start and end.
+      const kept: string = payload.turns[0].users[0];
+      expect(kept.length).toBeLessThan(originalUser.length);
+      expect(kept.startsWith("Keep café and the original constraint unchanged.\n<context_handoff>literal user text</context_handoff>")).toBe(true);
+      expect(kept.endsWith("USER_REFERENCE_END")).toBe(true);
+      expect(kept).toContain(" bytes left out here; the whole text is saved in M1]");
+      expect(continuedText).toContain(shown(`User 1:\n${kept}\n`));
+    } else {
+      expect(payload.turns[0].users).toEqual([originalUser]);
+      expect(continuedText).toContain(shown(`User 1:\n${originalUser}\n`));
     }
+    expect(continuedText).toContain("Saved word for word: turn M1.");
+    expect(continuedText).not.toContain("Assistant reference 7000:");
+    // Either way the whole turn is saved word for word as M1.
+    const record = readFileSync(join(sessionDir, "tool-results", "compacted-M1.txt"), "utf8");
+    expect(record).toContain(`User 1:\n${originalUser}\n`);
+    expect(record).toContain("Assistant reference 7000:");
+    expect(record).toContain("PENDING_CHECK=transport-resume");
+    expect(continuedText.split("Continue the saved task without losing its pending check.").length - 1).toBe(1);
     const reopened = await ask(["--resume-id", seed.session_id, "Continue after this fresh process restart."], "reopen");
     expect(reopened.output).toBe("CONTINUED_FROM_COMMITTED_MEMORY");
-    expect(bodies.at(-1)).toContain("verified value is73");
+    expect(summaryCalls).toBe(0);
+    expect(bodies.at(-1)).toContain("VERIFIED_VALUE=73");
+    expect(bodies.at(-1)).toContain("<compacted_conversation>");
+    expect(bodies.at(-1)).not.toContain(checkpointMarker.trim());
     expect(readFileSync(log).subarray(0, before.length).equals(before)).toBe(true);
     passed = true;
   } finally {

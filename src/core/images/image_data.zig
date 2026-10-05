@@ -5,7 +5,38 @@ const Allocator = std.mem.Allocator;
 pub const max_encoded_image_bytes: usize = 5 * 1024 * 1024;
 pub const max_result_frame_bytes: usize = 8 * 1024 * 1024;
 pub const max_tool_images: usize = 8;
+pub const max_source_ref_bytes: usize = 512;
 pub const Error = Allocator.Error || error{ InvalidImage, ImageLimitExceeded, UnsupportedImageType };
+
+pub fn validSourceRef(source_ref: []const u8) bool {
+    if (source_ref.len == 0 or source_ref.len > max_source_ref_bytes or !std.unicode.utf8ValidateSlice(source_ref)) return false;
+    for (source_ref) |byte| if (byte < 0x20 or byte == 0x7f) return false;
+    return true;
+}
+
+test "source references are bounded opaque UTF-8 without control bytes" {
+    try std.testing.expect(validSourceRef("host:screenshot-1"));
+    try std.testing.expect(validSourceRef("é" ** 256));
+    for ([_][]const u8{ "", "a" ** 513, "bad\nref", "bad\x7fref", "\xff" }) |value| {
+        try std.testing.expect(!validSourceRef(value));
+    }
+}
+
+test "tool source references support deferred images without weakening validation" {
+    const alloc = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, "[{\"type\":\"image\",\"mimeType\":\"image/png\",\"sourceRef\":\"host:original\"}]", .{});
+    defer parsed.deinit();
+    const images = try parseToolImages(alloc, parsed.value.array.items);
+    defer types.freeToolImages(alloc, images);
+    try std.testing.expectEqual(@as(usize, 1), images.len);
+    try std.testing.expectEqualStrings("", images[0].data);
+    try std.testing.expectEqualStrings("host:original", images[0].source_ref.?);
+
+    var list = ImageList{ .alloc = alloc };
+    defer list.deinit();
+    try std.testing.expectError(error.ImageLimitExceeded, list.append("", "image/png"));
+    try std.testing.expectError(error.InvalidImage, list.appendWithSourceRef("", "image/png", "bad\nref"));
+}
 
 /// Owns validated images until take transfers them to the result owner.
 pub const ImageList = struct {
@@ -17,18 +48,29 @@ pub const ImageList = struct {
         for (self.items.items) |item| {
             self.alloc.free(item.data);
             self.alloc.free(item.mime_type);
+            if (item.source_ref) |source_ref| self.alloc.free(source_ref);
         }
         self.items.deinit(self.alloc);
     }
 
     pub fn append(self: *ImageList, data: []const u8, mime_type: []const u8) Error!void {
+        return self.appendWithSourceRef(data, mime_type, null);
+    }
+
+    fn appendWithSourceRef(self: *ImageList, data: []const u8, mime_type: []const u8, source_ref: ?[]const u8) Error!void {
         if (self.items.items.len >= max_tool_images or data.len > max_result_frame_bytes -| self.encoded_bytes) return error.ImageLimitExceeded;
-        try validateImage(self.alloc, data, mime_type);
+        if (source_ref) |value| if (!validSourceRef(value)) return error.InvalidImage;
+        if (data.len == 0) {
+            if (source_ref == null) return error.ImageLimitExceeded;
+            if (!supportedMediaType(mime_type)) return error.UnsupportedImageType;
+        } else try validateImage(self.alloc, data, mime_type);
         const owned_data = try self.alloc.dupe(u8, data);
         errdefer self.alloc.free(owned_data);
         const owned_type = try self.alloc.dupe(u8, mime_type);
         errdefer self.alloc.free(owned_type);
-        try self.items.append(self.alloc, .{ .data = owned_data, .mime_type = owned_type });
+        const owned_ref = if (source_ref) |value| try self.alloc.dupe(u8, value) else null;
+        errdefer if (owned_ref) |value| self.alloc.free(value);
+        try self.items.append(self.alloc, .{ .data = owned_data, .mime_type = owned_type, .source_ref = owned_ref });
         self.encoded_bytes += data.len;
     }
 
@@ -50,9 +92,18 @@ pub fn parseToolImages(alloc: Allocator, content: []const std.json.Value) Error!
         if (!embedded and !std.mem.eql(u8, kind.string, "image")) continue;
         const block = if (embedded) item.object.get("resource") orelse continue else item;
         if (block != .object) continue;
+        const source_ref: ?[]const u8 = if (!embedded and block.object.get("sourceRef") != null) ref: {
+            const value = block.object.get("sourceRef").?;
+            if (value != .string or !validSourceRef(value.string)) return error.InvalidImage;
+            break :ref value.string;
+        } else null;
         const data = block.object.get(if (embedded) "blob" else "data") orelse {
             if (embedded) continue;
-            return error.InvalidImage;
+            if (source_ref == null) return error.InvalidImage;
+            const mime_type = block.object.get("mimeType") orelse return error.InvalidImage;
+            if (mime_type != .string or !supportedMediaType(mime_type.string)) return error.InvalidImage;
+            try images.appendWithSourceRef("", mime_type.string, source_ref);
+            continue;
         };
         const mime_type = block.object.get("mimeType") orelse {
             if (embedded) continue;
@@ -60,7 +111,7 @@ pub fn parseToolImages(alloc: Allocator, content: []const std.json.Value) Error!
         };
         if (data != .string or mime_type != .string) return error.InvalidImage;
         if (!supportedMediaType(mime_type.string)) continue;
-        try images.append(data.string, mime_type.string);
+        try images.appendWithSourceRef(data.string, mime_type.string, source_ref);
     }
     return images.take();
 }
@@ -74,11 +125,10 @@ pub fn supportedMediaType(mime_type: []const u8) bool {
 
 pub fn validateImage(alloc: Allocator, encoded: []const u8, mime_type: []const u8) Error!void {
     if (encoded.len == 0 or encoded.len > max_encoded_image_bytes) return error.ImageLimitExceeded;
-    const decoder = std.base64.standard.Decoder;
-    const size = decoder.calcSizeForSlice(encoded) catch return error.InvalidImage;
+    const size = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return error.InvalidImage;
     const bytes = try alloc.alloc(u8, size);
     defer alloc.free(bytes);
-    decoder.decode(bytes, encoded) catch return error.InvalidImage;
+    std.base64.standard.Decoder.decode(bytes, encoded) catch return error.InvalidImage;
     const detected = detectMediaTypeFromBytes(bytes) orelse return error.UnsupportedImageType;
     if (!std.mem.eql(u8, detected, mime_type)) return error.InvalidImage;
 }
@@ -102,20 +152,46 @@ fn detectFormat(bytes: []const u8) ?ImageFormat {
     return null;
 }
 
-/// Longest side, in pixels, of any image in a chat request. Gateway provider
-/// routes reject larger images once a request carries many images (2000 on the
-/// strictest routes, 2576 on others). Images stay in conversation history, so
-/// one conservative bound keeps every later request valid. The vision tool
-/// route sends at most a few images and keeps none, so it does not apply this
-/// bound.
+/// The strictest supported provider permits an image up to 8000 pixels per
+/// side, but limits every image to 2000 when a request carries over 20 images.
 pub const max_image_dimension: u32 = 2000;
+pub const max_single_image_dimension: u32 = 8000;
+pub const strict_image_count: usize = 20;
+
+pub fn writeHostImageRecoveryNotice(writer: *std.Io.Writer, source_ref: []const u8, max_dimension: u32) std.Io.Writer.Error!void {
+    try writer.writeAll("Host source reference: ");
+    try std.json.Stringify.value(source_ref, .{}, writer);
+    try writer.print(". Use an available host-provided tool that accepts this reference to make a new copy at most {d} pixels per side and 5 MiB encoded, then return the copy as image data. If no suitable host tool or source is available, ask the user for a smaller image.]\n", .{max_dimension});
+}
+
+pub fn requestMaxDimension(image_count: usize) u32 {
+    return if (image_count > strict_image_count) max_image_dimension else max_single_image_dimension;
+}
+
+pub fn countRequestImages(messages: []const types.ChatMessage) usize {
+    var count: usize = 0;
+    for (messages) |message| {
+        count +|= message.images.len;
+        if (message.tool_result_memory) |memory| count +|= memory.tool_images.len;
+    }
+    return count;
+}
+
+pub fn fitsEncodedImageLimit(raw_bytes: usize) bool {
+    const groups = @divTrunc(std.math.add(usize, raw_bytes, 2) catch return false, 3);
+    return (std.math.mul(usize, groups, 4) catch return false) <= max_encoded_image_bytes;
+}
 
 pub const Dimensions = struct {
     width: u32,
     height: u32,
 
+    pub fn exceeds(self: Dimensions, limit: u32) bool {
+        return self.width > limit or self.height > limit;
+    }
+
     pub fn exceedsModelLimit(self: Dimensions) bool {
-        return self.width > max_image_dimension or self.height > max_image_dimension;
+        return self.exceeds(max_image_dimension);
     }
 };
 
@@ -187,7 +263,6 @@ const ImageBytes = union(enum) {
 };
 
 fn readBase64(encoded: []const u8, offset: usize, buffer: []u8) []const u8 {
-    const decoder = std.base64.standard.Decoder;
     var written: usize = 0;
     var group = offset / 3;
     var skip = offset % 3;
@@ -196,8 +271,8 @@ fn readBase64(encoded: []const u8, offset: usize, buffer: []u8) []const u8 {
         if (start >= encoded.len or encoded.len - start < 4) break;
         const quad = encoded[start..][0..4];
         var decoded: [3]u8 = undefined;
-        const decoded_len = decoder.calcSizeForSlice(quad) catch break;
-        decoder.decode(decoded[0..decoded_len], quad) catch break;
+        const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(quad) catch break;
+        std.base64.standard.Decoder.decode(decoded[0..decoded_len], quad) catch break;
         if (skip < decoded_len) {
             const count = @min(decoded_len - skip, buffer.len - written);
             @memcpy(buffer[written..][0..count], decoded[skip..][0..count]);
@@ -411,10 +486,29 @@ test "image dimensions read every supported header" {
     try expectDimensions(.{ .width = 5000, .height = 2 }, &testWebpExtended(5000, 2));
 }
 
-test "model image limit allows exactly the maximum side" {
-    try std.testing.expect(!(Dimensions{ .width = max_image_dimension, .height = max_image_dimension }).exceedsModelLimit());
-    try std.testing.expect((Dimensions{ .width = max_image_dimension + 1, .height = 1 }).exceedsModelLimit());
-    try std.testing.expect((Dimensions{ .width = 1, .height = max_image_dimension + 1 }).exceedsModelLimit());
+test "request image limit follows the count and byte boundaries" {
+    try std.testing.expectEqual(@as(u32, 8000), requestMaxDimension(1));
+    try std.testing.expectEqual(@as(u32, 8000), requestMaxDimension(20));
+    try std.testing.expectEqual(@as(u32, 2000), requestMaxDimension(21));
+    const wide = Dimensions{ .width = 3420, .height = 2224 };
+    try std.testing.expect(!wide.exceeds(requestMaxDimension(20)));
+    try std.testing.expect(wide.exceeds(requestMaxDimension(21)));
+    try std.testing.expect(!(Dimensions{ .width = 8000, .height = 1 }).exceeds(requestMaxDimension(1)));
+    try std.testing.expect((Dimensions{ .width = 8001, .height = 1 }).exceeds(requestMaxDimension(1)));
+    const max_raw = max_encoded_image_bytes / 4 * 3;
+    try std.testing.expect(fitsEncodedImageLimit(max_raw));
+    try std.testing.expect(!fitsEncodedImageLimit(max_raw + 1));
+    try std.testing.expect(!fitsEncodedImageLimit(std.math.maxInt(usize)));
+}
+
+test "request image count includes attachments and retained tool images" {
+    const attachments = [_]types.ImageAttachment{.{ .path = @constCast("image.png"), .media_type = @constCast("image/png") }};
+    const tool_images = [_]types.ToolImage{.{ .data = @constCast("base64"), .mime_type = @constCast("image/png") }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .images = &attachments },
+        .{ .role = .tool, .tool_result_memory = .{ .tool_images = &tool_images } },
+    };
+    try std.testing.expectEqual(@as(usize, 2), countRequestImages(&messages));
 }
 
 test "image dimensions reject malformed and truncated headers" {

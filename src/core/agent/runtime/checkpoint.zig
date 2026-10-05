@@ -6,8 +6,14 @@ const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const magic = "FXCP";
-const version: u16 = 1;
+/// Version 2 stores inline image bytes raw in a blob section after the JSON.
+/// Its little-endian payload is:
+///   u32 json_len | json | u32 blob_count | (u32 blob_len | blob)*
+const version: u16 = 2;
+/// Version 1 embedded inline image bytes as base64 inside a JSON-only payload.
+const json_only_version: u16 = 1;
 const header_bytes: usize = 4 + 2 + 2 + 4 + Sha256.digest_length;
+const length_bytes: usize = 4;
 pub const max_checkpoint_bytes: usize = 4 * 1024 * 1024;
 pub const max_history_turns: usize = 1024;
 
@@ -34,34 +40,62 @@ pub fn encode(
     usage: types.Usage,
 ) Error![]u8 {
     if (history.len > max_history_turns) return error.CheckpointTooLarge;
-    var payload: std.Io.Writer.Allocating = .init(alloc);
-    defer payload.deinit();
-    payload.writer.writeAll("{\"history\":[") catch return error.OutOfMemory;
+    const payload_limit = max_checkpoint_bytes - header_bytes;
+    var json: std.Io.Writer.Allocating = .init(alloc);
+    defer json.deinit();
+    var blobs: std.ArrayList([]const u8) = .empty;
+    defer blobs.deinit(alloc);
+    const image_blobs: session_codec.ImageBlobs = .{ .alloc = alloc, .items = &blobs };
+    var blob_section_bytes: usize = 0;
+
+    json.writer.writeAll("{\"history\":[") catch return error.OutOfMemory;
     for (history, 0..) |turn, index| {
-        if (index > 0) payload.writer.writeByte(',') catch return error.OutOfMemory;
-        session_codec.writeHistoryTurn(&payload.writer, turn) catch |err| switch (err) {
+        if (index > 0) json.writer.writeByte(',') catch return error.OutOfMemory;
+        const first_new_blob = blobs.items.len;
+        session_codec.writeHistoryTurnWithImageBlobs(&json.writer, turn, image_blobs) catch |err| switch (err) {
             error.InvalidSessionFormat => return error.InvalidCheckpoint,
             else => return error.OutOfMemory,
         };
-        if (payload.written().len > max_checkpoint_bytes - header_bytes) {
+        for (blobs.items[first_new_blob..]) |blob| blob_section_bytes +|= length_bytes +| blob.len;
+        if (payloadBytes(json.written().len, blob_section_bytes) > payload_limit) {
             return error.CheckpointTooLarge;
         }
     }
-    payload.writer.writeAll("],\"usage\":") catch return error.OutOfMemory;
-    std.json.Stringify.value(usage, .{}, &payload.writer) catch return error.OutOfMemory;
-    payload.writer.writeByte('}') catch return error.OutOfMemory;
-    if (payload.written().len > max_checkpoint_bytes - header_bytes) {
-        return error.CheckpointTooLarge;
-    }
+    json.writer.writeAll("],\"usage\":") catch return error.OutOfMemory;
+    std.json.Stringify.value(usage, .{}, &json.writer) catch return error.OutOfMemory;
+    json.writer.writeByte('}') catch return error.OutOfMemory;
+    const payload_len = payloadBytes(json.written().len, blob_section_bytes);
+    if (payload_len > payload_limit) return error.CheckpointTooLarge;
 
-    const out = try alloc.alloc(u8, header_bytes + payload.written().len);
+    // Every length below is bounded by payload_limit, so each fits in a u32.
+    const out = try alloc.alloc(u8, header_bytes + payload_len);
+    var cursor: usize = header_bytes;
+    writeSection(out, &cursor, json.written());
+    writeLength(out, &cursor, blobs.items.len);
+    for (blobs.items) |blob| writeSection(out, &cursor, blob);
+    std.debug.assert(cursor == out.len);
+
     @memcpy(out[0..magic.len], magic);
     std.mem.writeInt(u16, out[4..6], version, .little);
     std.mem.writeInt(u16, out[6..8], 0, .little);
-    std.mem.writeInt(u32, out[8..12], @intCast(payload.written().len), .little);
-    Sha256.hash(payload.written(), out[12..header_bytes], .{});
-    @memcpy(out[header_bytes..], payload.written());
+    std.mem.writeInt(u32, out[8..12], @intCast(payload_len), .little);
+    Sha256.hash(out[header_bytes..], out[12..header_bytes], .{});
     return out;
+}
+
+fn payloadBytes(json_len: usize, blob_section_bytes: usize) usize {
+    return length_bytes +| json_len +| length_bytes +| blob_section_bytes;
+}
+
+fn writeLength(out: []u8, cursor: *usize, value: usize) void {
+    std.mem.writeInt(u32, out[cursor.*..][0..length_bytes], @intCast(value), .little);
+    cursor.* += length_bytes;
+}
+
+fn writeSection(out: []u8, cursor: *usize, bytes: []const u8) void {
+    writeLength(out, cursor, bytes.len);
+    @memcpy(out[cursor.*..][0..bytes.len], bytes);
+    cursor.* += bytes.len;
 }
 
 pub fn decode(alloc: Allocator, bytes: []const u8) Error!Decoded {
@@ -69,7 +103,8 @@ pub fn decode(alloc: Allocator, bytes: []const u8) Error!Decoded {
         return error.CorruptCheckpoint;
     }
     if (!std.mem.eql(u8, bytes[0..magic.len], magic)) return error.CorruptCheckpoint;
-    if (std.mem.readInt(u16, bytes[4..6], .little) != version) {
+    const checkpoint_version = std.mem.readInt(u16, bytes[4..6], .little);
+    if (checkpoint_version != version and checkpoint_version != json_only_version) {
         return error.UnsupportedCheckpointVersion;
     }
     if (std.mem.readInt(u16, bytes[6..8], .little) != 0) {
@@ -82,11 +117,53 @@ pub fn decode(alloc: Allocator, bytes: []const u8) Error!Decoded {
     if (!std.crypto.timing_safe.eql([Sha256.digest_length]u8, digest, bytes[12..header_bytes].*)) {
         return error.CorruptCheckpoint;
     }
+    const payload = bytes[header_bytes..];
+    if (checkpoint_version == json_only_version) return decodeJson(alloc, payload, null);
 
+    var reader: PayloadReader = .{ .bytes = payload };
+    const json = reader.section() orelse return error.CorruptCheckpoint;
+    const blob_count = reader.length() orelse return error.CorruptCheckpoint;
+    // Every blob needs at least its length prefix.
+    if (blob_count > reader.remaining() / length_bytes) return error.CorruptCheckpoint;
+    const blobs = try alloc.alloc([]const u8, blob_count);
+    defer alloc.free(blobs);
+    for (blobs) |*blob| blob.* = reader.section() orelse return error.CorruptCheckpoint;
+    if (reader.remaining() != 0) return error.CorruptCheckpoint;
+    var blob_reader: session_codec.ImageBlobReader = .{ .blobs = blobs };
+    return decodeJson(alloc, json, &blob_reader);
+}
+
+/// Reads length-prefixed sections from a version 2 payload. Returned slices
+/// borrow from `bytes`.
+const PayloadReader = struct {
+    bytes: []const u8,
+    offset: usize = 0,
+
+    fn remaining(self: PayloadReader) usize {
+        return self.bytes.len - self.offset;
+    }
+
+    fn length(self: *PayloadReader) ?usize {
+        if (self.remaining() < length_bytes) return null;
+        const value = std.mem.readInt(u32, self.bytes[self.offset..][0..length_bytes], .little);
+        self.offset += length_bytes;
+        return value;
+    }
+
+    fn section(self: *PayloadReader) ?[]const u8 {
+        const len = self.length() orelse return null;
+        if (len > self.remaining()) return null;
+        const bytes = self.bytes[self.offset..][0..len];
+        self.offset += len;
+        return bytes;
+    }
+};
+
+fn decodeJson(alloc: Allocator, json: []const u8, image_blobs: ?*session_codec.ImageBlobReader) Error!Decoded {
     const parsed = std.json.parseFromSlice(
         std.json.Value,
         alloc,
-        bytes[header_bytes..],
+        json,
         .{},
     ) catch return error.InvalidCheckpoint;
     defer parsed.deinit();
@@ -105,11 +182,14 @@ pub fn decode(alloc: Allocator, bytes: []const u8) Error!Decoded {
         alloc.free(history);
     }
     for (history_value.array.items, 0..) |turn_value, index| {
-        history[index] = session_codec.parseHistoryTurn(alloc, turn_value) catch |err| switch (err) {
+        history[index] = session_codec.parseHistoryTurnWithImageBlobs(alloc, turn_value, image_blobs) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.InvalidCheckpoint,
         };
         decoded_count += 1;
+    }
+    if (image_blobs) |blobs| {
+        if (!blobs.consumedAll()) return error.InvalidCheckpoint;
     }
     const usage = std.json.parseFromValueLeaky(types.Usage, alloc, usage_value, .{}) catch
         return error.InvalidCheckpoint;
@@ -227,4 +307,150 @@ test "kernel checkpoint rejects corruption and unsupported versions" {
         error.UnsupportedCheckpointVersion,
         decode(alloc, unsupported),
     );
+}
+
+fn resealForTest(bytes: []u8) void {
+    std.mem.writeInt(u32, bytes[8..12], @intCast(bytes.len - header_bytes), .little);
+    Sha256.hash(bytes[header_bytes..], bytes[12..header_bytes], .{});
+}
+
+const TestImageHistory = struct {
+    digest_hex: [Sha256.digest_length * 2]u8,
+    images: [1]types.ImageAttachment,
+    history: [1]types.HistoryTurn,
+
+    fn init(self: *TestImageHistory, png: []const u8) void {
+        var digest: [Sha256.digest_length]u8 = undefined;
+        Sha256.hash(png, &digest, .{});
+        self.digest_hex = std.fmt.bytesToHex(digest, .lower);
+        self.images = .{.{
+            .id = 2,
+            .path = @constCast("inline://image-2"),
+            .media_type = @constCast("image/png"),
+            .snapshot_sha256 = &self.digest_hex,
+            .inline_data = @constCast(png),
+        }};
+        self.history = .{.{ .assistant = .{
+            .user = .{ .text = @constCast("[Image #2]"), .images = &self.images },
+            .assistant = @constCast("ok"),
+        } }};
+    }
+};
+
+test "kernel checkpoint stores inline image bytes raw beside the JSON" {
+    const alloc = std.testing.allocator;
+    const png = "\x89PNG\r\n\x1a\nraw-checkpoint-bytes";
+    var fixture: TestImageHistory = undefined;
+    fixture.init(png);
+    const bytes = try encode(alloc, &fixture.history, .{});
+    defer alloc.free(bytes);
+
+    try std.testing.expectEqual(version, std.mem.readInt(u16, bytes[4..6], .little));
+    // The only blob is the image itself, unencoded, at the end of the payload.
+    try std.testing.expect(std.mem.endsWith(u8, bytes, png));
+    try std.testing.expect(std.mem.find(u8, bytes, "\"inline_blob\":0") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"inline_data\"") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"encoding\":\"base64\"") == null);
+
+    var decoded = try decode(alloc, bytes);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualStrings(png, decoded.history[0].assistant.user.images[0].inline_data.?);
+}
+
+test "kernel checkpoint decodes version 1 checkpoints with base64 images" {
+    const alloc = std.testing.allocator;
+    const png = "\x89PNG\r\n\x1a\nlegacy-checkpoint";
+    var fixture: TestImageHistory = undefined;
+    fixture.init(png);
+    var payload: std.Io.Writer.Allocating = .init(alloc);
+    defer payload.deinit();
+    try payload.writer.writeAll("{\"history\":[");
+    try session_codec.writeHistoryTurn(&payload.writer, fixture.history[0]);
+    try payload.writer.writeAll("],\"usage\":");
+    try std.json.Stringify.value(types.Usage{}, .{}, &payload.writer);
+    try payload.writer.writeByte('}');
+
+    const legacy = try alloc.alloc(u8, header_bytes + payload.written().len);
+    defer alloc.free(legacy);
+    @memcpy(legacy[0..magic.len], magic);
+    std.mem.writeInt(u16, legacy[4..6], json_only_version, .little);
+    std.mem.writeInt(u16, legacy[6..8], 0, .little);
+    @memcpy(legacy[header_bytes..], payload.written());
+    resealForTest(legacy);
+    try std.testing.expect(std.mem.find(u8, legacy, "\"encoding\":\"base64\"") != null);
+
+    var decoded = try decode(alloc, legacy);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualStrings(png, decoded.history[0].assistant.user.images[0].inline_data.?);
+}
+
+test "kernel checkpoint rejects malformed blob sections" {
+    const alloc = std.testing.allocator;
+    var fixture: TestImageHistory = undefined;
+    fixture.init("\x89PNG\r\n\x1a\nblob-section");
+    const bytes = try encode(alloc, &fixture.history, .{});
+    defer alloc.free(bytes);
+
+    const dangling = try alloc.dupe(u8, bytes);
+    defer alloc.free(dangling);
+    const reference = "\"inline_blob\":";
+    const at = std.mem.find(u8, dangling, reference).? + reference.len;
+    dangling[at] = '7';
+    resealForTest(dangling);
+    try std.testing.expectError(error.InvalidCheckpoint, decode(alloc, dangling));
+
+    const truncated = try alloc.dupe(u8, bytes[0 .. bytes.len - 1]);
+    defer alloc.free(truncated);
+    resealForTest(truncated);
+    try std.testing.expectError(error.CorruptCheckpoint, decode(alloc, truncated));
+
+    const trailing = try alloc.alloc(u8, bytes.len + 1);
+    defer alloc.free(trailing);
+    @memcpy(trailing[0..bytes.len], bytes);
+    trailing[bytes.len] = 0;
+    resealForTest(trailing);
+    try std.testing.expectError(error.CorruptCheckpoint, decode(alloc, trailing));
+}
+
+test "kernel checkpoint requires each image blob once, in order" {
+    const alloc = std.testing.allocator;
+    var first: TestImageHistory = undefined;
+    first.init("\x89PNG\r\n\x1a\nfirst-blob");
+    var second: TestImageHistory = undefined;
+    second.init("\x89PNG\r\n\x1a\nsecond-blob");
+    const history = [_]types.HistoryTurn{ first.history[0], second.history[0] };
+    const bytes = try encode(alloc, &history, .{});
+    defer alloc.free(bytes);
+    var decoded = try decode(alloc, bytes);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualStrings("\x89PNG\r\n\x1a\nsecond-blob", decoded.history[1].assistant.user.images[0].inline_data.?);
+
+    const reference = "\"inline_blob\":";
+    const first_digit = std.mem.find(u8, bytes, reference ++ "0").? + reference.len;
+    const second_digit = std.mem.find(u8, bytes, reference ++ "1").? + reference.len;
+
+    const swapped = try alloc.dupe(u8, bytes);
+    defer alloc.free(swapped);
+    swapped[first_digit] = '1';
+    swapped[second_digit] = '0';
+    resealForTest(swapped);
+    try std.testing.expectError(error.InvalidCheckpoint, decode(alloc, swapped));
+
+    const duplicated = try alloc.dupe(u8, bytes);
+    defer alloc.free(duplicated);
+    duplicated[second_digit] = '0';
+    resealForTest(duplicated);
+    try std.testing.expectError(error.InvalidCheckpoint, decode(alloc, duplicated));
+
+    const extra_blob = "\x89PNG\r\n\x1a\nunreferenced";
+    const unreferenced = try alloc.alloc(u8, bytes.len + length_bytes + extra_blob.len);
+    defer alloc.free(unreferenced);
+    @memcpy(unreferenced[0..bytes.len], bytes);
+    var offset = bytes.len;
+    writeSection(unreferenced, &offset, extra_blob);
+    const json_len = std.mem.readInt(u32, bytes[header_bytes..][0..length_bytes], .little);
+    const count_at = header_bytes + length_bytes + json_len;
+    std.mem.writeInt(u32, unreferenced[count_at..][0..length_bytes], 3, .little);
+    resealForTest(unreferenced);
+    try std.testing.expectError(error.InvalidCheckpoint, decode(alloc, unreferenced));
 }

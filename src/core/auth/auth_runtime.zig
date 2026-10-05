@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const api_key_validator = @import("api_key_validator.zig");
 const auth_transition = @import("auth_transition.zig");
 const credentials = @import("credentials.zig");
@@ -858,6 +859,82 @@ const PromptCredentialRefreshTask = struct {
     }
 };
 
+/// The launch credential lookup an interactive session resolves after its
+/// first frame instead of before it.
+pub const StartupCredentialRequest = struct {
+    provider: model_provider.ProviderId,
+    preferred: ?credentials.Source,
+};
+
+pub const StartupCredentialOutcome = union(enum) {
+    /// The credential, when present, is owned by `std.heap.c_allocator`.
+    resolved: credentials.Resolution,
+    failed: anyerror,
+
+    pub fn deinit(self: *StartupCredentialOutcome) void {
+        switch (self.*) {
+            .resolved => |*resolution| if (resolution.credential) |*credential| {
+                credential.deinit(std.heap.c_allocator);
+                resolution.credential = null;
+            },
+            .failed => {},
+        }
+    }
+};
+
+/// Runs the launch credential resolution on a worker so the first frame does
+/// not wait for Keychain reads. Only the worker writes `outcome`; the main
+/// thread reads it after the release/acquire completion and join.
+const StartupCredentialTask = struct {
+    secret_store: host.SecretStore,
+    request: StartupCredentialRequest,
+    thread: ?std.Thread = null,
+    done: std.atomic.Value(bool) = .init(false),
+    outcome: StartupCredentialOutcome = .{ .resolved = .{} },
+
+    fn start(secret_store: host.SecretStore, request: StartupCredentialRequest) !*StartupCredentialTask {
+        const alloc = std.heap.c_allocator;
+        const task = try alloc.create(StartupCredentialTask);
+        errdefer alloc.destroy(task);
+        task.* = .{ .secret_store = secret_store, .request = request };
+        task.thread = try std.Thread.spawn(.{}, workerMain, .{task});
+        return task;
+    }
+
+    fn workerMain(self: *StartupCredentialTask) void {
+        defer self.done.store(true, .release);
+        // Matches the blocking launch path: stored credentials only, no network.
+        const resolution = credentials.resolveForProvider(
+            std.heap.c_allocator,
+            oauth_transport.unavailable_provider,
+            self.secret_store,
+            .stored,
+            self.request.provider,
+            self.request.preferred,
+        ) catch |err| {
+            self.outcome = .{ .failed = err };
+            return;
+        };
+        self.outcome = .{ .resolved = resolution };
+    }
+
+    fn takeOutcome(self: *StartupCredentialTask) StartupCredentialOutcome {
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+        const outcome = self.outcome;
+        self.outcome = .{ .resolved = .{} };
+        std.heap.c_allocator.destroy(self);
+        return outcome;
+    }
+
+    /// Waits for the worker: a Keychain read cannot be interrupted, so this
+    /// joins the same way an abandoned prompt credential refresh does.
+    fn deinit(self: *StartupCredentialTask) void {
+        var outcome = self.takeOutcome();
+        outcome.deinit();
+    }
+};
+
 pub const ProviderPreparationIntent = union(enum) {
     provider: struct {
         target: model_provider.ProviderId,
@@ -1677,6 +1754,9 @@ pub const Runtime = struct {
     inventory_refresh_task: ?*InventoryRefreshTask = null,
     prompt_credential_refresh_task: ?*PromptCredentialRefreshTask = null,
     provider_preparation: ?*ProviderPreparation = null,
+    startup_credential_task: ?*StartupCredentialTask = null,
+    /// The launch source inventory waits for the first frame.
+    startup_inventory_deferred: bool = false,
 
     pub fn init(
         validator: api_key_validator.Provider,
@@ -1719,7 +1799,7 @@ pub const Runtime = struct {
         auth_mode: credentials.AuthMode,
     ) void {
         comptime {
-            if (std.meta.fields(Self).len != 31) {
+            if (std.meta.fields(Self).len != 33) {
                 @compileError("update Runtime.initInto for the changed field set");
             }
         }
@@ -1755,9 +1835,13 @@ pub const Runtime = struct {
         storage.inventory_refresh_task = null;
         storage.prompt_credential_refresh_task = null;
         storage.provider_preparation = null;
+        storage.startup_credential_task = null;
+        storage.startup_inventory_deferred = false;
     }
 
     pub fn deinit(self: *Self, alloc: Allocator) void {
+        if (self.startup_credential_task) |task| task.deinit();
+        self.startup_credential_task = null;
         self.stopProviderPreparation();
         if (self.inventory_refresh_task) |task| task.deinit();
         self.inventory_refresh_task = null;
@@ -2801,6 +2885,45 @@ pub const Runtime = struct {
         const task = self.prompt_credential_refresh_task orelse return;
         self.prompt_credential_refresh_task = null;
         task.deinit();
+    }
+
+    /// Starts resolving the launch credential on a worker. Returns false when
+    /// the worker cannot start; the caller then resolves the credential inline.
+    pub fn beginStartupCredentialLoad(self: *Self, request: StartupCredentialRequest) bool {
+        // Single-threaded builds have no worker; the caller resolves inline.
+        if (comptime builtin.single_threaded) return false;
+        std.debug.assert(self.startup_credential_task == null);
+        self.startup_credential_task = StartupCredentialTask.start(self.secret_store, request) catch |err| {
+            debug_trace.logf("auth", "startup credential worker unavailable err={s}", .{@errorName(err)});
+            return false;
+        };
+        return true;
+    }
+
+    /// Probing every source loads the Keychain framework, and the launch only
+    /// needs the inventory for onboarding, so an active credential lets the
+    /// probe wait until after the first frame.
+    pub fn deferStartupSourceInventory(self: *Self) void {
+        self.startup_inventory_deferred = true;
+    }
+
+    /// Returns true once when the deferred launch inventory is due.
+    pub fn takeDeferredStartupSourceInventory(self: *Self) bool {
+        const deferred = self.startup_inventory_deferred;
+        self.startup_inventory_deferred = false;
+        return deferred;
+    }
+
+    pub fn startupCredentialPending(self: *const Self) bool {
+        return self.startup_credential_task != null;
+    }
+
+    /// Returns the finished launch credential lookup once; null while it runs.
+    pub fn takeStartupCredentialLoad(self: *Self) ?StartupCredentialOutcome {
+        const task = self.startup_credential_task orelse return null;
+        if (!task.done.load(.acquire)) return null;
+        self.startup_credential_task = null;
+        return task.takeOutcome();
     }
 
     pub fn refreshSelectedCredentialIfNeeded(

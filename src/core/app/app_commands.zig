@@ -3,7 +3,9 @@ const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
+const app_bootstrap_runtime = @import("app_bootstrap_runtime.zig");
 const io_mod = @import("../shared/io.zig");
+const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
@@ -227,6 +229,19 @@ fn refreshWorkspaceAvailabilityForList(app: anytype) !void {
     }
 }
 
+fn handleShellCommand(app: anytype, rest: []const u8) !void {
+    if (!std.mem.eql(u8, std.mem.trim(u8, rest, " \t"), "reload")) {
+        try app.writeDomainNotice(.{ .topic = "", .tone = .@"error", .body = "usage: /shell reload" }, true);
+        return;
+    }
+    shell_snapshot.processOwner().markDirty(.user_reload);
+    try app.writeDomainNotice(.{
+        .topic = "shell",
+        .tone = .neutral,
+        .body = "The next command reloads your shell startup files. Remembered command approvals were reset.",
+    }, true);
+}
+
 fn handleWorkspaceCommand(app: anytype, rest: []const u8) !void {
     const maybe_action = parseWorkspaceCommand(rest) catch {
         try app.writeDomainNotice(.{
@@ -386,10 +401,12 @@ pub fn Handlers(comptime App: type) type {
                 .show_credits = commandShowCredits,
                 .paste_clipboard = commandPasteClipboard,
                 .toggle_fast = commandToggleFast,
+                .handle_ultrafast = commandHandleUltrafast,
                 .handle_statusline = commandHandleStatusline,
                 .rename_session = commandRenameSession,
                 .handle_notifications = commandHandleNotifications,
                 .handle_workspace = commandHandleWorkspace,
+                .handle_shell = commandHandleShell,
                 .show_version = commandShowVersion,
                 .unknown = commandUnknown,
             };
@@ -402,6 +419,12 @@ pub fn Handlers(comptime App: type) type {
             try app.writeDomainNotice(.{ .topic = "mcp", .tone = .warning, .body = notice }, true);
         }
 
+        pub fn collectShellSnapshotFacts(app: *App) !void {
+            var buffer: [shell_snapshot.max_notice_bytes]u8 = undefined;
+            const notice = shell_snapshot.processOwner().takeUiNotice(&buffer) orelse return;
+            try app.writeDomainNotice(.{ .topic = "shell", .tone = .warning, .body = notice }, true);
+        }
+
         pub fn collectMcpReloadFacts(app: *App) !void {
             if (comptime !@hasDecl(App, "takeMcpReloadCompletion")) return;
             var completion = (try app.takeMcpReloadCompletion()) orelse return;
@@ -411,6 +434,14 @@ pub fn Handlers(comptime App: type) type {
             {
                 switch (app.mcpReloadCompletionOrigin()) {
                     .command => {},
+                    .slack_setup => {
+                        if (comptime @hasDecl(App, "acquireMcpRuntime")) {
+                            if (completion == .outcome and completion.outcome == .published) {
+                                try connectSlackAfterReload(app);
+                                return;
+                            }
+                        }
+                    },
                     .menu => |generation| {
                         try app.applyMcpMenuReloadCompletion(generation, &completion);
                         return;
@@ -503,7 +534,7 @@ pub fn Handlers(comptime App: type) type {
                 @hasDecl(App, "applyMcpMenuAuthenticationCompletion"))
             {
                 switch (app.mcpAuthenticationCompletionOrigin()) {
-                    .command => {},
+                    .command, .slack_setup => {},
                     .menu => |generation| {
                         try app.applyMcpMenuAuthenticationCompletion(generation, &completion);
                         return;
@@ -514,7 +545,9 @@ pub fn Handlers(comptime App: type) type {
             if (completion.result) |authentication| {
                 switch (authentication) {
                     .authenticated => |authenticated| {
-                        const success = if (authenticated.repaired_entries == 0)
+                        const success = if (std.mem.eql(u8, completion.server_name, "slack") and completion.reconnect_error == null)
+                            try app.alloc.dupe(u8, "Slack connected. You can now use Slack.")
+                        else if (authenticated.repaired_entries == 0)
                             try std.fmt.allocPrint(
                                 app.alloc,
                                 "Authenticated MCP server '{s}'.",
@@ -1257,6 +1290,25 @@ pub fn Handlers(comptime App: type) type {
             }, true);
         }
 
+        pub fn addSlack(app: *App) !void {
+            try commandHandleMcp(@ptrCast(app), "add slack");
+        }
+
+        fn connectSlackAfterReload(app: *App) !void {
+            var lease = app.acquireMcpRuntime() orelse return error.McpServerNotFound;
+            defer lease.deinit();
+            var snapshot = try lease.runtime.snapshotHealth(app.alloc, @intCast(@max(io_mod.milliTimestamp(), 0)));
+            defer snapshot.deinit(app.alloc);
+            for (snapshot.servers) |server| {
+                if (!std.mem.eql(u8, server.identity(), "slack")) continue;
+                if (server.connection == .ready) {
+                    try app.writeDomainNotice(.{ .topic = "mcp", .tone = .neutral, .body = "Slack connected. You can now use Slack." }, true);
+                    return;
+                }
+            }
+            try commandHandleMcp(@ptrCast(app), "auth slack --open");
+        }
+
         fn commandHandleMcp(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             const command = std.mem.trim(u8, rest, " \t");
@@ -1278,6 +1330,14 @@ pub fn Handlers(comptime App: type) type {
                 try app.openMcpMenu();
                 app.shell.render_requests.request(.footer);
                 return;
+            }
+            if (std.mem.eql(u8, std.mem.trim(u8, rest, " \t"), "add slack")) {
+                if (comptime @hasDecl(App, "mcpAuthenticationPending")) {
+                    if (app.mcpAuthenticationPending("slack")) {
+                        try app.writeDomainNotice(.{ .topic = "mcp", .tone = .neutral, .body = "Slack authorization is already in progress. Finish it in your browser." }, true);
+                        return;
+                    }
+                }
             }
             const result = try app.mcpCommandProvider().handle(app.alloc, rest, .{
                 .home = io_mod.getenv("HOME"),
@@ -1310,7 +1370,11 @@ pub fn Handlers(comptime App: type) type {
                 return;
             }
             if (result.reload) {
-                app.beginMcpReload() catch |err| {
+                const reload = if (result.connect_slack) reload: {
+                    if (comptime @hasDecl(App, "beginMcpSlackSetup")) break :reload app.beginMcpSlackSetup();
+                    break :reload error.McpAuthenticationUnavailable;
+                } else app.beginMcpReload();
+                reload catch |err| {
                     reload_warning = true;
                     reload_notice = if (result.report_reload)
                         try app.alloc.dupe(
@@ -1715,11 +1779,15 @@ pub fn Handlers(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "skills",
                     .tone = .@"error",
-                    .body = "Skills could not be refreshed. The previous catalog was not shown as current.",
+                    .body = if (ready.action == .startup_notice)
+                        "Skills could not be loaded. Run /skills to try again."
+                    else
+                        "Skills could not be refreshed. The previous catalog was not shown as current.",
                 }, true);
                 return;
             }
             switch (ready.action) {
+                .startup_notice => try app_bootstrap_runtime.Runtime(App).writeSkillDiagnosticsNotice(app),
                 .list => try executeSkillsCommand(
                     app,
                     app.skillsCommandProvider(),
@@ -2018,6 +2086,11 @@ pub fn Handlers(comptime App: type) type {
             try session_commands.Commands(App).toggleFast(app);
         }
 
+        fn commandHandleUltrafast(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try session_commands.Commands(App).handleUltrafast(app, rest);
+        }
+
         fn commandHandleStatusline(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (std.mem.trim(u8, rest, " \t").len == 0) {
@@ -2036,6 +2109,11 @@ pub fn Handlers(comptime App: type) type {
         fn commandHandleNotifications(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try handleNotificationsCommand(app, rest);
+        }
+
+        fn commandHandleShell(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try handleShellCommand(app, rest);
         }
 
         fn commandHandleWorkspace(ctx: *anyopaque, rest: []const u8) !void {
@@ -3956,10 +4034,16 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
     if (comptime provider_runtime.supported(App)) snapshot.model = provider_runtime.model(app);
     if (comptime @hasField(App, "effort")) snapshot.effort = app.effort.displayLabel();
     if (comptime @hasField(App, "fast_mode")) snapshot.fast_mode = app.fast_mode;
+    if (comptime @hasField(App, "worker") and
+        @hasField(@TypeOf(app.worker), "agent_turn_settings"))
+    {
+        snapshot.ultrafast_mode = app.worker.agent_turn_settings.ultrafast_mode;
+    }
     if (comptime @hasDecl(App, "resolvedModelCapabilities") and provider_runtime.supported(App)) {
         const capabilities = app.resolvedModelCapabilities(provider_runtime.model(app));
         snapshot.reasoning_efforts = capabilities.reasoning_efforts;
         snapshot.supports_fast_mode = capabilities.supports_fast_mode;
+        snapshot.supports_ultrafast_mode = capabilities.supports_ultrafast_mode;
     }
     if (comptime @hasField(App, "permission_engine")) snapshot.permission_mode = @tagName(app.permission_engine.mode);
     if (comptime @hasField(App, "input_runtime")) {
@@ -4099,6 +4183,15 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
         .fast_mode => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
             if (enabled != app.fast_mode) try session_commands.Commands(@TypeOf(app.*)).toggleFast(app);
+        },
+        .ultrafast_mode => {
+            const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
+            if (enabled != app.worker.agent_turn_settings.ultrafast_mode) {
+                try session_commands.Commands(@TypeOf(app.*)).handleUltrafast(
+                    app,
+                    if (enabled) "on" else "off",
+                );
+            }
         },
         .permission_mode => try session_commands.Commands(@TypeOf(app.*)).handlePermissions(app, change.value),
         .sound_level => try handleNotificationsCommand(app, change.value),
@@ -4486,7 +4579,7 @@ const SkillsInstallReplayApp = struct {
         return self.reload_count;
     }
 
-    noinline fn writeDomainNotice(self: *SkillsInstallReplayApp, notice: types.SemanticNotice, _: bool) !void {
+    pub noinline fn writeDomainNotice(self: *SkillsInstallReplayApp, notice: types.SemanticNotice, _: bool) !void {
         self.write_count += 1;
         self.last_tone = notice.tone;
         _ = try self.shell.appendSemanticNotice(self.alloc, notice);
@@ -4555,6 +4648,7 @@ test "trace notice distinguishes Markdown file outcomes without a feedback CTA" 
 }
 
 test "trace compaction summary renders recorded events without file tracing" {
+    const compactor = @import("../compactor/compactor.zig");
     const alloc = std.testing.allocator;
     diagnostics.resetForTest();
     defer diagnostics.resetForTest();
@@ -4564,8 +4658,8 @@ test "trace compaction summary renders recorded events without file tracing" {
     try writeCompactionSummary(&empty.writer, alloc);
     try std.testing.expect(std.mem.find(u8, empty.written(), "\n## Context Compaction\n(none recorded)\n") != null);
 
-    diagnostics.traceCompactionEvent(.{ .turn_id = 10, .step_id = 176 }, .decision, "decision=compact estimated_tokens={d}", .{279466});
-    diagnostics.traceCompactionFailure(.{ .turn_id = 10 }, .retention_exhausted, "estimated_tokens={d}", .{59000});
+    compactor.traceEvent(.{ .turn_id = 10, .step_id = 176 }, .decision, "decision=compact estimated_tokens={d}", .{279466});
+    compactor.traceFailure(.{ .turn_id = 10 }, .retention_exhausted, "estimated_tokens={d}", .{59000});
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -4576,7 +4670,7 @@ test "trace compaction summary renders recorded events without file tracing" {
 
     diagnostics.resetForTest();
     for (0..diagnostics.compaction_ring_capacity + 3) |index| {
-        diagnostics.traceCompactionEvent(.{ .turn_id = 11 }, .decision, "decision=compact index={d}", .{index});
+        compactor.traceEvent(.{ .turn_id = 11 }, .decision, "decision=compact index={d}", .{index});
     }
     var wrapped: std.Io.Writer.Allocating = .init(alloc);
     defer wrapped.deinit();

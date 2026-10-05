@@ -15,11 +15,13 @@ const {
 const binary = resolve(import.meta.dir, "../../zig-out/bin/fx");
 const HEAD = "HISTORY_HEAD_29b7";
 const TAIL = "HISTORY_TAIL_16d3";
-const HANDOFF = `INTERNAL_HANDOFF_4e12: preserve ${HEAD} and ${TAIL}; follow the latest user request.`;
+// A fact entry, which the compacted conversation keeps whatever the turn
+// numbers.
+const HANDOFF = `Facts:\nF1: INTERNAL_HANDOFF_4e12: preserve ${HEAD} and ${TAIL}; follow the latest user request.`;
 const FOLLOWUP = "FOLLOWUP_OK_732c";
 const REOPEN = "REOPEN_OK_492a";
 const ACTIVITY = /Compacting \((?:\d+h)?(?:\d+m)?\d+s\)/;
-const COMPACTION_OUTPUT = /Compacting|compaction|Context compacted|No context to compact|Your existing context was kept|Synthetic summary rejection|INTERNAL_HANDOFF_4e12/i;
+const COMPACTION_OUTPUT = /Compacting|compaction|Context compacted|No context to compact|Synthetic summary rejection|INTERNAL_HANDOFF_4e12/i;
 
 type Trigger = "manual" | "auto" | "overflow" | "ordinary";
 type Outcome = "success" | "cancel" | "empty" | "provider-error";
@@ -48,6 +50,7 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
   const workspace = join(root, "workspace");
   mkdirSync(join(home, ".fx"), { recursive: true });
   mkdirSync(workspace);
+  writeFileSync(join(workspace, "seed-notes.txt"), "seed notes\n");
   writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
     model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false,
   }));
@@ -81,6 +84,10 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
       // Each chunk/retry needs a fresh Response, not a consumed held body.
       return fakeGatewayFinalText(phase === "attempt" && outcome === "empty" ? "" : HANDOFF);
     }
+    // Each seed turn reads a note before replying, so compaction has work to
+    // summarize. That extra request is not counted as ordinary.
+    const seedRead = `seed-read-${ordinary + 1}`;
+    if (phase === "seed" && !raw.includes(`"${seedRead}"`)) return fakeGatewayToolCall(seedRead, "read_file", { path: "seed-notes.txt" });
     ordinary++;
     if (phase === "seed") return fakeGatewayFinalText(seedReply(ordinary));
     if (phase === "attempt") {
@@ -110,13 +117,13 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
   let launchIndex = 0;
   const stderrPaths: string[] = [];
   const tapes: string[] = [];
-  async function cli(args: string[]) {
+  async function cli(args: string[], expectedStderr = "") {
     const child = Bun.spawn([binary, ...args], { cwd: workspace, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
     const timer = setTimeout(() => child.kill(), 30_000);
     try {
       const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
       expect(code).toBe(0);
-      expect(stderr).toBe("");
+      expect(stderr).toBe(expectedStderr);
       return JSON.parse(stdout);
     } finally { clearTimeout(timer); }
   }
@@ -192,7 +199,7 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
   }
   try {
     for (let turn = 1; turn <= seedTurns; turn++) {
-      const reply = await cli(["ask", "--json", "--auto", ...(sessionId ? ["--resume", sessionId] : []), `Seed ordinary historical turn ${turn}.`]);
+      const reply = await cli(["ask", "--json", "--auto", ...(sessionId ? ["--resume", sessionId] : []), `Seed ordinary historical turn ${turn}.`], "Reading seed-notes.txt\n");
       if (sessionId) expect(reply.session_id).toBe(sessionId);
       else sessionId = reply.session_id;
       expect(sessionId).toBeTruthy();
@@ -276,7 +283,9 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         if (trigger === "manual") {
           await terminal.waitForPane((pane) => !ACTIVITY.test(pane) && hasEmptyComposer(pane), 10_000);
           expect(f.counts().ordinary).toBe(f.seedTurns);
-          expect(f.counts().summaries).toBeGreaterThan(1);
+          // The reply holds only facts, so fx asks once more for the notes
+          // of the turn that did work.
+          expect(f.counts().summaries).toBe(2);
         } else {
           await until(() => f.counts().ordinary === f.seedTurns + (trigger === "overflow" ? 2 : 1), "ordinary request after compaction");
           const pane = await terminal.waitForText(/Thinking \(/, 10_000);
@@ -402,7 +411,8 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         await terminal.waitForPane((pane) => !ACTIVITY.test(pane) && pane.includes(feedback) && hasEmptyComposer(pane), 15_000);
         expect(f.durable()).toBe(0);
         expect(f.counts().ordinary).toBe(f.seedTurns);
-        expect(f.counts().summaries).toBe(outcome === "empty" ? 2 : 1);
+        // A failed or empty summary is retried once on the fallback model.
+        expect(f.counts().summaries).toBe(outcome === "cancel" ? 1 : 2);
         const afterFailure = f.counts();
         if (outcome === "cancel") f.summaryHold.dispose();
         await terminal.sendKeys("Escape");
@@ -659,10 +669,12 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         .join("\n");
       const at = source.indexOf("STEER_RULE_8d4");
       expect(at).toBeGreaterThan(-1);
-      const header = source.slice(source.lastIndexOf("\n### ", at) + 1, at);
-      expect(header).toStartWith("### User\n> USER_RETAINED:");
-      expect(header).not.toContain("Generated notice");
-      expect(source).toContain("STEER_END_8d4");
+      // Steering is the user's own message, labeled as added during the turn.
+      const header = source.slice(source.lastIndexOf("[", at), at);
+      expect(header).toBe("[User, added while the assistant worked]\n");
+      expect(source).toContain(steering);
+      // The task stays the live request, so the summarizer sees it only as context.
+      expect(source).toContain(`[Turn in progress]\n[User, this message stays in the conversation after the summary]\n${task}`);
 
       const sessionId = readdirSync(join(home, ".fx/sessions"))
         .find((id) => existsSync(join(home, ".fx/sessions", id, "events.jsonl")));
@@ -671,14 +683,18 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       await until(() => readFileSync(join(sessionDir, "events.jsonl"), "utf8").includes("\"turn_completed\""), "saved turn", 10_000);
       const handoff = readFileSync(join(sessionDir, "events.jsonl"), "utf8").trim().split("\n")
         .map((line) => JSON.parse(line)).find((frame) => frame.event?.context_checkpoint)?.event.context_checkpoint.summary ?? "";
-      const match = /> fx-compaction-state-v1 (\S+) (\d+) ([a-f0-9]{64})\n/.exec(handoff);
-      expect(match).not.toBeNull();
-      const state = JSON.parse(readFileSync(join(sessionDir, "tool-results", match![1]!), "utf8"));
-      expect(state.users).toEqual([task, steering]);
+      expect(handoff.startsWith("fx-compactor-v1\n")).toBe(true);
+      const state = JSON.parse(handoff.slice("fx-compactor-v1\n".length));
+      // Only the turn in progress was compacted; its steering is kept exactly.
+      expect(state.turns).toEqual([]);
+      expect(state.open.users).toEqual([steering]);
+      expect(state.tool_count).toBeGreaterThan(0);
+      expect(state.open.first_tool).toBe(1);
 
       const afterCompaction = ordinaryBodies.at(-1)!;
-      expect(afterCompaction).toContain("<context_handoff>");
+      expect(afterCompaction).toContain("<compacted_conversation>");
       expect(afterCompaction).toContain("STEER_END_8d4");
+      expect(afterCompaction.split("STEER_TASK_8d4").length - 1).toBe(1);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       passed = true;
     } finally {
@@ -707,9 +723,12 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       mkdirSync(workspace);
       copyFileSync(join(import.meta.dir, "fixtures/favicon.png"), image);
       copyFileSync(join(import.meta.dir, "fixtures/favicon.png"), queuedImage);
+      // After an overflow the whole request, fx's own instructions included,
+      // must fit a fifth of the rejected one, so the newest reads are small
+      // enough to stay: the six newest steps are kept, the one before is not.
       for (let step = 2; step <= 24; step++) {
         writeFileSync(join(workspace, `probe-${step}.txt`),
-          Array.from({ length: 80 }, (_, line) =>
+          Array.from({ length: step >= 20 ? 2 : 80 }, (_, line) =>
             `READ_PROBE_BEFORE_OVERFLOW_67e step=${step} line=${line} long evidence for retained context boundary\n`).join(""));
       }
       writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
@@ -806,7 +825,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         await until(() => postCompactionTool && savedFrames(eventsPath)
           .some((frame) => frame.event?.context_checkpoint), "post-compaction tool", 20_000);
         const retained = JSON.parse(readFileSync(recoveryPath, "utf8")).checkpoint.execution;
-        expect(retained.tool_steps).toHaveLength(9);
+        expect(retained.tool_steps).toHaveLength(6);
         expect(retained.steering).toHaveLength(1);
         await active.waitForText("POST_COMPACT_TOOL_RUNNING_67e", 10_000);
         await active.sendText(`QUEUED_DURING_TOOL_67e ${queuedImage}`);
@@ -814,14 +833,14 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
           "queued image admission", 5_000);
         if (injectedStaleCheckpoint) {
           const stale = JSON.parse(readFileSync(recoveryPath, "utf8"));
-          expect(stale.checkpoint.execution.tool_steps.length).toBeGreaterThanOrEqual(2);
-          stale.checkpoint.execution.tool_steps = stale.checkpoint.execution.tool_steps.slice(2);
+          expect(stale.checkpoint.execution.tool_steps.length).toBeGreaterThanOrEqual(1);
+          stale.checkpoint.execution.tool_steps = stale.checkpoint.execution.tool_steps.slice(1);
           for (const steering of stale.checkpoint.execution.steering) {
-            expect(steering.after_tool_step_count).toBeGreaterThanOrEqual(2);
-            steering.after_tool_step_count -= 2;
+            expect(steering.after_tool_step_count).toBeGreaterThanOrEqual(1);
+            steering.after_tool_step_count -= 1;
           }
           writeFileSync(recoveryPath, JSON.stringify(stale));
-          expect(stale.checkpoint.execution.tool_steps).toHaveLength(7);
+          expect(stale.checkpoint.execution.tool_steps).toHaveLength(5);
         }
 
         const fixturePid = active.processPid();

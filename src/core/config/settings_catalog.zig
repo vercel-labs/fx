@@ -32,6 +32,7 @@ pub const SettingId = enum {
     model,
     effort,
     fast_mode,
+    ultrafast_mode,
     permission_mode,
     sound_level,
     startup_scrollback,
@@ -51,6 +52,8 @@ pub const Snapshot = struct {
     reasoning_efforts: model_capabilities.ReasoningEffortOptions = .{},
     fast_mode: bool = false,
     supports_fast_mode: bool = false,
+    ultrafast_mode: bool = false,
+    supports_ultrafast_mode: bool = false,
     permission_mode: []const u8 = "ask",
     statusline_context: bool = false,
     statusline_session: bool = false,
@@ -67,6 +70,7 @@ pub const Snapshot = struct {
             .model => self.model,
             .effort => self.effort,
             .fast_mode => onOff(self.fast_mode),
+            .ultrafast_mode => onOff(self.ultrafast_mode),
             .permission_mode => if (std.mem.eql(u8, self.permission_mode, "yolo")) "full access" else self.permission_mode,
             .statusline_context => onOff(self.statusline_context),
             .statusline_session => onOff(self.statusline_session),
@@ -263,6 +267,7 @@ const specs = [_]Spec{
     .{ .id = .model, .category = .agent, .label = "Model", .description = "Choose the model used for new turns" },
     .{ .id = .effort, .category = .agent, .label = "Reasoning effort", .description = "Control how much reasoning the model applies" },
     .{ .id = .fast_mode, .category = .agent, .label = "Fast mode", .description = "Use faster inference when the model supports it" },
+    .{ .id = .ultrafast_mode, .category = .agent, .label = "Ultra mode", .description = "Request the highest-speed mode when the model supports it" },
     .{ .id = .permission_mode, .category = .agent, .label = "Permission mode", .description = "Choose when fx asks before taking actions" },
     .{ .id = .session_titles, .category = .agent, .label = "Session titles", .description = "Generate a short session title from the first prompt" },
     .{ .id = .sound_level, .category = .notifications, .label = "Sound level", .description = "Choose off, on, or max sounds and terminal bells" },
@@ -307,6 +312,7 @@ pub fn optionCount(snapshot: *const Snapshot, id: SettingId) usize {
         else
             0,
         .fast_mode => if (snapshot.supports_fast_mode or snapshot.fast_mode) on_off_options.len else 0,
+        .ultrafast_mode => if (snapshot.supports_ultrafast_mode or snapshot.ultrafast_mode) on_off_options.len else 0,
         else => staticOptionsFor(id).len,
     };
 }
@@ -355,6 +361,7 @@ fn staticOptionsFor(id: SettingId) []const []const u8 {
     return switch (id) {
         .model, .effort => &.{},
         .fast_mode,
+        .ultrafast_mode,
         .statusline_context,
         .statusline_session,
         .statusline_workspace,
@@ -419,9 +426,9 @@ test "settings catalog projects grouped searchable preferences" {
         .sound_level = "on",
     };
 
-    try std.testing.expectEqual(@as(usize, 13), filteredCount(snapshot, .all, ""));
+    try std.testing.expectEqual(@as(usize, 14), filteredCount(snapshot, .all, ""));
     try std.testing.expectEqual(@as(usize, 5), filteredCount(snapshot, .interface, ""));
-    try std.testing.expectEqual(@as(usize, 5), filteredCount(snapshot, .agent, ""));
+    try std.testing.expectEqual(@as(usize, 6), filteredCount(snapshot, .agent, ""));
     try std.testing.expectEqual(@as(usize, 1), filteredCount(snapshot, .notifications, ""));
     try std.testing.expectEqual(@as(usize, 2), filteredCount(snapshot, .advanced, ""));
 

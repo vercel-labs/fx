@@ -4,7 +4,6 @@ const contracts = @import("contracts.zig");
 const terminal_engine = @import("engine.zig");
 const shell_resolver = @import("shell_resolver.zig");
 const terminal_store = @import("store.zig");
-const tmux_session = @import("tmux_session.zig");
 const host_capabilities = @import("../hosts/host.zig");
 const session_layout = @import("../session/session_layout.zig");
 const process_identity = @import("../execution/process_identity.zig");
@@ -35,9 +34,13 @@ const launcher_config_bytes: usize = contracts.max_command_bytes * 6 +
     4096;
 const wait_poll_ns: u64 = 5 * std.time.ns_per_ms;
 const graceful_close_ms: i64 = 800;
+/// Total time terminals get to leave after a hangup when fx exits.
+const exit_grace_ms: i64 = 500;
+/// Bound on joining terminal backend threads when fx exits.
+const exit_join_ms: i64 = 500;
 const control_poll_ms: i32 = 50;
 const marker_frame_timeout_ms: i64 = 5_000;
-const marker_ack_timeout_ms: i64 = tmux_session.marker_acknowledgement_timeout_ms;
+const marker_ack_timeout_ms: i64 = 15_000;
 const command_release_byte: u8 = 2;
 const control_nonce_len: usize = 32;
 const marker_frame_len: usize = control_nonce_len + 1;
@@ -253,7 +256,7 @@ pub const WorkTracker = struct {
     }
 };
 
-fn isSupported() bool {
+pub fn isSupported() bool {
     return isSupportedForOs(builtin.os.tag);
 }
 
@@ -314,47 +317,12 @@ pub fn runControlMarker(raw_args: []const [*:0]const u8) !void {
         else
             return error.InvalidControlMarker;
 
-    const tmux_failure = if (std.mem.startsWith(
-        u8,
-        control_path,
-        "/tmp/fx-tmux-marker-",
-    ))
-        io_mod.getenv("FX_TERMINAL_TEST_TMUX_MARKER_FAILURE")
-    else
-        null;
-    if (tmux_failure) |failure| {
-        if (std.mem.eql(u8, failure, "child-exit")) {
-            return error.InjectedTmuxMarkerChildExit;
-        }
-        if (std.mem.eql(u8, failure, "no-peer")) {
-            while (true) io_mod.sleep(wait_poll_ns);
-        }
-    }
-
     var bytes: [marker_frame_len]u8 = @splat(0);
     @memcpy(bytes[0..control_nonce_len], nonce);
     bytes[control_nonce_len] = @intFromEnum(kind);
     const address = try std.Io.net.UnixAddress.init(control_path);
     var stream = try address.connect(io_mod.getIo());
     defer stream.close(io_mod.getIo());
-    if (tmux_failure) |failure| {
-        if (std.mem.eql(u8, failure, "silent-peer")) {
-            while (true) io_mod.sleep(wait_poll_ns);
-        }
-        if (std.mem.eql(u8, failure, "partial-marker")) {
-            try writeAllFd(
-                stream.socket.handle,
-                bytes[0 .. bytes.len / 2],
-                false,
-            );
-            while (true) io_mod.sleep(wait_poll_ns);
-        }
-        if (std.mem.eql(u8, failure, "invalid-nonce")) {
-            bytes[0] ^= 1;
-            try writeAllFd(stream.socket.handle, &bytes, false);
-            while (true) io_mod.sleep(wait_poll_ns);
-        }
-    }
     try writeAllFd(stream.socket.handle, &bytes, false);
     var ack: [1]u8 = undefined;
     try receiveSocketExact(stream.socket, &ack, marker_ack_timeout_ms);
@@ -654,13 +622,13 @@ const UnsupportedRegistry = struct {
         _: WorkTracker,
         _: *terminal_store.ProfileStore,
         _: []const u8,
-        _: []const u8,
-        _: []const u8,
-    ) !UnsupportedRegistry {
+    ) UnsupportedRegistry {
         return .{ .alloc = alloc };
     }
 
-    pub fn shutdownSessionsOnly(_: *UnsupportedRegistry) void {}
+    pub fn closeAllForExit(_: *UnsupportedRegistry) bool {
+        return true;
+    }
 
     pub fn deinit(self: *UnsupportedRegistry) void {
         self.* = undefined;
@@ -691,156 +659,108 @@ const SupportedRegistry = struct {
     alloc: Allocator,
     tracker: WorkTracker,
     profile: *terminal_store.ProfileStore,
+    /// Durable owner identity of this fx process instance, borrowed for the
+    /// registry's lifetime. See `terminal_store.formatOwnerIdentity`.
     host_identity: []const u8,
-    durable_root: []const u8,
-    transport_root: []const u8,
     mutex: std.Io.Mutex = .init,
     sessions: [max_sessions]?*Session = @splat(null),
     references: [max_sessions]usize = @splat(0),
     recycle_cursor: usize = 0,
-    recovery: ?terminal_store.RecoveredList = null,
+    /// Set once by `closeAllForExit`, under `mutex`. Later starts are refused
+    /// so no terminal can outlive a clean exit of its owning process.
+    exiting: bool = false,
 
+    /// Performs no I/O. Records left by earlier processes are reconciled only
+    /// when their owner session lists its terminals, never at startup.
     pub fn init(
         alloc: Allocator,
         tracker: WorkTracker,
         profile: *terminal_store.ProfileStore,
         host_identity: []const u8,
-        durable_root: []const u8,
-        transport_root: []const u8,
-    ) !SupportedRegistry {
-        var registry = SupportedRegistry{
+    ) SupportedRegistry {
+        return .{
             .alloc = alloc,
             .tracker = tracker,
             .profile = profile,
             .host_identity = host_identity,
-            .durable_root = durable_root,
-            .transport_root = transport_root,
         };
-        errdefer registry.deinitRecoveryAttempt();
-        var recovered = try profile.recover(host_identity, io_mod.milliTimestamp());
-        var recovered_owned = true;
-        errdefer if (recovered_owned) recovered.deinit();
-        for (recovered.sessions.items) |*durable| {
-            if (!(try durable.close_cleanup_pending())) continue;
-            try finalizeRecoveredCloseBackend(
-                alloc,
-                profile.process_provider,
-                durable_root,
-                transport_root,
-                durable.record,
-            );
-            try durable.finish_close(io_mod.milliTimestamp());
-        }
-        while (recovered.sessions.pop()) |recovered_session| {
-            var durable = recovered_session;
-            var durable_owned = true;
-            defer if (durable_owned) durable.deinit();
-            if (durable.record.backend == .tmux and
-                (durable.record.lifecycle == .starting or
-                    durable.record.lifecycle == .running))
-            {
-                durable_owned = false;
-                try registry.recoverTmux(durable);
-                continue;
-            }
-            if (durable.record.backend == .tmux) {
-                tmux_session.cleanupOwnedNamespace(
-                    alloc,
-                    profile.process_provider,
-                    durable_root,
-                    transport_root,
-                    durable.record.backend_identity,
-                );
-            }
-        }
-        registry.recovery = recovered;
-        recovered_owned = false;
-        return registry;
     }
 
-    fn recoverTmux(
-        self: *SupportedRegistry,
-        durable: terminal_store.DurableSession,
-    ) !void {
-        const session = try self.alloc.create(Session);
-        var initialized = false;
-        defer if (!initialized) self.alloc.destroy(session);
-        session.* = Session.initRecovered(
-            self.alloc,
-            self.tracker,
-            durable,
-        ) catch |err| return err;
-        initialized = true;
-        var session_owned = true;
-        defer if (session_owned) {
-            session.deinitRecoveryAttempt();
-            self.alloc.destroy(session);
-        };
-        try self.profile.register_resident(&session.durable);
-        const slot = self.reserve(session) orelse return error.CapacityExceeded;
-        std.debug.assert(slot.evicted == null);
-        var reserved = true;
-        defer if (reserved) self.removeOwned(slot.index, session);
-        session.markLive();
-        const remains_live = session.recoverTmux(
-            self.durable_root,
-            self.transport_root,
-        ) catch |err| {
-            debug_trace.logf(
-                "terminal_host",
-                "tmux recovery deferred id={s} err={s}",
-                .{ session.id, @errorName(err) },
-            );
-            session.markNotLive();
-            if (!definitiveTmuxRecoveryLoss(err)) return err;
-            session.cleanupDefinitiveTmuxRecoveryAttempt() catch |cleanup_err| {
-                debug_trace.logf(
-                    "terminal_host",
-                    "tmux definitive recovery cleanup deferred id={s} err={s}",
-                    .{ session.id, @errorName(cleanup_err) },
-                );
-                return cleanup_err;
-            };
-            session.markLost();
-            return;
-        };
-        if (!remains_live) {
-            session.markNotLive();
-            return;
-        }
-        self.releaseReference(slot.index, session);
-        reserved = false;
-        session_owned = false;
-    }
-
-    /// Kills every live session's process without freeing any session state.
+    /// Ends every terminal this process owns, without a prompt. Each live
+    /// process group is hung up and given at most `exit_grace_ms` in total,
+    /// then killed, and its record is marked lost so a resumed session shows
+    /// it as ended. Backend threads are joined within `exit_join_ms`.
     ///
-    /// For a host that must exit while client threads are still running: those
-    /// threads may hold session pointers, so nothing here may be destroyed, but
-    /// the child processes still have to be signalled or they outlive the host
-    /// that owns them. `deinit` does both; this does only the half that is safe
-    /// while other threads are reading.
-    pub fn shutdownSessionsOnly(self: *SupportedRegistry) void {
+    /// Returns whether every backend finished, which `deinit` requires.
+    /// Otherwise the registry must stay allocated until process exit.
+    pub fn closeAllForExit(self: *SupportedRegistry) bool {
         const zio = io_mod.getIo();
-        // Take a reference on every live session before releasing the lock.
-        // A bare pointer copy would not stop a client that still holds the
-        // registry from recycling a reference-free slot and destroying the
-        // session this loop is about to signal, which is the use-after-free
-        // this drain exists to prevent. Recycling skips a referenced slot.
         var pinned: [max_sessions]?*Session = @splat(null);
         self.mutex.lockUncancelable(zio);
+        self.exiting = true;
         for (&self.sessions, 0..) |*entry, index| {
             const session = entry.* orelse continue;
             self.references[index] += 1;
             pinned[index] = session;
         }
         self.mutex.unlock(zio);
-
-        for (&pinned, 0..) |maybe_session, index| {
+        defer for (pinned, 0..) |maybe_session, index| {
             const session = maybe_session orelse continue;
-            session.shutdown();
             self.releaseReference(index, session);
+        };
+
+        var hung_up: usize = 0;
+        for (pinned) |maybe_session| {
+            const session = maybe_session orelse continue;
+            if (session.hangUpForExit()) hung_up += 1;
         }
+        if (hung_up != 0) {
+            const grace_deadline = io_mod.milliTimestamp() + exit_grace_ms;
+            while ((anyLive(&pinned) or anyExitTreeAlive(&pinned)) and
+                io_mod.milliTimestamp() < grace_deadline)
+            {
+                io_mod.sleep(wait_poll_ns);
+            }
+            for (pinned) |maybe_session| {
+                const session = maybe_session orelse continue;
+                session.killForExit();
+            }
+            debug_trace.logf(
+                "terminal",
+                "ended {d} terminal(s) for process exit",
+                .{hung_up},
+            );
+        }
+        const join_deadline = io_mod.milliTimestamp() + exit_join_ms;
+        var finished = true;
+        for (pinned) |maybe_session| {
+            const session = maybe_session orelse continue;
+            if (!session.finalizeBackendBefore(join_deadline)) finished = false;
+        }
+        return finished;
+    }
+
+    fn anyLive(pinned: *const [max_sessions]?*Session) bool {
+        for (pinned) |maybe_session| {
+            const session = maybe_session orelse continue;
+            if (session.isLive()) return true;
+        }
+        return false;
+    }
+
+    fn anyExitTreeAlive(pinned: *const [max_sessions]?*Session) bool {
+        for (pinned) |maybe_session| {
+            const session = maybe_session orelse continue;
+            if (session.exitTreeAlive()) return true;
+        }
+        return false;
+    }
+
+    fn isExiting(self: *SupportedRegistry) bool {
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        defer self.mutex.unlock(zio);
+        return self.exiting;
     }
 
     pub fn deinit(self: *SupportedRegistry) void {
@@ -859,23 +779,6 @@ const SupportedRegistry = struct {
             session.deinit();
             self.alloc.destroy(session);
         }
-        if (self.recovery) |*recovered| recovered.deinit();
-        self.* = undefined;
-    }
-
-    fn deinitRecoveryAttempt(self: *SupportedRegistry) void {
-        const zio = io_mod.getIo();
-        self.mutex.lockUncancelable(zio);
-        var sessions = self.sessions;
-        self.sessions = @splat(null);
-        self.mutex.unlock(zio);
-
-        for (&sessions) |*entry| {
-            const session = entry.* orelse continue;
-            session.deinitRecoveredRegistryAttempt();
-            self.alloc.destroy(session);
-        }
-        if (self.recovery) |*recovered| recovered.deinit();
         self.* = undefined;
     }
 
@@ -1101,7 +1004,11 @@ const SupportedRegistry = struct {
 
         const slot = self.reserve(session) orelse {
             session.deinitUnlaunched();
-            return self.failure(.start, .capacity_exceeded, null);
+            return self.failure(
+                .start,
+                if (self.isExiting()) .cancelled else .capacity_exceeded,
+                null,
+            );
         };
         defer self.releaseReference(slot.index, session);
         if (slot.evicted) |evicted| {
@@ -1111,11 +1018,7 @@ const SupportedRegistry = struct {
         session_owned = false;
 
         session.markLive();
-        session.launch(
-            request,
-            self.durable_root,
-            self.transport_root,
-        ) catch |err| {
+        session.launch(request) catch |err| {
             debug_trace.logf(
                 "terminal_host",
                 "session launch failed id={s} err={s}",
@@ -1136,6 +1039,11 @@ const SupportedRegistry = struct {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return self.failure(.start, launchFailureCode(err), null);
         };
+        // A start that raced `closeAllForExit` must not outlive it.
+        if (self.isExiting()) {
+            _ = session.hangUpForExit();
+            session.killForExit();
+        }
 
         const condition = request.return_when orelse .started;
         const ceiling = request.wait_ceiling_ms orelse 5_000;
@@ -1317,6 +1225,14 @@ const SupportedRegistry = struct {
         filters: contracts.ListFilters,
     ) Allocator.Error!contracts.OwnedResult {
         const owner_authority = filters.owner_authority.?;
+        self.reconcileOwner(owner_authority) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return self.actionError(
+                .list,
+                owner_authority.principal.durable_session_id,
+                err,
+            );
+        };
         var catalog = self.profile.ownerCatalog(owner_authority) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return self.actionError(
@@ -1356,6 +1272,29 @@ const SupportedRegistry = struct {
         ) catch return error.OutOfMemory;
     }
 
+    /// Records the terminals of this owner's earlier, now gone, fx process
+    /// instances as lost and finishes their interrupted closes. Terminals of a
+    /// running instance, including this one, are left untouched.
+    fn reconcileOwner(
+        self: *SupportedRegistry,
+        claim: contracts.OwnerCatalogAuthorityClaim,
+    ) !void {
+        var recovered = try self.profile.reconcileOwner(
+            claim,
+            io_mod.milliTimestamp(),
+        );
+        defer recovered.deinit();
+        for (recovered.sessions.items) |*durable| {
+            if (!(try durable.close_cleanup_pending())) continue;
+            try finalizeRecoveredClose(
+                self.alloc,
+                self.profile.process_provider,
+                durable.record,
+            );
+            try durable.finish_close(io_mod.milliTimestamp());
+        }
+    }
+
     const Reservation = struct {
         index: usize,
         evicted: ?*Session,
@@ -1373,6 +1312,7 @@ const SupportedRegistry = struct {
         const zio = io_mod.getIo();
         self.mutex.lockUncancelable(zio);
         defer self.mutex.unlock(zio);
+        if (self.exiting) return null;
         for (&self.sessions, 0..) |*entry, index| {
             if (entry.* != null) continue;
             entry.* = session;
@@ -1460,37 +1400,7 @@ const SupportedRegistry = struct {
     }
 };
 
-fn finalizeRecoveredCloseBackend(
-    alloc: Allocator,
-    process_provider: process_provider_mod.Provider,
-    durable_root: []const u8,
-    transport_root: []const u8,
-    record: terminal_store.Record,
-) !void {
-    switch (record.backend) {
-        .native => try finalizeRecoveredNativeClose(
-            alloc,
-            process_provider,
-            record,
-        ),
-        .tmux => try tmux_session.cleanupOwnedNamespaceChecked(
-            alloc,
-            process_provider,
-            durable_root,
-            transport_root,
-            record.backend_identity,
-            if (record.pid) |pid|
-                if (record.process_token) |process_token|
-                    .{ .pid = pid, .process_token = process_token }
-                else
-                    null
-            else
-                null,
-        ),
-    }
-}
-
-fn finalizeRecoveredNativeClose(
+fn finalizeRecoveredClose(
     alloc: Allocator,
     process_provider: process_provider_mod.Provider,
     record: terminal_store.Record,
@@ -1535,22 +1445,6 @@ fn requireCloseCandidate(
     }
 }
 
-fn definitiveTmuxRecoveryLoss(err: anyerror) bool {
-    return switch (err) {
-        error.TmuxRecoveryMissing,
-        error.TmuxRecoveryReplaced,
-        error.TmuxCompletionUnavailable,
-        error.MalformedTmuxLifecycle,
-        error.MalformedTmuxShellIdentity,
-        error.MalformedTmuxManifest,
-        error.MalformedTmuxPane,
-        error.TmuxRecoveryManifestMissing,
-        error.TmuxRecoveryShellIdentityMissing,
-        => true,
-        else => false,
-    };
-}
-
 const SignalTarget = struct {
     pid: std.posix.pid_t,
     token: process_identity.ProcessInstanceToken,
@@ -1561,14 +1455,6 @@ const ProcessGroupDelivery = enum {
     missing,
     failed,
 };
-
-fn shouldPauseRecoveredTmuxProcess(
-    lifecycle: contracts.Lifecycle,
-    terminal_present: bool,
-    child_pid_present: bool,
-) bool {
-    return lifecycle == .starting and !terminal_present and child_pid_present;
-}
 
 const Session = struct {
     alloc: Allocator,
@@ -1586,14 +1472,10 @@ const Session = struct {
     last_output_ms: i64,
     child_pid: ?std.posix.pid_t = null,
     child_token: ?process_identity.ProcessInstanceToken = null,
-    recovered_start_identity: bool = false,
     term: ?std.process.Child.Term = null,
     shell_ready_seen: bool = false,
     start_failure: ?contracts.StructuredErrorCode = null,
     master_fd: ?std.posix.fd_t = null,
-    tmux_backend: ?tmux_session.Backend = null,
-    tmux_capture: ?std.Io.net.Stream = null,
-    tmux_lifecycle_index: usize = 0,
     launcher: ?std.process.Child = null,
     control_file: ?std.Io.File = null,
     liveness_file: ?std.Io.File = null,
@@ -1610,10 +1492,17 @@ const Session = struct {
     backend_done: std.Io.Event = .unset,
     backend_join_mutex: std.Io.Mutex = .init,
     backend_started: bool = false,
-    backend_detaching: std.atomic.Value(bool) = .init(false),
     live_counted: bool = false,
     input_quiesced: bool = false,
     close_committed: bool = false,
+    /// Set when the owning fx process ends this terminal on exit. Its record
+    /// is then marked lost instead of exited, which a resume reports as
+    /// ended when fx exited.
+    ending_with_owner: bool = false,
+    /// The process tree recorded when the owner's exit hangs this terminal
+    /// up, so processes outside the shell's process group can be killed
+    /// after the shell itself exits. Used only by the exit path.
+    exit_tree: ?process_tree.Tracker = null,
     engine: terminal_engine.Grid,
     screen_available: bool = true,
     durable: terminal_store.DurableSession,
@@ -1690,81 +1579,6 @@ const Session = struct {
         };
     }
 
-    fn initRecovered(
-        alloc: Allocator,
-        tracker: WorkTracker,
-        durable_value: terminal_store.DurableSession,
-    ) !Session {
-        var durable = durable_value;
-        errdefer durable.deinit();
-        const id = try alloc.dupe(u8, durable.record.session_id);
-        errdefer alloc.free(id);
-        const shell = try alloc.dupe(u8, durable.record.shell);
-        errdefer alloc.free(shell);
-        const cwd = try alloc.dupe(u8, durable.record.cwd);
-        errdefer alloc.free(cwd);
-        var execution_scope = try durable.load_recovery_execution_scope(alloc);
-        errdefer execution_scope.deinit(alloc);
-        const command = if (durable.record.command) |value|
-            try alloc.dupe(u8, value)
-        else
-            null;
-        errdefer if (command) |value| alloc.free(value);
-        var screen_available = true;
-        const engine = reconstructEngine(alloc, &durable) catch |err| switch (err) {
-            error.ScreenMissing,
-            error.ScreenCorrupt,
-            error.ScreenUnsupported,
-            error.ScreenRetentionEvicted,
-            error.ScreenRawGap,
-            error.ScreenResizeUncheckpointed,
-            => blk: {
-                screen_available = false;
-                break :blk try terminal_engine.Grid.init(
-                    alloc,
-                    durable.record.dimensions.columns,
-                    durable.record.dimensions.rows,
-                );
-            },
-            else => return err,
-        };
-        const child_pid = if (durable.record.pid) |value|
-            std.fmt.parseInt(std.posix.pid_t, value, 10) catch null
-        else
-            null;
-        const child_token = if (durable.record.process_token) |value|
-            process_identity.ProcessInstanceToken.parse(value) catch null
-        else
-            null;
-        return .{
-            .alloc = alloc,
-            .tracker = tracker,
-            .id = id,
-            .shell = shell,
-            .cwd = cwd,
-            .command = command,
-            .startup_match = null,
-            .dimensions = durable.record.dimensions,
-            .lifecycle = durable.record.lifecycle,
-            .last_output_ms = durable.record.updated_at_ms,
-            .timeout_at_ms = durable.record.timeout_at_ms,
-            .child_pid = child_pid,
-            .child_token = child_token,
-            .term = if (durable.record.termination) |termination| switch (termination) {
-                .exited => |code| .{ .exited = @intCast(code) },
-                .signal => |signal| if (signalFromInt(signal)) |value|
-                    .{ .signal = value }
-                else
-                    null,
-            } else null,
-            .shell_ready_seen = durable.record.lifecycle == .running,
-            .engine = engine,
-            .screen_available = screen_available,
-            .durable = durable,
-            .workspace_root = execution_scope.workspace_root,
-        };
-    }
-
     fn deinitUnlaunched(self: *Session) void {
         self.engine.deinit();
         self.durable.deinit();
@@ -1777,16 +1591,12 @@ const Session = struct {
         self.* = undefined;
     }
 
-    fn launch(
-        self: *Session,
-        request: contracts.StartRequest,
-        durable_root: []const u8,
-        transport_root: []const u8,
-    ) !void {
-        try switch (request.backend) {
-            .native => self.launchNative(request),
-            .tmux => self.launchTmux(request, durable_root, transport_root),
-        };
+    fn launch(self: *Session, request: contracts.StartRequest) !void {
+        switch (request.backend) {
+            .native => try self.launchNative(request),
+            // Only records written by earlier fx versions name tmux.
+            .tmux => return error.UnsupportedBackend,
+        }
     }
 
     fn startTimeoutWatcher(self: *Session) !void {
@@ -1834,336 +1644,6 @@ const Session = struct {
             );
         };
         if (!self.signalProcess(.kill)) self.markLost();
-    }
-
-    fn launchTmux(
-        self: *Session,
-        request: contracts.StartRequest,
-        durable_root: []const u8,
-        transport_root: []const u8,
-    ) !void {
-        var invocation = try shell_resolver.resolve(
-            null,
-            pinnedShell(request.shell, self.shell),
-        );
-
-        const executable = try self_exe.pathForPeerReexec(self.alloc);
-        defer self.alloc.free(executable);
-        var paths = try tmux_session.Paths.init(
-            self.alloc,
-            durable_root,
-            transport_root,
-            self.durable.record.backend_identity,
-        );
-        defer paths.deinit(self.alloc);
-        var nonce_bytes: [16]u8 = undefined;
-        io_mod.getIo().random(&nonce_bytes);
-        const nonce = std.fmt.bytesToHex(nonce_bytes, .lower);
-        const command_path = if (request.command != null) paths.command else null;
-        const bootstrap = try shell_resolver.buildBootstrap(
-            self.alloc,
-            executable,
-            paths.marker_socket,
-            &nonce,
-            command_path,
-        );
-        defer self.alloc.free(bootstrap);
-        const source_command = try shell_resolver.buildSourceCommand(
-            self.alloc,
-            paths.bootstrap,
-        );
-        defer self.alloc.free(source_command);
-        if (request.command != null) invocation.setCommand(source_command);
-
-        var backend = try tmux_session.Backend.start(
-            self.alloc,
-            self.durable.profile.process_provider,
-            durable_root,
-            transport_root,
-            self.durable.record.backend_identity,
-            executable,
-            self.dimensions,
-            .{
-                .argv = invocation.argv(),
-                .cwd = request.cwd,
-                .control_path = paths.marker_socket,
-                .control_nonce = &nonce,
-                .bootstrap_path = paths.bootstrap,
-                .bootstrap = bootstrap,
-                .command_path = command_path,
-                .command = request.command,
-                .interactive_source = if (request.command == null)
-                    source_command
-                else
-                    null,
-                .tmux_socket = paths.socket,
-                .tmux_target = paths.target,
-                .lifecycle_path = paths.lifecycle,
-                .shell_identity_path = paths.shell_identity,
-                .manifest_ready_path = paths.manifest_ready,
-                .release_path = paths.release,
-                .command_release_path = paths.command_release,
-            },
-        );
-        var backend_owned = true;
-        errdefer if (backend_owned) {
-            backend.killSession();
-            backend.deinit();
-        };
-        try backend.beginCapture();
-        var capture = try backend.acceptCapture();
-        var capture_owned = true;
-        errdefer if (capture_owned) capture.close(io_mod.getIo());
-
-        self.tmux_backend = backend;
-        backend_owned = false;
-        self.tmux_capture = capture;
-        capture_owned = false;
-        self.output_active.store(true, .release);
-        self.output_thread = std.Thread.spawn(.{}, outputMain, .{self}) catch |err| {
-            self.output_active.store(false, .release);
-            self.tmux_capture.?.close(io_mod.getIo());
-            self.tmux_capture = null;
-            self.tmux_backend.?.killSession();
-            self.tmux_backend.?.deinit();
-            self.tmux_backend = null;
-            return err;
-        };
-        self.backend_started = true;
-        self.control_thread = std.Thread.spawn(.{}, tmuxControlMain, .{self}) catch |err| {
-            self.backend_started = false;
-            self.tmux_backend.?.stopCapture();
-            self.tmux_capture.?.close(io_mod.getIo());
-            self.tmux_capture = null;
-            self.output_thread.?.join();
-            self.output_thread = null;
-            self.tmux_backend.?.killSession();
-            self.tmux_backend.?.deinit();
-            self.tmux_backend = null;
-            return err;
-        };
-        maybeDelayForTest("FX_TERMINAL_TEST_TMUX_PREPARED_RELEASE_DELAY_MS");
-        self.tmux_backend.?.release() catch |err| {
-            self.tmux_backend.?.killSession();
-            return err;
-        };
-        self.child_released = true;
-    }
-
-    fn recoverTmux(
-        self: *Session,
-        durable_root: []const u8,
-        transport_root: []const u8,
-    ) !bool {
-        const executable = try self_exe.pathForPeerReexec(self.alloc);
-        defer self.alloc.free(executable);
-        const backend = tmux_session.Backend.recover(
-            self.alloc,
-            self.durable.profile.process_provider,
-            durable_root,
-            transport_root,
-            self.durable.record.backend_identity,
-            executable,
-        ) catch |err| {
-            debug_trace.logf(
-                "terminal_host",
-                "tmux recovery stage=backend id={s} err={s}",
-                .{ self.id, @errorName(err) },
-            );
-            return err;
-        };
-        self.tmux_backend = backend;
-        const recovered = &self.tmux_backend.?;
-        if (tmuxRecoveryFailure(self.id, "after-backend")) return error.InjectedFailure;
-
-        const frames = recovered.lifecycle() catch |err| {
-            debug_trace.logf("terminal_host", "tmux recovery stage=lifecycle id={s} err={s}", .{ self.id, @errorName(err) });
-            return err;
-        };
-        defer self.alloc.free(frames);
-        if (tmuxRecoveryFailure(self.id, "lifecycle") or
-            tmuxRecoveryFailure(self.id, "allocation") or
-            tmuxRecoveryFailure(self.id, "storage")) return error.InjectedFailure;
-        const terminal_present = tmuxTerminalFrame(frames) != null;
-        if (recovered.paneIsDead() and !terminal_present) {
-            return error.TmuxCompletionUnavailable;
-        }
-        if (self.lifecycle == .starting) {
-            if (tmuxShellPid(frames)) |raw_pid| {
-                const identity = try recovered.shellIdentity();
-                if (std.math.cast(u32, identity.pid) != raw_pid) {
-                    return error.TmuxRecoveryReplaced;
-                }
-                if (!terminal_present) {
-                    var pid_buffer: [32]u8 = undefined;
-                    const pid_text = try std.fmt.bufPrint(
-                        &pid_buffer,
-                        "{d}",
-                        .{identity.pid},
-                    );
-                    switch (self.durable.profile.process_provider.matchToken(
-                        self.alloc,
-                        pid_text,
-                        identity.process_token,
-                    )) {
-                        .matched => {},
-                        .missing, .mismatched => return error.TmuxRecoveryReplaced,
-                        .unavailable => return error.TmuxRecoveryIdentityUnavailable,
-                    }
-                }
-                self.child_pid = identity.pid;
-                self.child_token = identity.process_token;
-                self.recovered_start_identity = true;
-            }
-        }
-        if (tmuxRecoveryFailure(self.id, "identity")) return error.InjectedFailure;
-        const process_paused = shouldPauseRecoveredTmuxProcess(
-            self.lifecycle,
-            terminal_present,
-            self.child_pid != null,
-        );
-        if (process_paused and !self.signalNative(std.c.SIG.STOP)) {
-            return error.TmuxChildIdentityUnavailable;
-        }
-        defer if (process_paused) {
-            if (!self.signalNative(std.c.SIG.CONT)) {
-                debug_trace.logf(
-                    "terminal_host",
-                    "tmux recovery resume failed id={s}",
-                    .{self.id},
-                );
-            }
-        };
-
-        if (tmuxRecoveryFailure(self.id, "capture")) return error.InjectedFailure;
-        var capture = recovered.captureScreen() catch |err| {
-            debug_trace.logf("terminal_host", "tmux recovery stage=screen-capture id={s} err={s}", .{ self.id, @errorName(err) });
-            return err;
-        };
-        defer capture.deinit();
-        if (tmuxRecoveryFailure(self.id, "screen-capture")) return error.InjectedFailure;
-        self.reanchorTmuxScreen(capture) catch |err| {
-            debug_trace.logf("terminal_host", "tmux recovery stage=screen-reanchor id={s} err={s}", .{ self.id, @errorName(err) });
-            return err;
-        };
-        if (tmuxRecoveryFailure(self.id, "screen-reanchor")) return error.InjectedFailure;
-        self.child_released = true;
-
-        if (terminal_present) {
-            try self.applyRecoveredTmuxFrames(frames);
-            try recovered.cleanupChecked(
-                self.durable.profile.process_provider,
-            );
-            recovered.deinit();
-            self.tmux_backend = null;
-            return false;
-        }
-
-        if (self.lifecycle == .running) {
-            self.tmux_lifecycle_index = tmuxStartupFrameCount(frames);
-        }
-        recovered.beginCapture() catch |err| {
-            debug_trace.logf("terminal_host", "tmux recovery stage=begin-capture id={s} err={s}", .{ self.id, @errorName(err) });
-            return err;
-        };
-        if (tmuxRecoveryFailure(self.id, "begin-capture")) return error.InjectedFailure;
-        const stream = recovered.acceptCapture() catch |err| {
-            debug_trace.logf("terminal_host", "tmux recovery stage=accept-capture id={s} err={s}", .{ self.id, @errorName(err) });
-            return err;
-        };
-        self.tmux_capture = stream;
-        if (tmuxRecoveryFailure(self.id, "accept-capture")) return error.InjectedFailure;
-        self.output_active.store(true, .release);
-        self.output_thread = std.Thread.spawn(.{}, outputMain, .{self}) catch |err| {
-            self.output_active.store(false, .release);
-            return err;
-        };
-        if (tmuxRecoveryFailure(self.id, "output-thread")) return error.InjectedFailure;
-        if (self.lifecycle == .starting and self.child_pid == null) {
-            self.tmux_backend.?.release() catch |err| {
-                debug_trace.logf("terminal_host", "tmux recovery stage=release-prepared id={s} err={s}", .{ self.id, @errorName(err) });
-                return err;
-            };
-            self.child_released = true;
-            if (tmuxRecoveryFailure(self.id, "release")) return error.InjectedFailure;
-        }
-        if (tmuxRecoveryFailure(self.id, "control-thread")) return error.InjectedFailure;
-        self.control_thread = try std.Thread.spawn(.{}, tmuxControlMain, .{self});
-        self.backend_started = true;
-        try self.startTimeoutWatcher();
-        return true;
-    }
-
-    fn reanchorTmuxScreen(
-        self: *Session,
-        capture: tmux_session.ScreenCapture,
-    ) !void {
-        const now_ms = io_mod.milliTimestamp();
-        if (self.durable.record.raw_gap == null) {
-            _ = try self.durable.begin_raw_gap(now_ms);
-        }
-        if (tmuxRecoveryFailure(self.id, "after-gap")) return error.InjectedFailure;
-        if (capture.dimensions.rows != self.dimensions.rows or
-            capture.dimensions.columns != self.dimensions.columns)
-        {
-            try self.durable.check_resize_capacity(capture.dimensions);
-            try self.durable.resize(capture.dimensions, now_ms);
-            try self.engine.resize(
-                capture.dimensions.columns,
-                capture.dimensions.rows,
-            );
-        }
-        self.dimensions = capture.dimensions;
-        self.screen_available = false;
-        if (!capture.exact_modes_available) {
-            debug_trace.logf(
-                "terminal_host",
-                "tmux screen reanchor unavailable id={s} reason=unobservable_modes",
-                .{self.id},
-            );
-            return;
-        }
-        return error.TmuxScreenFactsUnavailable;
-    }
-
-    fn applyRecoveredTmuxFrames(
-        self: *Session,
-        frames: []const tmux_session.LifecycleFrame,
-    ) !void {
-        if (frames.len == 0 or frames[0].kind != .prepared) {
-            return error.InvalidTmuxLifecycle;
-        }
-        for (frames[1..]) |frame| {
-            if (self.lifecycle == .running and !tmuxLifecycleTerminal(frame.kind)) {
-                continue;
-            }
-            switch (frame.kind) {
-                .prepared => return error.InvalidTmuxLifecycle,
-                .shell_ready => if (self.command == null) {
-                    self.publishStarted(frame.value);
-                } else {
-                    self.shell_ready_seen = true;
-                },
-                .command_started => {
-                    if (self.command == null or !self.shell_ready_seen) {
-                        return error.InvalidTmuxLifecycle;
-                    }
-                    self.command_start_cursor = self.durable.output_cursor();
-                    self.publishStarted(frame.value);
-                },
-                .command_exited => self.setTerm(.{ .exited = @intCast(frame.value) }),
-                .command_signal => {
-                    const signal = signalFromInt(frame.value) orelse
-                        return error.InvalidTmuxLifecycle;
-                    self.setTerm(.{ .signal = signal });
-                },
-                .startup_failed => self.handleControl(.{
-                    .kind = .startup_failed,
-                    .value = frame.value,
-                }),
-                .invalid_term => self.markLost(),
-            }
-        }
     }
 
     fn launchNative(self: *Session, request: contracts.StartRequest) !void {
@@ -2311,90 +1791,24 @@ const Session = struct {
 
     fn deinit(self: *Session) void {
         self.shutdown();
+        if (self.exit_tree) |*tree| {
+            tree.deinit();
+            self.exit_tree = null;
+        }
         self.stopTimeoutWatcher();
         if (self.backend_started) {
             self.finalizeBackend();
         } else {
             if (self.output_thread) |thread| thread.join();
             if (self.master_fd) |fd| closeFd(fd);
-            if (self.tmux_capture) |stream| stream.close(io_mod.getIo());
             if (self.control_file) |file| file.close(io_mod.getIo());
             if (self.liveness_file) |file| file.close(io_mod.getIo());
             if (self.launcher) |*child| {
                 if (child.id != null) child.kill(io_mod.getIo());
             }
         }
-        if (self.tmux_backend) |*backend| {
-            if (!self.close_committed) backend.killSession();
-            backend.deinit();
-            self.tmux_backend = null;
-        }
         self.markNotLive();
         self.deinitUnlaunched();
-    }
-
-    fn deinitRecoveryAttempt(self: *Session) void {
-        std.debug.assert(!self.backend_started);
-        self.stopTmuxRecoveryHandles();
-        if (self.tmux_backend) |*backend| {
-            backend.deinitRetainingOwnedNamespace();
-            self.tmux_backend = null;
-        }
-        self.markNotLive();
-        self.deinitUnlaunched();
-    }
-
-    fn deinitRecoveredRegistryAttempt(self: *Session) void {
-        if (!self.backend_started) {
-            self.deinitRecoveryAttempt();
-            return;
-        }
-        self.backend_detaching.store(true, .release);
-        if (self.tmux_backend) |*backend| backend.stopCapture();
-        if (self.tmux_capture) |stream| {
-            stream.close(io_mod.getIo());
-            self.tmux_capture = null;
-        }
-        self.backend_done.waitUncancelable(io_mod.getIo());
-        if (self.control_thread) |thread| {
-            thread.join();
-            self.control_thread = null;
-        }
-        self.backend_started = false;
-        if (self.tmux_backend) |*backend| {
-            backend.deinitRetainingOwnedNamespace();
-            self.tmux_backend = null;
-        }
-        self.markNotLive();
-        self.deinitUnlaunched();
-    }
-
-    fn cleanupDefinitiveTmuxRecoveryAttempt(self: *Session) !void {
-        std.debug.assert(!self.backend_started);
-        self.stopTmuxRecoveryHandles();
-        const backend = if (self.tmux_backend) |*value| value else return;
-        backend.cleanupChecked(
-            self.durable.profile.process_provider,
-        ) catch |err| {
-            backend.deinitRetainingOwnedNamespace();
-            self.tmux_backend = null;
-            return err;
-        };
-        backend.deinit();
-        self.tmux_backend = null;
-    }
-
-    fn stopTmuxRecoveryHandles(self: *Session) void {
-        if (self.tmux_backend) |*backend| backend.stopCapture();
-        if (self.tmux_capture) |stream| {
-            stream.close(io_mod.getIo());
-            self.tmux_capture = null;
-        }
-        if (self.output_thread) |thread| {
-            thread.join();
-            self.output_thread = null;
-        }
-        self.output_active.store(false, .release);
     }
 
     fn shutdown(self: *Session) void {
@@ -2420,6 +1834,100 @@ const Session = struct {
         }
         self.backend_started = false;
         self.durable.release_completed_handles();
+    }
+
+    /// `finalizeBackend` bounded by `deadline_ms`. Returns false, leaving the
+    /// backend threads running, when output has not ended by then, for
+    /// example because a process that left the terminal still holds its PTY.
+    fn finalizeBackendBefore(self: *Session, deadline_ms: i64) bool {
+        const zio = io_mod.getIo();
+        self.backend_join_mutex.lockUncancelable(zio);
+        const started = self.backend_started;
+        self.backend_join_mutex.unlock(zio);
+        if (!started) return true;
+        const remaining_ms = deadline_ms - io_mod.milliTimestamp();
+        if (remaining_ms > 0) {
+            self.backend_done.waitTimeout(zio, .{ .duration = .{
+                .clock = .awake,
+                .raw = .fromMilliseconds(remaining_ms),
+            } }) catch {};
+        }
+        if (!self.backend_done.isSet()) {
+            debug_trace.logf(
+                "terminal",
+                "terminal backend still draining at exit id={s}",
+                .{self.id},
+            );
+            return false;
+        }
+        self.finalizeBackend();
+        return true;
+    }
+
+    fn isLive(self: *Session) bool {
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        defer self.mutex.unlock(zio);
+        return self.lifecycle == .starting or self.lifecycle == .running;
+    }
+
+    /// First step of ending a terminal with its owner: marks it and hangs up
+    /// its process group. Job control can run the shell's commands in their
+    /// own process groups, so the process tree is recorded first and those
+    /// processes are hung up too. Returns whether it was live.
+    fn hangUpForExit(self: *Session) bool {
+        const zio = io_mod.getIo();
+        self.timeout_done.set(zio);
+        self.mutex.lockUncancelable(zio);
+        const live = self.lifecycle == .starting or self.lifecycle == .running;
+        if (live) self.ending_with_owner = true;
+        self.mutex.unlock(zio);
+        if (!live) return false;
+        self.exit_tree = self.recordProcessTreeForExit();
+        _ = self.signalProcess(.hangup);
+        if (self.exit_tree) |*tree| {
+            if (tree.root) |root| {
+                _ = tree.signalOutsideProcessGroupChecked(signalValue(.hangup), root.pid);
+            }
+        }
+        return true;
+    }
+
+    fn recordProcessTreeForExit(self: *Session) ?process_tree.Tracker {
+        const target = self.signalTarget() orelse return null;
+        if (!self.matchesSignalTarget(target)) return null;
+        var tree = process_tree.Tracker.init(self.alloc) catch |err| {
+            debug_trace.logf("terminal", "exit process tree unavailable id={s} err={s}", .{ self.id, @errorName(err) });
+            return null;
+        };
+        tree.refresh(target.pid) catch |err| {
+            debug_trace.logf("terminal", "exit process tree unavailable id={s} err={s}", .{ self.id, @errorName(err) });
+            tree.deinit();
+            return null;
+        };
+        return tree;
+    }
+
+    fn exitTreeAlive(self: *Session) bool {
+        if (self.exit_tree) |*tree| return tree.anyAlive();
+        return false;
+    }
+
+    /// Last step of ending a terminal with its owner: kills what the hangup
+    /// left, including processes outside the shell's process group after the
+    /// shell exited, and records a terminal still running as lost. Closing
+    /// the liveness pipe also makes the launcher kill the process group if
+    /// the signal missed it.
+    fn killForExit(self: *Session) void {
+        if (self.isLive()) {
+            _ = self.signalProcess(.kill);
+            self.markLost();
+        }
+        if (self.exit_tree) |*tree| {
+            _ = tree.signalAll(signalValue(.kill));
+            tree.deinit();
+            self.exit_tree = null;
+        }
     }
 
     fn markLive(self: *Session) void {
@@ -2699,8 +2207,7 @@ const Session = struct {
             return;
         };
         if (self.screen_available) {
-            const feed_mode: terminal_engine.FeedMode = if (self.durable.record.backend == .tmux) .tmux_live else .native_live;
-            feed_result = self.engine.feedMode(bytes, feed_mode) catch |err| blk: {
+            feed_result = self.engine.feedMode(bytes, .native_live) catch |err| blk: {
                 self.screen_available = false;
                 debug_trace.logf(
                     "terminal_host",
@@ -2731,20 +2238,16 @@ const Session = struct {
 
         if (feed_result) |*result| {
             defer result.deinit(self.alloc);
-            if (self.durable.record.backend == .tmux) {
-                std.debug.assert(result.replies.items.len == 0);
-            } else {
-                const fd = master_fd orelse return;
-                for (result.replies.items) |reply| {
-                    writeAllFd(fd, reply.bytes, true) catch |err| {
-                        debug_trace.logf(
-                            "terminal_host",
-                            "terminal protocol reply failed id={s} err={s}",
-                            .{ self.id, @errorName(err) },
-                        );
-                        return;
-                    };
-                }
+            const fd = master_fd orelse return;
+            for (result.replies.items) |reply| {
+                writeAllFd(fd, reply.bytes, true) catch |err| {
+                    debug_trace.logf(
+                        "terminal_host",
+                        "terminal protocol reply failed id={s} err={s}",
+                        .{ self.id, @errorName(err) },
+                    );
+                    return;
+                };
             }
         }
 
@@ -2810,9 +2313,7 @@ const Session = struct {
             .prepared => {},
             .shell_ready => {
                 if (self.command == null) {
-                    if (self.tmux_backend == null and
-                        !self.establishStartupBoundary())
-                    {
+                    if (!self.establishStartupBoundary()) {
                         debug_trace.logf(
                             "terminal_host",
                             "terminal shell boundary unavailable id={s}",
@@ -2827,7 +2328,7 @@ const Session = struct {
                     if (self.lifecycle != .starting or self.shell_ready_seen) {
                         debug_trace.logf(
                             "terminal_host",
-                            "tmux shell-ready rejected id={s} lifecycle={s} seen={any}",
+                            "terminal shell-ready rejected id={s} lifecycle={s} seen={any}",
                             .{ self.id, @tagName(self.lifecycle), self.shell_ready_seen },
                         );
                         self.lifecycle = .lost;
@@ -2847,7 +2348,7 @@ const Session = struct {
                 if (!valid) {
                     debug_trace.logf(
                         "terminal_host",
-                        "tmux recovered command boundary invalid id={s}",
+                        "terminal command boundary invalid id={s}",
                         .{self.id},
                     );
                     self.failClosed(.session_lost);
@@ -2866,7 +2367,7 @@ const Session = struct {
                 if (!self.releaseCommandEvaluation()) {
                     debug_trace.logf(
                         "terminal_host",
-                        "tmux recovered command release unavailable id={s}",
+                        "terminal command release unavailable id={s}",
                         .{self.id},
                     );
                     self.failClosed(.session_lost);
@@ -2883,7 +2384,7 @@ const Session = struct {
             .startup_failed => {
                 debug_trace.logf(
                     "terminal_host",
-                    "tmux startup failed id={s} code={d}",
+                    "terminal startup failed id={s} code={d}",
                     .{ self.id, frame.value },
                 );
                 const failure: StartupFailure = switch (frame.value) {
@@ -2903,7 +2404,7 @@ const Session = struct {
             .invalid_term => {
                 debug_trace.logf(
                     "terminal_host",
-                    "tmux launcher reported invalid term id={s}",
+                    "terminal launcher reported invalid term id={s}",
                     .{self.id},
                 );
                 self.markLost();
@@ -2921,23 +2422,15 @@ const Session = struct {
             self.failClosed(.session_lost);
             return;
         };
-        const recovered_token = if (self.recovered_start_identity and
-            self.child_pid == pid)
-            self.child_token
-        else
-            null;
         const token: ?process_identity.ProcessInstanceToken =
-            if (recovered_token) |value|
-                value
-            else
-                self.durable.profile.process_provider.captureToken(
-                    self.alloc,
-                    pid_text,
-                ) catch null;
+            self.durable.profile.process_provider.captureToken(
+                self.alloc,
+                pid_text,
+            ) catch null;
         if (token == null) {
             debug_trace.logf(
                 "terminal_host",
-                "tmux recovered child identity unavailable id={s} pid={d}",
+                "terminal child identity unavailable id={s} pid={d}",
                 .{ self.id, pid },
             );
             self.failClosed(.process_identity_unavailable);
@@ -2945,13 +2438,11 @@ const Session = struct {
         }
         const zio = io_mod.getIo();
         self.mutex.lockUncancelable(zio);
-        if (self.lifecycle != .starting or
-            (self.child_pid != null and !self.recovered_start_identity))
-        {
+        if (self.lifecycle != .starting or self.child_pid != null) {
             debug_trace.logf(
                 "terminal_host",
-                "terminal child start rejected id={s} lifecycle={s} pending={any}",
-                .{ self.id, @tagName(self.lifecycle), self.recovered_start_identity },
+                "terminal child start rejected id={s} lifecycle={s}",
+                .{ self.id, @tagName(self.lifecycle) },
             );
             self.persistLostLocked(io_mod.milliTimestamp());
         } else {
@@ -2973,7 +2464,6 @@ const Session = struct {
             self.child_pid = pid;
             self.child_token = token;
             self.timeout_at_ms = self.durable.record.timeout_at_ms;
-            self.recovered_start_identity = false;
             self.lifecycle = contracts.transition_lifecycle(
                 self.lifecycle,
                 .child_started,
@@ -3019,6 +2509,13 @@ const Session = struct {
         if (self.close_committed) {
             self.term = term;
             self.lifecycle = .closed;
+            self.mutex.unlock(zio);
+            self.closeLiveness();
+            return;
+        }
+        if (self.ending_with_owner and self.lifecycle == .running) {
+            self.term = term;
+            self.persistLostLocked(io_mod.milliTimestamp());
             self.mutex.unlock(zio);
             self.closeLiveness();
             return;
@@ -3162,14 +2659,9 @@ const Session = struct {
         defer self.write_mutex.unlock(zio);
         self.mutex.lockUncancelable(zio);
         const file = self.liveness_file;
-        const tmux = if (self.tmux_backend) |*backend| backend else null;
         const running = self.lifecycle == .running;
         self.mutex.unlock(zio);
         if (!running) return false;
-        if (tmux) |backend| {
-            backend.releaseCommand() catch return false;
-            return true;
-        }
         if (file == null) return false;
         file.?.writeStreamingAll(
             zio,
@@ -3580,21 +3072,10 @@ fn writeAction(
     session.mutex.lockUncancelable(zio);
     const running = session.lifecycle == .running;
     const master_fd = if (session.input_quiesced) null else session.master_fd;
-    const tmux_ready = !session.input_quiesced and session.tmux_backend != null;
     session.mutex.unlock(zio);
-    if (!running or (master_fd == null and !tmux_ready)) {
-        return error.InvalidLifecycle;
-    }
+    if (!running or master_fd == null) return error.InvalidLifecycle;
 
-    if (session.tmux_backend) |*backend| {
-        const paste = switch (request.payload.?) {
-            .paste => true,
-            .text, .keys, .controls => false,
-        };
-        try backend.write(encoded.items, paste);
-    } else {
-        try writeAllFd(master_fd.?, encoded.items, true);
-    }
+    try writeAllFd(master_fd.?, encoded.items, true);
 
     session.mutex.lockUncancelable(zio);
     defer session.mutex.unlock(zio);
@@ -3642,9 +3123,8 @@ fn resizeAction(
     );
     session.mutex.lockUncancelable(zio);
     const fd = session.master_fd;
-    const tmux_ready = session.tmux_backend != null;
     const valid = session.lifecycle == .starting or session.lifecycle == .running;
-    if (!valid or (fd == null and !tmux_ready)) {
+    if (!valid or fd == null) {
         session.mutex.unlock(zio);
         return error.InvalidLifecycle;
     }
@@ -3688,60 +3168,33 @@ fn resizeAction(
     resized_engine_owned = false;
     session.dimensions = request.dimensions;
     session.mutex.unlock(zio);
-    if (session.tmux_backend) |*backend| {
-        backend.resize(request.dimensions) catch |err| {
-            rollbackTmuxResize(
-                session,
-                previous_dimensions,
-                previous_payload,
-            );
-            return err;
-        };
-    } else {
-        resizeFd(fd.?, request.dimensions) catch |err| {
-            rollbackDurableResize(
-                session,
-                fd.?,
-                previous_dimensions,
-                previous_payload,
-            );
-            return err;
-        };
-        if (!session.signalNative(std.c.SIG.WINCH)) {
-            rollbackDurableResize(
-                session,
-                fd.?,
-                previous_dimensions,
-                previous_payload,
-            );
-            return error.ProcessIdentityUnavailable;
-        }
-    }
-    if (session.tmux_backend != null and tmuxResizeCheckpointFailure()) {
-        rollbackTmuxResize(
+    resizeFd(fd.?, request.dimensions) catch |err| {
+        rollbackDurableResize(
             session,
+            fd.?,
             previous_dimensions,
             previous_payload,
         );
-        return error.InjectedFailure;
+        return err;
+    };
+    if (!session.signalNative(std.c.SIG.WINCH)) {
+        rollbackDurableResize(
+            session,
+            fd.?,
+            previous_dimensions,
+            previous_payload,
+        );
+        return error.ProcessIdentityUnavailable;
     }
     session.mutex.lockUncancelable(zio);
     session.checkpointLocked(session.durable.output_cursor(), now_ms) catch |err| {
         session.mutex.unlock(zio);
-        if (session.tmux_backend != null) {
-            rollbackTmuxResize(
-                session,
-                previous_dimensions,
-                previous_payload,
-            );
-        } else {
-            rollbackDurableResize(
-                session,
-                fd.?,
-                previous_dimensions,
-                previous_payload,
-            );
-        }
+        rollbackDurableResize(
+            session,
+            fd.?,
+            previous_dimensions,
+            previous_payload,
+        );
         return err;
     };
     session.mutex.unlock(zio);
@@ -3754,26 +3207,6 @@ fn resizeAction(
             .dimensions = request.dimensions,
         } } },
     ) catch return error.OutOfMemory;
-}
-
-fn tmuxResizeCheckpointFailure() bool {
-    const value = io_mod.getenv(
-        "FX_TERMINAL_TEST_TMUX_RESIZE_CHECKPOINT_FAILURE",
-    ) orelse return false;
-    return std.mem.eql(u8, value, "allocation") or
-        std.mem.eql(u8, value, "storage") or
-        std.mem.eql(u8, value, "checkpoint");
-}
-
-fn tmuxRecoveryFailure(session_id: []const u8, point: []const u8) bool {
-    const value = io_mod.getenv(
-        "FX_TERMINAL_TEST_TMUX_RECOVERY_FAILURE",
-    ) orelse return false;
-    if (!std.mem.eql(u8, value, point)) return false;
-    const selected_session = io_mod.getenv(
-        "FX_TERMINAL_TEST_TMUX_RECOVERY_SESSION_ID",
-    ) orelse return true;
-    return std.mem.eql(u8, selected_session, session_id);
 }
 
 fn rollbackDurableResize(
@@ -3806,27 +3239,6 @@ fn rollbackDurableResize(
         );
         return;
     }
-    restoreDurableResize(session, dimensions, checkpoint_payload);
-}
-
-fn rollbackTmuxResize(
-    session: *Session,
-    dimensions: contracts.Dimensions,
-    checkpoint_payload: []const u8,
-) void {
-    const backend = if (session.tmux_backend) |*value| value else return;
-    backend.resize(dimensions) catch |err| {
-        const zio = io_mod.getIo();
-        session.mutex.lockUncancelable(zio);
-        session.screen_available = false;
-        session.mutex.unlock(zio);
-        debug_trace.logf(
-            "terminal_host",
-            "tmux resize rollback failed id={s} err={s}",
-            .{ session.id, @errorName(err) },
-        );
-        return;
-    };
     restoreDurableResize(session, dimensions, checkpoint_payload);
 }
 
@@ -3923,19 +3335,6 @@ fn processGroupMissing(pid: std.posix.pid_t) bool {
     };
 }
 
-test "running tmux recovery does not pause the published process group" {
-    try std.testing.expect(!shouldPauseRecoveredTmuxProcess(
-        .running,
-        false,
-        true,
-    ));
-    try std.testing.expect(shouldPauseRecoveredTmuxProcess(
-        .starting,
-        false,
-        true,
-    ));
-}
-
 test "terminal signaling accepts a process group that exited during descendant delivery" {
     try std.testing.expect(terminalSignalCompleted(
         .{ .delivered = 1 },
@@ -3971,12 +3370,6 @@ fn closeAction(
         session.write_mutex.unlock(zio);
         return err;
     };
-    if (session.durable.record.backend == .tmux and
-        io_mod.getenv("FX_TERMINAL_TEST_INTERRUPT_CLOSE_AFTER_COMMIT") != null)
-    {
-        session.write_mutex.unlock(zio);
-        return error.InjectedTmuxCloseInterruption;
-    }
     session.mutex.lockUncancelable(zio);
     session.input_quiesced = true;
     session.close_committed = true;
@@ -4043,9 +3436,6 @@ fn closeAction(
     session.lifecycle = .closed;
     session.mutex.unlock(zio);
     session.finalizeBackend();
-    if (session.tmux_backend) |*backend| {
-        try backend.cleanupChecked(session.durable.profile.process_provider);
-    }
     try session.durable.finish_close(io_mod.milliTimestamp());
     if (force_signal_attempted and forceCloseSignalIncomplete(force_tree_complete)) {
         return contracts.OwnedResult.init(
@@ -4197,47 +3587,6 @@ const ControlFrame = struct {
     value: u32,
 };
 
-fn tmuxLifecycleTerminal(kind: tmux_session.LifecycleKind) bool {
-    return switch (kind) {
-        .command_exited,
-        .command_signal,
-        .startup_failed,
-        .invalid_term,
-        => true,
-        .prepared, .shell_ready, .command_started => false,
-    };
-}
-
-fn tmuxTerminalFrame(
-    frames: []const tmux_session.LifecycleFrame,
-) ?tmux_session.LifecycleFrame {
-    for (frames) |frame| if (tmuxLifecycleTerminal(frame.kind)) return frame;
-    return null;
-}
-
-fn tmuxShellPid(
-    frames: []const tmux_session.LifecycleFrame,
-) ?u32 {
-    for (frames) |frame| switch (frame.kind) {
-        .shell_ready => return frame.value,
-        .prepared,
-        .command_started,
-        .command_exited,
-        .command_signal,
-        .startup_failed,
-        .invalid_term,
-        => {},
-    };
-    return null;
-}
-
-fn tmuxStartupFrameCount(frames: []const tmux_session.LifecycleFrame) usize {
-    for (frames, 0..) |frame, index| {
-        if (tmuxLifecycleTerminal(frame.kind)) return index;
-    }
-    return frames.len;
-}
-
 fn writeControlFd(fd: std.posix.fd_t, kind: ControlKind, value: u32) !void {
     var bytes: [control_frame_len]u8 = undefined;
     bytes[0] = @intFromEnum(kind);
@@ -4272,10 +3621,7 @@ fn outputMain(session: *Session) void {
         session.output_done.set(io_mod.getIo());
     }
     var buffer: [256 * 1024]u8 = undefined;
-    const fd = session.master_fd orelse if (session.tmux_capture) |stream|
-        stream.socket.handle
-    else
-        return;
+    const fd = session.master_fd orelse return;
     while (true) {
         if (session.command_boundary_requested.load(.acquire)) {
             while (readOutputChunk(session, fd, &buffer, 0) catch return) {}
@@ -4291,93 +3637,6 @@ fn outputMain(session: *Session) void {
             control_poll_ms,
         ) catch break;
     }
-}
-
-fn tmuxControlMain(session: *Session) void {
-    defer {
-        session.backend_done.set(io_mod.getIo());
-        session.markNotLive();
-    }
-    var terminal_seen = false;
-    while (!terminal_seen and !session.backend_detaching.load(.acquire)) {
-        const backend = if (session.tmux_backend) |*value| value else {
-            session.markLost();
-            break;
-        };
-        const frames = backend.lifecycle() catch |err| {
-            debug_trace.logf(
-                "terminal_host",
-                "tmux lifecycle read deferred id={s} err={s}",
-                .{ session.id, @errorName(err) },
-            );
-            io_mod.sleep(wait_poll_ns);
-            continue;
-        };
-        defer session.alloc.free(frames);
-        if (session.tmux_lifecycle_index > frames.len) {
-            session.markLost();
-            break;
-        }
-        while (session.tmux_lifecycle_index < frames.len) {
-            const frame = frames[session.tmux_lifecycle_index];
-            session.tmux_lifecycle_index += 1;
-            const control = ControlFrame{
-                .kind = switch (frame.kind) {
-                    .prepared => .prepared,
-                    .shell_ready => .shell_ready,
-                    .command_started => .command_started,
-                    .command_exited => .command_exited,
-                    .command_signal => .command_signal,
-                    .startup_failed => .startup_failed,
-                    .invalid_term => .invalid_term,
-                },
-                .value = frame.value,
-            };
-            terminal_seen = switch (control.kind) {
-                .command_exited,
-                .command_signal,
-                .startup_failed,
-                .invalid_term,
-                => true,
-                .prepared, .shell_ready, .command_started => false,
-            };
-            if (terminal_seen) {
-                backend.stopCapture();
-                if (session.tmux_capture) |stream| {
-                    stream.close(io_mod.getIo());
-                    session.tmux_capture = null;
-                }
-                session.output_done.waitUncancelable(io_mod.getIo());
-            }
-            if (control.kind == .shell_ready) {
-                maybeDelayForTest(
-                    "FX_TERMINAL_TEST_TMUX_SHELL_READY_HOST_DELAY_MS",
-                );
-            }
-            session.handleControl(control);
-            if (terminal_seen) break;
-        }
-        if (!terminal_seen) io_mod.sleep(wait_poll_ns);
-    }
-
-    if (session.tmux_backend) |*backend| backend.stopCapture();
-    session.output_done.waitUncancelable(io_mod.getIo());
-    if (session.output_thread) |thread| {
-        thread.join();
-        session.output_thread = null;
-    }
-    maybeDelayForTest("FX_TERMINAL_TEST_BACKEND_CLEANUP_DELAY_MS");
-    const zio = io_mod.getIo();
-    session.write_mutex.lockUncancelable(zio);
-    if (session.tmux_capture) |stream| stream.close(zio);
-    session.tmux_capture = null;
-    session.mutex.lockUncancelable(zio);
-    const close_committed = session.close_committed;
-    session.mutex.unlock(zio);
-    if (!close_committed and !session.backend_detaching.load(.acquire)) {
-        if (session.tmux_backend) |*backend| backend.killSession();
-    }
-    session.write_mutex.unlock(zio);
 }
 
 fn controlMain(session: *Session) void {
@@ -4578,9 +3837,8 @@ fn launchFailureCode(err: anyerror) contracts.StructuredErrorCode {
         error.ResizeFailed,
         error.TerminalHostUnsupported,
         error.LauncherNotPrepared,
-        error.TmuxUnavailable,
         => .pty_unavailable,
-        error.TmuxIncompatible => .protocol_incompatible,
+        error.UnsupportedBackend => .unsupported_host,
         error.RelativeShellPath,
         error.UnsupportedShell,
         error.LauncherConfigTooLarge,
@@ -4848,35 +4106,6 @@ test "session initialization owns durable resources" {
         checkSessionInitAllocationFailures,
         .{},
     );
-}
-
-test "recovered session owns the saved workspace scope" {
-    const alloc = std.testing.allocator;
-    var fixture = try TestDurableFixture.init(alloc);
-    defer fixture.deinit();
-    var persistence = testPersistence("/saved-workspace/cwd");
-    persistence.grant.principal.workspace_root = "/saved-workspace";
-    persistence.grant.principal.backend = .tmux;
-    const durable = try terminal_store.DurableSession.create(&fixture.profile, .{
-        .session_id = "terminal-recovered-scope",
-        .host_identity = "test-host",
-        .shell = "/bin/zsh",
-        .cwd = "/saved-workspace/cwd",
-        .command = "printf ready",
-        .backend = .tmux,
-        .dimensions = .{ .rows = 24, .columns = 80 },
-        .persistence = persistence,
-        .now_ms = 1,
-    });
-    var session = try Session.initRecovered(
-        alloc,
-        .{ .context = null, .update_fn = ignoreWorkUpdate },
-        durable,
-    );
-    defer session.deinitUnlaunched();
-
-    try std.testing.expectEqualStrings("/saved-workspace", session.workspace_root);
-    try std.testing.expectEqualStrings("/saved-workspace/cwd", session.cwd);
 }
 
 test "terminal state does not release live work before backend cleanup" {
@@ -5541,12 +4770,12 @@ test "malformed raw fallback durably replaces an invalid checkpoint with corrupt
     );
 }
 
-test "shutdownSessionsOnly signals live sessions and leaves them allocated" {
+test "exit close ends live sessions within the grace bound and refuses new starts" {
     if (!isSupported()) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var fixture = try TestDurableFixture.init(alloc);
     defer fixture.deinit();
-    const id = try alloc.dupe(u8, "terminal-shutdown-only");
+    const id = try alloc.dupe(u8, "terminal-exit-close");
     var probe: WorkProbe = .{};
     var session = try Session.init(
         alloc,
@@ -5562,42 +4791,94 @@ test "shutdownSessionsOnly signals live sessions and leaves them allocated" {
     );
     defer session.deinitUnlaunched();
 
+    // A live session whose process ignores the hangup: no published child, so
+    // neither signal can reach it and only the final kill step can end it.
     session.markLive();
     session.lifecycle = .running;
-    // A real handle, so releasing it is observable rather than vacuous.
     session.liveness_file = try std.Io.Dir.createFileAbsolute(
         io_mod.getIo(),
         "/dev/null",
         .{ .truncate = false },
     );
 
-    var registry = SupportedRegistry{
-        .alloc = alloc,
-        .tracker = .{ .context = &probe, .update_fn = WorkProbe.update },
-        .profile = &fixture.profile,
-        .host_identity = "test-host",
-        .durable_root = "/workspace",
-        .transport_root = "/workspace",
-    };
+    var registry = SupportedRegistry.init(
+        alloc,
+        .{ .context = &probe, .update_fn = WorkProbe.update },
+        &fixture.profile,
+        "test-host",
+    );
     registry.sessions[0] = &session;
 
-    // A slot with no outstanding reference is exactly the slot a client may
-    // recycle, so this is the case the pin has to cover.
+    const started = io_mod.milliTimestamp();
+    try std.testing.expect(registry.closeAllForExit());
+    const elapsed = io_mod.milliTimestamp() - started;
+    try std.testing.expect(elapsed >= exit_grace_ms);
+    try std.testing.expect(elapsed < exit_grace_ms + exit_join_ms);
+
+    // Every pin is released, the liveness pipe is closed so the launcher kills
+    // the process group, and the durable record says the terminal ended.
     try std.testing.expectEqual(@as(usize, 0), registry.references[0]);
-
-    registry.shutdownSessionsOnly();
-
-    // Every reference taken to pin the session for shutdown is given back, so
-    // the drain cannot wedge a later removeOwned that waits for the count.
-    try std.testing.expectEqual(@as(usize, 0), registry.references[0]);
-
-    // The liveness handle is released, so the session was actually shut down.
     try std.testing.expect(session.liveness_file == null);
-    // And the session is still allocated: the registry slot still points at it
-    // and the object is readable, which is what makes this safe to call while
-    // client threads still hold session pointers.
-    try std.testing.expect(registry.sessions[0] == &session);
-    try std.testing.expectEqual(contracts.Lifecycle.running, session.lifecycle);
+    try std.testing.expect(session.ending_with_owner);
+    try std.testing.expectEqual(contracts.Lifecycle.lost, session.lifecycle);
+    try std.testing.expectEqual(contracts.Lifecycle.lost, session.durable.record.lifecycle);
+
+    // A start that arrives after exit began cannot reserve a slot.
+    const late_id = try alloc.dupe(u8, "terminal-exit-late");
+    var late = try Session.init(
+        alloc,
+        .{ .context = &probe, .update_fn = WorkProbe.update },
+        &fixture.profile,
+        "test-host",
+        late_id,
+        .{
+            .cwd = "/workspace",
+            .shell = .{ .executable = .{ .path = "/bin/zsh" } },
+        },
+        testPersistence("/workspace"),
+    );
+    defer late.deinitUnlaunched();
+    try std.testing.expect(registry.reserve(&late) == null);
+    try std.testing.expect(registry.isExiting());
+    registry.sessions[0] = null;
+}
+
+test "exit close skips sessions that already ended" {
+    if (!isSupported()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    const id = try alloc.dupe(u8, "terminal-exit-finished");
+    var probe: WorkProbe = .{};
+    var session = try Session.init(
+        alloc,
+        .{ .context = &probe, .update_fn = WorkProbe.update },
+        &fixture.profile,
+        "test-host",
+        id,
+        .{
+            .cwd = "/workspace",
+            .shell = .{ .executable = .{ .path = "/bin/zsh" } },
+        },
+        testPersistence("/workspace"),
+    );
+    defer session.deinitUnlaunched();
+    session.lifecycle = .exited;
+
+    var registry = SupportedRegistry.init(
+        alloc,
+        .{ .context = &probe, .update_fn = WorkProbe.update },
+        &fixture.profile,
+        "test-host",
+    );
+    registry.sessions[0] = &session;
+    const started = io_mod.milliTimestamp();
+    try std.testing.expect(registry.closeAllForExit());
+    // Nothing was live, so exit does not wait out the grace period.
+    try std.testing.expect(io_mod.milliTimestamp() - started < exit_grace_ms);
+    try std.testing.expect(!session.ending_with_owner);
+    try std.testing.expectEqual(contracts.Lifecycle.exited, session.lifecycle);
+    registry.sessions[0] = null;
 }
 
 test "durable release and exit wait survive resident session removal" {
@@ -5636,8 +4917,6 @@ test "durable release and exit wait survive resident session removal" {
         .tracker = .{ .context = &probe, .update_fn = WorkProbe.update },
         .profile = &fixture.profile,
         .host_identity = "test-host",
-        .durable_root = "/workspace",
-        .transport_root = "/workspace",
     };
     var cancelled = std.atomic.Value(bool).init(false);
     var released = try registry.write(.{
@@ -5726,8 +5005,6 @@ test "a referenced slot is never recycled out from under its holder" {
         .tracker = .{ .context = &probe, .update_fn = WorkProbe.update },
         .profile = &fixture.profile,
         .host_identity = "test-host",
-        .durable_root = "/workspace",
-        .transport_root = "/workspace",
         .sessions = @splat(&resident),
         .references = @splat(1),
     };

@@ -3,7 +3,6 @@ const credentials = @import("../auth/credentials.zig");
 const secret = @import("../auth/secret.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
-const diagnostics = @import("../workspace/diagnostics.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const image_attachments = @import("../images/image_attachments.zig");
@@ -15,6 +14,7 @@ const session_runtime = @import("../session/session.zig");
 const session_codec = @import("../session/session_codec.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
+const compactor = @import("../compactor/compactor.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
 const types = @import("../shared/types.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -23,8 +23,10 @@ const compaction_activity = @import("../output/compaction_activity.zig");
 
 pub const AgentTurnSettings = struct {
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
+    auto_compact_percent: u8 = compactor.default_percent,
     first_call_tool_choice: types.ToolChoice = .auto,
     fast_mode: bool = false,
+    ultrafast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
     /// Gateway provider routing for turns built from these settings. When set
     /// on WorkerRuntime.agent_turn_settings the slice is owned by the worker
@@ -650,7 +652,7 @@ pub const WorkerRuntime = struct {
     fn finishCompactionActivityLocked(self: *WorkerRuntime, turn_id: u64) void {
         const op = self.compaction_presentation.snapshot.operation orelse return;
         if (op.turn_id != turn_id or !op.active()) return;
-        diagnostics.traceCompactionLog(true, "unsettled operation at worker finish turn_id={d}", .{turn_id});
+        compactor.traceLog(true, "unsettled operation at worker finish turn_id={d}", .{turn_id});
         var feedback = compaction_activity.failure(
             if (self.isCancelRequested()) error.Cancelled else error.CompactionInterrupted,
             op.stage(),
@@ -1888,6 +1890,13 @@ pub const WorkerRuntime = struct {
         for (self.queued_prompts.items) |*prompt| prompt.agent_settings.fast_mode = enabled;
     }
 
+    pub fn syncQueuedPromptUltrafastMode(self: *WorkerRuntime, enabled: bool) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.agent_turn_settings.ultrafast_mode = enabled;
+        for (self.queued_prompts.items) |*prompt| prompt.agent_settings.ultrafast_mode = enabled;
+    }
+
     pub fn syncQueuedPromptEffort(self: *WorkerRuntime, effort: types.ReasoningEffort) void {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
@@ -2849,7 +2858,7 @@ fn appendHistoryTurnProjection(
 ) ![]types.HistoryTurn {
     _ = max_history_turns;
     const retained = if (turn == .compacted_summary and
-        std.mem.startsWith(u8, turn.compacted_summary.summary, types.context_handoff_open))
+        compactor.replacesPriorContext(turn.compacted_summary.summary))
         &.{}
     else
         current;

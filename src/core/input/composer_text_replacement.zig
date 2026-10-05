@@ -164,6 +164,7 @@ const Fixture = struct {
             "provider/model",
             2,
             true,
+            false,
             .effort,
         );
         self.picker.slash_completion_index = 4;

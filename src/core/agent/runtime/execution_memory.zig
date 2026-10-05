@@ -2,7 +2,6 @@ const std = @import("std");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const types = @import("../../shared/types.zig");
 const image_data = @import("../../images/image_data.zig");
-const png_downscale = @import("../../images/png_downscale.zig");
 const execution_memory_helpers = @import("../execution_memory.zig");
 const result_store = @import("../../session/result_store.zig");
 const command_replay_store = @import("../../session/command_replay_store.zig");
@@ -292,6 +291,13 @@ test "retained standalone cut rebuilds exactly the selected execution suffix" {
     }
 }
 
+/// Steering the user typed during the turn, which a cancelled turn keeps.
+fn isSteering(message: ChatMessage) bool {
+    if (message.restored_steering) return true;
+    const content = message.content orelse return false;
+    return steeringText(content) != null;
+}
+
 fn steeringText(content: []const u8) ?[]const u8 {
     if (std.mem.startsWith(u8, content, parent_steering_open) and std.mem.endsWith(u8, content, parent_steering_close)) {
         // Keep the sender label in persisted text and ordinary history replay.
@@ -385,7 +391,7 @@ pub fn buildInterruptedExecutionMemory(
                 }
             }
             for (user_tail) |entry| {
-                if (!entry.permission_feedback) continue;
+                if (!entry.permission_feedback and !isSteering(entry)) continue;
                 if (entry.tool_call_id) |source_tool_call_id| {
                     if (execution_memory_helpers.findToolCallById(calls, source_tool_call_id) == null) {
                         continue;
@@ -497,6 +503,34 @@ test "interrupted execution memory retains marked feedback through mixed user ta
     try std.testing.expectEqualStrings("first command feedback marker", results[0].permission_feedback[0]);
     try std.testing.expectEqual(@as(usize, 1), results[1].permission_feedback.len);
     try std.testing.expectEqualStrings("second command feedback marker", results[1].permission_feedback[0]);
+}
+
+test "interrupted execution memory keeps steering typed right after a tool result" {
+    const alloc = std.testing.allocator;
+    var calls = [_]ToolCall{
+        .{ .id = "call_done", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"run\",\"task\":\"work\"}}" },
+        .{ .id = "call_active", .name = "read_file", .arguments_json = "{\"path\":\"a.txt\"}" },
+    };
+    const steering = try steeringMessage(alloc, "check the tests too");
+    defer alloc.free(steering);
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = calls[0..1] },
+        .{ .role = .tool, .content = "child is still running", .tool_call_id = calls[0].id, .tool_name = calls[0].name, .tool_result_status = .success },
+        .{ .role = .user, .content = steering },
+        .{ .role = .user, .content = "custom hint", .permission_feedback = false },
+        .{ .role = .assistant, .content = "on it" },
+        .{ .role = .assistant, .tool_calls = calls[1..2] },
+    };
+
+    const memory = try buildInterruptedExecutionMemory(alloc, &messages, calls[1]);
+    defer types.freeExecutionMemory(alloc, memory);
+
+    // The cancelled turn keeps what the user typed, after the step it
+    // followed; an unmarked plain message still stays out.
+    try std.testing.expectEqual(@as(usize, 1), memory.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 1), memory.steering.len);
+    try std.testing.expectEqualStrings("check the tests too", memory.steering[0].text);
+    try std.testing.expectEqual(@as(usize, 1), memory.steering[0].after_tool_step_count);
 }
 
 fn hasToolResultForCall(
@@ -635,10 +669,8 @@ pub fn prepareCapturedToolModelOutput(
     };
 }
 
-/// Fits tool images to the model pixel limit, then saves them so later
-/// requests can load them again. `scratch` holds temporary resize buffers.
-pub fn retainToolImages(arena: Allocator, scratch: Allocator, config: Config, call: ToolCall, prepared: *result_store.PreparedResult) !void {
-    try fitToolImagesForHistory(arena, scratch, config, call, prepared);
+/// Retains the original tool images so later requests can project a safe view.
+pub fn retainToolImages(arena: Allocator, config: Config, call: ToolCall, prepared: *result_store.PreparedResult) !void {
     const memory = &prepared.memory;
     if (memory.tool_images.len == 0 or memory.tool_image_handle != null) return;
     const capability = config.session_child_capability orelse return;
@@ -655,169 +687,15 @@ pub fn retainToolImages(arena: Allocator, scratch: Allocator, config: Config, ca
     prepared.model_output = try std.mem.concat(arena, u8, &.{ notice, prepared.model_output[0..keep] });
 }
 
-/// Tool images after fitting them to `image_data.max_image_dimension`.
-const FittedToolImages = struct {
-    /// Images within the pixel limit, in their original order. Borrows the
-    /// input slice when nothing changed.
-    images: []const types.ToolImage,
-    /// One line per downscaled or withheld image; empty when nothing changed.
-    notice: []const u8 = "",
-    downscaled: usize = 0,
-    withheld: usize = 0,
-};
-
-fn exceedsModelImageLimit(image: types.ToolImage) bool {
-    const dimensions = image_data.encodedImageDimensions(image.data) orelse return false;
-    return dimensions.exceedsModelLimit();
-}
-
-fn countOversizedImages(images: []const types.ToolImage) usize {
-    var count: usize = 0;
-    for (images) |image| {
-        if (exceedsModelImageLimit(image)) count += 1;
-    }
-    return count;
-}
-
-const DownscaledToolImage = struct {
-    image: types.ToolImage,
-    dimensions: image_data.Dimensions,
-};
-
-/// Shrinks a PNG tool image to the model pixel limit. Returns null for other
-/// formats, undecodable PNGs, and copies that would exceed the encoded size
-/// limit. Temporary buffers use `scratch`; the returned image is owned by `arena`.
-fn downscaleToolImage(arena: Allocator, scratch: Allocator, image: types.ToolImage) Allocator.Error!?DownscaledToolImage {
-    if (!png_downscale.supportsMediaType(image.mime_type)) return null;
-    const decoder = std.base64.standard.Decoder;
-    const png_len = decoder.calcSizeForSlice(image.data) catch return null;
-    const png = try scratch.alloc(u8, png_len);
-    defer scratch.free(png);
-    decoder.decode(png, image.data) catch return null;
-    const smaller = try png_downscale.downscaleOversized(scratch, image.mime_type, png) orelse return null;
-    defer scratch.free(smaller.png);
-    const encoded_len = std.base64.standard.Encoder.calcSize(smaller.png.len);
-    if (encoded_len > image_data.max_encoded_image_bytes) return null;
-    const encoded = try arena.alloc(u8, encoded_len);
-    _ = std.base64.standard.Encoder.encode(encoded, smaller.png);
-    return .{
-        .image = .{ .data = encoded, .mime_type = try arena.dupe(u8, "image/png") },
-        .dimensions = .{ .width = smaller.width, .height = smaller.height },
-    };
-}
-
-/// JSON framing `result_store.storeToolImages` adds around each image's data.
-const stored_image_overhead_bytes: usize = 64;
-
-/// Shrinks PNG tool images over the model pixel limit and withholds other
-/// oversized images, so every image kept in history fits every request.
-/// Re-encoded copies can be larger than their source, so a copy that would
-/// take the result past the stored image limit is withheld as well.
-fn fitToolImagesToModelLimit(arena: Allocator, scratch: Allocator, images: []const types.ToolImage) !FittedToolImages {
-    if (countOversizedImages(images) == 0) return .{ .images = images };
-
-    var budget: usize = image_data.max_result_frame_bytes -| 2;
-    for (images) |image| {
-        if (!exceedsModelImageLimit(image)) budget -|= image.data.len + stored_image_overhead_bytes;
-    }
-    var fitted: FittedToolImages = .{ .images = &.{} };
-    var kept: std.ArrayList(types.ToolImage) = try .initCapacity(arena, images.len);
-    var notice: std.Io.Writer.Allocating = .init(arena);
-    for (images) |image| {
-        const original = image_data.encodedImageDimensions(image.data) orelse {
-            kept.appendAssumeCapacity(image);
-            continue;
-        };
-        if (!original.exceedsModelLimit()) {
-            kept.appendAssumeCapacity(image);
-            continue;
-        }
-        const smaller = try downscaleToolImage(arena, scratch, image) orelse {
-            fitted.withheld += 1;
-            try notice.writer.print(
-                "[Image not sent: {s} is {d}x{d} pixels, over the {d}-pixel limit per side, and fx could not downscale it, so it is not visible in this conversation. Load a copy at most {d} pixels per side instead, without changing the original.]\n",
-                .{ image.mime_type, original.width, original.height, image_data.max_image_dimension, image_data.max_image_dimension },
-            );
-            continue;
-        };
-        const stored_bytes = smaller.image.data.len + stored_image_overhead_bytes;
-        if (stored_bytes > budget) {
-            fitted.withheld += 1;
-            try notice.writer.print(
-                "[Image not sent: its downscaled {d}x{d} copy would take this result past the {d} MiB image limit, so it is not visible in this conversation. Load it in a separate call.]\n",
-                .{ smaller.dimensions.width, smaller.dimensions.height, image_data.max_result_frame_bytes / (1024 * 1024) },
-            );
-            continue;
-        }
-        budget -= stored_bytes;
-        kept.appendAssumeCapacity(smaller.image);
-        fitted.downscaled += 1;
-        try image_data.writeDownscaledNotice(&notice.writer, original, smaller.dimensions);
-    }
-    fitted.images = kept.items;
-    fitted.notice = notice.written();
-    return fitted;
-}
-
-/// Fits tool images to the model pixel limit before the result enters
-/// history, where one oversized image would fail every later request. The
-/// notice stays in the model-visible output. `scratch` holds temporary
-/// decode buffers and is fully released before returning.
-fn fitToolImagesForHistory(arena: Allocator, scratch: Allocator, config: Config, call: ToolCall, prepared: *result_store.PreparedResult) !void {
-    const fitted = try fitToolImagesToModelLimit(arena, scratch, prepared.memory.tool_images);
-    if (fitted.downscaled == 0 and fitted.withheld == 0) return;
-    debug_trace.logf("images", "event=tool_images_fitted call_id={s} tool={s} downscaled={d} withheld={d} max_dimension={d}", .{ call.id, call.name, fitted.downscaled, fitted.withheld, image_data.max_image_dimension });
-    prepared.memory.tool_images = fitted.images;
-    const output = try prependImageNotice(arena, fitted.notice, prepared.model_output, config.max_tool_result_bytes);
-    if (output.len < fitted.notice.len + prepared.model_output.len) prepared.memory.truncated = true;
-    prepared.model_output = output;
-}
-
-/// Leaves out stored images over the model pixel limit. They were saved
-/// before images were fitted on entry; loading a PNG source again yields a
-/// downscaled copy, while other formats need a smaller copy.
-fn withholdOversizedStoredImages(arena: Allocator, images: []const types.ToolImage) !FittedToolImages {
-    if (countOversizedImages(images) == 0) return .{ .images = images };
-
-    var fitted: FittedToolImages = .{ .images = &.{} };
-    var kept: std.ArrayList(types.ToolImage) = try .initCapacity(arena, images.len);
-    var notice: std.Io.Writer.Allocating = .init(arena);
-    for (images) |image| {
-        if (image_data.encodedImageDimensions(image.data)) |dimensions| {
-            if (dimensions.exceedsModelLimit()) {
-                fitted.withheld += 1;
-                try notice.writer.print(
-                    "[Image not sent: {s} is {d}x{d} pixels, over the {d}-pixel limit per side, so it is not visible in this conversation.",
-                    .{ image.mime_type, dimensions.width, dimensions.height, image_data.max_image_dimension },
-                );
-                if (png_downscale.supportsMediaType(image.mime_type)) {
-                    try notice.writer.writeAll(" Load it again to get a downscaled copy.]\n");
-                } else {
-                    try notice.writer.print(" Load a copy at most {d} pixels per side instead, without changing the original.]\n", .{image_data.max_image_dimension});
-                }
-                continue;
-            }
-        }
-        kept.appendAssumeCapacity(image);
-    }
-    fitted.images = kept.items;
-    fitted.notice = notice.written();
-    return fitted;
-}
-
 fn needsImageMaterialization(messages: []const ChatMessage) bool {
     for (messages) |message| {
         const memory = message.tool_result_memory orelse continue;
         if (memory.tool_images.len == 0 and memory.tool_image_handle != null) return true;
-        for (memory.tool_images) |image| {
-            if (exceedsModelImageLimit(image)) return true;
-        }
     }
     return false;
 }
 
-/// Loads stored tool images for a request and withholds any over the model
-/// pixel limit, so sessions saved before that limit existed stay usable.
+/// Loads stored tool images for a request without changing session history.
 pub fn materializeToolImages(arena: Allocator, config: Config, messages: []const ChatMessage) ![]const ChatMessage {
     if (!needsImageMaterialization(messages)) return messages;
     const materialized = try arena.dupe(ChatMessage, messages);
@@ -836,19 +714,62 @@ pub fn materializeToolImages(arena: Allocator, config: Config, messages: []const
                     continue;
                 };
             }
-            const fitted = try withholdOversizedStoredImages(arena, memory.tool_images);
-            if (fitted.withheld == 0) continue;
-            debug_trace.logf("images", "event=stored_tool_images_withheld call_id={s} withheld={d} kept={d} max_dimension={d}", .{ message.tool_call_id orelse "", fitted.withheld, fitted.images.len, image_data.max_image_dimension });
-            memory.tool_images = fitted.images;
-            message.content = try prependImageNotice(arena, fitted.notice, message.content orelse "", config.max_tool_result_bytes);
         }
     }
     return materialized;
 }
 
+fn requestToolImageFits(image: types.ToolImage, max_dimension: u32) bool {
+    const dimensions = image_data.encodedImageDimensions(image.data) orelse return false;
+    return !dimensions.exceeds(max_dimension) and
+        image.data.len <= image_data.max_encoded_image_bytes and
+        image_data.supportedMediaType(image.mime_type);
+}
+
+/// Builds a safe request view without changing the tool images saved in history.
+pub fn withholdRequestToolImages(arena: Allocator, messages: []const ChatMessage, max_dimension: u32, text_limit: usize) ![]const ChatMessage {
+    var projected: ?[]ChatMessage = null;
+    for (messages, 0..) |message, index| {
+        const memory = message.tool_result_memory orelse continue;
+        const has_unsafe = for (memory.tool_images) |image| {
+            if (!requestToolImageFits(image, max_dimension)) break true;
+        } else false;
+        if (!has_unsafe) continue;
+        var kept: std.ArrayList(types.ToolImage) = try .initCapacity(arena, memory.tool_images.len);
+        var notice: std.Io.Writer.Allocating = .init(arena);
+        for (memory.tool_images) |image| {
+            if (requestToolImageFits(image, max_dimension)) {
+                kept.appendAssumeCapacity(image);
+                continue;
+            }
+            const dimensions = image_data.encodedImageDimensions(image.data);
+            if (dimensions) |size| {
+                try notice.writer.print("[Image not sent: {s} is {d}x{d} pixels; this request permits at most {d} per side and 5 MiB encoded per image. ", .{ image.mime_type, size.width, size.height, max_dimension });
+            } else if (image.source_ref != null and image.data.len == 0) {
+                try notice.writer.print("[Image not sent: only a host source reference was supplied; this request permits at most {d} per side and 5 MiB encoded per image. ", .{max_dimension});
+            } else {
+                try notice.writer.writeAll("[Image not sent: its dimensions could not be verified. ");
+            }
+            if (image.source_ref) |source_ref| {
+                try image_data.writeHostImageRecoveryNotice(&notice.writer, source_ref, max_dimension);
+            } else {
+                try notice.writer.writeAll("If this tool result names a local file, use an available image tool to save a smaller copy, then read_file the copy. If no tool or path is available, ask the user; ask before installing software.]\n");
+            }
+        }
+        if (kept.items.len == memory.tool_images.len) continue;
+        const output = projected orelse try arena.dupe(ChatMessage, messages);
+        projected = output;
+        output[index].tool_result_memory.?.tool_images = kept.items;
+        output[index].content = try prependImageNotice(arena, notice.written(), message.content orelse "", text_limit);
+    }
+    return projected orelse messages;
+}
+
 fn prependImageNotice(alloc: Allocator, notice: []const u8, content: []const u8, limit: usize) Allocator.Error![]u8 {
-    const keep = @import("../../config/context_limits.zig").utf8PrefixLength(content, limit -| notice.len);
-    return std.mem.concat(alloc, u8, &.{ notice[0..@min(notice.len, limit)], content[0..keep] });
+    const utf8_prefix_length = @import("../../config/context_limits.zig").utf8PrefixLength;
+    const notice_keep = utf8_prefix_length(notice, limit);
+    const keep = utf8_prefix_length(content, limit -| notice.len);
+    return std.mem.concat(alloc, u8, &.{ notice[0..notice_keep], content[0..keep] });
 }
 
 fn testEncodedToolImage(arena: Allocator, bytes: []const u8, mime_type: []const u8) !types.ToolImage {
@@ -876,141 +797,96 @@ fn testImageConfig(cancel: *std.atomic.Value(bool)) Config {
     };
 }
 
-test "oversized tool images are downscaled or withheld before the result enters history" {
+test "request projection withholds unsafe tool images without changing history" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var cancel = std.atomic.Value(bool).init(false);
-    const wide_png = try png_downscale.testSolidGrayPng(std.testing.allocator, 2400, 2, 90);
-    defer std.testing.allocator.free(wide_png);
-    const images = [_]types.ToolImage{
-        try testEncodedToolImage(arena, wide_png, "image/png"),
-        try testJpegHeaderToolImage(arena, 3420, 2224),
-        try testPngHeaderToolImage(arena, 640, 480),
-    };
-    var prepared = result_store.PreparedResult{
-        .model_output = "captured three frames",
-        .memory = .{ .tool_images = &images },
-    };
-
-    try fitToolImagesForHistory(arena, std.testing.allocator, testImageConfig(&cancel), toolCall("call_frames", "capture", "{}"), &prepared);
-
-    try std.testing.expectEqual(@as(usize, 2), prepared.memory.tool_images.len);
-    try std.testing.expectEqual(
-        @as(?image_data.Dimensions, .{ .width = 2000, .height = 2 }),
-        image_data.encodedImageDimensions(prepared.memory.tool_images[0].data),
-    );
-    try std.testing.expectEqualStrings("image/png", prepared.memory.tool_images[0].mime_type);
-    try std.testing.expectEqualStrings(images[2].data, prepared.memory.tool_images[1].data);
-    try std.testing.expectEqualStrings(
-        "[Image downscaled from 2400x2 to 2000x2 pixels to fit the 2000-pixel limit per side. Multiply coordinates in this image by 1.20 to get original pixels.]\n" ++
-            "[Image not sent: image/jpeg is 3420x2224 pixels, over the 2000-pixel limit per side, and fx could not downscale it, so it is not visible in this conversation. Load a copy at most 2000 pixels per side instead, without changing the original.]\n" ++
-            "captured three frames",
-        prepared.model_output,
-    );
-    try std.testing.expect(!prepared.memory.truncated);
-}
-
-test "tool images within the pixel limit pass through unchanged" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var cancel = std.atomic.Value(bool).init(false);
-    const images = [_]types.ToolImage{
-        try testPngHeaderToolImage(arena, image_data.max_image_dimension, image_data.max_image_dimension),
-        .{ .data = try arena.dupe(u8, "bm90IGFuIGltYWdl"), .mime_type = try arena.dupe(u8, "image/png") },
-    };
-    var prepared = result_store.PreparedResult{
-        .model_output = "image attached",
-        .memory = .{ .tool_images = &images },
-    };
-
-    try fitToolImagesForHistory(arena, std.testing.allocator, testImageConfig(&cancel), toolCall("call_edge", "read_file", "{}"), &prepared);
-
-    try std.testing.expectEqual(@as([*]const types.ToolImage, &images), prepared.memory.tool_images.ptr);
-    try std.testing.expectEqual(@as(usize, 2), prepared.memory.tool_images.len);
-    try std.testing.expectEqualStrings("image attached", prepared.model_output);
-}
-
-test "downscaled tool images that would overflow the stored image limit are withheld" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var cancel = std.atomic.Value(bool).init(false);
-    const wide_png = try png_downscale.testSolidGrayPng(std.testing.allocator, 2400, 2, 90);
-    defer std.testing.allocator.free(wide_png);
-    // Data that is not an image header is stored unchanged and still counts.
-    const filler = try arena.alloc(u8, image_data.max_result_frame_bytes - 100);
-    @memset(filler, 'A');
-    const images = [_]types.ToolImage{
-        .{ .data = filler, .mime_type = try arena.dupe(u8, "image/png") },
-        try testEncodedToolImage(arena, wide_png, "image/png"),
-    };
-    var prepared = result_store.PreparedResult{
-        .model_output = "two images",
-        .memory = .{ .tool_images = &images },
-    };
-
-    try fitToolImagesForHistory(arena, std.testing.allocator, testImageConfig(&cancel), toolCall("call_full", "capture", "{}"), &prepared);
-
-    try std.testing.expectEqual(@as(usize, 1), prepared.memory.tool_images.len);
-    try std.testing.expectEqual(filler.ptr, prepared.memory.tool_images[0].data.ptr);
-    try std.testing.expectEqualStrings(
-        "[Image not sent: its downscaled 2000x2 copy would take this result past the 8 MiB image limit, so it is not visible in this conversation. Load it in a separate call.]\ntwo images",
-        prepared.model_output,
-    );
-}
-
-test "image notices never push tool output past the configured limit" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var cancel = std.atomic.Value(bool).init(false);
-    const config = testImageConfig(&cancel);
-    const wide_png = try png_downscale.testSolidGrayPng(std.testing.allocator, 2400, 2, 90);
-    defer std.testing.allocator.free(wide_png);
-    const images = [_]types.ToolImage{try testEncodedToolImage(arena, wide_png, "image/png")};
-    const output = try arena.alloc(u8, config.max_tool_result_bytes);
-    @memset(output, 'x');
-    var prepared = result_store.PreparedResult{
-        .model_output = output,
-        .memory = .{ .tool_images = &images },
-    };
-
-    try fitToolImagesForHistory(arena, std.testing.allocator, config, toolCall("call_long", "capture", "{}"), &prepared);
-
-    try std.testing.expect(prepared.model_output.len <= config.max_tool_result_bytes);
-    try std.testing.expect(std.mem.startsWith(u8, prepared.model_output, "[Image downscaled from 2400x2 to 2000x2 pixels"));
-    try std.testing.expect(prepared.memory.truncated);
-}
-
-test "request materialization withholds oversized images saved before fitting" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var cancel = std.atomic.Value(bool).init(false);
     const images = [_]types.ToolImage{
         try testPngHeaderToolImage(arena, 3420, 2224),
-        try testJpegHeaderToolImage(arena, 4032, 3024),
-        try testPngHeaderToolImage(arena, 10, 10),
+        try testJpegHeaderToolImage(arena, 8001, 1),
+        try testPngHeaderToolImage(arena, 1, 1),
     };
-    const messages = [_]ChatMessage{
-        .{ .role = .tool, .tool_call_id = "call_old", .tool_name = "read_file", .content = "image attached", .tool_result_memory = .{ .tool_images = &images } },
-        .{ .role = .user, .content = "retry" },
-    };
-
-    const materialized = try materializeToolImages(arena, testImageConfig(&cancel), &messages);
-
-    try std.testing.expectEqual(@as(usize, 1), materialized[0].tool_result_memory.?.tool_images.len);
-    try std.testing.expectEqualStrings(images[2].data, materialized[0].tool_result_memory.?.tool_images[0].data);
-    try std.testing.expectEqualStrings(
-        "[Image not sent: image/png is 3420x2224 pixels, over the 2000-pixel limit per side, so it is not visible in this conversation. Load it again to get a downscaled copy.]\n" ++
-            "[Image not sent: image/jpeg is 4032x3024 pixels, over the 2000-pixel limit per side, so it is not visible in this conversation. Load a copy at most 2000 pixels per side instead, without changing the original.]\n" ++
-            "image attached",
-        materialized[0].content.?,
-    );
+    const messages = [_]ChatMessage{.{ .role = .tool, .content = "<path>frame.png</path>", .tool_result_memory = .{ .tool_images = &images } }};
+    const normal = try withholdRequestToolImages(arena, &messages, 8000, 4096);
+    try std.testing.expectEqual(@as(usize, 2), normal[0].tool_result_memory.?.tool_images.len);
+    const strict = try withholdRequestToolImages(arena, &messages, 2000, 4096);
+    try std.testing.expectEqual(@as(usize, 1), strict[0].tool_result_memory.?.tool_images.len);
+    try std.testing.expect(std.mem.find(u8, strict[0].content.?, "<path>frame.png</path>") != null);
     try std.testing.expectEqual(@as(usize, 3), messages[0].tool_result_memory.?.tool_images.len);
-    try std.testing.expectEqualStrings("retry", materialized[1].content.?);
+}
+
+test "retaining tool results leaves original images in history" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cancel = std.atomic.Value(bool).init(false);
+    const images = [_]types.ToolImage{try testPngHeaderToolImage(arena, 3420, 2224)};
+    var prepared = result_store.PreparedResult{ .model_output = "source <path>frame.png</path>", .memory = .{ .tool_images = &images } };
+    try retainToolImages(arena, testImageConfig(&cancel), toolCall("call_frame", "read_file", "{}"), &prepared);
+    try std.testing.expectEqual(@as(usize, 1), prepared.memory.tool_images.len);
+    try std.testing.expectEqualStrings(images[0].data, prepared.memory.tool_images[0].data);
+    try std.testing.expectEqualStrings("source <path>frame.png</path>", prepared.model_output);
+}
+
+test "request image notices remain bounded without mutating retained text" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const images = [_]types.ToolImage{try testJpegHeaderToolImage(arena, 8001, 1)};
+    const content = try arena.alloc(u8, 2048);
+    @memset(content, 'x');
+    const messages = [_]ChatMessage{.{ .role = .tool, .content = content, .tool_result_memory = .{ .tool_images = &images } }};
+    const projected = try withholdRequestToolImages(arena, &messages, 8000, 512);
+    try std.testing.expect(projected[0].content.?.len <= 512);
+    try std.testing.expect(std.mem.startsWith(u8, projected[0].content.?, "[Image not sent:"));
+    try std.testing.expectEqual(@as(usize, 0), projected[0].tool_result_memory.?.tool_images.len);
+    try std.testing.expectEqual(@as(usize, 2048), messages[0].content.?.len);
+}
+
+test "request image notices preserve UTF-8 at every byte limit" {
+    const alloc = std.testing.allocator;
+    const content = "é界𐐀 tail";
+    for ([_][]const u8{ "", "ASCII ", "é", "界", "𐐀" }) |notice| {
+        const full = try std.mem.concat(alloc, u8, &.{ notice, content });
+        defer alloc.free(full);
+        for (0..full.len + 1) |limit| {
+            const output = try prependImageNotice(alloc, notice, content, limit);
+            defer alloc.free(output);
+            try std.testing.expect(output.len <= limit);
+            try std.testing.expect(std.unicode.utf8ValidateSlice(output));
+            if (limit == full.len) try std.testing.expectEqualStrings(full, output);
+        }
+    }
+}
+
+test "request image notices keep clipped source references as JSON text" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const source_ref = "é" ** 256;
+    var image = try testPngHeaderToolImage(arena, 8001, 1);
+    image.source_ref = try arena.dupe(u8, source_ref);
+    const images = [_]types.ToolImage{ image, image };
+    const content = "original tool output";
+    const messages = [_]ChatMessage{.{ .role = .tool, .content = content, .tool_result_memory = .{ .tool_images = &images } }};
+    const projected = try withholdRequestToolImages(arena, &messages, 8000, 1079);
+    const output = projected[0].content.?;
+    try std.testing.expect(output.len <= 1079);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(output));
+    try std.testing.expect(std.mem.find(u8, output, source_ref) != null);
+    try std.testing.expectEqual(@as(usize, 0), projected[0].tool_result_memory.?.tool_images.len);
+    try std.testing.expectEqual(@as(usize, 2), messages[0].tool_result_memory.?.tool_images.len);
+    try std.testing.expectEqualStrings(content, messages[0].content.?);
+    for (messages[0].tool_result_memory.?.tool_images) |retained| {
+        try std.testing.expectEqualStrings(source_ref, retained.source_ref.?);
+        try std.testing.expectEqualStrings(image.data, retained.data);
+    }
+
+    var writer: std.Io.Writer.Allocating = .init(arena);
+    try std.json.Stringify.value(output, .{}, &writer.writer);
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena, writer.written(), .{});
+    try std.testing.expect(parsed.value == .string);
+    try std.testing.expectEqualStrings(output, parsed.value.string);
 }
 
 pub fn applyToolResultMemory(
@@ -1705,7 +1581,6 @@ test "saved read_tool_result preparation preserves exact secret-like output" {
 }
 
 test "retrieved output remains backed across the inline cap" {
-    const compaction = @import("context_compaction.zig");
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1745,21 +1620,14 @@ test "retrieved output remains backed across the inline cap" {
         try std.testing.expectEqual(@min(case.bytes, case.cap), prepared.model_output.len);
         try std.testing.expect(std.mem.startsWith(u8, prepared.model_output, head));
         try std.testing.expect(std.mem.find(u8, prepared.model_output, "[redacted]") == null);
-        var messages = [_]ChatMessage{.{ .role = .tool, .tool_call_id = "retrieval-cap", .tool_name = "read_tool_result", .content = prepared.model_output, .tool_result_memory = prepared.memory }};
         if (case.bytes > case.cap and storage != .unavailable) {
             const handle = prepared.memory.output_handle orelse return error.TestExpectedStoredRetrieval;
             try std.testing.expectEqual(case.bytes, prepared.memory.stored_output_bytes);
             const stored = try result_store.readForReplayManaged(arena, &capability, handle, case.bytes);
             try std.testing.expectEqualStrings(raw, stored);
-            try compaction.promoteMessageResults(arena, &messages, .{ .managed = &capability }, 0);
-            try std.testing.expectEqualStrings(handle, messages[0].tool_result_memory.?.output_handle.?);
         } else {
             try std.testing.expect(prepared.memory.output_handle == null);
-            if (case.bytes > case.cap) {
-                try std.testing.expectError(error.IncompleteCompactionResult, compaction.promoteMessageResults(arena, &messages, .unavailable, 0));
-            } else {
-                try std.testing.expectEqualStrings(raw, prepared.model_output);
-            }
+            if (case.bytes <= case.cap) try std.testing.expectEqualStrings(raw, prepared.model_output);
         }
     };
 }
@@ -1788,7 +1656,6 @@ test "retrieved output storage failure does not publish an unbacked result" {
 
 test "saved tool output preparation keeps builtins and dynamic tools compactable" {
     const builtins = @import("../../../builtins/tools.zig");
-    const compaction = @import("context_compaction.zig");
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1812,9 +1679,6 @@ test "saved tool output preparation keeps builtins and dynamic tools compactable
         }, toolCall("tool-preparation", name, "{}"), raw);
         const handle = prepared.memory.output_handle orelse return error.TestExpectedStoredOutput;
         try std.testing.expectEqual(raw.len, prepared.memory.stored_output_bytes);
-        var messages = [_]ChatMessage{.{ .role = .tool, .tool_call_id = "tool-preparation", .tool_name = name, .content = prepared.model_output, .tool_result_memory = prepared.memory }};
-        try compaction.promoteMessageResults(arena, &messages, .{ .legacy_dir = dir }, 0);
-        try std.testing.expectEqualStrings(handle, messages[0].tool_result_memory.?.output_handle.?);
         const stored = try result_store.readByRange(arena, dir, handle, 1, 16384);
         try std.testing.expect(std.mem.find(u8, stored, raw) != null);
     }

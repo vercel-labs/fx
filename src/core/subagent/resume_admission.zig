@@ -186,7 +186,7 @@ test "managed child marker is hidden from external access" {
     var visible = try loadVisibleReadOnlyDetail(store, alloc, "child", .{});
     visible.deinit(alloc);
 
-    const state_store = child_state.Store{ .sessions = &store, .parent_id = "parent" };
+    const state_store = child_state.Store{ .backend = .{ .v1 = &store }, .parent_id = "parent" };
     try state_store.markChildSession(alloc, "child");
     try std.testing.expectError(
         error.SessionNotFound,

@@ -35,6 +35,7 @@ pub const Defaults = struct {
     model: []const u8,
     effort: types.ReasoningEffort,
     fast_mode: bool = false,
+    ultrafast_mode: bool = false,
     conversation_language: session.ConversationLanguage,
 };
 
@@ -123,7 +124,7 @@ pub const ApprovalResolveOptions = struct {
 
 pub const Runtime = struct {
     alloc: Allocator,
-    sessions: *session_store.Store,
+    backend: child_state.Backend,
     root_id: []u8,
     host_authority: authority.HostResolver,
     child_runner: ChildRunner,
@@ -146,6 +147,29 @@ pub const Runtime = struct {
         host_authority: authority.HostResolver,
         child_runner: ChildRunner,
     ) !*Runtime {
+        return createWith(alloc, .{ .v1 = sessions }, root_id, host_authority, child_runner);
+    }
+
+    /// A host over a v2 parent, whose children live in its log (D22).
+    /// Borrows `children` and the callback contexts until deinit; the
+    /// parent stays open until then (`tla/Wiring.tla`
+    /// ParentOutlivesChildren).
+    pub fn createV2(
+        alloc: Allocator,
+        children: *child_state.V2Children,
+        host_authority: authority.HostResolver,
+        child_runner: ChildRunner,
+    ) !*Runtime {
+        return createWith(alloc, .{ .v2 = children }, children.parent.id(), host_authority, child_runner);
+    }
+
+    fn createWith(
+        alloc: Allocator,
+        backend: child_state.Backend,
+        root_id: []const u8,
+        host_authority: authority.HostResolver,
+        child_runner: ChildRunner,
+    ) !*Runtime {
         try domain.validateId(root_id);
         const runtime = try alloc.create(Runtime);
         errdefer alloc.destroy(runtime);
@@ -153,7 +177,7 @@ pub const Runtime = struct {
         errdefer alloc.free(owned_root);
         runtime.* = .{
             .alloc = alloc,
-            .sessions = sessions,
+            .backend = backend,
             .root_id = owned_root,
             .host_authority = host_authority,
             .child_runner = child_runner,
@@ -165,7 +189,7 @@ pub const Runtime = struct {
             .alloc = alloc,
         };
         runtime.authority_resolver = .{
-            .sessions = sessions,
+            .backend = backend,
             .root_id = runtime.root_id,
             .host = host_authority,
         };
@@ -193,14 +217,24 @@ pub const Runtime = struct {
         child_runner_context: ?*anyopaque,
         host_authority: authority.HostResolver,
     ) void {
-        self.sessions = sessions;
+        self.backend = .{ .v1 = sessions };
+        self.rebindHost(child_runner_context, host_authority);
+    }
+
+    /// Points the host's callbacks at a host context that moved; the
+    /// backend stays as it is.
+    pub fn rebindHost(
+        self: *Runtime,
+        child_runner_context: ?*anyopaque,
+        host_authority: authority.HostResolver,
+    ) void {
         self.host_authority = host_authority;
         self.child_runner.context = child_runner_context;
-        self.authority_resolver.sessions = sessions;
+        self.authority_resolver.backend = self.backend;
         self.authority_resolver.root_id = self.root_id;
         self.authority_resolver.host = host_authority;
-        self.managed.sessions = sessions;
-        self.managed.state_store.sessions = sessions;
+        self.managed.backend = self.backend;
+        self.managed.state_store.backend = self.backend;
         self.managed.services.context = self;
         self.managed.authority_resolver = &self.authority_resolver;
         self.managed.approvals = &self.approvals;
@@ -433,7 +467,7 @@ pub const Runtime = struct {
     fn managedOwnerValue(self: *Runtime) managed_owner.Owner {
         return .{
             .alloc = self.alloc,
-            .sessions = self.sessions,
+            .backend = self.backend,
             .state_store = self.childStateStore(),
             .services = .{
                 .context = self,
@@ -447,7 +481,7 @@ pub const Runtime = struct {
 
     fn childStateStore(self: *Runtime) child_state.Store {
         return .{
-            .sessions = self.sessions,
+            .backend = self.backend,
             .parent_id = self.root_id,
         };
     }
@@ -629,6 +663,9 @@ pub const Runtime = struct {
                         active,
                     );
                     try self.managed.state_store.save(alloc, registry);
+                    // A v2 child lost before its first turn has no log to
+                    // resume, so its next work starts it fresh (D33).
+                    if (self.backend == .v2) try self.ensureManagedChildSession(alloc, started.id, active.id, defaults);
                     return managedAdmissionReady(alloc, started.id);
                 }
                 const child_id = try session_store.generateSessionId(alloc);
@@ -662,21 +699,45 @@ pub const Runtime = struct {
         work_id: []const u8,
         defaults: Defaults,
     ) !void {
+        const sessions = switch (self.backend) {
+            .v2 => |children| {
+                // A v2 child reaches the disk with its first turn, under
+                // the id its spawn line names (D34); until then only its
+                // settings wait here.
+                try children.rememberSeed(child_id, .{
+                    .preferences = .{
+                        .provider = defaults.provider,
+                        .model = @constCast(defaults.model),
+                        .effort = defaults.effort,
+                        .fast_mode = defaults.fast_mode,
+                        .ultrafast_mode = defaults.ultrafast_mode,
+                    },
+                    .language = defaults.conversation_language,
+                });
+                debug_trace.logf(
+                    "subagent",
+                    "child session reserved child_id={s} work_id={s} provider={s} model={s} effort={s} fast_mode={} ultrafast_mode={}",
+                    .{ child_id, work_id, @tagName(defaults.provider), defaults.model, defaults.effort.label(), defaults.fast_mode, defaults.ultrafast_mode },
+                );
+                return;
+            },
+            .v1 => |value| value,
+        };
         var state = try freshChildState(
             alloc,
             child_id,
-            self.sessions.workspace_root,
+            sessions.workspace_root,
             work_id,
             defaults,
         );
         defer state.deinit(alloc);
-        if (self.sessions.startWritableSession(alloc, state)) |writable_value| {
+        if (sessions.startWritableSession(alloc, state)) |writable_value| {
             var writable = writable_value;
             writable.log.park();
             writable.deinit(alloc);
             debug_trace.logf(
                 "subagent",
-                "child session created child_id={s} work_id={s} provider={s} model={s} effort={s} fast_mode={}",
+                "child session created child_id={s} work_id={s} provider={s} model={s} effort={s} fast_mode={} ultrafast_mode={}",
                 .{
                     child_id,
                     work_id,
@@ -684,6 +745,7 @@ pub const Runtime = struct {
                     state.preferences.model,
                     state.preferences.effort.label(),
                     state.preferences.fast_mode,
+                    state.preferences.ultrafast_mode,
                 },
             );
         } else |err| switch (err) {
@@ -947,10 +1009,35 @@ pub const Runtime = struct {
         child_id: []const u8,
         work_id: []const u8,
     ) !?[]u8 {
-        var state = self.sessions.loadReadOnly(alloc, child_id) catch return null;
-        defer state.deinit(alloc);
-        const text = assistantTextForWork(state.history, work_id) orelse return null;
-        return @as(?[]u8, try alloc.dupe(u8, text));
+        switch (self.backend) {
+            .v1 => |sessions| {
+                var state = sessions.loadReadOnly(alloc, child_id) catch return null;
+                defer state.deinit(alloc);
+                const text = assistantTextForWork(state.history, work_id) orelse return null;
+                return @as(?[]u8, try alloc.dupe(u8, text));
+            },
+            .v2 => |children| {
+                const history = children.parent.store.childHistory(alloc, child_id) catch return null;
+                defer types.freeHistoryTurnSlice(alloc, history);
+                const text = assistantTextForWork(history, work_id) orelse return null;
+                return @as(?[]u8, try alloc.dupe(u8, text));
+            },
+        }
+    }
+
+    /// A child's saved preferences, read without opening it. Caller owns.
+    fn childPreferences(self: *Runtime, alloc: Allocator, child_id: []const u8) !session_codec.DurableSessionPreferences {
+        switch (self.backend) {
+            .v1 => |sessions| {
+                var state = try sessions.loadReadOnly(alloc, child_id);
+                defer state.deinit(alloc);
+                const model = try alloc.dupe(u8, state.preferences.model);
+                var preferences = state.preferences;
+                preferences.model = model;
+                return preferences;
+            },
+            .v2 => |children| return children.parent.store.childPreferences(alloc, child_id),
+        }
     }
 
     fn encodeManaged(
@@ -975,11 +1062,11 @@ pub const Runtime = struct {
     ) Allocator.Error!StatusPublisher {
         var model: []u8 = undefined;
         var effort: types.ReasoningEffort = undefined;
-        if (self.sessions.loadReadOnly(alloc, child_id)) |loaded| {
-            var state = loaded;
-            defer state.deinit(alloc);
-            model = try alloc.dupe(u8, state.preferences.model);
-            effort = state.preferences.effort;
+        if (self.childPreferences(alloc, child_id)) |loaded| {
+            var preferences = loaded;
+            defer preferences.deinit(alloc);
+            model = try alloc.dupe(u8, preferences.model);
+            effort = preferences.effort;
         } else |err| {
             debug_trace.eventf("subagent", "status_publisher_fallback", .{}, "child_id={s} reason=session_load_failed error={s}", .{ child_id, @errorName(err) });
             model = try alloc.dupe(u8, fallback.model);
@@ -1069,8 +1156,8 @@ fn operationIdAlloc(
 }
 
 fn checkYieldedOwnership(alloc: Allocator) !void {
-    var runtime = Runtime{ .alloc = alloc, .sessions = undefined, .root_id = undefined, .host_authority = undefined, .child_runner = undefined, .approvals = undefined, .authority_resolver = undefined, .managed = undefined };
-    runtime.managed = .{ .alloc = alloc, .sessions = undefined, .state_store = undefined, .services = undefined, .authority_resolver = undefined, .approvals = undefined };
+    var runtime = Runtime{ .alloc = alloc, .backend = undefined, .root_id = undefined, .host_authority = undefined, .child_runner = undefined, .approvals = undefined, .authority_resolver = undefined, .managed = undefined };
+    runtime.managed = .{ .alloc = alloc, .backend = undefined, .state_store = undefined, .services = undefined, .authority_resolver = undefined, .approvals = undefined };
     defer runtime.yielded.deinit(alloc);
     defer while (runtime.yielded.items.len > 0) {
         const item = runtime.yielded.items[0];
@@ -1123,7 +1210,7 @@ test "subagent admission preserves an undelivered result before advancing its ch
         .total_output_tokens = 0,
     });
     defer loaded.deinit(alloc);
-    var runtime = Runtime{ .alloc = alloc, .sessions = &sessions, .root_id = undefined, .host_authority = undefined, .child_runner = undefined, .approvals = undefined, .authority_resolver = undefined, .managed = undefined };
+    var runtime = Runtime{ .alloc = alloc, .backend = .{ .v1 = &sessions }, .root_id = undefined, .host_authority = undefined, .child_runner = undefined, .approvals = undefined, .authority_resolver = undefined, .managed = undefined };
     defer runtime.yielded.deinit(alloc);
     try runtime.retainYielded("frozen-child", "old-work", 4096, 64);
     defer runtime.removeYielded("frozen-child", "old-work");
@@ -1146,7 +1233,7 @@ test "subagent admission preserves an undelivered result before advancing its ch
 
 test "parallel subagent wait bookkeeping stays serialized" {
     const alloc = std.testing.allocator;
-    var runtime = Runtime{ .alloc = alloc, .sessions = undefined, .root_id = undefined, .host_authority = undefined, .child_runner = undefined, .approvals = undefined, .authority_resolver = undefined, .managed = undefined };
+    var runtime = Runtime{ .alloc = alloc, .backend = undefined, .root_id = undefined, .host_authority = undefined, .child_runner = undefined, .approvals = undefined, .authority_resolver = undefined, .managed = undefined };
     defer runtime.yielded.deinit(alloc);
     const Writer = struct {
         runtime: *Runtime,
@@ -1622,7 +1709,7 @@ const OverrideResolverFixture = struct {
     fn run(raw: ?*anyopaque, turn: *execution.TurnContext, message: domain.QueuedMessage, _: domain.AdmissionSnapshot, _: *std.atomic.Value(bool)) execution.ServiceError!execution.RunOutcome {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
         self.runs += 1;
-        self.observed_model = std.testing.allocator.dupe(u8, turn.loaded.state.preferences.model) catch return error.ProviderFailed;
+        self.observed_model = std.testing.allocator.dupe(u8, turn.loaded.v1.state.preferences.model) catch return error.ProviderFailed;
         if (!turn.worker.beginDirectProcessing(1)) return error.ProviderFailed;
         turn.commit(turn.active_work_id.?, .{ .assistant = .{
             .user = .{ .text = message.content },
@@ -1854,8 +1941,16 @@ fn terminalResult(
             .result = result,
             .error_code = "child_interrupted",
         },
+        .lost => .{
+            .ok = false,
+            .result = result orelse lost_result,
+            .error_code = "child_lost",
+        },
     };
 }
+
+/// A crash lost the work before the child started it (D33).
+const lost_result = "fx stopped before this message reached the subagent, so it never ran. Send it again if it is still needed.";
 
 test "terminal result projects every managed outcome without a lifecycle phase" {
     const completed = terminalResult(.{
@@ -1873,6 +1968,7 @@ test "terminal result projects every managed outcome without a lifecycle phase" 
         .{ .outcome = .failed, .error_code = "child_failed" },
         .{ .outcome = .cancelled, .error_code = "child_cancelled" },
         .{ .outcome = .interrupted, .error_code = "child_interrupted" },
+        .{ .outcome = .lost, .error_code = "child_lost" },
     };
     for (cases) |case| {
         const projected = terminalResult(.{
@@ -1883,6 +1979,12 @@ test "terminal result projects every managed outcome without a lifecycle phase" 
         try std.testing.expectEqualStrings("partial", projected.result.?);
         try std.testing.expectEqualStrings(case.error_code, projected.error_code.?);
     }
+
+    // Work lost before the child started it says so, so the parent can
+    // send it again (D33).
+    const lost = terminalResult(.{ .phase = .interrupted, .outcome = .lost }, null);
+    try std.testing.expect(!lost.ok);
+    try std.testing.expectEqualStrings(lost_result, lost.result.?);
 
     const missing = terminalResult(.{
         .phase = .finished,
@@ -2044,6 +2146,7 @@ fn freshChildState(
             .model = model,
             .effort = defaults.effort,
             .fast_mode = defaults.fast_mode,
+            .ultrafast_mode = defaults.ultrafast_mode,
         },
         .history = try alloc.alloc(types.HistoryTurn, 0),
         .total_input_tokens = 0,
@@ -2068,6 +2171,7 @@ fn captureAdmission(
         .model = request.preferences.model,
         .provider = request.preferences.provider,
         .effort = request.preferences.effort,
+        .ultrafast_mode = request.preferences.ultrafast_mode,
         .permission_mode = snapshot.permission_mode,
         .tool_names = snapshot.tools,
         .rules = snapshot.rules,

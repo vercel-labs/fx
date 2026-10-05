@@ -12,6 +12,7 @@ pub fn fromCatalogEntry(entry: model_catalog.ModelCatalogEntry) model_capabiliti
         .supports_reasoning = entry.has_reasoning,
         .reasoning_efforts = .fromSlice(entry.reasoning_efforts.items),
         .supports_fast_mode = entry.supports_fast_mode,
+        .supports_ultrafast_mode = entry.supports_ultrafast_mode,
         .supports_tool_use = entry.has_tool_use,
         .supports_vision = entry.has_vision,
         .supports_file_input = entry.has_file_input,

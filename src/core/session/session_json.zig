@@ -1,5 +1,6 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
+const image_data = @import("../images/image_data.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const types = @import("../shared/types.zig");
@@ -162,6 +163,11 @@ fn writeUserTurnJson(writer: *std.Io.Writer, user: session.UserTurn) !void {
         try writeImageSnapshotLocatorJson(writer, image.snapshot_path);
         try writer.writeAll(",\"snapshot_sha256\":");
         try std.json.Stringify.value(image.snapshot_sha256, .{}, writer);
+        if (image.source_ref) |source_ref| {
+            if (!image_data.validSourceRef(source_ref)) return error.InvalidSessionFormat;
+            try writer.writeAll(",\"source_ref\":");
+            try std.json.Stringify.value(source_ref, .{}, writer);
+        }
         try writer.writeByte('}');
     }
     try writer.writeAll("]}");
@@ -1077,6 +1083,12 @@ fn validateImagesArray(alloc: Allocator, maybe_value: ?std.json.Value) ![]sessio
 
     for (value.array.items, 0..) |entry, i| {
         const object = try requireObject(entry);
+        const source_ref = if (object.get("source_ref")) |_| source: {
+            const value_bytes = try requireString(object, "source_ref");
+            if (!image_data.validSourceRef(value_bytes)) return error.InvalidSessionFormat;
+            break :source try alloc.dupe(u8, value_bytes);
+        } else null;
+        errdefer if (source_ref) |value_bytes| alloc.free(value_bytes);
         const snapshot_path = try optionalStringDup(alloc, object.get("snapshot_path"));
         var owns_snapshot_path = true;
         errdefer if (owns_snapshot_path) {
@@ -1096,6 +1108,7 @@ fn validateImagesArray(alloc: Allocator, maybe_value: ?std.json.Value) ![]sessio
             snapshot_path,
             snapshot_sha256,
         );
+        images[i].source_ref = source_ref;
         owns_snapshot_path = false;
         owns_snapshot_sha256 = false;
         parsed_count += 1;
@@ -2018,6 +2031,36 @@ test "legacy summary streaming structurally skips externally reordered history" 
     try std.testing.expectEqualStrings("reordered", summary.id);
     try std.testing.expect(summary.workspace_root == null);
     try std.testing.expectEqual(@as(usize, 1), summary.history_len);
+}
+
+test "session JSON image source refs round trip and reject malformed metadata" {
+    const alloc = std.testing.allocator;
+    var images = [_]types.ImageAttachment{.{
+        .id = 1,
+        .path = @constCast("inline://image-1"),
+        .media_type = @constCast("image/png"),
+        .source_ref = @constCast("host:original"),
+    }};
+    const history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("inspect"), .images = &images },
+        .assistant = @constCast("reply"),
+    } }};
+    const bytes = try renderSessionJson(alloc, "refs", 1, 2, .literal("en"), "/workspace", &history, .{});
+    defer alloc.free(bytes);
+    try std.testing.checkAllAllocationFailures(alloc, struct {
+        fn check(a: Allocator, encoded: []const u8) !void {
+            var loaded = try parseLegacyExact(TestStoredSession, a, encoded);
+            defer loaded.deinit(a);
+            const image = loaded.history[0].assistant.user.images[0];
+            try std.testing.expectEqualStrings("host:original", image.source_ref.?);
+            try std.testing.expect(image.inline_data == null);
+            try std.testing.expect(image.snapshot_path == null);
+            try std.testing.expect(image.snapshot_sha256 == null);
+        }
+    }.check, .{bytes});
+    const invalid = try std.mem.replaceOwned(u8, alloc, bytes, "\"host:original\"", "\"\"");
+    defer alloc.free(invalid);
+    try std.testing.expectError(error.InvalidSessionFormat, parseLegacyExact(TestStoredSession, alloc, invalid));
 }
 
 test "schema v2 legacy exact reader migrates background ownership to inert history" {

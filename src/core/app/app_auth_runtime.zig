@@ -471,6 +471,100 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// Explains a launch credential that could not be loaded, once the
+        /// launch lookup has settled without an active source.
+        pub fn writeStartupCredentialFailure(
+            app: *App,
+            provider: model_provider.ProviderId,
+            load_failure: ?credentials.LoadFailure,
+        ) !void {
+            const auth_view = app.auth.view();
+            const load_error: anyerror = if (load_failure) |failure|
+                failure.err
+            else if (auth_view.stored_key_status == .unavailable or auth_view.fx_login_status == .unavailable)
+                error.CredentialStorageUnavailable
+            else
+                return;
+            if (auth_view.active_source != null) return;
+            const body = try auth_runtime.preparationFailureText(app.alloc, provider, load_error);
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(.{
+                .topic = "auth",
+                .tone = .warning,
+                .body = body,
+            }, true);
+        }
+
+        pub fn startupCredentialPending(app: *const App) bool {
+            if (comptime !@hasDecl(@TypeOf(app.auth), "startupCredentialPending")) return false;
+            return app.auth.startupCredentialPending();
+        }
+
+        /// Probes the launch source inventory once the first frame is on screen.
+        pub fn collectDeferredStartupInventory(app: *App) void {
+            if (comptime !@hasDecl(@TypeOf(app.auth), "takeDeferredStartupSourceInventory")) return;
+            if (app.shell.render_requests.hasReason(.first_frame)) return;
+            if (!app.auth.takeDeferredStartupSourceInventory()) return;
+            app.auth.refreshSourceInventory(app.alloc) catch |err| {
+                debug_trace.logf("auth", "startup source inventory refresh failed err={s}", .{@errorName(err)});
+            };
+            app.shell.render_requests.request(.footer);
+        }
+
+        /// Settles the launch credential that was resolved after the first
+        /// frame, in the order the blocking launch path settles it before
+        /// its first frame: adoption, status, inventory, onboarding, notice.
+        pub fn collectStartupCredentialFacts(app: *App) !void {
+            if (comptime !@hasDecl(@TypeOf(app.auth), "takeStartupCredentialLoad")) return;
+            var outcome = app.auth.takeStartupCredentialLoad() orelse return;
+            defer outcome.deinit();
+            // The blocking path aborts launch on these errors; only allocation
+            // failure can reach here for a Keychain-backed Gateway lookup.
+            const resolution = switch (outcome) {
+                .failed => |err| return err,
+                .resolved => |*resolution| resolution,
+            };
+
+            var adopted = false;
+            if (resolution.credential) |*credential| {
+                if (app.auth.credentialSource()) |selected| {
+                    debug_trace.logf("auth", "startup credential dropped source={t} reason=selected_during_load selected={t}", .{ credential.source, selected });
+                } else {
+                    var owned = try credential.clone(app.alloc);
+                    defer owned.deinit(app.alloc);
+                    adopted = app.auth.adoptCredential(app.alloc, &owned);
+                }
+            }
+            app.auth.recordStartupStatus(
+                resolution.stored_key_status,
+                resolution.fx_login_status,
+                resolution.failure,
+                app.auth.view().onboarding_skipped,
+            );
+            app.auth.refreshSourceInventory(app.alloc) catch |err| {
+                debug_trace.logf("auth", "startup source inventory refresh failed err={s}", .{@errorName(err)});
+            };
+            const auth_view = app.auth.view();
+            if (auth_view.active_source == null and !auth_view.onboarding_skipped and !app.auth.pickerView().active) {
+                app.auth.openOnboardingPicker(app.alloc);
+            }
+            const provider = if (comptime provider_runtime.supported(App)) provider_runtime.provider(app) else .gateway;
+            try writeStartupCredentialFailure(app, provider, resolution.failure);
+
+            // Model cache warmup waited for this credential (see startModelCacheWarmup).
+            if (adopted) {
+                applyCredentialChange(app, true);
+            } else if (comptime @hasDecl(App, "startModelCacheWarmup")) {
+                app.startModelCacheWarmup();
+            }
+            // Before the first frame commits, its own hook starts the prewarm.
+            if (adopted and !app.shell.render_requests.hasReason(.first_frame)) {
+                startPromptCredentialPrewarm(app);
+            }
+            debug_trace.logf("auth", "startup credential settled adopted={} source={?t}", .{ adopted, auth_view.active_source });
+            app.shell.render_requests.request(.footer);
+        }
+
         pub fn collectSourceInventoryFacts(app: *App) !void {
             const result = app.auth.takeSourceInventoryRefresh() orelse return;
             switch (result) {
@@ -1742,6 +1836,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn collectPendingPromptCredential(
             app: *App,
         ) !PendingPromptCredentialReadiness {
+            if (startupCredentialPending(app)) return .pending;
             if (comptime @hasDecl(@TypeOf(app.auth), "providerPreparationPending")) {
                 if (app.auth.providerPreparationPending()) return .pending;
             }
@@ -1782,6 +1877,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn retryPendingPromptCredential(
             app: *App,
         ) !PendingPromptCredentialReadiness {
+            if (startupCredentialPending(app)) return .pending;
             if (comptime @hasDecl(@TypeOf(app.auth), "providerPreparationPending")) {
                 if (app.auth.providerPreparationPending()) return .pending;
             }
@@ -2285,6 +2381,7 @@ const TestTeamSelection = struct {
 };
 
 const TestAuth = struct {
+    startup_pending: bool = false,
     select_result: ?bool = false,
     sign_in_transition: login_flow.SignInTransition = .none,
     logout_changed: bool = false,
@@ -2381,6 +2478,10 @@ const TestAuth = struct {
 
     fn openSignInPickerFromRoot(self: *TestAuth, alloc: std.mem.Allocator) !bool {
         return self.openSignInPicker(alloc);
+    }
+
+    fn startupCredentialPending(self: *const TestAuth) bool {
+        return self.startup_pending;
     }
 
     fn openChatGptSignInPickerFromRoot(self: *TestAuth, alloc: std.mem.Allocator) !bool {
@@ -3510,4 +3611,185 @@ test "prompt credential refresh falls back when its task cannot start" {
         try Runtime(TestApp).retryPendingPromptCredential(&app),
     );
     try std.testing.expectEqual(@as(usize, 2), app.auth.refresh_count);
+}
+
+var stable_startup_credential_test_environ: ?*std.process.Environ.Map = null;
+
+/// Installs exactly `entries` with the Keychain disabled, so the launch lookup
+/// reads only what a test provides and never the developer's real Keychain.
+const StartupCredentialTestEnv = struct {
+    map: std.process.Environ.Map,
+
+    fn install(alloc: std.mem.Allocator, entries: []const [2][]const u8) !*StartupCredentialTestEnv {
+        if (stable_startup_credential_test_environ == null) {
+            const empty = try std.heap.page_allocator.create(std.process.Environ.Map);
+            empty.* = std.process.Environ.Map.init(std.heap.page_allocator);
+            stable_startup_credential_test_environ = empty;
+        }
+        const self = try alloc.create(StartupCredentialTestEnv);
+        errdefer alloc.destroy(self);
+        self.* = .{ .map = std.process.Environ.Map.init(alloc) };
+        errdefer self.map.deinit();
+        try self.map.put("FX_DISABLE_KEYCHAIN", "1");
+        for (entries) |entry| try self.map.put(entry[0], entry[1]);
+        io_mod.setEnvironMap(&self.map);
+        return self;
+    }
+
+    fn deinit(self: *StartupCredentialTestEnv, alloc: std.mem.Allocator) void {
+        io_mod.setEnvironMap(stable_startup_credential_test_environ.?);
+        self.map.deinit();
+        alloc.destroy(self);
+    }
+};
+
+const StartupCredentialApp = struct {
+    alloc: std.mem.Allocator = std.testing.allocator,
+    auth: auth_runtime.Runtime = .{},
+    submission: @import("input_submit_runtime.zig").State = .{},
+    shell: struct {
+        render_requests: struct {
+            first_frame_pending: bool = false,
+            footer_requested: bool = false,
+
+            fn request(self: *@This(), _: anytype) void {
+                self.footer_requested = true;
+            }
+
+            fn hasReason(self: @This(), _: anytype) bool {
+                return self.first_frame_pending;
+            }
+        } = .{},
+    } = .{},
+    model_cache: struct {
+        resets: usize = 0,
+
+        fn reset(self: *@This()) void {
+            self.resets += 1;
+        }
+    } = .{},
+    warmups: usize = 0,
+    notices: usize = 0,
+
+    fn writeDomainNotice(self: *@This(), _: types.SemanticNotice, _: bool) !void {
+        self.notices += 1;
+    }
+
+    fn startModelCacheWarmup(self: *@This()) void {
+        self.warmups += 1;
+    }
+
+    fn waitForStartupCredential(self: *@This()) !void {
+        const task = self.auth.startup_credential_task orelse return error.TestExpectedStartupCredentialTask;
+        var waited_ms: usize = 0;
+        while (!task.done.load(.acquire)) : (waited_ms += 1) {
+            if (waited_ms >= 5000) return error.TestStartupCredentialTimedOut;
+            io_mod.sleep(std.time.ns_per_ms);
+        }
+    }
+};
+
+test "prompts wait while the launch credential is still loading" {
+    var app: TestApp = .{};
+    defer app.deinit();
+    app.auth.active_source = null;
+    app.auth.startup_pending = true;
+
+    try std.testing.expectEqual(PendingPromptCredentialReadiness.pending, try Runtime(TestApp).collectPendingPromptCredential(&app));
+    try std.testing.expectEqual(PendingPromptCredentialReadiness.pending, try Runtime(TestApp).retryPendingPromptCredential(&app));
+    try std.testing.expect(!app.auth.picker_opened);
+    try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
+}
+
+test "a deferred launch credential settles once, like the blocking launch" {
+    const alloc = std.testing.allocator;
+    var env = try StartupCredentialTestEnv.install(alloc, &.{.{ "AI_GATEWAY_API_KEY", "launch-key" }});
+    defer env.deinit(alloc);
+    var app: StartupCredentialApp = .{};
+    defer app.auth.deinit(app.alloc);
+    const runtime = Runtime(StartupCredentialApp);
+
+    try std.testing.expect(app.auth.beginStartupCredentialLoad(.{ .provider = .gateway, .preferred = .ai_gateway_api_key }));
+    try std.testing.expect(runtime.startupCredentialPending(&app));
+    try app.waitForStartupCredential();
+    try runtime.collectStartupCredentialFacts(&app);
+    try std.testing.expect(!runtime.startupCredentialPending(&app));
+    try std.testing.expectEqual(@as(?credentials.Source, .ai_gateway_api_key), app.auth.credentialSource());
+    try std.testing.expect(!app.auth.pickerView().active);
+    try std.testing.expectEqual(@as(usize, 1), app.model_cache.resets);
+    try std.testing.expectEqual(@as(usize, 1), app.warmups);
+    try std.testing.expectEqual(@as(usize, 0), app.notices);
+    try std.testing.expect(app.shell.render_requests.footer_requested);
+
+    try runtime.collectStartupCredentialFacts(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.warmups);
+}
+
+test "a launch lookup that finds no credential opens onboarding when it settles" {
+    const alloc = std.testing.allocator;
+    var env = try StartupCredentialTestEnv.install(alloc, &.{});
+    defer env.deinit(alloc);
+    var app: StartupCredentialApp = .{};
+    defer app.auth.deinit(app.alloc);
+    const runtime = Runtime(StartupCredentialApp);
+
+    try std.testing.expect(app.auth.beginStartupCredentialLoad(.{ .provider = .gateway, .preferred = .ai_gateway_api_key }));
+    try std.testing.expect(!app.auth.pickerView().active);
+    try app.waitForStartupCredential();
+    try runtime.collectStartupCredentialFacts(&app);
+
+    try std.testing.expect(app.auth.credentialSource() == null);
+    try std.testing.expect(app.auth.pickerView().active);
+    try std.testing.expectEqual(@as(usize, 0), app.model_cache.resets);
+    try std.testing.expectEqual(@as(usize, 1), app.warmups);
+}
+
+test "a credential chosen during the launch lookup is kept" {
+    const alloc = std.testing.allocator;
+    var env = try StartupCredentialTestEnv.install(alloc, &.{.{ "AI_GATEWAY_API_KEY", "launch-key" }});
+    defer env.deinit(alloc);
+    var app: StartupCredentialApp = .{};
+    defer app.auth.deinit(app.alloc);
+    const runtime = Runtime(StartupCredentialApp);
+
+    try std.testing.expect(app.auth.beginStartupCredentialLoad(.{ .provider = .gateway, .preferred = .ai_gateway_api_key }));
+    var chosen: credentials.Credential = .{ .token = try alloc.dupe(u8, "chosen-token"), .source = .fx_login };
+    defer chosen.deinit(alloc);
+    _ = app.auth.adoptCredential(alloc, &chosen);
+    try app.waitForStartupCredential();
+    try runtime.collectStartupCredentialFacts(&app);
+
+    try std.testing.expectEqual(@as(?credentials.Source, .fx_login), app.auth.credentialSource());
+    try std.testing.expectEqual(@as(usize, 0), app.model_cache.resets);
+}
+
+test "a deferred launch inventory waits for the first frame and runs once" {
+    const alloc = std.testing.allocator;
+    var env = try StartupCredentialTestEnv.install(alloc, &.{.{ "AI_GATEWAY_API_KEY", "launch-key" }});
+    defer env.deinit(alloc);
+    var app: StartupCredentialApp = .{};
+    defer app.auth.deinit(app.alloc);
+    const runtime = Runtime(StartupCredentialApp);
+
+    app.auth.deferStartupSourceInventory();
+    app.shell.render_requests.first_frame_pending = true;
+    runtime.collectDeferredStartupInventory(&app);
+    try std.testing.expect(!app.auth.source_inventory.contains(.ai_gateway_api_key));
+    try std.testing.expect(!app.shell.render_requests.footer_requested);
+
+    app.shell.render_requests.first_frame_pending = false;
+    runtime.collectDeferredStartupInventory(&app);
+    try std.testing.expect(app.auth.source_inventory.contains(.ai_gateway_api_key));
+    try std.testing.expect(app.shell.render_requests.footer_requested);
+    try std.testing.expect(!app.auth.takeDeferredStartupSourceInventory());
+}
+
+test "quitting during the launch lookup waits for its worker" {
+    const alloc = std.testing.allocator;
+    var env = try StartupCredentialTestEnv.install(alloc, &.{});
+    defer env.deinit(alloc);
+    var auth: auth_runtime.Runtime = .{};
+    try std.testing.expect(auth.beginStartupCredentialLoad(.{ .provider = .gateway, .preferred = .ai_gateway_api_key }));
+    auth.deinit(alloc);
+    try std.testing.expect(!auth.startupCredentialPending());
 }

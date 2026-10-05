@@ -36,6 +36,7 @@ const MIRRORED_ENV_KEYS = [
   "FX_GATEWAY_CHAT_URL",
   "FX_MAX_AGENT_STEPS",
   "FX_MODEL",
+  "FX_SESSIONS_V2",
 ] as const;
 
 export function canonicalSubagentIdForStore(childId: string): string {

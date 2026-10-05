@@ -760,7 +760,7 @@ test "actionable catalog preserves discovery and child visibility" {
         var writable = try store.startWritableSession(alloc, durable);
         writable.deinit(alloc);
     }
-    const children = child_state.Store{ .sessions = &store, .parent_id = "public" };
+    const children = child_state.Store{ .backend = .{ .v1 = &store }, .parent_id = "public" };
     try children.markChildSession(alloc, "private-marker");
     var stopped = std.atomic.Value(bool).init(false);
     var catalog = try listActionableCatalog(store, alloc, null, &stopped, null);
@@ -834,7 +834,7 @@ test "actionable catalog preserves discovery and child visibility" {
     defer repaired.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), repaired.summaries.items.len);
     try std.testing.expectEqualStrings("Changed title", repaired.summaries.items[0].title.?);
-    const new_owner = child_state.Store{ .sessions = &store, .parent_id = "parent" };
+    const new_owner = child_state.Store{ .backend = .{ .v1 = &store }, .parent_id = "parent" };
     try new_owner.markChildSession(alloc, "public");
     var hidden = try listActionableCatalog(store, alloc, null, &stopped, &writer);
     defer hidden.deinit(alloc);

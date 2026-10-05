@@ -286,18 +286,15 @@ describe("configured providers", () => {
 
   test("configured child compaction uses the model capability lookup", async () => {
     let parentTurns = 0;
-    let summaries = 0;
     const f = fixture(body => {
       if (body.model === "child-model") {
-        if (!body.tools?.length) {
-          summaries++;
-          return completion(body.model, "The child is retaining repeated context details and should continue acknowledging them.");
-        }
-        return completion(body.model, "child reply", Math.ceil(JSON.stringify(body).length / 4));
+        // Context pressure comes from the child's own replies. Compaction keeps
+        // them word for word, shortening the longest, so it needs no model call.
+        return completion(body.model, "child reply " + "detail ".repeat(2000), Math.ceil(JSON.stringify(body).length / 4));
       }
       if (body.messages.at(-1)?.role === "tool") return completion(body.model, "parent reply");
       parentTurns++;
-      return toolCompletion(body.model, "subagent", { request: { action: "message", agent: "reader", message: `child context ${parentTurns} ` + "detail ".repeat(2000), ...(parentTurns === 1 ? { model: "child-model" } : {}) } }, `context-call-${parentTurns}`);
+      return toolCompletion(body.model, "subagent", { request: { action: "message", agent: "reader", message: `child context ${parentTurns}`, ...(parentTurns === 1 ? { model: "child-model" } : {}) } }, `context-call-${parentTurns}`);
     });
     (f.settings.providers.local.model_metadata as any)["child-model"] = { context_window: 32768, max_output_tokens: 512, supports_tool_use: true };
     f.save();
@@ -311,8 +308,9 @@ describe("configured providers", () => {
         if (!JSON.parse(returned).ok) throw new Error(returned);
         expect(JSON.parse(returned).ok).toBe(true);
       }
-      expect(summaries).toBeGreaterThan(0);
       const childRequests = f.requests.filter(request => request.body.model === "child-model");
+      // Only the child model's own small context window makes the child compact.
+      expect(childRequests.some(request => JSON.stringify(request.body.messages).includes("<compacted_conversation>"))).toBe(true);
       expect(childRequests.every(request => request.body.max_tokens > 0 && request.body.max_tokens <= 512)).toBe(true);
       expect(f.requests.every(request => request.path === "/v1/chat/completions" && request.authorization === null)).toBe(true);
     } finally { f.close(); }
@@ -462,6 +460,31 @@ describe("configured providers", () => {
       f.close();
     }
   }, 12000);
+
+  test("a connection without a saved model runs from --model or FX_MODEL and rejects a blank FX_MODEL", async () => {
+    const f = fixture();
+    try {
+      delete (f.settings.models as Record<string, string>).local;
+      f.save();
+      const chatModels = () => f.requests.filter(request => request.path === "/v1/chat/completions").map(request => request.body.model);
+
+      const flag = await runFx(["ask", "--json", "--no-save", "--model", "flag-model", "hello"], { cwd: f.workspace, env: f.env, timeoutMs: 10000 });
+      if (flag.code !== 0) throw new Error(flag.stdout + flag.stderr);
+      const env = await runFx(["ask", "--json", "--no-save", "hello"], { cwd: f.workspace, env: { ...f.env, FX_MODEL: "  env-model  " }, timeoutMs: 10000 });
+      if (env.code !== 0) throw new Error(env.stdout + env.stderr);
+      expect(chatModels()).toEqual(["flag-model", "env-model"]);
+
+      const status = await runFx(["status", "--json"], { cwd: f.workspace, env: { ...f.env, FX_MODEL: "env-model" } });
+      expect(status.code).toBe(0);
+      expect(JSON.parse(status.stdout)).toMatchObject({ model: "env-model", model_origin: "FX_MODEL", model_source: "local" });
+
+      const blank = await runFx(["status"], { cwd: f.workspace, env: { ...f.env, FX_MODEL: "   " } });
+      expect(blank.code).toBe(1);
+      expect(blank.stderr).toBe("fx: no model is selected for this connection; save one under \"models\" in ~/.fx/settings.json, or set a model for this run with --model or FX_MODEL\n");
+      expect(chatModels()).toHaveLength(2);
+      expect(JSON.parse(readFileSync(f.settingsPath, "utf8")).models.local).toBeUndefined();
+    } finally { f.close(); }
+  }, 25000);
 
   test("redirects cannot forward credentials to another connection", async () => {
     const target = fixture();

@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const permissions = @import("../../permissions/permissions.zig");
+const shell_snapshot = @import("../../terminal/shell_snapshot.zig");
 const types = @import("../../shared/types.zig");
 const pathing = @import("../../workspace/pathing.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
@@ -1057,6 +1058,9 @@ pub fn applyInitialSessionGrants(
         target_kind,
     );
     for (grants) |grant| {
+        if (std.mem.eql(u8, permissions.permissionNameForTool(grant.tool_name), "bash")) {
+            shell_snapshot.processOwner().recordShellGrant(grant.target_path);
+        }
         try appendLocalGrant(arena, local_grants, grant);
         try propagateGrant(hooks, grant);
     }

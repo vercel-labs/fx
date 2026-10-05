@@ -194,6 +194,7 @@ pub fn welcomeMessage(alloc: std.mem.Allocator) ![]u8 {
 }
 
 pub const StatuslineItems = struct {
+    ultrafast_indicator_active: bool = false,
     workspace_label: []const u8 = "",
     git_branch: ?[]const u8 = null,
     context_used: u64 = 0,
@@ -392,7 +393,12 @@ fn appendSessionStatusSegments(
     if (model_supports_effort and !effort.isDefault()) {
         appendStatusSegment(out, end, effort.displayLabel());
     }
-    if (fast_indicator_active) {
+    if (statusline.ultrafast_indicator_active) {
+        const marker_style = if (truecolor_enabled) "\x1b[38;2;255;204;0m" else "\x1b[38;5;220m";
+        var marker_buf: [64]u8 = undefined;
+        const marker = std.fmt.bufPrint(&marker_buf, "{s}⚡︎{s}", .{ marker_style, statusline_style }) catch "⚡︎";
+        appendStatusSegment(out, end, marker);
+    } else if (fast_indicator_active) {
         appendStatusSegment(out, end, "⚡︎");
     }
     if (statusline.session_title) |title| {
@@ -790,9 +796,11 @@ pub fn formatResumeHandoff(
     buffer: []u8,
     session_id: []const u8,
     terminal_cols: u16,
+    sessions_v2: bool,
 ) ![]const u8 {
     const label = "Continue session with:";
-    const command = "fx --resume ";
+    // A v2 session resumes only with the flag that saved it.
+    const command = if (sessions_v2) "fx --sessions-v2 --resume " else "fx --resume ";
     const single_row_width = label.len + 1 + command.len + session_id.len;
     const separator = if (single_row_width <= terminal_cols) " " else "\n  ";
     return std.fmt.bufPrint(
@@ -861,17 +869,24 @@ test "resume handoff uses one row only when the full instruction fits" {
 
     const single_row = "Continue session with: fx --resume session-123";
     var exact_buffer: [128]u8 = undefined;
-    const exact = try formatResumeHandoff(&exact_buffer, "session-123", single_row.len);
+    const exact = try formatResumeHandoff(&exact_buffer, "session-123", single_row.len, false);
     try std.testing.expectEqualStrings(
         "\x1b[38;5;245mContinue session with: fx --resume session-123\x1b[0m\n",
         exact,
     );
 
     var narrow_buffer: [128]u8 = undefined;
-    const narrow = try formatResumeHandoff(&narrow_buffer, "session-123", single_row.len - 1);
+    const narrow = try formatResumeHandoff(&narrow_buffer, "session-123", single_row.len - 1, false);
     try std.testing.expectEqualStrings(
         "\x1b[38;5;245mContinue session with:\n  fx --resume session-123\x1b[0m\n",
         narrow,
+    );
+
+    var v2_buffer: [128]u8 = undefined;
+    const v2 = try formatResumeHandoff(&v2_buffer, "session-123", 80, true);
+    try std.testing.expectEqualStrings(
+        "\x1b[38;5;245mContinue session with: fx --sessions-v2 --resume session-123\x1b[0m\n",
+        v2,
     );
 }
 
@@ -880,7 +895,7 @@ test "resume handoff follows the active muted theme shade" {
     defer initTheme(false, null);
 
     var buffer: [128]u8 = undefined;
-    const message = try formatResumeHandoff(&buffer, "session-123", 80);
+    const message = try formatResumeHandoff(&buffer, "session-123", 80, false);
     try std.testing.expectEqualStrings(
         "\x1b[38;5;247mContinue session with: fx --resume session-123\x1b[0m\n",
         message,
@@ -1009,6 +1024,43 @@ test "buildHintLine uses a monochrome lightning marker for fast mode" {
     const line = buildHintLine(false, true, "anthropic/claude-opus-4.8", .ask, true, types.ReasoningEffort.literal("low"), true, .{}, 80, &buf);
     try std.testing.expectEqualStrings("ask · opus 4.8 · low · ⚡︎", line);
     try std.testing.expectEqual(@as(usize, 25), display_width.visibleWidthIgnoringAnsi(line));
+}
+
+test "buildHintLine uses one vivid yellow lightning marker for Ultrafast in both themes" {
+    const terminal_engine = @import("../core/terminal/engine.zig");
+    defer initTheme(false, null);
+    defer setTruecolorSupport(true);
+    for ([_]bool{ false, true }) |light| {
+        initTheme(light, null);
+        for ([_]bool{ true, false }) |truecolor| {
+            setTruecolorSupport(truecolor);
+            var buf: [128]u8 = undefined;
+            const line = buildHintLine(false, true, "openai/gpt-6-astra", .auto, true, types.ReasoningEffort.literal("xhigh"), true, .{ .ultrafast_indicator_active = true }, 80, &buf);
+            var expected_buf: [128]u8 = undefined;
+            const yellow = if (truecolor) "\x1b[38;2;255;204;0m" else "\x1b[38;5;220m";
+            const expected = try std.fmt.bufPrint(&expected_buf, "{s}auto{s} · gpt-6-astra · xhigh · {s}⚡︎{s}", .{ permission_auto_style, statusline_style, yellow, statusline_style });
+            try std.testing.expectEqualStrings(expected, line);
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, line, "⚡︎"));
+            try std.testing.expectEqual(@as(usize, 31), display_width.visibleWidthIgnoringAnsi(line));
+            var grid = try terminal_engine.Grid.init(std.testing.allocator, 80, 1);
+            defer grid.deinit();
+            try grid.feed(line);
+            const marker_color: terminal_engine.Color = if (truecolor) .{ .rgb = .{ .r = 255, .g = 204, .b = 0 } } else .{ .indexed = 220 };
+            var markers: usize = 0;
+            for (grid.cells) |cell| {
+                if (cell.codepoint != 0x26a1) continue;
+                markers += 1;
+                try std.testing.expect(cell.style.fg.eql(marker_color));
+                try std.testing.expect(!cell.style.flags.dim);
+            }
+            try std.testing.expectEqual(@as(usize, 1), markers);
+            try std.testing.expect(grid.current_style.fg.eql(.{ .indexed = if (light) 241 else 245 }));
+            for (0..32) |width| {
+                const clipped = buildHintLine(false, true, "openai/gpt-6-astra", .auto, false, types.ReasoningEffort.literal("xhigh"), true, .{ .ultrafast_indicator_active = true }, @intCast(width), &buf);
+                try std.testing.expect(display_width.visibleWidthIgnoringAnsi(clipped) <= width);
+            }
+        }
+    }
 }
 
 test "buildHintLine shows effort when active" {

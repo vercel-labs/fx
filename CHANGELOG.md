@@ -1,8 +1,93 @@
 # fx
 
-## 0.0.11
+## 0.0.13
 
 <!-- release:start -->
+
+**fx now supports Ultrafast on supported OpenAI models and launches up to 23× faster. Shell calls are up to 8.6× faster, and exits are up to 44× faster in matched benchmarks.**
+
+### Breaking Changes
+
+- Terminals launched through the shell tool now stop when fx exits instead of staying alive for the next resume.
+- New libfx checkpoints cannot be restored by older versions. Existing checkpoints still load.
+- Invalid Base64 image input now throws directly from `prompt()` instead of failing the turn later.
+
+### New Features
+
+- Enable Ultrafast with `/ultrafast on` or `--ultrafast` on supported OpenAI models through AI Gateway. It uses a higher-priced inference tier.
+- Subagents and ACP sessions support Ultrafast. libfx supports it through `model.ultrafast`.
+- `/mcp add slack` now configures Slack, opens sign-in, and connects your account in one command.
+- Set `auto_compact_percent` from 10 to 80 to choose when automatic compaction starts.
+- libfx accepts raw image bytes and adds a `resizeImage` hook for preparing images before sending.
+- libfx image references survive checkpoints, so your app's tools can recover originals later.
+- ACP clients can steer running turns, supply session instructions and workspaces, and host MCP servers over the ACP connection.
+
+### Improvements
+
+- Launch benchmarks show 1.6–23× faster median first-screen rendering, depending on the terminal. Sign-in and skills finish loading afterward.
+- Shell calls are up to 8.6× faster with heavy startup files, dropping from 238.8 ms to 27.9 ms. Startup files load once per fx process; `/shell reload` refreshes them.
+- Exiting after a reply is up to 44× faster while a large usage history is loading, dropping from 1,003 ms to 23 ms.
+- Exiting with MCP servers is 2.8× faster in the matched macOS benchmark, dropping from 20.6 ms to 7.4 ms.
+- The shell overhaul removed 236–279 KB from native binaries in matched builds.
+- Compaction preserves original messages and final replies where they fit, while older turns and tool results remain searchable.
+- The Grok model picker now shows all supported subscription models.
+- Images can reach the model at up to 8,000 pixels per side when the request contains 20 images or fewer.
+
+### Bug Fixes
+
+- Steering sent after a tool result now survives cancellation and resume.
+- Subagents now start when the parent has more than 256 MCP tools.
+- Compaction no longer incorrectly flags answers to questions as unsupported rules.
+- Sessions v2 now retain assistant text around interrupted tool calls and generate titles after a crashed first turn.
+
+### Security
+
+- Reloading shell configuration clears remembered command approvals. Auto mode reviews routine commands that use captured aliases or functions.
+- ACP sessions use profile MCP servers only when the client explicitly opts in.
+
+<!-- release:end -->
+
+## 0.0.12
+
+**Session listing is up to 560× faster, large stores resume in under a second, and GitHub-flavored Markdown now renders better throughout the terminal.**
+
+### Breaking Changes
+
+- libfx now uses `LIBFX_MODEL_UNSUPPORTED_EFFORT` and `LIBFX_MODEL_UNSUPPORTED_FAST` for unsupported model settings. Callers checking the old error codes must update.
+
+### New Features
+
+- libfx accepts `model: { id, effort, fast }` and supports `Blob` or `File` images directly.
+- Detached processes such as `tmux`, `ssh-agent`, and browser drivers now stay alive between shell calls.
+- `/mcp list` now opens the interactive Servers menu.
+
+### Improvements
+
+- In a 14,600-session benchmark, `fx sessions` dropped from 95 seconds to 0.17 seconds and `fx --resume last` from 33 seconds to 0.5 seconds.
+- `/new`, `/clear`, and `/reset` now preserve the previous conversation in terminal scrollback.
+- Oversized PNGs shrink before being sent without changing the original file. fx tells you when another image cannot be sent.
+- Structured replies now use GitHub-flavored Markdown. Wide tables wrap inside their cells, and long URLs stay clickable.
+- Steering stays intact through compaction and session recovery.
+- MCP startup errors now explain whether the server exited, timed out, or returned invalid output.
+
+### Bug Fixes
+
+- Prompt-too-long errors now trigger compaction and one retry.
+- Numpad keys now work in the composer, including digits, operators, Enter, and navigation.
+- Codex, Grok, and custom connections now start with `--model` or `FX_MODEL` even when no model is saved.
+- `/model` now identifies models from custom connection settings without suggesting a Gateway sign-in.
+- Clearing the terminal with `Cmd+K` or `Ctrl+L` no longer crashes conversations containing tool calls.
+- tmux's session switcher and copy mode now stay open during terminal resizing.
+- `fx pr --create` and `fx issue --create` now publish the final response instead of earlier progress text.
+- Messages sent after interrupting a response now wait for the previous turn to close.
+- Malformed tool arguments no longer break the next model request.
+
+### Security
+
+- Slack MCP sign-in now requests only approved fx scopes and rejects unexpected OAuth resources or scope changes.
+- Symlinked skills outside fx's usual directories can now be allowed through `skill_symlink_authorities` in profile settings. Project settings cannot grant that access.
+
+## 0.0.11
 
 **fx now supports custom model connections and themes. Resume, file lookup and request handling are up to 100× faster, long turns use 17× less memory, and libfx adds steering, images, web search and model controls.**
 
@@ -63,8 +148,6 @@
 - **Custom connection credentials:** Custom connections read credentials only from their named environment variable, and committed project configuration cannot define model endpoints. Saved sessions refuse to resume against a changed endpoint or authentication identity.
 - **Review model:** Set `review_model` or `FX_REVIEW_MODEL` to choose the model used for auto-mode safety reviews. Review transport failures and malformed replies retry once; cautions never retry for approval, and an unresolved action stays blocked.
 - **Safe tool errors:** Tool failure details now redact secrets and escape terminal control sequences before rendering.
-
-<!-- release:end -->
 
 ## 0.0.10
 
