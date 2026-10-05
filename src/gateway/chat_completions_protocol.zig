@@ -2136,6 +2136,25 @@ test "chat completions tolerates a finish-reason-less terminal usage trailer" {
     }
 }
 
+test "chat completions accepts tool-call usage trailers without repeated finish reason" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "", ",\"finish_reason\":null" }) |reason| {
+        var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+        defer reducer.deinit();
+        try test_accept(&reducer, test_call);
+        try test_accept(&reducer, test_tools_finish);
+        const trailer = try std.fmt.allocPrint(alloc, "{{\"choices\":[{{\"index\":0,\"delta\":{{}}{s}}}],\"usage\":{{\"prompt_tokens\":16,\"completion_tokens\":6,\"total_tokens\":22}}}}", .{reason});
+        defer alloc.free(trailer);
+        try test_accept(&reducer, trailer);
+        try test_accept(&reducer, "[DONE]");
+        var result = try reducer.finish(false);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), result.completed.completion.tool_calls.len);
+        try std.testing.expectEqual(@as(?u64, 16), result.completed.completion.usage.input_tokens);
+        try std.testing.expectEqual(@as(?u64, 6), result.completed.completion.usage.output_tokens);
+    }
+}
+
 test "chat completions terminal usage cannot introduce content tools or a different finish" {
     const alloc = std.testing.allocator;
     const cases = [_]struct { delta: []const u8, reason: []const u8 }{
