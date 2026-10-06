@@ -1,5 +1,6 @@
 //! Session-owned native children isolate protocol lifetime from borrowed model requests.
 const std = @import("std");
+const executable_action = @import("../permissions/executable_action.zig");
 const builtin = @import("builtin");
 const protocol = @import("protocol.zig");
 const manifest = @import("manifest.zig");
@@ -30,6 +31,10 @@ pub const Runtime = struct {
     mutex: std.Io.Mutex = .init,
     dispatcher: ?*dispatcher_mod.StdioDispatcher = null,
     identity: ?[]u8 = null,
+    /// Approval belongs to one exact live child, not future executable replacements.
+    approved_mode: ?@import("../shared/types.zig").PermissionMode = null,
+    approved_action: ?[]u8 = null,
+    scope_session_id: ?[]u8 = null,
 
     /// The owning registry calls this after all provider workers have stopped.
     pub fn deinit(self: *Runtime, alloc: Allocator) void {
@@ -42,21 +47,47 @@ pub const Runtime = struct {
             dispatcher.deinitForced();
         }
         if (self.identity) |identity| alloc.free(identity);
+        if (self.approved_action) |action| alloc.free(action);
+        if (self.scope_session_id) |session_id| alloc.free(session_id);
         self.dispatcher = null;
         self.identity = null;
+        self.approved_mode = null;
+        self.approved_action = null;
+        self.scope_session_id = null;
     }
 
     /// Failed or ambiguous streams retire their connection instead of replaying a billed request.
-    pub fn stream(self: *Runtime, owner_alloc: Allocator, alloc: Allocator, root: []const u8, entrypoint: []const u8, provider: protocol.Provider, model: protocol.Model, request: streams.ModelRequest, execution_allowed: *const std.atomic.Value(bool)) !streams.Result {
+    pub fn stream(self: *Runtime, owner_alloc: Allocator, alloc: Allocator, root: []const u8, extension_id: []const u8, entrypoint: []const u8, provider: protocol.Provider, model: protocol.Model, request: streams.ModelRequest, execution_allowed: *const std.atomic.Value(bool)) !streams.Result {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+        const scope_session_id = request.session_id orelse return error.ExtensionSessionIdentityRequired;
         const executable = try manifest.canonical_child_path(alloc, root, entrypoint);
         defer alloc.free(executable);
         const identity = try executable_identity(alloc, executable);
         defer alloc.free(identity);
         if (self.identity) |previous| if (!std.mem.eql(u8, previous, identity)) self.deinit(owner_alloc);
+        if (self.scope_session_id) |previous_session| if (!std.mem.eql(u8, previous_session, scope_session_id)) self.deinit(owner_alloc);
         errdefer self.deinit(owner_alloc);
+        const action: executable_action.Action = .{ .extension_id = extension_id, .provider_id = provider.id, .executable_identity = identity };
+        const action_bytes = try std.json.Stringify.valueAlloc(alloc, action, .{});
+        defer alloc.free(action_bytes);
+        const previous = if (self.approved_action) |approved| if (std.mem.eql(u8, approved, action_bytes)) self.approved_mode else null else null;
+        const mode = if (request.executable_authorizer) |authority| try authority.authorize(alloc, action, previous) else if (execution_allowed.load(.seq_cst)) @import("../shared/types.zig").PermissionMode.yolo else return error.ExtensionExecutionPermissionRequired;
+        const current_identity = try executable_identity(alloc, executable);
+        defer alloc.free(current_identity);
+        if (!std.mem.eql(u8, identity, current_identity)) return error.ExtensionExecutableChanged;
+        if (request.executable_authorizer) |authority| {
+            // Human approval cannot outrank policy or mode changes made while the dialog was open.
+            const revalidated = try authority.authorize(alloc, action, mode);
+            if (revalidated != mode or !authority.unchanged(mode)) return error.ExtensionExecutionPermissionRequired;
+        } else if (!execution_allowed.load(.seq_cst)) return error.ExtensionExecutionPermissionRequired;
+        if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+        if (request.deadline) |deadline| if (!std.Io.Clock.Timestamp.compare(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake), .lt, deadline)) return error.Timeout;
+        if (self.approved_action) |approved| owner_alloc.free(approved);
+        self.approved_action = null;
+        self.approved_action = try owner_alloc.dupe(u8, action_bytes);
+        self.approved_mode = mode;
         if (self.dispatcher == null) {
             var environment = std.process.Environ.Map.init(alloc);
             defer environment.deinit();
@@ -71,6 +102,7 @@ pub const Runtime = struct {
             });
             self.dispatcher = try dispatcher_mod.StdioDispatcher.create(owner_alloc, std.heap.c_allocator, child, initial_generation, protocol.max_models_bytes);
             self.identity = try owner_alloc.dupe(u8, identity);
+            self.scope_session_id = try owner_alloc.dupe(u8, scope_session_id);
             var initialized = try rpc(struct { version: u32 }, self.dispatcher.?, alloc, "initialize", .{ .version = protocol.version }, .{
                 .timeout_ms = lifecycle_timeout_ms,
                 .deadline = request.deadline,
@@ -126,7 +158,10 @@ pub const Runtime = struct {
         try dispatcher.setNotificationSink(.{ .context = &handoff, .callback = event_handoff.Handoff.on_notification });
         defer dispatcher.clearNotificationSink();
         if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-        if (!execution_allowed.load(.seq_cst)) return error.ExtensionExecutionPermissionRequired;
+        if (request.executable_authorizer) |authority| {
+            const revalidated = try authority.authorize(alloc, action, self.approved_mode);
+            if (revalidated != mode or !authority.unchanged(mode)) return error.ExtensionExecutionPermissionRequired;
+        } else if (!execution_allowed.load(.seq_cst)) return error.ExtensionExecutionPermissionRequired;
         try request.admission.admit();
         request.attempt_evidence.provider_admitted = true;
         request.delivery.markPossiblySent();

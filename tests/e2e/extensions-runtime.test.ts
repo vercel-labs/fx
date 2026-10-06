@@ -10,6 +10,19 @@ import { EXTENSION_FIXTURE_KEY, PROFILE_DIRECTORY, FIXTURE_EXTENSION_DIRECTORY, 
 const TIMEOUT_MS = 15_000;
 const TUI_TIMEOUT_MS = 5_000;
 const TUI_STDERR_FILENAME = "fx-stderr.log";
+const EXECUTABLE_CHANGE_COMMENT = "\n// Changed identity requires a new native launch decision.\n";
+const EXECUTABLE_CHANGED_ERROR = "ExtensionExecutableChanged";
+const SECOND_PROVIDER_ID = "second-provider";
+const SECOND_PROVIDER_MODEL = `${SECOND_PROVIDER_ID}/fixture-model`;
+const NATIVE_APPROVAL_LABEL = "Execute trusted extension";
+const ASK_PERMISSION_MODE = "ask";
+const NATIVE_PERMISSION_NAME = "extension_execute";
+const NATIVE_SETTINGS_FILENAME = "settings.json";
+const ACTIVATION_FAILURE_CASES = [
+  { mode: "ask", permission: "deny", error: "ExtensionExecutionDenied" },
+  { mode: "ask", permission: "ask", error: "PermissionPromptUnavailable" },
+  { mode: "auto", permission: "ask", error: "ExtensionExecutionAutoReviewUnavailable" },
+];
 const AUTH_SCOPE_PROMPT = "check scoped authentication";
 const RPC_RESULT_TEXT = "extension-rpc-ok";
 const YOLO_WARNING_TEXT = "YOLO enabled: fx permission checks disabled\n";
@@ -51,11 +64,11 @@ function fixture(): { home: string; extension: string } {
 }
 
 // One fake account drives CLI proofs without inherited native credentials or keychain access.
-function askFixture(home: string) {
+function askFixture(home: string, permissionMode = UNRESTRICTED_PERMISSION_MODE) {
   return spawnSync(FX_BIN, ASK_ARGUMENTS, {
     cwd: home, timeout: TIMEOUT_MS, encoding: "utf8",
     env: { ...process.env, HOME: home, AI_GATEWAY_API_KEY: undefined, VERCEL_OIDC_TOKEN: undefined,
-      FX_MODEL: undefined, FX_PERMISSION_MODE: UNRESTRICTED_PERMISSION_MODE, FX_EXTENSION_TEST_KEY: EXTENSION_FIXTURE_KEY,
+      FX_MODEL: undefined, FX_PERMISSION_MODE: permissionMode, FX_EXTENSION_TEST_KEY: EXTENSION_FIXTURE_KEY,
       FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1" },
   });
 }
@@ -63,6 +76,20 @@ function askFixture(home: string) {
 afterEach(() => { for (const home of homes.splice(0)) cleanupIsolatedTestHome(home); });
 
 describe("local extension RPC runtime", () => {
+  // A held launch must not run initialize, even when the extension could remain HTTP-idle.
+  test.each(ACTIVATION_FAILURE_CASES)("native $mode activation holds $permission without spawning", ({ mode, permission, error }) => {
+    const { home, extension } = fixture();
+    const settingsPath = join(home, PROFILE_DIRECTORY, NATIVE_SETTINGS_FILENAME);
+    const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+    settings.permission = { [NATIVE_PERMISSION_NAME]: permission };
+    writeFileSync(settingsPath, JSON.stringify(settings));
+    const result = askFixture(home, mode);
+    expect(result.status).not.toBe(0);
+    expect(JSON.parse(result.stdout).error).toBe(error);
+    expect(existsSync(join(extension, RPC_LOG_FILENAME))).toBe(false);
+    expect(result.stdout + result.stderr).not.toContain(EXTENSION_FIXTURE_KEY);
+  });
+
   test("native file tool results and empty reasoning state replay to the next request", () => {
     const { home, extension } = fixture();
     writeFileSync(join(extension, TOOL_MODE_FILENAME), "");
@@ -123,6 +150,117 @@ describe("local extension RPC runtime", () => {
     expect(calls.every(call => !call.ambientKey)).toBe(true);
     expect(() => process.kill(calls[0].pid, 0)).toThrow();
   });
+
+  tuiTest("an executable changed during human approval never starts before reapproval", async () => {
+    const { home, extension } = fixture();
+    const stderrPath = join(home, TUI_STDERR_FILENAME);
+    let session: TmuxSession | undefined;
+    try {
+      session = await TmuxSession.create({ cmd: FX_BIN, cwd: home, stderrPath, isolated: true,
+        env: { HOME: home, AI_GATEWAY_API_KEY: "", VERCEL_OIDC_TOKEN: "", FX_MODEL: undefined,
+          FX_PERMISSION_MODE: ASK_PERMISSION_MODE, FX_EXTENSION_TEST_KEY: EXTENSION_FIXTURE_KEY,
+          FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "0" },
+      });
+      await session.waitForText("Run /help", TUI_TIMEOUT_MS);
+      await session.sendText(AUTH_SCOPE_PROMPT);
+      await session.waitForText(NATIVE_APPROVAL_LABEL, TUI_TIMEOUT_MS);
+      const executable = join(extension, VALID_MANIFEST.entrypoint);
+      writeFileSync(executable, readFileSync(executable, "utf8") + EXECUTABLE_CHANGE_COMMENT);
+      await session.sendKeys("Enter");
+      await session.waitForText(EXECUTABLE_CHANGED_ERROR, TUI_TIMEOUT_MS);
+      expect(existsSync(join(extension, RPC_LOG_FILENAME))).toBe(false);
+      expect(session.isAlive()).toBe(true);
+      await session.sendText(AUTH_SCOPE_PROMPT);
+      await session.waitForText(NATIVE_APPROVAL_LABEL, TUI_TIMEOUT_MS);
+      await session.sendKeys("Enter");
+      await session.waitForText(RPC_RESULT_TEXT, TUI_TIMEOUT_MS);
+      await session.sendText("/quit");
+      await session.waitForSessionEnd(TUI_TIMEOUT_MS);
+      const calls = readFileSync(join(extension, RPC_LOG_FILENAME), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      expect(calls.filter(call => call.method === "initialize")).toHaveLength(1);
+      expect(calls.filter(call => call.method === "provider.stream")).toHaveLength(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally { await session?.kill(); }
+  }, TIMEOUT_MS);
+
+  tuiTest("native child approval cannot cross provider identities", async () => {
+    const { home, extension } = fixture();
+    writeFileSync(join(extension, MANIFEST_FILENAME), JSON.stringify({ ...VALID_MANIFEST, providers: [VALID_MANIFEST.providers[0], { ...VALID_MANIFEST.providers[0], id: SECOND_PROVIDER_ID }] }));
+    const catalogPath = join(extension, VALID_MANIFEST.providers[0].models_file);
+    const catalog = JSON.parse(readFileSync(catalogPath, "utf8"));
+    catalog.models[0].reasoning = false;
+    catalog.models[0].reasoning_efforts = [];
+    writeFileSync(catalogPath, JSON.stringify(catalog));
+    const stderrPath = join(home, TUI_STDERR_FILENAME);
+    let session: TmuxSession | undefined;
+    try {
+      session = await TmuxSession.create({ cmd: FX_BIN, cwd: home, stderrPath, isolated: true,
+        env: { HOME: home, AI_GATEWAY_API_KEY: "", VERCEL_OIDC_TOKEN: "", FX_MODEL: undefined,
+          FX_PERMISSION_MODE: ASK_PERMISSION_MODE, FX_EXTENSION_TEST_KEY: EXTENSION_FIXTURE_KEY,
+          FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "0" },
+      });
+      await session.waitForText("Run /help", TUI_TIMEOUT_MS);
+      await session.sendText(AUTH_SCOPE_PROMPT);
+      await session.waitForText(NATIVE_APPROVAL_LABEL, TUI_TIMEOUT_MS);
+      await session.sendKeys("Enter");
+      await session.waitForText(RPC_RESULT_TEXT, TUI_TIMEOUT_MS);
+      expect(await session.capturePane()).not.toContain(NATIVE_APPROVAL_LABEL);
+      await session.sendText("/model");
+      await session.waitForText(SECOND_PROVIDER_MODEL, TUI_TIMEOUT_MS);
+      await session.sendKeys("Down");
+      await session.sendKeys("Enter");
+      const selected = JSON.parse(readFileSync(join(home, PROFILE_DIRECTORY, NATIVE_SETTINGS_FILENAME), "utf8"));
+      expect(selected.models.extension).toBe(SECOND_PROVIDER_MODEL);
+      await session.sendText(AUTH_SCOPE_PROMPT);
+      const pending = await session.waitForText(NATIVE_APPROVAL_LABEL, TUI_TIMEOUT_MS);
+      expect(pending).toContain(SECOND_PROVIDER_ID);
+      const held = readFileSync(join(extension, RPC_LOG_FILENAME), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      expect(held.filter(call => call.method === "provider.stream")).toHaveLength(1);
+      await session.sendKeys("Down");
+      await session.sendKeys("Enter");
+      await session.waitForText("ExtensionExecutionDenied", TUI_TIMEOUT_MS);
+      await session.sendText("/quit");
+      await session.waitForSessionEnd(TUI_TIMEOUT_MS);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally { await session?.kill(); }
+  }, TIMEOUT_MS);
+
+  tuiTest("native terminal confirms exact executable before initialization without yolo", async () => {
+    const { home, extension } = fixture();
+    const stderrPath = join(home, TUI_STDERR_FILENAME);
+    let session: TmuxSession | undefined;
+    try {
+      session = await TmuxSession.create({ cmd: FX_BIN, cwd: home, stderrPath, isolated: true,
+        env: { HOME: home, AI_GATEWAY_API_KEY: "", VERCEL_OIDC_TOKEN: "", FX_MODEL: undefined,
+          FX_PERMISSION_MODE: ASK_PERMISSION_MODE, FX_EXTENSION_TEST_KEY: EXTENSION_FIXTURE_KEY,
+          FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "0" },
+      });
+      await session.waitForText("Run /help", TUI_TIMEOUT_MS);
+      await session.sendText(AUTH_SCOPE_PROMPT);
+      const pending = await session.waitForText(NATIVE_APPROVAL_LABEL, TUI_TIMEOUT_MS);
+      expect(pending).toContain("OS privileges");
+      expect(existsSync(join(extension, RPC_LOG_FILENAME))).toBe(false);
+      await session.sendKeys("Enter");
+      await session.waitForText(RPC_RESULT_TEXT, TUI_TIMEOUT_MS);
+      expect(session.isAlive()).toBe(true);
+      const executable = join(extension, VALID_MANIFEST.entrypoint);
+      writeFileSync(executable, readFileSync(executable, "utf8") + EXECUTABLE_CHANGE_COMMENT);
+      await session.sendText(AUTH_SCOPE_PROMPT);
+      await session.waitForText(NATIVE_APPROVAL_LABEL, TUI_TIMEOUT_MS);
+      const retired = readFileSync(join(extension, RPC_LOG_FILENAME), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      expect(retired.filter(call => call.method === "shutdown")).toHaveLength(1);
+      expect(() => process.kill(retired[0].pid, 0)).toThrow();
+      await session.sendKeys("Down");
+      await session.sendKeys("Enter");
+      await session.waitForText("ExtensionExecutionDenied", TUI_TIMEOUT_MS);
+      await session.sendText("/quit");
+      await session.waitForSessionEnd(TUI_TIMEOUT_MS);
+      const calls = readFileSync(join(extension, RPC_LOG_FILENAME), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      expect(calls.map(call => call.method)).toEqual(["initialize", "provider.prepare", "provider.stream", "shutdown"]);
+      expect(() => process.kill(calls[0].pid, 0)).toThrow();
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally { await session?.kill(); }
+  }, TIMEOUT_MS);
 
   tuiTest("a terminal receives content before the provider completion", async () => {
     const { home, extension } = fixture();

@@ -1,4 +1,5 @@
 const std = @import("std");
+const executable_action = @import("../permissions/executable_action.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 const command_admission = @import("../permissions/command_admission.zig");
@@ -290,6 +291,7 @@ pub fn Bindings(comptime App: type) type {
                 .append_static_context = agentAppendStaticContext,
                 .validate_tool_call = agentValidateToolCall,
                 .check_tool_availability = agentCheckToolAvailability,
+                .request_executable_permission = if (comptime @hasDecl(App, "requestExecutablePermissionSync")) agentRequestExecutablePermission else null,
                 .request_tool_permission = agentRequestToolPermission,
                 .request_prepared_file_mutation_permission = agentRequestPreparedFileMutationPermission,
                 .resolve_tool_action_display_target = if (comptime @hasDecl(App, "resolveToolActionDisplayTarget"))
@@ -624,6 +626,11 @@ pub fn Bindings(comptime App: type) type {
                 return app.providerSet().select(provider_runtime.provider(app)).fallbackModelCapabilities(model);
             }
             return model_capabilities.capabilitiesForModel(model);
+        }
+
+        fn agentRequestExecutablePermission(ctx: *anyopaque, arena: Allocator, action: executable_action.Action, review_turn: permission_auto_classifier.ReviewTurnContext, mode: PermissionMode, previous: ?PermissionMode) !PermissionMode {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            return app.requestExecutablePermissionSync(arena, action, review_turn, mode, previous);
         }
 
         fn agentRequestToolPermission(ctx: *anyopaque, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, revalidation: ?agent_runtime.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {

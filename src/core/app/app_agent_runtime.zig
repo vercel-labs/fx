@@ -1,4 +1,6 @@
 const std = @import("std");
+const executable_action = @import("../permissions/executable_action.zig");
+const executable_admission = @import("../permissions/executable_admission.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 const command_admission = @import("../permissions/command_admission.zig");
@@ -551,6 +553,13 @@ pub fn Runtime(comptime App: type) type {
         ) ![]const u8 {
             const ctx = tool_runtime.withAdvertisedDynamicToolNames(toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), advertised_dynamic_tool_names);
             return formatToolAction(ctx, arena, call, display_target, .denied, label);
+        }
+
+        /// Host launch policy borrows current native permission state, not model tool authority.
+        pub fn requestExecutablePermissionSync(app: *App, arena: Allocator, action: executable_action.Action, review_turn: permission_auto_classifier.ReviewTurnContext, mode: PermissionMode, previous: ?PermissionMode, ignored_list_entries: []const []const u8, max_list_entries: usize, max_read_file_bytes: usize, max_read_file_lines: usize, max_read_file_line_len: usize, max_command_output_bytes: usize, gateway_retry_count: usize, gateway_chat_url: []const u8) !PermissionMode {
+            var ctx = toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url);
+            ctx.permission_review_turn = review_turn;
+            return executable_admission.authorize(arena, ctx.admissionInput(), action, review_turn, mode, previous, null);
         }
 
         pub fn requestToolPermissionSync(

@@ -1,4 +1,6 @@
 const std = @import("std");
+const executable_action = @import("../permissions/executable_action.zig");
+const executable_admission = @import("../permissions/executable_admission.zig");
 const std_builtin = @import("builtin");
 const command_admission = @import("../permissions/command_admission.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
@@ -1884,6 +1886,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .append_static_context = appendStaticContext,
         .validate_tool_call = validateToolCall,
         .check_tool_availability = checkToolAvailability,
+        .request_executable_permission = requestExecutablePermission,
         .request_tool_permission = requestToolPermissionOutcomeWithRequest,
         .request_prepared_file_mutation_permission = requestPreparedFileMutationPermissionOutcomeForRuntime,
         .resolve_tool_action_display_target = resolveToolActionDisplayTarget,
@@ -2270,6 +2273,22 @@ fn writeBlockedActionGuidance(
     try ctx.writeStderr(reason);
     try ctx.writeStderr("\n");
     try ctx.writeStderr(hint);
+}
+
+/// CLI approval remains native and interactive without manufacturing a ToolCall.
+fn requestCliExecutablePermission(raw_ctx: *anyopaque, alloc: Allocator, request: permission_request.PermissionRequest) !permission_request.OwnedPermissionResponse {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    return switch (try promptCliPermissionApproval(ctx, request.label)) {
+        .approve => permission_request.OwnedPermissionResponse.init(alloc, .once, null),
+        .deny => permission_request.OwnedPermissionResponse.init(alloc, .deny, null),
+        .unavailable => error.PermissionPromptUnavailable,
+    };
+}
+
+fn requestExecutablePermission(raw_ctx: *anyopaque, arena: Allocator, action: executable_action.Action, review_turn: permission_auto_classifier.ReviewTurnContext, mode: PermissionMode, previous: ?PermissionMode) !PermissionMode {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    const tool_ctx = cliAdmissionContext(ctx, &.{}, review_turn);
+    return executable_admission.authorize(arena, tool_ctx.admissionInput(), action, review_turn, mode, previous, .{ .context = raw_ctx, .request_fn = requestCliExecutablePermission });
 }
 
 fn requestCliPermission(

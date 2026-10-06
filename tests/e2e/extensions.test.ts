@@ -217,7 +217,7 @@ describe("local extension discovery", () => {
     expect(result.stderr + result.stdout).not.toContain(GATEWAY_FIXTURE_KEY);
   });
 
-  test("extension delivery stays fail-closed until executable activation is authorized", () => {
+  test("a registered catalog does not make a missing executable runnable", () => {
     const home = fixture(VALID_REGISTRY, VALID_MANIFEST);
     const result = spawnSync(FX_BIN, ASK_ARGUMENTS, {
       cwd: home, timeout: TIMEOUT_MS, encoding: "utf8",
@@ -226,7 +226,7 @@ describe("local extension discovery", () => {
         FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1" },
     });
     expect(result.status).not.toBe(0);
-    expect(result.stderr + result.stdout).toContain("ExtensionExecutionPermissionRequired");
+    expect(result.stderr + result.stdout).toContain("FileNotFound");
     expect(result.stderr + result.stdout).not.toContain(EXTENSION_FIXTURE_KEY);
   });
 

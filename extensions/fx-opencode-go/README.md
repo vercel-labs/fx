@@ -29,9 +29,15 @@ The executable runs with your OS privileges. An empty environment does not sandb
 
 Build fx from the checkout root and run `./zig-out/bin/fx`. Do not use an installed binary to verify this fork.
 
-Only native `yolo` currently authorizes executable activation. `ask` and `auto` remain closed.
-Use yolo only when you accept disabling native permission checks for the entire conversation.
-Do not enable it merely to bypass an extension approval failure.
+Use native `ask` for exact executable confirmation without disabling tool permissions. For interactive CLI approval:
+
+```sh
+./zig-out/bin/fx ask --prompt-permissions "Say hello"
+```
+
+Explicit profile `extension_execute` rules can authorize activation in `ask` or `auto`. Unresolved `auto` activation holds closed.
+See [activation policy](../../docs/extensions.md#trust-boundary) before granting a broad executable rule.
+Yolo is not required for scoped activation.
 
 ## Verified and unverified behavior
 

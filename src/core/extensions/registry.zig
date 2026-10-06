@@ -111,12 +111,12 @@ pub const Registry = struct {
         const account = request.credential.account_id orelse return error.ExtensionCredentialScopeMismatch;
         const expected = credential_scope(binding.provider);
         if (!std.mem.eql(u8, account, &expected)) return error.ExtensionCredentialScopeMismatch;
-        // Only the existing native unrestricted mode currently grants activation.
-        if (!self.unrestricted_execution.load(.seq_cst)) return error.ExtensionExecutionPermissionRequired;
+        // Model messages cannot supply the native root callback or unrestricted execution authority.
+        if (!self.unrestricted_execution.load(.seq_cst) and request.executable_authorizer == null) return error.ExtensionExecutionPermissionRequired;
         const entry = &self.entries.items[binding.extension_index];
         var scoped_request = request;
         scoped_request.session_id = request.session_id orelse self.fallback_session_id;
-        return entry.runtime.stream(self.alloc, alloc, entry.root, entry.manifest.value.entrypoint, binding.provider, binding.model, scoped_request, &self.unrestricted_execution);
+        return entry.runtime.stream(self.alloc, alloc, entry.root, entry.manifest.value.id, entry.manifest.value.entrypoint, binding.provider, binding.model, scoped_request, &self.unrestricted_execution);
     }
 
     /// Every public ID belongs to one provider; ambiguity cannot redirect credentials.

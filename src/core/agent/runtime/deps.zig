@@ -1,4 +1,5 @@
 const std = @import("std");
+const executable_action = @import("../../permissions/executable_action.zig");
 const agent_stream_provider = @import("../stream_provider.zig");
 const auth_runtime = @import("../../auth/auth_runtime.zig");
 const session_usage = @import("../../session/session_usage.zig");
@@ -175,6 +176,8 @@ pub const AgentRuntimeDeps = struct {
     live_tool_authority: ?LiveToolAuthorityProvider = null,
     /// Samples host-owned root permission mode at an action boundary.
     snapshot_root_permission_mode: ?*const fn (ctx: *anyopaque) PermissionMode = null,
+    /// Executable approval uses a native action, never a model ToolCall.
+    request_executable_permission: ?*const fn (ctx: *anyopaque, arena: Allocator, action: executable_action.Action, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, previous: ?PermissionMode) anyerror!PermissionMode = null,
     tool_activity_recorder: ?ToolActivityRecorder = null,
     finalize_turn: *const fn (ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, disposition: ?types.ProviderCompletionDisposition) anyerror!void = acknowledgePromptFinalization,
     prepare_parent_turn_context: ?*const fn (ctx: *anyopaque, arena: Allocator) anyerror!?PreparedParentTurnContext = null,

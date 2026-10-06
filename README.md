@@ -121,7 +121,7 @@ Add reusable instructions with [skills](https://fx.sh/docs/capabilities/skills),
 
 Trusted local executables can provide model catalogs and streaming through `~/.fx/extension.json`. See [local extensions](docs/extensions.md) and [OpenCode Go](extensions/fx-opencode-go/README.md).
 
-Extensions run with your OS privileges, not in a sandbox. Activation currently requires `yolo`; `ask` and `auto` remain closed. Do not enable `yolo` merely to bypass an extension approval failure.
+Extensions run with your OS privileges, not in a sandbox. Native `ask` confirms executable activation without disabling tool permissions. Explicit `extension_execute` rules can authorize activation in `ask` or `auto`; unresolved `auto` activation holds closed.
 
 ## Documentation
 

@@ -31,6 +31,9 @@ const SCHEMA_PROMPT = "Return the fixture answer as JSON.";
 const SCHEMA = { type: "object", properties: { answer: { type: "string" } }, required: ["answer"], additionalProperties: false };
 const SCHEMA_FORMAT = { name: "fixture_answer", description: "Return a local fixture answer", schema: SCHEMA };
 const SCHEMA_OUTPUT = JSON.stringify({ answer: "go-schema-ok" });
+const EXECUTABLE_PERMISSION = "extension_execute";
+const SETTINGS_RELATIVE_PATH = ".fx/settings.json";
+const EXPLICIT_ACTIVATION_CASES = [{ mode: "ask" }, { mode: "auto" }];
 const INPUT_TOKENS = 41;
 const OUTPUT_TOKENS = 17;
 const SESSION_RELATIVE_DIRECTORY = ".fx/sessions";
@@ -60,6 +63,30 @@ function streamReply(chunks: unknown[]): Response {
 }
 
 describe("native OpenCode Go extension", () => {
+  // Exact host-action authority must not disable native permission policy for file tools.
+  test.each(EXPLICIT_ACTIVATION_CASES)("explicit native executable allow works under $mode", async ({ mode }) => {
+    let requests = 0;
+    const server = Bun.serve({ hostname: HOST, port: 0, fetch() {
+      requests++;
+      return streamReply([{ choices: [{ index: 0, delta: { content: RESULT }, finish_reason: "stop" }] }]);
+    } });
+    const home = createGoProfile(server.port);
+    homes.push(home);
+    const settingsPath = join(home, SETTINGS_RELATIVE_PATH);
+    const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+    settings.permission = { [EXECUTABLE_PERMISSION]: "allow" };
+    writeFileSync(settingsPath, JSON.stringify(settings));
+    try {
+      const child = Bun.spawn([FX_BIN, "ask", "--json", "--no-save", TUI_PROMPT], { cwd: home, stdout: "pipe", stderr: "pipe", env: { ...goEnvironment(home), FX_PERMISSION_MODE: mode } });
+      const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+      expect(code, JSON.stringify({ stdout, stderr })).toBe(0);
+      expect(JSON.parse(stdout).output).toBe(RESULT);
+      expect(requests).toBe(1);
+      expect(stdout + stderr).not.toContain(KEY);
+      expect(stderr).not.toContain("YOLO enabled");
+    } finally { server.stop(true); }
+  }, TIMEOUT_MS);
+
   // Native CLI does not expose response_format; the shipped provider RPC is its public boundary.
   test("native provider schema contract reaches OpenAI and completes valid JSON", async () => {
     const bodies: any[] = [];

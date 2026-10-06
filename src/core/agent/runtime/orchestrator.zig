@@ -1,4 +1,6 @@
 const std = @import("std");
+const runtime_executable_admission = @import("executable_admission.zig");
+const executable_action = @import("../../permissions/executable_action.zig");
 const builtin = @import("builtin");
 const agent_steps = @import("../../config/agent_steps.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
@@ -3108,7 +3110,13 @@ fn processQueuedPromptLoop(
                 .stream = &stream_ctx,
                 .required_vision = vision_mode == .required,
             };
+            var executable_context: runtime_executable_admission.Context = .{
+                .deps = deps,
+                .fallback_mode = job.permission_mode,
+                .review_turn = buildReviewTurnContext(config, gateway_model, job.prompt, root_user_intent_context, &.{}, .{ .role = .assistant }, executable_action.permission_name),
+            };
             var model_request = agent_stream_provider.ModelRequest{
+                .executable_authorizer = executable_context.authorizer(),
                 .credential = .{
                     .secret = active_api_key,
                     .source = job.credential_source,

@@ -8,7 +8,13 @@ Registration and model discovery do not launch executables or transmit provider 
 
 An extension runs with your OS privileges. It can access files, use the network, and retain delivered credentials. An empty child environment is not a sandbox. Install only executables and catalogs you trust.
 
-Only native `yolo` currently authorizes activation. `ask` and `auto` fail closed. Yolo disables native permission checks for the entire conversation, not only this extension. Do not enable it merely to bypass an approval failure.
+Native `ask` confirms the registered provider, canonical executable path and SHA256 before launch. This is a host action, not a model tool. Approval cannot amend or substitute an executable. Native tool permissions remain active. CLI requests need the existing `--prompt-permissions` flag to open a human prompt.
+
+Explicit profile `extension_execute` rules can authorize activation under `ask` or `auto`. Rule targets contain `<extension-id>:<provider-id>:<executable-identity>`. Broad configured patterns also authorize matching replacement binaries; human approval does not. Current denies override cached approval.
+
+Approval belongs to the exact running child and action. A changed provider, executable digest, supplied session identity or permission mode requires current policy again. Policy changes apply before the next invocation and credential delivery; they cannot undo admitted effects or recall retained secrets.
+
+Unresolved `auto` activation holds closed without opening a prompt. An extension credential cannot review its own unactivated transport or become a Gateway credential. Yolo bypasses permission checks for the entire conversation; it is not required for scoped activation.
 
 ## Register an extension
 

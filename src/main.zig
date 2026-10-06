@@ -1,4 +1,5 @@
 const std = @import("std");
+const executable_action = @import("core/permissions/executable_action.zig");
 const extension_registry = @import("core/extensions/registry.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
@@ -1665,6 +1666,11 @@ const App = struct {
 
     pub fn requestToolPermissionSync(self: *App, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, revalidation: ?agent_runtime.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
         return AgentAppRuntime.requestToolPermissionSync(self, arena, call, review_turn, permission_mode, local_grants, live_authority, revalidation, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+    }
+
+    /// Composition delegates privileged native launch admission to the permission owner.
+    pub fn requestExecutablePermissionSync(self: *App, arena: Allocator, action: executable_action.Action, review_turn: permission_auto_classifier.ReviewTurnContext, mode: PermissionMode, previous: ?PermissionMode) !PermissionMode {
+        return AgentAppRuntime.requestExecutablePermissionSync(self, arena, action, review_turn, mode, previous, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
     pub fn requestToolPermissionSyncWithAdvertised(self: *App, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, revalidation: ?agent_runtime.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {

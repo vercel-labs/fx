@@ -238,6 +238,8 @@ capability. Missing, revoked, stale, or closed authority fails before transport.
 Security is permission-first.
 
 * `permission_mode` controls baseline behavior (`ask`, `auto`, or `yolo`)
+* trusted extension activation uses native `extension_execute` policy and non-tool human confirmation; executable identity and provider changes invalidate cached approval
+* unresolved extension activation in `auto` holds closed; an extension key cannot recursively authorize its own transport
 
 * `permission` config applies OpenCode-style wildcard rules
 

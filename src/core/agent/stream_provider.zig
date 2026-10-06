@@ -1,4 +1,5 @@
 const std = @import("std");
+const executable_action = @import("../permissions/executable_action.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -179,6 +180,8 @@ pub const RequestData = struct {
 /// Borrowed typed request. Providers own validation, wire serialization,
 /// endpoint selection, headers, HTTP, and stream reduction.
 pub const ModelRequest = struct {
+    /// Host-native root authority stays outside model-controlled messages and tools.
+    executable_authorizer: ?executable_action.Authorizer = null,
     credential: CredentialLease,
     session_id: ?[]const u8 = null,
     model: []const u8,
