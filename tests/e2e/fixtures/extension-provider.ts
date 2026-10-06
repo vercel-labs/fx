@@ -36,6 +36,7 @@ const DROP_STREAM_FILENAME = "drop-stream";
 const FAILURE_EXIT_CODE = 1;
 const SUCCESS_EXIT_CODE = 0;
 const CREDENTIAL_SLOT = "FX_EXTENSION_TEST_KEY";
+const SESSION_HEADER = "x-opencode-session";
 const methods = { initialize: "initialize", prepare: "provider.prepare", stream: "provider.stream", cancel: "provider.cancel", shutdown: "shutdown", event: "extension.event" };
 const events = { content: "content_delta", reasoning: "reasoning_delta", tool_started: "tool_started", tool_input: "tool_input_delta" };
 const lines = createInterface({ input: process.stdin });
@@ -58,7 +59,8 @@ function notify(request: any, type: string, fields: Record<string, unknown>, han
 for await (const line of lines) {
   const request = JSON.parse(line);
   appendFileSync(LOG_FILENAME, JSON.stringify({ method: request.method, pid: process.pid,
-    credential: Boolean(request.params.credential), ambientKey: Boolean(process.env[CREDENTIAL_SLOT]) }) + "\n");
+    credential: Boolean(request.params.credential), ambientKey: Boolean(process.env[CREDENTIAL_SLOT]),
+    sessionId: request.params.session_id, sessionHeader: request.params.headers?.[SESSION_HEADER] }) + "\n");
   let result: unknown;
   switch (request.method) {
     case methods.initialize: result = { version: PROTOCOL_VERSION }; break;

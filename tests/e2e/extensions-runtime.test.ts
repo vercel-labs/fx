@@ -30,6 +30,8 @@ const TOOL_MODE_FILENAME = "tool-roundtrip";
 const TOOL_FILENAME = "fixture-tool-data.txt";
 const TOOL_CONTENT = "fixture-tool-read-marker";
 const TOOL_RESULT_TEXT = "extension-tool-loop-ok";
+const MANIFEST_FILENAME = "extension.json";
+const SESSION_HEADERS = { "x-opencode-session": { source: "session_id" } };
 const UNRESTRICTED_PERMISSION_MODE = "yolo";
 const ASK_ARGUMENTS = ["ask", "--json", "--no-save", AUTH_SCOPE_PROMPT];
 const FIXTURE_EXECUTABLE_MODE = 0o700;
@@ -64,6 +66,9 @@ describe("local extension RPC runtime", () => {
   test("native file tool results and empty reasoning state replay to the next request", () => {
     const { home, extension } = fixture();
     writeFileSync(join(extension, TOOL_MODE_FILENAME), "");
+    writeFileSync(join(extension, MANIFEST_FILENAME), JSON.stringify({ ...VALID_MANIFEST, providers: [{
+      ...VALID_MANIFEST.providers[0], headers: SESSION_HEADERS,
+    }] }));
     writeFileSync(join(home, TOOL_FILENAME), TOOL_CONTENT);
     const result = askFixture(home);
     expect(result.status, result.stderr || result.stdout).toBe(0);
@@ -74,7 +79,10 @@ describe("local extension RPC runtime", () => {
     const calls = readFileSync(join(extension, RPC_LOG_FILENAME), "utf8").trim().split("\n").map(line => JSON.parse(line));
     expect(calls.filter(call => call.method === "initialize")).toHaveLength(1);
     expect(calls.filter(call => call.method === "provider.prepare")).toHaveLength(2);
-    expect(calls.filter(call => call.method === "provider.stream")).toHaveLength(2);
+    const streams = calls.filter(call => call.method === "provider.stream");
+    expect(streams).toHaveLength(2);
+    expect(streams[0].sessionId).toBeTruthy();
+    expect(streams.map(call => call.sessionHeader)).toEqual([streams[0].sessionId, streams[0].sessionId]);
     expect(() => process.kill(calls[0].pid, 0)).toThrow();
   });
 

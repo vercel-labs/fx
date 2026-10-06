@@ -12,6 +12,7 @@ const credentials = @import("../auth/credentials.zig");
 const stream_provider = @import("../agent/stream_provider.zig");
 const extension_process = @import("process.zig");
 const secret = @import("../auth/secret.zig");
+const session_layout = @import("../session/session_layout.zig");
 
 const Allocator = std.mem.Allocator;
 const public_model_id_format = "{s}/{s}";
@@ -69,6 +70,8 @@ pub const Registry = struct {
     entries: std.ArrayList(Loaded) = .empty,
     bindings: std.ArrayList(ModelBinding) = .empty,
     unrestricted_execution: std.atomic.Value(bool) = .init(false),
+    /// Unsaved root conversations still need stable provider-side accounting identity.
+    fallback_session_id: ?[]u8 = null,
 
     /// Unresolved ask/auto remain closed until exact native action admission is attached.
     pub fn set_permission_mode(self: *Registry, mode: types.PermissionMode) void {
@@ -110,7 +113,9 @@ pub const Registry = struct {
         // Only the existing native unrestricted mode currently grants activation.
         if (!self.unrestricted_execution.load(.seq_cst)) return error.ExtensionExecutionPermissionRequired;
         const entry = &self.entries.items[binding.extension_index];
-        return entry.runtime.stream(self.alloc, alloc, entry.root, entry.manifest.value.entrypoint, binding.provider, binding.model, request, &self.unrestricted_execution);
+        var scoped_request = request;
+        scoped_request.session_id = request.session_id orelse self.fallback_session_id;
+        return entry.runtime.stream(self.alloc, alloc, entry.root, entry.manifest.value.entrypoint, binding.provider, binding.model, scoped_request, &self.unrestricted_execution);
     }
 
     /// Every public ID belongs to one provider; ambiguity cannot redirect credentials.
@@ -125,6 +130,7 @@ pub const Registry = struct {
         self.bindings.deinit(self.alloc);
         for (self.entries.items) |*entry| entry.deinit(self.alloc);
         self.entries.deinit(self.alloc);
+        if (self.fallback_session_id) |id| self.alloc.free(id);
     }
 };
 
@@ -278,5 +284,6 @@ pub fn load(alloc: Allocator, registry_path: []const u8) !Registry {
         }
         try registry.entries.append(alloc, loaded);
     }
+    if (registry.entries.items.len > 0) registry.fallback_session_id = try session_layout.generateSessionId(alloc);
     return registry;
 }
