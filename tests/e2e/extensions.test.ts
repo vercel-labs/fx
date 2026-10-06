@@ -113,6 +113,7 @@ describe("local extension discovery", () => {
     const unsafe = [
       { "x-fixture": "unsafe-header-fixture\r\ninjected: true" },
       { Authorization: "unsafe-header-fixture" },
+      { "x-fixture": "unsafe-header-fixture", "X-Fixture": "unsafe-header-fixture" },
       { "x fixture": "unsafe-header-fixture" },
       { "x-fixture": { source: "env", name: "INVALID-ENV" } },
       { "x-fixture": { source: "session_id", extra: "unsafe-header-fixture" } },

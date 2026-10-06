@@ -27,7 +27,11 @@ Do not enable it merely to bypass an extension approval failure.
 
 Local dogfooding runs the built fx and this executable against a fake-key loopback HTTP peer.
 It proves custom endpoints, environment headers, stable `x-opencode-session`, `reasoning_effort: "max"`, native file tools,
-empty `reasoning_content` replay and streamed content. Token usage parsing is implemented but has no independent assertion yet. Core rejects stale or oversized events.
+empty `reasoning_content` replay, intact large UTF-8 file writes and real terminal streaming.
+Real Ctrl+C cancels the HTTP socket; a fresh user request completes without restarting the app.
+HTTP errors, redirects, lost finish markers and aggregate tool-budget failures do not replay or disclose secrets.
+Header names follow HTTP case rules; duplicate logical bindings fail before executable activation.
+Token usage parsing is implemented but has no independent assertion yet. Core rejects stale or oversized events.
 HTTP redirects and automatic provider retries are disabled. Provider error bodies do not enter the transcript.
 Image input remains disabled until the host supplies verified image snapshots.
 The request encoder supports JSON Schema response format, but that path has no local proof yet.

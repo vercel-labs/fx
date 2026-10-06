@@ -8,6 +8,7 @@ const max_event_bytes = 1024 * 1024;
 const max_text_bytes = 1024 * 1024;
 const max_delta_bytes = 64 * 1024;
 const max_tool_calls = 128;
+const max_tool_arguments_bytes = 1024 * 1024;
 const max_identity_bytes = 1024;
 const data_prefix = "data:";
 const done_marker = "[DONE]";
@@ -28,6 +29,7 @@ pub const Context = struct {
     reasoning: std.ArrayList(u8) = .empty,
     reasoning_seen: bool = false,
     calls: std.ArrayList(Call) = .empty,
+    tool_arguments_bytes: usize = 0,
     finish: ?[]const u8 = null,
     input_tokens: ?u64 = null,
     output_tokens: ?u64 = null,
@@ -115,7 +117,12 @@ pub const Context = struct {
                 if (tool.object.get("function")) |function| {
                     if (function != .object) return error.InvalidResponse;
                     if (function.object.get("name")) |value| try identity(self.alloc, &call.name, try wire.text(value));
-                    if (function.object.get("arguments")) |value| try append_bounded(self.alloc, &call.arguments, try wire.text(value));
+                    if (function.object.get("arguments")) |value| {
+                        const text = try wire.text(value);
+                        if (text.len > max_tool_arguments_bytes - self.tool_arguments_bytes) return error.ResponseTooLarge;
+                        try append_bounded(self.alloc, &call.arguments, text);
+                        self.tool_arguments_bytes += text.len;
+                    }
                 }
             }
         }
@@ -126,8 +133,7 @@ pub const Context = struct {
         var offset: usize = 0;
         while (offset < text.len) {
             if (self.cancel.load(.seq_cst)) return error.Cancelled;
-            var end = @min(offset + max_delta_bytes, text.len);
-            while (end < text.len and text[end] & utf8_tag_mask == utf8_continuation_tag) end -= 1;
+            const end = delta_end(text, offset);
             try self.output.send(.{ .jsonrpc = wire.jsonrpc, .method = event_method, .params = .{
                 .request_id = self.id,
                 .handle = self.handle,
@@ -161,13 +167,19 @@ pub const Context = struct {
                 .id = call.id,
                 .name = call.name,
             } });
-            try self.output.send(.{ .jsonrpc = wire.jsonrpc, .method = event_method, .params = .{
-                .request_id = self.id,
-                .handle = self.handle,
-                .type = "tool_input_delta",
-                .id = call.id,
-                .delta = call.arguments.items,
-            } });
+            var offset: usize = 0;
+            while (offset < call.arguments.items.len) {
+                if (self.cancel.load(.seq_cst)) return error.Cancelled;
+                const end = delta_end(call.arguments.items, offset);
+                try self.output.send(.{ .jsonrpc = wire.jsonrpc, .method = event_method, .params = .{
+                    .request_id = self.id,
+                    .handle = self.handle,
+                    .type = "tool_input_delta",
+                    .id = call.id,
+                    .delta = call.arguments.items[offset..end],
+                } });
+                offset = end;
+            }
         }
         var state = wire.object();
         try wire.put(alloc, &state, "reasoning_content", wire.string(self.reasoning.items));
@@ -177,6 +189,13 @@ pub const Context = struct {
         try self.output.reply(self.id, .{ .content = if (self.content.items.len > 0) self.content.items else null, .tool_calls = Value{ .array = calls }, .provider_state_json = replay, .finish_reason = self.finish, .usage = .{ .input_tokens = self.input_tokens, .output_tokens = self.output_tokens } });
     }
 };
+
+/// Both text and tool deltas retain complete UTF-8 characters within the host cap.
+fn delta_end(text: []const u8, offset: usize) usize {
+    var end = @min(offset + max_delta_bytes, text.len);
+    while (end < text.len and text[end] & utf8_tag_mask == utf8_continuation_tag) end -= 1;
+    return end;
+}
 
 /// Repeated identity fields must agree; fragment indexes cannot repurpose existing calls.
 fn identity(alloc: Allocator, owned: *[]const u8, value: []const u8) !void {

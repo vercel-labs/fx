@@ -111,8 +111,14 @@ pub fn validate_headers(headers: ?std.json.Value) !void {
     const value = headers orelse return;
     if (value != .object or value.object.count() > max_header_count) return error.ExtensionHeaderInvalid;
     var fields = value.object.iterator();
+    var count: usize = 0;
     while (fields.next()) |field| {
         const name = field.key_ptr.*;
+        // HTTP names are case-insensitive; ambiguous bindings cannot choose different credentials.
+        for (value.object.keys()[0..count]) |previous| {
+            if (std.ascii.eqlIgnoreCase(previous, name)) return error.ExtensionHeaderInvalid;
+        }
+        count += 1;
         if (name.len == 0 or name.len > max_header_name_bytes) return error.ExtensionHeaderInvalid;
         for (name) |byte| {
             if (!std.ascii.isAlphanumeric(byte) and std.mem.findScalar(u8, header_token_punctuation, byte) == null) return error.ExtensionHeaderInvalid;

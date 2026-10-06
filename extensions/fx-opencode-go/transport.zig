@@ -20,16 +20,20 @@ pub fn run(job: anytype) !void {
     for (credential) |byte| if (std.ascii.isControl(byte) or byte == 0x7f) return error.InvalidCredential;
     const header_values = try wire.field(params, "headers");
     if (header_values != .object) return error.InvalidHeaders;
-    const session = try wire.text(try wire.field(header_values, session_header));
-    if (session.len == 0) return error.InvalidHeaders;
+    var session_present = false;
     var headers: std.ArrayList(std.http.Header) = .empty;
     var iter = header_values.object.iterator();
     while (iter.next()) |entry| {
         for (managed_headers) |managed| if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, managed)) return error.InvalidHeaders;
         const value = try wire.text(entry.value_ptr.*);
+        if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, session_header)) {
+            if (session_present or value.len == 0) return error.InvalidHeaders;
+            session_present = true;
+        }
         for (value) |byte| if (std.ascii.isControl(byte) or byte == 0x7f) return error.InvalidHeaders;
         try headers.append(alloc, .{ .name = entry.key_ptr.*, .value = value });
     }
+    if (!session_present) return error.InvalidHeaders;
     const authorization = try std.fmt.allocPrint(alloc, "Bearer {s}", .{credential});
     defer std.crypto.secureZero(u8, authorization);
     var client = std.http.Client{ .allocator = alloc, .io = job.io };

@@ -1,24 +1,33 @@
 // Local HTTP dogfooding proves the actual executable without calling a paid provider.
 import { afterEach, describe, expect, test } from "bun:test";
-import { copyFileSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { TmuxSession, tmuxAvailable } from "./tmux-helpers";
 import { cleanupIsolatedTestHome, FX_BIN } from "../evals/eval-helpers";
-import { createExtensionProfile, PROFILE_DIRECTORY, FIXTURE_EXTENSION_DIRECTORY } from "./fixtures/extension-profile";
+import { createGoProfile, goEnvironment, KEY, HEADER_VALUE, HOST } from "./fixtures/opencode-go-profile";
 
-const SOURCE = join(import.meta.dir, "..", "..", "extensions", "fx-opencode-go");
-const EXECUTABLE = join(dirname(FX_BIN), "fx-opencode-go");
-const MODEL = "opencode-go/deepseek-flash";
-const KEY = "local-go-fixture-key";
-const HEADER_VALUE = "local-go-fixture-header";
+const LARGE_TOOL_CONTENT = "é".repeat(40 * 1024);
+const CASES = [
+  { name: "mixed-case session header", tool: "read_file", sessionHeader: "X-OpenCode-Session", prompt: "Read the fixture file and return the final answer." },
+  { name: "read_file with empty reasoning replay", tool: "read_file", sessionHeader: "x-opencode-session", prompt: "Read the fixture file and return the final answer." },
+  { name: "large UTF-8 write_file input", tool: "write_file", sessionHeader: "x-opencode-session", prompt: "Write the requested large fixture file and return the final answer." },
+];
 const RESULT = "go-native-local-ok";
 const TOOL_FILENAME = "go-fixture-data.txt";
 const TOOL_CONTENT = "go-real-tool-result";
 const TOOL_ID = "go-read-call";
-const MANIFEST_FILENAME = "extension.json";
-const CATALOG_FILENAME = "models.json";
-const SETTINGS_FILENAME = "settings.json";
-const HOST = "127.0.0.1";
 const TIMEOUT_MS = 20_000;
+const STREAM_DELAY_MS = 2_000;
+const TUI_TIMEOUT_MS = 10_000;
+const STREAM_PREFIX = "go-live-first-chunk";
+const CANCELLED_TEXT = "System: cancelled";
+const STDERR_FILENAME = "go-tui-stderr.log";
+const TUI_PROMPT = "Reply through the local Go fixture.";
+const FOLLOWUP_PROMPT = "Make one fresh local Go request.";
+const NEGATIVE_CASES = ["http-error", "redirect", "lost-finish", "aggregate-tools"].map(mode => ({ mode }));
+const LARGE_ARGUMENT_BYTES = 600 * 1024;
+const ERROR_BODY = "untrusted-go-error-body";
+const tuiTest = tmuxAvailable() ? test : test.skip;
 const homes: string[] = [];
 afterEach(() => { for (const home of homes.splice(0)) cleanupIsolatedTestHome(home); });
 
@@ -29,15 +38,104 @@ function streamReply(chunks: unknown[]): Response {
 }
 
 describe("native OpenCode Go extension", () => {
-  test("local endpoint receives max effort, scoped headers and real tool/reasoning replay", async () => {
-    const manifest = JSON.parse(readFileSync(join(SOURCE, MANIFEST_FILENAME), "utf8"));
+  // The real HTTP worker must stop its socket before a fresh explicit user request can recover.
+  tuiTest("real TTY sees early Go text, cancels HTTP and completes a fresh request", async () => {
+    let requests = 0;
+    let completed = 0;
+    let cancelled = 0;
+    const sessions: (string | null)[] = [];
+    const timers = new Set<ReturnType<typeof setTimeout>>();
+    const encoder = new TextEncoder();
+    const server = Bun.serve({ hostname: HOST, port: 0, fetch(request) {
+      requests++;
+      sessions.push(request.headers.get("x-opencode-session"));
+      return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode("data: " + JSON.stringify({ choices: [{ index: 0, delta: { content: STREAM_PREFIX } }] }) + "\n\n"));
+          const timer = setTimeout(() => {
+            timers.delete(timer);
+            completed++;
+            controller.enqueue(encoder.encode("data: " + JSON.stringify({ choices: [{ index: 0, delta: { content: RESULT }, finish_reason: "stop" }] }) + "\n\ndata: [DONE]\n\n"));
+            controller.close();
+          }, STREAM_DELAY_MS);
+          timers.add(timer);
+        },
+        cancel() { cancelled++; for (const timer of timers) clearTimeout(timer); timers.clear(); },
+      }), { headers: { "content-type": "text/event-stream" } });
+    } });
+    const home = createGoProfile(server.port);
+    homes.push(home);
+    const stderrPath = join(home, STDERR_FILENAME);
+    let session: TmuxSession | undefined;
+    try {
+      session = await TmuxSession.create({ cmd: FX_BIN, cwd: home, stderrPath, isolated: true,
+        env: { ...goEnvironment(home), FX_SKIP_ONBOARDING: "0", AI_GATEWAY_API_KEY: "", VERCEL_OIDC_TOKEN: "" } });
+      await session.waitForText("Run /help", TUI_TIMEOUT_MS);
+      await session.sendText(TUI_PROMPT);
+      await session.waitForText(STREAM_PREFIX, TUI_TIMEOUT_MS);
+      expect(completed).toBe(0);
+      await session.sendKeys("C-c");
+      await session.waitForText(CANCELLED_TEXT, TUI_TIMEOUT_MS);
+      expect(session.isAlive()).toBe(true);
+      await session.sendText(FOLLOWUP_PROMPT);
+      const pane = await session.waitForText(RESULT, TUI_TIMEOUT_MS);
+      expect(requests).toBe(2);
+      expect(completed).toBe(1);
+      expect(cancelled).toBeGreaterThanOrEqual(1);
+      expect(sessions[0]).toBeTruthy();
+      expect(sessions[1]).toBe(sessions[0]);
+      expect(pane.split(RESULT)).toHaveLength(2);
+      expect(session.isAlive()).toBe(true);
+      await session.sendText("/quit");
+      await session.waitForSessionEnd(TUI_TIMEOUT_MS);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      await session?.kill();
+      for (const timer of timers) clearTimeout(timer);
+      server.stop(true);
+    }
+  }, TIMEOUT_MS);
+
+  // HTTP failure, redirect and terminal-evidence loss must never trigger provider-side or host-side replay.
+  test.each(NEGATIVE_CASES)("$mode remains terminal without secret disclosure or tool side effects", async ({ mode }) => {
+    let requests = 0;
+    let redirected = 0;
+    const destination = Bun.serve({ hostname: HOST, port: 0, fetch() { redirected++; return new Response(RESULT); } });
+    let home = "";
+    const server = Bun.serve({ hostname: HOST, port: 0, fetch() {
+      requests++;
+      if (mode === "redirect") return Response.redirect(`http://${HOST}:${destination.port}/stolen`);
+      if (mode === "http-error") return new Response(ERROR_BODY + KEY, { status: 401 });
+      if (mode === "lost-finish") return new Response("data: " + JSON.stringify({ choices: [{ index: 0, delta: { content: STREAM_PREFIX } }] }) + "\n\n", { headers: { "content-type": "text/event-stream" } });
+      return streamReply([
+        { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: TOOL_ID, function: { name: "write_file", arguments: JSON.stringify({ path: join(home, TOOL_FILENAME), content: "x".repeat(LARGE_ARGUMENT_BYTES) }) } }] } }] },
+        { choices: [{ index: 0, delta: { tool_calls: [{ index: 1, id: TOOL_ID + "-second", function: { name: "write_file", arguments: JSON.stringify({ path: join(home, TOOL_FILENAME), content: "x".repeat(LARGE_ARGUMENT_BYTES) }) } }] } }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+      ]);
+    } });
+    try {
+      home = createGoProfile(server.port);
+      homes.push(home);
+      const child = Bun.spawn([FX_BIN, "ask", "--json", "--no-save", TUI_PROMPT], { cwd: home, stdout: "pipe", stderr: "pipe", env: goEnvironment(home) });
+      const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+      expect(code).toBe(1);
+      expect(JSON.parse(stdout).error).toBe("ExtensionRpcFailed");
+      expect(requests).toBe(1);
+      expect(redirected).toBe(0);
+      expect(stdout + stderr).not.toContain(KEY);
+      expect(stdout + stderr).not.toContain(ERROR_BODY);
+      expect(() => readFileSync(join(home, TOOL_FILENAME))).toThrow();
+    } finally { server.stop(true); destination.stop(true); }
+  }, TIMEOUT_MS);
+
+  test.each(CASES)("local endpoint receives max, scoped headers and $name", async scenario => {
     const requests: { body: any; authorization: string | null; session: string | null; header: string | null; path: string }[] = [];
     let home = "";
     const server = Bun.serve({ hostname: HOST, port: 0, async fetch(request) {
       const body = await request.json();
       requests.push({ body, authorization: request.headers.get("authorization"), session: request.headers.get("x-opencode-session"), header: request.headers.get("x-go-fixture"), path: new URL(request.url).pathname });
       if (requests.length === 1) return streamReply([
-        { choices: [{ index: 0, delta: { reasoning_content: "", tool_calls: [{ index: 0, id: TOOL_ID, function: { name: "read_file", arguments: JSON.stringify({ path: join(home, TOOL_FILENAME) }) } }] } }] },
+        { choices: [{ index: 0, delta: { reasoning_content: "", tool_calls: [{ index: 0, id: TOOL_ID, function: { name: scenario.tool, arguments: JSON.stringify({ path: join(home, TOOL_FILENAME), ...(scenario.tool === "write_file" ? { content: LARGE_TOOL_CONTENT } : {}) }) } }] } }] },
         { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], usage: { prompt_tokens: 10, completion_tokens: 20 } },
       ]);
       return streamReply([
@@ -46,19 +144,11 @@ describe("native OpenCode Go extension", () => {
       ]);
     } });
     try {
-      manifest.entrypoint = "provider";
-      manifest.providers[0].base_url = `http://${HOST}:${server.port}/v1`;
-      manifest.providers[0].headers["x-go-fixture"] = { source: "env", name: "FX_GO_TEST_HEADER" };
-      home = createExtensionProfile({ version: 1, extensions: [{ path: FIXTURE_EXTENSION_DIRECTORY }] }, manifest);
+      home = createGoProfile(server.port, scenario.sessionHeader);
       homes.push(home);
-      const extension = join(home, PROFILE_DIRECTORY, FIXTURE_EXTENSION_DIRECTORY);
-      copyFileSync(EXECUTABLE, join(extension, manifest.entrypoint));
-      copyFileSync(join(SOURCE, CATALOG_FILENAME), join(extension, CATALOG_FILENAME));
-      writeFileSync(join(home, PROFILE_DIRECTORY, SETTINGS_FILENAME), JSON.stringify({ provider: "extension", models: { extension: MODEL }, effort: "max", auto_upgrade: false }));
-      writeFileSync(join(home, TOOL_FILENAME), TOOL_CONTENT);
-      const child = Bun.spawn([FX_BIN, "ask", "--json", "--no-save", "Read the fixture file and return the final answer."], {
-        cwd: home, stdout: "pipe", stderr: "pipe", env: { ...process.env, HOME: home, AI_GATEWAY_API_KEY: undefined, VERCEL_OIDC_TOKEN: undefined,
-          FX_MODEL: undefined, FX_PERMISSION_MODE: "yolo", OPENCODE_API_KEY: KEY, FX_GO_TEST_HEADER: HEADER_VALUE, FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1" },
+      if (scenario.tool === "read_file") writeFileSync(join(home, TOOL_FILENAME), TOOL_CONTENT);
+      const child = Bun.spawn([FX_BIN, "ask", "--json", "--no-save", scenario.prompt], {
+        cwd: home, stdout: "pipe", stderr: "pipe", env: goEnvironment(home),
       });
       const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
       expect(code, JSON.stringify({ stdout: stdout.replaceAll(KEY, "[masked]"), stderr: stderr.replaceAll(KEY, "[masked]"), requests: requests.length })).toBe(0);
@@ -75,7 +165,9 @@ describe("native OpenCode Go extension", () => {
       expect(requests[0].session).toBeTruthy();
       expect(requests[1].session).toBe(requests[0].session);
       expect(requests[1].body.messages.some((message: any) => message.role === "assistant" && message.reasoning_content === "")).toBe(true);
-      expect(requests[1].body.messages.some((message: any) => message.role === "tool" && message.content.includes(TOOL_CONTENT))).toBe(true);
+      expect(requests[1].body.messages.some((message: any) => message.role === "tool")).toBe(true);
+      if (scenario.tool === "read_file") expect(requests[1].body.messages.some((message: any) => message.role === "tool" && message.content.includes(TOOL_CONTENT))).toBe(true);
+      else expect(readFileSync(join(home, TOOL_FILENAME), "utf8")).toBe(LARGE_TOOL_CONTENT);
       expect(stdout + stderr).not.toContain(KEY);
     } finally { server.stop(true); }
   }, TIMEOUT_MS);
