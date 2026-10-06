@@ -19,6 +19,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { silentFxEnv } from "../test-environment";
 import {
   classifierEvidenceFromRequest,
   fakeGatewayPermissionDecision,
@@ -965,7 +966,7 @@ function gatewayEnv(
   gateway: ReturnType<typeof startFakeGateway>,
   extra: Record<string, string | undefined> = {},
 ) {
-  return {
+  return silentFxEnv({
     HOME: root.home,
     AI_GATEWAY_API_KEY: "fake-command-permission-key",
     VERCEL_OIDC_TOKEN: undefined,
@@ -976,7 +977,7 @@ function gatewayEnv(
     FX_DIRECT_SECRET: "must-not-be-inherited",
     NO_COLOR: "1",
     ...extra,
-  };
+  });
 }
 
 function definedEnv(env: Record<string, string | undefined>) {

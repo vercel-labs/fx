@@ -1,5 +1,6 @@
 // Model-backed eval helpers. Requires a built binary and AI_GATEWAY_API_KEY.
 import { expect } from "bun:test";
+import "../test-environment";
 import { execFileSync, execSync, spawn as nodeSpawn } from "node:child_process";
 import {
   existsSync,

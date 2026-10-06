@@ -1,0 +1,3 @@
+# CI and local E2E runs start here rather than at the repository root.
+[test]
+preload = ["../test-environment.ts"]

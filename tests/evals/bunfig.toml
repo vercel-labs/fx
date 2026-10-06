@@ -1,0 +1,3 @@
+# Model-backed tests share the silent child default without changing product settings.
+[test]
+preload = ["../test-environment.ts"]

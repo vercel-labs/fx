@@ -1,0 +1,3 @@
+# Root test launches need the same silent children as package-local runs.
+[test]
+preload = ["./tests/test-environment.ts"]

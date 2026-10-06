@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { FX_BIN, REPO_ROOT } from "../../evals/eval-helpers";
+import { FX_TEST_SOUND_DISABLED } from "../../test-environment";
 import { analyzeRun } from "./analyzer";
 import {
   attachFrameEvidence,
@@ -746,6 +747,8 @@ function startShellCommand(
     `HISTFILE=${shQuote(fixture.histfile)}`,
     `SHELL=${shQuote(zshPath())}`,
     `TERM_PROGRAM=${shQuote(scenario.termProgram)}`,
+    // Existing GUI shells cannot inherit the Bun harness preload.
+    `FX_SOUND=${shQuote(FX_TEST_SOUND_DISABLED)}`,
     `FX_TRACE_LOG=${shQuote(manifest.traceLogPath)}`,
     `FX_TRACE_SCOPES=${shQuote(TRACE_SCOPES)}`,
     ...markerEnv,

@@ -25,6 +25,7 @@ import {
   type RecordedToolCall,
 } from "./agent-quality-matrix";
 import { REPO_ROOT, type HeadlessResult } from "./eval-helpers";
+import { silentFxEnv } from "../test-environment";
 
 export const DEFAULT_AB_ROW_IDS = [
   "slash-command-definition-search",
@@ -280,14 +281,14 @@ export async function runAbTrial(
 ): Promise<AbRunResult> {
   const binaryPath = sideBinary(config, side);
   const trialHome = mkdtempSync(join(tmpdir(), `fx-ab-${row.id}-${trialIndex}-${side}-`));
-  const env: Record<string, string | undefined> = {
+  const env = silentFxEnv({
     PATH: process.env.PATH ?? "",
     HOME: trialHome,
     NO_COLOR: "1",
     FX_MODEL: config.model,
     AI_GATEWAY_API_KEY: process.env.AI_GATEWAY_API_KEY,
     VERCEL_OIDC_TOKEN: process.env.VERCEL_OIDC_TOKEN,
-  };
+  });
 
   const versionOutput = await versionFor(binaryPath, env);
   const result = await runProcess(
