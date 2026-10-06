@@ -115,12 +115,19 @@ CI result.
 M0, the bounded M1 slice, and M2 completed-value caching have local evidence in
 [evidence/m2.json](evidence/m2.json) and
 [evidence/ledger.json](evidence/ledger.json). The refreshed qualification observed
-52 Zig tests and two different actual fixtures. Foundation comparisons retain
+62 Zig tests and two different actual fixtures. Foundation comparisons retain
 ten logical receipts while using eight or four captured-content reader calls.
 Cache comparisons retain eleven receipts, including four new logical consumers
 served from completed values and three rejected consumers with no output.
 The subscriber and framing contracts have unit evidence; their actual broker
 runtime qualification remains pending. No measured speedup is claimed.
+
+The authority registry owns exact bindings, derives opaque handles with HMAC,
+and checks registry generations and deadlines before start. Reclaimed permits
+remain charged tombstones for the task lifetime. Its ten tests are included in
+the latest qualification. Eight helper-oracle tests reject mutated reports; the
+earlier weak checker fails the two controls that exposed its identity and quota
+gaps. These checks supplement later runtime red-team validation.
 
 The available account has read access to `vercel-labs/fx`; an owned fork provides
 the publication route recorded in

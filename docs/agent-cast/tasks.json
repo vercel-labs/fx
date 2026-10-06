@@ -7,7 +7,7 @@
     "design": "docs/agent-cast-architecture.html",
     "scope": "Foundation first; no production permissions, broker, isolation or performance claim yet."
   },
-  "last_updated_utc": "2026-10-06T20:21:58.277937+00:00",
+  "last_updated_utc": "2026-10-06T20:53:14.195117+00:00",
   "routing_policy": {
     "routine_model": "gpt-6-luna",
     "implementation_model": "gpt-6.1-sol",
@@ -16,7 +16,7 @@
     "repair_policy": "At most two repair rounds per delegated scope before parent review",
     "spending_limit": null,
     "usage_policy": "Null means unavailable; actual token counts require a provider receipt. No inferred totals.",
-    "current_batch": "Completed cache locally verified; subscribers unit-tested; broker authority in progress; fork CI route available"
+    "current_batch": "M3 actual broker and Python/Node clients in parallel;62 tests and13 embedded CLI checks passed; draft CI checkpoint next"
   },
   "milestones": [
     {
@@ -252,14 +252,15 @@
       "evidence": [
         "docs/agent-cast/evidence/contract-review.json",
         "docs/agent-cast/evidence/foundation.json",
-        "docs/agent-cast/evidence/m2-2026-10-06/qualification.json"
+        "docs/agent-cast/evidence/m2-2026-10-06/qualification.json",
+        "docs/agent-cast/evidence/registry-2026-10-06/qualification.json"
       ],
       "usage": {
         "input_tokens": null,
         "output_tokens": null,
         "source": null
       },
-      "updated_at_utc": "2026-10-06T20:21:58.277937+00:00"
+      "updated_at_utc": "2026-10-06T20:53:14.195117+00:00"
     },
     {
       "id": "AC-0102",
@@ -288,14 +289,15 @@
       ],
       "evidence": [
         "docs/agent-cast/evidence/foundation.json",
-        "docs/agent-cast/evidence/m2-2026-10-06/qualification.json"
+        "docs/agent-cast/evidence/m2-2026-10-06/qualification.json",
+        "docs/agent-cast/evidence/registry-2026-10-06/qualification.json"
       ],
       "usage": {
         "input_tokens": null,
         "output_tokens": null,
         "source": null
       },
-      "updated_at_utc": "2026-10-06T20:21:58.277937+00:00"
+      "updated_at_utc": "2026-10-06T20:53:14.195117+00:00"
     },
     {
       "id": "AC-0103",
@@ -323,14 +325,15 @@
       "evidence": [
         "docs/agent-cast/evidence/contract-review.json",
         "docs/agent-cast/evidence/foundation.json",
-        "docs/agent-cast/evidence/m2-2026-10-06/qualification.json"
+        "docs/agent-cast/evidence/m2-2026-10-06/qualification.json",
+        "docs/agent-cast/evidence/registry-2026-10-06/qualification.json"
       ],
       "usage": {
         "input_tokens": null,
         "output_tokens": null,
         "source": null
       },
-      "updated_at_utc": "2026-10-06T20:21:58.277937+00:00"
+      "updated_at_utc": "2026-10-06T20:53:14.195117+00:00"
     },
     {
       "id": "AC-0104",
@@ -360,14 +363,15 @@
       "evidence": [
         "docs/agent-cast/evidence/foundation.json",
         "docs/agent-cast/evidence/foundation-2026-10-06/qualification.json",
-        "docs/agent-cast/evidence/m2-2026-10-06/qualification.json"
+        "docs/agent-cast/evidence/m2-2026-10-06/qualification.json",
+        "docs/agent-cast/evidence/registry-2026-10-06/qualification.json"
       ],
       "usage": {
         "input_tokens": null,
         "output_tokens": null,
         "source": null
       },
-      "updated_at_utc": "2026-10-06T20:21:58.277937+00:00"
+      "updated_at_utc": "2026-10-06T20:53:14.195117+00:00"
     },
     {
       "id": "AC-0105",
@@ -431,14 +435,15 @@
       ],
       "evidence": [
         "docs/agent-cast/evidence/m2.json",
-        "docs/agent-cast/evidence/m2-review.json"
+        "docs/agent-cast/evidence/m2-review.json",
+        "docs/agent-cast/evidence/registry-2026-10-06/qualification.json"
       ],
       "usage": {
         "input_tokens": null,
         "output_tokens": null,
         "source": null
       },
-      "updated_at_utc": "2026-10-06T20:21:58.277937+00:00"
+      "updated_at_utc": "2026-10-06T20:53:14.195117+00:00"
     },
     {
       "id": "AC-0202",
@@ -464,14 +469,15 @@
       ],
       "evidence": [
         "docs/agent-cast/evidence/m2-2026-10-06/qualification.json",
-        "docs/agent-cast/evidence/m2-review.json"
+        "docs/agent-cast/evidence/m2-review.json",
+        "docs/agent-cast/evidence/registry-2026-10-06/qualification.json"
       ],
       "usage": {
         "input_tokens": null,
         "output_tokens": null,
         "source": null
       },
-      "updated_at_utc": "2026-10-06T20:21:58.277937+00:00",
+      "updated_at_utc": "2026-10-06T20:53:14.195117+00:00",
       "pending_reason": "Thirteen subscriber unit tests pass; actual shared producer/cancellation runtime interaction remains pending broker composition."
     },
     {
@@ -497,31 +503,36 @@
         "Bounds, framing, epochs, roles, authority and reconnect semantics tested",
         "Two actual clients exercise shared state; same-UID process is not advertised as containment"
       ],
-      "evidence": [],
+      "evidence": [
+        "docs/agent-cast/evidence/authority-review.json",
+        "docs/agent-cast/evidence/registry-2026-10-06/qualification.json"
+      ],
       "usage": {
         "input_tokens": null,
         "output_tokens": null,
         "source": null
       },
       "updated_at_utc": "2026-10-06T20:21:58.277937+00:00",
-      "implementation_note": "Parent authored framed strict JSON-RPC parser; Sol is implementing host-owned authority registry. Broker executable not yet implemented."
+      "implementation_note": "Registry/framing contracts compile and pass tests; actual async broker implementation has begun with strict control FD, acknowledged output and generation-scoped cache."
     },
     {
       "id": "AC-0302",
       "milestone": "M3",
       "title": "Add Python and Node adapters",
-      "status": "planned",
+      "status": "in_progress",
       "depends_on": [
         "AC-0301"
       ],
       "owner": {
         "role": "implementation",
         "model": "gpt-6.1-sol",
-        "reasoning_effort": "medium"
+        "reasoning_effort": "medium",
+        "agent": "/root/agent_cast_clients"
       },
       "scope": [
-        "experimental Python/Node clients",
-        "adapter integration fixtures"
+        "experiments/agent_cast/clients/python/agent_cast.py",
+        "experiments/agent_cast/clients/node/agent_cast.mjs",
+        "client-only transport tests"
       ],
       "acceptance": [
         "Identical operation contract and ordinary results across both languages",
@@ -533,7 +544,8 @@
         "output_tokens": null,
         "source": null
       },
-      "updated_at_utc": "2026-10-06T19:38:41.491825+00:00"
+      "updated_at_utc": "2026-10-06T20:53:14.195117+00:00",
+      "pending_reason": "Clients are being implemented against locked broker DTOs; actual broker interoperability is pending."
     },
     {
       "id": "AC-0401",
@@ -712,13 +724,16 @@
         "Independently compare required and extra effects; qualification rejects deliberate broken controls.",
         "Every material finding is repaired and affected checks are rerun; unresolved findings block promotion."
       ],
-      "evidence": [],
+      "evidence": [
+        "docs/agent-cast/evidence/oracle-controls-2026-10-06/receipt.json"
+      ],
       "usage": {
         "input_tokens": null,
         "output_tokens": null,
         "source": null
       },
-      "updated_at_utc": "2026-10-06T20:02:55.247521+00:00"
+      "updated_at_utc": "2026-10-06T20:02:55.247521+00:00",
+      "implementation_note": "Early helper-oracle negative controls pass; full runtime red-team matrix remains planned."
     }
   ],
   "goal": {

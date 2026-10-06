@@ -46,6 +46,8 @@ def verify_report(report, content, mode):
         for index, receipt in enumerate(receipts):
             if receipt["logical_id"] != index + 1:
                 raise ValueError("logical identity changed")
+            if receipt["principal_domain"] != "fixture-operator" or receipt["task_id"] != "fixture-task":
+                raise ValueError("admitted principal or task changed")
             if index < 8:
                 expected = content[(index // 2) * 64:((index // 2) + 1) * 64]
                 agent = "agent-a" if index % 2 == 0 else "agent-b"
@@ -53,11 +55,14 @@ def verify_report(report, content, mode):
                     raise ValueError("agent identity changed")
                 if receipt["admission_status"] != "admitted" or receipt["status"] != "success":
                     raise ValueError("allowed read failed")
-                if receipt["physical_group"] is None:
-                    raise ValueError("successful read has no backing work")
+                expected_group = index // 2 if run["mode"] == "enabled" else index
+                if receipt["physical_group"] != expected_group:
+                    raise ValueError("successful read has the wrong backing work identity")
             else:
                 expected = b""
                 admission = "denied" if index == 8 else "stale_authority"
+                if receipt["agent_id"] != ("denied-agent" if index == 8 else "stale-agent"):
+                    raise ValueError("rejected agent identity changed")
                 if receipt["admission_status"] != admission or receipt["status"] != "admission_rejected":
                     raise ValueError("rejected call executed")
                 if receipt["physical_group"] is not None:
@@ -83,14 +88,18 @@ def verify_cache_report(report, content):
     if report["immutable_input_sha256"] != hashlib.sha256(content).hexdigest() or report["immutable_input_bytes"] != len(content):
         raise ValueError("cache demo did not capture the actual supplied fixture")
     limits, stats = report["limits"], report["cache"]
+    # These caps are independently specified by this qualification workload.
+    # A binary cannot authorize a larger budget by reporting matching counters.
+    if limits != {"max_entries": 8, "max_bytes": 32768}:
+        raise ValueError("cache changed the independent workload limits")
     if not 0 < stats["metadata_bytes"] <= stats["retained_bytes"] <= limits["max_bytes"]:
         raise ValueError("cache retained byte accounting exceeds its stated limits")
     if stats["entries"] != 4 or stats["entries"] > limits["max_entries"]:
         raise ValueError("cache did not retain four independent actual values")
     if (stats["hits"], stats["misses"], stats["backing_reads"], stats["rejected"]) != (4, 4, 4, 3):
         raise ValueError("cache reported incorrect physical work or rejected consumers")
-    if not 0 < report["batch_limits"]["max_result_bytes"] <= 16 * 1024 * 1024:
-        raise ValueError("cache demo has no bounded aggregate output reservation")
+    if report["batch_limits"] != {"max_result_bytes": 4096}:
+        raise ValueError("cache changed the independent aggregate output reservation")
     names = ["cold-agent-a", "completed-values-agent-b", "rejected-consumers"]
     if [batch["name"] for batch in report["batches"]] != names:
         raise ValueError("wrong independent cache batches")

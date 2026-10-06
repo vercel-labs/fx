@@ -7,7 +7,7 @@ on:
       - 'docs/agent-cast/**'
       - 'scripts/agent_cast_ledger.py'
       - 'scripts/qualify_agent_cast.py'
-      - 'scripts/tests/test_agent_cast_ledger.py'
+      - 'scripts/tests/test_agent_cast_*.py'
       - '.github/workflows/agent-cast.yml'
       - '.github/actions/setup-zig/**'
   workflow_dispatch:
@@ -40,6 +40,7 @@ jobs:
         run: |
           python3 scripts/agent_cast_ledger.py validate --json
           python3 -m unittest scripts.tests.test_agent_cast_ledger -v
+          python3 -m unittest scripts.tests.test_agent_cast_qualification -v
       - name: Build and drive the prototype
         run: python3 scripts/qualify_agent_cast.py --output "$RUNNER_TEMP/agent-cast-receipts"
       - name: Retain qualification evidence

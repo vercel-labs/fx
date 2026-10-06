@@ -1,0 +1,27 @@
+{
+  "recorded_at_utc": "2026-10-06T20:36:46.168279+00:00",
+  "scope": "Qualification helper oracles only. Deliberately weak prior helper must fail two negative controls; repaired helper must reject all mutated reports. Not a broken native-binary/broker or full M8 gate.",
+  "source_sha256": {
+    "scripts/qualify_agent_cast.py": "3b1eab84faa80bcd3ad5b145d82c5261981de6cab3c3b7b29e24259be3c49b2c",
+    "scripts/tests/test_agent_cast_qualification.py": "b39091d2d998421b9eaeadb8f5f89d098d2b2e553d788cf2c06dc66c5b56d3f9"
+  },
+  "weak_control_source_commit": "03cc8c91924138341dc2789c6581c0aa3a3bfed6",
+  "weak_control_source_sha256": "157002057aaaec3ec370460bc8daa6ef2672f71426ef7c86ce3dc6f980db471f",
+  "checks": [
+    {
+      "name": "known-weak-control",
+      "tests_run": 8,
+      "failures": 2,
+      "errors": 0,
+      "log": "known-weak-control.stderr"
+    },
+    {
+      "name": "repaired-oracle",
+      "tests_run": 8,
+      "failures": 0,
+      "errors": 0,
+      "log": "repaired-oracle.stderr"
+    }
+  ],
+  "ok": true
+}

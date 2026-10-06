@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "recorded_at_utc": "2026-10-06T20:26:21.574962+00:00",
+  "scope": "local foundation/cache correctness and subscriber/framing unit checks; logical agents in one process; no broker or isolation qualification",
+  "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "source_sha256": {
+    "experiments/agent_cast/build.zig": "a8720adf37fc415ddf4f647d68f642f007ced0a996fbef66b8b730d1bea5e0d6",
+    "experiments/agent_cast/src/authority.zig": "8b43a63572e6571e30e556ffc721f59ed175e9277420ff8e409f1bd8984afaba",
+    "experiments/agent_cast/src/cache.zig": "7b26432c7b196c97589048aa2a05e26b0f7f91526ed23ce2f3714148ced207d0",
+    "experiments/agent_cast/src/cache_demo.zig": "f75346013a621eab61afcc8a34a29860ed95ab510f787c298c5fa9c3a771ea33",
+    "experiments/agent_cast/src/cached_executor.zig": "60d3f98158ab47f469f8483a9e5ff20ddc2a9a5f791c09d5441d9fff96b45992",
+    "experiments/agent_cast/src/contracts.zig": "d11df3241d4d9c5441da4b85250d192fb0e890ff7bdd613368c917a71ca2470e",
+    "experiments/agent_cast/src/demo.zig": "1b085e57e0663722c0a15a7af8b65f14a2a3d5b377ccaf50e11589e6276fb032",
+    "experiments/agent_cast/src/executor.zig": "5453b7d0505222bb34e6a3bd83522695cd57beb714858949341646ecde51380b",
+    "experiments/agent_cast/src/optimizer.zig": "e33266af767f303d2c3918a27d514afd1e62913aad495fdfacf6b42dcfa55a63",
+    "experiments/agent_cast/src/subscribers.zig": "034a2ecd3e181b61794987a3128ba93a5b5cb2c0bf47f9164ecd9a5899ed302f",
+    "experiments/agent_cast/src/tests.zig": "c03790db06fd05069fbd65c8e7d30f3867eba7644a36ab1edd290c6ef9551d09",
+    "experiments/agent_cast/src/wire.zig": "2696b554acdbebc2efde48b20085abaf528e92710c302bf823995ed71cfb9547"
+  },
+  "checks": [
+    {
+      "name": "zig-version",
+      "argv": [
+        "<verified-zig-0.16.0>",
+        "version"
+      ],
+      "cwd": "<checkout>/experiments/agent_cast",
+      "exit_code": 0,
+      "seconds": 0.03716295794583857,
+      "stdout": "zig-version.stdout",
+      "stderr": "zig-version.stderr"
+    },
+    {
+      "name": "format",
+      "argv": [
+        "<verified-zig-0.16.0>",
+        "fmt",
+        "--check",
+        "src/",
+        "build.zig"
+      ],
+      "cwd": "<checkout>/experiments/agent_cast",
+      "exit_code": 1,
+      "seconds": 0.03903308417648077,
+      "stdout": "format.stdout",
+      "stderr": "format.stderr"
+    }
+  ],
+  "ci_status": "not_run",
+  "performance_claim": null,
+  "ok": false,
+  "zig_version": "0.16.0",
+  "error": "format failed: ",
+  "path_normalization": "Machine-specific path prefixes replaced; failed gate retained, not counted as verification."
+}

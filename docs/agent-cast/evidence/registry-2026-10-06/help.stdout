@@ -1,0 +1,10 @@
+Usage: agent-cast-demo --fixture PATH [--mode compare|enabled|disabled]
+
+Capture one file of 256 bytes to 1 MiB and exercise an experimental embedded
+immutable content reader. Compare mode checks every logical receipt and prints
+JSON with actual physical read counts. This is a correctness demonstration.
+Host admissions are fixture contracts, with no production permission checks.
+
+  --fixture PATH  File to capture once into owned immutable storage
+  --mode MODE     Select execution mode (default: compare)
+  --help          Show this help

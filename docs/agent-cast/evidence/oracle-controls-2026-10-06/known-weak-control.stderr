@@ -1,0 +1,37 @@
+test_cache_rejects_unauthorized_result_and_invented_counters (oracle_tests.AgentCastQualificationTests.test_cache_rejects_unauthorized_result_and_invented_counters) ... ok
+test_cache_rejects_unbounded_accounting (oracle_tests.AgentCastQualificationTests.test_cache_rejects_unbounded_accounting) ... FAIL
+test_cache_rejects_wrong_input_and_changed_principal_or_task (oracle_tests.AgentCastQualificationTests.test_cache_rejects_wrong_input_and_changed_principal_or_task) ... ok
+test_compare_rejects_changed_logical_identity (oracle_tests.AgentCastQualificationTests.test_compare_rejects_changed_logical_identity) ... ok
+test_compare_rejects_consistent_but_wrong_authority_and_identity (oracle_tests.AgentCastQualificationTests.test_compare_rejects_consistent_but_wrong_authority_and_identity) ... FAIL
+test_compare_rejects_skipped_receipt_and_empty_or_pinned_outputs (oracle_tests.AgentCastQualificationTests.test_compare_rejects_skipped_receipt_and_empty_or_pinned_outputs) ... ok
+test_compare_rejects_wrong_fixture_digest_length_and_logical_mismatch (oracle_tests.AgentCastQualificationTests.test_compare_rejects_wrong_fixture_digest_length_and_logical_mismatch) ... ok
+test_receipt_backed_positive_controls (oracle_tests.AgentCastQualificationTests.test_receipt_backed_positive_controls) ... ok
+
+======================================================================
+FAIL: test_cache_rejects_unbounded_accounting (oracle_tests.AgentCastQualificationTests.test_cache_rejects_unbounded_accounting)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/alvarogpt/Code/fx/scripts/tests/test_agent_cast_qualification.py", line 132, in test_cache_rejects_unbounded_accounting
+    self.assert_cache_rejected(unbounded)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+  File "/Users/alvarogpt/Code/fx/scripts/tests/test_agent_cast_qualification.py", line 44, in assert_cache_rejected
+    with self.assertRaises((ValueError, KeyError, TypeError)):
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: (<class 'ValueError'>, <class 'KeyError'>, <class 'TypeError'>) not raised
+
+======================================================================
+FAIL: test_compare_rejects_consistent_but_wrong_authority_and_identity (oracle_tests.AgentCastQualificationTests.test_compare_rejects_consistent_but_wrong_authority_and_identity)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/alvarogpt/Code/fx/scripts/tests/test_agent_cast_qualification.py", line 87, in test_compare_rejects_consistent_but_wrong_authority_and_identity
+    self.assert_compare_rejected(changed)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^
+  File "/Users/alvarogpt/Code/fx/scripts/tests/test_agent_cast_qualification.py", line 40, in assert_compare_rejected
+    with self.assertRaises((ValueError, KeyError, TypeError)):
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: (<class 'ValueError'>, <class 'KeyError'>, <class 'TypeError'>) not raised
+
+----------------------------------------------------------------------
+Ran 8 tests in 0.002s
+
+FAILED (failures=2)

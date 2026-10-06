@@ -8,4 +8,5 @@ test {
     _ = @import("cache_demo.zig");
     _ = @import("subscribers.zig");
     _ = @import("wire.zig");
+    _ = @import("authority.zig");
 }

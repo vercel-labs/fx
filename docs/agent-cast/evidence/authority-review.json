@@ -1,0 +1,15 @@
+{
+  "observed_at_utc": "2026-10-06T20:53:14.195117+00:00",
+  "source": "Independent Astra static review followed by parent62-test qualification with patched authority retry case.",
+  "requested_model": "gpt-6-astra",
+  "finding": "Exact duplicate issuance using the original deadline failed after expiry before retained-ID lookup.",
+  "resolution": "Future-deadline validation now applies only to new issuance. Exact expired retry returns retained permit and unchanged deadline; changed binding and reclaimed ID reject.",
+  "evidence": "registry-2026-10-06/qualification.json",
+  "integration_requirements": [
+    "Actual control-FD exclusivity and authenticated agent role must be runtime-tested.",
+    "Cache namespace must bind opaque task lifetime plus resource/implementation generations so late old producers cannot repopulate a new scope.",
+    "Prepared borrowed bindings must be copied before asynchronous execution.",
+    "Transport delivery and client acknowledgment are different facts; reconnect may replay output without repeating the backing effect."
+  ],
+  "broker_runtime_qualified": false
+}

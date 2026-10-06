@@ -1,0 +1,139 @@
+{
+  "experimental_scope": "certified embedded immutable content-reader sharing; fixture host admissions; no production permission integration or performance claim",
+  "mode": "enabled",
+  "immutable_input_sha256": "2745f274e3490392ffccab9ace5346efc80e5057787b8be2eeed28e1d4a56618",
+  "immutable_input_bytes": 1024,
+  "logical_call_count": 10,
+  "fixture_contract_verified": true,
+  "parity": null,
+  "runs": [
+    {
+      "mode": "enabled",
+      "logical_call_count": 10,
+      "receipt_count": 10,
+      "physical_reads": 4,
+      "receipts": [
+        {
+          "logical_id": 1,
+          "agent_id": "agent-a",
+          "principal_domain": "fixture-operator",
+          "task_id": "fixture-task",
+          "admission_status": "admitted",
+          "status": "success",
+          "physical_group": 0,
+          "output_bytes": 64,
+          "output_sha256": "0fb69e1a6a6e12658bdcf8ed8d19ce52375eb1c736a5ed4bfc9fd2eca6c19e02",
+          "output_hex": "666978747572652d302d77696e646f772d3030414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141"
+        },
+        {
+          "logical_id": 2,
+          "agent_id": "agent-b",
+          "principal_domain": "fixture-operator",
+          "task_id": "fixture-task",
+          "admission_status": "admitted",
+          "status": "success",
+          "physical_group": 0,
+          "output_bytes": 64,
+          "output_sha256": "0fb69e1a6a6e12658bdcf8ed8d19ce52375eb1c736a5ed4bfc9fd2eca6c19e02",
+          "output_hex": "666978747572652d302d77696e646f772d3030414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141"
+        },
+        {
+          "logical_id": 3,
+          "agent_id": "agent-a",
+          "principal_domain": "fixture-operator",
+          "task_id": "fixture-task",
+          "admission_status": "admitted",
+          "status": "success",
+          "physical_group": 1,
+          "output_bytes": 64,
+          "output_sha256": "7dac214a98f01ffc3302613c8fd5f6c8ca1391bd35021d87a3a0da56747b887b",
+          "output_hex": "666978747572652d302d77696e646f772d3031424242424242424242424242424242424242424242424242424242424242424242424242424242424242424242"
+        },
+        {
+          "logical_id": 4,
+          "agent_id": "agent-b",
+          "principal_domain": "fixture-operator",
+          "task_id": "fixture-task",
+          "admission_status": "admitted",
+          "status": "success",
+          "physical_group": 1,
+          "output_bytes": 64,
+          "output_sha256": "7dac214a98f01ffc3302613c8fd5f6c8ca1391bd35021d87a3a0da56747b887b",
+          "output_hex": "666978747572652d302d77696e646f772d3031424242424242424242424242424242424242424242424242424242424242424242424242424242424242424242"
+        },
+        {
+          "logical_id": 5,
+          "agent_id": "agent-a",
+          "principal_domain": "fixture-operator",
+          "task_id": "fixture-task",
+          "admission_status": "admitted",
+          "status": "success",
+          "physical_group": 2,
+          "output_bytes": 64,
+          "output_sha256": "e55b9510bc6f11fe4e0dfd80c1f31b4fecfcdb0df8da9f92abc6204b35e73f28",
+          "output_hex": "666978747572652d302d77696e646f772d3032434343434343434343434343434343434343434343434343434343434343434343434343434343434343434343"
+        },
+        {
+          "logical_id": 6,
+          "agent_id": "agent-b",
+          "principal_domain": "fixture-operator",
+          "task_id": "fixture-task",
+          "admission_status": "admitted",
+          "status": "success",
+          "physical_group": 2,
+          "output_bytes": 64,
+          "output_sha256": "e55b9510bc6f11fe4e0dfd80c1f31b4fecfcdb0df8da9f92abc6204b35e73f28",
+          "output_hex": "666978747572652d302d77696e646f772d3032434343434343434343434343434343434343434343434343434343434343434343434343434343434343434343"
+        },
+        {
+          "logical_id": 7,
+          "agent_id": "agent-a",
+          "principal_domain": "fixture-operator",
+          "task_id": "fixture-task",
+          "admission_status": "admitted",
+          "status": "success",
+          "physical_group": 3,
+          "output_bytes": 64,
+          "output_sha256": "c05b6652972fd8071b8f38ffa0040ffec1144a6f13653fc492171aaf216229db",
+          "output_hex": "666978747572652d302d77696e646f772d3033444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444"
+        },
+        {
+          "logical_id": 8,
+          "agent_id": "agent-b",
+          "principal_domain": "fixture-operator",
+          "task_id": "fixture-task",
+          "admission_status": "admitted",
+          "status": "success",
+          "physical_group": 3,
+          "output_bytes": 64,
+          "output_sha256": "c05b6652972fd8071b8f38ffa0040ffec1144a6f13653fc492171aaf216229db",
+          "output_hex": "666978747572652d302d77696e646f772d3033444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444"
+        },
+        {
+          "logical_id": 9,
+          "agent_id": "denied-agent",
+          "principal_domain": "fixture-operator",
+          "task_id": "fixture-task",
+          "admission_status": "denied",
+          "status": "admission_rejected",
+          "physical_group": null,
+          "output_bytes": 0,
+          "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "output_hex": ""
+        },
+        {
+          "logical_id": 10,
+          "agent_id": "stale-agent",
+          "principal_domain": "fixture-operator",
+          "task_id": "fixture-task",
+          "admission_status": "stale_authority",
+          "status": "admission_rejected",
+          "physical_group": null,
+          "output_bytes": 0,
+          "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "output_hex": ""
+        }
+      ]
+    }
+  ]
+}

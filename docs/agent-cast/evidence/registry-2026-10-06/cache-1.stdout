@@ -1,0 +1,220 @@
+{
+  "experimental_scope": "M2 synchronous owned completed-value cache; exact fresh fixture admissions; no production registry or performance claim",
+  "immutable_input_sha256": "3d55b51a98d198e5b5bf86d066c92f53c1349d4636253f2da34c573976850cf8",
+  "immutable_input_bytes": 1024,
+  "fixture_verified": true,
+  "logical_call_count": 11,
+  "limits": {
+    "max_entries": 8,
+    "max_bytes": 32768
+  },
+  "batch_limits": {
+    "max_result_bytes": 4096
+  },
+  "cache": {
+    "entries": 4,
+    "retained_bytes": 3388,
+    "metadata_bytes": 2112,
+    "hits": 4,
+    "misses": 4,
+    "backing_reads": 4,
+    "evictions": 0,
+    "not_retained": 0,
+    "rejected": 3
+  },
+  "retained_accounting": "allocated entry table plus owned key strings and outputs; allocator bookkeeping and caller-owned output copies excluded",
+  "batches": [
+    {
+      "name": "cold-agent-a",
+      "logical_calls": 4,
+      "cache_hits": 0,
+      "cache_misses": 4,
+      "backing_reads": 4,
+      "receipts": [
+        {
+          "logical_id": 1,
+          "agent_id": "agent-a",
+          "principal_domain": "fixture-operator",
+          "task_id": "cache-fixture-task",
+          "admission_status": "admitted",
+          "status": "success",
+          "source": "backing",
+          "cache_hit": false,
+          "cache_miss": true,
+          "backing_reads": 1,
+          "output_bytes": 64,
+          "output_sha256": "78ad0b32461ba8571cf48a68ea13270a107c2870582c9ad66785e85b496b9c65",
+          "output_hex": "666978747572652d312d77696e646f772d3030424242424242424242424242424242424242424242424242424242424242424242424242424242424242424242"
+        },
+        {
+          "logical_id": 2,
+          "agent_id": "agent-a",
+          "principal_domain": "fixture-operator",
+          "task_id": "cache-fixture-task",
+          "admission_status": "admitted",
+          "status": "success",
+          "source": "backing",
+          "cache_hit": false,
+          "cache_miss": true,
+          "backing_reads": 1,
+          "output_bytes": 64,
+          "output_sha256": "e326211393fafc090cd9c5a9f2b80bfd1ae6d25aa4b8e2da00a3722b22985ddf",
+          "output_hex": "666978747572652d312d77696e646f772d3031434343434343434343434343434343434343434343434343434343434343434343434343434343434343434343"
+        },
+        {
+          "logical_id": 3,
+          "agent_id": "agent-a",
+          "principal_domain": "fixture-operator",
+          "task_id": "cache-fixture-task",
+          "admission_status": "admitted",
+          "status": "success",
+          "source": "backing",
+          "cache_hit": false,
+          "cache_miss": true,
+          "backing_reads": 1,
+          "output_bytes": 64,
+          "output_sha256": "1db91568e4de19f31a1617a7444db895e788d140bc9ffff1bfcecda1c0393aa1",
+          "output_hex": "666978747572652d312d77696e646f772d3032444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444"
+        },
+        {
+          "logical_id": 4,
+          "agent_id": "agent-a",
+          "principal_domain": "fixture-operator",
+          "task_id": "cache-fixture-task",
+          "admission_status": "admitted",
+          "status": "success",
+          "source": "backing",
+          "cache_hit": false,
+          "cache_miss": true,
+          "backing_reads": 1,
+          "output_bytes": 64,
+          "output_sha256": "6f5a12f8e0fb4b34655f48660dfe6fe7681b8c041ceab9e41167718968848468",
+          "output_hex": "666978747572652d312d77696e646f772d3033454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545"
+        }
+      ]
+    },
+    {
+      "name": "completed-values-agent-b",
+      "logical_calls": 4,
+      "cache_hits": 4,
+      "cache_misses": 0,
+      "backing_reads": 0,
+      "receipts": [
+        {
+          "logical_id": 5,
+          "agent_id": "agent-b",
+          "principal_domain": "fixture-operator",
+          "task_id": "cache-fixture-task",
+          "admission_status": "admitted",
+          "status": "success",
+          "source": "cache",
+          "cache_hit": true,
+          "cache_miss": false,
+          "backing_reads": 0,
+          "output_bytes": 64,
+          "output_sha256": "78ad0b32461ba8571cf48a68ea13270a107c2870582c9ad66785e85b496b9c65",
+          "output_hex": "666978747572652d312d77696e646f772d3030424242424242424242424242424242424242424242424242424242424242424242424242424242424242424242"
+        },
+        {
+          "logical_id": 6,
+          "agent_id": "agent-b",
+          "principal_domain": "fixture-operator",
+          "task_id": "cache-fixture-task",
+          "admission_status": "admitted",
+          "status": "success",
+          "source": "cache",
+          "cache_hit": true,
+          "cache_miss": false,
+          "backing_reads": 0,
+          "output_bytes": 64,
+          "output_sha256": "e326211393fafc090cd9c5a9f2b80bfd1ae6d25aa4b8e2da00a3722b22985ddf",
+          "output_hex": "666978747572652d312d77696e646f772d3031434343434343434343434343434343434343434343434343434343434343434343434343434343434343434343"
+        },
+        {
+          "logical_id": 7,
+          "agent_id": "agent-b",
+          "principal_domain": "fixture-operator",
+          "task_id": "cache-fixture-task",
+          "admission_status": "admitted",
+          "status": "success",
+          "source": "cache",
+          "cache_hit": true,
+          "cache_miss": false,
+          "backing_reads": 0,
+          "output_bytes": 64,
+          "output_sha256": "1db91568e4de19f31a1617a7444db895e788d140bc9ffff1bfcecda1c0393aa1",
+          "output_hex": "666978747572652d312d77696e646f772d3032444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444"
+        },
+        {
+          "logical_id": 8,
+          "agent_id": "agent-b",
+          "principal_domain": "fixture-operator",
+          "task_id": "cache-fixture-task",
+          "admission_status": "admitted",
+          "status": "success",
+          "source": "cache",
+          "cache_hit": true,
+          "cache_miss": false,
+          "backing_reads": 0,
+          "output_bytes": 64,
+          "output_sha256": "6f5a12f8e0fb4b34655f48660dfe6fe7681b8c041ceab9e41167718968848468",
+          "output_hex": "666978747572652d312d77696e646f772d3033454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545"
+        }
+      ]
+    },
+    {
+      "name": "rejected-consumers",
+      "logical_calls": 3,
+      "cache_hits": 0,
+      "cache_misses": 0,
+      "backing_reads": 0,
+      "receipts": [
+        {
+          "logical_id": 9,
+          "agent_id": "denied-agent",
+          "principal_domain": "fixture-operator",
+          "task_id": "cache-fixture-task",
+          "admission_status": "denied",
+          "status": "admission_rejected",
+          "source": "rejected",
+          "cache_hit": false,
+          "cache_miss": false,
+          "backing_reads": 0,
+          "output_bytes": 0,
+          "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "output_hex": ""
+        },
+        {
+          "logical_id": 10,
+          "agent_id": "stale-agent",
+          "principal_domain": "fixture-operator",
+          "task_id": "cache-fixture-task",
+          "admission_status": "stale_authority",
+          "status": "admission_rejected",
+          "source": "rejected",
+          "cache_hit": false,
+          "cache_miss": false,
+          "backing_reads": 0,
+          "output_bytes": 0,
+          "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "output_hex": ""
+        },
+        {
+          "logical_id": 11,
+          "agent_id": "mismatched-agent",
+          "principal_domain": "fixture-operator",
+          "task_id": "cache-fixture-task",
+          "admission_status": "binding_mismatch",
+          "status": "admission_rejected",
+          "source": "rejected",
+          "cache_hit": false,
+          "cache_miss": false,
+          "backing_reads": 0,
+          "output_bytes": 0,
+          "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "output_hex": ""
+        }
+      ]
+    }
+  ]
+}

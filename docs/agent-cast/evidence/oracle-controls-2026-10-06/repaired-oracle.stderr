@@ -1,0 +1,13 @@
+test_cache_rejects_unauthorized_result_and_invented_counters (oracle_tests.AgentCastQualificationTests.test_cache_rejects_unauthorized_result_and_invented_counters) ... ok
+test_cache_rejects_unbounded_accounting (oracle_tests.AgentCastQualificationTests.test_cache_rejects_unbounded_accounting) ... ok
+test_cache_rejects_wrong_input_and_changed_principal_or_task (oracle_tests.AgentCastQualificationTests.test_cache_rejects_wrong_input_and_changed_principal_or_task) ... ok
+test_compare_rejects_changed_logical_identity (oracle_tests.AgentCastQualificationTests.test_compare_rejects_changed_logical_identity) ... ok
+test_compare_rejects_consistent_but_wrong_authority_and_identity (oracle_tests.AgentCastQualificationTests.test_compare_rejects_consistent_but_wrong_authority_and_identity) ... ok
+test_compare_rejects_skipped_receipt_and_empty_or_pinned_outputs (oracle_tests.AgentCastQualificationTests.test_compare_rejects_skipped_receipt_and_empty_or_pinned_outputs) ... ok
+test_compare_rejects_wrong_fixture_digest_length_and_logical_mismatch (oracle_tests.AgentCastQualificationTests.test_compare_rejects_wrong_fixture_digest_length_and_logical_mismatch) ... ok
+test_receipt_backed_positive_controls (oracle_tests.AgentCastQualificationTests.test_receipt_backed_positive_controls) ... ok
+
+----------------------------------------------------------------------
+Ran 8 tests in 0.001s
+
+OK
