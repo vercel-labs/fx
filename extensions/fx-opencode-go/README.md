@@ -33,7 +33,8 @@ HTTP errors, redirects, lost finish markers and aggregate tool-budget failures d
 Header names follow HTTP case rules; duplicate logical bindings fail before executable activation.
 Token usage parsing is implemented but has no independent assertion yet. Core rejects stale or oversized events.
 HTTP redirects and automatic provider retries are disabled. Provider error bodies do not enter the transcript.
-Image input remains disabled until the host supplies verified image snapshots.
+Native image upload forwards only verified snapshot bytes as OpenAI data URLs, never original or snapshot paths.
+Local proof retains two PNGs across tool continuation after the original file changes. Live image acceptance remains unverified.
 The request encoder supports JSON Schema response format, but that path has no local proof yet.
 
 The cached model metadata inherits [DeepSeek V4.1 Flash](https://raw.githubusercontent.com/anomalyco/models.dev/dev/models/deepseek/deepseek-v4.1-flash.toml)

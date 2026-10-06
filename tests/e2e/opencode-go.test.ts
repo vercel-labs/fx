@@ -1,11 +1,16 @@
 // Local HTTP dogfooding proves the actual executable without calling a paid provider.
 import { afterEach, describe, expect, test } from "bun:test";
-import { readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { TmuxSession, tmuxAvailable } from "./tmux-helpers";
 import { cleanupIsolatedTestHome, FX_BIN } from "../evals/eval-helpers";
 import { createGoProfile, goEnvironment, KEY, HEADER_VALUE, HOST } from "./fixtures/opencode-go-profile";
 
+const IMAGE_FIXTURE = join(import.meta.dir, "fixtures", "placeholder-logo.png");
+const IMAGE_FILENAME = "go-image.png";
+const SECOND_IMAGE_FILENAME = "go-second-image.png";
+const CHANGED_SOURCE = "source changed after capture";
+const IMAGE_PROMPT = "Describe the attached local fixture image.";
 const LARGE_TOOL_CONTENT = "é".repeat(40 * 1024);
 const CASES = [
   { name: "mixed-case session header", tool: "read_file", sessionHeader: "X-OpenCode-Session", prompt: "Read the fixture file and return the final answer." },
@@ -38,6 +43,44 @@ function streamReply(chunks: unknown[]): Response {
 }
 
 describe("native OpenCode Go extension", () => {
+  // Native snapshot validation must precede provider projection; no local path reaches HTTP.
+  test("verified image becomes an OpenAI data URL without exposing snapshot paths", async () => {
+    const bodies: any[] = [];
+    let home = "";
+    const server = Bun.serve({ hostname: HOST, port: 0, async fetch(request) {
+      bodies.push(await request.json());
+      if (bodies.length === 1) {
+        writeFileSync(join(home, IMAGE_FILENAME), CHANGED_SOURCE);
+        return streamReply([{ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: TOOL_ID, function: { name: "read_file", arguments: JSON.stringify({ path: join(home, TOOL_FILENAME) }) } }] }, finish_reason: "tool_calls" }] }]);
+      }
+      return streamReply([{ choices: [{ index: 0, delta: { content: RESULT }, finish_reason: "stop" }] }]);
+    } });
+    home = createGoProfile(server.port);
+    homes.push(home);
+    writeFileSync(join(home, TOOL_FILENAME), TOOL_CONTENT);
+    const image = join(home, IMAGE_FILENAME);
+    copyFileSync(IMAGE_FIXTURE, image);
+    const second = join(home, SECOND_IMAGE_FILENAME);
+    copyFileSync(IMAGE_FIXTURE, second);
+    try {
+      const child = Bun.spawn([FX_BIN, "ask", "--json", "--no-save", "--image", image, "--image", second, IMAGE_PROMPT], { cwd: home, stdout: "pipe", stderr: "pipe", env: goEnvironment(home) });
+      const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+      expect(code, JSON.stringify({ stdout, stderr })).toBe(0);
+      expect(JSON.parse(stdout).output).toBe(RESULT);
+      expect(bodies).toHaveLength(2);
+      for (const body of bodies) {
+        const parts = body.messages.find((message: any) => Array.isArray(message.content)).content;
+        expect(parts.some((part: any) => part.type === "text" && part.text.includes(IMAGE_PROMPT))).toBe(true);
+        const urls = parts.filter((part: any) => part.type === "image_url").map((part: any) => part.image_url.url);
+        expect(urls).toEqual(Array.from({ length: 2 }, () => "data:image/png;base64," + readFileSync(IMAGE_FIXTURE).toString("base64")));
+      }
+      expect(readFileSync(image, "utf8")).toBe(CHANGED_SOURCE);
+      expect(JSON.stringify(bodies)).not.toContain(image);
+      expect(JSON.stringify(bodies)).not.toContain(second);
+      expect(JSON.stringify(bodies)).not.toContain("snapshot_path");
+    } finally { server.stop(true); }
+  }, TIMEOUT_MS);
+
   // The real HTTP worker must stop its socket before a fresh explicit user request can recover.
   tuiTest("real TTY sees early Go text, cancels HTTP and completes a fresh request", async () => {
     let requests = 0;

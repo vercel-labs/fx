@@ -1,6 +1,7 @@
 //! Native conversation projection preserves tools and provider-owned reasoning without importing fx internals.
 const std = @import("std");
 const wire = @import("wire.zig");
+const image_parts = @import("image_parts.zig");
 const Allocator = wire.Allocator;
 const Value = wire.Value;
 const provider_id = "opencode-go";
@@ -100,9 +101,7 @@ fn messages(alloc: Allocator, input: Value) !Value {
         var projected = wire.object();
         const role = try wire.field(message, "role");
         try wire.put(alloc, &projected, "role", role);
-        try wire.put(alloc, &projected, "content", try wire.field(message, "content"));
-        const images = try wire.field(message, "images");
-        if (images != .array or images.array.items.len != 0) return error.VisionUnsupported;
+        try wire.put(alloc, &projected, "content", try image_parts.content(alloc, try wire.field(message, "content"), try wire.field(message, "images")));
         const tool_id = try wire.field(message, "tool_call_id");
         if (tool_id != .null) try wire.put(alloc, &projected, "tool_call_id", tool_id);
         const calls = try wire.field(message, "tool_calls");

@@ -10,6 +10,7 @@ const streams = @import("../agent/stream_provider.zig");
 const dispatcher_mod = @import("../mcp/stdio_dispatcher.zig");
 const event_handoff = @import("event_handoff.zig");
 const request_tools = @import("request_tools.zig");
+const request_messages = @import("request_messages.zig");
 
 const Allocator = std.mem.Allocator;
 const jsonrpc_version = "2.0";
@@ -79,6 +80,8 @@ pub const Runtime = struct {
             if (initialized.value.result.?.version != protocol.version) return error.ExtensionVersionUnsupported;
         }
         const dispatcher = self.dispatcher.?;
+        var messages = try request_messages.render(alloc, request);
+        defer messages.deinit();
         var functions = try request_tools.render(alloc, request.tools);
         defer functions.deinit();
         var prepared = try rpc(struct { handle: []const u8 }, dispatcher, alloc, "provider.prepare", .{
@@ -86,7 +89,7 @@ pub const Runtime = struct {
             .model = model,
             .request = .{
                 .model = request.model,
-                .messages = request.messages,
+                .messages = messages.value,
                 .functions = functions.value.object.get("functions").?,
                 .additional_functions = functions.value.object.get("additional_functions").?,
                 .dynamic_functions = functions.value.object.get("dynamic_functions").?,
@@ -198,6 +201,7 @@ fn encode(alloc: Allocator, id: u64, method: []const u8, params: anytype) ![]u8 
     var writer = std.Io.Writer.Allocating.init(alloc);
     defer writer.deinit();
     try std.json.Stringify.value(.{ .jsonrpc = jsonrpc_version, .id = id, .method = method, .params = params }, .{}, &writer.writer);
+    if (writer.written().len > protocol.max_models_bytes) return error.ExtensionRequestTooLarge;
     return writer.toOwnedSlice();
 }
 

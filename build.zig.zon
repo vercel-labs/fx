@@ -51,6 +51,7 @@
         "extensions/fx-opencode-go/runtime.zig",
         "extensions/fx-opencode-go/wire.zig",
         "extensions/fx-opencode-go/request.zig",
+        "extensions/fx-opencode-go/image_parts.zig",
         "extensions/fx-opencode-go/sse.zig",
         "extensions/fx-opencode-go/transport.zig",
         "extensions/fx-opencode-go/models.json",

@@ -44,6 +44,7 @@ pub const ModelBinding = struct {
             .reasoning_efforts = model_capabilities.ReasoningEffortOptions.fromSlice(efforts[0..count]),
             .supports_tool_use = self.model.tool_call,
             .supports_vision = self.model.supports_vision,
+            .supports_file_input = self.model.supports_vision,
             .context_window = self.model.context_window,
             .max_output_tokens = self.model.max_output_tokens,
         };
@@ -158,6 +159,7 @@ fn catalog_entries(raw: ?*anyopaque, alloc: Allocator, _: model_catalog.FetchInp
             .has_tool_use = binding.model.tool_call,
             .has_reasoning = binding.model.reasoning,
             .has_vision = binding.model.supports_vision,
+            .has_file_input = binding.model.supports_vision,
             .context_window = binding.model.context_window orelse unknown_model_limit,
             .max_tokens = binding.model.max_output_tokens orelse unknown_model_limit,
         };
