@@ -1,5 +1,5 @@
 [
-  { "file": "auto-mode-reliability.test.ts", "weight": 4 },
+  { "file": "extensions.test.ts", "weight": 1 },  { "file": "auto-mode-reliability.test.ts", "weight": 4 },
   { "file": "acp.test.ts", "weight": 29 },
   { "file": "ask-presentation.test.ts", "weight": 5 },
   { "file": "auth-refresh.test.ts", "weight": 2 },

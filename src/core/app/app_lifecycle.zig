@@ -1,4 +1,6 @@
 const std = @import("std");
+const extension_registry = @import("../extensions/registry.zig");
+const extension_protocol = @import("../extensions/protocol.zig");
 const io_mod = @import("../shared/io.zig");
 const agent_steps = @import("../config/agent_steps.zig");
 const config_runtime = @import("../config/config_runtime.zig");
@@ -119,6 +121,8 @@ pub const StartupState = struct {
     credential: ?credentials.Credential = null,
     credential_onboarding_skipped: bool = false,
     stored_key_status: credentials.StoredKeyReadStatus = .not_attempted,
+    extensions: ?*extension_registry.Registry = null,
+    extensions_load_error: ?anyerror = null,
     provider: model_provider.ProviderId = .gateway,
     selected_model: []u8 = &.{},
     configured_model: []u8 = &.{},
@@ -151,6 +155,10 @@ pub const StartupState = struct {
 
     pub fn deinit(self: *StartupState, alloc: Allocator) void {
         self.workspace_access.deinit(alloc);
+        if (self.extensions) |registry| {
+            registry.deinit();
+            alloc.destroy(registry);
+        }
         if (self.workspace_root.len > 0) alloc.free(self.workspace_root);
         if (self.credential) |*credential| credential.deinit(alloc);
         if (self.selected_model.len > 0) alloc.free(self.selected_model);
@@ -393,6 +401,23 @@ fn loadStartupStateFromOwnedWorkspace(
         false,
     );
 
+    if (profile_home orelse io_mod.getenv("HOME")) |home| {
+        const registry_path = try std.fs.path.join(alloc, &.{ home, extension_protocol.registry_relative_path });
+        defer alloc.free(registry_path);
+        var registry = extension_registry.load(alloc, registry_path) catch |err| blk: {
+            if (settings.provider == .extension or err == error.OutOfMemory) return err;
+            state.extensions_load_error = err;
+            break :blk extension_registry.Registry{ .alloc = alloc };
+        };
+        if (registry.bindings.items.len > 0) {
+            const owned = alloc.create(extension_registry.Registry) catch |err| {
+                registry.deinit();
+                return err;
+            };
+            owned.* = registry;
+            state.extensions = owned;
+        } else registry.deinit();
+    }
     const configured_selection = try configuredProviderSelection(default_model, settings);
     state.provider = configured_selection.provider;
     state.configured_model = try alloc.dupe(u8, configured_selection.model);
@@ -1113,6 +1138,7 @@ fn configuredProviderSelection(
         .gateway => default_model,
         .codex => return error.CodexModelNotSelected,
         .grok => return error.GrokModelNotSelected,
+        .extension => settings.models.get(.gateway) orelse io_mod.getenv("FX_MODEL") orelse return error.ExtensionModelNotSelected,
     };
     return .{ .provider = provider, .model = model };
 }

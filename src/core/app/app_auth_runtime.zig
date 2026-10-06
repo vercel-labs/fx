@@ -60,6 +60,7 @@ pub fn Runtime(comptime App: type) type {
                     .codex => .chatgpt_subscription,
                     .grok => .grok_subscription,
                     .gateway => app.auth.credentialSource() orelse .fx_login,
+                    .extension => .stored_key,
                 };
                 const route_change = app.auth.selectForProvider(app.alloc, provider) catch |err| switch (err) {
                     error.OutOfMemory => return err,

@@ -65,6 +65,7 @@ pub fn signInCompletion(
 ) SignInCompletionAction {
     return switch (provider) {
         .gateway => .vercel,
+        .extension => .{ .switch_provider = .extension },
         .codex => if (provider_routing_supported)
             .{ .switch_provider = .codex }
         else

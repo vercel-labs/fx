@@ -1479,6 +1479,7 @@ pub const Runtime = struct {
         provider: model_provider.ProviderId,
     ) !?bool {
         return switch (provider) {
+            .extension => null,
             .codex => if (self.credentialSource() == .chatgpt_subscription)
                 false
             else

@@ -1,4 +1,9 @@
 const std = @import("std");
+const extension_already_selected_message = "Extension provider is already selected.\n";
+const extension_credential_unavailable_message = "configure an extension credential first";
+const extension_catalog_unavailable_message = "Extension model catalog is unavailable";
+const extension_selected_message = "Provider set to extension.\n";
+const extension_models_unavailable_message = "fx models: Extension model catalog is unavailable\n";
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
@@ -685,6 +690,7 @@ fn activateProviderSelection(
             .gateway => "Gateway is already selected.\n",
             .codex => "Codex is already selected.\n",
             .grok => "Grok is already selected.\n",
+            .extension => extension_already_selected_message,
         });
         return true;
     }
@@ -732,6 +738,7 @@ fn activateProviderSelection(
                 .codex => "Codex credential is unavailable",
                 .grok => "Grok credential is unavailable",
                 .gateway => "configure a Gateway credential first",
+                .extension => extension_credential_unavailable_message,
             },
         );
         return false;
@@ -741,6 +748,7 @@ fn activateProviderSelection(
             .codex => "Codex model catalog is unavailable",
             .grok => "Grok model catalog is unavailable",
             .gateway => "Gateway model catalog is unavailable",
+            .extension => extension_catalog_unavailable_message,
         });
         return false;
     };
@@ -785,6 +793,7 @@ fn activateProviderSelection(
     if (performed_login) |provider| switch (provider) {
         .codex => try writeStdout(deps, "Signed in with Codex.\n"),
         .grok => try writeStdout(deps, "Signed in with Grok.\n"),
+        .extension => return error.InvalidLoginProviderArgs,
         .gateway => unreachable,
     };
     if (caller == .provider_command) {
@@ -792,6 +801,7 @@ fn activateProviderSelection(
             .gateway => "Provider set to Gateway.\n",
             .codex => "Provider set to Codex.\n",
             .grok => "Provider set to Grok.\n",
+            .extension => extension_selected_message,
         });
     }
     return true;
@@ -916,6 +926,7 @@ fn runNonInteractiveWithDeps(
             // Preserve the original `fx login` behavior for scripts and users.
             const login_provider = maybe_login_provider orelse .gateway;
             switch (login_provider) {
+                .extension => return error.InvalidLoginProviderArgs,
                 .gateway => login_flow.runLogin(
                     alloc,
                     cfg.gateway_provider.oauth_transport,
@@ -1145,11 +1156,13 @@ fn runNonInteractiveWithDeps(
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
 
             const catalog_access = startup.modelCatalogAccess();
-            const catalog_provider = cfg.provider_set.select(startup.provider).cli_model_catalog orelse {
+            const active_providers = if (startup.extensions) |registry| registry.attach(cfg.provider_set) else cfg.provider_set;
+            const catalog_provider = active_providers.select(startup.provider).cli_model_catalog orelse {
                 try writeStderr(deps, switch (startup.provider) {
                     .gateway => "fx models: Gateway model catalog is unavailable\n",
                     .codex => "fx models: Codex model catalog is unavailable\n",
                     .grok => "fx models: Grok model catalog is unavailable\n",
+                    .extension => extension_models_unavailable_message,
                 });
                 return .handled_failure;
             };

@@ -11,6 +11,15 @@ pub const Entry = struct {
     subscription: bool,
 };
 
+const extension_entry = Entry{
+    .id = .extension,
+    .slug = "extension",
+    .name = "Local extensions",
+    .route_name = "Local extension provider",
+    .description = "Profile-configured local provider extensions",
+    .subscription = false,
+};
+
 pub const entries = [_]Entry{
     .{
         .id = .gateway,
@@ -48,6 +57,7 @@ pub fn parse(value: []const u8) ?model_provider.ProviderId {
 }
 
 pub fn find(id: model_provider.ProviderId) *const Entry {
+    if (id == .extension) return &extension_entry;
     for (&entries) |*entry| if (entry.id == id) return entry;
     unreachable;
 }

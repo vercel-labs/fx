@@ -292,6 +292,7 @@ pub fn resolveForProvider(
             return .{ .credential = credential };
         },
         .gateway => {},
+        .extension => return .{},
     }
     return resolvePreferring(
         alloc,

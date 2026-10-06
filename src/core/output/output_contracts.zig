@@ -751,6 +751,7 @@ pub const ModelListSnapshot = struct {
             .gateway => "gateway",
             .codex => provider_catalog.label(.codex),
             .grok => provider_catalog.label(.grok),
+            .extension => provider_catalog.label(.extension),
         };
     }
 
