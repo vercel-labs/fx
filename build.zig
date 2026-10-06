@@ -67,6 +67,12 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("build_options", build_options.createModule());
 
     b.installArtifact(exe);
+    b.installArtifact(@import("extensions/fx-opencode-go/build.zig").create(
+        b,
+        b.path("extensions/fx-opencode-go/main.zig"),
+        target,
+        optimize,
+    ));
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());

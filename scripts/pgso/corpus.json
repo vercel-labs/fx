@@ -112,6 +112,7 @@
   "verification_scenarios": [
     {"name": "verify-extensions", "argv": ["bun", "test", "--max-concurrency", "1", "./extensions.test.ts"], "test_file": "extensions.test.ts"},
     {"name": "verify-extension-runtime", "argv": ["bun", "test", "--max-concurrency", "1", "./extensions-runtime.test.ts"], "test_file": "extensions-runtime.test.ts"},
+    {"name": "verify-opencode-go", "argv": ["bun", "test", "--max-concurrency", "1", "./opencode-go.test.ts"], "test_file": "opencode-go.test.ts"},
     {"name": "verify-auto-mode-reliability", "argv": ["bun", "test", "--max-concurrency", "1", "./auto-mode-reliability.test.ts"], "test_file": "auto-mode-reliability.test.ts"},
     {"name": "verify-oauth-keychain-migration", "argv": ["bun", "test", "--max-concurrency", "1", "./oauth-keychain-migration.test.ts"], "test_file": "oauth-keychain-migration.test.ts", "allow_keychain": true},
     {"name": "verify-tui-auth-source-selection", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-auth-source-selection.test.ts"], "test_file": "tui-auth-source-selection.test.ts"},

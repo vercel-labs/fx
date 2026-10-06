@@ -45,6 +45,17 @@
         "build.zig.zon",
         "LICENSE",
         "src",
+        // Export native provider sources without retaining their local build outputs.
+        "extensions/fx-opencode-go/build.zig",
+        "extensions/fx-opencode-go/main.zig",
+        "extensions/fx-opencode-go/runtime.zig",
+        "extensions/fx-opencode-go/wire.zig",
+        "extensions/fx-opencode-go/request.zig",
+        "extensions/fx-opencode-go/sse.zig",
+        "extensions/fx-opencode-go/transport.zig",
+        "extensions/fx-opencode-go/models.json",
+        "extensions/fx-opencode-go/extension.json",
+        "extensions/fx-opencode-go/README.md",
         "THIRD_PARTY_NOTICES.md",
     },
 }

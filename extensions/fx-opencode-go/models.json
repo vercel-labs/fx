@@ -1,0 +1,22 @@
+{
+  "models": [
+    {
+      "id": "deepseek-flash",
+      "wire_id": "deepseek-flash",
+      "name": "DeepSeek Flash",
+      "tool_call": true,
+      "reasoning": true,
+      "reasoning_efforts": [
+        "low",
+        "high",
+        "max"
+      ],
+      "context_window": 1000000,
+      "max_output_tokens": 384000,
+      "supports_vision": false
+    }
+  ],
+  "source": "https://github.com/anomalyco/models.dev/tree/dev/providers/opencode-go",
+  "retrieved_at": "2026-10-06T17:16:41.977Z",
+  "source_digest": "880d636e19e39dcc1f0f1c34d6686f8658880d39077dad2992d5a298b54f7329"
+}

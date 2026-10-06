@@ -9,6 +9,7 @@ const types = @import("../shared/types.zig");
 const streams = @import("../agent/stream_provider.zig");
 const dispatcher_mod = @import("../mcp/stdio_dispatcher.zig");
 const event_handoff = @import("event_handoff.zig");
+const request_tools = @import("request_tools.zig");
 
 const Allocator = std.mem.Allocator;
 const jsonrpc_version = "2.0";
@@ -78,15 +79,17 @@ pub const Runtime = struct {
             if (initialized.value.result.?.version != protocol.version) return error.ExtensionVersionUnsupported;
         }
         const dispatcher = self.dispatcher.?;
+        var functions = try request_tools.render(alloc, request.tools);
+        defer functions.deinit();
         var prepared = try rpc(struct { handle: []const u8 }, dispatcher, alloc, "provider.prepare", .{
             .provider = .{ .id = provider.id, .base_url = provider.base_url },
             .model = model,
             .request = .{
                 .model = request.model,
                 .messages = request.messages,
-                .functions = request.tools.advertised_functions,
-                .additional_functions = request.tools.additional_functions,
-                .dynamic_functions = request.tools.selected_dynamic,
+                .functions = functions.value.object.get("functions").?,
+                .additional_functions = functions.value.object.get("additional_functions").?,
+                .dynamic_functions = functions.value.object.get("dynamic_functions").?,
                 .tool_choice = request.tool_choice,
                 .reasoning_effort = if (request.provider_options.reasoning) |*effort| effort.gatewayValue() else null,
                 .fast = request.provider_options.fast,

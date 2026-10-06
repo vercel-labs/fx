@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "id": "fx-opencode-go",
+  "entrypoint": "zig-out/bin/fx-opencode-go",
+  "capabilities": [
+    "providers"
+  ],
+  "providers": [
+    {
+      "id": "opencode-go",
+      "base_url": "https://opencode.ai/zen/go/v1",
+      "api_key_env": "OPENCODE_API_KEY",
+      "models_file": "models.json",
+      "headers": {
+        "x-opencode-session": {
+          "source": "session_id"
+        }
+      }
+    }
+  ]
+}
