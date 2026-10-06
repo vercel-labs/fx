@@ -35,6 +35,10 @@ zig build test
 zig build run
 ```
 
+Root `zig build` also builds the native `fx-opencode-go` executable. Build it separately from `extensions/fx-opencode-go` when using its bundled registration manifest.
+
+Extension runtime changes require fake-key loopback dogfooding with the built binaries. The focused owners are `extensions.test.ts`, `extensions-runtime.test.ts`, and `opencode-go.test.ts`. They are verification-only in the macOS arm64 PGSO corpus. The Go owner covers native terminal cancellation, tool continuation, pinned images, saved token totals, and provider RPC schema formatting. Do not use production credentials for these checks.
+
 ## Verification Workflow
 
 Keep the local development loop focused: run the narrowest test that covers the changed path, build fx, and exercise the change using `./zig-out/bin/fx`. The installed `fx` on `PATH` is not valid development evidence.

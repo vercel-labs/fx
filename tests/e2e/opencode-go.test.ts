@@ -4,7 +4,7 @@ import { copyFileSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { TmuxSession, tmuxAvailable } from "./tmux-helpers";
 import { cleanupIsolatedTestHome, FX_BIN } from "../evals/eval-helpers";
-import { createGoProfile, goEnvironment, KEY, HEADER_VALUE, HOST } from "./fixtures/opencode-go-profile";
+import { createGoProfile, goEnvironment, KEY, HEADER_VALUE, HOST, EXECUTABLE } from "./fixtures/opencode-go-profile";
 
 const IMAGE_FIXTURE = join(import.meta.dir, "fixtures", "placeholder-logo.png");
 const IMAGE_FILENAME = "go-image.png";
@@ -18,6 +18,23 @@ const CASES = [
   { name: "large UTF-8 write_file input", tool: "write_file", sessionHeader: "x-opencode-session", prompt: "Write the requested large fixture file and return the final answer." },
 ];
 const RESULT = "go-native-local-ok";
+const RPC_VERSION = 1;
+const JSONRPC_VERSION = "2.0";
+const RPC_TIMEOUT_MS = 5_000;
+const SCHEMA_OUTPUT_LIMIT = 128;
+const SCHEMA_SESSION = "go-schema-conversation";
+const SCHEMA_PROVIDER = "opencode-go";
+const SCHEMA_MODEL = "deepseek-flash";
+const SCHEMA_BASE_PREFIX = "http://";
+const SCHEMA_BASE_PATH = "/v1";
+const SCHEMA_PROMPT = "Return the fixture answer as JSON.";
+const SCHEMA = { type: "object", properties: { answer: { type: "string" } }, required: ["answer"], additionalProperties: false };
+const SCHEMA_FORMAT = { name: "fixture_answer", description: "Return a local fixture answer", schema: SCHEMA };
+const SCHEMA_OUTPUT = JSON.stringify({ answer: "go-schema-ok" });
+const INPUT_TOKENS = 41;
+const OUTPUT_TOKENS = 17;
+const SESSION_RELATIVE_DIRECTORY = ".fx/sessions";
+const SESSION_FILENAME = "session.json";
 const TOOL_FILENAME = "go-fixture-data.txt";
 const TOOL_CONTENT = "go-real-tool-result";
 const TOOL_ID = "go-read-call";
@@ -43,6 +60,87 @@ function streamReply(chunks: unknown[]): Response {
 }
 
 describe("native OpenCode Go extension", () => {
+  // Native CLI does not expose response_format; the shipped provider RPC is its public boundary.
+  test("native provider schema contract reaches OpenAI and completes valid JSON", async () => {
+    const bodies: any[] = [];
+    const server = Bun.serve({ hostname: HOST, port: 0, async fetch(request) {
+      bodies.push(await request.json());
+      return streamReply([{ choices: [{ index: 0, delta: { content: SCHEMA_OUTPUT }, finish_reason: "stop" }] }]);
+    } });
+    const child = Bun.spawn([EXECUTABLE], { stdin: "pipe", stdout: "pipe", stderr: "pipe", env: {} });
+    const reader = child.stdout.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let requestId = 0;
+    async function rpc(method: string, params: unknown): Promise<any> {
+      const id = ++requestId;
+      child.stdin.write(JSON.stringify({ jsonrpc: JSONRPC_VERSION, id, method, params }) + "\n");
+      const reply = async () => {
+        for (;;) {
+          const newline = buffer.indexOf("\n");
+          if (newline >= 0) {
+            const frame = JSON.parse(buffer.slice(0, newline));
+            buffer = buffer.slice(newline + 1);
+            if (frame.id !== id) continue;
+            if (frame.error) throw new Error(frame.error.message);
+            return frame.result;
+          }
+          const next = await reader.read();
+          if (next.done) throw new Error("Provider exited before reply");
+          buffer += decoder.decode(next.value, { stream: true });
+        }
+      };
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try { return await Promise.race([reply(), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Provider RPC deadline")), RPC_TIMEOUT_MS); })]); }
+      finally { clearTimeout(timer); }
+    }
+    try {
+      const initialized = await rpc("initialize", { version: RPC_VERSION });
+      expect(initialized.version).toBe(RPC_VERSION);
+      const prepared = await rpc("provider.prepare", { provider: { id: SCHEMA_PROVIDER, base_url: SCHEMA_BASE_PREFIX + HOST + ":" + server.port + SCHEMA_BASE_PATH }, model: { wire_id: SCHEMA_MODEL }, request: {
+        messages: [{ role: "user", content: SCHEMA_PROMPT, images: [], tool_call_id: null, tool_calls: [], provider_state_json: null }],
+        functions: [], additional_functions: [], dynamic_functions: [], reasoning_effort: "max", max_output_tokens: SCHEMA_OUTPUT_LIMIT,
+        tool_choice: "none", parallel_tool_calls: null, response_format: SCHEMA_FORMAT,
+      } });
+      const completed = await rpc("provider.stream", { handle: prepared.handle, credential: KEY, headers: { "x-opencode-session": SCHEMA_SESSION }, session_id: SCHEMA_SESSION });
+      expect(JSON.parse(completed.content)).toEqual(JSON.parse(SCHEMA_OUTPUT));
+      expect(bodies).toHaveLength(1);
+      expect(bodies[0].response_format).toEqual({ type: "json_schema", json_schema: { ...SCHEMA_FORMAT, strict: true } });
+      expect(bodies[0].max_tokens).toBe(SCHEMA_OUTPUT_LIMIT);
+      expect(bodies[0].reasoning_effort).toBe("max");
+      await rpc("shutdown", {});
+      child.stdin.end();
+      expect(await child.exited).toBe(0);
+      expect(await new Response(child.stderr).text()).toBe("");
+    } finally {
+      if (child.exitCode === null) child.kill();
+      await child.exited;
+      await reader.cancel();
+      server.stop(true);
+    }
+  }, TIMEOUT_MS);
+
+  // Token facts must survive the actual native session writer, not only RPC decoding.
+  test("Go usage persists in native saved session totals", async () => {
+    const server = Bun.serve({ hostname: HOST, port: 0, fetch() {
+      return streamReply([{ choices: [{ index: 0, delta: { content: RESULT }, finish_reason: "stop" }], usage: { prompt_tokens: INPUT_TOKENS, completion_tokens: OUTPUT_TOKENS } }]);
+    } });
+    const home = createGoProfile(server.port);
+    homes.push(home);
+    try {
+      const child = Bun.spawn([FX_BIN, "ask", "--json", TUI_PROMPT], { cwd: home, stdout: "pipe", stderr: "pipe", env: goEnvironment(home) });
+      const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+      expect(code, JSON.stringify({ stdout, stderr })).toBe(0);
+      const output = JSON.parse(stdout);
+      expect(output.output).toBe(RESULT);
+      expect(output.session_id).not.toBe("");
+      const saved = JSON.parse(readFileSync(join(home, SESSION_RELATIVE_DIRECTORY, output.session_id, SESSION_FILENAME), "utf8"));
+      expect(saved.total_input_tokens).toBe(INPUT_TOKENS);
+      expect(saved.total_output_tokens).toBe(OUTPUT_TOKENS);
+      expect(stdout + stderr).not.toContain(KEY);
+    } finally { server.stop(true); }
+  }, TIMEOUT_MS);
+
   // Native snapshot validation must precede provider projection; no local path reaches HTTP.
   test("verified image becomes an OpenAI data URL without exposing snapshot paths", async () => {
     const bodies: any[] = [];

@@ -5,7 +5,7 @@ import { FX_BIN } from "../../evals/eval-helpers";
 import { createExtensionProfile, PROFILE_DIRECTORY, FIXTURE_EXTENSION_DIRECTORY } from "./extension-profile";
 
 const SOURCE = join(import.meta.dir, "..", "..", "..", "extensions", "fx-opencode-go");
-const EXECUTABLE = join(dirname(FX_BIN), "fx-opencode-go");
+export const EXECUTABLE = join(dirname(FX_BIN), "fx-opencode-go");
 const MANIFEST_FILENAME = "extension.json";
 const CATALOG_FILENAME = "models.json";
 const SETTINGS_FILENAME = "settings.json";

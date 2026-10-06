@@ -17,7 +17,17 @@ The executable runs with your OS privileges. An empty environment does not sandb
 ```
 
 3. Set `OPENCODE_API_KEY` in the environment used to start fx.
-4. Select `opencode-go/deepseek-flash` and reasoning effort `max`.
+4. Merge these settings into `~/.fx/settings.json`, preserving unrelated settings:
+
+```json
+{
+  "provider": "extension",
+  "models": { "extension": "opencode-go/deepseek-flash" },
+  "effort": "max"
+}
+```
+
+Build fx from the checkout root and run `./zig-out/bin/fx`. Do not use an installed binary to verify this fork.
 
 Only native `yolo` currently authorizes executable activation. `ask` and `auto` remain closed.
 Use yolo only when you accept disabling native permission checks for the entire conversation.
@@ -31,11 +41,12 @@ empty `reasoning_content` replay, intact large UTF-8 file writes and real termin
 Real Ctrl+C cancels the HTTP socket; a fresh user request completes without restarting the app.
 HTTP errors, redirects, lost finish markers and aggregate tool-budget failures do not replay or disclose secrets.
 Header names follow HTTP case rules; duplicate logical bindings fail before executable activation.
-Token usage parsing is implemented but has no independent assertion yet. Core rejects stale or oversized events.
+Actual saved fx conversations retain the input and output token counts reported by Go. Core rejects stale or oversized events.
 HTTP redirects and automatic provider retries are disabled. Provider error bodies do not enter the transcript.
 Native image upload forwards only verified snapshot bytes as OpenAI data URLs, never original or snapshot paths.
 Local proof retains two PNGs across tool continuation after the original file changes. Live image acceptance remains unverified.
-The request encoder supports JSON Schema response format, but that path has no local proof yet.
+The shipped provider RPC sends strict OpenAI JSON Schema format and completes valid JSON against a local HTTP peer.
+This is provider-protocol proof; native CLI does not expose a model response-schema flag. CLI `--json` formats fx output only.
 
 The cached model metadata inherits [DeepSeek V4.1 Flash](https://raw.githubusercontent.com/anomalyco/models.dev/dev/models/deepseek/deepseek-v4.1-flash.toml)
 with [Go reasoning and interleaving](https://raw.githubusercontent.com/anomalyco/models.dev/dev/providers/opencode-go/models/deepseek-v4.1-flash.toml).
