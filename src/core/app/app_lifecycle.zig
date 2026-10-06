@@ -454,6 +454,7 @@ fn loadStartupStateFromOwnedWorkspace(
         state.stored_key_status = resolution.stored_key_status;
     }
     state.permission_mode = loadPermissionMode(settings.permission_mode);
+    if (state.extensions) |registry| registry.set_permission_mode(state.permission_mode);
     state.yolo_acknowledged = settings.yolo_acknowledged orelse false;
     state.permission_rules = try types.dupePermissionRuleSet(alloc, settings.permission_rules);
     state.agent_step_limit = loadAgentStepLimit(default_agent_step_limit, settings.max_agent_steps);

@@ -10,6 +10,7 @@ const gateway_provider = @import("../gateway/gateway_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const credentials = @import("../auth/credentials.zig");
 const stream_provider = @import("../agent/stream_provider.zig");
+const extension_process = @import("process.zig");
 const secret = @import("../auth/secret.zig");
 
 const Allocator = std.mem.Allocator;
@@ -52,8 +53,10 @@ const Loaded = struct {
     root: []u8,
     manifest: std.json.Parsed(manifest_mod.Manifest),
     catalogs: std.ArrayList(std.json.Parsed(protocol.ModelFile)) = .empty,
+    runtime: extension_process.Runtime = .{},
 
     fn deinit(self: *Loaded, alloc: Allocator) void {
+        self.runtime.deinit(alloc);
         for (self.catalogs.items) |*catalog| catalog.deinit();
         self.catalogs.deinit(alloc);
         self.manifest.deinit();
@@ -65,6 +68,12 @@ pub const Registry = struct {
     alloc: Allocator,
     entries: std.ArrayList(Loaded) = .empty,
     bindings: std.ArrayList(ModelBinding) = .empty,
+    unrestricted_execution: std.atomic.Value(bool) = .init(false),
+
+    /// Unresolved ask/auto remain closed until exact native action admission is attached.
+    pub fn set_permission_mode(self: *Registry, mode: types.PermissionMode) void {
+        self.unrestricted_execution.store(mode == .yolo, .seq_cst);
+    }
 
     /// Scoped leases prevent a shared extension route from mixing independent keys.
     pub fn resolve_credential(self: *const Registry, alloc: Allocator, public_id: []const u8) !?credentials.Credential {
@@ -91,15 +100,17 @@ pub const Registry = struct {
     }
 
     /// Queued model changes cannot repurpose a lease issued to a previous namespace.
-    fn stream_model(context: ?*anyopaque, _: Allocator, request: stream_provider.ModelRequest) !stream_provider.Result {
+    fn stream_model(context: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequest) !stream_provider.Result {
         const self: *Registry = @ptrCast(@alignCast(context orelse return error.ExtensionRegistryUnavailable));
         const binding = self.resolve_model(request.model) orelse return error.ExtensionModelNotRegistered;
         if (request.credential.source != .extension_api_key) return error.ExtensionCredentialScopeMismatch;
         const account = request.credential.account_id orelse return error.ExtensionCredentialScopeMismatch;
         const expected = credential_scope(binding.provider);
         if (!std.mem.eql(u8, account, &expected)) return error.ExtensionCredentialScopeMismatch;
-        // Registration and key possession never grant executable activation.
-        return error.ExtensionExecutionPermissionRequired;
+        // Only the existing native unrestricted mode currently grants activation.
+        if (!self.unrestricted_execution.load(.seq_cst)) return error.ExtensionExecutionPermissionRequired;
+        const entry = &self.entries.items[binding.extension_index];
+        return entry.runtime.stream(self.alloc, alloc, entry.root, entry.manifest.value.entrypoint, binding.provider, binding.model, request, &self.unrestricted_execution);
     }
 
     /// Every public ID belongs to one provider; ambiguity cannot redirect credentials.

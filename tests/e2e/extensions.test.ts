@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { cleanupIsolatedTestHome, createIsolatedTestHome, FX_BIN } from "../evals/eval-helpers";
 import { TmuxSession, tmuxAvailable } from "./tmux-helpers";
@@ -24,6 +24,16 @@ const TUI_TIMEOUT_MS = 5_000;
 const TUI_STDERR_FILENAME = "fx-stderr.log";
 const SECOND_API_KEY_ENV = "FX_SECOND_EXTENSION_TEST_KEY";
 const AUTH_SCOPE_PROMPT = "check scoped authentication";
+const RPC_RESULT_TEXT = "extension-rpc-ok";
+const YOLO_WARNING_TEXT = "YOLO enabled: fx permission checks disabled\n";
+const RPC_LOG_FILENAME = "rpc-log.jsonl";
+const MISSING_FINISH_FILENAME = "missing-finish";
+const DROP_STREAM_FILENAME = "drop-stream";
+const RESTRICTED_PERMISSION_MODE = "ask";
+const UNRESTRICTED_PERMISSION_MODE = "yolo";
+const ASK_ARGUMENTS = ["ask", "--json", "--no-save", AUTH_SCOPE_PROMPT];
+const FIXTURE_EXECUTABLE_MODE = 0o700;
+const RPC_FIXTURE_SOURCE_PATH = join(import.meta.dir, "fixtures", "extension-provider.ts");
 const tuiTest = tmuxAvailable() ? test.serial : test.skip;
 const UNREACHABLE_GATEWAY = "http://127.0.0.1:1";
 const GATEWAY_FIXTURE_KEY = "wrong-gateway-fixture-key";
@@ -242,12 +252,75 @@ describe("local extension discovery", () => {
     expect(result.stderr + result.stdout).not.toContain(GATEWAY_FIXTURE_KEY);
   });
 
-  test("extension delivery stays fail-closed until executable activation is authorized", () => {
+  test("explicit yolo admits one scoped RPC request without ambient credentials", () => {
     const home = fixture(VALID_REGISTRY, VALID_MANIFEST);
-    const result = spawnSync(FX_BIN, ["ask", "--json", "--no-save", AUTH_SCOPE_PROMPT], {
+    const extension = join(home, PROFILE_DIRECTORY, FIXTURE_EXTENSION_DIRECTORY);
+    const executable = join(extension, VALID_MANIFEST.entrypoint);
+    writeFileSync(executable, `#!${process.execPath}\n${readFileSync(RPC_FIXTURE_SOURCE_PATH, "utf8")}`);
+    chmodSync(executable, FIXTURE_EXECUTABLE_MODE);
+    const result = spawnSync(FX_BIN, ASK_ARGUMENTS, {
       cwd: home, timeout: TIMEOUT_MS, encoding: "utf8",
       env: { ...process.env, HOME: home, AI_GATEWAY_API_KEY: undefined, VERCEL_OIDC_TOKEN: undefined,
-        FX_MODEL: undefined, FX_EXTENSION_TEST_KEY: EXTENSION_FIXTURE_KEY,
+        FX_MODEL: undefined, FX_PERMISSION_MODE: UNRESTRICTED_PERMISSION_MODE, FX_EXTENSION_TEST_KEY: EXTENSION_FIXTURE_KEY,
+        FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1" },
+    });
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+    expect(JSON.parse(result.stdout).output).toBe(RPC_RESULT_TEXT);
+    expect(result.stderr).toBe(YOLO_WARNING_TEXT);
+    const calls = readFileSync(join(extension, RPC_LOG_FILENAME), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(calls.map(call => call.method)).toEqual(["initialize", "provider.prepare", "provider.stream", "shutdown"]);
+    expect(calls.map(call => call.credential)).toEqual([false, false, true, false]);
+    expect(calls.every(call => !call.ambientKey)).toBe(true);
+    expect(() => process.kill(calls[0].pid, 0)).toThrow();
+  });
+
+  test("missing completion evidence never automatically repeats an admitted request", () => {
+    const home = fixture(VALID_REGISTRY, VALID_MANIFEST);
+    const extension = join(home, PROFILE_DIRECTORY, FIXTURE_EXTENSION_DIRECTORY);
+    const executable = join(extension, VALID_MANIFEST.entrypoint);
+    writeFileSync(executable, `#!${process.execPath}\n${readFileSync(RPC_FIXTURE_SOURCE_PATH, "utf8")}`);
+    chmodSync(executable, FIXTURE_EXECUTABLE_MODE);
+    writeFileSync(join(extension, MISSING_FINISH_FILENAME), "");
+    const result = spawnSync(FX_BIN, ASK_ARGUMENTS, {
+      cwd: home, timeout: TIMEOUT_MS, encoding: "utf8",
+      env: { ...process.env, HOME: home, AI_GATEWAY_API_KEY: undefined, VERCEL_OIDC_TOKEN: undefined,
+        FX_MODEL: undefined, FX_PERMISSION_MODE: UNRESTRICTED_PERMISSION_MODE, FX_EXTENSION_TEST_KEY: EXTENSION_FIXTURE_KEY,
+        FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1" },
+    });
+    expect(result.status, result.stderr || result.stdout).toBe(1);
+    expect(JSON.parse(result.stdout).error).toBe("ExtensionCompletionInvalid");
+    const calls = readFileSync(join(extension, RPC_LOG_FILENAME), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(calls.filter(call => call.method === "provider.stream")).toHaveLength(1);
+    expect(result.stderr).toBe(YOLO_WARNING_TEXT);
+  });
+
+  test("lost admitted RPC response never automatically restarts the executable", () => {
+    const home = fixture(VALID_REGISTRY, VALID_MANIFEST);
+    const extension = join(home, PROFILE_DIRECTORY, FIXTURE_EXTENSION_DIRECTORY);
+    const executable = join(extension, VALID_MANIFEST.entrypoint);
+    writeFileSync(executable, `#!${process.execPath}\n${readFileSync(RPC_FIXTURE_SOURCE_PATH, "utf8")}`);
+    chmodSync(executable, FIXTURE_EXECUTABLE_MODE);
+    writeFileSync(join(extension, DROP_STREAM_FILENAME), "");
+    const result = spawnSync(FX_BIN, ASK_ARGUMENTS, {
+      cwd: home, timeout: TIMEOUT_MS, encoding: "utf8",
+      env: { ...process.env, HOME: home, AI_GATEWAY_API_KEY: undefined, VERCEL_OIDC_TOKEN: undefined,
+        FX_MODEL: undefined, FX_PERMISSION_MODE: UNRESTRICTED_PERMISSION_MODE, FX_EXTENSION_TEST_KEY: EXTENSION_FIXTURE_KEY,
+        FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1" },
+    });
+    expect(result.status, result.stderr || result.stdout).toBe(1);
+    expect(JSON.parse(result.stdout).error).toBe("ExtensionStreamAmbiguous");
+    const calls = readFileSync(join(extension, RPC_LOG_FILENAME), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(calls.filter(call => call.method === "initialize")).toHaveLength(1);
+    expect(calls.filter(call => call.method === "provider.stream")).toHaveLength(1);
+    expect(result.stderr).toBe(YOLO_WARNING_TEXT);
+  });
+
+  test("extension delivery stays fail-closed until executable activation is authorized", () => {
+    const home = fixture(VALID_REGISTRY, VALID_MANIFEST);
+    const result = spawnSync(FX_BIN, ASK_ARGUMENTS, {
+      cwd: home, timeout: TIMEOUT_MS, encoding: "utf8",
+      env: { ...process.env, HOME: home, AI_GATEWAY_API_KEY: undefined, VERCEL_OIDC_TOKEN: undefined,
+        FX_MODEL: undefined, FX_PERMISSION_MODE: RESTRICTED_PERMISSION_MODE, FX_EXTENSION_TEST_KEY: EXTENSION_FIXTURE_KEY,
         FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1" },
     });
     expect(result.status).not.toBe(0);
@@ -267,6 +340,33 @@ describe("local extension discovery", () => {
     expect(result.stderr + result.stdout).toContain("ExtensionCredentialInvalid");
     expect(result.stderr + result.stdout).not.toContain(INVALID_EXTENSION_KEY_MARKER);
   });
+
+  tuiTest("a real terminal completes admitted RPC and retires its child on normal quit", async () => {
+    const home = fixture(VALID_REGISTRY, VALID_MANIFEST);
+    const extension = join(home, PROFILE_DIRECTORY, FIXTURE_EXTENSION_DIRECTORY);
+    const executable = join(extension, VALID_MANIFEST.entrypoint);
+    writeFileSync(executable, `#!${process.execPath}\n${readFileSync(RPC_FIXTURE_SOURCE_PATH, "utf8")}`);
+    chmodSync(executable, FIXTURE_EXECUTABLE_MODE);
+    const stderrPath = join(home, TUI_STDERR_FILENAME);
+    let session: TmuxSession | undefined;
+    try {
+      session = await TmuxSession.create({ cmd: FX_BIN, cwd: home, stderrPath, isolated: true,
+        env: { HOME: home, AI_GATEWAY_API_KEY: "", VERCEL_OIDC_TOKEN: "", FX_MODEL: undefined,
+          FX_PERMISSION_MODE: UNRESTRICTED_PERMISSION_MODE, FX_EXTENSION_TEST_KEY: EXTENSION_FIXTURE_KEY,
+          FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "0" },
+      });
+      await session.waitForText("Run /help", TUI_TIMEOUT_MS);
+      await session.sendText(AUTH_SCOPE_PROMPT);
+      await session.waitForText(RPC_RESULT_TEXT, TUI_TIMEOUT_MS);
+      expect(session.isAlive()).toBe(true);
+      await session.sendText("/quit");
+      await session.waitForSessionEnd(TUI_TIMEOUT_MS);
+      const calls = readFileSync(join(extension, RPC_LOG_FILENAME), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      expect(calls.map(call => call.method)).toEqual(["initialize", "provider.prepare", "provider.stream", "shutdown"]);
+      expect(() => process.kill(calls[0].pid, 0)).toThrow();
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally { await session?.kill(); }
+  }, TIMEOUT_MS);
 
   tuiTest("switching extension models never reuses another provider's credential", async () => {
     const home = fixture(VALID_REGISTRY, { ...VALID_MANIFEST, providers: [

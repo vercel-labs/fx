@@ -58,6 +58,7 @@ pub fn Runtime(comptime App: type) type {
         fn ensure_extension_prompt_credential(app: *App) !bool {
             if (comptime @hasField(App, "extensions") and @hasDecl(@TypeOf(app.auth), "adoptCredential")) {
                 const registry = app.extensions orelse return extension_auth_notice(app, extension_configuration_unavailable);
+                if (comptime @hasField(App, "permission_engine")) registry.set_permission_mode(app.permission_engine.mode);
                 const model = provider_runtime.model(app);
                 const binding = registry.resolve_model(model) orelse return extension_auth_notice(app, extension_configuration_unavailable);
                 var credential = registry.resolve_credential(app.alloc, model) catch |err| switch (err) {
