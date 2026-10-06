@@ -8,6 +8,7 @@ const secret = @import("../auth/secret.zig");
 const types = @import("../shared/types.zig");
 const streams = @import("../agent/stream_provider.zig");
 const dispatcher_mod = @import("../mcp/stdio_dispatcher.zig");
+const event_handoff = @import("event_handoff.zig");
 
 const Allocator = std.mem.Allocator;
 const jsonrpc_version = "2.0";
@@ -108,6 +109,16 @@ pub const Runtime = struct {
             .session_id = request.session_id,
         });
         defer secret.zeroAndFree(alloc, body);
+        var handoff = event_handoff.Handoff{
+            .alloc = std.heap.c_allocator,
+            .request_id = request_id,
+            .handle = handle,
+            .sink = request.events,
+            .pulse = request.cooperative_pulse,
+        };
+        defer handoff.deinit();
+        try dispatcher.setNotificationSink(.{ .context = &handoff, .callback = event_handoff.Handoff.on_notification });
+        defer dispatcher.clearNotificationSink();
         if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
         if (!execution_allowed.load(.seq_cst)) return error.ExtensionExecutionPermissionRequired;
         try request.admission.admit();
@@ -118,18 +129,25 @@ pub const Runtime = struct {
             .deadline = request.deadline,
             .cancel_flag = request.cancel_flag,
             .send_cancellation = false,
+            .wait_observer = .{ .context = &handoff, .callback = event_handoff.Handoff.on_wait },
         }) catch |err| {
             const cancellation = rpc(std.json.Value, dispatcher, alloc, "provider.cancel", .{ .handle = handle }, .{ .timeout_ms = shutdown_timeout_ms }) catch null;
             if (cancellation) |value| {
                 var owned = value;
                 owned.deinit();
             }
-            return if (err == error.Cancelled) error.Cancelled else error.ExtensionStreamAmbiguous;
+            return switch (err) {
+                error.Cancelled, error.OutOfMemory, error.ExtensionEventInvalid, error.ExtensionEventOverflow, error.ExtensionEventCorrelationInvalid => err,
+                else => error.ExtensionStreamAmbiguous,
+            };
         };
         defer alloc.free(frame);
+        dispatcher.clearNotificationSink();
+        try handoff.drain();
         var completed = try parse_reply(types.ModelCompletion, alloc, request_id, frame);
         defer completed.deinit();
         const source = completed.value.result.?;
+        try handoff.validate_content(source.content);
         if (source.tool_calls.len > max_tool_calls or source.finish_reason == null) return error.ExtensionCompletionInvalid;
         var result = streams.Result{ .completed = .{ .ownership = .owned, .usage = .{ .unavailable = .possibly_billed } } };
         errdefer result.deinit(alloc);
@@ -151,7 +169,7 @@ pub const Runtime = struct {
             result.completed.completion.billing = billing;
         }
         // CLI and terminal consumers reduce neutral events rather than completion storage.
-        if (source.content) |text| request.events.emit(.{ .content_delta = text });
+        if (!handoff.content_seen) if (source.content) |text| request.events.emit(.{ .content_delta = text });
         return result;
     }
 };

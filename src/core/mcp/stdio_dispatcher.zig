@@ -23,6 +23,12 @@ pub const ServerRequestWait = struct {
     callback: *const fn (*anyopaque) void,
 };
 
+/// Runs only on the requesting thread, never on the shared reader.
+pub const WaitObserver = struct {
+    context: *anyopaque,
+    callback: *const fn (*anyopaque) anyerror!void,
+};
+
 pub const RequestOptions = struct {
     timeout_ms: u32,
     deadline: ?std.Io.Clock.Timestamp = null,
@@ -34,6 +40,7 @@ pub const RequestOptions = struct {
     response_observer: ?ResponseObserver = null,
     server_requests: ?ServerRequestSink = null,
     server_request_wait: ?ServerRequestWait = null,
+    wait_observer: ?WaitObserver = null,
     deadline_gate: ?*operation_control.DeadlineGate = null,
     send_cancellation: bool = true,
     request_started: ?*bool = null,
@@ -484,6 +491,7 @@ pub const StdioDispatcher = struct {
         var server_request_wait_started = false;
 
         while (true) {
+            if (options.wait_observer) |observer| try observer.callback(observer.context);
             var response: ?[]u8 = null;
             var failure: ?anyerror = null;
             var send_cancel = false;
@@ -1456,7 +1464,8 @@ fn pendingChangeDeadline(
 fn pendingNeedsControlPolling(options: RequestOptions) bool {
     return options.cancel_flag != null or
         options.lifecycle_cancel_flag != null or
-        options.deadline_gate != null;
+        options.deadline_gate != null or
+        options.wait_observer != null;
 }
 
 fn earlierDeadline(

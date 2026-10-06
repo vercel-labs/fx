@@ -1,5 +1,6 @@
 [
   { "file": "extensions.test.ts", "weight": 3 },
+  { "file": "extensions-runtime.test.ts", "weight": 3 },
   { "file": "auto-mode-reliability.test.ts", "weight": 4 },
   { "file": "acp.test.ts", "weight": 29 },
   { "file": "ask-presentation.test.ts", "weight": 5 },

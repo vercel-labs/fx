@@ -1911,6 +1911,12 @@ const ProviderEventContext = struct {
     required_vision: bool,
 };
 
+/// Idle subprocess waits publish short chunks without touching reader-thread application state.
+fn onProviderFlush(raw: *anyopaque) void {
+    const ctx: *ProviderEventContext = @ptrCast(@alignCast(raw));
+    runtime_assistant_stream.flushAssistantStream(ctx.stream) catch {};
+}
+
 fn onProviderEvent(raw: *anyopaque, event: agent_stream_provider.Event) void {
     const ctx: *ProviderEventContext = @ptrCast(@alignCast(raw));
     switch (event) {
@@ -3133,7 +3139,7 @@ fn processQueuedPromptLoop(
                 .cooperative_pulse = deps.cooperative_transport_pulse,
                 .delivery = &gateway_delivery,
                 .attempt_evidence = &gateway_attempt_evidence,
-                .events = .{ .context = &provider_events, .emit_fn = onProviderEvent },
+                .events = .{ .context = &provider_events, .emit_fn = onProviderEvent, .flush_fn = onProviderFlush },
                 .cancel_flag = config.cancel_flag,
                 .provider_attempt_owner = .agent,
             };

@@ -34,6 +34,12 @@ pub const Event = union(enum) {
 pub const EventSink = struct {
     context: *anyopaque,
     emit_fn: *const fn (context: *anyopaque, event: Event) void,
+    /// Pending transports flush buffered presentation only from their owner thread.
+    flush_fn: ?*const fn (context: *anyopaque) void = null,
+
+    pub fn flush(self: EventSink) void {
+        if (self.flush_fn) |flush_fn| flush_fn(self.context);
+    }
 
     pub fn emit(self: EventSink, event: Event) void {
         self.emit_fn(self.context, event);
