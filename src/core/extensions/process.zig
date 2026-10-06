@@ -156,7 +156,11 @@ pub const Runtime = struct {
         };
         defer handoff.deinit();
         try dispatcher.setNotificationSink(.{ .context = &handoff, .callback = event_handoff.Handoff.on_notification });
-        defer dispatcher.clearNotificationSink();
+        defer {
+            // A reader waiting for capacity must leave its callback before the dispatcher joins it.
+            handoff.stop();
+            dispatcher.clearNotificationSink();
+        }
         if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
         if (request.executable_authorizer) |authority| {
             const revalidated = try authority.authorize(alloc, action, self.approved_mode);
@@ -172,6 +176,8 @@ pub const Runtime = struct {
             .send_cancellation = false,
             .wait_observer = .{ .context = &handoff, .callback = event_handoff.Handoff.on_wait },
         }) catch |err| {
+            // Cancellation replies share the same reader as the paused event producer.
+            handoff.stop();
             const cancellation = rpc(std.json.Value, dispatcher, alloc, "provider.cancel", .{ .handle = handle }, .{ .timeout_ms = shutdown_timeout_ms }) catch null;
             if (cancellation) |value| {
                 var owned = value;
@@ -183,6 +189,7 @@ pub const Runtime = struct {
             };
         };
         defer alloc.free(frame);
+        handoff.stop();
         dispatcher.clearNotificationSink();
         try handoff.drain();
         var completed = try parse_reply(types.ModelCompletion, alloc, request_id, frame);

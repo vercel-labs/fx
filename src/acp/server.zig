@@ -41,6 +41,7 @@ const web_search_runtime = @import("../core/tooling/web_search_runtime.zig");
 const elicitation = @import("../core/mcp/elicitation.zig");
 const tool_mcp_runtime = @import("../core/tooling/tool_mcp_runtime.zig");
 const permissions = @import("../core/permissions/permissions.zig");
+const extension_registry = @import("../core/extensions/registry.zig");
 
 const Allocator = std.mem.Allocator;
 const ErrorCode = jsonrpc.ErrorCode;
@@ -207,6 +208,8 @@ const ActivePrompt = struct {
 pub const ServerState = struct {
     alloc: Allocator,
     cfg: Config,
+    /// Provider bundles borrow this registry until prompt and child workers have stopped.
+    extensions: ?*extension_registry.Registry = null,
     writer: jsonrpc.Writer,
     initialized: bool = false,
     client_fs_read: bool = false,
@@ -281,6 +284,10 @@ pub const ServerState = struct {
         self.web_search_runtime.deinit();
         self.lifecycle_runtime.deinit();
         self.capability_resolver.deinit(self.alloc);
+        if (self.extensions) |registry| {
+            registry.deinit();
+            self.alloc.destroy(registry);
+        }
         var pending = self.pending_outbound.valueIterator();
         while (pending.next()) |entry| {
             if (entry.response) |*response| response.deinit(self.alloc);
@@ -334,7 +341,15 @@ fn adoptServerCredential(state: *ServerState, credential: *credentials.Credentia
 pub fn selectCredentialForProvider(
     state: *ServerState,
     provider: model_provider.ProviderId,
+    model: []const u8,
 ) !bool {
+    // A shared extension route cannot reuse another namespace's account-scoped lease.
+    if (state.cfg.provider_set.select(provider).model_credential) |resolver| {
+        var credential = try resolver.resolve(state.alloc, model) orelse return false;
+        defer credential.deinit(state.alloc);
+        adoptServerCredential(state, &credential);
+        return true;
+    }
     if (state.active_session) |active| {
         if (credentialMatchesProvider(active.credential_source, provider)) return true;
     }
@@ -1333,6 +1348,15 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
 
     state.workspace_root = startup.takeWorkspaceRoot();
     state.workspace_access = startup.takeWorkspaceAccess();
+    // A retried failed initialization cannot leave the provider bundle borrowing an abandoned registry.
+    if (state.extensions) |registry| {
+        registry.deinit();
+        alloc.destroy(registry);
+        state.cfg.provider_set.extension = .{};
+    }
+    // ACP owns the registry after startup so catalog and stream callbacks remain valid.
+    state.extensions = startup.take_extensions();
+    if (state.extensions) |registry| state.cfg.provider_set = registry.attach(state.cfg.provider_set);
 
     if (state.cfg.model_override) |override| {
         state.selected_model = try alloc.dupe(u8, override);
@@ -1349,8 +1373,9 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     defer if (startup_credential) |*credential| credential.deinit(alloc);
     var routed_credential: ?credentials.Credential = null;
     defer if (routed_credential) |*credential| credential.deinit(alloc);
+    const model_credential = state.cfg.provider_set.select(state.provider).model_credential;
     const startup_matches_model = if (startup_credential) |credential|
-        credentialMatchesProvider(credential.source, state.provider)
+        model_credential == null and credentialMatchesProvider(credential.source, state.provider)
     else
         false;
     const credential: *credentials.Credential = if (state.provider == .gateway and state.cfg.credential_override != null) override: {
@@ -1362,6 +1387,14 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     } else if (startup_matches_model)
         &startup_credential.?
     else routed: {
+        if (model_credential) |resolver| {
+            routed_credential = try resolver.resolve(alloc, state.selected_model);
+            if (routed_credential == null) return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_request,
+                .message = credentials.missing_extension_credential_message,
+            });
+            break :routed &routed_credential.?;
+        }
         const preferred = if (startup_credential) |value| value.source else null;
         const resolution = try credentials.resolveForProvider(
             alloc,
@@ -1568,11 +1601,13 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                         .message = "Model is not available for the active provider",
                     });
                 }
-                if (!try selectCredentialForProvider(state, session.provider)) {
+                if (!try selectCredentialForProvider(state, session.provider, value)) {
                     return state.writer.writeError(alloc, msg.id, .{
                         .code = ErrorCode.invalid_request,
                         .message = if (session.provider == .codex)
                             credentials.missing_chatgpt_credential_message
+                        else if (session.provider == .extension)
+                            credentials.missing_extension_credential_message
                         else
                             credentials.missing_grok_credential_message,
                     });

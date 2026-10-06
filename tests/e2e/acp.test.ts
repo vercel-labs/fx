@@ -15,7 +15,9 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { FX_BIN, HAS_API_KEY, REPO_ROOT, runFx } from "../evals/eval-helpers";
+import { cleanupIsolatedTestHome, FX_BIN, HAS_API_KEY, REPO_ROOT, runFx } from "../evals/eval-helpers";
+import { EXTENSION_FIXTURE_KEY, PROFILE_DIRECTORY, FIXTURE_EXTENSION_DIRECTORY,
+  VALID_MANIFEST, VALID_REGISTRY, createExtensionProfile } from "./fixtures/extension-profile";
 import {
   AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES,
   customProviderGuidanceState,
@@ -60,6 +62,13 @@ const MCP_STDIO_FIXTURE = join(
   "mcp-modern-stdio.mjs",
 );
 const MCP_TOOL_NAME = "mcp_fixture_echo";
+const EXTENSION_RPC_SOURCE_PATH = join(import.meta.dirname, "fixtures", "extension-provider.ts");
+const EXTENSION_EXECUTABLE_MODE = 0o700;
+const EXTENSION_RESULT_TEXT = "extension-rpc-ok";
+const EXTENSION_PRIVILEGE_WARNING = "not sandboxed";
+const EXTENSION_ACTIVATION_CASES = ["allow_once", "reject_once"] as const;
+const EXTENSION_RPC_LOG_FILENAME = "rpc-log.jsonl";
+const EXTENSION_PROMPT_TEXT = "check extension launch";
 
 function acpStdioServer(
   resultText: string,
@@ -1164,6 +1173,59 @@ async function continueRecovery(client: AcpClient, timeoutMs = LIVE_TIMEOUT) {
 }
 
 describe("acp: model-independent", () => {
+  // ACP must retain the startup registry and obtain native launch consent before credentials leave fx.
+  test.each(EXTENSION_ACTIVATION_CASES)("ACP extension launch honors %s consent", async (decision) => {
+    const home = createExtensionProfile(VALID_REGISTRY, VALID_MANIFEST);
+    const extension = join(home, PROFILE_DIRECTORY, FIXTURE_EXTENSION_DIRECTORY);
+    const executable = join(extension, VALID_MANIFEST.entrypoint);
+    writeFileSync(executable, `#!${process.execPath}\n${readFileSync(EXTENSION_RPC_SOURCE_PATH, "utf8")}`);
+    chmodSync(executable, EXTENSION_EXECUTABLE_MODE);
+    let extensionClient: AcpClient | undefined;
+    try {
+      extensionClient = await AcpClient.create({ cwd: home, env: { HOME: home,
+        AI_GATEWAY_API_KEY: undefined, VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
+        FX_PERMISSION_MODE: "ask", FX_EXTENSION_TEST_KEY: EXTENSION_FIXTURE_KEY,
+        FX_DISABLE_KEYCHAIN: "1" } });
+      extensionClient.setPermissionOption(decision);
+      const initialized = await extensionClient.request("initialize", { protocolVersion: 1 }, 1) as any;
+      expect(initialized.error).toBeUndefined();
+      expect(initialized.result.protocolVersion).toBe(1);
+      expect(existsSync(join(extension, EXTENSION_RPC_LOG_FILENAME))).toBe(false);
+      extensionClient.send({ jsonrpc: "2.0", id: 2, method: "session/new", params: { cwd: home, mcpServers: [] } });
+      const created = await readResponse(extensionClient, 2) as any;
+      expect(created.error).toBeUndefined();
+      const providerOption = created.result.configOptions.find((option: any) => option.id === "provider");
+      expect(providerOption.currentValue).toBe("extension");
+      expect(providerOption.options.some((option: any) => option.value === providerOption.currentValue)).toBe(true);
+      extensionClient.send({ jsonrpc: "2.0", id: 3, method: "session/prompt", params: {
+        sessionId: created.result.sessionId, prompt: [{ type: "text", text: EXTENSION_PROMPT_TEXT }],
+      } });
+      const prompted = await readResponse(extensionClient, 3) as any;
+      const messages = extensionClient.rawLines.map(line => JSON.parse(line));
+      const consent = messages.find(message => message.method === "session/request_permission");
+      expect(consent.params.toolCall.title).toContain(EXTENSION_PRIVILEGE_WARNING);
+      expect(extensionClient.rawLines.join("\n")).not.toContain(EXTENSION_FIXTURE_KEY);
+      if (decision === "allow_once") {
+        expect(prompted.error).toBeUndefined();
+        expect(extensionClient.rawLines.join("\n")).toContain(EXTENSION_RESULT_TEXT);
+        expect(readFileSync(join(extension, EXTENSION_RPC_LOG_FILENAME), "utf8")).toContain("provider.stream");
+      } else {
+        expect(existsSync(join(extension, EXTENSION_RPC_LOG_FILENAME))).toBe(false);
+        expect(extensionClient.rawLines.join("\n")).not.toContain(EXTENSION_RESULT_TEXT);
+      }
+      extensionClient.endStdin();
+      expect(await extensionClient.waitForExit()).toBe(0);
+      if (decision === "allow_once") {
+        const calls = readFileSync(join(extension, EXTENSION_RPC_LOG_FILENAME), "utf8").trim().split("\n").map(line => JSON.parse(line));
+        expect(calls.at(-1).method).toBe("shutdown");
+        expect(() => process.kill(calls[0].pid, 0)).toThrow();
+      }
+      expect(extensionClient.stderr).toBe("");
+    } finally {
+      await extensionClient?.close();
+      cleanupIsolatedTestHome(home);
+    }
+  }, TIMEOUT);
   test("response waits continue across an internal read slice timeout", async () => {
     let reads = 0;
     const reader = {

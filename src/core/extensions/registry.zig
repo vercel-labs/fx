@@ -99,6 +99,7 @@ pub const Registry = struct {
             .cli_model_catalog = .{ .context = self, .fetch_fn = catalog_ids },
             .model_catalog = .{ .context = self, .fetch_fn = catalog_entries },
             .model_capabilities = .{ .context = self, .resolve_fn = catalog_capabilities },
+            .model_credential = .{ .context = self, .resolve_fn = model_credential },
         };
         return result;
     }
@@ -134,6 +135,12 @@ pub const Registry = struct {
         if (self.fallback_session_id) |id| self.alloc.free(id);
     }
 };
+
+/// Provider consumers rebind credentials after restoring or selecting a model namespace.
+fn model_credential(raw: ?*anyopaque, alloc: Allocator, model: []const u8) !?credentials.Credential {
+    const registry: *const Registry = @ptrCast(@alignCast(raw.?));
+    return registry.resolve_credential(alloc, model);
+}
 
 /// Local bindings prevent vendor-name heuristics from inventing extension capabilities.
 fn catalog_capabilities(raw: ?*anyopaque, model: []const u8) model_capabilities.Capabilities {

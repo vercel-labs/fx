@@ -23,6 +23,8 @@ const permission_auto_classifier = @import("../core/permissions/auto_classifier.
 const auto_classifier_context = @import("../core/permissions/auto_classifier_context.zig");
 const permission_gate = @import("../core/permissions/permission_gate.zig");
 const permission_request = @import("../core/permissions/permission_request.zig");
+const executable_action = @import("../core/permissions/executable_action.zig");
+const executable_admission = @import("../core/permissions/executable_admission.zig");
 const session_codec = @import("../core/session/session_codec.zig");
 const session_log = @import("../core/session/session_log.zig");
 const session_store = @import("../core/session/session_store.zig");
@@ -65,6 +67,8 @@ const worker_runtime = @import("../core/agent/worker_runtime.zig");
 
 const Allocator = std.mem.Allocator;
 const ErrorCode = jsonrpc.ErrorCode;
+const executable_permission_id = "fx-native-extension-execute";
+const executable_permission_label_format = "{s}\n{s}";
 
 pub const no_active_session_rpc_error = jsonrpc.RpcError{
     .code = ErrorCode.invalid_params,
@@ -440,13 +444,15 @@ pub fn handlePrompt(
     const session = if (state.active_session) |*active| active else return .{
         .rpc_error = no_active_session_rpc_error,
     };
-    if (!try server.selectCredentialForProvider(state, session.provider)) {
+    if (!try server.selectCredentialForProvider(state, session.provider, session.model)) {
         return .{ .rpc_error = .{
             .code = ErrorCode.invalid_request,
             .message = if (session.provider == .codex)
                 credentials.missing_chatgpt_credential_message
             else if (session.provider == .grok)
                 credentials.missing_grok_credential_message
+            else if (session.provider == .extension)
+                credentials.missing_extension_credential_message
             else
                 credentials.missing_credential_message,
         } };
@@ -708,6 +714,7 @@ pub fn runSubagentChild(
         .host = subagent_host,
         .tool_context = ctx.toolContext(),
         .provider_set = state.cfg.provider_set,
+        .root_permission_mode = .{ .context = state, .snapshot_fn = snapshotServerPermissionMode },
         .system_prompt = state.cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = state.cfg.prompt_policy.modelPromptOverlay(admission.model),
         .skills_prompt_section = bounded_skills.text,
@@ -989,6 +996,8 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .validate_tool_call = validateToolCall,
         .check_tool_availability = checkToolAvailability,
         .request_tool_permission = requestToolPermissionOutcomeWithRequest,
+        .request_executable_permission = requestExecutablePermission,
+        .snapshot_root_permission_mode = snapshotRootPermissionMode,
         .request_prepared_file_mutation_permission = requestPreparedFileMutationPermissionOutcomeForRuntime,
         .resolve_tool_action_display_target = resolveToolActionDisplayTarget,
         .describe_tool_action = describeToolAction,
@@ -1254,6 +1263,39 @@ fn requestToolPermissionOutcome(raw_ctx: *anyopaque, arena: Allocator, call: Too
         permission_mode,
         local_grants,
     );
+}
+
+// Executable admission shares ACP consent transport while retaining host-only action identity.
+fn requestExecutablePermission(raw_ctx: *anyopaque, arena: Allocator, action: executable_action.Action, review_turn: permission_auto_classifier.ReviewTurnContext, mode: PermissionMode, previous: ?PermissionMode) !PermissionMode {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    var tool_ctx = ctx.toolContext();
+    tool_ctx.permission_review_turn = review_turn;
+    return executable_admission.authorize(arena, tool_ctx.admissionInput(), action, review_turn, mode, previous, .{ .context = raw_ctx, .request_fn = requestAcpExecutablePermission });
+}
+
+// Native privilege warnings must be visible before ACP clients choose an approval option.
+fn requestAcpExecutablePermission(raw_ctx: *anyopaque, alloc: Allocator, request: permission_request.PermissionRequest) !permission_request.OwnedPermissionResponse {
+    var rendered_request = request;
+    const label = if (request.explanation) |warning| try std.fmt.allocPrint(alloc, executable_permission_label_format, .{ warning, request.label }) else try alloc.dupe(u8, request.label);
+    defer alloc.free(label);
+    rendered_request.label = label;
+    return requestAcpPermission(raw_ctx, alloc, rendered_request, .{
+        .id = executable_permission_id,
+        .name = executable_action.permission_name,
+        .arguments_json = request.tool_arguments_preview orelse return error.ExtensionActionInvalid,
+    }, null, null);
+}
+
+// Mode changes affect new native launches immediately, including requests from children.
+fn snapshotServerPermissionMode(raw_ctx: *anyopaque) PermissionMode {
+    const state: *server.ServerState = @ptrCast(@alignCast(raw_ctx));
+    return if (state.active_session) |active| active.permission_mode else state.permission_mode;
+}
+
+// The prompt callback borrows the server's live mode rather than its dispatch-time snapshot.
+fn snapshotRootPermissionMode(raw_ctx: *anyopaque) PermissionMode {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    return snapshotServerPermissionMode(ctx.state);
 }
 
 fn requestToolPermissionOutcomeWithRequest(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, revalidation: ?agent_runtime.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
@@ -2437,6 +2479,8 @@ fn activeMcp(ctx: *AcpContext) ?*mcp_runtime.McpRuntime {
 fn onBackgroundUrlReady(_: *anyopaque, _: u64, _: []const u8) void {}
 
 pub fn mapToolKind(tool_name: []const u8) acp_types.ToolCallKind {
+    // Native executable consent must carry the same execution warning category as terminal actions.
+    if (std.mem.eql(u8, tool_name, executable_action.permission_name)) return .execute;
     if (std.mem.eql(u8, tool_name, "list_files")) return .read;
     if (std.mem.eql(u8, tool_name, "glob_files")) return .read;
     if (std.mem.eql(u8, tool_name, "grep_files")) return .search;

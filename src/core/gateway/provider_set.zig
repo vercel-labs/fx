@@ -8,8 +8,20 @@ const gateway_provider = @import("gateway_provider.zig");
 const web_search_provider = @import("../tooling/web_search_provider.zig");
 const auto_classifier = @import("../permissions/auto_classifier.zig");
 const model_catalog = @import("model_catalog.zig");
+const credentials = @import("../auth/credentials.zig");
 
 const Allocator = std.mem.Allocator;
+
+/// Session routes resolve the final model rather than inheriting another namespace's secret.
+const ModelCredentialProvider = struct {
+    context: ?*anyopaque,
+    resolve_fn: *const fn (?*anyopaque, Allocator, []const u8) anyerror!?credentials.Credential,
+
+    /// The caller owns the returned credential and must release its secret after the request.
+    pub fn resolve(self: ModelCredentialProvider, alloc: Allocator, model: []const u8) !?credentials.Credential {
+        return self.resolve_fn(self.context, alloc, model);
+    }
+};
 
 pub const Bundle = struct {
     pub const AuthStrategy = enum {
@@ -37,6 +49,7 @@ pub const Bundle = struct {
     cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
     model_catalog: ?model_catalog.Provider = null,
     model_capabilities: ?ModelCapabilitiesProvider = null,
+    model_credential: ?ModelCredentialProvider = null,
     permission_reviewer: ?auto_classifier.Provider = null,
     deferred_usage: ?generation_usage_provider.Provider = null,
     credits: ?gateway_provider.CreditsProvider = null,

@@ -653,6 +653,18 @@ pub const TurnContext = struct {
         return .{ .context = self, .request_fn = requestChildPermission };
     }
 
+    /// Native launch consent must reach the root UI without inventing delegable tool grants.
+    pub fn requestExecutablePermission(self: *TurnContext, alloc: Allocator, request: permission_request.PermissionRequest) !permission_request.OwnedPermissionResponse {
+        const child_id = self.child_id orelse return error.ChildNotAttached;
+        const work_id = self.active_work_id orelse return error.StaleRequest;
+        var observation = PermissionObservation{
+            .turn = self,
+            .stable_id = communication.stableApprovalId(child_id, work_id, communication.preparedRequestFingerprint(request)),
+            .grants = &.{},
+        };
+        return self.worker.requestPermissionBlockingObserved(alloc, request, null, .{ .context = &observation, .observe_fn = PermissionObservation.observe });
+    }
+
     fn requestChildPermission(
         raw: *anyopaque,
         alloc: Allocator,

@@ -18,6 +18,7 @@ const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
 const credentials = @import("../core/auth/credentials.zig");
 const model_provider = @import("../core/config/model_provider.zig");
+const extension_provider_option = ",{\"value\":\"extension\",\"name\":\"Local extension\"}";
 const mode_registry = @import("../core/modes/mode_registry.zig");
 const subagent_resume_admission = @import("../core/subagent/resume_admission.zig");
 const types = @import("../core/shared/types.zig");
@@ -560,13 +561,15 @@ fn handleRestoreSession(
         state.selected_model
     else
         writable.state.preferences.model;
-    if (!try server.selectCredentialForProvider(state, effective_provider)) {
+    if (!try server.selectCredentialForProvider(state, effective_provider, effective_model)) {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
             .message = if (effective_provider == .codex)
                 credentials.missing_chatgpt_credential_message
             else if (effective_provider == .grok)
                 credentials.missing_grok_credential_message
+            else if (effective_provider == .extension)
+                credentials.missing_extension_credential_message
             else
                 credentials.missing_credential_message,
         });
@@ -1119,6 +1122,8 @@ pub fn writeProviderConfigOption(
     try w.writeAll(",\"options\":[{\"value\":\"gateway\",\"name\":\"Vercel AI Gateway\"},{\"value\":\"codex\",\"name\":\"Codex subscription\"}");
     if (comptime !host_target.is_wasm) {
         try w.writeAll(",{\"value\":\"grok\",\"name\":\"Grok subscription\"}");
+        // A profile-selected extension must remain a valid choice in its active config response.
+        if (current == .extension) try w.writeAll(extension_provider_option);
     }
     try w.writeAll("]}");
 }

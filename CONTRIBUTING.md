@@ -37,7 +37,7 @@ zig build run
 
 Root `zig build` also builds the native `fx-opencode-go` executable. Build it separately from `extensions/fx-opencode-go` when using its bundled registration manifest.
 
-Extension runtime changes require fake-key loopback dogfooding with the built binaries. The focused owners are `extensions.test.ts`, `extensions-runtime.test.ts`, and `opencode-go.test.ts`. They are verification-only in the macOS arm64 PGSO corpus. The Go owner covers native terminal cancellation, tool continuation, pinned images, saved token totals, and provider RPC schema formatting. Do not use production credentials for these checks.
+Extension runtime changes require fake-key loopback dogfooding with the built binaries. The focused owners are `extensions.test.ts`, `extensions-runtime.test.ts`, and `opencode-go.test.ts`; `acp.test.ts` also owns ACP initialization and native executable consent. The extension suites are verification-only in the macOS arm64 PGSO corpus. The Go owner covers native terminal cancellation, tool continuation, pinned images, saved token totals, provider RPC schema formatting, and endpoint path/query preservation. Do not use production credentials for these checks.
 
 Bun tests preload `tests/test-environment.ts` to force `FX_SOUND=0` for inherited child environments, including direct fx spawns. New child environments must inherit this default or use its `silentFxEnv` helper when building an isolated environment. Only `tests/e2e/notifications.test.ts` may remove it with `FX_SOUND: undefined` when verifying sound behavior. Root, E2E, and eval test launches use the same preload.
 

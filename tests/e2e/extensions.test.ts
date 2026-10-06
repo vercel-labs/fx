@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { cleanupIsolatedTestHome, FX_BIN } from "../evals/eval-helpers";
 import { TmuxSession, tmuxAvailable } from "./tmux-helpers";
@@ -25,6 +25,11 @@ const UNREACHABLE_GATEWAY = "http://127.0.0.1:1";
 const GATEWAY_FIXTURE_KEY = "wrong-gateway-fixture-key";
 const INVALID_EXTENSION_KEY_MARKER = "invalid-extension-fixture";
 const INVALID_EXTENSION_KEY = `${INVALID_EXTENSION_KEY_MARKER}\r\nkey`;
+const RPC_FIXTURE_SOURCE_PATH = join(import.meta.dir, "fixtures", "extension-provider.ts");
+const FIXTURE_EXECUTABLE_MODE = 0o700;
+const RPC_RESULT_TEXT = "extension-rpc-ok";
+const RESUME_STARTUP_PROVIDERS = ["extension", "gateway"];
+const SAVE_ARGUMENTS = ["ask", "--json", AUTH_SCOPE_PROMPT];
 const homes: string[] = [];
 
 // Each owner retains cleanup authority over its private profiles.
@@ -49,6 +54,36 @@ afterEach(() => {
 });
 
 describe("local extension discovery", () => {
+  // Saved model ownership must outrank a different namespace selected for process startup.
+  test.each(RESUME_STARTUP_PROVIDERS)("CLI resume resolves saved extension credentials after %s startup", (startupProvider) => {
+    const home = fixture(VALID_REGISTRY, { ...VALID_MANIFEST, providers: [
+      VALID_MANIFEST.providers[0], { ...VALID_MANIFEST.providers[0], id: SECOND_PROVIDER,
+        api_key_env: SECOND_API_KEY_ENV },
+    ] });
+    const executable = join(home, PROFILE_DIRECTORY, FIXTURE_EXTENSION_DIRECTORY, VALID_MANIFEST.entrypoint);
+    writeFileSync(executable, `#!${process.execPath}\n${readFileSync(RPC_FIXTURE_SOURCE_PATH, "utf8")}`);
+    chmodSync(executable, FIXTURE_EXECUTABLE_MODE);
+    const environment = { ...process.env, HOME: home, FX_DISABLE_KEYCHAIN: "1",
+      AI_GATEWAY_API_KEY: GATEWAY_FIXTURE_KEY, VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
+      FX_PERMISSION_MODE: "yolo", FX_EXTENSION_TEST_KEY: EXTENSION_FIXTURE_KEY,
+      FX_SECOND_EXTENSION_TEST_KEY: SECOND_EXTENSION_FIXTURE_KEY,
+      FX_GATEWAY_BASE_URL: UNREACHABLE_GATEWAY };
+    const first = spawnSync(FX_BIN, SAVE_ARGUMENTS, { cwd: home, timeout: TIMEOUT_MS, encoding: "utf8", env: environment });
+    expect(first.status, first.stderr || first.stdout).toBe(0);
+    const saved = JSON.parse(first.stdout);
+    expect(saved.output).toBe(RPC_RESULT_TEXT);
+    const settingsPath = join(home, PROFILE_DIRECTORY, SETTINGS_FILENAME);
+    const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+    settings.provider = startupProvider;
+    settings.models.extension = SECOND_MODEL;
+    writeFileSync(settingsPath, JSON.stringify(settings));
+    const resumed = spawnSync(FX_BIN, [...SAVE_ARGUMENTS.slice(0, -1), "--resume-id", saved.session_id, AUTH_SCOPE_PROMPT],
+      { cwd: home, timeout: TIMEOUT_MS, encoding: "utf8", env: environment });
+    expect(resumed.status, resumed.stderr || resumed.stdout).toBe(0);
+    expect(JSON.parse(resumed.stdout)).toMatchObject({ output: RPC_RESULT_TEXT, model: MODEL, session_id: saved.session_id });
+    expect(resumed.stdout + resumed.stderr).not.toContain(SECOND_EXTENSION_FIXTURE_KEY);
+    expect(resumed.stdout + resumed.stderr).not.toContain(EXTENSION_FIXTURE_KEY);
+  });
   test("named provider selection preserves each preferred model and built-in preferences", () => {
     const home = fixture(VALID_REGISTRY, {
       ...VALID_MANIFEST, providers: [VALID_MANIFEST.providers[0], {

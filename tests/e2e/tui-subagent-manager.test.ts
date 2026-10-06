@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -26,8 +27,52 @@ import {
   tmuxAvailable,
 } from "./tmux-helpers";
 import { readTapeFrames, stdoutFrames } from "./render-lab/tape";
+import {
+  EXTENSION_FIXTURE_KEY,
+  FIXTURE_EXTENSION_DIRECTORY,
+  MODEL as EXTENSION_CHILD_MODEL,
+  MODELS_FILENAME,
+  PROFILE_DIRECTORY,
+  SETTINGS_FILENAME,
+  VALID_MANIFEST,
+  VALID_REGISTRY,
+} from "./fixtures/extension-profile";
 
 const TIMEOUT = 30_000;
+const EXTENSION_CHILD_NAME = "native-provider-child";
+const EXTENSION_CHILD_PROMPT = "Complete the local extension child request";
+const EXTENSION_PARENT_PROMPT = "Start the local extension child";
+const EXTENSION_PARENT_FINISHED = "EXTENSION_PARENT_IDLE";
+const EXTENSION_CHILD_FINISHED = "extension-rpc-ok";
+const EXTENSION_PARENT_KEY = "extension-subagent-parent-key";
+const EXTENSION_PARENT_KEY_SLOT = "FX_EXTENSION_PARENT_TEST_KEY";
+const EXTENSION_PARENT_DIRECTORY = "parent-extension";
+const EXTENSION_PARENT_PROVIDER = "subagent-parent-provider";
+const EXTENSION_PARENT_MODEL = `${EXTENSION_PARENT_PROVIDER}/${EXTENSION_CHILD_MODEL.split("/")[1]}`;
+const EXTENSION_MANIFEST_FILENAME = "extension.json";
+const EXTENSION_SUBAGENT_FILENAME = "subagent-fixture.json";
+const EXTENSION_STREAM_DELAY_FILENAME = "stream-delay-ms";
+const EXTENSION_STREAM_METHOD = "provider.stream";
+const EXTENSION_QUIT_COMMAND = "/quit";
+const EXTENSION_COMPLETED_STATUS = "completed";
+const EXTENSION_FAILED_STATUS = "failed";
+const EXTENSION_FAILURE_FALLBACK = "child failed before native provider stream";
+const EXTENSION_SESSION_DIRECTORY = "sessions";
+const EXTENSION_EVENTS_FILENAME = "events.jsonl";
+const EXTENSION_LOG_FILENAME = "rpc-log.jsonl";
+const EXTENSION_STREAM_MODE_FILENAME = "stream-events";
+const EXTENSION_STREAM_FINISHED_FILENAME = "stream-finished";
+const EXTENSION_PROVIDER_SOURCE = join(import.meta.dir, "fixtures", "extension-provider.ts");
+const EXTENSION_EXECUTABLE_MODE = 0o700;
+const EXTENSION_HELD_DELAY_MS = TIMEOUT * 2;
+const EXTENSION_CONTEXT_WINDOW = 8192;
+const EXTENSION_MAX_OUTPUT_TOKENS = 1024;
+const EXTENSION_CHILD_CASES = [
+  { label: "ask allow completes", mode: "ask", held: false, shared: false },
+  { label: "auto allow completes", mode: "auto", held: false, shared: false },
+  { label: "ask same namespace admits child executable", mode: "ask", held: false, shared: true },
+  { label: "quit joins an active provider child", mode: "ask", held: true, shared: false },
+];
 
 async function pasteVisibleText(
   session: TmuxSession,
@@ -243,6 +288,7 @@ type ConfigurationControl = {
   generation: number;
   configuration: {
     name: string;
+    model: string;
     effort: string;
     permission_mode: string;
     notifications: {
@@ -395,6 +441,109 @@ async function launch(
 }
 
 describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
+  // Real child workers borrow the registry, so both consent and host teardown need a live terminal.
+  test.each(EXTENSION_CHILD_CASES)("native extension subagent: $label", async ({ mode, held, shared }) => {
+    const fixture = createFixture();
+    const profile = join(fixture.home, PROFILE_DIRECTORY);
+    const extension = join(profile, FIXTURE_EXTENSION_DIRECTORY);
+    const parentExtension = join(profile, EXTENSION_PARENT_DIRECTORY);
+    writeFileSync(join(profile, SETTINGS_FILENAME), JSON.stringify({
+      provider: "extension", models: { extension: shared ? EXTENSION_CHILD_MODEL : EXTENSION_PARENT_MODEL },
+      sandbox: "none", permission_mode: mode,
+      permission: { extension_execute: "allow", subagent: "allow" },
+    }));
+    writeFileSync(join(profile, EXTENSION_MANIFEST_FILENAME), JSON.stringify({ ...VALID_REGISTRY,
+      extensions: [...VALID_REGISTRY.extensions, { path: EXTENSION_PARENT_DIRECTORY }],
+    }));
+    const source = readFileSync(EXTENSION_PROVIDER_SOURCE, "utf8");
+    // Independent runtimes keep the root's provider request from serializing its own child.
+    for (const [directory, manifest] of [[extension, VALID_MANIFEST], [parentExtension, {
+      ...VALID_MANIFEST, id: EXTENSION_PARENT_DIRECTORY,
+      providers: [{ ...VALID_MANIFEST.providers[0], id: EXTENSION_PARENT_PROVIDER, api_key_env: EXTENSION_PARENT_KEY_SLOT }],
+    }]] as const) {
+      mkdirSync(directory);
+      writeFileSync(join(directory, EXTENSION_MANIFEST_FILENAME), JSON.stringify(manifest));
+      writeFileSync(join(directory, MODELS_FILENAME), JSON.stringify({ models: [{
+        id: EXTENSION_CHILD_MODEL.split("/")[1], wire_id: EXTENSION_CHILD_MODEL.split("/")[1],
+        name: EXTENSION_CHILD_NAME, tool_call: true, context_window: EXTENSION_CONTEXT_WINDOW,
+        max_output_tokens: EXTENSION_MAX_OUTPUT_TOKENS,
+      }] }));
+      const executable = join(directory, manifest.entrypoint);
+      writeFileSync(executable, `#!${process.execPath}\n${source}`);
+      chmodSync(executable, EXTENSION_EXECUTABLE_MODE);
+    }
+    writeFileSync(join(extension, EXTENSION_SUBAGENT_FILENAME), JSON.stringify({ expected_credential: EXTENSION_FIXTURE_KEY }));
+    writeFileSync(join(shared ? extension : parentExtension, EXTENSION_SUBAGENT_FILENAME), JSON.stringify({
+      expected_credential: shared ? EXTENSION_FIXTURE_KEY : EXTENSION_PARENT_KEY,
+      parent_prompt: EXTENSION_PARENT_PROMPT, final_text: EXTENSION_PARENT_FINISHED,
+      tool_call: { id: EXTENSION_CHILD_NAME, name: "subagent", arguments_json: JSON.stringify({ command: { create: {
+        name: EXTENSION_CHILD_NAME, mode: "persistent", model: EXTENSION_CHILD_MODEL, prompt: EXTENSION_CHILD_PROMPT,
+      } } }) },
+    }));
+    if (held) {
+      writeFileSync(join(extension, EXTENSION_STREAM_DELAY_FILENAME), String(EXTENSION_HELD_DELAY_MS));
+      writeFileSync(join(extension, EXTENSION_STREAM_MODE_FILENAME), "");
+    }
+    session = await TmuxSession.create({
+      cmd: FX_BIN, cwd: fixture.workspace, isolated: true,
+      env: { HOME: fixture.home, AI_GATEWAY_API_KEY: undefined, VERCEL_OIDC_TOKEN: undefined,
+        FX_MODEL: undefined, FX_PERMISSION_MODE: mode, FX_EXTENSION_TEST_KEY: EXTENSION_FIXTURE_KEY,
+        [EXTENSION_PARENT_KEY_SLOT]: EXTENSION_PARENT_KEY, FX_DISABLE_KEYCHAIN: "1",
+        FX_SKIP_ONBOARDING: "1", FX_AUTO_UPGRADE: "0" },
+      width: 120, height: 36, stderrPath: fixture.stderrPath,
+    });
+    const active = session;
+    await active.waitForComposer(TIMEOUT);
+    await active.sendText(EXTENSION_PARENT_PROMPT);
+    await active.waitForText(EXTENSION_PARENT_FINISHED, TIMEOUT);
+    const controlPath = configurationControlPath(fixture);
+    const childId = readConfigurationControl(controlPath).child_id;
+    const logPath = join(extension, EXTENSION_LOG_FILENAME);
+    const deadline = Date.now() + TIMEOUT;
+    let failureDiagnostic: string | undefined;
+    let calls: Array<{ method: string; sessionId: string; pid: number; credential: boolean; ambientKey: boolean; keyValid: boolean }> = [];
+    while (Date.now() < deadline) {
+      if (existsSync(logPath)) {
+        calls = readFileSync(logPath, "utf8").trim().split("\n").map(line => JSON.parse(line));
+        if (calls.some(call => call.method === EXTENSION_STREAM_METHOD && call.sessionId === childId)) break;
+      }
+      const control = readConfigurationControl(controlPath) as ConfigurationControl & {
+        queue: Array<{ status: string }>;
+        events: Array<{ current?: string; reason?: string | null }>;
+      };
+      // Durable failure is terminal; waiting for an impossible RPC obscures the useful diagnostic.
+      if (control.queue.some(item => item.status === EXTENSION_FAILED_STATUS)) {
+        failureDiagnostic = control.events.findLast(event => event.current === EXTENSION_FAILED_STATUS)?.reason
+          ?? EXTENSION_FAILURE_FALLBACK;
+        break;
+      }
+      await Bun.sleep(25);
+    }
+    const streamed = calls.find(call => call.method === EXTENSION_STREAM_METHOD && call.sessionId === childId);
+    expect(streamed, failureDiagnostic).toBeDefined();
+    expect(streamed?.credential).toBe(true);
+    expect(streamed?.ambientKey).toBe(false);
+    expect(streamed?.keyValid).toBe(true);
+    if (held) {
+      expect(existsSync(join(extension, EXTENSION_STREAM_FINISHED_FILENAME))).toBe(false);
+    } else {
+      const completed = await waitForConfigurationControl(controlPath, control => {
+        const work = control as ConfigurationControl & { queue: Array<{ status: string }> };
+        return work.queue.some(item => item.status === EXTENSION_COMPLETED_STATUS);
+      });
+      expect(completed.configuration.model).toBe(EXTENSION_CHILD_MODEL);
+      const childEvents = join(profile, EXTENSION_SESSION_DIRECTORY, completed.child_id, EXTENSION_EVENTS_FILENAME);
+      expect(readFileSync(childEvents, "utf8")).toContain(EXTENSION_CHILD_FINISHED);
+    }
+    await active.sendText(EXTENSION_QUIT_COMMAND);
+    expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+    // Provider lifetime ends only after every borrowing worker has joined.
+    let childExited = false;
+    try { process.kill(streamed!.pid, 0); } catch { childExited = true; }
+    expect(childExited).toBe(true);
+  }, TIMEOUT * 2);
+
   test(
     "empty manager preserves the exact main screen, composer, cursor, resize, and repeated cycles",
     async () => {

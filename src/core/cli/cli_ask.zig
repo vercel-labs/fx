@@ -272,6 +272,7 @@ fn runAskChild(
         .host = ctx.subagent_host orelse return error.ProviderFailed,
         .tool_context = ctx.toolContext(),
         .provider_set = ctx.cfg.provider_set,
+        .root_permission_mode = .{ .context = ctx, .snapshot_fn = snapshotRootPermissionMode },
         .system_prompt = ctx.cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = ctx.cfg.prompt_policy.modelPromptOverlay(admission.model),
         .skills_prompt_section = ctx.subagent_skills_prompt,
@@ -1524,13 +1525,20 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
 
     var routed_credential: ?credentials.Credential = null;
     defer if (routed_credential) |*credential| credential.deinit(alloc);
+    // A restored namespace owns its own lease even when both routes use extension API keys.
+    const model_credential = ctx.cfg.provider_set.select(ctx.provider).model_credential;
     const startup_matches_final_model = if (startup.credential) |credential|
-        model_provider.authorizesCredential(ctx.provider, credential.source)
+        model_credential == null and model_provider.authorizesCredential(ctx.provider, credential.source)
     else
         false;
     const credential: *const credentials.Credential = if (startup_matches_final_model)
         &startup.credential.?
     else routed: {
+        if (model_credential) |resolver| {
+            routed_credential = try resolver.resolve(alloc, ctx.model);
+            if (routed_credential == null) return missingCredentialResult(alloc, options, ctx.provider);
+            break :routed &routed_credential.?;
+        }
         const preferred = if (startup.credential) |value| value.source else null;
         const resolution = try credentials.resolveForProvider(
             alloc,
@@ -2292,6 +2300,12 @@ fn requestExecutablePermission(raw_ctx: *anyopaque, arena: Allocator, action: ex
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     const tool_ctx = cliAdmissionContext(ctx, &.{}, review_turn);
     return executable_admission.authorize(arena, tool_ctx.admissionInput(), action, review_turn, mode, previous, .{ .context = raw_ctx, .request_fn = requestCliExecutablePermission });
+}
+
+// Child launches must sample the controlling host rather than retain an old admission mode.
+fn snapshotRootPermissionMode(raw_ctx: *anyopaque) PermissionMode {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    return ctx.permission_mode;
 }
 
 fn requestCliPermission(

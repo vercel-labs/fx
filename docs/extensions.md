@@ -10,6 +10,8 @@ An extension runs with your OS privileges. It can access files, use the network,
 
 Native `ask` confirms the registered provider, canonical executable path and SHA256 before launch. This is a host action, not a model tool. Approval cannot amend or substitute an executable. Native tool permissions remain active. CLI requests need the existing `--prompt-permissions` flag to open a human prompt.
 
+ACP sessions selected through the profile use the same registered providers. Their client receives native executable consent with the unsandboxed warning before activation. Resumed CLI and ACP sessions resolve the credential slot for their restored model namespace.
+
 Explicit profile `extension_execute` rules can authorize activation under `ask` or `auto`. Rule targets contain `<extension-id>:<provider-id>:<executable-identity>`. Broad configured patterns also authorize matching replacement binaries; human approval does not. Current denies override cached approval.
 
 Approval belongs to the exact running child and action. A changed provider, executable digest, supplied session identity or permission mode requires current policy again. Policy changes apply before the next invocation and credential delivery; they cannot undo admitted effects or recall retained secrets.

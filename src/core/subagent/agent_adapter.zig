@@ -7,6 +7,9 @@ const model_provider = @import("../config/model_provider.zig");
 const provider_set = @import("../gateway/provider_set.zig");
 const auto_classifier = @import("../permissions/auto_classifier.zig");
 const command_admission = @import("../permissions/command_admission.zig");
+const executable_action = @import("../permissions/executable_action.zig");
+const executable_admission = @import("../permissions/executable_admission.zig");
+const permission_request = @import("../permissions/permission_request.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
 const file_mutation = @import("../tooling/file_mutation.zig");
 const tool_admission = @import("../tooling/tool_admission.zig");
@@ -32,10 +35,17 @@ const tool_host = @import("tool_host.zig");
 
 const Allocator = std.mem.Allocator;
 
+/// Controlling host state can narrow an admitted child's mode while its turn is running.
+const RootPermissionModeProvider = struct {
+    context: *anyopaque,
+    snapshot_fn: *const fn (*anyopaque) types.PermissionMode,
+};
+
 pub const Config = struct {
     host: *tool_host.Runtime,
     tool_context: tool_runtime.Context,
     provider_set: provider_set.Set,
+    root_permission_mode: ?RootPermissionModeProvider = null,
     system_prompt: []const u8,
     model_prompt_overlay: ?[]const u8 = null,
     skills_prompt_section: []const u8 = "",
@@ -133,23 +143,30 @@ pub fn run(
     routed_config.tool_context.agent_stream_provider = provider.agent_stream_or_unavailable();
     routed_config.tool_context.permission_reviewer_provider = provider.permission_reviewer;
     routed_config.tool_context.auto_classifier = auto_classifier.Classifier.disabled();
-    if (!model_provider.authorizesCredential(
+    if (provider.model_credential != null or !model_provider.authorizesCredential(
         admission.provider,
         config.tool_context.credential_source,
     )) {
-        const resolution = credentials.resolveForProvider(
-            turn.alloc,
-            config.tool_context.oauth_transport,
-            config.tool_context.secret_store,
-            .refresh_if_needed,
-            admission.provider,
-            config.tool_context.credential_source,
-        ) catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            turn.setFailureDiagnostic("model_credential_resolution_failed", @errorName(err)) catch
-                return error.OutOfMemory;
-            return error.ProviderFailed;
-        };
+        const resolution = if (provider.model_credential) |resolver|
+            credentials.Resolution{ .credential = resolver.resolve(turn.alloc, admission.model) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                turn.setFailureDiagnostic("model_credential_resolution_failed", @errorName(err)) catch return error.OutOfMemory;
+                return error.ProviderFailed;
+            } }
+        else
+            credentials.resolveForProvider(
+                turn.alloc,
+                config.tool_context.oauth_transport,
+                config.tool_context.secret_store,
+                .refresh_if_needed,
+                admission.provider,
+                config.tool_context.credential_source,
+            ) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                turn.setFailureDiagnostic("model_credential_resolution_failed", @errorName(err)) catch
+                    return error.OutOfMemory;
+                return error.ProviderFailed;
+            };
         routed_credential = resolution.credential;
         const credential = if (routed_credential) |*value| value else {
             turn.setFailureDiagnostic("model_credential_missing", admission.model) catch
@@ -273,6 +290,8 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .context_enabled = context.config.context_enabled,
         .finalize_turn = finalizeTurn,
         .live_tool_authority = context.turn.liveToolAuthorityProvider(),
+        .snapshot_root_permission_mode = snapshotExecutablePermissionMode,
+        .request_executable_permission = requestExecutablePermission,
         .tool_activity_recorder = context.turn.toolActivityRecorder(),
         .prepare_parent_turn_context = prepareParentTurnContext,
         .acknowledge_parent_turn_context = acknowledgeParentTurnContext,
@@ -308,6 +327,44 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .usage = &context.turn.sessionRuntime().usage,
         .usage_allocator = context.turn.alloc,
     };
+}
+
+/// The stricter current child or root mode prevents a stale yolo admission from widening launch policy.
+fn executablePermissionMode(context: *Context, child_mode: types.PermissionMode) types.PermissionMode {
+    const root = context.config.root_permission_mode orelse return child_mode;
+    const root_mode = root.snapshot_fn(root.context);
+    if (root_mode == .ask or child_mode == .ask) return .ask;
+    if (root_mode == .auto or child_mode == .auto) return .auto;
+    return .yolo;
+}
+
+/// An unavailable current snapshot fails closed; authorization still returns its precise error.
+fn snapshotExecutablePermissionMode(raw: *anyopaque) types.PermissionMode {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    var live = context.turn.resolveLiveAuthority(context.turn.alloc) catch return .ask;
+    defer live.deinit(context.turn.alloc);
+    return executablePermissionMode(context, live.permission_mode);
+}
+
+/// Native approvals use the authenticated child/work route without advertising a model tool.
+fn promptExecutablePermission(raw: *anyopaque, alloc: Allocator, request: permission_request.PermissionRequest) !permission_request.OwnedPermissionResponse {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    return context.turn.requestExecutablePermission(alloc, request);
+}
+
+/// Every invocation rechecks host rules and saved denies before borrowing cached child consent.
+fn requestExecutablePermission(raw: *anyopaque, alloc: Allocator, action: executable_action.Action, review: auto_classifier.ReviewTurnContext, mode: types.PermissionMode, previous: ?types.PermissionMode) !types.PermissionMode {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    var live = try context.turn.resolveLiveAuthority(alloc);
+    defer live.deinit(alloc);
+    const current_mode = executablePermissionMode(context, live.permission_mode);
+    if (mode != current_mode) return error.ExtensionExecutionPermissionRequired;
+    const tool_ctx = admissionContext(context, &.{}, review);
+    var input = tool_ctx.admissionInput();
+    input.permission_rules = live.rules;
+    input.session_permission_state = &live.permission_state;
+    input.session_permission_state_provider = null;
+    return executable_admission.authorize(alloc, input, action, review, current_mode, previous, .{ .context = context, .request_fn = promptExecutablePermission });
 }
 
 fn refreshGatewayCredential(

@@ -30,6 +30,8 @@ pub const Handoff = struct {
     sink: streams.EventSink,
     pulse: ?streams.CooperativePulse,
     mutex: std.Io.Mutex = .init,
+    capacity_changed: std.Io.Condition = .init,
+    stopped: bool = false,
     pending: std.ArrayList(std.json.Parsed(WireEvent)) = .empty,
     pending_bytes: usize = 0,
     failure: ?anyerror = null,
@@ -50,7 +52,7 @@ pub const Handoff = struct {
         const self: *Handoff = @ptrCast(@alignCast(raw));
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
-        if (self.failure != null) return;
+        if (self.stopped or self.failure != null) return;
         self.capture(message) catch |err| {
             self.failure = err;
         };
@@ -63,6 +65,14 @@ pub const Handoff = struct {
         if (self.pulse) |pulse| try pulse.pulse();
     }
 
+    /// The owner releases backpressure before removing a sink or awaiting a cancellation reply.
+    pub fn stop(self: *Handoff) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        self.stopped = true;
+        self.capacity_changed.broadcast(io_mod.getIo());
+    }
+
     /// A final drain closes the race between the last notification and response publication.
     pub fn drain(self: *Handoff) !void {
         self.mutex.lockUncancelable(io_mod.getIo());
@@ -73,6 +83,7 @@ pub const Handoff = struct {
         var batch = self.pending;
         self.pending = .empty;
         self.pending_bytes = 0;
+        self.capacity_changed.signal(io_mod.getIo());
         self.mutex.unlock(io_mod.getIo());
         defer batch.deinit(self.alloc);
         defer for (batch.items) |*event| event.deinit();
@@ -111,7 +122,15 @@ pub const Handoff = struct {
         const event = parsed.value;
         if (!std.mem.eql(u8, event.handle, self.handle)) return error.ExtensionEventCorrelationInvalid;
         const payload_bytes = try validate(event);
-        if (self.pending.items.len >= max_pending_events or payload_bytes > max_pending_payload_bytes - self.pending_bytes) return error.ExtensionEventOverflow;
+        if (payload_bytes > max_pending_payload_bytes) return error.ExtensionEventOverflow;
+        // Pausing the reader propagates pressure to the pipe without discarding valid provider output.
+        while (!self.stopped and (self.pending.items.len >= max_pending_events or payload_bytes > max_pending_payload_bytes - self.pending_bytes)) {
+            self.capacity_changed.waitUncancelable(io_mod.getIo(), &self.mutex);
+        }
+        if (self.stopped) {
+            parsed.deinit();
+            return;
+        }
         try self.pending.append(self.alloc, parsed);
         self.pending_bytes += payload_bytes;
     }

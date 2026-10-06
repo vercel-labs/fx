@@ -1051,6 +1051,7 @@ pub fn Runtime(comptime App: type) type {
                     return error.ProviderFailed,
                 .tool_context = tool_context,
                 .provider_set = providers,
+                .root_permission_mode = if (comptime @hasField(App, "permission_engine")) .{ .context = app, .snapshot_fn = subagentRootPermissionMode } else null,
                 .system_prompt = prompt_policy.system_prompt,
                 .model_prompt_overlay = prompt_policy.modelPromptOverlay(admission.model),
                 .skills_prompt_section = bounded_skills.text,
@@ -1063,6 +1064,12 @@ pub fn Runtime(comptime App: type) type {
                 .project_context = modelVisibleProjectContext(app),
                 .lifecycle_view = app.lifecycle_view,
             }, turn, message, admission, cancel);
+        }
+
+        /// Provider activation samples the controlling conversation rather than queued child settings.
+        fn subagentRootPermissionMode(raw: *anyopaque) types.PermissionMode {
+            const app: *App = @ptrCast(@alignCast(raw));
+            return app.permission_engine.mode;
         }
 
         fn appendClaimedContextNotice(app: *App, writer: *std.Io.Writer, notice: []const u8) !void {

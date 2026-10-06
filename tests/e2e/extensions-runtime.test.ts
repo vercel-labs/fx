@@ -41,6 +41,7 @@ const RPC_LOG_FILENAME = "rpc-log.jsonl";
 const MISSING_FINISH_FILENAME = "missing-finish";
 const DROP_STREAM_FILENAME = "drop-stream";
 const STREAM_MODE_FILENAME = "stream-events";
+const STREAM_BACKPRESSURE_MODE = "backpressure";
 const STREAM_FINISHED_FILENAME = "stream-finished";
 const STREAM_PREFIX = "extension-first-chunk";
 const STREAM_RESULT = `${STREAM_PREFIX}-completed`;
@@ -54,6 +55,9 @@ const TOOL_MODE_FILENAME = "tool-roundtrip";
 const TOOL_FILENAME = "fixture-tool-data.txt";
 const TOOL_CONTENT = "fixture-tool-read-marker";
 const TOOL_RESULT_TEXT = "extension-tool-loop-ok";
+const TOOL_BURST_COUNTS = [1, 40, 128];
+const TOOL_NAME = "read_file";
+const TOOL_SUCCESS_STATUS = "success";
 const MANIFEST_FILENAME = "extension.json";
 const SESSION_HEADERS = { "x-opencode-session": { source: "session_id" } };
 const UNRESTRICTED_PERMISSION_MODE = "yolo";
@@ -101,16 +105,19 @@ describe("local extension RPC runtime", () => {
     expect(result.stdout + result.stderr).not.toContain(EXTENSION_FIXTURE_KEY);
   });
 
-  test("native file tool results and empty reasoning state replay to the next request", () => {
+  test.each(TOOL_BURST_COUNTS)("%i native file calls retain results and empty reasoning state through a burst", count => {
     const { home, extension } = fixture();
-    writeFileSync(join(extension, TOOL_MODE_FILENAME), "");
+    writeFileSync(join(extension, TOOL_MODE_FILENAME), String(count));
     writeFileSync(join(extension, MANIFEST_FILENAME), JSON.stringify({ ...VALID_MANIFEST, providers: [{
       ...VALID_MANIFEST.providers[0], headers: SESSION_HEADERS,
     }] }));
     writeFileSync(join(home, TOOL_FILENAME), TOOL_CONTENT);
     const result = askFixture(home);
-    expect(result.status, result.stderr || result.stdout).toBe(0);
-    expect(JSON.parse(result.stdout).output).toBe(TOOL_RESULT_TEXT);
+    expect(result.status, result.stderr + result.stdout).toBe(0);
+    const output = JSON.parse(result.stdout);
+    expect(output.output).toBe(TOOL_RESULT_TEXT);
+    expect(output.tool_calls).toHaveLength(count);
+    expect(output.tool_calls.every((call: { name: string; status: string }) => call.name === TOOL_NAME && call.status === TOOL_SUCCESS_STATUS)).toBe(true);
     expect(result.stderr).toContain(YOLO_WARNING_TEXT);
     expect(result.stderr).toContain(TOOL_FILENAME);
     expect(result.stderr).not.toContain(EXTENSION_FIXTURE_KEY);
@@ -369,9 +376,9 @@ describe("local extension RPC runtime", () => {
   }, TIMEOUT_MS);
 
 
-  tuiTest("cancellation retires the child and a fresh user request starts cleanly", async () => {
+  tuiTest("cancellation releases provider backpressure and a fresh user request starts cleanly", async () => {
     const { home, extension } = fixture();
-    writeFileSync(join(extension, STREAM_MODE_FILENAME), "");
+    writeFileSync(join(extension, STREAM_MODE_FILENAME), STREAM_BACKPRESSURE_MODE);
     const stderrPath = join(home, TUI_STDERR_FILENAME);
     let session: TmuxSession | undefined;
     try {
