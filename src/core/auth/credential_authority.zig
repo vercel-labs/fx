@@ -28,6 +28,7 @@ pub fn derive(
         => hash.update("\x00slot\x00"),
         .chatgpt_subscription,
         .grok_subscription,
+        .extension_api_key,
         => {
             const account = account_id orelse return null;
             if (account.len == 0) return null;

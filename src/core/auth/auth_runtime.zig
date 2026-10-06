@@ -1479,7 +1479,7 @@ pub const Runtime = struct {
         provider: model_provider.ProviderId,
     ) !?bool {
         return switch (provider) {
-            .extension => null,
+            .extension => if (self.credentialSource() == .extension_api_key) false else null,
             .codex => if (self.credentialSource() == .chatgpt_subscription)
                 false
             else
@@ -1498,7 +1498,7 @@ pub const Runtime = struct {
                     self,
                     loadRuntimeCredentialSource,
                 ),
-            .gateway => if (self.credentialSource() != .chatgpt_subscription and self.credentialSource() != .grok_subscription)
+            .gateway => if (model_provider.authorizesCredential(.gateway, self.credentialSource()))
                 false
             else
                 @as(?bool, try self.reselectByPrecedenceWithDeps(

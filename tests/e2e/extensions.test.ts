@@ -8,6 +8,8 @@ const PROVIDER = "fixture-provider";
 const MODEL = `${PROVIDER}/fixture-model`;
 const TIMEOUT_MS = 15_000;
 const UNREACHABLE_GATEWAY = "http://127.0.0.1:1";
+const GATEWAY_FIXTURE_KEY = "wrong-gateway-fixture-key";
+const INVALID_EXTENSION_KEY = "invalid-extension-fixture\r\nkey";
 const homes: string[] = [];
 
 // A private profile prevents discovery coverage from reading developer credentials.
@@ -78,6 +80,33 @@ describe("local extension discovery", () => {
     });
     expect(result.status).not.toBe(0);
     expect(result.stderr + result.stdout).toContain("needs access to Vercel AI Gateway");
+  });
+
+  test("missing extension keys never fall back to Gateway credentials", () => {
+    const home = fixture(VALID_REGISTRY, VALID_MANIFEST);
+    const result = spawnSync(FX_BIN, ["ask", "--json", "--no-save", "hello"], {
+      cwd: home, timeout: TIMEOUT_MS, encoding: "utf8",
+      env: { ...process.env, HOME: home, AI_GATEWAY_API_KEY: GATEWAY_FIXTURE_KEY,
+        VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined, FX_EXTENSION_TEST_KEY: undefined,
+        FX_SKIP_ONBOARDING: "1", FX_DISABLE_KEYCHAIN: "1", FX_GATEWAY_BASE_URL: UNREACHABLE_GATEWAY },
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr + result.stdout).toContain("selected extension provider");
+    expect(result.stderr + result.stdout).not.toContain("Vercel AI Gateway");
+    expect(result.stderr + result.stdout).not.toContain(GATEWAY_FIXTURE_KEY);
+  });
+
+  test("selected extension keys reject control bytes without exposing their value", () => {
+    const home = fixture(VALID_REGISTRY, VALID_MANIFEST);
+    const result = spawnSync(FX_BIN, ["ask", "--json", "--no-save", "hello"], {
+      cwd: home, timeout: TIMEOUT_MS, encoding: "utf8",
+      env: { ...process.env, HOME: home, AI_GATEWAY_API_KEY: GATEWAY_FIXTURE_KEY,
+        VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined, FX_EXTENSION_TEST_KEY: INVALID_EXTENSION_KEY,
+        FX_SKIP_ONBOARDING: "1", FX_DISABLE_KEYCHAIN: "1", FX_GATEWAY_BASE_URL: UNREACHABLE_GATEWAY },
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr + result.stdout).toContain("ExtensionCredentialInvalid");
+    expect(result.stderr + result.stdout).not.toContain(INVALID_EXTENSION_KEY);
   });
 
   test("rejects reserved built-in provider identities", () => {

@@ -25,10 +25,13 @@ pub fn parse(value: []const u8) ?ProviderId {
 pub fn authorizesCredential(provider: ProviderId, source: ?types.CredentialSource) bool {
     const selected = source orelse return false;
     return switch (provider) {
-        .gateway => selected != .chatgpt_subscription and selected != .grok_subscription,
+        .gateway => switch (selected) {
+            .vercel_oidc_token, .ai_gateway_api_key, .fx_login, .stored_key => true,
+            else => false,
+        },
         .codex => selected == .chatgpt_subscription,
         .grok => selected == .grok_subscription,
-        .extension => false,
+        .extension => selected == .extension_api_key,
     };
 }
 

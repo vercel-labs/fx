@@ -1380,6 +1380,8 @@ fn missingCredentialResult(
         credentials.missing_chatgpt_credential_message
     else if (provider == .grok)
         credentials.missing_grok_credential_message
+    else if (provider == .extension)
+        credentials.missing_extension_credential_message
     else
         credentials.missing_credential_message;
     try options.deps.write_stderr(options.deps.stderr_ctx, "fx ask: ");
@@ -1443,7 +1445,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
 
     var owned_resumed_model: ?[]u8 = null;
     defer if (owned_resumed_model) |model| alloc.free(model);
-    var ctx = AskContext.init(alloc, cfg, options.deps, startup.workspace_root);
+    var active_cfg = cfg;
+    if (startup.extensions) |registry| active_cfg.provider_set = registry.attach(cfg.provider_set);
+    var ctx = AskContext.init(alloc, active_cfg, options.deps, startup.workspace_root);
     defer ctx.deinit();
     if (options.save_session) {
         _ = try ctx.session.initializeProfileUsage(alloc, io_mod.getenv("HOME"));

@@ -8,9 +8,16 @@ const types = @import("../shared/types.zig");
 const provider_set = @import("../gateway/provider_set.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
+const credentials = @import("../auth/credentials.zig");
+const secret = @import("../auth/secret.zig");
 
 const Allocator = std.mem.Allocator;
 const public_model_id_format = "{s}/{s}";
+const credential_scope_separator = "\x00";
+const credential_scope_domain = "fx-extension-credential-v1";
+const blank_key_bytes = " \t\r\n";
+const first_printable_byte = ' ';
+const terminal_delete_byte = 0x7f;
 
 /// Borrowed descriptors remain valid until their owning registry is destroyed.
 pub const ModelBinding = struct {
@@ -29,7 +36,7 @@ pub const ModelBinding = struct {
         }
         return .{
             .supports_reasoning = self.model.reasoning,
-            .reasoning_efforts = .fromSlice(efforts[0..count]),
+            .reasoning_efforts = model_capabilities.ReasoningEffortOptions.fromSlice(efforts[0..count]),
             .supports_tool_use = self.model.tool_call,
             .supports_vision = self.model.supports_vision,
             .context_window = self.model.context_window,
@@ -55,6 +62,26 @@ pub const Registry = struct {
     alloc: Allocator,
     entries: std.ArrayList(Loaded) = .empty,
     bindings: std.ArrayList(ModelBinding) = .empty,
+
+    /// Scoped leases prevent a shared extension route from mixing independent keys.
+    pub fn resolve_credential(self: *const Registry, alloc: Allocator, public_id: []const u8) !?credentials.Credential {
+        const binding = self.resolve_model(public_id) orelse return error.ExtensionModelNotRegistered;
+        const key = io_mod.getenv(binding.provider.api_key_env) orelse return null;
+        if (std.mem.trim(u8, key, blank_key_bytes).len == 0) return null;
+        for (key) |byte| if (byte < first_printable_byte or byte == terminal_delete_byte) return error.ExtensionCredentialInvalid;
+        const owned_key = try alloc.dupe(u8, key);
+        errdefer secret.zeroAndFree(alloc, owned_key);
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update(credential_scope_domain);
+        for ([_][]const u8{ binding.provider.id, binding.provider.base_url, binding.provider.api_key_env }) |part| {
+            hash.update(credential_scope_separator);
+            hash.update(part);
+        }
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        hash.final(&digest);
+        const scope = std.fmt.bytesToHex(digest, .lower);
+        return .{ .token = owned_key, .source = .extension_api_key, .account_id = try alloc.dupe(u8, &scope) };
+    }
 
     /// Session-owned adapter contexts cannot replace the immutable built-in routes.
     pub fn attach(self: *Registry, builtins: provider_set.Set) provider_set.Set {

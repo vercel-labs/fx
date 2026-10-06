@@ -1,4 +1,5 @@
 const std = @import("std");
+const extension_catalog_access_message = "Extension catalog: authenticated with its configured API key.";
 const display_width = @import("../../core/shared/display_width.zig");
 const list_window = @import("../../core/shared/list_window.zig");
 const model_cache_runtime = @import("../../core/app/model_cache_runtime.zig");
@@ -357,6 +358,7 @@ fn loadedCatalogStatusText(state: model_cache_runtime.ModelMenuCatalogState) ?[]
             .stored_key => "Gateway catalog: authenticated with the stored API key.",
             .chatgpt_subscription => "Codex catalog: authenticated with a subscription.",
             .grok_subscription => "Grok catalog: authenticated with a subscription.",
+            .extension_api_key => extension_catalog_access_message,
         };
     }
     return null;
