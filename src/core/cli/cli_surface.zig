@@ -3,6 +3,11 @@ const extension_already_selected_message = "Extension provider is already select
 const extension_credential_unavailable_message = "configure an extension credential first";
 const extension_catalog_unavailable_message = "Extension model catalog is unavailable";
 const extension_selected_message = "Provider set to extension.\n";
+const named_provider_selected_format = "Provider set to {s}.\n";
+const extension_registry_unavailable_message = "selected provider is not registered in extension.json";
+const extension_settings_unavailable_message = "could not load extension provider settings";
+const extension_catalog_empty_message = "selected extension provider has no registered models";
+const extension_selection_save_failed_format = "failed to save extension provider selection ({s})";
 const extension_models_unavailable_message = "fx models: Extension model catalog is unavailable\n";
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
@@ -658,6 +663,69 @@ fn writeProviderActivationError(
     try writeStderr(deps, message);
 }
 
+/// Scope credentials to the requested namespace before persisted selection changes.
+fn activate_named_provider(alloc: Allocator, cfg: Config, deps: RunDeps, provider_name: []const u8) !bool {
+    var startup = deps.load_startup_state_without_credentials(alloc, cfg.default_model, cfg.default_agent_step_limit) catch {
+        try writeProviderActivationError(alloc, deps, .provider_command, extension_registry_unavailable_message);
+        return false;
+    };
+    defer startup.deinit(alloc);
+    const registry = startup.extensions orelse {
+        try writeProviderActivationError(alloc, deps, .provider_command, extension_registry_unavailable_message);
+        return false;
+    };
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    defer alloc.free(workspace_root);
+    var settings = config_runtime.loadMergedSettings(alloc, workspace_root) catch {
+        try writeProviderActivationError(alloc, deps, .provider_command, extension_settings_unavailable_message);
+        return false;
+    };
+    defer settings.deinit(alloc);
+    const saved = settings.models.get_named(provider_name);
+    var selected: ?[]const u8 = null;
+    for (registry.bindings.items) |binding| {
+        if (!std.mem.eql(u8, binding.provider.id, provider_name)) continue;
+        if (selected == null) selected = binding.public_id;
+        if (saved) |model| {
+            if (std.mem.eql(u8, binding.public_id, model)) {
+                selected = binding.public_id;
+                break;
+            }
+        }
+    }
+    const model = selected orelse {
+        try writeProviderActivationError(alloc, deps, .provider_command, extension_catalog_empty_message);
+        return false;
+    };
+    var credential = registry.resolve_credential(alloc, model) catch {
+        try writeProviderActivationError(alloc, deps, .provider_command, extension_credential_unavailable_message);
+        return false;
+    };
+    defer if (credential) |*value| value.deinit(alloc);
+    if (credential == null) {
+        try writeProviderActivationError(alloc, deps, .provider_command, extension_credential_unavailable_message);
+        return false;
+    }
+    var attempt = config_runtime.attemptUserPreferences(alloc, .{
+        .provider = .extension,
+        .model_preference = .{ .provider = .extension, .model = model },
+    });
+    defer attempt.deinit(alloc);
+    switch (attempt) {
+        .failure => |failure| {
+            const detail = try std.fmt.allocPrint(alloc, extension_selection_save_failed_format, .{@errorName(failure.err)});
+            defer alloc.free(detail);
+            try writeProviderActivationError(alloc, deps, .provider_command, detail);
+            return false;
+        },
+        .outcome => {},
+    }
+    const message = try std.fmt.allocPrint(alloc, named_provider_selected_format, .{provider_name});
+    defer alloc.free(message);
+    try writeStdout(deps, message);
+    return true;
+}
+
 fn activateProviderSelection(
     alloc: Allocator,
     cfg: Config,
@@ -1069,12 +1137,11 @@ fn runNonInteractiveWithDeps(
         },
         .provider => |rest| {
             if (rest.len != 1) {
-                try writeStderr(deps, "usage: fx provider <gateway|codex|grok>\n");
+                try writeTopLevelUsage(cfg.command_catalog, deps, .provider);
                 return .handled_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {
-                try writeStderr(deps, "fx provider: expected gateway, codex, or grok\n");
-                return .handled_failure;
+                return if (try activate_named_provider(alloc, cfg, deps, rest[0])) .handled_success else .handled_failure;
             };
             return if (try activateProviderSelection(alloc, cfg, deps, target, .provider_command))
                 .handled_success

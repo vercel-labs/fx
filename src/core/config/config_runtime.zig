@@ -659,7 +659,7 @@ fn mergeDetailedSettingsLayer(
                 },
             }
         }
-        mergeSettings(state.settings, &incoming, alloc);
+        try mergeSettings(state.settings, &incoming, alloc);
     } else |err| {
         if (err == error.OutOfMemory) return err;
         if (diagnostic_layer == .user and err == error.InvalidModelValue) state.prompt_history_store_allowed.* = false;
@@ -924,7 +924,7 @@ pub fn loadMergedSettingsFromPaths(alloc: Allocator, paths: Paths) !Settings {
         var user_settings = try parseSettingsValueForLayer(alloc, parsed.value, .profile, false, true);
         defer user_settings.deinit(alloc);
         user_settings.context_limits.retag(.user_global);
-        mergeSettings(&settings, &user_settings, alloc);
+        try mergeSettings(&settings, &user_settings, alloc);
 
         try mergeWorkspaceOverridesFromValue(&settings, alloc, parsed.value, paths.workspace_root);
         return settings;
@@ -1026,7 +1026,7 @@ fn mergeWorkspaceOverridesFromValue(target: *Settings, alloc: Allocator, root_va
     defer override_settings.deinit(alloc);
     override_settings.update_channel = null;
     override_settings.context_limits.retag(.user_workspace);
-    mergeSettings(target, &override_settings, alloc);
+    try mergeSettings(target, &override_settings, alloc);
 }
 
 fn mergeSettingsFile(target: *Settings, alloc: Allocator, path: []const u8) !void {
@@ -1035,7 +1035,7 @@ fn mergeSettingsFile(target: *Settings, alloc: Allocator, path: []const u8) !voi
 
     var parsed = try parseSettingsJsonForLayer(alloc, bytes, .project);
     defer parsed.deinit(alloc);
-    mergeSettings(target, &parsed, alloc);
+    try mergeSettings(target, &parsed, alloc);
 }
 
 fn readOptionalFile(alloc: Allocator, path: []const u8) !?[]u8 {
@@ -1299,6 +1299,13 @@ fn parseProfileOnlyFields(
                 try settings.models.putCopy(alloc, provider, model_value.string);
             }
         }
+        // Unknown structured fields stay opaque for compatibility with future profiles.
+        var named_models = models_value.object.iterator();
+        while (named_models.next()) |entry| {
+            if (model_provider.parse(entry.key_ptr.*) != null or entry.value_ptr.* != .string) continue;
+            settings_store.validateModel(entry.value_ptr.string) catch return error.InvalidModelValue;
+            try settings.models.put_named_copy(alloc, entry.key_ptr.*, entry.value_ptr.string);
+        }
     }
 
     if (root.object.get("permission_mode")) |permission_mode_value| {
@@ -1449,8 +1456,8 @@ fn parseProjectSafeFields(settings: *Settings, root: std.json.Value) !void {
     }
 }
 
-fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void {
-    target.models.mergeOwnedFrom(alloc, &incoming.models);
+fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) Allocator.Error!void {
+    try target.models.mergeOwnedFrom(alloc, &incoming.models);
     if (incoming.provider) |value| target.provider = value;
     if (incoming.permission_mode) |value| target.permission_mode = value;
     if (incoming.credential_source) |value| target.credential_source = value;
@@ -2025,7 +2032,7 @@ test "max_tool_result_bytes parses resolves merges and serializes" {
 
     var second = try parseSettingsJson(std.testing.allocator, "{\"max_tool_result_bytes\":131072}");
     defer second.deinit(std.testing.allocator);
-    mergeSettings(&first, &second, std.testing.allocator);
+    try mergeSettings(&first, &second, std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 131072), first.max_tool_result_bytes.?);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"max_tool_result_bytes\":131072}", .{});
@@ -2066,7 +2073,7 @@ test "startup_scrollback parses merges rejects invalid type and round trips" {
 
     var second = try parseSettingsJson(std.testing.allocator, "{\"startup_scrollback\":false}");
     defer second.deinit(std.testing.allocator);
-    mergeSettings(&first, &second, std.testing.allocator);
+    try mergeSettings(&first, &second, std.testing.allocator);
     try std.testing.expectEqual(false, first.startup_scrollback.?);
 
     try std.testing.expectError(error.InvalidStartupScrollbackType, parseSettingsJson(std.testing.allocator, "{\"startup_scrollback\":\"off\"}"));
@@ -2089,7 +2096,7 @@ test "slash menu categories parses merges and rejects invalid types" {
 
     var second = try parseSettingsJson(std.testing.allocator, "{\"slash_menu_categories\":false}");
     defer second.deinit(std.testing.allocator);
-    mergeSettings(&first, &second, std.testing.allocator);
+    try mergeSettings(&first, &second, std.testing.allocator);
     try std.testing.expectEqual(false, first.slash_menu_categories.?);
 
     try std.testing.expectError(
@@ -2109,7 +2116,7 @@ test "first_call_tool_choice parses merges and round trips" {
 
     var second = try parseSettingsJson(std.testing.allocator, "{\"first_call_tool_choice\":\"auto\"}");
     defer second.deinit(std.testing.allocator);
-    mergeSettings(&first, &second, std.testing.allocator);
+    try mergeSettings(&first, &second, std.testing.allocator);
     try std.testing.expectEqual(types.ToolChoice.auto, first.first_call_tool_choice.?);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"first_call_tool_choice\":\"none\"}", .{});
@@ -2968,7 +2975,7 @@ test "global statusline fields parse and merge independently" {
     );
     defer incoming.deinit(std.testing.allocator);
 
-    mergeSettings(&target, &incoming, std.testing.allocator);
+    try mergeSettings(&target, &incoming, std.testing.allocator);
 
     try std.testing.expectEqual(true, target.statusline_context.?);
     try std.testing.expectEqual(true, target.statusline_session.?);
@@ -3101,7 +3108,7 @@ test "notification settings default off parse and merge by field" {
         "{\"notifications\":{\"attention_required\":true,\"max\":true}}",
     );
     defer workspace.deinit(std.testing.allocator);
-    mergeSettings(&global, &workspace, std.testing.allocator);
+    try mergeSettings(&global, &workspace, std.testing.allocator);
 
     try std.testing.expectEqual(true, global.notification_turn_end.?);
     try std.testing.expectEqual(true, global.notification_attention_required.?);

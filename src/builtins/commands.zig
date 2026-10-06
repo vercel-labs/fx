@@ -2,6 +2,7 @@ const std = @import("std");
 const command_specs = @import("../core/slash_commands/command_specs.zig");
 
 const Allocator = std.mem.Allocator;
+const provider_usage = "provider <gateway|codex|grok|registered-provider>";
 
 pub const TopLevelKind = command_specs.TopLevelKind;
 pub const TopLevelSpec = command_specs.TopLevelSpec;
@@ -137,7 +138,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .provider,
         .token = "provider",
-        .usage = "provider <gateway|codex|grok>",
+        .usage = provider_usage,
         .summary = "Choose the model provider used by fx",
     },
     .{
@@ -294,7 +295,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
     .{ .entries = &.{
         .{ .kind = .login, .usage = "login [vercel|codex|grok]" },
         .{ .kind = .logout, .usage = "logout [vercel|codex|grok]" },
-        .{ .kind = .provider, .usage = "provider <gateway|codex|grok>" },
+        .{ .kind = .provider, .usage = provider_usage },
         .{ .kind = .setup, .usage = "setup" },
         .{ .kind = .teams, .usage = "teams" },
         .{ .kind = .credits, .usage = "credits|balance" },

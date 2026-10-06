@@ -1,4 +1,5 @@
 const std = @import("std");
+const provider_namespace_separator = '/';
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
@@ -1407,6 +1408,12 @@ fn putModelPreference(
         break :blk &root.getPtr("models").?.object;
     };
     changed = try putString(arena, models, @tagName(preference.provider), preference.model) or changed;
+    if (preference.provider == .extension) {
+        // Keep the active generic slot compatible while isolating each installed namespace.
+        const separator = std.mem.findScalar(u8, preference.model, provider_namespace_separator) orelse return error.InvalidModel;
+        if (separator == 0) return error.InvalidModel;
+        changed = try putString(arena, models, preference.model[0..separator], preference.model) or changed;
+    }
     const legacy_key = switch (preference.provider) {
         .gateway => "model",
         .codex => "codex_model",
@@ -1652,13 +1659,13 @@ fn validateKnownSettingsObject(
         if (value != .object) return error.InvalidSettingsFormat;
         var iterator = value.object.iterator();
         while (iterator.next()) |entry| {
-            const provider = model_provider.parse(entry.key_ptr.*) orelse
-                return error.InvalidSettingsFormat;
-            if (!std.mem.eql(u8, entry.key_ptr.*, @tagName(provider)) or
-                entry.value_ptr.* != .string)
-            {
-                return error.InvalidSettingsFormat;
+            if (model_provider.parse(entry.key_ptr.*)) |provider| {
+                if (!std.mem.eql(u8, entry.key_ptr.*, @tagName(provider))) return error.InvalidSettingsFormat;
+            } else {
+                // Opaque namespaces let older native slots coexist with installed providers.
+                try validateModel(entry.key_ptr.*);
             }
+            if (entry.value_ptr.* != .string) return error.InvalidSettingsFormat;
             try validateModel(entry.value_ptr.string);
         }
     }

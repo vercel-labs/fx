@@ -5,6 +5,27 @@ const provider_count = std.meta.fields(model_provider.ProviderId).len;
 
 pub const Preferences = struct {
     values: [provider_count]?[]u8 = [_]?[]u8{null} ** provider_count,
+    /// Installed namespaces must not share one preferred-model slot.
+    named: std.StringHashMapUnmanaged([]u8) = .{},
+
+    /// Borrowed identifiers keep configuration lookup allocation-free.
+    pub fn get_named(self: *const Preferences, provider: []const u8) ?[]const u8 {
+        return self.named.get(provider);
+    }
+
+    /// Copies isolate preferences from parsed configuration and registry buffers.
+    pub fn put_named_copy(self: *Preferences, alloc: std.mem.Allocator, provider: []const u8, model: []const u8) std.mem.Allocator.Error!void {
+        const owned_model = try alloc.dupe(u8, model);
+        errdefer alloc.free(owned_model);
+        if (self.named.getPtr(provider)) |current| {
+            alloc.free(current.*);
+            current.* = owned_model;
+            return;
+        }
+        const owned_provider = try alloc.dupe(u8, provider);
+        errdefer alloc.free(owned_provider);
+        try self.named.put(alloc, owned_provider, owned_model);
+    }
 
     pub fn get(self: *const Preferences, provider: model_provider.ProviderId) ?[]const u8 {
         return self.values[@intFromEnum(provider)];
@@ -45,16 +66,29 @@ pub const Preferences = struct {
         self: *Preferences,
         alloc: std.mem.Allocator,
         incoming: *Preferences,
-    ) void {
+    ) std.mem.Allocator.Error!void {
+        if (self == incoming) return;
+        // Reserve before ownership moves so allocation failure preserves both selections.
+        try self.named.ensureUnusedCapacity(alloc, incoming.named.count());
         inline for (std.meta.tags(model_provider.ProviderId)) |provider| {
             if (incoming.take(provider)) |model| self.putOwned(alloc, provider, model);
         }
+        var names = incoming.named.iterator();
+        while (names.next()) |entry| {
+            const target = self.named.getOrPutAssumeCapacity(entry.key_ptr.*);
+            if (target.found_existing) {
+                alloc.free(entry.key_ptr.*);
+                alloc.free(target.value_ptr.*);
+            }
+            target.value_ptr.* = entry.value_ptr.*;
+        }
+        incoming.named.clearRetainingCapacity();
     }
 
     pub fn count(self: *const Preferences) usize {
         var result: usize = 0;
         for (self.values) |value| result += @intFromBool(value != null);
-        return result;
+        return result + self.named.count();
     }
 
     pub fn isEmpty(self: *const Preferences) bool {
@@ -62,6 +96,13 @@ pub const Preferences = struct {
     }
 
     pub fn deinit(self: *Preferences, alloc: std.mem.Allocator) void {
+        var names = self.named.iterator();
+        while (names.next()) |entry| {
+            alloc.free(entry.key_ptr.*);
+            alloc.free(entry.value_ptr.*);
+        }
+        self.named.deinit(alloc);
+        self.named = .{};
         for (&self.values) |*value| {
             if (value.*) |model| alloc.free(model);
             value.* = null;
