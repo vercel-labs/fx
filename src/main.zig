@@ -824,11 +824,6 @@ const App = struct {
         };
         self.terminal_client.deinit();
         self.model_cache.deinit();
-        if (self.extensions) |registry| {
-            registry.deinit();
-            self.alloc.destroy(registry);
-            self.extensions = null;
-        }
         const resume_handoff = if (capture_resume_handoff and
             direct_deinit_disposition == .settled)
             SessionAppRuntime.finalizePersistenceWithResumeHandoff(self)
@@ -836,6 +831,12 @@ const App = struct {
             SessionAppRuntime.finalizePersistence(self);
             break :blk null;
         };
+        // Persistence closes and joins child agents before their borrowed adapters retire.
+        if (self.extensions) |registry| {
+            registry.deinit();
+            self.alloc.destroy(registry);
+            self.extensions = null;
+        }
         self.background.deinit(std.heap.c_allocator);
         self.worker.deinit(std.heap.c_allocator);
         self.web_fetch_runtime.deinit(self.alloc);
