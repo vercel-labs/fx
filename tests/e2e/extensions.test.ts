@@ -121,6 +121,85 @@ describe("local extension discovery", () => {
     expect(readFileSync(settingsPath, "utf8")).not.toContain(EXTENSION_FIXTURE_KEY);
     expect(readFileSync(settingsPath, "utf8")).not.toContain(SECOND_EXTENSION_FIXTURE_KEY);
   });
+  test("valid typed headers remain offline and never read an environment-backed value", () => {
+    const result = models(fixture(VALID_REGISTRY, { ...VALID_MANIFEST,
+      providers: [{ ...VALID_MANIFEST.providers[0], headers: {
+        "x-fixture-static": "fixture", "x-fixture-session": { source: "session_id" },
+        "x-fixture-env": { source: "env", name: "FX_UNSET_HEADER_FIXTURE" },
+      } }],
+    }));
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.stdout).ids).toContain(MODEL);
+  });
+
+  test("rejects unsafe header bindings before credential or executable access", () => {
+    const unsafe = [
+      { "x-fixture": "unsafe-header-fixture\r\ninjected: true" },
+      { Authorization: "unsafe-header-fixture" },
+      { "x fixture": "unsafe-header-fixture" },
+      { "x-fixture": { source: "env", name: "INVALID-ENV" } },
+      { "x-fixture": { source: "session_id", extra: "unsafe-header-fixture" } },
+    ];
+    for (const headers of unsafe) {
+      const result = models(fixture(VALID_REGISTRY, { ...VALID_MANIFEST,
+        providers: [{ ...VALID_MANIFEST.providers[0], headers }],
+      }));
+      expect(result.status).not.toBe(0);
+      expect(result.stderr + result.stdout).toContain("ExtensionHeaderInvalid");
+      expect(result.stderr + result.stdout).not.toContain("unsafe-header-fixture");
+    }
+  });
+
+  test("rejects unsafe endpoint and credential references during offline discovery", () => {
+    const unsafe = [
+      { base_url: "https://example.invalid/unsafe-endpoint-fixture\r\n" },
+      { base_url: "https://user:unsafe-endpoint-fixture@example.invalid/v1" },
+      { base_url: "http://example.invalid/v1" },
+      { api_key_env: "INVALID-ENV" },
+    ];
+    for (const change of unsafe) {
+      const result = models(fixture(VALID_REGISTRY, { ...VALID_MANIFEST,
+        providers: [{ ...VALID_MANIFEST.providers[0], ...change }],
+      }));
+      expect(result.status).not.toBe(0);
+      expect(result.stderr + result.stdout).toMatch(/ExtensionEndpointInvalid|ExtensionCredentialReferenceInvalid/);
+      expect(result.stderr + result.stdout).not.toContain("unsafe-endpoint-fixture");
+    }
+  });
+
+  test("rejects malformed reasoning and token limits before constructing menus", () => {
+    const unsafe = [
+      { reasoning_efforts: ["high\r\nunsafe-model-fixture"] },
+      { reasoning_efforts: ["low", "low"] },
+      { reasoning: false, reasoning_efforts: ["low"] },
+      { context_window: 0 },
+      { max_output_tokens: 0 },
+      { context_window: 1024, max_output_tokens: 2048 },
+    ];
+    for (const change of unsafe) {
+      const home = fixture(VALID_REGISTRY, VALID_MANIFEST);
+      const path = join(home, PROFILE_DIRECTORY, FIXTURE_EXTENSION_DIRECTORY, MODELS_FILENAME);
+      const catalog = JSON.parse(readFileSync(path, "utf8"));
+      Object.assign(catalog.models[0], change);
+      writeFileSync(path, JSON.stringify(catalog));
+      const result = models(home);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr + result.stdout).toContain("ExtensionModelInvalid");
+      expect(result.stderr + result.stdout).not.toContain("unsafe-model-fixture");
+    }
+  });
+
+  test("rejects duplicate provider declarations even when the first catalog is empty", () => {
+    const home = fixture(VALID_REGISTRY, { ...VALID_MANIFEST,
+      providers: [VALID_MANIFEST.providers[0], VALID_MANIFEST.providers[0]],
+    });
+    writeFileSync(join(home, PROFILE_DIRECTORY, FIXTURE_EXTENSION_DIRECTORY, MODELS_FILENAME), JSON.stringify({ models: [] }));
+    const result = models(home);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr + result.stdout).toContain("ExtensionProviderDuplicate");
+  });
+
   test("lists registered model metadata without launching the missing executable", () => {
     const result = models(fixture(VALID_REGISTRY, VALID_MANIFEST));
     expect(result.status).toBe(0);

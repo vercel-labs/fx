@@ -209,16 +209,23 @@ pub fn load(alloc: Allocator, registry_path: []const u8) !Registry {
         for (extension.value.capabilities) |capability| {
             if (!std.mem.eql(u8, capability, protocol.provider_capability)) return error.ExtensionCapabilityUnsupported;
         }
-        for (extension.value.providers) |provider| {
+        for (extension.value.providers, 0..) |provider, provider_index| {
             try manifest_mod.validate_id(provider.id);
             for (protocol.reserved_provider_ids) |reserved| {
                 if (std.ascii.eqlIgnoreCase(reserved, provider.id)) return error.ExtensionProviderReserved;
             }
-            for (registry.bindings.items) |binding| {
-                if (std.mem.eql(u8, binding.provider.id, provider.id)) return error.ExtensionProviderDuplicate;
+            // Declarations, not model bindings, own namespaces even when catalogs are empty.
+            for (extension.value.providers[0..provider_index]) |previous| {
+                if (std.mem.eql(u8, previous.id, provider.id)) return error.ExtensionProviderDuplicate;
+            }
+            for (registry.entries.items) |previous| {
+                for (previous.manifest.value.providers) |declared| {
+                    if (std.mem.eql(u8, declared.id, provider.id)) return error.ExtensionProviderDuplicate;
+                }
             }
             try manifest_mod.validate_endpoint(provider.base_url);
-            if (provider.api_key_env.len == 0) return error.ExtensionCredentialReferenceInvalid;
+            try manifest_mod.validate_environment_name(provider.api_key_env);
+            try manifest_mod.validate_headers(provider.headers);
             const models_path = try manifest_mod.canonical_child_path(alloc, root, provider.models_file);
             defer alloc.free(models_path);
             var catalog = try manifest_mod.read_json(protocol.ModelFile, alloc, models_path, protocol.max_models_bytes);
@@ -227,8 +234,7 @@ pub fn load(alloc: Allocator, registry_path: []const u8) !Registry {
                 return err;
             };
             for (catalog.value.models) |model| {
-                try manifest_mod.validate_model_id(model.id);
-                try manifest_mod.validate_model_id(model.wire_id);
+                try manifest_mod.validate_model(model);
                 const public_id = try std.fmt.allocPrint(alloc, public_model_id_format, .{ provider.id, model.id });
                 errdefer alloc.free(public_id);
                 if (registry.resolve_model(public_id) != null) return error.ExtensionModelDuplicate;
