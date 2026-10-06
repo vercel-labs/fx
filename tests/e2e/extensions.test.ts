@@ -1,15 +1,20 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { cleanupIsolatedTestHome, createIsolatedTestHome, FX_BIN } from "../evals/eval-helpers";
+import { TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
 const PROVIDER = "fixture-provider";
 const MODEL = `${PROVIDER}/fixture-model`;
 const TIMEOUT_MS = 15_000;
+const TUI_TIMEOUT_MS = 5_000;
+const TUI_STDERR_FILENAME = "fx-stderr.log";
+const tuiTest = tmuxAvailable() ? test.serial : test.skip;
 const UNREACHABLE_GATEWAY = "http://127.0.0.1:1";
 const GATEWAY_FIXTURE_KEY = "wrong-gateway-fixture-key";
-const INVALID_EXTENSION_KEY = "invalid-extension-fixture\r\nkey";
+const INVALID_EXTENSION_KEY_MARKER = "invalid-extension-fixture";
+const INVALID_EXTENSION_KEY = `${INVALID_EXTENSION_KEY_MARKER}\r\nkey`;
 const homes: string[] = [];
 
 // A private profile prevents discovery coverage from reading developer credentials.
@@ -106,8 +111,33 @@ describe("local extension discovery", () => {
     });
     expect(result.status).not.toBe(0);
     expect(result.stderr + result.stdout).toContain("ExtensionCredentialInvalid");
-    expect(result.stderr + result.stdout).not.toContain(INVALID_EXTENSION_KEY);
+    expect(result.stderr + result.stdout).not.toContain(INVALID_EXTENSION_KEY_MARKER);
   });
+
+  tuiTest("the model picker exposes cached extension reasoning without starting its executable", async () => {
+    const home = fixture(VALID_REGISTRY, VALID_MANIFEST);
+    const stderrPath = join(home, TUI_STDERR_FILENAME);
+    let session: TmuxSession | undefined;
+    try {
+      session = await TmuxSession.create({
+        cmd: FX_BIN, cwd: home, stderrPath, isolated: true,
+        env: { HOME: home, AI_GATEWAY_API_KEY: "", VERCEL_OIDC_TOKEN: "", FX_MODEL: undefined,
+          FX_EXTENSION_TEST_KEY: undefined, FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "0",
+          FX_GATEWAY_BASE_URL: UNREACHABLE_GATEWAY },
+      });
+      await session.waitForText("Run /help", TUI_TIMEOUT_MS);
+      await session.sendText("/model");
+      await session.waitForText(MODEL, TUI_TIMEOUT_MS);
+      await session.sendKeys("Enter");
+      const pane = await session.waitForText(/\blow\b/i, TUI_TIMEOUT_MS);
+      expect(pane).toMatch(/\bmax\b/i);
+      await session.sendKeys("Escape");
+      expect(session.isAlive()).toBe(true);
+    } finally {
+      await session?.kill();
+      if (session) expect(readFileSync(stderrPath, "utf8")).toBe("");
+    }
+  }, TIMEOUT_MS);
 
   test("rejects reserved built-in provider identities", () => {
     const manifest = { ...VALID_MANIFEST, providers: [{ ...VALID_MANIFEST.providers[0], id: "gateway" }] };

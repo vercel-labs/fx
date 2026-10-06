@@ -16,6 +16,8 @@ const public_model_id_format = "{s}/{s}";
 const credential_scope_separator = "\x00";
 const credential_scope_domain = "fx-extension-credential-v1";
 const blank_key_bytes = " \t\r\n";
+const chat_model_type = "language";
+const unknown_model_limit = 0;
 const first_printable_byte = ' ';
 const terminal_delete_byte = 0x7f;
 
@@ -88,6 +90,8 @@ pub const Registry = struct {
         var result = builtins;
         result.extension = .{
             .cli_model_catalog = .{ .context = self, .fetch_fn = catalog_ids },
+            .model_catalog = .{ .context = self, .fetch_fn = catalog_entries },
+            .model_capabilities = .{ .context = self, .resolve_fn = catalog_capabilities },
         };
         return result;
     }
@@ -106,6 +110,43 @@ pub const Registry = struct {
         self.entries.deinit(self.alloc);
     }
 };
+
+/// Local bindings prevent vendor-name heuristics from inventing extension capabilities.
+fn catalog_capabilities(raw: ?*anyopaque, model: []const u8) model_capabilities.Capabilities {
+    const registry: *const Registry = @ptrCast(@alignCast(raw.?));
+    const binding = registry.resolve_model(model) orelse return .{};
+    return binding.capabilities();
+}
+
+/// Caller-owned entries let model menus outlive their asynchronous catalog fetch.
+fn catalog_entries(raw: ?*anyopaque, alloc: Allocator, _: model_catalog.FetchInput) Allocator.Error!model_catalog.ProviderResult {
+    const registry: *const Registry = @ptrCast(@alignCast(raw.?));
+    var entries: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+    errdefer model_catalog.freeModelCatalog(alloc, &entries);
+    for (registry.bindings.items) |binding| {
+        const id = try alloc.dupe(u8, binding.public_id);
+        const model_type = alloc.dupe(u8, chat_model_type) catch |err| {
+            alloc.free(id);
+            return err;
+        };
+        var entry: model_catalog.ModelCatalogEntry = .{
+            .id = id,
+            .model_type = model_type,
+            .has_tool_use = binding.model.tool_call,
+            .has_reasoning = binding.model.reasoning,
+            .has_vision = binding.model.supports_vision,
+            .context_window = binding.model.context_window orelse unknown_model_limit,
+            .max_tokens = binding.model.max_output_tokens orelse unknown_model_limit,
+        };
+        errdefer model_catalog.freeModelCatalogEntry(alloc, entry);
+        for (binding.model.reasoning_efforts) |label| {
+            const effort = types.ReasoningEffort.parse(label) orelse continue;
+            try entry.reasoning_efforts.append(alloc, effort);
+        }
+        try entries.append(alloc, entry);
+    }
+    return .{ .catalog = entries };
+}
 
 /// Owned copies keep CLI rendering independent of registry teardown.
 fn catalog_ids(raw: ?*anyopaque, alloc: Allocator, input: gateway_provider.CliModelCatalogInput) gateway_provider.CliModelCatalogResult {

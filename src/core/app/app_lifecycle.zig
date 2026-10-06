@@ -199,6 +199,13 @@ pub const StartupState = struct {
         return credential.gatewayTeam();
     }
 
+    /// Adapter contexts must survive the temporary startup state.
+    pub fn take_extensions(self: *StartupState) ?*extension_registry.Registry {
+        const registry = self.extensions;
+        self.extensions = null;
+        return registry;
+    }
+
     pub fn takeCredential(self: *StartupState) ?credentials.Credential {
         const value = self.credential;
         self.credential = null;

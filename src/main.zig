@@ -1,4 +1,5 @@
 const std = @import("std");
+const extension_registry = @import("core/extensions/registry.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
@@ -495,6 +496,8 @@ const App = struct {
             oauth_transport.unavailable_provider,
         if (host_target.is_wasm) host.unavailable_secret_store else native_host.secret_store,
     ),
+    // Session adapters borrow registry metadata until all provider workers stop.
+    extensions: ?*extension_registry.Registry = null,
     provider_selection: provider_runtime.Runtime = provider_runtime.Runtime.init(std.heap.c_allocator),
     model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator, builtin_gateway.models_path),
     workspace_root: []u8 = &.{},
@@ -820,6 +823,11 @@ const App = struct {
         };
         self.terminal_client.deinit();
         self.model_cache.deinit();
+        if (self.extensions) |registry| {
+            registry.deinit();
+            self.alloc.destroy(registry);
+            self.extensions = null;
+        }
         const resume_handoff = if (capture_resume_handoff and
             direct_deinit_disposition == .settled)
             SessionAppRuntime.finalizePersistenceWithResumeHandoff(self)
@@ -1601,7 +1609,7 @@ const App = struct {
             .permission_reviewer;
     }
 
-    pub fn providerSet(_: *const App) provider_set.Set {
+    pub fn providerSet(self: *const App) provider_set.Set {
         if (comptime host_target.is_wasm) {
             return provider_set.gateway_only(.{
                 .capabilities = .{
@@ -1624,7 +1632,7 @@ const App = struct {
             providers.codex.permission_reviewer = null;
             providers.grok.permission_reviewer = null;
         }
-        return providers;
+        return if (self.extensions) |registry| registry.attach(providers) else providers;
     }
 
     pub fn describeToolAction(self: *App, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {

@@ -208,6 +208,7 @@ pub fn Runtime(comptime App: type) type {
             defer startup.deinit(app.alloc);
 
             app.workspace_root = startup.takeWorkspaceRoot();
+            if (comptime @hasField(App, "extensions")) app.extensions = startup.take_extensions();
             if (comptime @hasDecl(App, "adoptWorkspaceAccess")) {
                 app.adoptWorkspaceAccess(startup.takeWorkspaceAccess());
             }

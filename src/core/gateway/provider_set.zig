@@ -23,6 +23,12 @@ pub const Bundle = struct {
         deferred_usage: bool = false,
     };
 
+    /// Metadata-only resolvers keep local catalogs available before background loading.
+    const ModelCapabilitiesProvider = struct {
+        context: ?*anyopaque,
+        resolve_fn: *const fn (?*anyopaque, []const u8) model_capabilities.Capabilities,
+    };
+
     capabilities: Capabilities = .{},
     presentation: ?*const provider_catalog.Entry = null,
     auth_strategy: ?AuthStrategy = null,
@@ -30,6 +36,7 @@ pub const Bundle = struct {
     agent_stream: ?stream_provider.Provider = null,
     cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
     model_catalog: ?model_catalog.Provider = null,
+    model_capabilities: ?ModelCapabilitiesProvider = null,
     permission_reviewer: ?auto_classifier.Provider = null,
     deferred_usage: ?generation_usage_provider.Provider = null,
     credits: ?gateway_provider.CreditsProvider = null,
@@ -40,6 +47,7 @@ pub const Bundle = struct {
     }
 
     pub fn fallbackModelCapabilities(self: Bundle, model: []const u8) model_capabilities.Capabilities {
+        if (self.model_capabilities) |provider| return provider.resolve_fn(provider.context, model);
         return self.fallback_model_capabilities_fn(model);
     }
 };
