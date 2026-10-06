@@ -5,13 +5,15 @@ import { join } from "node:path";
 import { TmuxSession, tmuxAvailable } from "./tmux-helpers";
 import { cleanupIsolatedTestHome, FX_BIN } from "../evals/eval-helpers";
 import { createGoProfile, goEnvironment, KEY, HEADER_VALUE, HOST, EXECUTABLE } from "./fixtures/opencode-go-profile";
+import { PROFILE_DIRECTORY, FIXTURE_EXTENSION_DIRECTORY } from "./fixtures/extension-profile";
 
 const IMAGE_FIXTURE = join(import.meta.dir, "fixtures", "placeholder-logo.png");
 const IMAGE_FILENAME = "go-image.png";
 const SECOND_IMAGE_FILENAME = "go-second-image.png";
 const CHANGED_SOURCE = "source changed after capture";
 const IMAGE_PROMPT = "Describe the attached local fixture image.";
-const LARGE_TOOL_CONTENT = "é".repeat(40 * 1024);
+// A valid tool payload must survive more than one bounded host handoff batch.
+const LARGE_TOOL_CONTENT = "é".repeat(200 * 1024);
 const CASES = [
   { name: "mixed-case session header", tool: "read_file", sessionHeader: "X-OpenCode-Session", prompt: "Read the fixture file and return the final answer." },
   { name: "read_file with empty reasoning replay", tool: "read_file", sessionHeader: "x-opencode-session", prompt: "Read the fixture file and return the final answer." },
@@ -50,6 +52,12 @@ const STDERR_FILENAME = "go-tui-stderr.log";
 const TUI_PROMPT = "Reply through the local Go fixture.";
 const FOLLOWUP_PROMPT = "Make one fresh local Go request.";
 const NEGATIVE_CASES = ["http-error", "redirect", "lost-finish", "aggregate-tools"].map(mode => ({ mode }));
+const GO_MANIFEST_FILENAME = "extension.json";
+const ENDPOINT_CASES = [
+  { name: "bracketed IPv6", hostname: "::1", authority: "[::1]", basePath: "/v1", query: "", expectedTarget: "/v1/chat/completions" },
+  { name: "mixed-case localhost", hostname: HOST, authority: "LOCALHOST", basePath: "/v1", query: "", expectedTarget: "/v1/chat/completions" },
+  { name: "escaped path and query", hostname: HOST, authority: HOST, basePath: "/tenant%2Fone/v1/", query: "?api-version=fixture%2Freview&route=%2Ftenant", expectedTarget: "/tenant%2Fone/v1/chat/completions?api-version=fixture%2Freview&route=%2Ftenant" },
+];
 const LARGE_ARGUMENT_BYTES = 600 * 1024;
 const ERROR_BODY = "untrusted-go-error-body";
 const tuiTest = tmuxAvailable() ? test : test.skip;
@@ -63,6 +71,30 @@ function streamReply(chunks: unknown[]): Response {
 }
 
 describe("native OpenCode Go extension", () => {
+  // Native request delivery protects accepted endpoints from adapter-specific URI rewriting.
+  test.each(ENDPOINT_CASES)("configured loopback endpoint preserves $name", async scenario => {
+    const targets: string[] = [];
+    const server = Bun.serve({ hostname: scenario.hostname, port: 0, fetch(request) {
+      const url = new URL(request.url);
+      targets.push(url.pathname + url.search);
+      return streamReply([{ choices: [{ index: 0, delta: { content: RESULT }, finish_reason: "stop" }] }]);
+    } });
+    const home = createGoProfile(server.port);
+    homes.push(home);
+    const manifestPath = join(home, PROFILE_DIRECTORY, FIXTURE_EXTENSION_DIRECTORY, GO_MANIFEST_FILENAME);
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    manifest.providers[0].base_url = `${SCHEMA_BASE_PREFIX}${scenario.authority}:${server.port}${scenario.basePath}${scenario.query}`;
+    writeFileSync(manifestPath, JSON.stringify(manifest));
+    try {
+      const child = Bun.spawn([FX_BIN, "ask", "--json", "--no-save", TUI_PROMPT], { cwd: home, stdout: "pipe", stderr: "pipe", env: goEnvironment(home) });
+      const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+      expect(code, JSON.stringify({ stdout, stderr, targets })).toBe(0);
+      expect(JSON.parse(stdout).output).toBe(RESULT);
+      expect(targets).toEqual([scenario.expectedTarget]);
+      expect(stdout + stderr).not.toContain(KEY);
+    } finally { server.stop(true); }
+  }, TIMEOUT_MS);
+
   // Exact host-action authority must not disable native permission policy for file tools.
   test.each(EXPLICIT_ACTIVATION_CASES)("explicit native executable allow works under $mode", async ({ mode }) => {
     let requests = 0;

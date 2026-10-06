@@ -7,6 +7,10 @@ const transfer_buffer_bytes = 16 * 1024;
 const content_type = "application/json";
 const user_agent = "fx-opencode-go/1";
 const session_header = "x-opencode-session";
+const ipv6_loopback_address = "::1";
+const ipv6_loopback_host = "[::1]";
+const default_http_port = 80;
+const loopback_hosts = [_][]const u8{ "localhost", "127.0.0.1", ipv6_loopback_address, ipv6_loopback_host };
 const managed_headers = [_][]const u8{ "authorization", "proxy-authorization", "host", "content-length", "content-type", "connection", "transfer-encoding", "user-agent" };
 
 /// Job owns request parameters and socket publication throughout this synchronous worker call.
@@ -39,20 +43,36 @@ pub fn run(job: anytype) !void {
     var client = std.http.Client{ .allocator = alloc, .io = job.io };
     defer client.deinit();
     const uri = try std.Uri.parse(job.prepared.endpoint);
+    var connection_host: ?[]const u8 = null;
     if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) {
         if (!std.ascii.eqlIgnoreCase(uri.scheme, "http")) return error.InvalidEndpoint;
         const host = uri.host orelse return error.InvalidEndpoint;
         const name = try host.toRawMaybeAlloc(alloc);
-        if (!std.mem.eql(u8, name, "127.0.0.1") and !std.mem.eql(u8, name, "localhost") and !std.mem.eql(u8, name, "::1")) return error.InvalidEndpoint;
+        // Core admission accepts case-insensitive DNS names and bracketed IPv6 URI hosts.
+        var loopback = false;
+        for (loopback_hosts) |allowed| if (std.ascii.eqlIgnoreCase(name, allowed)) {
+            loopback = true;
+            break;
+        };
+        if (!loopback) return error.InvalidEndpoint;
+        if (std.mem.eql(u8, name, ipv6_loopback_host)) connection_host = ipv6_loopback_address;
     }
     if (uri.user != null or uri.password != null or uri.fragment != null) return error.InvalidEndpoint;
     if (job.cancel.load(.seq_cst)) return error.Cancelled;
-    var request = try client.request(.POST, uri, .{ .headers = .{
-        .content_type = .{ .override = content_type },
-        .authorization = .{ .override = authorization },
-        .accept_encoding = .omit,
-        .user_agent = .{ .override = user_agent },
-    }, .extra_headers = headers.items, .keep_alive = false, .redirect_behavior = .unhandled });
+    var request = prepared_request: {
+        // DNS resolution needs an unbracketed address, while HTTP authority must retain URI brackets.
+        const connection = if (connection_host) |name| try client.connectTcp(.{ .bytes = name }, uri.port orelse default_http_port, .plain) else null;
+        errdefer if (connection) |owned| {
+            owned.closing = true;
+            client.connection_pool.release(owned, job.io);
+        };
+        break :prepared_request try client.request(.POST, uri, .{ .connection = connection, .headers = .{
+            .content_type = .{ .override = content_type },
+            .authorization = .{ .override = authorization },
+            .accept_encoding = .omit,
+            .user_agent = .{ .override = user_agent },
+        }, .extra_headers = headers.items, .keep_alive = false, .redirect_behavior = .unhandled });
+    };
     defer request.deinit();
     if (request.connection) |connection| job.publish_socket(connection.stream_writer.stream);
     defer job.publish_socket(null);

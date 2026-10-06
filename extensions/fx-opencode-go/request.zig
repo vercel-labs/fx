@@ -6,6 +6,7 @@ const Allocator = wire.Allocator;
 const Value = wire.Value;
 const provider_id = "opencode-go";
 const completion_path = "/chat/completions";
+const path_separator = "/";
 const allowed_efforts = [_][]const u8{ "low", "high", "max" };
 
 /// The worker receives a credential-free prepared body; its arena owns all request strings.
@@ -27,7 +28,13 @@ pub const Prepared = struct {
         const provider = try wire.field(params, "provider");
         if (!std.mem.eql(u8, try wire.text(try wire.field(provider, "id")), provider_id)) return error.InvalidProvider;
         const base = try wire.text(try wire.field(provider, "base_url"));
-        const endpoint = try std.fmt.allocPrint(alloc, "{s}{s}", .{ std.mem.trimEnd(u8, base, "/"), completion_path });
+        var uri = try std.Uri.parse(base);
+        const base_path = switch (uri.path) {
+            .raw, .percent_encoded => |path| path,
+        };
+        // Encoded path ownership preserves proxy routing without rewriting query values.
+        uri.path = .{ .percent_encoded = try std.fmt.allocPrint(alloc, "{s}{s}", .{ std.mem.trimEnd(u8, base_path, path_separator), completion_path }) };
+        const endpoint = try std.fmt.allocPrint(alloc, "{f}", .{uri.fmt(.all)});
         const model = try wire.field(params, "model");
         const request = try wire.field(params, "request");
         var body = wire.object();
