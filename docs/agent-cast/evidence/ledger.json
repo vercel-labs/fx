@@ -1,0 +1,19 @@
+{
+  "recorded_at_utc": "2026-10-06T19:55:06.387230+00:00",
+  "argv": [
+    "python3",
+    "-m",
+    "unittest",
+    "scripts.tests.test_agent_cast_ledger",
+    "-v"
+  ],
+  "exit_code": 0,
+  "test_count": 10,
+  "stdout": "ledger-tests.stdout",
+  "stderr": "ledger-tests.stderr",
+  "source_sha256": {
+    "scripts/agent_cast_ledger.py": "6caebf0bed9b64d1e7bbb902338c5682cad06ceb662b65cd9b71cc426d1a1689",
+    "scripts/tests/test_agent_cast_ledger.py": "9fb9c0bf78a730f1bf229e2bc0c9f1f38e31c6bdbe8d2c85abccfa1e6e5a4fd2"
+  },
+  "scope": "CLI consistency, malformed input and dependency/status gates; no live CI or provider billing verification"
+}

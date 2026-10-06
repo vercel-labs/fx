@@ -1,0 +1,47 @@
+[
+  {
+    "phase": "format",
+    "argv": [
+      "<verified-zig-0.16.0>",
+      "fmt",
+      "src/",
+      "build.zig"
+    ],
+    "cwd": "<checkout>/experiments/agent_cast",
+    "exit_code": 0,
+    "seconds": 0.03945279214531183,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "phase": "build",
+    "argv": [
+      "<verified-zig-0.16.0>",
+      "build",
+      "-Doptimize=ReleaseSafe",
+      "-j1"
+    ],
+    "cwd": "<checkout>/experiments/agent_cast",
+    "exit_code": 0,
+    "seconds": 9.568622666876763,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "phase": "unit",
+    "argv": [
+      "<verified-zig-0.16.0>",
+      "build",
+      "test",
+      "-Doptimize=ReleaseSafe",
+      "-j1",
+      "--summary",
+      "all"
+    ],
+    "cwd": "<checkout>/experiments/agent_cast",
+    "exit_code": 0,
+    "seconds": 4.928705625003204,
+    "stdout": "",
+    "stderr": "Build Summary: 3/3 steps succeeded; 18/18 tests passed\ntest success\n+- run test 18 pass (18 total) 4ms MaxRSS:2M\n   +- compile test ReleaseSafe native success 4s MaxRSS:387M\n\n"
+  }
+]

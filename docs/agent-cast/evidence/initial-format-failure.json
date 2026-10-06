@@ -1,0 +1,16 @@
+[
+  {
+    "phase": "format",
+    "argv": [
+      "<verified-zig-0.16.0>",
+      "fmt",
+      "src/",
+      "build.zig"
+    ],
+    "cwd": "<checkout>/experiments/agent_cast",
+    "exit_code": 1,
+    "seconds": 0.040125666884705424,
+    "stdout": "",
+    "stderr": "src/contracts.zig:8:11: error: expected '{', found ','\n    opaque,\n          ^\nsrc/executor.zig:216:35: error: expected expression, found '.'\n            3 => request.effect = .opaque,\n                                  ^\nsrc/optimizer.zig:265:122: error: expected pointer dereference, optional unwrap, or field access, found 'opaque'\n    inline for (.{ contracts.Effect.mutable_read, contracts.Effect.mutation, contracts.Effect.external, contracts.Effect.opaque }) |effect| {\n                                                                                                                         ^~~~~~\n"
+  }
+]

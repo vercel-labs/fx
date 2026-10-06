@@ -1,0 +1,27 @@
+{
+  "observed_at_utc": "2026-10-06T19:55:56.443491+00:00",
+  "repository": "vercel-labs/fx",
+  "branch": "agent-cast-foundation",
+  "authenticated_account": "alvgeppetto-debug",
+  "viewer_permission": "READ",
+  "source": "gh repo view vercel-labs/fx --json nameWithOwner,isPrivate,viewerPermission",
+  "push": "not_attempted_without_repository_write_access",
+  "draft_pr": null,
+  "exact_commit_ci": "not_run",
+  "prototype_workflow": ".github/workflows/agent-cast.yml",
+  "required_product_checks": [
+    "Build & Test",
+    "E2E (deterministic)",
+    "Shellcheck",
+    "Startup Latency",
+    "macOS arm64"
+  ],
+  "required_prototype_checks": [
+    "Agent-cast (ubuntu-24.04)",
+    "Agent-cast (macos-15)"
+  ],
+  "ship_gate": "not_run",
+  "remaining_action": "Publish the local checkpoint using a contributor account with appropriate access, open a draft PR, and qualify its exact current commit.",
+  "checkpoint_ref": "agent-cast-foundation",
+  "checkpoint_policy": "Resolve the local branch HEAD after its checkpoint commit; verify the recorded source hashes and require CI on the exact current commit before promotion."
+}

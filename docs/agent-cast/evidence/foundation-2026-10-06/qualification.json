@@ -1,0 +1,171 @@
+{
+  "schema_version": 1,
+  "recorded_at_utc": "2026-10-06T19:46:12.090279+00:00",
+  "scope": "local foundation correctness; logical agent identities in one process",
+  "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "source_sha256": {
+    "experiments/agent_cast/build.zig": "6de2342b938220052abb5f2aa6484a2d0b4989318f929f8cfc6cd5b71260d5b5",
+    "experiments/agent_cast/src/contracts.zig": "d11df3241d4d9c5441da4b85250d192fb0e890ff7bdd613368c917a71ca2470e",
+    "experiments/agent_cast/src/demo.zig": "1b085e57e0663722c0a15a7af8b65f14a2a3d5b377ccaf50e11589e6276fb032",
+    "experiments/agent_cast/src/executor.zig": "d7a24d288eaa054762c58462e10877c14b736b26ab9dab23afca56b0f24cf990",
+    "experiments/agent_cast/src/optimizer.zig": "e33266af767f303d2c3918a27d514afd1e62913aad495fdfacf6b42dcfa55a63",
+    "experiments/agent_cast/src/tests.zig": "4d80e3ea2d4d149f0fb9c09bd3f0c327f20995aac083ea51a5e4e89bd4cbd8ce"
+  },
+  "checks": [
+    {
+      "name": "zig-version",
+      "argv": [
+        "<verified-zig-0.16.0>",
+        "version"
+      ],
+      "cwd": "<checkout>/experiments/agent_cast",
+      "exit_code": 0,
+      "seconds": 0.03602166613563895,
+      "stdout": "zig-version.stdout",
+      "stderr": "zig-version.stderr"
+    },
+    {
+      "name": "format",
+      "argv": [
+        "<verified-zig-0.16.0>",
+        "fmt",
+        "--check",
+        "src/",
+        "build.zig"
+      ],
+      "cwd": "<checkout>/experiments/agent_cast",
+      "exit_code": 0,
+      "seconds": 0.035616999957710505,
+      "stdout": "format.stdout",
+      "stderr": "format.stderr"
+    },
+    {
+      "name": "build",
+      "argv": [
+        "<verified-zig-0.16.0>",
+        "build",
+        "-Doptimize=ReleaseSafe",
+        "-j1"
+      ],
+      "cwd": "<checkout>/experiments/agent_cast",
+      "exit_code": 0,
+      "seconds": 5.185604041907936,
+      "stdout": "build.stdout",
+      "stderr": "build.stderr"
+    },
+    {
+      "name": "unit",
+      "argv": [
+        "<verified-zig-0.16.0>",
+        "build",
+        "test",
+        "-Doptimize=ReleaseSafe",
+        "-j1",
+        "--summary",
+        "all"
+      ],
+      "cwd": "<checkout>/experiments/agent_cast",
+      "exit_code": 0,
+      "seconds": 4.926578124985099,
+      "stdout": "unit.stdout",
+      "stderr": "unit.stderr"
+    },
+    {
+      "name": "help",
+      "argv": [
+        "<checkout>/experiments/agent_cast/zig-out/bin/agent-cast-demo",
+        "--help"
+      ],
+      "cwd": "<checkout>/experiments/agent_cast",
+      "exit_code": 0,
+      "seconds": 0.003019292140379548,
+      "stdout": "help.stdout",
+      "stderr": "help.stderr"
+    },
+    {
+      "name": "compare-0",
+      "argv": [
+        "<checkout>/experiments/agent_cast/zig-out/bin/agent-cast-demo",
+        "--fixture",
+        "<receipt-directory>/fixture-0.bin",
+        "--mode",
+        "compare"
+      ],
+      "cwd": "<checkout>/experiments/agent_cast",
+      "exit_code": 0,
+      "seconds": 0.002790084108710289,
+      "stdout": "compare-0.stdout",
+      "stderr": "compare-0.stderr"
+    },
+    {
+      "name": "compare-1",
+      "argv": [
+        "<checkout>/experiments/agent_cast/zig-out/bin/agent-cast-demo",
+        "--fixture",
+        "<receipt-directory>/fixture-1.bin",
+        "--mode",
+        "compare"
+      ],
+      "cwd": "<checkout>/experiments/agent_cast",
+      "exit_code": 0,
+      "seconds": 0.002785374876111746,
+      "stdout": "compare-1.stdout",
+      "stderr": "compare-1.stderr"
+    },
+    {
+      "name": "enabled",
+      "argv": [
+        "<checkout>/experiments/agent_cast/zig-out/bin/agent-cast-demo",
+        "--fixture",
+        "<receipt-directory>/fixture-0.bin",
+        "--mode",
+        "enabled"
+      ],
+      "cwd": "<checkout>/experiments/agent_cast",
+      "exit_code": 0,
+      "seconds": 0.0026113330386579037,
+      "stdout": "enabled.stdout",
+      "stderr": "enabled.stderr"
+    },
+    {
+      "name": "disabled",
+      "argv": [
+        "<checkout>/experiments/agent_cast/zig-out/bin/agent-cast-demo",
+        "--fixture",
+        "<receipt-directory>/fixture-0.bin",
+        "--mode",
+        "disabled"
+      ],
+      "cwd": "<checkout>/experiments/agent_cast",
+      "exit_code": 0,
+      "seconds": 0.002653209026902914,
+      "stdout": "disabled.stdout",
+      "stderr": "disabled.stderr"
+    }
+  ],
+  "ci_status": "not_run",
+  "performance_claim": null,
+  "ok": true,
+  "zig_version": "0.16.0",
+  "binary_sha256": "7a0f8aaf270097d069878f2f9cce0493a0cfb06ddbbbf6aca73fdc08e3a82291",
+  "fixtures": [
+    {
+      "sha256": "2745f274e3490392ffccab9ace5346efc80e5057787b8be2eeed28e1d4a56618",
+      "bytes": 1024,
+      "comparison": "compare-0.stdout",
+      "logical_receipts_per_mode": 10,
+      "disabled_backing_reads": 8,
+      "enabled_backing_reads": 4
+    },
+    {
+      "sha256": "3d55b51a98d198e5b5bf86d066c92f53c1349d4636253f2da34c573976850cf8",
+      "bytes": 1024,
+      "comparison": "compare-1.stdout",
+      "logical_receipts_per_mode": 10,
+      "disabled_backing_reads": 8,
+      "enabled_backing_reads": 4
+    }
+  ],
+  "path_normalization": "Machine-specific checkout, Zig executable, and receipt-directory prefixes replaced with declared placeholders; exits, logs, hashes, timings and outputs unchanged."
+}

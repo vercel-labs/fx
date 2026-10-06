@@ -1,0 +1,12 @@
+{
+  "version": "0.16.0",
+  "target": "aarch64-macos",
+  "source": "https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz",
+  "archive_bytes": 52238004,
+  "sha256": "b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489",
+  "published_sha256": "b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489",
+  "extracted_bytes": 370614961,
+  "executable": "<verified-zig-0.16.0>",
+  "version_stdout": "0.16.0",
+  "exit_code": 0
+}

@@ -1,0 +1,2 @@
+# Keep captured stderr verbatim, including Zig's final blank summary line.
+docs/agent-cast/evidence/**/*.stderr whitespace=-blank-at-eof

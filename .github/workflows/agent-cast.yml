@@ -1,0 +1,52 @@
+name: Agent-cast Foundation
+
+on:
+  pull_request:
+    paths:
+      - 'experiments/agent_cast/**'
+      - 'docs/agent-cast/**'
+      - 'scripts/agent_cast_ledger.py'
+      - 'scripts/qualify_agent_cast.py'
+      - 'scripts/tests/test_agent_cast_ledger.py'
+      - '.github/workflows/agent-cast.yml'
+      - '.github/actions/setup-zig/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-cast-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  qualify:
+    name: Agent-cast (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-15]
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-zig
+        with:
+          version: '0.16.0'
+          cache-key: agent-cast-foundation
+      - name: Validate ledger and exercise its failure cases
+        run: |
+          python3 scripts/agent_cast_ledger.py validate --json
+          python3 -m unittest scripts.tests.test_agent_cast_ledger -v
+      - name: Build and drive the prototype
+        run: python3 scripts/qualify_agent_cast.py --output "$RUNNER_TEMP/agent-cast-receipts"
+      - name: Retain qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-cast-${{ matrix.runner }}-${{ github.sha }}
+          path: ${{ runner.temp }}/agent-cast-receipts/
+          if-no-files-found: warn
+          retention-days: 14

@@ -1,0 +1,30 @@
+{
+  "recorded_at_utc": "2026-10-06T19:55:06.387230+00:00",
+  "source": "Delegated review response in this session; coordinator checked the cited boundary and owned-capture implementation.",
+  "agent": "/root/agent_cast_contract_review",
+  "requested_model": "gpt-6-astra",
+  "reasoning_effort": "high",
+  "scope": "Exact binding, immutable grouping and borrowed-memory contracts in the bounded synchronous fixture.",
+  "finding": "Borrowed binding data must remain unchanged as well as alive. A const slice alone does not freeze mutable backing.",
+  "resolution": [
+    "CallBinding and Plan document frozen borrowed backing through receipt consumption.",
+    "Snapshot duplicates bytes and path; identity points to stable owned hash storage.",
+    "Focused tests mutate original source/path buffers and verify captured bytes; mutation of captured bytes is detected before admission."
+  ],
+  "remaining_gaps": [
+    "Host admissions are fixture assertions, not production permission tokens or current registry queries.",
+    "No expiry/revocation race, cancellation, subscriber lifetime, completed cache, broker or worker recovery is qualified.",
+    "No latency or harness efficiency claim."
+  ],
+  "source_sha256": {
+    "experiments/agent_cast/build.zig": "6de2342b938220052abb5f2aa6484a2d0b4989318f929f8cfc6cd5b71260d5b5",
+    "experiments/agent_cast/src/contracts.zig": "d11df3241d4d9c5441da4b85250d192fb0e890ff7bdd613368c917a71ca2470e",
+    "experiments/agent_cast/src/demo.zig": "1b085e57e0663722c0a15a7af8b65f14a2a3d5b377ccaf50e11589e6276fb032",
+    "experiments/agent_cast/src/executor.zig": "d7a24d288eaa054762c58462e10877c14b736b26ab9dab23afca56b0f24cf990",
+    "experiments/agent_cast/src/optimizer.zig": "e33266af767f303d2c3918a27d514afd1e62913aad495fdfacf6b42dcfa55a63",
+    "experiments/agent_cast/src/tests.zig": "4d80e3ea2d4d149f0fb9c09bd3f0c327f20995aac083ea51a5e4e89bd4cbd8ce"
+  },
+  "input_tokens": null,
+  "output_tokens": null,
+  "usage_source": null
+}

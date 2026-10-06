@@ -1,0 +1,673 @@
+{
+  "schema_version": 1,
+  "project": {
+    "name": "agent-cast",
+    "objective": "Build an effect-aware execution optimizer backed by actor-owned resources; preserve logical authority and effects while reducing measured physical work.",
+    "location": "experiments/agent_cast/",
+    "design": "docs/agent-cast-architecture.html",
+    "scope": "Foundation first; no production permissions, broker, isolation or performance claim yet."
+  },
+  "last_updated_utc": "2026-10-06T19:55:56.443491+00:00",
+  "routing_policy": {
+    "routine_model": "gpt-6-luna",
+    "implementation_model": "gpt-6.1-sol",
+    "critical_review_model": "gpt-6-astra",
+    "context": "Short task briefs and explicit source allowlists; no full-history forks",
+    "repair_policy": "At most two repair rounds per delegated scope before parent review",
+    "spending_limit": null,
+    "usage_policy": "Null means unavailable; actual token counts require a provider receipt. No inferred totals.",
+    "current_batch": "M0/M1 locally verified; M2 queued; publication/CI pending"
+  },
+  "milestones": [
+    {
+      "id": "M0",
+      "title": "Program setup and reproducible toolchain",
+      "depends_on": [],
+      "acceptance": [
+        "Canonical task ledger validates; milestone/task IDs and dependencies are stable",
+        "Task-scoped Zig 0.16.0 matches repository CI and published archive SHA256",
+        "Compact model assignments, file ownership, and verification gates recorded"
+      ]
+    },
+    {
+      "id": "M1",
+      "title": "Typed planner and embedded immutable-reader proof",
+      "depends_on": [
+        "M0"
+      ],
+      "acceptance": [
+        "Per-logical identity and exact fixture admissions survive optimized grouping",
+        "Real bytes are captured once; enabled and disabled modes return equal full outputs",
+        "Denied/stale calls receive no data; unsupported execution is rejected",
+        "Build, focused tests, and built prototype interaction have successful receipts; CI remains separately gated"
+      ]
+    },
+    {
+      "id": "M2",
+      "title": "Bounded shared observation cache",
+      "depends_on": [
+        "M1"
+      ],
+      "acceptance": [
+        "Successful certified immutable values are reusable by separately admitted agents in one compatible task/domain",
+        "Different task/domain/view/contract cannot reuse a result; current authority checked on hits",
+        "Owned cache memory, entry/byte limits, eviction, and truthful provenance verified"
+      ]
+    },
+    {
+      "id": "M3",
+      "title": "Broker, Python and Node clients",
+      "depends_on": [
+        "M2"
+      ],
+      "acceptance": [
+        "Framed control/data, negotiated limits, logical IDs and backing work IDs interoperable",
+        "Two actual clients share eligible values; deadlines, cancellation and byte credits are independent",
+        "Exact host authority and resource generations rechecked before dispatch"
+      ]
+    },
+    {
+      "id": "M4",
+      "title": "Supervised workers and recovery",
+      "depends_on": [
+        "M3"
+      ],
+      "acceptance": [
+        "Worker loss replaces epoch, invalidates old handles, and retains settled/unknown receipts",
+        "Queued versus running versus committed cancellation classifications survive faults",
+        "Unknown effects are reconciled rather than automatically repeated; restart and memory budgets enforced"
+      ]
+    },
+    {
+      "id": "M5",
+      "title": "libfx and harness integration",
+      "depends_on": [
+        "M3",
+        "M4"
+      ],
+      "acceptance": [
+        "A deterministic provider fixture drives an actual libfx tool interaction and result publication",
+        "Schemas/outputs, host authority, output-drain and SDK cancellation semantics preserved",
+        "Native terminal/file-mutation migration remains separately reviewed; exact-commit product CI gates pass"
+      ]
+    },
+    {
+      "id": "M6",
+      "title": "Clean isolated eval tasks",
+      "depends_on": [
+        "M4",
+        "M5"
+      ],
+      "acceptance": [
+        "One existing Linux backend creates independent state from pinned images/fixtures",
+        "Full containment cleanup, routes/credentials revocation, reset probes and quarantine verified",
+        "Independent terminal-state grading detects required, missing and extra effects"
+      ]
+    },
+    {
+      "id": "M7",
+      "title": "Scoped service clients and measured strategy",
+      "depends_on": [
+        "M3",
+        "M4"
+      ],
+      "acceptance": [
+        "Pooled HTTP requests still execute every required application request",
+        "Pool partitions and credential/config generation changes are tested; database work requires its own reset contract",
+        "Cost model includes planning, guards, hashing, fan-out, useful work, output and persistence; valid native fallback tested"
+      ]
+    },
+    {
+      "id": "M8",
+      "title": "Comparative qualification and release decision",
+      "depends_on": [
+        "M5",
+        "M6",
+        "M7"
+      ],
+      "acceptance": [
+        "Compare exact fixed traces and full repeated trials against optimized native/persistent/warm baselines",
+        "Equal results/errors/audit/authority/effects under equal complete resource budgets",
+        "Publish only measured claims and require exact-commit CI plus local happy path and ship gate"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "AC-0001",
+      "milestone": "M0",
+      "title": "Freeze scope, milestones and model-routing policy",
+      "status": "verified_local",
+      "depends_on": [],
+      "owner": {
+        "role": "coordinator",
+        "model": "current-session",
+        "reasoning_effort": "inherited"
+      },
+      "scope": [
+        "docs/agent-cast/tasks.json",
+        "docs/agent-cast/milestones.md",
+        "docs/agent-cast/model-routing.md"
+      ],
+      "acceptance": [
+        "Milestones have gates and dependencies; each task has a bounded owner and scope",
+        "Model assignments agree with available tools; unknown usage remains null"
+      ],
+      "evidence": [
+        "docs/agent-cast/milestones.md",
+        "docs/agent-cast/model-routing.md",
+        "docs/agent-cast/evidence/ledger.json"
+      ],
+      "usage": {
+        "input_tokens": null,
+        "output_tokens": null,
+        "source": null
+      },
+      "updated_at_utc": "2026-10-06T19:55:56.443491+00:00"
+    },
+    {
+      "id": "AC-0002",
+      "milestone": "M0",
+      "title": "Implement and validate the read-only task-ledger CLI",
+      "status": "verified_local",
+      "depends_on": [],
+      "owner": {
+        "role": "routine tooling",
+        "model": "gpt-6-luna",
+        "reasoning_effort": "medium",
+        "agent": "/root/agent_cast_ledger_tools"
+      },
+      "scope": [
+        "scripts/agent_cast_ledger.py",
+        "scripts/tests/test_agent_cast_ledger.py"
+      ],
+      "acceptance": [
+        "Actual ledger validates; next/show preserve status and ownership",
+        "Malformed fields, cycles, missing dependencies, and unproven completion fail with useful errors",
+        "Checker does not present ledger status as live CI or ship verification"
+      ],
+      "evidence": [
+        "docs/agent-cast/evidence/ledger.json"
+      ],
+      "usage": {
+        "input_tokens": null,
+        "output_tokens": null,
+        "source": null
+      },
+      "updated_at_utc": "2026-10-06T19:55:56.443491+00:00",
+      "integration_note": "Luna authored the checker and one bounded repair; coordinator added CLI tests and repaired malformed milestone/schema-version handling."
+    },
+    {
+      "id": "AC-0003",
+      "milestone": "M0",
+      "title": "Provision pinned toolchain and record receipt",
+      "status": "verified_local",
+      "depends_on": [],
+      "owner": {
+        "role": "build owner",
+        "model": "current-session",
+        "reasoning_effort": "inherited"
+      },
+      "scope": [
+        "task-scoped temporary toolchain",
+        "docs/agent-cast/evidence/toolchain.json"
+      ],
+      "acceptance": [
+        "Zig 0.16.0 binary runs; archive hash equals published SHA256",
+        "No global toolchain/environment changes; one build job at a time"
+      ],
+      "evidence": [
+        "docs/agent-cast/evidence/toolchain.json"
+      ],
+      "usage": {
+        "input_tokens": null,
+        "output_tokens": null,
+        "source": null
+      },
+      "updated_at_utc": "2026-10-06T19:55:56.443491+00:00"
+    },
+    {
+      "id": "AC-0101",
+      "milestone": "M1",
+      "title": "Implement typed exact-binding and immutable grouping contracts",
+      "status": "verified_local",
+      "depends_on": [
+        "AC-0003"
+      ],
+      "owner": {
+        "role": "implementation",
+        "model": "gpt-6.1-sol",
+        "reasoning_effort": "high",
+        "agent": "/root/agent_cast_core"
+      },
+      "scope": [
+        "experiments/agent_cast/src/contracts.zig",
+        "experiments/agent_cast/src/optimizer.zig"
+      ],
+      "acceptance": [
+        "Preserve every logical call and exclude denied/stale/mismatched consumers",
+        "Share only compatible certified immutable reads; different domains/tasks/options/contracts remain separate",
+        "Borrowed data remains alive and immutable; bounded allocation and duplicate-ID rejection tested"
+      ],
+      "evidence": [
+        "docs/agent-cast/evidence/contract-review.json",
+        "docs/agent-cast/evidence/foundation.json"
+      ],
+      "usage": {
+        "input_tokens": null,
+        "output_tokens": null,
+        "source": null
+      },
+      "updated_at_utc": "2026-10-06T19:55:56.443491+00:00"
+    },
+    {
+      "id": "AC-0102",
+      "milestone": "M1",
+      "title": "Implement frozen-content executor and actual demo binary",
+      "status": "verified_local",
+      "depends_on": [
+        "AC-0101"
+      ],
+      "owner": {
+        "role": "implementation",
+        "model": "gpt-6.1-sol",
+        "reasoning_effort": "high",
+        "agent": "/root/agent_cast_core"
+      },
+      "scope": [
+        "experiments/agent_cast/src/executor.zig",
+        "experiments/agent_cast/src/demo.zig",
+        "experiments/agent_cast/build.zig",
+        "experiments/agent_cast/src/tests.zig"
+      ],
+      "acceptance": [
+        "Capture real file bytes once, execute known reader only, and preserve full logical outputs",
+        "Enabled/disabled parity includes denied/stale consumers, window bounds, contract and output-budget checks",
+        "Built demo uses input identity and actual executor counts; labels two logical agents without claiming multi-process execution"
+      ],
+      "evidence": [
+        "docs/agent-cast/evidence/foundation.json"
+      ],
+      "usage": {
+        "input_tokens": null,
+        "output_tokens": null,
+        "source": null
+      },
+      "updated_at_utc": "2026-10-06T19:55:56.443491+00:00"
+    },
+    {
+      "id": "AC-0103",
+      "milestone": "M1",
+      "title": "Review authority, ownership and equivalence boundaries",
+      "status": "verified_local",
+      "depends_on": [
+        "AC-0101"
+      ],
+      "owner": {
+        "role": "critical review",
+        "model": "gpt-6-astra",
+        "reasoning_effort": "high",
+        "agent": "/root/agent_cast_contract_review"
+      },
+      "scope": [
+        "experiments/agent_cast/src/contracts.zig",
+        "experiments/agent_cast/src/optimizer.zig",
+        "experiments/agent_cast/src/executor.zig"
+      ],
+      "acceptance": [
+        "Review exact-binding fields, denied consumers, immutable proof and mutable borrowed backing",
+        "Fix material findings before local proof; record remaining production gaps"
+      ],
+      "evidence": [
+        "docs/agent-cast/evidence/contract-review.json",
+        "docs/agent-cast/evidence/foundation.json"
+      ],
+      "usage": {
+        "input_tokens": null,
+        "output_tokens": null,
+        "source": null
+      },
+      "updated_at_utc": "2026-10-06T19:55:56.443491+00:00"
+    },
+    {
+      "id": "AC-0104",
+      "milestone": "M1",
+      "title": "Run focused tests and real enabled/disabled interactions",
+      "status": "verified_local",
+      "depends_on": [
+        "AC-0102",
+        "AC-0103"
+      ],
+      "owner": {
+        "role": "verification",
+        "model": "current-session",
+        "reasoning_effort": "inherited"
+      },
+      "scope": [
+        "experiments/agent_cast/zig-out/bin/agent-cast-demo",
+        "docs/agent-cast/evidence/foundation.json",
+        "scripts/qualify_agent_cast.py",
+        "experiments/agent_cast/README.md"
+      ],
+      "acceptance": [
+        "Format/build/focused tests pass under pinned toolchain",
+        "Personally run built binary against actual fixture and compare full result hashes and counts",
+        "Stderr clean, no abort; source/binary hashes and exit receipts retained; no speed claim"
+      ],
+      "evidence": [
+        "docs/agent-cast/evidence/foundation.json",
+        "docs/agent-cast/evidence/foundation-2026-10-06/qualification.json"
+      ],
+      "usage": {
+        "input_tokens": null,
+        "output_tokens": null,
+        "source": null
+      },
+      "updated_at_utc": "2026-10-06T19:55:56.443491+00:00"
+    },
+    {
+      "id": "AC-0105",
+      "milestone": "M1",
+      "title": "Prepare checkpoint and exact-commit CI qualification",
+      "status": "ci_pending",
+      "depends_on": [
+        "AC-0104"
+      ],
+      "owner": {
+        "role": "coordinator integration",
+        "model": "current-session",
+        "reasoning_effort": "inherited"
+      },
+      "scope": [
+        "feature branch checkpoint",
+        "draft pull request",
+        "CI qualification configuration"
+      ],
+      "acceptance": [
+        "Focused proof and built happy path precede any external publication",
+        "Require exact current commit CI including macOS and prototype qualification before any ready claim",
+        "Record absent publication authorization or unavailable checks; do not invent a successful gate"
+      ],
+      "evidence": [
+        "docs/agent-cast/evidence/checkpoint.json"
+      ],
+      "usage": {
+        "input_tokens": null,
+        "output_tokens": null,
+        "source": null
+      },
+      "updated_at_utc": "2026-10-06T19:55:56.443491+00:00",
+      "pending_reason": "Local CI configuration exists; available GitHub account has READ permission. Exact-commit publication and checks are pending."
+    },
+    {
+      "id": "AC-0201",
+      "milestone": "M2",
+      "title": "Add owned bounded completed-value cache",
+      "status": "planned",
+      "depends_on": [
+        "AC-0104"
+      ],
+      "owner": {
+        "role": "implementation",
+        "model": "gpt-6.1-sol",
+        "reasoning_effort": "high"
+      },
+      "scope": [
+        "experiments/agent_cast/src/cache.zig",
+        "cache-focused tests"
+      ],
+      "acceptance": [
+        "Cache successful immutable canonical values after each current logical admission",
+        "Prove two-agent sharing, domain/task isolation, invalidation, eviction and output lifetime"
+      ],
+      "evidence": [],
+      "usage": {
+        "input_tokens": null,
+        "output_tokens": null,
+        "source": null
+      },
+      "updated_at_utc": "2026-10-06T19:38:41.491825+00:00"
+    },
+    {
+      "id": "AC-0202",
+      "milestone": "M2",
+      "title": "Qualify inflight sharing and independent consumers",
+      "status": "planned",
+      "depends_on": [
+        "AC-0201"
+      ],
+      "owner": {
+        "role": "implementation",
+        "model": "gpt-6.1-sol",
+        "reasoning_effort": "high"
+      },
+      "scope": [
+        "cache/subscriber contracts",
+        "cancellation and deadline tests"
+      ],
+      "acceptance": [
+        "Cancel one subscriber without stopping work required by another",
+        "Keep independent deadlines/credits/audit/retry provenance; reject stale result delivery"
+      ],
+      "evidence": [],
+      "usage": {
+        "input_tokens": null,
+        "output_tokens": null,
+        "source": null
+      },
+      "updated_at_utc": "2026-10-06T19:38:41.491825+00:00"
+    },
+    {
+      "id": "AC-0301",
+      "milestone": "M3",
+      "title": "Implement framed local broker and scoped enrollment",
+      "status": "planned",
+      "depends_on": [
+        "AC-0202"
+      ],
+      "owner": {
+        "role": "implementation",
+        "model": "gpt-6.1-sol",
+        "reasoning_effort": "high"
+      },
+      "scope": [
+        "experiments/agent_cast/src/broker.zig",
+        "wire/enrollment contracts"
+      ],
+      "acceptance": [
+        "Bounds, framing, epochs, roles, authority and reconnect semantics tested",
+        "Two actual clients exercise shared state; same-UID process is not advertised as containment"
+      ],
+      "evidence": [],
+      "usage": {
+        "input_tokens": null,
+        "output_tokens": null,
+        "source": null
+      },
+      "updated_at_utc": "2026-10-06T19:38:41.491825+00:00"
+    },
+    {
+      "id": "AC-0302",
+      "milestone": "M3",
+      "title": "Add Python and Node adapters",
+      "status": "planned",
+      "depends_on": [
+        "AC-0301"
+      ],
+      "owner": {
+        "role": "implementation",
+        "model": "gpt-6.1-sol",
+        "reasoning_effort": "medium"
+      },
+      "scope": [
+        "experimental Python/Node clients",
+        "adapter integration fixtures"
+      ],
+      "acceptance": [
+        "Identical operation contract and ordinary results across both languages",
+        "Credits, interrupt, reconnect/status and cleanup work against real broker"
+      ],
+      "evidence": [],
+      "usage": {
+        "input_tokens": null,
+        "output_tokens": null,
+        "source": null
+      },
+      "updated_at_utc": "2026-10-06T19:38:41.491825+00:00"
+    },
+    {
+      "id": "AC-0401",
+      "milestone": "M4",
+      "title": "Supervise isolated worker lifetimes and uncertainty",
+      "status": "planned",
+      "depends_on": [
+        "AC-0301"
+      ],
+      "owner": {
+        "role": "implementation",
+        "model": "gpt-6.1-sol",
+        "reasoning_effort": "high"
+      },
+      "scope": [
+        "worker supervisor",
+        "receipt/reconciliation contracts",
+        "fault fixtures"
+      ],
+      "acceptance": [
+        "Inject pre-start, inflight, after-effect and before-publication failures",
+        "No duplicated uncertain mutation; bounded restart, drain and teardown"
+      ],
+      "evidence": [],
+      "usage": {
+        "input_tokens": null,
+        "output_tokens": null,
+        "source": null
+      },
+      "updated_at_utc": "2026-10-06T19:38:41.491825+00:00"
+    },
+    {
+      "id": "AC-0501",
+      "milestone": "M5",
+      "title": "Connect a fixture-driven libfx host tool",
+      "status": "planned",
+      "depends_on": [
+        "AC-0302",
+        "AC-0401"
+      ],
+      "owner": {
+        "role": "implementation",
+        "model": "gpt-6.1-sol",
+        "reasoning_effort": "high"
+      },
+      "scope": [
+        "SDK experimental adapter",
+        "fixture provider",
+        "existing host callback contract"
+      ],
+      "acceptance": [
+        "Actual tool call travels libfx to broker and returns its result",
+        "Preserve host authority/cancellation and document absent stable SDK recovery identity"
+      ],
+      "evidence": [],
+      "usage": {
+        "input_tokens": null,
+        "output_tokens": null,
+        "source": null
+      },
+      "updated_at_utc": "2026-10-06T19:38:41.491825+00:00"
+    },
+    {
+      "id": "AC-0601",
+      "milestone": "M6",
+      "title": "Qualify one existing Linux isolation backend",
+      "status": "planned",
+      "depends_on": [
+        "AC-0401",
+        "AC-0501"
+      ],
+      "owner": {
+        "role": "implementation",
+        "model": "gpt-6.1-sol",
+        "reasoning_effort": "high"
+      },
+      "scope": [
+        "existing backend adapter",
+        "reset and independent grader fixtures"
+      ],
+      "acceptance": [
+        "Fresh workspace/worker/backend state per trial; cleanup prevents surviving writers",
+        "Grader stays outside execution service; failed resets quarantined"
+      ],
+      "evidence": [],
+      "usage": {
+        "input_tokens": null,
+        "output_tokens": null,
+        "source": null
+      },
+      "updated_at_utc": "2026-10-06T19:38:41.491825+00:00"
+    },
+    {
+      "id": "AC-0701",
+      "milestone": "M7",
+      "title": "Add scoped pooled HTTP owner and cost attribution",
+      "status": "planned",
+      "depends_on": [
+        "AC-0302",
+        "AC-0401"
+      ],
+      "owner": {
+        "role": "implementation",
+        "model": "gpt-6.1-sol",
+        "reasoning_effort": "high"
+      },
+      "scope": [
+        "HTTP resource owner",
+        "controlled network fixtures",
+        "cost spans"
+      ],
+      "acceptance": [
+        "Retain client setup but perform all required requests",
+        "Credential/config partitions, drain, request accounting and full costs verified"
+      ],
+      "evidence": [],
+      "usage": {
+        "input_tokens": null,
+        "output_tokens": null,
+        "source": null
+      },
+      "updated_at_utc": "2026-10-06T19:38:41.491825+00:00"
+    },
+    {
+      "id": "AC-0801",
+      "milestone": "M8",
+      "title": "Qualify fixed traces and repeated agent outcomes",
+      "status": "planned",
+      "depends_on": [
+        "AC-0501",
+        "AC-0601",
+        "AC-0701"
+      ],
+      "owner": {
+        "role": "critical review",
+        "model": "gpt-6-astra",
+        "reasoning_effort": "high"
+      },
+      "scope": [
+        "qualification receipts",
+        "performance report",
+        "release decision"
+      ],
+      "acceptance": [
+        "Meaningful optimized baselines, equal work/resources, and independent outcomes",
+        "Exact-commit gates and local happy path verified; report failed/uncertain results"
+      ],
+      "evidence": [],
+      "usage": {
+        "input_tokens": null,
+        "output_tokens": null,
+        "source": null
+      },
+      "updated_at_utc": "2026-10-06T19:38:41.491825+00:00"
+    }
+  ]
+}

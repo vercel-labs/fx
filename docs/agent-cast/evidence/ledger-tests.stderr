@@ -1,0 +1,15 @@
+test_bool_is_not_a_schema_version_or_token_count (scripts.tests.test_agent_cast_ledger.LedgerCliTests.test_bool_is_not_a_schema_version_or_token_count) ... ok
+test_canonical_ledger_validates_without_mutation (scripts.tests.test_agent_cast_ledger.LedgerCliTests.test_canonical_ledger_validates_without_mutation) ... ok
+test_corrupt_field_types_return_diagnostics (scripts.tests.test_agent_cast_ledger.LedgerCliTests.test_corrupt_field_types_return_diagnostics) ... ok
+test_cycles_and_missing_dependencies_are_rejected (scripts.tests.test_agent_cast_ledger.LedgerCliTests.test_cycles_and_missing_dependencies_are_rejected) ... ok
+test_duplicate_ids_are_rejected (scripts.tests.test_agent_cast_ledger.LedgerCliTests.test_duplicate_ids_are_rejected) ... ok
+test_invalid_json_returns_structured_failure (scripts.tests.test_agent_cast_ledger.LedgerCliTests.test_invalid_json_returns_structured_failure) ... ok
+test_next_preserves_ownership_and_dependency_gate (scripts.tests.test_agent_cast_ledger.LedgerCliTests.test_next_preserves_ownership_and_dependency_gate) ... ok
+test_show_retains_full_task_records (scripts.tests.test_agent_cast_ledger.LedgerCliTests.test_show_retains_full_task_records) ... ok
+test_usage_requires_a_receipt_reference (scripts.tests.test_agent_cast_ledger.LedgerCliTests.test_usage_requires_a_receipt_reference) ... ok
+test_verified_status_requires_evidence_and_done_dependencies (scripts.tests.test_agent_cast_ledger.LedgerCliTests.test_verified_status_requires_evidence_and_done_dependencies) ... ok
+
+----------------------------------------------------------------------
+Ran 10 tests in 0.809s
+
+OK

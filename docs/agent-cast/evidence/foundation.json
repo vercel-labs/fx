@@ -1,0 +1,21 @@
+{
+  "recorded_at_utc": "2026-10-06T19:55:06.387230+00:00",
+  "status": "verified_local",
+  "qualification_receipt": "foundation-2026-10-06/qualification.json",
+  "zig_version": "0.16.0",
+  "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+  "unit_tests_passed": 18,
+  "fixture_comparisons_passed": 2,
+  "logical_receipts_per_mode": 10,
+  "disabled_backing_reader_calls": 8,
+  "enabled_backing_reader_calls": 4,
+  "actual_multi_process_agents": false,
+  "built_cli_stderr_clean": true,
+  "initial_failure_retained": "initial-format-failure.json",
+  "repair_receipt": "compiler-repair.json",
+  "qualifier_sha256": "cf2a1ecc20af226f0c57127ccd10a967b9b94cea34cdf40d88d4870e054c08df",
+  "binary_sha256": "7a0f8aaf270097d069878f2f9cce0493a0cfb06ddbbbf6aca73fdc08e3a82291",
+  "scope": "Owned captured bytes and fixture-certified snapshot calls inside one process; reader call counts are not OS calls or measured speedups.",
+  "ci_status": "not_run",
+  "performance_claim": null
+}
