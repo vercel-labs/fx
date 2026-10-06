@@ -242,6 +242,19 @@ describe("local extension discovery", () => {
     expect(result.stderr + result.stdout).not.toContain(GATEWAY_FIXTURE_KEY);
   });
 
+  test("extension delivery stays fail-closed until executable activation is authorized", () => {
+    const home = fixture(VALID_REGISTRY, VALID_MANIFEST);
+    const result = spawnSync(FX_BIN, ["ask", "--json", "--no-save", AUTH_SCOPE_PROMPT], {
+      cwd: home, timeout: TIMEOUT_MS, encoding: "utf8",
+      env: { ...process.env, HOME: home, AI_GATEWAY_API_KEY: undefined, VERCEL_OIDC_TOKEN: undefined,
+        FX_MODEL: undefined, FX_EXTENSION_TEST_KEY: EXTENSION_FIXTURE_KEY,
+        FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1" },
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr + result.stdout).toContain("ExtensionExecutionPermissionRequired");
+    expect(result.stderr + result.stdout).not.toContain(EXTENSION_FIXTURE_KEY);
+  });
+
   test("selected extension keys reject control bytes without exposing their value", () => {
     const home = fixture(VALID_REGISTRY, VALID_MANIFEST);
     const result = spawnSync(FX_BIN, ["ask", "--json", "--no-save", "hello"], {

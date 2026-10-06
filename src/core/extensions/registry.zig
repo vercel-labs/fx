@@ -9,6 +9,7 @@ const provider_set = @import("../gateway/provider_set.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const credentials = @import("../auth/credentials.zig");
+const stream_provider = @import("../agent/stream_provider.zig");
 const secret = @import("../auth/secret.zig");
 
 const Allocator = std.mem.Allocator;
@@ -73,15 +74,7 @@ pub const Registry = struct {
         for (key) |byte| if (byte < first_printable_byte or byte == terminal_delete_byte) return error.ExtensionCredentialInvalid;
         const owned_key = try alloc.dupe(u8, key);
         errdefer secret.zeroAndFree(alloc, owned_key);
-        var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        hash.update(credential_scope_domain);
-        for ([_][]const u8{ binding.provider.id, binding.provider.base_url, binding.provider.api_key_env }) |part| {
-            hash.update(credential_scope_separator);
-            hash.update(part);
-        }
-        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-        hash.final(&digest);
-        const scope = std.fmt.bytesToHex(digest, .lower);
+        const scope = credential_scope(binding.provider);
         return .{ .token = owned_key, .source = .extension_api_key, .account_id = try alloc.dupe(u8, &scope) };
     }
 
@@ -89,11 +82,24 @@ pub const Registry = struct {
     pub fn attach(self: *Registry, builtins: provider_set.Set) provider_set.Set {
         var result = builtins;
         result.extension = .{
+            .agent_stream = .{ .context = self, .stream_fn = stream_model },
             .cli_model_catalog = .{ .context = self, .fetch_fn = catalog_ids },
             .model_catalog = .{ .context = self, .fetch_fn = catalog_entries },
             .model_capabilities = .{ .context = self, .resolve_fn = catalog_capabilities },
         };
         return result;
+    }
+
+    /// Queued model changes cannot repurpose a lease issued to a previous namespace.
+    fn stream_model(context: ?*anyopaque, _: Allocator, request: stream_provider.ModelRequest) !stream_provider.Result {
+        const self: *Registry = @ptrCast(@alignCast(context orelse return error.ExtensionRegistryUnavailable));
+        const binding = self.resolve_model(request.model) orelse return error.ExtensionModelNotRegistered;
+        if (request.credential.source != .extension_api_key) return error.ExtensionCredentialScopeMismatch;
+        const account = request.credential.account_id orelse return error.ExtensionCredentialScopeMismatch;
+        const expected = credential_scope(binding.provider);
+        if (!std.mem.eql(u8, account, &expected)) return error.ExtensionCredentialScopeMismatch;
+        // Registration and key possession never grant executable activation.
+        return error.ExtensionExecutionPermissionRequired;
     }
 
     /// Every public ID belongs to one provider; ambiguity cannot redirect credentials.
@@ -174,6 +180,19 @@ fn catalog_ids(raw: ?*anyopaque, alloc: Allocator, input: gateway_provider.CliMo
     access.private_models_may_be_hidden = false;
     access.public_only_reason = null;
     return .{ .loaded = .{ .ids = ids, .provenance = .{ .access = access } } };
+}
+
+/// Registry selection and transport admission share one non-secret scope identity.
+fn credential_scope(provider: protocol.Provider) [std.crypto.hash.sha2.Sha256.digest_length * 2]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(credential_scope_domain);
+    for ([_][]const u8{ provider.id, provider.base_url, provider.api_key_env }) |part| {
+        hash.update(credential_scope_separator);
+        hash.update(part);
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hash.final(&digest);
+    return std.fmt.bytesToHex(digest, .lower);
 }
 
 /// Missing profile registration is intentionally equivalent to upstream behavior.
