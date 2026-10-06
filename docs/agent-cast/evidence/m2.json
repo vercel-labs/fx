@@ -1,0 +1,18 @@
+{
+  "observed_at_utc": "2026-10-06T20:21:58.277937+00:00",
+  "status": "verified_local",
+  "scope": "Completed immutable-value cache in one process; subscriber and wire contracts unit-tested; actual multi-client broker pending.",
+  "qualification": "m2-2026-10-06/qualification.json",
+  "review": "m2-review.json",
+  "unit_tests_passed": 52,
+  "actual_fixture_comparisons": 2,
+  "cache_logical_receipts_per_fixture": 11,
+  "cold_backing_reader_calls": 4,
+  "second_agent_cache_hits": 4,
+  "second_agent_backing_reader_calls": 0,
+  "rejected_consumers_per_fixture": 3,
+  "successful_cli_stderr_clean": true,
+  "aggregate_output_copy_hard_limit_bytes": 16777216,
+  "performance_claim": null,
+  "ci_status": "not_run"
+}

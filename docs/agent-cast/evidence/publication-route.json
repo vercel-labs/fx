@@ -1,0 +1,15 @@
+{
+  "observed_at_utc": "2026-10-06T20:21:58.277937+00:00",
+  "source": [
+    "gh api user --jq .login",
+    "gh api --method POST repos/vercel-labs/fx/forks",
+    "gh repo view fork --json viewerPermission"
+  ],
+  "authenticated_api_account": "alvgeppetto",
+  "canonical_repository": "vercel-labs/fx",
+  "fork_created": "alvgeppetto/fx",
+  "fork_permission": "ADMIN",
+  "draft_pr": null,
+  "exact_commit_ci": "not_run",
+  "note": "Earlier gh auth status exposed a keychain account label. User endpoint is authoritative for the account used by these API calls. No account switch or credential value was requested."
+}

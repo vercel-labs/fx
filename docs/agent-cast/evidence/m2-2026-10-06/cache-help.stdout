@@ -1,0 +1,10 @@
+Usage: agent-cast-cache-demo --fixture PATH
+
+Capture a real file of 256 bytes to 1 MiB. Run two independent admitted
+four-window batches, then a batch of denied, stale, and mismatched calls.
+JSON includes complete output bytes and actual hit, miss, and backing counts.
+Hits still validate fixture admission, hash the capture, and copy output.
+This synchronous experiment does not implement production registry validation.
+
+  --fixture PATH  Actual file to capture once
+  --help          Show this help

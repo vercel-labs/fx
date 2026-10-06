@@ -185,7 +185,7 @@ test "execution detects mutation of captured bytes before admitting calls" {
     try std.testing.expectError(error.SnapshotTampered, execute(std.testing.allocator, &snapshot, &.{call}, .enabled));
 }
 
-test "windows reject out of range offsets lengths and addition overflow without reading" {
+test "invalid windows return no content or successful reader result" {
     var snapshot = try Snapshot.init(std.testing.allocator, "file", "abcdef");
     defer snapshot.deinit(std.testing.allocator);
     const windows = [_]contracts.Window{
@@ -228,7 +228,7 @@ test "unsupported effects tools options and result contracts reject before dispa
     }
 }
 
-test "output budget rejects before content is read" {
+test "output budget rejects without returning content or a successful reader result" {
     var snapshot = try Snapshot.init(std.testing.allocator, "file", "abcdef");
     defer snapshot.deinit(std.testing.allocator);
     var request = fixture(&snapshot, 1, "agent-a", 0, 3).request;

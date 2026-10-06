@@ -10,8 +10,9 @@ results while using different backing read groups. Two agent identities appear
 in one embedded process; multi-process clients belong to the broker milestone.
 
 Host admission and current generation values are trusted fixture contracts.
-Production permissions, expiry, cancellation, a shared completed-value cache,
-worker supervision, service pools, and sandbox containment remain planned.
+Production permissions, live expiry, broker cancellation, worker supervision,
+service pools, and sandbox containment remain planned. Completed-value caching
+is implemented in the separate embedded cache executor described below.
 
 ## Build and qualify
 
@@ -25,9 +26,9 @@ PYTHONDONTWRITEBYTECODE=1 python3 scripts/qualify_agent_cast.py --zig "$AGENT_CA
 The runner creates a new temporary receipt directory and retains its fixtures,
 logs, and JSON evidence. `--output PATH` selects a new directory and rejects an
 existing path. It checks formatting, builds with one job, runs focused unit
-tests, and drives the built binary against two distinct 1 KiB fixtures. Full
-result bytes and rejected consumers are checked independently of the binary's
-own parity flag.
+tests, and drives the foundation and cache binaries against two distinct 1 KiB
+fixtures. Full result bytes, provenance, logical identities, and rejected
+consumers are checked independently of the binaries' own verification flags.
 
 To run individual checks, change to this directory:
 
@@ -63,6 +64,39 @@ Snapshot bytes, path, and identity remain at a stable address and unchanged
 through execution. Receipt output slices borrow the snapshot; consume receipts
 and destroy executions before destroying the snapshot. Plan-owned arrays have
 explicit `deinit` methods.
+
+## Completed-value cache
+
+Run the separately built cache demonstration with the same bounded input:
+
+```sh
+./zig-out/bin/agent-cast-cache-demo --fixture /path/to/fixture
+```
+
+The first four-window batch executes backing reads. A second admitted agent
+requests the same windows through four new logical calls and receives four
+cache hits. A third batch of denied, stale, and mismatched consumers receives
+no output. Each receipt reports its own identity and cache/backing provenance.
+
+Every lookup checks fresh exact fixture admission, capture integrity, and the
+registered reader contract. Keys and values are owned. FIFO eviction charges
+the allocated table plus retained strings and values to the cache quota;
+replacement storage fits that quota before allocation. Optional retention
+allocation failure preserves an already-copied successful output.
+
+Returned output copies survive eviction. They consume a separate explicit
+batch budget: 64 KiB by default, capped at 16 MiB. Before any cache access, the
+batch reserves admitted snapshot-read requested window lengths, including
+windows that may later fail dispatch. Excess or overflow rejects the whole
+batch without results or cache changes. Allocator overhead and the supplied
+snapshot have separate ownership and accounting.
+
+The subscriber registry enforces independent deadlines, cancellation, credit
+and output sequences, stale-handle rejection, and output drainage before
+success. The wire module bounds framed payloads and rejects duplicate JSON
+fields, excessive nesting, explicit null IDs, and non-object params. Their
+current evidence is unit testing. Actual broker connections, shared producer
+execution, and asynchronous cancellation qualification remain pending.
 
 ## Work ledger
 

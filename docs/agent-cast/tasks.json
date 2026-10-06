@@ -7,7 +7,7 @@
     "design": "docs/agent-cast-architecture.html",
     "scope": "Foundation first; no production permissions, broker, isolation or performance claim yet."
   },
-  "last_updated_utc": "2026-10-06T19:55:56.443491+00:00",
+  "last_updated_utc": "2026-10-06T20:21:58.277937+00:00",
   "routing_policy": {
     "routine_model": "gpt-6-luna",
     "implementation_model": "gpt-6.1-sol",
@@ -16,7 +16,7 @@
     "repair_policy": "At most two repair rounds per delegated scope before parent review",
     "spending_limit": null,
     "usage_policy": "Null means unavailable; actual token counts require a provider receipt. No inferred totals.",
-    "current_batch": "M0/M1 locally verified; M2 queued; publication/CI pending"
+    "current_batch": "Completed cache locally verified; subscribers unit-tested; broker authority in progress; fork CI route available"
   },
   "milestones": [
     {
@@ -251,14 +251,15 @@
       ],
       "evidence": [
         "docs/agent-cast/evidence/contract-review.json",
-        "docs/agent-cast/evidence/foundation.json"
+        "docs/agent-cast/evidence/foundation.json",
+        "docs/agent-cast/evidence/m2-2026-10-06/qualification.json"
       ],
       "usage": {
         "input_tokens": null,
         "output_tokens": null,
         "source": null
       },
-      "updated_at_utc": "2026-10-06T19:55:56.443491+00:00"
+      "updated_at_utc": "2026-10-06T20:21:58.277937+00:00"
     },
     {
       "id": "AC-0102",
@@ -286,14 +287,15 @@
         "Built demo uses input identity and actual executor counts; labels two logical agents without claiming multi-process execution"
       ],
       "evidence": [
-        "docs/agent-cast/evidence/foundation.json"
+        "docs/agent-cast/evidence/foundation.json",
+        "docs/agent-cast/evidence/m2-2026-10-06/qualification.json"
       ],
       "usage": {
         "input_tokens": null,
         "output_tokens": null,
         "source": null
       },
-      "updated_at_utc": "2026-10-06T19:55:56.443491+00:00"
+      "updated_at_utc": "2026-10-06T20:21:58.277937+00:00"
     },
     {
       "id": "AC-0103",
@@ -320,14 +322,15 @@
       ],
       "evidence": [
         "docs/agent-cast/evidence/contract-review.json",
-        "docs/agent-cast/evidence/foundation.json"
+        "docs/agent-cast/evidence/foundation.json",
+        "docs/agent-cast/evidence/m2-2026-10-06/qualification.json"
       ],
       "usage": {
         "input_tokens": null,
         "output_tokens": null,
         "source": null
       },
-      "updated_at_utc": "2026-10-06T19:55:56.443491+00:00"
+      "updated_at_utc": "2026-10-06T20:21:58.277937+00:00"
     },
     {
       "id": "AC-0104",
@@ -356,14 +359,15 @@
       ],
       "evidence": [
         "docs/agent-cast/evidence/foundation.json",
-        "docs/agent-cast/evidence/foundation-2026-10-06/qualification.json"
+        "docs/agent-cast/evidence/foundation-2026-10-06/qualification.json",
+        "docs/agent-cast/evidence/m2-2026-10-06/qualification.json"
       ],
       "usage": {
         "input_tokens": null,
         "output_tokens": null,
         "source": null
       },
-      "updated_at_utc": "2026-10-06T19:55:56.443491+00:00"
+      "updated_at_utc": "2026-10-06T20:21:58.277937+00:00"
     },
     {
       "id": "AC-0105",
@@ -389,79 +393,92 @@
         "Record absent publication authorization or unavailable checks; do not invent a successful gate"
       ],
       "evidence": [
-        "docs/agent-cast/evidence/checkpoint.json"
+        "docs/agent-cast/evidence/checkpoint.json",
+        "docs/agent-cast/evidence/publication-route.json"
       ],
       "usage": {
         "input_tokens": null,
         "output_tokens": null,
         "source": null
       },
-      "updated_at_utc": "2026-10-06T19:55:56.443491+00:00",
-      "pending_reason": "Local CI configuration exists; available GitHub account has READ permission. Exact-commit publication and checks are pending."
+      "updated_at_utc": "2026-10-06T20:21:58.277937+00:00",
+      "pending_reason": "Fork publication route now available; draft PR and exact-commit CI pending."
     },
     {
       "id": "AC-0201",
       "milestone": "M2",
       "title": "Add owned bounded completed-value cache",
-      "status": "planned",
+      "status": "verified_local",
       "depends_on": [
         "AC-0104"
       ],
       "owner": {
         "role": "implementation",
         "model": "gpt-6.1-sol",
-        "reasoning_effort": "high"
+        "reasoning_effort": "high",
+        "agent": "/root/agent_cast_core"
       },
       "scope": [
         "experiments/agent_cast/src/cache.zig",
-        "cache-focused tests"
+        "experiments/agent_cast/src/cached_executor.zig",
+        "experiments/agent_cast/src/cache_demo.zig",
+        "experiments/agent_cast/build.zig",
+        "experiments/agent_cast/src/tests.zig"
       ],
       "acceptance": [
         "Cache successful immutable canonical values after each current logical admission",
         "Prove two-agent sharing, domain/task isolation, invalidation, eviction and output lifetime"
       ],
-      "evidence": [],
+      "evidence": [
+        "docs/agent-cast/evidence/m2.json",
+        "docs/agent-cast/evidence/m2-review.json"
+      ],
       "usage": {
         "input_tokens": null,
         "output_tokens": null,
         "source": null
       },
-      "updated_at_utc": "2026-10-06T19:38:41.491825+00:00"
+      "updated_at_utc": "2026-10-06T20:21:58.277937+00:00"
     },
     {
       "id": "AC-0202",
       "milestone": "M2",
       "title": "Qualify inflight sharing and independent consumers",
-      "status": "planned",
+      "status": "implemented",
       "depends_on": [
         "AC-0201"
       ],
       "owner": {
         "role": "implementation",
         "model": "gpt-6.1-sol",
-        "reasoning_effort": "high"
+        "reasoning_effort": "high",
+        "agent": "/root/agent_cast_subscribers"
       },
       "scope": [
-        "cache/subscriber contracts",
-        "cancellation and deadline tests"
+        "experiments/agent_cast/src/subscribers.zig",
+        "broker subscriber runtime qualification"
       ],
       "acceptance": [
         "Cancel one subscriber without stopping work required by another",
         "Keep independent deadlines/credits/audit/retry provenance; reject stale result delivery"
       ],
-      "evidence": [],
+      "evidence": [
+        "docs/agent-cast/evidence/m2-2026-10-06/qualification.json",
+        "docs/agent-cast/evidence/m2-review.json"
+      ],
       "usage": {
         "input_tokens": null,
         "output_tokens": null,
         "source": null
       },
-      "updated_at_utc": "2026-10-06T19:38:41.491825+00:00"
+      "updated_at_utc": "2026-10-06T20:21:58.277937+00:00",
+      "pending_reason": "Thirteen subscriber unit tests pass; actual shared producer/cancellation runtime interaction remains pending broker composition."
     },
     {
       "id": "AC-0301",
       "milestone": "M3",
       "title": "Implement framed local broker and scoped enrollment",
-      "status": "planned",
+      "status": "in_progress",
       "depends_on": [
         "AC-0202"
       ],
@@ -471,8 +488,10 @@
         "reasoning_effort": "high"
       },
       "scope": [
+        "experiments/agent_cast/src/wire.zig",
+        "experiments/agent_cast/src/authority.zig",
         "experiments/agent_cast/src/broker.zig",
-        "wire/enrollment contracts"
+        "experimental broker runtime qualification"
       ],
       "acceptance": [
         "Bounds, framing, epochs, roles, authority and reconnect semantics tested",
@@ -484,7 +503,8 @@
         "output_tokens": null,
         "source": null
       },
-      "updated_at_utc": "2026-10-06T19:38:41.491825+00:00"
+      "updated_at_utc": "2026-10-06T20:21:58.277937+00:00",
+      "implementation_note": "Parent authored framed strict JSON-RPC parser; Sol is implementing host-owned authority registry. Broker executable not yet implemented."
     },
     {
       "id": "AC-0302",
@@ -659,7 +679,8 @@
       ],
       "acceptance": [
         "Meaningful optimized baselines, equal work/resources, and independent outcomes",
-        "Exact-commit gates and local happy path verified; report failed/uncertain results"
+        "Exact-commit gates and local happy path verified; report failed/uncertain results",
+        "Independent adversarial scenarios include deliberate broken/featureless controls that must fail qualification."
       ],
       "evidence": [],
       "usage": {
@@ -668,6 +689,44 @@
         "source": null
       },
       "updated_at_utc": "2026-10-06T19:38:41.491825+00:00"
+    },
+    {
+      "id": "AC-0802",
+      "milestone": "M8",
+      "title": "Independently red-team and close material runtime findings",
+      "status": "planned",
+      "depends_on": [
+        "AC-0801"
+      ],
+      "owner": {
+        "role": "independent critical review",
+        "model": "gpt-6-astra",
+        "reasoning_effort": "high"
+      },
+      "scope": [
+        "experiments/agent_cast/tests/red_team/",
+        "docs/agent-cast/evidence/red-team/"
+      ],
+      "acceptance": [
+        "Exercise real built runtime adversarial authority, cache, framing, cancellation, recovery, reset and service-generation paths.",
+        "Independently compare required and extra effects; qualification rejects deliberate broken controls.",
+        "Every material finding is repaired and affected checks are rerun; unresolved findings block promotion."
+      ],
+      "evidence": [],
+      "usage": {
+        "input_tokens": null,
+        "output_tokens": null,
+        "source": null
+      },
+      "updated_at_utc": "2026-10-06T20:02:55.247521+00:00"
     }
-  ]
+  ],
+  "goal": {
+    "status": "active",
+    "objective": "Implement M2 through M8 and independently red-team validate the full bounded agent-cast system.",
+    "requested_at_utc": "2026-10-06T19:59:10+00:00",
+    "token_budget": null,
+    "execution": "Overnight goal loop; honor operator stops; one heavy job per host; preserve existing data and failed receipts.",
+    "completion_rule": "All milestone acceptance and independent adversarial checks supported by current receipts; exact-commit CI and applicable ship gate remain mandatory."
+  }
 }

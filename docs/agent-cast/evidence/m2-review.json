@@ -1,0 +1,34 @@
+{
+  "observed_at_utc": "2026-10-06T20:21:58.277937+00:00",
+  "requested_model": "gpt-6-astra",
+  "source": "Independent static review responses in this session, followed by parent source inspection and actual combined qualification.",
+  "findings": [
+    {
+      "finding": "Insertion could temporarily exceed nominal cache allocation quota",
+      "resolution": "Eviction precedes allocation; tracking-allocator peak test exercises private insertion and would fail original order."
+    },
+    {
+      "finding": "Optional retention OOM could replace successful tool output with an error",
+      "resolution": "Copied success survives optional retention OOM; induced-failure sweeps cover empty cache and replacement after eviction."
+    },
+    {
+      "finding": "Batch output copies could approach 1GiB outside tiny cache quota",
+      "resolution": "Explicit aggregate reservation defaults64KiB and has16MiB hard cap; overflow/projected excess reject before cache access."
+    },
+    {
+      "finding": "Subscriber successful settlement discarded pending/undrained output",
+      "resolution": "Declared result size required; all active unexpired consumers must deliver exactly it, with no pending reservation. Four regression blocks cover partial/blocked/zero/cancelled consumers."
+    },
+    {
+      "finding": "Explicit null RPC IDs were treated as notifications; null params bypassed object profile",
+      "resolution": "Dynamic parse preserves field presence; present non-string ID/non-object params rejects, missing ID stays notification."
+    }
+  ],
+  "runtime_evidence": "m2-2026-10-06/qualification.json",
+  "limits": [
+    "Static review itself ran no code. Parent qualification covers52 unit tests and actual foundation/cache CLI paths.",
+    "Subscriber/framing modules have unit evidence; real broker/client cancellation and networking remain pending.",
+    "Fixture authority does not implement production permission issuance.",
+    "No end-to-end speedup measured; admitted cache hits still hash capture and copy output."
+  ]
+}

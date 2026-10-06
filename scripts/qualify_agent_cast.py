@@ -6,6 +6,7 @@ import datetime
 import hashlib
 import json
 import platform
+import re
 import subprocess
 import tempfile
 import time
@@ -76,12 +77,63 @@ def verify_report(report, content, mode):
         raise ValueError("single-mode run claims comparative parity")
 
 
+def verify_cache_report(report, content):
+    if report["fixture_verified"] is not True or report["logical_call_count"] != 11:
+        raise ValueError("cache demo did not retain its useful logical workload")
+    if report["immutable_input_sha256"] != hashlib.sha256(content).hexdigest() or report["immutable_input_bytes"] != len(content):
+        raise ValueError("cache demo did not capture the actual supplied fixture")
+    limits, stats = report["limits"], report["cache"]
+    if not 0 < stats["metadata_bytes"] <= stats["retained_bytes"] <= limits["max_bytes"]:
+        raise ValueError("cache retained byte accounting exceeds its stated limits")
+    if stats["entries"] != 4 or stats["entries"] > limits["max_entries"]:
+        raise ValueError("cache did not retain four independent actual values")
+    if (stats["hits"], stats["misses"], stats["backing_reads"], stats["rejected"]) != (4, 4, 4, 3):
+        raise ValueError("cache reported incorrect physical work or rejected consumers")
+    if not 0 < report["batch_limits"]["max_result_bytes"] <= 16 * 1024 * 1024:
+        raise ValueError("cache demo has no bounded aggregate output reservation")
+    names = ["cold-agent-a", "completed-values-agent-b", "rejected-consumers"]
+    if [batch["name"] for batch in report["batches"]] != names:
+        raise ValueError("wrong independent cache batches")
+    next_id = 1
+    for index, batch in enumerate(report["batches"]):
+        expected_count = 3 if index == 2 else 4
+        if batch["logical_calls"] != expected_count or len(batch["receipts"]) != expected_count:
+            raise ValueError("cache logical calls disappeared")
+        expected_counts = [(0, 4, 4), (4, 0, 0), (0, 0, 0)][index]
+        if (batch["cache_hits"], batch["cache_misses"], batch["backing_reads"]) != expected_counts:
+            raise ValueError("wrong batch provenance counters")
+        for window, call in enumerate(batch["receipts"]):
+            if call["logical_id"] != next_id:
+                raise ValueError("cache changed per-logical identity")
+            next_id += 1
+            if call["principal_domain"] != "fixture-operator" or call["task_id"] != "cache-fixture-task":
+                raise ValueError("cache changed the admitted task or principal")
+            if index < 2:
+                expected = content[window * 64:(window + 1) * 64]
+                if call["agent_id"] != ("agent-a" if index == 0 else "agent-b"):
+                    raise ValueError("cache changed consumer identity")
+                if call["admission_status"] != "admitted" or call["status"] != "success":
+                    raise ValueError("cache allowed read did not succeed")
+                if (call["source"], call["cache_hit"], call["cache_miss"], call["backing_reads"]) != [("backing", False, True, 1), ("cache", True, False, 0)][index]:
+                    raise ValueError("cache hit or backing provenance is incorrect")
+            else:
+                expected = b""
+                admission = ["denied", "stale_authority", "binding_mismatch"][window]
+                agent = ["denied-agent", "stale-agent", "mismatched-agent"][window]
+                if call["admission_status"] != admission or call["agent_id"] != agent or call["status"] != "admission_rejected":
+                    raise ValueError("rejected cache consumer changed identity or received admission")
+                if (call["source"], call["cache_hit"], call["cache_miss"], call["backing_reads"]) != ("rejected", False, False, 0):
+                    raise ValueError("rejected consumer performed cache or backing work")
+            if bytes.fromhex(call["output_hex"]) != expected or call["output_bytes"] != len(expected) or call["output_sha256"] != hashlib.sha256(expected).hexdigest():
+                raise ValueError("cache output differs from actual independently supplied bytes")
+
+
 def qualify(zig, output):
     checks = []
     receipt = {
         "schema_version": 1,
         "recorded_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "scope": "local foundation correctness; logical agent identities in one process",
+        "scope": "local foundation/cache correctness and subscriber/framing unit checks; logical agents in one process; no broker or isolation qualification",
         "platform": platform.platform(),
         "machine": platform.machine(),
         "source_sha256": {str(p.relative_to(ROOT)): digest(p) for p in sorted(PROJECT.rglob("*.zig")) if "zig-out" not in p.parts and ".zig-cache" not in p.parts},
@@ -91,14 +143,14 @@ def qualify(zig, output):
         "ok": False,
     }
 
-    def run(name, argv, cwd=PROJECT):
+    def run(name, argv, cwd=PROJECT, expected_exit=0):
         start = time.monotonic()
         result = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=300)
         (output / f"{name}.stdout").write_text(result.stdout)
         (output / f"{name}.stderr").write_text(result.stderr)
         check = {"name": name, "argv": [str(a) for a in argv], "cwd": str(cwd), "exit_code": result.returncode, "seconds": time.monotonic() - start, "stdout": f"{name}.stdout", "stderr": f"{name}.stderr"}
         checks.append(check)
-        if result.returncode:
+        if result.returncode != expected_exit:
             raise RuntimeError(f"{name} failed: {result.stderr[-2000:]}")
         return result
 
@@ -109,12 +161,21 @@ def qualify(zig, output):
         receipt["zig_version"] = version
         run("format", [zig, "fmt", "--check", "src/", "build.zig"])
         run("build", [zig, "build", "-Doptimize=ReleaseSafe", "-j1"])
-        run("unit", [zig, "build", "test", "-Doptimize=ReleaseSafe", "-j1", "--summary", "all"])
+        unit = run("unit", [zig, "build", "test", "-Doptimize=ReleaseSafe", "-j1", "--summary", "all"])
+        counts = re.search(r"(\d+)/(\d+) tests passed", unit.stderr)
+        if not counts or counts[1] != counts[2] or int(counts[1]) < 30:
+            raise ValueError("unit receipt does not prove the nonempty foundation/cache test owner ran")
+        receipt["unit_tests_passed"] = int(counts[1])
         binary = PROJECT / "zig-out" / "bin" / "agent-cast-demo"
         receipt["binary_sha256"] = digest(binary)
         help_result = run("help", [binary, "--help"])
         if help_result.stderr or "--fixture" not in help_result.stdout:
             raise ValueError("built CLI help interaction failed")
+        cache_binary = PROJECT / "zig-out" / "bin" / "agent-cast-cache-demo"
+        receipt["cache_binary_sha256"] = digest(cache_binary)
+        cache_help = run("cache-help", [cache_binary, "--help"])
+        if cache_help.stderr or "--fixture" not in cache_help.stdout:
+            raise ValueError("built cache CLI help failed")
         fixtures = []
         for fixture_index in range(2):
             content = b"".join(f"fixture-{fixture_index}-window-{i:02d}".encode().ljust(64, bytes([65 + fixture_index + i])) for i in range(16))
@@ -127,7 +188,11 @@ def qualify(zig, output):
                 raise ValueError("built comparison wrote unexpected stderr")
             report = json.loads(result.stdout)
             verify_report(report, content, "compare")
-            fixtures.append({"sha256": digest(path), "bytes": len(content), "comparison": f"compare-{fixture_index}.stdout", "logical_receipts_per_mode": 10, "disabled_backing_reads": report["runs"][0]["physical_reads"], "enabled_backing_reads": report["runs"][1]["physical_reads"]})
+            cached = run(f"cache-{fixture_index}", [cache_binary, "--fixture", path])
+            if cached.stderr:
+                raise ValueError("built cache interaction wrote unexpected stderr")
+            verify_cache_report(json.loads(cached.stdout), content)
+            fixtures.append({"sha256": digest(path), "bytes": len(content), "comparison": f"compare-{fixture_index}.stdout", "cache_comparison": f"cache-{fixture_index}.stdout", "logical_receipts_per_mode": 10, "cache_logical_receipts": 11, "disabled_backing_reads": report["runs"][0]["physical_reads"], "enabled_backing_reads": report["runs"][1]["physical_reads"]})
         if fixtures[0]["sha256"] == fixtures[1]["sha256"]:
             raise ValueError("the independent fixtures have identical content")
         receipt["fixtures"] = fixtures
@@ -137,6 +202,11 @@ def qualify(zig, output):
             if result.stderr:
                 raise ValueError("single-mode interaction wrote unexpected stderr")
             verify_report(json.loads(result.stdout), content, mode)
+        tiny = output / "too-small.bin"
+        tiny.write_bytes(b"actual-invalid-input")
+        rejected = run("cache-too-small", [cache_binary, "--fixture", tiny], expected_exit=1)
+        if rejected.stdout or rejected.stderr != "agent-cast-cache-demo: FixtureTooSmall; see --help\n":
+            raise ValueError("invalid cache input did not produce the expected ordinary error")
         receipt["ok"] = True
     except (OSError, subprocess.TimeoutExpired, RuntimeError, ValueError, KeyError) as error:
         receipt["error"] = str(error)

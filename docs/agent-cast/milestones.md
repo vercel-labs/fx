@@ -112,21 +112,25 @@ CI result.
 
 ## Current checkpoint
 
-M0 and the bounded M1 slice have local evidence in
-[evidence/foundation.json](evidence/foundation.json) and
-[evidence/ledger.json](evidence/ledger.json). The qualification observed 18 Zig
-tests, 10 ledger CLI tests, and two different actual fixtures. Each comparison
-retained ten logical receipts while using eight or four captured-content reader
-invocations. This is correctness evidence, with no measured speedup claim.
+M0, the bounded M1 slice, and M2 completed-value caching have local evidence in
+[evidence/m2.json](evidence/m2.json) and
+[evidence/ledger.json](evidence/ledger.json). The refreshed qualification observed
+52 Zig tests and two different actual fixtures. Foundation comparisons retain
+ten logical receipts while using eight or four captured-content reader calls.
+Cache comparisons retain eleven receipts, including four new logical consumers
+served from completed values and three rejected consumers with no output.
+The subscriber and framing contracts have unit evidence; their actual broker
+runtime qualification remains pending. No measured speedup is claimed.
 
-The available GitHub account has read access to `vercel-labs/fx`.
-[evidence/checkpoint.json](evidence/checkpoint.json) records the publication and
-CI gate. The added `Agent-cast Foundation` workflow builds and exercises this
-prototype on Linux and macOS when a permitted contributor publishes it. Its
-checks supplement the existing fx product checks.
+The available account has read access to `vercel-labs/fx`; an owned fork provides
+the publication route recorded in
+[evidence/publication-route.json](evidence/publication-route.json). Draft PR and
+exact-commit CI are pending. The `Agent-cast Foundation` workflow builds and
+exercises this prototype on Linux and macOS. Its checks supplement the existing
+fx product checks.
 
-The next task is `AC-0201`: owned bounded completed-value caching. Verify a new
-logical admission before every hit, keep task/domain/snapshot/contract boundaries
-in the key, and prove eviction plus output lifetime. Inflight cancellation and
-actual multi-client sharing follow as separate tasks. Refine later milestone
-scopes into concrete file ownership before dispatching them.
+The current work is `AC-0301`: broker framing and a host-owned authority registry,
+followed by an actual broker executable. `AC-0202` still needs a real shared
+producer and cancellation interaction. Later work retains its own runtime,
+recovery, containment, service and red-team gates. Refine those scopes into
+concrete file ownership before dispatching them.
