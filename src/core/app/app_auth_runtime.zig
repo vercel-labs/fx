@@ -16,6 +16,9 @@ const model_provider = @import("../config/model_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const types = @import("../shared/types.zig");
+const extension_key_required_format = "Set {s} for the selected extension provider.";
+const extension_configuration_unavailable = "The selected extension model is not registered.";
+const extension_credential_invalid = "The selected extension credential is invalid; check its configured environment slot.";
 
 fn oauthAuthEnabled(comptime App: type) bool {
     return runtime_profile.allows(App, .native_auth) or
@@ -51,11 +54,40 @@ fn selectCatalogModel(
 
 pub fn Runtime(comptime App: type) type {
     return struct {
+        /// A shared transport route must not authorize a different registered namespace.
+        fn ensure_extension_prompt_credential(app: *App) !bool {
+            if (comptime @hasField(App, "extensions") and @hasDecl(@TypeOf(app.auth), "adoptCredential")) {
+                const registry = app.extensions orelse return extension_auth_notice(app, extension_configuration_unavailable);
+                const model = provider_runtime.model(app);
+                const binding = registry.resolve_model(model) orelse return extension_auth_notice(app, extension_configuration_unavailable);
+                var credential = registry.resolve_credential(app.alloc, model) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return extension_auth_notice(app, extension_credential_invalid),
+                } orelse {
+                    const body = try std.fmt.allocPrint(app.alloc, extension_key_required_format, .{binding.provider.api_key_env});
+                    defer app.alloc.free(body);
+                    return extension_auth_notice(app, body);
+                };
+                defer credential.deinit(app.alloc);
+                applyCredentialChange(app, app.auth.adoptCredential(app.alloc, &credential));
+                return true;
+            }
+            return false;
+        }
+
+        /// Missing or malformed slots block admission without exposing a secret or native login flow.
+        fn extension_auth_notice(app: *App, body: []const u8) !bool {
+            try app.writeDomainNotice(.{ .topic = "auth", .tone = .warning, .body = body }, true);
+            app.shell.render_requests.request(.footer);
+            return false;
+        }
+
         fn ensurePromptCredential(app: *App) !bool {
             if (comptime provider_runtime.supported(App) and
                 @hasDecl(@TypeOf(app.auth), "selectForProvider"))
             {
                 const provider = provider_runtime.provider(app);
+                if (provider == .extension) return ensure_extension_prompt_credential(app);
                 const required_source: credentials.Source = switch (provider) {
                     .codex => .chatgpt_subscription,
                     .grok => .grok_subscription,
@@ -1154,11 +1186,11 @@ pub fn Runtime(comptime App: type) type {
                 @hasField(@TypeOf(app.session), "usage"))
             {
                 if (app.auth.gatewayCredential()) |credential| {
-                    const subscription = if (comptime @hasField(@TypeOf(credential), "source"))
-                        credential.source == .chatgpt_subscription or credential.source == .grok_subscription
+                    const gateway_authorized = if (comptime @hasField(@TypeOf(credential), "source"))
+                        model_provider.authorizesCredential(.gateway, credential.source)
                     else
-                        false;
-                    if (subscription) {
+                        true;
+                    if (!gateway_authorized) {
                         app.session.usage.clearReconciliationCredential();
                     } else {
                         if (comptime @hasDecl(

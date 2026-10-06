@@ -22,6 +22,8 @@ const MODELS_FILENAME = "models.json";
 const TIMEOUT_MS = 15_000;
 const TUI_TIMEOUT_MS = 5_000;
 const TUI_STDERR_FILENAME = "fx-stderr.log";
+const SECOND_API_KEY_ENV = "FX_SECOND_EXTENSION_TEST_KEY";
+const AUTH_SCOPE_PROMPT = "check scoped authentication";
 const tuiTest = tmuxAvailable() ? test.serial : test.skip;
 const UNREACHABLE_GATEWAY = "http://127.0.0.1:1";
 const GATEWAY_FIXTURE_KEY = "wrong-gateway-fixture-key";
@@ -77,7 +79,7 @@ describe("local extension discovery", () => {
     const home = fixture(VALID_REGISTRY, {
       ...VALID_MANIFEST, providers: [VALID_MANIFEST.providers[0], {
         ...VALID_MANIFEST.providers[0], id: SECOND_PROVIDER,
-        api_key_env: "FX_SECOND_EXTENSION_TEST_KEY",
+        api_key_env: SECOND_API_KEY_ENV,
       }],
     });
     const settingsPath = join(home, PROFILE_DIRECTORY, SETTINGS_FILENAME);
@@ -252,6 +254,42 @@ describe("local extension discovery", () => {
     expect(result.stderr + result.stdout).toContain("ExtensionCredentialInvalid");
     expect(result.stderr + result.stdout).not.toContain(INVALID_EXTENSION_KEY_MARKER);
   });
+
+  tuiTest("switching extension models never reuses another provider's credential", async () => {
+    const home = fixture(VALID_REGISTRY, { ...VALID_MANIFEST, providers: [
+      VALID_MANIFEST.providers[0], { ...VALID_MANIFEST.providers[0], id: SECOND_PROVIDER,
+        api_key_env: SECOND_API_KEY_ENV },
+    ] });
+    const catalogPath = join(home, PROFILE_DIRECTORY, FIXTURE_EXTENSION_DIRECTORY, MODELS_FILENAME);
+    const catalog = JSON.parse(readFileSync(catalogPath, "utf8"));
+    catalog.models[0].reasoning = false;
+    catalog.models[0].reasoning_efforts = [];
+    writeFileSync(catalogPath, JSON.stringify(catalog));
+    const stderrPath = join(home, TUI_STDERR_FILENAME);
+    let session: TmuxSession | undefined;
+    try {
+      session = await TmuxSession.create({ cmd: FX_BIN, cwd: home, stderrPath, isolated: true,
+        env: { HOME: home, AI_GATEWAY_API_KEY: "", VERCEL_OIDC_TOKEN: "", FX_MODEL: undefined,
+          FX_EXTENSION_TEST_KEY: EXTENSION_FIXTURE_KEY, FX_SECOND_EXTENSION_TEST_KEY: undefined,
+          FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "0", FX_GATEWAY_BASE_URL: UNREACHABLE_GATEWAY },
+      });
+      await session.waitForText("Run /help", TUI_TIMEOUT_MS);
+      await session.sendText("/model");
+      await session.waitForText(SECOND_MODEL, TUI_TIMEOUT_MS);
+      await session.sendKeys("Down");
+      await session.sendKeys("Enter");
+      await session.waitForText(SECOND_MODEL, TUI_TIMEOUT_MS);
+      await session.sendText(AUTH_SCOPE_PROMPT);
+      const pane = await session.waitForText(SECOND_API_KEY_ENV, TUI_TIMEOUT_MS);
+      expect(pane).not.toContain(EXTENSION_FIXTURE_KEY);
+      expect(session.isAlive()).toBe(true);
+      const settings = JSON.parse(readFileSync(join(home, PROFILE_DIRECTORY, SETTINGS_FILENAME), "utf8"));
+      expect(settings.models.extension).toBe(SECOND_MODEL);
+    } finally {
+      await session?.kill();
+      if (session) expect(readFileSync(stderrPath, "utf8")).toBe("");
+    }
+  }, TIMEOUT_MS);
 
   tuiTest("the model picker exposes cached extension reasoning without starting its executable", async () => {
     const home = fixture(VALID_REGISTRY, VALID_MANIFEST);

@@ -1479,7 +1479,8 @@ pub const Runtime = struct {
         provider: model_provider.ProviderId,
     ) !?bool {
         return switch (provider) {
-            .extension => if (self.credentialSource() == .extension_api_key) false else null,
+            // Installed namespaces require model-scoped resolution outside this native selector.
+            .extension => null,
             .codex => if (self.credentialSource() == .chatgpt_subscription)
                 false
             else
