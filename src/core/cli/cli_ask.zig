@@ -89,6 +89,7 @@ const ask_presentation = @import("../../ui/ask_presentation.zig");
 const url_opener = @import("../hosts/url_opener.zig");
 
 const Allocator = std.mem.Allocator;
+const executable_approval_label_format = "{s}\n{s}";
 const BackgroundRuntime = background_runtime.BackgroundRuntime;
 const ChatMessage = types.ChatMessage;
 const HistoryTurn = types.HistoryTurn;
@@ -2275,10 +2276,12 @@ fn writeBlockedActionGuidance(
     try ctx.writeStderr(hint);
 }
 
-/// CLI approval remains native and interactive without manufacturing a ToolCall.
+/// Consent must expose OS privileges before a native confirmation can authorize startup.
 fn requestCliExecutablePermission(raw_ctx: *anyopaque, alloc: Allocator, request: permission_request.PermissionRequest) !permission_request.OwnedPermissionResponse {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    return switch (try promptCliPermissionApproval(ctx, request.label)) {
+    const label = if (request.explanation) |warning| try std.fmt.allocPrint(alloc, executable_approval_label_format, .{ warning, request.label }) else try alloc.dupe(u8, request.label);
+    defer alloc.free(label);
+    return switch (try promptCliPermissionApproval(ctx, label)) {
         .approve => permission_request.OwnedPermissionResponse.init(alloc, .once, null),
         .deny => permission_request.OwnedPermissionResponse.init(alloc, .deny, null),
         .unavailable => error.PermissionPromptUnavailable,

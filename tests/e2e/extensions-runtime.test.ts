@@ -9,6 +9,17 @@ import { EXTENSION_FIXTURE_KEY, PROFILE_DIRECTORY, FIXTURE_EXTENSION_DIRECTORY, 
 
 const TIMEOUT_MS = 15_000;
 const TUI_TIMEOUT_MS = 5_000;
+const CLI_APPROVAL_ARGUMENTS = ["ask", "--json", "--prompt-permissions", "--no-save"];
+const CLI_APPROVAL_EXIT_FORMAT = "%s\\n";
+const CLI_APPROVAL_SHELL = "/bin/sh";
+const CLI_APPROVAL_STATUS_SUFFIX = ".status";
+const MODE_CHANGE_COMMAND = "/permissions auto";
+const MODE_CHANGE_NOTICE = "mode set to auto";
+const AUTO_REVIEW_UNAVAILABLE_ERROR = "ExtensionExecutionAutoReviewUnavailable";
+const CLI_APPROVAL_OUTPUT_FILENAME = "native-approval-output.json";
+const CLI_APPROVAL_PROMPT = "Approve? [y/N]";
+const CLI_PRIVILEGE_WARNING = "not sandboxed";
+const CLI_APPROVAL_CASES = [ { decision: "approve", answer: "y", exitCode: 0 }, { decision: "deny", answer: "n", exitCode: 1 } ];
 const TUI_STDERR_FILENAME = "fx-stderr.log";
 const EXECUTABLE_CHANGE_COMMENT = "\n// Changed identity requires a new native launch decision.\n";
 const EXECUTABLE_CHANGED_ERROR = "ExtensionExecutableChanged";
@@ -150,6 +161,74 @@ describe("local extension RPC runtime", () => {
     expect(calls.every(call => !call.ambientKey)).toBe(true);
     expect(() => process.kill(calls[0].pid, 0)).toThrow();
   });
+
+  tuiTest.each(CLI_APPROVAL_CASES)("native CLI human $decision preserves JSON and exact launch", async ({ decision, answer, exitCode }) => {
+    const { home, extension } = fixture();
+    const stdoutPath = join(home, CLI_APPROVAL_OUTPUT_FILENAME);
+    writeFileSync(stdoutPath, "");
+    const statusPath = stdoutPath + CLI_APPROVAL_STATUS_SUFFIX;
+    let session: TmuxSession | undefined;
+    try {
+      session = await TmuxSession.create({
+        cmd: CLI_APPROVAL_SHELL,
+        cwd: home, isolated: true,
+        env: { HOME: home, AI_GATEWAY_API_KEY: "", VERCEL_OIDC_TOKEN: "", FX_MODEL: undefined,
+          FX_PERMISSION_MODE: ASK_PERMISSION_MODE, FX_EXTENSION_TEST_KEY: EXTENSION_FIXTURE_KEY,
+          FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1" },
+      });
+      await session.sendText(`${[FX_BIN, ...CLI_APPROVAL_ARGUMENTS, AUTH_SCOPE_PROMPT].map(arg => JSON.stringify(arg)).join(" ")} > ${JSON.stringify(stdoutPath)}; printf ${JSON.stringify(CLI_APPROVAL_EXIT_FORMAT)} "$?" > ${JSON.stringify(statusPath)}`);
+      const prompt = await session.waitForText(CLI_APPROVAL_PROMPT, TUI_TIMEOUT_MS);
+      expect(prompt).toContain(CLI_PRIVILEGE_WARNING);
+      expect(existsSync(join(extension, RPC_LOG_FILENAME))).toBe(false);
+      await session.sendText(answer);
+      await session.waitForPane(() => existsSync(statusPath), TUI_TIMEOUT_MS);
+      expect(Number(readFileSync(statusPath, "utf8").trim())).toBe(exitCode);
+      const stdout = readFileSync(stdoutPath, "utf8");
+      expect(stdout).not.toContain(CLI_APPROVAL_PROMPT);
+      expect(stdout).not.toContain(EXTENSION_FIXTURE_KEY);
+      const result = JSON.parse(stdout);
+      if (decision === "approve") {
+        expect(result.output).toBe(RPC_RESULT_TEXT);
+        const calls = readFileSync(join(extension, RPC_LOG_FILENAME), "utf8").trim().split("\n").map(line => JSON.parse(line));
+        expect(calls.map(call => call.method)).toEqual(["initialize", "provider.prepare", "provider.stream", "shutdown"]);
+      } else {
+        expect(result.error).toBe("ExtensionExecutionDenied");
+        expect(existsSync(join(extension, RPC_LOG_FILENAME))).toBe(false);
+      }
+    } catch (error) {
+      throw new Error(String(error) + "\nCLI output: " + readFileSync(stdoutPath, "utf8") + "\n" + (session ? await session.capturePane() : ""));
+    } finally { await session?.kill(); }
+  }, TIMEOUT_MS);
+
+  tuiTest("a retained child cannot reuse ask approval after switching to auto", async () => {
+    const { home, extension } = fixture();
+    const stderrPath = join(home, TUI_STDERR_FILENAME);
+    let session: TmuxSession | undefined;
+    try {
+      session = await TmuxSession.create({ cmd: FX_BIN, cwd: home, stderrPath, isolated: true,
+        env: { HOME: home, AI_GATEWAY_API_KEY: "", VERCEL_OIDC_TOKEN: "", FX_MODEL: undefined,
+          FX_PERMISSION_MODE: ASK_PERMISSION_MODE, FX_EXTENSION_TEST_KEY: EXTENSION_FIXTURE_KEY,
+          FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "0" },
+      });
+      await session.waitForText("Run /help", TUI_TIMEOUT_MS);
+      await session.sendText(AUTH_SCOPE_PROMPT);
+      await session.waitForText(NATIVE_APPROVAL_LABEL, TUI_TIMEOUT_MS);
+      await session.sendKeys("Enter");
+      await session.waitForText(RPC_RESULT_TEXT, TUI_TIMEOUT_MS);
+      await session.sendText(MODE_CHANGE_COMMAND);
+      await session.waitForText(MODE_CHANGE_NOTICE, TUI_TIMEOUT_MS);
+      await session.sendText(AUTH_SCOPE_PROMPT);
+      const pane = await session.waitForText(AUTO_REVIEW_UNAVAILABLE_ERROR, TUI_TIMEOUT_MS);
+      expect(pane).not.toContain(NATIVE_APPROVAL_LABEL);
+      expect(session.isAlive()).toBe(true);
+      const calls = readFileSync(join(extension, RPC_LOG_FILENAME), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      expect(calls.map(call => call.method)).toEqual(["initialize", "provider.prepare", "provider.stream", "shutdown"]);
+      expect(() => process.kill(calls[0].pid, 0)).toThrow();
+      await session.sendText("/quit");
+      await session.waitForSessionEnd(TUI_TIMEOUT_MS);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally { await session?.kill(); }
+  }, TIMEOUT_MS);
 
   tuiTest("an executable changed during human approval never starts before reapproval", async () => {
     const { home, extension } = fixture();
