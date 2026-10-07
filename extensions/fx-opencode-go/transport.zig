@@ -2,6 +2,7 @@
 const std = @import("std");
 const wire = @import("wire.zig");
 const sse = @import("sse.zig");
+const stream_result = @import("stream_result.zig");
 const body_buffer_bytes = 8192;
 const transfer_buffer_bytes = 16 * 1024;
 const content_type = "application/json";
@@ -15,6 +16,8 @@ const managed_headers = [_][]const u8{ "authorization", "proxy-authorization", "
 
 /// Job owns request parameters and socket publication throughout this synchronous worker call.
 pub fn run(job: anytype) !void {
+    // Prepared family identity remains authoritative after its single-use handle moves to a worker.
+    if (job.prepared.api != .chat_completions) return error.UnsupportedApi;
     var arena = std.heap.ArenaAllocator.init(job.alloc);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -86,9 +89,10 @@ pub fn run(job: anytype) !void {
     var response = try request.receiveHead(&.{});
     if (response.head.status != .ok) return error.ProviderFailed;
     var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
-    var context = sse.Context{ .alloc = job.alloc, .output = job.output, .id = job.id, .handle = job.prepared.handle, .cancel = &job.cancel };
-    defer context.deinit();
+    var result = stream_result.Context{ .alloc = job.alloc, .output = job.output, .id = job.id, .handle = job.prepared.handle, .cancel = &job.cancel };
+    defer result.deinit();
+    var context = sse.Context{ .alloc = job.alloc, .result = &result };
     try context.consume(response.reader(&transfer_buffer));
     if (job.cancel.load(.seq_cst)) return error.Cancelled;
-    try context.reply();
+    try result.reply();
 }

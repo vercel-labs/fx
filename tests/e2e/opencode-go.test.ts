@@ -27,6 +27,12 @@ const SCHEMA_OUTPUT_LIMIT = 128;
 const SCHEMA_SESSION = "go-schema-conversation";
 const SCHEMA_PROVIDER = "opencode-go";
 const SCHEMA_MODEL = "deepseek-v4.1-flash";
+// A failed prepare must never leave a stream handle that can transmit a credential.
+const RPC_ROUTE_CASES = [
+  { name: "selected Chat route", wire: SCHEMA_MODEL, admitted: true },
+  { name: "unknown route", wire: "unselected-go-model", admitted: false },
+];
+const UNPREPARED_HANDLE = "prepared-unknown";
 const SCHEMA_BASE_PREFIX = "http://";
 const SCHEMA_BASE_PATH = "/v1";
 const SCHEMA_PROMPT = "Return the fixture answer as JSON.";
@@ -169,7 +175,7 @@ describe("native OpenCode Go extension", () => {
   }, TIMEOUT_MS);
 
   // Native CLI does not expose response_format; the shipped provider RPC is its public boundary.
-  test("native provider schema contract reaches OpenAI and completes valid JSON", async () => {
+  test.each(RPC_ROUTE_CASES)("native provider $name guards HTTP and structured output", async scenario => {
     const bodies: any[] = [];
     const server = Bun.serve({ hostname: HOST, port: 0, async fetch(request) {
       bodies.push(await request.json());
@@ -205,17 +211,24 @@ describe("native OpenCode Go extension", () => {
     try {
       const initialized = await rpc("initialize", { version: RPC_VERSION });
       expect(initialized.version).toBe(RPC_VERSION);
-      const prepared = await rpc("provider.prepare", { provider: { id: SCHEMA_PROVIDER, base_url: SCHEMA_BASE_PREFIX + HOST + ":" + server.port + SCHEMA_BASE_PATH }, model: { wire_id: SCHEMA_MODEL }, request: {
+      const prepare = rpc("provider.prepare", { provider: { id: SCHEMA_PROVIDER, base_url: SCHEMA_BASE_PREFIX + HOST + ":" + server.port + SCHEMA_BASE_PATH }, model: { wire_id: scenario.wire }, request: {
         messages: [{ role: "user", content: SCHEMA_PROMPT, images: [], tool_call_id: null, tool_calls: [], provider_state_json: null }],
         functions: [], additional_functions: [], dynamic_functions: [], reasoning_effort: "max", max_output_tokens: SCHEMA_OUTPUT_LIMIT,
         tool_choice: "none", parallel_tool_calls: null, response_format: SCHEMA_FORMAT,
       } });
-      const completed = await rpc("provider.stream", { handle: prepared.handle, credential: KEY, headers: { "x-opencode-session": SCHEMA_SESSION }, session_id: SCHEMA_SESSION });
-      expect(JSON.parse(completed.content)).toEqual(JSON.parse(SCHEMA_OUTPUT));
-      expect(bodies).toHaveLength(1);
-      expect(bodies[0].response_format).toEqual({ type: "json_schema", json_schema: { ...SCHEMA_FORMAT, strict: true } });
-      expect(bodies[0].max_tokens).toBe(SCHEMA_OUTPUT_LIMIT);
-      expect(bodies[0].reasoning_effort).toBe("max");
+      if (scenario.admitted) {
+        const prepared = await prepare;
+        const completed = await rpc("provider.stream", { handle: prepared.handle, credential: KEY, headers: { "x-opencode-session": SCHEMA_SESSION }, session_id: SCHEMA_SESSION });
+        expect(JSON.parse(completed.content)).toEqual(JSON.parse(SCHEMA_OUTPUT));
+        expect(bodies).toHaveLength(1);
+        expect(bodies[0].response_format).toEqual({ type: "json_schema", json_schema: { ...SCHEMA_FORMAT, strict: true } });
+        expect(bodies[0].max_tokens).toBe(SCHEMA_OUTPUT_LIMIT);
+        expect(bodies[0].reasoning_effort).toBe("max");
+      } else {
+        await expect(prepare).rejects.toThrow("Provider request failed");
+        await expect(rpc("provider.stream", { handle: UNPREPARED_HANDLE, credential: KEY, headers: { "x-opencode-session": SCHEMA_SESSION }, session_id: SCHEMA_SESSION })).rejects.toThrow("Provider request failed");
+        expect(bodies).toHaveLength(0);
+      }
       await rpc("shutdown", {});
       child.stdin.end();
       expect(await child.exited).toBe(0);

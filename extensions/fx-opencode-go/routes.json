@@ -1,0 +1,16 @@
+[
+  { "wire_id": "deepseek-v4.1-flash", "api": "chat_completions" },
+  { "wire_id": "glm-5.3", "api": "chat_completions" },
+  { "wire_id": "glm-5.3-flash", "api": "chat_completions" },
+  { "wire_id": "grok-4.7", "api": "responses" },
+  { "wire_id": "hy4-preview", "api": "chat_completions" },
+  { "wire_id": "kimi-k3", "api": "chat_completions" },
+  { "wire_id": "longcat-2.5-preview-free", "api": "chat_completions" },
+  { "wire_id": "mimo-v2.6-flash", "api": "chat_completions" },
+  { "wire_id": "mimo-v2.6-pro", "api": "chat_completions" },
+  { "wire_id": "muse-spark-1.3-contributor", "api": "responses" },
+  { "wire_id": "qwen3.8-flash", "api": "messages" },
+  { "wire_id": "qwen3.8-max", "api": "messages" },
+  { "wire_id": "space-bunny", "api": "chat_completions" },
+  { "wire_id": "deepseek-v4-pro", "api": "chat_completions" }
+]

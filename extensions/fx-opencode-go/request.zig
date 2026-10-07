@@ -2,6 +2,7 @@
 const std = @import("std");
 const wire = @import("wire.zig");
 const image_parts = @import("image_parts.zig");
+const routes = @import("routes.zig");
 const Allocator = wire.Allocator;
 const Value = wire.Value;
 const provider_id = "opencode-go";
@@ -15,6 +16,7 @@ pub const Prepared = struct {
     handle: []const u8,
     endpoint: []const u8,
     body: []const u8,
+    api: routes.Api,
 
     pub fn deinit(self: *Prepared) void {
         self.arena.deinit();
@@ -27,6 +29,11 @@ pub const Prepared = struct {
         const alloc = arena.allocator();
         const provider = try wire.field(params, "provider");
         if (!std.mem.eql(u8, try wire.text(try wire.field(provider, "id")), provider_id)) return error.InvalidProvider;
+        const model = try wire.field(params, "model");
+        const wire_id = try wire.text(try wire.field(model, "wire_id"));
+        const api = try routes.resolve(wire_id);
+        // Until each codec lands, an admitted family cannot send a mismatched Chat body.
+        if (api != .chat_completions) return error.UnsupportedApi;
         const base = try wire.text(try wire.field(provider, "base_url"));
         var uri = try std.Uri.parse(base);
         const base_path = switch (uri.path) {
@@ -35,7 +42,6 @@ pub const Prepared = struct {
         // Encoded path ownership preserves proxy routing without rewriting query values.
         uri.path = .{ .percent_encoded = try std.fmt.allocPrint(alloc, "{s}{s}", .{ std.mem.trimEnd(u8, base_path, path_separator), completion_path }) };
         const endpoint = try std.fmt.allocPrint(alloc, "{f}", .{uri.fmt(.all)});
-        const model = try wire.field(params, "model");
         const request = try wire.field(params, "request");
         var body = wire.object();
         try wire.put(alloc, &body, "model", try wire.field(model, "wire_id"));
@@ -96,7 +102,7 @@ pub const Prepared = struct {
         }
         const handle = try std.fmt.allocPrint(alloc, "prepared-{d}", .{id});
         const encoded = try std.json.Stringify.valueAlloc(alloc, body, .{});
-        return .{ .arena = arena, .handle = handle, .endpoint = endpoint, .body = encoded };
+        return .{ .arena = arena, .handle = handle, .endpoint = endpoint, .body = encoded, .api = api };
     }
 };
 
