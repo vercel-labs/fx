@@ -16,10 +16,18 @@
 //   holder's next write;
 // - checkpoints, each covering the chain up to a record.
 //
-// `prompt()` only queues a message. The worker the queue delivers it to adds
-// the input to the log, takes the lease, and runs every turn the log holds
-// until none is left, or its time runs out: then it asks the queue to
-// deliver the same message again, and the next worker continues the turn.
+// `prompt()` adds its input, with its caller's context, to the log, then
+// queues a message that only names it: the session, the message id and its
+// kind. The worker the queue delivers it to takes the lease and runs every
+// turn the log holds until none is left, or its time runs out: then it asks
+// the queue to deliver the same message again, and the next worker continues
+// the turn.
+//
+// A queue message is never trusted with what to run or as whom. A delivery
+// can arrive at a public route, so its body may come from anyone; the worker
+// acts only on a message its session's log already holds, and runs only
+// what that log says. Writing to the log takes the store's own credentials,
+// which only the app's authenticated `prompt()` path holds.
 
 // A write the session's chain refused because another worker continued it.
 // Harnesses recognize it by its code.
@@ -131,7 +139,8 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
   let lastTurnId = base?.lastTurnId ?? null;
   let yielded = base?.yielded === true;
   // The context each prompt's or steer's caller gave, which its turn runs
-  // with: an untaken steer becomes a turn.
+  // with: an untaken steer becomes a turn. Only an input in the log has one;
+  // a queue message never carries it.
   const contexts = new Map();
   for (const input of base?.pending ?? []) if (input.context !== undefined) contexts.set(input.messageId, input.context);
   // How many times each turn's engine stopped under it.
@@ -236,7 +245,14 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
   // landed ended. Its id is kept like a turn's, so a late delivery of the
   // same message is not taken as a new cancel.
   for (const input of inputs) {
-    if (input.type !== "cancel" || consumed.has(input.messageId)) continue;
+    if (consumed.has(input.messageId)) continue;
+    // A resume request asks only that its session be woken: it is spent once
+    // recorded, and its id is kept so its deliveries are recognized.
+    if (input.type === "resume") {
+      consume(input.messageId);
+      continue;
+    }
+    if (input.type !== "cancel") continue;
     const live = typeof input.target === "string"
       ? !consumed.has(input.target) || openTurn?.id === input.target
       : openTurn !== null && input.cursor > openTurn.at;
@@ -719,17 +735,24 @@ const errorSummary = (error) => ({ name: error?.name ?? "Error", message: String
 // The harness contract: a fenced write rejects with this code.
 const isFenced = (error) => error?.code === "FX_FENCED";
 
-// Writes what a queue message adds to its session: a restored agent's first
-// checkpoint and the message's input, a prompt with its caller's context. It
-// writes nothing the log already holds, so the sender and the consumer can
-// both call it.
+// The kinds of message a session's queue carries.
+const messageTypes = new Set(["prompt", "steer", "cancel", "resume"]);
+
+// Whether the session's log holds the message a delivery names: its input,
+// or its id among those already taken.
+const knownMessage = (state, message) => state.inputKeys.has(`${message.type}:${message.messageId}`) || state.consumed.has(message.messageId);
+
+// Writes what a message adds to its session, before the message is queued:
+// a restored agent's first checkpoint and the message's input, a prompt with
+// its caller's context. Only the sender calls it, so what a turn runs and as
+// whom comes from the app's own call, never from a queue delivery. It writes
+// nothing the log already holds, so a retried send writes it once.
 async function recordMessage(log, state, message) {
   if (message.seed && state.checkpoint === null && state.records.length === 0) {
     await log.append({ k: "checkpoint", through: null, data: message.seed });
   }
   const key = `${message.type}:${message.messageId}`;
-  const known = state.inputKeys.has(key) || state.consumed.has(message.messageId);
-  if ((message.type === "prompt" || message.type === "steer" || message.type === "cancel") && !known) {
+  if (messageTypes.has(message.type) && !knownMessage(state, message)) {
     await log.append({
       k: "input",
       key,
@@ -769,17 +792,23 @@ class SessionWorker {
     return foldSessionLog(entries, { now: Date.now(), alive: (lease) => this.backend.alive(lease) });
   }
 
-  // One queue delivery. Its input reaches the log at once, even while this
-  // process runs the session, so a steer or cancel reaches the running turn.
-  // Then it runs the session when no live worker holds it. Returns
-  // `{ timeoutSeconds }` to have the same message delivered again later.
+  // One queue delivery. Its sender wrote its input to the log before queueing
+  // it, so a steer or cancel reaches the running turn even before this runs.
+  // A delivery names a message the log must already hold; any other is not
+  // from a sender and is dropped before anything is written, whether or not
+  // its session exists. Then it runs the session when no live worker holds
+  // it. Returns `{ timeoutSeconds }` to have the same message delivered again
+  // later.
   async consume(message) {
     const log = await this.backend.session(this.sessionId);
+    let state = this.fold(await log.read());
+    if (!knownMessage(state, message)) {
+      this.agent.emit("session.refused", { reason: "unknown message" });
+      return undefined;
+    }
     await this.backend.refreshDeadline?.();
     // When this delivery's function stops, if it does.
     const deadline = this.backend.deadline() ?? (this.backend.maxDurationMs === null ? null : Date.now() + this.backend.maxDurationMs);
-    let state = this.fold(await log.read());
-    await recordMessage(log, state, message);
     for (let claims = 0; claims < 8; claims += 1) {
       if (this.running) return { timeoutSeconds: runningBackstopSeconds };
       state = this.fold(await log.read());
@@ -1469,7 +1498,14 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
         chosenDurability = chosen;
         const created = await createBackend(chosen);
         await created.start?.();
-        unlisten = created.listen((message) => {
+        unlisten = created.listen((delivered) => {
+          // Only the message's name is read from a delivery: the rest of its
+          // body, which a forged delivery would choose, is ignored.
+          if (!delivered || typeof delivered !== "object" || !messageTypes.has(delivered.type) || !validId(delivered.messageId) || !created.validSessionId(delivered.sessionId)) {
+            emit("session.refused", { reason: "malformed message" });
+            return undefined;
+          }
+          const message = { type: delivered.type, messageId: delivered.messageId, sessionId: delivered.sessionId };
           let worker = workers.get(message.sessionId);
           if (!worker) {
             worker = new SessionWorker(agent, created, message.sessionId);
@@ -1515,13 +1551,14 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
           ...(context === undefined ? {} : { context }),
         };
         const full = { ...message, ...extra, sessionId };
-        // A queue that ends with the process could lose the message, so its
-        // input reaches the log before the caller hears it was accepted.
-        if (!created.queueDurable) {
-          const log = await created.session(sessionId);
-          await recordMessage(log, foldSessionLog(await log.read()), full);
-        }
-        await created.queue.send(full, { idempotencyKey: `${sessionId}:${message.type}:${message.messageId}` });
+        // The input and its caller's context reach the log here, on the
+        // app's own call, before the caller hears the message was accepted.
+        // The queue carries only which message to run, so a delivery cannot
+        // choose what a turn runs or as whom, and a queue that ends with the
+        // process loses no input.
+        const log = await created.session(sessionId);
+        await recordMessage(log, foldSessionLog(await log.read()), full);
+        await created.queue.send({ type: message.type, messageId: message.messageId, sessionId }, { idempotencyKey: `${sessionId}:${message.type}:${message.messageId}` });
         seeded = true;
       };
       const startTurn = (type, messageId, input, retried = false, aborted = false) => {

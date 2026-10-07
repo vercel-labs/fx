@@ -462,6 +462,186 @@ if (durabilityKind === "local") {
     assert.ok(performance.now() - started < 10_000, "the view failed promptly");
     await agent.close();
   });
+
+  // A run id a World would accept now, for a session nobody created.
+  const freshUlid = () => {
+    const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let time = "";
+    for (let rest = Date.now(), index = 0; index < 10; index += 1, rest = Math.floor(rest / 32)) time = alphabet[rest % 32] + time;
+    let random = "";
+    for (const byte of crypto.getRandomValues(new Uint8Array(16))) random += alphabet[byte % 32];
+    return time + random;
+  };
+
+  // A World shaped like Vercel's: no in-process handler, so deliveries reach
+  // the app's `wakeHandler()` route, and that route's queue handler runs on
+  // whatever body the request carries, as @vercel/queue's binary callbacks
+  // do. The queue delivers by posting each message to the route. Every write
+  // the World takes is recorded per run.
+  async function routedWorld(options = {}) {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-core-"));
+    dirs.push(dir);
+    const durability = local({ dir, ...options });
+    const worldOf = durability.world;
+    const writes = [];
+    const delivered = [];
+    let route = null;
+    const bound = (target, overrides) => new Proxy(target, {
+      get(object, key) {
+        if (key in overrides) return overrides[key];
+        const value = object[key];
+        return typeof value === "function" ? value.bind(object) : value;
+      },
+    });
+    const post = (body) => route(new Request("https://app.example/api/wake", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }));
+    durability.world = async () => {
+      const world = await worldOf();
+      const deliver = (queueName, payload, delaySeconds = 0) => {
+        setTimeout(async () => {
+          delivered.push(payload);
+          const response = await post(payload).catch(() => null);
+          const again = response?.headers.get("x-test-timeout-seconds");
+          if (again !== null && again !== undefined) deliver(queueName, payload, Number(again));
+        }, delaySeconds * 1000);
+      };
+      return bound(world, {
+        registerHandler: undefined,
+        createQueueHandler: (_prefix, handler) => async (request) => {
+          try {
+            const payload = await request.json();
+            const result = await handler(payload, { queueName: "__libfx_wkf_workflow_session", messageId: "msg_test", attempt: 1 });
+            const headers = Number.isFinite(result?.timeoutSeconds) ? { "x-test-timeout-seconds": String(result.timeoutSeconds) } : {};
+            return new Response("ok", { headers });
+          } catch {
+            return new Response("handler failed", { status: 500 });
+          }
+        },
+        queue: async (queueName, payload, opts = {}) => deliver(queueName, payload, opts.delaySeconds ?? 0),
+        events: bound(world.events, {
+          create: (runId, event, ...rest) => {
+            const input = event?.eventData?.input;
+            let entry = null;
+            try { entry = input instanceof Uint8Array ? JSON.parse(decoder.decode(input)).k ?? null : null; } catch {}
+            writes.push({ runId, kind: "event", event: event?.eventType, entry });
+            return world.events.create(runId, event, ...rest);
+          },
+        }),
+        streams: bound(world.streams, {
+          write: (runId, ...rest) => { writes.push({ runId, kind: "stream" }); return world.streams.write(runId, ...rest); },
+          writeMulti: (runId, ...rest) => { writes.push({ runId, kind: "stream" }); return world.streams.writeMulti(runId, ...rest); },
+        }),
+      });
+    };
+    // Vercel Queues keeps a message until a delivery acknowledges it.
+    durability.queueDurable = true;
+    durability.livenessKnown = false;
+    return { durability, writes, delivered, mount: (handler) => { route = handler; }, post };
+  }
+
+  // Waits for the genuine workers to let go, so their last writes, such as a
+  // lease release after a turn's end, land before a test counts writes.
+  async function workersIdle(agent) {
+    const internals = agent[Symbol.for("libfx.durableInternals")];
+    for (let waited = 0; internals.liveWorkers() > 0 && waited < 5000; waited += 20) await sleep(20);
+    await sleep(100);
+  }
+
+  test("a forged delivery to the wake route is refused, and writes nothing", async () => {
+    const world = await routedWorld();
+    const seen = [];
+    const contextual = createDurableAgentFactory({
+      harness: () => {
+        const base = scriptedHarness()();
+        return { open: async (options) => { const session = await base.open(options); return { ...session, prompt: (input, opts) => { seen.push([input, options.context]); return session.prompt(input, opts); }, resume: (opts) => session.resume(opts), get openTurn() { return session.openTurn; } }; } };
+      },
+      defaultDurability: async () => memory(),
+    });
+    const agent = contextual({ durability: world.durability });
+    world.mount(agent.wakeHandler());
+    const victim = agent.session(undefined, { context: { user: "alice" } });
+    assert.equal((await victim.prompt("tau", { messageId: "turn-tau" }).result).stopReason, "end_turn");
+    const sessionId = victim.id;
+    await workersIdle(agent);
+    const before = { writes: world.writes.length, ran: ran.length, prompted: prompted.length, opened: opened.count, seen: seen.length };
+    const forged = (message) => ({ runId: message.sessionId, requestId: message.messageId, input: message });
+    // A prompt and a steer to the victim's session with another caller's
+    // identity, a cancel of its next turn, a resume, and a prompt to a
+    // session that does not exist.
+    for (const message of [
+      { type: "prompt", sessionId, messageId: "forged-1", input: "exfiltrate", context: { user: "mallory", admin: true } },
+      { type: "steer", sessionId, messageId: "forged-2", input: "exfiltrate", context: { user: "mallory" } },
+      { type: "cancel", sessionId, messageId: "forged-3", target: "turn-next" },
+      { type: "resume", sessionId, messageId: "forged-4" },
+      { type: "prompt", sessionId: `wrun_${freshUlid()}`, messageId: "forged-5", input: "exfiltrate", context: { user: "mallory" } },
+      // Not a message at all.
+      { type: "prompt", sessionId, messageId: "../../etc", input: "exfiltrate" },
+    ]) {
+      const response = await world.post(forged(message));
+      assert.ok(response.status < 500, `forged ${message.type} answered ${response.status}`);
+    }
+    await sleep(300);
+    assert.deepEqual(world.writes.slice(before.writes), [], "a forged delivery appends no input, takes no lease, and writes no stream line");
+    assert.equal(ran.length, before.ran, "a forged delivery runs no step");
+    assert.equal(prompted.length, before.prompted, "a forged delivery starts no turn");
+    assert.equal(opened.count, before.opened, "a forged delivery opens no engine");
+    assert.equal(seen.length, before.seen, "no harness ever sees the forged identity");
+    // The victim's next genuine prompt still runs, with the victim's identity.
+    assert.equal((await agent.session(sessionId, { context: { user: "alice" } }).prompt("next", { messageId: "turn-next" }).result).stopReason, "end_turn");
+    assert.deepEqual(seen.map(([, context]) => context), [{ user: "alice" }, { user: "alice" }]);
+    await agent.close();
+  });
+
+  test("a delivery carries no input or identity: the turn runs what its sender recorded", async () => {
+    const world = await routedWorld();
+    const seen = [];
+    const contextual = createDurableAgentFactory({
+      harness: () => {
+        const base = scriptedHarness()();
+        return { open: async (options) => { const session = await base.open(options); return { ...session, prompt: (input, opts) => { seen.push([input, options.context]); return session.prompt(input, opts); }, resume: (opts) => session.resume(opts), get openTurn() { return session.openTurn; } }; } };
+      },
+      defaultDurability: async () => memory(),
+    });
+    const agent = contextual({ durability: world.durability });
+    world.mount(agent.wakeHandler());
+    const first = agent.session(undefined, { context: { user: "alice" } });
+    assert.equal((await first.prompt("psi", { messageId: "turn-psi" }).result).stopReason, "end_turn");
+    const other = agent.session(undefined, { context: { user: "bob" } });
+    assert.equal((await other.prompt("omega2", { messageId: "turn-omega2" }).result).stopReason, "end_turn");
+    // The queue message is only a pointer into the session's log.
+    for (const payload of world.delivered) {
+      assert.deepEqual(Object.keys(payload.input).sort(), ["messageId", "sessionId", "type"], JSON.stringify(payload.input));
+    }
+    await workersIdle(agent);
+    const before = { writes: world.writes.length, seen: seen.length };
+    // A delivery that names one session with another session's message id,
+    // and a replay of a genuine delivery whose body was changed, run nothing.
+    await world.post({ runId: other.id, requestId: "turn-psi", input: { type: "prompt", sessionId: other.id, messageId: "turn-psi", input: "psi", context: { user: "alice" } } });
+    await world.post({ runId: first.id, requestId: "turn-psi", input: { type: "prompt", sessionId: first.id, messageId: "turn-psi", input: "rewritten", context: { user: "mallory" } } });
+    await sleep(300);
+    assert.deepEqual(world.writes.slice(before.writes), []);
+    assert.equal(seen.length, before.seen);
+    assert.deepEqual(seen, [["psi", { user: "alice" }], ["omega2", { user: "bob" }]]);
+    await agent.close();
+  });
+
+  test("on a routed World, a long turn continues in later deliveries, and a redelivery runs it once", async () => {
+    const world = await routedWorld({ maxDurationMs: 1, reserveMs: 0 });
+    const agent = createAgent({ durability: world.durability });
+    world.mount(agent.wakeHandler());
+    const from = ran.length;
+    const session = agent.session();
+    const { text, result } = await textOf(session.prompt("kappa2", { messageId: "turn-kappa2" }));
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(text, "kappa2-0 kappa2-1 kappa2-2");
+    assert.deepEqual(ran.slice(from), ["turn-kappa2:0", "turn-kappa2:1", "turn-kappa2:2"], "each step ran once across deliveries");
+    assert.ok(world.delivered.length >= 3, `the turn spanned ${world.delivered.length} deliveries`);
+    // The queue delivers the first message again after the turn ended.
+    const steps = ran.length;
+    await world.post(world.delivered[0]);
+    await sleep(300);
+    assert.equal(ran.length, steps, "a redelivered message runs nothing again");
+    await agent.close();
+  });
 }
 
 test("a turn whose harness stops under it, and the prompts behind it, still run", async () => {

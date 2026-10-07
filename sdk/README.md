@@ -996,8 +996,10 @@ export async function GET(request) {
 ```
 
 On your machine, the server runs each turn in its own process and keeps the
-session with `local()`. On Vercel, `prompt()` sends the prompt to Vercel Queues, and a separate
-invocation runs the turn while the `POST` response streams it. If the route's
+session with `local()`. On Vercel, `prompt()` stores the prompt and its
+caller's `context` in the session, then sends Vercel Queues a message that
+names it, and a separate invocation runs the turn while the `POST` response
+streams it. If the route's
 response ends first, the turn keeps running, and the client reconnects with
 the last `cursor` it read.
 
@@ -1021,6 +1023,14 @@ export const POST = agent.wakeHandler();
   }
 }
 ```
+
+The delivery route is a public URL, so libfx never trusts a delivery's body.
+A queue message carries only the session, a message id and its kind, never an
+input or a `context`. The route acts only on a message whose session already
+holds it, and runs only what the session holds, as the `prompt()` call that
+stored it gave. Any other request is dropped before anything is written,
+whether or not its session exists. Authorize callers and choose their
+`context` in your own routes, where they call `prompt()`.
 
 The delivery route's maximum duration bounds each invocation. libfx stops a
 turn 30 seconds before the deadline, at its next model request, and cuts off a
