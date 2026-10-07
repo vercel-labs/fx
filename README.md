@@ -73,6 +73,7 @@ Commands run in your login shell, zsh or bash, with your startup files applied, 
 
 - fx reloads automatically when your zsh or bash startup files change, such as `.zshrc`, `.zprofile`, `.bash_profile`, or `.bashrc`. After changing a file they source, run `/shell reload`.
 - Each command starts fresh: `cd`, `export`, and alias changes do not carry over to the next one.
+- In zsh, the model's commands run with bash-style settings: unmatched globs and words that start with `=` stay literal, unquoted variables split into words, `${arr[0]}` is the first element, and `path` and `status` are ordinary variables, so assigning them leaves `PATH` intact. Interactive sessions keep your own settings.
 - Tools that switch the environment by directory, such as direnv or mise hooks, apply the environment of the directory where fx captured the startup files, usually your workspace.
 - If the startup files cannot be captured, fx says so once and runs them for every command instead.
 - Terminals opened with `tty: true` run your full login shell and end when fx exits.

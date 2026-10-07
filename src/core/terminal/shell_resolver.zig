@@ -254,21 +254,33 @@ const captured_zsh_user_prelude = "\\builtin trap - TERM; ";
 
 /// zsh options for model commands, which are written as bash text. A word
 /// that starts with `=` stays a word instead of a command path lookup that
-/// aborts the rest of the command, an unmatched glob stays a literal word, and
-/// `${arr[0]}` is the first element. They run after the startup files and the
-/// snapshot replay, so the user's own settings cannot undo them.
-const zsh_model_command_options = "\\builtin unsetopt equals nomatch; \\builtin setopt kshzerosubscript; ";
+/// aborts the rest of the command, an unmatched glob stays a literal word,
+/// `${arr[0]}` is the first element, and unquoted variables split into words.
+/// They run after the startup files and the snapshot replay, so the user's own
+/// settings cannot undo them.
+const zsh_model_command_options = "\\builtin unsetopt equals nomatch; \\builtin setopt kshzerosubscript shwordsplit; ";
+
+/// The model command runs inside an anonymous function whose `path` and
+/// `status` are ordinary local variables. In zsh both are special: `path` is
+/// tied to PATH and `status` is read-only, so bash text that assigns either
+/// would empty PATH or abort the command. PATH itself is untouched. zsh counts
+/// function lines from the opening brace, so the command starting on the next
+/// line keeps its own line numbers in error messages. The closing brace sits
+/// on its own line after a blank one, so a trailing comment or line
+/// continuation cannot absorb it.
+const zsh_model_command_open = "() { \\builtin local -h path status\n";
+const zsh_model_command_close = "\n\n}";
 
 /// Returns the text the shell at `shell_path` runs for the model command
-/// `command`: prefixed with `zsh_model_command_options` for zsh, unchanged for
-/// other shells. The result is either `command` itself or allocated in `alloc`.
+/// `command`: wrapped as described above for zsh, unchanged for other shells.
+/// The result is either `command` itself or allocated in `alloc`.
 pub fn modelCommandText(
     alloc: Allocator,
     shell_path: []const u8,
     command: []const u8,
 ) Allocator.Error![]const u8 {
     if (shellKind(shell_path) != .zsh) return command;
-    return std.mem.concat(alloc, u8, &.{ zsh_model_command_options, command });
+    return std.mem.concat(alloc, u8, &.{ zsh_model_command_options, zsh_model_command_open, command, zsh_model_command_close });
 }
 
 pub fn capturedInvocation(
@@ -762,14 +774,10 @@ test "model command text sets bash-compatible options only for zsh" {
     const arena = arena_state.allocator();
 
     const command = "echo =====";
-    try std.testing.expectEqualStrings(
-        "\\builtin unsetopt equals nomatch; \\builtin setopt kshzerosubscript; echo =====",
-        try modelCommandText(arena, "/bin/zsh", command),
-    );
-    try std.testing.expectEqualStrings(
-        "\\builtin unsetopt equals nomatch; \\builtin setopt kshzerosubscript; echo =====",
-        try modelCommandText(arena, "/opt/homebrew/bin/zsh", command),
-    );
+    const wrapped = "\\builtin unsetopt equals nomatch; \\builtin setopt kshzerosubscript shwordsplit; " ++
+        "() { \\builtin local -h path status\necho =====\n\n}";
+    try std.testing.expectEqualStrings(wrapped, try modelCommandText(arena, "/bin/zsh", command));
+    try std.testing.expectEqualStrings(wrapped, try modelCommandText(arena, "/opt/homebrew/bin/zsh", command));
     // Other shells already treat these words as bash does; nothing is added
     // and nothing is allocated.
     try std.testing.expect((try modelCommandText(arena, "/bin/bash", command)).ptr == command.ptr);

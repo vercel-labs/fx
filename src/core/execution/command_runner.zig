@@ -1952,15 +1952,31 @@ test "zsh runs bash-style model commands as bash would" {
     const arena = arena_state.allocator();
     const cfg = Config{ .max_command_output_bytes = 16 * 1024 };
     // Unquoted `=====` aborted the rest of the command, the unmatched glob was
-    // a zsh error, and `${arr[0]}` was empty.
-    const command = "echo before; ls *.fx-no-such-ext 2>/dev/null; echo =====; arr=(a b); echo ${arr[0]}; echo after";
-    const expected = "exit_code=0\n<stdout>\nbefore\n=====\na\nafter\n</stdout>\n";
+    // a zsh error, and `${arr[0]}` was empty. A `path` loop variable emptied
+    // PATH so `ls` was not found, `status=` aborted the command, and unquoted
+    // variables stayed one word.
+    const cases = [_]struct { command: []const u8, expected: []const u8 }{
+        .{
+            .command = "echo before; ls *.fx-no-such-ext 2>/dev/null; echo =====; arr=(a b); echo ${arr[0]}; echo after",
+            .expected = "exit_code=0\n<stdout>\nbefore\n=====\na\nafter\n</stdout>\n",
+        },
+        .{
+            .command = "for path in a b; do :; done; ls -d /; status=$(echo ok); echo $status; cmd='echo two'; $cmd words; files='x y'; for f in $files; do echo \"[$f]\"; done",
+            .expected = "exit_code=0\n<stdout>\n/\nok\ntwo words\n[x]\n[y]\n</stdout>\n",
+        },
+    };
+    // zsh error messages keep the command's own line numbers.
+    const line_two_error = ":2: command not found: fx-no-such-command";
 
     // The clean profile and the user profile (snapshot or full startup).
     const environments = [_]command_environment.Environment{ .{ .clean = "/bin/zsh" }, .{ .user = "/bin/zsh" } };
     for (environments) |environment| {
-        const result = try executeCommandInEnvironment(cfg, arena, command, "/tmp", environment);
-        try std.testing.expectEqualStrings(expected, result.output);
+        for (cases) |case| {
+            const result = try executeCommandInEnvironment(cfg, arena, case.command, "/tmp", environment);
+            try std.testing.expectEqualStrings(case.expected, result.output);
+        }
+        const failed = try executeCommandInEnvironment(cfg, arena, "echo one\nfx-no-such-command", "/tmp", environment);
+        try std.testing.expect(std.mem.find(u8, failed.output, line_two_error) != null);
     }
 }
 
