@@ -84,8 +84,8 @@ GitHub Actions matrices. The remaining distributed subcommands are workflow
 phase interfaces: `train-shard`, `candidate`, `behavior-shard`, `measure`, and
 `aggregate`. They reject a source, corpus, toolchain, bitcode, instrumented
 binary, candidate, assignment, or shard identity mismatch. The aggregate
-command requires all 36 training scenarios, all 53 behavior scenarios, and all
-12 performance gates exactly once before it emits `eligible: true`.
+command requires every training scenario, every behavior scenario, and all 12
+performance gates exactly once before it emits `eligible: true`.
 
 Workflow artifact names include the producing run attempt, so earlier attempts
 remain available. Seed and candidate consumers use the artifact IDs returned
