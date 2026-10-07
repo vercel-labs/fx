@@ -76,6 +76,23 @@ const ENDPOINT_CASES = [
 ];
 const LARGE_ARGUMENT_BYTES = 600 * 1024;
 const ERROR_BODY = "untrusted-go-error-body";
+const RESPONSES_MODELS = [
+  { id: "grok-4.7", effort: "xhigh", efforts: ["low", "medium", "high", "xhigh"] },
+  { id: "muse-spark-1.3-contributor", effort: "minimal", efforts: ["minimal", "low", "medium", "high", "xhigh"] },
+];
+const RESPONSES_REASONING = { type: "reasoning", id: "reasoning-fixture", encrypted_content: "opaque-fixture-ciphertext", summary: [] };
+const RESPONSES_ITEM_ID = "function-item-fixture";
+const RESPONSES_REASONING_TEXT = "Private fixture reasoning.";
+const RESPONSES_FRAGMENT_BYTES = 7;
+const RESPONSES_SYSTEM_POLICY = "Fixture policy";
+const RESPONSES_DEVELOPER_POLICY = "Fixture developer policy";
+const RESPONSES_HISTORY_TEXT = "Canonical history";
+const RESPONSES_HISTORY_CALL = { id: "history-call", name: "history_tool", arguments_json: "{}" };
+const RESPONSES_FUNCTION = { name: "declared_tool", description: "Fixture tool", inputSchema: SCHEMA };
+const RESPONSES_CONTEXT_WINDOW = 1000000;
+const RESPONSES_CATALOG_FILENAME = "models.json";
+const RESPONSES_FAILURES = ["lost-completion", "truncated-completion", "failed", "incomplete", "wrong-status", "provider-error", "conflicting-id", "wrong-item-id", "bad-arguments", "missing-terminal-call", "replay-injection", "negative-usage", "unfinished-item", "completed-with-error", "empty-call-id", "duplicate-call-id", "undeclared-call", "argument-mismatch"];
+const TTY_APIS = ["chat", "responses"];
 const tuiTest = tmuxAvailable() ? test : test.skip;
 const homes: string[] = [];
 afterEach(() => { for (const home of homes.splice(0)) cleanupIsolatedTestHome(home); });
@@ -86,7 +103,233 @@ function streamReply(chunks: unknown[]): Response {
   return new Response(body, { headers: { "content-type": "text/event-stream" } });
 }
 
+// Only private profiles admit unfinished catalog choices, so product metadata stays controller-owned.
+function responsesProfile(port: number, model = RESPONSES_MODELS[0]): string {
+  const home = createGoProfile(port);
+  const catalogPath = join(home, PROFILE_DIRECTORY, FIXTURE_EXTENSION_DIRECTORY, RESPONSES_CATALOG_FILENAME);
+  const catalog = JSON.parse(readFileSync(catalogPath, "utf8"));
+  catalog.models.push({ id: model.id, wire_id: model.id, name: model.id, tool_call: true, reasoning: true,
+    reasoning_efforts: model.efforts, context_window: RESPONSES_CONTEXT_WINDOW, max_output_tokens: SCHEMA_OUTPUT_LIMIT, supports_vision: true, structured_output: true });
+  writeFileSync(catalogPath, JSON.stringify(catalog));
+  const settingsPath = join(home, SETTINGS_RELATIVE_PATH);
+  const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+  settings.models.extension = CURATED_PROVIDER_PREFIX + model.id;
+  settings.effort = model.effort;
+  writeFileSync(settingsPath, JSON.stringify(settings));
+  return home;
+}
+
+// Small network fragments prove SSE framing against actual sockets, including CRLF boundaries.
+function responsesReply(chunks: unknown[], fragmented = false): Response {
+  const bytes = new TextEncoder().encode(chunks.map(chunk => "data: " + JSON.stringify(chunk) + "\r\n\r\n").join(""));
+  return new Response(fragmented ? new ReadableStream({ start(controller) {
+    for (let offset = 0; offset < bytes.length; offset += RESPONSES_FRAGMENT_BYTES) controller.enqueue(bytes.slice(offset, offset + RESPONSES_FRAGMENT_BYTES));
+    controller.close();
+  } }) : bytes, { headers: { "content-type": "text/event-stream" } });
+}
+
+// Final snapshots are mandatory evidence for every streamed call and encrypted reasoning item.
+function responsesCompleted(output: unknown[] = [], status = "completed", usage = { input_tokens: INPUT_TOKENS, output_tokens: OUTPUT_TOKENS }) {
+  return { type: "response.completed", response: { status, output, usage } };
+}
+
+// Exercising the public provider RPC covers declared schemas unavailable through the CLI.
+function providerRpc() {
+  const child = Bun.spawn([EXECUTABLE], { stdin: "pipe", stdout: "pipe", stderr: "pipe", env: {} });
+  const reader = child.stdout.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let requestId = 0;
+  async function rpc(method: string, params: unknown): Promise<any> {
+    const id = ++requestId;
+    child.stdin.write(JSON.stringify({ jsonrpc: JSONRPC_VERSION, id, method, params }) + "\n");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const reply = async () => { for (;;) {
+      const newline = buffer.indexOf("\n");
+      if (newline >= 0) {
+        const frame = JSON.parse(buffer.slice(0, newline));
+        buffer = buffer.slice(newline + 1);
+        if (frame.id !== id) continue;
+        if (frame.error) throw new Error(frame.error.message);
+        return frame.result;
+      }
+      const next = await reader.read();
+      if (next.done) throw new Error("Provider exited before reply");
+      buffer += decoder.decode(next.value, { stream: true });
+    } };
+    try { return await Promise.race([reply(), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Provider RPC deadline")), RPC_TIMEOUT_MS); })]); }
+    finally { clearTimeout(timer); }
+  }
+  return { rpc, async close() {
+    if (child.exitCode === null) { await rpc("shutdown", {}); child.stdin.end(); }
+    expect(await child.exited).toBe(0);
+    expect(await new Response(child.stderr).text()).toBe("");
+    await reader.cancel();
+  } };
+}
+
+// Native nullable fields stay explicit so fixture requests follow the host projection contract.
+function responseRequest(state: string | null = null) {
+  return { messages: [{ role: "system", content: RESPONSES_SYSTEM_POLICY, images: [], tool_call_id: null, tool_calls: [], provider_state_json: null },
+    { role: "developer", content: RESPONSES_DEVELOPER_POLICY, images: [], tool_call_id: null, tool_calls: [], provider_state_json: null },
+    { role: "assistant", content: RESPONSES_HISTORY_TEXT, images: [], tool_call_id: null, tool_calls: [RESPONSES_HISTORY_CALL], provider_state_json: state },
+    { role: "tool", content: TOOL_CONTENT, images: [], tool_call_id: RESPONSES_HISTORY_CALL.id, tool_calls: [], provider_state_json: null },
+    { role: "user", content: SCHEMA_PROMPT, images: [], tool_call_id: null, tool_calls: [], provider_state_json: null }],
+    functions: [RESPONSES_FUNCTION], additional_functions: [RESPONSES_FUNCTION], dynamic_functions: [RESPONSES_FUNCTION], reasoning_effort: "high", max_output_tokens: SCHEMA_OUTPUT_LIMIT,
+    tool_choice: "none", parallel_tool_calls: false, response_format: SCHEMA_FORMAT };
+}
+
 describe("native OpenCode Go extension", () => {
+  // Both selected Responses identities must preserve real tools, images, replay and persisted usage.
+  test.each(RESPONSES_MODELS)("Responses $id completes fragmented reasoning and native tool continuation", async model => {
+    const requests: any[] = [];
+    let home = "";
+    const server = Bun.serve({ hostname: HOST, port: 0, async fetch(request) {
+      const body = await request.json();
+      requests.push({ body, path: new URL(request.url).pathname, authorization: request.headers.get("authorization") });
+      if (requests.length === 1) {
+        const call = { type: "function_call", id: RESPONSES_ITEM_ID, call_id: TOOL_ID, name: "read_file", arguments: JSON.stringify({ path: join(home, TOOL_FILENAME) }), status: "completed" };
+        const midpoint = Math.floor(call.arguments.length / 2);
+        writeFileSync(join(home, IMAGE_FILENAME), CHANGED_SOURCE);
+        return responsesReply([
+          { type: "response.reasoning_summary_text.delta", delta: RESPONSES_REASONING_TEXT },
+          { type: "response.output_item.added", output_index: 1, item: { ...call, arguments: "", status: "in_progress" } },
+          { type: "response.function_call_arguments.delta", output_index: 1, item_id: call.id, delta: call.arguments.slice(0, midpoint) },
+          { type: "response.function_call_arguments.delta", output_index: 1, item_id: call.id, delta: call.arguments.slice(midpoint) },
+          { type: "response.function_call_arguments.done", output_index: 1, item_id: call.id, arguments: call.arguments },
+          { type: "response.output_item.done", output_index: 1, item: call },
+          responsesCompleted([RESPONSES_REASONING, call]),
+        ], true);
+      }
+      return responsesReply([{ type: "response.output_text.delta", delta: RESULT }, responsesCompleted()], true);
+    } });
+    home = responsesProfile(server.port, model);
+    homes.push(home);
+    writeFileSync(join(home, TOOL_FILENAME), TOOL_CONTENT);
+    const image = join(home, IMAGE_FILENAME);
+    copyFileSync(IMAGE_FIXTURE, image);
+    try {
+      const child = Bun.spawn([FX_BIN, "ask", "--json", "--image", image, IMAGE_PROMPT], { cwd: home, stdout: "pipe", stderr: "pipe", env: goEnvironment(home) });
+      const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+      expect(code, JSON.stringify({ stdout, stderr })).toBe(0);
+      const output = JSON.parse(stdout);
+      expect(output.output).toBe(RESULT);
+      expect(requests).toHaveLength(2);
+      for (const { body, path, authorization } of requests) {
+        expect(path).toBe("/v1/responses");
+        expect(authorization).toBe("Bearer " + KEY);
+        expect(body.model).toBe(model.id);
+        expect(body.store).toBe(false);
+        expect(body.include).toEqual(["reasoning.encrypted_content"]);
+        expect(body.reasoning.effort).toBe(model.effort);
+        expect(body.messages).toBeUndefined();
+        expect(body.stream_options).toBeUndefined();
+        const parts = body.input.find((item: any) => Array.isArray(item.content)).content;
+        expect(parts.find((part: any) => part.type === "input_image").image_url).toBe("data:image/png;base64," + readFileSync(IMAGE_FIXTURE).toString("base64"));
+      }
+      const readTool = requests[0].body.tools.find((tool: any) => tool.name === "read_file");
+      expect(readTool.parameters.properties.path).toBeTruthy();
+      expect(readTool.function).toBeUndefined();
+      expect(requests[1].body.input.find((item: any) => item.type === "reasoning")).toEqual(RESPONSES_REASONING);
+      expect(requests[1].body.input.find((item: any) => item.type === "function_call").call_id).toBe(TOOL_ID);
+      expect(requests[1].body.input.find((item: any) => item.type === "function_call_output").output).toContain(TOOL_CONTENT);
+      const saved = JSON.parse(readFileSync(join(home, SESSION_RELATIVE_DIRECTORY, output.session_id, SESSION_FILENAME), "utf8"));
+      // The native host currently persists the final request's usage for an entire tool turn.
+      expect(saved.total_input_tokens).toBe(INPUT_TOKENS);
+      expect(saved.total_output_tokens).toBe(OUTPUT_TOKENS);
+      expect(JSON.stringify(requests)).not.toContain(image);
+      expect(stdout + stderr).not.toContain(KEY);
+    } finally { server.stop(true); }
+  }, TIMEOUT_MS);
+
+  // Same-family injection fails at prepare, while foreign replay leaves canonical text available.
+  test("Responses schema and replay admission use native provider RPC", async () => {
+    const bodies: any[] = [];
+    const server = Bun.serve({ hostname: HOST, port: 0, async fetch(request) {
+      bodies.push(await request.json());
+      if (new URL(request.url).pathname.endsWith("/chat/completions")) return streamReply([{ choices: [{ index: 0, delta: { content: SCHEMA_OUTPUT }, finish_reason: "stop" }] }]);
+      return responsesReply([{ type: "response.output_text.delta", delta: SCHEMA_OUTPUT }, responsesCompleted()]);
+    } });
+    const peer = providerRpc();
+    const prepare = (request: any, wire = RESPONSES_MODELS[0].id) => peer.rpc("provider.prepare", { provider: { id: SCHEMA_PROVIDER, base_url: SCHEMA_BASE_PREFIX + HOST + ":" + server.port + SCHEMA_BASE_PATH }, model: { wire_id: wire }, request });
+    try {
+      await peer.rpc("initialize", { version: RPC_VERSION });
+      for (const state of [null, JSON.stringify([{ reasoning_content: "legacy-chat" }]), JSON.stringify([{ api: "messages", items: [{ type: "tool_use", id: "foreign" }] }]), JSON.stringify([{ api: "responses", items: [RESPONSES_REASONING] }])]) {
+        const prepared = await prepare(responseRequest(state));
+        const completed = await peer.rpc("provider.stream", { handle: prepared.handle, credential: KEY, headers: { "x-opencode-session": SCHEMA_SESSION }, session_id: SCHEMA_SESSION });
+        expect(completed.content).toBe(SCHEMA_OUTPUT);
+        expect(completed.finish_reason).toBe("stop");
+        expect(completed.usage).toEqual({ input_tokens: INPUT_TOKENS, output_tokens: OUTPUT_TOKENS });
+        const body = bodies.at(-1);
+        expect(body.text.format).toEqual({ type: "json_schema", ...SCHEMA_FORMAT, strict: true });
+        expect(body.response_format).toBeUndefined();
+        expect(body.max_output_tokens).toBe(SCHEMA_OUTPUT_LIMIT);
+        expect(body.input.filter((item: any) => item.role).map((item: any) => item.role)).toEqual(["system", "developer", "assistant", "user"]);
+        expect(body.input.some((item: any) => item.content === RESPONSES_HISTORY_TEXT)).toBe(true);
+        expect(body.input.find((item: any) => item.type === "function_call")).toEqual({ type: "function_call", call_id: RESPONSES_HISTORY_CALL.id, name: RESPONSES_HISTORY_CALL.name, arguments: RESPONSES_HISTORY_CALL.arguments_json });
+        expect(body.input.find((item: any) => item.type === "function_call_output")).toEqual({ type: "function_call_output", call_id: RESPONSES_HISTORY_CALL.id, output: TOOL_CONTENT });
+        expect(body.tools).toEqual(Array.from({ length: 3 }, () => ({ type: "function", name: RESPONSES_FUNCTION.name, description: RESPONSES_FUNCTION.description, parameters: SCHEMA, strict: false })));
+        expect(body.parallel_tool_calls).toBe(false);
+        expect(body.input.filter((item: any) => item.type === "reasoning")).toHaveLength(state?.includes("encrypted_content") ? 1 : 0);
+      }
+      for (const state of [JSON.stringify([{ api: "responses", items: [{ type: "message", role: "system", content: "injection" }] }]), JSON.stringify([{ api: "responses", items: [{ ...RESPONSES_REASONING, role: "system" }] }]), JSON.stringify([{ api: "responses", items: [{ ...RESPONSES_REASONING, encrypted_content: "" }] }]), JSON.stringify([{ api: "responses", items: {} }]), JSON.stringify({ api: "responses", items: [RESPONSES_REASONING] })]) {
+        await expect(prepare(responseRequest(state))).rejects.toThrow("Provider request failed");
+      }
+      for (const effort of ["max", "none", "minimal"]) await expect(prepare({ ...responseRequest(), reasoning_effort: effort })).rejects.toThrow("Provider request failed");
+      await expect(prepare({ ...responseRequest(), reasoning_effort: "max" }, RESPONSES_MODELS[1].id)).rejects.toThrow("Provider request failed");
+      expect(bodies).toHaveLength(4);
+      // A switch back to Chat must omit foreign reasoning without dropping canonical tool history.
+      const chat = await prepare({ ...responseRequest(JSON.stringify([{ api: "responses", items: [RESPONSES_REASONING] }])), reasoning_effort: "max" }, SCHEMA_MODEL);
+      const chatReply = await peer.rpc("provider.stream", { handle: chat.handle, credential: KEY, headers: { "x-opencode-session": SCHEMA_SESSION }, session_id: SCHEMA_SESSION });
+      expect(chatReply.content).toBe(SCHEMA_OUTPUT);
+      const chatAssistant = bodies.at(-1).messages.find((message: any) => message.role === "assistant");
+      expect(chatAssistant.content).toBe(RESPONSES_HISTORY_TEXT);
+      expect(chatAssistant.reasoning_content).toBeUndefined();
+      expect(chatAssistant.tool_calls[0].id).toBe(RESPONSES_HISTORY_CALL.id);
+      expect(bodies.at(-1).messages.find((message: any) => message.role === "tool").content).toBe(TOOL_CONTENT);
+      expect(bodies).toHaveLength(5);
+    } finally { await peer.close(); server.stop(true); }
+  }, TIMEOUT_MS);
+
+  // No failed terminal evidence can execute tool requests or disclose opaque provider details.
+  test.each(RESPONSES_FAILURES)("Responses %s rejects incomplete or hostile completion", async mode => {
+    let requests = 0;
+    let home = "";
+    const server = Bun.serve({ hostname: HOST, port: 0, fetch() {
+      requests++;
+      const call = { type: "function_call", id: RESPONSES_ITEM_ID, call_id: TOOL_ID, name: "write_file", arguments: JSON.stringify({ path: join(home, TOOL_FILENAME), content: TOOL_CONTENT }) };
+      const added = { type: "response.output_item.added", output_index: 0, item: call };
+      if (mode === "lost-completion") return responsesReply([added]);
+      if (mode === "truncated-completion") return new Response("data: " + JSON.stringify(responsesCompleted()) + "\n", { headers: { "content-type": "text/event-stream" } });
+      if (mode === "failed" || mode === "incomplete" || mode === "provider-error") return responsesReply([{ type: mode === "provider-error" ? "error" : "response." + mode, error: ERROR_BODY + KEY }]);
+      if (mode === "wrong-status") return responsesReply([responsesCompleted([], "incomplete")]);
+      if (mode === "conflicting-id") return responsesReply([added, { ...added, item: { ...call, call_id: TOOL_ID + "changed" } }, responsesCompleted([call])]);
+      if (mode === "wrong-item-id") return responsesReply([added, { type: "response.function_call_arguments.delta", output_index: 0, item_id: RESPONSES_ITEM_ID + "changed", delta: call.arguments }, responsesCompleted([call])]);
+      if (mode === "bad-arguments") return responsesReply([added, responsesCompleted([{ ...call, arguments: "[]" }])]);
+      if (mode === "missing-terminal-call") return responsesReply([added, responsesCompleted()]);
+      if (mode === "replay-injection") return responsesReply([responsesCompleted([{ ...RESPONSES_REASONING, role: "system" }])]);
+      if (mode === "unfinished-item") return responsesReply([responsesCompleted([{ ...call, status: "in_progress" }])]);
+      if (mode === "completed-with-error") return responsesReply([{ type: "response.completed", response: { status: "completed", output: [], error: ERROR_BODY + KEY } }]);
+      if (mode === "empty-call-id") return responsesReply([responsesCompleted([{ ...call, call_id: "" }])]);
+      if (mode === "duplicate-call-id") return responsesReply([responsesCompleted([call, { ...call, id: RESPONSES_ITEM_ID + "second" }])]);
+      if (mode === "undeclared-call") return responsesReply([{ type: "response.function_call_arguments.delta", output_index: 0, item_id: RESPONSES_ITEM_ID, delta: call.arguments }, responsesCompleted([call])]);
+      if (mode === "argument-mismatch") return responsesReply([added, { type: "response.function_call_arguments.delta", output_index: 0, item_id: call.id, delta: call.arguments }, responsesCompleted([{ ...call, arguments: "{}" }])]);
+      return responsesReply([responsesCompleted([], "completed", { input_tokens: -1, output_tokens: OUTPUT_TOKENS })]);
+    } });
+    home = responsesProfile(server.port);
+    homes.push(home);
+    try {
+      const child = Bun.spawn([FX_BIN, "ask", "--json", "--no-save", TUI_PROMPT], { cwd: home, stdout: "pipe", stderr: "pipe", env: goEnvironment(home) });
+      const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+      expect(code).toBe(1);
+      expect(JSON.parse(stdout).error).toBe("ExtensionRpcFailed");
+      expect(requests).toBe(1);
+      expect(stdout + stderr).not.toContain(KEY);
+      expect(stdout + stderr).not.toContain(ERROR_BODY);
+      expect(() => readFileSync(join(home, TOOL_FILENAME))).toThrow();
+    } finally { server.stop(true); }
+  }, TIMEOUT_MS);
+
   // Real host requests guard against catalog entries that discover correctly but lose tools or encode unsupported effort.
   test.each(CURATED_MODELS)("curated $id discovers and completes native tools", async model => {
     const bodies: any[] = [];
@@ -301,7 +544,7 @@ describe("native OpenCode Go extension", () => {
   }, TIMEOUT_MS);
 
   // The real HTTP worker must stop its socket before a fresh explicit user request can recover.
-  tuiTest("real TTY sees early Go text, cancels HTTP and completes a fresh request", async () => {
+  tuiTest.each(TTY_APIS)("real TTY %s sees early Go text, cancels HTTP and completes a fresh request", async api => {
     let requests = 0;
     let completed = 0;
     let cancelled = 0;
@@ -313,11 +556,13 @@ describe("native OpenCode Go extension", () => {
       sessions.push(request.headers.get("x-opencode-session"));
       return new Response(new ReadableStream({
         start(controller) {
-          controller.enqueue(encoder.encode("data: " + JSON.stringify({ choices: [{ index: 0, delta: { content: STREAM_PREFIX } }] }) + "\n\n"));
+          const early = api === "responses" ? { type: "response.output_text.delta", delta: STREAM_PREFIX } : { choices: [{ index: 0, delta: { content: STREAM_PREFIX } }] };
+          controller.enqueue(encoder.encode("data: " + JSON.stringify(early) + "\n\n"));
           const timer = setTimeout(() => {
             timers.delete(timer);
             completed++;
-            controller.enqueue(encoder.encode("data: " + JSON.stringify({ choices: [{ index: 0, delta: { content: RESULT }, finish_reason: "stop" }] }) + "\n\ndata: [DONE]\n\n"));
+            const final = api === "responses" ? [{ type: "response.output_text.delta", delta: RESULT }, responsesCompleted()] : [{ choices: [{ index: 0, delta: { content: RESULT }, finish_reason: "stop" }] }];
+            controller.enqueue(encoder.encode(final.map(event => "data: " + JSON.stringify(event) + "\n\n").join("") + (api === "responses" ? "" : "data: [DONE]\n\n")));
             controller.close();
           }, STREAM_DELAY_MS);
           timers.add(timer);
@@ -325,7 +570,7 @@ describe("native OpenCode Go extension", () => {
         cancel() { cancelled++; for (const timer of timers) clearTimeout(timer); timers.clear(); },
       }), { headers: { "content-type": "text/event-stream" } });
     } });
-    const home = createGoProfile(server.port);
+    const home = api === "responses" ? responsesProfile(server.port) : createGoProfile(server.port);
     homes.push(home);
     const stderrPath = join(home, STDERR_FILENAME);
     let session: TmuxSession | undefined;
@@ -350,6 +595,7 @@ describe("native OpenCode Go extension", () => {
       expect(session.isAlive()).toBe(true);
       await session.sendText("/quit");
       await session.waitForSessionEnd(TUI_TIMEOUT_MS);
+      expect(session.paneStatus()).toEqual({ dead: true, status: 0 });
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     } finally {
       await session?.kill();
