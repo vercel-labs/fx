@@ -32,6 +32,9 @@ const TIMEOUT = 30_000;
 const TEST_TIMEOUT = 120_000;
 const SELECTED_COMPLETION_SGR = "\x1b[1m\x1b[38;5;255m";
 const DIM_SGR = "\x1b[38;5;245m";
+// Persisted setting names identify the acknowledgment boundary independently of repeated menu text.
+const STATUSLINE_CONTEXT_KEY = "context";
+const STATUSLINE_SESSION_KEY = "session";
 
 let session: TmuxSession | null = null;
 let gateway: ReturnType<typeof startFakeGateway> | null = null;
@@ -1733,12 +1736,15 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).not.toContain("←→ Change");
 
       await session.sendKeys("Right");
+      // The pre-toggle frame already matches the menu predicate, so persistence must acknowledge the input.
+      await waitForStatuslineValue(settingsPath, STATUSLINE_CONTEXT_KEY, true);
       grid = await waitForStatuslineMenu(session, "off  on");
       pane = grid.join("\n");
       expect(JSON.parse(readFileSync(settingsPath, "utf8")).statusLine.context).toBe(true);
 
       await session.sendKeys("Down");
       await session.sendKeys("Right");
+      await waitForStatuslineValue(settingsPath, STATUSLINE_SESSION_KEY, true);
       grid = await waitForStatuslineMenu(session, "Context");
       pane = grid.join("\n");
       expect(pane).not.toContain("saved to user settings");
