@@ -136,6 +136,47 @@ const LEGACY_REASONING = "legacy-chat-reasoning";
 const UNSUPPORTED_EFFORT = "unselected-effort";
 const REMOVED_WIRE = "deepseek-v4-pro";
 const CATALOG_CALL_OUTPUT_INDEX = 1;
+// Shared semantic labels keep catalog fixtures aligned without hidden per-scenario defaults.
+const CATALOG_FALLBACK_EFFORT = "max";
+const CATALOG_PERMISSION_MODE = "auto";
+const CATALOG_EXECUTABLE_ALLOW = "allow";
+const CATALOG_READ_TOOL = "read_file";
+const CATALOG_CHAT_API = "chat";
+const CATALOG_RESPONSES_API = "responses";
+const CATALOG_MESSAGES_API = "messages";
+const CATALOG_CHAT_REPLAY_API = "chat_completions";
+const CATALOG_TOOL_BLOCK_INDEX = 2;
+const CATALOG_MESSAGES_TOOL_FINISH = "tool_use";
+const CATALOG_MESSAGES_STOP_FINISH = "end_turn";
+const CATALOG_CHAT_TOOL_FINISH = "tool_calls";
+const CATALOG_CHAT_STOP_FINISH = "stop";
+const CATALOG_FUNCTION_TYPE = "function";
+const CATALOG_CALL_TYPE = "function_call";
+const CATALOG_CALL_COMPLETED = "completed";
+const CATALOG_CALL_IN_PROGRESS = "in_progress";
+const CATALOG_RESPONSES_EVENTS = {
+  call_added: "response.output_item.added",
+  arguments_delta: "response.function_call_arguments.delta",
+  call_done: "response.output_item.done",
+  text_delta: "response.output_text.delta",
+};
+const CATALOG_RPC_INITIALIZE = "initialize";
+const CATALOG_RPC_PREPARE = "provider.prepare";
+const CATALOG_RPC_STREAM = "provider.stream";
+const CATALOG_RPC_FAILURE = "Provider request failed";
+const CATALOG_ASSISTANT_ROLE = "assistant";
+const CATALOG_DEEPSEEK_MATCH = "deepseek";
+const CATALOG_COMMAND_ASK = "ask";
+const CATALOG_COMMAND_MODELS = "models";
+const CATALOG_JSON_FLAG = "--json";
+const CATALOG_NO_SAVE_FLAG = "--no-save";
+const CATALOG_RESUME_FLAG = "--resume";
+const CATALOG_QUIT_COMMAND = "/quit";
+const CATALOG_STARTUP_HINT = "Run /help";
+const CATALOG_PICKER_DOWN = "Down";
+const CATALOG_PICKER_UP = "Up";
+const CATALOG_PICKER_ENTER = "Enter";
+const CATALOG_SHOW_ONBOARDING = "0";
 
 const tuiTest = tmuxAvailable() ? test : test.skip;
 const homes: string[] = [];
@@ -215,21 +256,21 @@ function messagesTool(argumentsJson: string, index = 0, name = "write_file", id 
 // Distinct HTTP envelopes exercise native read_file without hiding wrong catalog routing.
 function catalogReply(api: string, home: string, tool: boolean): Response {
   const argumentsJson = JSON.stringify({ path: join(home, TOOL_FILENAME) });
-  if (api === "messages") return responsesReply([messagesStart(), ...(tool ? [...messagesThinking(), ...messagesTool(argumentsJson, 2, "read_file")] : messagesText(RESULT)), ...messagesTerminal(tool ? "tool_use" : "end_turn")]);
-  if (api === "responses") {
-    const call = { type: "function_call", id: RESPONSES_ITEM_ID, call_id: TOOL_ID, name: "read_file", arguments: argumentsJson, status: "completed" };
+  if (api === CATALOG_MESSAGES_API) return responsesReply([messagesStart(), ...(tool ? [...messagesThinking(), ...messagesTool(argumentsJson, CATALOG_TOOL_BLOCK_INDEX, CATALOG_READ_TOOL)] : messagesText(RESULT)), ...messagesTerminal(tool ? CATALOG_MESSAGES_TOOL_FINISH : CATALOG_MESSAGES_STOP_FINISH)]);
+  if (api === CATALOG_RESPONSES_API) {
+    const call = { type: CATALOG_CALL_TYPE, id: RESPONSES_ITEM_ID, call_id: TOOL_ID, name: CATALOG_READ_TOOL, arguments: argumentsJson, status: CATALOG_CALL_COMPLETED };
     return responsesReply(tool ? [
-      { type: "response.output_item.added", output_index: CATALOG_CALL_OUTPUT_INDEX, item: { ...call, arguments: "", status: "in_progress" } },
-      { type: "response.function_call_arguments.delta", output_index: CATALOG_CALL_OUTPUT_INDEX, item_id: call.id, delta: call.arguments },
-      { type: "response.output_item.done", output_index: CATALOG_CALL_OUTPUT_INDEX, item: call }, responsesCompleted([RESPONSES_REASONING, call]),
-    ] : [{ type: "response.output_text.delta", delta: RESULT }, responsesCompleted()]);
+      { type: CATALOG_RESPONSES_EVENTS.call_added, output_index: CATALOG_CALL_OUTPUT_INDEX, item: { ...call, arguments: "", status: CATALOG_CALL_IN_PROGRESS } },
+      { type: CATALOG_RESPONSES_EVENTS.arguments_delta, output_index: CATALOG_CALL_OUTPUT_INDEX, item_id: call.id, delta: call.arguments },
+      { type: CATALOG_RESPONSES_EVENTS.call_done, output_index: CATALOG_CALL_OUTPUT_INDEX, item: call }, responsesCompleted([RESPONSES_REASONING, call]),
+    ] : [{ type: CATALOG_RESPONSES_EVENTS.text_delta, delta: RESULT }, responsesCompleted()]);
   }
-  return streamReply([{ choices: [{ index: 0, delta: tool ? { reasoning_content: RESPONSES_REASONING_TEXT, tool_calls: [{ index: 0, id: TOOL_ID, function: { name: "read_file", arguments: argumentsJson } }] } : { content: RESULT }, finish_reason: tool ? "tool_calls" : "stop" }] }]);
+  return streamReply([{ choices: [{ index: 0, delta: tool ? { reasoning_content: RESPONSES_REASONING_TEXT, tool_calls: [{ index: 0, id: TOOL_ID, function: { name: CATALOG_READ_TOOL, arguments: argumentsJson } }] } : { content: RESULT }, finish_reason: tool ? CATALOG_CHAT_TOOL_FINISH : CATALOG_CHAT_STOP_FINISH }] }]);
 }
 
 // Effort placement belongs to the HTTP API, while admission belongs to the wire metadata.
 function projectedEffort(body: any, api: string): string | undefined {
-  return api === "messages" ? body.output_config?.effort : api === "responses" ? body.reasoning?.effort : body.reasoning_effort;
+  return api === CATALOG_MESSAGES_API ? body.output_config?.effort : api === CATALOG_RESPONSES_API ? body.reasoning?.effort : body.reasoning_effort;
 }
 
 // Native nullable request fields exercise schema, role merging and family-bound replay via RPC.
@@ -695,19 +736,19 @@ describe("native OpenCode Go extension", () => {
     const settingsPath = join(home, SETTINGS_RELATIVE_PATH);
     const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
     settings.models = { ...BUILTIN_PREFERENCES, extension: CURATED_PROVIDER_PREFIX + model.id };
-    settings.effort = model.effort ?? "max";
-    settings.permission = { [EXECUTABLE_PERMISSION]: "allow" };
+    settings.effort = model.effort ?? CATALOG_FALLBACK_EFFORT;
+    settings.permission = { [EXECUTABLE_PERMISSION]: CATALOG_EXECUTABLE_ALLOW };
     writeFileSync(settingsPath, JSON.stringify(settings));
     writeFileSync(join(home, TOOL_FILENAME), TOOL_CONTENT);
     try {
-      const discovery = Bun.spawn([FX_BIN, "models", "--json"], { cwd: home, stdout: "pipe", stderr: "pipe", env: { ...goEnvironment(home), FX_PERMISSION_MODE: "auto" } });
+      const discovery = Bun.spawn([FX_BIN, CATALOG_COMMAND_MODELS, CATALOG_JSON_FLAG], { cwd: home, stdout: "pipe", stderr: "pipe", env: { ...goEnvironment(home), FX_PERMISSION_MODE: CATALOG_PERMISSION_MODE } });
       const [catalog, discoveryError, discoveryCode] = await Promise.all([new Response(discovery.stdout).text(), new Response(discovery.stderr).text(), discovery.exited]);
       expect(discoveryCode, discoveryError).toBe(0);
       const discovered = JSON.parse(catalog).ids;
       expect(discovered).toEqual(CURATED_MODELS.map(choice => CURATED_PROVIDER_PREFIX + choice.id));
-      expect(discovered.filter((id: string) => id.includes("deepseek"))).toEqual([CURATED_PROVIDER_PREFIX + CURATED_MODELS[0].id]);
+      expect(discovered.filter((id: string) => id.includes(CATALOG_DEEPSEEK_MATCH))).toEqual([CURATED_PROVIDER_PREFIX + CURATED_MODELS[0].id]);
       expect(discoveryError).toBe("");
-      const child = Bun.spawn([FX_BIN, "ask", "--json", "--no-save", TUI_PROMPT], { cwd: home, stdout: "pipe", stderr: "pipe", env: { ...goEnvironment(home), FX_PERMISSION_MODE: "auto" } });
+      const child = Bun.spawn([FX_BIN, CATALOG_COMMAND_ASK, CATALOG_JSON_FLAG, CATALOG_NO_SAVE_FLAG, TUI_PROMPT], { cwd: home, stdout: "pipe", stderr: "pipe", env: { ...goEnvironment(home), FX_PERMISSION_MODE: CATALOG_PERMISSION_MODE } });
       const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
       expect(code, JSON.stringify({ stdout, stderr })).toBe(0);
       expect(JSON.parse(stdout).output).toBe(RESULT);
@@ -738,22 +779,22 @@ describe("native OpenCode Go extension", () => {
       return catalogReply(model.api, "", false);
     } });
     const peer = providerRpc();
-    const prepare = (model: typeof CURATED_MODELS[number], effort: string | null) => peer.rpc("provider.prepare", {
+    const prepare = (model: typeof CURATED_MODELS[number], effort: string | null) => peer.rpc(CATALOG_RPC_PREPARE, {
       provider: { id: SCHEMA_PROVIDER, base_url: SCHEMA_BASE_PREFIX + HOST + ":" + server.port + SCHEMA_BASE_PATH },
       model: { wire_id: model.wire, max_output_tokens: MESSAGES_OUTPUT_CAP }, request: { ...responseRequest(), reasoning_effort: effort, response_format: null } });
     try {
-      await peer.rpc("initialize", { version: RPC_VERSION });
+      await peer.rpc(CATALOG_RPC_INITIALIZE, { version: RPC_VERSION });
       for (const model of CURATED_MODELS) {
         for (const effort of [null, ...model.efforts]) {
           const prepared = await prepare(model, effort);
-          await peer.rpc("provider.stream", { handle: prepared.handle, credential: KEY, headers: { "x-opencode-session": SCHEMA_SESSION }, session_id: SCHEMA_SESSION });
+          await peer.rpc(CATALOG_RPC_STREAM, { handle: prepared.handle, credential: KEY, headers: { "x-opencode-session": SCHEMA_SESSION }, session_id: SCHEMA_SESSION });
           expect(projectedEffort(bodies.at(-1), model.api)).toBe(effort ?? undefined);
         }
         const before = requests;
-        for (const effort of [UNSUPPORTED_EFFORT, ...ALL_EFFORTS.filter(label => !model.efforts.includes(label))]) await expect(prepare(model, effort)).rejects.toThrow("Provider request failed");
+        for (const effort of [UNSUPPORTED_EFFORT, ...ALL_EFFORTS.filter(label => !model.efforts.includes(label))]) await expect(prepare(model, effort)).rejects.toThrow(CATALOG_RPC_FAILURE);
         expect(requests).toBe(before);
       }
-      await expect(prepare({ ...CURATED_MODELS[0], wire: REMOVED_WIRE }, null)).rejects.toThrow("Provider request failed");
+      await expect(prepare({ ...CURATED_MODELS[0], wire: REMOVED_WIRE }, null)).rejects.toThrow(CATALOG_RPC_FAILURE);
     } finally { await peer.close(); server.stop(true); }
   }, TIMEOUT_MS);
 
@@ -766,33 +807,33 @@ describe("native OpenCode Go extension", () => {
       return catalogReply(CURATED_MODELS.find(model => model.wire === body.model)!.api, "", false);
     } });
     const peer = providerRpc();
-    const prepare = (model: typeof CURATED_MODELS[number], state: string) => peer.rpc("provider.prepare", {
+    const prepare = (model: typeof CURATED_MODELS[number], state: string) => peer.rpc(CATALOG_RPC_PREPARE, {
       provider: { id: SCHEMA_PROVIDER, base_url: SCHEMA_BASE_PREFIX + HOST + ":" + server.port + SCHEMA_BASE_PATH },
       model: { wire_id: model.wire, max_output_tokens: MESSAGES_OUTPUT_CAP },
       request: { ...responseRequest(state), reasoning_effort: SWITCH_EFFORT, response_format: null } });
-    const stream = (handle: string) => peer.rpc("provider.stream", { handle, credential: KEY, headers: { "x-opencode-session": SCHEMA_SESSION }, session_id: SCHEMA_SESSION });
+    const stream = (handle: string) => peer.rpc(CATALOG_RPC_STREAM, { handle, credential: KEY, headers: { "x-opencode-session": SCHEMA_SESSION }, session_id: SCHEMA_SESSION });
     try {
-      await peer.rpc("initialize", { version: RPC_VERSION });
+      await peer.rpc(CATALOG_RPC_INITIALIZE, { version: RPC_VERSION });
       for (const reasoning of ["", LEGACY_REASONING]) {
         const prepared = await prepare(SWITCH_MODELS[0], JSON.stringify([{ reasoning_content: reasoning }]));
         expect((await stream(prepared.handle)).content).toBe(RESULT);
-        expect(bodies.at(-1).messages.find((message: any) => message.role === "assistant").reasoning_content).toBe(reasoning);
+        expect(bodies.at(-1).messages.find((message: any) => message.role === CATALOG_ASSISTANT_ROLE).reasoning_content).toBe(reasoning);
       }
       const before = bodies.length;
-      await expect(prepare(SWITCH_MODELS[0], JSON.stringify([{ reasoning_content: INPUT_TOKENS }]))).rejects.toThrow("Provider request failed");
+      await expect(prepare(SWITCH_MODELS[0], JSON.stringify([{ reasoning_content: INPUT_TOKENS }]))).rejects.toThrow(CATALOG_RPC_FAILURE);
       for (const model of SWITCH_MODELS) {
-        const family = model.api === "chat" ? "chat_completions" : model.api;
-        const item = model.api === "messages" ? MESSAGES_THINKING : RESPONSES_REASONING;
+        const family = model.api === CATALOG_CHAT_API ? CATALOG_CHAT_REPLAY_API : model.api;
+        const item = model.api === CATALOG_MESSAGES_API ? MESSAGES_THINKING : RESPONSES_REASONING;
         const tagged = { api: family, items: Array.from({ length: REPLAY_BOUNDARY_ITEMS }, () => item) };
         // Chat already requires exactly one reasoning item; valid typed items isolate the other families' count guard.
-        if (model.api !== "chat") await expect(prepare(model, JSON.stringify([tagged]))).rejects.toThrow("Provider request failed");
+        if (model.api !== CATALOG_CHAT_API) await expect(prepare(model, JSON.stringify([tagged]))).rejects.toThrow(CATALOG_RPC_FAILURE);
         // Outer envelope multiplicity is bounded even when both entries claim a foreign family.
-        const foreign = { ...tagged, api: model.api === "responses" ? "messages" : "responses" };
-        await expect(prepare(model, JSON.stringify([foreign, foreign]))).rejects.toThrow("Provider request failed");
+        const foreign = { ...tagged, api: model.api === CATALOG_RESPONSES_API ? CATALOG_MESSAGES_API : CATALOG_RESPONSES_API };
+        await expect(prepare(model, JSON.stringify([foreign, foreign]))).rejects.toThrow(CATALOG_RPC_FAILURE);
       }
       expect(bodies).toHaveLength(before);
       for (const model of SWITCH_MODELS) {
-        const foreign = { api: model.api === "responses" ? "messages" : "responses", items: { untrusted: LEGACY_REASONING } };
+        const foreign = { api: model.api === CATALOG_RESPONSES_API ? CATALOG_MESSAGES_API : CATALOG_RESPONSES_API, items: { untrusted: LEGACY_REASONING } };
         const prepared = await prepare(model, JSON.stringify([foreign]));
         expect((await stream(prepared.handle)).content).toBe(RESULT);
         const projected = JSON.stringify(bodies.at(-1));
@@ -816,11 +857,11 @@ describe("native OpenCode Go extension", () => {
     const settingsPath = join(home, SETTINGS_RELATIVE_PATH);
     const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
     settings.effort = SWITCH_EFFORT;
-    settings.permission = { [EXECUTABLE_PERMISSION]: "allow" };
+    settings.permission = { [EXECUTABLE_PERMISSION]: CATALOG_EXECUTABLE_ALLOW };
     writeFileSync(settingsPath, JSON.stringify(settings));
     writeFileSync(join(home, TOOL_FILENAME), TOOL_CONTENT);
     const run = async (model: string, args: string[], tool: boolean) => {
-      const child = Bun.spawn([FX_BIN, "ask", "--json", ...args], { cwd: home, stdout: "pipe", stderr: "pipe", env: { ...goEnvironment(home), FX_MODEL: CURATED_PROVIDER_PREFIX + model, FX_PERMISSION_MODE: "auto" } });
+      const child = Bun.spawn([FX_BIN, CATALOG_COMMAND_ASK, CATALOG_JSON_FLAG, ...args], { cwd: home, stdout: "pipe", stderr: "pipe", env: { ...goEnvironment(home), FX_MODEL: CURATED_PROVIDER_PREFIX + model, FX_PERMISSION_MODE: CATALOG_PERMISSION_MODE } });
       const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
       expect(code, JSON.stringify({ stdout, stderr })).toBe(0);
       if (tool) {
@@ -832,7 +873,7 @@ describe("native OpenCode Go extension", () => {
     };
     try {
       const first = await run(from.id, [TUI_PROMPT], true);
-      const resumed = await run(to.id, ["--resume", first.session_id, FOLLOWUP_PROMPT], false);
+      const resumed = await run(to.id, [CATALOG_RESUME_FLAG, first.session_id, FOLLOWUP_PROMPT], false);
       expect(resumed.session_id).toBe(first.session_id);
       expect(bodies).toHaveLength(3);
       expect(bodies[2].model).toBe(to.wire);
@@ -847,43 +888,43 @@ describe("native OpenCode Go extension", () => {
   // Native discovery and terminal selection must agree without creating a second DeepSeek alias.
   tuiTest("real TTY picker exposes the approved catalog and persists an actual selection", async () => {
     let requests = 0;
-    const server = Bun.serve({ hostname: HOST, port: 0, fetch() { requests++; return catalogReply("chat", "", false); } });
+    const server = Bun.serve({ hostname: HOST, port: 0, fetch() { requests++; return catalogReply(CATALOG_CHAT_API, "", false); } });
     const home = createGoProfile(server.port);
     homes.push(home);
     const settingsPath = join(home, SETTINGS_RELATIVE_PATH);
     const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
     settings.models = { ...BUILTIN_PREFERENCES, extension: CURATED_PROVIDER_PREFIX + CURATED_MODELS[0].id };
-    settings.permission = { [EXECUTABLE_PERMISSION]: "allow" };
+    settings.permission = { [EXECUTABLE_PERMISSION]: CATALOG_EXECUTABLE_ALLOW };
     writeFileSync(settingsPath, JSON.stringify(settings));
     const stderrPath = join(home, STDERR_FILENAME);
     let session: TmuxSession | undefined;
     try {
       session = await TmuxSession.create({ cmd: FX_BIN, cwd: home, stderrPath, isolated: true, height: PICKER_HEIGHT,
-        env: { ...goEnvironment(home), FX_PERMISSION_MODE: "auto", FX_SKIP_ONBOARDING: "0" } });
-      await session.waitForText("Run /help", TUI_TIMEOUT_MS);
+        env: { ...goEnvironment(home), FX_PERMISSION_MODE: CATALOG_PERMISSION_MODE, FX_SKIP_ONBOARDING: CATALOG_SHOW_ONBOARDING } });
+      await session.waitForText(CATALOG_STARTUP_HINT, TUI_TIMEOUT_MS);
       await session.sendText(PICKER_COMMAND);
       const pane = await session.waitForText(PICKER_DEEPSEEK_LABEL, TUI_TIMEOUT_MS);
       expect(pane.split(PICKER_DEEPSEEK_LABEL)).toHaveLength(2);
       expect(pane).not.toContain(REMOVED_WIRE);
       const views = [pane];
       for (const _ of CURATED_MODELS.slice(1)) {
-        await session.sendKeys("Down");
+        await session.sendKeys(CATALOG_PICKER_DOWN);
         views.push(await session.capturePane());
       }
       for (const model of CURATED_MODELS) expect(views.join("\n")).toContain(CURATED_PROVIDER_PREFIX + model.id);
       expect(requests).toBe(0);
-      for (const _ of CURATED_MODELS.slice(1)) await session.sendKeys("Up");
-      await session.sendKeys("Down");
-      await session.sendKeys("Enter");
+      for (const _ of CURATED_MODELS.slice(1)) await session.sendKeys(CATALOG_PICKER_UP);
+      await session.sendKeys(CATALOG_PICKER_DOWN);
+      await session.sendKeys(CATALOG_PICKER_ENTER);
       await session.waitForText(/\blow\b/i, TUI_TIMEOUT_MS);
-      await session.sendKeys("Enter");
+      await session.sendKeys(CATALOG_PICKER_ENTER);
       await session.sendText(TUI_PROMPT);
       await session.waitForText(RESULT, TUI_TIMEOUT_MS);
       const selected = JSON.parse(readFileSync(settingsPath, "utf8"));
       expect(selected.models.extension).toBe(CURATED_PROVIDER_PREFIX + CURATED_MODELS[1].id);
       for (const [provider, preference] of Object.entries(BUILTIN_PREFERENCES)) expect(selected.models[provider]).toBe(preference);
       expect(requests).toBe(1);
-      await session.sendText("/quit");
+      await session.sendText(CATALOG_QUIT_COMMAND);
       await session.waitForSessionEnd(TUI_TIMEOUT_MS);
       expect(session.paneStatus()).toEqual({ dead: true, status: 0 });
       expect(readFileSync(stderrPath, "utf8")).toBe("");

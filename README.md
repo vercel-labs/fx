@@ -121,8 +121,6 @@ Add reusable instructions with [skills](https://fx.sh/docs/capabilities/skills),
 
 Trusted local executables can provide model catalogs and streaming through `~/.fx/extension.json`. The OpenCode Go adapter offers 13 selected choices through Chat Completions, Responses and Messages, with native tools, reasoning and image snapshots. Built-in provider catalogs and saved preferences remain available. See [local extensions](docs/extensions.md) and [OpenCode Go setup, models and capability limits](extensions/fx-opencode-go/README.md).
 
-The bundled Go catalog curates DeepSeek V4.1 Flash, DeepSeek V4 Pro, Kimi K3, GLM-5.3-Flash and MiMo-V2.6-Flash. The built-in Vercel Gateway, Codex and Grok providers remain available.
-
 Extensions run with your OS privileges, not in a sandbox. Native `ask` confirms executable activation without disabling tool permissions. Explicit `extension_execute` rules can authorize activation in `ask` or `auto`; unresolved `auto` activation holds closed.
 
 ## Documentation
