@@ -58,6 +58,25 @@ const STDERR_FILENAME = "go-tui-stderr.log";
 const TUI_PROMPT = "Reply through the local Go fixture.";
 const FOLLOWUP_PROMPT = "Make one fresh local Go request.";
 const NEGATIVE_CASES = ["http-error", "redirect", "lost-finish", "aggregate-tools"].map(mode => ({ mode }));
+// Each malformed boundary must fail before native tools can produce a local effect.
+const CHAT_TERMINAL_FAILURES = [
+  { mode: "conflicting-finish", first: "content_filter", last: "tool_calls", calls: true },
+  { mode: "late-tool", first: "tool_calls", last: "tool_calls", calls: true, initialCall: true },
+  { mode: "late-content", first: "stop", last: "stop", content: RESULT },
+  { mode: "late-reasoning", first: "stop", last: "stop", reasoning: TOOL_CONTENT },
+  { mode: "stop-with-call", last: "stop", calls: true },
+  { mode: "length-with-call", last: "length", calls: true },
+  { mode: "filter-with-call", last: "content_filter", calls: true },
+  { mode: "tool-finish-without-call", last: "tool_calls" },
+];
+const CHAT_WRITE_TOOL = "write_file";
+const CHAT_FAILURE = "ExtensionRpcFailed";
+const CHAT_FAILURE_EXIT = 1;
+const CHAT_SUCCESS_EXIT = 0;
+const CHAT_NON_TOOL_STOPS = ["length", "content_filter"];
+const CHAT_LENGTH_FINISH = "length";
+const CHAT_LENGTH_NOTICE = "response hit provider length limit";
+const CHAT_FILTER_ERROR = "ModelError";
 const GO_MANIFEST_FILENAME = "extension.json";
 // The curated choices must preserve native tool continuation without borrowing another provider's preferences.
 const CURATED_MODELS = [
@@ -1166,6 +1185,65 @@ describe("native OpenCode Go extension", () => {
     }
   }, TIMEOUT_MS);
 
+  // Completed non-tool dispositions retain host length/filter handling rather than becoming RPC failures.
+  test.each(CHAT_NON_TOOL_STOPS)("Chat terminal evidence preserves %s without calls", async reason => {
+    let requests = 0;
+    const server = Bun.serve({ hostname: HOST, port: 0, fetch() {
+      requests++;
+      return streamReply([{ choices: [{ index: 0, delta: { content: RESULT }, finish_reason: reason }] },
+        { choices: [], usage: { prompt_tokens: INPUT_TOKENS, completion_tokens: OUTPUT_TOKENS } }]);
+    } });
+    try {
+      const home = createGoProfile(server.port);
+      homes.push(home);
+      const child = Bun.spawn([FX_BIN, CATALOG_COMMAND_ASK, CATALOG_JSON_FLAG, CATALOG_NO_SAVE_FLAG, TUI_PROMPT],
+        { cwd: home, stdout: "pipe", stderr: "pipe", env: goEnvironment(home) });
+      const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+      const response = JSON.parse(stdout);
+      expect(code).toBe(reason === CHAT_LENGTH_FINISH ? CHAT_SUCCESS_EXIT : CHAT_FAILURE_EXIT);
+      expect(requests).toBe(1);
+      expect(response.error).not.toBe(CHAT_FAILURE);
+      if (reason === CHAT_LENGTH_FINISH) {
+        expect(response.output).toBe(RESULT);
+        expect(stderr).toContain(CHAT_LENGTH_NOTICE);
+      } else expect(response.error).toBe(CHAT_FILTER_ERROR);
+    } finally { server.stop(true); }
+  }, TIMEOUT_MS);
+
+  // The real host must reject inconsistent terminal evidence without replay or filesystem effects.
+  test.each(CHAT_TERMINAL_FAILURES)("Chat terminal evidence rejects $mode", async scenario => {
+    let requests = 0;
+    let home = "";
+    const server = Bun.serve({ hostname: HOST, port: 0, fetch() {
+      requests++;
+      if (requests > 1) return streamReply([{ choices: [{ index: 0,
+        delta: { content: RESULT }, finish_reason: CATALOG_CHAT_STOP_FINISH }] }]);
+      const tool_calls = [{ index: 0, id: TOOL_ID, function: { name: CHAT_WRITE_TOOL,
+        arguments: JSON.stringify({ path: join(home, TOOL_FILENAME), content: TOOL_CONTENT }) } }];
+      const chunks: unknown[] = [];
+      if (scenario.first) chunks.push({ choices: [{ index: 0,
+        delta: scenario.initialCall ? { tool_calls: [{ ...tool_calls[0],
+          function: { ...tool_calls[0].function, arguments: "" } }] } : {}, finish_reason: scenario.first }] });
+      chunks.push({ choices: [{ index: 0, delta: {
+        ...(scenario.calls ? { tool_calls } : {}), ...(scenario.content ? { content: scenario.content } : {}),
+        ...(scenario.reasoning ? { reasoning_content: scenario.reasoning } : {}),
+      }, finish_reason: scenario.last }] });
+      return streamReply(chunks);
+    } });
+    try {
+      home = createGoProfile(server.port);
+      homes.push(home);
+      const child = Bun.spawn([FX_BIN, CATALOG_COMMAND_ASK, CATALOG_JSON_FLAG, CATALOG_NO_SAVE_FLAG, TUI_PROMPT],
+        { cwd: home, stdout: "pipe", stderr: "pipe", env: goEnvironment(home) });
+      const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+      expect(code).toBe(CHAT_FAILURE_EXIT);
+      expect(JSON.parse(stdout).error).toBe(CHAT_FAILURE);
+      expect(requests).toBe(1);
+      expect(stdout + stderr).not.toContain(KEY);
+      expect(() => readFileSync(join(home, TOOL_FILENAME))).toThrow();
+    } finally { server.stop(true); }
+  }, TIMEOUT_MS);
+
   // HTTP failure, redirect and terminal-evidence loss must never trigger provider-side or host-side replay.
   test.each(NEGATIVE_CASES)("$mode remains terminal without secret disclosure or tool side effects", async ({ mode }) => {
     let requests = 0;
@@ -1209,8 +1287,8 @@ describe("native OpenCode Go extension", () => {
         { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], usage: { prompt_tokens: 10, completion_tokens: 20 } },
       ]);
       return streamReply([
-        { choices: [{ index: 0, delta: { content: RESULT } }] },
-        { choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 15, completion_tokens: 5 } },
+        { choices: [{ index: 0, delta: { content: RESULT }, finish_reason: CATALOG_CHAT_STOP_FINISH }] },
+        { choices: [], usage: { prompt_tokens: INPUT_TOKENS, completion_tokens: OUTPUT_TOKENS } },
       ]);
     } });
     try {

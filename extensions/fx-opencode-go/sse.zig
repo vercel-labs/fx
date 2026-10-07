@@ -6,6 +6,10 @@ const sse_events = @import("sse_events.zig");
 const Allocator = wire.Allocator;
 const Value = wire.Value;
 const done_marker = "[DONE]";
+const finish_stop = "stop";
+const finish_tools = "tool_calls";
+const finish_length = "length";
+const finish_filter = "content_filter";
 
 /// Chat owns its terminal marker and legacy replay shape independently of other APIs.
 pub const Context = struct {
@@ -26,6 +30,8 @@ pub const Context = struct {
             try self.chunk(data);
         }
         if (!done or self.result.finish == null) return error.IncompleteResponse;
+        // Native tool authority requires both a tool finish and accumulated call evidence.
+        if (std.mem.eql(u8, self.result.finish.?, finish_tools) != (self.result.calls.items.len > 0)) return error.InvalidResponse;
         // Existing saved sessions depend on the untagged, single-element Chat reasoning envelope.
         if (self.result.reasoning_seen) {
             const replay = try std.json.Stringify.valueAlloc(self.alloc, .{.{ .reasoning_content = self.result.reasoning.items }}, .{});
@@ -49,22 +55,30 @@ pub const Context = struct {
         if (choices.array.items.len == 0) return;
         const choice = choices.array.items[0];
         if (choice != .object) return error.InvalidResponse;
+        var finish: ?[]const u8 = null;
         if (choice.object.get("finish_reason")) |value| if (value != .null) {
             const reason = try wire.text(value);
-            if (std.mem.eql(u8, reason, "stop")) self.result.finish = "stop" else if (std.mem.eql(u8, reason, "tool_calls")) self.result.finish = "tool_calls" else if (std.mem.eql(u8, reason, "length")) self.result.finish = "length" else if (std.mem.eql(u8, reason, "content_filter")) self.result.finish = "content_filter" else return error.InvalidResponse;
+            inline for (.{ finish_stop, finish_tools, finish_length, finish_filter }) |known| {
+                if (std.mem.eql(u8, reason, known)) finish = known;
+            }
+            if (finish == null) return error.InvalidResponse;
+            if (self.result.finish) |previous| if (!std.mem.eql(u8, previous, finish.?)) return error.InvalidResponse;
         };
         const delta = try wire.field(choice, "delta");
         if (delta != .object) return error.InvalidResponse;
         if (delta.object.get("content")) |value| if (value != .null) {
+            if (self.result.finish != null) return error.InvalidResponse;
             const text = try wire.text(value);
             try self.result.append_content(text);
         };
         if (delta.object.get("reasoning_content")) |value| if (value != .null) {
+            if (self.result.finish != null) return error.InvalidResponse;
             const text = try wire.text(value);
             try self.result.append_reasoning(text);
         };
         if (delta.object.get("tool_calls")) |tools| {
             if (tools != .array) return error.InvalidResponse;
+            if (self.result.finish != null and tools.array.items.len > 0) return error.InvalidResponse;
             for (tools.array.items) |tool| {
                 const index_value = try wire.field(tool, "index");
                 if (index_value != .integer or index_value.integer < 0) return error.InvalidResponse;
@@ -82,6 +96,8 @@ pub const Context = struct {
                 if (arguments) |text| try self.result.append_arguments(index, text);
             }
         }
+        // The first terminal chunk may contain its final delta; later chunks cannot revise it.
+        if (self.result.finish == null) self.result.finish = finish;
     }
 };
 
