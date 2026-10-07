@@ -2,8 +2,8 @@
   "models": [
     {
       "id": "deepseek-flash",
-      "wire_id": "deepseek-flash",
-      "name": "DeepSeek Flash",
+      "wire_id": "deepseek-v4.1-flash",
+      "name": "DeepSeek V4.1 Flash",
       "tool_call": true,
       "reasoning": true,
       "reasoning_efforts": [
@@ -13,10 +13,68 @@
       ],
       "context_window": 1000000,
       "max_output_tokens": 384000,
-      "supports_vision": true
+      "supports_vision": true,
+      "structured_output": true
+    },
+    {
+      "id": "deepseek-v4-pro",
+      "wire_id": "deepseek-v4-pro",
+      "name": "DeepSeek V4 Pro",
+      "tool_call": true,
+      "reasoning": true,
+      "reasoning_efforts": [
+        "high",
+        "max"
+      ],
+      "context_window": 1000000,
+      "max_output_tokens": 384000,
+      "supports_vision": false,
+      "structured_output": true
+    },
+    {
+      "id": "kimi-k3",
+      "wire_id": "kimi-k3",
+      "name": "Kimi K3",
+      "tool_call": true,
+      "reasoning": true,
+      "reasoning_efforts": [
+        "max"
+      ],
+      "context_window": 1048576,
+      "max_output_tokens": 131072,
+      "supports_vision": true,
+      "structured_output": true
+    },
+    {
+      "id": "glm-5.3-flash",
+      "wire_id": "glm-5.3-flash",
+      "name": "GLM-5.3-Flash",
+      "tool_call": true,
+      "reasoning": true,
+      "reasoning_efforts": [
+        "low",
+        "high",
+        "max"
+      ],
+      "context_window": 1000000,
+      "max_output_tokens": 131072,
+      "supports_vision": true,
+      "structured_output": true
+    },
+    {
+      "id": "mimo-v2.6-flash",
+      "wire_id": "mimo-v2.6-flash",
+      "name": "MiMo-V2.6-Flash",
+      "tool_call": true,
+      "reasoning": true,
+      "reasoning_efforts": [],
+      "context_window": 1048576,
+      "max_output_tokens": 131072,
+      "supports_vision": true,
+      "structured_output": false
     }
   ],
-  "source": "https://github.com/anomalyco/models.dev/tree/dev/providers/opencode-go",
-  "retrieved_at": "2026-10-06T17:16:41.977Z",
-  "source_digest": "880d636e19e39dcc1f0f1c34d6686f8658880d39077dad2992d5a298b54f7329"
+  "source": "https://github.com/anomalyco/models.dev/tree/6b32416340759c52202fef2b0e69cd89adb74bbe/providers/opencode-go",
+  "retrieved_at": "2026-10-07T11:22:16Z",
+  "source_digest": "df7864a5b123ea4c2d8a3706ac810945bd9ccf132a97d55b9d058a670704ca36"
 }

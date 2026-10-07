@@ -39,6 +39,29 @@ Explicit profile `extension_execute` rules can authorize activation in `ask` or 
 See [activation policy](../../docs/extensions.md#trust-boundary) before granting a broad executable rule.
 Yolo is not required for scoped activation.
 
+## Curated catalog
+
+The cached catalog adds five coding choices alongside the built-in Vercel Gateway, Codex and Grok providers.
+All five use Go's documented [Chat Completions endpoint](https://opencode.ai/docs/go/#endpoints).
+Models requiring Responses or Anthropic Messages are excluded because this executable implements Chat Completions only.
+
+| fx model ID | Intended role | Context / output tokens | Effort controls | Image metadata |
+| --- | --- | --- | --- | --- |
+| `opencode-go/deepseek-flash` | General coding | 1,000,000 / 384,000 | low, high, max | Yes |
+| `opencode-go/deepseek-v4-pro` | Complex text reasoning | 1,000,000 / 384,000 | high, max | No |
+| `opencode-go/kimi-k3` | Long-context repository work | 1,048,576 / 131,072 | max | Yes |
+| `opencode-go/glm-5.3-flash` | Efficient coding alternative | 1,000,000 / 131,072 | low, high, max | Yes |
+| `opencode-go/mimo-v2.6-flash` | Lower-cost coding alternative | 1,048,576 / 131,072 | Provider default | Yes |
+
+Roles describe the curation, not a performance guarantee. Limits, image support and effort options are source metadata;
+live acceptance of each capability remains unverified. MiMo declares no selectable effort, so fx leaves it to the provider.
+The adapter projects verified images only; it does not expose source models' audio, video or PDF modalities.
+Structured-output metadata is retained where declared; native CLI `--json` still formats fx output rather than setting a response schema.
+
+The existing public ID `opencode-go/deepseek-flash` remains stable for saved settings and sessions.
+Its wire ID is `deepseek-v4.1-flash`, matching its versioned metadata and the endpoint table.
+Go's [model listing](https://opencode.ai/zen/go/v1/models) advertises both IDs; this mapping does not depend on an undocumented alias equivalence.
+
 ## Verified and unverified behavior
 
 Local dogfooding runs the built fx and this executable against a fake-key loopback HTTP peer.
@@ -54,12 +77,13 @@ Local proof retains two PNGs across tool continuation after the original file ch
 The shipped provider RPC sends strict OpenAI JSON Schema format and completes valid JSON against a local HTTP peer.
 This is provider-protocol proof; native CLI does not expose a model response-schema flag. CLI `--json` formats fx output only.
 
-The cached model metadata inherits [DeepSeek V4.1 Flash](https://raw.githubusercontent.com/anomalyco/models.dev/dev/models/deepseek/deepseek-v4.1-flash.toml)
-with [Go reasoning and interleaving](https://raw.githubusercontent.com/anomalyco/models.dev/dev/providers/opencode-go/models/deepseek-v4.1-flash.toml).
-The catalog digest hashes those exact source bytes, separated by a NUL byte.
-The public `deepseek-flash` wire alias differs from that metadata ID. Live alias acceptance is unverified.
-[models.dev’s provider entry](https://raw.githubusercontent.com/anomalyco/models.dev/dev/providers/opencode-go/provider.toml)
-notes that the configured Go API and reasoning passthrough are not a public HTTP contract.
-Treat local `max` encoding proof as distinct from live maximum-reasoning acceptance.
-Live usage requires a real key and may consume plan quota. No live request has been performed.
+The catalog pins [models.dev revision 6b324163](https://github.com/anomalyco/models.dev/tree/6b32416340759c52202fef2b0e69cd89adb74bbe/providers/opencode-go).
+Each model inherits its declared `base_model` before applying Go overrides. In the table's order, the catalog digest hashes
+the base TOML bytes, when present, followed by the Go model TOML bytes, with one NUL byte between sources.
+DeepSeek V4 Pro has a self-contained Go entry and contributes only that entry's bytes.
+The public Go docs now document its endpoint. Reasoning passthrough is still not documented there as an HTTP field contract;
+treat local effort encoding proof as distinct from live acceptance.
+Automated native tool-continuation scenarios exercise all five catalog entries and verify model routing, supported effort
+encoding, provider-default omission and preservation of built-in model preferences.
+Live usage requires a real key and may consume plan quota. Automated proof makes no live completion requests.
 Four-platform Full CI remains required for the exact feature commit before declaring the work ready.

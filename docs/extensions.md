@@ -2,6 +2,7 @@
 
 Local extensions add provider catalogs and streaming without an embedded scripting runtime.
 The first provider is [fx-opencode-go](../extensions/fx-opencode-go/README.md).
+Its curated Go catalog supplements the built-in Vercel Gateway, Codex and Grok catalogs.
 Registration and model discovery do not launch executables or transmit provider credentials.
 
 ## Trust boundary
@@ -80,7 +81,7 @@ Executable identity includes canonical path and SHA256; changed executables reti
 Local proof uses fresh built binaries, fake keys, isolated profiles, loopback HTTP, and real terminal interaction.
 Native CLI approval and denial display the unsandboxed warning while preserving JSON stdout.
 An approved child cannot reuse ask consent after a switch to auto; unavailable activation retires it before another credential stream.
-It does not prove live Go alias, maximum-reasoning, or image acceptance.
-Live requests require a real Go key and can consume quota; none have been performed.
+It does not prove live Go maximum-reasoning, image, or schema acceptance.
+Live requests require a real Go key and can consume quota; automated verification makes no live completion requests.
 Full CI must pass on the exact commit across Linux x86_64, Linux arm64, macOS Intel, and macOS arm64 before readiness.
 Do not push, publish, or mark this work ready without the required approvals and gates.

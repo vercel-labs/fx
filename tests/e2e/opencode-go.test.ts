@@ -26,7 +26,7 @@ const RPC_TIMEOUT_MS = 5_000;
 const SCHEMA_OUTPUT_LIMIT = 128;
 const SCHEMA_SESSION = "go-schema-conversation";
 const SCHEMA_PROVIDER = "opencode-go";
-const SCHEMA_MODEL = "deepseek-flash";
+const SCHEMA_MODEL = "deepseek-v4.1-flash";
 const SCHEMA_BASE_PREFIX = "http://";
 const SCHEMA_BASE_PATH = "/v1";
 const SCHEMA_PROMPT = "Return the fixture answer as JSON.";
@@ -53,6 +53,16 @@ const TUI_PROMPT = "Reply through the local Go fixture.";
 const FOLLOWUP_PROMPT = "Make one fresh local Go request.";
 const NEGATIVE_CASES = ["http-error", "redirect", "lost-finish", "aggregate-tools"].map(mode => ({ mode }));
 const GO_MANIFEST_FILENAME = "extension.json";
+// The curated choices must preserve native tool continuation without borrowing another provider's preferences.
+const CURATED_MODELS = [
+  { id: "deepseek-flash", wire: "deepseek-v4.1-flash", effort: "max" },
+  { id: "deepseek-v4-pro", wire: "deepseek-v4-pro", effort: "max" },
+  { id: "kimi-k3", wire: "kimi-k3", effort: "max" },
+  { id: "glm-5.3-flash", wire: "glm-5.3-flash", effort: "max" },
+  { id: "mimo-v2.6-flash", wire: "mimo-v2.6-flash", effort: undefined },
+];
+const CURATED_PROVIDER_PREFIX = "opencode-go/";
+const BUILTIN_PREFERENCES = { gateway: "openai/gpt-5.6-sol", codex: "gpt-6.1-sol", grok: "grok-4.7" };
 const ENDPOINT_CASES = [
   { name: "bracketed IPv6", hostname: "::1", authority: "[::1]", basePath: "/v1", query: "", expectedTarget: "/v1/chat/completions" },
   { name: "mixed-case localhost", hostname: HOST, authority: "LOCALHOST", basePath: "/v1", query: "", expectedTarget: "/v1/chat/completions" },
@@ -71,6 +81,45 @@ function streamReply(chunks: unknown[]): Response {
 }
 
 describe("native OpenCode Go extension", () => {
+  // Real host requests guard against catalog entries that discover correctly but lose tools or encode unsupported effort.
+  test.each(CURATED_MODELS)("curated $id discovers and completes native tools", async model => {
+    const bodies: any[] = [];
+    let home = "";
+    const server = Bun.serve({ hostname: HOST, port: 0, async fetch(request) {
+      bodies.push(await request.json());
+      if (bodies.length === 1) return streamReply([{ choices: [{ index: 0, delta: {
+        tool_calls: [{ index: 0, id: TOOL_ID, function: { name: "read_file", arguments: JSON.stringify({ path: join(home, TOOL_FILENAME) }) } }],
+      }, finish_reason: "tool_calls" }] }]);
+      return streamReply([{ choices: [{ index: 0, delta: { content: RESULT }, finish_reason: "stop" }] }]);
+    } });
+    home = createGoProfile(server.port);
+    homes.push(home);
+    const settingsPath = join(home, SETTINGS_RELATIVE_PATH);
+    const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+    settings.models = { ...BUILTIN_PREFERENCES, extension: CURATED_PROVIDER_PREFIX + model.id };
+    writeFileSync(settingsPath, JSON.stringify(settings));
+    writeFileSync(join(home, TOOL_FILENAME), TOOL_CONTENT);
+    try {
+      const discovery = Bun.spawn([FX_BIN, "models", "--json"], { cwd: home, stdout: "pipe", stderr: "pipe", env: goEnvironment(home) });
+      const [catalog, discoveryError, discoveryCode] = await Promise.all([new Response(discovery.stdout).text(), new Response(discovery.stderr).text(), discovery.exited]);
+      expect(discoveryCode, discoveryError).toBe(0);
+      expect(JSON.parse(catalog).ids).toEqual(CURATED_MODELS.map(choice => CURATED_PROVIDER_PREFIX + choice.id));
+      const child = Bun.spawn([FX_BIN, "ask", "--json", "--no-save", TUI_PROMPT], { cwd: home, stdout: "pipe", stderr: "pipe", env: goEnvironment(home) });
+      const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+      expect(code, JSON.stringify({ stdout, stderr })).toBe(0);
+      expect(JSON.parse(stdout).output).toBe(RESULT);
+      expect(bodies).toHaveLength(2);
+      for (const body of bodies) {
+        expect(body.model).toBe(model.wire);
+        expect(body.reasoning_effort).toBe(model.effort);
+      }
+      expect(bodies[1].messages.some((message: any) => message.role === "tool" && message.content.includes(TOOL_CONTENT))).toBe(true);
+      const finalSettings = JSON.parse(readFileSync(settingsPath, "utf8"));
+      for (const [provider, preference] of Object.entries(BUILTIN_PREFERENCES)) expect(finalSettings.models[provider]).toBe(preference);
+      expect(stdout + stderr).not.toContain(KEY);
+    } finally { server.stop(true); }
+  }, TIMEOUT_MS);
+
   // Native request delivery protects accepted endpoints from adapter-specific URI rewriting.
   test.each(ENDPOINT_CASES)("configured loopback endpoint preserves $name", async scenario => {
     const targets: string[] = [];
@@ -355,7 +404,7 @@ describe("native OpenCode Go extension", () => {
       expect(JSON.parse(stdout).output).toBe(RESULT);
       expect(requests).toHaveLength(2);
       expect(requests.every(request => request.path === "/v1/chat/completions" && request.authorization === "Bearer " + KEY && request.header === HEADER_VALUE)).toBe(true);
-      expect(requests[0].body.model).toBe("deepseek-flash");
+      expect(requests[0].body.model).toBe(SCHEMA_MODEL);
       expect(requests[0].body.reasoning_effort).toBe("max");
       expect(requests[0].body.tool_choice).toBe("auto");
       expect(requests[0].body.parallel_tool_calls === undefined || typeof requests[0].body.parallel_tool_calls === "boolean").toBe(true);
