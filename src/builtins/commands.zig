@@ -2,7 +2,12 @@ const std = @import("std");
 const command_specs = @import("../core/slash_commands/command_specs.zig");
 
 const Allocator = std.mem.Allocator;
-const provider_usage = "provider <gateway|codex|grok|registered-provider>";
+// Shared synopsis width controls every top-level command row at narrow terminal sizes.
+const provider_usage = "provider <id>";
+// Provider-specific help keeps discoverable IDs without widening the navigation page.
+const provider_details = [_][]const u8{
+    "Use gateway, codex, grok, or a registered provider ID.",
+};
 
 pub const TopLevelKind = command_specs.TopLevelKind;
 pub const TopLevelSpec = command_specs.TopLevelSpec;
@@ -140,6 +145,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .token = "provider",
         .usage = provider_usage,
         .summary = "Choose the model provider used by fx",
+        .details = &provider_details,
     },
     .{
         .kind = .doctor,
