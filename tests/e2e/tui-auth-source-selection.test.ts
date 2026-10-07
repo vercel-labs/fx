@@ -1300,6 +1300,74 @@ for (const provider of ["gateway", "codex", "grok"] as const) {
 }
 
 
+tmuxTest("connected model picker switches across saved Gateway, Codex, and Grok logins", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-connected-models-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  gateway = startFakeGateway([fakeGatewayFinalText("CONNECTED_GATEWAY_RESPONSE")]);
+  chatgptOauth = startFakeChatGptOAuth();
+  const grok = startFakeGrokOAuth();
+  try {
+    writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+    writeSeededGrokLogin(home, grok.initialAccessToken);
+    const codexPath = join(home, ".fx", "chatgpt-auth.json");
+    const grokPath = join(home, ".fx", "grok-auth.json");
+    const codexLogin = readFileSync(codexPath, "utf8");
+    const grokLogin = readFileSync(grokPath, "utf8");
+    const settingsPath = join(home, ".fx", "settings.json");
+    writeFileSync(settingsPath, JSON.stringify({
+      provider: "gateway", models: { gateway: FAKE_GATEWAY_MODEL },
+    }), { mode: 0o600 });
+    const env = { ...chatgptOauth.env, ...grok.env, FX_MODEL: undefined };
+    session = await startFx(home, stderrPath, gateway, undefined, undefined, env);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendKeys("C-p");
+    await session.waitForText("codex:gpt-5.6-luna", TIMEOUT);
+    expect(await session.capturePane()).toContain("grok:grok-4.6");
+    await session.sendLiteralText("codex:gpt-5.6-luna");
+    await session.sendKeys("Enter");
+    // The catalog hands the selected model to its effort column.
+    await session.waitForText("medium", TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("Switched to Codex subscription with gpt-5.6-luna.", TIMEOUT);
+    expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("codex");
+    expect(JSON.parse(readFileSync(settingsPath, "utf8")).models.codex).toBe("gpt-5.6-luna");
+    await session.sendText("Use the selected Codex model.");
+    await session.waitForText("CHATGPT_DIRECT_RESPONSE", TIMEOUT);
+    const codexRequest = chatgptOauth.requests.find((request) => request.path === "/chatgpt/responses");
+    expect(codexRequest?.authorization).toBe(`Bearer ${chatgptOauth.accessToken}`);
+    expect(JSON.parse(codexRequest!.body!).model).toBe("gpt-5.6-luna");
+
+    await session.sendText("/model grok:grok-4.6 xhigh normal");
+    await session.waitForText("Switched to Grok subscription with grok-4.6.", TIMEOUT);
+    await session.sendText("Use the selected Grok model.");
+    await session.waitForText("GROK_DIRECT_RESPONSE", TIMEOUT);
+    const grokRequest = grok.requests.find((request) => request.path === "/v1/responses");
+    expect(grokRequest?.authorization).toBe(`Bearer ${grok.initialAccessToken}`);
+    expect(JSON.parse(grokRequest!.body!).model).toBe("grok-4.6");
+
+    await session.sendText(`/model gateway:${FAKE_GATEWAY_MODEL} auto normal`);
+    await session.waitForText(`Switched to Vercel AI Gateway with ${FAKE_GATEWAY_MODEL}.`, TIMEOUT);
+    await session.sendText("Use the selected Gateway model.");
+    await session.waitForText("CONNECTED_GATEWAY_RESPONSE", TIMEOUT);
+    expect(gateway.requests[0].headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
+    expect(readFileSync(codexPath, "utf8")).toBe(codexLogin);
+    expect(readFileSync(grokPath, "utf8")).toBe(grokLogin);
+    await session.sendText("/quit");
+    await session.waitForSessionEnd(TIMEOUT);
+    session = null;
+    session = await startFx(home, stderrPath, gateway, undefined, undefined, env);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendKeys("C-p");
+    await session.waitForText("codex:gpt-5.6-luna", TIMEOUT);
+    expect(await session.capturePane()).toContain("grok:grok-4.6");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  } finally {
+    grok.stop();
+  }
+}, 90_000);
+
+
 for (const provider of ["codex", "grok"] as const) {
   tmuxTest(`provider recovery switches from ${provider} after logout and preserves the fallback on restart`, async () => {
     home = mkdtempSync(join(tmpdir(), `fx-logout-fallback-${provider}-`));

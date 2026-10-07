@@ -34,12 +34,14 @@ curl -fsSL https://fx.sh/setup.sh | bash
 
 ## Get started
 
-Sign in with one of:
+Sign in to the providers you want to use:
 
 - `fx login`: Vercel AI Gateway
 - `fx login codex`: ChatGPT subscription (OpenAI Codex OAuth)
 - `fx login grok`: Grok subscription (xAI OAuth)
 - `fx setup`: AI Gateway API key
+
+Each login stays saved when you connect another provider. In the interactive shell, `/model` and Ctrl+P show models from all connected providers, including authenticated custom model connections. Choose a model to switch both the model and its provider. Models from another provider include the provider name, such as `codex:gpt-5.6-sol` or `grok:grok-4.6`. You can also enter `/model <provider>:<model-id>` directly. `/logout <provider>` signs out of that provider while keeping the other logins.
 
 fx loads Grok models from your subscription's live catalog, so new supported models appear without a static model list. Public xAI metadata enriches image support but does not filter subscription models.
 

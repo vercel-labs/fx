@@ -1,4 +1,5 @@
 const std = @import("std");
+const connected_model_catalog = @import("connected_model_catalog.zig");
 const credentials = @import("../auth/credentials.zig");
 const secret = @import("../auth/secret.zig");
 const collections = @import("../shared/collections.zig");
@@ -304,6 +305,7 @@ pub const Runtime = struct {
     outcome: CatalogOutcome = .{},
     from_profile_settings: bool = false,
     menu: ModelMenu = .{},
+    connections: ?connected_model_catalog.Input = null,
 
     pub fn init(alloc: Allocator, models_path: []const u8) Self {
         return .{
@@ -316,6 +318,12 @@ pub const Runtime = struct {
         self.cancelAndJoin();
         self.menu.deinit(self.alloc);
         model_catalog.freeModelCatalog(self.alloc, &self.catalog);
+    }
+
+    pub fn startConnectedWarmup(self: *Self, connections: connected_model_catalog.Input, access: credentials.CatalogAccess) void {
+        if (self.isLoading()) return;
+        self.connections = connections;
+        self.startWarmup(self.connections.?.provider(), access);
     }
 
     pub fn startWarmup(
@@ -571,6 +579,18 @@ pub const Runtime = struct {
         if (self.state != .ready or self.catalog.items.len == 0) return null;
 
         return try model_catalog.projectModelIds(alloc, self.catalog.items);
+    }
+
+    /// Borrowed model ID; the caller must copy it before mutating this cache.
+    pub fn selectionForModel(self: *Self, model: []const u8, active: @import("../config/model_provider.zig").ProviderId) ?@import("../config/model_provider.zig").ProviderSelection {
+        self.finishThreadIfDone();
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        const entry = findCatalogModel(self.catalog.items, model) orelse return null;
+        return .{
+            .provider = entry.selection_provider orelse active,
+            .model = if (entry.selection_provider != null) entry.id[(std.mem.findScalar(u8, entry.id, ':').? + 1)..] else entry.id,
+        };
     }
 
     pub fn metadataForModel(self: *Self, model: []const u8) ?model_capabilities.GatewayMetadata {
@@ -859,7 +879,7 @@ fn hydrateMenuSnapshot(
                 .id = id,
                 .provider = modelProvider(id),
                 .capabilities = model_capabilities.resolveCapabilities(
-                    id,
+                    if (entry.selection_provider != null) id[(std.mem.findScalar(u8, id, ':').? + 1)..] else id,
                     model_catalog_metadata.fromCatalogEntry(entry),
                 ),
             };
@@ -876,6 +896,12 @@ fn hydrateMenuSnapshot(
 }
 
 fn modelProvider(model: []const u8) []const u8 {
+    if (connected_model_catalog.qualifiedSelection(model, .{})) |selection| return switch (selection.provider) {
+        .codex => "openai",
+        .grok => "xai",
+        .gateway => modelProvider(selection.model),
+        .configured => model[0..std.mem.findScalar(u8, model, ':').?],
+    };
     const slash = std.mem.findScalar(u8, model, '/') orelse return "";
     if (slash == 0) return "";
     return model[0..slash];

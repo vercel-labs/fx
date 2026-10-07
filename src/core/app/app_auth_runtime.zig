@@ -51,6 +51,11 @@ fn selectCatalogModel(
     return if (entries.len > 0) entries[0].id else null;
 }
 
+fn exactCatalogModel(entries: []const model_catalog.ModelCatalogEntry, model: []const u8) ?[]const u8 {
+    for (entries) |entry| if (std.mem.eql(u8, entry.id, model)) return entry.id;
+    return null;
+}
+
 fn optionalGatewayApiKey(credential: anytype) ?[]const u8 {
     if (comptime @typeInfo(@TypeOf(credential.api_key)) == .optional) {
         return credential.api_key;
@@ -366,7 +371,11 @@ pub fn Runtime(comptime App: type) type {
 
         fn reconcileSubscriptionLogout(app: *App, removed: model_provider.ProviderId) !void {
             const selected = provider_runtime.provider(app);
-            if (!selected.eql(removed)) return;
+            if (!selected.eql(removed)) {
+                app.model_cache.reset();
+                if (comptime @hasDecl(App, "startModelCacheWarmup")) app.startModelCacheWarmup();
+                return;
+            }
             const candidates = auth_transition.logoutFallbackProviders(.{
                 .requested = removed,
                 .selected = selected,
@@ -1119,6 +1128,26 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        pub fn selectProviderModel(app: *App, selection: model_provider.ProviderSelection, effort: types.ReasoningEffort, fast_mode: bool, ultrafast_mode: bool) !void {
+            if (try rejectPendingPreparation(app) or try reject_provider_picker_if_busy(app)) return;
+            var settings = try config_runtime.loadMergedSettings(app.alloc, app.workspace_root);
+            defer settings.deinit(app.alloc);
+            const catalog_provider = app.providerCatalog(selection.provider) orelse return;
+            try beginPreparation(app, .{
+                .intent = .{ .provider = .{
+                    .target = selection.provider,
+                    .allow_login = false,
+                    .origin = .manual,
+                    .require_model = true,
+                    .model_options = .{ .effort = effort, .fast_mode = fast_mode, .ultrafast_mode = ultrafast_mode },
+                } },
+                .catalog_provider = catalog_provider,
+                .models_path = app.model_cache.models_path,
+                .preferred_source = if (selection.provider == .gateway) settings.credential_source else null,
+                .primary_model = selection.model,
+            });
+        }
+
         fn switchProvider(
             app: *App,
             target: model_provider.ProviderId,
@@ -1347,7 +1376,10 @@ pub fn Runtime(comptime App: type) type {
                 },
             };
             defer model_catalog.freeModelCatalog(app.alloc, &catalog);
-            const selected_model = selectCatalogModel(catalog.items, task.input.primary_model, task.input.preferred_model) orelse {
+            const selected_model = (if (request.require_model)
+                exactCatalogModel(catalog.items, task.input.primary_model.?)
+            else
+                selectCatalogModel(catalog.items, task.input.primary_model, task.input.preferred_model)) orelse {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .@"error",
@@ -1379,6 +1411,14 @@ pub fn Runtime(comptime App: type) type {
             app.provider_selection.adoptOwned(target, &owned_model);
             if (credential) |*value| _ = app.auth.adoptCredential(app.alloc, value);
             reconcileGatewayCredential(app);
+            if (request.model_options) |options| {
+                try @import("../session/session_commands.zig").Commands(App).selectModelFromPicker(app, provider_runtime.model(app), options.effort, options.fast_mode, options.ultrafast_mode);
+            }
+            // Rebuild the picker using the new active authority and remaining logins.
+            if (comptime @hasDecl(App, "startModelCacheWarmup")) {
+                app.model_cache.resetForProviderChange();
+                app.startModelCacheWarmup();
+            }
 
             const body = try std.fmt.allocPrint(
                 app.alloc,
@@ -3792,4 +3832,12 @@ test "quitting during the launch lookup waits for its worker" {
     try std.testing.expect(auth.beginStartupCredentialLoad(.{ .provider = .gateway, .preferred = .ai_gateway_api_key }));
     auth.deinit(alloc);
     try std.testing.expect(!auth.startupCredentialPending());
+}
+
+test "explicit provider model selection rejects a disappeared model" {
+    const entries = [_]model_catalog.ModelCatalogEntry{
+        .{ .id = @constCast("available"), .model_type = @constCast("language") },
+    };
+    try std.testing.expectEqualStrings("available", exactCatalogModel(&entries, "available").?);
+    try std.testing.expect(exactCatalogModel(&entries, "disappeared") == null);
 }
