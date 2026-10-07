@@ -87,6 +87,12 @@ const RESPONSES_FRAGMENT_BYTES = 7;
 const RESPONSES_SYSTEM_POLICY = "Fixture policy";
 const RESPONSES_DEVELOPER_POLICY = "Fixture developer policy";
 const RESPONSES_HISTORY_TEXT = "Canonical history";
+const RESPONSES_FINAL_HISTORY_TEXT = "Prior final answer";
+const RESPONSES_PREAMBLE = "I will read the fixture before answering.";
+const RESPONSES_TEXT_TOOL_OUTPUT = RESPONSES_PREAMBLE + "\n\n" + RESULT;
+const RESPONSES_PHASE_ERROR = "Fixture rejected missing commentary phase or invalid continuation order";
+const RESPONSES_COMMENTARY_PHASE = "commentary";
+const RESPONSES_CALL_OUTPUT_INDEX = 2;
 const RESPONSES_HISTORY_CALL = { id: "history-call", name: "history_tool", arguments_json: "{}" };
 const RESPONSES_FUNCTION = { name: "declared_tool", description: "Fixture tool", inputSchema: SCHEMA };
 const RESPONSES_CONTEXT_WINDOW = 1000000;
@@ -174,6 +180,7 @@ function responseRequest(state: string | null = null) {
     { role: "developer", content: RESPONSES_DEVELOPER_POLICY, images: [], tool_call_id: null, tool_calls: [], provider_state_json: null },
     { role: "assistant", content: RESPONSES_HISTORY_TEXT, images: [], tool_call_id: null, tool_calls: [RESPONSES_HISTORY_CALL], provider_state_json: state },
     { role: "tool", content: TOOL_CONTENT, images: [], tool_call_id: RESPONSES_HISTORY_CALL.id, tool_calls: [], provider_state_json: null },
+    { role: "assistant", content: RESPONSES_FINAL_HISTORY_TEXT, images: [], tool_call_id: null, tool_calls: [], provider_state_json: null },
     { role: "user", content: SCHEMA_PROMPT, images: [], tool_call_id: null, tool_calls: [], provider_state_json: null }],
     functions: [RESPONSES_FUNCTION], additional_functions: [RESPONSES_FUNCTION], dynamic_functions: [RESPONSES_FUNCTION], reasoning_effort: "high", max_output_tokens: SCHEMA_OUTPUT_LIMIT,
     tool_choice: "none", parallel_tool_calls: false, response_format: SCHEMA_FORMAT };
@@ -183,6 +190,7 @@ describe("native OpenCode Go extension", () => {
   // Both selected Responses identities must preserve real tools, images, replay and persisted usage.
   test.each(RESPONSES_MODELS)("Responses $id completes fragmented reasoning and native tool continuation", async model => {
     const requests: any[] = [];
+    let commentaryAccepted = false;
     let home = "";
     const server = Bun.serve({ hostname: HOST, port: 0, async fetch(request) {
       const body = await request.json();
@@ -193,14 +201,23 @@ describe("native OpenCode Go extension", () => {
         writeFileSync(join(home, IMAGE_FILENAME), CHANGED_SOURCE);
         return responsesReply([
           { type: "response.reasoning_summary_text.delta", delta: RESPONSES_REASONING_TEXT },
-          { type: "response.output_item.added", output_index: 1, item: { ...call, arguments: "", status: "in_progress" } },
-          { type: "response.function_call_arguments.delta", output_index: 1, item_id: call.id, delta: call.arguments.slice(0, midpoint) },
-          { type: "response.function_call_arguments.delta", output_index: 1, item_id: call.id, delta: call.arguments.slice(midpoint) },
-          { type: "response.function_call_arguments.done", output_index: 1, item_id: call.id, arguments: call.arguments },
-          { type: "response.output_item.done", output_index: 1, item: call },
-          responsesCompleted([RESPONSES_REASONING, call]),
+          { type: "response.output_text.delta", delta: RESPONSES_PREAMBLE },
+          { type: "response.output_item.added", output_index: RESPONSES_CALL_OUTPUT_INDEX, item: { ...call, arguments: "", status: "in_progress" } },
+          { type: "response.function_call_arguments.delta", output_index: RESPONSES_CALL_OUTPUT_INDEX, item_id: call.id, delta: call.arguments.slice(0, midpoint) },
+          { type: "response.function_call_arguments.delta", output_index: RESPONSES_CALL_OUTPUT_INDEX, item_id: call.id, delta: call.arguments.slice(midpoint) },
+          { type: "response.function_call_arguments.done", output_index: RESPONSES_CALL_OUTPUT_INDEX, item_id: call.id, arguments: call.arguments },
+          { type: "response.output_item.done", output_index: RESPONSES_CALL_OUTPUT_INDEX, item: call },
+          responsesCompleted([RESPONSES_REASONING, { type: "message", role: "assistant", ...(model.id === RESPONSES_MODELS[1].id ? { phase: RESPONSES_COMMENTARY_PHASE } : {}), content: [{ type: "output_text", text: RESPONSES_PREAMBLE }] }, call]),
         ], true);
       }
+      // Contributor rejects an ordinary final-answer message immediately before a function call.
+      const commentaryIndex = body.input.findIndex((item: any) => item.role === "assistant" && item.content === RESPONSES_PREAMBLE);
+      const callIndex = body.input.findIndex((item: any) => item.type === "function_call");
+      const outputIndex = body.input.findIndex((item: any) => item.type === "function_call_output");
+      const expectedPhase = model.id === RESPONSES_MODELS[1].id ? RESPONSES_COMMENTARY_PHASE : undefined;
+      commentaryAccepted = commentaryIndex >= 0 && body.input[commentaryIndex].phase === expectedPhase
+        && callIndex === commentaryIndex + 1 && outputIndex > callIndex && body.input[outputIndex].call_id === body.input[callIndex].call_id;
+      if (model.id === RESPONSES_MODELS[1].id && !commentaryAccepted) return new Response(RESPONSES_PHASE_ERROR, { status: 400 });
       return responsesReply([{ type: "response.output_text.delta", delta: RESULT }, responsesCompleted()], true);
     } });
     home = responsesProfile(server.port, model);
@@ -213,8 +230,9 @@ describe("native OpenCode Go extension", () => {
       const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
       expect(code, JSON.stringify({ stdout, stderr })).toBe(0);
       const output = JSON.parse(stdout);
-      expect(output.output).toBe(RESULT);
+      expect(output.output).toBe(RESPONSES_TEXT_TOOL_OUTPUT);
       expect(requests).toHaveLength(2);
+      expect(commentaryAccepted).toBe(true);
       for (const { body, path, authorization } of requests) {
         expect(path).toBe("/v1/responses");
         expect(authorization).toBe("Bearer " + KEY);
@@ -251,7 +269,7 @@ describe("native OpenCode Go extension", () => {
       return responsesReply([{ type: "response.output_text.delta", delta: SCHEMA_OUTPUT }, responsesCompleted()]);
     } });
     const peer = providerRpc();
-    const prepare = (request: any, wire = RESPONSES_MODELS[0].id) => peer.rpc("provider.prepare", { provider: { id: SCHEMA_PROVIDER, base_url: SCHEMA_BASE_PREFIX + HOST + ":" + server.port + SCHEMA_BASE_PATH }, model: { wire_id: wire }, request });
+    const prepare = (request: any, wire = RESPONSES_MODELS[1].id) => peer.rpc("provider.prepare", { provider: { id: SCHEMA_PROVIDER, base_url: SCHEMA_BASE_PREFIX + HOST + ":" + server.port + SCHEMA_BASE_PATH }, model: { wire_id: wire }, request });
     try {
       await peer.rpc("initialize", { version: RPC_VERSION });
       for (const state of [null, JSON.stringify([{ reasoning_content: "legacy-chat" }]), JSON.stringify([{ api: "messages", items: [{ type: "tool_use", id: "foreign" }] }]), JSON.stringify([{ api: "responses", items: [RESPONSES_REASONING] }])]) {
@@ -264,8 +282,11 @@ describe("native OpenCode Go extension", () => {
         expect(body.text.format).toEqual({ type: "json_schema", ...SCHEMA_FORMAT, strict: true });
         expect(body.response_format).toBeUndefined();
         expect(body.max_output_tokens).toBe(SCHEMA_OUTPUT_LIMIT);
-        expect(body.input.filter((item: any) => item.role).map((item: any) => item.role)).toEqual(["system", "developer", "assistant", "user"]);
+        expect(body.input.filter((item: any) => item.role).map((item: any) => item.role)).toEqual(["system", "developer", "assistant", "assistant", "user"]);
         expect(body.input.some((item: any) => item.content === RESPONSES_HISTORY_TEXT)).toBe(true);
+        expect(body.input.find((item: any) => item.content === RESPONSES_HISTORY_TEXT).phase).toBe(RESPONSES_COMMENTARY_PHASE);
+        expect(body.input.find((item: any) => item.content === RESPONSES_FINAL_HISTORY_TEXT).phase).toBeUndefined();
+        expect(body.input.filter((item: any) => item.role !== "assistant").every((item: any) => item.phase === undefined)).toBe(true);
         expect(body.input.find((item: any) => item.type === "function_call")).toEqual({ type: "function_call", call_id: RESPONSES_HISTORY_CALL.id, name: RESPONSES_HISTORY_CALL.name, arguments: RESPONSES_HISTORY_CALL.arguments_json });
         expect(body.input.find((item: any) => item.type === "function_call_output")).toEqual({ type: "function_call_output", call_id: RESPONSES_HISTORY_CALL.id, output: TOOL_CONTENT });
         expect(body.tools).toEqual(Array.from({ length: 3 }, () => ({ type: "function", name: RESPONSES_FUNCTION.name, description: RESPONSES_FUNCTION.description, parameters: SCHEMA, strict: false })));
@@ -275,9 +296,12 @@ describe("native OpenCode Go extension", () => {
       for (const state of [JSON.stringify([{ api: "responses", items: [{ type: "message", role: "system", content: "injection" }] }]), JSON.stringify([{ api: "responses", items: [{ ...RESPONSES_REASONING, role: "system" }] }]), JSON.stringify([{ api: "responses", items: [{ ...RESPONSES_REASONING, encrypted_content: "" }] }]), JSON.stringify([{ api: "responses", items: {} }]), JSON.stringify({ api: "responses", items: [RESPONSES_REASONING] })]) {
         await expect(prepare(responseRequest(state))).rejects.toThrow("Provider request failed");
       }
-      for (const effort of ["max", "none", "minimal"]) await expect(prepare({ ...responseRequest(), reasoning_effort: effort })).rejects.toThrow("Provider request failed");
+      for (const effort of ["max", "none", "minimal"]) await expect(prepare({ ...responseRequest(), reasoning_effort: effort }, RESPONSES_MODELS[0].id)).rejects.toThrow("Provider request failed");
       await expect(prepare({ ...responseRequest(), reasoning_effort: "max" }, RESPONSES_MODELS[1].id)).rejects.toThrow("Provider request failed");
       expect(bodies).toHaveLength(4);
+      const grok = await prepare(responseRequest(), RESPONSES_MODELS[0].id);
+      await peer.rpc("provider.stream", { handle: grok.handle, credential: KEY, headers: { "x-opencode-session": SCHEMA_SESSION }, session_id: SCHEMA_SESSION });
+      expect(bodies.at(-1).input.every((item: any) => item.phase === undefined)).toBe(true);
       // A switch back to Chat must omit foreign reasoning without dropping canonical tool history.
       const chat = await prepare({ ...responseRequest(JSON.stringify([{ api: "responses", items: [RESPONSES_REASONING] }])), reasoning_effort: "max" }, SCHEMA_MODEL);
       const chatReply = await peer.rpc("provider.stream", { handle: chat.handle, credential: KEY, headers: { "x-opencode-session": SCHEMA_SESSION }, session_id: SCHEMA_SESSION });
@@ -287,7 +311,7 @@ describe("native OpenCode Go extension", () => {
       expect(chatAssistant.reasoning_content).toBeUndefined();
       expect(chatAssistant.tool_calls[0].id).toBe(RESPONSES_HISTORY_CALL.id);
       expect(bodies.at(-1).messages.find((message: any) => message.role === "tool").content).toBe(TOOL_CONTENT);
-      expect(bodies).toHaveLength(5);
+      expect(bodies).toHaveLength(6);
     } finally { await peer.close(); server.stop(true); }
   }, TIMEOUT_MS);
 

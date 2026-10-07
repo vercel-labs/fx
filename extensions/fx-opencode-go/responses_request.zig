@@ -15,6 +15,21 @@ const function_type = "function";
 const call_type = "function_call";
 const call_output_type = "function_call_output";
 const schema_type = "json_schema";
+const commentary_phase = "commentary";
+
+/// Contributor's documented continuation grammar must not add unverified fields to Grok requests.
+pub fn apply_model_grammar(alloc: wire.Allocator, model: []const u8, body: *wire.Value) !void {
+    if (!std.mem.eql(u8, model, contributor_model)) return;
+    const input = try wire.field(body.*, "input");
+    for (input.array.items, 0..) |*item, index| {
+        const role = item.object.get("role") orelse continue;
+        if (!std.mem.eql(u8, try wire.text(role), assistant_role) or index + 1 >= input.array.items.len) continue;
+        const next = input.array.items[index + 1];
+        const kind = next.object.get("type") orelse continue;
+        // Contributor rejects pre-tool assistant text unless it is marked as commentary.
+        if (std.mem.eql(u8, try wire.text(kind), call_type)) try wire.put(alloc, item, "phase", wire.string(commentary_phase));
+    }
+}
 
 /// Model-specific effort admission prevents a global preference from changing provider semantics.
 pub fn validate_effort(model: []const u8, effort: wire.Value) !void {

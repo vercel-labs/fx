@@ -50,7 +50,10 @@ pub const Prepared = struct {
         var body = if (api == .responses) try responses_request.project(alloc, request) else try chat_body(alloc, request);
         try wire.put(alloc, &body, "model", try wire.field(model, "wire_id"));
         try wire.put(alloc, &body, "stream", .{ .bool = true });
-        if (api == .responses) try responses_request.validate_effort(wire_id, try wire.field(request, "reasoning_effort"));
+        if (api == .responses) {
+            try responses_request.validate_effort(wire_id, try wire.field(request, "reasoning_effort"));
+            try responses_request.apply_model_grammar(alloc, wire_id, &body);
+        }
         const handle = try std.fmt.allocPrint(alloc, "prepared-{d}", .{id});
         const encoded = try std.json.Stringify.valueAlloc(alloc, body, .{});
         return .{ .arena = arena, .handle = handle, .endpoint = endpoint, .body = encoded, .api = api };
