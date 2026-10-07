@@ -18,6 +18,7 @@ const jsonrpc_version = "2.0";
 const lifecycle_timeout_ms = 10_000;
 const stream_timeout_ms = 300_000;
 const shutdown_timeout_ms = 1_000;
+const admission_poll_ns = 10 * std.time.ns_per_ms;
 const max_executable_bytes = 64 * 1024 * 1024;
 const max_handle_bytes = 256;
 const max_tool_calls = 128;
@@ -58,9 +59,14 @@ pub const Runtime = struct {
 
     /// Failed or ambiguous streams retire their connection instead of replaying a billed request.
     pub fn stream(self: *Runtime, owner_alloc: Allocator, alloc: Allocator, root: []const u8, extension_id: []const u8, entrypoint: []const u8, provider: protocol.Provider, model: protocol.Model, request: streams.ModelRequest, execution_allowed: *const std.atomic.Value(bool)) !streams.Result {
-        self.mutex.lockUncancelable(io_mod.getIo());
+        // An abandoned waiter has no authority to retire another session's active child.
+        while (!self.mutex.tryLock()) {
+            try check_waiter(request);
+            if (request.cooperative_pulse) |pulse| try pulse.pulse();
+            io_mod.sleep(admission_poll_ns);
+        }
         defer self.mutex.unlock(io_mod.getIo());
-        if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+        try check_waiter(request);
         const scope_session_id = request.session_id orelse return error.ExtensionSessionIdentityRequired;
         const executable = try manifest.canonical_child_path(alloc, root, entrypoint);
         defer alloc.free(executable);
@@ -221,6 +227,12 @@ pub const Runtime = struct {
         return result;
     }
 };
+
+/// Admission and post-acquisition checks prevent expired work from touching shared runtime state.
+fn check_waiter(request: streams.ModelRequest) !void {
+    if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+    if (request.deadline) |deadline| if (!std.Io.Clock.Timestamp.compare(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake), .lt, deadline)) return error.Timeout;
+}
 
 /// Content identity prevents a retained process from silently surviving executable replacement.
 fn executable_identity(alloc: Allocator, path: []const u8) ![]u8 {

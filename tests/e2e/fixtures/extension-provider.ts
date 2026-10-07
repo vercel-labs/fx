@@ -33,6 +33,9 @@ const REPLAY_STATE_MARKER = "fixture-reasoning-replay";
 const REPLAY_STATE = JSON.stringify({ marker: REPLAY_STATE_MARKER, reasoning_content: "" });
 const STREAM_DELAY_MS = 2_000;
 const STREAM_DELAY_FILENAME = "stream-delay-ms";
+const STREAM_RELEASE_FILENAME = "stream-release";
+const STREAM_HOLD_MODE = "held";
+const STREAM_RELEASE_POLL_MS = 25;
 const MAX_STREAM_DELAY_MS = 60_000;
 const SUBAGENT_MODE_FILENAME = "subagent-fixture.json";
 const PROTOCOL_VERSION = 1;
@@ -139,12 +142,18 @@ for await (const line of lines) {
         if (readFileSync(STREAM_MODE_FILENAME, "utf8") === STREAM_BACKPRESSURE_MODE) {
           for (let index = 0; index < BACKPRESSURE_EVENT_COUNT; index++) notify(request, events.reasoning, { delta: BACKPRESSURE_DELTA });
         }
-        active.set(request.params.handle, setTimeout(() => {
+        // A file-controlled peer holds ownership until cancellation proof has finished.
+        const finish = () => {
+          if (readFileSync(STREAM_MODE_FILENAME, "utf8") === STREAM_HOLD_MODE && !existsSync(STREAM_RELEASE_FILENAME)) {
+            active.set(request.params.handle, setTimeout(finish, STREAM_RELEASE_POLL_MS));
+            return;
+          }
           notify(request, events.content, { delta: STREAM_SUFFIX });
           writeFileSync(FINISHED_FILENAME, "");
           reply(request.id, { content: STREAM_PREFIX + STREAM_SUFFIX, finish_reason: FINISH_REASON });
           active.delete(request.params.handle);
-        }, stream_delay_ms));
+        };
+        active.set(request.params.handle, setTimeout(finish, stream_delay_ms));
         continue;
       }
       result = { content: RESULT_TEXT, ...(existsSync(MISSING_FINISH_FILENAME) ? {} : { finish_reason: FINISH_REASON }) };

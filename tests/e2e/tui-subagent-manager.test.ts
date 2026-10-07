@@ -62,6 +62,18 @@ const EXTENSION_EVENTS_FILENAME = "events.jsonl";
 const EXTENSION_LOG_FILENAME = "rpc-log.jsonl";
 const EXTENSION_STREAM_MODE_FILENAME = "stream-events";
 const EXTENSION_STREAM_FINISHED_FILENAME = "stream-finished";
+const EXTENSION_STREAM_RELEASE_FILENAME = "stream-release";
+const EXTENSION_STREAM_HOLD_MODE = "held";
+const EXTENSION_STREAM_HELD_RESULT = "extension-first-chunk-completed";
+const EXTENSION_CANCELLED_TEXT = "System: cancelled";
+const EXTENSION_WAITING_PROMPT = "Make a queued root provider request";
+const EXTENSION_FRESH_PROMPT = "Make a fresh root provider request";
+const EXTENSION_CANCEL_TIMEOUT_MS = 5_000;
+const EXTENSION_RELEASE_POLL_MS = 25;
+const EXTENSION_STREAM_CANCEL_METHOD = "provider.cancel";
+const EXTENSION_TRACE_FILENAME = "extension-worker.trace";
+const EXTENSION_WORKER_FINISHED = "finish processing queued=0";
+const EXTENSION_TRACE_SCOPES = "agent,worker";
 const EXTENSION_PROVIDER_SOURCE = join(import.meta.dir, "fixtures", "extension-provider.ts");
 const EXTENSION_EXECUTABLE_MODE = 0o700;
 const EXTENSION_HELD_DELAY_MS = TIMEOUT * 2;
@@ -72,6 +84,7 @@ const EXTENSION_CHILD_CASES = [
   { label: "auto allow completes", mode: "auto", held: false, shared: false },
   { label: "ask same namespace admits child executable", mode: "ask", held: false, shared: true },
   { label: "quit joins an active provider child", mode: "ask", held: true, shared: false },
+  { label: "shared held child survives queued root cancellation", mode: "ask", held: true, shared: true },
 ];
 
 async function pasteVisibleText(
@@ -447,6 +460,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
     const profile = join(fixture.home, PROFILE_DIRECTORY);
     const extension = join(profile, FIXTURE_EXTENSION_DIRECTORY);
     const parentExtension = join(profile, EXTENSION_PARENT_DIRECTORY);
+    const tracePath = join(fixture.home, EXTENSION_TRACE_FILENAME);
     writeFileSync(join(profile, SETTINGS_FILENAME), JSON.stringify({
       provider: "extension", models: { extension: shared ? EXTENSION_CHILD_MODEL : EXTENSION_PARENT_MODEL },
       sandbox: "none", permission_mode: mode,
@@ -481,15 +495,15 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
       } } }) },
     }));
     if (held) {
-      writeFileSync(join(extension, EXTENSION_STREAM_DELAY_FILENAME), String(EXTENSION_HELD_DELAY_MS));
-      writeFileSync(join(extension, EXTENSION_STREAM_MODE_FILENAME), "");
+      writeFileSync(join(extension, EXTENSION_STREAM_DELAY_FILENAME), String(shared ? EXTENSION_RELEASE_POLL_MS : EXTENSION_HELD_DELAY_MS));
+      writeFileSync(join(extension, EXTENSION_STREAM_MODE_FILENAME), shared ? EXTENSION_STREAM_HOLD_MODE : "");
     }
     session = await TmuxSession.create({
       cmd: FX_BIN, cwd: fixture.workspace, isolated: true,
       env: { HOME: fixture.home, AI_GATEWAY_API_KEY: undefined, VERCEL_OIDC_TOKEN: undefined,
         FX_MODEL: undefined, FX_PERMISSION_MODE: mode, FX_EXTENSION_TEST_KEY: EXTENSION_FIXTURE_KEY,
         [EXTENSION_PARENT_KEY_SLOT]: EXTENSION_PARENT_KEY, FX_DISABLE_KEYCHAIN: "1",
-        FX_SKIP_ONBOARDING: "1", FX_AUTO_UPGRADE: "0" },
+        FX_SKIP_ONBOARDING: "1", FX_AUTO_UPGRADE: "0", FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: EXTENSION_TRACE_SCOPES },
       width: 120, height: 36, stderrPath: fixture.stderrPath,
     });
     const active = session;
@@ -526,6 +540,39 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
     expect(streamed?.keyValid).toBe(true);
     if (held) {
       expect(existsSync(join(extension, EXTENSION_STREAM_FINISHED_FILENAME))).toBe(false);
+      if (shared) {
+        // A cancelled waiter must return before the holder is released or receives any cancellation.
+        const before = calls.length;
+        const finishedBefore = countOccurrences(readFileSync(tracePath, "utf8"), EXTENSION_WORKER_FINISHED);
+        await active.sendText(EXTENSION_WAITING_PROMPT);
+        await active.waitForText(EXTENSION_WAITING_PROMPT, TIMEOUT);
+        await active.sendKeys("C-c");
+        await active.waitForText(EXTENSION_CANCELLED_TEXT, EXTENSION_CANCEL_TIMEOUT_MS);
+        // UI cancellation is immediate; the existing worker trace proves actual unwind before release.
+        const cancelDeadline = Date.now() + EXTENSION_CANCEL_TIMEOUT_MS;
+        while (Date.now() < cancelDeadline && countOccurrences(readFileSync(tracePath, "utf8"), EXTENSION_WORKER_FINISHED) === finishedBefore) {
+          await Bun.sleep(EXTENSION_RELEASE_POLL_MS);
+        }
+        expect(countOccurrences(readFileSync(tracePath, "utf8"), EXTENSION_WORKER_FINISHED)).toBeGreaterThan(finishedBefore);
+        const during = readFileSync(logPath, "utf8").trim().split("\n").map(line => JSON.parse(line));
+        expect(during).toHaveLength(before);
+        expect(during.some(call => call.method === EXTENSION_STREAM_CANCEL_METHOD)).toBe(false);
+        expect(existsSync(join(extension, EXTENSION_STREAM_FINISHED_FILENAME))).toBe(false);
+        process.kill(streamed!.pid, 0);
+        writeFileSync(join(extension, EXTENSION_STREAM_RELEASE_FILENAME), "");
+        const completed = await waitForConfigurationControl(controlPath, control =>
+          (control as ConfigurationControl & { queue: Array<{ status: string }> }).queue.some(item => item.status === EXTENSION_COMPLETED_STATUS));
+        const childEvents = join(profile, EXTENSION_SESSION_DIRECTORY, completed.child_id, EXTENSION_EVENTS_FILENAME);
+        expect(readFileSync(childEvents, "utf8")).toContain(EXTENSION_STREAM_HELD_RESULT);
+        await active.sendText(EXTENSION_FRESH_PROMPT);
+        await active.waitForText(EXTENSION_STREAM_HELD_RESULT, TIMEOUT);
+        const after = readFileSync(logPath, "utf8").trim().split("\n").map(line => JSON.parse(line));
+        const fresh = after.slice(before).filter(call => call.method === EXTENSION_STREAM_METHOD);
+        expect(fresh).toHaveLength(1);
+        expect(fresh[0].sessionId).not.toBe(childId);
+        expect(fresh[0].keyValid).toBe(true);
+        expect(fresh[0].ambientKey).toBe(false);
+      }
     } else {
       const completed = await waitForConfigurationControl(controlPath, control => {
         const work = control as ConfigurationControl & { queue: Array<{ status: string }> };
@@ -537,6 +584,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
     }
     await active.sendText(EXTENSION_QUIT_COMMAND);
     expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+    expect(active.paneStatus()).toEqual({ dead: true, status: 0 });
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
     // Provider lifetime ends only after every borrowing worker has joined.
     let childExited = false;
