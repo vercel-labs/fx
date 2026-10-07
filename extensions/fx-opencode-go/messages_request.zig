@@ -4,7 +4,6 @@ const wire = @import("wire.zig");
 const image_parts = @import("image_parts.zig");
 const replay = @import("replay.zig");
 const function_groups = [_][]const u8{ "functions", "additional_functions", "dynamic_functions" };
-const allowed_efforts = [_][]const u8{ "low", "medium", "xhigh" };
 const system_roles = [_][]const u8{ "system", "developer" };
 const user_role = "user";
 const assistant_role = "assistant";
@@ -147,13 +146,6 @@ pub fn project(alloc: wire.Allocator, request: wire.Value) !wire.Value {
     var config = wire.object();
     const effort = try wire.field(request, "reasoning_effort");
     if (effort != .null) {
-        const label = try wire.text(effort);
-        var valid = false;
-        for (allowed_efforts) |allowed| if (std.mem.eql(u8, label, allowed)) {
-            valid = true;
-            break;
-        };
-        if (!valid) return error.InvalidReasoningEffort;
         try wire.put(alloc, &config, "effort", effort);
     }
     const format = try wire.field(request, "response_format");

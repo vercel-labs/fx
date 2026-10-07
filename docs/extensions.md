@@ -2,7 +2,7 @@
 
 Local extensions add provider catalogs and streaming without an embedded scripting runtime.
 The first provider is [fx-opencode-go](../extensions/fx-opencode-go/README.md).
-Its curated Go catalog supplements the built-in Vercel Gateway, Codex and Grok catalogs.
+Its 13 selected Go models use Chat Completions, Responses or Messages and supplement the built-in Vercel Gateway, Codex and Grok catalogs.
 Registration and model discovery do not launch executables or transmit provider credentials.
 
 ## Trust boundary
@@ -57,7 +57,9 @@ Configured headers accept literal strings or these exact bindings:
 Header names follow HTTP case rules. Duplicate logical names and unsafe values fail before delivery.
 Environment bindings resolve only for an admitted request, not discovery or preparation.
 Saved session identity is preserved. Unsaved conversations receive a stable identity for the loaded registry lifetime.
-The Go transport sends the admitted key as a Bearer credential and includes `x-opencode-session`.
+The Go transport includes `x-opencode-session`. Chat Completions and Responses send the admitted
+key as managed Bearer authentication; Messages sends managed `x-api-key` and
+`anthropic-version: 2023-06-01`. Extension headers cannot override these protocol fields.
 
 ## Provider protocol
 
@@ -71,6 +73,13 @@ Streaming receives the prepared handle, admitted credential, resolved headers, a
 Notifications use `extension.event` with `params.request_id` and `params.handle`, not a top-level notification ID.
 Core owns permissions, tool execution, UI delivery, session replay, and usage accounting.
 Image parts contain only host-verified snapshot bytes, not filesystem paths.
+The standalone Go adapter owns per-wire API routing and effort admission from its pinned catalog.
+Tagged replay stays within its API family; switching families retains canonical text/tools while
+omitting foreign opaque state. Untagged legacy Chat reasoning remains compatible. Saved turns
+retain canonical history, not opaque replay. Malformed same-family replay fails preparation.
+Strict schema metadata requires documentation for the selected API, not generic JSON mode.
+See the [Go catalog and sources](../extensions/fx-opencode-go/README.md#selected-catalog) for limits,
+HY4/Space Bunny forwarding uncertainty, and Muse Contributor consent/account eligibility.
 
 Events and frames are bounded. Foreign handles, oversized events, invalid completion evidence, and uncertain delivery fail terminally.
 Fx does not automatically repeat an ambiguous admitted request. Start a fresh user request after resolving the failure.

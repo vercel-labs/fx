@@ -11,6 +11,5 @@
   { "wire_id": "muse-spark-1.3-contributor", "api": "responses" },
   { "wire_id": "qwen3.8-flash", "api": "messages" },
   { "wire_id": "qwen3.8-max", "api": "messages" },
-  { "wire_id": "space-bunny", "api": "chat_completions" },
-  { "wire_id": "deepseek-v4-pro", "api": "chat_completions" }
+  { "wire_id": "space-bunny", "api": "chat_completions" }
 ]

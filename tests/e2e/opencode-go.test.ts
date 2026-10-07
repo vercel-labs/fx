@@ -61,11 +61,19 @@ const NEGATIVE_CASES = ["http-error", "redirect", "lost-finish", "aggregate-tool
 const GO_MANIFEST_FILENAME = "extension.json";
 // The curated choices must preserve native tool continuation without borrowing another provider's preferences.
 const CURATED_MODELS = [
-  { id: "deepseek-flash", wire: "deepseek-v4.1-flash", effort: "max" },
-  { id: "deepseek-v4-pro", wire: "deepseek-v4-pro", effort: "max" },
-  { id: "kimi-k3", wire: "kimi-k3", effort: "max" },
-  { id: "glm-5.3-flash", wire: "glm-5.3-flash", effort: "max" },
-  { id: "mimo-v2.6-flash", wire: "mimo-v2.6-flash", effort: undefined },
+  { id: "deepseek-flash", wire: "deepseek-v4.1-flash", api: "chat", effort: "max", efforts: ["low", "high", "max"] },
+  { id: "glm-5.3", wire: "glm-5.3", api: "chat", effort: "max", efforts: ["low", "high", "max"] },
+  { id: "glm-5.3-flash", wire: "glm-5.3-flash", api: "chat", effort: "max", efforts: ["low", "high", "max"] },
+  { id: "grok-4.7", wire: "grok-4.7", api: "responses", effort: "xhigh", efforts: ["low", "medium", "high", "xhigh"] },
+  { id: "hy4-preview", wire: "hy4-preview", api: "chat", effort: "none", efforts: ["none", "high"] },
+  { id: "kimi-k3", wire: "kimi-k3", api: "chat", effort: "max", efforts: ["max"] },
+  { id: "longcat-2.5-preview-free", wire: "longcat-2.5-preview-free", api: "chat", effort: undefined, efforts: [] },
+  { id: "mimo-v2.6-flash", wire: "mimo-v2.6-flash", api: "chat", effort: undefined, efforts: [] },
+  { id: "mimo-v2.6-pro", wire: "mimo-v2.6-pro", api: "chat", effort: undefined, efforts: [] },
+  { id: "muse-spark-1.3-contributor", wire: "muse-spark-1.3-contributor", api: "responses", effort: "minimal", efforts: ["minimal", "low", "medium", "high", "xhigh"] },
+  { id: "qwen3.8-flash", wire: "qwen3.8-flash", api: "messages", effort: "medium", efforts: ["low", "medium", "xhigh"] },
+  { id: "qwen3.8-max", wire: "qwen3.8-max", api: "messages", effort: "xhigh", efforts: ["low", "medium", "xhigh"] },
+  { id: "space-bunny", wire: "space-bunny", api: "chat", effort: "medium", efforts: ["low", "medium", "high", "xhigh", "max"] },
 ];
 const CURATED_PROVIDER_PREFIX = "opencode-go/";
 const BUILTIN_PREFERENCES = { gateway: "openai/gpt-5.6-sol", codex: "gpt-6.1-sol", grok: "grok-4.7" };
@@ -95,8 +103,6 @@ const RESPONSES_COMMENTARY_PHASE = "commentary";
 const RESPONSES_CALL_OUTPUT_INDEX = 2;
 const RESPONSES_HISTORY_CALL = { id: "history-call", name: "history_tool", arguments_json: "{}" };
 const RESPONSES_FUNCTION = { name: "declared_tool", description: "Fixture tool", inputSchema: SCHEMA };
-const RESPONSES_CONTEXT_WINDOW = 1000000;
-const RESPONSES_CATALOG_FILENAME = "models.json";
 const RESPONSES_FAILURES = ["lost-completion", "truncated-completion", "failed", "incomplete", "wrong-status", "provider-error", "conflicting-id", "wrong-item-id", "bad-arguments", "missing-terminal-call", "replay-injection", "negative-usage", "unfinished-item", "completed-with-error", "empty-call-id", "duplicate-call-id", "undeclared-call", "argument-mismatch"];
 const MESSAGES_MODELS = [
   { id: "qwen3.8-flash", effort: "medium", efforts: ["low", "medium", "xhigh"] },
@@ -106,13 +112,31 @@ const MESSAGES_OUTPUT_CAP = 131072;
 const MESSAGES_VERSION = "2023-06-01";
 const MESSAGES_THINKING = { type: "thinking", thinking: RESPONSES_REASONING_TEXT, signature: "opaque-fixture-signature" };
 const MESSAGES_REDACTED = { type: "redacted_thinking", data: "opaque-fixture-redacted" };
+// Unequal snapshots reject stale-input reuse and additive usage regressions independently.
+const MESSAGES_START_INPUT = 23;
+const MESSAGES_START_OUTPUT = 3;
+const MESSAGES_PRIOR_USAGE = { input_tokens: 31, output_tokens: 11, cache_creation_input_tokens: 2, cache_read_input_tokens: 4 };
 const MESSAGES_CACHE_CREATED = 5;
 const MESSAGES_CACHE_READ = 7;
 const MESSAGES_TOTAL_INPUT = INPUT_TOKENS + MESSAGES_CACHE_CREATED + MESSAGES_CACHE_READ;
 const MESSAGES_MAX_INTEGER = "9223372036854775807";
-const MESSAGES_FAILURES = ["lost-stop", "truncated-stop", "missing-reason", "unknown-reason", "open-block", "missing-start", "duplicate-start", "wrong-index", "wrong-delta", "late-delta", "reopened-block", "bad-arguments", "conflicting-id", "duplicate-call-id", "missing-signature", "signature-control", "thinking-after-signature", "replay-injection", "negative-usage", "negative-cache", "cache-without-input", "usage-overflow", "provider-error", "tools-with-end-turn", "tool-reason-without-call", "initial-input-conflict", "signature-limit", "aggregate-replay"];
+const MESSAGES_FAILURES = ["lost-stop", "truncated-stop", "missing-reason", "unknown-reason", "open-block", "missing-start", "duplicate-start", "wrong-index", "wrong-delta", "late-delta", "reopened-block", "bad-arguments", "duplicate-call-id", "missing-signature", "signature-control", "thinking-after-signature", "replay-injection", "negative-usage", "negative-cache", "cache-without-input", "usage-overflow", "provider-error", "tools-with-end-turn", "tool-reason-without-call", "initial-input-conflict", "signature-limit", "aggregate-replay"];
 const MESSAGES_HEADER_CONFLICTS = ["x-api-key", "X-API-Key", "anthropic-version", "ANTHROPIC-VERSION", "Authorization"];
 const TTY_APIS = ["chat", "responses", "messages"];
+const API_PATHS: Record<string, string> = { chat: "/v1/chat/completions", responses: "/v1/responses", messages: "/v1/messages" };
+const SWITCH_MODELS = [CURATED_MODELS[0], CURATED_MODELS[3], CURATED_MODELS[10]];
+const SWITCH_PAIRS = SWITCH_MODELS.flatMap(from => SWITCH_MODELS.filter(to => to.api !== from.api).map(to => ({ from, to })));
+const SWITCH_EFFORT = "low";
+const PICKER_COMMAND = "/model";
+const PICKER_HEIGHT = 60;
+const PICKER_DEEPSEEK_LABEL = "opencode-go/deepseek-flash";
+const ALL_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+const REPLAY_BOUNDARY_ITEMS = 129;
+const LEGACY_REASONING = "legacy-chat-reasoning";
+const UNSUPPORTED_EFFORT = "unselected-effort";
+const REMOVED_WIRE = "deepseek-v4-pro";
+const CATALOG_CALL_OUTPUT_INDEX = 1;
+
 const tuiTest = tmuxAvailable() ? test : test.skip;
 const homes: string[] = [];
 afterEach(() => { for (const home of homes.splice(0)) cleanupIsolatedTestHome(home); });
@@ -123,14 +147,9 @@ function streamReply(chunks: unknown[]): Response {
   return new Response(body, { headers: { "content-type": "text/event-stream" } });
 }
 
-// Only private profiles admit unfinished catalog choices, so product metadata stays controller-owned.
+// Product discovery supplies every route; private profiles change only selected preferences.
 function responsesProfile(port: number, model = RESPONSES_MODELS[0]): string {
   const home = createGoProfile(port);
-  const catalogPath = join(home, PROFILE_DIRECTORY, FIXTURE_EXTENSION_DIRECTORY, RESPONSES_CATALOG_FILENAME);
-  const catalog = JSON.parse(readFileSync(catalogPath, "utf8"));
-  catalog.models.push({ id: model.id, wire_id: model.id, name: model.id, tool_call: true, reasoning: true,
-    reasoning_efforts: model.efforts, context_window: RESPONSES_CONTEXT_WINDOW, max_output_tokens: SCHEMA_OUTPUT_LIMIT, supports_vision: true, structured_output: true });
-  writeFileSync(catalogPath, JSON.stringify(catalog));
   const settingsPath = join(home, SETTINGS_RELATIVE_PATH);
   const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
   settings.models.extension = CURATED_PROVIDER_PREFIX + model.id;
@@ -139,14 +158,9 @@ function responsesProfile(port: number, model = RESPONSES_MODELS[0]): string {
   return home;
 }
 
-// Disposable Qwen choices keep unshipped product catalog metadata outside the implementation checkpoint.
+// The selected Qwen output cap comes from the same shipped catalog as native discovery.
 function messagesProfile(port: number, model = MESSAGES_MODELS[0]): string {
-  const home = responsesProfile(port, model);
-  const catalogPath = join(home, PROFILE_DIRECTORY, FIXTURE_EXTENSION_DIRECTORY, RESPONSES_CATALOG_FILENAME);
-  const catalog = JSON.parse(readFileSync(catalogPath, "utf8"));
-  catalog.models.find((item: any) => item.id === model.id).max_output_tokens = MESSAGES_OUTPUT_CAP;
-  writeFileSync(catalogPath, JSON.stringify(catalog));
-  return home;
+  return responsesProfile(port, model);
 }
 
 // Small network fragments prove SSE framing against actual sockets, including CRLF boundaries.
@@ -166,7 +180,7 @@ function responsesCompleted(output: unknown[] = [], status = "completed", usage 
 // Messages terminal evidence must remain separate from the typed block lifecycle.
 function messagesStart() {
   return { type: "message_start", message: { type: "message", role: "assistant", content: [],
-    usage: { input_tokens: INPUT_TOKENS, output_tokens: 0 } } };
+    usage: { input_tokens: MESSAGES_START_INPUT, output_tokens: MESSAGES_START_OUTPUT } } };
 }
 
 // Cumulative output usage replaces the start count instead of summing streaming snapshots.
@@ -196,6 +210,26 @@ function messagesTool(argumentsJson: string, index = 0, name = "write_file", id 
   return [{ type: "content_block_start", index, content_block: { type: "tool_use", id, name, input: {} } },
     ...[argumentsJson.slice(0, midpoint), argumentsJson.slice(midpoint)].map(partial_json => ({ type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json } })),
     { type: "content_block_stop", index }];
+}
+
+// Distinct HTTP envelopes exercise native read_file without hiding wrong catalog routing.
+function catalogReply(api: string, home: string, tool: boolean): Response {
+  const argumentsJson = JSON.stringify({ path: join(home, TOOL_FILENAME) });
+  if (api === "messages") return responsesReply([messagesStart(), ...(tool ? [...messagesThinking(), ...messagesTool(argumentsJson, 2, "read_file")] : messagesText(RESULT)), ...messagesTerminal(tool ? "tool_use" : "end_turn")]);
+  if (api === "responses") {
+    const call = { type: "function_call", id: RESPONSES_ITEM_ID, call_id: TOOL_ID, name: "read_file", arguments: argumentsJson, status: "completed" };
+    return responsesReply(tool ? [
+      { type: "response.output_item.added", output_index: CATALOG_CALL_OUTPUT_INDEX, item: { ...call, arguments: "", status: "in_progress" } },
+      { type: "response.function_call_arguments.delta", output_index: CATALOG_CALL_OUTPUT_INDEX, item_id: call.id, delta: call.arguments },
+      { type: "response.output_item.done", output_index: CATALOG_CALL_OUTPUT_INDEX, item: call }, responsesCompleted([RESPONSES_REASONING, call]),
+    ] : [{ type: "response.output_text.delta", delta: RESULT }, responsesCompleted()]);
+  }
+  return streamReply([{ choices: [{ index: 0, delta: tool ? { reasoning_content: RESPONSES_REASONING_TEXT, tool_calls: [{ index: 0, id: TOOL_ID, function: { name: "read_file", arguments: argumentsJson } }] } : { content: RESULT }, finish_reason: tool ? "tool_calls" : "stop" }] }]);
+}
+
+// Effort placement belongs to the HTTP API, while admission belongs to the wire metadata.
+function projectedEffort(body: any, api: string): string | undefined {
+  return api === "messages" ? body.output_config?.effort : api === "responses" ? body.reasoning?.effort : body.reasoning_effort;
 }
 
 // Native nullable request fields exercise schema, role merging and family-bound replay via RPC.
@@ -320,7 +354,8 @@ describe("native OpenCode Go extension", () => {
     const bodies: any[] = [];
     const server = Bun.serve({ hostname: HOST, port: 0, async fetch(request) {
       bodies.push(await request.json());
-      return responsesReply([messagesStart(), ...messagesText(SCHEMA_OUTPUT), ...messagesTerminal()]);
+      return responsesReply([messagesStart(), ...messagesText(SCHEMA_OUTPUT),
+        { type: "message_delta", delta: { stop_reason: null }, usage: MESSAGES_PRIOR_USAGE }, ...messagesTerminal()]);
     } });
     const peer = providerRpc();
     const prepare = (request: any, cap: number | null = MESSAGES_OUTPUT_CAP) => peer.rpc("provider.prepare", { provider: { id: SCHEMA_PROVIDER, base_url: SCHEMA_BASE_PREFIX + HOST + ":" + server.port + SCHEMA_BASE_PATH }, model: { wire_id: MESSAGES_MODELS[0].id, max_output_tokens: cap }, request });
@@ -441,7 +476,7 @@ describe("native OpenCode Go extension", () => {
       if (mode === "wrong-index") return responsesReply([start, { ...tool[0], index: 1 }, ...tool.slice(1), ...terminal]);
       if (mode === "wrong-delta") return responsesReply([start, tool[0], { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: RESULT } }, ...tool.slice(1), ...terminal]);
       if (mode === "late-delta") return responsesReply([start, ...tool, tool[1], ...terminal]);
-      if (mode === "reopened-block" || mode === "conflicting-id") return responsesReply([start, ...tool, { ...tool[0], content_block: { ...tool[0].content_block, id: TOOL_ID + "changed" } }, ...terminal]);
+      if (mode === "reopened-block") return responsesReply([start, ...tool, { ...tool[0], content_block: { ...tool[0].content_block, id: TOOL_ID + "changed" } }, ...terminal]);
       if (mode === "duplicate-call-id") return responsesReply([start, ...tool, ...messagesTool("{}", 1), ...terminal]);
       if (mode === "bad-arguments") return responsesReply([start, ...messagesTool("[]"), ...terminal]);
       if (mode === "missing-signature") return responsesReply([start, ...messagesThinking().filter(event => !(event.type === "content_block_delta" && event.delta?.type === "signature_delta")), ...messagesTerminal()]);
@@ -648,40 +683,211 @@ describe("native OpenCode Go extension", () => {
   // Real host requests guard against catalog entries that discover correctly but lose tools or encode unsupported effort.
   test.each(CURATED_MODELS)("curated $id discovers and completes native tools", async model => {
     const bodies: any[] = [];
+    const paths: string[] = [];
     let home = "";
     const server = Bun.serve({ hostname: HOST, port: 0, async fetch(request) {
       bodies.push(await request.json());
-      if (bodies.length === 1) return streamReply([{ choices: [{ index: 0, delta: {
-        tool_calls: [{ index: 0, id: TOOL_ID, function: { name: "read_file", arguments: JSON.stringify({ path: join(home, TOOL_FILENAME) }) } }],
-      }, finish_reason: "tool_calls" }] }]);
-      return streamReply([{ choices: [{ index: 0, delta: { content: RESULT }, finish_reason: "stop" }] }]);
+      paths.push(new URL(request.url).pathname);
+      return catalogReply(model.api, home, bodies.length === 1);
     } });
     home = createGoProfile(server.port);
     homes.push(home);
     const settingsPath = join(home, SETTINGS_RELATIVE_PATH);
     const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
     settings.models = { ...BUILTIN_PREFERENCES, extension: CURATED_PROVIDER_PREFIX + model.id };
+    settings.effort = model.effort ?? "max";
+    settings.permission = { [EXECUTABLE_PERMISSION]: "allow" };
     writeFileSync(settingsPath, JSON.stringify(settings));
     writeFileSync(join(home, TOOL_FILENAME), TOOL_CONTENT);
     try {
-      const discovery = Bun.spawn([FX_BIN, "models", "--json"], { cwd: home, stdout: "pipe", stderr: "pipe", env: goEnvironment(home) });
+      const discovery = Bun.spawn([FX_BIN, "models", "--json"], { cwd: home, stdout: "pipe", stderr: "pipe", env: { ...goEnvironment(home), FX_PERMISSION_MODE: "auto" } });
       const [catalog, discoveryError, discoveryCode] = await Promise.all([new Response(discovery.stdout).text(), new Response(discovery.stderr).text(), discovery.exited]);
       expect(discoveryCode, discoveryError).toBe(0);
-      expect(JSON.parse(catalog).ids).toEqual(CURATED_MODELS.map(choice => CURATED_PROVIDER_PREFIX + choice.id));
-      const child = Bun.spawn([FX_BIN, "ask", "--json", "--no-save", TUI_PROMPT], { cwd: home, stdout: "pipe", stderr: "pipe", env: goEnvironment(home) });
+      const discovered = JSON.parse(catalog).ids;
+      expect(discovered).toEqual(CURATED_MODELS.map(choice => CURATED_PROVIDER_PREFIX + choice.id));
+      expect(discovered.filter((id: string) => id.includes("deepseek"))).toEqual([CURATED_PROVIDER_PREFIX + CURATED_MODELS[0].id]);
+      expect(discoveryError).toBe("");
+      const child = Bun.spawn([FX_BIN, "ask", "--json", "--no-save", TUI_PROMPT], { cwd: home, stdout: "pipe", stderr: "pipe", env: { ...goEnvironment(home), FX_PERMISSION_MODE: "auto" } });
       const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
       expect(code, JSON.stringify({ stdout, stderr })).toBe(0);
       expect(JSON.parse(stdout).output).toBe(RESULT);
       expect(bodies).toHaveLength(2);
+      expect(stderr).toContain(TOOL_FILENAME);
+      expect(stderr).not.toMatch(/error|panic|YOLO enabled/i);
+      expect(paths).toEqual([API_PATHS[model.api], API_PATHS[model.api]]);
       for (const body of bodies) {
         expect(body.model).toBe(model.wire);
-        expect(body.reasoning_effort).toBe(model.effort);
+        expect(projectedEffort(body, model.api)).toBe(model.effort);
       }
-      expect(bodies[1].messages.some((message: any) => message.role === "tool" && message.content.includes(TOOL_CONTENT))).toBe(true);
+      expect(JSON.stringify(bodies[1])).toContain(TOOL_CONTENT);
+      expect(JSON.stringify(bodies[1])).toContain(TOOL_ID);
       const finalSettings = JSON.parse(readFileSync(settingsPath, "utf8"));
       for (const [provider, preference] of Object.entries(BUILTIN_PREFERENCES)) expect(finalSettings.models[provider]).toBe(preference);
       expect(stdout + stderr).not.toContain(KEY);
     } finally { server.stop(true); }
+  }, TIMEOUT_MS);
+
+  // Per-wire metadata admission catches stale global scales before credentials can reach HTTP.
+  test("all selected effort controls and removed route are checked through provider RPC", async () => {
+    let requests = 0;
+    const bodies: any[] = [];
+    const server = Bun.serve({ hostname: HOST, port: 0, async fetch(request) {
+      requests++;
+      bodies.push(await request.json());
+      const model = CURATED_MODELS.find(item => item.wire === bodies.at(-1).model)!;
+      return catalogReply(model.api, "", false);
+    } });
+    const peer = providerRpc();
+    const prepare = (model: typeof CURATED_MODELS[number], effort: string | null) => peer.rpc("provider.prepare", {
+      provider: { id: SCHEMA_PROVIDER, base_url: SCHEMA_BASE_PREFIX + HOST + ":" + server.port + SCHEMA_BASE_PATH },
+      model: { wire_id: model.wire, max_output_tokens: MESSAGES_OUTPUT_CAP }, request: { ...responseRequest(), reasoning_effort: effort, response_format: null } });
+    try {
+      await peer.rpc("initialize", { version: RPC_VERSION });
+      for (const model of CURATED_MODELS) {
+        for (const effort of [null, ...model.efforts]) {
+          const prepared = await prepare(model, effort);
+          await peer.rpc("provider.stream", { handle: prepared.handle, credential: KEY, headers: { "x-opencode-session": SCHEMA_SESSION }, session_id: SCHEMA_SESSION });
+          expect(projectedEffort(bodies.at(-1), model.api)).toBe(effort ?? undefined);
+        }
+        const before = requests;
+        for (const effort of [UNSUPPORTED_EFFORT, ...ALL_EFFORTS.filter(label => !model.efforts.includes(label))]) await expect(prepare(model, effort)).rejects.toThrow("Provider request failed");
+        expect(requests).toBe(before);
+      }
+      await expect(prepare({ ...CURATED_MODELS[0], wire: REMOVED_WIRE }, null)).rejects.toThrow("Provider request failed");
+    } finally { await peer.close(); server.stop(true); }
+  }, TIMEOUT_MS);
+
+  // Legacy state compatibility and bounded envelopes must hold at the actual credential-free prepare boundary.
+  test("legacy Chat replay and tagged family bounds preserve canonical history", async () => {
+    const bodies: any[] = [];
+    const server = Bun.serve({ hostname: HOST, port: 0, async fetch(request) {
+      const body = await request.json();
+      bodies.push(body);
+      return catalogReply(CURATED_MODELS.find(model => model.wire === body.model)!.api, "", false);
+    } });
+    const peer = providerRpc();
+    const prepare = (model: typeof CURATED_MODELS[number], state: string) => peer.rpc("provider.prepare", {
+      provider: { id: SCHEMA_PROVIDER, base_url: SCHEMA_BASE_PREFIX + HOST + ":" + server.port + SCHEMA_BASE_PATH },
+      model: { wire_id: model.wire, max_output_tokens: MESSAGES_OUTPUT_CAP },
+      request: { ...responseRequest(state), reasoning_effort: SWITCH_EFFORT, response_format: null } });
+    const stream = (handle: string) => peer.rpc("provider.stream", { handle, credential: KEY, headers: { "x-opencode-session": SCHEMA_SESSION }, session_id: SCHEMA_SESSION });
+    try {
+      await peer.rpc("initialize", { version: RPC_VERSION });
+      for (const reasoning of ["", LEGACY_REASONING]) {
+        const prepared = await prepare(SWITCH_MODELS[0], JSON.stringify([{ reasoning_content: reasoning }]));
+        expect((await stream(prepared.handle)).content).toBe(RESULT);
+        expect(bodies.at(-1).messages.find((message: any) => message.role === "assistant").reasoning_content).toBe(reasoning);
+      }
+      const before = bodies.length;
+      await expect(prepare(SWITCH_MODELS[0], JSON.stringify([{ reasoning_content: INPUT_TOKENS }]))).rejects.toThrow("Provider request failed");
+      for (const model of SWITCH_MODELS) {
+        const family = model.api === "chat" ? "chat_completions" : model.api;
+        const item = model.api === "messages" ? MESSAGES_THINKING : RESPONSES_REASONING;
+        const tagged = { api: family, items: Array.from({ length: REPLAY_BOUNDARY_ITEMS }, () => item) };
+        // Chat already requires exactly one reasoning item; valid typed items isolate the other families' count guard.
+        if (model.api !== "chat") await expect(prepare(model, JSON.stringify([tagged]))).rejects.toThrow("Provider request failed");
+        // Outer envelope multiplicity is bounded even when both entries claim a foreign family.
+        const foreign = { ...tagged, api: model.api === "responses" ? "messages" : "responses" };
+        await expect(prepare(model, JSON.stringify([foreign, foreign]))).rejects.toThrow("Provider request failed");
+      }
+      expect(bodies).toHaveLength(before);
+      for (const model of SWITCH_MODELS) {
+        const foreign = { api: model.api === "responses" ? "messages" : "responses", items: { untrusted: LEGACY_REASONING } };
+        const prepared = await prepare(model, JSON.stringify([foreign]));
+        expect((await stream(prepared.handle)).content).toBe(RESULT);
+        const projected = JSON.stringify(bodies.at(-1));
+        expect(projected).not.toContain(LEGACY_REASONING);
+        for (const text of [RESPONSES_HISTORY_TEXT, TOOL_CONTENT, RESPONSES_HISTORY_CALL.id]) expect(projected).toContain(text);
+      }
+    } finally { await peer.close(); server.stop(true); }
+  }, TIMEOUT_MS);
+
+  // Saved turns preserve portable canonical history across every directed API-family pair.
+  test.each(SWITCH_PAIRS)("saved $from.api to $to.api switch keeps text and tools without opaque replay", async ({ from, to }) => {
+    const bodies: any[] = [];
+    let home = "";
+    const server = Bun.serve({ hostname: HOST, port: 0, async fetch(request) {
+      const body = await request.json();
+      bodies.push(body);
+      return catalogReply(body.model === from.wire ? from.api : to.api, home, bodies.length === 1);
+    } });
+    home = createGoProfile(server.port);
+    homes.push(home);
+    const settingsPath = join(home, SETTINGS_RELATIVE_PATH);
+    const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+    settings.effort = SWITCH_EFFORT;
+    settings.permission = { [EXECUTABLE_PERMISSION]: "allow" };
+    writeFileSync(settingsPath, JSON.stringify(settings));
+    writeFileSync(join(home, TOOL_FILENAME), TOOL_CONTENT);
+    const run = async (model: string, args: string[], tool: boolean) => {
+      const child = Bun.spawn([FX_BIN, "ask", "--json", ...args], { cwd: home, stdout: "pipe", stderr: "pipe", env: { ...goEnvironment(home), FX_MODEL: CURATED_PROVIDER_PREFIX + model, FX_PERMISSION_MODE: "auto" } });
+      const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+      expect(code, JSON.stringify({ stdout, stderr })).toBe(0);
+      if (tool) {
+        expect(stderr).toContain(TOOL_FILENAME);
+        expect(stderr).not.toMatch(/error|panic|YOLO enabled/i);
+      } else expect(stderr).toBe("");
+      expect(JSON.parse(stdout).output).toBe(RESULT);
+      return JSON.parse(stdout);
+    };
+    try {
+      const first = await run(from.id, [TUI_PROMPT], true);
+      const resumed = await run(to.id, ["--resume", first.session_id, FOLLOWUP_PROMPT], false);
+      expect(resumed.session_id).toBe(first.session_id);
+      expect(bodies).toHaveLength(3);
+      expect(bodies[2].model).toBe(to.wire);
+      const projected = JSON.stringify(bodies[2]);
+      for (const text of [TUI_PROMPT, RESULT, FOLLOWUP_PROMPT, TOOL_CONTENT, TOOL_ID]) expect(projected).toContain(text);
+      for (const opaque of [RESPONSES_REASONING.encrypted_content, MESSAGES_THINKING.signature, MESSAGES_REDACTED.data, RESPONSES_REASONING_TEXT]) expect(projected).not.toContain(opaque);
+      const saved = JSON.parse(readFileSync(join(home, SESSION_RELATIVE_DIRECTORY, resumed.session_id, SESSION_FILENAME), "utf8"));
+      expect(JSON.stringify(saved)).not.toContain(RESPONSES_REASONING.encrypted_content);
+    } finally { server.stop(true); }
+  }, TIMEOUT_MS);
+
+  // Native discovery and terminal selection must agree without creating a second DeepSeek alias.
+  tuiTest("real TTY picker exposes the approved catalog and persists an actual selection", async () => {
+    let requests = 0;
+    const server = Bun.serve({ hostname: HOST, port: 0, fetch() { requests++; return catalogReply("chat", "", false); } });
+    const home = createGoProfile(server.port);
+    homes.push(home);
+    const settingsPath = join(home, SETTINGS_RELATIVE_PATH);
+    const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+    settings.models = { ...BUILTIN_PREFERENCES, extension: CURATED_PROVIDER_PREFIX + CURATED_MODELS[0].id };
+    settings.permission = { [EXECUTABLE_PERMISSION]: "allow" };
+    writeFileSync(settingsPath, JSON.stringify(settings));
+    const stderrPath = join(home, STDERR_FILENAME);
+    let session: TmuxSession | undefined;
+    try {
+      session = await TmuxSession.create({ cmd: FX_BIN, cwd: home, stderrPath, isolated: true, height: PICKER_HEIGHT,
+        env: { ...goEnvironment(home), FX_PERMISSION_MODE: "auto", FX_SKIP_ONBOARDING: "0" } });
+      await session.waitForText("Run /help", TUI_TIMEOUT_MS);
+      await session.sendText(PICKER_COMMAND);
+      const pane = await session.waitForText(PICKER_DEEPSEEK_LABEL, TUI_TIMEOUT_MS);
+      expect(pane.split(PICKER_DEEPSEEK_LABEL)).toHaveLength(2);
+      expect(pane).not.toContain(REMOVED_WIRE);
+      const views = [pane];
+      for (const _ of CURATED_MODELS.slice(1)) {
+        await session.sendKeys("Down");
+        views.push(await session.capturePane());
+      }
+      for (const model of CURATED_MODELS) expect(views.join("\n")).toContain(CURATED_PROVIDER_PREFIX + model.id);
+      expect(requests).toBe(0);
+      for (const _ of CURATED_MODELS.slice(1)) await session.sendKeys("Up");
+      await session.sendKeys("Down");
+      await session.sendKeys("Enter");
+      await session.waitForText(/\blow\b/i, TUI_TIMEOUT_MS);
+      await session.sendKeys("Enter");
+      await session.sendText(TUI_PROMPT);
+      await session.waitForText(RESULT, TUI_TIMEOUT_MS);
+      const selected = JSON.parse(readFileSync(settingsPath, "utf8"));
+      expect(selected.models.extension).toBe(CURATED_PROVIDER_PREFIX + CURATED_MODELS[1].id);
+      for (const [provider, preference] of Object.entries(BUILTIN_PREFERENCES)) expect(selected.models[provider]).toBe(preference);
+      expect(requests).toBe(1);
+      await session.sendText("/quit");
+      await session.waitForSessionEnd(TUI_TIMEOUT_MS);
+      expect(session.paneStatus()).toEqual({ dead: true, status: 0 });
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally { await session?.kill(); server.stop(true); }
   }, TIMEOUT_MS);
 
   // Native request delivery protects accepted endpoints from adapter-specific URI rewriting.

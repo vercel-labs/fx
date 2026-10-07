@@ -14,7 +14,6 @@ const responses_path = "/responses";
 const messages_path = "/messages";
 const max_output_limit = std.math.maxInt(u32);
 const path_separator = "/";
-const allowed_efforts = [_][]const u8{ "low", "high", "max" };
 
 /// The worker receives a credential-free prepared body; its arena owns all request strings.
 pub const Prepared = struct {
@@ -52,6 +51,7 @@ pub const Prepared = struct {
         uri.path = .{ .percent_encoded = try std.fmt.allocPrint(alloc, "{s}{s}", .{ std.mem.trimEnd(u8, base_path, path_separator), api_path }) };
         const endpoint = try std.fmt.allocPrint(alloc, "{f}", .{uri.fmt(.all)});
         var request = try wire.field(params, "request");
+        try routes.validate_effort(wire_id, try wire.field(request, "reasoning_effort"));
         if (api == .messages) {
             // Messages requires a limit even when the native turn leaves it to catalog admission.
             const admitted = try wire.field(model, "max_output_tokens");
@@ -69,7 +69,6 @@ pub const Prepared = struct {
         try wire.put(alloc, &body, "model", try wire.field(model, "wire_id"));
         try wire.put(alloc, &body, "stream", .{ .bool = true });
         if (api == .responses) {
-            try responses_request.validate_effort(wire_id, try wire.field(request, "reasoning_effort"));
             try responses_request.apply_model_grammar(alloc, wire_id, &body);
         }
         const handle = try std.fmt.allocPrint(alloc, "prepared-{d}", .{id});
@@ -87,13 +86,6 @@ fn chat_body(alloc: Allocator, request: Value) !Value {
     try wire.put(alloc, &body, "messages", try messages(alloc, try wire.field(request, "messages")));
     const effort = try wire.field(request, "reasoning_effort");
     if (effort != .null) {
-        const label = try wire.text(effort);
-        var valid = false;
-        for (allowed_efforts) |allowed| if (std.mem.eql(u8, label, allowed)) {
-            valid = true;
-            break;
-        };
-        if (!valid) return error.InvalidReasoningEffort;
         try wire.put(alloc, &body, "reasoning_effort", effort);
     }
     const output_limit = try wire.field(request, "max_output_tokens");

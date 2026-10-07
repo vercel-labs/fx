@@ -3,9 +3,7 @@ const std = @import("std");
 const wire = @import("wire.zig");
 const image_parts = @import("image_parts.zig");
 const replay = @import("replay.zig");
-const common_efforts = [_][]const u8{ "low", "medium", "high", "xhigh" };
 const contributor_model = "muse-spark-1.3-contributor";
-const contributor_minimal = "minimal";
 const encrypted_include = "reasoning.encrypted_content";
 const function_groups = [_][]const u8{ "functions", "additional_functions", "dynamic_functions" };
 const message_roles = [_][]const u8{ "system", "developer", "user", "assistant" };
@@ -29,15 +27,6 @@ pub fn apply_model_grammar(alloc: wire.Allocator, model: []const u8, body: *wire
         // Contributor rejects pre-tool assistant text unless it is marked as commentary.
         if (std.mem.eql(u8, try wire.text(kind), call_type)) try wire.put(alloc, item, "phase", wire.string(commentary_phase));
     }
-}
-
-/// Model-specific effort admission prevents a global preference from changing provider semantics.
-pub fn validate_effort(model: []const u8, effort: wire.Value) !void {
-    if (effort == .null) return;
-    const label = try wire.text(effort);
-    for (common_efforts) |allowed| if (std.mem.eql(u8, label, allowed)) return;
-    if (std.mem.eql(u8, model, contributor_model) and std.mem.eql(u8, label, contributor_minimal)) return;
-    return error.InvalidReasoningEffort;
 }
 
 /// All returned values belong to the caller's request arena, including decoded replay strings.
