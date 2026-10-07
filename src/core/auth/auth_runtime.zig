@@ -1499,7 +1499,8 @@ pub const Runtime = struct {
                     self,
                     loadRuntimeCredentialSource,
                 ),
-            .gateway => if (model_provider.authorizesCredential(.gateway, self.credentialSource()))
+            // An absent source preserves deferred onboarding; transport admission still requires Gateway-owned credentials.
+            .gateway => if (self.credentialSource() == null or model_provider.authorizesCredential(.gateway, self.credentialSource()))
                 false
             else
                 @as(?bool, try self.reselectByPrecedenceWithDeps(
