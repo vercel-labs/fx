@@ -3,12 +3,16 @@ const std = @import("std");
 const wire = @import("wire.zig");
 const sse = @import("sse.zig");
 const responses_sse = @import("responses_sse.zig");
+const messages_sse = @import("messages_sse.zig");
 const stream_result = @import("stream_result.zig");
 const body_buffer_bytes = 8192;
 const transfer_buffer_bytes = 16 * 1024;
 const content_type = "application/json";
 const user_agent = "fx-opencode-go/1";
 const session_header = "x-opencode-session";
+const api_key_header = "x-api-key";
+const version_header = "anthropic-version";
+const messages_version = "2023-06-01";
 const ipv6_loopback_address = "::1";
 const ipv6_loopback_host = "[::1]";
 const default_http_port = 80;
@@ -17,8 +21,6 @@ const managed_headers = [_][]const u8{ "authorization", "proxy-authorization", "
 
 /// Job owns request parameters and socket publication throughout this synchronous worker call.
 pub fn run(job: anytype) !void {
-    // Prepared family identity remains authoritative after its single-use handle moves to a worker.
-    if (job.prepared.api == .messages) return error.UnsupportedApi;
     var arena = std.heap.ArenaAllocator.init(job.alloc);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -33,6 +35,7 @@ pub fn run(job: anytype) !void {
     var iter = header_values.object.iterator();
     while (iter.next()) |entry| {
         for (managed_headers) |managed| if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, managed)) return error.InvalidHeaders;
+        if (job.prepared.api == .messages and (std.ascii.eqlIgnoreCase(entry.key_ptr.*, api_key_header) or std.ascii.eqlIgnoreCase(entry.key_ptr.*, version_header))) return error.InvalidHeaders;
         const value = try wire.text(entry.value_ptr.*);
         if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, session_header)) {
             if (session_present or value.len == 0) return error.InvalidHeaders;
@@ -42,7 +45,13 @@ pub fn run(job: anytype) !void {
         try headers.append(alloc, .{ .name = entry.key_ptr.*, .value = value });
     }
     if (!session_present) return error.InvalidHeaders;
-    const authorization = try std.fmt.allocPrint(alloc, "Bearer {s}", .{credential});
+    // Prepared family owns authentication; user bindings cannot replace either Messages header.
+    if (job.prepared.api == .messages) {
+        try headers.append(alloc, .{ .name = api_key_header, .value = credential });
+        try headers.append(alloc, .{ .name = version_header, .value = messages_version });
+    }
+    // Messages sends the managed key directly, avoiding an unused second credential copy.
+    const authorization = if (job.prepared.api == .messages) try alloc.alloc(u8, 0) else try std.fmt.allocPrint(alloc, "Bearer {s}", .{credential});
     defer std.crypto.secureZero(u8, authorization);
     var client = std.http.Client{ .allocator = alloc, .io = job.io };
     defer client.deinit();
@@ -72,7 +81,7 @@ pub fn run(job: anytype) !void {
         };
         break :prepared_request try client.request(.POST, uri, .{ .connection = connection, .headers = .{
             .content_type = .{ .override = content_type },
-            .authorization = .{ .override = authorization },
+            .authorization = if (job.prepared.api == .messages) .omit else .{ .override = authorization },
             .accept_encoding = .omit,
             .user_agent = .{ .override = user_agent },
         }, .extra_headers = headers.items, .keep_alive = false, .redirect_behavior = .unhandled });
@@ -98,7 +107,7 @@ pub fn run(job: anytype) !void {
             try context.consume(response.reader(&transfer_buffer));
         },
         .responses => try responses_sse.consume(&result, response.reader(&transfer_buffer)),
-        .messages => return error.UnsupportedApi,
+        .messages => try messages_sse.consume(&result, response.reader(&transfer_buffer)),
     }
     if (job.cancel.load(.seq_cst)) return error.Cancelled;
     try result.reply();

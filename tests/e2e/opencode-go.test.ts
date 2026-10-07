@@ -98,7 +98,21 @@ const RESPONSES_FUNCTION = { name: "declared_tool", description: "Fixture tool",
 const RESPONSES_CONTEXT_WINDOW = 1000000;
 const RESPONSES_CATALOG_FILENAME = "models.json";
 const RESPONSES_FAILURES = ["lost-completion", "truncated-completion", "failed", "incomplete", "wrong-status", "provider-error", "conflicting-id", "wrong-item-id", "bad-arguments", "missing-terminal-call", "replay-injection", "negative-usage", "unfinished-item", "completed-with-error", "empty-call-id", "duplicate-call-id", "undeclared-call", "argument-mismatch"];
-const TTY_APIS = ["chat", "responses"];
+const MESSAGES_MODELS = [
+  { id: "qwen3.8-flash", effort: "medium", efforts: ["low", "medium", "xhigh"] },
+  { id: "qwen3.8-max", effort: "xhigh", efforts: ["low", "medium", "xhigh"] },
+];
+const MESSAGES_OUTPUT_CAP = 131072;
+const MESSAGES_VERSION = "2023-06-01";
+const MESSAGES_THINKING = { type: "thinking", thinking: RESPONSES_REASONING_TEXT, signature: "opaque-fixture-signature" };
+const MESSAGES_REDACTED = { type: "redacted_thinking", data: "opaque-fixture-redacted" };
+const MESSAGES_CACHE_CREATED = 5;
+const MESSAGES_CACHE_READ = 7;
+const MESSAGES_TOTAL_INPUT = INPUT_TOKENS + MESSAGES_CACHE_CREATED + MESSAGES_CACHE_READ;
+const MESSAGES_MAX_INTEGER = "9223372036854775807";
+const MESSAGES_FAILURES = ["lost-stop", "truncated-stop", "missing-reason", "unknown-reason", "open-block", "missing-start", "duplicate-start", "wrong-index", "wrong-delta", "late-delta", "reopened-block", "bad-arguments", "conflicting-id", "duplicate-call-id", "missing-signature", "signature-control", "thinking-after-signature", "replay-injection", "negative-usage", "negative-cache", "cache-without-input", "usage-overflow", "provider-error", "tools-with-end-turn", "tool-reason-without-call", "initial-input-conflict", "signature-limit", "aggregate-replay"];
+const MESSAGES_HEADER_CONFLICTS = ["x-api-key", "X-API-Key", "anthropic-version", "ANTHROPIC-VERSION", "Authorization"];
+const TTY_APIS = ["chat", "responses", "messages"];
 const tuiTest = tmuxAvailable() ? test : test.skip;
 const homes: string[] = [];
 afterEach(() => { for (const home of homes.splice(0)) cleanupIsolatedTestHome(home); });
@@ -125,6 +139,16 @@ function responsesProfile(port: number, model = RESPONSES_MODELS[0]): string {
   return home;
 }
 
+// Disposable Qwen choices keep unshipped product catalog metadata outside the implementation checkpoint.
+function messagesProfile(port: number, model = MESSAGES_MODELS[0]): string {
+  const home = responsesProfile(port, model);
+  const catalogPath = join(home, PROFILE_DIRECTORY, FIXTURE_EXTENSION_DIRECTORY, RESPONSES_CATALOG_FILENAME);
+  const catalog = JSON.parse(readFileSync(catalogPath, "utf8"));
+  catalog.models.find((item: any) => item.id === model.id).max_output_tokens = MESSAGES_OUTPUT_CAP;
+  writeFileSync(catalogPath, JSON.stringify(catalog));
+  return home;
+}
+
 // Small network fragments prove SSE framing against actual sockets, including CRLF boundaries.
 function responsesReply(chunks: unknown[], fragmented = false): Response {
   const bytes = new TextEncoder().encode(chunks.map(chunk => "data: " + JSON.stringify(chunk) + "\r\n\r\n").join(""));
@@ -137,6 +161,51 @@ function responsesReply(chunks: unknown[], fragmented = false): Response {
 // Final snapshots are mandatory evidence for every streamed call and encrypted reasoning item.
 function responsesCompleted(output: unknown[] = [], status = "completed", usage = { input_tokens: INPUT_TOKENS, output_tokens: OUTPUT_TOKENS }) {
   return { type: "response.completed", response: { status, output, usage } };
+}
+
+// Messages terminal evidence must remain separate from the typed block lifecycle.
+function messagesStart() {
+  return { type: "message_start", message: { type: "message", role: "assistant", content: [],
+    usage: { input_tokens: INPUT_TOKENS, output_tokens: 0 } } };
+}
+
+// Cumulative output usage replaces the start count instead of summing streaming snapshots.
+function messagesTerminal(reason = "end_turn") {
+  return [{ type: "message_delta", delta: { stop_reason: reason }, usage: { input_tokens: INPUT_TOKENS, output_tokens: OUTPUT_TOKENS,
+    cache_creation_input_tokens: MESSAGES_CACHE_CREATED, cache_read_input_tokens: MESSAGES_CACHE_READ } }, { type: "message_stop" }];
+}
+
+// Indexed typed blocks expose API gaps while canonical calls retain dense native indexes.
+function messagesText(text: string, index = 0) {
+  return [{ type: "content_block_start", index, content_block: { type: "text", text: "" } },
+    { type: "content_block_delta", index, delta: { type: "text_delta", text } }, { type: "content_block_stop", index }];
+}
+
+// Typed thinking fragments are replayed only after both the block and message close.
+function messagesThinking() {
+  const midpoint = Math.floor(MESSAGES_THINKING.signature.length / 2);
+  return [{ type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "", signature: "" } },
+    { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: MESSAGES_THINKING.thinking } },
+    ...[MESSAGES_THINKING.signature.slice(0, midpoint), MESSAGES_THINKING.signature.slice(midpoint)].map(signature => ({ type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature } })),
+    { type: "content_block_stop", index: 0 }, { type: "content_block_start", index: 1, content_block: MESSAGES_REDACTED }, { type: "content_block_stop", index: 1 }];
+}
+
+// Fragmented JSON reaches the actual socket worker before native tool execution is permitted.
+function messagesTool(argumentsJson: string, index = 0, name = "write_file", id = TOOL_ID) {
+  const midpoint = Math.floor(argumentsJson.length / 2);
+  return [{ type: "content_block_start", index, content_block: { type: "tool_use", id, name, input: {} } },
+    ...[argumentsJson.slice(0, midpoint), argumentsJson.slice(midpoint)].map(partial_json => ({ type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json } })),
+    { type: "content_block_stop", index }];
+}
+
+// Native nullable request fields exercise schema, role merging and family-bound replay via RPC.
+function messagesRequest(state: string | null = null) {
+  const request = responseRequest(state);
+  request.reasoning_effort = MESSAGES_MODELS[0].effort;
+  request.tool_choice = "auto";
+  request.messages.splice(2, 0, { role: "user", content: SCHEMA_PROMPT, images: [], tool_call_id: null, tool_calls: [], provider_state_json: null });
+  request.messages.push({ role: "user", content: TUI_PROMPT, images: [], tool_call_id: null, tool_calls: [], provider_state_json: null });
+  return request;
 }
 
 // Exercising the public provider RPC covers declared schemas unavailable through the CLI.
@@ -187,6 +256,228 @@ function responseRequest(state: string | null = null) {
 }
 
 describe("native OpenCode Go extension", () => {
+  // Both Qwen identities exercise the full native tool runtime with immutable image admission.
+  test.each(MESSAGES_MODELS)("Messages $id preserves fragmented thinking, native tools and image snapshots", async model => {
+    const requests: any[] = [];
+    let home = "";
+    const server = Bun.serve({ hostname: HOST, port: 0, async fetch(request) {
+      const body = await request.json();
+      requests.push({ body, path: new URL(request.url).pathname, key: request.headers.get("x-api-key"), version: request.headers.get("anthropic-version"), authorization: request.headers.get("authorization") });
+      if (requests.length === 1) {
+        writeFileSync(join(home, IMAGE_FILENAME), CHANGED_SOURCE);
+        const thinking = messagesThinking();
+        // Qwen documents empty signatures; opaque nonempty replay remains a separate grammar case.
+        if (model.id === MESSAGES_MODELS[0].id) for (const event of thinking) if (event.type === "content_block_delta" && event.delta?.type === "signature_delta") event.delta.signature = "";
+        return responsesReply([messagesStart(), ...thinking, ...messagesText(RESPONSES_PREAMBLE, 2),
+          ...messagesTool(JSON.stringify({ path: join(home, TOOL_FILENAME) }), 3, "read_file"), ...messagesTerminal("tool_use")], true);
+      }
+      return responsesReply([messagesStart(), ...messagesText(RESULT), ...messagesTerminal()], true);
+    } });
+    home = messagesProfile(server.port, model);
+    homes.push(home);
+    writeFileSync(join(home, TOOL_FILENAME), TOOL_CONTENT);
+    const image = join(home, IMAGE_FILENAME);
+    copyFileSync(IMAGE_FIXTURE, image);
+    try {
+      const child = Bun.spawn([FX_BIN, "ask", "--json", "--image", image, IMAGE_PROMPT], { cwd: home, stdout: "pipe", stderr: "pipe", env: goEnvironment(home) });
+      const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+      expect(code, JSON.stringify({ stdout, stderr })).toBe(0);
+      const output = JSON.parse(stdout);
+      expect(output.output).toBe(RESPONSES_TEXT_TOOL_OUTPUT);
+      expect(requests).toHaveLength(2);
+      for (const { body, path, key, version, authorization } of requests) {
+        expect(path).toBe("/v1/messages");
+        expect(key).toBe(KEY);
+        expect(version).toBe(MESSAGES_VERSION);
+        expect(authorization).toBeNull();
+        expect(body.max_tokens).toBe(MESSAGES_OUTPUT_CAP);
+        expect(body.model).toBe(model.id);
+        expect(body.output_config).toEqual({ effort: model.effort });
+        expect(body.system.every((item: any) => item.type === "text")).toBe(true);
+        expect(body.messages.every((item: any) => item.role === "user" || item.role === "assistant")).toBe(true);
+        expect(body.messages.flatMap((item: any) => item.content).find((item: any) => item.type === "image")).toEqual({ type: "image", source: { type: "base64", media_type: "image/png", data: readFileSync(IMAGE_FIXTURE).toString("base64") } });
+        expect(body.tools.find((tool: any) => tool.name === "read_file").input_schema.properties.path).toBeTruthy();
+        expect(body.reasoning_effort).toBeUndefined();
+        expect(body.stream_options).toBeUndefined();
+      }
+      const assistant = requests[1].body.messages.find((item: any) => item.role === "assistant");
+      expect(assistant.content).toEqual([{ ...MESSAGES_THINKING, signature: model.id === MESSAGES_MODELS[0].id ? "" : MESSAGES_THINKING.signature }, MESSAGES_REDACTED,
+        { type: "text", text: RESPONSES_PREAMBLE }, { type: "tool_use", id: TOOL_ID, name: "read_file", input: { path: join(home, TOOL_FILENAME) } }]);
+      expect(requests[1].body.messages.flatMap((item: any) => item.content).find((item: any) => item.type === "tool_result")).toMatchObject({ type: "tool_result", tool_use_id: TOOL_ID });
+      expect(requests[1].body.messages.flatMap((item: any) => item.content).find((item: any) => item.type === "tool_result").content).toContain(TOOL_CONTENT);
+      const saved = JSON.parse(readFileSync(join(home, SESSION_RELATIVE_DIRECTORY, output.session_id, SESSION_FILENAME), "utf8"));
+      expect(saved.total_input_tokens).toBe(MESSAGES_TOTAL_INPUT);
+      expect(saved.total_output_tokens).toBe(OUTPUT_TOKENS);
+      expect(readFileSync(image, "utf8")).toBe(CHANGED_SOURCE);
+      expect(JSON.stringify(requests)).not.toContain(image);
+      expect(JSON.stringify(requests)).not.toContain("snapshot_path");
+      expect(stdout + stderr).not.toContain(KEY);
+    } finally { server.stop(true); }
+  }, TIMEOUT_MS);
+
+  // RPC covers schema fields, model limits and replay boundaries unavailable through native CLI flags.
+  test("Messages schema, effort, grouped history and replay use the actual provider RPC", async () => {
+    const bodies: any[] = [];
+    const server = Bun.serve({ hostname: HOST, port: 0, async fetch(request) {
+      bodies.push(await request.json());
+      return responsesReply([messagesStart(), ...messagesText(SCHEMA_OUTPUT), ...messagesTerminal()]);
+    } });
+    const peer = providerRpc();
+    const prepare = (request: any, cap: number | null = MESSAGES_OUTPUT_CAP) => peer.rpc("provider.prepare", { provider: { id: SCHEMA_PROVIDER, base_url: SCHEMA_BASE_PREFIX + HOST + ":" + server.port + SCHEMA_BASE_PATH }, model: { wire_id: MESSAGES_MODELS[0].id, max_output_tokens: cap }, request });
+    try {
+      await peer.rpc("initialize", { version: RPC_VERSION });
+      const states = [null, JSON.stringify([{ reasoning_content: "legacy-chat" }]), JSON.stringify([{ api: "responses", items: [RESPONSES_REASONING] }]),
+        JSON.stringify([{ api: "messages", items: [MESSAGES_THINKING, MESSAGES_REDACTED] }]), JSON.stringify([{ api: "messages", items: [{ ...MESSAGES_THINKING, signature: "" }] }])];
+      for (const state of states) {
+        const prepared = await prepare(messagesRequest(state));
+        const completed = await peer.rpc("provider.stream", { handle: prepared.handle, credential: KEY, headers: { "x-opencode-session": SCHEMA_SESSION }, session_id: SCHEMA_SESSION });
+        expect(completed.content).toBe(SCHEMA_OUTPUT);
+        expect(completed.finish_reason).toBe("stop");
+        expect(completed.usage).toEqual({ input_tokens: MESSAGES_TOTAL_INPUT, output_tokens: OUTPUT_TOKENS });
+        const body = bodies.at(-1);
+        expect(body.output_config).toEqual({ effort: MESSAGES_MODELS[0].effort, format: { type: "json_schema", schema: SCHEMA } });
+        expect(body.max_tokens).toBe(SCHEMA_OUTPUT_LIMIT);
+        expect(body.system).toEqual([{ type: "text", text: RESPONSES_SYSTEM_POLICY }, { type: "text", text: RESPONSES_DEVELOPER_POLICY }]);
+        expect(body.messages.map((item: any) => item.role)).toEqual(["user", "assistant", "user", "assistant", "user"]);
+        expect(body.messages.at(-1).content).toEqual([{ type: "text", text: SCHEMA_PROMPT }, { type: "text", text: TUI_PROMPT }]);
+        expect(body.messages[1].content.find((item: any) => item.type === "tool_use")).toEqual({ type: "tool_use", id: RESPONSES_HISTORY_CALL.id, name: RESPONSES_HISTORY_CALL.name, input: {} });
+        expect(body.messages[2].content[0]).toEqual({ type: "tool_result", tool_use_id: RESPONSES_HISTORY_CALL.id, content: TOOL_CONTENT });
+        expect(body.messages[1].content.filter((item: any) => item.type === "thinking")).toHaveLength(state?.includes('"api":"messages"') ? 1 : 0);
+        expect(body.tool_choice).toEqual({ type: "auto", disable_parallel_tool_use: true });
+        expect(body.tools).toEqual(Array.from({ length: 3 }, () => ({ name: RESPONSES_FUNCTION.name, description: RESPONSES_FUNCTION.description, input_schema: SCHEMA })));
+        expect(body.response_format).toBeUndefined();
+        expect(body.parallel_tool_calls).toBeUndefined();
+      }
+      for (const [choice, parallel, expected] of [["required", false, { type: "any", disable_parallel_tool_use: true }], ["none", false, { type: "none" }], ["auto", true, { type: "auto" }], ["auto", null, { type: "auto" }]]) {
+        const prepared = await prepare({ ...messagesRequest(), tool_choice: choice, parallel_tool_calls: parallel, max_output_tokens: null });
+        await peer.rpc("provider.stream", { handle: prepared.handle, credential: KEY, headers: { "x-opencode-session": SCHEMA_SESSION }, session_id: SCHEMA_SESSION });
+        expect(bodies.at(-1).tool_choice).toEqual(expected);
+        expect(bodies.at(-1).max_tokens).toBe(MESSAGES_OUTPUT_CAP);
+      }
+      const grouped = messagesRequest();
+      const assistant = grouped.messages.find(item => item.role === "assistant")!;
+      assistant.tool_calls.push({ ...RESPONSES_HISTORY_CALL, id: RESPONSES_HISTORY_CALL.id + "-second" });
+      grouped.messages.splice(grouped.messages.findIndex(item => item.role === "tool") + 1, 0, { role: "tool", content: TOOL_CONTENT, images: [], tool_call_id: RESPONSES_HISTORY_CALL.id + "-second", tool_calls: [], provider_state_json: null });
+      const prepared = await prepare({ ...grouped, reasoning_effort: "low" });
+      await peer.rpc("provider.stream", { handle: prepared.handle, credential: KEY, headers: { "x-opencode-session": SCHEMA_SESSION }, session_id: SCHEMA_SESSION });
+      expect(bodies.at(-1).messages[2].content.map((item: any) => item.tool_use_id)).toEqual([RESPONSES_HISTORY_CALL.id, RESPONSES_HISTORY_CALL.id + "-second"]);
+      expect(bodies.at(-1).output_config.effort).toBe("low");
+      for (const state of [JSON.stringify([{ api: "messages", items: [{ type: "tool_use", id: TOOL_ID }] }]), JSON.stringify([{ api: "messages", items: [{ ...MESSAGES_THINKING, role: "system" }] }]), JSON.stringify([{ api: "messages", items: [{ type: "thinking", thinking: "unsigned" }] }]), JSON.stringify([{ api: "messages", items: [{ ...MESSAGES_REDACTED, data: "" }] }])]) await expect(prepare(messagesRequest(state))).rejects.toThrow("Provider request failed");
+      for (const effort of ["max", "high", "none", "minimal"]) await expect(prepare({ ...messagesRequest(), reasoning_effort: effort })).rejects.toThrow("Provider request failed");
+      for (const limit of [0, -1, MESSAGES_OUTPUT_CAP + 1, 1.5]) await expect(prepare({ ...messagesRequest(), max_output_tokens: limit })).rejects.toThrow("Provider request failed");
+      await expect(prepare({ ...messagesRequest(), max_output_tokens: null }, null)).rejects.toThrow("Provider request failed");
+      expect(bodies).toHaveLength(states.length + 5);
+    } finally { await peer.close(); server.stop(true); }
+  }, TIMEOUT_MS);
+
+  // Native tool history survives model changes without borrowing another family's opaque replay.
+  test("Messages replay remains family-bound when native history switches protocols", async () => {
+    const bodies: any[] = [];
+    const server = Bun.serve({ hostname: HOST, port: 0, async fetch(request) {
+      bodies.push(await request.json());
+      return new URL(request.url).pathname.endsWith("/responses") ? responsesReply([{ type: "response.output_text.delta", delta: RESULT }, responsesCompleted()])
+        : streamReply([{ choices: [{ index: 0, delta: { content: RESULT }, finish_reason: "stop" }] }]);
+    } });
+    const peer = providerRpc();
+    try {
+      await peer.rpc("initialize", { version: RPC_VERSION });
+      for (const wire of [SCHEMA_MODEL, RESPONSES_MODELS[0].id]) {
+        const request = responseRequest(JSON.stringify([{ api: "messages", items: [MESSAGES_THINKING, MESSAGES_REDACTED] }]));
+        request.reasoning_effort = wire === SCHEMA_MODEL ? "max" : "high";
+        const prepared = await peer.rpc("provider.prepare", { provider: { id: SCHEMA_PROVIDER, base_url: SCHEMA_BASE_PREFIX + HOST + ":" + server.port + SCHEMA_BASE_PATH }, model: { wire_id: wire }, request });
+        const completed = await peer.rpc("provider.stream", { handle: prepared.handle, credential: KEY, headers: { "x-opencode-session": SCHEMA_SESSION }, session_id: SCHEMA_SESSION });
+        expect(completed.content).toBe(RESULT);
+        expect(JSON.stringify(bodies.at(-1))).not.toContain(MESSAGES_THINKING.signature);
+        expect(JSON.stringify(bodies.at(-1))).not.toContain(MESSAGES_REDACTED.data);
+        expect(JSON.stringify(bodies.at(-1))).toContain(RESPONSES_HISTORY_CALL.id);
+        expect(JSON.stringify(bodies.at(-1))).toContain(TOOL_CONTENT);
+        expect(JSON.stringify(bodies.at(-1))).toContain(RESPONSES_HISTORY_TEXT);
+      }
+    } finally { await peer.close(); server.stop(true); }
+  }, TIMEOUT_MS);
+
+  // Recognized non-tool stops still require message_stop and retain their native finish semantics.
+  test.each(["max_tokens", "stop_sequence"])("Messages %s maps a complete terminal reason", async reason => {
+    const server = Bun.serve({ hostname: HOST, port: 0, fetch() { return responsesReply([messagesStart(), ...messagesText(RESULT), ...messagesTerminal(reason)]); } });
+    const peer = providerRpc();
+    try {
+      await peer.rpc("initialize", { version: RPC_VERSION });
+      const prepared = await peer.rpc("provider.prepare", { provider: { id: SCHEMA_PROVIDER, base_url: SCHEMA_BASE_PREFIX + HOST + ":" + server.port + SCHEMA_BASE_PATH }, model: { wire_id: MESSAGES_MODELS[0].id, max_output_tokens: MESSAGES_OUTPUT_CAP }, request: messagesRequest() });
+      const completed = await peer.rpc("provider.stream", { handle: prepared.handle, credential: KEY, headers: { "x-opencode-session": SCHEMA_SESSION }, session_id: SCHEMA_SESSION });
+      expect(completed.content).toBe(RESULT);
+      expect(completed.finish_reason).toBe(reason === "max_tokens" ? "length" : "stop");
+    } finally { await peer.close(); server.stop(true); }
+  }, TIMEOUT_MS);
+
+  // Caller bindings cannot override managed Messages authentication or version negotiation.
+  test.each(MESSAGES_HEADER_CONFLICTS)("Messages rejects conflicting %s header before HTTP", async header => {
+    let requests = 0;
+    const server = Bun.serve({ hostname: HOST, port: 0, fetch() { requests++; return responsesReply([messagesStart(), ...messagesTerminal()]); } });
+    const peer = providerRpc();
+    try {
+      await peer.rpc("initialize", { version: RPC_VERSION });
+      const prepared = await peer.rpc("provider.prepare", { provider: { id: SCHEMA_PROVIDER, base_url: SCHEMA_BASE_PREFIX + HOST + ":" + server.port + SCHEMA_BASE_PATH }, model: { wire_id: MESSAGES_MODELS[0].id, max_output_tokens: MESSAGES_OUTPUT_CAP }, request: messagesRequest() });
+      await expect(peer.rpc("provider.stream", { handle: prepared.handle, credential: KEY, headers: { "x-opencode-session": SCHEMA_SESSION, [header]: HEADER_VALUE }, session_id: SCHEMA_SESSION })).rejects.toThrow("Provider request failed");
+      expect(requests).toBe(0);
+    } finally { await peer.close(); server.stop(true); }
+  }, TIMEOUT_MS);
+
+  // Unclosed, cross-typed or malformed blocks never authorize real native filesystem effects.
+  test.each(MESSAGES_FAILURES)("Messages %s rejects incomplete or hostile stream", async mode => {
+    let requests = 0;
+    let home = "";
+    const server = Bun.serve({ hostname: HOST, port: 0, fetch() {
+      requests++;
+      const tool = messagesTool(JSON.stringify({ path: join(home, TOOL_FILENAME), content: TOOL_CONTENT }));
+      const start = messagesStart();
+      const terminal = messagesTerminal("tool_use");
+      if (mode === "lost-stop") return responsesReply([start, ...tool, terminal[0]]);
+      if (mode === "truncated-stop") return new Response([start, ...tool, terminal[0]].map(event => "data: " + JSON.stringify(event) + "\n\n").join("") + "data: " + JSON.stringify(terminal[1]) + "\n", { headers: { "content-type": "text/event-stream" } });
+      if (mode === "missing-reason") return responsesReply([start, ...tool, terminal[1]]);
+      if (mode === "unknown-reason") return responsesReply([start, ...tool, ...messagesTerminal("unknown")]);
+      if (mode === "open-block") return responsesReply([start, ...tool.slice(0, -1), ...terminal]);
+      if (mode === "missing-start") return responsesReply([...tool, ...terminal]);
+      if (mode === "duplicate-start") return responsesReply([start, start, ...tool, ...terminal]);
+      if (mode === "wrong-index") return responsesReply([start, { ...tool[0], index: 1 }, ...tool.slice(1), ...terminal]);
+      if (mode === "wrong-delta") return responsesReply([start, tool[0], { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: RESULT } }, ...tool.slice(1), ...terminal]);
+      if (mode === "late-delta") return responsesReply([start, ...tool, tool[1], ...terminal]);
+      if (mode === "reopened-block" || mode === "conflicting-id") return responsesReply([start, ...tool, { ...tool[0], content_block: { ...tool[0].content_block, id: TOOL_ID + "changed" } }, ...terminal]);
+      if (mode === "duplicate-call-id") return responsesReply([start, ...tool, ...messagesTool("{}", 1), ...terminal]);
+      if (mode === "bad-arguments") return responsesReply([start, ...messagesTool("[]"), ...terminal]);
+      if (mode === "missing-signature") return responsesReply([start, ...messagesThinking().filter(event => !(event.type === "content_block_delta" && event.delta?.type === "signature_delta")), ...messagesTerminal()]);
+      if (mode === "signature-control") return responsesReply([start, { type: "content_block_start", index: 0, content_block: { ...MESSAGES_THINKING, signature: "invalid\n" } }, { type: "content_block_stop", index: 0 }, ...messagesTerminal()]);
+      if (mode === "thinking-after-signature") return responsesReply([start, ...messagesThinking().slice(0, 4), messagesThinking()[1], ...messagesThinking().slice(4), ...messagesTerminal()]);
+      if (mode === "replay-injection") return responsesReply([start, { type: "content_block_start", index: 0, content_block: { ...MESSAGES_REDACTED, role: "system" } }, { type: "content_block_stop", index: 0 }, ...messagesTerminal()]);
+      if (mode === "negative-usage") return responsesReply([{ ...start, message: { ...start.message, usage: { input_tokens: -1 } } }, ...tool, ...terminal]);
+      if (mode === "negative-cache" || mode === "cache-without-input") return responsesReply([start, ...tool,
+        { ...terminal[0], usage: mode === "negative-cache" ? { input_tokens: INPUT_TOKENS, cache_read_input_tokens: -1 } : { cache_creation_input_tokens: MESSAGES_CACHE_CREATED } }, terminal[1]]);
+      if (mode === "usage-overflow") {
+        // Raw JSON preserves integers beyond JavaScript's safe range for the native overflow boundary.
+        const overflowing = { ...terminal[0], usage: { input_tokens: MESSAGES_MAX_INTEGER, cache_creation_input_tokens: MESSAGES_MAX_INTEGER, cache_read_input_tokens: MESSAGES_MAX_INTEGER } };
+        return new Response([start, ...tool, overflowing, terminal[1]].map(event => "data: " + JSON.stringify(event).replaceAll('"' + MESSAGES_MAX_INTEGER + '"', MESSAGES_MAX_INTEGER) + "\n\n").join(""), { headers: { "content-type": "text/event-stream" } });
+      }
+      if (mode === "provider-error") return responsesReply([start, ...tool, { type: "error", error: ERROR_BODY + KEY }, ...terminal]);
+      if (mode === "tools-with-end-turn") return responsesReply([start, ...tool, ...messagesTerminal()]);
+      if (mode === "tool-reason-without-call") return responsesReply([start, ...messagesText(RESULT), ...terminal]);
+      if (mode === "initial-input-conflict") return responsesReply([start, { ...tool[0], content_block: { ...tool[0].content_block, input: { value: RESULT } } }, ...tool.slice(1), ...terminal]);
+      if (mode === "signature-limit") return responsesReply([start, { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "", signature: "" } },
+        ...Array.from({ length: 2 }, () => ({ type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "x".repeat(LARGE_ARGUMENT_BYTES) } })), { type: "content_block_stop", index: 0 }, ...messagesTerminal()]);
+      return responsesReply([start, ...Array.from({ length: 15 }, (_, index) => [{ type: "content_block_start", index, content_block: { ...MESSAGES_REDACTED, data: "x".repeat(LARGE_ARGUMENT_BYTES) } }, { type: "content_block_stop", index }]).flat(), ...messagesTerminal()]);
+    } });
+    home = messagesProfile(server.port);
+    homes.push(home);
+    try {
+      const child = Bun.spawn([FX_BIN, "ask", "--json", "--no-save", TUI_PROMPT], { cwd: home, stdout: "pipe", stderr: "pipe", env: goEnvironment(home) });
+      const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+      expect(code, JSON.stringify({ stdout, stderr })).toBe(1);
+      expect(JSON.parse(stdout).error).toBe("ExtensionRpcFailed");
+      expect(requests).toBe(1);
+      expect(stdout + stderr).not.toContain(KEY);
+      expect(stdout + stderr).not.toContain(ERROR_BODY);
+      expect(() => readFileSync(join(home, TOOL_FILENAME))).toThrow();
+    } finally { server.stop(true); }
+  }, TIMEOUT_MS);
+
   // Both selected Responses identities must preserve real tools, images, replay and persisted usage.
   test.each(RESPONSES_MODELS)("Responses $id completes fragmented reasoning and native tool continuation", async model => {
     const requests: any[] = [];
@@ -580,13 +871,13 @@ describe("native OpenCode Go extension", () => {
       sessions.push(request.headers.get("x-opencode-session"));
       return new Response(new ReadableStream({
         start(controller) {
-          const early = api === "responses" ? { type: "response.output_text.delta", delta: STREAM_PREFIX } : { choices: [{ index: 0, delta: { content: STREAM_PREFIX } }] };
-          controller.enqueue(encoder.encode("data: " + JSON.stringify(early) + "\n\n"));
+          const early = api === "responses" ? [{ type: "response.output_text.delta", delta: STREAM_PREFIX }] : api === "messages" ? [messagesStart(), ...messagesText(STREAM_PREFIX).slice(0, -1)] : [{ choices: [{ index: 0, delta: { content: STREAM_PREFIX } }] }];
+          controller.enqueue(encoder.encode(early.map(event => "data: " + JSON.stringify(event) + "\n\n").join("")));
           const timer = setTimeout(() => {
             timers.delete(timer);
             completed++;
-            const final = api === "responses" ? [{ type: "response.output_text.delta", delta: RESULT }, responsesCompleted()] : [{ choices: [{ index: 0, delta: { content: RESULT }, finish_reason: "stop" }] }];
-            controller.enqueue(encoder.encode(final.map(event => "data: " + JSON.stringify(event) + "\n\n").join("") + (api === "responses" ? "" : "data: [DONE]\n\n")));
+            const final = api === "responses" ? [{ type: "response.output_text.delta", delta: RESULT }, responsesCompleted()] : api === "messages" ? [...messagesText(RESULT).slice(1), ...messagesTerminal()] : [{ choices: [{ index: 0, delta: { content: RESULT }, finish_reason: "stop" }] }];
+            controller.enqueue(encoder.encode(final.map(event => "data: " + JSON.stringify(event) + "\n\n").join("") + (api === "chat" ? "data: [DONE]\n\n" : "")));
             controller.close();
           }, STREAM_DELAY_MS);
           timers.add(timer);
@@ -594,7 +885,7 @@ describe("native OpenCode Go extension", () => {
         cancel() { cancelled++; for (const timer of timers) clearTimeout(timer); timers.clear(); },
       }), { headers: { "content-type": "text/event-stream" } });
     } });
-    const home = api === "responses" ? responsesProfile(server.port) : createGoProfile(server.port);
+    const home = api === "responses" ? responsesProfile(server.port) : api === "messages" ? messagesProfile(server.port) : createGoProfile(server.port);
     homes.push(home);
     const stderrPath = join(home, STDERR_FILENAME);
     let session: TmuxSession | undefined;

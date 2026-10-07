@@ -4,12 +4,15 @@ const wire = @import("wire.zig");
 const image_parts = @import("image_parts.zig");
 const routes = @import("routes.zig");
 const responses_request = @import("responses_request.zig");
+const messages_request = @import("messages_request.zig");
 const replay = @import("replay.zig");
 const Allocator = wire.Allocator;
 const Value = wire.Value;
 const provider_id = "opencode-go";
 const completion_path = "/chat/completions";
 const responses_path = "/responses";
+const messages_path = "/messages";
+const max_output_limit = std.math.maxInt(u32);
 const path_separator = "/";
 const allowed_efforts = [_][]const u8{ "low", "high", "max" };
 
@@ -35,19 +38,34 @@ pub const Prepared = struct {
         const model = try wire.field(params, "model");
         const wire_id = try wire.text(try wire.field(model, "wire_id"));
         const api = try routes.resolve(wire_id);
-        // Until each codec lands, an admitted family cannot send a mismatched Chat body.
-        if (api == .messages) return error.UnsupportedApi;
         const base = try wire.text(try wire.field(provider, "base_url"));
         var uri = try std.Uri.parse(base);
         const base_path = switch (uri.path) {
             .raw, .percent_encoded => |path| path,
         };
         // Encoded path ownership preserves proxy routing without rewriting query values.
-        const api_path = if (api == .responses) responses_path else completion_path;
+        const api_path = switch (api) {
+            .chat_completions => completion_path,
+            .responses => responses_path,
+            .messages => messages_path,
+        };
         uri.path = .{ .percent_encoded = try std.fmt.allocPrint(alloc, "{s}{s}", .{ std.mem.trimEnd(u8, base_path, path_separator), api_path }) };
         const endpoint = try std.fmt.allocPrint(alloc, "{f}", .{uri.fmt(.all)});
-        const request = try wire.field(params, "request");
-        var body = if (api == .responses) try responses_request.project(alloc, request) else try chat_body(alloc, request);
+        var request = try wire.field(params, "request");
+        if (api == .messages) {
+            // Messages requires a limit even when the native turn leaves it to catalog admission.
+            const admitted = try wire.field(model, "max_output_tokens");
+            if (admitted != .integer or admitted.integer <= 0 or admitted.integer > max_output_limit) return error.InvalidRequest;
+            const requested = try wire.field(request, "max_output_tokens");
+            const limit = if (requested == .null) admitted else requested;
+            if (limit != .integer or limit.integer <= 0 or limit.integer > admitted.integer) return error.InvalidRequest;
+            try wire.put(alloc, &request, "max_output_tokens", limit);
+        }
+        var body = switch (api) {
+            .chat_completions => try chat_body(alloc, request),
+            .responses => try responses_request.project(alloc, request),
+            .messages => try messages_request.project(alloc, request),
+        };
         try wire.put(alloc, &body, "model", try wire.field(model, "wire_id"));
         try wire.put(alloc, &body, "stream", .{ .bool = true });
         if (api == .responses) {
