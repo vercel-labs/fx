@@ -54,7 +54,9 @@ pub fn evidence(text: []const u8) Evidence {
 pub fn infer_expectation(prompt: []const u8) ?Script {
     if (may_request_language_switch(prompt)) return null;
     const script = evidence(prompt).script orelse return null;
-    return if (script == .latin and has_english_authority_signal(prompt)) script else null;
+    return if (script == .latin and
+        !has_extended_latin_letter(prompt) and
+        has_english_authority_signal(prompt)) script else null;
 }
 
 pub fn decide(input: DecisionInput) Decision {
@@ -120,6 +122,25 @@ fn contains_ignore_case(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
+fn has_extended_latin_letter(text: []const u8) bool {
+    var index: usize = 0;
+    while (index < text.len) {
+        const width = std.unicode.utf8ByteSequenceLength(text[index]) catch {
+            index += 1;
+            continue;
+        };
+        if (index + width > text.len) return false;
+        const codepoint = std.unicode.utf8Decode(text[index .. index + width]) catch {
+            index += width;
+            continue;
+        };
+        if ((codepoint >= 0x00C0 and codepoint <= 0x024F) or
+            (codepoint >= 0x1E00 and codepoint <= 0x1EFF)) return true;
+        index += width;
+    }
+    return false;
+}
+
 fn has_english_authority_signal(text: []const u8) bool {
     const words = [_][]const u8{
         "the",
@@ -173,9 +194,11 @@ test "response language evidence distinguishes clear scripts" {
 
 test "response language expectation follows the current human unless a switch may be explicit" {
     try std.testing.expectEqual(Script.latin, infer_expectation("The lockfile is broken again.").?);
+    try std.testing.expectEqual(Script.latin, infer_expectation("The lockfile’s broken — please fix it.").?);
     try std.testing.expect(infer_expectation("请再次检查锁文件。") == null);
     try std.testing.expect(infer_expectation("Answer in Japanese and keep it short.") == null);
     try std.testing.expect(infer_expectation("Translate the error into Russian.") == null);
+    try std.testing.expect(infer_expectation("Dịch nội dung sau sang tiếng Hàn. The lockfile is broken again.") == null);
     try std.testing.expect(infer_expectation("Why did you answer in Chinese? Reply in English.") == null);
     try std.testing.expect(infer_expectation("Rispondi in giapponese.") == null);
     try std.testing.expect(infer_expectation("Antworte auf Japanisch.") == null);
