@@ -126,6 +126,61 @@ describe("configured providers", () => {
     } finally { f.close(); }
   }, 25000);
 
+  test("sends configured literal and environment-backed request headers", async () => {
+    const f = fixture();
+    try {
+      Object.assign(f.settings.providers.local, {
+        headers: { "x-opencode-session": "fx-verify-0001" },
+        header_env: { "api-key": "FX_TEST_PROVIDER_HEADER_TOKEN" },
+      });
+      f.save();
+      const result = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: { ...f.env, FX_TEST_PROVIDER_HEADER_TOKEN: "header-secret" }, timeoutMs: 20000 });
+      if (result.code !== 0) throw new Error(`fx ask failed: ${result.stdout} ${result.stderr}`);
+      expect(f.requests).toHaveLength(1);
+      const headers = f.requests[0].headers;
+      expect(headers["x-opencode-session"]).toBe("fx-verify-0001");
+      expect(headers["api-key"]).toBe("header-secret");
+      expect(headers["accept"]).toBe("text/event-stream");
+      expect(headers["authorization"]).toBeUndefined();
+    } finally { f.close(); }
+  }, 25000);
+
+  test("a missing header environment credential fails before sending", async () => {
+    const f = fixture();
+    try {
+      Object.assign(f.settings.providers.local, { header_env: { "api-key": "FX_TEST_PROVIDER_HEADER_TOKEN" } });
+      f.save();
+      const result = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: { ...f.env, FX_TEST_PROVIDER_HEADER_TOKEN: undefined }, timeoutMs: 10000 });
+      expect(result.code).not.toBe(0);
+      expect(f.requests).toHaveLength(0);
+      expect(result.stdout + result.stderr).toContain("MissingConfiguredProviderHeaderEnvironment");
+    } finally { f.close(); }
+  }, 15000);
+
+  test("invalid environment-backed header bytes are rejected before sending", async () => {
+    const f = fixture();
+    try {
+      Object.assign(f.settings.providers.local, { header_env: { "api-key": "FX_TEST_PROVIDER_HEADER_TOKEN" } });
+      f.save();
+      const result = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: { ...f.env, FX_TEST_PROVIDER_HEADER_TOKEN: "bad\nheader" }, timeoutMs: 10000 });
+      expect(result.code).not.toBe(0);
+      expect(f.requests).toHaveLength(0);
+    } finally { f.close(); }
+  }, 15000);
+
+  test("provider error diagnostics redact environment-backed header credentials", async () => {
+    const secret = "header-secret-token";
+    const f = fixture(() => Response.json({ error: { message: `rejected ${secret}` } }, { status: 401 }));
+    try {
+      Object.assign(f.settings.providers.local, { header_env: { "api-key": "FX_TEST_PROVIDER_HEADER_TOKEN" } });
+      f.save();
+      const result = await runFx(["ask", "--json", "--no-save", "hello"], { cwd: f.workspace, env: { ...f.env, FX_TEST_PROVIDER_HEADER_TOKEN: secret }, timeoutMs: 10000 });
+      expect(result.code).toBe(1);
+      expect(result.stdout + result.stderr).not.toContain(secret);
+      expect(f.requests).toHaveLength(1);
+    } finally { f.close(); }
+  }, 15000);
+
   test("terminal usage may repeat an empty matching finished choice", async () => {
     const f = fixture(async body => {
       const response = completion(body.model);

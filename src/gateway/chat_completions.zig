@@ -126,11 +126,26 @@ fn phase_deadline(milliseconds: i64, caller: ?std.Io.Clock.Timestamp) std.Io.Clo
     return phase;
 }
 
+fn request_headers(alloc: Allocator, definition: *const definitions.Definition) !std.ArrayList(std.http.Header) {
+    var headers: std.ArrayList(std.http.Header) = .empty;
+    errdefer headers.deinit(alloc);
+    try headers.append(alloc, .{ .name = "accept", .value = "text/event-stream" });
+    for (definition.headers) |header| try headers.append(alloc, .{ .name = header.name, .value = header.value });
+    for (definition.header_env) |ref| {
+        const value = io.getenv(ref.env) orelse return error.MissingConfiguredProviderHeaderEnvironment;
+        definitions.validate_header_value(value) catch return error.InvalidConfiguredProviderHeaderEnvironment;
+        try headers.append(alloc, .{ .name = ref.name, .value = value });
+    }
+    return headers;
+}
+
 fn post(alloc: Allocator, definition: *const definitions.Definition, request: streams.ModelRequest, token: ?[]const u8, payload: []const u8) !streams.Result {
     const url = try definition.chat_url(alloc);
     defer alloc.free(url);
     const authorization = if (token) |value| try std.fmt.allocPrint(alloc, "Bearer {s}", .{value}) else null;
     defer if (authorization) |value| secret.zeroAndFree(alloc, value);
+    var header_list = try request_headers(alloc, definition);
+    defer header_list.deinit(alloc);
     var client: std.http.Client = .{ .allocator = alloc, .io = io.getIo() };
     defer client.deinit();
     var uri = try std.Uri.parse(url);
@@ -139,7 +154,7 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
         .client = &client,
         .uri = uri,
         .authorization = authorization,
-        .extra_headers = &.{.{ .name = "accept", .value = "text/event-stream" }},
+        .extra_headers = header_list.items,
     };
     try request.admission.admit();
     var opened = try client_mod.openBoundedPost(alloc, request.cancel_flag, phase_deadline(30_000, request.deadline), &operation);
@@ -178,6 +193,12 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
         };
         errdefer alloc.free(detail);
         if (token) |value| {
+            const redacted = try codec.redact_error_detail(alloc, detail, value);
+            alloc.free(detail);
+            detail = redacted;
+        }
+        for (definition.header_env) |ref| {
+            const value = io.getenv(ref.env) orelse continue;
             const redacted = try codec.redact_error_detail(alloc, detail, value);
             alloc.free(detail);
             detail = redacted;
@@ -262,6 +283,33 @@ test "configured capability lookup matches catalog projection and preserves unkn
     try std.testing.expect(provider.lookupCapabilities("partial").?.context_window == null);
     try std.testing.expect(provider.lookupCapabilities("unknown").?.max_output_tokens == null);
     try std.testing.expectEqualDeep(model_capabilities.Capabilities{}, provider.lookupCapabilities("missing-fast").?);
+}
+
+test "configured request headers keep accept, add literals, and resolve environment values" {
+    const alloc = std.testing.allocator;
+    var registry = try definitions.Registry.parse_json(alloc,
+        \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:1234/v1","auth":{"type":"none"},"headers":{"x-opencode-session":"fx-verify-0001"},"header_env":{"x-api-key":"FX_TEST_REQUEST_HEADER"}}}
+    );
+    defer registry.deinit(alloc);
+    var map = std.process.Environ.Map.init(alloc);
+    defer map.deinit();
+    try map.put("FX_TEST_REQUEST_HEADER", "header-value");
+    const previous = io.environMap();
+    defer if (previous) |environ| io.setEnvironMap(environ);
+    io.setEnvironMap(&map);
+
+    var headers = try request_headers(alloc, registry.get("local").?);
+    defer headers.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), headers.items.len);
+    try std.testing.expectEqualStrings("accept", headers.items[0].name);
+    try std.testing.expectEqualStrings("text/event-stream", headers.items[0].value);
+    try std.testing.expectEqualStrings("x-opencode-session", headers.items[1].name);
+    try std.testing.expectEqualStrings("fx-verify-0001", headers.items[1].value);
+    try std.testing.expectEqualStrings("x-api-key", headers.items[2].name);
+    try std.testing.expectEqualStrings("header-value", headers.items[2].value);
+
+    _ = map.swapRemove("FX_TEST_REQUEST_HEADER");
+    try std.testing.expectError(error.MissingConfiguredProviderHeaderEnvironment, request_headers(alloc, registry.get("local").?));
 }
 
 fn fetch_cli_catalog(raw: ?*anyopaque, alloc: Allocator, input: gateway_provider.CliModelCatalogInput) gateway_provider.CliModelCatalogResult {
