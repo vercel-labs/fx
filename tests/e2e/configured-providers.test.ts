@@ -10,6 +10,33 @@ async function withReasoning(response: Response, ...deltas: Record<string, unkno
 }
 
 describe("configured providers", () => {
+  for (const repeatFinishChoice of [false, true]) {
+    test(`trailer-only usage mode works on an arbitrary endpoint (repeat finish: ${repeatFinishChoice})`, async () => {
+      const f = fixture(() => {
+        const finish = [{ index: 0, delta: {}, finish_reason: "stop" }];
+        const chunks = [
+          { choices: [{ index: 0, delta: { content: "local reply" }, finish_reason: null }], usage: { prompt_tokens: 12, completion_tokens: 0, total_tokens: 12 } },
+          { choices: [{ index: 0, delta: {}, finish_reason: null }], usage: { prompt_tokens: 0, completion_tokens: 1, total_tokens: 1 } },
+          { choices: finish, usage: { prompt_tokens: 0, completion_tokens: 1, total_tokens: 1 } },
+          { choices: repeatFinishChoice ? finish : [], usage: { prompt_tokens: 12, completion_tokens: 3, total_tokens: 15 } },
+        ];
+        return new Response(chunks.map(value => `data: ${JSON.stringify(value)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
+      });
+      try {
+        const defaults = await runFx(["ask", "--json", "--no-save", "Say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+        expect(defaults.code).not.toBe(0);
+        expect(JSON.parse(defaults.stdout).error).toBe("ConflictingIdentity");
+        (f.settings.providers.local as any).usage_mode = "trailer-only";
+        f.save();
+        const result = await runFx(["ask", "--json", "--no-save", "Say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+        if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+        const saved = JSON.parse(result.stdout);
+        expect(saved.output).toBe("local reply");
+        expect(saved.usage).toEqual({ input_tokens: 12, output_tokens: 3 });
+      } finally { f.close(); }
+    }, 45000);
+  }
+
   test.each(["reasoning", "reasoning_content"])("replays %s through a tool result and saved-session continuation", async field => {
     let calls = 0;
     const f = fixture(body => {

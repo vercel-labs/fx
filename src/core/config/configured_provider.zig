@@ -24,12 +24,14 @@ pub const ParseError = Allocator.Error || error{
     InvalidAuth,
     InvalidEnvironmentName,
     InvalidToolChoiceMode,
+    InvalidUsageMode,
     InvalidModelId,
     InvalidModelMetadata,
 };
 
 pub const Protocol = enum { @"openai-chat-completions" };
 pub const ToolChoiceMode = enum { omit, send };
+pub const UsageMode = enum { cumulative, @"trailer-only" };
 
 /// Describes a credential slot, never a credential value. Resolution belongs at
 /// the effectful edge; `none` must omit Authorization rather than supply a token.
@@ -54,6 +56,7 @@ pub const Definition = struct {
     base_url: []const u8,
     auth: Auth,
     tool_choice_mode: ToolChoiceMode = .omit,
+    usage_mode: UsageMode = .cumulative,
     reviewer_model: ?[]const u8 = null,
     model_metadata: []const ModelMetadata = &.{},
 
@@ -163,7 +166,7 @@ pub const Registry = struct {
 
 fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) ParseError!Definition {
     try validate_id(id);
-    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata" });
+    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "usage_mode", "reviewer_model", "model_metadata" });
     const protocol = try required(value, "protocol");
     if (protocol != .string or !std.mem.eql(u8, protocol.string, "openai-chat-completions")) return error.InvalidProtocol;
     const url = try required(value, "base_url");
@@ -174,6 +177,11 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
     if (value.object.get("tool_choice_mode")) |choice| {
         if (choice != .string) return error.InvalidToolChoiceMode;
         mode = if (std.mem.eql(u8, choice.string, "omit")) .omit else if (std.mem.eql(u8, choice.string, "send")) .send else return error.InvalidToolChoiceMode;
+    }
+    var usage_mode: UsageMode = .cumulative;
+    if (value.object.get("usage_mode")) |usage| {
+        if (usage != .string) return error.InvalidUsageMode;
+        usage_mode = std.meta.stringToEnum(UsageMode, usage.string) orelse return error.InvalidUsageMode;
     }
     var reviewer: ?[]const u8 = null;
     if (value.object.get("reviewer_model")) |model_value| {
@@ -202,6 +210,7 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
         .base_url = owned_url,
         .auth = owned_auth,
         .tool_choice_mode = mode,
+        .usage_mode = usage_mode,
         .reviewer_model = owned_reviewer,
         .model_metadata = if (value.object.get("model_metadata")) |metadata| try parse_metadata(alloc, metadata) else &.{},
     };
@@ -382,6 +391,7 @@ test "configured provider owns definitions and preserves unknown metadata" {
     const local = registry.get("local").?;
     try std.testing.expectEqual(Auth.none, local.auth);
     try std.testing.expectEqual(ToolChoiceMode.omit, local.tool_choice_mode);
+    try std.testing.expectEqual(UsageMode.cumulative, local.usage_mode);
     try std.testing.expect(local.reviewer_model == null);
     const chat = try local.chat_url(alloc);
     defer alloc.free(chat);
@@ -635,4 +645,20 @@ fn test_invalid_allocations(alloc: Allocator) !void {
 
 test "configured provider validation failures release earlier definitions and models" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, test_invalid_allocations, .{});
+}
+
+test "configured provider usage mode parses explicit modes and rejects invalid values" {
+    const alloc = std.testing.allocator;
+    for ([_]UsageMode{ .cumulative, .@"trailer-only" }) |mode| {
+        const json = try std.fmt.allocPrint(alloc, "{{\"local\":{{{s},\"usage_mode\":\"{s}\"}}}}", .{ test_required_fields, @tagName(mode) });
+        defer alloc.free(json);
+        var registry = try Registry.parse_json(alloc, json);
+        defer registry.deinit(alloc);
+        try std.testing.expectEqual(mode, registry.get("local").?.usage_mode);
+    }
+    for ([_][]const u8{ "null", "true", "1", "\"unknown\"" }) |value| {
+        const json = try std.fmt.allocPrint(alloc, "{{\"local\":{{{s},\"usage_mode\":{s}}}}}", .{ test_required_fields, value });
+        defer alloc.free(json);
+        try std.testing.expectError(error.InvalidUsageMode, Registry.parse_json(alloc, json));
+    }
 }
