@@ -92,6 +92,8 @@ fx provider local
 FX_PROVIDER=openrouter FX_MODEL=openai/gpt-4.1 fx ask "review this change"
 ```
 
+For endpoints that report per-chunk token deltas before a cumulative usage trailer, set `"usage_mode": "trailer-only"` in the connection definition. The default, `"cumulative"`, validates cumulative counts throughout the stream. Trailer-only mode reads usage from the final trailer and leaves counts unknown if no trailer arrives.
+
 See [Custom model connections](https://fx.sh/docs/configure-fx/custom-model-connections) for connection JSON, model metadata, and behavior details.
 
 ## Ultrafast mode

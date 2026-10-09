@@ -653,7 +653,7 @@ pub const Reducer = struct {
     response_model: ?[]u8 = null,
     usage: types.Usage = .{},
     usage_total: ?u64 = null,
-    usage_trailer_only: bool = false,
+    usage_mode: configured_provider.UsageMode = .cumulative,
     usage_final_fields: packed struct(u3) {
         input: bool = false,
         output: bool = false,
@@ -759,8 +759,8 @@ pub const Reducer = struct {
             self.refusal_seen = self.refusal_seen or refusal.len != 0;
         }
         if (non_null(delta, "tool_calls")) |value| try self.accept_tools(value);
-        // Cloudflare sends per-chunk deltas here and cumulative totals in a trailer.
-        if (!self.usage_trailer_only) {
+        // Trailer-only endpoints send per-chunk deltas here instead of cumulative counts.
+        if (self.usage_mode == .cumulative) {
             if (non_null(root, "usage")) |usage| try self.accept_usage(usage, non_null(choice, "finish_reason") != null);
         }
         if (non_null(choice, "finish_reason")) |value| {
@@ -1045,18 +1045,10 @@ fn append_bounded(alloc: Allocator, destination: *std.ArrayList(u8), text: []con
 /// exactly at framed [DONE], without waiting for EOF or consuming another event.
 /// event_bytes also bounds all wire between dispatched data events (including
 /// ignored fields/comments); total_wire_bytes bounds the entire consumed stream.
-pub fn consume_stream(alloc: Allocator, source: *std.Io.Reader, request: stream_provider.RequestData, limits: Limits, events: ?stream_provider.EventSink, cancel_flag: *const std.atomic.Value(bool)) Error!stream_provider.Result {
-    return consume_stream_usage(alloc, source, request, limits, events, cancel_flag, false);
-}
-
-pub fn consume_cloudflare_stream(alloc: Allocator, source: *std.Io.Reader, request: stream_provider.RequestData, limits: Limits, events: ?stream_provider.EventSink, cancel_flag: *const std.atomic.Value(bool)) Error!stream_provider.Result {
-    return consume_stream_usage(alloc, source, request, limits, events, cancel_flag, true);
-}
-
-fn consume_stream_usage(alloc: Allocator, source: *std.Io.Reader, request: stream_provider.RequestData, limits: Limits, events: ?stream_provider.EventSink, cancel_flag: *const std.atomic.Value(bool), usage_trailer_only: bool) Error!stream_provider.Result {
+pub fn consume_stream(alloc: Allocator, source: *std.Io.Reader, request: stream_provider.RequestData, limits: Limits, events: ?stream_provider.EventSink, cancel_flag: *const std.atomic.Value(bool), usage_mode: configured_provider.UsageMode) Error!stream_provider.Result {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     var reducer = try Reducer.init(alloc, request, limits);
-    reducer.usage_trailer_only = usage_trailer_only;
+    reducer.usage_mode = usage_mode;
     defer reducer.deinit();
     var framing = sse.Reader{ .max_event_bytes = limits.event_bytes };
     defer framing.deinit(alloc);
@@ -1528,9 +1520,9 @@ test "chat completions reasoning presentation checks cancellation before content
         var source = std.Io.Reader.fixed(wire);
         const sink: stream_provider.EventSink = .{ .context = &observer, .emit_fn = Observer.emit };
         if (cancel) {
-            try std.testing.expectError(error.Cancelled, consume_stream(std.testing.allocator, &source, test_request(), .{}, sink, &flag));
+            try std.testing.expectError(error.Cancelled, consume_stream(std.testing.allocator, &source, test_request(), .{}, sink, &flag, .cumulative));
         } else {
-            var result = try consume_stream(std.testing.allocator, &source, test_request(), .{}, sink, &flag);
+            var result = try consume_stream(std.testing.allocator, &source, test_request(), .{}, sink, &flag, .cumulative);
             defer result.deinit(std.testing.allocator);
         }
         try std.testing.expectEqual(@as(usize, 1), observer.reasoning_count);
@@ -2314,32 +2306,32 @@ test "chat completions stream framing handles chunks trailers truncation and wir
         defer alloc.free(buffer);
         var fixed = std.Io.Reader.fixed(wire);
         var source = fixed.limited(.unlimited, buffer);
-        var result = try consume_stream(alloc, &source.interface, test_request(), .{}, null, &cancelled);
+        var result = try consume_stream(alloc, &source.interface, test_request(), .{}, null, &cancelled, .cumulative);
         defer result.deinit(alloc);
         try std.testing.expectEqualStrings("hello", result.completed.completion.content.?);
         try std.testing.expectEqual(@as(?u64, 5), result.completed.completion.usage.input_tokens);
     }
     for ([_][]const u8{ "", "data: [DONE]\n\n", "data: " ++ test_stop ++ "\n\n", "data: " ++ test_stop ++ "\n\ndata: [DONE]", "data: " ++ test_stop ++ "\n\ndata: [DONE]\n" }) |truncated| {
         var source = std.Io.Reader.fixed(truncated);
-        try std.testing.expectError(error.IncompleteStream, consume_stream(alloc, &source, test_request(), .{}, null, &cancelled));
+        try std.testing.expectError(error.IncompleteStream, consume_stream(alloc, &source, test_request(), .{}, null, &cancelled, .cumulative));
     }
     {
         var source = std.Io.Reader.fixed(": comment\n" ** 20);
-        try std.testing.expectError(error.EventTooLarge, consume_stream(alloc, &source, test_request(), .{ .event_bytes = 30 }, null, &cancelled));
+        try std.testing.expectError(error.EventTooLarge, consume_stream(alloc, &source, test_request(), .{ .event_bytes = 30 }, null, &cancelled, .cumulative));
     }
     {
         var source = std.Io.Reader.fixed(": comment\n\n" ** 20);
-        try std.testing.expectError(error.StreamTooLarge, consume_stream(alloc, &source, test_request(), .{ .total_wire_bytes = 30 }, null, &cancelled));
+        try std.testing.expectError(error.StreamTooLarge, consume_stream(alloc, &source, test_request(), .{ .total_wire_bytes = 30 }, null, &cancelled, .cumulative));
     }
     {
         var source = std.Io.Reader.fixed(wire);
-        try std.testing.expectError(error.StreamTooLarge, consume_stream(alloc, &source, test_request(), .{ .total_wire_bytes = wire.len - 1 }, null, &cancelled));
+        try std.testing.expectError(error.StreamTooLarge, consume_stream(alloc, &source, test_request(), .{ .total_wire_bytes = wire.len - 1 }, null, &cancelled, .cumulative));
     }
     // A terminal delimiter is sufficient: never wait for a failing next read.
     var source = std.Io.Reader.failing;
     source.buffer = @constCast(wire);
     source.end = wire.len;
-    var result = try consume_stream(alloc, &source, test_request(), .{}, null, &cancelled);
+    var result = try consume_stream(alloc, &source, test_request(), .{}, null, &cancelled, .cumulative);
     defer result.deinit(alloc);
 }
 
@@ -2375,7 +2367,7 @@ test "chat completions cancellation poisons retained state and progress cannot e
     try std.testing.expectError(error.StreamClosed, reducer.finish(false));
     var cancelled = std.atomic.Value(bool).init(true);
     var source = std.Io.Reader.fixed("data: " ++ test_text ++ "\n\n");
-    try std.testing.expectError(error.Cancelled, consume_stream(alloc, &source, test_request(), .{}, null, &cancelled));
+    try std.testing.expectError(error.Cancelled, consume_stream(alloc, &source, test_request(), .{}, null, &cancelled, .cumulative));
     var request = test_request();
     request.budget = .{ .cancel_flag = &cancelled };
     const serialized = try build_request(alloc, request, .{});
@@ -2392,7 +2384,7 @@ test "chat completions cancellation poisons retained state and progress cannot e
     var observer = Observer{ .flag = &cancelled };
     cancelled.store(false, .seq_cst);
     source = std.Io.Reader.fixed("data: " ++ test_text ++ "\n\ndata: " ++ test_stop ++ "\n\ndata: [DONE]\n\n");
-    try std.testing.expectError(error.Cancelled, consume_stream(alloc, &source, test_request(), .{}, .{ .context = &observer, .emit_fn = Observer.emit }, &cancelled));
+    try std.testing.expectError(error.Cancelled, consume_stream(alloc, &source, test_request(), .{}, .{ .context = &observer, .emit_fn = Observer.emit }, &cancelled, .cumulative));
     try std.testing.expectEqual(@as(usize, 1), observer.count);
 }
 
@@ -2405,7 +2397,7 @@ fn test_allocation_paths(alloc: Allocator) !void {
     defer alloc.free(body);
     var source = std.Io.Reader.fixed("data: " ++ test_text ++ "\n\ndata: " ++ test_call ++ "\n\ndata: " ++ test_tools_finish ++ "\n\ndata: [DONE]\n\n");
     const cancelled = std.atomic.Value(bool).init(false);
-    var result = try consume_stream(alloc, &source, request, .{}, null, &cancelled);
+    var result = try consume_stream(alloc, &source, request, .{}, null, &cancelled, .cumulative);
     defer result.deinit(alloc);
 }
 
@@ -2558,7 +2550,7 @@ test "chat completions exact wire and aggregate delta bounds include the termina
     const wire = "data: " ++ test_text ++ "\n\ndata: " ++ test_stop ++ "\n\ndata: [DONE]\n\n";
     const cancelled = std.atomic.Value(bool).init(false);
     var source = std.Io.Reader.fixed(wire);
-    var result = try consume_stream(alloc, &source, test_request(), .{ .total_wire_bytes = wire.len }, null, &cancelled);
+    var result = try consume_stream(alloc, &source, test_request(), .{ .total_wire_bytes = wire.len }, null, &cancelled, .cumulative);
     defer result.deinit(alloc);
     for ([_]struct { limits: Limits, failure: Error }{
         .{ .limits = .{ .total_wire_bytes = test_text.len }, .failure = error.StreamTooLarge },
@@ -2592,7 +2584,7 @@ test "chat completions prose resembling a call stays prose and cancellation afte
     try std.testing.expectError(error.Cancelled, cancelled.finish(true));
 }
 
-test "chat completions Cloudflare delta usage is replaced by cumulative trailer" {
+test "chat completions trailer-only usage ignores deltas and reads cumulative trailer" {
     const alloc = std.testing.allocator;
     const first = "{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":0,\"total_tokens\":10}}";
     const next = "{\"choices\":[{\"index\":0,\"delta\":{}}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":1,\"total_tokens\":1}}";
@@ -2604,7 +2596,7 @@ test "chat completions Cloudflare delta usage is replaced by cumulative trailer"
         defer alloc.free(wire);
         var source = std.Io.Reader.fixed(wire);
         var flag = std.atomic.Value(bool).init(false);
-        var result = try consume_cloudflare_stream(alloc, &source, test_request(), .{}, null, &flag);
+        var result = try consume_stream(alloc, &source, test_request(), .{}, null, &flag, .@"trailer-only");
         defer result.deinit(alloc);
         try std.testing.expectEqual(@as(?u64, 10), result.completed.completion.usage.input_tokens);
         try std.testing.expectEqual(@as(?u64, 3), result.completed.completion.usage.output_tokens);

@@ -198,12 +198,7 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
     }
     var limits: codec.Limits = .{};
     if (request.content_capture_limit) |limit| limits.content_bytes = @min(limit, limits.content_bytes);
-    if (uri.host) |host| {
-        if (std.ascii.eqlIgnoreCase(host.percent_encoded, "api.cloudflare.com") and std.mem.startsWith(u8, definition.base_url, "https://api.cloudflare.com/client/v4/accounts/")) {
-            return codec.consume_cloudflare_stream(alloc, reader, request.data(), limits, request.events, request.cancel_flag);
-        }
-    }
-    return codec.consume_stream(alloc, reader, request.data(), limits, request.events, request.cancel_flag);
+    return codec.consume_stream(alloc, reader, request.data(), limits, request.events, request.cancel_flag, definition.usage_mode);
 }
 
 /// The returned entry borrows its strings; fetch_catalog replaces them with owned copies.
