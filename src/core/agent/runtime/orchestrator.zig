@@ -13,6 +13,7 @@ const agent_stream_provider = @import("../stream_provider.zig");
 const session_runtime = @import("../../session/session.zig");
 const session_codec = @import("../../session/session_codec.zig");
 const result_store = @import("../../session/result_store.zig");
+const usage_owner = @import("../../session/usage_owner.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const diagnostics = @import("../../workspace/diagnostics.zig");
 const gateway_error_format = @import("../../shared/gateway_error_format.zig");
@@ -7243,8 +7244,19 @@ fn processQueuedPromptLoop(
                 try deps.push_text(deps.ctx, .{ .operational = "\n" });
             }
             last_gateway_message_count = gateway_instructions.items.len + request_messages.len;
+            const stream_credential: types.CredentialLease = if (job.credential_source == .host_managed)
+                .host_managed
+            else
+                .{ .direct = .{
+                    .secret_bytes = active_api_key,
+                    .source = job.credential_source orelse .ai_gateway_api_key,
+                    .account_id = job.account_id,
+                    .tenant_context = job.gateway_team,
+                } };
+            var gateway_user_buf: [usage_owner.gateway_user_len]u8 = undefined;
             var provider_opts = try model_capabilities.resolveUltrafastProviderOptions(request_capabilities, job.provider, gateway_model, config.effort, route_fast_mode, config.ultrafast_mode);
             provider_opts.prompt_caching = config.provider_capabilities.gateway_prompt_caching;
+            provider_opts.gateway_user = usage_owner.gatewayUser(stream_credential, &gateway_user_buf);
             provider_opts.provider_order = config.provider_order;
             provider_opts.provider_strict = config.provider_strict;
             runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, route_fast_mode, config.effort, provider_opts);
@@ -7529,15 +7541,7 @@ fn processQueuedPromptLoop(
                 .pending_status = &pending_auto_retry_status,
             };
             var model_request = agent_stream_provider.ModelRequest{
-                .credential = if (job.credential_source == .host_managed)
-                    .host_managed
-                else
-                    .{ .direct = .{
-                        .secret_bytes = active_api_key,
-                        .source = job.credential_source orelse .ai_gateway_api_key,
-                        .account_id = job.account_id,
-                        .tenant_context = job.gateway_team,
-                    } },
+                .credential = stream_credential,
                 .session_id = lifecycle.scope.session_id,
                 .model = gateway_model,
                 .retry_count = config.gateway_retry_count,

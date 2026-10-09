@@ -223,8 +223,8 @@ const gateway_connection_setup_timeout_ms: i64 = 30_000;
 const gateway_retry_after_max_ns: u64 = 5 * std.time.ns_per_s;
 const gateway_transfer_buffer_bytes: usize = 256 * 1024;
 const provider_failure_detail_max_bytes: usize = 600;
-const generation_response_max_bytes: usize = 128 * 1024;
-const generation_lookup_timeout_ms: i64 = 30_000;
+const usage_response_max_bytes: usize = 128 * 1024;
+const usage_lookup_timeout_ms: i64 = 30_000;
 // Covers a 4 MiB string at worst-case JSON escaping plus SSE framing.
 const max_sse_event_line_bytes: usize = 32 * 1024 * 1024;
 const e2e_gateway_chat_url_env = "FX_E2E_GATEWAY_CHAT_URL";
@@ -282,21 +282,25 @@ pub fn fetchGatewayGetResult(alloc: std.mem.Allocator, api_key: ?[]const u8, pat
     return fetchGatewayGet(alloc, api_key, null, path, e2e_gateway_credits_url_env);
 }
 
-pub fn fetchGatewayGenerationResult(
+/// GETs one AI Gateway usage path under `gateway_origin`: a cost lookup,
+/// `/v1/generation?id=` and a generation id, or a usage report,
+/// `/v1/report?` and URL-safe parameters. Any other path is refused before
+/// a connection is made.
+pub fn fetchGatewayUsageResult(
     alloc: std.mem.Allocator,
     api_key: ?[]const u8,
     gateway_team: ?[]const u8,
     gateway_origin: []const u8,
-    generation_id: []const u8,
+    path: []const u8,
     cancel_flag: *std.atomic.Value(bool),
 ) !GetResult {
-    if (!types.validGatewayGenerationId(generation_id)) return error.InvalidGenerationId;
-    var operation = GenerationLookupOperation{
+    if (!usagePathAllowed(path)) return error.InvalidUsagePath;
+    var operation = UsageLookupOperation{
         .alloc = alloc,
         .api_key = api_key,
         .gateway_team = gateway_team,
         .gateway_origin = gateway_origin,
-        .generation_id = generation_id,
+        .path = path,
     };
     return runBoundedHttpOperation(
         GetResult,
@@ -304,30 +308,41 @@ pub fn fetchGatewayGenerationResult(
         cancel_flag,
         std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
             .clock = .awake,
-            .raw = .fromMilliseconds(generation_lookup_timeout_ms),
+            .raw = .fromMilliseconds(usage_lookup_timeout_ms),
         }),
         &operation,
     );
 }
 
-const GenerationLookupOperation = struct {
+/// Whether `path` is a cost lookup or a usage report path, the only two
+/// that `fetchGatewayUsageResult` sends.
+fn usagePathAllowed(path: []const u8) bool {
+    const generation_prefix = "/v1/generation?id=";
+    if (std.mem.startsWith(u8, path, generation_prefix)) {
+        return types.validGatewayGenerationId(path[generation_prefix.len..]);
+    }
+    const report_prefix = "/v1/report?";
+    if (!std.mem.startsWith(u8, path, report_prefix)) return false;
+    if (path.len == report_prefix.len or path.len > 512) return false;
+    for (path[report_prefix.len..]) |char| switch (char) {
+        'a'...'z', 'A'...'Z', '0'...'9', '_', '-', '.', '=', '&' => {},
+        else => return false,
+    };
+    return true;
+}
+
+const UsageLookupOperation = struct {
     alloc: std.mem.Allocator,
     api_key: ?[]const u8,
     gateway_team: ?[]const u8,
     gateway_origin: []const u8,
-    generation_id: []const u8,
+    path: []const u8,
 
     fn run(self: *@This()) !GetResult {
-        const path = try std.fmt.allocPrint(
-            self.alloc,
-            "/v1/generation?id={s}",
-            .{self.generation_id},
-        );
-        defer self.alloc.free(path);
         const url = try std.fmt.allocPrint(
             self.alloc,
             "{s}{s}",
-            .{ self.gateway_origin, path },
+            .{ self.gateway_origin, self.path },
         );
         defer self.alloc.free(url);
         const uri = try std.Uri.parse(url);
@@ -366,7 +381,7 @@ const GenerationLookupOperation = struct {
         const reader = response.reader(&transfer_buffer);
         const body = reader.allocRemaining(
             self.alloc,
-            .limited(generation_response_max_bytes),
+            .limited(usage_response_max_bytes),
         ) catch |err| switch (err) {
             error.StreamTooLong => return error.GatewayGenerationResponseTooLarge,
             else => return err,
@@ -4036,7 +4051,7 @@ test "the gateway event tap sees every parsed event, so usage prices the call ex
 
     try std.testing.expectEqual(@as(usize, 3), tap.events);
     _ = try call.finish(.completed);
-    var view = try ledger.view(std.testing.allocator, .session, io_mod.milliTimestamp(), .{});
+    var view = try ledger.view(std.testing.allocator, io_mod.milliTimestamp(), .{});
     defer view.deinit(std.testing.allocator);
     try std.testing.expectEqual(usage_mod.report.Completeness.complete, view.completeness);
     try std.testing.expectEqual(@as(f64, 0.0042), view.totals.?.total_cost);
@@ -8571,12 +8586,12 @@ test "generation lookup cancellation interrupts TLS setup" {
         .{ &fixture, &cancel_flag, &request_done },
     );
     const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
-    const result = fetchGatewayGenerationResult(
+    const result = fetchGatewayUsageResult(
         std.testing.allocator,
         "test-key",
         null,
         origin,
-        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "/v1/generation?id=gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
         &cancel_flag,
     );
     const elapsed_ms = started.durationTo(
@@ -8588,6 +8603,23 @@ test "generation lookup cancellation interrupts TLS setup" {
 
     try std.testing.expectError(error.Cancelled, result);
     try std.testing.expect(elapsed_ms < 1000);
+}
+
+test "usage fetches send only cost lookup and report paths" {
+    try std.testing.expect(usagePathAllowed("/v1/generation?id=gen_01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+    try std.testing.expect(usagePathAllowed("/v1/report?start_date=2026-10-09&end_date=2026-10-09&group_by=model&user_id=fx_0123abcd"));
+    try std.testing.expect(!usagePathAllowed("/v1/generation?id=gen_bad"));
+    try std.testing.expect(!usagePathAllowed("/v1/report?"));
+    try std.testing.expect(!usagePathAllowed("/v1/report?user_id=a%2Fb"));
+    try std.testing.expect(!usagePathAllowed("/v1/report?x=1#frag"));
+    try std.testing.expect(!usagePathAllowed("/v1/report?x=1/../credits"));
+    try std.testing.expect(!usagePathAllowed("/v1/credits"));
+    try std.testing.expect(!usagePathAllowed("//evil.example/v1/report?x=1"));
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    try std.testing.expectError(
+        error.InvalidUsagePath,
+        fetchGatewayUsageResult(std.testing.allocator, null, null, "http://127.0.0.1:1", "/v1/credits", &cancel_flag),
+    );
 }
 
 test "gateway retry sleep rejects cancellation before waiting" {

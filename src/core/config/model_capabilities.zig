@@ -15,6 +15,10 @@ pub const ResolvedProviderOptions = struct {
     /// Sends `provider_order` as the gateway's hard `only` restriction
     /// instead of its `order` preference.
     provider_strict: bool = false,
+    /// Borrowed AI Gateway user tag from `usage_owner.gatewayUser`, which
+    /// attributes the request in Gateway's usage reports. Null sends none.
+    /// The backing memory must outlive request-body serialization.
+    gateway_user: ?[]const u8 = null,
 };
 
 pub const ReasoningEffortOptions = struct {

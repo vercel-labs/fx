@@ -175,15 +175,6 @@ pub fn buildGatewayRequiredToolRequestBodyWithOptionsAndBudget(
     );
 }
 
-pub fn buildGatewayRequiredToolRequestBodyWithMaxOutputTokens(
-    alloc: std.mem.Allocator,
-    tools_json: []const u8,
-    messages: []const ChatMessage,
-    max_output_tokens: u32,
-) ![]u8 {
-    return buildGatewayRequestBodyWithSettings(alloc, tools_json, messages, .{}, "required", max_output_tokens);
-}
-
 pub fn buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
     alloc: std.mem.Allocator,
     tools_json: []const u8,
@@ -459,14 +450,20 @@ pub fn writeProviderOptions(writer: *std.Io.Writer, options: model_capabilities.
         }
         if (!allows_openai) return error.UltrafastProviderRestricted;
     }
-    const gateway_options = options.fast or options.ultrafast or options.prompt_caching or routing;
+    const gateway_options = options.fast or options.ultrafast or options.prompt_caching or routing or options.gateway_user != null;
     if (!gateway_options and options.parallel_tool_calls == null) return;
 
     try writer.writeAll(",\"providerOptions\":{");
     if (gateway_options) {
         try writer.writeAll("\"gateway\":{");
         var needs_comma = false;
+        if (options.gateway_user) |user| {
+            try writer.writeAll("\"user\":");
+            try std.json.Stringify.value(user, .{}, writer);
+            needs_comma = true;
+        }
         if (options.fast and !options.ultrafast) {
+            if (needs_comma) try writer.writeByte(',');
             try writer.writeAll("\"speed\":\"fast\"");
             needs_comma = true;
         }
@@ -509,6 +506,20 @@ test "Ultrafast serializes only the OpenAI tier and strict OpenAI routing" {
     try std.testing.expect(std.mem.find(u8, out.written(), "\"only\":[\"openai\"]") != null);
     try std.testing.expect(std.mem.find(u8, out.written(), "\"speed\"") == null);
     try std.testing.expectError(error.UltrafastProviderRestricted, writeProviderOptions(&out.writer, .{ .ultrafast = true, .provider_strict = true, .provider_order = &.{"azure"} }));
+}
+
+test "the Gateway user tag is sent alone or ahead of the other Gateway options" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeProviderOptions(&out.writer, .{ .gateway_user = "fx_0123" });
+    try std.testing.expectEqualStrings(",\"providerOptions\":{\"gateway\":{\"user\":\"fx_0123\"}}", out.written());
+
+    out.clearRetainingCapacity();
+    try writeProviderOptions(&out.writer, .{ .gateway_user = "fx_0123", .fast = true, .prompt_caching = true, .parallel_tool_calls = false });
+    try std.testing.expectEqualStrings(
+        ",\"providerOptions\":{\"gateway\":{\"user\":\"fx_0123\",\"speed\":\"fast\",\"caching\":\"auto\"},\"xai\":{\"parallelToolCalls\":false}}",
+        out.written(),
+    );
 }
 
 pub fn validateToolMessageHistory(alloc: std.mem.Allocator, messages: []const ChatMessage) !void {
@@ -1540,7 +1551,7 @@ test "required gateway request serializes required tool choice and max output" {
         .{ .role = .user, .content = "question" },
     };
 
-    const body = try buildGatewayRequiredToolRequestBodyWithMaxOutputTokens(alloc, "[]", &messages, 4096);
+    const body = try buildGatewayRequiredToolRequestBodyWithOptionsAndOutputLimit(alloc, "[]", &messages, .{}, 4096);
     defer alloc.free(body);
 
     try std.testing.expectEqualStrings(
@@ -1558,7 +1569,7 @@ test "required gateway request validates history" {
 
     try std.testing.expectError(
         error.InvalidGatewayHistory,
-        buildGatewayRequiredToolRequestBodyWithMaxOutputTokens(alloc, "[]", &messages, 4096),
+        buildGatewayRequiredToolRequestBodyWithOptionsAndOutputLimit(alloc, "[]", &messages, .{}, 4096),
     );
 }
 

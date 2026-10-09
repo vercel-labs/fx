@@ -2931,8 +2931,8 @@ pub fn Runtime(comptime App: type) type {
         fn usageTarget(context: *anyopaque) ?usage_owner.Target {
             const app: *App = @ptrCast(@alignCast(context));
             if (comptime !@hasField(App, "session_persistence")) return null;
-            if (app.session_persistence.v2) |v2| return .{ .session_id = v2.id(), .marker = .v2 };
-            if (app.session_persistence.writable) |*loaded| return .{ .session_id = loaded.active_id, .marker = .v1 };
+            if (app.session_persistence.v2) |v2| return .{ .session_id = v2.id() };
+            if (app.session_persistence.writable) |*loaded| return .{ .session_id = loaded.active_id };
             return null;
         }
 
@@ -3970,13 +3970,6 @@ pub fn Runtime(comptime App: type) type {
         pub fn requestPersistenceShutdown(app: *App) void {
             app.session_persistence.session_picker_load.requestStop();
             app.session_persistence.title_generation.requestStop();
-        }
-
-        /// Exit publishes nothing to the profile usage ledger, so it never
-        /// waits on another process holding its lock. The session keeps
-        /// unpublished usage for recovery and the next resume.
-        pub fn abandonProfileLedgerForProcessExit(app: *App) void {
-            if (comptime @hasField(@TypeOf(app.session), "usage")) app.session.usage.abandon();
         }
 
         fn LiveHistorySink(comptime SinkApp: type) type {

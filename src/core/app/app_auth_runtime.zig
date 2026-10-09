@@ -2038,13 +2038,16 @@ pub fn Runtime(comptime App: type) type {
 
         /// Usage looks Gateway generations up with the session's current
         /// Gateway credential; a subscription or no credential looks none up.
-        fn reconcileGatewayCredential(app: *App) void {
+        /// A subscription still names its source, which usage history shows.
+        pub fn reconcileGatewayCredential(app: *App) void {
             if (comptime !runtime_profile.allows(App, .generation_usage)) return;
             if (comptime !@hasField(App, "session") or !@hasField(@TypeOf(app.session), "usage")) return;
             const credential = app.auth.gatewayCredential() orelse return app.session.usage.setCredential(null);
             if (gatewayCredentialSource(credential) == .host_managed) return app.session.usage.setCredential(.host_managed);
             const source = gatewayCredentialSource(credential);
-            if (source == .chatgpt_subscription or source == .grok_subscription) return app.session.usage.setCredential(null);
+            if (source == .chatgpt_subscription or source == .grok_subscription) {
+                return app.session.usage.setCredential(.{ .direct = .{ .source = source } });
+            }
             const api_key = optionalGatewayApiKey(credential) orelse return;
             app.session.usage.setCredential(.{ .direct = .{ .secret_bytes = api_key, .source = source } });
         }

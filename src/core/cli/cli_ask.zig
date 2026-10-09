@@ -1731,7 +1731,6 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.session.bindUsage(alloc, if (options.save_session) .{
         .host = askUsageHost(&ctx),
         .home_path = io_mod.getenv("HOME"),
-        .recovery = session_adapter.usage_recovery_readers,
     } else .{ .host = null, .home_path = null });
     ctx.use_process_interrupt_flag = options.deps.install_headless_interrupt;
     try ctx.checkCancellation();
@@ -2475,8 +2474,8 @@ fn askUsageHost(ctx: *AskContext) usage_owner.Host {
 /// lock, and the run never switches sessions.
 fn askUsageTarget(raw_ctx: *anyopaque) ?usage_owner.Target {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    if (ctx.v2) |v2| return .{ .session_id = v2.id(), .marker = .v2 };
-    if (ctx.writable) |*writable| return .{ .session_id = writable.active_id, .marker = .v1 };
+    if (ctx.v2) |v2| return .{ .session_id = v2.id() };
+    if (ctx.writable) |*writable| return .{ .session_id = writable.active_id };
     return null;
 }
 
@@ -8059,7 +8058,7 @@ test "headless ask overwrites session usage from latest completion" {
     try std.testing.expectEqual(@as(u64, 23), ctx.writable.?.state.total_output_tokens);
 }
 
-test "saved ask settles profile publication before persistence teardown" {
+test "saved ask settles its usage before persistence teardown" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8093,7 +8092,6 @@ test "saved ask settles profile publication before persistence teardown" {
     ctx.session.bindUsage(alloc, .{
         .host = askUsageHost(&ctx),
         .home_path = home,
-        .recovery = session_adapter.usage_recovery_readers,
     });
     _ = agentRuntimeDeps(&ctx);
 
@@ -8117,13 +8115,10 @@ test "saved ask settles profile publication before persistence teardown" {
     }
     try invocation.completed(.{ .usage = .{ .input_tokens = 10, .output_tokens = 2 } });
 
-    // Closing settles: the fact publishes and the last checkpoint lands
-    // while the session is still open.
+    // Closing settles: the last checkpoint lands while the session is
+    // still open.
     ctx.deinit();
     ctx_live = false;
-    const profile_usage = try tmp.dir.readFileAlloc(std.testing.io, "home/.fx/usage.jsonl", alloc, .limited(1 << 20));
-    defer alloc.free(profile_usage);
-    try std.testing.expect(std.mem.find(u8, profile_usage, "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV") != null);
 
     var store = try session_store.Store.initFromHome(alloc, home, workspace);
     defer store.deinit(alloc);

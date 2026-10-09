@@ -1721,17 +1721,15 @@ pub const SessionRuntime = struct {
         host: ?usage_owner.Host,
         /// The HOME that holds `.fx`; null counts usage in memory only.
         home_path: ?[]const u8,
-        recovery: ?usage_owner.RecoveryReaders = null,
     };
 
-    /// Binds usage to its host and profile. Call once this runtime is at
+    /// Binds usage to its host and HOME. Call once this runtime is at
     /// its final address.
     pub fn bindUsage(self: *SessionRuntime, alloc: Allocator, binding: UsageBinding) void {
         self.usage.bind(alloc, .{
             .host = binding.host,
             .home_path = binding.home_path,
             .lookup = self.usage.lookup,
-            .recovery = binding.recovery,
         });
     }
 

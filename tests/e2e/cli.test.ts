@@ -29,7 +29,9 @@ import {
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
+  fakeGatewayReport,
   fakeGatewaySse,
+  gatewayUserTag,
   startFakeGateway,
 } from "./tmux-helpers";
 
@@ -1284,101 +1286,98 @@ describe("cli: status", () => {
 });
 
 describe("cli: usage", () => {
+  const usageKey = "fake-usage-history-key";
+
+  function usageEnv(
+    home: string,
+    gateway: ReturnType<typeof startFakeGateway>,
+    key: string | null = usageKey,
+  ) {
+    return {
+      ...NO_GATEWAY_AUTH,
+      AI_GATEWAY_API_KEY: key ?? undefined,
+      HOME: home,
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_GATEWAY_BASE_URL: gateway.baseUrl,
+      FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+    };
+  }
+
+  const modelA = {
+    model: "provider/a",
+    total_cost: 0.25,
+    input_tokens: 9,
+    output_tokens: 1,
+    cached_input_tokens: 5,
+    cache_creation_input_tokens: 1,
+    reasoning_tokens: 2,
+    request_count: 1,
+  };
+  const modelB = { model: "provider/b", total_cost: 0.1, input_tokens: 10, output_tokens: 2, request_count: 1 };
+
   test(
-    "fx usage reads rolling local facts without credentials or profile mutation",
+    "fx usage shows what AI Gateway recorded for the API key's fx requests",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-usage-"));
+      const gateway = startFakeGateway([], {
+        report: (query) =>
+          fakeGatewayReport(query.get("start_date") === query.get("end_date") ? [modelA] : [modelA, modelB]),
+      });
       try {
-        const home = join(root, "home");
-        const fxDir = join(home, ".fx");
-        mkdirSync(fxDir, { recursive: true, mode: 0o700 });
-        chmodSync(fxDir, 0o700);
-        const now = Date.now();
-        const records = [
-          {
-            schema_version: 1,
-            kind: "coverage",
-            started_at_ms: now - 40 * 24 * 60 * 60 * 1000,
-          },
-          {
-            schema_version: 1,
-            kind: "generation",
-            fact: {
-              id: "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-              created_at_ms: now - 60 * 60 * 1000,
-              model: "provider/a",
-              input_tokens: 15,
-              output_tokens: 3,
-              cache_read_tokens: 5,
-              cache_write_tokens: 1,
-              reasoning_tokens: 2,
-              total_cost: 0.25,
-            },
-          },
-          {
-            schema_version: 1,
-            kind: "generation",
-            fact: {
-              id: "gen_01ARZ3NDEKTSV4RRFFQ69G5FAW",
-              created_at_ms: now - 2 * 24 * 60 * 60 * 1000,
-              model: "provider/b",
-              input_tokens: 10,
-              output_tokens: 2,
-              cache_read_tokens: 0,
-              cache_write_tokens: 0,
-              reasoning_tokens: null,
-              total_cost: 0.1,
-            },
-          },
-        ];
-        const usagePath = join(fxDir, "usage.jsonl");
-        writeFileSync(
-          usagePath,
-          records.map((record) => JSON.stringify(record)).join("\n") + "\n",
-          { mode: 0o600 },
-        );
-        chmodSync(usagePath, 0o600);
-        const before = readFileSync(usagePath, "utf8");
-        const entriesBefore = readdirSync(fxDir).sort();
-        const env = {
-          ...NO_GATEWAY_AUTH,
-          HOME: realpathSync(home),
-          FX_DISABLE_KEYCHAIN: "1",
-        };
-
+        const home = realpathSync(root);
+        const env = usageEnv(home, gateway);
         const text = await runFx(["usage"], { env });
         expect(text.code).toBe(0);
         expect(text.stderr).toBe("");
-        expect(text.stdout).toContain("Usage (30 days)");
+        expect(text.stdout).toStartWith("Usage (30 days)\nFrom AI Gateway as of ");
+        // Cache counts in input and reasoning in output: 15 + 3 + 12.
         expect(text.stdout).toContain("Total tokens  30");
-        expect(text.stdout.indexOf("provider/a")).toBeLessThan(
-          text.stdout.indexOf("provider/b"),
-        );
+        expect(text.stdout.indexOf("provider/a")).toBeLessThan(text.stdout.indexOf("provider/b"));
 
-        const json = await runFx(
-          ["usage", "--json", "--period", "24h"],
-          { env },
-        );
+        // One query per period, for this key's fx user only.
+        expect(gateway.reportRequests).toHaveLength(3);
+        for (const query of gateway.reportRequests) {
+          expect(query.get("group_by")).toBe("model");
+          expect(query.get("user_id")).toBe(gatewayUserTag(usageKey));
+        }
+        const end = gateway.reportRequests[0]!.get("end_date")!;
+        const daysBefore = (days: number) =>
+          new Date(Date.parse(`${end}T00:00:00Z`) - days * 86_400_000).toISOString().slice(0, 10);
+        expect(gateway.reportRequests.map((query) => [query.get("start_date"), query.get("end_date")]))
+          .toEqual([[end, end], [daysBefore(6), end], [daysBefore(29), end]]);
+
+        // The answer is kept privately, without the key, and reused.
+        const snapshot = join(home, ".fx", "usage-gateway.json");
+        expect(lstatSync(snapshot).mode & 0o777).toBe(0o600);
+        expect(readFileSync(snapshot, "utf8")).not.toContain(usageKey);
+        const json = await runFx(["usage", "--json", "--period", "today"], { env });
         expect(json.code).toBe(0);
         expect(json.stderr).toBe("");
+        expect(gateway.reportRequests).toHaveLength(3);
         const report = JSON.parse(json.stdout);
         expect(report).toMatchObject({
           kind: "usage",
           schema_version: 1,
-          period: "24h",
-          completeness: "complete",
+          period: "today",
+          source: "ai_gateway",
+          refresh_failed: false,
+          unavailable: null,
           totals: {
             total_tokens: 18,
             input_tokens: 15,
             output_tokens: 3,
+            cache_read_tokens: 5,
+            cache_write_tokens: 1,
+            reasoning_tokens: 2,
             request_count: 1,
+            spend: 0.25,
           },
         });
-        expect(report.models.map((model: { model: string }) => model.model))
-          .toEqual(["provider/a"]);
-        expect(readFileSync(usagePath, "utf8")).toBe(before);
-        expect(readdirSync(fxDir).sort()).toEqual(entriesBefore);
+        expect(typeof report.as_of_ms).toBe("number");
+        expect(report.models.map((model: { model: string }) => model.model)).toEqual(["provider/a"]);
+        expect(existsSync(join(home, ".fx", "usage.jsonl"))).toBe(false);
       } finally {
+        gateway.stop();
         rmSync(root, { recursive: true, force: true });
       }
     },
@@ -1386,228 +1385,47 @@ describe("cli: usage", () => {
   );
 
   test(
-    "fx usage preserves known totals when the ledger is incomplete",
+    "fx usage says why it has no history",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-usage-incomplete-"));
-      try {
-        const home = join(root, "home");
-        const fxDir = join(home, ".fx");
-        mkdirSync(fxDir, { recursive: true, mode: 0o700 });
-        const now = Date.now();
-        const records = [
-          {
-            schema_version: 1,
-            kind: "coverage",
-            started_at_ms: now - 40 * 24 * 60 * 60 * 1000,
-          },
-          {
-            schema_version: 1,
-            kind: "generation",
-            fact: {
-              id: "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-              created_at_ms: now - 2,
-              model: "provider/model",
-              input_tokens: 4,
-              output_tokens: 2,
-              cache_read_tokens: 0,
-              cache_write_tokens: 0,
-              reasoning_tokens: 1,
-              total_cost: 0.01,
-            },
-          },
-          {
-            schema_version: 1,
-            kind: "incident",
-            occurred_at_ms: now - 1,
-            completeness: "incomplete",
-          },
-        ];
-        writeFileSync(
-          join(fxDir, "usage.jsonl"),
-          records.map((record) => JSON.stringify(record)).join("\n") + "\n",
-          { mode: 0o600 },
-        );
-        writeFileSync(join(fxDir, "usage.lock"), "", { mode: 0o600 });
-        const env = {
-          ...NO_GATEWAY_AUTH,
-          HOME: realpathSync(home),
-          FX_DISABLE_KEYCHAIN: "1",
-        };
-
-        const text = await runFx(["usage"], { env });
-        expect(text.code).toBe(0);
-        expect(text.stdout).toContain("Known totals may be incomplete.");
-        expect(text.stdout).toContain("Total tokens  6");
-
-        const json = await runFx(["usage", "--json"], { env });
-        expect(json.code).toBe(0);
-        expect(JSON.parse(json.stdout)).toMatchObject({
-          completeness: "incomplete",
-          totals: { total_tokens: 6, spend: 0.01 },
-        });
-      } finally {
-        rmSync(root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "fx usage distinguishes empty, invalid, corrupt, and unsafe local state",
-    async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-usage-states-"));
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-usage-none-"));
+      let status = 403;
+      const gateway = startFakeGateway([], { report: () => new Response("{}", { status }) });
       try {
         const home = realpathSync(root);
-        const env = { ...NO_GATEWAY_AUTH, HOME: home, FX_DISABLE_KEYCHAIN: "1" };
-        const empty = await runFx(["usage", "--json"], { env });
-        expect(empty.code).toBe(0);
-        expect(JSON.parse(empty.stdout)).toMatchObject({
-          coverage: { status: "not_started" },
+        const signedOut = await runFx(["usage"], { env: usageEnv(home, gateway, null) });
+        expect(signedOut.code).toBe(0);
+        expect(signedOut.stdout).toBe(
+          "Usage (30 days)\nUsage history needs an AI Gateway API key. Add one with 'fx setup'.\n",
+        );
+        expect(gateway.reportRequests).toHaveLength(0);
+
+        // A refused key is remembered, so fx does not ask again on its own.
+        const refused = await runFx(["usage", "--json"], { env: usageEnv(home, gateway) });
+        expect(refused.code).toBe(0);
+        expect(JSON.parse(refused.stdout)).toMatchObject({
+          kind: "usage",
           totals: null,
+          source: "ai_gateway",
+          unavailable: "refused",
         });
-        expect(existsSync(join(home, ".fx"))).toBe(false);
+        expect(gateway.reportRequests).toHaveLength(1);
+        const again = await runFx(["usage"], { env: usageEnv(home, gateway) });
+        expect(again.stdout).toContain("AI Gateway refused usage reports for this key.");
+        expect(gateway.reportRequests).toHaveLength(1);
 
-        const invalid = await runFx(
-          ["usage", "--period", "session", "--json"],
-          { env },
-        );
-        expect(invalid.code).toBe(1);
-        expect(JSON.parse(invalid.stdout)).toMatchObject({
-          kind: "usage",
-          code: "InvalidUsageArgs",
-        });
+        // Another key has no snapshot yet, and AI Gateway is down.
+        status = 503;
+        const down = await runFx(["usage", "--json"], { env: usageEnv(home, gateway, "fake-other-key") });
+        expect(down.code).toBe(0);
+        expect(JSON.parse(down.stdout)).toMatchObject({ totals: null, unavailable: "failed" });
 
-        const fxDir = join(home, ".fx");
-        mkdirSync(fxDir, { mode: 0o700 });
-        chmodSync(fxDir, 0o700);
-        writeFileSync(
-          join(fxDir, "usage.jsonl"),
-          `${JSON.stringify({
-            schema_version: 1,
-            kind: "coverage",
-            started_at_ms: Date.now() - 1,
-          })}\n`,
-          { mode: 0o600 },
-        );
-        if (platform() !== "win32") {
-          chmodSync(fxDir, 0o755);
-          const entries = readdirSync(fxDir);
-          const unsafeDirectory = await runFx(["usage", "--json"], { env });
-          expect(unsafeDirectory.code).toBe(1);
-          expect(JSON.parse(unsafeDirectory.stdout)).toMatchObject({
-            kind: "usage",
-            code: "PrivateStatePermissionsUnsupported",
-          });
-          expect(lstatSync(fxDir).mode & 0o777).toBe(0o755);
-          expect(readdirSync(fxDir)).toEqual(entries);
-          chmodSync(fxDir, 0o700);
-        }
-        writeFileSync(join(fxDir, "usage.jsonl"), "{\"broken\":true}\n", {
-          mode: 0o600,
-        });
-        writeFileSync(join(fxDir, "usage.lock"), "", { mode: 0o600 });
-        const corrupt = await runFx(["usage", "--json"], { env });
-        expect(corrupt.code).toBe(1);
-        expect(JSON.parse(corrupt.stdout)).toMatchObject({
-          kind: "usage",
-          code: "InvalidUsageStore",
-        });
-
-        if (platform() !== "win32") {
-          rmSync(join(fxDir, "usage.jsonl"));
-          const fifo = spawnSync("mkfifo", [join(fxDir, "usage.jsonl")]);
-          expect(fifo.status).toBe(0);
-          const special = await runFx(["usage", "--json"], { env });
-          expect(special.code).toBe(1);
-          expect(JSON.parse(special.stdout)).toMatchObject({
-            kind: "usage",
-            code: "DurablePathUnsafe",
-          });
-
-          rmSync(join(fxDir, "usage.jsonl"));
-          const socketPath = join(fxDir, "usage.jsonl");
-          const server = createServer();
-          await new Promise<void>((resolve, reject) => {
-            server.once("error", reject);
-            server.listen(socketPath, () => {
-              server.off("error", reject);
-              resolve();
-            });
-          });
-          try {
-            const socket = await runFx(["usage", "--json"], { env });
-            expect(socket.code).toBe(1);
-            expect(JSON.parse(socket.stdout)).toMatchObject({
-              kind: "usage",
-              code: "DurablePathUnsafe",
-            });
-          } finally {
-            await new Promise<void>((resolve) => server.close(() => resolve()));
-          }
+        for (const period of ["session", "24h"]) {
+          const invalid = await runFx(["usage", "--period", period, "--json"], { env: usageEnv(home, gateway) });
+          expect(invalid.code).toBe(1);
+          expect(JSON.parse(invalid.stdout)).toMatchObject({ kind: "usage", code: "InvalidUsageArgs" });
         }
       } finally {
-        rmSync(root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "fx usage preserves known totals but fails closed when recovery storage is unsafe",
-    async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-usage-recovery-"));
-      try {
-        const home = join(root, "home");
-        const fxDir = join(home, ".fx");
-        mkdirSync(fxDir, { recursive: true, mode: 0o700 });
-        chmodSync(fxDir, 0o700);
-        writeFileSync(
-          join(fxDir, "usage.jsonl"),
-          [
-            {
-              schema_version: 1,
-              kind: "coverage",
-              started_at_ms: Date.now() - 40 * 24 * 60 * 60 * 1000,
-            },
-            {
-              schema_version: 1,
-              kind: "generation",
-              fact: {
-                id: "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-                created_at_ms: Date.now() - 1,
-                model: "provider/model",
-                input_tokens: 4,
-                output_tokens: 2,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-                reasoning_tokens: 1,
-                total_cost: 0.01,
-              },
-            },
-          ].map((record) => JSON.stringify(record)).join("\n") + "\n",
-          { mode: 0o600 },
-        );
-        writeFileSync(join(fxDir, "usage.lock"), "", { mode: 0o600 });
-        const outside = join(root, "outside");
-        writeFileSync(outside, "not a session directory");
-        symlinkSync(outside, join(fxDir, "sessions"));
-
-        const result = await runFx(["usage", "--json"], {
-          env: {
-            ...NO_GATEWAY_AUTH,
-            HOME: realpathSync(home),
-            FX_DISABLE_KEYCHAIN: "1",
-          },
-        });
-        expect(result.code).toBe(0);
-        expect(result.stderr).toBe("");
-        expect(JSON.parse(result.stdout)).toMatchObject({
-          kind: "usage",
-          coverage: { status: "full" },
-          completeness: "incomplete",
-          totals: { total_tokens: 6, spend: 0.01 },
-        });
-      } finally {
+        gateway.stop();
         rmSync(root, { recursive: true, force: true });
       }
     },
@@ -4264,7 +4082,10 @@ describe("cli: ask success", () => {
           maxOutputTokens: 64_000,
         });
         expect(gateway.modelRequests).toHaveLength(1);
-        expect(request.providerOptions).toEqual({ gateway: { caching: "auto" } });
+        expect(request.providerOptions).toEqual({
+          gateway: { user: gatewayUserTag("fake-portable-ask-key"), caching: "auto" },
+        });
+        expect(gateway.requests[0]!.body).not.toContain("fake-portable-ask-key");
         expect(
           gateway.requests[0]!.headers.get(
             "ai-language-model-specification-version",

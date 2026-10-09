@@ -6,6 +6,7 @@ import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
   fakeGatewayFinalText,
   fakeShellRun,
+  GATEWAY_USER_TAG,
   startFakeGateway,
 } from "./tmux-helpers";
 
@@ -240,6 +241,10 @@ describe("review model override", () => {
       expect(
         gateway.classifierRequests[0].headers.get("ai-language-model-id"),
       ).toBe("openai/gpt-5-alt");
+      // The review is attributed to the same AI Gateway user as the turn.
+      const reviewUser = JSON.parse(gateway.classifierRequests[0].body).providerOptions?.gateway?.user;
+      expect(reviewUser).toMatch(GATEWAY_USER_TAG);
+      expect(reviewUser).toBe(JSON.parse(gateway.requests[0].body).providerOptions?.gateway?.user);
       expect(jev.requests).toHaveLength(0);
     },
     TIMEOUT,

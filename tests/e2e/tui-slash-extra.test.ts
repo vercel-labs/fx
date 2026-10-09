@@ -413,7 +413,7 @@ describe.skipIf(SKIP)("tui: extra slash commands", () => {
       await session.waitForComposer(10_000);
       await session.sendText("/cost");
       const pane = await session.waitForText(/no usage yet/, 5_000);
-      expect(pane).toContain("[session]  24h  7d  30d");
+      expect(pane).toContain("[session]  today  7d  30d");
       expect(pane).not.toMatch(/^[*✓!✗⊘i] usage/m);
       expect(pane).toContain("tab period");
       expect(pane).toContain("r refresh");

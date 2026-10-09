@@ -864,37 +864,6 @@ fn loadConversationUsage(
     };
 }
 
-/// A conversation session's usage and the update time in its metadata.
-pub const ConversationUsage = struct {
-    usage: usage_mod.Snapshot,
-    updated_at_ms: i64,
-};
-
-/// What usage recovery reads from a marked session: the usage a full load
-/// gives and the metadata's update time, with the same metadata checks but
-/// without replaying the history. Null when the session isn't in the
-/// conversation format, so the caller loads it in full. The caller owns
-/// `usage`.
-pub fn loadConversationUsageOnly(
-    alloc: Allocator,
-    dir: *io_mod.VerifiedDir,
-    expected_session_id: []const u8,
-) !?ConversationUsage {
-    const metadata_bytes = (try readConversationMetadataBytes(alloc, dir)) orelse return null;
-    defer alloc.free(metadata_bytes);
-    if (!try isConversationMetadata(alloc, metadata_bytes)) return null;
-    var metadata = try session_codec.decodeSessionMetadata(alloc, metadata_bytes);
-    defer metadata.deinit();
-    if (!std.mem.eql(u8, metadata.value.id, expected_session_id)) return error.InvalidSessionMetadata;
-    _ = session.ConversationLanguage.fromSlice(metadata.value.conversation_language) catch
-        return error.InvalidSessionMetadata;
-    if (types.ReasoningEffort.parse(metadata.value.effort) == null) return error.InvalidSessionMetadata;
-    return .{
-        .usage = try loadConversationUsage(alloc, dir, expected_session_id, metadata.value.updated_at_ms),
-        .updated_at_ms = metadata.value.updated_at_ms,
-    };
-}
-
 /// Whether only the usage sidecar is damaged, so a recovery copy may
 /// continue without it. Unsafe storage and recognized foreign formats do
 /// not authorize a lossy copy.

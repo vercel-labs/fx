@@ -19,6 +19,7 @@ import {
   composerContains,
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
+  fakeGatewayReport,
   fakeGatewayToolCall,
   hasEmptyComposer,
   heldFakeGatewayFinalText,
@@ -36,6 +37,32 @@ const DIM_SGR = "\x1b[38;5;245m";
 
 let session: TmuxSession | null = null;
 let gateway: ReturnType<typeof startFakeGateway> | null = null;
+
+/** A TUI environment whose API key's usage history comes from `fake`. */
+function historyGatewayEnv(home: string, fake: ReturnType<typeof startFakeGateway>) {
+  return {
+    HOME: home,
+    AI_GATEWAY_API_KEY: "fake-usage-dashboard-key",
+    VERCEL_OIDC_TOKEN: undefined,
+    FX_AUTO_UPGRADE: "0",
+    FX_GATEWAY_BASE_URL: fake.baseUrl,
+    FX_E2E_GATEWAY_CHAT_URL: fake.chatUrl,
+    FX_E2E_GATEWAY_MODELS_URL: `${fake.baseUrl}/coding-agent/v1/models`,
+  };
+}
+
+/** A report row whose input holds one cached token and output one reasoning token. */
+function dashboardReportRow(model: string, input: number, output: number, cost: number) {
+  return {
+    model,
+    total_cost: cost,
+    input_tokens: input - 1,
+    cached_input_tokens: 1,
+    output_tokens: output - 1,
+    reasoning_tokens: 1,
+    request_count: 1,
+  };
+}
 const workDirs: string[] = [];
 
 afterEach(async () => {
@@ -1877,10 +1904,10 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       let pane = grid.join("\n");
       expect(pane).toContain("no usage yet");
       expect(pane).not.toMatch(/^[*✓!✗⊘i] usage/m);
-      // Shift+Tab wraps from the session to 30 days: tracking has not started.
+      // Shift+Tab wraps from the session to 30 days, which needs an API key.
       await session.sendKeys("BTab");
       pane = (await waitForUsageMenu(session, "[30d]")).join("\n");
-      expect(pane).toContain("no usage yet");
+      expect(pane).toContain("history needs an AI Gateway API key");
 
       await session.sendKeys("Escape");
       await session.waitForComposer(5_000);
@@ -1899,120 +1926,34 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
-    "usage dashboard preserves ledger totals when recovery storage is unsafe",
+    "usage dashboard reuses AI Gateway's answer instead of asking again on reopen",
     async () => {
-      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-usage-recovery-")));
-      workDirs.push(root);
-      const home = join(root, "home");
-      const workspace = join(root, "workspace");
-      const fxDir = join(home, ".fx");
-      mkdirSync(fxDir, { recursive: true, mode: 0o700 });
-      mkdirSync(workspace, { recursive: true });
-      const now = Date.now();
-      writeFileSync(
-        join(fxDir, "usage.jsonl"),
-        JSON.stringify({
-          schema_version: 1,
-          kind: "coverage",
-          started_at_ms: now - 40 * 24 * 60 * 60 * 1000,
-        }) + "\n",
-        { mode: 0o600 },
-      );
-      writeFileSync(join(fxDir, "usage.lock"), "", { mode: 0o600 });
-      const outside = join(root, "outside");
-      writeFileSync(outside, "not a session directory");
-      symlinkSync(outside, join(fxDir, "sessions"));
-
-      session = await TmuxSession.create({
-        cwd: workspace,
-        env: {
-          HOME: home,
-          AI_GATEWAY_API_KEY: undefined,
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_AUTO_UPGRADE: "0",
-        },
-        width: 100,
-        height: 30,
-      });
-      await session.waitForComposer(10_000);
-      await session.sendText("/usage");
-      await waitForUsageMenu(session);
-      await session.sendKeys("BTab");
-      const pane = (await waitForUsageMenu(session, "[30d]")).join("\n");
-      expect(pane).not.toContain("usage unavailable");
-      expect(pane).toContain("warning: totals may be incomplete");
-      expect(pane).toContain("no priced requests yet");
-
-      await session.sendKeys("Escape");
-      await session.waitForComposer(5_000);
-      await session.sendText("/quit");
-      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
-      session = null;
-    },
-    TEST_TIMEOUT,
-  );
-
-  test(
-    "usage dashboard reopen discovers usage created after its initial snapshot",
-    async () => {
-      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-usage-late-")));
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-usage-reuse-")));
       workDirs.push(root);
       const home = join(root, "home");
       const workspace = join(root, "workspace");
       mkdirSync(home, { recursive: true, mode: 0o700 });
       mkdirSync(workspace, { recursive: true });
-
-      session = await TmuxSession.create({
-        cwd: workspace,
-        env: {
-          HOME: home,
-          AI_GATEWAY_API_KEY: undefined,
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_AUTO_UPGRADE: "0",
-        },
-        width: 100,
-        height: 30,
+      gateway = startFakeGateway([], {
+        report: () => fakeGatewayReport([dashboardReportRow("provider/a", 12, 2, 0.25)]),
       });
+
+      session = await TmuxSession.create({ cwd: workspace, env: historyGatewayEnv(home, gateway), width: 100, height: 30 });
       await session.waitForComposer(10_000);
       await session.sendText("/usage");
-      await session.waitForText("no usage yet", TIMEOUT);
+      await waitForUsageMenu(session);
+      await session.sendKeys("BTab");
+      let pane = await session.waitForText(/\[30d\][\s\S]*\s14\s+1\s+provider\/a/, TIMEOUT);
+      expect(pane).toMatch(/note: AI Gateway as of \d\d:\d\d UTC/);
+      expect(gateway.reportRequests).toHaveLength(3);
       await session.sendKeys("Escape");
       await session.waitForComposer(5_000);
-
-      const fxDir = join(home, ".fx");
-      const now = Date.now();
-      writeFileSync(
-        join(fxDir, "usage.jsonl"),
-        [
-          JSON.stringify({
-            schema_version: 1,
-            kind: "coverage",
-            started_at_ms: now - 40 * 24 * 60 * 60 * 1000,
-          }),
-          JSON.stringify({
-            schema_version: 1,
-            kind: "generation",
-            fact: {
-              id: "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-              created_at_ms: now - 1_000,
-              model: "provider/a",
-              input_tokens: 10,
-              output_tokens: 2,
-              cache_read_tokens: 1,
-              cache_write_tokens: 0,
-              reasoning_tokens: 1,
-              total_cost: 0.25,
-            },
-          }),
-        ].join("\n") + "\n",
-        { mode: 0o600 },
-      );
-      writeFileSync(join(fxDir, "usage.lock"), "", { mode: 0o600 });
 
       await session.sendText("/usage");
       await waitForUsageMenu(session);
       await session.sendKeys("BTab");
-      await session.waitForText(/\[30d\][\s\S]*\s12\s+1\s+provider\/a/, TIMEOUT);
+      pane = await session.waitForText(/\[30d\][\s\S]*\s14\s+1\s+provider\/a/, TIMEOUT);
+      expect(gateway.reportRequests).toHaveLength(3);
 
       await session.sendKeys("Escape");
       await session.waitForComposer(5_000);
@@ -2024,7 +1965,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
-    "usage dashboard retry recovers after profile initialization becomes safe",
+    "usage dashboard retries a failed AI Gateway refresh with r",
     async () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-usage-retry-")));
       workDirs.push(root);
@@ -2032,65 +1973,30 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       const workspace = join(root, "workspace");
       mkdirSync(home, { recursive: true, mode: 0o700 });
       mkdirSync(workspace, { recursive: true });
-      const unsafeTarget = join(root, "unsafe-profile");
-      mkdirSync(unsafeTarget, { mode: 0o700 });
-      symlinkSync(unsafeTarget, join(home, ".fx"));
-
-      session = await TmuxSession.create({
-        cwd: workspace,
-        env: {
-          HOME: home,
-          AI_GATEWAY_API_KEY: undefined,
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_AUTO_UPGRADE: "0",
-        },
-        width: 100,
-        height: 30,
+      let available = false;
+      gateway = startFakeGateway([], {
+        report: () => available
+          ? fakeGatewayReport([dashboardReportRow("provider/a", 12, 2, 0.25)])
+          : new Response("unavailable", { status: 503 }),
       });
+
+      session = await TmuxSession.create({ cwd: workspace, env: historyGatewayEnv(home, gateway), width: 100, height: 30 });
       await session.waitForComposer(10_000);
       await session.sendText("/usage");
       await session.waitForText("[session]", TIMEOUT);
       await session.sendKeys("BTab");
       await session.waitForPane(
-        (current) => current.includes("[30d]") && current.includes("usage unavailable; press r to retry"),
+        (current) =>
+          current.includes("[30d]") &&
+          current.includes("couldn't load usage from AI Gateway") &&
+          current.includes("hint: press r to retry"),
         TIMEOUT,
       );
 
-      rmSync(join(home, ".fx"));
-      const fxDir = join(home, ".fx");
-      mkdirSync(fxDir, { mode: 0o700 });
-      const now = Date.now();
-      writeFileSync(
-        join(fxDir, "usage.jsonl"),
-        [
-          JSON.stringify({
-            schema_version: 1,
-            kind: "coverage",
-            started_at_ms: now - 40 * 24 * 60 * 60 * 1000,
-          }),
-          JSON.stringify({
-            schema_version: 1,
-            kind: "generation",
-            fact: {
-              id: "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-              created_at_ms: now - 1_000,
-              model: "provider/a",
-              input_tokens: 10,
-              output_tokens: 2,
-              cache_read_tokens: 1,
-              cache_write_tokens: 0,
-              reasoning_tokens: 1,
-              total_cost: 0.25,
-            },
-          }),
-        ].join("\n") + "\n",
-        { mode: 0o600 },
-      );
-      writeFileSync(join(fxDir, "usage.lock"), "", { mode: 0o600 });
-
+      available = true;
       await session.sendLiteral("R");
-      const pane = await session.waitForText(/\[30d\][\s\S]*\s12\s+1\s+provider\/a/, TIMEOUT);
-      expect(pane).not.toContain("usage unavailable");
+      const pane = await session.waitForText(/\[30d\][\s\S]*\s14\s+1\s+provider\/a/, TIMEOUT);
+      expect(pane).not.toContain("couldn't load usage");
 
       await session.sendKeys("Escape");
       await session.waitForComposer(5_000);
@@ -2102,19 +2008,14 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
-    "usage dashboard reaches Session when every rolling scope is unavailable",
+    "usage dashboard explains history without an API key and keeps the session view",
     async () => {
-      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-usage-corrupt-")));
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-usage-no-key-")));
       workDirs.push(root);
       const home = join(root, "home");
       const workspace = join(root, "workspace");
-      const fxDir = join(home, ".fx");
-      mkdirSync(fxDir, { recursive: true, mode: 0o700 });
+      mkdirSync(home, { recursive: true, mode: 0o700 });
       mkdirSync(workspace, { recursive: true });
-      writeFileSync(join(fxDir, "usage.jsonl"), "{\"broken\":true}\n", {
-        mode: 0o600,
-      });
-      writeFileSync(join(fxDir, "usage.lock"), "", { mode: 0o600 });
 
       session = await TmuxSession.create({
         cwd: workspace,
@@ -2129,15 +2030,17 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       });
       await session.waitForComposer(10_000);
       await session.sendText("/usage");
-      // The session's own view works while the profile ledger cannot be read.
       let pane = await session.waitForText("no usage yet", TIMEOUT);
       expect(pane).toContain("[session]");
       expect(pane).toMatch(/api \S+  wall \S+  lines/);
 
-      for (const period of ["[24h]", "[7d]", "[30d]"]) {
+      for (const period of ["[today]", "[7d]", "[30d]"]) {
         await session.sendKeys("Right");
         pane = await session.waitForPane(
-          (current) => current.includes(period) && current.includes("usage unavailable; press r to retry"),
+          (current) =>
+            current.includes(period) &&
+            current.includes("history needs an AI Gateway API key") &&
+            current.includes("hint: add one with 'fx setup'"),
           TIMEOUT,
         );
       }
@@ -2152,102 +2055,34 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
-    "usage dashboard changes scope, selects and expands models, and refreshes",
+    "usage dashboard changes scope, selects and expands models",
     async () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-usage-menu-")));
       workDirs.push(root);
       const home = join(root, "home");
       const workspace = join(root, "workspace");
-      const fxDir = join(home, ".fx");
-      mkdirSync(fxDir, { recursive: true, mode: 0o700 });
+      mkdirSync(home, { recursive: true, mode: 0o700 });
       mkdirSync(workspace, { recursive: true });
-      const now = Date.now();
-      const fact = (
-        id: string,
-        model: string,
-        createdAtMs: number,
-        input: number,
-        output: number,
-        cost: number,
-      ) => ({
-        schema_version: 1,
-        kind: "generation",
-        fact: {
-          id,
-          created_at_ms: createdAtMs,
-          model,
-          input_tokens: input,
-          output_tokens: output,
-          cache_read_tokens: 1,
-          cache_write_tokens: 0,
-          reasoning_tokens: 1,
-          total_cost: cost,
+      const a = dashboardReportRow("provider/a", 100, 20, 1);
+      const b = dashboardReportRow("provider/b", 10, 2, 0.1);
+      const c = dashboardReportRow("provider/c", 4, 1, 0.01);
+      gateway = startFakeGateway([], {
+        report: (query) => {
+          const days = (Date.parse(query.get("end_date")!) - Date.parse(query.get("start_date")!)) / 86_400_000 + 1;
+          return fakeGatewayReport(days === 1 ? [a] : days === 7 ? [a, b] : [a, b, c]);
         },
       });
-      const usagePath = join(fxDir, "usage.jsonl");
-      writeFileSync(
-        usagePath,
-        [
-          JSON.stringify({
-            schema_version: 1,
-            kind: "coverage",
-            started_at_ms: now - 40 * 24 * 60 * 60 * 1000,
-          }),
-          JSON.stringify(
-            fact(
-              "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-              "provider/a",
-              now - 60 * 60 * 1000,
-              100,
-              20,
-              1,
-            ),
-          ),
-          JSON.stringify(
-            fact(
-              "gen_01ARZ3NDEKTSV4RRFFQ69G5FAW",
-              "provider/b",
-              now - 2 * 24 * 60 * 60 * 1000,
-              10,
-              2,
-              0.1,
-            ),
-          ),
-          JSON.stringify(
-            fact(
-              "gen_01ARZ3NDEKTSV4RRFFQ69G5FAX",
-              "provider/c",
-              now - 10 * 24 * 60 * 60 * 1000,
-              4,
-              1,
-              0.01,
-            ),
-          ),
-        ].join("\n") + "\n",
-        { mode: 0o600 },
-      );
-      writeFileSync(join(fxDir, "usage.lock"), "", { mode: 0o600 });
 
-      session = await TmuxSession.create({
-        cwd: workspace,
-        env: {
-          HOME: home,
-          AI_GATEWAY_API_KEY: undefined,
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_AUTO_UPGRADE: "0",
-        },
-        width: 120,
-        height: 36,
-      });
+      session = await TmuxSession.create({ cwd: workspace, env: historyGatewayEnv(home, gateway), width: 120, height: 36 });
       await session.waitForComposer(10_000);
       await session.sendText("/usage");
       let pane = await session.waitForText("[session]", TIMEOUT);
       pane = await session.waitForText("no usage yet", TIMEOUT);
       expect(pane).toMatch(/api \S+  wall \S+  lines/);
 
-      // Tab walks session, 24h, 7d, 30d. 24h holds one model, so no total.
+      // Tab walks session, today, 7d, 30d. Today holds one model, so no total.
       await session.sendKeys("Tab");
-      pane = await session.waitForText(/\[24h\][\s\S]*\$1\.00\s+120\s+1\s+provider\/a/, TIMEOUT);
+      pane = await session.waitForText(/\[today\][\s\S]*\$1\.00\s+120\s+1\s+provider\/a/, TIMEOUT);
       expect(pane).not.toMatch(/\btotal\b/);
       await session.sendKeys("Tab");
       pane = await session.waitForText(/\[7d\][\s\S]*\$1\.10\s+132\s+2\s+total/, TIMEOUT);
@@ -2257,7 +2092,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("Left");
       await session.waitForText("[7d]", TIMEOUT);
       await session.sendKeys("BTab");
-      await session.waitForText("[24h]", TIMEOUT);
+      await session.waitForText("[today]", TIMEOUT);
       await session.sendKeys("Right");
       await session.waitForText(/\[7d\][\s\S]*132\s+2\s+total/, TIMEOUT);
 
@@ -2271,31 +2106,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.resizeWindow(120, 36);
       pane = await session.waitForText(/in 10  cached 1  out 2  reasoning 1/, TIMEOUT);
       expect(pane).toMatch(/❯ .*provider\/b/);
-
-      appendFileSync(
-        usagePath,
-        JSON.stringify(
-          fact(
-            "gen_01ARZ3NDEKTSV4RRFFQ69G5FAY",
-            "provider/d",
-            now - 500,
-            4,
-            1,
-            0.01,
-          ),
-        ) + "\n",
-      );
-      await session.sendLiteral("R");
-      pane = await session.waitForText(/137\s+3\s+total/, TIMEOUT);
-      expect(pane).toMatch(/❯ .*provider\/b/);
-
-      appendFileSync(usagePath, "{\"broken\":true}\n");
-      await session.sendLiteral("R");
-      pane = await session.waitForText(
-        "warning: refresh failed; showing earlier data",
-        TIMEOUT,
-      );
-      expect(pane).toMatch(/137\s+3\s+total/);
+      // One query per period for the whole visit.
+      expect(gateway.reportRequests).toHaveLength(3);
 
       await session.sendKeys("Escape");
       await session.waitForComposer(5_000);

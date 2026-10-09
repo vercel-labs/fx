@@ -974,8 +974,7 @@ fn hasTurnStart(bodies: []const schema.Body) bool {
 fn needsSync(bodies: []const schema.Body) bool {
     for (bodies) |body| switch (body) {
         .turn_committed, .turn_interrupted, .child_spawned, .child_finished => return true,
-        // Usage is durable before fx clears its usage-recovery marker
-        // (`tla/Wiring.tla` UsageNeverSilent).
+        // A usage checkpoint is durable when it returns, so a call may send.
         // fx removes the side folder only once the move is durable (D47).
         // Compactor records need no sync of their own: the compaction line
         // that cites them comes later in the log, which keeps a prefix (D50).

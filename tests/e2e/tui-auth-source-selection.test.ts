@@ -6045,7 +6045,7 @@ test(
 );
 
 test(
-  "saved provider switching publishes Gateway, Codex, and Grok usage to one profile ledger",
+  "saved provider switching records Gateway, Codex, and Grok usage in each session",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-provider-usage-ledger-"));
     const workspace = join(home, "workspace");
@@ -6134,24 +6134,29 @@ test(
         expect(result.stdout).toContain(route.text);
       }
 
-      const usage = await runFx(
-        ["usage", "--json", "--period", "24h"],
-        { cwd: workspace, env: { HOME: home }, timeoutMs: TIMEOUT },
-      );
-      expect(usage.code, usage.stderr).toBe(0);
-      const report = JSON.parse(usage.stdout) as {
-        completeness: string;
-        totals: { input_tokens: number; output_tokens: number; request_count: number };
-        models: Array<{ model: string; totals: { request_count: number } }>;
-      };
-      expect(report.completeness).toBe("complete");
-      expect(report.totals).toMatchObject({
-        input_tokens: 49,
-        output_tokens: 16,
-        request_count: 3,
-      });
+      // Each route's usage stays in its own session: AI Gateway history
+      // never sees subscription calls.
+      const sessionsDir = join(home, ".fx", "sessions");
+      const snapshots = readdirSync(sessionsDir, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => join(sessionsDir, entry.name, "usage-v2.json"))
+        .filter((path) => existsSync(path))
+        .map((path) => (JSON.parse(readFileSync(path, "utf8")) as {
+          snapshot: {
+            billing: string;
+            input_tokens: number;
+            output_tokens: number;
+            request_count: number | null;
+            models: Array<{ model: string; request_count: number | null }>;
+          };
+        }).snapshot);
+      expect(snapshots).toHaveLength(3);
+      expect(snapshots.map((snapshot) => snapshot.billing)).toEqual(["complete", "complete", "complete"]);
+      expect(snapshots.reduce((sum, snapshot) => sum + snapshot.input_tokens, 0)).toBe(49);
+      expect(snapshots.reduce((sum, snapshot) => sum + snapshot.output_tokens, 0)).toBe(16);
+      expect(snapshots.reduce((sum, snapshot) => sum + (snapshot.request_count ?? 0), 0)).toBe(3);
       expect(Object.fromEntries(
-        report.models.map((model) => [model.model, model.totals.request_count]),
+        snapshots.flatMap((snapshot) => snapshot.models).map((model) => [model.model, model.request_count]),
       )).toEqual({
         [FAKE_GATEWAY_MODEL]: 1,
         "codex/gpt-5.6-sol": 1,

@@ -335,7 +335,34 @@ export type FakeGatewayOptions = {
   // Response for the /v4/ai/evaluation-model endpoint (TypeSafe Jev through
   // the gateway). Defaults to a clear Jev decision.
   evaluationResponse?: FakeGatewayResponse;
+  // Response for /v1/report usage queries. Defaults to no usage.
+  report?: (query: URLSearchParams, request: Request) => Response | Promise<Response>;
 };
+
+/** One model's row in an AI Gateway `group_by=model` usage report. */
+export type FakeGatewayReportRow = {
+  model: string;
+  total_cost: number;
+  input_tokens: number;
+  output_tokens: number;
+  cached_input_tokens?: number;
+  cache_creation_input_tokens?: number;
+  reasoning_tokens?: number;
+  request_count: number;
+};
+
+/** An AI Gateway usage report body with these rows. */
+export function fakeGatewayReport(rows: FakeGatewayReportRow[]): Response {
+  return Response.json({
+    results: rows.map((row) => ({
+      cached_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+      reasoning_tokens: 0,
+      market_cost: row.total_cost,
+      ...row,
+    })),
+  });
+}
 
 // Session title generation calls carry this instruction regardless of the
 // provider protocol. Fake servers route them to their own channel so they
@@ -344,6 +371,15 @@ export type FakeGatewayOptions = {
 // SSE trace assertions) and without a usable title, leaving the locally
 // derived title in place for tests that do not opt in.
 export const TITLE_GENERATION_MARKER = "Generate a short title";
+
+/** The AI Gateway user tag fx sends with requests made with this API key. */
+export function gatewayUserTag(apiKey: string): string {
+  const digest = createHash("sha256").update(`fx-gateway-user-v1\0${apiKey}`).digest("hex");
+  return `fx_${digest.slice(0, 32)}`;
+}
+
+/** Matches the AI Gateway user tag fx sends for any API key. */
+export const GATEWAY_USER_TAG = /^fx_[0-9a-f]{32}$/;
 
 export function fakeGatewayTitleDefault() {
   return fakeGatewaySse([{
@@ -375,6 +411,7 @@ function serveFakeGateway(
   const titleResponses = [...(options.titleResponses ?? [])];
   const modelRequests: FakeGatewayModelRequest[] = [];
   const generationRequests: string[] = [];
+  const reportRequests: URLSearchParams[] = [];
   const server = Bun.serve({
     port: 0,
     idleTimeout: 0,
@@ -392,6 +429,12 @@ function serveFakeGateway(
             tags: ["tool-use"],
           }],
         });
+      }
+      if (req.method === "GET" && new URL(req.url).pathname === "/v1/report") {
+        const query = new URL(req.url).searchParams;
+        reportRequests.push(query);
+        if (options.report) return options.report(query, req);
+        return fakeGatewayReport([]);
       }
       if (req.method === "GET" && new URL(req.url).pathname === "/v1/generation") {
         const generationId = new URL(req.url).searchParams.get("id") ?? "";
@@ -458,6 +501,7 @@ function serveFakeGateway(
     evaluationRequests,
     titleRequests,
     generationRequests,
+    reportRequests,
     modelRequests,
     requestCount() {
       return requests.length;

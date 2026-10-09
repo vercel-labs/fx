@@ -96,7 +96,7 @@ test "the embedded tree lists, opens, and reads like a directory" {
     }
     try std.testing.expect(saw_cases and saw_readme);
     const cases = try compat.openDir(std.testing.io, "cases", .{});
-    const corpus = try cases.readFileAlloc(std.testing.io, "record.jsonl", std.testing.allocator, .limited(1 << 22));
+    const corpus = try cases.readFileAlloc(std.testing.io, "snapshot.jsonl", std.testing.allocator, .limited(1 << 22));
     defer std.testing.allocator.free(corpus);
     try std.testing.expect(corpus.len > 0);
     try std.testing.expectError(error.FileNotFound, compat.openDir(std.testing.io, "missing", .{}));

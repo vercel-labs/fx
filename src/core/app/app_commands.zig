@@ -1026,7 +1026,7 @@ pub fn Handlers(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "usage",
                     .tone = .neutral,
-                    .body = "Durable profile usage is unavailable in this host; active session usage remains in memory.",
+                    .body = "Usage history is unavailable in this host; this session's usage stays in memory.",
                 }, true);
                 return;
             }
@@ -1038,7 +1038,7 @@ pub fn Handlers(comptime App: type) type {
             openUsageDashboard(app, .session);
         }
 
-        /// Shows `scope`: the session's view at once, a rolling view from
+        /// Shows `scope`: the session's view at once, a history view from
         /// the loader when it has one, otherwise loading.
         pub fn refreshUsageMenu(app: *App, scope: usage_mod.Scope) !void {
             if (scope == .session) {
@@ -1058,7 +1058,7 @@ pub fn Handlers(comptime App: type) type {
                 return;
             }
             app.input_runtime.usage_menu.setLoadingScope(app.alloc, scope);
-            _ = loader.refresh(@max(io_mod.milliTimestamp(), 0));
+            _ = loader.refresh(@max(io_mod.milliTimestamp(), 0), false);
             app.shell.render_requests.request(.footer);
         }
 
@@ -1070,7 +1070,7 @@ pub fn Handlers(comptime App: type) type {
                 recordUsageRefreshFailure(app, scope, error.ProfileUsageUnavailable);
                 return;
             };
-            _ = loader.refresh(@max(io_mod.milliTimestamp(), 0));
+            _ = loader.refresh(@max(io_mod.milliTimestamp(), 0), true);
             app.shell.render_requests.request(.footer);
         }
 
@@ -1105,8 +1105,8 @@ pub fn Handlers(comptime App: type) type {
                     app.input_runtime.usage_menu.openLoading(app.alloc, scope);
                     recordUsageRefreshFailure(app, scope, err);
                 }
-                // The rolling periods load meanwhile, ready for Tab.
-                if (app.session.usage.dashboardLoader()) |loader| _ = loader.refresh(@max(io_mod.milliTimestamp(), 0));
+                // The history periods load meanwhile, ready for Tab.
+                if (app.session.usage.dashboardLoader()) |loader| _ = loader.refresh(@max(io_mod.milliTimestamp(), 0), false);
                 return;
             }
             const loader = app.session.usage.dashboardLoader() orelse {
@@ -1119,7 +1119,7 @@ pub fn Handlers(comptime App: type) type {
             } else {
                 app.input_runtime.usage_menu.openLoading(app.alloc, scope);
             }
-            _ = loader.refresh(@max(io_mod.milliTimestamp(), 0));
+            _ = loader.refresh(@max(io_mod.milliTimestamp(), 0), false);
             app.shell.render_requests.request(.footer);
         }
 

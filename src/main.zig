@@ -874,7 +874,6 @@ const App = struct {
         self.stopStream();
         self.worker.requestShutdown();
         SessionAppRuntime.requestPersistenceShutdown(self);
-        SessionAppRuntime.abandonProfileLedgerForProcessExit(self);
         self.upgrader.stopForProcessExit();
         self.file_index.requestStop();
         WorkspaceAppRuntime.requestStop(self);
@@ -892,8 +891,6 @@ const App = struct {
         WorkerAppRuntime.settleFinishedPromptsForShutdown(self) catch |err| {
             SessionAppRuntime.recordShutdownFailure(self, err);
         };
-        // The dashboard loader reads the profile usage ledger that
-        // persistence flushes; stop it first.
         InputSubmitRuntime.clearPendingSubmission(self, "shutdown");
         const resume_handoff = SessionAppRuntime.finalizePersistenceWithResumeHandoff(self);
         const shutdown_failure = self.session_persistence.shutdown_failure;
@@ -3744,7 +3741,9 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
         std.mem.eql(u8, command, "status") or
         std.mem.eql(u8, command, "doctor") or
         std.mem.eql(u8, command, "models") or
-        std.mem.eql(u8, command, "credits");
+        std.mem.eql(u8, command, "credits") or
+        // Also fetches AI Gateway usage reports, which need concurrency.
+        std.mem.eql(u8, command, "usage");
 }
 
 test "auth and upgrade commands use early threaded io without full entry config" {
@@ -3760,7 +3759,7 @@ test "auth and upgrade commands use early threaded io without full entry config"
 }
 
 test "credential-reading commands use early threaded io without full entry config" {
-    for ([_][:0]const u8{ "status", "doctor", "models", "credits" }) |command| {
+    for ([_][:0]const u8{ "status", "doctor", "models", "credits", "usage" }) |command| {
         const args = &.{command};
         try std.testing.expect(!needsFullEntryConfig(args));
         try std.testing.expect(needsEarlyThreadedIo(args));

@@ -146,8 +146,9 @@ pub const oauth_transport_provider = oauth_transport.Provider{
     .execute_fn = executeOAuthRequest,
 };
 
-/// The usage module's `/v1/generation` transport: fx's Gateway client, which
-/// owns trusted origins, the timeout, cancellation, and the E2E override.
+/// The usage module's AI Gateway transport for cost lookups and usage
+/// reports: fx's Gateway client, which owns trusted origins, the allowed
+/// paths, the timeout, cancellation, and the E2E override.
 pub const usage_lookup: usage_mod.host.Lookup = .{ .context = &usage_lookup_context, .vtable = &usage_lookup_vtable };
 var usage_lookup_context: u8 = 0;
 const usage_lookup_vtable: usage_mod.host.Lookup.VTable = .{ .trusted = usageLookupTrusted, .fetch = usageLookupFetch };
@@ -163,24 +164,24 @@ fn usageLookupFetch(
 ) usage_mod.host.Lookup.FetchError!usage_mod.host.Lookup.Response {
     const alloc = std.heap.c_allocator;
     // The client only reads the flag.
-    var response = gateway_client.fetchGatewayGenerationResult(
+    var response = gateway_client.fetchGatewayUsageResult(
         alloc,
         request.secret,
         request.team,
         request.origin,
-        request.generation_id,
+        request.path,
         @constCast(request.cancel),
     ) catch |err| switch (err) {
         error.Cancelled => return error.Canceled,
         error.GatewayGenerationResponseTooLarge => return error.BodyTooLarge,
         else => {
-            debug_trace.logf("gateway", "generation usage lookup failed reason={s}", .{@errorName(err)});
+            debug_trace.logf("gateway", "usage lookup failed reason={s}", .{@errorName(err)});
             return error.Transport;
         },
     };
     defer response.deinit(alloc);
     if (response.status != .ok) {
-        debug_trace.logf("gateway", "generation usage lookup status={d}", .{@intFromEnum(response.status)});
+        debug_trace.logf("gateway", "usage lookup status={d}", .{@intFromEnum(response.status)});
     }
     if (response.body.len > body.len) return error.BodyTooLarge;
     @memcpy(body[0..response.body.len], response.body);
@@ -621,8 +622,12 @@ fn streamAgentCompletion(
             error.SubscriptionCredentialCannotAuthorizeGateway,
         );
     }
+    // A prepared body carries the tag from the caller that prepared it.
+    var gateway_user_buf: [usage_owner.gateway_user_len]u8 = undefined;
+    var request_data = request.data();
+    request_data.provider_options.gateway_user = usage_owner.gatewayUser(request.credential, &gateway_user_buf);
     const payload = request.prepared_request_body orelse
-        try buildAgentRequest(alloc, request.data());
+        try buildAgentRequest(alloc, request_data);
     defer if (request.prepared_request_body == null) alloc.free(payload);
     var events = request.events;
     const stream_request = gateway_client.StreamRequest{
@@ -1097,9 +1102,6 @@ pub fn executeGatewayWorker(
         .{ .role = .system, .content = web_search_system_prompt },
         .{ .role = .user, .content = request.query },
     };
-    const payload = try vercel_protocol.buildGatewayRequiredToolRequestBodyWithMaxOutputTokens(alloc, tools_json, &messages, request.max_output_tokens);
-    defer alloc.free(payload);
-
     const lease: shared_types.CredentialLease = if (config.credential_source == .host_managed)
         .host_managed
     else
@@ -1108,6 +1110,16 @@ pub fn executeGatewayWorker(
             .source = config.credential_source,
             .tenant_context = config.team,
         } };
+    var gateway_user_buf: [usage_owner.gateway_user_len]u8 = undefined;
+    const payload = try vercel_protocol.buildGatewayRequiredToolRequestBodyWithOptionsAndOutputLimit(
+        alloc,
+        tools_json,
+        &messages,
+        .{ .gateway_user = usage_owner.gatewayUser(lease, &gateway_user_buf) },
+        request.max_output_tokens,
+    );
+    defer alloc.free(payload);
+
     var invocation = try usage_owner.Invocation.begin(config.usage, lease);
     var delivery = gateway_client.DeliveryCertainty.init();
     const provider_tool_name = try selectedToolName(request.backend);
@@ -1627,6 +1639,7 @@ fn expectGatewayWorkerAdapterExecutes(backend: web_search_contract.SearchBackend
     defer usage.deinit();
     var response = try executeGatewayWorker(alloc, .{
         .api_key = "key",
+        .credential_source = .stored_key,
         .team = "team_123",
         .model = "provider/model",
         .retry_count = 1,
@@ -1655,6 +1668,7 @@ fn expectGatewayWorkerAdapterExecutes(backend: web_search_contract.SearchBackend
     try std.testing.expect(fake.saw_output_bound);
     try std.testing.expect(fake.saw_required_tool_choice);
     try std.testing.expect(fake.saw_expected_provider_tool);
+    try std.testing.expect(fake.saw_gateway_user);
     var usage_snapshot = try usage.snapshot(alloc);
     defer usage_snapshot.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), usage_snapshot.pending.len);
@@ -1904,6 +1918,7 @@ const FakeStream = struct {
     saw_output_bound: bool = false,
     saw_required_tool_choice: bool = false,
     saw_expected_provider_tool: bool = false,
+    saw_gateway_user: bool = false,
 
     fn execute(
         raw_ctx: *anyopaque,
@@ -1935,6 +1950,8 @@ const FakeStream = struct {
         self.saw_inner_prompt = std.mem.find(u8, payload, "Research the user's query with the web_search tool and preserve sources for citation.") != null;
         self.saw_output_bound = std.mem.find(u8, payload, "\"maxOutputTokens\":4096") != null;
         self.saw_required_tool_choice = std.mem.find(u8, payload, "\"toolChoice\":{\"type\":\"required\"}") != null;
+        // The tag for API key "key": fx_ and SHA-256("fx-gateway-user-v1\x00key")[0..16] in hex.
+        self.saw_gateway_user = std.mem.find(u8, payload, "\"providerOptions\":{\"gateway\":{\"user\":\"fx_7a4d36a57bd8726a74d397daef6eac15\"}}") != null;
         const tool_name = if (self.saw_exa)
             "exa_search"
         else if (self.saw_parallel)
@@ -3335,7 +3352,9 @@ const UsageLookupTestServer = struct {
     }
 };
 
-fn runUsageLookup(response: []const u8, body: []u8, cancel: bool) !usage_mod.host.Lookup.Response {
+const test_generation_path = "/v1/generation?id=gen_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+
+fn runUsageLookup(path: []const u8, response: []const u8, body: []u8, cancel: bool) !usage_mod.host.Lookup.Response {
     var server: UsageLookupTestServer = .{ .response = response };
     const port = try server.start();
     defer server.stop();
@@ -3345,7 +3364,7 @@ fn runUsageLookup(response: []const u8, body: []u8, cancel: bool) !usage_mod.hos
     var flag: std.atomic.Value(bool) = .init(cancel);
     const request: usage_mod.host.Lookup.Request = .{
         .origin = origin,
-        .generation_id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        .path = path,
         .team = null,
         .secret = "vck_fixture",
         .cancel = &flag,
@@ -3357,7 +3376,10 @@ fn runUsageLookup(response: []const u8, body: []u8, cancel: bool) !usage_mod.hos
         const address = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
         if (address.connect(wake.io(), .{ .mode = .stream })) |stream| stream.close(wake.io()) else |_| {}
     } else {
-        try std.testing.expectStringStartsWith(server.request_line[0..server.request_line_len], "GET /v1/generation?id=gen_01ARZ3NDEKTSV4RRFFQ69G5FAV ");
+        const line = server.request_line[0..server.request_line_len];
+        try std.testing.expectStringStartsWith(line, "GET ");
+        try std.testing.expectStringStartsWith(line["GET ".len..], path);
+        try std.testing.expectStringStartsWith(line["GET ".len + path.len ..], " HTTP/1.1");
     }
     return result;
 }
@@ -3368,15 +3390,24 @@ test "usage lookups go through the Gateway client and map its answers" {
     try std.testing.expect(!usage_lookup.trusted("http://example.com"));
 
     var body: [64]u8 = undefined;
-    const found = try runUsageLookup("HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":{}}", &body, false);
+    const found = try runUsageLookup(test_generation_path, "HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":{}}", &body, false);
     try std.testing.expectEqual(@as(u16, 200), found.status);
     try std.testing.expectEqualStrings("{\"data\":{}}", body[0..found.body_len]);
 
-    const unauthorized = try runUsageLookup("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", &body, false);
+    const unauthorized = try runUsageLookup(test_generation_path, "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", &body, false);
     try std.testing.expectEqual(@as(u16, 401), unauthorized.status);
 
     var small: [4]u8 = undefined;
-    try std.testing.expectError(error.BodyTooLarge, runUsageLookup("HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":{}}", &small, false));
+    try std.testing.expectError(error.BodyTooLarge, runUsageLookup(test_generation_path, "HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":{}}", &small, false));
 
-    try std.testing.expectError(error.Canceled, runUsageLookup("", &body, true));
+    try std.testing.expectError(error.Canceled, runUsageLookup(test_generation_path, "", &body, true));
+
+    const report = try runUsageLookup(
+        "/v1/report?start_date=2026-10-09&end_date=2026-10-09&group_by=model&user_id=fx_0123",
+        "HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\n{\"results\":[]}",
+        &body,
+        false,
+    );
+    try std.testing.expectEqual(@as(u16, 200), report.status);
+    try std.testing.expectEqualStrings("{\"results\":[]}", body[0..report.body_len]);
 }

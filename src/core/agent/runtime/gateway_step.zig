@@ -831,7 +831,7 @@ test "invalid writer at provider completion prevents delivery of executable tool
     const Host = struct {
         calls: usize = 0,
         fn current(_: *anyopaque) ?usage_owner.Target {
-            return .{ .session_id = "sess-invalid-writer", .marker = .v1 };
+            return .{ .session_id = "sess-invalid-writer" };
         }
         fn persist(raw: *anyopaque, _: []const u8, _: *const usage_mod.host.Checkpoint) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(raw));

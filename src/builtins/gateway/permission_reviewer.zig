@@ -90,8 +90,18 @@ fn reviewGatewayConfig(
     ).review(alloc, request);
 }
 
+/// The credential a review request is sent and billed with.
+fn reviewLease(config: *const GatewayConfig) types.CredentialLease {
+    if (config.credential_source == .host_managed) return .host_managed;
+    return .{ .direct = .{
+        .secret_bytes = config.api_key orelse "",
+        .source = config.credential_source,
+        .tenant_context = config.team,
+    } };
+}
+
 fn buildGatewayReview(
-    _: *anyopaque,
+    context: *anyopaque,
     alloc: Allocator,
     _: []const u8,
     tools_json: []const u8,
@@ -101,13 +111,15 @@ fn buildGatewayReview(
     deadline: std.Io.Clock.Timestamp,
     cancel_flag: *std.atomic.Value(bool),
 ) ![]u8 {
+    const config: *const GatewayConfig = @ptrCast(@alignCast(context));
+    var gateway_user_buf: [usage_owner.gateway_user_len]u8 = undefined;
     return vercel_protocol.buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
         alloc,
         tools_json,
         instructions,
         messages,
         target_call_id,
-        .{},
+        .{ .gateway_user = usage_owner.gatewayUser(reviewLease(config), &gateway_user_buf) },
         2048,
         deadline,
         cancel_flag,
@@ -144,15 +156,7 @@ fn sendGatewayReview(
         return .permanent_failure;
     }
 
-    const lease: types.CredentialLease = if (config.credential_source == .host_managed)
-        .host_managed
-    else
-        .{ .direct = .{
-            .secret_bytes = config.api_key orelse "",
-            .source = config.credential_source,
-            .tenant_context = config.team,
-        } };
-    var invocation = usage_owner.Invocation.begin(config.usage, lease) catch |err| {
+    var invocation = usage_owner.Invocation.begin(config.usage, reviewLease(config)) catch |err| {
         debug_trace.logf(
             "permission",
             "event=auto_review_usage result=permanent_failure phase=begin reason={s}",
@@ -563,7 +567,7 @@ test "terminal checkpoint failure releases automatic reviewer stream" {
         calls: usize = 0,
 
         fn current(_: *anyopaque) ?usage_owner.Target {
-            return .{ .session_id = "sess-reviewer", .marker = .v1 };
+            return .{ .session_id = "sess-reviewer" };
         }
 
         fn persist(raw_ctx: *anyopaque, _: []const u8, _: *const usage_mod.host.Checkpoint) anyerror!void {

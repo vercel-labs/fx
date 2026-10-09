@@ -7,25 +7,21 @@
 //! - `billing` reads `incomplete` while a call is in flight, and the API
 //!   duration counts as incomplete then (`snapshotCurrent`).
 //! - Wall time is the saved time plus this run's.
+//! - The publication backlog is always empty: a fact settles into the
+//!   totals when it arrives.
 //!
-//! - Each staged fact is also written as a pending "bridge" entry with the
-//!   same id and the call's sequence, and `billing` reads `pending` while
-//!   one exists. That is today's shape: older binaries count a backlog fact
-//!   through its bridge when they publish it, and the 18-key shape, which
-//!   has no backlog, keeps it as a lookup. The core keeps waiting
-//!   entries plus bridges within the 16 every parser accepts.
-//!
-//! Reading:
+//! Reading a snapshot an older binary saved:
 //!
 //! - A waiting entry without `observed_at_ms` (the 18-key shape) is observed
 //!   at the saved checkpoint's time, as today's recovery reads it. A missing
 //!   `credential_source` stays null, as today.
-//! - A backlog fact with a bridge is staged with the bridge's sequence; the
-//!   bridge is not a waiting entry.
+//! - Older binaries wrote each staged fact twice: in the publication
+//!   backlog, and as a pending "bridge" entry with the same id and the
+//!   call's sequence. A backlog fact with a bridge is restored staged with
+//!   the bridge's sequence, and the core settles it; the bridge is not a
+//!   waiting entry.
 //! - A backlog fact without one is already in the totals (older binaries
-//!   count it when no session sink is configured). It can't be staged again
-//!   without counting it twice, so it restores as an `incomplete` incident
-//!   and is not published from here.
+//!   count it when no session sink is configured), so it is skipped.
 
 const std = @import("std");
 const core = @import("core/ledger.zig");
@@ -37,8 +33,7 @@ const ceiling = core.Limits.ceiling;
 /// Storage a written snapshot borrows.
 pub const Buffers = struct {
     models: [ceiling]snapshot.Model = undefined,
-    pending: [2 * ceiling]snapshot.Pending = undefined,
-    backlog: [ceiling]record.GenerationFact = undefined,
+    pending: [ceiling]snapshot.Pending = undefined,
     incidents: [ceiling]record.Incident = undefined,
 };
 
@@ -51,11 +46,9 @@ pub const Times = struct {
     live: bool = false,
 };
 
-/// What `ledger` is persisted as. `bridge_origin` is the session's Gateway
-/// origin, written on each staged fact's bridge entry; empty writes none
-/// (dev labs). Borrows `ledger`, `bridge_origin`, and `buffers` until any
-/// changes.
-pub fn snapshotOf(ledger: *const core.Ledger, times: Times, bridge_origin: []const u8, buffers: *Buffers) snapshot.Snapshot {
+/// What `ledger` is persisted as. Borrows `ledger` and `buffers` until
+/// either changes.
+pub fn snapshotOf(ledger: *const core.Ledger, times: Times, buffers: *Buffers) snapshot.Snapshot {
     const at_ms = times.at_ms;
     const opened_at_ms = times.opened_at_ms;
     const in_flight = !times.live and ledger.active.items.len > 0;
@@ -91,33 +84,6 @@ pub fn snapshotOf(ledger: *const core.Ledger, times: Times, bridge_origin: []con
             .observed_at_ms = entry.observed_at_ms,
         };
     }
-    var pending_count = ledger.waiting().len;
-    for (ledger.staged(), 0..) |*entry, index| {
-        const fact = entry.fact();
-        if (bridge_origin.len > 0) {
-            buffers.pending[pending_count] = .{
-                .id = entry.id.slice(),
-                .sequence = entry.sequence,
-                .provider = .gateway,
-                .origin = bridge_origin,
-                .team = null,
-                .observed_at_ms = @max(fact.created_at_ms, 0),
-            };
-            pending_count += 1;
-        }
-        buffers.backlog[index] = .{
-            .id = entry.id.slice(),
-            .created_at_ms = fact.created_at_ms,
-            .model = fact.model,
-            .input_tokens = fact.input_tokens,
-            .output_tokens = fact.output_tokens,
-            .cache_read_tokens = fact.cache_read_tokens,
-            .cache_write_tokens = fact.cache_write_tokens,
-            .reasoning_tokens = fact.reasoning_tokens,
-            .billable_web_search_calls = fact.billable_web_search_calls,
-            .total_cost = fact.total_cost,
-        };
-    }
     for (ledger.incidentList(), 0..) |incident, index| {
         buffers.incidents[index] = .{
             .occurred_at_ms = incident.occurred_at_ms,
@@ -130,7 +96,7 @@ pub fn snapshotOf(ledger: *const core.Ledger, times: Times, bridge_origin: []con
     const totals = ledger.totals;
     return .{
         .billing = if (in_flight) .incomplete else switch (ledger.availability()) {
-            .complete => if (pending_count > 0) .pending else .complete,
+            .complete => .complete,
             .pending => .pending,
             .incomplete => .incomplete,
             .legacy => .legacy,
@@ -153,8 +119,8 @@ pub fn snapshotOf(ledger: *const core.Ledger, times: Times, bridge_origin: []con
         .lines_added = activity.lines_added,
         .lines_removed = activity.lines_removed,
         .models = buffers.models[0..ledger.rows.items.len],
-        .pending = buffers.pending[0..pending_count],
-        .publication_backlog = buffers.backlog[0..ledger.staged().len],
+        .pending = buffers.pending[0..ledger.waiting().len],
+        .publication_backlog = &.{},
         .incidents = buffers.incidents[0..ledger.incidentList().len],
     };
 }
@@ -194,18 +160,15 @@ pub fn restoredOf(saved: *const snapshot.Snapshot, saved_at_ms: i64, buffers: *R
         } };
     }
 
-    // Bridge entries: a staged fact's pending entry with the same id.
+    // Bridge entries: a staged fact's pending entry with the same id. A fact
+    // without one is already in the totals.
     var bridged: [ceiling]bool = @splat(false);
     var staged: usize = 0;
-    var counted_at_ms: ?i64 = null;
     for (saved.publication_backlog) |fact| {
         const bridge = for (saved.pending, 0..) |entry, entry_index| {
             if (!bridged[entry_index] and std.mem.eql(u8, entry.id, fact.id)) break entry_index;
         } else null;
-        const entry_index = bridge orelse {
-            counted_at_ms = @max(saved_at_ms, 0);
-            continue;
-        };
+        const entry_index = bridge orelse continue;
         bridged[entry_index] = true;
         buffers.backlog[staged] = .{ .sequence = saved.pending[entry_index].sequence, .fact = .{
             .id = core.GenerationId.parse(fact.id) catch return error.InvalidRestore,
@@ -246,20 +209,7 @@ pub fn restoredOf(saved: *const snapshot.Snapshot, saved_at_ms: i64, buffers: *R
             },
         };
     }
-    var incident_count = saved.incidents.len;
-    if (counted_at_ms) |at_ms| {
-        if (incident_count < snapshot.max_incidents) {
-            buffers.incidents[incident_count] = .{ .occurred_at_ms = at_ms, .completeness = .incomplete };
-            incident_count += 1;
-        } else {
-            // Today's collapse rule: one `incomplete` incident at the newest time.
-            var newest = at_ms;
-            for (buffers.incidents[0..incident_count]) |incident| newest = @max(newest, incident.occurred_at_ms);
-            buffers.incidents[0] = .{ .occurred_at_ms = newest, .completeness = .incomplete };
-            incident_count = 1;
-        }
-    }
-    const availability: core.Availability = if (counted_at_ms != null) .incomplete else switch (saved.billing) {
+    const availability: core.Availability = switch (saved.billing) {
         .complete => .complete,
         // Bridges were all the pending entries there were.
         .pending => if (waiting == 0) .complete else .pending,
@@ -283,7 +233,7 @@ pub fn restoredOf(saved: *const snapshot.Snapshot, saved_at_ms: i64, buffers: *R
         .rows = buffers.rows[0..saved.models.len],
         .pending = buffers.pending[0..waiting],
         .backlog = buffers.backlog[0..staged],
-        .incidents = buffers.incidents[0..incident_count],
+        .incidents = buffers.incidents[0..saved.incidents.len],
         .activity = .{
             .api_duration_ms = saved.api_duration_ms,
             .api_duration_complete = saved.api_duration_complete,
@@ -318,15 +268,13 @@ fn testFact(n: u64, model: []const u8, cost: f64) core.Fact {
     return .{ .id = testId(n), .created_at_ms = @intCast(1_000 + n), .model = model, .total_cost = cost, .input_tokens = 10, .output_tokens = 5, .reasoning_tokens = 1 };
 }
 
-/// A ledger with one settled row, one waiting entry, one staged fact, and an
-/// incident.
+/// A ledger with two settled rows, one waiting entry, and an incident.
 fn busyLedger() !core.Ledger {
     var ledger: core.Ledger = try .init(testing.allocator, .{}, .fresh);
     errdefer ledger.deinit(testing.allocator);
     var out: core.Output = .{};
     for (0..5) |_| try ledger.step(.{ .begin = .gateway }, &out, null);
     try ledger.step(.{ .finish_exact = .{ .sequence = 1, .fact = testFact(1, "model/a", 0.5) } }, &out, null);
-    try ledger.step(.{ .publish = .{ .sequence = 1, .result = .appended } }, &out, null);
     try ledger.step(.{ .finish_lookup = .{ .sequence = 2, .request = .{
         .id = testId(2),
         .origin = "https://ai-gateway.vercel.sh",
@@ -346,16 +294,16 @@ test "a checkpoint is a valid snapshot that restores to the same ledger" {
     var ledger = try busyLedger();
     defer ledger.deinit(testing.allocator);
     var buffers: Buffers = .{};
-    const snap = snapshotOf(&ledger, .{ .at_ms = 10_000, .opened_at_ms = 4_000 }, origin, &buffers);
+    const snap = snapshotOf(&ledger, .{ .at_ms = 10_000, .opened_at_ms = 4_000 }, &buffers);
     try snapshot.validate(snap);
     try testing.expectEqual(snapshot.Billing.incomplete, snap.billing);
     try testing.expectEqual(@as(u64, 6_000), snap.wall_duration_ms);
     try testing.expectEqual(@as(u64, 5), snap.settled_through_sequence);
-    // The waiting entry, then the staged fact's bridge.
-    try testing.expectEqual(@as(usize, 2), snap.pending.len);
-    try testing.expectEqual(@as(u64, 3), snap.pending[1].sequence);
-    try testing.expectEqualStrings(snap.publication_backlog[0].id, snap.pending[1].id);
-    try testing.expectEqual(@as(usize, 1), snap.publication_backlog.len);
+    // Only the waiting entry: settled facts leave no bridge or backlog.
+    try testing.expectEqual(@as(usize, 1), snap.pending.len);
+    try testing.expectEqual(@as(usize, 0), snap.publication_backlog.len);
+    try testing.expectEqual(@as(usize, 2), snap.models.len);
+    try testing.expectEqual(@as(f64, 0.75), snap.total_cost);
     try testing.expectEqual(@as(?snapshot.CredentialSource, .fx_login), snap.pending[0].credential_source);
 
     // Through the rich bytes, as a sidecar holds them.
@@ -365,7 +313,7 @@ test "a checkpoint is a valid snapshot that restores to the same ledger" {
     defer parsed.deinit(testing.allocator);
     var restore_buffers: RestoreBuffers = .{};
     const restored = try restoredOf(&parsed.snapshot, 10_000, &restore_buffers);
-    try testing.expectEqual(@as(core.Sequence, 3), restored.backlog[0].sequence);
+    try testing.expectEqual(@as(usize, 0), restored.backlog.len);
     try testing.expectEqual(@as(usize, 1), restored.pending.len);
 
     var again: core.Ledger = try .init(testing.allocator, .{}, .fresh);
@@ -373,7 +321,7 @@ test "a checkpoint is a valid snapshot that restores to the same ledger" {
     var out: core.Output = .{};
     try again.restore(restored, &out, null);
     var again_buffers: Buffers = .{};
-    const resaved = snapshotOf(&again, .{ .at_ms = 10_000, .opened_at_ms = 10_000 }, origin, &again_buffers);
+    const resaved = snapshotOf(&again, .{ .at_ms = 10_000, .opened_at_ms = 10_000 }, &again_buffers);
     // Same bytes, apart from the wall time already folded in, and billing:
     // nothing is in flight after a restore.
     var expected = snap;
@@ -389,36 +337,35 @@ test "a checkpoint is a valid snapshot that restores to the same ledger" {
     try testing.expectEqualStrings(a.written(), b.written());
 }
 
-test "bridges make billing pending, as today, and none are written without an origin" {
+test "a settled fact is complete, in every shape, with nothing left to look up" {
     var ledger: core.Ledger = try .init(testing.allocator, .{}, .fresh);
     defer ledger.deinit(testing.allocator);
     var out: core.Output = .{};
     try ledger.step(.{ .begin = .gateway }, &out, null);
     try ledger.step(.{ .finish_exact = .{ .sequence = 1, .fact = testFact(1, "model/a", 0.5) } }, &out, null);
     var buffers: Buffers = .{};
-    var snap = snapshotOf(&ledger, .{ .at_ms = 5, .opened_at_ms = 5 }, origin, &buffers);
-    try testing.expectEqual(snapshot.Billing.pending, snap.billing);
+    const snap = snapshotOf(&ledger, .{ .at_ms = 5, .opened_at_ms = 5 }, &buffers);
+    try testing.expectEqual(snapshot.Billing.complete, snap.billing);
+    try testing.expectEqual(@as(usize, 0), snap.pending.len);
+    try testing.expectEqual(@as(f64, 0.5), snap.total_cost);
     try snapshot.validate(snap);
-    // The 18-key shape keeps the bridge, so a rollback can still count it.
+    // The 18-key shape has the call in its totals, and no lookup for it.
     var legacy: std.Io.Writer.Allocating = .init(testing.allocator);
     defer legacy.deinit();
     try snapshot.writeLegacy18(&legacy.writer, snap);
-    try testing.expect(std.mem.indexOf(u8, legacy.written(), testId(1).slice()) != null);
-    snap = snapshotOf(&ledger, .{ .at_ms = 5, .opened_at_ms = 5 }, "", &buffers);
-    try testing.expectEqual(snapshot.Billing.complete, snap.billing);
-    try testing.expectEqual(@as(usize, 0), snap.pending.len);
+    try testing.expect(std.mem.indexOf(u8, legacy.written(), testId(1).slice()) == null);
 }
 
 test "a quiet ledger reads complete, and API time is incomplete only while a call is in flight" {
     var ledger: core.Ledger = try .init(testing.allocator, .{}, .fresh);
     defer ledger.deinit(testing.allocator);
     var buffers: Buffers = .{};
-    var snap = snapshotOf(&ledger, .{ .at_ms = 0, .opened_at_ms = 0 }, origin, &buffers);
+    var snap = snapshotOf(&ledger, .{ .at_ms = 0, .opened_at_ms = 0 }, &buffers);
     try testing.expectEqual(snapshot.Billing.complete, snap.billing);
     try testing.expect(snap.api_duration_complete);
     var out: core.Output = .{};
     try ledger.step(.{ .begin = .gateway }, &out, null);
-    snap = snapshotOf(&ledger, .{ .at_ms = 0, .opened_at_ms = 0 }, origin, &buffers);
+    snap = snapshotOf(&ledger, .{ .at_ms = 0, .opened_at_ms = 0 }, &buffers);
     try testing.expect(!snap.api_duration_complete);
     try testing.expectEqual(snapshot.Billing.incomplete, snap.billing);
     try snapshot.validate(snap);
@@ -428,7 +375,7 @@ fn gatewayFact(id: *const core.GenerationId, cost: f64) record.GenerationFact {
     return .{ .id = id.slice(), .created_at_ms = 1, .model = "m/a", .input_tokens = 1, .output_tokens = 1, .cache_read_tokens = 0, .cache_write_tokens = 0, .reasoning_tokens = null, .total_cost = cost };
 }
 
-test "an older binary's bridged fact is staged; an unbridged one was counted and becomes an incident" {
+test "an older binary's bridged fact is staged; an unbridged one was counted and is skipped" {
     const id6 = testId(6);
     const id8 = testId(8);
     const id9 = testId(9);
@@ -451,15 +398,17 @@ test "an older binary's bridged fact is staged; an unbridged one was counted and
     try testing.expectEqual(@as(?core.CredentialSource, null), restored.pending[0].request.credential_source);
     try testing.expectEqual(@as(usize, 1), restored.backlog.len);
     try testing.expectEqual(@as(core.Sequence, 6), restored.backlog[0].sequence);
-    try testing.expectEqual(@as(usize, 1), restored.incidents.len);
-    try testing.expectEqual(core.Availability.incomplete, restored.availability);
+    try testing.expectEqual(@as(usize, 0), restored.incidents.len);
+    try testing.expectEqual(core.Availability.pending, restored.availability);
     var ledger: core.Ledger = try .init(testing.allocator, .{}, .fresh);
     defer ledger.deinit(testing.allocator);
     var out: core.Output = .{};
     try ledger.restore(restored, &out, null);
+    // The bridged fact settled into the totals; the unbridged one was there.
+    try testing.expectEqual(@as(f64, 0.1), ledger.view().totals.total_cost);
 }
 
-test "bridges alone restore to complete, and a full incident list collapses" {
+test "bridges alone restore to complete, and an unbridged fact adds no incident" {
     const id2 = testId(2);
     const pending = [_]snapshot.Pending{.{ .id = id2.slice(), .sequence = 2, .origin = origin, .team = null }};
     const backlog = [_]record.GenerationFact{gatewayFact(&id2, 0.1)};
@@ -480,6 +429,7 @@ test "bridges alone restore to complete, and a full incident list collapses" {
     saved.pending = &.{};
     saved.incidents = &incidents;
     restored = try restoredOf(&saved, 3, &buffers);
-    try testing.expectEqual(@as(usize, 1), restored.incidents.len);
-    try testing.expectEqual(core.Incident{ .occurred_at_ms = 15, .completeness = .incomplete }, restored.incidents[0]);
+    try testing.expectEqual(@as(usize, snapshot.max_incidents), restored.incidents.len);
+    try testing.expectEqual(@as(usize, 0), restored.backlog.len);
+    try testing.expectEqual(core.Availability.incomplete, restored.availability);
 }

@@ -100,10 +100,10 @@ test "writes one JSON line per step with contiguous sequence numbers" {
     try trace.write(.{
         .machine = "ledger",
         .instance = "session",
-        .event = "finish_exact",
+        .event = "finish_lookup",
         .from = "active",
-        .to = "fact",
-        .effects = &.{ "persist_checkpoint", "publish_backlog" },
+        .to = "lookup",
+        .effects = &.{ "persist_checkpoint", "start_lookup" },
         .data = &.{
             .{ .name = "call", .value = .{ .int = 7 } },
             .{ .name = "incident", .value = .{ .boolean = false } },
@@ -113,8 +113,8 @@ test "writes one JSON line per step with contiguous sequence numbers" {
     try trace.write(.{ .machine = "ledger", .instance = "session", .event = "begin", .from = "idle", .to = "active" });
 
     try std.testing.expectEqualStrings(
-        "{\"v\":1,\"seq\":1,\"machine\":\"ledger\",\"inst\":\"session\",\"event\":\"finish_exact\"," ++
-            "\"from\":\"active\",\"to\":\"fact\",\"effects\":[\"persist_checkpoint\",\"publish_backlog\"]," ++
+        "{\"v\":1,\"seq\":1,\"machine\":\"ledger\",\"inst\":\"session\",\"event\":\"finish_lookup\"," ++
+            "\"from\":\"active\",\"to\":\"lookup\",\"effects\":[\"persist_checkpoint\",\"start_lookup\"]," ++
             "\"data\":{\"call\":7,\"incident\":false,\"note\":\"x\"}}\n" ++
             "{\"v\":1,\"seq\":2,\"machine\":\"ledger\",\"inst\":\"session\",\"event\":\"begin\"," ++
             "\"from\":\"idle\",\"to\":\"active\",\"effects\":[],\"data\":{}}\n",

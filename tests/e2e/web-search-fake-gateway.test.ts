@@ -26,7 +26,7 @@ import {
   contentText,
 } from "./conditional-guidance-oracle";
 import { expectPermissionModeContext } from "./permission-mode-context";
-import { fakeGatewayTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
+import { fakeGatewayTitleDefault, GATEWAY_USER_TAG, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 
 const TIMEOUT = 15_000;
 const SOURCE_URL = "https://ziglang.org/download/";
@@ -971,7 +971,7 @@ describe("web_search Gateway fixture", () => {
           const request = JSON.parse(gateway.requests[0].body);
           expect(request).not.toHaveProperty("reasoning");
           expect(request).not.toHaveProperty("fast");
-          expect(request.providerOptions?.gateway).toEqual({ caching: "auto" });
+          expect(request.providerOptions?.gateway).toEqual({ user: expect.stringMatching(GATEWAY_USER_TAG), caching: "auto" });
           expect(gateway.requests[0].body).not.toContain('"thinking"');
 
           const stored = JSON.parse(

@@ -841,8 +841,8 @@ pub fn usageHost(state: *ServerState) usage_owner.Host {
 fn usageTarget(context: *anyopaque) ?usage_owner.Target {
     const state: *ServerState = @ptrCast(@alignCast(context));
     const active = if (state.active_session) |*session| session else return null;
-    if (active.v2) |v2| return .{ .session_id = v2.id(), .marker = .v2 };
-    if (active.writable) |*writable| return .{ .session_id = writable.active_id, .marker = .v1 };
+    if (active.v2) |v2| return .{ .session_id = v2.id() };
+    if (active.writable) |*writable| return .{ .session_id = writable.active_id };
     return null;
 }
 

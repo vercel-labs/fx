@@ -1486,7 +1486,6 @@ fn activateSession(
     state.active_session.?.session_rt.bindUsage(state.alloc, .{
         .host = server.usageHost(state),
         .home_path = if (comptime host_target.is_wasm) null else io_mod.getenv("HOME"),
-        .recovery = session_adapter.usage_recovery_readers,
     });
     server.setActiveUsageCredential(state, &state.active_session.?);
     if (state.active_session.?.writable) |*writable| {

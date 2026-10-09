@@ -242,15 +242,15 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .usage,
         .token = "usage",
-        .usage = "usage [--period <24h|7d|30d>] [--json]",
-        .summary = "Show local fx token usage and spend",
+        .usage = "usage [--period <today|7d|30d>] [--json]",
+        .summary = "Show fx token usage and spend from AI Gateway",
         .options = &.{
-            .{ .flag = "--period <24h|7d|30d>", .description = "Select a rolling window (default: 30d)" },
+            .{ .flag = "--period <today|7d|30d>", .description = "Select whole UTC days ending today (default: 30d)" },
             json_option,
         },
         .details = &.{
-            "Reports only usage recorded by fx on this machine.",
-            "This command reads local state and does not query account-wide Gateway reports.",
+            "Reports what AI Gateway recorded for fx requests made with this API key, on every machine.",
+            "Fetches new numbers when the last ones are more than 15 minutes old. Needs a Pro or Enterprise team.",
         },
     },
     .{
@@ -325,7 +325,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .credits, .usage = "credits|balance", .summary = "Show Vercel AI Gateway credits" },
     } },
     .{ .entries = &.{
-        .{ .kind = .usage, .usage = "usage [--period <24h|7d|30d>]", .summary = "Show locally recorded token usage and spend" },
+        .{ .kind = .usage, .usage = "usage [--period <today|7d|30d>]", .summary = "Show fx token usage and spend from AI Gateway" },
     } },
     .{ .entries = &.{
         .{ .kind = .status, .usage = "status" },

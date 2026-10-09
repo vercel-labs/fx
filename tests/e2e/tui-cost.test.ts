@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
 import {
+  fakeGatewayReport,
   fakeGatewaySse,
   startFakeGateway,
   TmuxSession,
@@ -138,46 +139,17 @@ async function waitForGenerationRequests(
   expect(activeGateway.generationRequests).toHaveLength(count);
 }
 
-async function waitForProfileUsage(
-  home: string,
-  generationId: string,
-): Promise<void> {
+// Waits until the session's usage checkpoint holds the call's settled cost.
+async function waitForSettledCheckpoint(path: string, cost: number): Promise<void> {
   const deadline = Date.now() + TIMEOUT;
-  const usagePath = join(home, ".fx", "usage.jsonl");
   while (Date.now() < deadline) {
     try {
-      if (readFileSync(usagePath, "utf8").includes(generationId)) return;
+      const usage = readUsageCheckpoint(path);
+      if (usage.pending.length === 0 && usage.total_cost === cost) return;
     } catch {}
     await Bun.sleep(20);
   }
-  throw new Error("Timed out waiting for profile usage publication");
-}
-
-// Holds the profile-wide usage ledger lock the way another fx process would.
-async function holdProfileUsageLock(home: string) {
-  const holder = Bun.spawn(
-    [
-      "python3",
-      "-c",
-      "import fcntl, os, sys, time\n" +
-        "fd = os.open(sys.argv[1], os.O_RDWR)\n" +
-        "fcntl.flock(fd, fcntl.LOCK_EX)\n" +
-        "print('locked', flush=True)\n" +
-        "time.sleep(120)",
-      join(home, ".fx", "usage.lock"),
-    ],
-    { stdout: "pipe", stderr: "pipe" },
-  );
-  const reader = holder.stdout.getReader();
-  const decoder = new TextDecoder();
-  let output = "";
-  while (!output.includes("locked")) {
-    const chunk = await reader.read();
-    if (chunk.done) throw new Error("usage lock holder exited early");
-    output += decoder.decode(chunk.value);
-  }
-  reader.releaseLock();
-  return holder;
+  throw new Error("Timed out waiting for the usage checkpoint to settle");
 }
 
 test(
@@ -252,7 +224,6 @@ test(
 
     expect(exitCode).toBe(0);
     expect(gateway.generationRequests).toEqual([]);
-    await waitForProfileUsage(home, GENERATION_ID);
     const events = filesNamed(home, "events.jsonl")
       .map((path) => readFileSync(path, "utf8"))
       .join("\n");
@@ -317,7 +288,7 @@ test("fx ask gives immediate generation reconciliation a bounded drain", async (
   expect(usage.pending).toEqual([]);
 });
 
-test("fx usage reports an unresolved delayed fallback as pending", async () => {
+test("fx ask keeps an unresolved delayed fallback pending in the session", async () => {
   root = mkdtempSync(join(tmpdir(), "fx-cost-pending-profile-"));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
@@ -358,27 +329,15 @@ test("fx usage reports an unresolved delayed fallback as pending", async () => {
   });
   const askStderr = await new Response(ask.stderr).text();
   expect(await ask.exited, askStderr).toBe(0);
-  await waitForProfileUsage(home, GENERATION_ID);
 
-  const usage = Bun.spawn(
-    [FX_BIN, "usage", "--period", "24h", "--json"],
-    {
-      cwd: workspace,
-      env: { ...process.env, HOME: home },
-      stdout: "pipe",
-      stderr: "pipe",
-    },
-  );
-  const usageStdout = await new Response(usage.stdout).text();
-  const usageStderr = await new Response(usage.stderr).text();
-  expect(await usage.exited, usageStderr).toBe(0);
-  const report = JSON.parse(usageStdout);
-  expect(report.completeness).toBe("pending");
-  expect(report.totals.request_count).toBe(0);
+  const usage = latestUsageCheckpoint(home);
+  expect(usage.billing).toBe("pending");
+  expect(usage.pending.map((item) => item.id)).toEqual([GENERATION_ID]);
+  expect(usage.total_cost).toBe(0);
   expect(gateway.generationRequests).toEqual([GENERATION_ID]);
 });
 
-test("fx usage reports a missing generation identity as incomplete", async () => {
+test("fx ask records a call without a generation identity as incomplete", async () => {
   root = mkdtempSync(join(tmpdir(), "fx-cost-incomplete-profile-"));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
@@ -411,21 +370,9 @@ test("fx usage reports a missing generation identity as incomplete", async () =>
   const askStderr = await new Response(ask.stderr).text();
   expect(await ask.exited, askStderr).toBe(0);
 
-  const usage = Bun.spawn(
-    [FX_BIN, "usage", "--period", "24h", "--json"],
-    {
-      cwd: workspace,
-      env: { ...process.env, HOME: home },
-      stdout: "pipe",
-      stderr: "pipe",
-    },
-  );
-  const usageStdout = await new Response(usage.stdout).text();
-  const usageStderr = await new Response(usage.stderr).text();
-  expect(await usage.exited, usageStderr).toBe(0);
-  const report = JSON.parse(usageStdout);
-  expect(report.completeness).toBe("incomplete");
-  expect(report.totals.request_count).toBe(0);
+  const usage = latestUsageCheckpoint(home);
+  expect(usage.billing).toBe("incomplete");
+  expect(usage.total_cost).toBe(0);
   expect(gateway.generationRequests).toEqual([]);
 });
 
@@ -529,7 +476,7 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
         await waitForGenerationRequests(gateway, 2);
         expect(releaseResumeGeneration).not.toBeNull();
         releaseResumeGeneration!();
-        await waitForProfileUsage(home, GENERATION_ID);
+        await waitForSettledCheckpoint(usageSidecars[0]!, 0.0123);
 
         await session.sendText("/cost");
         const cost = await session.waitForText(/in 130 \(20 cached, 10 written\)  out 25 \(5 reasoning\)/, TIMEOUT);
@@ -594,6 +541,18 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
         ],
         {
           models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+          // What AI Gateway reports for this turn: cache and reasoning apart.
+          report: () =>
+            fakeGatewayReport([{
+              model: MODEL,
+              total_cost: 0.0123,
+              input_tokens: 100,
+              cached_input_tokens: 20,
+              cache_creation_input_tokens: 10,
+              output_tokens: 20,
+              reasoning_tokens: 5,
+              request_count: 1,
+            }]),
           generationResponse(generationId) {
             generationAttempts += 1;
             if (generationId !== GENERATION_ID) {
@@ -623,7 +582,7 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
       expect(firstCost).toContain("[session]");
       expect(firstCost).toMatch(/\$0\.0123\s+155\s+1\s/);
       await session.sendKeys("Right");
-      await session.waitForText("[24h]", TIMEOUT);
+      await session.waitForText("[today]", TIMEOUT);
       await session.sendKeys("Right");
       await session.waitForText("[7d]", TIMEOUT);
       await session.sendKeys("Right");
@@ -645,7 +604,7 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
       expect(resumedCost).toContain("[session]");
       expect(resumedCost).toMatch(/\$0\.0123\s+155\s+1\s/);
       await session.sendKeys("Right");
-      await session.waitForText("[24h]", TIMEOUT);
+      await session.waitForText("[today]", TIMEOUT);
       await session.sendKeys("Right");
       await session.waitForText("[7d]", TIMEOUT);
       await session.sendKeys("Right");
@@ -656,9 +615,9 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
   );
 
   test(
-    "interactive exit keeps pending usage without waiting on a held ledger lock",
+    "interactive exit keeps an unresolved lookup pending and exits promptly",
     async () => {
-      root = mkdtempSync(join(tmpdir(), "fx-cost-held-ledger-"));
+      root = mkdtempSync(join(tmpdir(), "fx-cost-exit-pending-"));
       const home = join(root, "home");
       const workspace = join(root, "workspace");
       const stderrPath = join(root, "stderr.log");
@@ -698,24 +657,17 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
         stderr: "pipe",
       });
       expect(await fixture.exited).toBe(0);
-      await waitForProfileUsage(home, GENERATION_ID);
 
-      const holder = await holdProfileUsageLock(home);
-      try {
-        session = await TmuxSession.create({
-          cmd: `${FX_BIN} --resume-last`,
-          cwd: workspace,
-          env: gatewayEnvironment(home),
-          stderrPath,
-        });
-        await session.waitForComposer(TIMEOUT);
-        await session.sendText("/quit");
-        await session.waitForSessionEnd(TIMEOUT);
-        session = null;
-      } finally {
-        holder.kill();
-        await holder.exited;
-      }
+      session = await TmuxSession.create({
+        cmd: `${FX_BIN} --resume-last`,
+        cwd: workspace,
+        env: gatewayEnvironment(home),
+        stderrPath,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("/quit");
+      await session.waitForSessionEnd(TIMEOUT);
+      session = null;
 
       const report = JSON.parse(
         readFileSync(
@@ -726,7 +678,7 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
       const persistence = report.stages.find(
         (stage: { name: string }) => stage.name === "persistence_finalized",
       );
-      // Waiting on the held lock costs at least its 2s deadline per attempt.
+      // The 401 lookup doesn't hold up shutdown.
       expect(persistence.step_ms).toBeLessThan(1000);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(latestUsageCheckpoint(home).pending.map((item) => item.id))

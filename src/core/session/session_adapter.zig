@@ -52,8 +52,6 @@ const PieceKind = std.meta.Tag(Event);
 pub const files_dir_name = profile_paths.session_files_dir_name;
 /// Folder of v2 sessions' hosted terminal state, under `~/.fx` (D45).
 pub const terminal_dir_name = profile_paths.terminal_dir_name;
-/// Folder of the usage-recovery markers of v2 sessions, under `~/.fx`;
-/// v1's readers load only v1 sessions, so v2 markers live apart.
 /// The profile's home folder, opened for listing: creating `~/.fx` in it
 /// syncs it, and Linux cannot sync a folder opened any other way (`O_PATH`).
 fn openHome(home: []const u8) !io_mod.VerifiedDir {
@@ -174,11 +172,18 @@ pub const Store = struct {
         store.* = undefined;
     }
 
-    /// `~/.fx/{name}`, or null when nothing has made it yet.
+    /// `~/.fx/{name}`, or null when nothing has made it yet. Every caller is
+    /// about to change the folder, so an existing `~/.fx` is made `0700` as
+    /// every other fx writer makes it: one made by hand or an install script
+    /// keeps the default mode, and refusing it would refuse every resume.
     fn openProfileFolder(store: *Store, name: []const u8) !?io_mod.VerifiedDir {
         var home = try openHome(store.home);
         defer home.close();
-        var fx = try io_mod.openVerifiedPrivateDirIfPresent(&home, profile_paths.root_dir_name) orelse return null;
+        _ = home.dir.statFile(io_mod.getIo(), profile_paths.root_dir_name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        var fx = try io_mod.openOrCreateVerifiedPrivateDir(&home, profile_paths.root_dir_name);
         defer fx.close();
         return io_mod.openVerifiedPrivateDirIfPresent(&fx, name);
     }
@@ -2628,50 +2633,6 @@ fn summaryOf(alloc: Allocator, scratch: Allocator, item: sm.Summary) !session_st
     };
 }
 
-// ---------------------------------------------------------------------------
-// Usage recovery: what the profile's readers need from v2 sessions
-
-/// How usage recovery reads marked sessions of either format.
-pub const usage_recovery_readers: usage_owner.RecoveryReaders = .{
-    .v1 = session_store.readUsageForRecovery,
-    .v2 = readNewestUsage,
-    .storage_readable = session_store.usageStorageReadable,
-};
-
-/// The newest `set usage` value of a v2 session, or the usage in its newest
-/// snapshot, read back from the end without the session's lock: what usage
-/// recovery reads for a marked session. Null when it has none. The caller
-/// owns the bytes.
-pub fn readNewestUsage(alloc: Allocator, home: []const u8, id: []const u8) !?[]u8 {
-    var store = try Store.open(alloc, home);
-    defer store.deinit(alloc);
-    var scratch = std.heap.ArenaAllocator.init(alloc);
-    defer scratch.deinit();
-    const sa = scratch.allocator();
-    var from: sm.From = .end;
-    while (true) {
-        var page = try store.manager.read(sa, id, from, .backward, replay_page_lines);
-        defer page.deinit();
-        for (page.entries) |entry| {
-            const body = entry.body orelse continue;
-            switch (body) {
-                .set => |setting| if (setting.key == .usage) return try alloc.dupe(u8, setting.value),
-                .snapshot => |snapshot| {
-                    const state = try std.json.parseFromSliceLeaky(std.json.Value, sa, snapshot.state, .{});
-                    if (state != .object) return error.InvalidUsageCheckpoint;
-                    const usage = state.object.get("usage") orelse return null;
-                    var out: std.Io.Writer.Allocating = .init(alloc);
-                    errdefer out.deinit();
-                    std.json.Stringify.value(usage, .{}, &out.writer) catch return error.OutOfMemory;
-                    return try out.toOwnedSlice();
-                },
-                else => {},
-            }
-        }
-        from = .{ .at = page.next orelse return null };
-    }
-}
-
 /// v1's error names for a failed resume, so every host reports the same
 /// error whichever backend is on.
 /// Whether a failed write may still have reached the log: after any I/O
@@ -2684,18 +2645,6 @@ pub fn writeMayHaveLanded(err: anyerror) bool {
 }
 
 const ResumeError = error{ SessionNotFound, NoSavedSessions, NoRememberedSession, SessionBusy, InvalidSessionFormat, UnsupportedSessionFormat } || sm.OpenError;
-
-/// The storage causes a host names (D29), from an OS error; null for any
-/// other error.
-fn storageCause(err: anyerror) ?error{ NoSpaceLeft, AccessDenied, ReadOnlyFileSystem, FileTooBig } {
-    return switch (err) {
-        error.NoSpaceLeft => error.NoSpaceLeft,
-        error.AccessDenied, error.PermissionDenied => error.AccessDenied,
-        error.ReadOnlyFileSystem => error.ReadOnlyFileSystem,
-        error.FileTooBig => error.FileTooBig,
-        else => null,
-    };
-}
 
 fn resumeError(err: sm.OpenError, target: Target) ResumeError {
     return switch (err) {
@@ -3962,21 +3911,6 @@ test "a usage checkpoint is a set event, and resume restores it with its time" {
     defer restored.deinit(testing.allocator);
     try testing.expect(restored.usage != null);
     try testing.expectEqual(@as(i64, 42), restored.usage_saved_at_ms);
-    const newest = (try readNewestUsage(testing.allocator, t.home, id)).?;
-    defer testing.allocator.free(newest);
-    try testing.expect(std.mem.startsWith(u8, newest, "{\"at_ms\":42,\"snapshot\":"));
-}
-
-test "a usage marker that cannot be written names a storage cause (D29)" {
-    // The real write is proven on a full disk end to end; opening the
-    // markers folder makes it private again, so a unit test cannot block it.
-    const Cause = ?error{ NoSpaceLeft, AccessDenied, ReadOnlyFileSystem, FileTooBig };
-    try testing.expectEqual(@as(Cause, error.NoSpaceLeft), storageCause(error.NoSpaceLeft));
-    try testing.expectEqual(@as(Cause, error.AccessDenied), storageCause(error.AccessDenied));
-    try testing.expectEqual(@as(Cause, error.AccessDenied), storageCause(error.PermissionDenied));
-    try testing.expectEqual(@as(Cause, error.ReadOnlyFileSystem), storageCause(error.ReadOnlyFileSystem));
-    try testing.expectEqual(@as(Cause, error.FileTooBig), storageCause(error.FileTooBig));
-    try testing.expectEqual(@as(Cause, null), storageCause(error.InputOutput));
 }
 
 test "a failed resume reports v1's error names" {
@@ -4493,6 +4427,24 @@ test "a web-fetch download on v2 is a read-only blob the model opens by its path
     const stat = try file.stat(io_mod.getIo());
     try testing.expectEqual(@as(u32, 0o400), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
     try testing.expect(!pathExists(&t, &.{ ".fx", files_dir_name }));
+}
+
+test "a resume makes a hand-made ~/.fx private instead of refusing the session" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    try OldSideFolder.commitTurn(&t, s);
+    s.close();
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), ".fx", .fromMode(0o755), .{});
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    r.close();
+    const stat = try t.tmp.dir.statFile(io_mod.getIo(), ".fx", .{ .follow_symlinks = false });
+    try testing.expectEqual(@as(u32, 0o700), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
 }
 
 test "a move cut short is redone on the next open, and old names still resolve (D47)" {

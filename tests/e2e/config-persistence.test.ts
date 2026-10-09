@@ -21,6 +21,7 @@ import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   fakeGatewayToolCall,
+  GATEWAY_USER_TAG,
   hasEmptyComposer,
   startFakeGateway,
   TmuxSession,
@@ -1523,7 +1524,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           reasoning: "future-tier",
         });
         expect(JSON.parse(gateway.requests[1]!.body).providerOptions).toEqual({
-          gateway: { caching: "auto" },
+          gateway: { user: expect.stringMatching(GATEWAY_USER_TAG), caching: "auto" },
         });
 
         await session.sendText("/quit");

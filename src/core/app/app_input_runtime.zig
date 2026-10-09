@@ -5353,7 +5353,7 @@ test "app_input_runtime Tab cycles usage scopes in both directions" {
     app.input_runtime.usage_menu.openError(alloc, .session);
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
-    try std.testing.expectEqual(usage_mod.Scope.hours_24, app.input_runtime.usage_menu.navigationScope());
+    try std.testing.expectEqual(usage_mod.Scope.today, app.input_runtime.usage_menu.navigationScope());
 
     try feedRoutingBytes(&app, "\x1b[Z");
     try std.testing.expectEqual(usage_mod.Scope.session, app.input_runtime.usage_menu.navigationScope());

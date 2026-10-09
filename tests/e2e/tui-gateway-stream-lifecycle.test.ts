@@ -38,6 +38,7 @@ import {
   hasEmptyComposer,
   isEmptyComposerLine,
   isComposerLine,
+  GATEWAY_USER_TAG,
   startDynamicFakeGateway,
   startFakeGateway,
   TmuxSession,
@@ -2736,7 +2737,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       for (const request of queuedGateway.requests.slice(1)) {
         const retryRequest = JSON.parse(request.body);
         expect(retryRequest).not.toHaveProperty("fast");
-        expect(retryRequest.providerOptions?.gateway).toEqual({ caching: "auto" });
+        expect(retryRequest.providerOptions?.gateway).toEqual({ user: expect.stringMatching(GATEWAY_USER_TAG), caching: "auto" });
       }
       const scrollback = await session!.captureFullScrollback();
       expect(scrollback).toContain(finalText);
@@ -3016,10 +3017,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       });
       const secondRequest = JSON.parse(queuedGateway.requests[1]!.body);
       expect(secondRequest).not.toHaveProperty("fast");
-      expect(secondRequest.providerOptions?.gateway).toEqual({ caching: "auto" });
+      expect(secondRequest.providerOptions?.gateway).toEqual({ user: expect.stringMatching(GATEWAY_USER_TAG), caching: "auto" });
       const finalRequest = JSON.parse(queuedGateway.requests[2]!.body);
       expect(finalRequest).not.toHaveProperty("fast");
-      expect(finalRequest.providerOptions?.gateway).toEqual({ caching: "auto" });
+      expect(finalRequest.providerOptions?.gateway).toEqual({ user: expect.stringMatching(GATEWAY_USER_TAG), caching: "auto" });
       expect(scrollback).toContain(finalText);
       expect(scrollback).toMatch(TURN_SUMMARY_WITH_TOKENS);
       expect(scrollback).not.toContain("✓ recovered");

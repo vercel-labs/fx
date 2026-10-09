@@ -1864,14 +1864,43 @@ fn runNonInteractiveWithDeps(
                 );
                 return .handled_failure;
             };
-            // Local facts only: no credentials, no Gateway, no profile writes.
-            var profile: usage_owner.ReadOnly = undefined;
-            profile.open(alloc, home, session_adapter.usage_recovery_readers) catch |err| {
-                try writeUsageCommandFailure(alloc, deps, err, opts.format);
-                return .handled_failure;
-            };
-            defer profile.deinit();
-            var view = profile.profile.view(alloc, opts.scope, @max(io_mod.milliTimestamp(), 0)) catch |err| {
+            var startup = if (cfg.auth_mode == .host_managed)
+                try deps.load_startup_state_with_auth_mode(
+                    alloc,
+                    cfg.gateway_provider.oauth_transport,
+                    cfg.secret_store,
+                    cfg.default_model,
+                    cfg.default_agent_step_limit,
+                    cfg.auth_mode,
+                )
+            else
+                try deps.load_startup_state(
+                    alloc,
+                    cfg.gateway_provider.oauth_transport,
+                    cfg.secret_store,
+                    cfg.default_model,
+                    cfg.default_agent_step_limit,
+                );
+            defer startup.deinit(alloc);
+            try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
+            // AI Gateway's usage reports for this credential's fx requests.
+            const lease: ?types.CredentialLease = if (startup.auth_mode == .host_managed)
+                .host_managed
+            else if (startup.credential) |credential|
+                .{ .direct = .{
+                    .secret_bytes = startup.apiKey() orelse "",
+                    .source = credential.source,
+                    .tenant_context = startup.gatewayTeam(),
+                } }
+            else
+                null;
+            var view = usage_owner.historyView(
+                alloc,
+                home,
+                cfg.provider_set.select(startup.provider).usage_lookup,
+                lease,
+                opts.scope,
+            ) catch |err| {
                 try writeUsageCommandFailure(alloc, deps, err, opts.format);
                 return .handled_failure;
             };
@@ -3824,14 +3853,7 @@ fn parseUsageArgs(args: []const [:0]const u8) !UsageOptions {
             if (period_seen or index + 1 >= args.len) return error.InvalidUsageArgs;
             period_seen = true;
             index += 1;
-            options.scope = if (std.mem.eql(u8, args[index], "24h"))
-                .hours_24
-            else if (std.mem.eql(u8, args[index], "7d"))
-                .days_7
-            else if (std.mem.eql(u8, args[index], "30d"))
-                .days_30
-            else
-                return error.InvalidUsageArgs;
+            options.scope = usage_mod.Scope.fromCliValue(args[index]) orelse return error.InvalidUsageArgs;
             continue;
         }
         return error.InvalidUsageArgs;

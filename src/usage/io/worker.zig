@@ -6,34 +6,26 @@
 //!   with `receipt.classifyStatus` and `receipt.parseLookup`, then
 //!   `lookup_found`, `lookup_unauthorized`, `lookup_rejected`, or
 //!   `lookup_retry`.
-//! - `publish_backlog` → one `Publisher.publish` per staged fact, then
-//!   `publish` or `publish_conflict`; and one `publish_incident` per session
-//!   incident, then `incident_published`.
-//! - `publish_pending` → one `Publisher.publish_pending`.
 //! - `persist_checkpoint` → `Host.SessionSink.persist`, before the step that
-//!   asked for it returns. With `Markers`, the recovery marker is
-//!   durable first whenever the checkpoint owes the profile ledger, and is
-//!   cleared after one that owes nothing; `core/publish.zig` checks that
-//!   order and traces it (machine `publication`).
+//!   asked for it returns.
 //!
 //! Concurrency:
 //!
 //! - **One task.** The worker is a single `std.Io.concurrent` task. It starts
-//!   only when the core has lookup, publication, or checkpoint-retry work,
-//!   and exits as soon as none is left; the next piece of work starts it
-//!   again. Between attempts it sleeps on a futex with a deadline, so a
-//!   backoff never spins.
+//!   only when the core has lookup or checkpoint-retry work, and exits as
+//!   soon as none is left; the next piece of work starts it again. Between
+//!   attempts it sleeps on a futex with a deadline, so a backoff never spins.
 //! - **Lock order: `checkpoint`, then `state`.** `checkpoint` serializes every
 //!   core step and the persist that follows it, so checkpoints reach the sink
 //!   in step order. `state` guards the core, the schedule, and the credential;
 //!   it is held only for memory operations, never across I/O. The worker
-//!   holds neither lock across `fetch` or `publish`, and takes `checkpoint`
-//!   to pick its next job, so it never starts work whose checkpoint is still
-//!   being written.
+//!   holds neither lock across `fetch`, and takes `checkpoint` to pick its
+//!   next job, so it never starts work whose checkpoint is still being
+//!   written.
 //! - **`close`** sets the cancel flag `fetch` honors, cancels the task, and
 //!   joins it (the budget is 250 ms), then persists a last checkpoint
-//!   if one is owed. Pending lookups and staged facts stay in that
-//!   checkpoint, so nothing owed is lost.
+//!   if one is owed. Pending lookups stay in that checkpoint, so nothing
+//!   owed is lost.
 //!
 //! Credentials: the worker keeps the current secret in memory and the
 //! core keeps only its SHA-256 digest. A 401/403 blocks the entry for that
@@ -55,76 +47,12 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const core = @import("../core/ledger.zig");
 const host = @import("../host.zig");
-const publication = @import("../core/publish.zig");
 const receipt = @import("../receipt.zig");
 const trace = @import("../trace.zig");
 
 /// The largest `/v1/generation` body read, as fx's
 /// `generation_response_max_bytes`.
 pub const max_body_bytes = 128 * 1024;
-
-/// Where staged facts go: the profile ledger (`usage.jsonl`). The module
-/// owns that I/O; this is the seam between the worker and it.
-pub const Publisher = struct {
-    context: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        /// Appends `fact` to the profile ledger, or finds it already there.
-        /// Durable when it returns. Must not retain `fact`.
-        publish: *const fn (context: *anyopaque, fact: *const core.Fact) PublishError!Answer,
-        /// Appends a waiting entry's `pending` record. Null keeps none.
-        publish_pending: ?*const fn (context: *anyopaque, record: *const PendingRecord) PublishError!void = null,
-        /// Appends one of the session's incidents. Null keeps them with the
-        /// session (and its marker).
-        publish_incident: ?*const fn (context: *anyopaque, incident: core.Incident) PublishError!void = null,
-    };
-
-    /// `conflict`: another variant of the generation holds the id, so the
-    /// fact is never retried.
-    pub const Answer = enum { appended, duplicate, conflict };
-
-    pub const PendingRecord = struct {
-        id: []const u8,
-        observed_at_ms: i64,
-    };
-
-    pub const PublishError = error{
-        /// The ledger lock is held elsewhere: try again later.
-        Busy,
-        /// Any other failure; the fact stays staged and is retried.
-        Failed,
-    };
-
-    pub fn publish(publisher: Publisher, fact: *const core.Fact) PublishError!Answer {
-        return publisher.vtable.publish(publisher.context, fact);
-    }
-};
-
-/// The session's recovery marker (`io/markers.zig`). Without one the
-/// worker persists checkpoints with no marker (unit tests, dev labs).
-pub const Markers = struct {
-    context: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        /// `markers.prepareCheckpoint`: when `input.next_owes`, the marker is
-        /// durable when this returns. Returns the time to persist with the
-        /// checkpoint, strictly after `input.saved_at_ms`.
-        prepare: *const fn (context: *anyopaque, input: Input) Error!i64,
-        /// `markers.finishCheckpoint` after a checkpoint that owes nothing.
-        clear: *const fn (context: *anyopaque) Error!void,
-    };
-
-    pub const Input = struct {
-        now_ms: i64,
-        saved_at_ms: i64,
-        saved_owes: bool,
-        next_owes: bool,
-    };
-
-    pub const Error = error{MarkerFailed};
-};
 
 /// Persists checkpoints: the frozen ledger copy, handed over after the state
 /// lock is released (`usage.zig` turns it into a `Checkpoint`).
@@ -156,7 +84,7 @@ pub const Checkpoint = struct {
     /// Borrowed for the `persist` call only.
     ledger: *const core.Ledger,
     /// Wall-clock time to persist with it, strictly after the previous
-    /// checkpoint's (the v2 `set usage` `at_ms`, the recovery marker's time).
+    /// checkpoint's (the v2 `set usage` `at_ms`).
     at_ms: i64,
     /// When this run opened the session; wall time is the saved
     /// `ledger.activity.wall_duration_ms` plus `at_ms - opened_at_ms`.
@@ -166,24 +94,12 @@ pub const Checkpoint = struct {
 /// A saved session to continue.
 pub const Restore = struct {
     saved: core.Restored,
-    /// The saved checkpoint's time (`markers.CheckpointInput.saved_at_ms`).
+    /// The saved checkpoint's time: the next one persists strictly after it.
     saved_at_ms: i64,
-    /// Whether the session's marker exists now.
-    marker: bool,
 };
 
-/// Whether a checkpoint can still owe the profile ledger, as today's
-/// `needsProfileRecovery`: anything staged, waiting, or unpublished, or a
-/// call not settled through.
-pub fn owes(ledger: *const core.Ledger) bool {
-    return ledger.settled_through != ledger.next_sequence - 1 or
-        ledger.waiting().len > 0 or
-        ledger.staged().len > 0 or
-        ledger.incidentList().len > 0;
-}
-
-/// Backoff for one entry's lookups, a fact's publication, or a failed
-/// checkpoint. See the file comment for the default schedule.
+/// Backoff for one entry's lookups or a failed checkpoint. See the file
+/// comment for the default schedule.
 pub const Schedule = struct {
     first_ms: u32 = 1_000,
     max_ms: u32 = 60_000,
@@ -221,22 +137,16 @@ pub const Options = struct {
     start: core.Start = .fresh,
     lookup: host.Lookup,
     sink: Sink,
-    publisher: Publisher,
-    markers: ?Markers = null,
     restore: ?Restore = null,
-    /// A new session (no `restore`) whose marker is already on disk: an
-    /// earlier run died before its first checkpoint was durable.
-    existing_marker: bool = false,
     /// The core's trace instance (`core.Ledger.trace_instance`). Borrowed.
     trace_instance: []const u8 = "session",
     schedule: Schedule = .{},
     /// Core steps are traced here when trace code is compiled in. Written
     /// only under the checkpoint lock; the owner flushes it after `close`.
     tracer: ?*trace.Writer = null,
-    /// Never start a task. The owner publishes with `publishOwed` after each
-    /// report instead; lookups and checkpoint retries never run. For a
-    /// ledger with no profile and no lookups, where the publisher is in
-    /// memory, and for single-threaded hosts.
+    /// Never start a task: lookups and checkpoint retries never run, and a
+    /// failed checkpoint waits for the next step or `close`. For ledgers
+    /// that look nothing up, and for single-threaded hosts.
     inline_only: bool = false,
     wall_start: WallStart = .open,
 };
@@ -258,12 +168,6 @@ pub const Stats = struct {
     canceled: u32 = 0,
     stale_answers: u32 = 0,
     refused_answers: u32 = 0,
-    publishes: u32 = 0,
-    publish_failures: u32 = 0,
-    conflicts: u32 = 0,
-    pending_records: u32 = 0,
-    incidents_published: u32 = 0,
-    marker_failures: u32 = 0,
     persists: u32 = 0,
     persist_failures: u32 = 0,
     /// Sleeps until the next due job.
@@ -273,8 +177,8 @@ pub const Stats = struct {
     scheduled_lookups: u32 = 0,
 };
 
-/// What a call reports. Lookup answers and publication results come from the
-/// worker itself, and credentials through `setCredential`.
+/// What a call reports. Lookup answers come from the worker itself, and
+/// credentials through `setCredential`.
 pub const CallEvent = union(enum) {
     begin: core.Provider,
     finish_exact: @FieldType(core.Event, "finish_exact"),
@@ -289,7 +193,7 @@ pub const CallEvent = union(enum) {
     }
 };
 
-pub const InitError = core.Ledger.InitError || core.Ledger.RestoreError || error{ InvalidSchedule, TooManyStaged };
+pub const InitError = core.Ledger.InitError || core.Ledger.RestoreError || error{InvalidSchedule};
 
 pub const ReportError = core.StepError || error{
     /// `close` has run.
@@ -380,7 +284,7 @@ const Cause = enum {
     credential,
     /// A lookup said to ask again: wait out the next backoff.
     retry,
-    /// Any other lookup answer or a publication result.
+    /// Any other lookup answer, or a restore.
     answer,
 };
 
@@ -388,15 +292,7 @@ const Next = union(enum) {
     exit,
     wait: struct { due_ms: i64, observed: u32 },
     lookup,
-    publish,
     checkpoint,
-};
-
-/// What the task publishes next, copied out under `state`.
-const Outbound = union(enum) {
-    fact: core.Staged,
-    pending: struct { sequence: core.Sequence, id: core.GenerationId, observed_at_ms: i64 },
-    incident: core.Incident,
 };
 
 /// The worker for one session ledger. It owns the ledger core. Initialize in
@@ -409,8 +305,6 @@ pub const Worker = struct {
     gpa: Allocator,
     lookup: host.Lookup,
     sink: Sink,
-    publisher: Publisher,
-    markers: ?Markers,
     schedule: Schedule,
     tracer: ?*trace.Writer,
     inline_only: bool,
@@ -428,10 +322,6 @@ pub const Worker = struct {
     held: Held = .{},
     jobs: [core.Limits.ceiling]Job = undefined,
     job_count: usize = 0,
-    /// Waiting entries whose `pending` record isn't published yet.
-    pending_records: [core.Limits.ceiling]core.Sequence = undefined,
-    pending_record_count: usize = 0,
-    publish_due: ?Due = null,
     /// Activity changed since the last checkpoint.
     activity_dirty: bool = false,
     /// A step's checkpoint failed; `checkpoint_due` says when to try again.
@@ -447,13 +337,10 @@ pub const Worker = struct {
     frozen: core.Ledger,
     checkpoint_number: u64 = 0,
     task: ?Io.Future(void) = null,
-    publication: publication.Machine = .{},
     saved_at_ms: i64 = 0,
-    saved_owes: bool = false,
 
     // Owned by the task.
     outgoing: Outgoing = .{},
-    outbound: Outbound = undefined,
     body: []u8,
 
     /// Bumped (and woken) when new work arrives or `close` runs.
@@ -480,8 +367,6 @@ pub const Worker = struct {
             .gpa = gpa,
             .lookup = options.lookup,
             .sink = options.sink,
-            .publisher = options.publisher,
-            .markers = options.markers,
             .schedule = options.schedule,
             .tracer = options.tracer,
             .inline_only = options.inline_only,
@@ -491,31 +376,21 @@ pub const Worker = struct {
             .frozen = frozen,
             .body = body,
         };
-        var marker = options.existing_marker;
         if (options.restore) |saved| {
             var out: core.Output = .{};
             try w.ledger.restore(saved.saved, &out, w.tracer);
-            _ = w.afterStepLocked(&out, .answer);
             w.startWallAt(options.wall_start, true);
-            freeze(&w.frozen, &w.ledger);
             w.saved_at_ms = saved.saved_at_ms;
-            w.saved_owes = owes(&w.frozen);
-            marker = saved.marker;
+            // Restoring settled facts an older binary staged: the task, or
+            // the next step or `close`, persists them.
+            if (w.afterStepLocked(&out, .answer)) {
+                w.dirty = true;
+                w.checkpoint_due = .{ .due_ms = w.nowMs() };
+            }
         } else {
             w.startWallAt(options.wall_start, false);
-            freeze(&w.frozen, &w.ledger);
-            if (!marker) return;
         }
-        // A later run of the session: the publication machine starts from
-        // what is durable.
-        if (w.markers != null) {
-            var staged: [core.Limits.ceiling]core.Sequence = undefined;
-            const projection = projectionOf(&w.frozen, &staged);
-            w.publication.step(.{ .restart = .{ .saved = projection, .marker = marker } }, w.tracer) catch |err| switch (err) {
-                error.TooManyStaged => return error.TooManyStaged,
-                else => w.counters.trace_errors += 1,
-            };
-        }
+        freeze(&w.frozen, &w.ledger);
     }
 
     fn startWallAt(w: *Worker, wall_start: WallStart, restored: bool) void {
@@ -550,7 +425,7 @@ pub const Worker = struct {
     }
 
     /// Starts the work a restored session brought: lookups once a credential
-    /// arrives, and publishing its backlog, incidents, and pending records.
+    /// arrives, and the checkpoint its restore owes.
     pub fn start(w: *Worker) void {
         w.checkpoint.lockUncancelable(w.io);
         defer w.checkpoint.unlock(w.io);
@@ -727,7 +602,6 @@ pub const Worker = struct {
         }
         // Neither lock is held: the task may need both to finish its step.
         if (task) |*running| running.cancel(w.io);
-        w.publishOwed();
 
         w.checkpoint.lockUncancelable(w.io);
         defer w.checkpoint.unlock(w.io);
@@ -740,36 +614,6 @@ pub const Worker = struct {
             break :blk due;
         };
         if (owed) return w.persistFrozen();
-        // A marker whose clear failed earlier, for a checkpoint that owes nothing.
-        if (w.markers) |markers| if (w.publication.marker and !w.saved_owes) w.clearMarker(markers);
-    }
-
-    /// One attempt for each item owed now, in the task's order: the bounded
-    /// final publish at `close` (with the task joined), and every publish of
-    /// an `inline_only` worker. The first failure stops it; what is left
-    /// stays in the checkpoint and under the marker for the next run.
-    /// Lookups are not attempted. No task may be running.
-    pub fn publishOwed(w: *Worker) void {
-        var attempts = blk: {
-            w.state.lockUncancelable(w.io);
-            defer w.state.unlock(w.io);
-            const incidents = if (w.publisher.vtable.publish_incident != null) w.ledger.incidentList().len else 0;
-            break :blk w.ledger.staged().len + w.pending_record_count + incidents;
-        };
-        while (attempts > 0) : (attempts -= 1) {
-            const failures = blk: {
-                w.state.lockUncancelable(w.io);
-                defer w.state.unlock(w.io);
-                w.prunePendingRecordsLocked();
-                if (!w.hasPublicationLocked()) return;
-                w.outbound = w.nextOutboundLocked();
-                break :blk w.counters.publish_failures;
-            };
-            w.runPublish();
-            w.state.lockUncancelable(w.io);
-            defer w.state.unlock(w.io);
-            if (w.counters.publish_failures != failures) return;
-        }
     }
 
     // Steps and scheduling ----------------------------------------------------
@@ -785,18 +629,6 @@ pub const Worker = struct {
         for (out.effects()) |effect| switch (effect) {
             .persist_checkpoint => persist = true,
             .start_lookup => |sequence| w.planLookupLocked(sequence, cause, now),
-            .publish_backlog => if (w.publish_due == null) {
-                w.publish_due = .{ .due_ms = now };
-            },
-            .publish_pending => |sequence| {
-                const queued = std.mem.indexOfScalar(core.Sequence, w.pending_records[0..w.pending_record_count], sequence) != null;
-                // At most max_pending entries wait, and max_pending <= ceiling.
-                if (!queued and w.pending_record_count < w.pending_records.len) {
-                    w.pending_records[w.pending_record_count] = sequence;
-                    w.pending_record_count += 1;
-                }
-                if (w.publish_due == null) w.publish_due = .{ .due_ms = now };
-            },
         };
         if (persist) {
             freeze(&w.frozen, &w.ledger);
@@ -849,22 +681,8 @@ pub const Worker = struct {
     fn persistFrozen(w: *Worker) error{CheckpointFailed}!void {
         const protection = w.io.swapCancelProtection(.blocked);
         defer _ = w.io.swapCancelProtection(protection);
-        var staged: [core.Limits.ceiling]core.Sequence = undefined;
-        const projection = projectionOf(&w.frozen, &staged);
         const now = wallMs(w.io);
-        var at_ms = if (now > w.saved_at_ms) now else w.saved_at_ms +| 1;
-        var plan: publication.Plan = .{ .write_marker = false, .clear_marker = false };
-        if (w.markers) |markers| {
-            plan = w.publication.checkpoint(projection);
-            // Called for every checkpoint: it also picks the checkpoint's time.
-            at_ms = markers.vtable.prepare(markers.context, .{
-                .now_ms = now,
-                .saved_at_ms = w.saved_at_ms,
-                .saved_owes = w.saved_owes,
-                .next_owes = projection.owes,
-            }) catch return w.persistFailed(true);
-            if (plan.write_marker) w.tracePublication(.marker_written);
-        }
+        const at_ms = if (now > w.saved_at_ms) now else w.saved_at_ms +| 1;
         w.checkpoint_number += 1;
         const checkpoint: Checkpoint = .{
             .number = w.checkpoint_number,
@@ -872,13 +690,8 @@ pub const Worker = struct {
             .at_ms = at_ms,
             .opened_at_ms = w.openedAt(),
         };
-        w.sink.persist(&checkpoint) catch return w.persistFailed(false);
+        w.sink.persist(&checkpoint) catch return w.persistFailed();
         w.saved_at_ms = at_ms;
-        w.saved_owes = projection.owes;
-        if (w.markers) |markers| {
-            w.tracePublication(.{ .persisted = projection });
-            if (plan.clear_marker) w.clearMarker(markers);
-        }
         w.state.lockUncancelable(w.io);
         defer w.state.unlock(w.io);
         w.counters.persists += 1;
@@ -886,48 +699,19 @@ pub const Worker = struct {
         w.checkpoint_due = null;
     }
 
-    fn persistFailed(w: *Worker, marker: bool) error{CheckpointFailed} {
+    fn persistFailed(w: *Worker) error{CheckpointFailed} {
         w.state.lockUncancelable(w.io);
         defer w.state.unlock(w.io);
-        if (marker) w.counters.marker_failures += 1 else w.counters.persist_failures += 1;
+        w.counters.persist_failures += 1;
         const retries = if (w.checkpoint_due) |due| due.retries else 0;
         w.dirty = true;
         w.checkpoint_due = w.later(retries, w.nowMs());
         return error.CheckpointFailed;
     }
 
-    /// Caller holds `checkpoint`. A failed clear leaves the marker; the
-    /// next checkpoint that owes nothing, or `close`, tries again.
-    fn clearMarker(w: *Worker, markers: Markers) void {
-        markers.vtable.clear(markers.context) catch {
-            w.state.lockUncancelable(w.io);
-            defer w.state.unlock(w.io);
-            w.counters.marker_failures += 1;
-            return;
-        };
-        w.tracePublication(.marker_cleared);
-    }
-
-    /// Steps the publication machine. Caller holds `checkpoint`. A refusal
-    /// here is a worker bug the machine caught; it is counted, not hidden.
-    fn tracePublication(w: *Worker, event: publication.Event) void {
-        w.publication.step(event, w.tracer) catch {
-            w.state.lockUncancelable(w.io);
-            defer w.state.unlock(w.io);
-            w.counters.trace_errors += 1;
-        };
-    }
-
     /// Whether anything is due now or later. Under `state`.
     fn hasWorkLocked(w: *const Worker) bool {
-        if (w.job_count > 0) return true;
-        if (w.publish_due != null and w.hasPublicationLocked()) return true;
-        return w.dirty;
-    }
-
-    fn hasPublicationLocked(w: *const Worker) bool {
-        return w.ledger.staged().len > 0 or w.pending_record_count > 0 or
-            (w.publisher.vtable.publish_incident != null and w.ledger.incidentList().len > 0);
+        return w.job_count > 0 or w.dirty;
     }
 
     /// Starts the task if there is work and it isn't running, else wakes it.
@@ -995,7 +779,6 @@ pub const Worker = struct {
                     w.stop();
                     return;
                 },
-                .publish => w.runPublish(),
                 .checkpoint => w.runCheckpoint(),
             }
         }
@@ -1018,18 +801,13 @@ pub const Worker = struct {
             w.running = false;
             return .exit;
         }
-        w.prunePendingRecordsLocked();
-        if (w.publish_due != null and !w.hasPublicationLocked()) w.publish_due = null;
         w.pruneJobsLocked();
 
-        const Pick = struct { due_ms: i64, what: enum { lookup, publish, checkpoint }, index: usize = 0 };
+        const Pick = struct { due_ms: i64, what: enum { lookup, checkpoint }, index: usize = 0 };
         var pick: ?Pick = null;
         if (w.dirty) {
             const due = w.checkpoint_due.?;
             pick = .{ .due_ms = due.due_ms, .what = .checkpoint };
-        } else if (w.publish_due) |due| {
-            // A fact publishes only once its checkpoint is durable.
-            pick = .{ .due_ms = due.due_ms, .what = .publish };
         }
         for (w.jobs[0..w.job_count], 0..) |job, index| {
             if (pick == null or job.due.due_ms < pick.?.due_ms) pick = .{ .due_ms = job.due.due_ms, .what = .lookup, .index = index };
@@ -1045,53 +823,11 @@ pub const Worker = struct {
         }
         switch (chosen.what) {
             .checkpoint => return .checkpoint,
-            .publish => {
-                w.outbound = w.nextOutboundLocked();
-                return .publish;
-            },
             .lookup => {
                 w.prepareLookupLocked(w.jobs[chosen.index].sequence);
                 return .lookup;
             },
         }
-    }
-
-    /// Drops the pending records of entries that no longer wait: a lookup
-    /// resolved before its record was published, so the record isn't needed.
-    /// Under `state`, before `hasPublicationLocked` decides.
-    fn prunePendingRecordsLocked(w: *Worker) void {
-        var kept: usize = 0;
-        for (w.pending_records[0..w.pending_record_count]) |sequence| {
-            const waits = for (w.ledger.waiting()) |entry| {
-                if (entry.sequence == sequence) break true;
-            } else false;
-            if (!waits) continue;
-            w.pending_records[kept] = sequence;
-            kept += 1;
-        }
-        w.pending_record_count = kept;
-    }
-
-    /// Pending records first, then incidents, then staged facts: the order
-    /// today's flush publishes them in. Under `state`, right after
-    /// `prunePendingRecordsLocked` and a true `hasPublicationLocked`.
-    fn nextOutboundLocked(w: *Worker) Outbound {
-        if (w.pending_record_count > 0) {
-            const sequence = w.pending_records[0];
-            for (w.ledger.waiting()) |entry| {
-                if (entry.sequence == sequence) return .{ .pending = .{ .sequence = sequence, .id = entry.id, .observed_at_ms = entry.observed_at_ms } };
-            }
-        }
-        if (w.publisher.vtable.publish_incident != null and w.ledger.incidentList().len > 0) {
-            return .{ .incident = w.ledger.incidentList()[0] };
-        }
-        return .{ .fact = w.ledger.staged()[0] };
-    }
-
-    fn dropPendingRecordLocked(w: *Worker, sequence: core.Sequence) void {
-        const index = std.mem.indexOfScalar(core.Sequence, w.pending_records[0..w.pending_record_count], sequence) orelse return;
-        std.mem.copyForwards(core.Sequence, w.pending_records[index .. w.pending_record_count - 1], w.pending_records[index + 1 .. w.pending_record_count]);
-        w.pending_record_count -= 1;
     }
 
     /// Copies one entry's request and the credential for the task.
@@ -1121,6 +857,8 @@ pub const Worker = struct {
         w.counters.lookups += 1;
     }
 
+    const generation_path_prefix = "/v1/generation?id=";
+
     /// Sends one lookup and applies its answer. Returns `error.Canceled`
     /// only when `close` stopped it.
     fn runLookup(w: *Worker) error{Canceled}!void {
@@ -1130,9 +868,12 @@ pub const Worker = struct {
             w.countLocked(.untrusted);
             return w.answer(.{ .lookup_rejected = o.sequence }, .answer);
         }
+        var path_buf: [generation_path_prefix.len + core.GenerationId.length]u8 = undefined;
+        path_buf[0..generation_path_prefix.len].* = generation_path_prefix.*;
+        path_buf[generation_path_prefix.len..].* = o.id.bytes;
         const request: host.Lookup.Request = .{
             .origin = o.originText(),
-            .generation_id = o.id.slice(),
+            .path = &path_buf,
             .team = o.teamText(),
             .secret = o.secretText(),
             .cancel = &w.cancel,
@@ -1230,89 +971,6 @@ pub const Worker = struct {
         if (persist) w.persistFrozen() catch {};
     }
 
-    fn runPublish(w: *Worker) void {
-        const protection = w.io.swapCancelProtection(.blocked);
-        defer _ = w.io.swapCancelProtection(protection);
-        switch (w.outbound) {
-            .fact => |*staged| w.publishFact(staged),
-            .pending => |pending| {
-                const record: Publisher.PendingRecord = .{ .id = pending.id.slice(), .observed_at_ms = pending.observed_at_ms };
-                const result = if (w.publisher.vtable.publish_pending) |f| f(w.publisher.context, &record) else {};
-                w.state.lockUncancelable(w.io);
-                defer w.state.unlock(w.io);
-                result catch return w.publishFailedLocked();
-                w.counters.pending_records += 1;
-                w.dropPendingRecordLocked(pending.sequence);
-                w.publish_due = .{ .due_ms = w.nowMs() };
-            },
-            .incident => |incident| {
-                const f = w.publisher.vtable.publish_incident.?;
-                f(w.publisher.context, incident) catch {
-                    w.state.lockUncancelable(w.io);
-                    defer w.state.unlock(w.io);
-                    return w.publishFailedLocked();
-                };
-                w.checkpoint.lockUncancelable(w.io);
-                defer w.checkpoint.unlock(w.io);
-                var out: core.Output = .{};
-                const persist = blk: {
-                    w.state.lockUncancelable(w.io);
-                    defer w.state.unlock(w.io);
-                    w.counters.incidents_published += 1;
-                    w.publish_due = .{ .due_ms = w.nowMs() };
-                    w.ledger.step(.{ .incident_published = incident }, &out, w.tracer) catch break :blk false;
-                    break :blk w.afterStepLocked(&out, .answer);
-                };
-                if (persist) w.persistFrozen() catch {};
-            },
-        }
-    }
-
-    /// Under `state`.
-    fn publishFailedLocked(w: *Worker) void {
-        w.counters.publish_failures += 1;
-        const retries = if (w.publish_due) |due| due.retries else 0;
-        w.publish_due = w.later(retries, w.nowMs());
-    }
-
-    fn publishFact(w: *Worker, staged: *const core.Staged) void {
-        const fact = staged.fact();
-        const reply = w.publisher.publish(&fact) catch {
-            w.state.lockUncancelable(w.io);
-            defer w.state.unlock(w.io);
-            return w.publishFailedLocked();
-        };
-        w.checkpoint.lockUncancelable(w.io);
-        defer w.checkpoint.unlock(w.io);
-        if (w.markers != null) w.tracePublication(switch (reply) {
-            .appended, .duplicate => .{ .appended = staged.sequence },
-            .conflict => .{ .conflict = staged.sequence },
-        });
-        var out: core.Output = .{};
-        const persist = blk: {
-            w.state.lockUncancelable(w.io);
-            defer w.state.unlock(w.io);
-            w.counters.publishes += 1;
-            const event: core.Event = switch (reply) {
-                .appended => .{ .publish = .{ .sequence = staged.sequence, .result = .appended } },
-                .duplicate => .{ .publish = .{ .sequence = staged.sequence, .result = .duplicate } },
-                .conflict => .{ .publish_conflict = staged.sequence },
-            };
-            if (reply == .conflict) w.counters.conflicts += 1;
-            w.ledger.step(event, &out, w.tracer) catch {
-                w.counters.refused_answers += 1;
-                break :blk false;
-            };
-            // Keep draining while anything remains to publish.
-            w.publish_due = if (w.hasPublicationLocked()) .{ .due_ms = w.nowMs() } else null;
-            break :blk w.afterStepLocked(&out, .answer);
-        };
-        if (persist) {
-            if (w.markers != null and reply != .conflict) w.tracePublication(.{ .settled = staged.sequence });
-            w.persistFrozen() catch {};
-        }
-    }
-
     fn runCheckpoint(w: *Worker) void {
         w.checkpoint.lockUncancelable(w.io);
         defer w.checkpoint.unlock(w.io);
@@ -1328,13 +986,6 @@ pub const Worker = struct {
 
 fn wallMs(io: Io) i64 {
     return Io.Clock.Timestamp.now(io, .real).raw.toMilliseconds();
-}
-
-/// The publication machine's view of a checkpoint.
-fn projectionOf(ledger: *const core.Ledger, buffer: *[core.Limits.ceiling]core.Sequence) publication.Projection {
-    const staged = ledger.staged();
-    for (staged, 0..) |entry, index| buffer[index] = entry.sequence;
-    return .{ .staged = buffer[0..staged.len], .owes = owes(ledger) };
 }
 
 fn sameDigest(a: ?core.Digest, b: ?core.Digest) bool {
@@ -1432,6 +1083,9 @@ const TestLookup = struct {
 
     fn fetch(context: *anyopaque, request: *const host.Lookup.Request, body: []u8) host.Lookup.FetchError!host.Lookup.Response {
         const t: *TestLookup = @ptrCast(@alignCast(context));
+        const prefix = "/v1/generation?id=";
+        if (!std.mem.startsWith(u8, request.path, prefix)) return error.Transport;
+        const generation_id = request.path[prefix.len..];
         const answer = blk: {
             t.mutex.lockUncancelable(testing.io);
             defer t.mutex.unlock(testing.io);
@@ -1449,10 +1103,10 @@ const TestLookup = struct {
             .status => |status| return .{ .status = status, .body_len = 0 },
             .transport => return error.Transport,
             .canceled => return error.Canceled,
-            .found => |cost| return .{ .status = 200, .body_len = foundBody(body, request.generation_id, cost).len },
+            .found => |cost| return .{ .status = 200, .body_len = foundBody(body, generation_id, cost).len },
             .slow_found => |cost| {
                 testing.io.sleep(.fromMilliseconds(50), .awake) catch return error.Canceled;
-                return .{ .status = 200, .body_len = foundBody(body, request.generation_id, cost).len };
+                return .{ .status = 200, .body_len = foundBody(body, generation_id, cost).len };
             },
             .hold => {
                 while (!request.cancel.load(.acquire)) {
@@ -1482,8 +1136,9 @@ const TestSink = struct {
     count: u64 = 0,
     last_number: u64 = 0,
     pending: usize = 0,
-    backlog: usize = 0,
     active: usize = 0,
+    total_cost: f64 = 0,
+    last_at_ms: i64 = 0,
     scrubbed: bool = true,
 
     fn handle(s: *TestSink) Sink {
@@ -1502,8 +1157,9 @@ const TestSink = struct {
         s.count += 1;
         const ledger = checkpoint.ledger;
         s.pending = ledger.pending.items.len;
-        s.backlog = ledger.backlog.items.len;
         s.active = ledger.active.items.len;
+        s.total_cost = ledger.totals.total_cost;
+        s.last_at_ms = checkpoint.at_ms;
         if (ledger.credential != null or ledger.known_count != 0) s.scrubbed = false;
         for (ledger.pending.items) |entry| if (entry.blocked_by != null) {
             s.scrubbed = false;
@@ -1511,90 +1167,16 @@ const TestSink = struct {
     }
 };
 
-const TestPublisher = struct {
-    busy: u32 = 0,
-    published: u32 = 0,
-    answer: Publisher.Answer = .appended,
-    pending_records: u32 = 0,
-    incidents: u32 = 0,
-
-    fn handle(p: *TestPublisher) Publisher {
-        return .{ .context = p, .vtable = &.{ .publish = publish } };
-    }
-
-    /// With pending records and incidents, as the profile ledger takes them.
-    fn handleFull(p: *TestPublisher) Publisher {
-        return .{ .context = p, .vtable = &.{ .publish = publish, .publish_pending = publishPending, .publish_incident = publishIncident } };
-    }
-
-    fn publish(context: *anyopaque, _: *const core.Fact) Publisher.PublishError!Publisher.Answer {
-        const p: *TestPublisher = @ptrCast(@alignCast(context));
-        if (p.busy > 0) {
-            p.busy -= 1;
-            return error.Busy;
-        }
-        p.published += 1;
-        return p.answer;
-    }
-
-    fn publishPending(context: *anyopaque, _: *const Publisher.PendingRecord) Publisher.PublishError!void {
-        const p: *TestPublisher = @ptrCast(@alignCast(context));
-        p.pending_records += 1;
-    }
-
-    fn publishIncident(context: *anyopaque, _: core.Incident) Publisher.PublishError!void {
-        const p: *TestPublisher = @ptrCast(@alignCast(context));
-        p.incidents += 1;
-    }
-};
-
-/// Records when the marker is written and cleared, against the sink's
-/// checkpoint count at that moment.
-const TestMarkers = struct {
-    sink: *const TestSink,
-    present: bool = false,
-    /// Sink count at the first write, and at the last clear.
-    first_write_at: ?u64 = null,
-    last_clear_at: ?u64 = null,
-    writes: u32 = 0,
-    clears: u32 = 0,
-    at_ms: i64 = 0,
-
-    fn handle(m: *TestMarkers) Markers {
-        return .{ .context = m, .vtable = &.{ .prepare = prepare, .clear = clear } };
-    }
-
-    fn prepare(context: *anyopaque, input: Markers.Input) Markers.Error!i64 {
-        const m: *TestMarkers = @ptrCast(@alignCast(context));
-        if (input.next_owes and !m.present) {
-            m.present = true;
-            m.writes += 1;
-            if (m.first_write_at == null) m.first_write_at = m.sink.count;
-        }
-        m.at_ms = @max(input.now_ms, input.saved_at_ms + 1);
-        return m.at_ms;
-    }
-
-    fn clear(context: *anyopaque) Markers.Error!void {
-        const m: *TestMarkers = @ptrCast(@alignCast(context));
-        m.present = false;
-        m.clears += 1;
-        m.last_clear_at = m.sink.count;
-    }
-};
-
 const Rig = struct {
     worker: Worker = undefined,
     lookup: TestLookup = .{},
     sink: TestSink = .{},
-    publisher: TestPublisher = .{},
     rows: [4]core.ModelRow = undefined,
 
     fn start(r: *Rig, schedule: Schedule) !void {
         try r.worker.init(testing.allocator, testing.io, .{
             .lookup = r.lookup.handle(),
             .sink = r.sink.handle(),
-            .publisher = r.publisher.handle(),
             .schedule = schedule,
         });
     }
@@ -1631,8 +1213,7 @@ const Rig = struct {
     }
 
     fn settled(r: *Rig) bool {
-        const v = r.view();
-        return v.pending == 0 and v.backlog == 0;
+        return r.view().pending == 0;
     }
 
     fn blocked(r: *Rig) bool {
@@ -1671,16 +1252,14 @@ test "a schedule that could spin is refused" {
     var w: Worker = undefined;
     var lookup: TestLookup = .{};
     var sink: TestSink = .{};
-    var publisher: TestPublisher = .{};
     try testing.expectError(error.InvalidSchedule, w.init(testing.allocator, testing.io, .{
         .lookup = lookup.handle(),
         .sink = sink.handle(),
-        .publisher = publisher.handle(),
         .schedule = .{ .first_ms = 0 },
     }));
 }
 
-test "nothing starts until the core has lookup or publication work" {
+test "nothing starts until the core has lookup or checkpoint work" {
     var r: Rig = .{};
     try r.start(fast);
     defer r.finish();
@@ -1758,7 +1337,8 @@ test "a lookup that 404s then 200s settles, and the task exits when idle" {
     try testing.expectEqual(@as(u32, 3), s.lookups);
     try testing.expect(s.waits >= 2);
     try testing.expectEqual(@as(f64, 0.5), r.view().totals.total_cost);
-    try testing.expectEqual(@as(u32, 1), r.publisher.published);
+    // The settle was checkpointed.
+    try testing.expectEqual(@as(f64, 0.5), r.sink.total_cost);
     try testing.expectEqualStrings(api_key, r.lookup.lastSecret().?);
     try testing.expect(r.sink.scrubbed);
 }
@@ -1946,11 +1526,10 @@ test "a begin whose checkpoint fails ends unbilled, so nothing stays in flight" 
     r.worker.deinit();
 }
 
-test "a busy profile ledger is retried until the fact publishes" {
+test "an exact fact settles in its report, checkpointed, with no task" {
     var r: Rig = .{};
     try r.start(fast);
     defer r.finish();
-    r.publisher.busy = 2;
     const call = try r.begin();
     _ = try r.worker.report(.{ .finish_exact = .{ .sequence = call, .fact = .{
         .id = testId(call),
@@ -1958,10 +1537,10 @@ test "a busy profile ledger is retried until the fact publishes" {
         .model = "openai/gpt-4.1-nano",
         .total_cost = 0.125,
     } } });
-    try r.waitFor(2_000, Rig.settled);
-    try testing.expectEqual(@as(u32, 1), r.publisher.published);
-    try testing.expectEqual(@as(u32, 2), r.worker.stats().publish_failures);
     try testing.expectEqual(@as(f64, 0.125), r.view().totals.total_cost);
+    try testing.expectEqual(@as(f64, 0.125), r.sink.total_cost);
+    try testing.expectEqual(@as(u64, 2), r.sink.count);
+    try testing.expectEqual(@as(u32, 0), r.worker.stats().spawns);
 }
 
 test "freeze copies every list and scrubs credentials" {
@@ -2010,91 +1589,20 @@ fn idleAndSettled(r: *Rig) bool {
     return Rig.settled(r) and Rig.idle(r);
 }
 
-test "the marker is durable before a checkpoint that owes and cleared after one that owes nothing" {
-    var r: Rig = .{};
-    var markers: TestMarkers = .{ .sink = &r.sink };
-    var trace_out: std.Io.Writer.Allocating = .init(testing.allocator);
-    defer trace_out.deinit();
-    var tracer: trace.Writer = .init(&trace_out.writer);
-    try r.worker.init(testing.allocator, testing.io, .{
-        .lookup = r.lookup.handle(),
-        .sink = r.sink.handle(),
-        .publisher = r.publisher.handle(),
-        .markers = markers.handle(),
-        .schedule = fast,
-        .tracer = &tracer,
-    });
-    defer r.finish();
-    const call = try r.begin();
-    // The call in flight owes the ledger, so the marker came first.
-    try testing.expectEqual(@as(?u64, 0), markers.first_write_at);
-    _ = try r.worker.report(.{ .finish_exact = .{ .sequence = call, .fact = exactFact(call, 0.25) } });
-    try r.waitFor(2_000, idleAndSettled);
-    try testing.expectEqual(@as(u32, 1), markers.writes);
-    try testing.expectEqual(@as(u32, 1), markers.clears);
-    // Cleared only after the checkpoint that owes nothing was durable.
-    try testing.expectEqual(@as(?u64, r.sink.count), markers.last_clear_at);
-    try testing.expect(!r.worker.publication.marker);
-    try testing.expectEqual(@as(u32, 0), r.worker.stats().trace_errors);
-    try testing.expectEqual(@as(f64, 0.25), r.view().totals.total_cost);
-    const written = trace_out.written();
-    for ([_][]const u8{ "write_marker", "stage", "append", "settle", "clear_marker" }) |event| {
-        var needle: [32]u8 = undefined;
-        const quoted = try std.fmt.bufPrint(&needle, "\"event\":\"{s}\"", .{event});
-        try testing.expect(std.mem.indexOf(u8, written, quoted) != null);
-    }
+/// A session an older binary saved with one fact still staged for its
+/// profile ledger.
+fn restoredWithStaged(staged: []const core.Restored.StagedFact) Restore {
+    return .{ .saved = .{
+        .availability = .complete,
+        .next_sequence = 3,
+        .settled_through = 2,
+        .totals = .{},
+        .backlog = staged,
+    }, .saved_at_ms = 10 };
 }
 
-test "a conflict answer is never retried, and its incident reaches the profile" {
+test "a restored staged fact settles at once, and start checkpoints it" {
     var r: Rig = .{};
-    r.publisher.answer = .conflict;
-    try r.worker.init(testing.allocator, testing.io, .{
-        .lookup = r.lookup.handle(),
-        .sink = r.sink.handle(),
-        .publisher = r.publisher.handleFull(),
-        .schedule = fast,
-    });
-    defer r.finish();
-    const call = try r.begin();
-    _ = try r.worker.report(.{ .finish_exact = .{ .sequence = call, .fact = exactFact(call, 1) } });
-    try r.waitFor(2_000, idleAndSettled);
-    const s = r.worker.stats();
-    try testing.expectEqual(@as(u32, 1), s.publishes);
-    try testing.expectEqual(@as(u32, 1), s.conflicts);
-    try testing.expectEqual(@as(u32, 1), s.incidents_published);
-    try testing.expectEqual(@as(u32, 1), r.publisher.published);
-    try testing.expectEqual(@as(u32, 1), r.publisher.incidents);
-    const v = r.view();
-    try testing.expectEqual(@as(f64, 0), v.totals.total_cost);
-    try testing.expectEqual(core.Availability.incomplete, v.availability);
-    try testing.expectEqual(@as(u64, 1), v.unpriced.no_receipt);
-}
-
-test "only real lookups publish a pending record" {
-    var r: Rig = .{};
-    try r.worker.init(testing.allocator, testing.io, .{
-        .lookup = r.lookup.handle(),
-        .sink = r.sink.handle(),
-        .publisher = r.publisher.handleFull(),
-        .schedule = fast,
-    });
-    defer r.finish();
-    const exact = try r.begin();
-    const waiting = try r.begin();
-    _ = try r.worker.report(.{ .finish_exact = .{ .sequence = exact, .fact = exactFact(exact, 1) } });
-    try r.finishLookup(waiting);
-    try r.waitFor(2_000, struct {
-        fn done(rig: *Rig) bool {
-            return rig.worker.stats().pending_records == 1 and rig.publisher.published == 1;
-        }
-    }.done);
-    try r.waitFor(2_000, Rig.idle);
-    try testing.expectEqual(@as(u32, 1), r.publisher.pending_records);
-}
-
-test "a restored backlog publishes once start runs, from a traced restart" {
-    var r: Rig = .{};
-    var markers: TestMarkers = .{ .sink = &r.sink, .present = true };
     var trace_out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer trace_out.deinit();
     var tracer: trace.Writer = .init(&trace_out.writer);
@@ -2102,83 +1610,54 @@ test "a restored backlog publishes once start runs, from a traced restart" {
     try r.worker.init(testing.allocator, testing.io, .{
         .lookup = r.lookup.handle(),
         .sink = r.sink.handle(),
-        .publisher = r.publisher.handle(),
-        .markers = markers.handle(),
-        .restore = .{ .saved = .{
-            .availability = .complete,
-            .next_sequence = 3,
-            .settled_through = 2,
-            .totals = .{},
-            .backlog = &staged,
-        }, .saved_at_ms = 10, .marker = true },
+        .restore = restoredWithStaged(&staged),
         .schedule = fast,
         .tracer = &tracer,
     });
     defer r.finish();
-    // Nothing runs before start.
-    try testing.expectEqual(@as(u32, 0), r.worker.stats().spawns);
-    r.worker.start();
-    try r.waitFor(2_000, idleAndSettled);
-    try testing.expectEqual(@as(u32, 1), r.publisher.published);
     try testing.expectEqual(@as(f64, 0.5), r.view().totals.total_cost);
-    try testing.expect(!markers.present);
+    // Nothing runs, and nothing is written, before start.
+    try testing.expectEqual(@as(u32, 0), r.worker.stats().spawns);
+    try testing.expectEqual(@as(u64, 0), r.sink.count);
+    r.worker.start();
+    try r.waitFor(2_000, struct {
+        fn done(rig: *Rig) bool {
+            return rig.sink.count == 1 and Rig.idle(rig);
+        }
+    }.done);
+    try testing.expectEqual(@as(f64, 0.5), r.sink.total_cost);
     // The checkpoint after a restart is strictly later than the saved one.
-    try testing.expect(markers.at_ms > 10);
-    try testing.expect(std.mem.indexOf(u8, trace_out.written(), "\"event\":\"restart\"") != null);
+    try testing.expect(r.sink.last_at_ms > 10);
+    try testing.expect(std.mem.indexOf(u8, trace_out.written(), "\"from\":\"settled\",\"to\":\"settled\"") != null);
     try testing.expectEqual(@as(u32, 0), r.worker.stats().trace_errors);
 }
 
-test "close publishes what is still owed once, and a busy ledger leaves it staged for the next run" {
-    {
-        var r: Rig = .{};
-        try r.start(.{ .first_ms = 60_000, .max_ms = 60_000 });
-        const call = try r.begin();
-        _ = try r.worker.report(.{ .finish_exact = .{ .sequence = call, .fact = exactFact(call, 0.75) } });
-        try r.worker.close();
-        // Published by the task or by close, but exactly once.
-        try testing.expectEqual(@as(u32, 1), r.publisher.published);
-        try testing.expectEqual(@as(usize, 0), r.sink.backlog);
-        r.worker.deinit();
-    }
-    {
-        var r: Rig = .{};
-        r.publisher.busy = std.math.maxInt(u32);
-        try r.start(.{ .first_ms = 60_000, .max_ms = 60_000 });
-        const call = try r.begin();
-        _ = try r.worker.report(.{ .finish_exact = .{ .sequence = call, .fact = exactFact(call, 0.75) } });
-        const busy_before_close = r.publisher.busy;
-        try r.worker.close();
-        // At most one attempt at close, and the fact is in the last checkpoint.
-        try testing.expect(busy_before_close - r.publisher.busy <= 1);
-        try testing.expectEqual(@as(u32, 0), r.publisher.published);
-        try testing.expectEqual(@as(usize, 1), r.sink.backlog);
-        r.worker.deinit();
-    }
+test "close writes what a restore settled when no task ran" {
+    var r: Rig = .{};
+    const staged = [_]core.Restored.StagedFact{.{ .sequence = 2, .fact = exactFact(2, 0.75) }};
+    try r.worker.init(testing.allocator, testing.io, .{
+        .lookup = r.lookup.handle(),
+        .sink = r.sink.handle(),
+        .restore = restoredWithStaged(&staged),
+        .schedule = fast,
+        .inline_only = true,
+    });
+    try r.worker.close();
+    try testing.expectEqual(@as(u64, 1), r.sink.count);
+    try testing.expectEqual(@as(f64, 0.75), r.sink.total_cost);
+    r.worker.deinit();
 }
 
-test "a lookup that resolves before its pending record publishes leaves nothing to publish" {
+test "a restore with nothing staged owes no checkpoint" {
     var r: Rig = .{};
     try r.worker.init(testing.allocator, testing.io, .{
         .lookup = r.lookup.handle(),
         .sink = r.sink.handle(),
-        .publisher = r.publisher.handle(),
+        .restore = restoredWithStaged(&.{}),
         .schedule = fast,
+        .inline_only = true,
     });
-    defer r.finish();
-    // Step the core directly so the task never runs: the record is queued,
-    // then the entry is rejected before the record goes out.
-    const w = &r.worker;
-    var out: core.Output = .{};
-    try w.ledger.step(.{ .set_credential = core.credentialDigest(api_key) }, &out, null);
-    try w.ledger.step(.{ .begin = .gateway }, &out, null);
-    _ = w.afterStepLocked(&out, .report);
-    try w.ledger.step(.{ .finish_lookup = .{ .sequence = 1, .request = .{ .id = testId(1), .origin = test_origin, .credential_source = .ai_gateway_api_key, .observed_at_ms = 1 } } }, &out, null);
-    _ = w.afterStepLocked(&out, .report);
-    try testing.expectEqual(@as(usize, 1), w.pending_record_count);
-    try w.ledger.step(.{ .lookup_rejected = 1 }, &out, null);
-    _ = w.afterStepLocked(&out, .answer);
-    w.dirty = false;
-    // The stale record is dropped; with no incident publisher there is nothing to do.
-    try testing.expectEqual(Next.exit, w.next());
-    try testing.expectEqual(@as(usize, 0), w.pending_record_count);
+    try r.worker.close();
+    try testing.expectEqual(@as(u64, 0), r.sink.count);
+    r.worker.deinit();
 }

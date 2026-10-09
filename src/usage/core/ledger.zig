@@ -10,15 +10,14 @@
 //! - Exact settlement never takes a lookup slot.
 //! - A 401/403 lookup blocks the entry only for the credential that
 //!   answered it; any other credential (or none) puts it back in `lookup`.
-//! - A fact that finds the backlog full settles into the session totals
-//!   only (`local`), with an incident.
 //! - Model rows: totals go to at most `max_models`
 //!   per-model rows, because older readers reject more rows and require the
 //!   rows to add up to the totals. A fact whose model would need a row when
 //!   they are full stays out of the totals (`unpriced`), with an incident.
 //!
-//! Totals and per-model rows change exactly once per call, at `publish` or at
-//! a local settle, with checked arithmetic.
+//! Totals and per-model rows change exactly once per call, when its fact
+//! arrives (an exact receipt or a found lookup), with checked arithmetic.
+//! Usage history comes from AI Gateway's reports, so nothing is published.
 
 const std = @import("std");
 const trace = @import("../trace.zig");
@@ -49,7 +48,7 @@ pub const CredentialSource = enum {
 };
 
 /// A call's state, named exactly as in the formal model.
-pub const State = enum { idle, active, unbilled, fact, lookup, blocked, unpriced, local, settled };
+pub const State = enum { idle, active, unbilled, lookup, blocked, unpriced, settled };
 
 pub const Availability = enum { complete, pending, incomplete, legacy };
 
@@ -62,10 +61,6 @@ pub const Incident = struct {
 
 /// Why calls are missing from the totals, as the views word it.
 pub const UnpricedReason = enum { lookup_pending, sign_in_cannot_look_up, no_receipt };
-
-/// The profile ledger's answer to a staged fact. A `conflict` answer is its
-/// own event, `publish_conflict`.
-pub const PublishResult = enum { appended, duplicate };
 
 /// Whether `source` may authorize lookups for `provider`, as fx's
 /// `model_provider.authorizesCredential`. Snapshots must keep this rule.
@@ -87,24 +82,20 @@ pub const max_account_bytes = 1024;
 pub const max_identifier_bytes = 8 * 1024;
 
 /// Bounds on the ledger's state. The defaults are production's: older
-/// binaries reject snapshots with more pending entries, backlog facts,
-/// incidents, or model rows.
+/// binaries reject snapshots with more pending entries, incidents, or model
+/// rows.
 pub const Limits = struct {
     max_active: u32 = 64,
     max_pending: u32 = 16,
-    max_backlog: u32 = 16,
     max_incidents: u32 = 16,
     max_models: u32 = 32,
     /// Model names plus the ids, origins, teams, and accounts of waiting
-    /// entries and staged facts.
+    /// entries.
     max_identifier_bytes: u32 = max_identifier_bytes,
-    /// Pending entries a persisted snapshot holds: waiting entries plus one
-    /// bridge per staged fact (`checkpoint.zig`). Older parsers reject
-    /// more than 16.
+    /// Pending entries a persisted snapshot holds. Older parsers reject more
+    /// than 16. A snapshot an older binary saved counts its staged facts here
+    /// too, one bridge entry each.
     max_persisted_pending: u32 = 16,
-    /// The session origin's length: each staged fact's bridge entry adds its
-    /// id and this to the identifier budget. 0 when no bridge is written.
-    bridge_origin_bytes: u32 = 0,
 
     /// Upper bound for every count limit; it also sizes `Output`.
     pub const ceiling = 64;
@@ -112,18 +103,10 @@ pub const Limits = struct {
     fn valid(limits: Limits) bool {
         inline for (std.meta.fields(Limits)) |field| {
             const value = @field(limits, field.name);
-            if (comptime std.mem.eql(u8, field.name, "bridge_origin_bytes")) {
-                if (value > max_origin_bytes) return false;
-            } else {
-                const max = if (comptime std.mem.eql(u8, field.name, "max_identifier_bytes")) max_identifier_bytes else ceiling;
-                if (value == 0 or value > max) return false;
-            }
+            const max = if (comptime std.mem.eql(u8, field.name, "max_identifier_bytes")) max_identifier_bytes else ceiling;
+            if (value == 0 or value > max) return false;
         }
         return true;
-    }
-
-    fn bridgeBytes(limits: Limits) usize {
-        return if (limits.bridge_origin_bytes == 0) 0 else GenerationId.length + limits.bridge_origin_bytes;
     }
 };
 
@@ -226,53 +209,6 @@ pub const Fact = struct {
         if (fact.reasoning_tokens) |reasoning| {
             if (reasoning > fact.output_tokens) return error.ReasoningExceedsOutput;
         }
-    }
-};
-
-/// A fact staged for profile publication.
-pub const Staged = struct {
-    sequence: Sequence,
-    id: GenerationId,
-    created_at_ms: i64,
-    model: Text(max_model_bytes),
-    total_cost: f64,
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_read_tokens: u64,
-    cache_write_tokens: u64,
-    reasoning_tokens: ?u64,
-    billable_web_search_calls: u64,
-
-    fn init(sequence: Sequence, source: Fact) Staged {
-        return .{
-            .sequence = sequence,
-            .id = source.id,
-            .created_at_ms = source.created_at_ms,
-            .model = .init(source.model),
-            .total_cost = source.total_cost,
-            .input_tokens = source.input_tokens,
-            .output_tokens = source.output_tokens,
-            .cache_read_tokens = source.cache_read_tokens,
-            .cache_write_tokens = source.cache_write_tokens,
-            .reasoning_tokens = source.reasoning_tokens,
-            .billable_web_search_calls = source.billable_web_search_calls,
-        };
-    }
-
-    /// The fact, borrowing this entry's model name.
-    pub fn fact(staged: *const Staged) Fact {
-        return .{
-            .id = staged.id,
-            .created_at_ms = staged.created_at_ms,
-            .model = staged.model.slice(),
-            .total_cost = staged.total_cost,
-            .input_tokens = staged.input_tokens,
-            .output_tokens = staged.output_tokens,
-            .cache_read_tokens = staged.cache_read_tokens,
-            .cache_write_tokens = staged.cache_write_tokens,
-            .reasoning_tokens = staged.reasoning_tokens,
-            .billable_web_search_calls = staged.billable_web_search_calls,
-        };
     }
 };
 
@@ -423,7 +359,6 @@ pub const View = struct {
     unpriced: Unpriced,
     active: u32,
     pending: u32,
-    backlog: u32,
     incidents: u32,
 };
 
@@ -447,12 +382,6 @@ pub const Event = union(enum) {
     lookup_rejected: Sequence,
     /// 404, 408, 425, 429, 5xx, or a transport error: ask again later.
     lookup_retry: Sequence,
-    /// The profile ledger accepted a staged fact.
-    publish: struct { sequence: Sequence, result: PublishResult },
-    /// The profile ledger answered conflict for a staged fact.
-    publish_conflict: Sequence,
-    /// The profile ledger holds one of the session's incidents.
-    incident_published: Incident,
 };
 
 pub const EventTag = std.meta.Tag(Event);
@@ -477,19 +406,12 @@ pub const Effect = union(enum) {
     persist_checkpoint,
     /// Ask `/v1/generation` about this pending entry (with backoff on retry).
     start_lookup: Sequence,
-    /// Publish the staged facts and the session's incidents to the profile
-    /// ledger.
-    publish_backlog,
-    /// Append this waiting entry's `pending` record to the profile ledger
-    /// (real lookups only). Idempotent: the profile answers duplicate.
-    publish_pending: Sequence,
 };
 
 /// One model step, written to the trace by `writeTrace`.
 pub const Transition = struct {
     event: TraceEvent,
-    /// The call's sequence; 0 for `set_credential` and `incident_published`,
-    /// which have no single call.
+    /// The call's sequence; 0 for `set_credential`, which has no single call.
     call: Sequence,
     /// Null when there is no single call (written as "-").
     from: ?State,
@@ -504,8 +426,8 @@ pub const Transition = struct {
     applied: bool = false,
     /// `set_credential`: blocked entries moved back to `lookup`.
     moved: u32 = 0,
-    /// Which identifier-budget checks refused: 1 staging or a waiting entry,
-    /// 2 a new row (the model's `spent` arguments).
+    /// Which identifier-budget checks refused: 1 a waiting entry, 2 a new
+    /// row (the model's `spent` arguments).
     budget: u2 = 0,
 };
 
@@ -538,21 +460,17 @@ pub const StepError = FactError || error{
     NotActive,
     /// The sequence names no entry in `lookup` (it may be blocked).
     NotLookingUp,
-    /// The sequence names no staged fact.
-    NotStaged,
     /// Lookups need a credential.
     NoCredential,
     InvalidGenerationId,
     InvalidLookupRequest,
-    /// The generation id already belongs to another waiting or staged call.
+    /// The generation id already belongs to another waiting call.
     DuplicateGenerationId,
     /// A found lookup returned a different generation id.
     GenerationIdMismatch,
     /// Adding the call would overflow a total.
     Overflow,
     CredentialOrdinalsExhausted,
-    /// `incident_published` for an incident the session no longer holds.
-    NotRecorded,
 };
 
 const Active = struct {
@@ -573,7 +491,6 @@ pub const Ledger = struct {
     next_sequence: Sequence = 1,
     active: std.ArrayList(Active),
     pending: std.ArrayList(Pending),
-    backlog: std.ArrayList(Staged),
     incidents: std.ArrayList(Incident),
     rows: std.ArrayList(ModelRow),
     totals: Totals,
@@ -587,8 +504,7 @@ pub const Ledger = struct {
     settled_through: Sequence = 0,
     activity: Activity = .{},
     /// The trace instance this core writes under. A restarted process traces
-    /// a new instance: each process's core is its own behavior of the model,
-    /// and the publication machine is the one that spans crashes.
+    /// a new instance: each process's core is its own behavior of the model.
     trace_instance: []const u8 = "session",
     credential: ?Credential = null,
     known: [max_known_credentials]Credential = undefined,
@@ -605,8 +521,6 @@ pub const Ledger = struct {
         errdefer active.deinit(gpa);
         var pending: std.ArrayList(Pending) = try .initCapacity(gpa, limits.max_pending);
         errdefer pending.deinit(gpa);
-        var backlog: std.ArrayList(Staged) = try .initCapacity(gpa, limits.max_backlog);
-        errdefer backlog.deinit(gpa);
         var incidents: std.ArrayList(Incident) = try .initCapacity(gpa, limits.max_incidents);
         errdefer incidents.deinit(gpa);
         const rows: std.ArrayList(ModelRow) = try .initCapacity(gpa, limits.max_models);
@@ -614,7 +528,6 @@ pub const Ledger = struct {
             .limits = limits,
             .active = active,
             .pending = pending,
-            .backlog = backlog,
             .incidents = incidents,
             .rows = rows,
             .totals = switch (start) {
@@ -629,7 +542,6 @@ pub const Ledger = struct {
     pub fn deinit(ledger: *Ledger, gpa: std.mem.Allocator) void {
         ledger.active.deinit(gpa);
         ledger.pending.deinit(gpa);
-        ledger.backlog.deinit(gpa);
         ledger.incidents.deinit(gpa);
         ledger.rows.deinit(gpa);
         ledger.* = undefined;
@@ -672,15 +584,8 @@ pub const Ledger = struct {
             },
             .active = @intCast(ledger.active.items.len),
             .pending = @intCast(ledger.pending.items.len),
-            .backlog = @intCast(ledger.backlog.items.len),
             .incidents = @intCast(ledger.incidents.items.len),
         };
-    }
-
-    /// Facts waiting for profile publication, oldest first. Valid until the
-    /// next step.
-    pub fn staged(ledger: *const Ledger) []const Staged {
-        return ledger.backlog.items;
     }
 
     /// Entries waiting on a lookup or blocked, oldest first. Valid until the
@@ -709,9 +614,6 @@ pub const Ledger = struct {
             .lookup_unauthorized => |sequence| try ledger.lookupUnauthorized(sequence, out),
             .lookup_rejected => |sequence| try ledger.lookupRejected(sequence, out),
             .lookup_retry => |sequence| try ledger.lookupRetry(sequence, out),
-            .publish => |e| try ledger.publish(e.sequence, out),
-            .publish_conflict => |sequence| try ledger.publishConflict(sequence, out),
-            .incident_published => |incident| try ledger.incidentPublished(incident, out),
         }
         if (trace.on(tracer)) |writer| writeTrace(writer, ledger.trace_instance, out) catch |err| {
             out.trace_error = err;
@@ -747,16 +649,8 @@ pub const Ledger = struct {
         return null;
     }
 
-    fn stagedIndex(ledger: *const Ledger, sequence: Sequence) ?usize {
-        for (ledger.backlog.items, 0..) |entry, index| {
-            if (entry.sequence == sequence) return index;
-        }
-        return null;
-    }
-
     fn idInUse(ledger: *const Ledger, id: GenerationId) bool {
         for (ledger.pending.items) |entry| if (entry.id.eql(id)) return true;
-        for (ledger.backlog.items) |entry| if (entry.id.eql(id)) return true;
         return false;
     }
 
@@ -780,12 +674,10 @@ pub const Ledger = struct {
         ledger.incidents.appendAssumeCapacity(.{ .occurred_at_ms = occurred_at_ms, .completeness = completeness });
     }
 
-    /// A call that ends missing from the totals: counted and made visible,
-    /// and its incident published.
-    fn leaveUnpriced(ledger: *Ledger, next_no_receipt: u64, at_ms: i64, out: *Output) void {
+    /// A call that ends missing from the totals: counted and made visible.
+    fn leaveUnpriced(ledger: *Ledger, next_no_receipt: u64, at_ms: i64) void {
         ledger.no_receipt = next_no_receipt;
         ledger.recordIncident(at_ms);
-        out.push(.publish_backlog);
     }
 
     fn begin(ledger: *Ledger, provider: Provider, out: *Output) StepError!void {
@@ -810,7 +702,7 @@ pub const Ledger = struct {
         const index = ledger.activeIndex(sequence) orelse return error.NotActive;
         try fact.validate();
         if (ledger.idInUse(fact.id)) return error.DuplicateGenerationId;
-        const plan = try ledger.planAccept(fact);
+        const plan = try ledger.planAccept(fact, 0);
         _ = ledger.endActive(index);
         ledger.accept(.finish_exact, sequence, .active, fact, plan, out);
     }
@@ -824,12 +716,13 @@ pub const Ledger = struct {
         }
         if (ledger.idInUse(request.id)) return error.DuplicateGenerationId;
         const room = ledger.pending.items.len < ledger.limits.max_pending;
-        const fits = ledger.fitsIdentifiers(request.identifierBytes()) and ledger.persistedRoom(0);
+        // The persisted array's cap counts as spent budget, as in the model.
+        const fits = ledger.fitsIdentifiers(request.identifierBytes()) and
+            ledger.pending.items.len < ledger.limits.max_persisted_pending;
         if (room and fits) {
             _ = ledger.endActive(index);
             ledger.pending.appendAssumeCapacity(.init(sequence, provider, request));
             out.push(.persist_checkpoint);
-            out.push(.{ .publish_pending = sequence });
             if (ledger.credential != null) out.push(.{ .start_lookup = sequence });
             out.transition = ledger.transition(.finish_lookup, sequence, .active, .lookup);
             return;
@@ -838,11 +731,11 @@ pub const Ledger = struct {
         // dropped silently.
         const next_no_receipt = std.math.add(u64, ledger.no_receipt, 1) catch return error.Overflow;
         _ = ledger.endActive(index);
-        ledger.leaveUnpriced(next_no_receipt, request.observed_at_ms, out);
+        ledger.leaveUnpriced(next_no_receipt, request.observed_at_ms);
         out.push(.persist_checkpoint);
         out.transition = ledger.transition(.finish_lookup, sequence, .active, .unpriced);
         out.transition.?.incident = true;
-        if (room) out.transition.?.budget = budget_stage;
+        if (room) out.transition.?.budget = budget_waiting;
     }
 
     fn finishUnbilled(ledger: *Ledger, sequence: Sequence, out: *Output) StepError!void {
@@ -857,7 +750,7 @@ pub const Ledger = struct {
         if (at_ms < 0) return error.InvalidTime;
         const next_no_receipt = std.math.add(u64, ledger.no_receipt, 1) catch return error.Overflow;
         _ = ledger.endActive(index);
-        ledger.leaveUnpriced(next_no_receipt, at_ms, out);
+        ledger.leaveUnpriced(next_no_receipt, at_ms);
         out.push(.persist_checkpoint);
         out.transition = ledger.transition(.finish_unpriced, sequence, .active, .unpriced);
         out.transition.?.incident = true;
@@ -937,10 +830,8 @@ pub const Ledger = struct {
         const index = try ledger.lookingUp(sequence);
         try fact.validate();
         if (!ledger.pending.items[index].id.eql(fact.id)) return error.GenerationIdMismatch;
-        for (ledger.backlog.items) |entry| if (entry.id.eql(fact.id)) return error.DuplicateGenerationId;
-        // The entry's bytes are freed by this step, so the fact may use them.
-        const freed = ledger.pending.items[index].identifierBytes();
-        const plan = try ledger.planAcceptFreeing(fact, freed, 1);
+        // The entry's bytes are freed by this step, so a new row may use them.
+        const plan = try ledger.planAccept(fact, ledger.pending.items[index].identifierBytes());
         _ = ledger.pending.orderedRemove(index);
         ledger.accept(.lookup_found, sequence, .lookup, fact, plan, out);
     }
@@ -957,7 +848,7 @@ pub const Ledger = struct {
         const index = try ledger.lookingUp(sequence);
         const next_no_receipt = std.math.add(u64, ledger.no_receipt, 1) catch return error.Overflow;
         const removed = ledger.pending.orderedRemove(index);
-        ledger.leaveUnpriced(next_no_receipt, removed.observed_at_ms, out);
+        ledger.leaveUnpriced(next_no_receipt, removed.observed_at_ms);
         out.push(.persist_checkpoint);
         out.transition = ledger.transition(.lookup_rejected, sequence, .lookup, .unpriced);
         out.transition.?.incident = true;
@@ -967,71 +858,6 @@ pub const Ledger = struct {
         _ = try ledger.lookingUp(sequence);
         out.push(.{ .start_lookup = sequence });
         out.transition = ledger.transition(.lookup_retry, sequence, .lookup, .lookup);
-    }
-
-    /// Totals apply here, once. A duplicate answer means an earlier run
-    /// appended the fact; this session hasn't counted it, so it does now.
-    /// Settling never needs identifier bytes: a new row's name is smaller
-    /// than the staged fact it replaces.
-    fn publish(ledger: *Ledger, sequence: Sequence, out: *Output) StepError!void {
-        const index = ledger.stagedIndex(sequence) orelse return error.NotStaged;
-        const fact = ledger.backlog.items[index].fact();
-        const plan = try ledger.planSettle(fact, null);
-        const next_no_receipt = if (plan == .no_row)
-            std.math.add(u64, ledger.no_receipt, 1) catch return error.Overflow
-        else
-            ledger.no_receipt;
-        // `fact` borrows the entry's model name; settle before removing it.
-        const created_at_ms = fact.created_at_ms;
-        switch (plan) {
-            .row => |row| ledger.commitSettle(sequence, fact, row),
-            .no_row => {},
-        }
-        _ = ledger.backlog.orderedRemove(index);
-        out.push(.persist_checkpoint);
-        switch (plan) {
-            .row => {
-                out.transition = ledger.transition(.publish, sequence, .fact, .settled);
-                out.transition.?.applied = true;
-            },
-            .no_row => {
-                ledger.leaveUnpriced(next_no_receipt, created_at_ms, out);
-                out.transition = ledger.transition(.publish, sequence, .fact, .unpriced);
-                out.transition.?.incident = true;
-            },
-        }
-    }
-
-    /// The profile ledger answered conflict: another variant of the
-    /// generation holds the id. The fact leaves the backlog without settling
-    /// and is never retried; an incident keeps the gap visible.
-    fn publishConflict(ledger: *Ledger, sequence: Sequence, out: *Output) StepError!void {
-        const index = ledger.stagedIndex(sequence) orelse return error.NotStaged;
-        const next_no_receipt = std.math.add(u64, ledger.no_receipt, 1) catch return error.Overflow;
-        const removed = ledger.backlog.orderedRemove(index);
-        ledger.leaveUnpriced(next_no_receipt, removed.created_at_ms, out);
-        out.push(.persist_checkpoint);
-        out.transition = ledger.transition(.publish_conflict, sequence, .fact, .unpriced);
-        out.transition.?.incident = true;
-    }
-
-    /// The profile ledger holds `incident` now, so the session stops owing
-    /// it. Session availability stays incomplete. An incident the list no
-    /// longer holds (it collapsed meanwhile) is `error.NotRecorded`.
-    fn incidentPublished(ledger: *Ledger, incident: Incident, out: *Output) StepError!void {
-        const index = for (ledger.incidents.items, 0..) |held, i| {
-            if (held.occurred_at_ms == incident.occurred_at_ms and held.completeness == incident.completeness) break i;
-        } else return error.NotRecorded;
-        _ = ledger.incidents.orderedRemove(index);
-        out.push(.persist_checkpoint);
-        out.transition = .{
-            .event = .incident_published,
-            .call = 0,
-            .from = null,
-            .to = null,
-            .cred = ledger.credentialOrdinal(),
-            .rows = @intCast(ledger.rows.items.len),
-        };
     }
 
     const RowPlan = struct {
@@ -1048,20 +874,9 @@ pub const Ledger = struct {
         no_row: u2,
     };
 
-    const AcceptPlan = struct {
-        what: union(enum) {
-            stage,
-            /// The backlog is full (or the budget is spent), so the call
-            /// settles locally.
-            local: SettlePlan,
-        },
-        /// Which budget checks refused (the model's `spent` arguments).
-        budget: u2 = 0,
-    };
-
     /// Everything a settle would change, computed without changing anything.
     /// `budget_free` is the identifier budget left for a new row, or null when
-    /// the settle frees more than a row needs (publish).
+    /// the settle frees more than a row needs (a restored staged fact).
     fn planSettle(ledger: *const Ledger, fact: Fact, budget_free: ?usize) error{Overflow}!SettlePlan {
         const index: ?usize = for (ledger.rows.items, 0..) |*row, i| {
             if (std.mem.eql(u8, row.name(), fact.model)) break i;
@@ -1078,27 +893,12 @@ pub const Ledger = struct {
         } };
     }
 
-    fn planAccept(ledger: *const Ledger, fact: Fact) StepError!AcceptPlan {
-        return ledger.planAcceptFreeing(fact, 0, 0);
-    }
-
-    /// `freed` identifier bytes and `freed_entries` waiting entries leave
-    /// the ledger in the same step.
-    fn planAcceptFreeing(ledger: *const Ledger, fact: Fact, freed: usize, freed_entries: usize) StepError!AcceptPlan {
+    /// The settle for a fact arriving now, with `freed` identifier bytes
+    /// leaving the ledger in the same step.
+    fn planAccept(ledger: *const Ledger, fact: Fact, freed: usize) StepError!SettlePlan {
         const used = ledger.identifierBytes() -| freed;
-        const free = ledger.limits.max_identifier_bytes -| used;
-        const room = ledger.backlog.items.len < ledger.limits.max_backlog;
-        const staged_bytes = GenerationId.length + fact.model.len + ledger.limits.bridgeBytes();
-        if (room and staged_bytes <= free and ledger.persistedRoom(freed_entries)) return .{ .what = .stage };
-        var plan: AcceptPlan = .{ .what = .{ .local = try ledger.planSettle(fact, free) } };
-        if (room) plan.budget |= budget_stage;
-        switch (plan.what.local) {
-            .row => {},
-            .no_row => |bits| {
-                plan.budget |= bits;
-                _ = std.math.add(u64, ledger.no_receipt, 1) catch return error.Overflow;
-            },
-        }
+        const plan = try ledger.planSettle(fact, ledger.limits.max_identifier_bytes -| used);
+        if (plan == .no_row) _ = std.math.add(u64, ledger.no_receipt, 1) catch return error.Overflow;
         return plan;
     }
 
@@ -1114,53 +914,36 @@ pub const Ledger = struct {
         sortRows(ledger.rows.items);
     }
 
-    /// Stages the fact, or settles it locally, as `plan` decided.
-    fn accept(ledger: *Ledger, event: TraceEvent, sequence: Sequence, from: State, fact: Fact, plan: AcceptPlan, out: *Output) void {
+    /// Settles the fact into the totals once, or leaves it unpriced when its
+    /// model finds no row, as `plan` decided.
+    fn accept(ledger: *Ledger, event: TraceEvent, sequence: Sequence, from: State, fact: Fact, plan: SettlePlan, out: *Output) void {
         out.push(.persist_checkpoint);
-        switch (plan.what) {
-            .stage => {
-                ledger.backlog.appendAssumeCapacity(.init(sequence, fact));
-                out.push(.publish_backlog);
-                out.transition = ledger.transition(event, sequence, from, .fact);
+        switch (plan) {
+            .row => |row| {
+                ledger.commitSettle(sequence, fact, row);
+                out.transition = ledger.transition(event, sequence, from, .settled);
+                out.transition.?.applied = true;
             },
-            .local => |settle| switch (settle) {
-                .row => |row| {
-                    ledger.commitSettle(sequence, fact, row);
-                    ledger.recordIncident(fact.created_at_ms);
-                    out.push(.publish_backlog);
-                    out.transition = ledger.transition(event, sequence, from, .local);
-                    out.transition.?.applied = true;
-                    out.transition.?.incident = true;
-                },
-                .no_row => {
-                    // Checked in planAcceptFreeing.
-                    ledger.leaveUnpriced(ledger.no_receipt + 1, fact.created_at_ms, out);
-                    out.transition = ledger.transition(event, sequence, from, .unpriced);
-                    out.transition.?.incident = true;
-                },
+            .no_row => |budget| {
+                // Checked in planAccept.
+                ledger.leaveUnpriced(ledger.no_receipt + 1, fact.created_at_ms);
+                out.transition = ledger.transition(event, sequence, from, .unpriced);
+                out.transition.?.incident = true;
+                out.transition.?.budget = budget;
             },
         }
-        out.transition.?.budget = plan.budget;
     }
 
     // Identifier budget --------------------------------------------------------
 
     /// Bytes older readers count against `max_identifier_bytes`: model
-    /// names, waiting entries' id, origin, team, and account, and staged
-    /// facts' id and model (`validateSnapshotContract`).
+    /// names, and waiting entries' id, origin, team, and account
+    /// (`validateSnapshotContract`).
     fn identifierBytes(ledger: *const Ledger) usize {
         var total: usize = 0;
         for (ledger.rows.items) |*row| total += row.name().len;
         for (ledger.pending.items) |*entry| total += entry.identifierBytes();
-        for (ledger.backlog.items) |*entry| total += GenerationId.length + entry.model.slice().len + ledger.limits.bridgeBytes();
         return total;
-    }
-
-    /// Whether the persisted pending array has room for one more entry
-    /// once `freed_entries` waiting entries leave.
-    fn persistedRoom(ledger: *const Ledger, freed_entries: usize) bool {
-        const persisted = ledger.pending.items.len + ledger.backlog.items.len - freed_entries;
-        return persisted < ledger.limits.max_persisted_pending;
     }
 
     fn fitsIdentifiers(ledger: *const Ledger, extra: usize) bool {
@@ -1178,17 +961,16 @@ pub const Ledger = struct {
     };
 
     /// Loads a saved session. Calls that were waiting come back in
-    /// `lookup` (blocking is runtime-only), staged facts come back staged,
-    /// and earlier calls survive as rows. Asks for every restored lookup's
-    /// `pending` record again and for the
-    /// backlog and incidents to be published. Needs no checkpoint: nothing
-    /// changed from what was saved. With a trace writer, writes one `restore`
-    /// record per restored waiting or staged call.
+    /// `lookup` (blocking is runtime-only), and earlier calls survive as
+    /// rows. A snapshot an older binary saved may still stage facts for its
+    /// profile ledger: each settles into the totals now, or is left unpriced
+    /// with an incident when its model finds no row, so no call goes missing.
+    /// Asks for a checkpoint only when it settled one. With a trace writer,
+    /// writes one `restore` record per restored waiting or staged call.
     pub fn restore(ledger: *Ledger, saved: Restored, out: *Output, tracer: ?*trace.Writer) RestoreError!void {
         out.* = .{};
         if (ledger.next_sequence != 1 or ledger.active.items.len != 0 or ledger.pending.items.len != 0 or
-            ledger.backlog.items.len != 0 or ledger.rows.items.len != 0 or ledger.incidents.items.len != 0 or
-            ledger.credential != null)
+            ledger.rows.items.len != 0 or ledger.incidents.items.len != 0 or ledger.credential != null)
         {
             return error.AlreadyStarted;
         }
@@ -1206,19 +988,44 @@ pub const Ledger = struct {
         sortRows(ledger.rows.items);
         for (saved.pending) |entry| {
             ledger.pending.appendAssumeCapacity(.init(entry.sequence, entry.provider, entry.request));
-            out.push(.{ .publish_pending = entry.sequence });
         }
-        for (saved.backlog) |entry| ledger.backlog.appendAssumeCapacity(.init(entry.sequence, entry.fact));
         ledger.incidents.appendSliceAssumeCapacity(saved.incidents);
         if (saved.incidents.len > 0) ledger.incomplete = true;
-        if (saved.backlog.len > 0 or saved.incidents.len > 0) out.push(.publish_backlog);
+        // Bounded by `max_persisted_pending` (validated), at most the ceiling.
+        var outcomes: [Limits.ceiling]State = undefined;
+        for (saved.backlog, 0..) |entry, index| outcomes[index] = ledger.settleRestored(entry);
+        if (saved.backlog.len > 0) out.push(.persist_checkpoint);
 
-        if (trace.on(tracer)) |writer| ledger.writeRestored(writer) catch |err| {
+        if (trace.on(tracer)) |writer| ledger.writeRestored(writer, saved.backlog, outcomes[0..saved.backlog.len]) catch |err| {
             out.trace_error = err;
         };
     }
 
-    fn writeRestored(ledger: *const Ledger, writer: *trace.Writer) std.Io.Writer.Error!void {
+    /// Settles a staged fact from an older binary's snapshot, as its publish
+    /// would have, and returns where the call ended. Needs no identifier
+    /// bytes: a new row's name is smaller than the staged fact it replaces.
+    /// A total that would overflow leaves the call unpriced instead.
+    fn settleRestored(ledger: *Ledger, entry: Restored.StagedFact) State {
+        const plan = ledger.planSettle(entry.fact, null) catch SettlePlan{ .no_row = 0 };
+        switch (plan) {
+            .row => |row| {
+                ledger.commitSettle(entry.sequence, entry.fact, row);
+                return .settled;
+            },
+            .no_row => {
+                // At most `max_persisted_pending` restored facts: no overflow.
+                ledger.leaveUnpriced(ledger.no_receipt + 1, entry.fact.created_at_ms);
+                return .unpriced;
+            },
+        }
+    }
+
+    fn writeRestored(
+        ledger: *const Ledger,
+        writer: *trace.Writer,
+        staged: []const Restored.StagedFact,
+        outcomes: []const State,
+    ) std.Io.Writer.Error!void {
         // A summary first (the restored rows), then one record per call in
         // sequence order.
         var summary: Output = .{};
@@ -1234,10 +1041,10 @@ pub const Ledger = struct {
                     state = .lookup;
                 }
             }
-            for (ledger.backlog.items) |entry| {
+            for (staged, outcomes) |entry, outcome| {
                 if (entry.sequence > last and (next == null or entry.sequence < next.?)) {
                     next = entry.sequence;
-                    state = .fact;
+                    state = outcome;
                 }
             }
             const call = next orelse return;
@@ -1269,7 +1076,7 @@ pub const Ledger = struct {
 };
 
 /// A trace record's `budget`: which identifier-budget checks refused.
-const budget_stage: u2 = 1;
+const budget_waiting: u2 = 1;
 const budget_row: u2 = 2;
 
 /// Session activity that rides along in checkpoints; the model doesn't need
@@ -1302,6 +1109,8 @@ pub const Restored = struct {
     totals: Totals,
     rows: []const Row = &.{},
     pending: []const Waiting = &.{},
+    /// Facts an older binary staged for its profile ledger; `restore`
+    /// settles them.
     backlog: []const StagedFact = &.{},
     incidents: []const Incident = &.{},
     activity: Activity = .{},
@@ -1316,7 +1125,7 @@ fn validateRestored(limits: Limits, saved: Restored) Ledger.RestoreError!void {
     if (saved.next_sequence == 0 or saved.next_sequence == std.math.maxInt(Sequence)) return bad;
     if (saved.settled_through >= saved.next_sequence) return bad;
     if (saved.rows.len > limits.max_models or saved.pending.len > limits.max_pending or
-        saved.backlog.len > limits.max_backlog or saved.incidents.len > limits.max_incidents or
+        saved.incidents.len > limits.max_incidents or
         saved.pending.len + saved.backlog.len > limits.max_persisted_pending)
     {
         return bad;
@@ -1353,7 +1162,7 @@ fn validateRestored(limits: Limits, saved: Restored) Ledger.RestoreError!void {
         for (saved.pending) |waiting| {
             if (waiting.sequence == entry.sequence or waiting.request.id.eql(entry.fact.id)) return bad;
         }
-        bytes += GenerationId.length + entry.fact.model.len + limits.bridgeBytes();
+        bytes += GenerationId.length + entry.fact.model.len;
     }
     for (saved.incidents) |incident| if (incident.occurred_at_ms < 0) return bad;
     if (bytes > limits.max_identifier_bytes) return bad;
@@ -1472,7 +1281,6 @@ const Harness = struct {
     const Shadow = struct {
         state: State,
         totals: u8 = 0,
-        published: u8 = 0,
         incident: bool = false,
     };
 
@@ -1508,8 +1316,6 @@ const Harness = struct {
                 }
             }
             try testing.expectEqual(t.moved, moved);
-        } else if (t.event == .incident_published) {
-            try testing.expectEqual(@as(Sequence, 0), t.call);
         } else {
             const entry = try h.calls.getOrPut(testing.allocator, t.call);
             if (!entry.found_existing) entry.value_ptr.* = .{ .state = .idle };
@@ -1517,17 +1323,24 @@ const Harness = struct {
             try testing.expectEqual(shadow.state, t.from.?);
             shadow.state = t.to.?;
             if (t.applied) shadow.totals += 1;
-            if (t.event == .publish or t.event == .publish_conflict) shadow.published += 1;
             if (t.incident) shadow.incident = true;
         }
         try h.checkInvariants();
     }
 
-    /// Restores `saved` and seeds the shadow from what came back.
+    /// Restores `saved` and seeds the shadow from what came back. A staged
+    /// fact settled exactly when its model has a row now (the tests never
+    /// overflow a total).
     fn restore(h: *Harness, saved: Restored) !void {
         try h.ledger.restore(saved, &h.out, null);
         for (h.ledger.waiting()) |entry| try h.calls.put(testing.allocator, entry.sequence, .{ .state = .lookup });
-        for (h.ledger.staged()) |entry| try h.calls.put(testing.allocator, entry.sequence, .{ .state = .fact });
+        for (saved.backlog) |entry| {
+            const has_row = for (h.ledger.rows.items) |*row| {
+                if (std.mem.eql(u8, row.name(), entry.fact.model)) break true;
+            } else false;
+            const shadow: Shadow = if (has_row) .{ .state = .settled, .totals = 1 } else .{ .state = .unpriced, .incident = true };
+            try h.calls.put(testing.allocator, entry.sequence, shadow);
+        }
         try h.checkInvariants();
     }
 
@@ -1551,9 +1364,9 @@ const Harness = struct {
     fn checkInvariants(h: *const Harness) !void {
         const ledger = &h.ledger;
         const limits = ledger.limits;
-        // PendingBounded, BacklogBounded, RowsBounded.
+        // PendingBounded, RowsBounded.
         try testing.expect(ledger.pending.items.len <= limits.max_pending);
-        try testing.expect(ledger.backlog.items.len <= limits.max_backlog);
+        try testing.expect(ledger.pending.items.len <= limits.max_persisted_pending);
         try testing.expect(ledger.rows.items.len <= limits.max_models);
         try testing.expect(ledger.incidents.items.len <= limits.max_incidents);
         try testing.expect(ledger.active.items.len <= limits.max_active);
@@ -1563,15 +1376,12 @@ const Harness = struct {
             const sequence = entry.key_ptr.*;
             const shadow = entry.value_ptr.*;
             // NoDoubleCount.
-            try testing.expect(shadow.totals <= 1 and shadow.published <= 1);
+            try testing.expect(shadow.totals <= 1);
             // SettledCountedOnce.
-            try testing.expectEqual(shadow.state == .settled, shadow.totals == 1 and shadow.published == 1);
-            try testing.expectEqual(shadow.state == .local, shadow.totals == 1 and shadow.published == 0);
-            // NeverSilent.
-            if (shadow.state == .unpriced or shadow.state == .local) {
+            try testing.expectEqual(shadow.state == .settled, shadow.totals == 1);
+            // NeverSilent: the incident keeps the session incomplete.
+            if (shadow.state == .unpriced) {
                 try testing.expect(shadow.incident);
-                // The incident is in the session's list or, once published,
-                // in the profile ledger; either way the session stays incomplete.
                 try testing.expect(ledger.incomplete);
             }
             // UnpricedNotCounted.
@@ -1579,9 +1389,7 @@ const Harness = struct {
             // The shadow and the ledger agree on where each call is.
             const in_active = ledger.activeIndex(sequence) != null;
             const in_pending = ledger.pendingIndex(sequence);
-            const in_backlog = ledger.stagedIndex(sequence) != null;
             try testing.expectEqual(shadow.state == .active, in_active);
-            try testing.expectEqual(shadow.state == .fact, in_backlog);
             try testing.expectEqual(shadow.state == .lookup or shadow.state == .blocked, in_pending != null);
             if (in_pending) |index| {
                 const status = ledger.pending.items[index].status;
@@ -1654,10 +1462,6 @@ fn fingerprint(ledger: *const Ledger) u64 {
         scalar(&h, entry.status);
         h.update(&entry.id.bytes);
     }
-    for (ledger.backlog.items) |entry| {
-        scalar(&h, entry.sequence);
-        h.update(entry.model.slice());
-    }
     for (ledger.incidents.items) |incident| scalar(&h, incident.occurred_at_ms);
     for (ledger.rows.items) |row| {
         scalar(&h, row.first_sequence);
@@ -1695,20 +1499,16 @@ test "the last sequence is never handed out" {
     try testing.expectError(error.SequenceExhausted, h.step(.{ .begin = .gateway }));
 }
 
-test "an exact fact is staged, then publish applies the totals once" {
+test "an exact fact settles into the totals once" {
     var h: Harness = try .init(.{});
     defer h.deinit();
     const call = try h.begin();
     try h.step(.{ .finish_exact = .{ .sequence = call, .fact = testFact(call, test_model, 0.25) } });
-    try testing.expectEqual(State.fact, h.state(call));
-    try testing.expectEqual(@as(usize, 1), h.effectCount(.persist_checkpoint));
-    try testing.expectEqual(@as(usize, 1), h.effectCount(.publish_backlog));
-    try testing.expectEqual(@as(f64, 0), h.ledger.view().totals.total_cost);
-    try testing.expectEqualStrings(test_model, h.ledger.staged()[0].fact().model);
-
-    try h.step(.{ .publish = .{ .sequence = call, .result = .appended } });
     try testing.expectEqual(State.settled, h.state(call));
     try testing.expect(h.out.transition.?.applied);
+    try testing.expect(!h.out.transition.?.incident);
+    try testing.expectEqual(@as(usize, 1), h.out.effects().len);
+    try testing.expectEqual(@as(usize, 1), h.effectCount(.persist_checkpoint));
     const view = h.ledger.view();
     try testing.expectEqual(@as(f64, 0.25), view.totals.total_cost);
     try testing.expectEqual(@as(u64, 10), view.totals.input_tokens);
@@ -1718,17 +1518,8 @@ test "an exact fact is staged, then publish applies the totals once" {
     try testing.expectEqualStrings(test_model, view.models[0].name());
     try testing.expectEqual(Availability.complete, view.availability);
 
-    try testing.expectError(error.NotStaged, h.step(.{ .publish = .{ .sequence = call, .result = .duplicate } }));
-}
-
-test "a duplicate answer settles a fact an earlier run appended" {
-    var h: Harness = try .init(.{});
-    defer h.deinit();
-    const call = try h.begin();
-    try h.step(.{ .finish_exact = .{ .sequence = call, .fact = testFact(call, test_model, 1) } });
-    try h.step(.{ .publish = .{ .sequence = call, .result = .duplicate } });
-    try testing.expectEqual(State.settled, h.state(call));
-    try testing.expectEqual(@as(f64, 1), h.ledger.view().totals.total_cost);
+    // The call is finished: it settles once.
+    try testing.expectError(error.NotActive, h.step(.{ .finish_exact = .{ .sequence = call, .fact = testFact(call + 1, test_model, 1) } }));
 }
 
 test "exact settlement never needs a lookup slot" {
@@ -1741,8 +1532,7 @@ test "exact settlement never needs a lookup slot" {
     try h.step(.{ .finish_lookup = .{ .sequence = b, .request = testRequest(b) } });
     try testing.expectEqual(@as(u32, 2), h.ledger.view().pending);
     try h.step(.{ .finish_exact = .{ .sequence = c, .fact = testFact(c, test_model, 0.5) } });
-    try testing.expectEqual(State.fact, h.state(c));
-    try h.step(.{ .publish = .{ .sequence = c, .result = .appended } });
+    try testing.expectEqual(State.settled, h.state(c));
     try testing.expectEqual(@as(f64, 0.5), h.ledger.view().totals.total_cost);
     try testing.expectEqual(Availability.pending, h.ledger.availability());
 }
@@ -1890,7 +1680,7 @@ test "facts are validated before anything changes" {
     edge.reasoning_tokens = edge.output_tokens;
     edge.total_cost = 0;
     try h.step(.{ .finish_exact = .{ .sequence = call, .fact = edge } });
-    try testing.expectEqual(State.fact, h.state(call));
+    try testing.expectEqual(State.settled, h.state(call));
 }
 
 test "lookup requests are validated before anything changes" {
@@ -1923,18 +1713,16 @@ test "lookup requests are validated before anything changes" {
     try testing.expectEqual(@as(?[]const u8, null), h.ledger.waiting()[1].accountText());
 }
 
-test "a generation id belongs to one waiting or staged call" {
+test "a generation id belongs to one waiting call" {
     var h: Harness = try .init(.{});
     defer h.deinit();
     const a = try h.begin();
     const b = try h.begin();
-    const c = try h.begin();
     try h.step(.{ .finish_lookup = .{ .sequence = a, .request = testRequest(a) } });
     try testing.expectError(error.DuplicateGenerationId, h.step(.{ .finish_lookup = .{ .sequence = b, .request = testRequest(a) } }));
     try testing.expectError(error.DuplicateGenerationId, h.step(.{ .finish_exact = .{ .sequence = b, .fact = testFact(a, test_model, 1) } }));
     try h.step(.{ .finish_exact = .{ .sequence = b, .fact = testFact(b, test_model, 1) } });
-    try testing.expectError(error.DuplicateGenerationId, h.step(.{ .finish_exact = .{ .sequence = c, .fact = testFact(b, test_model, 1) } }));
-    try testing.expectError(error.DuplicateGenerationId, h.step(.{ .finish_lookup = .{ .sequence = c, .request = testRequest(b) } }));
+    try testing.expectEqual(State.settled, h.state(b));
 }
 
 test "an fx login 401 blocks only that credential, and an API key retries it" {
@@ -1963,9 +1751,7 @@ test "an fx login 401 blocks only that credential, and an API key retries it" {
     try testing.expectEqual(State.lookup, h.state(a));
     try testing.expectEqual(a, h.out.effects()[0].start_lookup);
     try h.step(.{ .lookup_found = .{ .sequence = a, .fact = testFact(a, test_model, 0.75) } });
-    try testing.expectEqual(State.fact, h.state(a));
-    try testing.expectEqual(@as(usize, 1), h.effectCount(.publish_backlog));
-    try h.step(.{ .publish = .{ .sequence = a, .result = .appended } });
+    try testing.expectEqual(State.settled, h.state(a));
     try testing.expectEqual(Availability.complete, h.ledger.availability());
     try testing.expectEqual(@as(f64, 0.75), h.ledger.view().totals.total_cost);
     try testing.expectEqual(@as(u64, 0), h.ledger.view().unpriced.count);
@@ -2027,74 +1813,46 @@ test "a found lookup must carry the entry's generation id" {
     try testing.expectError(error.InvalidCost, h.step(.{ .lookup_found = .{ .sequence = a, .fact = bad } }));
 }
 
-test "a full backlog settles the fact into the session totals only" {
-    var h: Harness = try .init(.{ .max_backlog = 1 });
-    defer h.deinit();
-    const a = try h.begin();
-    const b = try h.begin();
-    try h.step(.{ .finish_exact = .{ .sequence = a, .fact = testFact(a, test_model, 1) } });
-    try h.step(.{ .finish_exact = .{ .sequence = b, .fact = testFact(b, test_model, 2) } });
-    try testing.expectEqual(State.local, h.state(b));
-    try testing.expect(h.out.transition.?.applied and h.out.transition.?.incident);
-    // Only its incident goes to the profile ledger.
-    try testing.expectEqual(@as(usize, 1), h.effectCount(.publish_backlog));
-    try testing.expectEqual(@as(usize, 1), h.ledger.staged().len);
-    try testing.expectEqual(@as(f64, 2), h.ledger.view().totals.total_cost);
-    try testing.expectEqual(Availability.incomplete, h.ledger.availability());
-    try testing.expectEqual(@as(i64, @intCast(1_000 + b)), h.ledger.incidentList()[0].occurred_at_ms);
-    try h.step(.{ .publish = .{ .sequence = a, .result = .appended } });
-    try testing.expectEqual(@as(f64, 3), h.ledger.view().totals.total_cost);
-    try testing.expectEqual(@as(u64, 0), h.ledger.view().unpriced.count);
-
-    // A found lookup takes the same path.
-    try h.step(.{ .set_credential = api_key });
-    const c = try h.begin();
-    const d = try h.begin();
-    try h.step(.{ .finish_exact = .{ .sequence = c, .fact = testFact(c, test_model, 1) } });
-    try h.step(.{ .finish_lookup = .{ .sequence = d, .request = testRequest(d) } });
-    try h.step(.{ .lookup_found = .{ .sequence = d, .fact = testFact(d, test_model, 4) } });
-    try testing.expectEqual(State.local, h.state(d));
-}
-
 test "model rows are bounded; a fact needing one more stays out of the totals" {
-    var h: Harness = try .init(.{ .max_models = 1, .max_backlog = 1 });
+    var h: Harness = try .init(.{ .max_models = 1 });
     defer h.deinit();
     const a = try h.begin();
     const b = try h.begin();
     const c = try h.begin();
-    const d = try h.begin();
     try h.step(.{ .finish_exact = .{ .sequence = a, .fact = testFact(a, "model/a", 1) } });
-    try h.step(.{ .publish = .{ .sequence = a, .result = .appended } });
     try h.step(.{ .finish_exact = .{ .sequence = b, .fact = testFact(b, "model/b", 2) } });
-    try h.step(.{ .publish = .{ .sequence = b, .result = .appended } });
     try testing.expectEqual(State.unpriced, h.state(b));
     try testing.expect(h.out.transition.?.incident and !h.out.transition.?.applied);
     try testing.expectEqual(@as(f64, 1), h.ledger.view().totals.total_cost);
     try testing.expectEqual(@as(u64, 1), h.ledger.view().unpriced.no_receipt);
     try testing.expectEqual(@as(usize, 1), h.ledger.view().models.len);
+    try testing.expectEqual(Availability.incomplete, h.ledger.availability());
+    try testing.expectEqual(@as(i64, @intCast(1_000 + b)), h.ledger.incidentList()[0].occurred_at_ms);
     // An existing row still takes more.
     try h.step(.{ .finish_exact = .{ .sequence = c, .fact = testFact(c, "model/a", 4) } });
-    // And a local settle with no row is unpriced too.
-    try h.step(.{ .finish_exact = .{ .sequence = d, .fact = testFact(d, "model/d", 8) } });
-    try testing.expectEqual(State.unpriced, h.state(d));
-    try h.step(.{ .publish = .{ .sequence = c, .result = .appended } });
     try testing.expectEqual(State.settled, h.state(c));
     try testing.expectEqual(@as(f64, 5), h.ledger.view().totals.total_cost);
+
+    // A found lookup takes the same path.
+    try h.step(.{ .set_credential = api_key });
+    const d = try h.begin();
+    try h.step(.{ .finish_lookup = .{ .sequence = d, .request = testRequest(d) } });
+    try h.step(.{ .lookup_found = .{ .sequence = d, .fact = testFact(d, "model/d", 8) } });
+    try testing.expectEqual(State.unpriced, h.state(d));
     try testing.expectEqual(@as(u64, 2), h.ledger.view().unpriced.no_receipt);
 }
 
 test "rows stay ordered by first sequence when facts settle out of order" {
     var h: Harness = try .init(.{});
     defer h.deinit();
+    try h.step(.{ .set_credential = api_key });
     var calls: [3]Sequence = undefined;
     for (&calls) |*call| call.* = try h.begin();
-    try h.step(.{ .finish_exact = .{ .sequence = calls[0], .fact = testFact(calls[0], "model/x", 1) } });
+    try h.step(.{ .finish_lookup = .{ .sequence = calls[0], .request = testRequest(calls[0]) } });
     try h.step(.{ .finish_exact = .{ .sequence = calls[1], .fact = testFact(calls[1], "model/y", 1) } });
     try h.step(.{ .finish_exact = .{ .sequence = calls[2], .fact = testFact(calls[2], "model/x", 1) } });
-    try h.step(.{ .publish = .{ .sequence = calls[2], .result = .appended } });
-    try h.step(.{ .publish = .{ .sequence = calls[1], .result = .appended } });
     try testing.expectEqualStrings("model/y", h.ledger.view().models[0].name());
-    try h.step(.{ .publish = .{ .sequence = calls[0], .result = .appended } });
+    try h.step(.{ .lookup_found = .{ .sequence = calls[0], .fact = testFact(calls[0], "model/x", 1) } });
     const models = h.ledger.view().models;
     try testing.expectEqualStrings("model/x", models[0].name());
     try testing.expectEqual(calls[0], models[0].first_sequence);
@@ -2103,31 +1861,24 @@ test "rows stay ordered by first sequence when facts settle out of order" {
 }
 
 test "totals use checked arithmetic, and an overflow changes nothing" {
-    var h: Harness = try .init(.{ .max_backlog = 1 });
+    var h: Harness = try .init(.{});
     defer h.deinit();
     const a = try h.begin();
     const b = try h.begin();
     var big = testFact(a, test_model, 1);
     big.input_tokens = std.math.maxInt(u64);
     try h.step(.{ .finish_exact = .{ .sequence = a, .fact = big } });
-    try h.step(.{ .publish = .{ .sequence = a, .result = .appended } });
-    try h.step(.{ .finish_exact = .{ .sequence = b, .fact = testFact(b, test_model, 1) } });
-    try testing.expectError(error.Overflow, h.step(.{ .publish = .{ .sequence = b, .result = .appended } }));
-    try testing.expectEqual(State.fact, h.state(b));
+    try testing.expectError(error.Overflow, h.step(.{ .finish_exact = .{ .sequence = b, .fact = testFact(b, test_model, 1) } }));
+    try testing.expectEqual(State.active, h.state(b));
 
-    // The same at a local settle, and for cost.
-    const c = try h.begin();
-    try testing.expectError(error.Overflow, h.step(.{ .finish_exact = .{ .sequence = c, .fact = testFact(c, test_model, 1) } }));
-    try testing.expectEqual(State.active, h.state(c));
-
+    // The same for cost, across rows.
     var costly: Harness = try .init(.{});
     defer costly.deinit();
     const x = try costly.begin();
     const y = try costly.begin();
     try costly.step(.{ .finish_exact = .{ .sequence = x, .fact = testFact(x, test_model, std.math.floatMax(f64)) } });
-    try costly.step(.{ .finish_exact = .{ .sequence = y, .fact = testFact(y, "model/other", std.math.floatMax(f64)) } });
-    try costly.step(.{ .publish = .{ .sequence = x, .result = .appended } });
-    try testing.expectError(error.Overflow, costly.step(.{ .publish = .{ .sequence = y, .result = .appended } }));
+    try testing.expectError(error.Overflow, costly.step(.{ .finish_exact = .{ .sequence = y, .fact = testFact(y, "model/other", std.math.floatMax(f64)) } }));
+    try testing.expectEqual(State.active, costly.state(y));
 }
 
 test "unknown reasoning makes the total unknown; a legacy session starts unknown" {
@@ -2137,7 +1888,6 @@ test "unknown reasoning makes the total unknown; a legacy session starts unknown
     var fact = testFact(a, test_model, 1);
     fact.reasoning_tokens = null;
     try h.step(.{ .finish_exact = .{ .sequence = a, .fact = fact } });
-    try h.step(.{ .publish = .{ .sequence = a, .result = .appended } });
     try testing.expectEqual(@as(?u64, null), h.ledger.view().totals.reasoning_tokens);
     try testing.expectEqual(@as(?u64, 1), h.ledger.view().totals.request_count);
 
@@ -2182,7 +1932,7 @@ test "availability follows today's rules" {
     try h.step(.{ .finish_lookup = .{ .sequence = a, .request = testRequest(a) } });
     try testing.expectEqual(Availability.pending, h.ledger.availability());
     try h.step(.{ .lookup_found = .{ .sequence = a, .fact = testFact(a, test_model, 1) } });
-    // Staged facts are priced; only waiting entries make it pending.
+    // Only waiting entries make it pending.
     try testing.expectEqual(Availability.complete, h.ledger.availability());
 }
 
@@ -2252,7 +2002,7 @@ test "each step writes one ledger record with model state names" {
     try testing.expectEqualStrings(
         "{\"v\":1,\"seq\":1,\"machine\":\"ledger\",\"inst\":\"session\",\"event\":\"set_credential\",\"from\":\"-\",\"to\":\"-\",\"effects\":[],\"data\":{\"call\":0,\"cred\":1,\"rows\":0,\"moved\":0}}\n" ++
             "{\"v\":1,\"seq\":2,\"machine\":\"ledger\",\"inst\":\"session\",\"event\":\"begin\",\"from\":\"idle\",\"to\":\"active\",\"effects\":[\"persist_checkpoint\"],\"data\":{\"call\":1,\"cred\":1,\"rows\":0,\"incident\":false,\"applied\":false,\"budget\":0}}\n" ++
-            "{\"v\":1,\"seq\":3,\"machine\":\"ledger\",\"inst\":\"session\",\"event\":\"finish_lookup\",\"from\":\"active\",\"to\":\"lookup\",\"effects\":[\"persist_checkpoint\",\"publish_pending\",\"start_lookup\"],\"data\":{\"call\":1,\"cred\":1,\"rows\":0,\"incident\":false,\"applied\":false,\"budget\":0}}\n" ++
+            "{\"v\":1,\"seq\":3,\"machine\":\"ledger\",\"inst\":\"session\",\"event\":\"finish_lookup\",\"from\":\"active\",\"to\":\"lookup\",\"effects\":[\"persist_checkpoint\",\"start_lookup\"],\"data\":{\"call\":1,\"cred\":1,\"rows\":0,\"incident\":false,\"applied\":false,\"budget\":0}}\n" ++
             "{\"v\":1,\"seq\":4,\"machine\":\"ledger\",\"inst\":\"session\",\"event\":\"lookup_unauthorized\",\"from\":\"lookup\",\"to\":\"blocked\",\"effects\":[],\"data\":{\"call\":1,\"cred\":1,\"rows\":0,\"incident\":false,\"applied\":false,\"budget\":0}}\n" ++
             "{\"v\":1,\"seq\":5,\"machine\":\"ledger\",\"inst\":\"session\",\"event\":\"set_credential\",\"from\":\"-\",\"to\":\"-\",\"effects\":[\"start_lookup\"],\"data\":{\"call\":0,\"cred\":2,\"rows\":0,\"moved\":1}}\n",
         buffer.written(),
@@ -2279,7 +2029,7 @@ test "random event streams keep every model invariant" {
         var h: Harness = try .init(.{
             .max_active = random.intRangeAtMost(u32, 1, 4),
             .max_pending = random.intRangeAtMost(u32, 1, 3),
-            .max_backlog = random.intRangeAtMost(u32, 1, 3),
+            .max_persisted_pending = random.intRangeAtMost(u32, 1, 3),
             .max_incidents = random.intRangeAtMost(u32, 1, 3),
             .max_models = random.intRangeAtMost(u32, 1, 3),
             // Small enough that the budget refuses some additions.
@@ -2292,7 +2042,7 @@ test "random event streams keep every model invariant" {
         while (steps < 400) : (steps += 1) {
             const call = random.intRangeAtMost(Sequence, 1, h.ledger.next_sequence);
             const fact = testFact(call, models[random.uintLessThan(usize, models.len)], @as(f64, @floatFromInt(random.uintLessThan(u8, 100))) / 64);
-            const event: Event = switch (random.uintLessThan(u8, 13)) {
+            const event: Event = switch (random.uintLessThan(u8, 10)) {
                 0 => .{ .begin = .gateway },
                 1 => .{ .finish_exact = .{ .sequence = call, .fact = fact } },
                 2 => .{ .finish_lookup = .{ .sequence = call, .request = testRequest(call) } },
@@ -2302,85 +2052,30 @@ test "random event streams keep every model invariant" {
                 6 => .{ .lookup_found = .{ .sequence = call, .fact = fact } },
                 7 => .{ .lookup_unauthorized = call },
                 8 => .{ .lookup_rejected = call },
-                9 => .{ .lookup_retry = call },
-                10 => .{ .publish_conflict = call },
-                11 => .{ .incident_published = .{ .occurred_at_ms = random.intRangeAtMost(i64, 0, 9), .completeness = .incomplete } },
-                else => .{ .publish = .{ .sequence = call, .result = if (random.boolean()) .appended else .duplicate } },
+                else => .{ .lookup_retry = call },
             };
             // Refusals are checked for leaving the ledger unchanged inside
             // `Harness.step`; only the expected ones may occur.
             h.step(event) catch |err| switch (err) {
-                error.TooManyActive, error.NotActive, error.NotLookingUp, error.NotStaged, error.NoCredential, error.DuplicateGenerationId, error.NotRecorded => {},
+                error.TooManyActive, error.NotActive, error.NotLookingUp, error.NoCredential, error.DuplicateGenerationId => {},
                 else => return err,
             };
         }
-        // Every staged fact can still be published (FactsPublished), and with
-        // a credential that finds them, every lookup resolves (LookupsResolve).
+        // With a credential that finds them, every lookup resolves
+        // (LookupsResolve).
         try h.step(.{ .set_credential = credentialDigest("resolver") });
         while (h.ledger.waiting().len > 0) {
             const entry = h.ledger.waiting()[0];
             try h.step(.{ .lookup_found = .{ .sequence = entry.sequence, .fact = testFact(entry.sequence, "model/a", 1) } });
         }
-        while (h.ledger.staged().len > 0) {
-            try h.step(.{ .publish = .{ .sequence = h.ledger.staged()[0].sequence, .result = .appended } });
-        }
         var it = h.calls.valueIterator();
-        while (it.next()) |shadow| try testing.expect(shadow.state != .fact and shadow.state != .lookup and shadow.state != .blocked);
+        while (it.next()) |shadow| try testing.expect(shadow.state != .lookup and shadow.state != .blocked);
     }
 }
 
-test "a conflict answer leaves the fact unpriced with an incident, and is never retried" {
-    var h: Harness = try .init(.{});
-    defer h.deinit();
-    const call = try h.begin();
-    try h.step(.{ .finish_exact = .{ .sequence = call, .fact = testFact(call, test_model, 0.5) } });
-    try h.step(.{ .publish_conflict = call });
-    try testing.expectEqual(State.unpriced, h.state(call));
-    try testing.expect(h.out.transition.?.incident and !h.out.transition.?.applied);
-    try testing.expectEqual(@as(usize, 1), h.effectCount(.persist_checkpoint));
-    try testing.expectEqual(@as(usize, 1), h.effectCount(.publish_backlog));
-    const view = h.ledger.view();
-    try testing.expectEqual(@as(f64, 0), view.totals.total_cost);
-    try testing.expectEqual(@as(u64, 1), view.unpriced.no_receipt);
-    try testing.expectEqual(Availability.incomplete, view.availability);
-    try testing.expectEqual(@as(i64, @intCast(1_000 + call)), h.ledger.incidentList()[0].occurred_at_ms);
-    try testing.expectError(error.NotStaged, h.step(.{ .publish_conflict = call }));
-    try testing.expectError(error.NotStaged, h.step(.{ .publish = .{ .sequence = call, .result = .duplicate } }));
-}
-
-test "a published incident leaves the session's list; availability stays incomplete" {
-    var h: Harness = try .init(.{});
-    defer h.deinit();
-    const a = try h.begin();
-    const b = try h.begin();
-    try h.step(.{ .finish_unpriced = .{ .sequence = a, .at_ms = 10 } });
-    try h.step(.{ .finish_unpriced = .{ .sequence = b, .at_ms = 20 } });
-    try h.step(.{ .incident_published = .{ .occurred_at_ms = 10, .completeness = .incomplete } });
-    try testing.expectEqual(@as(usize, 1), h.effectCount(.persist_checkpoint));
-    try testing.expectEqual(@as(usize, 1), h.ledger.incidentList().len);
-    try testing.expectEqual(@as(i64, 20), h.ledger.incidentList()[0].occurred_at_ms);
-    try testing.expectError(error.NotRecorded, h.step(.{ .incident_published = .{ .occurred_at_ms = 10, .completeness = .incomplete } }));
-    try testing.expectError(error.NotRecorded, h.step(.{ .incident_published = .{ .occurred_at_ms = 20, .completeness = .pending } }));
-    try h.step(.{ .incident_published = .{ .occurred_at_ms = 20, .completeness = .incomplete } });
-    try testing.expectEqual(@as(usize, 0), h.ledger.incidentList().len);
-    try testing.expectEqual(Availability.incomplete, h.ledger.availability());
-}
-
-test "only a real lookup asks for a pending record" {
-    var h: Harness = try .init(.{});
-    defer h.deinit();
-    const a = try h.begin();
-    const b = try h.begin();
-    try h.step(.{ .finish_exact = .{ .sequence = a, .fact = testFact(a, test_model, 1) } });
-    try testing.expectEqual(@as(usize, 0), h.effectCount(.publish_pending));
-    try h.step(.{ .finish_lookup = .{ .sequence = b, .request = testRequest(b) } });
-    try testing.expectEqual(@as(usize, 1), h.effectCount(.publish_pending));
-    try testing.expectEqual(b, h.out.effects()[1].publish_pending);
-}
-
-test "the identifier budget refuses a waiting entry, staging, and a new row, never a settle" {
+test "the identifier budget refuses a waiting entry and a new row, never an existing row" {
     // One request is 30 (id) + 28 (origin) + 8 (team) + 6 (account) = 72 bytes.
-    var h: Harness = try .init(.{ .max_identifier_bytes = 72 + 30 + 7 });
+    var h: Harness = try .init(.{ .max_identifier_bytes = 72 + 7 });
     defer h.deinit();
     const a = try h.begin();
     const b = try h.begin();
@@ -2391,26 +2086,19 @@ test "the identifier budget refuses a waiting entry, staging, and a new row, nev
     try testing.expectEqual(State.unpriced, h.state(b));
     try testing.expectEqual(@as(u2, 1), h.out.transition.?.budget);
 
-    // Staging needs 30 + the model; 37 bytes are left, so a 7-byte model fits
-    // and an 8-byte one settles locally.
+    // 7 bytes are left: a 7-byte model takes a new row, an 8-byte one can't.
     const c = try h.begin();
     const d = try h.begin();
     try h.step(.{ .finish_exact = .{ .sequence = c, .fact = testFact(c, "model/x", 1) } });
-    try testing.expectEqual(State.fact, h.state(c));
-    try h.step(.{ .finish_exact = .{ .sequence = d, .fact = testFact(d, "model/xy", 2) } });
-    // No bytes are left for a new row either.
-    try testing.expectEqual(State.unpriced, h.state(d));
-    try testing.expectEqual(@as(u2, 3), h.out.transition.?.budget);
-    // Settling frees the fact's 37 bytes and takes 7 for the row.
-    try h.step(.{ .publish = .{ .sequence = c, .result = .appended } });
     try testing.expectEqual(State.settled, h.state(c));
     try testing.expectEqual(@as(u2, 0), h.out.transition.?.budget);
-    // 30 bytes are left, too few to stage, but a local settle into an
-    // existing row needs none.
+    try h.step(.{ .finish_exact = .{ .sequence = d, .fact = testFact(d, "model/xy", 2) } });
+    try testing.expectEqual(State.unpriced, h.state(d));
+    try testing.expectEqual(@as(u2, 2), h.out.transition.?.budget);
+    // No bytes are left, but settling into an existing row needs none.
     const e = try h.begin();
     try h.step(.{ .finish_exact = .{ .sequence = e, .fact = testFact(e, "model/x", 4) } });
-    try testing.expectEqual(State.local, h.state(e));
-    try testing.expectEqual(@as(u2, 1), h.out.transition.?.budget);
+    try testing.expectEqual(State.settled, h.state(e));
     try testing.expectEqual(@as(f64, 5), h.ledger.view().totals.total_cost);
 }
 
@@ -2421,11 +2109,11 @@ test "a found lookup may reuse the bytes its waiting entry frees" {
     const a = try h.begin();
     try h.step(.{ .finish_lookup = .{ .sequence = a, .request = testRequest(a) } });
     try h.step(.{ .lookup_found = .{ .sequence = a, .fact = testFact(a, "model/x", 1) } });
-    try testing.expectEqual(State.fact, h.state(a));
+    try testing.expectEqual(State.settled, h.state(a));
     try testing.expectEqual(@as(u2, 0), h.out.transition.?.budget);
 }
 
-test "waiting entries and staged facts share the persisted pending array" {
+test "the persisted pending array bounds waiting entries, never an exact fact" {
     var h: Harness = try .init(.{ .max_persisted_pending = 2 });
     defer h.deinit();
     try h.step(.{ .set_credential = api_key });
@@ -2434,36 +2122,20 @@ test "waiting entries and staged facts share the persisted pending array" {
     const c = try h.begin();
     const d = try h.begin();
     try h.step(.{ .finish_lookup = .{ .sequence = a, .request = testRequest(a) } });
-    try h.step(.{ .finish_exact = .{ .sequence = b, .fact = testFact(b, "model/x", 1) } });
-    try testing.expectEqual(State.fact, h.state(b));
-    // Full: an exact fact settles locally, a lookup is unpriced. Both are
-    // spent budget, not a full list, and neither is dropped silently.
-    try h.step(.{ .finish_exact = .{ .sequence = c, .fact = testFact(c, "model/x", 2) } });
-    try testing.expectEqual(State.local, h.state(c));
+    try h.step(.{ .finish_lookup = .{ .sequence = b, .request = testRequest(b) } });
+    // Full: a lookup is unpriced. That is spent budget, not a full list, and
+    // it is not dropped silently.
+    try h.step(.{ .finish_lookup = .{ .sequence = c, .request = testRequest(c) } });
+    try testing.expectEqual(State.unpriced, h.state(c));
     try testing.expectEqual(@as(u2, 1), h.out.transition.?.budget);
     try testing.expect(h.out.transition.?.incident);
-    try h.step(.{ .finish_lookup = .{ .sequence = d, .request = testRequest(d) } });
-    try testing.expectEqual(State.unpriced, h.state(d));
-    try testing.expectEqual(@as(u2, 1), h.out.transition.?.budget);
-    // A found lookup trades its waiting entry for a staged fact: still fits.
+    // An exact fact still settles.
+    try h.step(.{ .finish_exact = .{ .sequence = d, .fact = testFact(d, "model/x", 2) } });
+    try testing.expectEqual(State.settled, h.state(d));
+    // A found lookup frees its entry.
     try h.step(.{ .lookup_found = .{ .sequence = a, .fact = testFact(a, "model/x", 4) } });
-    try testing.expectEqual(State.fact, h.state(a));
-    try testing.expectEqual(@as(u2, 0), h.out.transition.?.budget);
-}
-
-test "each staged fact's bridge entry counts against the identifier budget" {
-    // A bridge adds 30 (id) + 10 (origin); staging needs 30 + 7 + 40 = 77,
-    // and a local settle needs 7 for the new row.
-    var h: Harness = try .init(.{ .max_identifier_bytes = 77 + 7, .bridge_origin_bytes = 10 });
-    defer h.deinit();
-    const a = try h.begin();
-    const b = try h.begin();
-    try h.step(.{ .finish_exact = .{ .sequence = a, .fact = testFact(a, "model/x", 1) } });
-    try testing.expectEqual(State.fact, h.state(a));
-    try h.step(.{ .finish_exact = .{ .sequence = b, .fact = testFact(b, "model/x", 1) } });
-    try testing.expectEqual(State.local, h.state(b));
-    try testing.expectEqual(@as(u2, 1), h.out.transition.?.budget);
-    try testing.expectError(error.InvalidLimits, Ledger.init(testing.allocator, .{ .bridge_origin_bytes = max_origin_bytes + 1 }, .fresh));
+    try testing.expectEqual(State.settled, h.state(a));
+    try testing.expectEqual(@as(usize, 1), h.ledger.waiting().len);
 }
 
 test "settled_through follows the calls in flight" {
@@ -2570,29 +2242,53 @@ test "a restored session picks up where it was saved" {
     defer h.deinit();
     const rows = [_]Restored.Row{.{ .model = "model/a", .first_sequence = 1, .totals = .{ .total_cost = 2, .input_tokens = 10 } }};
     const pending = [_]Restored.Waiting{.{ .sequence = 4, .provider = .gateway, .request = testRequest(4) }};
+    // An older binary staged this fact for its profile ledger.
     const backlog = [_]Restored.StagedFact{.{ .sequence = 6, .fact = testFact(6, "model/a", 1) }};
     try h.restore(testRestored(&rows, &pending, &backlog));
-    try testing.expectEqual(@as(usize, 1), h.effectCount(.publish_pending));
-    try testing.expectEqual(@as(usize, 1), h.effectCount(.publish_backlog));
-    try testing.expectEqual(@as(usize, 0), h.effectCount(.persist_checkpoint));
-    try testing.expectEqual(@as(usize, 0), h.effectCount(.start_lookup));
+    // The staged fact settled into its row, and that is checkpointed.
+    try testing.expectEqual(State.settled, h.state(6));
+    try testing.expectEqual(@as(f64, 3), h.ledger.view().totals.total_cost);
+    try testing.expectEqual(@as(usize, 1), h.ledger.view().models.len);
+    try testing.expectEqual(@as(usize, 1), h.out.effects().len);
+    try testing.expectEqual(@as(usize, 1), h.effectCount(.persist_checkpoint));
     try testing.expectEqual(Availability.pending, h.ledger.availability());
     try testing.expectEqual(@as(u64, 70), h.ledger.activity.api_duration_ms);
 
     // New calls continue after the saved sequence.
     try testing.expectEqual(@as(Sequence, 10), try h.begin());
-    // A credential looks the restored entry up; the staged fact settles into its row.
+    // A credential looks the restored entry up.
     try h.step(.{ .set_credential = api_key });
     try testing.expectEqual(@as(Sequence, 4), h.out.effects()[0].start_lookup);
-    try h.step(.{ .publish = .{ .sequence = 6, .result = .duplicate } });
-    try testing.expectEqual(@as(f64, 3), h.ledger.view().totals.total_cost);
-    try testing.expectEqual(@as(usize, 1), h.ledger.view().models.len);
     try h.step(.{ .lookup_found = .{ .sequence = 4, .fact = testFact(4, "model/b", 4) } });
-    try h.step(.{ .publish = .{ .sequence = 4, .result = .appended } });
     try testing.expectEqual(@as(f64, 7), h.ledger.view().totals.total_cost);
     try testing.expectEqualStrings("model/a", h.ledger.view().models[0].name());
 
     try testing.expectError(error.AlreadyStarted, h.ledger.restore(testRestored(&.{}, &.{}, &.{}), &h.out, null));
+}
+
+test "a restored session with nothing staged needs no checkpoint" {
+    var h: Harness = try .init(.{});
+    defer h.deinit();
+    const pending = [_]Restored.Waiting{.{ .sequence = 4, .provider = .gateway, .request = testRequest(4) }};
+    try h.restore(testRestored(&.{}, &pending, &.{}));
+    try testing.expectEqual(@as(usize, 0), h.out.effects().len);
+}
+
+test "a restored staged fact with no row left is unpriced with an incident" {
+    var h: Harness = try .init(.{ .max_models = 1 });
+    defer h.deinit();
+    const rows = [_]Restored.Row{.{ .model = "model/a", .first_sequence = 1, .totals = .{ .total_cost = 2, .input_tokens = 10 } }};
+    const backlog = [_]Restored.StagedFact{
+        .{ .sequence = 5, .fact = testFact(5, "model/b", 1) },
+        .{ .sequence = 6, .fact = testFact(6, "model/a", 4) },
+    };
+    try h.restore(testRestored(&rows, &.{}, &backlog));
+    try testing.expectEqual(State.unpriced, h.state(5));
+    try testing.expectEqual(State.settled, h.state(6));
+    try testing.expectEqual(@as(f64, 6), h.ledger.view().totals.total_cost);
+    try testing.expectEqual(@as(u64, 1), h.ledger.view().unpriced.no_receipt);
+    try testing.expectEqual(Availability.incomplete, h.ledger.availability());
+    try testing.expectEqual(@as(i64, 1_005), h.ledger.incidentList()[0].occurred_at_ms);
 }
 
 test "restore keeps incomplete, legacy, and incidents" {
@@ -2604,7 +2300,7 @@ test "restore keeps incomplete, legacy, and incidents" {
     saved.incidents = &.{.{ .occurred_at_ms = 3, .completeness = .pending }};
     try ledger.restore(saved, &out, null);
     try testing.expectEqual(Availability.incomplete, ledger.availability());
-    try testing.expectEqual(@as(usize, 1), out.effect_count);
+    try testing.expectEqual(@as(usize, 0), out.effect_count);
     try testing.expectEqual(Completeness.pending, ledger.incidentList()[0].completeness);
 
     var legacy: Ledger = try .init(testing.allocator, .{}, .fresh);
@@ -2665,7 +2361,7 @@ test "a restored session writes one restore record per call it brings back" {
     try ledger.restore(testRestored(&rows, &pending, &backlog), &out, &writer);
     try testing.expectEqualStrings(
         "{\"v\":1,\"seq\":1,\"machine\":\"ledger\",\"inst\":\"session\",\"event\":\"restore\",\"from\":\"-\",\"to\":\"-\",\"effects\":[],\"data\":{\"call\":0,\"cred\":0,\"rows\":1}}\n" ++
-            "{\"v\":1,\"seq\":2,\"machine\":\"ledger\",\"inst\":\"session\",\"event\":\"restore\",\"from\":\"fact\",\"to\":\"fact\",\"effects\":[],\"data\":{\"call\":3,\"cred\":0,\"rows\":1,\"incident\":false,\"applied\":false,\"budget\":0}}\n" ++
+            "{\"v\":1,\"seq\":2,\"machine\":\"ledger\",\"inst\":\"session\",\"event\":\"restore\",\"from\":\"settled\",\"to\":\"settled\",\"effects\":[],\"data\":{\"call\":3,\"cred\":0,\"rows\":1,\"incident\":false,\"applied\":false,\"budget\":0}}\n" ++
             "{\"v\":1,\"seq\":3,\"machine\":\"ledger\",\"inst\":\"session\",\"event\":\"restore\",\"from\":\"lookup\",\"to\":\"lookup\",\"effects\":[],\"data\":{\"call\":7,\"cred\":0,\"rows\":1,\"incident\":false,\"applied\":false,\"budget\":0}}\n",
         buffer.written(),
     );
