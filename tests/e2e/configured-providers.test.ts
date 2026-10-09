@@ -181,6 +181,20 @@ describe("configured providers", () => {
     } finally { f.close(); }
   }, 15000);
 
+  test("provider error diagnostics redact configured literal header credentials", async () => {
+    const secret = "literal-secret-value";
+    const f = fixture(() => Response.json({ error: { message: `rejected ${secret}` } }, { status: 401 }));
+    try {
+      Object.assign(f.settings.providers.local, { headers: { "x-literal-secret": secret } });
+      f.save();
+      const result = await runFx(["ask", "--json", "--no-save", "hello"], { cwd: f.workspace, env: f.env, timeoutMs: 10000 });
+      expect(result.code).toBe(1);
+      expect(result.stdout + result.stderr).not.toContain(secret);
+      expect(f.requests).toHaveLength(1);
+      expect(f.requests[0].headers["x-literal-secret"]).toBe(secret);
+    } finally { f.close(); }
+  }, 15000);
+
   test("terminal usage may repeat an empty matching finished choice", async () => {
     const f = fixture(async body => {
       const response = completion(body.model);

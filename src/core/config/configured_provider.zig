@@ -41,9 +41,11 @@ pub const Auth = union(enum) {
     bearer: []const u8,
 };
 
-/// One literal request header. Values are non-secret connection configuration;
-/// credential headers belong in `header_env` so they resolve from the
-/// environment when a request is sent.
+/// One literal request header. Values are connection configuration rather than
+/// a credential store: credentials belong in `header_env`, where they resolve
+/// from the environment at request time. Provider error diagnostics still
+/// treat literal values as sensitive and mask them when they are long enough
+/// to be credential-shaped.
 pub const Header = struct {
     name: []const u8,
     value: []const u8,

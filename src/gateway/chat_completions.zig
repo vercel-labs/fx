@@ -18,6 +18,9 @@ const model_provider = @import("../core/config/model_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const Allocator = std.mem.Allocator;
 
+// Literal header values shorter than this are ordinary flags like `x-strict: true`; masking them would star out common words in every provider error body.
+const min_masked_literal_header_bytes = 8;
+
 /// Every callback borrows the immutable definition from the owning profile runtime.
 pub fn bundle(definition: *const definitions.Definition) provider_set.Bundle {
     const context: *anyopaque = @ptrCast(@constCast(definition));
@@ -93,6 +96,22 @@ test "chat completions adapter binds replay to endpoint authority and wires proj
     try std.testing.expect(request.messages[0].provider_replay.?.parts_json.ptr == replay.parts_json.ptr);
 }
 
+test "configured literal header values are masked from provider errors only when credential shaped" {
+    const alloc = std.testing.allocator;
+    var registry = try definitions.Registry.parse_json(alloc,
+        \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:1234/v1","auth":{"type":"none"},"headers":{"x-literal-secret":"literal-secret-value","x-strict":"true"}}}
+    );
+    defer registry.deinit(alloc);
+    const definition = registry.get("local").?;
+    const raw = try alloc.dupe(u8, "upstream rejected literal-secret-value under strict=true");
+    const detail = try redact_provider_error_detail(alloc, raw, definition, null);
+    defer alloc.free(detail);
+    try std.testing.expect(std.mem.find(u8, detail, "literal-secret-value") == null);
+    try std.testing.expect(std.mem.find(u8, detail, "*" ** "literal-secret-value".len) != null);
+    try std.testing.expect(std.mem.find(u8, detail, "strict=true") != null);
+    try std.testing.expect(std.mem.find(u8, detail, "upstream rejected") != null);
+}
+
 fn stream(raw: ?*anyopaque, alloc: Allocator, request: streams.ModelRequest) !streams.Result {
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
     const definition = definition_at(raw);
@@ -137,6 +156,38 @@ fn request_headers(alloc: Allocator, definition: *const definitions.Definition) 
         try headers.append(alloc, .{ .name = ref.name, .value = value });
     }
     return headers;
+}
+
+/// Scrubs the provider error detail with the bearer token, every
+/// environment-backed header value, and every credential-shaped literal header
+/// value. Takes ownership of `detail` and frees it before returning an error.
+fn redact_provider_error_detail(
+    alloc: Allocator,
+    detail: []u8,
+    definition: *const definitions.Definition,
+    token: ?[]const u8,
+) Allocator.Error![]u8 {
+    var scrubbed = detail;
+    errdefer alloc.free(scrubbed);
+    if (token) |value| {
+        const masked = try codec.redact_error_detail(alloc, scrubbed, value);
+        alloc.free(scrubbed);
+        scrubbed = masked;
+    }
+    for (definition.header_env) |ref| {
+        const value = io.getenv(ref.env) orelse continue;
+        const masked = try codec.redact_error_detail(alloc, scrubbed, value);
+        alloc.free(scrubbed);
+        scrubbed = masked;
+    }
+    for (definition.headers) |header| {
+        // Real credentials stay masked through `header_env` unconditionally.
+        if (header.value.len < min_masked_literal_header_bytes) continue;
+        const masked = try codec.redact_error_detail(alloc, scrubbed, header.value);
+        alloc.free(scrubbed);
+        scrubbed = masked;
+    }
+    return scrubbed;
 }
 
 fn post(alloc: Allocator, definition: *const definitions.Definition, request: streams.ModelRequest, token: ?[]const u8, payload: []const u8) !streams.Result {
@@ -191,18 +242,7 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
             error.StreamTooLong => try alloc.dupe(u8, "Provider error response exceeded the local limit"),
             else => return err,
         };
-        errdefer alloc.free(detail);
-        if (token) |value| {
-            const redacted = try codec.redact_error_detail(alloc, detail, value);
-            alloc.free(detail);
-            detail = redacted;
-        }
-        for (definition.header_env) |ref| {
-            const value = io.getenv(ref.env) orelse continue;
-            const redacted = try codec.redact_error_detail(alloc, detail, value);
-            alloc.free(detail);
-            detail = redacted;
-        }
+        detail = try redact_provider_error_detail(alloc, detail, definition, token);
 
         return .{ .failed = .{ .kind = switch (response.head.status) {
             .bad_request => .invalid_request,
