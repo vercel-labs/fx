@@ -653,6 +653,7 @@ pub const Reducer = struct {
     response_model: ?[]u8 = null,
     usage: types.Usage = .{},
     usage_total: ?u64 = null,
+    usage_trailer_only: bool = false,
     usage_final_fields: packed struct(u3) {
         input: bool = false,
         output: bool = false,
@@ -758,7 +759,10 @@ pub const Reducer = struct {
             self.refusal_seen = self.refusal_seen or refusal.len != 0;
         }
         if (non_null(delta, "tool_calls")) |value| try self.accept_tools(value);
-        if (non_null(root, "usage")) |usage| try self.accept_usage(usage, non_null(choice, "finish_reason") != null);
+        // Cloudflare sends per-chunk deltas here and cumulative totals in a trailer.
+        if (!self.usage_trailer_only) {
+            if (non_null(root, "usage")) |usage| try self.accept_usage(usage, non_null(choice, "finish_reason") != null);
+        }
         if (non_null(choice, "finish_reason")) |value| {
             const reason = try string(value);
             self.finish_reason = if (std.mem.eql(u8, reason, "stop")) .stop else if (std.mem.eql(u8, reason, "tool_calls")) .tool_calls else if (std.mem.eql(u8, reason, "length")) .length else if (std.mem.eql(u8, reason, "content_filter")) .content_filter else return error.InvalidFinishReason;
@@ -1042,8 +1046,17 @@ fn append_bounded(alloc: Allocator, destination: *std.ArrayList(u8), text: []con
 /// event_bytes also bounds all wire between dispatched data events (including
 /// ignored fields/comments); total_wire_bytes bounds the entire consumed stream.
 pub fn consume_stream(alloc: Allocator, source: *std.Io.Reader, request: stream_provider.RequestData, limits: Limits, events: ?stream_provider.EventSink, cancel_flag: *const std.atomic.Value(bool)) Error!stream_provider.Result {
+    return consume_stream_usage(alloc, source, request, limits, events, cancel_flag, false);
+}
+
+pub fn consume_cloudflare_stream(alloc: Allocator, source: *std.Io.Reader, request: stream_provider.RequestData, limits: Limits, events: ?stream_provider.EventSink, cancel_flag: *const std.atomic.Value(bool)) Error!stream_provider.Result {
+    return consume_stream_usage(alloc, source, request, limits, events, cancel_flag, true);
+}
+
+fn consume_stream_usage(alloc: Allocator, source: *std.Io.Reader, request: stream_provider.RequestData, limits: Limits, events: ?stream_provider.EventSink, cancel_flag: *const std.atomic.Value(bool), usage_trailer_only: bool) Error!stream_provider.Result {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     var reducer = try Reducer.init(alloc, request, limits);
+    reducer.usage_trailer_only = usage_trailer_only;
     defer reducer.deinit();
     var framing = sse.Reader{ .max_event_bytes = limits.event_bytes };
     defer framing.deinit(alloc);
@@ -2577,4 +2590,24 @@ test "chat completions prose resembling a call stays prose and cancellation afte
     try test_accept(&cancelled, test_stop);
     try test_accept(&cancelled, "[DONE]");
     try std.testing.expectError(error.Cancelled, cancelled.finish(true));
+}
+
+test "chat completions Cloudflare delta usage is replaced by cumulative trailer" {
+    const alloc = std.testing.allocator;
+    const first = "{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":0,\"total_tokens\":10}}";
+    const next = "{\"choices\":[{\"index\":0,\"delta\":{}}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":1,\"total_tokens\":1}}";
+    const stop = "{\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":1,\"total_tokens\":1}}";
+    for ([_][]const u8{ "[]", "[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]" }) |choices| {
+        const trailer = try std.fmt.allocPrint(alloc, "{{\"choices\":{s},\"usage\":{{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":13}}}}", .{choices});
+        defer alloc.free(trailer);
+        const wire = try std.fmt.allocPrint(alloc, "data: {s}\n\ndata: {s}\n\ndata: {s}\n\ndata: {s}\n\ndata: [DONE]\n\n", .{ first, next, stop, trailer });
+        defer alloc.free(wire);
+        var source = std.Io.Reader.fixed(wire);
+        var flag = std.atomic.Value(bool).init(false);
+        var result = try consume_cloudflare_stream(alloc, &source, test_request(), .{}, null, &flag);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(@as(?u64, 10), result.completed.completion.usage.input_tokens);
+        try std.testing.expectEqual(@as(?u64, 3), result.completed.completion.usage.output_tokens);
+        try std.testing.expectEqualStrings("OK", result.completed.completion.content.?);
+    }
 }
