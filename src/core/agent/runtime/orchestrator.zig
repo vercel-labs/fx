@@ -3020,6 +3020,8 @@ test "provider executed result reports one observed request only for search alia
         "exa_search",
         "parallel_search",
         "perplexity_search",
+        "browserbase_search",
+        "tako_search",
     };
     for (aliases) |name| {
         const result = providerExecutedResult(.{
@@ -3088,7 +3090,9 @@ fn appendProviderExecutedToolResult(
             .call = visible_call,
             .status_started = true,
         };
-    } else if (runtime_tool_presentation.isProviderSearchAlias(call.name)) {
+    } else if (runtime_tool_presentation.isProviderSearchAlias(call.name) or
+        runtime_tool_presentation.isProviderFetchAlias(call.name))
+    {
         provider_visible_lifecycle = .{
             .call = call,
             .status_started = try runtime_tool_presentation.startToolVisibleLifecycle(
@@ -7278,6 +7282,8 @@ fn processQueuedPromptLoop(
                     .advertised_names = config.advertised_tool_names,
                     .advertised_functions = config.advertised_functions,
                     .selected_dynamic = advertised_dynamic_tools,
+                    .web_search_backend = config.web_search_backend,
+                    .web_fetch_backend = config.web_fetch_backend,
                 },
                 .tool_choice = tool_choice,
                 .vision_mode = vision_mode,

@@ -799,7 +799,7 @@ pub noinline fn composePickerOptionRowAnnotated(
     // Model, provider, and model-catalog pickers signal selection by
     // brightness alone, like the question panel; other pickers keep the filled row.
     const selected_style = switch (kind) {
-        .model_stage, .provider_stage, .models => ui_render.selected_completion_style,
+        .model_stage, .provider_stage, .web_stage, .models => ui_render.selected_completion_style,
         .file, .slash, .skills, .help, .settings, .sessions, .mcp, .auth => ui_render.approval_button_inactive_style,
     };
     const base_style = if (selected) selected_style else ui_render.dim_style;
@@ -858,7 +858,7 @@ pub fn composePickerStatusRow(
     start_col: u16,
     width: u16,
 ) !std.ArrayList(u8) {
-    return composePickerStatusRowWithProvider(alloc, kind, model_stage, .provider, loading, failed, start_col, width);
+    return composePickerStatusRowWithProvider(alloc, kind, model_stage, .provider, .search, loading, failed, start_col, width);
 }
 
 pub fn composePickerStatusRowWithProvider(
@@ -866,6 +866,7 @@ pub fn composePickerStatusRowWithProvider(
     kind: input_presentation.PickerKind,
     model_stage: picker_state.ModelPickerStage,
     provider_stage: picker_state.ProviderPickerStage,
+    web_stage: picker_state.WebPickerStage,
     loading: bool,
     failed: bool,
     start_col: u16,
@@ -895,6 +896,10 @@ pub fn composePickerStatusRowWithProvider(
             .team => if (loading) "loading teams..." else if (failed) "unable to load teams" else "no matching teams",
             .key_source => "no matching key sources",
             .api_key => "",
+        },
+        .web_stage => switch (web_stage) {
+            .search => "no matching search backends",
+            .fetch => "no matching fetch backends",
         },
         .models => "no models available",
         .file => if (loading)

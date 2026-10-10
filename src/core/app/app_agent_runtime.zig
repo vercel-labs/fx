@@ -58,6 +58,7 @@ const tool_runtime = @import("../tooling/tool_runtime.zig");
 const skill_invocation = @import("../skills/skill_invocation.zig");
 const web_fetch_runtime = @import("../tooling/web_fetch_runtime.zig");
 const web_search_runtime = @import("../tooling/web_search_runtime.zig");
+const web_tools = @import("../tooling/web_tools.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
@@ -1217,6 +1218,10 @@ pub fn Runtime(comptime App: type) type {
                 .skill_catalog = .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
                 .advertised_tool_names = child_projection.advertised_names,
                 .advertised_functions = child_projection.advertised_functions,
+                .web_selection = .{
+                    .search = if (comptime @hasField(App, "web_search")) app.web_search else .default,
+                    .fetch = if (comptime @hasField(App, "web_fetch")) app.web_fetch else .default,
+                },
                 .custom_tool_guidance = child_projection.custom_guidance,
                 .context_registry = app.contextRegistry(),
                 .context_enabled = if (comptime @hasField(App, "context_enabled")) app.context_enabled else true,
@@ -1299,6 +1304,8 @@ pub fn Runtime(comptime App: type) type {
                 .current_prompt_is_root_authority = app.worker.active_prompt_is_root_authority,
                 .session_child_capability = session_child_capability,
                 .context_limits = if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
+                .web_search_backend = if (comptime @hasField(App, "web_search")) app.web_search else .default,
+                .web_fetch_backend = if (comptime @hasField(App, "web_fetch")) app.web_fetch else .default,
             };
         }
     };
@@ -1317,7 +1324,11 @@ fn formatToolAction(
     if (std.mem.eql(u8, call.name, "web_search") or tool_presentation.isProviderSearchAlias(call.name)) {
         return formatWebSearchAction(arena, call, state, denied_label);
     }
-    const spec = ctx.tool_registry.lookup(call.name) orelse {
+    const lookup_name = if (tool_presentation.isProviderFetchAlias(call.name))
+        "web_fetch"
+    else
+        call.name;
+    const spec = ctx.tool_registry.lookup(lookup_name) orelse {
         if (dynamicMcpActionLabel(state)) |label| {
             if (mcpToolAvailable(ctx, call.name)) {
                 return formatToolActionValue(arena, label, call.name);
@@ -1639,6 +1650,8 @@ const FakeApp = struct {
     total_input_tokens: u64 = 0,
     total_output_tokens: u64 = 0,
     total_web_search_requests: u64 = 0,
+    web_search: web_tools.SearchBackend = .default,
+    web_fetch: web_tools.FetchBackend = .default,
     append_context_count: usize = 0,
     snapshot_tools_count: usize = 0,
     snapshot_permission_mode: ?PermissionMode = null,

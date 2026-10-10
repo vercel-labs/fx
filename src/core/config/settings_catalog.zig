@@ -1,6 +1,7 @@
 const std = @import("std");
 const model_capabilities = @import("model_capabilities.zig");
 const types = @import("../shared/types.zig");
+const web_tools = @import("../tooling/web_tools.zig");
 
 pub const Category = enum {
     all,
@@ -34,6 +35,8 @@ pub const SettingId = enum {
     fast_mode,
     ultrafast_mode,
     permission_mode,
+    web_search,
+    web_fetch,
     sound_level,
     startup_scrollback,
     prompt_history,
@@ -55,6 +58,8 @@ pub const Snapshot = struct {
     ultrafast_mode: bool = false,
     supports_ultrafast_mode: bool = false,
     permission_mode: []const u8 = "ask",
+    web_search: web_tools.SearchBackend = .default,
+    web_fetch: web_tools.FetchBackend = .default,
     statusline_context: bool = false,
     statusline_session: bool = false,
     statusline_workspace: bool = false,
@@ -72,6 +77,8 @@ pub const Snapshot = struct {
             .fast_mode => onOff(self.fast_mode),
             .ultrafast_mode => onOff(self.ultrafast_mode),
             .permission_mode => if (std.mem.eql(u8, self.permission_mode, "yolo")) "full access" else self.permission_mode,
+            .web_search => self.web_search.slug(),
+            .web_fetch => self.web_fetch.slug(),
             .statusline_context => onOff(self.statusline_context),
             .statusline_session => onOff(self.statusline_session),
             .statusline_workspace => onOff(self.statusline_workspace),
@@ -269,6 +276,8 @@ const specs = [_]Spec{
     .{ .id = .fast_mode, .category = .agent, .label = "Fast mode", .description = "Use faster inference when the model supports it" },
     .{ .id = .ultrafast_mode, .category = .agent, .label = "Ultra mode", .description = "Request the highest-speed mode when the model supports it" },
     .{ .id = .permission_mode, .category = .agent, .label = "Permission mode", .description = "Choose when fx asks before taking actions" },
+    .{ .id = .web_search, .category = .agent, .label = "Web search", .description = "Choose the AI Gateway search backend advertised as web_search" },
+    .{ .id = .web_fetch, .category = .agent, .label = "Web fetch", .description = "Choose local fetch or AI Gateway Browserbase fetch" },
     .{ .id = .session_titles, .category = .agent, .label = "Session titles", .description = "Generate a short session title from the first prompt" },
     .{ .id = .sound_level, .category = .notifications, .label = "Sound level", .description = "Choose off, on, or max sounds and terminal bells" },
     .{ .id = .startup_scrollback, .category = .advanced, .label = "Startup scrollback", .description = "Restore terminal output when fx starts" },
@@ -373,6 +382,8 @@ fn staticOptionsFor(id: SettingId) []const []const u8 {
         => &on_off_options,
         .sound_level => &sound_level_options,
         .permission_mode => &permission_options,
+        .web_search => &web_tools.search_slugs,
+        .web_fetch => &web_tools.fetch_slugs,
     };
 }
 
@@ -426,9 +437,9 @@ test "settings catalog projects grouped searchable preferences" {
         .sound_level = "on",
     };
 
-    try std.testing.expectEqual(@as(usize, 14), filteredCount(snapshot, .all, ""));
+    try std.testing.expectEqual(@as(usize, 16), filteredCount(snapshot, .all, ""));
     try std.testing.expectEqual(@as(usize, 5), filteredCount(snapshot, .interface, ""));
-    try std.testing.expectEqual(@as(usize, 6), filteredCount(snapshot, .agent, ""));
+    try std.testing.expectEqual(@as(usize, 8), filteredCount(snapshot, .agent, ""));
     try std.testing.expectEqual(@as(usize, 1), filteredCount(snapshot, .notifications, ""));
     try std.testing.expectEqual(@as(usize, 2), filteredCount(snapshot, .advanced, ""));
 
@@ -541,6 +552,23 @@ test "settings menu navigates rows and changes selected values inline" {
 
     menu.openWithStartupScrollback(false);
     try std.testing.expect(!menu.startup_scrollback);
+}
+
+test "settings catalog exposes web search and fetch backend rows" {
+    const snapshot: Snapshot = .{
+        .web_search = .exa,
+        .web_fetch = .local,
+    };
+    const search = itemAt(snapshot, .agent, "web search", 0).?;
+    try std.testing.expectEqual(SettingId.web_search, search.id);
+    try std.testing.expectEqualStrings("exa", search.value);
+    try std.testing.expectEqual(@as(usize, 5), optionCount(&snapshot, .web_search));
+    try std.testing.expectEqualStrings("tako", cycleChange(&snapshot, .web_search, -1).?.value);
+
+    const fetch = itemAt(snapshot, .agent, "web fetch", 0).?;
+    try std.testing.expectEqual(SettingId.web_fetch, fetch.id);
+    try std.testing.expectEqualStrings("local", fetch.value);
+    try std.testing.expectEqualStrings("browserbase", cycleChange(&snapshot, .web_fetch, 1).?.value);
 }
 
 test "notification level keeps the existing off on and max policy" {

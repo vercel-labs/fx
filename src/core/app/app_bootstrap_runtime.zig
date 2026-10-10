@@ -567,6 +567,8 @@ pub fn Runtime(comptime App: type) type {
             app.auto_upgrade_enabled = startup.auto_upgrade;
             app.upgrader.configure_channel(startup.update_channel);
             app.effort = startup.effort;
+            if (comptime @hasField(@TypeOf(app.*), "web_search")) app.web_search = startup.web_search;
+            if (comptime @hasField(@TypeOf(app.*), "web_fetch")) app.web_fetch = startup.web_fetch;
             if (comptime @hasField(App, "review_model")) app.review_model = startup.takeReviewModel();
             app.shell.setCommandOutputRenderPolicy(
                 app_render_runtime.Runtime(App).shellStyles(),

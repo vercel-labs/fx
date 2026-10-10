@@ -74,6 +74,7 @@ pub const Command = union(enum) {
     setup: []const [:0]const u8,
     status: []const [:0]const u8,
     permissions: []const [:0]const u8,
+    web: []const [:0]const u8,
     mcp: []const [:0]const u8,
     slack: []const [:0]const u8,
     models: []const [:0]const u8,
@@ -634,6 +635,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
             if (command_specs.matchesTopLevel(command_catalog, command, .upgrade)) return .{ .upgrade = args[1..] };
         },
         'w' => {
+            if (command_specs.matchesTopLevel(command_catalog, command, .web)) return .{ .web = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .workspace)) return .{ .workspace = args[1..] };
         },
         else => {},
@@ -1416,6 +1418,22 @@ fn runNonInteractiveWithDeps(
                 .grants = &.{},
                 .rules = rules,
                 .runtime_grants_available = false,
+            }).render(alloc, opts.format);
+            defer alloc.free(text);
+            try writeFormattedOutput(deps, text, opts.format);
+            return .handled_success;
+        },
+        .web => |rest| {
+            const opts = parseLocalSurfaceArgs(rest) catch |err| {
+                try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .web, "web", err, rest);
+                return .handled_failure;
+            };
+            var startup = try deps.load_startup_state_without_credentials(alloc, cfg.default_model, cfg.default_agent_step_limit);
+            defer startup.deinit(alloc);
+            try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
+            const text = try (output_contracts.WebSnapshot{
+                .search = startup.web_search,
+                .fetch = startup.web_fetch,
             }).render(alloc, opts.format);
             defer alloc.free(text);
             try writeFormattedOutput(deps, text, opts.format);
@@ -4130,6 +4148,10 @@ test "parse recognizes every top-level command and preserves unknown commands" {
     }
     switch (parse(command_catalog, &.{@constCast("permissions")})) {
         .permissions => |rest| try std.testing.expectEqual(@as(usize, 0), rest.len),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(command_catalog, &.{ @constCast("web"), @constCast("--json") })) {
+        .web => |rest| try std.testing.expectEqual(@as(usize, 1), rest.len),
         else => return error.TestExpectedEqual,
     }
     switch (parse(command_catalog, &.{ @constCast("models"), @constCast("--json") })) {

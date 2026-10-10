@@ -5,6 +5,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const model_tool_schema = @import("../tooling/model_tool_schema.zig");
+const web_tools = @import("../tooling/web_tools.zig");
 const model_provider = @import("../config/model_provider.zig");
 const credential_authority = @import("../auth/credential_authority.zig");
 
@@ -150,6 +151,8 @@ pub const ToolSelection = struct {
     advertised_functions: []const model_tool_schema.FunctionSchema = &.{},
     additional_functions: []const model_tool_schema.FunctionSchema = &.{},
     selected_dynamic: []const DynamicFunctionTool = &.{},
+    web_search_backend: web_tools.SearchBackend = .default,
+    web_fetch_backend: web_tools.FetchBackend = .default,
 
     pub fn advertisedFunction(self: ToolSelection, name: []const u8) ?model_tool_schema.FunctionSchema {
         for (self.advertised_functions) |function| {

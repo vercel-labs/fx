@@ -17,11 +17,14 @@ const ToolCall = types.ToolCall;
 
 /// Maps an internal tool name to the public ACP-facing name.
 pub fn acpToolName(tool_name: []const u8) []const u8 {
-    return if (tool_presentation.isProviderSearchAlias(tool_name)) "web_search" else tool_name;
+    if (tool_presentation.isProviderSearchAlias(tool_name)) return "web_search";
+    if (tool_presentation.isProviderFetchAlias(tool_name)) return "web_fetch";
+    return tool_name;
 }
 
 pub fn mapToolKind(tool_name: []const u8) acp_types.ToolCallKind {
     if (tool_presentation.isProviderSearchAlias(tool_name)) return .search;
+    if (tool_presentation.isProviderFetchAlias(tool_name)) return .fetch;
     if (std.mem.eql(u8, tool_name, "glob_files")) return .read;
     if (std.mem.eql(u8, tool_name, "grep_files")) return .search;
     if (std.mem.eql(u8, tool_name, "read_file")) return .read;
@@ -41,7 +44,9 @@ pub fn describeToolTitle(registry: tool_dispatch.Registry, arena: Allocator, cal
     if (registry.lookup(call.name) != null) {
         if (try tool_presentation.formatSubagentPlainAction(arena, call, .identity)) |title| return title;
     }
-    if (tool_presentation.isProviderSearchAlias(call.name)) {
+    if (tool_presentation.isProviderSearchAlias(call.name) or
+        tool_presentation.isProviderFetchAlias(call.name))
+    {
         return tool_presentation.formatPlainAction(arena, .{
             .tool_registry = registry,
             .call = call,

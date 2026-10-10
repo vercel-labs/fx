@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const question_answer = @import("../agent/question_answer.zig");
 const config_runtime = @import("../config/config_runtime.zig");
+const web_tools = @import("../tooling/web_tools.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
@@ -433,6 +434,8 @@ pub const SessionPreferencePatch = struct {
     effort: ?types.ReasoningEffort = null,
     fast_mode: ?bool = null,
     ultrafast_mode: ?bool = null,
+    web_search: ?web_tools.SearchBackend = null,
+    web_fetch: ?web_tools.FetchBackend = null,
 
     pub fn userSettingsPatch(self: SessionPreferencePatch) config_runtime.UserSettingsPatch {
         var patch = config_runtime.UserSettingsPatch{
@@ -440,6 +443,8 @@ pub const SessionPreferencePatch = struct {
             .effort = self.effort,
             .fast_mode = self.fast_mode,
             .ultrafast_mode = self.ultrafast_mode,
+            .web_search = self.web_search,
+            .web_fetch = self.web_fetch,
         };
         if (self.model) |model| patch.model_preference = .{
             .provider = self.provider orelse .gateway,

@@ -7286,7 +7286,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(connections).toBe(7);
       expect(requests).toBe(6);
       expect(socketFailure).toBeUndefined();
-      expect(trace).toContain("event=receive_head_error");
+      // The peer reset can reach the writer or response reader, depending on scheduling.
+      expect(trace).toMatch(/event=(?:request_send_error|receive_head_error)\b/);
       expect(trace).toContain("provider_attempts=6/10");
       expect(trace).toContain("recovery=retry_request");
     } finally {
@@ -7973,6 +7974,52 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 60_000);
+
+  test.each(["run", "message"] as const)("subagent %s inherits web backend settings", async (action) => {
+    const root = createFixtureRoot("subagent-web-backends");
+    const childTask = "Report CHILD_WEB_BACKENDS without using tools.";
+    let childRequests = 0;
+    writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({
+      web: { search: "parallel", fetch: "browserbase" },
+    }));
+    const gateway = startDynamicFakeGateway((body) => {
+      const request = parseGatewayRequest(body);
+      expect(toolByName(request, "parallel_search")?.id).toBe("gateway.parallel_search");
+      expect(toolByName(request, "browserbase_fetch")?.id).toBe("gateway.browserbase_fetch");
+      expect(toolByName(request, "exa_search")).toBeUndefined();
+      expect(toolByName(request, "web_fetch")).toBeUndefined();
+      if (hasCurrentToolResult(body, "delegate-web")) {
+        return fakeGatewayFinalText("WEB_BACKENDS_INHERITED");
+      }
+      if (toolByName(request, "subagent") === undefined) {
+        childRequests++;
+        return fakeGatewayFinalText("CHILD_WEB_BACKENDS");
+      }
+      return fakeGatewayToolCall("delegate-web", "subagent", {
+        request: action === "run"
+          ? { action, task: childTask }
+          : { action, agent: "researcher", message: childTask },
+      });
+    }, { classifierDecision: "clear" });
+    try {
+      const result = await runFx(["ask", "--json", "--auto", "Delegate the backend check."], {
+        cwd: root.workspace,
+        env: {
+          ...fixtureEnv(root, gateway, join(root.root, "trace.log")),
+          FX_WEB_SEARCH_BACKEND: undefined,
+          FX_WEB_FETCH_BACKEND: undefined,
+        },
+        timeoutMs: 20_000,
+      });
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).final_output).toBe("WEB_BACKENDS_INHERITED");
+      expect(childRequests).toBe(1);
+      expect(gateway.requests).toHaveLength(3);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   test("ask fake Gateway exercises one-off and chat-created persistent subagents", async () => {
     const root = createFixtureRoot("subagent-managed-flow");

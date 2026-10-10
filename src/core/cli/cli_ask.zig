@@ -90,6 +90,7 @@ const tool_set_contract = @import("../tooling/tool_set.zig");
 const tool_specs = @import("../tooling/tool_specs.zig");
 const web_fetch_runtime = @import("../tooling/web_fetch_runtime.zig");
 const web_search_runtime = @import("../tooling/web_search_runtime.zig");
+const web_tools = @import("../tooling/web_tools.zig");
 const types = @import("../shared/types.zig");
 const history_range = @import("../shared/history_range.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
@@ -278,6 +279,7 @@ fn runAskChild(
             .permission_mode = admission.permission_mode,
             .permission_rules = admission.rules,
             .subagent_available = true,
+            .web_fetch_backend = ctx.web_fetch,
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(ctx.alloc);
@@ -290,6 +292,7 @@ fn runAskChild(
         .skill_catalog = .{ .skills = ctx.loaded_skills.skills, .diagnostics = ctx.loaded_skills.diagnostics },
         .advertised_tool_names = child_projection.advertised_names,
         .advertised_functions = child_projection.advertised_functions,
+        .web_selection = .{ .search = ctx.web_search, .fetch = ctx.web_fetch },
         .custom_tool_guidance = child_projection.custom_guidance,
         .context_registry = ctx.deps.context_registry,
         .context_enabled = ctx.context_enabled,
@@ -593,6 +596,8 @@ const AskContext = struct {
     persisted_ultrafast_mode: bool = false,
     ultrafast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
+    web_search: web_tools.SearchBackend = .default,
+    web_fetch: web_tools.FetchBackend = .default,
     /// Borrowed gateway provider routing for this run; startup state owns the
     /// backing memory.
     provider_order: []const []const u8 = &.{},
@@ -1781,6 +1786,8 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.provider_order = startup.provider_order;
     ctx.provider_strict = startup.provider_strict;
     ctx.effort = toCoreReasoningEffort(startup.effort);
+    ctx.web_search = startup.web_search;
+    ctx.web_fetch = startup.web_fetch;
     ctx.first_call_tool_choice = startup.first_call_tool_choice;
     ctx.permission_mode = permission_mode;
     ctx.reviewer_model = startup.review_model;
@@ -2044,6 +2051,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .permission_mode = ctx.permission_mode,
         .permission_rules = ctx.permission_rules,
         .subagent_available = ctx.subagent_host != null,
+        .web_fetch_backend = ctx.web_fetch,
     }, session_child_capability != null);
     defer tool_projection.deinit(alloc);
 
@@ -2114,6 +2122,8 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .fast_mode = ctx.fast_mode,
         .ultrafast_mode = ctx.ultrafast_mode,
         .effort = ctx.effort,
+        .web_search_backend = ctx.web_search,
+        .web_fetch_backend = ctx.web_fetch,
         .provider_order = if (ctx.provider == .gateway) ctx.provider_order else &.{},
         .provider_strict = ctx.provider == .gateway and ctx.provider_strict,
         .first_call_tool_choice = ctx.first_call_tool_choice,

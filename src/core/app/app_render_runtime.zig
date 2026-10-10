@@ -9,6 +9,7 @@ const terminal_ui_projection = @import("../terminal/ui_projection.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const provider_picker_runtime = @import("provider_picker_runtime.zig");
+const web_picker_runtime = @import("web_picker_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const picker_state = @import("../input/picker_state.zig");
 const core_input_runtime = @import("../input/runtime.zig");
@@ -531,6 +532,7 @@ pub fn Runtime(comptime App: type) type {
         var effort_picker_labels_buf: [types.ReasoningEffort.max_options + 1][]const u8 = undefined;
         var fast_picker_labels_buf: [3][]const u8 = undefined;
         var provider_picker_column: provider_picker_runtime.ColumnBuffer = .{};
+        var web_picker_column: web_picker_runtime.ColumnBuffer = .{};
         noinline fn footerContext(
             app: *App,
             upgrade_status_buf: *[64]u8,
@@ -621,8 +623,36 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
 
+            const web_query = if (model_query == null and provider_query == null)
+                app.input_runtime.picker.activeWebPickerQuery(&app.input_runtime.edit_state)
+            else
+                null;
+            var web_stage: picker_state.WebPickerStage = .search;
+            var web_picker_items: []const []const u8 = &.{};
+            var web_picker_annotations: []const []const u8 = &.{};
+            var web_picker_index: usize = 0;
+            var web_picker_window_start: usize = 0;
+            var web_picker_anchor: usize = 0;
+            if (web_query) |picker_query| {
+                web_stage = picker_query.stage;
+                web_picker_anchor = picker_query.token_start;
+                const count = web_picker_runtime.Runtime(App).columnOptions(app, picker_query, &web_picker_column);
+                web_picker_items = web_picker_column.labels[0..count];
+                web_picker_annotations = web_picker_column.annotations[0..count];
+                switch (picker_query.stage) {
+                    .search => {
+                        web_picker_index = app.input_runtime.picker.web_search_column_index;
+                        web_picker_window_start = app.input_runtime.picker.web_search_column_window_start;
+                    },
+                    .fetch => {
+                        web_picker_index = app.input_runtime.picker.web_fetch_column_index;
+                        web_picker_window_start = app.input_runtime.picker.web_fetch_column_window_start;
+                    },
+                }
+            }
+
             const completion_rt = input_completion_runtime.CompletionRuntime(App);
-            const file_query = if (model_query == null and provider_query == null and completion_rt.hasFileQuery(app))
+            const file_query = if (model_query == null and provider_query == null and web_query == null and completion_rt.hasFileQuery(app))
                 app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state)
             else
                 null;
@@ -745,6 +775,13 @@ pub fn Runtime(comptime App: type) type {
                 .provider_picker_completion_index = provider_picker_index,
                 .provider_picker_completion_window_start = provider_picker_window_start,
                 .provider_picker_completion_anchor = provider_picker_anchor,
+                .web_query_active = web_query != null,
+                .web_picker_stage = web_stage,
+                .web_picker_completions = web_picker_items,
+                .web_picker_annotations = web_picker_annotations,
+                .web_picker_completion_index = web_picker_index,
+                .web_picker_completion_window_start = web_picker_window_start,
+                .web_picker_completion_anchor = web_picker_anchor,
                 .file_query_active = file_query != null,
                 .file_completions = file_view.items,
                 .file_completion_index = file_selection orelse 0,

@@ -12,6 +12,7 @@ const model_provider = @import("model_provider.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const update_target = @import("../upgrade/update_target.zig");
+const web_tools = @import("../tooling/web_tools.zig");
 
 const Allocator = std.mem.Allocator;
 const max_settings_bytes: usize = 64 * 1024;
@@ -114,6 +115,8 @@ pub const UserSettingsPatch = struct {
     notification_turn_end: ?bool = null,
     notification_attention_required: ?bool = null,
     notification_max: ?bool = null,
+    web_search: ?web_tools.SearchBackend = null,
+    web_fetch: ?web_tools.FetchBackend = null,
 
     fn isEmpty(self: UserSettingsPatch) bool {
         return self.model_preference == null and
@@ -134,7 +137,9 @@ pub const UserSettingsPatch = struct {
             self.session_titles == null and
             self.notification_turn_end == null and
             self.notification_attention_required == null and
-            self.notification_max == null;
+            self.notification_max == null and
+            self.web_search == null and
+            self.web_fetch == null;
     }
 };
 
@@ -1114,6 +1119,21 @@ fn applyUserPatchToRoot(
         }
         if (patch.notification_max) |enabled| {
             application.changed = try putBool(arena, &notifications.object, "max", enabled) or application.changed;
+        }
+    }
+    if (patch.web_search != null or patch.web_fetch != null) {
+        var web = if (root.object.getPtr("web")) |value| blk: {
+            if (value.* != .object) return error.InvalidSettingsFormat;
+            break :blk value;
+        } else blk: {
+            try root.object.put(arena, "web", .{ .object = .empty });
+            break :blk root.object.getPtr("web").?;
+        };
+        if (patch.web_search) |backend| {
+            application.changed = try putString(arena, &web.object, "search", backend.slug()) or application.changed;
+        }
+        if (patch.web_fetch) |backend| {
+            application.changed = try putString(arena, &web.object, "fetch", backend.slug()) or application.changed;
         }
     }
     try cleanupLegacyWorkspacePreferences(arena, root, patch, &application);

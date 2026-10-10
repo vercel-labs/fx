@@ -29,8 +29,16 @@ pub const InlinePickerKind = enum {
     slash,
     model,
     provider,
+    web,
     file,
     skill,
+};
+
+/// Columns of the `/web` picker, left to right. Search is always first; fetch
+/// refines the committed search token.
+pub const WebPickerStage = enum {
+    search,
+    fetch,
 };
 
 const InlinePickerSuppression = union(enum) {
@@ -56,6 +64,10 @@ pub const login_prefix = "/login ";
 const setup_prefix = "/setup ";
 pub const provider_picker_prefixes = [_][]const u8{ provider_prefix, login_prefix, setup_prefix };
 
+/// Executing bare `/web` reseeds the composer with this prefix so the search
+/// column opens the way `/provider ` does.
+pub const web_prefix = "/web ";
+
 pub const ModelPickerQuery = struct {
     stage: ModelPickerStage,
     query: []const u8,
@@ -67,6 +79,12 @@ pub const ProviderPickerQuery = struct {
     /// The `/provider ` or `/login ` the user typed, kept verbatim so rewriting
     /// the composer does not swap one alias for the other.
     prefix: []const u8,
+    query: []const u8,
+    token_start: usize,
+};
+
+pub const WebPickerQuery = struct {
+    stage: WebPickerStage,
     query: []const u8,
     token_start: usize,
 };
@@ -113,6 +131,12 @@ pub const State = struct {
     team_column_window_start: usize = 0,
     key_source_column_index: usize = 0,
     key_source_column_window_start: usize = 0,
+    web_picker_stage: WebPickerStage = .search,
+    web_picker_pending_search: std.ArrayList(u8) = .empty,
+    web_search_column_index: usize = 0,
+    web_search_column_window_start: usize = 0,
+    web_fetch_column_index: usize = 0,
+    web_fetch_column_window_start: usize = 0,
     file_completion: file_completion_state.State = .{},
     // The ordinal is meaningful only within file_completion's presented rows.
     file_completion_index: usize = 0,
@@ -132,6 +156,7 @@ pub const State = struct {
         self.model_picker_pending_model.deinit(alloc);
         self.provider_picker_pending_provider.deinit(alloc);
         self.provider_picker_pending_method.deinit(alloc);
+        self.web_picker_pending_search.deinit(alloc);
         inline for (std.meta.fields(State)) |field| {
             // The child's owner already restored its defaults.
             if (comptime std.mem.eql(u8, field.name, "file_completion")) continue;
@@ -175,6 +200,7 @@ pub const State = struct {
         self.slash_completion_index = 0;
         self.slash_completion_window_start = 0;
         self.reconcileProviderPickerAfterEdit(editor);
+        self.reconcileWebPickerAfterEdit(editor);
         self.inline_picker_suppression = suppressionAfterEdit(
             self.inline_picker_suppression,
             self.inlinePickerTriggerKind(editor),
@@ -190,6 +216,14 @@ pub const State = struct {
         const trimmed = editor.input.items[leadingWhitespaceLen(editor.input.items)..];
         if (providerPickerPrefixLen(trimmed) == null) return;
         self.clearProviderPickerFlow();
+    }
+
+    fn reconcileWebPickerAfterEdit(self: *State, editor: *const editor_state.State) void {
+        if (self.web_picker_stage == .search) return;
+        if (self.rawWebPickerQuery(editor) != null) return;
+        const trimmed = editor.input.items[leadingWhitespaceLen(editor.input.items)..];
+        if (!hasWebPickerPrefix(trimmed)) return;
+        self.clearWebPickerFlow();
     }
 
     pub fn resetFilePickerIndex(self: *State) void {
@@ -212,6 +246,11 @@ pub const State = struct {
         return self.rawProviderPickerQuery(editor);
     }
 
+    pub fn activeWebPickerQuery(self: *const State, editor: *const editor_state.State) ?WebPickerQuery {
+        if (self.isInlinePickerDismissed(.web)) return null;
+        return self.rawWebPickerQuery(editor);
+    }
+
     pub fn activeInlineSkillQuery(self: *const State, editor: *const editor_state.State) ?InlineSkillQuery {
         if (self.isInlinePickerSuppressed(.skill)) return null;
         return findInlineSkillQuery(editor.input.items, editor.cursor);
@@ -225,6 +264,7 @@ pub const State = struct {
     fn rawFilePickerQuery(self: *const State, editor: *const editor_state.State) ?FilePickerQuery {
         if (self.rawModelPickerQuery(editor) != null) return null;
         if (self.rawProviderPickerQuery(editor) != null) return null;
+        if (self.rawWebPickerQuery(editor) != null) return null;
         const command_text = std.mem.trimStart(u8, editor.input.items, " \t\r\n");
         if (tokenMatchesAt(command_text, 0, "/mcp")) return null;
         return findFilePickerQuery(editor.input.items, editor.cursor);
@@ -233,6 +273,7 @@ pub const State = struct {
     pub fn inlinePickerTriggerKind(self: *const State, editor: *const editor_state.State) ?InlinePickerKind {
         if (self.rawModelPickerQuery(editor) != null) return .model;
         if (self.rawProviderPickerQuery(editor) != null) return .provider;
+        if (self.rawWebPickerQuery(editor) != null) return .web;
         if (self.rawFilePickerQuery(editor) != null) return .file;
         if (findInlineSkillQuery(editor.input.items, editor.cursor) != null) return .skill;
         if (findInlineSlashQuery(editor.input.items, editor.cursor) != null) return .slash;
@@ -305,11 +346,33 @@ pub const State = struct {
         };
     }
 
+    fn rawWebPickerQuery(self: *const State, editor: *const editor_state.State) ?WebPickerQuery {
+        const items = editor.input.items;
+        const trim_start = leadingWhitespaceLen(items);
+        const trimmed = items[trim_start..];
+        if (!hasWebPickerPrefix(trimmed)) return null;
+
+        const stage = self.web_picker_stage;
+        if (stage == .search) return .{
+            .stage = .search,
+            .query = trimmed[web_prefix.len..],
+            .token_start = trim_start + web_prefix.len,
+        };
+
+        const token_start = webPickerTokenStart(trimmed, self.web_picker_pending_search.items) orelse return null;
+        return .{
+            .stage = stage,
+            .query = trimmed[token_start..],
+            .token_start = trim_start + token_start,
+        };
+    }
+
     /// The composer text changed, so whichever column is open no longer has a
     /// trustworthy highlighted row.
     pub fn resetActiveCompletionIndex(self: *State) void {
         self.resetActiveModelPickerIndex();
         self.resetActiveProviderPickerIndex();
+        self.resetActiveWebPickerIndex();
     }
 
     fn resetActiveProviderPickerIndex(self: *State) void {
@@ -331,6 +394,19 @@ pub const State = struct {
                 self.key_source_column_window_start = 0;
             },
             .api_key => {},
+        }
+    }
+
+    fn resetActiveWebPickerIndex(self: *State) void {
+        switch (self.web_picker_stage) {
+            .search => {
+                self.web_search_column_index = 0;
+                self.web_search_column_window_start = 0;
+            },
+            .fetch => {
+                self.web_fetch_column_index = 0;
+                self.web_fetch_column_window_start = 0;
+            },
         }
     }
 
@@ -375,8 +451,37 @@ pub const State = struct {
         self.key_source_column_window_start = 0;
     }
 
+    pub fn beginWebPickerFlow(
+        self: *State,
+        alloc: Allocator,
+        search: []const u8,
+        stage: WebPickerStage,
+    ) Allocator.Error!void {
+        const stable_search = try alloc.dupe(u8, search);
+        defer alloc.free(stable_search);
+
+        try self.web_picker_pending_search.ensureTotalCapacity(alloc, stable_search.len);
+        self.web_picker_pending_search.clearRetainingCapacity();
+        self.web_picker_pending_search.appendSliceAssumeCapacity(stable_search);
+        self.web_picker_stage = stage;
+        self.resetActiveWebPickerIndex();
+    }
+
+    pub fn clearWebPickerFlow(self: *State) void {
+        self.web_picker_stage = .search;
+        self.web_picker_pending_search.clearRetainingCapacity();
+        self.web_search_column_index = 0;
+        self.web_search_column_window_start = 0;
+        self.web_fetch_column_index = 0;
+        self.web_fetch_column_window_start = 0;
+    }
+
     pub fn isModelShapedInput(self: *const State, editor: *const editor_state.State) bool {
         return isBareModelCommandAtCursor(editor) or self.rawModelPickerQuery(editor) != null;
+    }
+
+    pub fn isWebShapedInput(self: *const State, editor: *const editor_state.State) bool {
+        return isBareWebCommandAtCursor(editor) or self.rawWebPickerQuery(editor) != null;
     }
 
     fn resetActiveModelPickerIndex(self: *State) void {
@@ -471,6 +576,12 @@ pub fn isBareModelCommandAtCursor(editor: *const editor_state.State) bool {
     if (editor.cursor != editor.input.items.len) return false;
     const trimmed = std.mem.trimStart(u8, editor.input.items, " \t");
     return std.ascii.eqlIgnoreCase(trimmed, "/model");
+}
+
+pub fn isBareWebCommandAtCursor(editor: *const editor_state.State) bool {
+    if (editor.cursor != editor.input.items.len) return false;
+    const trimmed = std.mem.trimStart(u8, editor.input.items, " \t");
+    return std.ascii.eqlIgnoreCase(trimmed, "/web");
 }
 
 pub fn filterCompletionLabels(query: []const u8, options: []const []const u8, out: [][]const u8) usize {
@@ -600,6 +711,17 @@ fn providerPickerTokenStart(
     return skipPickerSpaces(trimmed, cursor + wanted_method.len);
 }
 
+fn hasWebPickerPrefix(trimmed: []const u8) bool {
+    return trimmed.len >= web_prefix.len and std.ascii.eqlIgnoreCase(trimmed[0..web_prefix.len], web_prefix);
+}
+
+fn webPickerTokenStart(trimmed: []const u8, search: []const u8) ?usize {
+    if (!hasWebPickerPrefix(trimmed)) return null;
+    if (search.len == 0) return null;
+    if (!tokenMatchesAt(trimmed, web_prefix.len, search)) return null;
+    return skipPickerSpaces(trimmed, web_prefix.len + search.len);
+}
+
 /// True when `token` sits at `start` as a whole word. Without the boundary
 /// check a committed `vercel` would also claim `vercelfoo`, re-anchoring the
 /// picker mid-token in text that no longer names the choice.
@@ -623,6 +745,7 @@ test "picker deinit releases owned text and restores declared defaults" {
     try state.model_picker_pending_model.appendSlice(alloc, "model");
     try state.provider_picker_pending_provider.appendSlice(alloc, "provider");
     try state.provider_picker_pending_method.appendSlice(alloc, "method");
+    try state.web_picker_pending_search.appendSlice(alloc, "exa");
     state.model_picker_stage = .fast;
     state.provider_picker_stage = .api_key;
     state.slash_completion_index = 7;
@@ -1010,4 +1133,44 @@ test "committed tokens only match at word boundaries" {
 
     state.reconcileInlinePickerAfterEdit(&editor);
     try std.testing.expectEqual(ProviderPickerStage.provider, state.provider_picker_stage);
+}
+
+test "web picker opens on /web space and anchors fetch under the search token" {
+    const alloc = std.testing.allocator;
+    var editor: editor_state.State = .{};
+    defer editor.deinit(alloc);
+    var state: State = .{};
+    defer state.deinit(alloc);
+
+    try editor.setText(alloc, "/web ");
+    const search = state.activeWebPickerQuery(&editor).?;
+    try std.testing.expectEqual(WebPickerStage.search, search.stage);
+    try std.testing.expectEqualStrings("", search.query);
+    try std.testing.expectEqual(web_prefix.len, search.token_start);
+    try std.testing.expectEqual(InlinePickerKind.web, state.inlinePickerTriggerKind(&editor).?);
+
+    try editor.setText(alloc, "/web ta");
+    try std.testing.expectEqualStrings("ta", state.activeWebPickerQuery(&editor).?.query);
+
+    try state.beginWebPickerFlow(alloc, "exa", .fetch);
+    try editor.setText(alloc, "/web exa ");
+    const fetch = state.activeWebPickerQuery(&editor).?;
+    try std.testing.expectEqual(WebPickerStage.fetch, fetch.stage);
+    try std.testing.expectEqual("/web exa ".len, fetch.token_start);
+}
+
+test "editing a committed search token degrades the web picker to the search column" {
+    const alloc = std.testing.allocator;
+    var editor: editor_state.State = .{};
+    defer editor.deinit(alloc);
+    var state: State = .{};
+    defer state.deinit(alloc);
+
+    try state.beginWebPickerFlow(alloc, "exa", .fetch);
+    try editor.setText(alloc, "/web ex");
+    state.reconcileInlinePickerAfterEdit(&editor);
+
+    const query = state.activeWebPickerQuery(&editor).?;
+    try std.testing.expectEqual(WebPickerStage.search, query.stage);
+    try std.testing.expectEqualStrings("ex", query.query);
 }

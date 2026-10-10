@@ -1322,6 +1322,24 @@ fn expectedProviderToolName(alloc: std.mem.Allocator, payload: []const u8) !?[]c
         {
             return "parallel_search";
         }
+        if (std.mem.eql(u8, tool_type.string, "provider") and
+            std.mem.eql(u8, id.string, "gateway.browserbase_search") and
+            std.mem.eql(u8, name.string, "browserbase_search"))
+        {
+            return "browserbase_search";
+        }
+        if (std.mem.eql(u8, tool_type.string, "provider") and
+            std.mem.eql(u8, id.string, "gateway.tako_search") and
+            std.mem.eql(u8, name.string, "tako_search"))
+        {
+            return "tako_search";
+        }
+        if (std.mem.eql(u8, tool_type.string, "provider") and
+            std.mem.eql(u8, id.string, "gateway.browserbase_fetch") and
+            std.mem.eql(u8, name.string, "browserbase_fetch"))
+        {
+            return "browserbase_fetch";
+        }
     }
     return null;
 }
@@ -1342,6 +1360,18 @@ test "expected provider tool name only trusts advertised provider schemas" {
         .{
             .payload = "{\"tools\":[{\"type\":\"provider\",\"id\":\"gateway.parallel_search\",\"name\":\"parallel_search\"}]}",
             .name = "parallel_search",
+        },
+        .{
+            .payload = "{\"tools\":[{\"type\":\"provider\",\"id\":\"gateway.browserbase_search\",\"name\":\"browserbase_search\"}]}",
+            .name = "browserbase_search",
+        },
+        .{
+            .payload = "{\"tools\":[{\"type\":\"provider\",\"id\":\"gateway.tako_search\",\"name\":\"tako_search\"}]}",
+            .name = "tako_search",
+        },
+        .{
+            .payload = "{\"tools\":[{\"type\":\"provider\",\"id\":\"gateway.browserbase_fetch\",\"name\":\"browserbase_fetch\"}]}",
+            .name = "browserbase_fetch",
         },
     };
     for (cases) |case| {

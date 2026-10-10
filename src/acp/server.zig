@@ -42,6 +42,7 @@ const context_contract = @import("../core/workspace/context_contract.zig");
 const workspace_access = @import("../core/workspace/workspace_access.zig");
 const web_fetch_runtime = @import("../core/tooling/web_fetch_runtime.zig");
 const web_search_runtime = @import("../core/tooling/web_search_runtime.zig");
+const web_tools = @import("../core/tooling/web_tools.zig");
 const elicitation = @import("../core/mcp/elicitation.zig");
 const tool_mcp_runtime = @import("../core/tooling/tool_mcp_runtime.zig");
 const permissions = @import("../core/permissions/permissions.zig");
@@ -326,6 +327,8 @@ pub const ServerState = struct {
     configured_ultrafast_mode: bool = false,
     process_ultrafast_override: ?bool = null,
     effort: types.ReasoningEffort = .auto,
+    web_search: web_tools.SearchBackend = .default,
+    web_fetch: web_tools.FetchBackend = .default,
     first_call_tool_choice: types.ToolChoice = .auto,
     context_enabled: bool = true,
     session_titles: bool = true,
@@ -2639,6 +2642,8 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         (state.cfg.model_override == null or startup.fast_mode_source != .compiled_default);
     configureUltrafastStartup(state, &startup);
     state.effort = startup.effort;
+    state.web_search = startup.web_search;
+    state.web_fetch = startup.web_fetch;
     state.first_call_tool_choice = startup.first_call_tool_choice;
     state.context_enabled = startup.context_enabled;
     state.session_titles = startup.session_title_generation;

@@ -494,6 +494,35 @@ async function readAcpResponse(client: AcpClient, id: number) {
 }
 
 describe("web_search Gateway fixture", () => {
+  test.each(["allow", "ask", "deny"] as const)(
+    "Browserbase fetch is hidden when a domain rule requires local admission: %s",
+    async (action) => {
+      const root = createIsolatedRoot();
+      writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({
+        web: { fetch: "browserbase" },
+        permission: { web_fetch: { "domain:example.com": action } },
+      }));
+      const gateway = startFakeGateway([outerFinalAnswer()]);
+      try {
+        const result = await runFx(["ask", "--auto", "--json", "--no-save", "Reply without fetching."], {
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway, { FX_WEB_FETCH_BACKEND: undefined }),
+          timeoutMs: TIMEOUT,
+        });
+        parseFxJson(result);
+        expect(result.stderr).toBe("");
+        expect(gateway.requests).toHaveLength(1);
+        const request = parseGatewayRequest(gateway.requests[0]!.body);
+        expect(toolByName(request, "browserbase_fetch")).toBeUndefined();
+        expect(toolByName(request, "web_fetch")).toBeUndefined();
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
   test(
     "unadvertised native web_search cannot start a worker",
     async () => {
@@ -989,7 +1018,7 @@ describe("web_search Gateway fixture", () => {
   );
 
   test(
-    "unknown direct provider backend selector fails before a Gateway request",
+    "invalid backend selector falls back to Exa",
     async () => {
       const root = createIsolatedRoot();
       const gateway = startFakeGateway();
@@ -999,14 +1028,15 @@ describe("web_search Gateway fixture", () => {
           {
             cwd: root.workspace,
             env: fakeGatewayEnv(root, gateway, {
-              FX_WEB_SEARCH_BACKEND: "parallel_search",
+              FX_WEB_SEARCH_BACKEND: "not-a-backend",
             }),
             timeoutMs: TIMEOUT,
           },
         );
 
-        expect(result.code).toBe(1);
-        expect(gateway.requests).toHaveLength(0);
+        parseFxJson(result);
+        expect(gateway.requests).toHaveLength(2);
+        expect(toolByName(parseGatewayRequest(gateway.requests[0]!.body), "exa_search")).toBeDefined();
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });

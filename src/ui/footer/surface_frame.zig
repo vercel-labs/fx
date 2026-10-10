@@ -407,7 +407,9 @@ fn buildFooterSurfaceProjection(
         ctx.model_query_active;
     const show_provider_query = !viewer_active and !show_auth_picker and !show_inline_catalog and !show_skills_query and !modal_active and !ctx.stream.active and
         ctx.provider_query_active and !show_model_query;
-    const show_file_query = !viewer_active and !show_inline_catalog and !show_skills_query and !modal_active and ctx.file_query_active and !show_model_query and !show_provider_query;
+    const show_web_query = !viewer_active and !show_auth_picker and !show_inline_catalog and !show_skills_query and !modal_active and !ctx.stream.active and
+        ctx.web_query_active and !show_model_query and !show_provider_query;
+    const show_file_query = !viewer_active and !show_inline_catalog and !show_skills_query and !modal_active and ctx.file_query_active and !show_model_query and !show_provider_query and !show_web_query;
     const prepared_slash_prefix = if (!show_auth_picker and
         !show_inline_catalog and
         !show_skills_query)
@@ -415,7 +417,7 @@ fn buildFooterSurfaceProjection(
             ctx,
             modal_active,
             show_model_query,
-            show_provider_query or show_file_query,
+            show_provider_query or show_web_query or show_file_query,
         )
     else
         null;
@@ -437,18 +439,26 @@ fn buildFooterSurfaceProjection(
         modal_active,
         show_model_query,
         show_provider_query,
+        show_web_query,
         show_file_query,
         if (prepared_slash_prefix != null) prepared_slash_menu.resultCount() else null,
     );
     const show_slash_query = prepared_slash_prefix != null and geometry.show_slash_query;
-    const show_picker = show_auth_picker or show_inline_catalog or show_skills_query or show_model_query or show_provider_query or show_file_query or show_slash_query;
+    const show_picker = show_auth_picker or show_inline_catalog or show_skills_query or show_model_query or show_provider_query or show_web_query or show_file_query or show_slash_query;
     const picker_items: []const []const u8 = if (show_model_query)
         ctx.model_completions
     else if (show_provider_query)
         ctx.provider_picker_completions
+    else if (show_web_query)
+        ctx.web_picker_completions
     else
         &.{};
-    const picker_annotations: []const []const u8 = if (show_provider_query) ctx.provider_picker_annotations else &.{};
+    const picker_annotations: []const []const u8 = if (show_provider_query)
+        ctx.provider_picker_annotations
+    else if (show_web_query)
+        ctx.web_picker_annotations
+    else
+        &.{};
     const file_picker_items: []const file_index.SearchResult = if (show_file_query) ctx.file_completions else &.{};
     const picker_selection_index: usize = if (show_skills_query)
         ctx.skills_menu.selected_index
@@ -460,6 +470,8 @@ fn buildFooterSurfaceProjection(
         ctx.model_completion_index
     else if (show_provider_query)
         ctx.provider_picker_completion_index
+    else if (show_web_query)
+        ctx.web_picker_completion_index
     else if (show_file_query)
         ctx.file_completion_index
     else
@@ -472,6 +484,8 @@ fn buildFooterSurfaceProjection(
         ctx.model_completion_window_start
     else if (show_provider_query)
         ctx.provider_picker_completion_window_start
+    else if (show_web_query)
+        ctx.web_picker_completion_window_start
     else if (show_file_query)
         ctx.file_completion_window_start
     else
@@ -508,6 +522,8 @@ fn buildFooterSurfaceProjection(
         .model_stage
     else if (show_provider_query)
         .provider_stage
+    else if (show_web_query)
+        .web_stage
     else if (show_file_query)
         .file
     else

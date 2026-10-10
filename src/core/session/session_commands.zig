@@ -18,6 +18,7 @@ const provider_runtime = @import("../app/provider_runtime.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
+const web_tools = @import("../tooling/web_tools.zig");
 const render_request = @import("../../ui/render_request.zig");
 
 const freeStringList = collections.freeStringList;
@@ -391,6 +392,73 @@ pub fn Commands(comptime App: type) type {
             }
 
             try app.writeDomainNotice(.{ .topic = "", .tone = .@"error", .body = permissions_usage }, true);
+        }
+
+        pub fn handleWeb(app: *App, rest: []const u8) !void {
+            const patch = web_tools.parseCommand(rest) catch {
+                try app.writeDomainNotice(.{ .topic = "", .tone = .@"error", .body = web_tools.command_usage }, true);
+                return;
+            };
+            if (patch) |change| {
+                try applyWebPatch(app, change);
+                return;
+            }
+            try writeWebStatus(app);
+        }
+
+        fn applyWebPatch(app: *App, patch: web_tools.CommandPatch) !void {
+            if (comptime @hasField(App, "web_search")) {
+                if (patch.search) |search| app.web_search = search;
+            }
+            if (comptime @hasField(App, "web_fetch")) {
+                if (patch.fetch) |fetch| app.web_fetch = fetch;
+            }
+
+            var out: std.Io.Writer.Allocating = .init(app.alloc);
+            defer out.deinit();
+            var first = true;
+            if (patch.search) |search| {
+                try out.writer.print("search set to {s}", .{search.slug()});
+                first = false;
+            }
+            if (patch.fetch) |fetch| {
+                if (!first) try out.writer.writeAll(", ");
+                try out.writer.print("fetch set to {s}", .{fetch.slug()});
+            }
+            try app.writeDomainNotice(.{
+                .topic = "web",
+                .tone = .neutral,
+                .body = out.writer.buffered(),
+            }, true);
+
+            try persistPreferenceTargets(
+                app,
+                .{
+                    .web_search = patch.search,
+                    .web_fetch = patch.fetch,
+                },
+                "web tools",
+                true,
+            );
+        }
+
+        fn writeWebStatus(app: *App) !void {
+            const search: web_tools.SearchBackend = if (comptime @hasField(App, "web_search"))
+                app.web_search
+            else
+                .default;
+            const fetch: web_tools.FetchBackend = if (comptime @hasField(App, "web_fetch"))
+                app.web_fetch
+            else
+                .default;
+            const status = try (output_contracts.WebSnapshot{
+                .search = search,
+                .fetch = fetch,
+            }).renderInteractiveBody(app.alloc);
+            defer app.alloc.free(status);
+            const notice = try std.fmt.allocPrint(app.alloc, "{s}\n{s}", .{ status, web_tools.command_usage });
+            defer app.alloc.free(notice);
+            try app.writeDomainNotice(.{ .topic = "web", .tone = .neutral, .body = notice }, true);
         }
 
         pub fn handleAllowlist(app: *App, rest: []const u8) !void {
@@ -1806,6 +1874,8 @@ const FakeApp = struct {
     agent_step_limit: usize = 24,
     fast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
+    web_search: web_tools.SearchBackend = .default,
+    web_fetch: web_tools.FetchBackend = .default,
     cached_ids: ?[]const []const u8 = null,
     gateway_metadata_model: ?[]const u8 = null,
     gateway_metadata: model_capabilities.GatewayMetadata = .{},
@@ -1818,6 +1888,8 @@ const FakeApp = struct {
     last_preference_effort: ?types.ReasoningEffort = null,
     last_preference_fast_mode: ?bool = null,
     last_preference_ultrafast_mode: ?bool = null,
+    last_preference_web_search: ?web_tools.SearchBackend = null,
+    last_preference_web_fetch: ?web_tools.FetchBackend = null,
     preference_settings_error: ?anyerror = null,
     preference_session_error: ?anyerror = null,
     preference_failure_cleanup: config_runtime.LegacyCleanup = .{},
@@ -1972,6 +2044,8 @@ const FakeApp = struct {
         self.last_preference_effort = patch.effort;
         self.last_preference_fast_mode = patch.fast_mode;
         self.last_preference_ultrafast_mode = patch.ultrafast_mode;
+        self.last_preference_web_search = patch.web_search;
+        self.last_preference_web_fetch = patch.web_fetch;
         if (self.preference_settings_error == null) {
             const attempt = config_runtime.attemptUserPreferences(
                 self.alloc,
@@ -2439,6 +2513,38 @@ test "session_commands argless permissions writes one read-only status notice wi
     try std.testing.expectEqual(@as(usize, 0), app.permission_mode_preference_commit_count);
     try std.testing.expectEqual(@as(?types.PermissionMode, null), app.worker.synced_mode);
     try std.testing.expectEqual(@as(?types.PermissionMode, null), app.worker.synced_state_mode);
+}
+
+test "session_commands handleWeb reports usage and current backends" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-opus-4.6");
+    defer app.deinit();
+
+    try Commands(FakeApp).handleWeb(&app, "");
+    try expectTranscriptContains(&app, "search: exa");
+    try expectTranscriptContains(&app, "fetch: local");
+    try expectTranscriptContains(&app, web_tools.command_usage);
+    try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleWeb(&app, "search");
+    try expectTranscriptContains(&app, web_tools.command_usage);
+    try std.testing.expectEqual(web_tools.SearchBackend.exa, app.web_search);
+    try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
+}
+
+test "session_commands handleWeb updates runtime backends and persists" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-opus-4.6");
+    defer app.deinit();
+    app.preference_settings_error = error.SettingsUnavailable;
+
+    try Commands(FakeApp).handleWeb(&app, "tako browserbase");
+    try std.testing.expectEqual(web_tools.SearchBackend.tako, app.web_search);
+    try std.testing.expectEqual(web_tools.FetchBackend.browserbase, app.web_fetch);
+    try std.testing.expectEqual(web_tools.SearchBackend.tako, app.last_preference_web_search.?);
+    try std.testing.expectEqual(web_tools.FetchBackend.browserbase, app.last_preference_web_fetch.?);
+    try expectTranscriptContains(&app, "search set to tako, fetch set to browserbase");
 }
 
 test "session_commands handlePermissions reports usage and invalid action before touching settings" {

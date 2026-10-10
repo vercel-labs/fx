@@ -17,6 +17,7 @@ const config_runtime = @import("../config/config_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const editor_state = @import("../input/editor_state.zig");
 const settings_catalog = @import("../config/settings_catalog.zig");
+const web_tools = @import("../tooling/web_tools.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const feedback_runtime = @import("../feedback/runtime.zig");
 const output_contracts = @import("../output/output_contracts.zig");
@@ -37,6 +38,7 @@ const display_width = @import("../shared/display_width.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_presentation = @import("../tooling/tool_presentation.zig");
 const session_commands = @import("../session/session_commands.zig");
+const web_picker_runtime = @import("web_picker_runtime.zig");
 const usage_recovery = @import("../session/usage_recovery.zig");
 const usage_dashboard_runtime = @import("usage_dashboard_runtime.zig");
 const usage_report = @import("../session/usage_report.zig");
@@ -385,6 +387,7 @@ pub fn Handlers(comptime App: type) type {
                 .attach_image = commandAttachImage,
                 .manage_images = commandManageImages,
                 .handle_model = commandHandleModel,
+                .handle_web = commandHandleWeb,
                 .handle_permissions = commandHandlePermissions,
                 .handle_allowlist = commandHandleAllowlist,
                 .show_stats = commandShowStats,
@@ -762,6 +765,15 @@ pub fn Handlers(comptime App: type) type {
         fn commandHandleModel(ctx: *anyopaque, query: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try session_commands.Commands(App).handleModel(app, query);
+        }
+
+        fn commandHandleWeb(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (std.mem.trim(u8, rest, " \t").len == 0 and web_picker_runtime.supported(App)) {
+                try web_picker_runtime.Runtime(App).open(app);
+                return;
+            }
+            try session_commands.Commands(App).handleWeb(app, rest);
         }
 
         fn commandHandlePermissions(ctx: *anyopaque, rest: []const u8) !void {
@@ -4046,6 +4058,8 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
         snapshot.supports_ultrafast_mode = capabilities.supports_ultrafast_mode;
     }
     if (comptime @hasField(App, "permission_engine")) snapshot.permission_mode = @tagName(app.permission_engine.mode);
+    if (comptime @hasField(App, "web_search")) snapshot.web_search = app.web_search;
+    if (comptime @hasField(App, "web_fetch")) snapshot.web_fetch = app.web_fetch;
     if (comptime @hasField(App, "input_runtime")) {
         snapshot.startup_scrollback = app.input_runtime.settings_menu.startup_scrollback;
         if (comptime @hasField(@TypeOf(app.input_runtime), "slash_menu_categories")) {
@@ -4194,6 +4208,20 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
             }
         },
         .permission_mode => try session_commands.Commands(@TypeOf(app.*)).handlePermissions(app, change.value),
+        .web_search => {
+            const backend = web_tools.parseSearch(change.value) orelse return error.InvalidSettingsCatalogValue;
+            var buf: [32]u8 = undefined;
+            const rest = std.fmt.bufPrint(&buf, "search {s}", .{backend.slug()}) catch
+                return error.InvalidSettingsCatalogValue;
+            try session_commands.Commands(@TypeOf(app.*)).handleWeb(app, rest);
+        },
+        .web_fetch => {
+            const backend = web_tools.parseFetch(change.value) orelse return error.InvalidSettingsCatalogValue;
+            var buf: [32]u8 = undefined;
+            const rest = std.fmt.bufPrint(&buf, "fetch {s}", .{backend.slug()}) catch
+                return error.InvalidSettingsCatalogValue;
+            try session_commands.Commands(@TypeOf(app.*)).handleWeb(app, rest);
+        },
         .sound_level => try handleNotificationsCommand(app, change.value),
         .startup_scrollback => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;

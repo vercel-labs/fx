@@ -14,6 +14,7 @@ const model_preferences = @import("model_preferences.zig");
 const configured_provider = @import("configured_provider.zig");
 const update_target = @import("../upgrade/update_target.zig");
 pub const context_limits = @import("context_limits.zig");
+const web_tools = @import("../tooling/web_tools.zig");
 
 const Allocator = std.mem.Allocator;
 const max_settings_bytes: usize = 64 * 1024;
@@ -68,6 +69,8 @@ pub const Settings = struct {
     startup_scrollback: ?bool = null,
     prompt_history_enabled: ?bool = null,
     effort: ?types.ReasoningEffort = null,
+    web_search: ?web_tools.SearchBackend = null,
+    web_fetch: ?web_tools.FetchBackend = null,
     /// Optional review-model override for automatic permission review. Owned by
     /// this Settings; freed in deinit. Null keeps the provider's default.
     review_model: ?[]const u8 = null,
@@ -858,6 +861,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "auto_upgrade",
         "update_channel",
         "permission_mode",
+        "web",
         "credential_source",
         "yolo_acknowledged",
         "permission",
@@ -1813,6 +1817,18 @@ fn parseProfileOnlyFields(
         }
     }
 
+    if (root.object.get("web")) |web_value| {
+        if (web_value != .object) return error.InvalidWebSettingsType;
+        if (web_value.object.get("search")) |search_value| {
+            if (search_value != .string) return error.InvalidWebSearchType;
+            settings.web_search = web_tools.parseSearch(search_value.string) orelse return error.InvalidWebSearchValue;
+        }
+        if (web_value.object.get("fetch")) |fetch_value| {
+            if (fetch_value != .string) return error.InvalidWebFetchType;
+            settings.web_fetch = web_tools.parseFetch(fetch_value.string) orelse return error.InvalidWebFetchValue;
+        }
+    }
+
     if (root.object.get("statusLine")) |statusline_value| {
         const value = statusline_value;
         if (value != .object) {
@@ -1999,6 +2015,8 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     }
     if (incoming.prompt_history_enabled) |value| target.prompt_history_enabled = value;
     if (incoming.effort) |value| target.effort = value;
+    if (incoming.web_search) |value| target.web_search = value;
+    if (incoming.web_fetch) |value| target.web_fetch = value;
     if (incoming.review_model) |value| {
         if (target.review_model) |old| alloc.free(old);
         target.review_model = value;

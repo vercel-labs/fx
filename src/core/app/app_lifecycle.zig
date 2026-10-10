@@ -18,6 +18,7 @@ const workspace_access = @import("../workspace/workspace_access.zig");
 const update_target = @import("../upgrade/update_target.zig");
 const notification_sound = @import("../notifications/sound.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
+const web_tools = @import("../tooling/web_tools.zig");
 const compactor = @import("../compactor/compactor.zig");
 const types = @import("../shared/types.zig");
 const ui_render = @import("../../ui/render.zig");
@@ -162,6 +163,8 @@ pub const StartupState = struct {
     prompt_history_store_allowed: bool = true,
     config_diagnostics: []config_runtime.ConfigDiagnostic = &.{},
     effort: types.ReasoningEffort = .auto,
+    web_search: web_tools.SearchBackend = .default,
+    web_fetch: web_tools.FetchBackend = .default,
     /// Owned gateway provider slugs in preference order; empty leaves routing
     /// to the gateway.
     provider_order: [][]const u8 = &.{},
@@ -794,6 +797,8 @@ fn loadStartupStateWithKeychainRead(
     state.startup_scrollback = settings.startup_scrollback orelse true;
     state.theme = if (settings.theme) |value| try alloc.dupe(u8, value) else null;
     state.effort = settings.effort orelse .auto;
+    state.web_search = web_tools.resolveSearch(io_mod.getenv("FX_WEB_SEARCH_BACKEND"), settings.web_search) catch .default;
+    state.web_fetch = web_tools.resolveFetch(io_mod.getenv("FX_WEB_FETCH_BACKEND"), settings.web_fetch) catch .default;
     state.review_model = try alloc.dupe(u8, settings.review_model orelse "");
     state.first_call_tool_choice = settings.first_call_tool_choice orelse .auto;
     state.provider_strict = settings.provider_strict orelse false;

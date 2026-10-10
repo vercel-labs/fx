@@ -929,7 +929,7 @@ pub fn composeFooterFrame(
             var status_row = if (input.picker_kind == .file and ctx.file_completion_status != null)
                 try picker_presentation.composePickerOptionRow(alloc, .file, input.picker_start_col, ctx.file_completion_status.?, false, shell.layout.cols)
             else
-                try picker_presentation.composePickerStatusRowWithProvider(alloc, input.picker_kind, ctx.model_picker_stage, ctx.provider_picker_stage, input.picker_loading, input.picker_failed, input.picker_start_col, shell.layout.cols);
+                try picker_presentation.composePickerStatusRowWithProvider(alloc, input.picker_kind, ctx.model_picker_stage, ctx.provider_picker_stage, ctx.web_picker_stage, input.picker_loading, input.picker_failed, input.picker_start_col, shell.layout.cols);
             try pushFooterBandRow(alloc, &frame, plan, rows.picker_start, &status_row);
         }
     }

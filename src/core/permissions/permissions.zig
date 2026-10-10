@@ -1601,6 +1601,15 @@ pub fn webFetchRuleWarningCount(rules: []const types.PermissionRule) usize {
     return count;
 }
 
+/// Domain rules require the URL before admission, which provider execution cannot supply.
+pub fn web_fetch_has_domain_rules(rules: types.PermissionRuleSet) bool {
+    for (rules.rules) |rule| {
+        if (std.mem.eql(u8, rule.permission, web_fetch_permission) and
+            isCanonicalWebFetchDomainPattern(rule.pattern)) return true;
+    }
+    return false;
+}
+
 fn ruleMatchesPermission(rule_permission: []const u8, permission: []const u8, tool_name: ?[]const u8) bool {
     if (wildcardMatch(rule_permission, permission)) return true;
     const name = tool_name orelse return false;

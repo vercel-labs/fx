@@ -35,11 +35,16 @@ pub fn isProviderSearchAlias(tool_name: []const u8) bool {
     return tooling_presentation.isProviderSearchAlias(tool_name);
 }
 
+pub fn isProviderFetchAlias(tool_name: []const u8) bool {
+    return tooling_presentation.isProviderFetchAlias(tool_name);
+}
+
 pub fn streamStartMayHaveExecutedAtProvider(
     registry: tool_dispatch.Registry,
     tool_name: []const u8,
 ) bool {
     if (isProviderSearchAlias(tool_name)) return true;
+    if (isProviderFetchAlias(tool_name)) return true;
     const spec = registry.lookup(tool_name) orelse return false;
     return spec.provider_executed;
 }
@@ -51,6 +56,7 @@ fn fallbackToolDisplay(
     // Provider-executed search backends are never registered locally; their
     // stream names (exa_search, ...) are internal identifiers, not display copy.
     if (tooling_presentation.isProviderSearchAlias(tool_name)) return "web search";
+    if (tooling_presentation.isProviderFetchAlias(tool_name)) return "web fetch";
     const lookup_name = if (std.mem.eql(u8, tool_name, "run_command"))
         "shell"
     else
@@ -95,6 +101,12 @@ pub const ProvisionalToolStatuses = struct {
         if (tooling_presentation.isProviderSearchAlias(tool_name)) {
             return .{ .eligible = .{
                 .action_label = "Searching",
+                .activity_kind = .read,
+            } };
+        }
+        if (tooling_presentation.isProviderFetchAlias(tool_name)) {
+            return .{ .eligible = .{
+                .action_label = "Fetching",
                 .activity_kind = .read,
             } };
         }
@@ -710,6 +722,7 @@ pub fn transitionPresentationGroup(
 
 pub fn activityKind(registry: tool_dispatch.Registry, tool_name: []const u8) types.ToolActivityKind {
     if (tooling_presentation.isProviderSearchAlias(tool_name)) return .read;
+    if (tooling_presentation.isProviderFetchAlias(tool_name)) return .read;
     return tool_dispatch.toolActivityKind(registry, tool_name);
 }
 
@@ -719,6 +732,7 @@ pub fn activityKindForCall(
     call: ToolCall,
 ) types.ToolActivityKind {
     if (tooling_presentation.isProviderSearchAlias(call.name)) return .read;
+    if (tooling_presentation.isProviderFetchAlias(call.name)) return .read;
     return tool_dispatch.toolActivityKindForCall(alloc, registry, call);
 }
 

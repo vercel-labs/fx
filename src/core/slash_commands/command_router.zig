@@ -19,6 +19,7 @@ pub const ParsedCommand = union(enum) {
     image: []const u8,
     images: []const u8,
     model: []const u8,
+    web: []const u8,
     permissions: []const u8,
     allowlist: []const u8,
     stats,
@@ -59,6 +60,7 @@ pub const CommandHandlers = struct {
     attach_image: *const fn (ctx: *anyopaque, path: []const u8) anyerror!void,
     manage_images: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_model: *const fn (ctx: *anyopaque, query: []const u8) anyerror!void,
+    handle_web: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_permissions: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_allowlist: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_stats: *const fn (ctx: *anyopaque) anyerror!void,
@@ -105,6 +107,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .images => .{ .images = payload },
         .image => .{ .image = payload },
         .model => .{ .model = payload },
+        .web => .{ .web = payload },
         .permissions => .{ .permissions = payload },
         .allowlist => .{ .allowlist = payload },
         .stats => .stats,
@@ -159,6 +162,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .image => |path| try handlers.attach_image(handlers.ctx, path),
         .images => |rest| try handlers.manage_images(handlers.ctx, rest),
         .model => |query| try handlers.handle_model(handlers.ctx, query),
+        .web => |rest| try handlers.handle_web(handlers.ctx, rest),
         .permissions => |rest| try handlers.handle_permissions(handlers.ctx, rest),
         .allowlist => |rest| try handlers.handle_allowlist(handlers.ctx, rest),
         .stats => try handlers.show_stats(handlers.ctx),
@@ -194,6 +198,13 @@ test "parse extracts model command payload" {
     const parsed = parse(testSlashRegistry(), "/model claude-opus");
     switch (parsed) {
         .model => |query| try std.testing.expectEqualStrings("claude-opus", query),
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "parse extracts web command payload" {
+    switch (parse(testSlashRegistry(), "/web search tako")) {
+        .web => |rest| try std.testing.expectEqualStrings("search tako", rest),
         else => return error.TestExpectedEqual,
     }
 }
@@ -484,6 +495,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .attach_image = unexpectedPayload,
         .manage_images = unexpectedPayload,
         .handle_model = unexpectedPayload,
+        .handle_web = unexpectedPayload,
         .handle_permissions = unexpectedPayload,
         .handle_allowlist = unexpectedPayload,
         .show_stats = unexpectedNoPayload,

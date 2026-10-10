@@ -4,6 +4,7 @@ const permissions = @import("../permissions/permissions.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
 const tool_set_contract = @import("tool_set.zig");
 const types = @import("../shared/types.zig");
+const web_tools = @import("web_tools.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -11,6 +12,7 @@ pub const Options = struct {
     permission_mode: types.PermissionMode = .auto,
     permission_rules: types.PermissionRuleSet = .{},
     subagent_available: bool = false,
+    web_fetch_backend: web_tools.FetchBackend = .default,
 };
 
 const BuildKind = enum { full, read_only };
@@ -560,15 +562,18 @@ fn appendBuiltinTool(
     if (!includeBuiltinForKind(tool.name, kind, tool_set)) return;
     if (std.mem.eql(u8, tool.name, "subagent") and !options.subagent_available) return;
     if (std.mem.eql(u8, tool.name, "vision")) return;
+    const fetch_provider_executed = std.mem.eql(u8, tool.name, "web_fetch") and
+        options.web_fetch_backend.isProviderExecuted();
+    const provider_executed = tool.provider_executed or fetch_provider_executed;
     if (options.permission_mode != .yolo) {
-        if (tool.provider_executed and !providerExecutionIsAllowed(tool.name, options.permission_rules)) return;
+        if (provider_executed and !providerExecutionIsAllowed(tool.name, options.permission_rules)) return;
         if (permissions.rulesDenyAllTargetsForTool(options.permission_rules, tool.name)) return;
     }
     try advertised_names.append(alloc, tool.name);
-    if (!tool.provider_executed and tool.write_provider_advertisement_fn == null) {
+    if (!provider_executed and tool.write_provider_advertisement_fn == null) {
         try advertised_functions.append(alloc, tool.model_schema);
     }
-    if (tool.write_provider_advertisement_fn != null) {
+    if (tool.write_provider_advertisement_fn != null or fetch_provider_executed) {
         if (first_custom_guidance.*) {
             first_custom_guidance.* = false;
         } else {
@@ -582,6 +587,7 @@ fn appendBuiltinTool(
 /// hides it exactly like a `deny`. The tool name doubles as the target pattern
 /// because the provider owns the call and fx never sees its arguments.
 fn providerExecutionIsAllowed(tool_name: []const u8, rules: types.PermissionRuleSet) bool {
+    if (permissions.isWebFetchToolName(tool_name) and permissions.web_fetch_has_domain_rules(rules)) return false;
     const permission = permissions.permissionNameForTool(tool_name);
     return switch (permissions.ruleDecisionForPermissionPattern(rules, permission, tool_name, .none)) {
         .none, .allow => true,
@@ -660,6 +666,56 @@ test "provider-executed search follows settled advertisement permission" {
             if (case.advertised) test_web_search.description else "",
             projection.custom_guidance,
         );
+    }
+}
+
+test "provider-executed fetch cannot bypass domain rules" {
+    const alloc = std.testing.allocator;
+    for (std.meta.tags(types.PermissionAction)) |action| {
+        var rules = [_]types.PermissionRule{.{
+            .permission = @constCast("web_fetch"),
+            .pattern = @constCast("domain:example.com"),
+            .action = action,
+        }};
+        var provider = try buildTestModelToolProjection(alloc, .{
+            .web_fetch_backend = .browserbase,
+            .permission_rules = .{ .rules = &rules },
+        });
+        defer provider.deinit(alloc);
+        try expectNotContainsName(provider.advertised_names, "web_fetch");
+
+        var local = try buildTestModelToolProjection(alloc, .{
+            .web_fetch_backend = .local,
+            .permission_rules = .{ .rules = &rules },
+        });
+        defer local.deinit(alloc);
+        try expectContainsName(local.advertised_names, "web_fetch");
+
+        var full_access = try buildTestModelToolProjection(alloc, .{
+            .permission_mode = .yolo,
+            .web_fetch_backend = .browserbase,
+            .permission_rules = .{ .rules = &rules },
+        });
+        defer full_access.deinit(alloc);
+        try expectContainsName(full_access.advertised_names, "web_fetch");
+    }
+}
+
+test "provider-executed fetch stays available without domain rules" {
+    const alloc = std.testing.allocator;
+    var rules = [_]types.PermissionRule{.{
+        .permission = @constCast("read"),
+        .pattern = @constCast("*"),
+        .action = .deny,
+    }};
+    var projection = try buildTestModelToolProjection(alloc, .{
+        .web_fetch_backend = .browserbase,
+        .permission_rules = .{ .rules = &rules },
+    });
+    defer projection.deinit(alloc);
+    try expectContainsName(projection.advertised_names, "web_fetch");
+    for (projection.advertised_functions) |function| {
+        try std.testing.expect(!std.mem.eql(u8, function.name, "web_fetch"));
     }
 }
 

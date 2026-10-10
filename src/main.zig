@@ -122,6 +122,7 @@ const tool_mcp_runtime = @import("core/tooling/tool_mcp_runtime.zig");
 const tool_runtime = @import("core/tooling/tool_runtime.zig");
 const web_fetch_runtime = @import("core/tooling/web_fetch_runtime.zig");
 const web_search_runtime = @import("core/tooling/web_search_runtime.zig");
+const web_tools = @import("core/tooling/web_tools.zig");
 const worker_runtime = @import("core/agent/worker_runtime.zig");
 const question_prompt = @import("core/agent/question_prompt.zig");
 const gateway_client = @import("gateway/client.zig");
@@ -589,6 +590,8 @@ const App = struct {
     fast_mode: bool = false,
     auto_upgrade_enabled: bool = true,
     effort: ReasoningEffort = .auto,
+    web_search: web_tools.SearchBackend = .default,
+    web_fetch: web_tools.FetchBackend = .default,
     /// Resolved review-model override for automatic permission review
     /// (`review_model` setting or FX_REVIEW_MODEL). Owned; empty keeps the
     /// reviewer's compiled default.
@@ -2028,6 +2031,7 @@ const App = struct {
             .permission_mode = permission_mode,
             .permission_rules = permission_rules,
             .subagent_available = self.session_persistence.subagent_host != null,
+            .web_fetch_backend = self.web_fetch,
         });
     }
 
@@ -4777,6 +4781,7 @@ test {
     _ = auth_runtime;
     _ = @import("core/auth/auth_transition.zig");
     _ = @import("core/app/provider_picker_runtime.zig");
+    _ = @import("core/app/web_picker_runtime.zig");
     _ = @import("core/workspace/context_contract.zig");
     _ = @import("core/workspace/workspace_access.zig");
     _ = @import("core/workspace/workspace_commands.zig");

@@ -7,6 +7,7 @@ const mem_utils = @import("../shared/mem_utils.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_args = @import("tool_args.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
+const web_tools = @import("web_tools.zig");
 const terminal_contracts = @import("../terminal/contracts.zig");
 const terminal_client_runtime = @import("../terminal/client.zig");
 const terminal_ui_projection = @import("../terminal/ui_projection.zig");
@@ -248,9 +249,11 @@ pub const RunCommandActivity = struct {
 };
 
 pub fn isProviderSearchAlias(name: []const u8) bool {
-    return std.mem.eql(u8, name, "exa_search") or
-        std.mem.eql(u8, name, "perplexity_search") or
-        std.mem.eql(u8, name, "parallel_search");
+    return web_tools.isProviderSearchAlias(name);
+}
+
+pub fn isProviderFetchAlias(name: []const u8) bool {
+    return web_tools.isProviderFetchAlias(name);
 }
 
 fn projectRunCommandActivitySource(

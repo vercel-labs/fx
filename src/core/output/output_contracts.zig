@@ -21,6 +21,7 @@ const update_notes = @import("../upgrade/update_notes.zig");
 const update_target = @import("../upgrade/update_target.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
+const web_tools = @import("../tooling/web_tools.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -825,6 +826,45 @@ pub const ModelDetail = struct {
     efforts: model_capabilities.ReasoningEffortOptions = .{},
     fast: bool = false,
     ultrafast: bool = false,
+};
+
+pub const WebSnapshot = struct {
+    search: web_tools.SearchBackend,
+    fetch: web_tools.FetchBackend,
+
+    pub fn render(self: WebSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        return switch (format) {
+            .text => self.renderText(alloc),
+            .json => self.renderJson(alloc),
+        };
+    }
+
+    pub fn renderText(self: WebSnapshot, alloc: Allocator) ![]u8 {
+        return std.fmt.allocPrint(
+            alloc,
+            "[web] search={s}\n[web] fetch={s}\n",
+            .{ self.search.slug(), self.fetch.slug() },
+        );
+    }
+
+    pub fn renderInteractiveBody(self: WebSnapshot, alloc: Allocator) ![]u8 {
+        return std.fmt.allocPrint(
+            alloc,
+            "search: {s}\nfetch: {s}",
+            .{ self.search.slug(), self.fetch.slug() },
+        );
+    }
+
+    pub fn renderJson(self: WebSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.writeAll("{\"kind\":\"web\",\"search\":");
+        try std.json.Stringify.value(self.search.slug(), .{}, &out.writer);
+        try out.writer.writeAll(",\"fetch\":");
+        try std.json.Stringify.value(self.fetch.slug(), .{}, &out.writer);
+        try out.writer.writeByte('}');
+        return try out.toOwnedSlice();
+    }
 };
 
 pub const ModelListSnapshot = struct {
@@ -2304,6 +2344,20 @@ test "core permissions snapshot text and json stay stable" {
         "{\"kind\":\"permissions\",\"mode\":\"auto\",\"grant_count\":2,\"grant_scope\":\"session\",\"runtime_grants_available\":true,\"rules_scope\":\"persistent_config\",\"rules\":[{\"permission\":\"edit\",\"pattern\":\"src/*\",\"action\":\"allow\"},{\"permission\":\"open_url\",\"pattern\":\"*\",\"action\":\"ask\"}],\"grants\":[{\"tool_name\":\"write_file\",\"target_path\":\"/tmp/workspace/src/app.zig\",\"display_target\":\"src/app.zig\"},{\"tool_name\":\"run_command\",\"target_path\":\"/tmp/workspace::npm test\",\"display_target\":\"/tmp/workspace::npm test\"}]}",
         json,
     );
+}
+
+test "web snapshot renders search and fetch backends" {
+    const snapshot = WebSnapshot{
+        .search = .tako,
+        .fetch = .browserbase,
+    };
+    const text = try snapshot.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("[web] search=tako\n[web] fetch=browserbase\n", text);
+
+    const json = try snapshot.renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expectEqualStrings("{\"kind\":\"web\",\"search\":\"tako\",\"fetch\":\"browserbase\"}", json);
 }
 
 test "model list explains public-only and rejected-credential catalogs" {
