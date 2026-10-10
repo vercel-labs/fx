@@ -115,6 +115,8 @@ pub const Evidence = struct {
     cause: FailureCause,
     delivery: Delivery,
     attempts: AttemptState,
+    /// Experimental strict budget. Normal recovery remains patient.
+    enforce_attempt_limit: bool = false,
     output: OutputEvidence = .none,
     tool: ToolEvidence = .none,
     pacing: RetryPacingState = .idle,
@@ -213,6 +215,13 @@ pub noinline fn decide(evidence: Evidence) Decision {
         };
     }
 
+    if (evidence.enforce_attempt_limit and evidence.attempts.consumed >= @max(1, evidence.attempts.limit)) {
+        return .{
+            .strategy = .pause,
+            .required_action = if (evidence.tool == .uncertain) .inspect_uncertain_tool else .continue_later,
+        };
+    }
+
     const strategy: Strategy = if (evidence.delivery == .definitely_unsent)
         .retry_request
     else switch (evidence.tool) {
@@ -253,6 +262,23 @@ pub noinline fn decide(evidence: Evidence) Decision {
         .reserve_provider_attempt = true,
         .throttled = throttled,
     };
+}
+
+test "adaptive retry strict budget pauses while control remains patient" {
+    var evidence: Evidence = .{
+        .cause = .provider_unavailable,
+        .delivery = .possibly_sent,
+        .attempts = .{ .consumed = 3, .limit = 3 },
+    };
+    try std.testing.expect(decide(evidence).reserve_provider_attempt);
+    evidence.enforce_attempt_limit = true;
+    try std.testing.expectEqual(Strategy.pause, decide(evidence).strategy);
+    try std.testing.expect(!decide(evidence).reserve_provider_attempt);
+    try std.testing.expectEqual(RequiredAction.continue_later, decide(evidence).required_action);
+    evidence.tool = .uncertain;
+    try std.testing.expectEqual(RequiredAction.inspect_uncertain_tool, decide(evidence).required_action);
+    evidence.cause = .connectivity_lost;
+    try std.testing.expectEqual(Strategy.wait_for_connectivity, decide(evidence).strategy);
 }
 
 /// Connectivity probe cadence after `attempt` consecutive connectivity
