@@ -248,6 +248,7 @@ function startAuthFixture(
   let resourceReadRequests = 0;
 
   const server = Bun.serve({
+    hostname: "127.0.0.1",
     port: 0,
     idleTimeout: 30,
     async fetch(request) {

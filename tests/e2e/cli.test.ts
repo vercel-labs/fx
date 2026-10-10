@@ -102,7 +102,7 @@ function writeSeededFxAuth(
 function startRequestCatcher() {
   const requests: Array<{ method: string; path: string }> = [];
   const server = Bun.serve({
-    hostname: "0.0.0.0",
+    hostname: "127.0.0.1",
     port: 0,
     fetch(request) {
       const url = new URL(request.url);

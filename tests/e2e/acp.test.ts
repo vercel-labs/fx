@@ -4101,6 +4101,7 @@ describe("acp: model-independent", () => {
       const pidPath = join(root.root, "rejected-project-mcp.pid");
       let unavailableAttempts = 0;
       const unavailable = Bun.serve({
+        hostname: "127.0.0.1",
         port: 0,
         fetch() {
           unavailableAttempts += 1;
@@ -4485,6 +4486,7 @@ describe("acp: model-independent", () => {
       let mcpRequests = 0;
       let metadataRequests = 0;
       const server = Bun.serve({
+        hostname: "127.0.0.1",
         port: 0,
         fetch(request) {
           const path = new URL(request.url).pathname;
@@ -4551,6 +4553,7 @@ describe("acp: model-independent", () => {
       const httpFixture = startModernMcpHttpFixture("json");
       const bearer = "acp-mcp-bearer-secret";
       const proxy = Bun.serve({
+        hostname: "127.0.0.1",
         port: 0,
         async fetch(request) {
           if (request.headers.get("authorization") !== `Bearer ${bearer}`) {
@@ -5566,6 +5569,7 @@ describe("acp: model-independent", () => {
       const wirePath = join(root.root, "mcp-elicitation-url.wire.jsonl");
       let urlRequests = 0;
       const target = Bun.serve({
+        hostname: "127.0.0.1",
         port: 0,
         fetch() {
           urlRequests += 1;
@@ -5769,6 +5773,7 @@ describe("acp: model-independent", () => {
       const root = createIsolatedRoot("fx-acp-mcp-legacy-url-");
       let targetRequests = 0;
       const target = Bun.serve({
+        hostname: "127.0.0.1",
         port: 0,
         fetch() {
           targetRequests += 1;

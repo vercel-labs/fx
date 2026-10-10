@@ -217,6 +217,7 @@ function startClassifierProxy(prepared: PreparedScenario) {
     prepared.actionBatches ?? actions.map((action) => [action]);
   let nextToolCallId = 1;
   const server = Bun.serve({
+    hostname: "127.0.0.1",
     port: 0,
     idleTimeout: 0,
     async fetch(req) {
