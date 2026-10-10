@@ -42,6 +42,29 @@ pub fn steeringMessage(alloc: Allocator, text: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, steering_open ++ "{s}" ++ steering_close, .{text});
 }
 
+test "withholdOlderToolImages keeps only the newest tool images" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var old_images = [_]types.ToolImage{.{ .data = @constCast("b2xk"), .mime_type = @constCast("image/png") }};
+    var new_images = [_]types.ToolImage{.{ .data = @constCast("bmV3"), .mime_type = @constCast("image/png") }};
+    const messages = [_]ChatMessage{
+        .{ .role = .tool, .content = "old", .tool_result_memory = .{ .tool_images = &old_images, .tool_image_handle = @constCast("image-result-old") } },
+        .{ .role = .assistant, .content = "next" },
+        .{ .role = .tool, .content = "new", .tool_result_memory = .{ .tool_images = &new_images } },
+    };
+    const projected = try withholdOlderToolImages(arena, &messages, 4096);
+    try std.testing.expectEqual(@as(usize, 0), projected[0].tool_result_memory.?.tool_images.len);
+    try std.testing.expect(std.mem.find(u8, projected[0].content.?, "read_tool_result image-result-old") != null);
+    try std.testing.expect(std.mem.endsWith(u8, projected[0].content.?, "old"));
+    try std.testing.expectEqual(@as(usize, 1), projected[2].tool_result_memory.?.tool_images.len);
+    try std.testing.expectEqual(@as(usize, 1), messages[0].tool_result_memory.?.tool_images.len);
+
+    const single = [_]ChatMessage{messages[2]};
+    const unchanged = try withholdOlderToolImages(arena, &single, 4096);
+    try std.testing.expect(unchanged.ptr == (&single).ptr);
+}
+
 test "steering message tells the model to apply the update and continue" {
     const message = try steeringMessage(std.testing.allocator, "focus on rendering");
     defer std.testing.allocator.free(message);
@@ -761,6 +784,31 @@ pub fn withholdRequestToolImages(arena: Allocator, messages: []const ChatMessage
         projected = output;
         output[index].tool_result_memory.?.tool_images = kept.items;
         output[index].content = try prependImageNotice(arena, notice.written(), message.content orelse "", text_limit);
+    }
+    return projected orelse messages;
+}
+
+/// Keeps images only on the newest tool result that has any. Older tool
+/// results keep their text and a notice; their images stay in session history.
+pub fn withholdOlderToolImages(arena: Allocator, messages: []const ChatMessage, text_limit: usize) ![]const ChatMessage {
+    var newest: ?usize = null;
+    for (messages, 0..) |message, index| {
+        const memory = message.tool_result_memory orelse continue;
+        if (memory.tool_images.len != 0) newest = index;
+    }
+    const keep_index = newest orelse return messages;
+    var projected: ?[]ChatMessage = null;
+    for (messages[0..keep_index], 0..) |message, index| {
+        const memory = message.tool_result_memory orelse continue;
+        if (memory.tool_images.len == 0) continue;
+        const output = projected orelse try arena.dupe(ChatMessage, messages);
+        projected = output;
+        output[index].tool_result_memory.?.tool_images = &.{};
+        const notice = if (memory.tool_image_handle) |handle|
+            try std.fmt.allocPrint(arena, "[Image not sent: an earlier request with it was too large for the provider. Load it again with read_tool_result {s} if you still need it.]\n", .{handle})
+        else
+            "[Image not sent: an earlier request with it was too large for the provider. Read the file again if you still need it.]\n";
+        output[index].content = try prependImageNotice(arena, notice, message.content orelse "", text_limit);
     }
     return projected orelse messages;
 }

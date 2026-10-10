@@ -3725,6 +3725,71 @@ test "retained tool images stay out of the measured text estimate" {
     try std.testing.expectEqual(raw_text_tokens, blind.estimated_input_tokens);
 }
 
+test "a too-large request with tool images retries with only the newest images" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(result_dir);
+
+    const image_len = try std.base64.standard.Decoder.calcSizeForSlice(test_image_base64);
+    const original = try alloc.alloc(u8, image_len);
+    defer alloc.free(original);
+    try std.base64.standard.Decoder.decode(original, test_image_base64);
+    var payloads: [2][]u8 = undefined;
+    for (&payloads, 0..) |*payload, index| {
+        const padded = try png_downscale.testPaddedPng(alloc, original, @intCast((index + 1) * 4 * 1024));
+        defer alloc.free(padded);
+        payload.* = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(padded.len));
+        _ = std.base64.standard.Encoder.encode(payload.*, padded);
+    }
+    defer for (payloads) |payload| alloc.free(payload);
+    const first_images = [_]types.ToolImage{.{ .data = payloads[0], .mime_type = @constCast("image/png") }};
+    const second_images = [_]types.ToolImage{.{ .data = payloads[1], .mime_type = @constCast("image/png") }};
+    const model = "provider/tool-image-request-limit";
+    const first_calls = [_]ToolCall{toolCall("call-1", "read_file", "{\"path\":\"a.png\"}")};
+    const second_calls = [_]ToolCall{toolCall("call-2", "read_file", "{\"path\":\"b.png\"}")};
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .tool_calls = &first_calls },
+        .{ .tool_calls = &second_calls },
+        .{ .status = .payload_too_large, .err_body = "request body too large" },
+        .{ .content = "done" },
+    });
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.available_capability_overrides = &.{.{ .model = model, .capabilities = .{
+        .context_window = 1_000_000,
+        .image_input_support = .native,
+        .supports_vision = true,
+        .supports_file_input = true,
+    } }};
+    hooks.capability_overrides = hooks.available_capability_overrides;
+    hooks.permission_decisions = &.{ .once, .once };
+    hooks.exec_plans = &.{
+        .{ .result = .{ .model_output = "first image", .tool_result_memory = .{ .tool_images = &first_images } } },
+        .{ .result = .{ .model_output = "second image", .tool_result_memory = .{ .tool_images = &second_images } } },
+    };
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.tool_result_dir = result_dir;
+    var job = fixture.job();
+    job.model = @constCast(model);
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    // The retry is the same conversation, not a compaction request.
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+    const rejected = gateway.request_bodies.items[2];
+    const retried = gateway.request_bodies.items[3];
+    try std.testing.expect(std.mem.find(u8, rejected, payloads[0]) != null);
+    try std.testing.expect(std.mem.find(u8, retried, payloads[0]) == null);
+    try std.testing.expect(std.mem.find(u8, retried, payloads[1]) != null);
+    try std.testing.expect(std.mem.find(u8, retried, "first image") != null);
+    try std.testing.expect(std.mem.find(u8, retried, "Image not sent") != null);
+    try std.testing.expect(std.mem.find(u8, retried, "compacted_conversation") == null);
+    try std.testing.expectEqualStrings("done", hooks.finish_assistant_text.?);
+}
+
 test "cancelled automatic compaction is retried by the next prompt" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

@@ -6785,6 +6785,7 @@ fn processQueuedPromptLoop(
     var last_tool_call_name: []const u8 = "none";
     var last_tool_call_id: []const u8 = "none";
     var last_gateway_message_count: usize = stable_prefix.items.len + history_messages.items.len + 1;
+    var last_request_had_tool_images = false;
     var selected_dynamic_tools: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
     try selected_dynamic_tools.ensureTotalCapacity(arena, config.initial_dynamic_tools.len);
     for (config.initial_dynamic_tools) |tool| {
@@ -7216,7 +7217,11 @@ fn processQueuedPromptLoop(
                 }
             }
             const materialized_messages = if (request_capabilities.image_input_support == .native) native: {
-                const loaded_messages = try runtime_execution_memory.materializeToolImages(overlay_arena, config, result_request_messages);
+                const all_loaded_messages = try runtime_execution_memory.materializeToolImages(overlay_arena, config, result_request_messages);
+                const loaded_messages = if (agent.tool_images_exceeded_request_size)
+                    try runtime_execution_memory.withholdOlderToolImages(overlay_arena, all_loaded_messages, config.max_tool_result_bytes)
+                else
+                    all_loaded_messages;
                 const max_dimension = image_data.requestMaxDimension(image_data.countRequestImages(loaded_messages));
                 const safe_tool_messages = try runtime_execution_memory.withholdRequestToolImages(overlay_arena, loaded_messages, max_dimension, config.max_tool_result_bytes);
                 const projection = try image_attachments.withholdOversizedAttachments(
@@ -7247,6 +7252,10 @@ fn processQueuedPromptLoop(
                 try deps.push_text(deps.ctx, .{ .operational = "\n" });
             }
             last_gateway_message_count = gateway_instructions.items.len + request_messages.len;
+            last_request_had_tool_images = for (request_messages) |message| {
+                const memory = message.tool_result_memory orelse continue;
+                if (memory.tool_images.len != 0) break true;
+            } else false;
             var provider_opts = try model_capabilities.resolveUltrafastProviderOptions(request_capabilities, job.provider, gateway_model, config.effort, route_fast_mode, config.ultrafast_mode);
             provider_opts.prompt_caching = config.provider_capabilities.gateway_prompt_caching;
             provider_opts.provider_order = config.provider_order;
@@ -8102,6 +8111,23 @@ fn processQueuedPromptLoop(
             else
                 compacted_suffix_len < within_turn_suffix.items.len;
             if (response_failure) |failure| {
+                // Image bytes, not tokens, usually push a request past a
+                // provider or proxy body limit, and compaction keeps recent
+                // tool images. Retry with only the newest ones, without
+                // compacting, and keep sending only the newest from now on.
+                if (failure.kind == .request_too_large and !agent.tool_images_exceeded_request_size and
+                    last_request_had_tool_images and streamReplaySafe(&stream_ctx) and
+                    !config.cancel_flag.load(.seq_cst))
+                {
+                    agent.tool_images_exceeded_request_size = true;
+                    debug_trace.eventf("context_compaction", "tool_images_withheld_after_request_too_large", step_ctx, "model={s}", .{gateway_model});
+                    _ = summary_accumulator.finishTokenRequestWithoutUsage(false);
+                    stream_result.deinit(arena);
+                    stream_result_set = false;
+                    reset_stream_for_next_attempt = true;
+                    skip_next_preflight_refresh = true;
+                    continue;
+                }
                 if (shouldRecoverContextOverflow(
                     failure,
                     has_compactable_context,

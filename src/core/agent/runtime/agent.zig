@@ -21,6 +21,10 @@ pub const Agent = struct {
     /// definitions, which compaction cannot shrink. Manual compaction sizes
     /// its result with it.
     request_fixed_tokens: ?usize = null,
+    /// Set when a provider rejected a request carrying tool images as too
+    /// large. Later requests send only the newest tool result's images; older
+    /// ones stay saved and reloadable.
+    tool_images_exceeded_request_size: bool = false,
 
     pub fn deinit(self: *Agent, alloc: Allocator) void {
         self.clearHistory(alloc);

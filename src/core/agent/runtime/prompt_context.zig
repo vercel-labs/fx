@@ -32,12 +32,27 @@ const ImagePartData = struct {
     data: ?[]const u8 = null,
 };
 
+/// Responses `input_image` parts carry the URL as a string; chat-completions
+/// `image_url` parts wrap it in an object.
+const ImageUrl = struct {
+    url: []const u8,
+
+    pub fn jsonParse(alloc: Allocator, source: anytype, options: std.json.ParseOptions) !ImageUrl {
+        if (try source.peekNextTokenType() == .string) {
+            return .{ .url = try std.json.innerParse([]const u8, alloc, source, options) };
+        }
+        const Wrapped = struct { url: []const u8 };
+        const wrapped = try std.json.innerParse(Wrapped, alloc, source, options);
+        return .{ .url = wrapped.url };
+    }
+};
+
 const ImagePart = struct {
     type: []const u8 = "",
     mediaType: ?[]const u8 = null,
     detail: ?[]const u8 = null,
     data: ?ImagePartData = null,
-    image_url: ?[]const u8 = null,
+    image_url: ?ImageUrl = null,
 };
 
 const MessageContent = struct {
@@ -62,6 +77,7 @@ const CostMessage = struct {
 const CostRequest = struct {
     prompt: ?[]const CostMessage = null,
     input: ?[]const CostMessage = null,
+    messages: ?[]const CostMessage = null,
 };
 
 pub const MeasurementError = error{ OutOfMemory, InvalidRequestMeasurement };
@@ -94,11 +110,13 @@ pub fn measureProviderRequest(alloc: Allocator, body: []const u8, request: strea
         else => error.InvalidRequestMeasurement,
     };
     defer parsed.deinit();
-    if (parsed.value.prompt != null and parsed.value.input != null) return error.InvalidRequestMeasurement;
-    const messages = parsed.value.prompt orelse parsed.value.input orelse {
-        // Unrecognized envelope (e.g. chat-completions "messages" bodies):
-        // degrade to the conservative text estimate rather than fail the
-        // request over a shape this measurer does not know.
+    const envelopes = @as(u8, @intFromBool(parsed.value.prompt != null)) +
+        @intFromBool(parsed.value.input != null) +
+        @intFromBool(parsed.value.messages != null);
+    if (envelopes > 1) return error.InvalidRequestMeasurement;
+    const messages = parsed.value.prompt orelse parsed.value.input orelse parsed.value.messages orelse {
+        // Unrecognized envelope: degrade to the conservative text estimate
+        // rather than fail the request over a shape this measurer does not know.
         const tokens = textTokens(body);
         return .{ .serialized_bytes = body.len, .text_tokens = tokens, .estimated_input_tokens = tokens };
     };
@@ -119,7 +137,9 @@ pub fn measureProviderRequest(alloc: Allocator, body: []const u8, request: strea
             continue;
         for (parts) |part| {
             const payload = if (parsed.value.input != null and std.mem.eql(u8, part.type, "input_image"))
-                part.image_url orelse return error.InvalidRequestMeasurement
+                (part.image_url orelse return error.InvalidRequestMeasurement).url
+            else if (parsed.value.messages != null and std.mem.eql(u8, part.type, "image_url"))
+                (part.image_url orelse return error.InvalidRequestMeasurement).url
             else if (parsed.value.prompt != null and std.mem.eql(u8, part.type, "file") and
                 std.mem.startsWith(u8, part.mediaType orelse "", "image/"))
             payload: {
@@ -498,12 +518,31 @@ test "provider request measurement excludes responses-protocol tool image payloa
     try std.testing.expectEqual(textTokens(without_image_payload), measured.text_tokens);
 }
 
-test "provider request measurement degrades to text estimate on unknown envelopes" {
-    // Chat-completions bodies carry a "messages" array this measurer does not
-    // parse. An image-bearing request must degrade to the conservative text
-    // estimate, never fail the request.
+test "provider request measurement excludes chat-completions image payloads" {
+    // Chat-completions bodies carry user images, including retained tool
+    // images, as image_url parts with data URLs.
     const body =
-        \\{"model":"fixture/model","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]}
+        \\{"model":"fixture/model","messages":[{"role":"tool","tool_call_id":"call_1","content":"capture"},{"role":"user","content":[{"type":"text","text":"The tool \"read_file\" returned 1 image(s)."},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAABBBBCCCCDDDD"}}]}]}
+    ;
+    var request = measurement_test_request(false);
+    request.messages = &.{.{
+        .role = .tool,
+        .content = "capture",
+        .tool_result_memory = .{
+            .tool_images = &.{.{ .data = @constCast("AAAABBBBCCCCDDDD"), .mime_type = @constCast("image/png") }},
+        },
+    }};
+    const measured = try measureProviderRequest(std.testing.allocator, body, request);
+    try std.testing.expect(measured.image_identity != null);
+    const without_image_payload =
+        \\{"model":"fixture/model","messages":[{"role":"tool","tool_call_id":"call_1","content":"capture"},{"role":"user","content":[{"type":"text","text":"The tool \"read_file\" returned 1 image(s)."},{"type":"image_url","image_url":{"url":""}}]}]}
+    ;
+    try std.testing.expectEqual(textTokens(without_image_payload), measured.text_tokens);
+}
+
+test "provider request measurement degrades to text estimate on unknown envelopes" {
+    const body =
+        \\{"model":"fixture/model","contents":[{"role":"user","parts":[{"inline_data":{"data":"AAAA"}}]}]}
     ;
     const measured = try measureProviderRequest(std.testing.allocator, body, measurement_test_request(true));
     try std.testing.expectEqual(textTokens(body), measured.estimated_input_tokens);
