@@ -69,6 +69,8 @@ Paste an image, attach one with `fx ask --image PATH`, or ask fx to `read_file` 
 
 When a file-backed image cannot be sent, the model receives its source path and the reason. It can use an image tool already on your system, such as `sips` on macOS or `ffmpeg` on Linux, to save a smaller **new** file and read that copy. fx does not automatically install image tools or overwrite the original. If no usable file or tool is available, the model should ask you for a smaller copy or permission before installing software.
 
+Every request re-sends the images already in the conversation, so image-heavy sessions keep requests under 30 MiB and 100 images. When a request would be larger, fx leaves the oldest images out of that request and tells the model how to load each one again; your conversation history is unchanged. If a provider still rejects a request as too large, fx lowers the limit for that model in the current conversation and retries with fewer images instead of compacting.
+
 ## Shell commands
 
 Commands run in your login shell, zsh or bash, with your startup files applied, so your aliases, functions, and `PATH` work as they do in your terminal. fx runs the startup files once and restores their result for each command, so a slow `.zshrc` does not slow down every call.

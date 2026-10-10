@@ -21,6 +21,9 @@ pub const Agent = struct {
     /// definitions, which compaction cannot shrink. Manual compaction sizes
     /// its result with it.
     request_fixed_tokens: ?usize = null,
+    /// A request size limit learned from a provider rejection, kept for later
+    /// requests to the same model in this conversation. Plain value state.
+    request_byte_limit: ?RequestByteLimitState = null,
 
     pub fn deinit(self: *Agent, alloc: Allocator) void {
         self.clearHistory(alloc);
@@ -88,6 +91,27 @@ pub const Agent = struct {
         self.history.clearRetainingCapacity();
         // Cleared history no longer resembles the calibrated request.
         self.request_token_calibration = null;
+        self.request_byte_limit = null;
+    }
+
+    /// Returns the learned request size limit for `model`, if any.
+    pub fn requestByteLimit(self: *const Agent, model: []const u8) ?usize {
+        const state = self.request_byte_limit orelse return null;
+        if (!std.mem.eql(u8, state.modelSlice(), model)) return null;
+        return state.bytes;
+    }
+
+    /// Lowers the learned limit for `model` to `bytes`. A limit learned for
+    /// another model is replaced, and an unmatchable model id is ignored.
+    pub fn lowerRequestByteLimit(self: *Agent, model: []const u8, bytes: usize) void {
+        if (model.len == 0 or model.len > max_request_calibration_model_bytes) {
+            debug_trace.logf("agent", "request size limit not learned: unmatchable model id len={d}", .{model.len});
+            return;
+        }
+        const limit = if (self.requestByteLimit(model)) |current| @min(current, bytes) else bytes;
+        var state = RequestByteLimitState{ .model_len = model.len, .bytes = limit };
+        @memcpy(state.model[0..model.len], model);
+        self.request_byte_limit = state;
     }
 
     /// Records the calibration for later turns. An empty or oversized model
@@ -146,7 +170,18 @@ pub const Agent = struct {
         previous.deinit(alloc);
         // Replaced history no longer resembles the calibrated request.
         self.request_token_calibration = null;
+        self.request_byte_limit = null;
         self.fresh = false;
+    }
+};
+
+pub const RequestByteLimitState = struct {
+    model: [max_request_calibration_model_bytes]u8 = undefined,
+    model_len: usize = 0,
+    bytes: usize = 0,
+
+    pub fn modelSlice(self: *const RequestByteLimitState) []const u8 {
+        return self.model[0..self.model_len];
     }
 };
 
@@ -201,6 +236,33 @@ test "Agent request token calibration survives startTurn and dies with cleared h
     agent.storeRequestTokenCalibration("fixture/model", cost);
     try agent.restoreHistory(alloc, &.{});
     try std.testing.expectEqual(@as(?RequestTokenCalibrationState, null), agent.request_token_calibration);
+}
+
+test "Agent request size limit only lowers, follows the model, and dies with cleared history" {
+    const alloc = std.testing.allocator;
+    var agent: Agent = .{};
+    defer agent.deinit(alloc);
+
+    try std.testing.expectEqual(@as(?usize, null), agent.requestByteLimit("fixture/model"));
+    agent.lowerRequestByteLimit("fixture/model", 4000);
+    agent.lowerRequestByteLimit("fixture/model", 9000);
+    try std.testing.expectEqual(@as(?usize, 4000), agent.requestByteLimit("fixture/model"));
+    try std.testing.expectEqual(@as(?usize, null), agent.requestByteLimit("other/model"));
+    agent.startTurn();
+    try std.testing.expectEqual(@as(?usize, 4000), agent.requestByteLimit("fixture/model"));
+
+    agent.lowerRequestByteLimit("other/model", 7000);
+    try std.testing.expectEqual(@as(?usize, 7000), agent.requestByteLimit("other/model"));
+    try std.testing.expectEqual(@as(?usize, null), agent.requestByteLimit("fixture/model"));
+
+    agent.lowerRequestByteLimit("x" ** (max_request_calibration_model_bytes + 1), 10);
+    try std.testing.expectEqual(@as(?usize, 7000), agent.requestByteLimit("other/model"));
+
+    agent.clearHistory(alloc);
+    try std.testing.expectEqual(@as(?usize, null), agent.requestByteLimit("other/model"));
+    agent.lowerRequestByteLimit("other/model", 7000);
+    try agent.restoreHistory(alloc, &.{});
+    try std.testing.expectEqual(@as(?usize, null), agent.requestByteLimit("other/model"));
 }
 
 test "Agent startTurn consumes freshness and resets usage" {

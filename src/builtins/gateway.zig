@@ -637,7 +637,7 @@ fn streamAgentCompletion(
     else
         vercel_failure_diagnostics.collect(alloc, payload, result.err_body);
     if (result.status != .ok) return .{ .failed = .{
-        .kind = failureKind(result.status),
+        .kind = gatewayFailureKind(alloc, result.status, result.err_body),
         .detail = result.err_body,
         .diagnostics = .{
             .schema = diagnostics.schema,
@@ -706,6 +706,25 @@ const EventBridge = struct {
         sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label, .arguments_json = arguments_json } });
     }
 };
+
+/// Gateway reports the last provider it tried, so a provider's size rejection
+/// can arrive as a 400 from a later fallback. Classify it as too large.
+fn gatewayFailureKind(alloc: Allocator, status: std.http.Status, err_body: ?[]const u8) agent_stream_provider_contract.FailureKind {
+    const kind = failureKind(status);
+    if (kind != .invalid_request) return kind;
+    const body = err_body orelse return kind;
+    return if (vercel_failure_diagnostics.providerRejectedRequestSize(alloc, body)) .request_too_large else kind;
+}
+
+test "Gateway 400 with a provider 413 attempt is a size failure" {
+    const alloc = std.testing.allocator;
+    const fallback_body = "{\"providerMetadata\":{\"gateway\":{\"routing\":{\"modelAttempts\":[{\"providerAttempts\":[{\"statusCode\":413},{\"statusCode\":400}]}]}}}}";
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.request_too_large, gatewayFailureKind(alloc, .bad_request, fallback_body));
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.invalid_request, gatewayFailureKind(alloc, .bad_request, "AI_APICallError: Bad Request"));
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.invalid_request, gatewayFailureKind(alloc, .bad_request, null));
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.request_too_large, gatewayFailureKind(alloc, .payload_too_large, null));
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.rate_limited, gatewayFailureKind(alloc, .too_many_requests, fallback_body));
+}
 
 fn failureKind(status: std.http.Status) agent_stream_provider_contract.FailureKind {
     return switch (status) {

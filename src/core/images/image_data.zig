@@ -177,9 +177,15 @@ pub fn countRequestImages(messages: []const types.ChatMessage) usize {
     return count;
 }
 
+/// Padded base64 length of `raw_bytes`, or null when it overflows `usize`.
+pub fn encodedImageBytes(raw_bytes: usize) ?usize {
+    const groups = @divTrunc(std.math.add(usize, raw_bytes, 2) catch return null, 3);
+    return std.math.mul(usize, groups, 4) catch null;
+}
+
 pub fn fitsEncodedImageLimit(raw_bytes: usize) bool {
-    const groups = @divTrunc(std.math.add(usize, raw_bytes, 2) catch return false, 3);
-    return (std.math.mul(usize, groups, 4) catch return false) <= max_encoded_image_bytes;
+    const encoded = encodedImageBytes(raw_bytes) orelse return false;
+    return encoded <= max_encoded_image_bytes;
 }
 
 pub const Dimensions = struct {

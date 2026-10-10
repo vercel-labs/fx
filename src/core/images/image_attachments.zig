@@ -828,15 +828,26 @@ fn probeSnapshotDimensions(path: []const u8) ?image_data.Dimensions {
     return reader.dimensions();
 }
 
-fn attachmentFitsEncodedLimit(attachment: types.ImageAttachment) bool {
-    if (attachment.inline_data) |bytes| return image_data.fitsEncodedImageLimit(bytes.len);
-    const path = attachment.snapshot_path orelse return false;
-    var file = openSnapshotFileNoFollow(path) catch return false;
+fn attachmentRawBytes(attachment: types.ImageAttachment) ?usize {
+    if (attachment.inline_data) |bytes| return bytes.len;
+    const path = attachment.snapshot_path orelse return null;
+    var file = openSnapshotFileNoFollow(path) catch return null;
     defer file.close(io_mod.getIo());
-    const stat = file.stat(io_mod.getIo()) catch return false;
-    if (stat.kind != .file or stat.nlink != 1) return false;
-    const size = std.math.cast(usize, stat.size) orelse return false;
+    const stat = file.stat(io_mod.getIo()) catch return null;
+    if (stat.kind != .file or stat.nlink != 1) return null;
+    return std.math.cast(usize, stat.size);
+}
+
+fn attachmentFitsEncodedLimit(attachment: types.ImageAttachment) bool {
+    const size = attachmentRawBytes(attachment) orelse return false;
     return image_data.fitsEncodedImageLimit(size);
+}
+
+/// Base64 bytes the attachment adds to a request, or null when its size
+/// cannot be read.
+pub fn attachmentEncodedBytes(attachment: types.ImageAttachment) ?usize {
+    const size = attachmentRawBytes(attachment) orelse return null;
+    return image_data.encodedImageBytes(size);
 }
 
 fn writeWithheldAttachmentNotice(

@@ -54,7 +54,9 @@ test {
     _ = @import("runtime/tests/tool_flow.zig");
     _ = @import("runtime/tests/interruption_flow.zig");
     _ = @import("runtime/tests/finalization_flow.zig");
+    _ = @import("runtime/agent.zig");
     _ = @import("runtime/orchestrator.zig");
+    _ = @import("runtime/request_image_budget.zig");
     _ = @import("runtime/text_completion.zig");
     _ = @import("runtime/vision_contracts.zig");
 }

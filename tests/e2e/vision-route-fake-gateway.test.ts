@@ -20,7 +20,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
-import { jpegHeader, solidPng } from "./fixtures/image-encoding";
+import { jpegHeader, paddedPng, solidPng } from "./fixtures/image-encoding";
 import { fakeGatewaySse, fakeGatewayTitleDefault, hasEmptyComposer, TITLE_GENERATION_MARKER, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
 const TIMEOUT = 15_000;
@@ -3362,3 +3362,140 @@ test.skipIf(!tmuxAvailable())("TUI recovery retains images through failure and c
     rmSync(root.root, { recursive: true, force: true });
   }
 }, TIMEOUT * 3);
+
+describe("request size budget", () => {
+  const SIZE_CAP_BYTES = 4_000_000;
+  const SIZE_IMAGE_COUNT = 6;
+  const SIZE_NOTICE = "not sent to keep the request under the provider's size limit";
+  const SIZE_PROMPT = "Read img01.png through img06.png one at a time with read_file.";
+  // Bodies AI Gateway returned on 2026-10-07 for a request over Claude's
+  // limit, reduced to the fields fx reads.
+  const gatewayFallbackBody = JSON.stringify({
+    error: { message: "Bad Request", type: "AI_APICallError", param: { statusCode: 400 } },
+    providerMetadata: {
+      gateway: {
+        routing: {
+          resolvedProvider: "anthropic",
+          modelAttempts: [
+            {
+              canonicalSlug: "anthropic/claude-haiku-4.5",
+              success: false,
+              providerAttempts: [
+                { provider: "anthropic", success: false, error: "Payload Too Large", statusCode: 413 },
+                { provider: "bedrock", success: false, error: "Input is too long.", statusCode: 400 },
+                { provider: "vertexAnthropic", success: false, error: "Bad Request", statusCode: 400 },
+              ],
+            },
+          ],
+        },
+      },
+    },
+  });
+  const payloadTooLargeBody = JSON.stringify({
+    error: { message: "Payload Too Large", type: "AI_APICallError", param: { statusCode: 413 } },
+  });
+
+  type SizeRequest = { body: string; images: string[]; tools: boolean; status: number };
+
+  function startSizeCappedGateway(rejection: { status: number; body: string }, images: Map<string, string>) {
+    const byData = new Map([...images].map(([name, data]) => [data, name]));
+    const requests: SizeRequest[] = [];
+    let issued = 0;
+    const server = Bun.serve({
+      port: 0,
+      maxRequestBodySize: 64 * 1024 * 1024,
+      async fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname === "/coding-agent/v1/models") {
+          return Response.json({ data: [{ id: GEMINI_MODEL, type: "language", tags: ["vision", "file-input", "tool-use"] }] });
+        }
+        if (req.method !== "POST") return new Response("not found", { status: 404 });
+        const body = await req.text();
+        if (body.includes(TITLE_GENERATION_MARKER)) return fakeGatewayTitleDefault();
+        const parsed = JSON.parse(body) as { tools?: unknown[] };
+        const tools = Array.isArray(parsed.tools) && parsed.tools.length > 0;
+        const carried = nativeFileParts(body).map((part) => byData.get(part.data.data) ?? "unknown");
+        const status = body.length > SIZE_CAP_BYTES ? rejection.status : 200;
+        requests.push({ body, images: carried, tools, status });
+        if (status !== 200) {
+          return new Response(rejection.body, { status, headers: { "content-type": "application/json" } });
+        }
+        if (!tools) return sseText("Summary: the user asked fx to read six images.");
+        if (issued < SIZE_IMAGE_COUNT) {
+          issued += 1;
+          return sseToolCall("read_file", { path: `img0${issued}.png` }, `call_img_${issued}`);
+        }
+        return sseText(`done: read ${SIZE_IMAGE_COUNT} images`);
+      },
+    });
+    return {
+      requests,
+      env: (root: ReturnType<typeof createIsolatedRoot>) => ({
+        HOME: root.home,
+        AI_GATEWAY_API_KEY: "fake-size-budget-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_GATEWAY_BASE_URL: `http://127.0.0.1:${server.port}`,
+        FX_GATEWAY_CHAT_URL: `http://127.0.0.1:${server.port}/v4/ai/language-model`,
+        FX_MODEL: GEMINI_MODEL,
+      }),
+      stop() {
+        server.stop(true);
+      },
+    };
+  }
+
+  function writeSizeImages(workspace: string) {
+    const images = new Map<string, string>();
+    for (let index = 1; index <= SIZE_IMAGE_COUNT; index++) {
+      // About 1 MB of base64 each, distinct bytes per file.
+      const png = paddedPng(solidPng(64, 64), 750_000 + index);
+      writeFileSync(join(workspace, `img0${index}.png`), png);
+      images.set(`img0${index}.png`, png.toString("base64"));
+    }
+    return images;
+  }
+
+  for (const [label, rejection] of [
+    ["a Gateway 400 hiding a provider 413", { status: 400, body: gatewayFallbackBody }],
+    ["an HTTP 413", { status: 413, body: payloadTooLargeBody }],
+  ] as const) {
+    test(`${label} leaves out the oldest images instead of compacting`, async () => {
+      const root = createIsolatedRoot();
+      const images = writeSizeImages(root.workspace);
+      const gateway = startSizeCappedGateway(rejection, images);
+      try {
+        const result = await runFx(["ask", "--json", "--auto", "--no-color", SIZE_PROMPT], {
+          cwd: root.workspace,
+          env: gateway.env(root),
+          timeoutMs: TIMEOUT * 2,
+        });
+        const json = parseFxJson(result);
+        expect(json.output).toContain(`done: read ${SIZE_IMAGE_COUNT} images`);
+
+        const rejected = gateway.requests.filter((request) => request.status !== 200);
+        expect(rejected).toHaveLength(1);
+        // No summary request: the conversation was not compacted.
+        expect(gateway.requests.every((request) => request.tools)).toBe(true);
+
+        const rejectedIndex = gateway.requests.indexOf(rejected[0]!);
+        const learnedLimit = Math.floor(rejected[0]!.body.length / 4) * 3;
+        const after = gateway.requests.slice(rejectedIndex + 1);
+        expect(after.length).toBeGreaterThan(0);
+        for (const request of after) {
+          expect(request.body.length).toBeLessThanOrEqual(learnedLimit);
+          // Text history survives: the original prompt rides every request.
+          expect(request.body).toContain(SIZE_PROMPT);
+        }
+        // The retry drops the oldest images and keeps the newest.
+        expect(after[0]!.images).not.toContain("img01.png");
+        expect(after[0]!.images).toContain(rejected[0]!.images.at(-1));
+        expect(after[0]!.body).toContain(SIZE_NOTICE);
+        expect(after[0]!.body).toContain("read_tool_result with handle");
+        expect(after.at(-1)!.images).toContain("img06.png");
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }, TIMEOUT * 3);
+  }
+});

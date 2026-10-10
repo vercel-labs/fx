@@ -57,6 +57,7 @@ const image_data = @import("../../images/image_data.zig");
 const runtime_assistant_stream = @import("assistant_stream.zig");
 const runtime_tool_presentation = @import("tool_presentation.zig");
 const runtime_execution_memory = @import("execution_memory.zig");
+const request_image_budget = @import("request_image_budget.zig");
 const execution_memory_helpers = @import("../execution_memory.zig");
 const runtime_agent = @import("agent.zig");
 const runtime_tool_admission = @import("tool_admission.zig");
@@ -4511,6 +4512,95 @@ test "context overflow recovery is typed safe and bounded" {
     ));
 }
 
+/// Size retries allowed in one turn. Each lowers the learned limit, so the
+/// next request leaves out more of its oldest images.
+const max_request_size_retries: u8 = 2;
+
+/// A size rejection is retried without compaction only when the rejected
+/// request carried images the next one can leave out. Anything else falls
+/// through to context overflow recovery.
+fn shouldRetryWithFewerImages(
+    failure: agent_stream_provider.Failure,
+    images_sent: usize,
+    retries_used: u8,
+    replay_safe: bool,
+    cancelled: bool,
+) bool {
+    return !cancelled and
+        replay_safe and
+        images_sent > 0 and
+        retries_used < max_request_size_retries and
+        failure.kind == .request_too_large;
+}
+
+/// The size the next request must fit after `rejected_bytes` were refused.
+fn loweredRequestByteLimit(rejected_bytes: usize) usize {
+    return rejected_bytes / 4 * 3;
+}
+
+/// Leaves the oldest images out of `request` until its serialized body fits
+/// `limits`, rebuilding after each change, and returns the body to send.
+/// Every pass leaves out at least one more image, so the loop ends.
+fn fitRequestImages(
+    arena: Allocator,
+    provider: agent_stream_provider.Provider,
+    request: *agent_stream_provider.RequestData,
+    first_body: []const u8,
+    limits: request_image_budget.Limits,
+    tool_text_limit: usize,
+    trace_ctx: TraceContext,
+) ![]const u8 {
+    var body = first_body;
+    while (true) {
+        const projection = try request_image_budget.withholdOldestImages(arena, request.messages, body.len, limits, tool_text_limit);
+        if (projection.withheld == 0) return body;
+        var smaller = request.*;
+        smaller.messages = projection.messages;
+        const rebuilt = (try provider.buildRequest(arena, smaller)) orelse return body;
+        debug_trace.eventf("images", "request_images_withheld", trace_ctx, "withheld={d} request_bytes_before={d} request_bytes_after={d} limit_bytes={d}", .{
+            projection.withheld,
+            body.len,
+            rebuilt.len,
+            limits.max_request_bytes,
+        });
+        request.* = smaller;
+        body = rebuilt;
+    }
+}
+
+test "size rejections retry with fewer images only while images remain" {
+    const too_large = agent_stream_provider.Failure{ .kind = .request_too_large };
+    const overflow_text = agent_stream_provider.Failure{
+        .kind = .invalid_request,
+        .detail = @constCast("AI_APICallError: input is too long"),
+    };
+    const cases = [_]struct {
+        failure: agent_stream_provider.Failure,
+        images_sent: usize = 3,
+        retries_used: u8 = 0,
+        replay_safe: bool = true,
+        cancelled: bool = false,
+        expected: bool,
+    }{
+        .{ .failure = too_large, .expected = true },
+        .{ .failure = too_large, .retries_used = max_request_size_retries - 1, .expected = true },
+        .{ .failure = too_large, .retries_used = max_request_size_retries, .expected = false },
+        .{ .failure = too_large, .images_sent = 0, .expected = false },
+        .{ .failure = too_large, .replay_safe = false, .expected = false },
+        .{ .failure = too_large, .cancelled = true, .expected = false },
+        .{ .failure = overflow_text, .expected = false },
+    };
+    for (cases) |case| try std.testing.expectEqual(case.expected, shouldRetryWithFewerImages(
+        case.failure,
+        case.images_sent,
+        case.retries_used,
+        case.replay_safe,
+        case.cancelled,
+    ));
+    try std.testing.expectEqual(@as(usize, 30_000), loweredRequestByteLimit(40_000));
+    try std.testing.expect(loweredRequestByteLimit(33_829_735) < 33_829_735);
+}
+
 /// fx never asks a model to extend an assistant message, and models without
 /// prefill support reject that shape. Returns `source` unchanged, or an
 /// `arena` copy ending with a host continuation when history projection left
@@ -7008,6 +7098,7 @@ fn processQueuedPromptLoop(
         var assistant_prefill_recovery_used = false;
         var skip_next_preflight_refresh = false;
         var context_overflow_recovery: ContextOverflowRecoveryState = .ready;
+        var request_size_retries: u8 = 0;
         var recovery_has_unexecuted_tool_start = false;
         var successful_recovery_strategy: ?model_response_recovery.Strategy = null;
         defer {
@@ -7269,7 +7360,7 @@ fn processQueuedPromptLoop(
                 config.first_call_tool_choice
             else
                 .auto;
-            const request_data = agent_stream_provider.RequestData{
+            var request_data = agent_stream_provider.RequestData{
                 .model = gateway_model,
                 .instructions = gateway_instructions.items,
                 .messages = request_messages,
@@ -7287,11 +7378,22 @@ fn processQueuedPromptLoop(
             };
             var prepared_request_body: ?[]const u8 = null;
             var request_cost_for_attempt: ?runtime_prompt_context.RequestCost = null;
+            var request_images_for_attempt: usize = 0;
             if (try deps.agent_stream_provider.buildRequest(
                 overlay_arena,
                 request_data,
-            )) |request_body| {
+            )) |built_request_body| {
+                const request_body = try fitRequestImages(
+                    overlay_arena,
+                    deps.agent_stream_provider,
+                    &request_data,
+                    built_request_body,
+                    .{ .max_request_bytes = agent.requestByteLimit(gateway_model) orelse request_image_budget.default_max_request_bytes },
+                    config.max_tool_result_bytes,
+                    step_ctx,
+                );
                 prepared_request_body = request_body;
+                request_images_for_attempt = image_data.countRequestImages(request_data.messages);
                 const measured_request_cost = try runtime_prompt_context.measureProviderRequest(std.heap.c_allocator, request_body, request_data);
                 const applicable_calibration = if (agent.request_token_calibration) |*calibration|
                     if (std.mem.eql(u8, calibration.modelSlice(), gateway_model) and calibration.cost.applies(measured_request_cost))
@@ -8102,6 +8204,32 @@ fn processQueuedPromptLoop(
             else
                 compacted_suffix_len < within_turn_suffix.items.len;
             if (response_failure) |failure| {
+                // A size rejection with images aboard retries with a lower
+                // limit, which leaves out the oldest images instead of
+                // compacting the conversation.
+                if (request_cost_for_attempt) |rejected| if (shouldRetryWithFewerImages(
+                    failure,
+                    request_images_for_attempt,
+                    request_size_retries,
+                    streamReplaySafe(&stream_ctx),
+                    config.cancel_flag.load(.seq_cst),
+                )) {
+                    const limit = loweredRequestByteLimit(rejected.serialized_bytes);
+                    agent.lowerRequestByteLimit(gateway_model, limit);
+                    request_size_retries += 1;
+                    debug_trace.eventf("images", "request_size_retry", step_ctx, "model={s} rejected_bytes={d} images_sent={d} limit_bytes={d} retry={d}", .{
+                        gateway_model,
+                        rejected.serialized_bytes,
+                        request_images_for_attempt,
+                        limit,
+                        request_size_retries,
+                    });
+                    _ = summary_accumulator.finishTokenRequestWithoutUsage(false);
+                    stream_result.deinit(arena);
+                    stream_result_set = false;
+                    reset_stream_for_next_attempt = true;
+                    continue;
+                };
                 if (shouldRecoverContextOverflow(
                     failure,
                     has_compactable_context,
