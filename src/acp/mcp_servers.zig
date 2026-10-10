@@ -3,6 +3,9 @@ const acp_types = @import("types.zig");
 const builtin_tools = @import("../builtins/tools.zig");
 const mcp_contract = @import("../core/mcp/mcp_contract.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
+const mcp_host = @import("../core/mcp_host/host.zig");
+const io_mod = @import("../core/shared/io.zig");
+const build_options = @import("build_options");
 const streamable_http = @import("../core/mcp/streamable_http.zig");
 const message_carrier = @import("../core/mcp/message_carrier.zig");
 const elicitation = @import("../core/mcp/elicitation.zig");
@@ -47,6 +50,8 @@ pub const OwnedServerConfigs = struct {
 
 pub const Preparation = union(enum) {
     ready: ?*mcp_runtime.McpRuntime,
+    /// MCP-v2's host, when FX_MCP_ENGINE=v2 selects it.
+    host: *mcp_host.Host,
     failed: []u8,
 
     pub fn deinit(self: *Preparation, alloc: Allocator) void {
@@ -57,6 +62,7 @@ pub const Preparation = union(enum) {
                     alloc.destroy(runtime);
                 }
             },
+            .host => |h| h.destroy(),
             .failed => |message| alloc.free(message),
         }
         self.* = undefined;
@@ -68,6 +74,18 @@ pub const Preparation = union(enum) {
                 self.* = .{ .ready = null };
                 break :blk runtime;
             },
+            .host => null,
+            .failed => unreachable,
+        };
+    }
+
+    pub fn takeHost(self: *Preparation) ?*mcp_host.Host {
+        return switch (self.*) {
+            .host => |h| blk: {
+                self.* = .{ .ready = null };
+                break :blk h;
+            },
+            .ready => null,
             .failed => unreachable,
         };
     }
@@ -106,6 +124,31 @@ pub fn parseResume(alloc: Allocator, params_raw: ?[]const u8) ParseError!OwnedSe
 
 /// Moves parsed configs into an existing MCP runtime and performs required
 /// server startup. A failed result owns its rendered diagnostic.
+fn prepareHost(
+    alloc: Allocator,
+    configs: []const mcp_contract.McpServerConfig,
+    questions: elicitation.Capabilities,
+    url_completions: ?tool_mcp_runtime.LegacyUrlCompletionSink,
+) Allocator.Error!Preparation {
+    const home = io_mod.getenv("HOME") orelse return .{ .failed = try alloc.dupe(u8, "MCP servers need HOME to be set.") };
+    // Read only while the host starts.
+    var inherited = io_mod.cloneEnvironMap(alloc) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .failed = try std.fmt.allocPrint(alloc, "MCP servers could not read the environment: {s}", .{@errorName(err)}) },
+    };
+    defer inherited.deinit();
+    const h = mcp_host.Host.create(alloc, io_mod.getIo(), configs, &inherited, .{
+        .client_version = build_options.app_version,
+        .credentials = .detect(alloc, home),
+        .questions = questions,
+        .url_completions = url_completions,
+    }, builtin_tools.registry) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .failed = try std.fmt.allocPrint(alloc, "MCP servers could not start: {s}", .{@errorName(err)}) },
+    };
+    return .{ .host = h };
+}
+
 pub fn prepare(
     alloc: Allocator,
     configs: *OwnedServerConfigs,
@@ -114,6 +157,8 @@ pub fn prepare(
     host_channel: ?message_carrier.Carrier,
 ) Allocator.Error!Preparation {
     if (configs.items.items.len == 0) return .{ .ready = null };
+    // MCP-v2 starts each server when the model first needs it.
+    if (mcp_host.selected()) return prepareHost(alloc, configs.items.items, elicitation_capabilities, legacy_url_completion_sink);
 
     const runtime = try alloc.create(mcp_runtime.McpRuntime);
     runtime.* = mcp_runtime.McpRuntime.initWithElicitation(alloc, elicitation_capabilities);

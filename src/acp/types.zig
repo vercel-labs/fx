@@ -172,6 +172,23 @@ pub fn writeAgentMessageChunk(w: *std.Io.Writer, message_id: []const u8, text: [
     try w.writeAll("}}");
 }
 
+/// ACP v1 Session Notice: shown to the user, never part of the session's
+/// history. Only for a client that advertised `session.notices`.
+pub fn writeNotice(w: *std.Io.Writer, severity: []const u8, title: []const u8) !void {
+    try w.writeAll("{\"sessionUpdate\":\"notice\",\"severity\":");
+    try writeJsonStr(severity, w);
+    try w.writeAll(",\"title\":");
+    try writeJsonStr(title, w);
+    try w.writeByte('}');
+}
+
+test "writeNotice writes an ACP v1 notice update" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeNotice(&out.writer, "info", "A \"quoted\" title");
+    try std.testing.expectEqualStrings("{\"sessionUpdate\":\"notice\",\"severity\":\"info\",\"title\":\"A \\\"quoted\\\" title\"}", out.written());
+}
+
 pub fn writeAgentThoughtChunk(w: *std.Io.Writer, text: []const u8) !void {
     try w.writeAll("{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":");
     try writeJsonStr(text, w);
@@ -288,6 +305,8 @@ pub const AgentCapabilities = struct {
     system_prompt: bool = false,
     /// Serves `type: "acp"` MCP servers over this connection.
     mcp_over_acp: bool = false,
+    /// Speaks MCP's HTTP+SSE transport (2024-11-05), which MCP-v2 doesn't.
+    mcp_sse: bool = true,
 };
 
 pub fn writeInitializeResponse(w: *std.Io.Writer, capabilities: AgentCapabilities) !void {
@@ -299,7 +318,7 @@ pub fn writeInitializeResponse(w: *std.Io.Writer, capabilities: AgentCapabilitie
     try w.print("\"promptCapabilities\":{{\"image\":{s},\"audio\":false,\"embeddedContext\":true}},", .{if (capabilities.image_prompts) "true" else "false"});
     try w.print("\"mcpCapabilities\":{{\"http\":{s},\"sse\":{s},\"acp\":{s}}},", .{
         mcp_servers,
-        mcp_servers,
+        if (capabilities.mcp_servers and capabilities.mcp_sse) "true" else "false",
         if (capabilities.mcp_over_acp) "true" else "false",
     });
     try w.writeAll("\"sessionCapabilities\":{\"list\":{},\"resume\":{},\"close\":{}");

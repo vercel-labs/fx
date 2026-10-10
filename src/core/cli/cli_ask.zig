@@ -43,6 +43,7 @@ const mcp_elicitation = @import("../mcp/elicitation.zig");
 const mcp_access_policy = @import("../mcp/access_policy.zig");
 const mcp_model_catalog = @import("../mcp/model_catalog.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
+const mcp_host = @import("../mcp_host/host.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
@@ -255,6 +256,7 @@ pub const Config = struct {
     max_history_turns: usize,
     mode_registry: mode_registry.Registry,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
+    load_mcp_host: ?mcp_host.LoadFn = null,
     context_limit_overrides: []const config_runtime.context_limits.Override = &.{},
     additional_directories: []const []const u8 = &.{},
     saved_directories_suppressed: bool = false,
@@ -465,6 +467,7 @@ const RunDeps = struct {
     context_registry: context_contract.Registry,
     tool_set: tool_set_contract.ToolSet,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
+    load_mcp_host: ?mcp_host.LoadFn = null,
     process_queued_prompt: ProcessQueuedPromptFn = processQueuedPromptDefault,
     persist_yolo_acknowledgment: PersistYoloAcknowledgmentFn = persistYoloAcknowledgmentDefault,
     discard_pristine_session_ctx: ?*anyopaque = null,
@@ -631,6 +634,8 @@ const AskContext = struct {
     context_snapshot: context_contract.GatheredContextSnapshot = .{},
     context_enabled: bool = true,
     mcp: ?*mcp_runtime.McpRuntime = null,
+    /// MCP-v2's host when FX_MCP_ENGINE=v2 selects it; `mcp` then stays null.
+    mcp_host: ?*mcp_host.Host = null,
     mcp_elicitation_capabilities: @import("../mcp/elicitation.zig").Capabilities = .{},
     failed: bool = false,
     typed_error_code: ?[]const u8 = null,
@@ -835,6 +840,8 @@ const AskContext = struct {
             m.deinit();
             self.alloc.destroy(m);
         }
+        // `fx ask` exits next, so nothing waits for its servers.
+        if (self.mcp_host != null) mcp_host.signalServersForExit();
         if (self.image_snapshot_temp_dir) |path| {
             image_attachments.cleanupSnapshotDir(path);
             self.alloc.free(path);
@@ -1265,7 +1272,9 @@ const AskContext = struct {
             .lifecycle_view = self.lifecycle_view,
             .lifecycle_scope = self.lifecycleContext().scope,
         };
-        if (self.mcp != null) {
+        if (self.mcp_host) |h| {
+            h.catalog.wire(&tc);
+        } else if (self.mcp != null) {
             tc.mcp_ctx = @ptrCast(self);
             tc.mcp_has_tool = mcpHasTool;
             tc.mcp_validate_tool = mcpValidateTool;
@@ -1374,6 +1383,7 @@ pub fn run(alloc: Allocator, args: []const [:0]const u8, cfg: Config, context_re
         .context_registry = context_registry,
         .tool_set = tool_set,
         .load_mcp_runtime = cfg.load_mcp_runtime,
+        .load_mcp_host = cfg.load_mcp_host,
         .install_headless_interrupt = true,
     });
 }
@@ -1619,6 +1629,7 @@ pub fn runPrompt(alloc: Allocator, prompt: []const u8, auto_permission: bool, cf
             .context_registry = context_registry,
             .tool_set = tool_set,
             .load_mcp_runtime = cfg.load_mcp_runtime,
+            .load_mcp_host = cfg.load_mcp_host,
         },
     });
     defer result.deinit(alloc);
@@ -1633,6 +1644,7 @@ pub fn runPromptCapture(alloc: Allocator, prompt: []const u8, auto_permission: b
             .context_registry = context_registry,
             .tool_set = tool_set,
             .load_mcp_runtime = cfg.load_mcp_runtime,
+            .load_mcp_host = cfg.load_mcp_host,
         },
     });
 }
@@ -2025,6 +2037,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         } else {
             mcp.connectRequiredForAsk(ctx.toolRegistry(), ctx.cancelFlag());
         }
+    }
+    if (options.deps.load_mcp_host) |load_host| {
+        ctx.mcp_host = try load_host(alloc, startup.workspace_root, ctx.toolRegistry(), .{ .questions = ctx.mcp_elicitation_capabilities });
+        if (ctx.mcp_host) |h| try reportUnapprovedMcpServers(&ctx, h);
     }
     try ctx.checkCancellation();
     if (ctx.mcp) |mcp| {
@@ -2619,7 +2635,9 @@ fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, project_context: ?
     try ctx.deps.context_registry.appendDefaultStatic(.{
         .project_context = project_context orelse ctx.modelVisibleProjectContext(),
     }, arena, messages);
-    var snapshot = if (ctx.mcp) |mcp|
+    var snapshot = if (ctx.mcp_host) |h|
+        try h.catalog.modelSnapshot(arena)
+    else if (ctx.mcp) |mcp|
         try mcp.snapshotModelCatalog(arena, ctx.permission_rules, true)
     else
         try mcp_model_catalog.Snapshot.empty(arena);
@@ -2960,6 +2978,7 @@ fn lifecycleDynamicMcpToolAvailable(ctx: *AskContext, name: []const u8, advertis
 }
 
 fn lifecycleDynamicMcpAvailability(ctx: *AskContext) tool_mcp_runtime.RuntimeCapabilities {
+    if (ctx.mcp_host) |h| return h.catalog.runtimeCapabilities();
     if (ctx.mcp == null) return .{};
     return .{ .context = @ptrCast(ctx), .has_tool = mcpHasTool };
 }
@@ -3823,6 +3842,18 @@ fn onMcpProgress(raw_ctx: *anyopaque, lifecycle_id: types.ToolLifecycleId, text:
     };
 }
 
+/// The same warning v1 gives for project servers still waiting for approval.
+fn reportUnapprovedMcpServers(ctx: *AskContext, h: *mcp_host.Host) !void {
+    var listed = false;
+    for (h.runtime.servers()) |s| {
+        if (s.held != .waiting_for_approval) continue;
+        try ctx.writeStderr(if (listed) ", " else "fx ask: skipped unapproved project MCP servers: ");
+        try ctx.writeStderr(s.name);
+        listed = true;
+    }
+    if (listed) try ctx.writeStderr(". Approve with fx mcp trust approve <name> before retrying.\n");
+}
+
 fn activateAskMcp(ctx: *AskContext) anyerror!*mcp_runtime.McpRuntime {
     const runtime = ctx.mcp orelse return error.McpRuntimeUnavailable;
     try runtime.connectDeferredForAsk(ctx.toolRegistry(), ctx.cancelFlag());
@@ -4098,7 +4129,9 @@ fn resolveAskSubagentAuthority(
     if (ctx.mcp != null) {
         _ = activateAskMcp(ctx) catch return error.HostAuthorityUnavailable;
     }
-    const integrations = if (ctx.mcp) |mcp|
+    const integrations = if (ctx.mcp_host) |h|
+        h.catalog.snapshotToolNames(alloc, ctx.permission_rules)
+    else if (ctx.mcp) |mcp|
         mcp.snapshotToolNames(alloc, ctx.permission_rules)
     else
         alloc.alloc([]u8, 0);
@@ -4107,7 +4140,9 @@ fn resolveAskSubagentAuthority(
         for (owned_integrations) |name| alloc.free(name);
         alloc.free(owned_integrations);
     }
-    var mcp_view = if (ctx.mcp) |mcp|
+    var mcp_view = if (ctx.mcp_host) |h|
+        try h.catalog.snapshotAccessView(alloc, root_id, root_id, ctx.permission_rules, false)
+    else if (ctx.mcp) |mcp|
         try mcp.snapshotAccessView(
             alloc,
             root_id,
@@ -5404,6 +5439,7 @@ test "CLI lifecycle dynamic MCP capability preserves its callback context" {
     var mcp = mcp_runtime.McpRuntime.init(std.testing.allocator);
     defer mcp.deinit();
     ctx.mcp = &mcp;
+    ctx.mcp_host = null;
 
     const capability = lifecycleDynamicMcpAvailability(&ctx);
 

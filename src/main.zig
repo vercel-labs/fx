@@ -76,6 +76,7 @@ const display_width = @import("core/shared/display_width.zig");
 const file_index_mod = @import("core/workspace/file_index.zig");
 const mcp_command_provider = @import("core/mcp/command_provider.zig");
 const mcp_runtime_mod = @import("core/mcp/mcp_runtime.zig");
+const mcp_host = @import("core/mcp_host/host.zig");
 const mcp_model_catalog = @import("core/mcp/model_catalog.zig");
 const mcp_access_policy = @import("core/mcp/access_policy.zig");
 const mcp_menu_state = @import("core/mcp/menu_state.zig");
@@ -438,8 +439,10 @@ const App = struct {
         return builtin_context.prompt_policy;
     }
 
-    pub fn slashRegistry(_: *const Self) command_specs.SlashRegistry {
-        return builtin_commands.slash_registry;
+    pub fn slashRegistry(self: *const Self) command_specs.SlashRegistry {
+        var registry = builtin_commands.slash_registry;
+        registry.arguments = self.mcp.host_completion;
+        return registry;
     }
 
     pub fn mcpCommandProvider(_: *const Self) mcp_command_provider.Provider {
@@ -690,6 +693,7 @@ const App = struct {
             handle_sigwinch,
             .{
                 .load_mcp_runtime = if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
+                .load_mcp_host = if (comptime host_target.is_wasm) null else builtin_mcp.loadHost,
                 .skill_root_policy = if (comptime host_target.is_wasm) wasm_skill_root_policy else builtin_skills.root_policy,
                 .terminal_title = app.terminalTitle(),
             },
@@ -1644,6 +1648,45 @@ const App = struct {
 
     pub fn installInitialMcpRuntime(self: *App, runtime: ?*mcp_runtime_mod.McpRuntime) void {
         self.mcp.installInitial(runtime);
+    }
+
+    pub fn loadMcpHost(self: *App, load: mcp_host.LoadFn) !void {
+        try self.mcp.loadHost(load, self.alloc, self.workspace_root, self.toolRegistry(), .{ .form = true, .url = true });
+    }
+
+    pub fn mcpHostSelected(_: *const App) bool {
+        return mcp_host.selected();
+    }
+
+    pub fn runMcpVerbs(self: *App, rest: []const u8) !void {
+        try self.mcp.runVerbs(io_mod.getenv("HOME") orelse "", self.workspace_root, rest);
+    }
+
+    pub fn takeMcpHostNotices(self: *App) []app_mcp_runtime.State.HostNotice {
+        return self.mcp.takeHostNotices();
+    }
+
+    pub fn refreshMcpCompletion(self: *App) void {
+        self.mcp.refreshCompletion();
+    }
+
+    pub fn openMcpHostMenu(self: *App) void {
+        self.mcp.openHostMenu();
+    }
+
+    /// The composer's text is the menu's filter.
+    pub fn mcpHostMenuKey(self: *App, key: mcp_host.menu.Key) !void {
+        try self.mcp.hostMenuKey(key, self.input_runtime.edit_state.input.items, io_mod.getenv("HOME") orelse "", self.workspace_root);
+        self.shell.render_requests.request(.footer);
+    }
+
+    pub fn refreshMcpHostMenu(self: *App) void {
+        if (self.mcp.refreshHostMenu()) self.shell.render_requests.request(.footer);
+    }
+
+    pub fn applyMcpHostReload(self: *App) !void {
+        if (!self.mcp.takeHostReload()) return;
+        try self.mcp.reloadHost(self.alloc, self.workspace_root, self.toolRegistry());
     }
 
     pub fn acquireMcpRuntime(self: *App) ?app_mcp_runtime.Lease {
@@ -3104,6 +3147,7 @@ const App = struct {
         try app_commands.Handlers(App).collectMcpAuthenticationFacts(self);
         try app_commands.Handlers(App).collectMcpReloadFacts(self);
         try app_commands.Handlers(App).collectMcpStartupHealthFacts(self);
+        try app_commands.Handlers(App).collectMcpHostFacts(self);
         try app_commands.Handlers(App).collectShellSnapshotFacts(self);
         if (try self.mcp.refreshMenuHealth(self.alloc, @intCast(@max(io_mod.milliTimestamp(), 0)))) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
@@ -3739,7 +3783,13 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
             std.mem.eql(u8, effective_args[2], "slack")) or
             std.mem.eql(u8, effective_args[1], "auth") or
             std.mem.eql(u8, effective_args[1], "list") or
-            std.mem.eql(u8, effective_args[1], "logout");
+            std.mem.eql(u8, effective_args[1], "logout") or
+            // MCP-v2's verbs start a host or delete a stored login.
+            std.mem.eql(u8, effective_args[1], "show") or
+            std.mem.eql(u8, effective_args[1], "login") or
+            std.mem.eql(u8, effective_args[1], "remove") or
+            std.mem.eql(u8, effective_args[1], "approve") or
+            std.mem.eql(u8, effective_args[1], "reject");
     }
     return std.mem.eql(u8, command, "slack") or
         std.mem.eql(u8, command, "login") or
@@ -3778,14 +3828,14 @@ test "credential-reading commands use early threaded io without full entry confi
 test "MCP credential commands use early threaded io" {
     try std.testing.expect(needsEarlyThreadedIo(&.{ "mcp", "add", "slack" }));
     try std.testing.expect(!needsEarlyThreadedIo(&.{ "mcp", "add", "slack", "node" }));
-    for ([_][:0]const u8{ "auth", "list", "logout" }) |operation| {
+    for ([_][:0]const u8{ "auth", "list", "logout", "show", "login", "remove", "approve", "reject" }) |operation| {
         try std.testing.expect(needsEarlyThreadedIo(&.{
             @as([:0]const u8, "mcp"),
             operation,
             @as([:0]const u8, "fixture"),
         }));
     }
-    for ([_][:0]const u8{ "add", "path", "remove" }) |operation| {
+    for ([_][:0]const u8{ "add", "path" }) |operation| {
         try std.testing.expect(!needsEarlyThreadedIo(&.{
             @as([:0]const u8, "mcp"),
             operation,
@@ -3926,6 +3976,7 @@ fn fullEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .inspect_mcp_local_config = builtin_mcp.inspectLocalConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
+        .load_mcp_host = builtin_mcp.loadHost,
         .add_mcp_profile_server = builtin_mcp.addProfileServer,
         .remove_mcp_profile_server = builtin_mcp.removeProfileServer,
         .acp_runner = .{ .run_fn = runAcpServer },
@@ -3965,6 +4016,7 @@ fn localEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .inspect_mcp_local_config = builtin_mcp.inspectLocalConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
+        .load_mcp_host = builtin_mcp.loadHost,
         .add_mcp_profile_server = builtin_mcp.addProfileServer,
         .remove_mcp_profile_server = builtin_mcp.removeProfileServer,
         .acp_runner = .{ .run_fn = runAcpServer },
@@ -4004,6 +4056,7 @@ fn emptyEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .inspect_mcp_local_config = builtin_mcp.inspectLocalConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
+        .load_mcp_host = builtin_mcp.loadHost,
         .add_mcp_profile_server = builtin_mcp.addProfileServer,
         .remove_mcp_profile_server = builtin_mcp.removeProfileServer,
         .acp_runner = .{ .run_fn = runAcpServer },
@@ -4759,6 +4812,8 @@ test "semantic code block preserves indentation on wrapped continuation rows" {
 }
 
 test {
+    _ = @import("mcp/mcp.zig");
+    _ = @import("core/mcp_host/runtime.zig");
     _ = @import("napi_fetch_state.zig");
     _ = @import("core/config/model_provider.zig");
     _ = @import("core/config/configured_provider.zig");

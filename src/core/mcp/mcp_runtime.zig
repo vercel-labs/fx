@@ -726,14 +726,7 @@ pub const McpRuntime = struct {
             }
             break :accepted sink.accept(sink.context, origin, acp_id);
         };
-        return switch (accepted) {
-            .missing => null,
-            .awaiting_completion => .awaiting_completion,
-            .completed => |id| completed: {
-                sink.publish(sink.context, id);
-                break :completed .completed;
-            },
-        };
+        return sink.settleAccept(accepted);
     }
 
     pub fn addServer(
@@ -1914,17 +1907,7 @@ pub const McpRuntime = struct {
         return names.toOwnedSlice(alloc);
     }
 
-    pub const AlwaysLoadedTools = struct {
-        tools: []tool_mcp_runtime.SelectedTool,
-        /// Owned context notice naming tools the schema budget left unloaded.
-        notice: ?[]u8 = null,
-
-        pub fn deinit(self: *AlwaysLoadedTools, alloc: Allocator) void {
-            tool_mcp_runtime.freeSelectedTools(alloc, self.tools);
-            if (self.notice) |notice| alloc.free(notice);
-            self.* = undefined;
-        }
-    };
+    pub const AlwaysLoadedTools = selected_schema.AlwaysLoadedTools;
 
     /// Projects every ready tool of servers configured as always loaded,
     /// sharing one `mcp_selected_schema_bytes` budget in catalog order. Does
@@ -1937,20 +1920,15 @@ pub const McpRuntime = struct {
         limits: context_limits.Values,
         access: tool_mcp_runtime.Access,
     ) !AlwaysLoadedTools {
-        var selected: std.ArrayList(tool_mcp_runtime.SelectedTool) = .empty;
-        errdefer {
-            for (selected.items) |tool| tool.deinit(alloc);
-            selected.deinit(alloc);
-        }
-        if (self.retiring.load(.acquire)) return .{ .tools = try selected.toOwnedSlice(alloc) };
+        var loaded: selected_schema.AlwaysLoaded = .init(limits);
+        errdefer loaded.deinit(alloc);
+        if (self.retiring.load(.acquire)) return loaded.finish(alloc);
         var guard = OperationAccessGuard.init(self.alloc, access, self.generation) catch |err| switch (err) {
             error.OutOfMemory => return err,
-            else => return .{ .tools = try selected.toOwnedSlice(alloc) },
+            else => return loaded.finish(alloc),
         };
         defer guard.deinit();
 
-        var remaining = limits.mcp_selected_schema_bytes.effectiveBytes();
-        var omitted: usize = 0;
         {
             self.catalog_mutex.lockSharedUncancelable(io_mod.getIo());
             defer self.catalog_mutex.unlockShared(io_mod.getIo());
@@ -1962,39 +1940,11 @@ pub const McpRuntime = struct {
                 for (server.tool_catalog.tools.items) |tool| {
                     if (permissions.rulesDenyAllTargetsForPermission(permission_rules, tool.prefixed_name)) continue;
                     if (!guard.allows(.{ .tool = tool.prefixed_name })) continue;
-                    if (omitted > 0) {
-                        omitted += 1;
-                        continue;
-                    }
-                    var projection = try selected_schema.project(alloc, tool, server.instructions, limits);
-                    const payload = switch (projection) {
-                        .selected, .rejected => |value| value,
-                    };
-                    if (projection == .rejected or payload.model_output.len > remaining) {
-                        if (projection == .selected) omitted += 1;
-                        projection.deinit(alloc);
-                        continue;
-                    }
-                    if (payload.notice) |notice| alloc.free(notice);
-                    errdefer alloc.free(payload.model_output);
-                    const name = try alloc.dupe(u8, tool.prefixed_name);
-                    errdefer alloc.free(name);
-                    try selected.append(alloc, .{
-                        .name = name,
-                        .schema_json = payload.model_output,
-                        .mcp_binding = self.bindingForTool(server, tool),
-                    });
-                    remaining -= payload.model_output.len;
+                    try loaded.add(alloc, tool, server.instructions, self.bindingForTool(server, tool), limits);
                 }
             }
         }
-        const notice = if (omitted > 0) try std.fmt.allocPrint(
-            alloc,
-            "[context] {d} always-loaded MCP tool{s} exceeded the mcp_selected_schema_bytes budget and stay available through capability_search",
-            .{ omitted, if (omitted == 1) "" else "s" },
-        ) else null;
-        errdefer if (notice) |value| alloc.free(value);
-        return .{ .tools = try selected.toOwnedSlice(alloc), .notice = notice };
+        return loaded.finish(alloc);
     }
 
     pub fn snapshotAccessView(

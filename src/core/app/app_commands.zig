@@ -412,6 +412,38 @@ pub fn Handlers(comptime App: type) type {
             };
         }
 
+        /// What MCP-v2 and `/mcp` have to say, and the reload a `/mcp` change asked for.
+        fn closeOtherMenusForMcp(app: *App) void {
+            closeModelMenuIfPresent(app);
+            closeHelpMenuIfPresent(app);
+            closeInlineCommandMenusIfPresent(app);
+            if (comptime @hasField(App, "skills")) app.skills.closeMenu();
+            if (comptime @hasField(App, "input_runtime")) {
+                if (comptime @hasField(@TypeOf(app.input_runtime), "settings_menu")) {
+                    app.input_runtime.settings_menu.close();
+                }
+            }
+            if (comptime @hasField(App, "session_persistence")) {
+                app.session_persistence.session_picker.active = false;
+            }
+        }
+
+        pub fn collectMcpHostFacts(app: *App) !void {
+            if (comptime !@hasDecl(App, "takeMcpHostNotices")) return;
+            app.applyMcpHostReload() catch |err| {
+                debug_trace.logf("mcp", "MCP-v2 reload failed err={s}", .{@errorName(err)});
+                try app.writeDomainNotice(.{ .topic = "mcp", .tone = .warning, .body = "The MCP config changed, but fx couldn't load it again. Your current servers are still active." }, true);
+            };
+            const notices = app.takeMcpHostNotices();
+            defer {
+                for (notices) |n| std.heap.c_allocator.free(n.text);
+                std.heap.c_allocator.free(notices);
+            }
+            for (notices) |n| try app.writeDomainNotice(.{ .topic = "mcp", .tone = if (n.warning) .warning else .neutral, .body = n.text }, true);
+            app.refreshMcpCompletion();
+            app.refreshMcpHostMenu();
+        }
+
         pub fn collectMcpStartupHealthFacts(app: *App) !void {
             if (comptime !@hasDecl(App, "takeMcpStartupHealthNotice")) return;
             const notice = (try app.takeMcpStartupHealthNotice()) orelse return;
@@ -1312,21 +1344,19 @@ pub fn Handlers(comptime App: type) type {
         fn commandHandleMcp(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             const command = std.mem.trim(u8, rest, " \t");
+            // MCP-v2: `/mcp` alone opens the menu, and `/mcp
+            // VERB` runs the verbs `fx mcp` has.
+            if (comptime @hasDecl(App, "runMcpVerbs")) if (app.mcpHostSelected()) {
+                if (command.len > 0) return app.runMcpVerbs(command);
+                closeOtherMenusForMcp(app);
+                app.openMcpHostMenu();
+                app.shell.render_requests.request(.footer);
+                return;
+            };
             if ((command.len == 0 or std.mem.eql(u8, command, "list")) and
                 comptime @hasDecl(App, "openMcpMenu"))
             {
-                closeModelMenuIfPresent(app);
-                closeHelpMenuIfPresent(app);
-                closeInlineCommandMenusIfPresent(app);
-                if (comptime @hasField(App, "skills")) app.skills.closeMenu();
-                if (comptime @hasField(App, "input_runtime")) {
-                    if (comptime @hasField(@TypeOf(app.input_runtime), "settings_menu")) {
-                        app.input_runtime.settings_menu.close();
-                    }
-                }
-                if (comptime @hasField(App, "session_persistence")) {
-                    app.session_persistence.session_picker.active = false;
-                }
+                closeOtherMenusForMcp(app);
                 try app.openMcpMenu();
                 app.shell.render_requests.request(.footer);
                 return;

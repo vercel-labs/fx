@@ -131,6 +131,8 @@ pub const WorkspaceEnvironmentField = enum {
 };
 
 pub const WorkspaceDiagnostic = struct {
+    /// About `~/.fx/mcp.json` rather than `.mcp.json`.
+    profile: bool = false,
     server_name: ?[]u8 = null,
     environment_variable: ?[]u8 = null,
     environment_field: ?WorkspaceEnvironmentField = null,
@@ -166,8 +168,9 @@ pub fn renderWorkspaceDiagnostic(
             "value";
         return std.fmt.allocPrint(
             alloc,
-            ".mcp.json server '{s}' field {s} requires environment variable '{s}'; set it or use ${{{s}:-default}}.",
+            "{s} server '{s}' field {s} requires environment variable '{s}'; set it or use ${{{s}:-default}}.",
             .{
+                diagnosticFile(diagnostic),
                 encoded_server.bytes,
                 field,
                 encoded_variable.bytes,
@@ -177,9 +180,13 @@ pub fn renderWorkspaceDiagnostic(
     }
     return std.fmt.allocPrint(
         alloc,
-        ".mcp.json server '{s}' was skipped: {s}.",
-        .{ encoded_server.bytes, @tagName(diagnostic.cause) },
+        "{s} server '{s}' was skipped: {s}.",
+        .{ diagnosticFile(diagnostic), encoded_server.bytes, @tagName(diagnostic.cause) },
     );
+}
+
+fn diagnosticFile(diagnostic: WorkspaceDiagnostic) []const u8 {
+    return if (diagnostic.profile) "~/.fx/mcp.json" else ".mcp.json";
 }
 
 pub const WorkspaceParseResult = struct {
@@ -503,11 +510,34 @@ pub fn expandApprovedWorkspaceConfigs(
     result: *WorkspaceParseResult,
     environment: *const std.process.Environ.Map,
 ) Allocator.Error!void {
+    return expandConfigs(alloc, &result.configs, &result.diagnostics, environment, false);
+}
+
+/// Expands `${VAR}` in profile servers too, as MCP-v2 does; a
+/// server that can't be expanded is dropped
+/// with a diagnostic, as in `.mcp.json`.
+pub fn expandProfileConfigs(
+    alloc: Allocator,
+    configs: *std.ArrayList(McpServerConfig),
+    diagnostics: *std.ArrayList(WorkspaceDiagnostic),
+    environment: *const std.process.Environ.Map,
+) Allocator.Error!void {
+    return expandConfigs(alloc, configs, diagnostics, environment, true);
+}
+
+fn expandConfigs(
+    alloc: Allocator,
+    configs: *std.ArrayList(McpServerConfig),
+    diagnostics: *std.ArrayList(WorkspaceDiagnostic),
+    environment: *const std.process.Environ.Map,
+    profile: bool,
+) Allocator.Error!void {
     var expansion_budget = WorkspaceExpansionBudget.init();
     var index: usize = 0;
-    while (index < result.configs.items.len) {
-        const config = &result.configs.items[index];
-        if (config.workspace_admission != .approved) {
+    while (index < configs.items.len) {
+        const config = &configs.items[index];
+        const expands = if (profile) config.source == .profile else config.workspace_admission == .approved;
+        if (!expands) {
             index += 1;
             continue;
         }
@@ -525,23 +555,26 @@ pub fn expandApprovedWorkspaceConfigs(
         switch (failure) {
             .missing => |missing| {
                 errdefer mem_utils.free(alloc, missing.variable_name);
-                try result.diagnostics.append(alloc, .{
+                try diagnostics.append(alloc, .{
+                    .profile = profile,
                     .server_name = server_name,
                     .environment_variable = missing.variable_name,
                     .environment_field = missing.field,
                     .cause = .missing_environment_variable,
                 });
             },
-            .invalid => try result.diagnostics.append(alloc, .{
+            .invalid => try diagnostics.append(alloc, .{
+                .profile = profile,
                 .server_name = server_name,
                 .cause = .invalid_entry,
             }),
-            .limit_exceeded => try result.diagnostics.append(alloc, .{
+            .limit_exceeded => try diagnostics.append(alloc, .{
+                .profile = profile,
                 .server_name = server_name,
                 .cause = .environment_expansion_limit_exceeded,
             }),
         }
-        var removed = result.configs.orderedRemove(index);
+        var removed = configs.orderedRemove(index);
         removed.deinit(alloc);
     }
 }

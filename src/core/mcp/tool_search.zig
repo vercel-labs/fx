@@ -38,8 +38,6 @@ pub fn search(
     limits: context_limits.Values,
     operation_access: *const OperationAccessGuard,
 ) !tool_mcp_runtime.SearchResult {
-    var auth_witnesses: std.ArrayList(CatalogAuthWitness) = .empty;
-    defer auth_witnesses.deinit(alloc);
     if (try renderAuthenticationRequired(
         alloc,
         server_handles,
@@ -67,18 +65,12 @@ pub fn search(
             server.tool_catalog.tools.items.len,
         );
     }
-    if (!server_configured) {
-        return tool_mcp_runtime.SearchResult{
-            .model_output = try alloc.dupe(
-                u8,
-                "{\"tools\":[],\"count\":0,\"total_matches\":0,\"more_available\":false,\"next_cursor\":null,\"state\":\"server_not_found\"}",
-            ),
-        };
-    }
-    const candidate_storage = try alloc.alloc(ToolSearchMatch, candidate_capacity);
-    defer alloc.free(candidate_storage);
-    const documents = try alloc.alloc(capability_retrieval.Document, candidate_capacity);
-    defer alloc.free(documents);
+    if (!server_configured) return .{ .model_output = try alloc.dupe(u8, server_not_found_output) };
+    const candidates = try alloc.alloc(Candidate, candidate_capacity);
+    defer alloc.free(candidates);
+    // The catalog is read here, so each candidate's auth generation is too.
+    const witnesses = try alloc.alloc(?CatalogAuthWitness, candidate_capacity);
+    defer alloc.free(witnesses);
     var identity_scratch_state = std.heap.ArenaAllocator.init(alloc);
     defer mem_utils.deinit_arena(identity_scratch_state);
     const identity_scratch = identity_scratch_state.allocator();
@@ -90,75 +82,116 @@ pub fn search(
         if (!server.isPublished() or server.state.load(.acquire) != .ready) continue;
         if (!tool_catalog.serverCatalogAvailable(server)) continue;
         if (!operation_access.allows(.{ .tool_server = server.config.name })) continue;
-        const searchable_instructions = if (server.instructions) |instructions|
-            instructions[0..context_limits.utf8PrefixLength(instructions, mcp_server_instruction_search_bytes)]
-        else
-            "";
         if (!server.isPublished()) continue;
         for (server.tool_catalog.tools.items) |*tool| {
             if (!operation_access.allows(.{ .tool = tool.prefixed_name })) continue;
-            if (permissions.rulesDenyAllTargetsForPermission(permission_rules, tool.prefixed_name)) continue;
-            if (!try tool_result_limits.modelProjectionPreservesText(identity_scratch, server.config.name) or
-                !try tool_result_limits.modelProjectionPreservesText(identity_scratch, tool.prefixed_name))
-            {
-                continue;
-            }
-            const searchable_description = tool.description[0..context_limits.utf8PrefixLength(
-                tool.description,
-                mcp_tool_description_search_bytes,
-            )];
-            const searchable_schema = tool.input_schema_json[0..context_limits.utf8PrefixLength(
-                tool.input_schema_json,
-                mcp_tool_schema_search_bytes,
-            )];
-            candidate_storage[candidate_count] = .{
-                .server = server,
+            if (!try searchable(identity_scratch, permission_rules, server.config.name, tool)) continue;
+            candidates[candidate_count] = .{
+                .server_name = server.config.name,
+                .instructions = server.instructions,
                 .tool = tool,
+                .binding = bindingForSnapshot(runtime_generation, server, tool.*),
             };
-            documents[candidate_count] = .{
-                .identities = .{ tool.original_name, tool.prefixed_name },
-                .stable_key = tool.prefixed_name,
-                .primary = .{
-                    server.config.name,
-                    tool.original_name,
-                    tool.prefixed_name,
-                    tool.title orelse "",
-                },
-                .primary_extra = tool.tags,
-                .secondary = .{
-                    searchable_description,
-                    searchable_schema,
-                    searchable_instructions,
-                },
-            };
+            witnesses[candidate_count] = if (catalogAuthWitness(server)) |generation| .{ .server = server, .generation = generation } else null;
             candidate_count += 1;
         }
+    }
+    var matched: std.ArrayList(usize) = .empty;
+    defer matched.deinit(alloc);
+    var result = try rank(alloc, candidates[0..candidate_count], request, limits, &matched);
+    errdefer result.deinit(alloc);
+    var auth_witnesses: std.ArrayList(CatalogAuthWitness) = .empty;
+    defer auth_witnesses.deinit(alloc);
+    for (matched.items) |index| {
+        const witness = witnesses[index] orelse continue;
+        for (auth_witnesses.items) |seen| {
+            if (seen.server == witness.server) break;
+        } else try auth_witnesses.append(alloc, witness);
+    }
+    try validateCatalogAuthWitnesses(auth_witnesses.items);
+    return result;
+}
+
+const server_not_found_output = "{\"tools\":[],\"count\":0,\"total_matches\":0,\"more_available\":false,\"next_cursor\":null,\"state\":\"server_not_found\"}";
+
+/// The page a search names no configured server for.
+pub fn renderServerNotFound(alloc: Allocator) ![]u8 {
+    return alloc.dupe(u8, server_not_found_output);
+}
+
+/// One tool a search may return. The strings and the tool are borrowed for
+/// the search.
+pub const Candidate = struct {
+    server_name: []const u8,
+    instructions: ?[]const u8,
+    tool: *const McpTool,
+    binding: tool_mcp_runtime.Binding,
+};
+
+/// Whether a tool may appear in a search at all: no rule denies it, and the
+/// model's text projection keeps its names intact.
+pub fn searchable(scratch: Allocator, permission_rules: types.PermissionRuleSet, server_name: []const u8, tool: *const McpTool) !bool {
+    if (permissions.rulesDenyAllTargetsForPermission(permission_rules, tool.prefixed_name)) return false;
+    return try tool_result_limits.modelProjectionPreservesText(scratch, server_name) and
+        try tool_result_limits.modelProjectionPreservesText(scratch, tool.prefixed_name);
+}
+
+/// Ranks `candidates` for `request` and renders the page the model sees,
+/// within the search and schema budgets. `matched`, when given, receives the
+/// index of every ranked candidate.
+pub fn rank(
+    alloc: Allocator,
+    candidates: []const Candidate,
+    request: capability_retrieval.Request,
+    limits: context_limits.Values,
+    matched: ?*std.ArrayList(usize),
+) !tool_mcp_runtime.SearchResult {
+    const documents = try alloc.alloc(capability_retrieval.Document, candidates.len);
+    defer alloc.free(documents);
+    for (candidates, documents) |candidate, *document| {
+        const tool = candidate.tool;
+        const searchable_instructions = if (candidate.instructions) |instructions|
+            instructions[0..context_limits.utf8PrefixLength(instructions, mcp_server_instruction_search_bytes)]
+        else
+            "";
+        const searchable_description = tool.description[0..context_limits.utf8PrefixLength(
+            tool.description,
+            mcp_tool_description_search_bytes,
+        )];
+        const searchable_schema = tool.input_schema_json[0..context_limits.utf8PrefixLength(
+            tool.input_schema_json,
+            mcp_tool_schema_search_bytes,
+        )];
+        document.* = .{
+            .identities = .{ tool.original_name, tool.prefixed_name },
+            .stable_key = tool.prefixed_name,
+            .primary = .{
+                candidate.server_name,
+                tool.original_name,
+                tool.prefixed_name,
+                tool.title orelse "",
+            },
+            .primary_extra = tool.tags,
+            .secondary = .{
+                searchable_description,
+                searchable_schema,
+                searchable_instructions,
+            },
+        };
     }
     var page = try capability_retrieval.retrieve(
         alloc,
         request,
         .mcp,
-        documents[0..candidate_count],
+        documents,
     );
     defer page.deinit(alloc);
-    const matches = try alloc.alloc(ToolSearchMatch, page.matches.len);
+    const matches = try alloc.alloc(Candidate, page.matches.len);
     defer alloc.free(matches);
-    for (page.matches, 0..) |match, index| {
-        matches[index] = candidate_storage[match.document_index];
-    }
-    for (matches) |match| {
-        const generation = catalogAuthWitness(match.server) orelse continue;
-        var witnessed = false;
-        for (auth_witnesses.items) |witness| {
-            if (witness.server == match.server) {
-                witnessed = true;
-                break;
-            }
-        }
-        if (!witnessed) try auth_witnesses.append(alloc, .{
-            .server = match.server,
-            .generation = generation,
-        });
+    if (matched) |out| try out.ensureUnusedCapacity(alloc, page.matches.len);
+    for (page.matches, matches) |match, *candidate| {
+        candidate.* = candidates[match.document_index];
+        if (matched) |out| out.appendAssumeCapacity(match.document_index);
     }
 
     const full_cursor = try page.cursorAfter(alloc, matches.len);
@@ -180,9 +213,7 @@ pub fn search(
         errdefer alloc.free(full);
         var notice = try renderSearchNotice(alloc, matches, matches.len, limits, observed_bytes, false);
         errdefer if (notice) |value| alloc.free(value);
-        const selected = try selectSearchSchemas(alloc, runtime_generation, matches[0..matches.len], limits, &notice);
-        errdefer tool_mcp_runtime.freeSelectedTools(alloc, selected);
-        try validateCatalogAuthWitnesses(auth_witnesses.items);
+        const selected = try selectSearchSchemas(alloc, matches[0..matches.len], limits, &notice);
         return tool_mcp_runtime.SearchResult{ .model_output = full, .notice = notice, .selected_tools = selected };
     }
     alloc.free(full);
@@ -218,9 +249,7 @@ pub fn search(
     errdefer alloc.free(output);
     var notice = try renderSearchNotice(alloc, matches, selected_count, limits, observed_bytes, true);
     errdefer if (notice) |value| alloc.free(value);
-    const selected = try selectSearchSchemas(alloc, runtime_generation, matches[0..selected_count], limits, &notice);
-    errdefer tool_mcp_runtime.freeSelectedTools(alloc, selected);
-    try validateCatalogAuthWitnesses(auth_witnesses.items);
+    const selected = try selectSearchSchemas(alloc, matches[0..selected_count], limits, &notice);
     return tool_mcp_runtime.SearchResult{ .model_output = output, .notice = notice, .selected_tools = selected };
 }
 
@@ -230,7 +259,7 @@ fn appendSearchNotice(alloc: Allocator, notice: *?[]u8, message: []const u8) !vo
     notice.* = combined;
 }
 
-fn selectSearchSchemas(alloc: Allocator, runtime_generation: u64, matches: []const ToolSearchMatch, limits: context_limits.Values, notice: *?[]u8) ![]const tool_mcp_runtime.SelectedTool {
+fn selectSearchSchemas(alloc: Allocator, matches: []const Candidate, limits: context_limits.Values, notice: *?[]u8) ![]const tool_mcp_runtime.SelectedTool {
     var selected: std.ArrayList(tool_mcp_runtime.SelectedTool) = .empty;
     errdefer {
         for (selected.items) |tool| tool.deinit(alloc);
@@ -238,7 +267,7 @@ fn selectSearchSchemas(alloc: Allocator, runtime_generation: u64, matches: []con
     }
     var remaining = limits.mcp_selected_schema_bytes.effectiveBytes();
     for (matches) |match| {
-        var projection = try selected_schema.project(alloc, match.tool.*, match.server.instructions, limits);
+        var projection = try selected_schema.project(alloc, match.tool.*, match.instructions, limits);
         var owned = true;
         defer if (owned) projection.deinit(alloc);
         const payload = switch (projection) {
@@ -252,7 +281,7 @@ fn selectSearchSchemas(alloc: Allocator, runtime_generation: u64, matches: []con
         }
         const name = try alloc.dupe(u8, match.tool.prefixed_name);
         errdefer alloc.free(name);
-        try selected.append(alloc, .{ .name = name, .schema_json = payload.model_output, .mcp_binding = bindingForSnapshot(runtime_generation, match.server, match.tool.*) });
+        try selected.append(alloc, .{ .name = name, .schema_json = payload.model_output, .mcp_binding = match.binding });
         remaining -= payload.model_output.len;
         if (payload.notice) |message| alloc.free(message);
         owned = false;
@@ -260,14 +289,9 @@ fn selectSearchSchemas(alloc: Allocator, runtime_generation: u64, matches: []con
     return selected.toOwnedSlice(alloc);
 }
 
-const ToolSearchMatch = struct {
-    server: *McpServer,
-    tool: *const McpTool,
-};
-
 fn renderSearchResult(
     alloc: Allocator,
-    matches: []const ToolSearchMatch,
+    matches: []const Candidate,
     selected_count: usize,
     total_matches: usize,
     next_cursor: ?[]const u8,
@@ -302,7 +326,7 @@ fn renderSearchResult(
 
 fn renderSearchNotice(
     alloc: Allocator,
-    matches: []const ToolSearchMatch,
+    matches: []const Candidate,
     selected_count: usize,
     limits: context_limits.Values,
     observed_bytes: usize,
@@ -339,7 +363,7 @@ fn renderSearchNotice(
 fn writeToolMetadataJson(
     alloc: Allocator,
     writer: *std.Io.Writer,
-    match: ToolSearchMatch,
+    match: Candidate,
     description_limit: context_limits.Resolved,
 ) !void {
     const tool = match.tool;
@@ -352,7 +376,7 @@ fn writeToolMetadataJson(
     try writer.writeAll("{\"name\":");
     try writeEncodedJsonScalar(alloc, writer, tool.prefixed_name);
     try writer.writeAll(",\"server\":");
-    try writeEncodedJsonScalar(alloc, writer, match.server.config.name);
+    try writeEncodedJsonScalar(alloc, writer, match.server_name);
     try writer.writeAll(",\"description\":");
     try std.json.Stringify.value(bounded.text, .{}, writer);
     try writer.writeAll(",\"purpose\":");
@@ -395,7 +419,8 @@ pub fn boundedEncodedScalar(alloc: Allocator, value: []const u8, max_bytes: usiz
 const encodeScalarAlloc = model_context_encoding.scalarAlloc;
 const writeEncodedJsonScalar = model_context_encoding.writeJsonScalar;
 
-fn queryContainsCompleteIdentity(query: []const u8, identity: []const u8) bool {
+/// Whether `query` names `identity` as a whole word, ignoring case.
+pub fn queryContainsCompleteIdentity(query: []const u8, identity: []const u8) bool {
     if (identity.len == 0 or identity.len > query.len) return false;
 
     var start: usize = 0;
@@ -423,45 +448,46 @@ pub fn renderAuthenticationRequired(
         server.status_lock.lockUncancelable(io_mod.getIo());
         const failed = server.state.load(.acquire) == .failed;
         server.status_lock.unlock(io_mod.getIo());
-        const mode: enum { oauth, bearer_environment } = if (authentication == .required)
-            .oauth
-        else if (failed and server.config.bearer_token_env != null and
-            io_mod.getenv(server.config.bearer_token_env.?) == null)
-            .bearer_environment
-        else
-            continue;
-
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-        try out.writer.writeAll(
-            "{\"tools\":[],\"count\":0,\"authentication_required\":{\"server\":",
-        );
-        try writeEncodedJsonScalar(alloc, &out.writer, server.config.name);
-        switch (mode) {
-            .oauth => {
-                try out.writer.writeAll(",\"interactive\":true,\"message\":");
-                const guidance = try std.fmt.allocPrint(alloc, "Run /mcp auth {s} --open in an interactive fx session.", .{server.config.name});
-                defer alloc.free(guidance);
-                try writeEncodedJsonScalar(alloc, &out.writer, guidance);
-            },
-            .bearer_environment => {
-                try out.writer.writeAll(
-                    ",\"interactive\":false,\"environment\":",
-                );
-                try writeEncodedJsonScalar(
-                    alloc,
-                    &out.writer,
-                    server.config.bearer_token_env.?,
-                );
-                try out.writer.writeAll(
-                    ",\"message\":\"Set this environment variable before starting fx.\"",
-                );
-            },
+        if (authentication == .required) {
+            const guidance = try std.fmt.allocPrint(alloc, "Run /mcp auth {s} --open in an interactive fx session.", .{server.config.name});
+            defer alloc.free(guidance);
+            return try writeAuthenticationRequired(alloc, server.config.name, .{ .oauth = guidance });
         }
-        try out.writer.writeAll("}}");
-        return try out.toOwnedSlice();
+        if (failed and server.config.bearer_token_env != null and io_mod.getenv(server.config.bearer_token_env.?) == null) {
+            return try writeAuthenticationRequired(alloc, server.config.name, .{ .bearer_environment = server.config.bearer_token_env.? });
+        }
     }
     return null;
+}
+
+pub const AuthenticationRequired = union(enum) {
+    /// What the user runs to sign in.
+    oauth: []const u8,
+    /// The variable to set before starting fx.
+    bearer_environment: []const u8,
+};
+
+/// The page a search returns when the server it names needs a sign-in.
+pub fn writeAuthenticationRequired(alloc: Allocator, server_name: []const u8, required: AuthenticationRequired) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll(
+        "{\"tools\":[],\"count\":0,\"authentication_required\":{\"server\":",
+    );
+    try writeEncodedJsonScalar(alloc, &out.writer, server_name);
+    switch (required) {
+        .oauth => |guidance| {
+            try out.writer.writeAll(",\"interactive\":true,\"message\":");
+            try writeEncodedJsonScalar(alloc, &out.writer, guidance);
+        },
+        .bearer_environment => |variable| {
+            try out.writer.writeAll(",\"interactive\":false,\"environment\":");
+            try writeEncodedJsonScalar(alloc, &out.writer, variable);
+            try out.writer.writeAll(",\"message\":\"Set this environment variable before starting fx.\"");
+        },
+    }
+    try out.writer.writeAll("}}");
+    return try out.toOwnedSlice();
 }
 
 /// Tells the model why the server a search names is down, so it can report
@@ -480,22 +506,23 @@ pub fn renderServerFailure(
         defer server.status_lock.unlock(io_mod.getIo());
         if (server.state.load(.acquire) != .failed) continue;
         const failure = server.last_error orelse continue;
-        const message = try std.fmt.allocPrint(
-            alloc,
-            "MCP server '{s}' is unavailable: {s}",
-            .{ server.config.name, failure },
-        );
-        defer alloc.free(message);
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-        try out.writer.writeAll(
-            "{\"tools\":[],\"count\":0,\"total_matches\":0,\"more_available\":false,\"next_cursor\":null,\"state\":\"server_failed\",\"error\":",
-        );
-        try writeEncodedJsonScalar(alloc, &out.writer, message);
-        try out.writer.writeByte('}');
-        return try out.toOwnedSlice();
+        return try writeServerFailure(alloc, server.config.name, failure);
     }
     return null;
+}
+
+/// The page a search returns when the server it names is down.
+pub fn writeServerFailure(alloc: Allocator, server_name: []const u8, failure: []const u8) ![]u8 {
+    const message = try std.fmt.allocPrint(alloc, "MCP server '{s}' is unavailable: {s}", .{ server_name, failure });
+    defer alloc.free(message);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll(
+        "{\"tools\":[],\"count\":0,\"total_matches\":0,\"more_available\":false,\"next_cursor\":null,\"state\":\"server_failed\",\"error\":",
+    );
+    try writeEncodedJsonScalar(alloc, &out.writer, message);
+    try out.writer.writeByte('}');
+    return try out.toOwnedSlice();
 }
 
 test "MCP search names why the server it names is down" {

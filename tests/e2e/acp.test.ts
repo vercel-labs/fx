@@ -3034,6 +3034,186 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP session/new calls a supplied modern HTTP MCP server through MCP-v2",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-mcp-v2-");
+      const httpFixture = startModernMcpHttpFixture("json");
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("search_http", "capability_search", {
+          kind: "mcp",
+          server: "fixture",
+          query: "echo",
+          limit: 5,
+        }),
+        fakeGatewayToolCall("select_http", "mcp_select_tool", {
+          name: MCP_TOOL_NAME,
+        }),
+        fakeGatewayToolCall("call_http", MCP_TOOL_NAME, { text: "acp" }),
+        finalText("ACP MCP-v2 complete"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_MCP_ENGINE: "v2" },
+        });
+        const initialized = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
+        // Only what ACP v1 defines and MCP-v2 speaks: no HTTP+SSE, no "type": "acp".
+        expect(initialized.result.agentCapabilities.mcpCapabilities).toEqual({ http: true, sse: false, acp: false });
+        const created = await client.request(
+          "session/new",
+          {
+            cwd: root.workspace,
+            mcpServers: [{
+              type: "http",
+              name: "fixture",
+              url: httpFixture.url,
+              headers: [{ name: "X-Workspace", value: "acp" }],
+            }],
+          },
+          2,
+        ) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+        // MCP-v2 starts a server when the model first needs it.
+        expect(httpFixture.requests).toHaveLength(0);
+        await client.request("session/set_mode", { modeId: "auto" }, 3);
+        const requestStart = gateway.requests.length;
+        const prompt = await runPrompt(client, "Find and call the supplied MCP echo tool.", TIMEOUT);
+        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(requestStart + 4);
+        expect(acpToolResultText(gateway.requests[requestStart + 1]!.body, "search_http"))
+          .toContain(MCP_TOOL_NAME);
+        expect(acpToolResultText(gateway.requests[requestStart + 3]!.body, "call_http"))
+          .toContain(MODERN_HTTP_TOOL_RESULT + ":acp");
+        const toolCalls = prompt.messages
+          .filter((message) => message.params?.update?.sessionUpdate === "tool_call")
+          .map((message) => message.params.update);
+        const toolCall = (id: string) => toolCalls.find((update) => update.toolCallId === id);
+        expect(toolCall("search_http")?._meta.fx.toolCall).toEqual({ internal: true });
+        expect(toolCall("select_http")?._meta.fx.toolCall).toEqual({ internal: true });
+        expect(toolCall("call_http")?.name).toBe(MCP_TOOL_NAME);
+
+        const initialPrompt = acpGatewayRequest(gateway.requests[0]!.body).prompt
+          .map((message) => acpContentText(message.content))
+          .join("\n");
+        expect(initialPrompt).toContain('<server name="fixture"');
+        expect(httpFixture.requests.map((entry) => entry.message.method)).toContain("tools/call");
+        for (const entry of httpFixture.requests) {
+          expect(entry.headers["x-workspace"]).toBe("acp");
+        }
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        httpFixture.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "context notices go to an editor that shows notices as ACP v1 Session Notices",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-notices-");
+      const httpFixture = startModernMcpHttpFixture("json");
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("search_notice", "capability_search", { kind: "mcp", server: "fixture", query: "echo", limit: 5 }),
+        finalText("ACP notices complete"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_MCP_ENGINE: "v2" },
+          // A short description limit, so the search truncates the tool's.
+          args: ["--context-limit", "mcp_description_bytes=8", "acp"],
+        });
+        await client.request("initialize", { protocolVersion: 1, clientCapabilities: { session: { notices: {} } } }, 1);
+        const created = await client.request(
+          "session/new",
+          {
+            cwd: root.workspace,
+            mcpServers: [{ type: "http", name: "fixture", url: httpFixture.url, headers: [], _meta: { fx: { alwaysLoaded: false } } }],
+          },
+          2,
+        ) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "auto" }, 3);
+        const prompt = await runPrompt(client, "Find the echo tool.", TIMEOUT);
+        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+        const updates = prompt.messages.map((message) => message.params?.update).filter(Boolean);
+        const notices = updates.filter((update) => update.sessionUpdate === "notice");
+        expect(notices.length).toBeGreaterThan(0);
+        expect(notices[0].severity).toBe("info");
+        expect(notices[0].title).toStartWith("MCP description for");
+        const texts = updates.filter((update) => update.sessionUpdate === "agent_message_chunk").map((update) => update.content?.text ?? "");
+        expect(texts.join("")).not.toContain("[context]");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        httpFixture.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "ACP on MCP-v2 loads a supplied server's tools every turn, unless it opts out",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-mcp-v2-loaded-");
+      const httpFixture = startModernMcpHttpFixture("json");
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("call_loaded", MCP_TOOL_NAME, { text: "acp" }),
+        finalText("ACP MCP-v2 loaded"),
+        finalText("ACP MCP-v2 lazy"),
+      ]);
+      const offered = (index: number) =>
+        acpGatewayRequest(gateway.requests[index]!.body).tools.some((tool) => tool.name === MCP_TOOL_NAME);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_MCP_ENGINE: "v2" },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const server = { type: "http", name: "fixture", url: httpFixture.url, headers: [] };
+        const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [server] }, 2) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "auto" }, 3);
+        let start = gateway.requests.length;
+        const loaded = await runPrompt(client, "Call the supplied MCP echo tool.", TIMEOUT);
+        expect(loaded.promptResult.result.stopReason).toBe("end_turn");
+        // Offered on the first request: no capability_search, no select.
+        expect(gateway.requests).toHaveLength(start + 2);
+        expect(offered(start)).toBe(true);
+        expect(acpToolResultText(gateway.requests[start + 1]!.body, "call_loaded")).toContain(MODERN_HTTP_TOOL_RESULT + ":acp");
+
+        const lazy = await client.request(
+          "session/new",
+          { cwd: root.workspace, mcpServers: [{ ...server, _meta: { fx: { alwaysLoaded: false } } }] },
+          4,
+        ) as any;
+        expect(lazy.error).toBeUndefined();
+        await client.readLine();
+        start = gateway.requests.length;
+        const quiet = await runPrompt(client, "Say hello.", TIMEOUT);
+        expect(quiet.promptResult.result.stopReason).toBe("end_turn");
+        expect(offered(start)).toBe(false);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        httpFixture.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
     "ACP keeps supplied MCP tools advertised on every turn",
     async () => {
       const root = createIsolatedRoot("fx-acp-mcp-always-");
@@ -5414,6 +5594,79 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP form elicitation answers an MCP-v2 server's input request",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-mcp-v2-form-");
+      const pidPath = join(root.root, "mcp-v2-form.pid");
+      const wirePath = join(root.root, "mcp-v2-form.wire.jsonl");
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("select_form", "mcp_select_tool", { name: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_form", MCP_TOOL_NAME, { text: "acp-form" }),
+        finalText("ACP MCP-v2 form complete"),
+      ]);
+      const directRequests: Array<Record<string, any>> = [];
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_MCP_ENGINE: "v2" },
+        });
+        await client.request(
+          "initialize",
+          { protocolVersion: 1, clientCapabilities: { elicitation: { form: {} } } },
+          1,
+        );
+        const created = await client.request(
+          "session/new",
+          {
+            cwd: root.workspace,
+            mcpServers: [acpStdioServer("unused", pidPath, "mrtr_input_required", {
+              FX_MCP_WIRE_LOG: wirePath,
+              FX_MCP_EXPECT_ELICITATION: "form",
+              FX_MCP_SPEC_CLIENT: "1",
+            })],
+          },
+          2,
+        ) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "auto" }, 3);
+        client.setElicitationHandler((params) => {
+          directRequests.push(params);
+          return { action: "accept", content: { confirmed: true } };
+        });
+
+        const prompt = await runPrompt(client, "Call the supplied MRTR MCP tool and use the form response.", TIMEOUT);
+        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(3);
+        expect(directRequests).toHaveLength(1);
+        expect(directRequests[0]).toMatchObject({
+          toolCallId: "call_form",
+          mode: "form",
+          requestedSchema: { type: "object", properties: { confirmed: { type: "boolean" } } },
+        });
+        const calls = readFileSync(wirePath, "utf8")
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line).message as Record<string, any>)
+          .filter((message) => message.method === "tools/call");
+        expect(calls).toHaveLength(2);
+        expect(calls[1]?.params?.inputResponses).toEqual({
+          confirm: { action: "accept", content: { confirmed: true } },
+        });
+        expect(calls[1]?.params?.requestState).toBe("opaque");
+        expect(calls[1]?.params?._meta?.["io.modelcontextprotocol/clientCapabilities"])
+          .toEqual({ elicitation: { form: {} } });
+      } finally {
+        await client?.close();
+        if (existsSync(pidPath)) await expectMcpProcessExited(pidPath);
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
     "ACP EOF cancels a pending direct elicitation without hanging",
     async () => {
       const root = createIsolatedRoot("fx-acp-mcp-elicitation-eof-");
@@ -5558,8 +5811,8 @@ describe("acp: model-independent", () => {
     LIVE_TIMEOUT,
   );
 
-  test(
-    "ACP URL consent completes only after modern MCP retry without prefetching",
+  for (const engine of ["v1", "v2"] as const) test(
+    `ACP URL consent completes only after modern MCP retry without prefetching (${engine})`,
     async () => {
       const root = createIsolatedRoot("fx-acp-mcp-elicitation-url-");
       const pidPath = join(root.root, "mcp-elicitation-url.pid");
@@ -5582,7 +5835,7 @@ describe("acp: model-independent", () => {
       try {
         client = await AcpClient.create({
           cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
+          env: { ...fakeGatewayEnv(root, gateway), ...(engine === "v2" ? { FX_MCP_ENGINE: "v2" } : {}) },
         });
         await client.request(
           "initialize",
@@ -5604,6 +5857,7 @@ describe("acp: model-independent", () => {
                 FX_MCP_WIRE_LOG: wirePath,
                 FX_MCP_EXPECT_ELICITATION: "url",
                 FX_MCP_ELICITATION_URL: targetUrl,
+                ...(engine === "v2" ? { FX_MCP_SPEC_CLIENT: "1" } : {}),
               },
             )],
           },
@@ -5654,7 +5908,8 @@ describe("acp: model-independent", () => {
         expect(calls[1]?.params?.inputResponses).toEqual({
           confirm: { action: "accept" },
         });
-        expect(calls[1]?.params?.requestState).toEqual({ fixture: "opaque" });
+        // MCP-v2 sends the spec's opaque string back as it came.
+        expect(calls[1]?.params?.requestState).toEqual(engine === "v2" ? "opaque" : { fixture: "opaque" });
         expect(calls[1]?.params?.name).toBe(calls[0]?.params?.name);
         expect(calls[1]?.params?.arguments).toEqual(calls[0]?.params?.arguments);
         expect(gateway.requests.every((request) =>
@@ -5763,8 +6018,8 @@ describe("acp: model-independent", () => {
     LIVE_TIMEOUT,
   );
 
-  test(
-    "legacy URL completion is correlated from the notification listener to ACP",
+  for (const engine of ["v1", "v2"] as const) test(
+    `legacy URL completion is correlated from the notification listener to ACP (${engine})`,
     async () => {
       const root = createIsolatedRoot("fx-acp-mcp-legacy-url-");
       let targetRequests = 0;
@@ -5794,7 +6049,7 @@ describe("acp: model-independent", () => {
       try {
         client = await AcpClient.create({
           cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
+          env: { ...fakeGatewayEnv(root, gateway), ...(engine === "v2" ? { FX_MCP_ENGINE: "v2" } : {}) },
         });
         await client.request(
           "initialize",
@@ -5887,8 +6142,8 @@ describe("acp: model-independent", () => {
     LIVE_TIMEOUT,
   );
 
-  test(
-    "legacy URL completion waits for ACP consent and publishes exactly once",
+  for (const engine of ["v1", "v2"] as const) test(
+    `legacy URL completion waits for ACP consent and publishes exactly once (${engine})`,
     async () => {
       const root = createIsolatedRoot("fx-acp-mcp-legacy-url-early-");
       const fixture = startLegacyStreamableHttpFixture("2025-11-25", {
@@ -5908,7 +6163,7 @@ describe("acp: model-independent", () => {
       try {
         client = await AcpClient.create({
           cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
+          env: { ...fakeGatewayEnv(root, gateway), ...(engine === "v2" ? { FX_MCP_ENGINE: "v2" } : {}) },
         });
         await client.request(
           "initialize",

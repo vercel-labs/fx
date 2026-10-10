@@ -603,6 +603,30 @@ pub fn composeResumeMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bo
     return composeCatalogMenuHintRow(alloc, width, ctrl_c_pending, .scope);
 }
 
+/// fx's hint line: the widest of `variants` that fits, or the warning that
+/// a second Ctrl+C exits.
+pub fn composeVariantHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool, variants: []const []const u8) !std.ArrayList(u8) {
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
+    if (ctrl_c_pending) {
+        try row.appendSlice(alloc, ui_render.statusline_style);
+        try row_text.appendClipped(alloc, &row, "press ctrl+c again to exit", width);
+        try row.appendSlice(alloc, ui_render.reset_style);
+        return row;
+    }
+    var hint = variants[variants.len - 1];
+    for (variants) |candidate| {
+        if (display_width.visibleWidth(candidate) <= width) {
+            hint = candidate;
+            break;
+        }
+    }
+    try row.appendSlice(alloc, ui_render.dim_style);
+    try row_text.appendClipped(alloc, &row, hint, width);
+    try row.appendSlice(alloc, ui_render.reset_style);
+    return row;
+}
+
 pub fn composeMcpMenuHintRow(
     alloc: Allocator,
     width: u16,
@@ -610,14 +634,6 @@ pub fn composeMcpMenuHintRow(
     projection: render_input.McpMenuProjection,
 ) !std.ArrayList(u8) {
     const state = projection.state;
-    if (ctrl_c_pending) {
-        var warning: std.ArrayList(u8) = .empty;
-        errdefer warning.deinit(alloc);
-        try warning.appendSlice(alloc, ui_render.statusline_style);
-        try row_text.appendClipped(alloc, &warning, "press ctrl+c again to exit", width);
-        try warning.appendSlice(alloc, ui_render.reset_style);
-        return warning;
-    }
 
     const root_variants = [_][]const u8{
         "↑↓ move  tab section  enter inspect  s add Slack  a add  r reload  c help  esc close",
@@ -677,20 +693,7 @@ pub fn composeMcpMenuHintRow(
         .details => details_variants,
         .confirm => confirm_variants,
     };
-    var hint = variants[variants.len - 1];
-    for (variants) |candidate| {
-        if (display_width.visibleWidth(candidate) <= width) {
-            hint = candidate;
-            break;
-        }
-    }
-
-    var row: std.ArrayList(u8) = .empty;
-    errdefer row.deinit(alloc);
-    try row.appendSlice(alloc, ui_render.dim_style);
-    try row_text.appendClipped(alloc, &row, hint, width);
-    try row.appendSlice(alloc, ui_render.reset_style);
-    return row;
+    return composeVariantHintRow(alloc, width, ctrl_c_pending, &variants);
 }
 
 pub fn composeHelpMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool) !std.ArrayList(u8) {
