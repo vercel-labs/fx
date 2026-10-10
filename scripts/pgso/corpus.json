@@ -111,6 +111,7 @@
     {"name": "verify-review-model-override", "argv": ["bun", "test", "--max-concurrency", "1", "./review-model-override.test.ts"], "test_file": "review-model-override.test.ts", "requires_tmux": false},
     {"name": "verify-configured-providers", "argv": ["bun", "test", "--max-concurrency", "1", "./configured-providers.test.ts"], "test_file": "configured-providers.test.ts", "requires_tmux": false},
     {"name": "verify-oauth-keychain-migration", "argv": ["bun", "test", "--max-concurrency", "1", "./oauth-keychain-migration.test.ts"], "test_file": "oauth-keychain-migration.test.ts", "allow_keychain": true},
+    {"name": "verify-remote-report", "argv": ["bun", "test", "--max-concurrency", "1", "./remote-report.test.ts"], "test_file": "remote-report.test.ts", "requires_tmux": false},
     {"name": "verify-tui-auth-source-selection", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-auth-source-selection.test.ts"], "test_file": "tui-auth-source-selection.test.ts"},
     {"name": "verify-tui-compaction-activity", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-compaction-activity.test.ts"], "test_file": "tui-compaction-activity.test.ts"},
     {"name": "verify-compaction-policy", "argv": ["bun", "test", "--max-concurrency", "1", "./compaction-policy.test.ts"], "test_file": "compaction-policy.test.ts", "requires_tmux": false},

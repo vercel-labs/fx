@@ -23,6 +23,7 @@
   { "file": "oauth-keychain-migration.test.ts", "weight": 30 },
   { "file": "permission-errors.test.ts", "weight": 1 },
   { "file": "prompt-history.test.ts", "weight": 14 },
+  { "file": "remote-report.test.ts", "weight": 1 },
   { "file": "session-recovery.test.ts", "weight": 13 },
   { "file": "sessions-v2.test.ts", "weight": 80 },
   { "file": "session-title.test.ts", "weight": 5 },

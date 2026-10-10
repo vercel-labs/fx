@@ -72,6 +72,7 @@ const js_host_workspace = @import("core/hosts/js_host_workspace.zig");
 const host_target = @import("core/hosts/target.zig");
 const native_host = @import("core/hosts/native.zig");
 const debug_trace = @import("core/shared/debug_trace.zig");
+const remote_report = @import("core/reporting/remote_report.zig");
 const display_width = @import("core/shared/display_width.zig");
 const file_index_mod = @import("core/workspace/file_index.zig");
 const mcp_command_provider = @import("core/mcp/command_provider.zig");
@@ -3509,6 +3510,7 @@ fn writeTopLevelHelpFast(raw_env: RawEnviron) !void {
 
 fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_args: []const [:0]const u8) !void {
     io_mod.setRawEnviron(raw_env);
+    remote_report.setBuildInfo(version, build_options.git_commit);
 
     const alloc = processAllocator();
     const auth_mode = credentials.parseAuthMode(rawEnvValue(raw_env, "FX_AUTH_MODE")) catch {
@@ -3552,14 +3554,24 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
             // or a disk scan, so end the process here. The app is declared in
             // this scope because those threads still reference it.
             var app: App = undefined;
-            const outcome = app_entry_runtime.runInteractive(App, &app, alloc, &owned_launch, auth_mode) catch exitFast(1);
+            const outcome = app_entry_runtime.runInteractive(App, &app, alloc, &owned_launch, auth_mode) catch {
+                remote_report.flushOnExit();
+                exitFast(1);
+            };
+            remote_report.flushOnExit();
             exitFast(switch (outcome) {
                 .returned => 0,
                 .exit => |code| code,
             });
         },
-        .returned => exitFast(0),
-        .exit => |code| exitFast(code),
+        .returned => {
+            remote_report.flushOnExit();
+            exitFast(0);
+        },
+        .exit => |code| {
+            remote_report.flushOnExit();
+            exitFast(code);
+        },
     }
 }
 
@@ -4823,6 +4835,7 @@ test {
     _ = @import("builtins/context.zig");
     _ = @import("builtins/gateway.zig");
     _ = @import("core/shared/debug_trace.zig");
+    _ = @import("core/reporting/remote_report.zig");
     _ = @import("core/output/diff.zig");
     _ = @import("core/shared/display_width.zig");
     _ = @import("core/cli/doctor_runtime.zig");

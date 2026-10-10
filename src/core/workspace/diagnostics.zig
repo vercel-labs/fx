@@ -4,11 +4,14 @@
 //! low-level event log, while diagnostics are small in-memory summaries that
 //! make the user-initiated trace report useful without requiring tracing.
 
+const std = @import("std");
+const io_mod = @import("../shared/io.zig");
 const network_metrics = @import("network_metrics.zig");
 const tool_call_metrics = @import("tool_call_metrics.zig");
 const render_metrics = @import("render_metrics.zig");
 const compactor = @import("../compactor/compactor.zig");
 const model_catalog_metrics = @import("model_catalog_metrics.zig");
+const remote_report = @import("../reporting/remote_report.zig");
 
 pub const NetworkCall = network_metrics.NetworkCall;
 pub const NetworkCallKind = network_metrics.NetworkCallKind;
@@ -42,6 +45,7 @@ pub fn snapshotRenderEvents(out: []RenderEvent) usize {
 
 pub fn recordNetworkCall(call: NetworkCall) void {
     network_metrics.record(call);
+    remote_report.recordNetworkCall(&call);
 }
 
 pub fn snapshotNetworkCalls(out: []NetworkCall) usize {
@@ -58,6 +62,7 @@ pub fn snapshotNetworkTurnRollups(out: []NetworkTurnRollup) usize {
 
 pub fn recordToolCall(call: ToolCallMetric) void {
     tool_call_metrics.record(call);
+    remote_report.recordToolCall(&call);
 }
 
 /// Records a model-catalog load, capability lookup, or image gate outcome so
@@ -72,6 +77,17 @@ pub fn snapshotModelCatalogEvents(out: []ModelCatalogEvent) usize {
 
 pub fn recordToolCallResult(input: ToolCallRecord) void {
     tool_call_metrics.recordResult(input);
+    if (!remote_report.isEnabled()) return;
+    const now_ms = io_mod.milliTimestamp();
+    const elapsed = if (now_ms > input.started_at_ms) now_ms - input.started_at_ms else 0;
+    var metric: ToolCallMetric = .{
+        .started_at_ms = input.started_at_ms,
+        .duration_ms = @intCast(@min(elapsed, @as(i64, std.math.maxInt(u32)))),
+        .outcome = input.outcome,
+        .subagent_id = input.subagent_id,
+    };
+    metric.setName(input.name);
+    remote_report.recordToolCall(&metric);
 }
 
 pub fn snapshotToolCalls(out: []ToolCallMetric) usize {

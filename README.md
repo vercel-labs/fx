@@ -161,6 +161,18 @@ Automatic compaction starts when a request reaches 80 percent of the model's usa
 { "auto_compact_percent": 60 }
 ```
 
+## Remote reports
+
+Remote reporting is off unless `FX_REPORT_URL` is set to an `http://` or `https://` URL. When it is set, fx POSTs one JSON report to that URL when the process exits. `FX_REPORT_TOKEN`, when set, is sent as `Authorization: Bearer <token>`. The report contains the fx version, commit, OS, architecture, and one entry per model call (model, status, duration, token counts, error name, stop reason) and per tool call (tool name, outcome, duration). Prompts, tool arguments, tool output, file paths, and command output are never included. fx waits at most 3 seconds for delivery and never prints delivery errors. Set `FX_TRACE=1` to see them in the trace log under the `remote_report` scope.
+
+[`apps/report-server`](apps/report-server/README.md) is a minimal receiver that stores reports and serves a summary.
+
+```bash
+bun apps/report-server/server.ts
+FX_REPORT_URL=http://127.0.0.1:8787/v1/reports fx ask "summarize this repo"
+curl http://127.0.0.1:8787/v1/summary
+```
+
 ## Embed fx
 
 fx builds as a native binary or WebAssembly. Applications embedding fx can provide network transport, session storage, configuration, permission handling, and terminal I/O.
