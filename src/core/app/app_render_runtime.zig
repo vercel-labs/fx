@@ -816,6 +816,10 @@ pub fn Runtime(comptime App: type) type {
                     .now_ms = now_ms,
                     .selection_failure = app.session_persistence.session_picker.selection_failure,
                 } else .{},
+                .fork_menu = if (comptime @hasField(App, "session_persistence"))
+                    app.session_persistence.fork_menu.projection()
+                else
+                    .{},
                 .statusline_menu = render_input.statuslineMenuProjection(
                     &app.input_runtime.statusline_menu,
                     settings_snapshot,
@@ -1171,7 +1175,7 @@ pub fn Runtime(comptime App: type) type {
                     if (!question_active and approval == null and
                         (settingsMenuActive(app) or helpMenuActive(app) or
                             skillsMenuActive(app) or modelMenuActive(app) or
-                            sessionMenuActive(app)))
+                            sessionMenuActive(app) or forkMenuActive(app)))
                     {
                         app.shell.render_requests.request(.footer);
                     }
@@ -1181,7 +1185,7 @@ pub fn Runtime(comptime App: type) type {
                 },
             }
 
-            if (!question_active and approval == null and (settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or modelMenuActive(app) or sessionMenuActive(app))) {
+            if (!question_active and approval == null and (settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or modelMenuActive(app) or sessionMenuActive(app) or forkMenuActive(app))) {
                 if (try app_lifecycle.closeFullTranscriptIfActive(
                     app.alloc,
                     &app.terminal,
@@ -1988,6 +1992,11 @@ pub fn Runtime(comptime App: type) type {
 
         fn sessionMenuActive(app: *const App) bool {
             if (comptime @hasField(App, "session_persistence")) return app.session_persistence.session_picker.active;
+            return false;
+        }
+
+        fn forkMenuActive(app: *const App) bool {
+            if (comptime @hasField(App, "session_persistence")) return app.session_persistence.fork_menu.active();
             return false;
         }
 

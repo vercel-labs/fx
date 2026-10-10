@@ -11,6 +11,7 @@ pub const ParsedCommand = union(enum) {
     reset_session,
     resume_session,
     rename_session: []const u8,
+    fork_session,
     help,
     login,
     logout: []const u8,
@@ -51,6 +52,7 @@ pub const CommandHandlers = struct {
     new_session: *const fn (ctx: *anyopaque) anyerror!void,
     reset_session: *const fn (ctx: *anyopaque) anyerror!void,
     resume_session: *const fn (ctx: *anyopaque) anyerror!void,
+    fork_session: *const fn (ctx: *anyopaque) anyerror!void,
     show_help: *const fn (ctx: *anyopaque) anyerror!void,
     login: *const fn (ctx: *anyopaque) anyerror!void,
     logout: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
@@ -97,6 +99,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .reset_session => .reset_session,
         .resume_session => .resume_session,
         .rename_session => .{ .rename_session = payload },
+        .fork_session => .fork_session,
         .help => .help,
         .login => .login,
         .logout => .{ .logout = payload },
@@ -151,6 +154,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .reset_session => try handlers.reset_session(handlers.ctx),
         .resume_session => try handlers.resume_session(handlers.ctx),
         .rename_session => |rest| try handlers.rename_session(handlers.ctx, rest),
+        .fork_session => try handlers.fork_session(handlers.ctx),
         .help => try handlers.show_help(handlers.ctx),
         .login => try handlers.login(handlers.ctx),
         .logout => |rest| try handlers.logout(handlers.ctx, rest),
@@ -238,6 +242,11 @@ test "parse distinguishes new and reset lifecycle commands" {
 
 test "parse recognizes interactive resume" {
     try std.testing.expectEqual(ParsedCommand.resume_session, parse(testSlashRegistry(), "/resume"));
+}
+
+test "parse recognizes fork without a payload" {
+    try std.testing.expectEqual(ParsedCommand.fork_session, parse(testSlashRegistry(), "/fork"));
+    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/fork 2"));
 }
 
 test "parse recognizes logout" {
@@ -433,6 +442,10 @@ fn recordResumeSession(ctx: *anyopaque) anyerror!void {
     testContext(ctx).called = "resume";
 }
 
+fn recordForkSession(ctx: *anyopaque) anyerror!void {
+    testContext(ctx).called = "fork";
+}
+
 fn recordModel(ctx: *anyopaque, value: []const u8) anyerror!void {
     const test_context = testContext(ctx);
     test_context.called = "model";
@@ -476,6 +489,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .new_session = unexpectedNoPayload,
         .reset_session = unexpectedNoPayload,
         .resume_session = unexpectedNoPayload,
+        .fork_session = unexpectedNoPayload,
         .show_help = unexpectedNoPayload,
         .login = unexpectedNoPayload,
         .logout = unexpectedPayload,
@@ -541,6 +555,16 @@ test "route calls interactive resume handler" {
     try route(testSlashRegistry(), &handlers, "/resume");
 
     try std.testing.expectEqualStrings("resume", ctx.called);
+}
+
+test "route calls fork handler" {
+    var ctx: TestContext = .{};
+    var handlers = testHandlers(&ctx);
+    handlers.fork_session = recordForkSession;
+
+    try route(testSlashRegistry(), &handlers, "/fork");
+
+    try std.testing.expectEqualStrings("fork", ctx.called);
 }
 
 test "route forwards borrowed payload slice" {

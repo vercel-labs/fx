@@ -376,6 +376,7 @@ pub fn Handlers(comptime App: type) type {
                 .new_session = commandNewSession,
                 .reset_session = commandResetSession,
                 .resume_session = commandResumeSession,
+                .fork_session = commandForkSession,
 
                 .show_help = commandShowHelp,
                 .login = commandLogin,
@@ -690,6 +691,19 @@ pub fn Handlers(comptime App: type) type {
                 return;
             }
             try app_session_runtime.Runtime(App).openSessionPicker(app);
+        }
+
+        fn commandForkSession(ctx: *anyopaque) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) {
+                try app.writeDomainNotice(.{
+                    .topic = "session",
+                    .tone = .warning,
+                    .body = "Session forking is owned by the embedding SDK for this host.",
+                }, true);
+                return;
+            }
+            try app_session_runtime.Runtime(App).openForkMenu(app);
         }
 
         fn commandRenameSession(ctx: *anyopaque, rest: []const u8) !void {

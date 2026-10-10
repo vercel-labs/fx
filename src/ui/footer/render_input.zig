@@ -9,6 +9,7 @@ const mcp_health = @import("../../core/mcp/health.zig");
 const mcp_menu_state = @import("../../core/mcp/menu_state.zig");
 const mcp_runtime = @import("../../core/mcp/mcp_runtime.zig");
 const picker_state = @import("../../core/input/picker_state.zig");
+const session_adapter = @import("../../core/session/session_adapter.zig");
 const session_catalog = @import("../../core/session/session_catalog.zig");
 const session_store = @import("../../core/session/session_store.zig");
 const usage_report = @import("../../core/session/usage_report.zig");
@@ -243,6 +244,17 @@ pub const SessionMenuProjection = struct {
     }
 };
 
+pub const ForkMenuProjection = struct {
+    /// The session's prompts, oldest first.
+    points: []const session_adapter.Session.ForkPoint = &.{},
+    selected: usize = 0,
+    window_start: usize = 0,
+
+    pub fn active(self: ForkMenuProjection) bool {
+        return self.points.len > 0;
+    }
+};
+
 pub const HelpMenuProjection = struct {
     active: bool = false,
     category: ?command_specs.SlashPresentationCategory = null,
@@ -465,6 +477,7 @@ pub const RenderContext = struct {
     settings_menu: SettingsMenuProjection = .{},
     model_menu: ModelMenuProjection = .{},
     session_menu: SessionMenuProjection = .{},
+    fork_menu: ForkMenuProjection = .{},
     statusline_menu: StatuslineMenuProjection = .{},
     usage_menu: UsageMenuProjection = .{},
     workspace_menu: WorkspaceMenuProjection = .{},
@@ -489,9 +502,12 @@ pub fn activeCompactCommandMenu(ctx: RenderContext) ?CompactCommandMenuProjectio
 
 pub const steering_composer_gap_rows: u16 = 1;
 pub const max_steering_message_rows: u16 = 2;
+/// Rows a message layout holds: steering previews show two, fork menu
+/// prompts three.
+pub const max_message_layout_rows: u16 = 3;
 
-const SteeringMessageLayout = struct {
-    rows: [max_steering_message_rows][]const u8 = @splat(""),
+pub const SteeringMessageLayout = struct {
+    rows: [max_message_layout_rows][]const u8 = @splat(""),
     row_count: u16 = 0,
     content_width: u16,
     truncated: bool = false,
@@ -524,7 +540,7 @@ pub fn steering_message_layout(
     var layout: SteeringMessageLayout = .{
         .content_width = if (waits_for_boundary) width -| 2 else width,
     };
-    const limit = @min(row_limit, max_steering_message_rows);
+    const limit = @min(row_limit, max_message_layout_rows);
     var offset: usize = 0;
     while (layout.row_count < limit) {
         const start = offset;

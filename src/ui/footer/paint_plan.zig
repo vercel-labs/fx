@@ -25,6 +25,7 @@ const help_menu_presentation = @import("help_menu_presentation.zig");
 const settings_menu_presentation = @import("settings_menu_presentation.zig");
 const mcp_menu_presentation = @import("mcp_menu_presentation.zig");
 const resume_menu_presentation = @import("resume_menu_presentation.zig");
+const fork_menu_presentation = @import("fork_menu_presentation.zig");
 const question_ui = @import("question_ui.zig");
 const render_input = @import("render_input.zig");
 const row_text = @import("row_text.zig");
@@ -771,6 +772,18 @@ pub fn composeFooterFrame(
                 );
                 try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
             }
+        } else if (input.picker_kind == .fork and ctx.fork_menu.active()) {
+            var menu_row_index: u16 = 0;
+            while (menu_row_index < input.picker_rows) : (menu_row_index += 1) {
+                var menu_row = try fork_menu_presentation.composeForkMenuRow(
+                    alloc,
+                    ctx.fork_menu,
+                    menu_row_index,
+                    shell.layout.cols,
+                    input.picker_rows,
+                );
+                try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
+            }
         } else if (input.picker_kind == .models and ctx.model_menu.active) {
             var menu_row_index: u16 = 0;
             while (menu_row_index < input.picker_rows) : (menu_row_index += 1) {
@@ -965,6 +978,8 @@ pub fn composeFooterFrame(
         try input_presentation.composeHelpMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
     else if (input.show_picker and input.picker_kind == .sessions)
         try input_presentation.composeResumeMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
+    else if (input.show_picker and input.picker_kind == .fork)
+        try input_presentation.composeForkMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
     else if (input.show_picker and input.picker_kind == .models)
         try input_presentation.composeModelsMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
     else if (input.show_picker and input.picker_kind == .slash and input.slash_menu_layout != null)

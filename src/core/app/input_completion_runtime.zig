@@ -30,6 +30,7 @@ const render_input = @import("../../ui/footer/render_input.zig");
 const skills_menu_presentation = @import("../../ui/footer/skills_menu_presentation.zig");
 const model_menu_presentation = @import("../../ui/footer/model_menu_presentation.zig");
 const resume_menu_presentation = @import("../../ui/footer/resume_menu_presentation.zig");
+const fork_menu_presentation = @import("../../ui/footer/fork_menu_presentation.zig");
 const help_menu_presentation = @import("../../ui/footer/help_menu_presentation.zig");
 const settings_menu_presentation = @import("../../ui/footer/settings_menu_presentation.zig");
 const surface_frame = @import("../../ui/footer/surface_frame.zig");
@@ -394,6 +395,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             if (try routeSkillsMenuMove(app, delta)) return true;
             if (comptime runtime_profile.allows(App, .durable_sessions)) {
                 if (try routeSessionPickerMove(app, delta)) return true;
+                if (try routeForkMenuMove(app, delta)) return true;
             }
             if (hasFileQuery(app)) {
                 navigateFilePicker(app, delta);
@@ -484,6 +486,19 @@ pub fn CompletionRuntime(comptime App: type) type {
             if (app.stream.active) return false;
             if (!app.session_persistence.session_picker.active) return false;
             _ = app_session_runtime.Runtime(App).moveSessionPicker(app, delta, try sessionPickerVisibleItems(app));
+            return true;
+        }
+
+        fn routeForkMenuMove(app: *App, delta: i32) !bool {
+            if (comptime !@hasField(App, "session_persistence")) return false;
+            const menu = &app.session_persistence.fork_menu;
+            if (!menu.active()) return false;
+            menu.move(delta);
+            menu.window_start = fork_menu_presentation.windowStart(
+                menu.projection(),
+                app.shell.layout.cols,
+                try inlineMenuRowBudget(app, fork_menu_presentation.max_inline_rows),
+            );
             return true;
         }
 

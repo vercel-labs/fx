@@ -1367,6 +1367,10 @@ const App = struct {
         return SessionAppRuntime.resumeSelectedSession(self);
     }
 
+    pub fn forkBeforeSelectedPrompt(self: *App) ![]u8 {
+        return SessionAppRuntime.forkBeforeSelectedPrompt(self);
+    }
+
     pub fn startSessionCatalogPreload(self: *App) void {
         SessionAppRuntime.preloadSessionCatalog(self);
     }

@@ -29,7 +29,7 @@ pub const composeDividerRow = row_text.composeDividerRow;
 pub const appendClipped = row_text.appendClipped;
 pub const appendAbsoluteColumn = row_text.appendAbsoluteColumn;
 
-pub const PickerKind = enum { model_stage, provider_stage, models, file, slash, skills, help, settings, sessions, mcp, auth };
+pub const PickerKind = enum { model_stage, provider_stage, models, file, slash, skills, help, settings, sessions, fork, mcp, auth };
 pub const CappedInputRows = struct {
     row_limit: usize,
     total_lines: u16,
@@ -65,28 +65,36 @@ pub fn composeSteeringMessageRows(
     var composed: ComposedInputRows = .{};
     errdefer composed.deinit(alloc);
     const layout = render_input.steering_message_layout(message, width, waits_for_boundary, row_limit);
-    for (layout.rows[0..layout.row_count], 0..) |content, index| {
-        const normalized = try alloc.dupe(u8, content);
-        defer alloc.free(normalized);
-        for (normalized) |*byte| {
-            if (byte.* == '\t') byte.* = ' ';
-        }
-        var safe = try text_utils.encodeTerminalSafe(alloc, normalized, std.math.maxInt(usize));
-        defer safe.deinit(alloc);
-
+    for (0..layout.row_count) |index| {
         var row: std.ArrayList(u8) = .empty;
         errdefer row.deinit(alloc);
         try row.appendSlice(alloc, if (waits_for_boundary) ui_render.dim_style else ui_render.hint_style);
         if (waits_for_boundary) try row_text.appendClipped(alloc, &row, "┋ ", width);
-        const ellipsis = layout.truncated and index + 1 == layout.row_count and layout.content_width > 0;
-        try row_text.appendClipped(alloc, &row, safe.bytes, layout.content_width - @as(u16, @intFromBool(ellipsis)));
-        if (ellipsis) {
-            try row.appendSlice(alloc, "…");
-        }
+        try appendMessageLayoutRow(alloc, &row, layout, index);
         try row.appendSlice(alloc, ui_render.reset_style);
         try composed.rows.append(alloc, row);
     }
     return composed;
+}
+
+/// Appends row `index` of a `steering_message_layout` as terminal-safe text,
+/// tabs as spaces, ending in `…` when it is the last row of a cut message.
+pub fn appendMessageLayoutRow(
+    alloc: Allocator,
+    row: *std.ArrayList(u8),
+    layout: render_input.SteeringMessageLayout,
+    index: usize,
+) !void {
+    const normalized = try alloc.dupe(u8, layout.rows[index]);
+    defer alloc.free(normalized);
+    for (normalized) |*byte| {
+        if (byte.* == '\t') byte.* = ' ';
+    }
+    var safe = try text_utils.encodeTerminalSafe(alloc, normalized, std.math.maxInt(usize));
+    defer safe.deinit(alloc);
+    const ellipsis = layout.truncated and index + 1 == layout.row_count and layout.content_width > 0;
+    try row_text.appendClipped(alloc, row, safe.bytes, layout.content_width - @as(u16, @intFromBool(ellipsis)));
+    if (ellipsis) try row.appendSlice(alloc, "…");
 }
 
 test "steering rows use the dotted rail without an escape hint" {
@@ -709,6 +717,39 @@ pub fn composeHelpMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool
         "↑↓ move  tab category  enter  esc",
         "tab category  enter open  esc",
         "tab enter esc",
+    };
+    var hint = variants[variants.len - 1];
+    for (variants) |candidate| {
+        if (display_width.visibleWidth(candidate) <= width) {
+            hint = candidate;
+            break;
+        }
+    }
+
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
+    try row.appendSlice(alloc, ui_render.dim_style);
+    try row_text.appendClipped(alloc, &row, hint, width);
+    try row.appendSlice(alloc, ui_render.reset_style);
+    return row;
+}
+
+pub fn composeForkMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool) !std.ArrayList(u8) {
+    if (ctrl_c_pending) {
+        var warning: std.ArrayList(u8) = .empty;
+        errdefer warning.deinit(alloc);
+        try warning.appendSlice(alloc, ui_render.statusline_style);
+        try row_text.appendClipped(alloc, &warning, "press ctrl+c again to exit", width);
+        try warning.appendSlice(alloc, ui_render.reset_style);
+        return warning;
+    }
+
+    const variants = [_][]const u8{
+        "↑↓ navigate     enter fork     esc close",
+        "↑↓ navigate  enter fork  esc close",
+        "↑↓ move  enter  esc",
+        "enter fork  esc close",
+        "enter esc",
     };
     var hint = variants[variants.len - 1];
     for (variants) |candidate| {

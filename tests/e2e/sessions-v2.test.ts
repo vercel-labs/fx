@@ -4,6 +4,8 @@ import { createHash } from "node:crypto";
 import {
   appendFileSync,
   chmodSync,
+  copyFileSync,
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -16,9 +18,10 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
+  composerContains,
   FAKE_GATEWAY_MODEL,
   type FakeGatewayOptions,
   fakeGatewayFinalText,
@@ -26,6 +29,7 @@ import {
   fakeGatewayToolCall,
   fakeShellRun,
   heldFakeGatewayFinalText,
+  isComposerLine,
   startDynamicFakeGateway,
   startFakeGateway,
   TmuxSession,
@@ -1274,6 +1278,131 @@ test.skipIf(!tmuxAvailable())("the picker shows a session open in another fx as 
     rmSync(fixture.root, { recursive: true, force: true });
   }
 }, TIMEOUT * 4);
+
+/// The env that traces one launch's session wiring to `trace`.
+function wiringTrace(trace: string) {
+  return { FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "wiring" };
+}
+
+/// With FX_E2E_TLA_DIR set, keeps a run's traces and saved logs for offline
+/// checking: `<dir>/<test name>/*.wiring.log` and `<dir>/<test name>/sessions-v2/`.
+function keepRunForOfflineCheck(fixture: Fixture, name: string, traces: string[]) {
+  const dir = process.env.FX_E2E_TLA_DIR;
+  if (!dir) return;
+  const kept = join(dir, name.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, ""));
+  mkdirSync(kept, { recursive: true });
+  for (const trace of traces) if (existsSync(trace)) copyFileSync(trace, join(kept, basename(trace)));
+  if (existsSync(v2Root(fixture))) cpSync(v2Root(fixture), join(kept, "sessions-v2"), { recursive: true });
+}
+
+/// The fork menu's rows below the composer, each with whether it is selected.
+async function forkMenuRows(session: TmuxSession) {
+  const lines = (await session.capturePaneEscapes()).split("\n");
+  const plain = lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  const composer = plain.findLastIndex(isComposerLine);
+  return plain
+    .map((text, index) => ({ text: text.trim(), selected: lines[index]!.includes("\x1b[1m") }))
+    .slice(composer + 1)
+    .filter((row) => row.text.startsWith("Fork prompt"));
+}
+
+const forkTest = "/fork starts a session before a chosen prompt and leaves the source as it was";
+test.skipIf(!tmuxAvailable())(forkTest, async () => {
+  const fixture = createFixture("fx-v2-app-fork-");
+  const trace = join(fixture.root, "app.wiring.log");
+  const gateway = replyToLatest([
+    ["Fork prompt one.", "FORK_ONE"],
+    ["Fork prompt two.", "FORK_TWO"],
+    ["Fork prompt three.", "FORK_THREE"],
+    ["A new second prompt in the fork.", "FORK_NEW_SECOND"],
+  ]);
+  try {
+    const app = await startApp(fixture, gateway, [], true, wiringTrace(trace));
+    for (const [prompt, answer] of [["Fork prompt one.", "FORK_ONE"], ["Fork prompt two.", "FORK_TWO"], ["Fork prompt three.", "FORK_THREE"]]) {
+      await app.session.sendText(prompt!);
+      await app.session.waitForText(answer!, TIMEOUT);
+    }
+    await app.session.sendText("/rename Fork source");
+    await app.session.waitForText('renamed to "Fork source"', TIMEOUT);
+    await app.session.waitForStableComposer();
+    const source = onlySession(fixture);
+    const sourcePath = join(v2Root(fixture), source, "log.jsonl");
+    const sourceLog = readFileSync(sourcePath);
+
+    await app.session.sendText("/fork");
+    await app.session.waitForPane((pane) => pane.includes("enter fork"), TIMEOUT);
+    expect(await forkMenuRows(app.session)).toEqual([
+      { text: "Fork prompt one.", selected: false },
+      { text: "Fork prompt two.", selected: false },
+      { text: "Fork prompt three.", selected: true },
+    ]);
+    await app.session.sendKeys("Up");
+    expect((await forkMenuRows(app.session)).map((row) => row.selected)).toEqual([false, true, false]);
+    await app.session.sendKeys("Enter");
+
+    expect(await scrollbackContains(app.session, `original session fx --sessions-v2 --resume ${source}`)).toContain("* session forked: Fork source (fork)");
+    await app.session.waitForPane((pane) => composerContains(pane, "Fork prompt two.") && !pane.includes("enter fork"), TIMEOUT);
+    const ids = savedSessions(fixture);
+    expect(ids.length).toBe(2);
+    const fork = ids.find((id) => id !== source)!;
+    expect(logLines(fixture, fork).filter((line) => line.kind === "turn_committed").length).toBe(1);
+    const forkLog = readFileSync(join(v2Root(fixture), fork, "log.jsonl"), "utf8");
+    expect(forkLog).toContain("Fork prompt one.");
+    expect(forkLog).not.toContain("Fork prompt two.");
+    expect(storedTitles(fixture, fork).at(-1)).toBe("Fork source (fork)");
+    // The fork wrote nothing into the source; closing it on the switch adds
+    // only the manager's clean-close line.
+    const sourceAfterFork = readFileSync(sourcePath);
+    expect(sourceAfterFork.subarray(0, sourceLog.length).equals(sourceLog)).toBe(true);
+    const added = sourceAfterFork.subarray(sourceLog.length).toString("utf8").trimEnd().split("\n");
+    expect(added.map((line) => JSON.parse(line).kind)).toEqual(["closed"]);
+
+    // The next prompt goes on in the fork; the source stays as it was.
+    await app.session.sendKeys("C-u");
+    await app.session.sendText("A new second prompt in the fork.");
+    await app.session.waitForText("FORK_NEW_SECOND", TIMEOUT);
+    await quitApp(app);
+    expect(readFileSync(join(v2Root(fixture), fork, "log.jsonl"), "utf8")).toContain("A new second prompt in the fork.");
+    expect(readFileSync(sourcePath).equals(sourceAfterFork)).toBe(true);
+    expect(gateway.requests.at(-1)!.body).not.toContain("Fork prompt two.");
+    for (const id of ids) expectWholeLog(fixture, id);
+    expectNoV1Sessions(fixture);
+  } finally {
+    keepRunForOfflineCheck(fixture, forkTest, [trace]);
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 4);
+
+const forkWithoutV2Test = "/fork without --sessions-v2 says forking needs it";
+test.skipIf(!tmuxAvailable())(forkWithoutV2Test, async () => {
+  const fixture = createFixture("fx-v2-app-fork-v1-");
+  const trace = join(fixture.root, "app.wiring.log");
+  const gateway = replyToLatest([]);
+  const stderrPath = join(fixture.root, "stderr.log");
+  writeFileSync(stderrPath, "");
+  let session: TmuxSession | null = null;
+  try {
+    session = await TmuxSession.create({
+      cmd: FX_BIN,
+      cwd: fixture.workspace,
+      env: { ...env(fixture, gateway, false), NO_COLOR: "1", ...wiringTrace(trace) },
+      stderrPath,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/fork");
+    await session.waitForText("! session: forking needs --sessions-v2", TIMEOUT);
+    expect(await session.capturePane()).not.toContain("enter fork");
+    await session.sendText("/quit");
+    expect(await session.waitForSessionEnd()).toBe(true);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  } finally {
+    if (session) await session.kill();
+    keepRunForOfflineCheck(fixture, forkWithoutV2Test, [trace]);
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
 
 // ---------------------------------------------------------------------------
 // ACP

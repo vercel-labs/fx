@@ -1816,6 +1816,82 @@ pub const Session = struct {
         try replay(self.source(), alloc, alloc, .start, null, ReplaySink.init(&sink));
     }
 
+    /// A prompt a fork can start before: the turn it opened and its text.
+    pub const ForkPoint = struct {
+        turn: u64,
+        prompt: []u8,
+    };
+
+    /// Every turn's prompt in the log, oldest first, for `fork` (D58).
+    /// Caller owns the slice and each prompt; free with `freeForkPoints`.
+    pub fn forkPoints(self: *Session, alloc: Allocator) ![]ForkPoint {
+        const Sink = struct {
+            alloc: Allocator,
+            points: std.ArrayList(ForkPoint) = .empty,
+
+            fn turn(sink: *@This(), value: types.HistoryTurn, number: ?u64) !void {
+                defer types.freeHistoryTurn(sink.alloc, value);
+                const user = switch (value) {
+                    .assistant => |entry| entry.user,
+                    .interrupted => |entry| entry.user,
+                    .compacted_summary => return,
+                };
+                const prompt = try sink.alloc.dupe(u8, user.text);
+                errdefer sink.alloc.free(prompt);
+                try sink.points.append(sink.alloc, .{ .turn = number orelse return error.InvalidConversationFrame, .prompt = prompt });
+            }
+
+            fn summary(_: *@This(), _: []const u8) !void {}
+        };
+        var sink: Sink = .{ .alloc = alloc };
+        errdefer {
+            for (sink.points.items) |point| alloc.free(point.prompt);
+            sink.points.deinit(alloc);
+        }
+        try replay(self.source(), alloc, alloc, .start, null, ReplaySink.init(&sink));
+        return sink.points.toOwnedSlice(alloc);
+    }
+
+    pub fn freeForkPoints(alloc: Allocator, points: []const ForkPoint) void {
+        for (points) |point| alloc.free(point.prompt);
+        alloc.free(points);
+    }
+
+    pub const Fork = struct {
+        /// The fork holds every turn before this one (a `ForkPoint.turn`).
+        before_turn: u64,
+        workspace: []const u8,
+        host: Host,
+        /// The title the source shows; the fork gets it marked as a fork.
+        title: ?[]const u8 = null,
+    };
+
+    /// A new session holding this one's log up to the end of the turn before
+    /// `options.before_turn`, under a new id (D58). The manager copies the
+    /// lines and hard-links the blobs; this session is never written. The
+    /// caller owns the fork, open for writing.
+    pub fn fork(self: *Session, alloc: Allocator, options: Fork) !*Session {
+        if (options.before_turn == 0) return error.InvalidForkPoint;
+        io_mod.e2eFailIfDurableMutationAttempted();
+        const handle = try self.store.manager.openFork(.{
+            .source = self.id(),
+            .at = .{ .turn = options.before_turn - 1 },
+            .workspace = options.workspace,
+            .host = options.host,
+        });
+        errdefer handle.release();
+        const copy = try init(alloc, self.store, handle, false);
+        errdefer copy.destroyInner();
+        try copy.openMoved();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const state = try handle.state(arena.allocator());
+        copy.last_turn = state.last_turn;
+        if (options.title) |title| try copy.rename(try forkTitle(arena.allocator(), title));
+        traceWiring("Fork", copy.id(), "", copy.store.pid);
+        return copy;
+    }
+
     /// The session as v1's `DurableSessionState`, for hosts that restore
     /// through it, and its stored title. Caller owns both.
     pub fn durableState(self: *Session, alloc: Allocator, workspace: []const u8) !Resumed {
@@ -3117,6 +3193,13 @@ fn decodeUsageValue(alloc: Allocator, value: std.json.Value) !UsageCheckpoint {
     return .{ .snapshot = try session_usage.parseSnapshotValue(alloc, snapshot), .at_ms = at.integer };
 }
 
+/// A fork's title: the source's, marked once as a fork (D58).
+fn forkTitle(arena: Allocator, title: []const u8) ![]const u8 {
+    const mark = " (fork)";
+    if (std.mem.endsWith(u8, title, mark)) return title;
+    return std.fmt.allocPrint(arena, "{s}" ++ mark, .{title});
+}
+
 /// The title v1 derives from the first prompt of `history`, if any.
 fn deriveTitle(arena: Allocator, history: []const types.HistoryTurn) !?[]const u8 {
     const display = session_display_metadata.deriveFromHistory(arena, history) catch return null;
@@ -3616,6 +3699,82 @@ fn countTitleSets(manager: *sm.Manager, id: []const u8) !usize {
 fn storedTitle(s: *Session) !?[]u8 {
     const shown = try s.info(testing.allocator);
     return shown.title;
+}
+
+fn commitPrompt(s: *Session, prompt: []const u8) !void {
+    try s.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast(prompt) }, .assistant = @constCast("ok") } }, types.ConversationLanguage.default());
+}
+
+fn lineCount(manager: *sm.Manager, id: []const u8) !usize {
+    var page = try manager.read(testing.allocator, id, .start, .forward, 1000);
+    defer page.deinit();
+    return page.entries.len;
+}
+
+test "fork points list every turn's prompt, an interrupted one included (D58)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    try commitPrompt(s, "first");
+    try s.commitTurn(.{ .interrupted = .{ .user = .{ .text = @constCast("second") }, .terminal_reason = .cancelled } }, types.ConversationLanguage.default());
+    try commitPrompt(s, "third\nwith a second line");
+    const points = try s.forkPoints(testing.allocator);
+    defer Session.freeForkPoints(testing.allocator, points);
+    try testing.expectEqual(@as(usize, 3), points.len);
+    try testing.expectEqualStrings("first", points[0].prompt);
+    try testing.expectEqualStrings("second", points[1].prompt);
+    try testing.expectEqualStrings("third\nwith a second line", points[2].prompt);
+    try testing.expect(points[0].turn < points[1].turn and points[1].turn < points[2].turn);
+}
+
+test "a fork holds the turns before its prompt under a new id and leaves the source as it was (D58)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    try commitPrompt(s, "first");
+    try commitPrompt(s, "second");
+    try commitPrompt(s, "third");
+    const source_lines = try lineCount(t.store.manager, s.id());
+    const points = try s.forkPoints(testing.allocator);
+    defer Session.freeForkPoints(testing.allocator, points);
+
+    const copy = try s.fork(testing.allocator, .{ .before_turn = points[2].turn, .workspace = "/w", .host = .app, .title = "Plan" });
+    defer copy.close();
+    try testing.expect(!std.mem.eql(u8, s.id(), copy.id()));
+    try testing.expectEqual(source_lines, try lineCount(t.store.manager, s.id()));
+    var restored = try copy.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), restored.history.len);
+    try testing.expectEqualStrings("second", restored.history[1].assistant.user.text);
+    try testing.expectEqualStrings("Plan (fork)", restored.title.?);
+    // The fork goes on as any session does; the source is still untouched.
+    try commitPrompt(copy, "a different third");
+    try testing.expectEqual(source_lines, try lineCount(t.store.manager, s.id()));
+}
+
+test "a fork of a fork keeps one fork mark, and a fork before the first prompt is empty (D58)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    try commitPrompt(s, "first");
+    const points = try s.forkPoints(testing.allocator);
+    defer Session.freeForkPoints(testing.allocator, points);
+    const copy = try s.fork(testing.allocator, .{ .before_turn = points[0].turn, .workspace = "/w", .host = .app, .title = "Plan (fork)" });
+    defer copy.close();
+    var restored = try copy.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), restored.history.len);
+    try testing.expectEqualStrings("Plan (fork)", restored.title.?);
+    try testing.expectError(error.InvalidForkPoint, s.fork(testing.allocator, .{ .before_turn = 0, .workspace = "/w", .host = .app }));
 }
 
 test "a session whose first turn never ended takes its first prompt as title at its next turn end (D52)" {
