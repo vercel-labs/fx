@@ -14,6 +14,7 @@ pub const ResolveError = error{
 pub const Profile = command_environment.Profile;
 pub const Environment = command_environment.Environment;
 
+/// Shells fx can use as the login shell and restore from a snapshot.
 pub const ShellKind = enum { bash, zsh };
 
 pub fn shellKind(path: []const u8) ?ShellKind {
@@ -21,6 +22,30 @@ pub fn shellKind(path: []const u8) ?ShellKind {
     if (std.mem.eql(u8, basename, "bash")) return .bash;
     if (std.mem.eql(u8, basename, "zsh")) return .zsh;
     return null;
+}
+
+/// How fx starts a shell. POSIX shells run only when chosen explicitly: they
+/// are never the login shell and have no snapshot.
+const Family = enum { bash, zsh, posix };
+
+const posix_shell_names = [_][]const u8{ "sh", "dash", "ksh" };
+
+fn family(path: []const u8) ?Family {
+    if (shellKind(path)) |kind| return switch (kind) {
+        .bash => .bash,
+        .zsh => .zsh,
+    };
+    const basename = std.fs.path.basename(path);
+    for (posix_shell_names) |name| {
+        if (std.mem.eql(u8, basename, name)) return .posix;
+    }
+    return null;
+}
+
+/// Reports whether fx can run commands in the shell named or located by
+/// `path`: bash, zsh, sh, dash, or ksh.
+pub fn isSupportedShell(path: []const u8) bool {
+    return family(path) != null;
 }
 
 fn fallbackLoginShell() []const u8 {
@@ -76,11 +101,14 @@ pub fn resolve(
         return error.RelativeShellPath;
     }
 
-    const kind = shellKind(selection.path) orelse return error.UnsupportedShell;
+    const kind = family(selection.path) orelse return error.UnsupportedShell;
 
     var result = Invocation{ .path = selection.path };
     result.append(selection.path);
     switch (kind) {
+        // A non-interactive POSIX shell reads no startup files; an interactive
+        // one reads only $ENV.
+        .posix => result.append("-i"),
         .bash => {
             if (selection.clean_start) {
                 result.append("--noprofile");
@@ -156,6 +184,46 @@ pub fn environmentForShellSpec(
     };
 }
 
+/// Environment for a captured (non-TTY) run in an explicitly chosen shell.
+/// The process keeps one startup-file snapshot, of the default shell, and a
+/// `user` environment for any other shell would replace it and reset the
+/// approvals bound to it. So only the default shell runs with the user's
+/// startup files; another shell runs without them and inherits fx's
+/// environment, which already carries the user's PATH and variables.
+pub fn capturedEnvironmentForShellSpec(
+    alloc: Allocator,
+    configured_login_shell: ?[]const u8,
+    shell: contracts.ShellSpec,
+) (ResolveError || Allocator.Error)!Environment {
+    const explicit = switch (shell) {
+        .user_login => return environmentForShellSpec(alloc, configured_login_shell, shell),
+        .executable => |value| value,
+    };
+    const default_path = supportedLoginShell(configured_login_shell) catch |err| switch (err) {
+        error.MissingLoginShell => null,
+        else => return err,
+    };
+    if (default_path) |path| {
+        if (std.mem.eql(u8, path, explicit.path)) return environmentForShellSpec(alloc, configured_login_shell, shell);
+    }
+    _ = try resolve(null, shell);
+    return .{ .clean = try alloc.dupe(u8, explicit.path) };
+}
+
+/// Environment for a captured (non-TTY) run: the explicitly chosen shell when
+/// there is one, otherwise the login shell with `profile`. Permission admission
+/// and the shell tool both call this, so the approved environment is the one
+/// that runs.
+pub fn capturedRunEnvironment(
+    alloc: Allocator,
+    configured_login_shell: ?[]const u8,
+    profile: ?Profile,
+    shell: ?contracts.ShellSpec,
+) (ResolveError || Allocator.Error)!Environment {
+    if (shell) |spec| return capturedEnvironmentForShellSpec(alloc, configured_login_shell, spec);
+    return environment(alloc, configured_login_shell, profile);
+}
+
 pub fn profileShell(
     alloc: Allocator,
     configured_login_shell: ?[]const u8,
@@ -184,6 +252,25 @@ pub fn profileShell(
 
 const captured_zsh_user_prelude = "\\builtin trap - TERM; ";
 
+/// zsh options for model commands, which are written as bash text. A word
+/// that starts with `=` stays a word instead of a command path lookup that
+/// aborts the rest of the command, an unmatched glob stays a literal word, and
+/// `${arr[0]}` is the first element. They run after the startup files and the
+/// snapshot replay, so the user's own settings cannot undo them.
+const zsh_model_command_options = "\\builtin unsetopt equals nomatch; \\builtin setopt kshzerosubscript; ";
+
+/// Returns the text the shell at `shell_path` runs for the model command
+/// `command`: prefixed with `zsh_model_command_options` for zsh, unchanged for
+/// other shells. The result is either `command` itself or allocated in `alloc`.
+pub fn modelCommandText(
+    alloc: Allocator,
+    shell_path: []const u8,
+    command: []const u8,
+) Allocator.Error![]const u8 {
+    if (shellKind(shell_path) != .zsh) return command;
+    return std.mem.concat(alloc, u8, &.{ zsh_model_command_options, command });
+}
+
 pub fn capturedInvocation(
     alloc: Allocator,
     environment_value: Environment,
@@ -201,6 +288,12 @@ pub fn capturedInvocation(
             return invocation;
         },
         .user => |path| {
+            if (family(path) == .posix) {
+                var invocation = try resolve(null, .{ .executable = .{ .path = path } });
+                removeInteractiveFlag(&invocation);
+                invocation.setCommand(command);
+                return invocation;
+            }
             var invocation = try resolve(path, .user_login);
             if (std.mem.eql(u8, std.fs.path.basename(path), "bash")) {
                 removeInteractiveFlag(&invocation);
@@ -368,19 +461,24 @@ fn removeInteractiveFlag(invocation: *Invocation) void {
     invocation.len -= 1;
 }
 
+/// Builds the script the TTY shell at `shell_path` sources. Bash and zsh read
+/// the command file with `$(< file)` and run it with `builtin eval`; POSIX
+/// shells have neither, so they use `cat` and `eval`.
 pub fn buildBootstrap(
     alloc: Allocator,
+    shell_path: []const u8,
     executable: []const u8,
     control_path: []const u8,
     nonce: []const u8,
     command_path: ?[]const u8,
 ) Allocator.Error![]u8 {
+    const posix = family(shell_path) == .posix;
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(alloc);
 
     try output.appendSlice(alloc, "set +x; ");
     if (command_path) |path| {
-        try output.appendSlice(alloc, "fx_terminal_command=$(< ");
+        try output.appendSlice(alloc, if (posix) "fx_terminal_command=$(cat " else "fx_terminal_command=$(< ");
         try appendShellWord(&output, alloc, path);
         try output.appendSlice(alloc, ") || exit 125; ");
     }
@@ -397,8 +495,12 @@ pub fn buildBootstrap(
         );
         try output.appendSlice(
             alloc,
-            " || exit 125; builtin eval -- \"$fx_terminal_command\"; " ++
-                "fx_terminal_status=$?; exit \"$fx_terminal_status\"\n",
+            if (posix)
+                " || exit 125; eval \"$fx_terminal_command\"; " ++
+                    "fx_terminal_status=$?; exit \"$fx_terminal_status\"\n"
+            else
+                " || exit 125; builtin eval -- \"$fx_terminal_command\"; " ++
+                    "fx_terminal_status=$?; exit \"$fx_terminal_status\"\n",
         );
     } else {
         try output.appendSlice(alloc, " || exit 125\n");
@@ -559,6 +661,64 @@ test "login shell resolution falls back without accepting explicit unsupported s
     );
 }
 
+test "explicit POSIX shells run directly and never become the login shell" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    for ([_][]const u8{ "/bin/sh", "/bin/dash", "/usr/bin/ksh" }) |path| {
+        try std.testing.expect(isSupportedShell(path));
+        const tty = try resolve(null, .{ .executable = .{ .path = path } });
+        try std.testing.expectEqualSlices([]const u8, &.{ path, "-i" }, tty.argv());
+        const user = try capturedInvocation(arena, .{ .user = path }, "printf ok");
+        try std.testing.expectEqualSlices([]const u8, &.{ path, "-c", "printf ok" }, user.argv());
+        const clean = try capturedInvocation(arena, .{ .clean = path }, "printf ok");
+        try std.testing.expectEqualSlices([]const u8, &.{ path, "-c", "printf ok" }, clean.argv());
+    }
+    try std.testing.expect(!isSupportedShell("/opt/homebrew/bin/fish"));
+    try std.testing.expect(!isSupportedShell("/usr/bin/python3"));
+    // A POSIX login shell still falls back, as an unsupported one always has.
+    try std.testing.expectEqualStrings(fallbackLoginShell(), (try resolve("/bin/ksh", .user_login)).path);
+}
+
+test "captured runs keep startup files only for the default shell" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const bash: contracts.ShellSpec = .{ .executable = .{ .path = "/bin/bash" } };
+
+    // Choosing the default shell explicitly is the same as not choosing one.
+    const same = try capturedEnvironmentForShellSpec(arena, "/bin/bash", bash);
+    try std.testing.expectEqualStrings("/bin/bash", same.user);
+    const same_clean = try capturedEnvironmentForShellSpec(arena, "/bin/bash", .{ .executable = .{ .path = "/bin/bash", .clean_start = true } });
+    try std.testing.expectEqualStrings("/bin/bash", same_clean.clean);
+    // Any other shell runs without startup files, so the default shell's snapshot stays.
+    const other = try capturedEnvironmentForShellSpec(arena, "/bin/zsh", bash);
+    try std.testing.expectEqualStrings("/bin/bash", other.clean);
+    const posix = try capturedEnvironmentForShellSpec(arena, "/bin/zsh", .{ .executable = .{ .path = "/bin/sh" } });
+    try std.testing.expectEqualStrings("/bin/sh", posix.clean);
+    const no_login = try capturedEnvironmentForShellSpec(arena, null, bash);
+    try std.testing.expectEqualStrings("/bin/bash", no_login.clean);
+    try std.testing.expectError(error.UnsupportedShell, capturedEnvironmentForShellSpec(arena, "/bin/zsh", .{ .executable = .{ .path = "/usr/bin/python3" } }));
+    try std.testing.expectError(error.RelativeShellPath, capturedEnvironmentForShellSpec(arena, "/bin/zsh", .{ .executable = .{ .path = "bash" } }));
+}
+
+test "POSIX TTY bootstrap avoids bash and zsh syntax" {
+    const bootstrap = try buildBootstrap(
+        std.testing.allocator,
+        "/bin/dash",
+        "/tmp/fx",
+        "/tmp/control",
+        "abcd",
+        "/tmp/command",
+    );
+    defer std.testing.allocator.free(bootstrap);
+    try std.testing.expect(std.mem.find(u8, bootstrap, "fx_terminal_command=$(cat '/tmp/command')") != null);
+    try std.testing.expect(std.mem.find(u8, bootstrap, "eval \"$fx_terminal_command\"") != null);
+    try std.testing.expect(std.mem.find(u8, bootstrap, "builtin") == null);
+    try std.testing.expect(std.mem.find(u8, bootstrap, "$(<") == null);
+}
+
 test "captured profiles use exact non-PTY argv" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -594,6 +754,26 @@ test "captured profiles use exact non-PTY argv" {
     for (&expected_zsh_user, zsh_user.argv()) |expected, actual| {
         try std.testing.expectEqualStrings(expected, actual);
     }
+}
+
+test "model command text sets bash-compatible options only for zsh" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const command = "echo =====";
+    try std.testing.expectEqualStrings(
+        "\\builtin unsetopt equals nomatch; \\builtin setopt kshzerosubscript; echo =====",
+        try modelCommandText(arena, "/bin/zsh", command),
+    );
+    try std.testing.expectEqualStrings(
+        "\\builtin unsetopt equals nomatch; \\builtin setopt kshzerosubscript; echo =====",
+        try modelCommandText(arena, "/opt/homebrew/bin/zsh", command),
+    );
+    // Other shells already treat these words as bash does; nothing is added
+    // and nothing is allocated.
+    try std.testing.expect((try modelCommandText(arena, "/bin/bash", command)).ptr == command.ptr);
+    try std.testing.expect((try modelCommandText(arena, "/bin/sh", command)).ptr == command.ptr);
 }
 
 test "captured invocation provider projection shell-quotes every argv word" {
@@ -650,6 +830,7 @@ test "unsupported login shell profiles fall back for captured and persistent exe
 test "bootstrap quotes private paths and separates command completion" {
     const commandless = try buildBootstrap(
         std.testing.allocator,
+        "/bin/zsh",
         "/tmp/fx'bin",
         "/tmp/control",
         "nonce",
@@ -664,6 +845,7 @@ test "bootstrap quotes private paths and separates command completion" {
 
     const command = try buildBootstrap(
         std.testing.allocator,
+        "/bin/zsh",
         "/tmp/fx",
         "/tmp/control",
         "nonce",
@@ -694,6 +876,7 @@ test "bootstrap quotes private paths and separates command completion" {
 fn checkBootstrapAllocationFailures(alloc: Allocator) !void {
     const bootstrap = try buildBootstrap(
         alloc,
+        "/bin/zsh",
         "/tmp/fx",
         "/tmp/control",
         "nonce",

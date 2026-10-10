@@ -713,11 +713,11 @@ pub fn executeCommandInEnvironment(
     cwd: []const u8,
     environment: command_environment.Environment,
 ) !command_contract.RunCommandResult {
-    switch (environment) {
+    const shell_path = switch (environment) {
         .legacy => return executeCommand(cfg, arena, command, cwd),
         .workspace_clean => return error.InvalidCommandEnvironment,
-        .clean, .user => {},
-    }
+        .clean, .user => |path| path,
+    };
 
     var scratch_state = std.heap.ArenaAllocator.init(arena);
     defer mem_utils.deinit_arena(scratch_state);
@@ -726,15 +726,13 @@ pub fn executeCommandInEnvironment(
     var effective_cfg = cfg;
     if (effective_cfg.timeout_started_ms == null) effective_cfg.timeout_started_ms = io_mod.milliTimestamp();
     try ExecutionControl.init(effective_cfg).check();
-    switch (environment) {
-        .user => |shell_path| if (snapshotEligible(shell_path, command)) {
-            if (try executeWithSnapshot(arena, scratch, effective_cfg, command, cwd, shell_path)) |result| {
-                return result;
-            }
-        },
-        else => {},
+    if (environment == .user and snapshotEligible(shell_path, command)) {
+        if (try executeWithSnapshot(arena, scratch, effective_cfg, command, cwd, shell_path)) |result| {
+            return result;
+        }
     }
-    const invocation = try shell_resolver.capturedInvocation(scratch, environment, command);
+    const shell_command = try shell_resolver.modelCommandText(scratch, shell_path, command);
+    const invocation = try shell_resolver.capturedInvocation(scratch, environment, shell_command);
     debug_trace.logf(
         "core",
         "command runner explicit environment={s} shell={s}",
@@ -820,7 +818,11 @@ fn executeWithSnapshot(
         &nonce,
     });
     const invocation = try shell_resolver.snapshotInvocation(scratch, generation.shell_path, failure_marker);
-    const script = try shell_resolver.snapshotScript(scratch, generation.replay, command);
+    const script = try shell_resolver.snapshotScript(
+        scratch,
+        generation.replay,
+        try shell_resolver.modelCommandText(scratch, generation.shell_path, command),
+    );
     debug_trace.logf(
         "core",
         "command runner snapshot generation={d} shell={s} replay_bytes={d}",
@@ -1938,6 +1940,28 @@ test "explicit captured profiles execute exact shells without synthetic stderr" 
             zsh_user.output,
         );
     } else |_| {}
+}
+
+test "zsh runs bash-style model commands as bash would" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cfg = Config{ .max_command_output_bytes = 16 * 1024 };
+    // Unquoted `=====` aborted the rest of the command, the unmatched glob was
+    // a zsh error, and `${arr[0]}` was empty.
+    const command = "echo before; ls *.fx-no-such-ext 2>/dev/null; echo =====; arr=(a b); echo ${arr[0]}; echo after";
+    const expected = "exit_code=0\n<stdout>\nbefore\n=====\na\nafter\n</stdout>\n";
+
+    // The clean profile and the user profile (snapshot or full startup).
+    const environments = [_]command_environment.Environment{ .{ .clean = "/bin/zsh" }, .{ .user = "/bin/zsh" } };
+    for (environments) |environment| {
+        const result = try executeCommandInEnvironment(cfg, arena, command, "/tmp", environment);
+        try std.testing.expectEqualStrings(expected, result.output);
+    }
 }
 
 test "zsh user profile reports natural SIGTERM after alias-safe startup" {

@@ -31,6 +31,7 @@ const command_result_mapping = @import("../../tooling/command_result_mapping.zig
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
 const tooling_tool_admission = @import("../../tooling/tool_admission.zig");
 const tool_args = @import("../../tooling/tool_args.zig");
+const shell_request = @import("../../terminal/shell_request.zig");
 const hooks = @import("../../hooks/hooks.zig");
 const command_environment = @import("../../execution/command_environment.zig");
 const context_contract = @import("../../workspace/context_contract.zig");
@@ -305,6 +306,28 @@ fn terminal_request_schema_advertised(
     advertised_functions: []const model_tool_schema.FunctionSchema,
 ) bool {
     return request_union_schema_advertised(advertised_functions, "shell");
+}
+
+/// The shell tool is advertised with the flat contract: `command` at the top
+/// level and no `request` wrapper.
+fn terminal_flat_schema_advertised(
+    advertised_functions: []const model_tool_schema.FunctionSchema,
+) bool {
+    for (advertised_functions) |function| {
+        if (!std.mem.eql(u8, function.name, "shell")) continue;
+        var has_command = false;
+        for (function.input_schema.properties) |property| {
+            if (std.mem.eql(u8, property.name, "request")) return false;
+            if (std.mem.eql(u8, property.name, "command")) has_command = true;
+        }
+        // A schema that still requires action is the reduced run-only
+        // projection, which keeps its own shape.
+        for (function.input_schema.required) |name| {
+            if (std.mem.eql(u8, name, "action")) return false;
+        }
+        return has_command;
+    }
+    return false;
 }
 
 fn read_tool_result_request_schema_advertised(
@@ -687,10 +710,55 @@ fn complete_projected_tool_exchanges(
 }
 
 /// Returns source unchanged or an owned projection released by free_terminal_request_projection.
+/// The shape shell calls take in the schema fx advertises.
+const ShellArgumentsForm = enum {
+    /// `{"request": {...}}` with an action.
+    nested,
+    /// The flat contract read by `shell_request`.
+    flat,
+};
+
 fn project_terminal_request_messages(
     alloc: Allocator,
     registry: tool_dispatch.Registry,
     attempt_eligible: bool,
+    source: []const ChatMessage,
+    provider: agent_stream_provider.Provider,
+    selection: model_provider.ProviderSelection,
+) ![]const ChatMessage {
+    return project_shell_history(alloc, registry, attempt_eligible, .nested, source, provider, selection);
+}
+
+/// History arguments for one shell call. Nested form re-wraps it; flat form
+/// shows a call fx read in the flat contract and leaves any other call
+/// exactly as sent. Null means unchanged.
+fn shellHistoryArguments(
+    alloc: Allocator,
+    arguments_json: []const u8,
+    form: ShellArgumentsForm,
+) Allocator.Error!?[]u8 {
+    switch (form) {
+        .nested => return projected_terminal_request_arguments(alloc, arguments_json),
+        .flat => {
+            var scratch_state = std.heap.ArenaAllocator.init(alloc);
+            defer scratch_state.deinit();
+            const scratch = scratch_state.allocator();
+            const request = switch (try shell_request.read(scratch, arguments_json, shell_request.no_lookup_locator)) {
+                .request => |value| value,
+                .problem => return null,
+            };
+            const flat = try shell_request.modelArguments(scratch, request);
+            if (std.mem.eql(u8, flat, arguments_json)) return null;
+            return try alloc.dupe(u8, flat);
+        },
+    }
+}
+
+fn project_shell_history(
+    alloc: Allocator,
+    registry: tool_dispatch.Registry,
+    attempt_eligible: bool,
+    form: ShellArgumentsForm,
     source: []const ChatMessage,
     provider: agent_stream_provider.Provider,
     selection: model_provider.ProviderSelection,
@@ -736,7 +804,7 @@ fn project_terminal_request_messages(
             }
             const tool = registry.lookup(call.name) orelse continue;
             if (tool.executor_kind != .terminal) continue;
-            if (try projected_terminal_request_arguments(alloc, call.arguments_json)) |arguments| {
+            if (try shellHistoryArguments(alloc, call.arguments_json, form)) |arguments| {
                 alloc.free(arguments);
                 needs_projection = true;
             }
@@ -804,10 +872,17 @@ fn project_terminal_request_messages(
                 {
                     const legacy = findLegacyCall(legacy_calls.items, message_index, call.id) orelse continue;
                     if (!legacy.mapped) continue;
-                    const arguments = try projectLegacyTerminalExecArguments(
+                    const nested = try projectLegacyTerminalExecArguments(
                         alloc,
                         call.arguments_json,
                     ) orelse continue;
+                    const arguments = switch (form) {
+                        .nested => nested,
+                        .flat => blk: {
+                            defer alloc.free(nested);
+                            break :blk (try shellHistoryArguments(alloc, nested, .flat)) orelse try alloc.dupe(u8, nested);
+                        },
+                    };
                     var mapped = call;
                     mapped.name = "shell";
                     mapped.arguments_json = arguments;
@@ -823,9 +898,10 @@ fn project_terminal_request_messages(
                     false;
                 const arguments = if (call.argument_integrity == .valid and
                     registered_terminal)
-                    (try projected_terminal_request_arguments(
+                    (try shellHistoryArguments(
                         alloc,
                         call.arguments_json,
+                        form,
                     )) orelse try alloc.dupe(u8, call.arguments_json)
                 else
                     try alloc.dupe(u8, call.arguments_json);
@@ -1403,6 +1479,8 @@ fn agentShellWriteLeaseSessionId(
     const tool = registry.lookup(call.name) orelse return null;
     if (tool.executor_kind != .terminal or
         !std.mem.eql(u8, tool.name, "shell")) return null;
+    // Only a write holds a lease. A call without a readable action is not
+    // one; it is left as sent and shell decode rejects it with the reason.
     const parsed = std.json.parseFromSliceLeaky(
         std.json.Value,
         alloc,
@@ -1410,12 +1488,11 @@ fn agentShellWriteLeaseSessionId(
         .{},
     ) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        else => error.InvalidTerminalLeaseTrackingInput,
+        else => null,
     };
-    if (parsed != .object) return error.InvalidTerminalLeaseTrackingInput;
-    const action = parsed.object.get("action") orelse return error.InvalidTerminalLeaseTrackingInput;
-    if (action != .string) return error.InvalidTerminalLeaseTrackingInput;
-    if (!std.mem.eql(u8, action.string, "write")) return null;
+    if (parsed != .object) return null;
+    const action = parsed.object.get("action") orelse return null;
+    if (action != .string or !std.mem.eql(u8, action.string, "write")) return null;
     const session_id = parsed.object.get("session_id") orelse
         return error.InvalidTerminalLeaseTrackingInput;
     if (session_id != .string or session_id.string.len == 0) {
@@ -1454,6 +1531,62 @@ test "shell write retains one internal finalization lease safety edge" {
         registry,
         .{ .id = "list", .name = "shell", .arguments_json = "{\"action\":\"list\"}" },
     )) == null);
+    // A call left as sent because it could not be read holds no lease.
+    for ([_][]const u8{
+        "{\"request\":{\"action\":\"wait\",\"session_id\":\"shell-one\"}}",
+        "{\"command\":\"ls\",\"session_id\":\"shell-one\"}",
+        "[]",
+    }) |arguments| {
+        try std.testing.expect((try agentShellWriteLeaseSessionId(
+            arena,
+            registry,
+            .{ .id = "unread", .name = "shell", .arguments_json = arguments },
+        )) == null);
+    }
+}
+
+/// Rewrites every shell call fx can read into the canonical form shell decode
+/// and permission admission both read, so one interpretation is stored,
+/// approved, and run. A call that cannot be read stays exactly as sent; decode
+/// rejects it with the reason.
+fn normalize_flat_shell_tool_calls(
+    alloc: Allocator,
+    registry: tool_dispatch.Registry,
+    source: []const ToolCall,
+) Allocator.Error![]const ToolCall {
+    var normalized: ?[]ToolCall = null;
+    errdefer if (normalized) |calls| {
+        for (calls, source) |call, original| {
+            if (call.arguments_json.ptr != original.arguments_json.ptr) {
+                alloc.free(@constCast(call.arguments_json));
+            }
+        }
+        alloc.free(calls);
+    };
+
+    for (source, 0..) |call, index| {
+        if (call.argument_integrity != .valid) continue;
+        const tool = registry.lookup(call.name) orelse continue;
+        if (tool.executor_kind != .terminal) continue;
+        var scratch_state = std.heap.ArenaAllocator.init(alloc);
+        defer scratch_state.deinit();
+        const scratch = scratch_state.allocator();
+        const request = switch (try shell_request.read(scratch, call.arguments_json, shell_request.system_locator)) {
+            .request => |value| value,
+            .problem => continue,
+        };
+        const internal = try shell_request.internalArguments(scratch, request);
+        if (std.mem.eql(u8, internal, call.arguments_json)) continue;
+        const arguments_json = try alloc.dupe(u8, internal);
+        if (normalized == null) {
+            normalized = alloc.dupe(ToolCall, source) catch |err| {
+                alloc.free(arguments_json);
+                return err;
+            };
+        }
+        normalized.?[index].arguments_json = arguments_json;
+    }
+    return normalized orelse source;
 }
 
 fn normalize_terminal_request_tool_calls(
@@ -2403,6 +2536,88 @@ test "terminal request normalization unwraps only exact eligible native calls" {
     }};
     const malformed = try normalize_terminal_request_tool_calls(arena, native_registry, true, &malformed_calls);
     try std.testing.expectEqual(malformed_calls[0..].ptr, malformed.ptr);
+}
+
+test "flat shell normalization stores the canonical request fx will run" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const shell_tool = tool_dispatch.Tool{
+        .name = "shell",
+        .description = "shell",
+        .model_schema = .{ .name = "shell", .description = "shell" },
+        .executor_kind = .terminal,
+        .decode = undefined,
+        .call = undefined,
+        .reads_only_fn = undefined,
+        .irreversible_fn = undefined,
+    };
+    const tools = [_]tool_dispatch.Tool{shell_tool};
+    const registry = tool_dispatch.Registry{ .tools = &tools };
+
+    const calls = [_]ToolCall{
+        .{ .id = "flat", .name = "shell", .arguments_json = "{\"command\":\"ls\",\"wait\":2}", .provisional_id = "provisional-flat" },
+        .{ .id = "string", .name = "shell", .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"ls\\\"}\"}" },
+        .{ .id = "ambiguous", .name = "shell", .arguments_json = "{\"command\":\"ls\",\"session_id\":\"s\"}" },
+        .{ .id = "malformed", .name = "shell", .arguments_json = "{", .argument_integrity = .malformed_json },
+        .{ .id = "other", .name = "read_file", .arguments_json = "{\"path\":\"README.md\"}" },
+    };
+    const normalized = try normalize_flat_shell_tool_calls(arena, registry, &calls);
+    try std.testing.expect(normalized.ptr != calls[0..].ptr);
+    try std.testing.expectEqualStrings("{\"action\":\"run\",\"command\":\"ls\",\"yield_time_ms\":2000}", normalized[0].arguments_json);
+    try std.testing.expectEqualStrings(calls[0].id, normalized[0].id);
+    try std.testing.expectEqualStrings(calls[0].provisional_id.?, normalized[0].provisional_id.?);
+    try std.testing.expectEqualStrings("{\"action\":\"run\",\"command\":\"ls\"}", normalized[1].arguments_json);
+    // Unreadable, malformed, and other tools' calls keep their exact bytes.
+    for (calls[2..], normalized[2..]) |original, call| {
+        try std.testing.expectEqual(original.arguments_json.ptr, call.arguments_json.ptr);
+    }
+
+    const canonical = [_]ToolCall{.{ .id = "canonical", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"ls\"}" }};
+    const unchanged = try normalize_flat_shell_tool_calls(arena, registry, &canonical);
+    try std.testing.expectEqual(canonical[0..].ptr, unchanged.ptr);
+}
+
+test "flat shell history shows read calls flat and other calls as sent" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { stored: []const u8, expected: ?[]const u8 }{
+        .{ .stored = "{\"action\":\"run\",\"command\":\"ls\",\"tty\":true,\"yield_time_ms\":1500}", .expected = "{\"command\":\"ls\",\"interactive\":true,\"wait\":1.5}" },
+        .{ .stored = "{\"action\":\"stop\",\"session_id\":\"s\"}", .expected = "{\"session_id\":\"s\",\"stop\":true}" },
+        .{ .stored = "{\"command\":\"ls\"}", .expected = null },
+        // A rejected call keeps the exact text the model sent, with no extra wrapper.
+        .{ .stored = "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"ls\"}", .expected = null },
+        .{ .stored = "{\"command\":\"ls\",\"session_id\":\"s\"}", .expected = null },
+        .{ .stored = "{}", .expected = null },
+    };
+    for (cases) |case| {
+        const projected = try shellHistoryArguments(alloc, case.stored, .flat);
+        defer if (projected) |bytes| alloc.free(bytes);
+        if (case.expected) |expected| {
+            try std.testing.expectEqualStrings(expected, projected.?);
+        } else {
+            try std.testing.expect(projected == null);
+        }
+    }
+}
+
+test "flat shell schema is recognized from the advertised function" {
+    const flat_properties = [_]model_tool_schema.Property{
+        .{ .name = "command", .json_type = .string },
+        .{ .name = "session_id", .json_type = .string },
+    };
+    const nested_properties = [_]model_tool_schema.Property{.{ .name = "request", .json_type = .object }};
+    const reduced_properties = [_]model_tool_schema.Property{
+        .{ .name = "action", .json_type = .string },
+        .{ .name = "command", .json_type = .string },
+    };
+    const flat = [_]model_tool_schema.FunctionSchema{.{ .name = "shell", .description = "", .input_schema = .{ .properties = &flat_properties } }};
+    const nested = [_]model_tool_schema.FunctionSchema{.{ .name = "shell", .description = "", .input_schema = .{ .properties = &nested_properties, .required = &.{"request"} } }};
+    const reduced = [_]model_tool_schema.FunctionSchema{.{ .name = "shell", .description = "", .input_schema = .{ .properties = &reduced_properties, .required = &.{ "action", "command" } } }};
+    try std.testing.expect(terminal_flat_schema_advertised(&flat));
+    try std.testing.expect(!terminal_flat_schema_advertised(&nested));
+    try std.testing.expect(!terminal_flat_schema_advertised(&reduced));
+    try std.testing.expect(!terminal_flat_schema_advertised(&.{}));
 }
 
 fn check_terminal_request_normalization_allocation_failures(alloc: Allocator) !void {
@@ -5497,6 +5712,9 @@ fn processQueuedPromptInner(
     const base_nested_terminal_advertised = terminal_request_schema_advertised(
         config.advertised_functions,
     );
+    const base_flat_terminal_advertised = terminal_flat_schema_advertised(
+        config.advertised_functions,
+    );
     const base_nested_subagent_advertised = subagent_request_schema_advertised(
         config.advertised_functions,
     );
@@ -5742,6 +5960,7 @@ fn processQueuedPromptInner(
         .{ .catalog = if (skill_section) |*section| section else null, .explicit = if (explicit_section) |*section| section else null },
         request_capabilities,
         base_nested_terminal_advertised,
+        base_flat_terminal_advertised,
         base_nested_subagent_advertised,
         base_nested_read_tool_result_advertised,
         finalization,
@@ -6687,6 +6906,7 @@ fn processQueuedPromptLoop(
     skills: PreparedSkills,
     initial_request_capabilities: model_capabilities.Capabilities,
     base_nested_terminal_advertised: bool,
+    base_flat_terminal_advertised: bool,
     base_nested_subagent_advertised: bool,
     base_nested_read_tool_result_advertised: bool,
     finalization: *TurnFinalizationGuard,
@@ -7169,6 +7389,10 @@ fn processQueuedPromptLoop(
                 base_nested_terminal_advertised,
                 vision_mode,
             );
+            const flat_shell_eligible = terminal_request_normalization_eligible(
+                base_flat_terminal_advertised,
+                vision_mode,
+            );
             const subagent_request_eligible = subagent_request_normalization_eligible(
                 base_nested_subagent_advertised,
                 vision_mode,
@@ -7178,10 +7402,11 @@ fn processQueuedPromptLoop(
                     base_nested_read_tool_result_advertised,
                     vision_mode,
                 );
-            const terminal_request_messages = try project_terminal_request_messages(
+            const terminal_request_messages = try project_shell_history(
                 overlay_arena,
                 deps.tool_registry,
-                terminal_request_eligible,
+                terminal_request_eligible or flat_shell_eligible,
+                if (flat_shell_eligible) .flat else .nested,
                 projected_request_messages,
                 deps.agent_stream_provider,
                 .{ .provider = job.provider, .model = gateway_model },
@@ -8038,12 +8263,15 @@ fn processQueuedPromptLoop(
                         debug_trace.logf("agent", "provider_resolved event dropped err=OutOfMemory", .{});
                     }
                 }
-                completion.tool_calls = try normalize_terminal_request_tool_calls(
-                    arena,
-                    deps.tool_registry,
-                    terminal_request_eligible,
-                    completion.tool_calls,
-                );
+                completion.tool_calls = if (flat_shell_eligible)
+                    try normalize_flat_shell_tool_calls(arena, deps.tool_registry, completion.tool_calls)
+                else
+                    try normalize_terminal_request_tool_calls(
+                        arena,
+                        deps.tool_registry,
+                        terminal_request_eligible,
+                        completion.tool_calls,
+                    );
                 completion.tool_calls = try normalize_subagent_request_tool_calls(
                     arena,
                     deps.tool_registry,

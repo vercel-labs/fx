@@ -4923,16 +4923,18 @@ fn testProcessQueuedPromptChecksExecOnlyTerminal(_: *agent_runtime.Agent, deps: 
     const advertised_shell = for (cfg.advertised_functions) |function| {
         if (std.mem.eql(u8, function.name, "shell")) break function;
     } else return error.TestExpectedEqual;
-    try std.testing.expect(model_tool_schema.isSingleRequiredObjectUnionField(
+    // The exec-only projection advertises the flat contract without terminal input.
+    try std.testing.expect(!model_tool_schema.isSingleRequiredObjectUnionField(
         advertised_shell.input_schema,
         "request",
     ));
-    try std.testing.expect(std.mem.find(u8, advertised_shell.description, "shell.interact") != null);
+    try std.testing.expect(std.mem.find(u8, advertised_shell.description, "{session_id, stop: true}") != null);
+    try std.testing.expect(std.mem.find(u8, advertised_shell.description, "{session_id, input}") == null);
     try std.testing.expectEqualStrings(builtin_tools.web_search.description, cfg.custom_tool_guidance);
     try std.testing.expectEqualStrings("test model overlay", cfg.model_prompt_overlay.?);
     const runtime_shell = deps.tool_registry.lookup("shell") orelse
         return error.TestExpectedEqual;
-    try std.testing.expect(std.mem.find(u8, runtime_shell.description, "shell.interact") != null);
+    try std.testing.expect(std.mem.find(u8, runtime_shell.description, "Send command to start something") != null);
     try testPushAssistantText(deps, "assistant text");
 }
 
@@ -4943,7 +4945,7 @@ fn testProcessQueuedPromptChecksFullTerminal(_: *agent_runtime.Agent, deps: *con
     const advertised_shell = for (cfg.advertised_functions) |function| {
         if (std.mem.eql(u8, function.name, "shell")) break function;
     } else return error.TestExpectedEqual;
-    try std.testing.expect(std.mem.find(u8, advertised_shell.description, "shell.interact") != null);
+    try std.testing.expect(std.mem.find(u8, advertised_shell.description, "{session_id, input}") != null);
     try testPushAssistantText(deps, "assistant text");
 }
 

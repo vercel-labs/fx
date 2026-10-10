@@ -4916,6 +4916,7 @@ test {
     _ = @import("core/terminal/contracts.zig");
     _ = @import("core/terminal/operation.zig");
     _ = @import("core/terminal/shell_resolver.zig");
+    _ = @import("core/terminal/shell_request.zig");
     _ = @import("core/terminal/shell_snapshot.zig");
     _ = @import("core/terminal/native_session.zig");
     _ = @import("core/terminal/recovery.zig");

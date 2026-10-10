@@ -1170,7 +1170,7 @@ describe("gateway stream lifecycle", () => {
       expectOnlyLeadingSystemMessages(gateway.requests[0]!.body);
       expect(contentText(request.prompt[1]?.content)).toBe(WEB_SEARCH_GUIDANCE);
       expect(toolByName(oracleRequest, "shell")?.description).toBe(
-        "Run every command with shell.run. Fast commands complete in one call; commands still running after yield_time_ms return one owned session_id and remain available across turns. Use shell.interact with that exact session_id: omit chars to observe, or provide chars to send exact input and then observe. Use shell.stop only when termination is requested. output_delta is always terminal-safe; unsafe bytes are escaped while full_output_handle retains exact output, so do not run a separate command merely to test output safety or shell usability. Never detach with &, nohup, setsid, or double-forking. Each call starts a new shell with the user's startup files applied: their aliases, functions, and PATH are available, but cd, export, and alias changes do not carry over to the next call. In zsh, quote glob patterns meant for another program (for example '--include=*.zig') because unmatched globs are errors, and quote words that begin with =.",
+        "Run any command in a new shell. Send command to start something; fast commands finish in one call. If it is still running after wait seconds, you get a session_id: send {session_id} to check on it, or {session_id, stop: true} to end it. Send either command or session_id, not both. output_delta is always terminal-safe; unsafe bytes are escaped while full_output_handle retains exact output. Never detach with &, nohup, setsid, or double-forking. Each call starts a new shell with the user's startup files applied: their aliases, functions, and PATH are available, but cd, export, and alias changes do not carry over to the next call. To change file contents, use edit_file or write_file instead of sed, perl, or heredocs.",
       );
       expect(toolByName(oracleRequest, "skill")?.description).toContain(
         "the task clearly matches one",
@@ -4844,33 +4844,31 @@ describe("gateway stream lifecycle", () => {
     const gateway = startGateway((body) => {
       switch (step++) {
         case 0:
-          return fakeGatewayToolCall("zero_timeout", "shell", {
-            request: { action: "run", command, profile: "clean", timeout_ms: 0 },
-          });
+          // command with session_id could mean either a new run or the running command.
+          return fakeGatewayToolCall("ambiguous", "shell", { command, session_id: "shell-unknown" });
         case 1: {
           expect(existsSync(marker)).toBe(false);
-          const correction = JSON.parse(toolResultOutput(body, "zero_timeout")).error;
+          const correction = JSON.parse(toolResultOutput(body, "ambiguous")).error;
           expect(correction.code).toBe("invalid_shell_request");
           expect(correction.executed).toBe(false);
+          expect(correction.problems[0]).toContain("command and session_id were both sent");
           expect(correction.retry_with).toBeUndefined();
-          return fakeGatewayToolCall("repair_invalid", "shell", {
-            request: { command, profile: "clean" },
-            yield_time_ms: "1000",
+          // A request string cut off before its closing quote and brace.
+          return fakeGatewayToolCall("cut_off", "shell", {
+            request: JSON.stringify({ command }).slice(0, -2),
           });
         }
         case 2: {
           expect(existsSync(marker)).toBe(false);
-          const correction = JSON.parse(toolResultOutput(body, "repair_invalid")).error;
+          const correction = JSON.parse(toolResultOutput(body, "cut_off")).error;
           expect(correction.code).toBe("invalid_shell_request");
           expect(correction.executed).toBe(false);
-          expect(correction.problems).toContain("request.action is required.");
-          expect(correction.retry_with).toEqual({
-            request: { action: "run", command, profile: "clean", yield_time_ms: 1000 },
-          });
-          return fakeGatewayToolCall("repair_valid", "shell", correction.retry_with);
+          expect(correction.problems[0]).toContain("looks cut off");
+          expect(correction.retry_with).toBeUndefined();
+          return fakeGatewayToolCall("repaired", "shell", { command });
         }
         case 3:
-          expect(shellResult(body, "repair_valid")).toMatchObject({
+          expect(shellResult(body, "repaired")).toMatchObject({
             state: "completed", exit_code: 0, output_delta: "REPAIRED_SHELL_OK",
           });
           return fakeGatewayFinalText("SHELL_REPAIR_COMPLETE");
@@ -4890,9 +4888,9 @@ describe("gateway stream lifecycle", () => {
       expect(gateway.requestCount()).toBe(4);
       expect(gateway.classifierRequests).toHaveLength(0);
       const trace = readFileSync(tracePath, "utf8");
-      expect(trace).toContain("call_id=repair_invalid");
+      expect(trace).toContain("call_id=cut_off");
       expect(trace.split("\n").filter((line) =>
-        (line.includes("call_id=repair_invalid") || line.includes("call_id=zero_timeout")) &&
+        (line.includes("call_id=cut_off") || line.includes("call_id=ambiguous")) &&
         (line.includes("permission_request") || line.includes("execution_start"))
       )).toHaveLength(0);
       expect(result.stderr).not.toMatch(/panic|error:|error\./i);
@@ -4916,16 +4914,10 @@ describe("gateway stream lifecycle", () => {
         expect(toolResultOutput(body, "neighbor_1")).toContain("NEIGHBOR_OK");
       }
       return fakeGatewaySse([
-        { type: "tool-call", toolCallId: `invalid_${batch}`, toolName: "shell", input: {
-          request: {
-            command: "printf unexpected > must-not-run.txt",
-            tty: true,
-            shell: batch === 1
-              ? { kind: "executable", path: "/bin/bash" }
-              : { path: "/bin/bash", kind: "executable" },
-          },
-          yield_time_ms: "1000",
-        } },
+        // The same ambiguous call both times, with its fields in a different order.
+        { type: "tool-call", toolCallId: `invalid_${batch}`, toolName: "shell", input: batch === 1
+          ? { command: "printf unexpected > must-not-run.txt", session_id: "shell-none", interactive: true }
+          : { interactive: true, session_id: "shell-none", command: "printf unexpected > must-not-run.txt" } },
         { type: "tool-call", toolCallId: `neighbor_${batch}`, toolName: "read_file", input: { path: "neighbor.txt" } },
         { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
       ]);

@@ -488,9 +488,10 @@ test "shell request corrections stop after the complete repeated batch" {
     const shell = @import("../../../tools/shell/shell.zig");
     var state: TerminalValidationRetryState = .{};
     defer state.deinit(alloc);
+    // Unreadable calls: a command beside a session is ambiguous in either order.
     const inputs = [_][]const u8{
-        "{\"command\":\"true\",\"yield_time_ms\":\"1000\"}",
-        "{\"yield_time_ms\":\"1000\",\"command\":\"true\"}",
+        "{\"command\":\"true\",\"session_id\":\"shell-3\"}",
+        "{\"session_id\":\"shell-3\",\"command\":\"true\"}",
     };
     for (inputs, 0..) |args, index| {
         const call: ToolCall = .{ .id = "invalid", .name = "shell", .arguments_json = args };

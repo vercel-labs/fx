@@ -21,6 +21,7 @@ const terminal_managed_observer = @import("../terminal/managed_observer.zig");
 const permission_prompter = @import("../permissions/permission_prompter.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const permissions = @import("../permissions/permissions.zig");
+const shell_request = @import("../terminal/shell_request.zig");
 const shell_resolver = @import("../terminal/shell_resolver.zig");
 const tool_args = @import("tool_args.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
@@ -149,7 +150,7 @@ pub fn callUsesCommandAuthority(
     const tool = registry.lookup(call.name) orelse return false;
     if (tool.executor_kind == .run_command) return true;
     const expected_action = tool.captured_command_action orelse return false;
-    const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
+    const args = try callArguments(arena, call);
     const action = tool_args.optionalStringArg(args, "action") orelse return false;
     return std.mem.eql(u8, action, expected_action);
 }
@@ -799,7 +800,7 @@ fn reviewRequestForCall(
 fn isShellInputCall(input: Input, arena: Allocator, call: ToolCall) !bool {
     const tool = registeredTool(input, call.name) orelse return false;
     if (!std.mem.eql(u8, call.name, "shell") or tool.executor_kind != .terminal) return false;
-    const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
+    const args = try callArguments(arena, call);
     if (!std.mem.eql(u8, tool_args.optionalStringArg(args, "action") orelse "", "interact")) return false;
     const chars = tool_args.optionalStringArg(args, "chars") orelse return false;
     return chars.len > 0;
@@ -812,7 +813,7 @@ fn shellInputReceiver(
 ) !?permission_auto_classifier.ShellInputReceiver {
     var context = input.terminal_review_context orelse return null;
     context.alloc = arena;
-    const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
+    const args = try callArguments(arena, call);
     const session_id = try tool_args.requiredStringArg(args, "session_id");
     const snapshot = terminal_managed_observer.inspectInput(context, session_id) catch |err| {
         if (err == error.OutOfMemory or err == error.Cancelled) return err;
@@ -1948,12 +1949,22 @@ fn permissionOutcomeForDecision(
 
 /// Reports whether a shell call asks to reload the user's startup files.
 fn shellCallRequestsReload(arena: Allocator, call: ToolCall) bool {
-    const value = std.json.parseFromSliceLeaky(std.json.Value, arena, call.arguments_json, .{}) catch return false;
-    if (value != .object) return false;
-    const request = value.object.get("request") orelse return false;
-    if (request != .object) return false;
-    const reload = request.object.get("reload") orelse return false;
-    return reload == .bool and reload.bool;
+    const args = callArguments(arena, call) catch return false;
+    return tool_args.optionalBoolArg(args, "reload") orelse false;
+}
+
+/// A call's arguments as admission reads them. Shell calls take the canonical
+/// form `shell_request` gives them, the same form shell decode runs, so the
+/// permission decision always covers exactly what will execute. Other tools'
+/// arguments are read as sent. The map borrows from `arena`.
+fn callArguments(arena: Allocator, call: ToolCall) !std.json.ObjectMap {
+    if (std.mem.eql(u8, call.name, "shell")) {
+        switch (try shell_request.read(arena, call.arguments_json, shell_request.system_locator)) {
+            .request => |request| return tool_args.parseToolArgsObject(arena, try shell_request.internalArguments(arena, request)),
+            .problem => {},
+        }
+    }
+    return tool_args.parseToolArgsObject(arena, call.arguments_json);
 }
 
 /// Binds the remembered grant's shell snapshot epoch to a shell admission.
@@ -2117,7 +2128,7 @@ pub fn runCommandContext(
     call: ToolCall,
 ) !command_admission.CommandContext {
     if (!try isRunCommandCall(input, arena, call)) return error.NotRunCommand;
-    const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
+    const args = try callArguments(arena, call);
     const command = try tool_args.requiredStringArg(args, "command");
     const execution_mode: command_admission.CommandExecutionMode =
         if (tool_args.optionalBoolArg(args, "tty") orelse false) .tty else .captured;
@@ -2152,10 +2163,9 @@ fn nativeCommandEnvironment(
 ) !command_environment.Environment {
     var login_shell_buffer: [4096]u8 = undefined;
     const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
+    const shell = try explicitShell(arena, args);
     if (execution_mode == .tty) {
-        if (try explicitTtyShell(arena, args)) |shell| {
-            return shell_resolver.environmentForShellSpec(arena, configured, shell);
-        }
+        if (shell) |spec| return shell_resolver.environmentForShellSpec(arena, configured, spec);
     }
     const profile_raw = tool_args.nullablePlaceholderStringArg(args, "profile");
     const profile: ?command_environment.Profile = if (profile_raw) |raw|
@@ -2163,10 +2173,10 @@ fn nativeCommandEnvironment(
             return error.InvalidCommandProfile
     else
         null;
-    return shell_resolver.environment(arena, configured, profile);
+    return shell_resolver.capturedRunEnvironment(arena, configured, profile, shell);
 }
 
-fn explicitTtyShell(
+fn explicitShell(
     arena: Allocator,
     args: std.json.ObjectMap,
 ) !?terminal_contracts.ShellSpec {
@@ -2184,6 +2194,33 @@ fn explicitTtyShell(
         .path = try tool_args.requiredStringArg(value.object, "path"),
         .clean_start = tool_args.optionalBoolArg(value.object, "clean_start") orelse false,
     } };
+}
+
+test "explicit shells apply to captured runs without replacing the default snapshot" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // /bin/sh is never the login shell fx snapshots, so a captured run starts it clean.
+    const args = try tool_args.parseToolArgsObject(arena, "{\"action\":\"run\",\"command\":\"true\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/sh\"}}");
+    const captured = try nativeCommandEnvironment(arena, args, .captured);
+    try std.testing.expectEqualStrings("/bin/sh", captured.clean);
+    const tty = try nativeCommandEnvironment(arena, args, .tty);
+    try std.testing.expectEqualStrings("/bin/sh", tty.user);
+}
+
+test "shell reload requests are seen in every form admission receives" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for ([_]struct { args: []const u8, reload: bool }{
+        .{ .args = "{\"action\":\"run\",\"command\":\"true\",\"reload\":true}", .reload = true },
+        .{ .args = "{\"request\":{\"action\":\"run\",\"command\":\"true\",\"reload\":true}}", .reload = true },
+        .{ .args = "{\"command\":\"true\",\"reload\":true}", .reload = true },
+        .{ .args = "{\"command\":\"true\"}", .reload = false },
+    }) |case| {
+        const call: ToolCall = .{ .id = "reload", .name = "shell", .arguments_json = case.args };
+        try std.testing.expectEqual(case.reload, shellCallRequestsReload(arena, call));
+    }
 }
 
 pub fn permissionStateKeyForCall(
@@ -2501,7 +2538,7 @@ pub fn permissionTargetResolutionFailureMessage(
 /// resolve their `path` argument, command tools resolve `cwd`; each prefers
 /// its own key so a stray extra key cannot misname the argument that failed.
 fn targetPathForFailureMessage(arena: Allocator, call: ToolCall) !?[]const u8 {
-    const args = tool_args.parseToolArgsObject(arena, call.arguments_json) catch |err| switch (err) {
+    const args = callArguments(arena, call) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
     };

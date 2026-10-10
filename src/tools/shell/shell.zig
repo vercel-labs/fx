@@ -15,6 +15,7 @@ const terminal_managed_observer = @import("../../core/terminal/managed_observer.
 const terminal_operation = @import("../../core/terminal/operation.zig");
 const terminal_store = @import("../../core/terminal/store.zig");
 const shell_resolver = @import("../../core/terminal/shell_resolver.zig");
+const shell_request = @import("../../core/terminal/shell_request.zig");
 const shell_snapshot = @import("../../core/terminal/shell_snapshot.zig");
 const sort_utils = @import("../../core/shared/sort_utils.zig");
 const terminal_contracts = @import("../../core/terminal/contracts.zig");
@@ -115,10 +116,17 @@ fn decode_input(
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
+    // The orchestrator normally stores calls already in this form; reading
+    // again keeps decode and permission admission on the same request when
+    // it did not.
+    const internal_json = switch (try shell_request.read(arena, args_json, shell_request.system_locator)) {
+        .request => |request| try shell_request.internalArguments(arena, request),
+        .problem => return null,
+    };
     var raw = std.json.parseFromSliceLeaky(
         std.json.Value,
         arena,
-        args_json,
+        internal_json,
         .{ .allocate = .alloc_always },
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -181,169 +189,48 @@ fn effective_interact_yield_time(has_input: bool, requested_ms: u32) u32 {
     return @min(requested_ms, managed_contract.max_yield_time_ms);
 }
 
-// Advisory only: none of these values enters the executable decode path.
+// Advisory only: retry_with is shown to the model and never executed.
 fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: bool) Allocator.Error![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
-    if (args_json.len > 16 * 1024) {
-        return correction_json(alloc, &.{"Request is too large to suggest a repair; submit the intended action with only its required fields."}, null);
+    const request = switch (try shell_request.read(arena, args_json, shell_request.system_locator)) {
+        .problem => |text| return correction_json(alloc, &.{text}, null),
+        .request => |request| request,
+    };
+    if (!supports_tty and needsSavedSession(request)) {
+        return correction_json(alloc, &.{"interactive and input need a saved fx session. Run the command without interactive."}, null);
     }
-    const raw = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch |err| switch (err) {
+    // fx read the call but could not decode it; its canonical form is the repair.
+    const retry_text = try shell_request.modelArguments(arena, request);
+    const retry = std.json.parseFromSliceLeaky(std.json.Value, arena, retry_text, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return correction_json(alloc, &.{"Shell arguments must be a JSON object."}, null),
+        else => return correction_json(alloc, &.{"Send command to run something, or session_id to check, type into, or stop a running command."}, null),
     };
-    if (raw != .object or raw.object.count() > 32) {
-        return correction_json(alloc, &.{"Shell arguments must be one bounded request object."}, null);
-    }
+    return correction_json(alloc, &.{"Send the shell call as retry_with shows."}, retry);
+}
 
-    var problems: std.ArrayList([]const u8) = .empty;
-    var repairable = true;
-    var object = raw.object;
-    if (raw.object.get("request")) |wrapper| {
-        var request = wrapper;
-        if (request == .string) {
-            try problems.append(arena, "request must be an object, not a JSON string.");
-            request = std.json.parseFromSliceLeaky(std.json.Value, arena, request.string, .{}) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return correction_json(alloc, problems.items, null),
-            };
-        }
-        if (request != .object or request.object.count() > 32) {
-            return correction_json(alloc, &.{"request must be one object containing the intended action."}, null);
-        }
-        object = request.object;
-        if (raw.object.count() > 1) {
-            try problems.append(arena, "Only request is allowed at the top level; put action fields inside request.");
-            var outer = raw.object.iterator();
-            while (outer.next()) |entry| {
-                const name = entry.key_ptr.*;
-                if (std.mem.eql(u8, name, "request")) continue;
-                if (object.contains(name)) {
-                    repairable = false;
-                } else {
-                    try object.put(arena, name, entry.value_ptr.*);
-                }
-            }
-        }
-    }
-    elideKnownNullFields(&object);
-    const action_value = object.get("action");
-    const action: Action = if (action_value) |value| blk: {
-        if (value == .string) {
-            if (std.meta.stringToEnum(Action, value.string)) |action| break :blk action;
-        }
-        try problems.append(arena, "request.action must be run, interact, or stop.");
-        return correction_json(alloc, problems.items, null);
-    } else blk: {
-        try problems.append(arena, "request.action is required.");
-        const command = object.get("command") orelse return correction_json(alloc, problems.items, null);
-        if (command != .string or object.contains("session_id") or object.contains("chars") or object.contains("force")) {
-            return correction_json(alloc, problems.items, null);
-        }
-        try object.put(arena, "action", .{ .string = "run" });
-        break :blk .run;
+fn needsSavedSession(request: shell_request.Request) bool {
+    return switch (request) {
+        .run => |run| run.tty,
+        .interact => |interact| interact.chars != null,
+        .stop => false,
     };
-
-    var scratch: ActionFieldCorrectionScratch = .{};
-    if (try actionFieldCorrection(arena, action, object, &scratch)) |correction| {
-        for (correction.invalid_fields) |name| {
-            try problems.append(arena, try std.fmt.allocPrint(
-                arena,
-                "request.{s} is not accepted for {s}.",
-                .{ text_utils.utf8PrefixByBytes(name, 64), @tagName(action) },
-            ));
-            // A non-null unknown field can express intent that cannot be reconstructed.
-            if (object.get(name).? != .null) repairable = false;
-            _ = object.orderedRemove(name);
-        }
-        for (correction.missing_fields) |name| {
-            try problems.append(arena, try std.fmt.allocPrint(arena, "request.{s} is required.", .{name}));
-            repairable = false;
-        }
-        for (correction.conflicts) |conflict| {
-            try problems.append(arena, try std.fmt.allocPrint(arena, "Choose either request.{s} or request.{s}.", .{ conflict[0], conflict[1] }));
-            repairable = false;
-        }
-    }
-
-    var canonical: std.json.ObjectMap = .empty;
-    inline for (@typeInfo(Input).@"struct".fields) |field| {
-        if (object.get(field.name)) |original| {
-            var value = original;
-            const T = if (@typeInfo(field.type) == .optional) @typeInfo(field.type).optional.child else field.type;
-            const expected = comptime switch (@typeInfo(T)) {
-                .int => "an integer",
-                .bool => "a boolean",
-                .pointer => "a string",
-                .@"enum" => "an advertised value",
-                else => "an object matching its schema",
-            };
-            var type_reported = false;
-            if (comptime @typeInfo(T) == .int) {
-                if (value == .string) {
-                    try problems.append(arena, "request." ++ field.name ++ " must be an integer.");
-                    type_reported = true;
-                    if (std.fmt.parseInt(T, value.string, 10)) |number| {
-                        value = if (std.math.cast(i64, number)) |integer|
-                            .{ .integer = integer }
-                        else
-                            .{ .number_string = try std.fmt.allocPrint(arena, "{d}", .{number}) };
-                    } else |_| {
-                        repairable = false;
-                    }
-                }
-            }
-            if (std.json.parseFromValueLeaky(field.type, arena, value, .{})) |_| {
-                if (comptime T == ShellInput) {
-                    var shell: std.json.ObjectMap = .empty;
-                    inline for (@typeInfo(ShellInput).@"struct".fields) |member| {
-                        if (value.object.get(member.name)) |supplied| {
-                            try shell.put(arena, member.name, supplied);
-                        }
-                    }
-                    value = .{ .object = shell };
-                }
-            } else |err| {
-                if (err == error.OutOfMemory) return error.OutOfMemory;
-                if (!type_reported) try problems.append(arena, "request." ++ field.name ++ " must be " ++ expected ++ ".");
-                repairable = false;
-            }
-            try canonical.put(arena, field.name, value);
-        }
-    }
-    const candidate = std.json.parseFromValueLeaky(Input, arena, .{ .object = canonical }, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return correction_json(alloc, problems.items, null),
-    };
-    if (argument_problem(candidate)) |problem| {
-        try problems.append(arena, problem);
-        repairable = false;
-    }
-    if (!supports_tty and (canonical.contains("tty") or canonical.contains("shell") or canonical.contains("chars"))) {
-        try problems.append(arena, "Interactive Shell fields require a saved session.");
-        repairable = false;
-    }
-    if (problems.items.len == 0) {
-        try problems.append(arena, "Submit one Shell action inside request.");
-    }
-    return correction_json(alloc, problems.items, if (repairable) canonical else null);
 }
 
 fn correction_json(
     alloc: Allocator,
     problems: []const []const u8,
-    candidate: ?std.json.ObjectMap,
+    retry_with: ?std.json.Value,
 ) Allocator.Error![]u8 {
-    const Retry = struct { request: std.json.Value };
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     std.json.Stringify.value(.{ .@"error" = .{
         .code = "invalid_shell_request",
         .executed = false,
         .problems = problems,
-        .instruction = if (candidate != null) @as(?[]const u8, "Call shell once using retry_with exactly.") else null,
-        .retry_with = if (candidate) |object| @as(?Retry, .{ .request = .{ .object = object } }) else null,
+        .instruction = if (retry_with != null) @as(?[]const u8, "Call shell once using retry_with exactly.") else null,
+        .retry_with = retry_with,
     } }, .{ .emit_null_optional_fields = false }, &out.writer) catch return error.OutOfMemory;
     return try out.toOwnedSlice();
 }
@@ -355,7 +242,6 @@ fn argument_problem(input: Input) ?[]const u8 {
             if (command.len == 0 or command.len > terminal_contracts.max_command_bytes) return "request.command must contain 1-65536 bytes.";
             if (input.timeout_ms == 0) return "request.timeout_ms must be at least 1; choose the intended deadline.";
             if (input.profile != null and input.shell != null) return "Choose either request.profile or request.shell.";
-            if (!input.tty and input.shell != null) return "request.shell requires tty=true; choose the intended execution mode.";
             if (input.yield_time_ms > managed_contract.max_yield_time_ms) return "request.yield_time_ms must be between 0 and 30000.";
         },
         .interact => {
@@ -499,10 +385,10 @@ fn validateRun(
         );
     };
     if (!input.tty) {
-        _ = commandEnvironment(arena, ctx, input.profile) catch |err| {
+        _ = commandEnvironment(arena, ctx, input) catch |err| {
             return try std.fmt.allocPrint(
                 ctx.allocator,
-                "shell run profile is invalid: {s}",
+                "shell run environment is invalid: {s}",
                 .{@errorName(err)},
             );
         };
@@ -553,11 +439,11 @@ fn callRun(
     const environment = commandEnvironment(
         request_arena,
         ctx,
-        input.profile,
+        input,
     ) catch |err| {
         return .{ .failure = try std.fmt.allocPrint(
             ctx.allocator,
-            "shell run profile is invalid: {s}",
+            "shell run environment is invalid: {s}",
             .{@errorName(err)},
         ) };
     };
@@ -1811,18 +1697,24 @@ fn resolveCwd(
     );
 }
 
+/// The captured-run environment, derived by the same function permission
+/// admission uses, so the shell that runs is the one that was approved.
 fn commandEnvironment(
     alloc: Allocator,
     ctx: tool_dispatch.DispatchContext,
-    profile: ?command_environment.Profile,
+    input: Input,
 ) !command_environment.Environment {
     if (ctx.captured_command_host == .workspace_clean) {
-        if (profile != null) return error.InvalidWorkspaceInput;
+        if (input.profile != null or input.shell != null) return error.InvalidWorkspaceInput;
         return .workspace_clean;
     }
     var login_shell_buffer: [4096]u8 = undefined;
     const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
-    return shell_resolver.environment(alloc, configured, profile);
+    const shell: ?terminal_contracts.ShellSpec = if (input.shell) |chosen|
+        .{ .executable = .{ .path = chosen.path, .clean_start = chosen.clean_start } }
+    else
+        null;
+    return shell_resolver.capturedRunEnvironment(alloc, configured, input.profile, shell);
 }
 
 pub fn isCapturedCommand(erased: tool_dispatch.ToolInput) bool {
@@ -1901,31 +1793,21 @@ test "shell action fields are closed and command authority covers every run" {
     );
 }
 
-test "shell timeout minimum is enforced before correction and execution" {
+test "shell timeout of zero or less means no deadline" {
     const alloc = std.testing.allocator;
-    const zero = try decode(.{ .allocator = alloc }, "{\"action\":\"run\",\"command\":\"true\",\"timeout_ms\":0}");
-    switch (zero) {
-        .input => |input| {
-            input.deinit(alloc);
-            return error.TestUnexpectedResult;
-        },
-        .failure => |failure| {
-            defer alloc.free(failure);
-            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, failure, .{});
-            defer parsed.deinit();
-            const detail = parsed.value.object.get("error").?.object;
-            try std.testing.expectEqualStrings("invalid_shell_request", detail.get("code").?.string);
-            try std.testing.expect(!detail.get("executed").?.bool);
-            try std.testing.expect(detail.get("retry_with") == null);
-        },
-    }
-    for ([_][]const u8{
-        "{\"action\":\"run\",\"command\":\"true\"}",
-        "{\"action\":\"run\",\"command\":\"true\",\"timeout_ms\":1}",
-    }) |args| {
-        const decoded = try decode(.{ .allocator = alloc }, args);
+    for ([_]struct { args: []const u8, timeout_ms: ?u64 }{
+        .{ .args = "{\"action\":\"run\",\"command\":\"true\",\"timeout_ms\":0}", .timeout_ms = null },
+        .{ .args = "{\"command\":\"true\",\"timeout\":-5}", .timeout_ms = null },
+        .{ .args = "{\"action\":\"run\",\"command\":\"true\",\"timeout_ms\":1}", .timeout_ms = 1 },
+        .{ .args = "{\"command\":\"true\",\"timeout\":2.5}", .timeout_ms = 2500 },
+    }) |case| {
+        const decoded = try decode(.{ .allocator = alloc }, case.args);
         switch (decoded) {
-            .input => |input| input.deinit(alloc),
+            .input => |erased| {
+                defer erased.deinit(alloc);
+                const owned: *OwnedInput = @ptrCast(@alignCast(erased.ptr));
+                try std.testing.expectEqual(case.timeout_ms, owned.value.timeout_ms);
+            },
             .failure => |failure| {
                 alloc.free(failure);
                 return error.TestUnexpectedResult;
@@ -1934,31 +1816,55 @@ test "shell timeout minimum is enforced before correction and execution" {
     }
 }
 
-test "shell request correction suggests only unambiguous repairs without executing" {
+test "shell decode accepts every shape it can read exactly" {
     const alloc = std.testing.allocator;
-    const cases = [_]struct { input: []const u8, retry: ?[]const u8 }{
-        .{ .input = "{\"command\":\"sleep 30\",\"timeout_ms\":\"40000\",\"yield_time_ms\":\"30000\"}", .retry = "{\"action\":\"run\",\"command\":\"sleep 30\",\"yield_time_ms\":30000,\"timeout_ms\":40000}" },
-        .{ .input = "{\"request\":{\"command\":\"sleep 30\"},\"yield_time_ms\":\"30000\"}", .retry = "{\"action\":\"run\",\"command\":\"sleep 30\",\"yield_time_ms\":30000}" },
-        .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"background\":null}", .retry = "{\"action\":\"run\",\"command\":\"true\"}" },
-        .{ .input = "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"true\\\"}\"}", .retry = "{\"action\":\"run\",\"command\":\"true\"}" },
-        .{ .input = "{\"action\":\"interact\",\"session_id\":\"shell-3\",\"yield_time_ms\":\"1000\",\"unused\":null}", .retry = "{\"action\":\"interact\",\"yield_time_ms\":1000,\"session_id\":\"shell-3\"}" },
-        .{ .input = "{\"command\":\"true\",\"tty\":true}", .retry = null },
-        .{ .input = "{}", .retry = null },
-        .{ .input = "{\"action\":null,\"command\":\"true\"}", .retry = null },
-        .{ .input = "{\"session_id\":\"shell-3\"}", .retry = null },
-        .{ .input = "{\"command\":\"true\",\"session_id\":\"shell-3\"}", .retry = null },
-        .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"background\":true}", .retry = null },
-        .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"profile\":\"clean\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/bash\"}}", .retry = null },
-        .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":30001}", .retry = null },
-        .{ .input = "{\"request\":{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":\"1000\",\"timeout_ms\":0}}", .retry = null },
-        .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":4294967296}", .retry = null },
-        .{ .input = "{\"action\":\"stop\",\"session_id\":\"shell-3\",\"force\":\"true\"}", .retry = null },
-        .{ .input = "{\"request\":{\"action\":\"run\",\"command\":\"true\"},\"command\":\"false\"}", .retry = null },
-        .{ .input = "{", .retry = null },
-        .{ .input = "[]", .retry = null },
+    const cases = [_]struct { args: []const u8, action: Action }{
+        .{ .args = "{\"command\":\"ls\"}", .action = .run },
+        .{ .args = "{\"command\":\"echo ${arr[0]}\",\"shell\":\"/bin/bash\"}", .action = .run },
+        .{ .args = "{\"command\":\"sleep 30\",\"timeout_ms\":\"40000\",\"yield_time_ms\":\"30000\"}", .action = .run },
+        .{ .args = "{\"request\":{\"command\":\"sleep 30\"},\"yield_time_ms\":\"30000\"}", .action = .run },
+        .{ .args = "{\"action\":\"run\",\"command\":\"true\",\"background\":null}", .action = .run },
+        .{ .args = "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"true\\\"}\"}", .action = .run },
+        .{ .args = "{\"action\":null,\"command\":\"true\"}", .action = .run },
+        .{ .args = "{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":4294967296}", .action = .run },
+        .{ .args = "{\"action\":\"run\",\"command\":\"true\",\"profile\":\"clean\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/bash\"}}", .action = .run },
+        .{ .args = "{\"session_id\":\"shell-3\"}", .action = .interact },
+        .{ .args = "{\"session_id\":\"shell-3\",\"input\":\"q\"}", .action = .interact },
+        .{ .args = "{\"action\":\"interact\",\"session_id\":\"shell-3\",\"yield_time_ms\":\"1000\",\"unused\":null}", .action = .interact },
+        .{ .args = "{\"session_id\":\"shell-3\",\"stop\":true}", .action = .stop },
+        .{ .args = "{\"action\":\"stop\",\"session_id\":\"shell-3\",\"force\":\"true\"}", .action = .stop },
     };
     for (cases) |case| {
-        const result = try decode(.{ .allocator = alloc }, case.input);
+        const decoded = try decode(.{ .allocator = alloc }, case.args);
+        switch (decoded) {
+            .input => |erased| {
+                defer erased.deinit(alloc);
+                const owned: *OwnedInput = @ptrCast(@alignCast(erased.ptr));
+                try std.testing.expectEqual(case.action, owned.value.action);
+            },
+            .failure => |failure| {
+                defer alloc.free(failure);
+                std.debug.print("decode rejected {s}: {s}\n", .{ case.args, failure });
+                return error.TestUnexpectedResult;
+            },
+        }
+    }
+}
+
+test "shell decode explains calls it cannot read and suggests no guess" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { args: []const u8, problem: []const u8 }{
+        .{ .args = "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"ls\"}", .problem = "not valid JSON" },
+        .{ .args = "{\"command\":\"true\",\"session_id\":\"shell-3\"}", .problem = "both sent" },
+        .{ .args = "{\"action\":\"run\",\"command\":\"true\",\"background\":true}", .problem = "background is not a shell field" },
+        .{ .args = "{\"request\":{\"action\":\"run\",\"command\":\"true\"},\"command\":\"false\"}", .problem = "inside and outside request" },
+        .{ .args = "{\"command\":\"print(1)\",\"shell\":\"/usr/bin/python3\"}", .problem = "shell must be bash" },
+        .{ .args = "{}", .problem = "Send command" },
+        .{ .args = "{", .problem = "not valid JSON" },
+        .{ .args = "[]", .problem = "one JSON object" },
+    };
+    for (cases) |case| {
+        const result = try decode(.{ .allocator = alloc }, case.args);
         const failure = switch (result) {
             .failure => |failure| failure,
             .input => |input| {
@@ -1972,45 +1878,32 @@ test "shell request correction suggests only unambiguous repairs without executi
         const detail = parsed.value.object.get("error").?.object;
         try std.testing.expectEqualStrings("invalid_shell_request", detail.get("code").?.string);
         try std.testing.expect(!detail.get("executed").?.bool);
-        try std.testing.expect(detail.get("problems").?.array.items.len > 0);
+        try std.testing.expect(detail.get("retry_with") == null);
+        const problems = detail.get("problems").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), problems.len);
+        try std.testing.expect(std.mem.find(u8, problems[0].string, case.problem) != null);
+        // Presentation still counts the problem as one invalid field.
         try std.testing.expect((try tool_result_errors.inspectTerminalActionFieldCorrection(alloc, failure)) != null);
-        if (case.retry) |expected| {
-            const request = detail.get("retry_with").?.object.get("request").?;
-            const json = try std.json.Stringify.valueAlloc(alloc, request, .{});
-            defer alloc.free(json);
-            try std.testing.expectEqualStrings(expected, json);
-            const decoded = try decode(.{ .allocator = alloc }, json);
-            switch (decoded) {
-                .input => |input| input.deinit(alloc),
-                .failure => |reason| {
-                    alloc.free(reason);
-                    return error.TestUnexpectedResult;
-                },
-            }
-        } else {
-            try std.testing.expect(detail.get("retry_with") == null);
-        }
     }
 }
 
-fn check_request_correction_allocations(alloc: Allocator, args_json: []const u8) !void {
+fn check_decode_allocations(alloc: Allocator, args_json: []const u8) !void {
     const result = try decode(.{ .allocator = alloc }, args_json);
     switch (result) {
         .failure => |failure| alloc.free(failure),
-        .input => |input| {
-            input.deinit(alloc);
-            return error.TestUnexpectedResult;
-        },
+        .input => |input| input.deinit(alloc),
     }
 }
 
-test "shell request correction releases partial allocations" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_request_correction_allocations, .{
+test "shell decode releases partial allocations" {
+    for ([_][]const u8{
         "{\"request\":{\"command\":\"true\"},\"yield_time_ms\":\"30000\"}",
-    });
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_request_correction_allocations, .{
         "{\"command\":\"true\",\"tty\":true,\"shell\":{\"path\":\"/bin/bash\",\"kind\":\"executable\"}}",
-    });
+        "{\"request\":\"{\\\"command\\\":\"}",
+        "{\"command\":\"true\",\"session_id\":\"s\"}",
+    }) |args| {
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, check_decode_allocations, .{args});
+    }
 }
 
 test "shell request correction canonicalizes nested shell members" {
@@ -2044,7 +1937,7 @@ test "shell request correction bounds feedback and preserves input bytes" {
     defer alloc.free(correction);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, correction, .{});
     defer parsed.deinit();
-    const request = parsed.value.object.get("error").?.object.get("retry_with").?.object.get("request").?.object;
+    const request = parsed.value.object.get("error").?.object.get("retry_with").?.object;
     try std.testing.expectEqualStrings(command, request.get("command").?.string);
 
     const long_key = try std.fmt.allocPrint(alloc, "{{\"command\":\"true\",\"{s}\":null}}", .{key});
@@ -2155,7 +2048,7 @@ test "TTY execution requires matching shell authority" {
     );
 }
 
-test "shell decoder preserves null omission and rejects cross action fields" {
+test "shell decoder preserves null omission and ignores fields of other actions" {
     const alloc = std.testing.allocator;
     const ctx = tool_dispatch.DispatchContext{ .allocator = alloc };
     const decoded = try decode(
@@ -2172,18 +2065,23 @@ test "shell decoder preserves null omission and rejects cross action fields" {
             try std.testing.expect(isCapturedCommand(input));
         },
     }
-    const invalid = try decode(
+    // A command beside an explicit interact does not apply to it; the call
+    // observes the session and runs nothing.
+    const stray = try decode(
         ctx,
         "{\"action\":\"interact\",\"session_id\":\"shell-session\",\"command\":\"true\"}",
     );
-    switch (invalid) {
-        .input => |input| {
-            defer input.deinit(alloc);
-            return error.TestUnexpectedResult;
-        },
+    switch (stray) {
         .failure => |failure| {
             defer alloc.free(failure);
-            try std.testing.expect(std.mem.find(u8, failure, "invalid_shell_request") != null);
+            return error.TestUnexpectedResult;
+        },
+        .input => |erased| {
+            defer erased.deinit(alloc);
+            const owned: *OwnedInput = @ptrCast(@alignCast(erased.ptr));
+            try std.testing.expectEqual(Action.interact, owned.value.action);
+            try std.testing.expect(owned.value.command == null);
+            try std.testing.expect(owned.value.chars == null);
         },
     }
 }
@@ -2262,12 +2160,17 @@ test "shell interaction wait bounds empty observations without delaying writes" 
         .{ .allocator = std.testing.allocator },
         "{\"action\":\"interact\",\"session_id\":\"shell-1\",\"yield_time_ms\":4294967296}",
     );
+    // An out-of-range wait clamps to the ceiling instead of failing.
     switch (overflow) {
-        .input => |input| {
-            defer input.deinit(std.testing.allocator);
+        .input => |erased| {
+            defer erased.deinit(std.testing.allocator);
+            const owned: *OwnedInput = @ptrCast(@alignCast(erased.ptr));
+            try std.testing.expectEqual(managed_contract.max_wait_ceiling_ms, owned.value.yield_time_ms);
+        },
+        .failure => |message| {
+            std.testing.allocator.free(message);
             return error.TestUnexpectedResult;
         },
-        .failure => |message| std.testing.allocator.free(message),
     }
 }
 
@@ -2693,7 +2596,7 @@ test "registered shell empty observation waits through one managed execution" {
     const environment = try commandEnvironment(
         environment_arena_state.allocator(),
         .{ .allocator = alloc, .workspace_root = "/tmp" },
-        .clean,
+        .{ .action = .run, .profile = .clean },
     );
     const command_ctx = command_admission.CommandContext{
         .command = "sleep 2; printf done",
