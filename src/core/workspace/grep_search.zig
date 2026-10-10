@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
+const git_command = @import("git_command.zig");
 const glob_pattern = @import("glob_pattern.zig");
 const ignored_dirs = @import("ignored_dirs.zig");
 const io_mod = @import("../shared/io.zig");
@@ -186,10 +187,14 @@ fn countDirectoryMatchesWithOptions(
 }
 
 fn gitIgnoresRoot(arena: Allocator, absolute_root: []const u8) bool {
-    const argv = [_][]const u8{ "git", "--no-optional-locks", "check-ignore", "-q", "--", "." };
+    const executable = git_command.trustedExecutable() orelse return false;
+    const argv = git_command.argv(executable, &.{ "check-ignore", "-q", "--", "." });
+    var environment = git_command.readOnlyEnvironment(arena, null) catch return false;
+    defer environment.deinit();
     const result = std.process.run(arena, io_mod.getIo(), .{
         .argv = &argv,
         .cwd = .{ .path = absolute_root },
+        .environ_map = &environment,
         .stdout_limit = std.Io.Limit.limited(1024),
         .stderr_limit = std.Io.Limit.limited(1024),
     }) catch return false;
@@ -399,8 +404,27 @@ fn countCandidateList(
     }
 }
 
-pub fn gitGrepArgvForTest() [9][]const u8 {
-    return .{ "git", "--no-optional-locks", "grep", "-n", "-I", "-F", "-z", "-e", "needle" };
+const git_grep_match_args = [_][]const u8{ "grep", "-n", "-I", "-F", "-z" };
+const git_grep_count_args = [_][]const u8{ "grep", "--count", "-I", "-F", "-z" };
+
+pub fn gitGrepArgvForTest() git_command.Argv(git_grep_match_args.len + 2) {
+    return git_command.argv("git", &(git_grep_match_args ++ [_][]const u8{ "-e", "needle" }));
+}
+
+fn appendGitGrepArgv(
+    arena: Allocator,
+    argv: *std.ArrayList([]const u8),
+    grep_args: []const []const u8,
+    pattern: []const u8,
+    case_insensitive: bool,
+    include: ?glob_pattern.Pattern,
+) !void {
+    const executable = git_command.trustedExecutable() orelse return error.GitGrepUnavailable;
+    try git_command.appendPrefix(arena, argv, executable);
+    try argv.appendSlice(arena, grep_args);
+    if (case_insensitive) try argv.append(arena, "-i");
+    try argv.appendSlice(arena, &.{ "-e", pattern, "--" });
+    try argv.append(arena, safeGitIncludePathspec(include) orelse ".");
 }
 
 const GitGrepMatchesResult = struct {
@@ -425,18 +449,14 @@ fn gitGrepTrackedMatches(
 
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(arena);
-    try argv.appendSlice(arena, &.{ "git", "--no-optional-locks", "grep", "-n", "-I", "-F", "-z" });
-    if (case_insensitive) try argv.append(arena, "-i");
-    try argv.appendSlice(arena, &.{ "-e", pattern, "--" });
-    if (safeGitIncludePathspec(include)) |pathspec| {
-        try argv.append(arena, pathspec);
-    } else {
-        try argv.append(arena, ".");
-    }
+    try appendGitGrepArgv(arena, &argv, &git_grep_match_args, pattern, case_insensitive, include);
+    var environment = try git_command.readOnlyEnvironment(arena, null);
+    defer environment.deinit();
 
     const result = std.process.run(arena, io_mod.getIo(), .{
         .argv = argv.items,
         .cwd = .{ .path = absolute_root },
+        .environ_map = &environment,
         .stdout_limit = std.Io.Limit.limited(git_grep_stdout_limit),
         .stderr_limit = std.Io.Limit.limited(1024),
     }) catch return error.GitGrepFailed;
@@ -468,18 +488,14 @@ fn gitGrepTrackedCounts(
 
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(arena);
-    try argv.appendSlice(arena, &.{ "git", "--no-optional-locks", "grep", "--count", "-I", "-F", "-z" });
-    if (case_insensitive) try argv.append(arena, "-i");
-    try argv.appendSlice(arena, &.{ "-e", pattern, "--" });
-    if (safeGitIncludePathspec(include)) |pathspec| {
-        try argv.append(arena, pathspec);
-    } else {
-        try argv.append(arena, ".");
-    }
+    try appendGitGrepArgv(arena, &argv, &git_grep_count_args, pattern, case_insensitive, include);
+    var environment = try git_command.readOnlyEnvironment(arena, null);
+    defer environment.deinit();
 
     const result = std.process.run(arena, io_mod.getIo(), .{
         .argv = argv.items,
         .cwd = .{ .path = absolute_root },
+        .environ_map = &environment,
         .stdout_limit = std.Io.Limit.limited(git_grep_stdout_limit),
         .stderr_limit = std.Io.Limit.limited(1024),
     }) catch return error.GitGrepFailed;
@@ -868,15 +884,39 @@ fn runGitForTest(alloc: Allocator, cwd: []const u8, args: []const []const u8) !v
 
 test "grep search git grep argv uses literal fixed-string flags" {
     const argv = gitGrepArgvForTest();
+    const tail_start = 1 + git_command.global_options.len;
 
     try std.testing.expectEqualStrings("git", argv[0]);
-    try std.testing.expectEqualStrings("--no-optional-locks", argv[1]);
-    try std.testing.expectEqualStrings("grep", argv[2]);
-    try std.testing.expectEqualStrings("-n", argv[3]);
-    try std.testing.expectEqualStrings("-I", argv[4]);
-    try std.testing.expectEqualStrings("-F", argv[5]);
-    try std.testing.expectEqualStrings("-z", argv[6]);
-    try std.testing.expectEqualStrings("-e", argv[7]);
+    try std.testing.expectEqualSlices([]const u8, &git_command.global_options, argv[1..tail_start]);
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{ "grep", "-n", "-I", "-F", "-z", "-e", "needle" },
+        argv[tail_start..],
+    );
+}
+
+test "grep search does not run programs named by repository config" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const trap = try git_command.createTrapRepositoryForTest(alloc, &tmp);
+    defer trap.deinit(alloc);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const matches = try collectDirectoryMatches(arena_state.allocator(), trap.root, trap.root, "needle", false, null);
+    try std.testing.expectEqual(@as(usize, 1), matches.matches.len);
+    const counts = try countDirectoryMatchesWithIgnored(
+        arena_state.allocator(),
+        trap.root,
+        trap.root,
+        "needle",
+        false,
+        ignored_dirs.ignored_directory_names,
+        null,
+    );
+    try std.testing.expectEqual(@as(usize, 1), counts.matching_files);
+    try std.testing.expect(!trap.markerExists());
 }
 
 test "grep search preserves explicitly requested ignored directory roots" {

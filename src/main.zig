@@ -4884,6 +4884,7 @@ test {
     _ = @import("core/output/output_contracts.zig");
     _ = @import("core/workspace/pathing.zig");
     _ = @import("core/workspace/current_branch.zig");
+    _ = @import("core/workspace/git_command.zig");
     _ = @import("core/permissions/permission_gate.zig");
     _ = @import("core/permissions/permissions.zig");
     _ = @import("core/execution/process_identity.zig");

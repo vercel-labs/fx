@@ -1139,6 +1139,41 @@ describe("@ file picker", () => {
   );
 
   tmuxTest(
+    "indexes a workspace without running programs named by repository config",
+    async () => {
+      const current = createFixture("fx-file-picker-repository-config-");
+      initGit(current.workspace);
+      writeFileSync(join(current.workspace, "startup-listing.txt"), "listing");
+      writeFileSync(join(current.workspace, ".gitignore"), "ignored-local.txt\n");
+      writeFileSync(join(current.workspace, "ignored-local.txt"), "must not be indexed");
+      git(current.workspace, "add", "startup-listing.txt");
+      const marker = join(current.root, "repository-program-ran");
+      git(
+        current.workspace,
+        "config",
+        "core.fsmonitor",
+        `echo fsmonitor >> ${JSON.stringify(marker)}; false`,
+      );
+
+      // Plain git runs the configured monitor, which proves the fixture is armed.
+      execFileSync("git", ["ls-files"], { cwd: current.workspace, stdio: "pipe" });
+      expect(existsSync(marker)).toBe(true);
+      unlinkSync(marker);
+
+      const active = await startMockFx(current, [], 1000);
+      // Git includes .gitignore but excludes ignored-local.txt; recursive
+      // fallback would index all three and cannot satisfy this count.
+      await waitForReadyAndAdoptedFileIndex(current.tracePath, 2);
+      await active.sendLiteral("@startup-listing");
+      await active.waitForText("startup-listing.txt", 5_000);
+
+      expect(existsSync(marker)).toBe(false);
+      expectCleanRuntime(current, active);
+    },
+    TIMEOUT,
+  );
+
+  tmuxTest(
     "submits an unmatched file mention without requiring dismissal",
     async () => {
       const current = createFixture("fx-file-picker-unmatched-submit-");

@@ -1,5 +1,6 @@
 const std = @import("std");
 const command_lex = @import("command_lex.zig");
+const git_command = @import("../workspace/git_command.zig");
 
 const max_command_bytes = 8 * 1024;
 const max_ls_operands = 64;
@@ -735,14 +736,7 @@ fn appendGitPrelude(
     alloc: std.mem.Allocator,
     argv: *std.ArrayList([]const u8),
 ) std.mem.Allocator.Error!void {
-    try argv.appendSlice(alloc, &.{
-        "/usr/bin/git",
-        "--no-pager",
-        "-c",
-        "core.hooksPath=/dev/null",
-        "-c",
-        "core.fsmonitor=false",
-    });
+    try git_command.appendPrefix(alloc, argv, "/usr/bin/git");
 }
 
 fn directGit(argv: []const []const u8) StageAdmission {
@@ -786,7 +780,7 @@ fn planGitDiff(
 ) std.mem.Allocator.Error!StageAdmission {
     var argv: std.ArrayList([]const u8) = .empty;
     try appendGitPrelude(alloc, &argv);
-    try argv.appendSlice(alloc, &.{ "diff", "--no-ext-diff", "--no-textconv", "--color=never" });
+    try argv.appendSlice(alloc, &.{ "diff", "--no-ext-diff", "--no-textconv", "--color=never", "--ignore-submodules=dirty", "--submodule=short" });
 
     var index: usize = 0;
     while (index < arguments.len and !std.mem.eql(u8, arguments[index], "--")) : (index += 1) {
@@ -820,7 +814,7 @@ fn planGitLog(
 ) std.mem.Allocator.Error!StageAdmission {
     var argv: std.ArrayList([]const u8) = .empty;
     try appendGitPrelude(alloc, &argv);
-    try argv.appendSlice(alloc, &.{ "log", "--no-ext-diff", "--no-textconv", "--color=never", "--max-count=100" });
+    try argv.appendSlice(alloc, &.{ "log", "--no-show-signature", "--pretty=medium", "--no-ext-diff", "--no-textconv", "--submodule=short", "--color=never", "--max-count=100" });
 
     var index: usize = 0;
     while (index < arguments.len and !std.mem.eql(u8, arguments[index], "--")) : (index += 1) {
@@ -1301,22 +1295,36 @@ test "planner pins read-only git inspection to hardened argv and environment" {
 
     try std.testing.expectEqual(EnvironmentProfile.git_read_only, stage.environment_profile);
     try std.testing.expectEqualStrings("/usr/bin/git", stage.executable);
-    const expected = [_][]const u8{
-        "/usr/bin/git",
-        "--no-pager",
-        "-c",
-        "core.hooksPath=/dev/null",
-        "-c",
-        "core.fsmonitor=false",
+    const expected = [_][]const u8{"/usr/bin/git"} ++ git_command.global_options ++ [_][]const u8{
         "diff",
         "--no-ext-diff",
         "--no-textconv",
         "--color=never",
+        "--ignore-submodules=dirty",
+        "--submodule=short",
         "--name-only",
         "--",
         "src",
     };
     try expectArgv(&expected, stage.argv);
+
+    var log_admission = try expectDirect("git log --oneline -n 3", .linux);
+    defer log_admission.deinit(std.testing.allocator);
+    const log_expected = [_][]const u8{"/usr/bin/git"} ++ git_command.global_options ++ [_][]const u8{
+        "log",
+        "--no-show-signature",
+        "--pretty=medium",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--submodule=short",
+        "--color=never",
+        "--max-count=100",
+        "--oneline",
+        "-n",
+        "3",
+        "--",
+    };
+    try expectArgv(&log_expected, log_admission.direct_read_only.stages[0].argv);
 }
 
 test "planner limits bounded readers to pipeline input" {
