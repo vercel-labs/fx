@@ -15,6 +15,7 @@ from scripts.pgso.model import PgsoError
 REQUIRED_ZIG_VERSION = "0.16.0"
 REQUIRED_LLVM_VERSION = "21.1.8"
 SUPPORTED_TARGET = "aarch64-macos"
+IR_SIZE_SCRIPT = pathlib.Path(__file__).resolve().with_name("ir_size.py")
 
 
 def _resolve_executable(command: str, display_name: str) -> pathlib.Path:
@@ -96,6 +97,8 @@ class Toolchain:
     llvm_link: pathlib.Path
     llvm_split: pathlib.Path
     clang: pathlib.Path
+    libllvm: pathlib.Path
+    ir_size: pathlib.Path
     apple_ld: pathlib.Path
     apple_ld_version: str
     strip: pathlib.Path
@@ -166,6 +169,12 @@ class Toolchain:
         }
         llvm_version = versions["opt"]
 
+        libllvm = (llvm_root.parent / "lib" / "libLLVM.dylib").resolve()
+        if not libllvm.is_file() or libllvm.stat().st_size == 0:
+            raise PgsoError(f"missing LLVM C library: {libllvm}")
+        if not IR_SIZE_SCRIPT.is_file():
+            raise PgsoError(f"missing IR size passes: {IR_SIZE_SCRIPT}")
+
         strip = _resolve_executable("strip", "strip")
         codesign = _resolve_executable("codesign", "codesign")
         otool = _resolve_executable("otool", "otool")
@@ -224,6 +233,8 @@ class Toolchain:
             llvm_link=llvm_tools["llvm-link"],
             llvm_split=llvm_tools["llvm-split"],
             clang=llvm_tools["clang"],
+            libllvm=libllvm,
+            ir_size=IR_SIZE_SCRIPT,
             apple_ld=apple_ld,
             apple_ld_version=apple_ld_version,
             strip=strip,

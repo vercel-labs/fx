@@ -6,6 +6,7 @@ import os
 import pathlib
 import re
 import stat
+import sys
 import uuid
 from collections.abc import Sequence
 
@@ -46,6 +47,15 @@ IR_OUTLINER_FLAGS = (
 OUTLINE_CLEANUP_FLAGS = (
     "-passes=internalize,constmerge,globaldce,mergefunc,verify",
     "-internalize-public-api-list=main,_mh_execute_header",
+)
+
+# Zig writes raw bitcode. LLVM's own writer, which the IR size passes use,
+# wraps Darwin bitcode in the 0x0B17C0DE wrapper header.
+BITCODE_MAGICS = (b"BC\xc0\xde", b"\xde\xc0\x17\x0b")
+
+# Drop the constants that `ir_size.py sparse-constants` left without uses.
+SPARSE_CLEANUP_FLAGS = (
+    "-passes=globaldce,verify",
 )
 
 BENCHMARK_USE_FLAGS = (
@@ -340,6 +350,23 @@ def zig_build_argv(
     return tuple(argv)
 
 
+def ir_size_argv(
+    toolchain: Toolchain,
+    command: str,
+    source: pathlib.Path,
+    output: pathlib.Path,
+) -> tuple[str, ...]:
+    return (
+        sys.executable,
+        str(toolchain.ir_size),
+        "--libllvm",
+        str(toolchain.libllvm),
+        command,
+        str(source),
+        str(output),
+    )
+
+
 def instrumentation_argv(
     toolchain: Toolchain,
     paths: PipelinePaths,
@@ -510,6 +537,8 @@ def temporal_candidate_link_argv(
         "_main",
         "-no_deduplicate",
         "-no_function_starts",
+        # fx builds without unwind tables; newer ld otherwise emits ~160 KB.
+        "-no_compact_unwind",
         "-order_file",
         str(paths.logs / "candidate-order.txt"),
         "-map",
@@ -817,13 +846,68 @@ def emit_bitcode(
         log_path=paths.logs / "emit-bitcode.json",
     )
     _require_nonempty_file(paths.bitcode, "ReleaseSafe LLVM bitcode")
-    with paths.bitcode.open("rb") as stream:
-        if stream.read(4) != b"BC\xc0\xde":
-            raise PgsoError(f"invalid LLVM bitcode header: {paths.bitcode}")
+    _require_bitcode_header(paths.bitcode)
+    # Every job derives instrumentation and profile use from this file, so
+    # the helper attributes are part of the recorded bitcode identity.
+    staged = paths.bitcode.with_name(paths.bitcode.name + ".staged")
+    run_checked(
+        ir_size_argv(toolchain, "outline-helpers", paths.bitcode, staged),
+        cwd=paths.root,
+        env=os.environ.copy(),
+        timeout_s=300,
+        log_path=paths.logs / "outline-helpers.json",
+        require_empty_stderr=True,
+    )
+    _require_nonempty_file(staged, "outlined-helper bitcode")
+    _require_bitcode_header(staged)
+    os.replace(staged, paths.bitcode)
     digest = sha256_file(paths.bitcode)
     if expected_sha256 is not None:
         validate_bitcode_hash(paths.bitcode, expected_sha256)
     return digest
+
+
+def _require_bitcode_header(path: pathlib.Path) -> None:
+    with path.open("rb") as stream:
+        if stream.read(4) not in BITCODE_MAGICS:
+            raise PgsoError(f"invalid LLVM bitcode header: {path}")
+
+
+def rewrite_sparse_constants(toolchain: Toolchain, paths: PipelinePaths) -> None:
+    """Replace copies of mostly undefined constants with their defined stores."""
+    rewritten = paths.profile_use_bitcode.with_name(
+        paths.profile_use_bitcode.name + ".sparse"
+    )
+    run_checked(
+        ir_size_argv(
+            toolchain,
+            "sparse-constants",
+            paths.profile_use_bitcode,
+            rewritten,
+        ),
+        cwd=paths.root,
+        env=os.environ.copy(),
+        timeout_s=300,
+        log_path=paths.logs / "sparse-constants.json",
+        require_empty_stderr=True,
+    )
+    _require_nonempty_file(rewritten, "sparse-constant bitcode")
+    run_checked(
+        (
+            str(toolchain.opt),
+            *SPARSE_CLEANUP_FLAGS,
+            str(rewritten),
+            "-o",
+            str(paths.profile_use_bitcode),
+        ),
+        cwd=paths.root,
+        env=os.environ.copy(),
+        timeout_s=300,
+        log_path=paths.logs / "sparse-cleanup.json",
+        require_empty_stderr=True,
+    )
+    _require_nonempty_file(paths.profile_use_bitcode, "profile-use bitcode")
+    rewritten.unlink()
 
 
 def validate_bitcode_hash(path: pathlib.Path, expected_sha256: str) -> None:
@@ -1182,6 +1266,7 @@ def apply_profile(
     )
     if paths.selector != "fx":
         _require_nonempty_file(paths.profile_use_bitcode, "profile-use bitcode")
+        rewrite_sparse_constants(toolchain, paths)
         return paths.profile_use_bitcode
 
     _require_nonempty_file(
@@ -1233,6 +1318,7 @@ def apply_profile(
         require_empty_stderr=True,
     )
     _require_nonempty_file(paths.profile_use_bitcode, "profile-use bitcode")
+    rewrite_sparse_constants(toolchain, paths)
     outlined_symbols = _defined_external_symbols(
         toolchain,
         paths.profile_use_bitcode,

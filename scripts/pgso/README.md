@@ -11,7 +11,7 @@ The driver requires:
 - macOS on an arm64 host
 - generic `aarch64-macos` output
 - Zig `0.16.0`
-- LLVM `21.1.8` tools and profile runtime from one configured LLVM root
+- LLVM `21.1.8` tools, profile runtime, and C library (`lib/libLLVM.dylib`) from one configured LLVM root
 - the selected Xcode macOS SDK and native Apple linker with arm64 support
 - Bun `1.3.14`
 - Hyperfine `1.20.0`
@@ -78,6 +78,25 @@ the training corpus, benchmark candidates, or performance measurement hardware.
 Generated IR helpers are kept in one dense linker cluster ordered by their
 hottest profiled caller so outlining does not scatter startup code across cold
 pages.
+
+Two size passes in [`ir_size.py`](ir_size.py) run through the pinned LLVM C
+library. Right after Zig emits bitcode, `outline-helpers` marks small shared
+std helpers `noinline`: the allocator's slice `free`, `remap`, and aligned
+allocation, the writer's `write`, `writeAll`, and allocating-writer setup and
+teardown, and the byte list's `appendSlice` and `deinit`. Zig otherwise copies
+them into thousands of call sites (`free` alone into about 11,000). The pass
+runs before instrumentation, so training, profile use, and the recorded
+bitcode identity all include it. It reports matches per pattern and fails if
+the allocator `free` helper does not match. After profile use and outlining,
+`sparse-constants` rewrites copies from mostly undefined internal constants
+into stores of their defined bytes, then `globaldce,verify` drops the dead
+constants. Zig emits such a constant for each `return error.X` from a
+function returning a large error union. Undefined bytes become "destination
+unchanged", a refinement of copying undefined bytes; explicit values,
+including zeros, are still stored. Benchmark artifacts receive both passes so
+their candidates keep the production code shape. The candidate link passes
+`-no_compact_unwind`: fx builds without unwind tables, and newer Apple linkers
+otherwise emit about 160 KB of compact unwind data.
 
 `python3 -m scripts.pgso.distributed plan` emits deterministic, non-empty
 GitHub Actions matrices. The remaining distributed subcommands are workflow

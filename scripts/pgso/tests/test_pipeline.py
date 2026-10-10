@@ -26,6 +26,7 @@ from scripts.pgso.pipeline import (
     candidate_object_argv,
     candidate_link_argv,
     candidate_runtime_probe_argv,
+    emit_bitcode,
     temporal_candidate_link_argv,
     map_temporal_symbols,
     parse_macos_link_contract,
@@ -169,7 +170,13 @@ class PgsoPipelineTests(unittest.TestCase):
         self.assertEqual("1000000", command[command.index("-stack_size") + 1])
         self.assertIn(str(toolchain.zig_darwin_sdk / "libSystem.tbd"), command)
         self.assertIn(str(self.paths.logs / "candidate-order.txt"), command)
-        for flag in ("-order_file", "-no_deduplicate", "-no_function_starts", "-map"):
+        for flag in (
+            "-order_file",
+            "-no_deduplicate",
+            "-no_function_starts",
+            "-no_compact_unwind",
+            "-map",
+        ):
             self.assertIn(flag, command)
         original = candidate_link_argv(self.toolchain, self.paths)
         probe = candidate_runtime_probe_argv(self.toolchain, self.paths)
@@ -213,6 +220,8 @@ class PgsoPipelineTests(unittest.TestCase):
             "llvm_link": tool_root / "llvm-link",
             "llvm_split": tool_root / "llvm-split",
             "clang": tool_root / "clang",
+            "libllvm": self.root / "libLLVM.dylib",
+            "ir_size": tool_root / "ir_size.py",
             "apple_ld": tool_root / "ld",
             "apple_ld_version": "1167.5",
             "strip": tool_root / "strip",
@@ -237,6 +246,113 @@ class PgsoPipelineTests(unittest.TestCase):
         path.write_text(f"#!/usr/bin/python3\n{body}\n")
         path.chmod(0o755)
         return path
+
+    def write_ir_size(self, actions: pathlib.Path, *, output: bytes = b"BC\xc0\xdestaged") -> pathlib.Path:
+        return self.write_executable(
+            "fake-ir-size",
+            f"""import pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('ir_size ' + ' '.join(sys.argv[1:]) + '\\n')
+pathlib.Path(sys.argv[-1]).write_bytes({output!r})
+print('{{}}')""",
+        )
+
+    def write_bitcode_zig(self, actions: pathlib.Path) -> pathlib.Path:
+        return self.write_executable(
+            "bitcode-zig",
+            f"""import pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('zig ' + ' '.join(sys.argv[1:]) + '\\n')
+prefix = pathlib.Path(sys.argv[sys.argv.index('--prefix') + 1])
+(prefix / 'pgso').mkdir(parents=True, exist_ok=True)
+(prefix / 'pgso' / 'fx.bc').write_bytes(b'BC\\xc0\\xdezig')""",
+        )
+
+    def test_emitted_bitcode_outlines_helpers_before_identity_is_recorded(self) -> None:
+        actions = self.root / "emit-actions"
+        toolchain = dataclasses.replace(
+            self.toolchain,
+            zig=self.write_bitcode_zig(actions),
+            ir_size=self.write_ir_size(actions),
+        )
+        self.spec.repo_root.mkdir(parents=True)
+
+        digest = emit_bitcode(toolchain, self.spec, self.paths)
+
+        self.assertEqual(b"BC\xc0\xdestaged", self.paths.bitcode.read_bytes())
+        self.assertEqual(sha256_file(self.paths.bitcode), digest)
+        lines = actions.read_text().splitlines()
+        self.assertEqual(2, len(lines))
+        self.assertTrue(lines[0].startswith("zig build pgso-ir "))
+        self.assertEqual(
+            f"ir_size --libllvm {toolchain.libllvm} outline-helpers "
+            f"{self.paths.bitcode} {self.paths.bitcode}.staged",
+            lines[1],
+        )
+        self.assertFalse(self.paths.bitcode.with_name("fx.bc.staged").exists())
+        emit_bitcode(toolchain, self.spec, self.paths, expected_sha256=digest)
+
+    def test_emitted_bitcode_accepts_the_darwin_bitcode_wrapper(self) -> None:
+        actions = self.root / "emit-wrapper"
+        wrapped = b"\xde\xc0\x17\x0bwrapped"
+        toolchain = dataclasses.replace(
+            self.toolchain,
+            zig=self.write_bitcode_zig(actions),
+            ir_size=self.write_ir_size(actions, output=wrapped),
+        )
+        self.spec.repo_root.mkdir(parents=True)
+
+        digest = emit_bitcode(toolchain, self.spec, self.paths)
+
+        self.assertEqual(wrapped, self.paths.bitcode.read_bytes())
+        self.assertEqual(sha256_file(self.paths.bitcode), digest)
+
+    def test_emitted_bitcode_rejects_a_failed_or_invalid_helper_pass(self) -> None:
+        actions = self.root / "emit-failures"
+        self.spec.repo_root.mkdir(parents=True)
+        failing = self.write_executable(
+            "failing-ir-size",
+            "import sys\nsys.stderr.write('ir_size: no out-of-line helper matched')\nsys.exit(1)",
+        )
+        for ir_size, message in (
+            (failing, "failed with exit code 1"),
+            (self.write_ir_size(actions, output=b"not bitcode"), "invalid LLVM bitcode header"),
+        ):
+            with self.subTest(message=message):
+                toolchain = dataclasses.replace(
+                    self.toolchain,
+                    zig=self.write_bitcode_zig(actions),
+                    ir_size=ir_size,
+                )
+                with self.assertRaisesRegex(PgsoError, message):
+                    emit_bitcode(toolchain, self.spec, self.paths)
+
+    def test_benchmark_profile_use_rewrites_sparse_constants(self) -> None:
+        actions = self.root / "benchmark-actions"
+        opt = self.write_executable(
+            "benchmark-opt",
+            f"""import pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('opt ' + ' '.join(sys.argv[1:]) + '\\n')
+pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'bitcode')""",
+        )
+        paths = PipelinePaths.create(self.root / "run-bench", selector="ui_activity")
+        toolchain = dataclasses.replace(
+            self.toolchain,
+            opt=opt,
+            ir_size=self.write_ir_size(actions),
+        )
+        paths.bitcode.write_bytes(b"same bitcode")
+        paths.merged_profile.write_bytes(b"profile")
+
+        result = apply_profile(toolchain, paths, sha256_file(paths.bitcode))
+
+        self.assertEqual(paths.profile_use_bitcode, result)
+        lines = actions.read_text().splitlines()
+        self.assertEqual(3, len(lines))
+        self.assertIn("-passes=default<O2>,mergefunc,iroutliner", lines[0])
+        self.assertIn(f"sparse-constants {paths.profile_use_bitcode} ", lines[1])
+        self.assertIn("-passes=globaldce,verify", lines[2])
 
     def test_profile_pipelines_use_the_exact_accepted_flags(self) -> None:
         self.assertEqual(
@@ -764,6 +880,7 @@ print('_main T ---------------- 0')""",
             llvm_split=split,
             llvm_link=link,
             llvm_nm=nm,
+            ir_size=self.write_ir_size(actions),
         )
         self.paths.bitcode.write_bytes(b"same bitcode")
         self.paths.merged_profile.write_bytes(b"profile")
@@ -777,7 +894,7 @@ print('_main T ---------------- 0')""",
         self.assertEqual(self.paths.profile_use_bitcode, result)
         self.assertEqual(b"bitcode", result.read_bytes())
         lines = actions.read_text().splitlines()
-        self.assertEqual(8, len(lines))
+        self.assertEqual(10, len(lines))
         self.assertIn("-passes=default<O2>,mergefunc", lines[0])
         self.assertNotIn("iroutliner", lines[0])
         self.assertEqual("nm", lines[1])
@@ -788,7 +905,16 @@ print('_main T ---------------- 0')""",
         self.assertIn(str(self.paths.outline_split_bitcodes[1]), lines[4])
         self.assertTrue(lines[5].startswith("link "))
         self.assertIn("-passes=internalize,constmerge,globaldce,mergefunc,verify", lines[6])
-        self.assertEqual("nm", lines[7])
+        self.assertTrue(lines[7].startswith("ir_size --libllvm "))
+        self.assertIn(f"sparse-constants {self.paths.profile_use_bitcode} ", lines[7])
+        self.assertIn("-passes=globaldce,verify", lines[8])
+        self.assertTrue(lines[8].endswith(f"-o {self.paths.profile_use_bitcode}"))
+        self.assertEqual("nm", lines[9])
+        self.assertFalse(
+            self.paths.profile_use_bitcode.with_name(
+                self.paths.profile_use_bitcode.name + ".sparse"
+            ).exists()
+        )
         self.assertTrue((self.paths.logs / "public-symbols-before.json").is_file())
         self.assertTrue((self.paths.logs / "public-symbols-after.json").is_file())
 

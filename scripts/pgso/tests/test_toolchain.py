@@ -9,7 +9,7 @@ import unittest
 from unittest import mock
 
 from scripts.pgso.model import PgsoError
-from scripts.pgso.toolchain import Toolchain
+from scripts.pgso.toolchain import IR_SIZE_SCRIPT, Toolchain
 
 
 class PgsoToolchainTests(unittest.TestCase):
@@ -29,6 +29,8 @@ class PgsoToolchainTests(unittest.TestCase):
         self.system_bin.mkdir()
         self.profile_runtime.parent.mkdir(parents=True)
         self.profile_runtime.write_bytes(b"profile runtime")
+        self.libllvm = self.root / "llvm" / "lib" / "libLLVM.dylib"
+        self.libllvm.write_bytes(b"llvm c library")
         self.sdk.mkdir()
 
         self.zig = self.root / "zig"
@@ -123,6 +125,9 @@ esac"""
             toolchain.llvm_split,
         )
         self.assertEqual((self.llvm_bin / "clang").resolve(), toolchain.clang)
+        self.assertEqual(self.libllvm.resolve(), toolchain.libllvm)
+        self.assertEqual(IR_SIZE_SCRIPT, toolchain.ir_size)
+        self.assertTrue(toolchain.ir_size.is_file())
         self.assertEqual((self.system_bin / "strip").resolve(), toolchain.strip)
         self.assertEqual(
             (self.system_bin / "codesign").resolve(),
@@ -140,6 +145,16 @@ esac"""
         self.assertEqual("21.1.8", toolchain.llvm_version)
         self.assertEqual("aarch64-macos", toolchain.target)
         self.assertEqual("arm64", toolchain.host_arch)
+
+    def test_discover_requires_the_llvm_c_library_from_the_same_root(self) -> None:
+        for contents in (None, b""):
+            with self.subTest(contents=contents):
+                if contents is None:
+                    self.libllvm.unlink(missing_ok=True)
+                else:
+                    self.libllvm.write_bytes(contents)
+                with self.assertRaisesRegex(PgsoError, "missing LLVM C library"):
+                    self.discover()
 
     def test_discover_rejects_the_wrong_target(self) -> None:
         with self.assertRaisesRegex(PgsoError, "unsupported target: x86_64-macos"):

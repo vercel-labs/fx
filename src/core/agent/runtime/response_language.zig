@@ -51,7 +51,10 @@ pub fn evidence(text: []const u8) Evidence {
     );
 }
 
-pub fn infer_expectation(prompt: []const u8) ?Script {
+// noinline: these prompt scans touch every prompt byte once per signal and
+// are the turn loop's hottest code. Keeping them in their own function keeps
+// their profile out of the turn loop, which can then compile for size.
+pub noinline fn infer_expectation(prompt: []const u8) ?Script {
     if (may_request_language_switch(prompt)) return null;
     const script = evidence(prompt).script orelse return null;
     return if (script == .latin and has_english_authority_signal(prompt)) script else null;
