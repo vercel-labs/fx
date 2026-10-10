@@ -18,6 +18,14 @@ pub fn ToolRegistry(comptime Tool: type) type {
 }
 
 /// Registry for command-like capabilities keyed by a public command token and aliases.
+/// A completion for a command's arguments that only the running app knows,
+/// such as a server name.
+pub const ArgumentCompletion = struct {
+    /// The whole input it completes to, such as "/mcp show context7".
+    full: []const u8,
+    description: ?[]const u8 = null,
+};
+
 pub fn CommandRegistry(comptime Command: type) type {
     return struct {
         const Self = @This();
@@ -28,6 +36,8 @@ pub fn CommandRegistry(comptime Command: type) type {
         };
 
         commands: []const Command = &.{},
+        /// Argument completions the app supplies at run time, all for one command.
+        arguments: []const ArgumentCompletion = &.{},
 
         pub fn lookup(self: Self, command: []const u8) ?*const Command {
             const matched = self.matchExact(command) orelse return null;

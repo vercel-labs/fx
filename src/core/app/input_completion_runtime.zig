@@ -387,6 +387,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         fn routeNonSlashPickerMove(app: *App, delta: i32) !bool {
+            if (try routeMcpHostMenuMove(app, delta)) return true;
             if (try routeSettingsMenuMove(app, delta)) return true;
             if (try routeHelpMenuMove(app, delta)) return true;
             if (try routeModelMenuMove(app, delta)) return true;
@@ -410,6 +411,13 @@ pub fn CompletionRuntime(comptime App: type) type {
             // Mid-turn bare `/model`: consume arrows without slash/skill navigation.
             if (app.stream.active and picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) return true;
             return false;
+        }
+
+        fn routeMcpHostMenuMove(app: *App, delta: i32) !bool {
+            if (comptime !@hasDecl(App, "mcpHostMenuKey")) return false;
+            if (!app.mcp.hostMenuActive()) return false;
+            try app.mcpHostMenuKey(if (delta < 0) .up else .down);
+            return true;
         }
 
         fn routeSettingsMenuMove(app: *App, delta: i32) !bool {

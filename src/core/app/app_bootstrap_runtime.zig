@@ -20,6 +20,7 @@ const record_tape = @import("../workspace/record_tape.zig");
 const statusline_identity = @import("../workspace/statusline_identity.zig");
 const shared_io = @import("../shared/io.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
+const mcp_host = @import("../mcp_host/host.zig");
 const mcp_health = @import("../mcp/health.zig");
 const permissions = @import("../permissions/permissions.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
@@ -113,6 +114,7 @@ fn writeSessionAssemblyBody(
 
 pub const CapabilityProviders = struct {
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
+    load_mcp_host: ?mcp_host.LoadFn = null,
     skill_root_policy: skill_contract.RootPolicy,
     terminal_title: host.TerminalTitle,
 };
@@ -148,6 +150,7 @@ fn BootstrapDeps(comptime App: type) type {
         configure_session_preferences: ConfigureSessionPreferencesFn,
         initialize_persistence: InitializePersistenceFn,
         load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
+        load_mcp_host: ?mcp_host.LoadFn = null,
         load_skills: LoadSkillsFn,
         skill_root_policy: skill_contract.RootPolicy,
         welcome_message: WelcomeMessageFn,
@@ -196,6 +199,7 @@ pub fn Runtime(comptime App: type) type {
                 .configure_session_preferences = configureSessionPreferencesDefault,
                 .initialize_persistence = initializePersistenceDefault,
                 .load_mcp_runtime = capability_providers.load_mcp_runtime,
+                .load_mcp_host = capability_providers.load_mcp_host,
                 .load_skills = app_runtime_setup.loadSkills,
                 .skill_root_policy = capability_providers.skill_root_policy,
                 .welcome_message = welcomeMessageDefault,
@@ -602,6 +606,9 @@ pub fn Runtime(comptime App: type) type {
             } else {
                 app.mcp_runtime = profile_mcp;
             }
+            if (comptime @hasDecl(App, "loadMcpHost")) if (deps.load_mcp_host) |load_host| {
+                try app.loadMcpHost(load_host);
+            };
 
             const skills_deferred = try beginStartupSkillsLoad(app);
             if (!skills_deferred) {

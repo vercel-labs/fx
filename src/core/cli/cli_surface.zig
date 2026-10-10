@@ -49,6 +49,8 @@ const mcp_command_provider = @import("../mcp/command_provider.zig");
 const mcp_health = @import("../mcp/health.zig");
 const project_config = @import("../mcp/project_config.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
+const mcp_host = @import("../mcp_host/host.zig");
+const mcp_verbs = @import("../mcp_host/verbs.zig");
 const mcp_auth = @import("../mcp/mcp_auth.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
@@ -240,6 +242,7 @@ pub const Config = struct {
     inspect_mcp_local_config: mcp_health.InspectLocalConfigFn =
         mcp_health.inspectLocalConfigUnavailable,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
+    load_mcp_host: ?mcp_host.LoadFn = null,
     add_mcp_profile_server: mcp_command_provider.AddProfileServerFn =
         mcp_command_provider.addProfileServerUnavailable,
     remove_mcp_profile_server: mcp_command_provider.RemoveProfileServerFn =
@@ -1108,12 +1111,13 @@ fn runNonInteractiveWithDeps(
         return .handled_success;
     }
 
-    if (topLevelHelpRequest(cfg.command_catalog, effective_args)) |kind| {
+    // MCP-v2's verbs print their own help, and pass `-h` after `--` to the server.
+    if (topLevelHelpRequest(cfg.command_catalog, effective_args)) |kind| if (kind != .mcp or !mcp_host.selected()) {
         const text = try command_specs.renderTopLevelCommandHelp(alloc, cfg.command_catalog, kind);
         defer alloc.free(text);
         try writeStdout(deps, text);
         return .handled_success;
-    }
+    };
 
     switch (parsed_command) {
         .interactive, .resume_session => unreachable,
@@ -2407,6 +2411,7 @@ fn runTopLevelMcp(
     cfg: Config,
     deps: RunDeps,
 ) !RunResult {
+    if (mcp_host.selected()) return runMcpVerbs(alloc, rest, cfg, deps);
     if (rest.len == 0) {
         const help = try command_specs.renderTopLevelCommandHelp(alloc, cfg.command_catalog, .mcp);
         defer alloc.free(help);
@@ -2607,6 +2612,93 @@ fn runTopLevelMcp(
     try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
     return .handled_failure;
 }
+
+/// `fx mcp` on MCP-v2: the verbs `/mcp` shares.
+fn runMcpVerbs(alloc: Allocator, rest: []const [:0]const u8, cfg: Config, deps: RunDeps) !RunResult {
+    const home = deps.getenv(deps.env_ctx, "HOME") orelse {
+        try writeStderr(deps, "fx mcp: HOME isn't set\n");
+        return .handled_failure;
+    };
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    defer alloc.free(workspace_root);
+    const args = try alloc.alloc([]const u8, rest.len);
+    defer alloc.free(args);
+    for (rest, args) |r, *a| a.* = r;
+    var out_buffer: [1024]u8 = undefined;
+    var err_buffer: [512]u8 = undefined;
+    var out: DepsWriter = .init(deps, .stdout, &out_buffer);
+    var err: DepsWriter = .init(deps, .stderr, &err_buffer);
+    var hosts: CliMcpHosts = .{ .alloc = alloc, .cfg = cfg, .workspace_root = workspace_root };
+    const code = mcp_verbs.run(.{
+        .gpa = alloc,
+        .out = &out.interface,
+        .err = &err.interface,
+        .surface = .cli,
+        .home = home,
+        .workspace_root = workspace_root,
+        .hosts = .{ .context = &hosts, .get = CliMcpHosts.get, .release = CliMcpHosts.release, .changed = CliMcpHosts.changed },
+    }, args);
+    return switch (code) {
+        0 => .handled_success,
+        1 => .handled_failure,
+        else => .{ .handled_exit = code },
+    };
+}
+
+/// A host made for one `fx mcp` command.
+const CliMcpHosts = struct {
+    alloc: Allocator,
+    cfg: Config,
+    workspace_root: []const u8,
+
+    fn get(context: *anyopaque, notify: ?mcp_verbs.Notify) anyerror!?*mcp_host.Host {
+        const self: *CliMcpHosts = @ptrCast(@alignCast(context));
+        const load = self.cfg.load_mcp_host orelse return null;
+        return load(self.alloc, self.workspace_root, self.cfg.tool_set.registry, .{ .notify = notify });
+    }
+
+    /// `fx mcp` exits after its one command, so nothing waits for the
+    /// servers; a logout already waited for its revocation.
+    fn release(_: *anyopaque, _: *mcp_host.Host) void {
+        mcp_host.signalServersForExit();
+    }
+
+    fn changed(_: *anyopaque) void {}
+};
+
+/// Streams through `deps`, so `login` shows its address while it waits.
+const DepsWriter = struct {
+    deps: RunDeps,
+    stream: enum { stdout, stderr },
+    interface: std.Io.Writer,
+
+    fn init(deps: RunDeps, stream: @FieldType(DepsWriter, "stream"), buffer: []u8) DepsWriter {
+        return .{ .deps = deps, .stream = stream, .interface = .{ .vtable = &.{ .drain = drain }, .buffer = buffer } };
+    }
+
+    fn emit(self: *DepsWriter, bytes: []const u8) std.Io.Writer.Error!void {
+        if (bytes.len == 0) return;
+        const written = switch (self.stream) {
+            .stdout => writeStdout(self.deps, bytes),
+            .stderr => writeStderr(self.deps, bytes),
+        };
+        written catch return error.WriteFailed;
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *DepsWriter = @alignCast(@fieldParentPtr("interface", w));
+        try self.emit(w.buffered());
+        w.end = 0;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            try self.emit(d);
+            n += d.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| try self.emit(last);
+        return n + last.len * splat;
+    }
+};
 
 fn authenticateMcpCommand(
     alloc: Allocator,
@@ -3628,6 +3720,7 @@ fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
         .max_history_turns = cfg.max_history_turns,
         .mode_registry = cfg.mode_registry,
         .load_mcp_runtime = cfg.load_mcp_runtime,
+        .load_mcp_host = cfg.load_mcp_host,
     };
 }
 

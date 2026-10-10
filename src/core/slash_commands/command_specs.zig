@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_mod = @import("../shared/io.zig");
 
 pub const mcp_add_usage = "mcp add slack | mcp add NAME COMMAND [ARGS...] | mcp add --transport http NAME URL";
 pub const mcp_auth_usage = "mcp auth NAME";
@@ -576,6 +577,13 @@ pub fn slashCompletionPrefix(registry: SlashRegistry, input: []const u8) ?[]cons
 }
 
 pub fn slashCompletionCount(registry: SlashRegistry, prefix: []const u8) usize {
+    if (runtimeArgQuery(registry, prefix)) |query| {
+        var count: usize = 0;
+        for (registry.arguments) |entry| {
+            if (runtimeArgMatches(registry, entry.full, query)) count += 1;
+        }
+        return count;
+    }
     if (allowlistArgCompletionPrefix(prefix)) |query| {
         return allowlistArgCompletionCount(query);
     }
@@ -601,6 +609,9 @@ pub fn slashCompletionCount(registry: SlashRegistry, prefix: []const u8) usize {
 }
 
 pub fn nthSlashCompletion(registry: SlashRegistry, prefix: []const u8, n: usize) ?[]const u8 {
+    if (runtimeArgQuery(registry, prefix)) |query| {
+        return (nthRuntimeArg(registry, query, n) orelse return null).full;
+    }
     if (allowlistArgCompletionPrefix(prefix)) |query| {
         return nthAllowlistArgCompletion(query, n);
     }
@@ -624,6 +635,7 @@ pub fn nthSlashCompletion(registry: SlashRegistry, prefix: []const u8, n: usize)
 /// known arg-completion commands. Returns 0 when
 /// the prefix is not an arg-completion command.
 pub fn argCompletionAnchor(prefix: []const u8) usize {
+    if (mcpVerbsOn() and argCompletionPrefix(prefix, "/mcp") != null) return "/mcp ".len;
     if (statuslineArgCompletionPrefix(prefix) != null) return "/statusline ".len;
     if (notificationsArgCompletionPrefix(prefix) != null) return "/sound ".len;
     if (permissionsArgCompletionPrefix(prefix) != null) return "/permissions ".len;
@@ -637,6 +649,10 @@ pub fn argCompletionAnchor(prefix: []const u8) usize {
 /// shows only the argument. For everything else the
 /// full command string is returned unchanged.
 pub fn nthSlashCompletionLabel(registry: SlashRegistry, prefix: []const u8, n: usize) ?[]const u8 {
+    if (runtimeArgQuery(registry, prefix)) |query| {
+        const entry = nthRuntimeArg(registry, query, n) orelse return null;
+        return entry.full[runtimeArgCommand(registry).len + 1 ..];
+    }
     if (allowlistArgCompletionPrefix(prefix)) |query| {
         return nthAllowlistArgLabel(query, n);
     }
@@ -656,6 +672,9 @@ pub fn nthSlashCompletionLabel(registry: SlashRegistry, prefix: []const u8, n: u
 }
 
 pub fn nthSlashCompletionDescription(registry: SlashRegistry, prefix: []const u8, n: usize) ?[]const u8 {
+    if (runtimeArgQuery(registry, prefix)) |query| {
+        return (nthRuntimeArg(registry, query, n) orelse return null).description;
+    }
     if (allowlistArgCompletionPrefix(prefix) != null) return null;
     if (statuslineArgCompletionPrefix(prefix) != null) return null;
     if (notificationsArgCompletionPrefix(prefix) != null) return null;
@@ -849,6 +868,46 @@ const allowlist_local_add_tool_completions = scopedAllowlistCompletions("local",
 const allowlist_user_add_tool_completions = scopedAllowlistCompletions("user", allowlist_add_tool_completions);
 const allowlist_local_remove_tool_completions = scopedAllowlistCompletions("local", allowlist_remove_tool_completions);
 const allowlist_user_remove_tool_completions = scopedAllowlistCompletions("user", allowlist_remove_tool_completions);
+
+/// MCP-v2's `/mcp` completes its verbs and server names. The
+/// check goes with FX_MCP_ENGINE when v1 is removed.
+fn mcpVerbsOn() bool {
+    const value = io_mod.getenv("FX_MCP_ENGINE") orelse return false;
+    return std.mem.eql(u8, value, "v2");
+}
+
+fn runtimeArgCommand(registry: SlashRegistry) []const u8 {
+    const first = registry.arguments[0].full;
+    return first[0 .. std.mem.indexOfScalar(u8, first, ' ') orelse first.len];
+}
+
+/// What follows the command the app's completions are for, untrimmed at
+/// the end so a finished word moves on to the next one.
+fn runtimeArgQuery(registry: SlashRegistry, prefix: []const u8) ?[]const u8 {
+    if (registry.arguments.len == 0) return null;
+    const command = runtimeArgCommand(registry);
+    if (!std.mem.startsWith(u8, prefix, command) or prefix.len == command.len) return null;
+    if (prefix[command.len] != ' ') return null;
+    return std.mem.trimStart(u8, prefix[command.len..], " ");
+}
+
+/// A verb matches before its first space, and `VERB NAME` after it.
+fn runtimeArgMatches(registry: SlashRegistry, full: []const u8, query: []const u8) bool {
+    const rest = full[runtimeArgCommand(registry).len + 1 ..];
+    const naming = std.mem.indexOfScalar(u8, query, ' ') != null;
+    if (naming != (std.mem.indexOfScalar(u8, rest, ' ') != null)) return false;
+    return std.ascii.startsWithIgnoreCase(rest, query);
+}
+
+fn nthRuntimeArg(registry: SlashRegistry, query: []const u8, n: usize) ?mod_registry.ArgumentCompletion {
+    var idx: usize = 0;
+    for (registry.arguments) |entry| {
+        if (!runtimeArgMatches(registry, entry.full, query)) continue;
+        if (idx == n) return entry;
+        idx += 1;
+    }
+    return null;
+}
 
 fn argCompletionPrefix(prefix: []const u8, command: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, prefix, command)) return null;

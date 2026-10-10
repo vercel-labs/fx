@@ -253,6 +253,18 @@ const AcpContext = struct {
         try self.sendUpdate(out.writer.buffered());
     }
 
+    /// A notice the client shows outside the conversation (ACP v1).
+    fn sendNotice(self: *AcpContext, text: []const u8) !void {
+        const plain = try stripAnsiAlloc(self.alloc, text);
+        defer if (plain.ptr != text.ptr) self.alloc.free(plain);
+        // The tag is for the model; a notice's title stands alone.
+        const title = std.mem.trimStart(u8, std.mem.cutPrefix(u8, plain, "[context]") orelse plain, " ");
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        defer out.deinit();
+        try acp_types.writeNotice(&out.writer, "info", if (title.len > 0) title else plain);
+        try self.sendUpdate(out.writer.buffered());
+    }
+
     fn sendModelRecoveryStatus(
         self: *AcpContext,
         status: types.RouteRecoveryStatus,
@@ -501,7 +513,9 @@ const AcpContext = struct {
             },
         };
         if (comptime !host_target.is_wasm) {
-            if (session.mcp != null) {
+            if (session.mcp_host) |h| {
+                h.catalog.wire(&tc);
+            } else if (session.mcp != null) {
                 tc.mcp_ctx = @ptrCast(self);
                 tc.mcp_has_tool = mcpHasTool;
                 tc.mcp_validate_tool = mcpValidateTool;
@@ -1344,13 +1358,18 @@ fn initialDynamicTools(
     const host_tools = ctx.state.host_tools.dynamic_tools;
     if (comptime host_target.is_wasm) return host_tools;
     const session = if (ctx.state.active_session) |*active| active else return host_tools;
-    const mcp = session.mcp orelse return host_tools;
-    const loaded = try mcp.snapshotAlwaysLoadedTools(
+    const loaded = if (session.mcp) |mcp| try mcp.snapshotAlwaysLoadedTools(
         arena,
         session.permission_rules,
         ctx.state.context_limits,
         .unrestricted,
-    );
+    ) else if (session.mcp_host) |h| try h.catalog.snapshotAlwaysLoadedTools(
+        arena,
+        session.permission_rules,
+        ctx.state.context_limits,
+        .unrestricted,
+        &session.cancel_flag,
+    ) else return host_tools;
     if (loaded.notice) |notice| try pushContextNotice(@ptrCast(ctx), notice);
     if (loaded.tools.len == 0) return host_tools;
     var tools: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
@@ -2192,7 +2211,9 @@ fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, project_context: ?
     if (ctx.state.cfg.minimal_kernel) return;
     const active_session = if (ctx.state.active_session) |*session| session else null;
     var snapshot = if (active_session) |session|
-        if (session.mcp) |mcp|
+        if (session.mcp_host) |h|
+            try h.catalog.modelSnapshot(arena)
+        else if (session.mcp) |mcp|
             try mcp.snapshotModelCatalog(arena, session.permission_rules, false)
         else
             try mcp_model_catalog.Snapshot.empty(arena)
@@ -2435,6 +2456,11 @@ fn describeToolActionDenied(raw_ctx: *anyopaque, arena: Allocator, call: ToolCal
 
 fn lifecycleDynamicMcpToolAvailable(ctx: *AcpContext, name: []const u8, advertised_dynamic_tool_names: []const []const u8) bool {
     if (comptime host_target.is_wasm) return false;
+    const session = if (ctx.state.active_session) |*active| active else null;
+    if (session) |s| if (s.mcp_host) |h| {
+        const capabilities = h.catalog.runtimeCapabilities();
+        return dynamicMcpToolAvailable(ctx.toolRegistry(), name, advertised_dynamic_tool_names, capabilities.context, capabilities.has_tool, .unrestricted);
+    };
     return dynamicMcpToolAvailable(ctx.toolRegistry(), name, advertised_dynamic_tool_names, @ptrCast(ctx), mcpHasTool, .unrestricted);
 }
 
@@ -3112,6 +3138,9 @@ fn pushContextNotice(raw_ctx: *anyopaque, text: []const u8) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = if (ctx.state.active_session) |*active| active else return;
     if (!try session.session_rt.claimContextNotice(ctx.alloc, text)) return;
+    // ACP v1 Session Notices where the client shows them;
+    // otherwise a message, as ACP allows.
+    if (ctx.state.client_notices) return ctx.sendNotice(text) catch {};
     try pushSystemNotice(raw_ctx, text);
 }
 
@@ -3334,12 +3363,15 @@ fn requestAcpElicitation(
         runtime.inputIdentityWitness(origin.server_name)
     else
         null;
+    // MCP-v2 ties an answer to the call that asked, and drops it once that
+    // call has ended, so its server counts as live here.
+    const host_session = if (responder.acp.state.active_session) |*active| active.mcp_host != null else false;
     const transition = mcp_elicitation.decideTransition(
         transition_state,
         bindingForAcpInput(responder, origin),
         answerBindingForAcpInput(responder, origin, live_witness),
         acpAwakeMillis(),
-        live_witness != null,
+        live_witness != null or host_session,
     );
     switch (transition) {
         .consume => transition_state = .consumed,
@@ -3349,12 +3381,15 @@ fn requestAcpElicitation(
 
     if (input_request.mode == .url and action == .accept) {
         if (legacy_source_id != null) {
-            const runtime = activeMcp(responder.acp) orelse return error.McpInputRequired;
-            const accept_result = runtime.acceptLegacyUrlCompletion(
-                origin,
-                url_id.?,
-                server.legacyUrlCompletionSink(state),
-            ) orelse return error.McpInputRequired;
+            const sink = server.legacyUrlCompletionSink(state);
+            // MCP-v2's host has no generations to check: the sink takes the
+            // consent itself.
+            const accept_result = if (activeMcp(responder.acp)) |runtime|
+                runtime.acceptLegacyUrlCompletion(origin, url_id.?, sink) orelse return error.McpInputRequired
+            else if (host_session)
+                sink.settleAccept(sink.accept(sink.context, origin, url_id.?)) orelse return error.McpInputRequired
+            else
+                return error.McpInputRequired;
             if (accept_result == .awaiting_completion) {
                 const retained_acp_id = try state.alloc.dupe(u8, url_id.?);
                 errdefer state.alloc.free(retained_acp_id);

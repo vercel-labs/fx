@@ -866,6 +866,7 @@ pub fn Runtime(comptime App: type) type {
                 modelMenuActive(app) or
                 sessionMenuActive(app) or
                 mcpMenuActive(app) or
+                mcpHostMenuActive(app) or
                 helpMenuActive(app);
             var authentication_active = false;
             if (comptime runtime_profile.allows(App, .native_auth)) {
@@ -1310,6 +1311,7 @@ pub fn Runtime(comptime App: type) type {
                 }
                 return true;
             }
+            if (try routeMcpHostMenuByte(app, byte)) return true;
             if (mcpMenuActive(app)) {
                 if (comptime @hasField(App, "mcp")) {
                     if (app.mcp.menu.screen == .add) {
@@ -1572,6 +1574,7 @@ pub fn Runtime(comptime App: type) type {
                 '\r' => {
                     if (try submitSettingsMenuSelection(app)) return;
                     if (try submitHelpMenuSelection(app, max_input_len, max_prompt_history)) return;
+                    if (try submitMcpHostMenu(app)) return;
                     if (try submitAuthPickerSelection(app)) return;
                     if (try submitModelMenuSelection(app)) return;
                     if (try submitSkillsMenuSelection(app, max_input_len)) return;
@@ -1771,6 +1774,8 @@ pub fn Runtime(comptime App: type) type {
 
         fn activeCatalogMenuOwnsByte(app: *App, byte: u8) bool {
             if (settingsMenuActive(app)) return true;
+            // Typing filters its list.
+            if (mcpHostMenuActive(app)) return true;
             if (helpMenuActive(app)) return true;
             if (modelMenuActive(app)) return true;
             if (sessionMenuActive(app)) return true;
@@ -1881,6 +1886,36 @@ pub fn Runtime(comptime App: type) type {
                 return app.mcp.menu.active;
             }
             return false;
+        }
+
+        /// The `/mcp` menu on MCP-v2.
+        fn mcpHostMenuActive(app: *App) bool {
+            if (comptime !@hasDecl(App, "mcpHostMenuKey")) return false;
+            return app.mcp.hostMenuActive();
+        }
+
+        /// Off the list there's nothing to type into: printable bytes are
+        /// dropped so the hidden filter doesn't change, and on a
+        /// confirmation any of them means no, like `[y/N]`. Control bytes
+        /// pass, so Ctrl+C and Ctrl+J/K still work.
+        fn routeMcpHostMenuByte(app: *App, byte: u8) !bool {
+            if (comptime !@hasDecl(App, "mcpHostMenuKey")) return false;
+            if (!mcpHostMenuActive(app) or app.mcp.host_menu.screen == .list) return false;
+            if (byte == '\r') {
+                try app.mcpHostMenuKey(.enter);
+                return true;
+            }
+            if (byte < 0x20) return false;
+            if (byte >= 0x80) input_reset.resetPendingTextScalarWithTrace(&app.input_runtime.text_scalar, "mcp_host_menu");
+            if (app.mcp.host_menu.screen == .confirm) try app.mcpHostMenuKey(.escape);
+            return true;
+        }
+
+        fn submitMcpHostMenu(app: *App) !bool {
+            if (comptime !@hasDecl(App, "mcpHostMenuKey")) return false;
+            if (!mcpHostMenuActive(app)) return false;
+            try app.mcpHostMenuKey(.enter);
+            return true;
         }
 
         fn mcpMenuProjection(app: *App) render_input.McpMenuProjection {
@@ -2407,7 +2442,7 @@ pub fn Runtime(comptime App: type) type {
         /// borrowing a composer they are already using.
         fn modelPickerShortcutBlocked(app: *App) bool {
             if (settingsMenuActive(app) or helpMenuActive(app) or
-                skillsMenuActive(app) or sessionMenuActive(app) or mcpMenuActive(app)) return true;
+                skillsMenuActive(app) or sessionMenuActive(app) or mcpMenuActive(app) or mcpHostMenuActive(app)) return true;
             if (comptime @hasField(App, "auth")) {
                 if (app.auth.pickerView().active) return true;
             }
@@ -3262,6 +3297,15 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn cancelMcpMenu(app: *App) !bool {
+            if (comptime @hasDecl(App, "mcpHostMenuKey")) if (mcpHostMenuActive(app)) {
+                // Back a screen; closing the list clears its filter too.
+                try app.mcpHostMenuKey(.escape);
+                if (!mcpHostMenuActive(app)) {
+                    app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                    paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+                }
+                return true;
+            };
             if (!mcpMenuActive(app)) return false;
             if (comptime @hasField(App, "mcp")) {
                 debug_trace.logf("mcp", "MCP menu escape screen={s} filter={}", .{ @tagName(app.mcp.menu.screen), app.mcp.menu.filter_active });

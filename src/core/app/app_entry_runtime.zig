@@ -23,6 +23,7 @@ const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mcp_command_provider = @import("../mcp/command_provider.zig");
 const mcp_health = @import("../mcp/health.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
+const mcp_host = @import("../mcp_host/host.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const update_target = @import("../upgrade/update_target.zig");
 const test_builtin_gateway = if (builtin.is_test)
@@ -98,6 +99,7 @@ pub const Config = struct {
     inspect_mcp_local_config: mcp_health.InspectLocalConfigFn =
         mcp_health.inspectLocalConfigUnavailable,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
+    load_mcp_host: ?mcp_host.LoadFn = null,
     add_mcp_profile_server: mcp_command_provider.AddProfileServerFn =
         mcp_command_provider.addProfileServerUnavailable,
     remove_mcp_profile_server: mcp_command_provider.RemoveProfileServerFn =
@@ -502,6 +504,7 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
         .inspect_mcp_profile_config = cfg.inspect_mcp_profile_config,
         .inspect_mcp_local_config = cfg.inspect_mcp_local_config,
         .load_mcp_runtime = cfg.load_mcp_runtime,
+        .load_mcp_host = cfg.load_mcp_host,
         .add_mcp_profile_server = cfg.add_mcp_profile_server,
         .remove_mcp_profile_server = cfg.remove_mcp_profile_server,
         .acp_runner = cfg.acp_runner,

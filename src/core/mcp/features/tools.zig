@@ -446,6 +446,17 @@ pub fn buildListRequest(
     return try output.toOwnedSlice();
 }
 
+/// Parses one tool object from a `tools/list` result, with the same checks a
+/// listed page applies. The caller owns the tool.
+pub fn parseToolJson(alloc: Allocator, json: []const u8, limits: Limits) Error!Tool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, json, .{ .parse_numbers = false }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidTool,
+    };
+    defer parsed.deinit();
+    return parseTool(alloc, parsed.value, limits);
+}
+
 fn parseTool(alloc: Allocator, value: std.json.Value, limits: Limits) Error!Tool {
     if (value != .object) return error.InvalidTool;
     const name_value = value.object.get("name") orelse return error.InvalidTool;

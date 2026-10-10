@@ -7,6 +7,76 @@ const McpTool = @import("catalog_state.zig").McpTool;
 const Allocator = std.mem.Allocator;
 const encodeScalarAlloc = model_context_encoding.scalarAlloc;
 
+pub const AlwaysLoadedTools = struct {
+    tools: []tool_mcp_runtime.SelectedTool,
+    /// Owned context notice naming tools the schema budget left unloaded.
+    notice: ?[]u8 = null,
+
+    pub fn deinit(self: *AlwaysLoadedTools, alloc: Allocator) void {
+        tool_mcp_runtime.freeSelectedTools(alloc, self.tools);
+        if (self.notice) |notice| alloc.free(notice);
+        self.* = undefined;
+    }
+};
+
+/// Always-loaded tools share one `mcp_selected_schema_bytes` budget, in the
+/// order they are added. Once one doesn't fit, it and every later one are
+/// only counted, and stay reachable through capability_search.
+pub const AlwaysLoaded = struct {
+    selected: std.ArrayList(tool_mcp_runtime.SelectedTool) = .empty,
+    remaining: usize,
+    omitted: usize = 0,
+
+    pub fn init(limits: context_limits.Values) AlwaysLoaded {
+        return .{ .remaining = limits.mcp_selected_schema_bytes.effectiveBytes() };
+    }
+
+    pub fn deinit(b: *AlwaysLoaded, alloc: Allocator) void {
+        tool_mcp_runtime.freeSelectedTools(alloc, b.selected.items);
+        b.* = undefined;
+    }
+
+    pub fn add(
+        b: *AlwaysLoaded,
+        alloc: Allocator,
+        tool: McpTool,
+        server_instructions: ?[]const u8,
+        binding: tool_mcp_runtime.Binding,
+        limits: context_limits.Values,
+    ) !void {
+        if (b.omitted > 0) {
+            b.omitted += 1;
+            return;
+        }
+        var projection = try project(alloc, tool, server_instructions, limits);
+        const payload = switch (projection) {
+            .selected, .rejected => |value| value,
+        };
+        if (projection == .rejected or payload.model_output.len > b.remaining) {
+            if (projection == .selected) b.omitted += 1;
+            projection.deinit(alloc);
+            return;
+        }
+        if (payload.notice) |notice| alloc.free(notice);
+        errdefer alloc.free(payload.model_output);
+        const name = try alloc.dupe(u8, tool.prefixed_name);
+        errdefer alloc.free(name);
+        try b.selected.append(alloc, .{ .name = name, .schema_json = payload.model_output, .mcp_binding = binding });
+        b.remaining -= payload.model_output.len;
+    }
+
+    /// Hands the tools over, with a notice when the budget left any out.
+    pub fn finish(b: *AlwaysLoaded, alloc: Allocator) !AlwaysLoadedTools {
+        const notice = if (b.omitted > 0) try std.fmt.allocPrint(
+            alloc,
+            "[context] {d} always-loaded MCP tool{s} exceeded the mcp_selected_schema_bytes budget and stay available through capability_search",
+            .{ b.omitted, if (b.omitted == 1) "" else "s" },
+        ) else null;
+        errdefer if (notice) |value| alloc.free(value);
+        return .{ .tools = try b.selected.toOwnedSlice(alloc), .notice = notice };
+    }
+};
+
 pub fn project(alloc: Allocator, tool: McpTool, server_instructions: ?[]const u8, limits: context_limits.Values) !tool_mcp_runtime.ToolSchemaResult {
     const instruction_limit = limits.mcp_server_instructions_bytes;
     const observed = if (server_instructions) |value| value.len else 0;

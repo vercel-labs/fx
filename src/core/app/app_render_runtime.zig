@@ -763,6 +763,13 @@ pub fn Runtime(comptime App: type) type {
                     render_input.skillsMenuProjection(&app.skills)
                 else
                     .{},
+                .mcp_host_menu = if (comptime @hasField(App, "mcp")) .{
+                    .state = app.mcp.host_menu,
+                    .rows = app.mcp.host_menu_rows,
+                    .filter = app.input_runtime.edit_state.input.items,
+                    .tools = app.mcp.host_menu_tools,
+                    .notes = app.mcp.host_menu_notes,
+                } else .{},
                 .mcp_menu = if (comptime @hasField(App, "mcp")) blk: {
                     const view = app.mcp.menuView();
                     break :blk .{

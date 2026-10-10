@@ -7,6 +7,7 @@ const model_cache_runtime = @import("../../core/app/model_cache_runtime.zig");
 const app_mcp_runtime = @import("../../core/app/app_mcp_runtime.zig");
 const mcp_health = @import("../../core/mcp/health.zig");
 const mcp_menu_state = @import("../../core/mcp/menu_state.zig");
+const mcp_host_menu_presentation = @import("mcp_host_menu_presentation.zig");
 const mcp_runtime = @import("../../core/mcp/mcp_runtime.zig");
 const picker_state = @import("../../core/input/picker_state.zig");
 const session_catalog = @import("../../core/session/session_catalog.zig");
@@ -461,6 +462,7 @@ pub const RenderContext = struct {
     },
     skills_menu: SkillsMenuProjection = .{},
     mcp_menu: McpMenuProjection = .{},
+    mcp_host_menu: mcp_host_menu_presentation.Projection = .{},
     help_menu: HelpMenuProjection = .{},
     settings_menu: SettingsMenuProjection = .{},
     model_menu: ModelMenuProjection = .{},

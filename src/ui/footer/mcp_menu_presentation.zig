@@ -578,34 +578,10 @@ fn composeAddRow(
 }
 
 fn composeFactRow(alloc: Allocator, label: []const u8, value: []const u8, width: u16) !std.ArrayList(u8) {
-    var row: std.ArrayList(u8) = .empty;
-    errdefer row.deinit(alloc);
-    try row.appendSlice(alloc, ui_render.dim_style);
-    if (width > 4) try row.appendSlice(alloc, "  ");
-    const value_col: usize = @min(22, width);
-    try appendTerminalSafeSingleLine(alloc, &row, label, value_col -| 2);
-    try row_text.appendSpacesToColumn(alloc, &row, value_col);
-    try row.appendSlice(alloc, ui_render.selected_completion_style);
-    try appendTerminalSafeSingleLine(alloc, &row, value, @as(usize, width) -| value_col);
-    try row.appendSlice(alloc, ui_render.reset_style);
-    return row;
+    return row_text.composeFactRow(alloc, label, value, width, 22, ui_render.selected_completion_style);
 }
 
-fn composeTextRow(
-    alloc: Allocator,
-    text: []const u8,
-    width: u16,
-    style: []const u8,
-    indent: usize,
-) !std.ArrayList(u8) {
-    var row: std.ArrayList(u8) = .empty;
-    errdefer row.deinit(alloc);
-    try row.appendSlice(alloc, style);
-    if (indent > 0) try row.appendNTimes(alloc, ' ', @min(indent, width));
-    try appendTerminalSafeSingleLine(alloc, &row, text, @as(usize, width) -| indent);
-    try row.appendSlice(alloc, ui_render.reset_style);
-    return row;
-}
+const composeTextRow = row_text.composeTextRow;
 
 fn composeConfigurationIssueRow(
     alloc: Allocator,
@@ -650,16 +626,7 @@ fn cloneClipped(alloc: Allocator, text: []const u8, width: u16) !std.ArrayList(u
     return row;
 }
 
-fn appendTerminalSafeSingleLine(
-    alloc: Allocator,
-    row: *std.ArrayList(u8),
-    text: []const u8,
-    width: usize,
-) !void {
-    var encoded = try text_utils.encodeTerminalSafeInline(alloc, text, 4096);
-    defer encoded.deinit(alloc);
-    try row_text.appendSingleLineEllipsized(alloc, row, encoded.bytes, width);
-}
+const appendTerminalSafeSingleLine = row_text.appendTerminalSafeSingleLine;
 
 test "MCP menu empty server state is compact and actionable" {
     const projection: McpMenuProjection = .{

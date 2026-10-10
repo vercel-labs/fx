@@ -1,6 +1,7 @@
 const std = @import("std");
 const image_attachments = @import("../../core/images/image_attachments.zig");
 const display_width = @import("../../core/shared/display_width.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 const ui_render = @import("../render.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 
@@ -124,6 +125,41 @@ pub fn appendAbsoluteColumn(alloc: Allocator, out: *std.ArrayList(u8), col: u16)
 
 /// Pads `out` with spaces until its visible width reaches `target_col`.
 /// No-op when the row is already at or past the column.
+/// Appends untrusted text as one line: control bytes escaped, whitespace
+/// flattened, and the end ellipsized to `width` columns.
+pub fn appendTerminalSafeSingleLine(alloc: Allocator, row: *std.ArrayList(u8), text: []const u8, width: usize) !void {
+    var encoded = try text_utils.encodeTerminalSafeInline(alloc, text, 4096);
+    defer encoded.deinit(alloc);
+    try appendSingleLineEllipsized(alloc, row, encoded.bytes, width);
+}
+
+/// A dim label, then its value from `value_col`; both untrusted text.
+pub fn composeFactRow(alloc: Allocator, label: []const u8, value: []const u8, width: u16, value_col: usize, value_style: []const u8) !std.ArrayList(u8) {
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
+    try row.appendSlice(alloc, ui_render.dim_style);
+    if (width > 4) try row.appendSlice(alloc, "  ");
+    const col = @min(value_col, width);
+    try appendTerminalSafeSingleLine(alloc, &row, label, col -| 2);
+    try appendSpacesToColumn(alloc, &row, col);
+    try row.appendSlice(alloc, ui_render.reset_style);
+    try row.appendSlice(alloc, value_style);
+    try appendTerminalSafeSingleLine(alloc, &row, value, @as(usize, width) -| col);
+    try row.appendSlice(alloc, ui_render.reset_style);
+    return row;
+}
+
+/// One styled line of untrusted text, indented.
+pub fn composeTextRow(alloc: Allocator, text: []const u8, width: u16, style: []const u8, indent: usize) !std.ArrayList(u8) {
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
+    try row.appendSlice(alloc, style);
+    if (indent > 0) try row.appendNTimes(alloc, ' ', @min(indent, width));
+    try appendTerminalSafeSingleLine(alloc, &row, text, @as(usize, width) -| indent);
+    try row.appendSlice(alloc, ui_render.reset_style);
+    return row;
+}
+
 pub fn appendSpacesToColumn(alloc: Allocator, out: *std.ArrayList(u8), target_col: usize) !void {
     const current = display_width.visibleWidthIgnoringAnsi(out.items);
     if (current >= target_col) return;

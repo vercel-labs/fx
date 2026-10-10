@@ -24,6 +24,7 @@ const model_catalog = @import("../core/gateway/model_catalog.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
 const hooks = @import("../core/hooks/hooks.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
+const mcp_host = @import("../core/mcp_host/host.zig");
 const mode_registry = @import("../core/modes/mode_registry.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
 const session_codec = @import("../core/session/session_codec.zig");
@@ -246,6 +247,8 @@ pub const ActiveSessionState = struct {
     session_rt: session_runtime.SessionRuntime,
     title_task: ?*session_title_generation.Task = null,
     mcp: ?*mcp_runtime.McpRuntime = null,
+    /// MCP-v2's host when FX_MCP_ENGINE=v2 selects it; `mcp` then stays null.
+    mcp_host: ?*mcp_host.Host = null,
     /// Session-scoped client system prompt, appended after fx's instructions.
     /// Owned by the server allocator; empty when the client supplied none.
     client_system_prompt: []u8 = &.{},
@@ -301,6 +304,8 @@ pub const ServerState = struct {
     client_fs_read: bool = false,
     client_fs_write: bool = false,
     client_terminal: bool = false,
+    /// The client shows ACP v1 Session Notices (`session.notices`).
+    client_notices: bool = false,
     client_elicitation: elicitation.Capabilities = .{},
     workspace_root: []u8 = &.{},
     workspace_access: workspace_access.WorkspaceAccess = .{},
@@ -723,6 +728,7 @@ fn destroyActiveSession(state: *ServerState) void {
             runtime.deinit();
             state.alloc.destroy(runtime);
         }
+        if (active.mcp_host) |h| h.destroy();
     }
     active.session_rt.deinit(state.alloc);
     if (active.writable) |*writable| writable.deinit(state.alloc);
@@ -790,7 +796,9 @@ fn resolveSubagentAuthority(
     }
     state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
     defer state.subagent_authority_mutex.unlock(io_mod.getIo());
-    const integrations = if (active.mcp) |mcp|
+    const integrations = if (active.mcp_host) |h|
+        h.catalog.snapshotToolNames(alloc, active.permission_rules)
+    else if (active.mcp) |mcp|
         mcp.snapshotToolNames(alloc, active.permission_rules)
     else
         alloc.alloc([]u8, 0);
@@ -799,7 +807,9 @@ fn resolveSubagentAuthority(
         for (owned_integrations) |name| alloc.free(name);
         alloc.free(owned_integrations);
     }
-    var mcp_view = if (active.mcp) |mcp|
+    var mcp_view = if (active.mcp_host) |h|
+        try h.catalog.snapshotAccessView(alloc, root_id, root_id, active.permission_rules, false)
+    else if (active.mcp) |mcp|
         try mcp.snapshotAccessView(
             alloc,
             root_id,
@@ -2341,6 +2351,8 @@ const InitializeRequest = struct {
     client_fs_read: bool = false,
     client_fs_write: bool = false,
     client_terminal: bool = false,
+    /// The client shows ACP v1 Session Notices (`session.notices`).
+    client_notices: bool = false,
     client_elicitation: elicitation.Capabilities = .{},
     host_tools: host_tool_runtime.Runtime = .{},
     host_instructions: []u8 = &.{},
@@ -2384,6 +2396,12 @@ fn parseInitializeRequest(
                 request.client_fs_write = value == .bool and value.bool;
             }
         }
+    }
+    if (capabilities.object.get("session")) |session| {
+        // Omitted and null both mean no.
+        if (session == .object) if (session.object.get("notices")) |notices| {
+            request.client_notices = notices != .null;
+        };
     }
     if (capabilities.object.get("terminal")) |value| {
         request.client_terminal = value == .bool and value.bool;
@@ -2699,6 +2717,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.client_fs_read = request.client_fs_read;
     state.client_fs_write = request.client_fs_write;
     state.client_terminal = request.client_terminal;
+    state.client_notices = request.client_notices;
     state.client_elicitation = request.client_elicitation;
     state.host_tools.deinit();
     state.host_tools = request.host_tools;
@@ -2719,7 +2738,10 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         .mcp_servers = state.cfg.allow_acp_mcp,
         .steering = !host_target.is_wasm and !state.cfg.minimal_kernel,
         .system_prompt = !host_target.is_wasm and !state.cfg.minimal_kernel,
-        .mcp_over_acp = state.cfg.allow_acp_mcp and !host_target.is_wasm,
+        // MCP-v2 takes only what ACP v1 defines and it speaks: stdio and
+        // HTTP.
+        .mcp_over_acp = state.cfg.allow_acp_mcp and !host_target.is_wasm and !mcp_host.selected(),
+        .mcp_sse = !mcp_host.selected(),
     });
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 }

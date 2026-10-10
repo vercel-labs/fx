@@ -20,6 +20,7 @@ const skills_menu_presentation = @import("skills_menu_presentation.zig");
 const help_menu_presentation = @import("help_menu_presentation.zig");
 const settings_menu_presentation = @import("settings_menu_presentation.zig");
 const mcp_menu_presentation = @import("mcp_menu_presentation.zig");
+const mcp_host_menu_presentation = @import("mcp_host_menu_presentation.zig");
 const resume_menu_presentation = @import("resume_menu_presentation.zig");
 const question_ui = @import("question_ui.zig");
 const render_input = @import("render_input.zig");
@@ -397,7 +398,7 @@ fn buildFooterSurfaceProjection(
     const inline_api_key = ctx.auth_picker.active and ctx.auth_picker.stage == .api_key and ctx.auth_picker.api_key_inline;
     const show_auth_picker = !viewer_active and !modal_active and !ctx.stream.active and ctx.auth_picker.active and !inline_api_key;
     const show_settings_menu = !viewer_active and !show_auth_picker and !modal_active and ctx.settings_menu.active;
-    const show_mcp_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !modal_active and ctx.mcp_menu.state.active;
+    const show_mcp_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !modal_active and (ctx.mcp_menu.state.active or ctx.mcp_host_menu.active());
     const show_help_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !modal_active and ctx.help_menu.active;
     const show_session_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !modal_active and ctx.session_menu.active;
     const show_models_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_menu and !modal_active and ctx.model_menu.active;
@@ -603,6 +604,12 @@ fn buildFooterSurfaceProjection(
             ctx.settings_menu,
             shell.layout.cols,
             settings_picker_row_budget,
+        )
+    else if (show_mcp_menu and ctx.mcp_host_menu.active())
+        mcp_host_menu_presentation.menuRowCount(
+            ctx.mcp_host_menu,
+            shell.layout.cols,
+            mcp_picker_row_budget,
         )
     else if (show_mcp_menu)
         mcp_menu_presentation.menuRowCount(
