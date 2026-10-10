@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const darwin_process_spawn = @import("darwin_process_spawn.zig");
+const termux_dns = @import("termux_dns.zig");
 
 pub const RawEnviron = [*:null]const ?[*:0]const u8;
 
@@ -20,7 +21,9 @@ pub fn setIo(zio: std.Io) void {
 }
 
 fn process_io_for(comptime os_tag: std.Target.Os.Tag, zio: std.Io) std.Io {
-    return if (os_tag == .macos) darwin_process_spawn.wrap(zio) else zio;
+    if (os_tag == .macos) return darwin_process_spawn.wrap(zio);
+    if (os_tag == .linux) return termux_dns.wrap(zio);
+    return zio;
 }
 
 pub fn getIo() std.Io {
@@ -113,12 +116,15 @@ test "getIo Darwin test fallback runs a child through the selected backend" {
     try std.testing.expectEqualStrings("", result.stderr);
 }
 
-test "non-Darwin process I/O keeps the original vtable" {
+test "non-Darwin process I/O keeps the original vtable except Termux DNS" {
     const original = std.testing.io;
     const selected = process_io_for(.linux, original);
 
     try std.testing.expect(selected.userdata == original.userdata);
-    try std.testing.expect(selected.vtable == original.vtable);
+    inline for (@typeInfo(std.Io.VTable).@"struct".fields) |field| {
+        if (comptime std.mem.eql(u8, field.name, "netLookup")) continue;
+        try std.testing.expectEqual(@field(original.vtable, field.name), @field(selected.vtable, field.name));
+    }
 }
 
 test "openDirAbsoluteNoFollow rejects unsafe path components" {
