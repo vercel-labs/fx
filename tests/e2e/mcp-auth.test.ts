@@ -4141,11 +4141,17 @@ describe("MCP remote authentication lifecycle", () => {
 });
 
 describe("MCP-v2 login (FX_MCP_ENGINE=v2)", () => {
+  // Without a display (Linux with no DISPLAY, an SSH session, or
+  // FX_NO_OPEN_BROWSER) fx offers paste-back instead of opening a browser.
+  // These tests drive the fake browser, so they declare one everywhere.
   const v2Env = (root: ReturnType<typeof createRoot>) => ({
     ...baseEnv(root),
     FX_MCP_ENGINE: "v2",
     FX_DISABLE_KEYCHAIN: "1",
     FX_MCP_PROTOCOL_VERSION: undefined,
+    DISPLAY: ":0",
+    SSH_CONNECTION: undefined,
+    FX_NO_OPEN_BROWSER: undefined,
   });
   const statusOf = async (root: ReturnType<typeof createRoot>) => {
     const list = await runFx(["mcp", "list", "--json"], { cwd: root.workspace, env: v2Env(root) });
