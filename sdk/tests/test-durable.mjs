@@ -1172,6 +1172,21 @@ test("a session object's model and instructions reach its model requests, over t
   await agent.close();
 });
 
+test("a tool that stops being idempotent changes the tools a checkpoint names", async () => {
+  const durability = await durabilityFor();
+  const first = createFxAgent(agentOptions(durability));
+  const session = first.session();
+  assert.equal((await session.prompt("hello").result).stopReason, "end_turn");
+  await first.close();
+
+  const mismatches = [];
+  const onEvent = (event) => { if (event.type === "checkpoint.mismatch") mismatches.push(event.changed); };
+  const other = createFxAgent(agentOptions(durability, { tools: [{ ...lookup, idempotent: false }, send], onEvent }));
+  assert.equal((await other.session(session.id).prompt("lookup no longer reruns").result).stopReason, "end_turn");
+  await other.close();
+  assert.deepEqual(mismatches, [["toolSchemaHash"]]);
+});
+
 test("a checkpoint names the libfx, tools and model that saved it, and a resume with others hears so", async () => {
   const durability = await durabilityFor();
   const mismatches = (list) => (event) => { if (event.type === "checkpoint.mismatch") list.push(event); };

@@ -2053,6 +2053,9 @@ function normalizeHostTools(value) {
       description,
       inputSchema: schema,
       ...(writes === undefined ? {} : { writes }),
+      // The engine does not read `idempotent`, but it stays in the shape a
+      // checkpoint records, so a change to it counts as a changed tool set.
+      ...(idempotent === true ? { idempotent: true } : {}),
     });
     executors.set(name, execute);
   }

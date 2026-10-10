@@ -1993,10 +1993,9 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
     let defaultSession = null;
     const durableAgent = {
       // For tests and drivers: stops a session's running worker as its
-      // deadline would, and waits for what its turn has written so far.
+      // deadline would.
       [durableInternals]: {
         stopAtDeadline: (sessionId) => workers.get(sessionId)?.stopNow?.(),
-        settled: async (sessionId) => { await workers.get(sessionId)?.settled?.(); },
         liveWorkers: () => workers.size,
         // The newest lease the session's log holds, standing or not.
         lastLease: async (sessionId) => {
