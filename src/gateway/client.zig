@@ -3310,6 +3310,20 @@ fn parseSseTokenTotal(usage_value: std.json.Value, key: []const u8) ?u64 {
 
 const SseBillingParseError = std.mem.Allocator.Error || error{InvalidSseBilling};
 
+/// Chooses the generation time for terminal stream billing. Prefers the
+/// gateway's `response-metadata.timestamp`. Some routes (Anthropic) omit that
+/// field; the terminal cost is still authoritative, so a missing timestamp
+/// falls back to the local receive time instead of discarding the billing and
+/// deferring to a generation lookup. A present but malformed or conflicting
+/// timestamp still rejects the billing.
+fn terminalBillingCreatedAtMs(
+    response_timestamp_ms: ?i64,
+    response_timestamp_invalid: bool,
+) ?i64 {
+    if (response_timestamp_invalid) return null;
+    return response_timestamp_ms orelse io_mod.milliTimestamp();
+}
+
 fn parseSseBilling(
     alloc: std.mem.Allocator,
     root: std.json.Value,
@@ -4017,7 +4031,10 @@ fn consumeSseStreamTraced(
             finish_billing = parseSseBilling(
                 alloc,
                 root,
-                if (response_timestamp_invalid) null else response_timestamp_ms,
+                terminalBillingCreatedAtMs(
+                    response_timestamp_ms,
+                    response_timestamp_invalid,
+                ),
                 tool_accumulators.items,
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -4356,6 +4373,62 @@ test "consumeSseStream captures exact terminal billing" {
     try std.testing.expectEqual(@as(u64, 10), billing.cache_write_tokens);
     try std.testing.expectEqual(@as(u64, 5), billing.reasoning_tokens.?);
     try std.testing.expectEqual(@as(u64, 2), billing.billable_web_search_calls);
+}
+
+test "consumeSseStream stamps terminal billing with receive time when response metadata has no timestamp" {
+    // Anthropic routes send `response-metadata` without `timestamp`; the
+    // terminal cost is still authoritative and must not be discarded.
+    const payload =
+        "data: {\"type\":\"response-metadata\",\"modelId\":\"anthropic/claude-opus-5.5\"}\n\n" ++
+        "data: {\"type\":\"text-start\",\"id\":\"t1\",\"providerMetadata\":{\"gateway\":{\"generationId\":\"gen_01ARZ3NDEKTSV4RRFFQ69G5FAV\"}}}\n\n" ++
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"usage\":{\"inputTokens\":{\"total\":28242,\"noCache\":4,\"cacheRead\":28238,\"cacheWrite\":0},\"outputTokens\":{\"total\":4,\"text\":4,\"reasoning\":0}},\"providerMetadata\":{\"gateway\":{\"cost\":\"0.0114872\",\"routing\":{\"originalModelId\":\"anthropic/claude-opus-5.5-fast\",\"canonicalSlug\":\"anthropic/claude-opus-5.5\",\"finalProvider\":\"anthropic\"}}}}\n\n";
+    var reader = std.Io.Reader.fixed(payload);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+
+    const before_ms = io_mod.milliTimestamp();
+    var completion = try consumeSseStream(
+        std.testing.allocator,
+        &reader,
+        undefined,
+        Noop.chunk,
+        null,
+        &cancel_flag,
+    );
+    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    const after_ms = io_mod.milliTimestamp();
+
+    const billing = completion.billing orelse return error.TestExpectedBilling;
+    try std.testing.expectEqualStrings("anthropic/claude-opus-5.5", billing.model);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0114872), billing.total_cost, 1e-12);
+    try std.testing.expectEqual(@as(u64, 28242), billing.input_tokens);
+    try std.testing.expectEqual(@as(u64, 28238), billing.cache_read_tokens);
+    try std.testing.expectEqual(@as(u64, 4), billing.output_tokens);
+    try std.testing.expect(billing.created_at_ms >= before_ms);
+    try std.testing.expect(billing.created_at_ms <= after_ms);
+}
+
+test "consumeSseStream still rejects terminal billing with a malformed response timestamp" {
+    const payload =
+        "data: {\"type\":\"response-metadata\",\"modelId\":\"provider/resolved\",\"timestamp\":\"not-a-timestamp\"}\n\n" ++
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"usage\":{\"inputTokens\":{\"total\":1},\"outputTokens\":{\"total\":2}},\"providerMetadata\":{\"gateway\":{\"cost\":\"0.01\",\"routing\":{\"canonicalSlug\":\"provider/resolved\"}}}}\n\n";
+    var reader = std.Io.Reader.fixed(payload);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+    var completion = try consumeSseStream(
+        std.testing.allocator,
+        &reader,
+        undefined,
+        Noop.chunk,
+        null,
+        &cancel_flag,
+    );
+    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    try std.testing.expect(completion.billing == null);
 }
 
 test "consumeSseStream surfaces finish reasoning tokens in turn usage" {
