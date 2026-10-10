@@ -14,7 +14,10 @@ const wasm = await readFile(resolve(scriptDir, "../../zig-out/bin/fx-core.wasm")
 const pngData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=";
 for (const shape of ["plain", "reasoning-text", "reasoning-only", "provider-terminal", "image"]) {
   let modelRequests = 0;
-  const remembered = shape === "reasoning-only" ? "Done." : "remembered value";
+  const remembered = "remembered value";
+  // fx retries a reply with reasoning and no answer; only the answered attempt
+  // may reach the checkpoint.
+  const answerRequest = shape === "reasoning-only" ? 2 : 1;
   const model = shape === "image" ? "checkpoint/vision-model" : "checkpoint/model";
   const server = createServer((request, response) => {
     let body = "";
@@ -31,24 +34,26 @@ for (const shape of ["plain", "reasoning-text", "reasoning-only", "provider-term
       }
       modelRequests += 1;
       response.writeHead(200, { "content-type": "text/event-stream" });
-      if (modelRequests === 1) {
+      if (modelRequests <= answerRequest) {
+        const answerless = modelRequests < answerRequest;
         const frames = [];
         if (shape !== "plain") frames.push(
           { type: "reasoning-start", id: "reasoning" },
-          { type: "reasoning-delta", id: "reasoning", delta: "Retain this context." },
-          { type: "reasoning-end", id: "reasoning", providerMetadata: { vertex: { thoughtSignature: "checkpoint-reasoning" } } },
+          { type: "reasoning-delta", id: "reasoning", delta: answerless ? "Nothing to say yet." : "Retain this context." },
+          { type: "reasoning-end", id: "reasoning", providerMetadata: { vertex: { thoughtSignature: answerless ? "checkpoint-discarded" : "checkpoint-reasoning" } } },
         );
         if (shape === "provider-terminal") frames.push(
           { type: "tool-call", toolCallId: "lookup", toolName: "exa_search", input: { query: "fixture" }, providerExecuted: true, providerMetadata: { vertex: { thoughtSignature: "checkpoint-call" } } },
           { type: "tool-result", toolCallId: "lookup", result: { content: "stored-provider-evidence" } },
         );
-        if (shape !== "reasoning-only") frames.push({ type: "text-delta", id: "answer", delta: remembered });
+        if (!answerless) frames.push({ type: "text-delta", id: "answer", delta: remembered });
         frames.push({ type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage: { inputTokens: { total: 2 }, outputTokens: { total: 2 } } });
         response.end(frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join("") + "data: [DONE]\n\n");
         return;
       }
-      assert.equal(modelRequests, 2, "unexpected extra model request");
+      assert.equal(modelRequests, answerRequest + 1, "unexpected extra model request");
       assert.ok(body.includes("store this context"), "restored request omitted the prior user turn");
+      assert.ok(!body.includes("checkpoint-discarded"), "restored request replayed a discarded answerless attempt");
       if (shape === "image") {
         const files = JSON.parse(body).prompt
           .filter((message) => message.role === "user" && Array.isArray(message.content))
@@ -130,7 +135,7 @@ for (const shape of ["plain", "reasoning-text", "reasoning-only", "provider-term
     assert.equal((await second.result).stopReason, "end_turn");
     assert.equal(await target.close(), undefined);
     target = null;
-    assert.equal(modelRequests, 2);
+    assert.equal(modelRequests, answerRequest + 1);
     console.log(`checkpoint integration passed: ${sourceBackend} -> ${targetBackend} (${shape})`);
   } finally {
     await source?.close().catch(() => {});
