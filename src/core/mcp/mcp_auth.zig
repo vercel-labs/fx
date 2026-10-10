@@ -1391,12 +1391,19 @@ fn authorizeWithRedirect(
     defer registration.deinit(alloc);
     try checkAuthorizationCancellation(options.cancellation());
 
+    // RFC 6750 incremental authorization: carry the previously granted scope only
+    // when the server asks for more. A stored grant can exceed the scope budget
+    // (Datadog grants 166 scopes), which must not block a fresh authorization.
+    const previous_scope = if (options.challenge.insufficient_scope)
+        options.previous_scope
+    else
+        null;
     const scope = if (fixed_scope) |value| try alloc.dupe(u8, value) else try requestedScope(
         alloc,
         options.config.scopes,
         options.challenge.scope,
         prm.scopes_supported,
-        options.previous_scope,
+        previous_scope,
         contains(metadata.scopes_supported, "offline_access"),
     );
     defer if (scope) |value| alloc.free(value);

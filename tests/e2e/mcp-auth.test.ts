@@ -1402,6 +1402,35 @@ describe("MCP remote authentication lifecycle", () => {
     expect(auth.revocations).toBe(2);
   }, 30_000);
 
+  test("re-authorization survives a stored grant larger than the scope budget", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const credentialPath = seedExpiredCredentials(
+      root,
+      auth,
+      Date.now() + 3_600_000,
+    );
+    const saved = JSON.parse(readFileSync(credentialPath, "utf8"));
+    saved.credentials[0].scope = Array.from(
+      { length: 80 },
+      (_, index) => `granted.scope.${index}`,
+    ).join(" ");
+    writeFileSync(credentialPath, JSON.stringify(saved), { mode: 0o600 });
+
+    const result = await runFx(["mcp", "auth", "fixture"], {
+      cwd: root.workspace,
+      env: { ...baseEnv(root), AI_GATEWAY_API_KEY: undefined },
+      timeoutMs: 20_000,
+    });
+
+    expect(result.stderr).not.toContain("TooManyOAuthScopes");
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("Authenticated MCP server 'fixture'");
+    const opened = new URL(readFileSync(root.openLog, "utf8").trim());
+    expect(opened.searchParams.get("scope")).toBe("tools.read offline_access");
+  }, 30_000);
+
   test("pinned localhost callback reuses one port without aborting", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);
