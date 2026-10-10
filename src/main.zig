@@ -2220,6 +2220,10 @@ const App = struct {
         );
     }
 
+    pub fn selectProviderModel(self: *App, selection: model_provider.ProviderSelection, effort: types.ReasoningEffort, fast_mode: bool, ultrafast_mode: bool) !void {
+        return AuthAppRuntime.selectProviderModel(self, selection, effort, fast_mode, ultrafast_mode);
+    }
+
     pub fn fetchModelIds(self: *App) !std.ArrayList([]u8) {
         return AgentAppRuntime.fetchModelIds(
             self,
@@ -2248,10 +2252,14 @@ const App = struct {
                 debug_trace.logf("auth", "model_cache_warmup_deferred reason=startup_credential_pending", .{});
                 return;
             }
-            self.model_cache.startWarmup(
-                self.providerSet().select(self.provider_selection.selection().provider).model_catalog orelse return,
-                self.auth.modelCatalogAccess(),
-            );
+            if (self.providerSet().select(self.provider_selection.selection().provider).model_catalog == null) return;
+            self.model_cache.startConnectedWarmup(.{
+                .providers = self.providerSet(),
+                .active = self.provider_selection.selection().provider,
+                .transport = self.auth.oauthTransport(),
+                .secret_store = self.auth.secretStore(),
+                .workspace_root = self.workspace_root,
+            }, self.auth.modelCatalogAccess());
         }
     }
 
@@ -2272,10 +2280,16 @@ const App = struct {
         return self.model_cache.snapshotCachedModelIds(alloc);
     }
 
+    pub fn providerModelSelection(self: *App, model: []const u8) ?model_provider.ProviderSelection {
+        return self.model_cache.selectionForModel(model, self.provider_selection.selection().provider) orelse
+            @import("core/app/connected_model_catalog.zig").qualifiedSelection(model, self.provider_selection.definitions);
+    }
+
     pub fn resolvedModelCapabilities(self: *App, model: []const u8) model_capabilities.Capabilities {
-        const bundle = self.providerSet().select(self.provider_selection.selection().provider);
+        const selection = self.providerModelSelection(model);
+        const bundle = self.providerSet().select(if (selection) |value| value.provider else self.provider_selection.selection().provider);
         return model_capabilities.mergeCapabilities(
-            bundle.fallbackModelCapabilities(model),
+            bundle.fallbackModelCapabilities(if (selection) |value| value.model else model),
             self.model_cache.metadataForModel(model),
         );
     }
@@ -4789,6 +4803,7 @@ test {
     _ = input_submit_runtime;
     _ = @import("core/app/app_lifecycle.zig");
     _ = @import("core/app/model_cache_runtime.zig");
+    _ = @import("core/app/connected_model_catalog.zig");
     _ = @import("core/app/usage_dashboard_runtime.zig");
     _ = @import("core/app/app_process_runtime.zig");
     _ = @import("core/app/app_render_runtime.zig");

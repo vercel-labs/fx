@@ -890,6 +890,15 @@ pub fn Commands(comptime App: type) type {
             fast_mode: bool,
             ultrafast_mode: bool,
         ) !void {
+            if (comptime @hasDecl(App, "providerModelSelection") and @hasDecl(App, "selectProviderModel")) {
+                if (app.providerModelSelection(model)) |selection| {
+                    if (!selection.provider.eql(provider_runtime.provider(app))) {
+                        try app.selectProviderModel(selection, effort, fast_mode, ultrafast_mode);
+                        return;
+                    }
+                    if (!std.mem.eql(u8, selection.model, model)) return selectModelFromPicker(app, selection.model, effort, fast_mode, ultrafast_mode);
+                }
+            }
             try setResolvedModelRuntime(app, model);
             var patch = app_session_runtime.SessionPreferencePatch{
                 .provider = provider_runtime.provider(app),
@@ -1145,6 +1154,9 @@ pub fn Commands(comptime App: type) type {
         }
 
         fn resolveModelQuery(app: *App, query: []const u8) ![]u8 {
+            if (comptime @hasDecl(App, "providerModelSelection")) {
+                if (app.providerModelSelection(query) != null) return app.alloc.dupe(u8, query);
+            }
             if (try app.snapshotCachedModelIds(app.alloc)) |snapshot| {
                 var ids = snapshot;
                 defer freeStringList(app.alloc, &ids);
@@ -1166,6 +1178,15 @@ pub fn Commands(comptime App: type) type {
         }
 
         fn setResolvedModel(app: *App, resolved: []const u8, announce: bool) !void {
+            if (comptime @hasDecl(App, "providerModelSelection") and @hasDecl(App, "selectProviderModel")) {
+                if (app.providerModelSelection(resolved)) |selection| {
+                    if (!selection.provider.eql(provider_runtime.provider(app))) {
+                        try app.selectProviderModel(selection, app.effort, false, false);
+                        return;
+                    }
+                    if (!std.mem.eql(u8, selection.model, resolved)) return setResolvedModel(app, selection.model, announce);
+                }
+            }
             const model_changed = !std.mem.eql(u8, provider_runtime.model(app), resolved);
             try setResolvedModelRuntime(app, resolved);
             if (model_changed and app.fast_mode) {

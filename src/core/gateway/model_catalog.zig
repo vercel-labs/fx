@@ -313,6 +313,9 @@ fn traceCatalogLoadOutcome(
 
 pub const ModelCatalogEntry = struct {
     id: []u8,
+    /// Picker-only route identity for a qualified model from another connection.
+    /// Null leaves the model ID in the active provider's namespace.
+    selection_provider: ?model_provider.ProviderId = null,
     /// The catalog's display name, trimmed; null when the catalog has none.
     name: ?[]u8 = null,
     model_type: []u8,
@@ -378,6 +381,7 @@ fn cloneModelCatalogEntry(alloc: std.mem.Allocator, entry: ModelCatalogEntry) !M
 
     var cloned = ModelCatalogEntry{
         .id = id,
+        .selection_provider = entry.selection_provider,
         .name = name,
         .model_type = model_type,
         .released = entry.released,

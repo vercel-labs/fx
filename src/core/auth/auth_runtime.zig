@@ -941,6 +941,12 @@ pub const ProviderPreparationIntent = union(enum) {
         allow_login: bool,
         origin: auth_transition.ProviderSwitchIntent,
         fallback: ?model_provider.ProviderId = null,
+        model_options: ?struct {
+            effort: types.ReasoningEffort,
+            fast_mode: bool,
+            ultrafast_mode: bool,
+        } = null,
+        require_model: bool = false,
     },
     team: struct {
         index: usize,
