@@ -60,7 +60,7 @@ fn fetch(raw: ?*anyopaque, alloc: Allocator, provider: versions.Provider) versio
     };
     defer response.deinit(alloc);
     if (response.status != .ok) {
-        debug_trace.logf("models", "provider version lookup rejected provider={t} status={d}", .{ provider, @intFromEnum(response.status) });
+        debug_trace.logf("models", "provider version lookup rejected provider={t} status={d}", .{ provider, @backingInt(response.status) });
         return error.ProviderVersionUnavailable;
     }
     return parseResponse(alloc, provider, response.body) catch |err| {

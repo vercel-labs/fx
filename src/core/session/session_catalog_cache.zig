@@ -10,6 +10,7 @@
 //! The file is disposable: a missing, corrupt, or older-version index is
 //! rebuilt from the session directories, which remain the only authority.
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const child_state = @import("../subagent/child_state.zig");
@@ -19,6 +20,7 @@ const session_discovery = @import("session_discovery.zig");
 const session_layout = @import("session_layout.zig");
 const session_store = @import("session_store.zig");
 const summary_codec = @import("session_summary_codec.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -100,7 +102,7 @@ const Summary = struct {
         }
         for ([_]?[]const u8{ self.workspace_root, self.origin_workspace_root }) |root| {
             const path = root orelse continue;
-            if (!std.fs.path.isAbsolute(path) or path.len > std.Io.Dir.max_path_bytes) return false;
+            if (!std.Io.Dir.path.isAbsolute(path) or path.len > std.Io.Dir.max_path_bytes) return false;
         }
         return true;
     }
@@ -451,21 +453,21 @@ fn fingerprint(dir: std.Io.Dir, id: []const u8) !?Fingerprint {
     // presence, absence, or replacement must invalidate a cached row, so bind
     // them into the digest.
     for ([_][]const u8{ "session.json", "events.jsonl", "authority.json", "authority.pending.json", "display.json" }) |name| {
-        const path = try std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ id, name });
+        const path = try std.mem.print(&path_buffer, "{s}/{s}", .{ id, name });
         if (try statOptional(dir, path)) |stat| {
             if (stat.kind != .file or stat.nlink != 1) return null;
             digest.update(&.{1});
             addStat(&digest, stat);
         } else digest.update(&.{0});
     }
-    const child_path = try std.fmt.bufPrint(&path_buffer, "{s}/subagent", .{id});
+    const child_path = try std.mem.print(&path_buffer, "{s}/subagent", .{id});
     const child = try statOptional(dir, child_path);
     if (child) |stat| {
         if (stat.kind != .directory) return null;
         digest.update(&.{1});
         addStat(&digest, stat);
         for ([_][]const u8{ "owner.json", "control.json" }) |name| {
-            const path = try std.fmt.bufPrint(&path_buffer, "{s}/subagent/{s}", .{ id, name });
+            const path = try std.mem.print(&path_buffer, "{s}/subagent/{s}", .{ id, name });
             if (try statOptional(dir, path)) |marker| {
                 if (marker.kind != .file or marker.nlink != 1) return null;
                 digest.update(&.{1});
@@ -493,7 +495,7 @@ fn sameStat(a: std.Io.File.Stat, b: std.Io.File.Stat) bool {
 }
 
 fn addStat(hash: *Sha256, stat: std.Io.File.Stat) void {
-    const values = [_]u128{ stat.inode, stat.nlink, stat.size, @intFromEnum(stat.kind), stat.permissions.toMode(), @bitCast(@as(i128, stat.mtime.nanoseconds)), @bitCast(@as(i128, stat.ctime.nanoseconds)) };
+    const values = [_]u128{ stat.inode, stat.nlink, stat.size, @backingInt(stat.kind), stat.permissions.toMode(), @bitCast(@as(i128, stat.mtime.nanoseconds)), @bitCast(@as(i128, stat.ctime.nanoseconds)) };
     var bytes: [16]u8 = undefined;
     for (values) |value| {
         std.mem.writeInt(u128, &bytes, value, .little);
@@ -798,8 +800,8 @@ test "actionable catalog preserves discovery and child visibility" {
             try std.testing.expectEqual(@as(?bool, false), result.subagent_child);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{store});
-    try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.candidate, .{store});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, AllocationCheck.run, .{store});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, AllocationCheck.candidate, .{store});
 
     stopped.store(false, .release);
     var empty_cache: Loaded = .{};
@@ -865,7 +867,7 @@ test "actionable catalog lists and caches legacy sessions without event logs" {
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
     // Oldest persisted format: a schema v2 snapshot with no event log.
-    const manifest = try std.fmt.allocPrint(alloc, "{{\"schema_version\":2,\"id\":\"legacy-old\",\"created_at_ms\":1,\"updated_at_ms\":2,\"workspace_root\":\"{s}\",\"conversation_language\":\"en\",\"history_len\":1,\"history\":[{{\"role\":\"user\",\"content\":\"saved\"}}],\"total_input_tokens\":0,\"total_output_tokens\":0}}\n", .{workspace});
+    const manifest = try alloc.print("{{\"schema_version\":2,\"id\":\"legacy-old\",\"created_at_ms\":1,\"updated_at_ms\":2,\"workspace_root\":\"{s}\",\"conversation_language\":\"en\",\"history_len\":1,\"history\":[{{\"role\":\"user\",\"content\":\"saved\"}}],\"total_input_tokens\":0,\"total_output_tokens\":0}}\n", .{workspace});
     defer alloc.free(manifest);
     var file = try tmp.dir.createFile(std.testing.io, "home/.fx/sessions/legacy-old/session.json", .{});
     try file.writeStreamingAll(std.testing.io, manifest);
@@ -905,12 +907,12 @@ test "a summary outside the row contract stays listed without disabling the inde
         .{ .id = "legacy-ok", .created_at_ms = 1, .updated_at_ms = 2 },
         .{ .id = "clock-skewed", .created_at_ms = 2000, .updated_at_ms = 1000 },
     }) |snapshot| {
-        const dir_path = try std.fmt.allocPrint(alloc, "home/.fx/sessions/{s}", .{snapshot.id});
+        const dir_path = try alloc.print("home/.fx/sessions/{s}", .{snapshot.id});
         defer alloc.free(dir_path);
         try tmp.dir.createDirPath(std.testing.io, dir_path);
-        const path = try std.fmt.allocPrint(alloc, "{s}/session.json", .{dir_path});
+        const path = try alloc.print("{s}/session.json", .{dir_path});
         defer alloc.free(path);
-        const manifest = try std.fmt.allocPrint(alloc, "{{\"schema_version\":2,\"id\":\"{s}\",\"created_at_ms\":{d},\"updated_at_ms\":{d},\"workspace_root\":\"{s}\",\"conversation_language\":\"en\",\"history_len\":1,\"history\":[{{\"role\":\"user\",\"content\":\"saved\"}}],\"total_input_tokens\":0,\"total_output_tokens\":0}}\n", .{ snapshot.id, snapshot.created_at_ms, snapshot.updated_at_ms, workspace });
+        const manifest = try alloc.print("{{\"schema_version\":2,\"id\":\"{s}\",\"created_at_ms\":{d},\"updated_at_ms\":{d},\"workspace_root\":\"{s}\",\"conversation_language\":\"en\",\"history_len\":1,\"history\":[{{\"role\":\"user\",\"content\":\"saved\"}}],\"total_input_tokens\":0,\"total_output_tokens\":0}}\n", .{ snapshot.id, snapshot.created_at_ms, snapshot.updated_at_ms, workspace });
         defer alloc.free(manifest);
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = manifest });
     }
@@ -952,7 +954,7 @@ test "actionable catalog lists an interrupted legacy upgrade without caching it"
     defer alloc.free(home);
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
-    const snapshot = try std.fmt.allocPrint(alloc, "{{\"schema_version\":2,\"id\":\"fenced\",\"created_at_ms\":1,\"updated_at_ms\":2,\"workspace_root\":\"{s}\",\"conversation_language\":\"en\",\"history_len\":1,\"history\":[{{\"role\":\"user\",\"content\":\"saved\"}}],\"total_input_tokens\":0,\"total_output_tokens\":0}}\n", .{workspace});
+    const snapshot = try alloc.print("{{\"schema_version\":2,\"id\":\"fenced\",\"created_at_ms\":1,\"updated_at_ms\":2,\"workspace_root\":\"{s}\",\"conversation_language\":\"en\",\"history_len\":1,\"history\":[{{\"role\":\"user\",\"content\":\"saved\"}}],\"total_input_tokens\":0,\"total_output_tokens\":0}}\n", .{workspace});
     defer alloc.free(snapshot);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.fx/sessions/fenced/session.legacy.json", .data = snapshot });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.fx/sessions/fenced/authority.pending.json", .data = "pending" });
@@ -1021,14 +1023,14 @@ test "actionable catalog lists an unverifiable child marker without caching it" 
 extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
 
 test "catalog cache ignores a FIFO without blocking" {
-    if (comptime @import("builtin").os.tag == .windows or @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+    if (comptime @import("builtin").target.os.tag == .windows or @import("builtin").target.os.tag == .wasi) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ root, file_name });
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.mem.printSentinel(&path_buf, "{s}/{s}", .{ root, file_name }, 0);
     if (mkfifo(path, 0o600) != 0) return error.SkipZigTest;
     var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true, .follow_symlinks = false }) };
     defer dir.close();
@@ -1135,7 +1137,7 @@ test "catalog rows reject a v5 JSON payload relabelled v6" {
     defer tmp.cleanup();
     var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true, .follow_symlinks = false }) };
     defer dir.close();
-    const payload = "[{\"id\":\"legacy\",\"fingerprint\":\"" ++ "1" ** 64 ++ "\",\"value\":{\"legacy_ranking\":{\"workspace_root\":\"/workspace\",\"updated_at_ms\":20}}}]";
+    const payload = "[{\"id\":\"legacy\",\"fingerprint\":\"" ++ text_utils.repeat("1", 64) ++ "\",\"value\":{\"legacy_ranking\":{\"workspace_root\":\"/workspace\",\"updated_at_ms\":20}}}]";
     var digest: Fingerprint = undefined;
     Sha256.hash(payload, &digest, .{});
     var bytes: std.Io.Writer.Allocating = .init(alloc);
@@ -1173,7 +1175,7 @@ test "catalog fingerprint binds authority fence display sidecar and missing even
     // invalidate the observation even when session.json and events.jsonl are
     // untouched.
     for ([_][]const u8{ "authority.json", "authority.pending.json", "display.json" }) |name| {
-        const path = try std.fmt.allocPrint(std.testing.allocator, "session/{s}", .{name});
+        const path = try std.testing.allocator.print("session/{s}", .{name});
         defer std.testing.allocator.free(path);
         const absent = (try fingerprint(tmp.dir, "session")).?;
         var file = try tmp.dir.createFile(std.testing.io, path, .{});

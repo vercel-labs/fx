@@ -186,12 +186,45 @@ pub const Context = struct {
             0;
         self.lifecycle.catalog_mutex.unlock(io_mod.getIo());
         var refresh_finished = false;
-        errdefer |err| if (!refresh_finished and
-            err != error.McpAccessDenied and
-            err != error.McpAuthorityChanged)
-        {
-            self.recordToolRefreshFailure(server, current, decision.may_serve_snapshot, err);
+        return self.fetchAndCommit(
+            server,
+            deadline,
+            cancel_flag,
+            access,
+            access_target,
+            &operation_access,
+            may_mutate_before_transport,
+            &connection_locked,
+            &refresh_finished,
+            current,
+            decision,
+            invalidation_generation,
+        ) catch |err| {
+            if (!refresh_finished and
+                err != error.McpAccessDenied and
+                err != error.McpAuthorityChanged)
+            {
+                self.recordToolRefreshFailure(server, current, decision.may_serve_snapshot, err);
+            }
+            return err;
         };
+    }
+
+    fn fetchAndCommit(
+        self: Context,
+        server: *McpServer,
+        deadline: std.Io.Clock.Timestamp,
+        cancel_flag: ?*std.atomic.Value(bool),
+        access: tool_mcp_runtime.Access,
+        access_target: access_policy.Target,
+        operation_access: *OperationAccessGuard,
+        may_mutate_before_transport: bool,
+        connection_locked: *bool,
+        refresh_finished: *bool,
+        current: catalog_freshness.SnapshotMetadata,
+        decision: catalog_freshness.RefreshDecision,
+        invalidation_generation: u64,
+    ) !bool {
         var fetched = tool_catalog.fetchCurrent(self.lifecycle.alloc, .{
             .alloc = self.lifecycle.alloc,
             .runtime_generation = self.generation,
@@ -205,7 +238,7 @@ pub const Context = struct {
             {
                 if (!may_mutate_before_transport) {
                     server.connection_lock.unlockShared(io_mod.getIo());
-                    connection_locked = false;
+                    connection_locked.* = false;
                     try operation_access.refreshAndAuthorize(access_target);
                     self.recordToolRefreshFailure(
                         server,
@@ -213,7 +246,7 @@ pub const Context = struct {
                         decision.may_serve_snapshot,
                         err,
                     );
-                    refresh_finished = true;
+                    refresh_finished.* = true;
                     return decision.may_serve_snapshot;
                 }
                 const control = streamable_http.Control{
@@ -227,18 +260,18 @@ pub const Context = struct {
                     server_auth.captureLegacySseAuth(self.lifecycle.alloc, server, legacy_sse.?, control);
                 captured catch |capture_err| {
                     server.connection_lock.unlockShared(io_mod.getIo());
-                    connection_locked = false;
+                    connection_locked.* = false;
                     self.recordToolRefreshFailure(
                         server,
                         current,
                         decision.may_serve_snapshot,
                         capture_err,
                     );
-                    refresh_finished = true;
+                    refresh_finished.* = true;
                     return decision.may_serve_snapshot;
                 };
                 server.connection_lock.unlockShared(io_mod.getIo());
-                connection_locked = false;
+                connection_locked.* = false;
                 try operation_access.refreshAndAuthorize(access_target);
                 if (try authorizePendingChallengeIfAutomated(
                     self.lifecycle.alloc,
@@ -247,7 +280,7 @@ pub const Context = struct {
                 )) {
                     try operation_access.refreshAndAuthorize(access_target);
                     try self.lifecycle.reconnectRemote(server, deadline, cancel_flag, .credentials);
-                    refresh_finished = true;
+                    refresh_finished.* = true;
                     return true;
                 }
                 self.recordToolRefreshFailure(
@@ -256,14 +289,14 @@ pub const Context = struct {
                     decision.may_serve_snapshot,
                     err,
                 );
-                refresh_finished = true;
+                refresh_finished.* = true;
                 return decision.may_serve_snapshot;
             }
             if (err == error.McpSessionExpired and legacy_http != null) {
                 const client = legacy_http.?;
                 const version = client.version;
                 server.connection_lock.unlockShared(io_mod.getIo());
-                connection_locked = false;
+                connection_locked.* = false;
                 try operation_access.refreshAndAuthorize(access_target);
                 if (!may_mutate_before_transport) {
                     self.recordToolRefreshFailure(
@@ -272,7 +305,7 @@ pub const Context = struct {
                         decision.may_serve_snapshot,
                         err,
                     );
-                    refresh_finished = true;
+                    refresh_finished.* = true;
                     return decision.may_serve_snapshot;
                 }
                 try self.lifecycle.recoverLegacyHttpSession(
@@ -282,11 +315,11 @@ pub const Context = struct {
                     deadline,
                     cancel_flag,
                 );
-                refresh_finished = true;
+                refresh_finished.* = true;
                 return true;
             }
             server.connection_lock.unlockShared(io_mod.getIo());
-            connection_locked = false;
+            connection_locked.* = false;
             if (err == error.McpAccessDenied) return error.McpAccessDenied;
             if (err == error.McpAuthorityChanged) return error.McpAuthorityChanged;
             self.recordToolRefreshFailure(server, current, decision.may_serve_snapshot, err);
@@ -309,7 +342,7 @@ pub const Context = struct {
                 .{ .alloc = self.lifecycle.alloc, .runtime_generation = self.generation, .access = access, .target = access_target },
             ) catch |err| {
                 server.connection_lock.unlockShared(io_mod.getIo());
-                connection_locked = false;
+                connection_locked.* = false;
                 self.recordToolRefreshFailure(server, current, decision.may_serve_snapshot, err);
                 return decision.may_serve_snapshot;
             };
@@ -318,7 +351,7 @@ pub const Context = struct {
             server.legacy_http == null)
         {
             server.connection_lock.unlockShared(io_mod.getIo());
-            connection_locked = false;
+            connection_locked.* = false;
             self.recordToolRefreshFailure(
                 server,
                 current,
@@ -332,7 +365,7 @@ pub const Context = struct {
         else
             null;
         server.connection_lock.unlockShared(io_mod.getIo());
-        connection_locked = false;
+        connection_locked.* = false;
 
         try operation_access.refreshAndAuthorize(access_target);
 
@@ -374,7 +407,7 @@ pub const Context = struct {
         if (server.connection_generation != current.connection_generation) {
             try lockRwSharedUntil(self.lifecycle.catalog_mutex, deadline, cancel_flag);
             defer self.lifecycle.catalog_mutex.unlockShared(io_mod.getIo());
-            refresh_finished = true;
+            refresh_finished.* = true;
             return tool_catalog.serverCatalogAvailable(server);
         }
 
@@ -414,7 +447,7 @@ pub const Context = struct {
                 }
                 server.catalog_commit_lock.unlock(io_mod.getIo());
                 catalog_commit_locked = false;
-                refresh_finished = true;
+                refresh_finished.* = true;
                 debug_trace.logf(
                     "mcp",
                     "rejected stale tool refresh server={s} source_connection_generation={d} source_catalog_generation={d}",
@@ -430,7 +463,7 @@ pub const Context = struct {
                 }
                 server.catalog_commit_lock.unlock(io_mod.getIo());
                 catalog_commit_locked = false;
-                refresh_finished = true;
+                refresh_finished.* = true;
                 self.recordToolRefreshFailure(
                     server,
                     current,
@@ -463,7 +496,7 @@ pub const Context = struct {
                 }
                 server.catalog_commit_lock.unlock(io_mod.getIo());
                 catalog_commit_locked = false;
-                refresh_finished = true;
+                refresh_finished.* = true;
                 debug_trace.logf(
                     "mcp",
                     "tool cache refreshed without schema change server={s} catalog_generation={d} fetched_at_ms={d} expiry_ms={d} notifications_seen={d} notifications_coalesced={d}",
@@ -510,7 +543,7 @@ pub const Context = struct {
                 }
                 server.catalog_commit_lock.unlock(io_mod.getIo());
                 catalog_commit_locked = false;
-                refresh_finished = true;
+                refresh_finished.* = true;
                 retired.deinit(self.lifecycle.alloc);
                 debug_trace.logf(
                     "mcp",

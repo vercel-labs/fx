@@ -177,7 +177,7 @@ test "client system prompt rejects invalid combinations before a session exists"
     const oversized = try alloc.alloc(u8, max_bytes + 1);
     defer alloc.free(oversized);
     @memset(oversized, 'x');
-    const json = try std.fmt.allocPrint(alloc, "{{\"systemPrompt\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}", .{oversized});
+    const json = try alloc.print("{{\"systemPrompt\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}", .{oversized});
     defer alloc.free(json);
     try std.testing.expectError(error.SystemPromptTooLarge, parse(alloc, json));
 }

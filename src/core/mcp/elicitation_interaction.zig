@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const elicitation = @import("elicitation.zig");
 const mrtr = @import("mrtr.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
@@ -386,8 +387,7 @@ fn answerField(
         null;
     defer if (display_description) |description| alloc.free(description);
     const question = if (display_description) |description|
-        try std.fmt.allocPrint(
-            alloc,
+        try alloc.print(
             "MCP server {s} requests {s}{s} — {s}\nReason: {s}",
             .{
                 server_name,
@@ -398,8 +398,7 @@ fn answerField(
             },
         )
     else
-        try std.fmt.allocPrint(
-            alloc,
+        try alloc.print(
             "MCP server {s} requests {s}{s}\nReason: {s}",
             .{
                 server_name,
@@ -519,8 +518,7 @@ fn answerCompactField(
     const temp = arena.allocator();
     const display_name = try terminalSafeAlloc(temp, field.displayName());
     const description = try terminalSafeAlloc(temp, field.description orelse "");
-    const question = try std.fmt.allocPrint(
-        temp,
+    const question = try temp.print(
         "MCP server {s} requests {s}{s}\n{s}\nReason: {s}\nChoose an option to submit.",
         .{ server_name, display_name, if (field.required) " (required)" else " (optional)", description, message },
     );
@@ -595,8 +593,7 @@ fn askToKeepCurrentValue(
     else
         try alloc.dupe(u8, "(skipped)");
     defer alloc.free(display_value);
-    const question = try std.fmt.allocPrint(
-        alloc,
+    const question = try alloc.print(
         "MCP server {s}: current value for {s} is {s}. Keep it or edit it?",
         .{ server_name, display_name, display_value },
     );
@@ -661,8 +658,7 @@ fn answerMultiSelect(
     for (field.choices) |choice| {
         const display_title = try terminalSafeAlloc(alloc, choice.title);
         defer alloc.free(display_title);
-        const question = try std.fmt.allocPrint(
-            alloc,
+        const question = try alloc.print(
             "MCP server {s}: include {s} in {s}?\nReason: {s}",
             .{ server_name, display_title, display_name, request_message },
         );
@@ -710,8 +706,7 @@ fn choose_fill_action(
     cancel_flag: ?*const std.atomic.Value(bool),
     questioner: Questioner,
 ) Error!FillAction {
-    const question = try std.fmt.allocPrint(
-        alloc,
+    const question = try alloc.print(
         "MCP server {s}: choose how to fill {s}{s}.\nReason: {s}",
         .{
             server_name,
@@ -763,8 +758,7 @@ fn retryInvalidForm(
     cancel_flag: ?*const std.atomic.Value(bool),
     questioner: Questioner,
 ) Error!bool {
-    const question = try std.fmt.allocPrint(
-        alloc,
+    const question = try alloc.print(
         "A response for MCP server {s} did not satisfy the requested form constraints. Edit the form or cancel?",
         .{server_name},
     );
@@ -898,7 +892,7 @@ fn choiceLabelAlloc(
 ) Error![]u8 {
     const title = try terminalSafeAlloc(alloc, raw_title);
     defer alloc.free(title);
-    return std.fmt.allocPrint(alloc, "[{d}] {s}", .{ choice_index + 1, title });
+    return alloc.print("[{d}] {s}", .{ choice_index + 1, title });
 }
 
 fn answerUrl(
@@ -922,8 +916,7 @@ fn answerUrl(
         .punycode => "\nWarning: This host uses Punycode and may disguise its destination.",
         .non_ascii => "\nWarning: This host contains non-ASCII characters and may be visually ambiguous.",
     };
-    const question = try std.fmt.allocPrint(
-        alloc,
+    const question = try alloc.print(
         "MCP server {s} requests an external browser action. Target host: {s}\nComplete URL: {s}{s}\nOpen it? fx will not fetch this URL or see browser contents.",
         .{ display_server_name, display_host, display_url, warning },
     );
@@ -954,8 +947,7 @@ fn answerUrl(
         return alloc.dupe(u8, "{\"action\":\"accept\"}");
     }
 
-    const failure_question = try std.fmt.allocPrint(
-        alloc,
+    const failure_question = try alloc.print(
         "fx could not open the browser for {s}. The URL was not fetched. Continue manually, retry the browser, or cancel?",
         .{display_host},
     );
@@ -1018,8 +1010,7 @@ fn answerLegacyUrlCompletion(
 
     const display_server_name = try terminalSafeAlloc(alloc, server_name);
     defer alloc.free(display_server_name);
-    const question = try std.fmt.allocPrint(
-        alloc,
+    const question = try alloc.print(
         "Complete the browser flow requested by MCP server {s}. fx will continue automatically if the server confirms every URL request. Otherwise choose I completed it / Retry, or Cancel.",
         .{display_server_name},
     );
@@ -1529,7 +1520,7 @@ fn checkAcceptedFormAllocationFailures(alloc: Allocator) !void {
 
 test "form interaction owns every accepted response allocation" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkAcceptedFormAllocationFailures,
         .{},
     );
@@ -1571,7 +1562,7 @@ test "compact form defaults skip and choice labels preserve exact values" {
             ,
         }, .{ .questioner = fixture.questioner(), .browser = fixture.browser(), .capabilities = .{ .form = true }, .compact_forms = true });
         defer alloc.free(response);
-        const expected = try std.fmt.allocPrint(alloc, "{{\"form\":{{\"action\":\"accept\",\"content\":{s}}}}}", .{case.content});
+        const expected = try alloc.print("{{\"form\":{{\"action\":\"accept\",\"content\":{s}}}}}", .{case.content});
         defer alloc.free(expected);
         try std.testing.expectEqualStrings(expected, response);
         try std.testing.expectEqual(@as(usize, 1), fixture.answer_index);
@@ -1587,8 +1578,7 @@ test "compact form keeps review for short text numbers and booleans" {
         .{ .kind = "boolean", .answer = "True", .value = "true" },
     }) |case| {
         var fixture = Fixture{ .answers = &.{ case.answer, "Submit" } };
-        const requests = try std.fmt.allocPrint(
-            alloc,
+        const requests = try alloc.print(
             "{{\"form\":{{\"method\":\"elicitation/create\",\"params\":{{\"message\":\"Value\",\"requestedSchema\":{{\"type\":\"object\",\"properties\":{{\"value\":{{\"type\":\"{s}\"}}}},\"required\":[\"value\"]}}}}}}}}",
             .{case.kind},
         );
@@ -1600,7 +1590,7 @@ test "compact form keeps review for short text numbers and booleans" {
             .compact_forms = true,
         });
         defer alloc.free(response);
-        const expected = try std.fmt.allocPrint(alloc, "{{\"form\":{{\"action\":\"accept\",\"content\":{{\"value\":{s}}}}}}}", .{case.value});
+        const expected = try alloc.print("{{\"form\":{{\"action\":\"accept\",\"content\":{{\"value\":{s}}}}}}}", .{case.value});
         defer alloc.free(expected);
         try std.testing.expectEqualStrings(expected, response);
         try std.testing.expect(fixture.review_contained_values);

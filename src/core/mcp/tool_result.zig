@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
@@ -36,8 +37,7 @@ pub fn extract(alloc: Allocator, options: ExtractOptions) !tool_mcp_runtime.Call
         .{},
     ) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        const raw = try std.fmt.allocPrint(
-            alloc,
+        const raw = try alloc.print(
             "MCP protocol failure: {s}",
             .{@errorName(err)},
         );
@@ -208,7 +208,7 @@ pub fn restart_failed_result(
     try out.writer.writeAll(",\"tool\":");
     try std.json.Stringify.value(tool_name, .{}, &out.writer);
     try out.writer.writeAll(",\"error\":{\"kind\":\"server_restart_failed\",\"message\":");
-    const message = try std.fmt.allocPrint(alloc, "MCP server stopped and could not be restarted: {s}", .{failure});
+    const message = try alloc.print("MCP server stopped and could not be restarted: {s}", .{failure});
     defer alloc.free(message);
     try std.json.Stringify.value(message, .{}, &out.writer);
     try out.writer.writeAll("}}");
@@ -344,8 +344,7 @@ fn serialize_capped(
     }
 
     const combined = try collect_result_text(arena, result);
-    const marker = try std.fmt.allocPrint(
-        arena,
+    const marker = try arena.print(
         "\n... [mcp tool result truncated for {s}/{s}: original {d} bytes; cap is {d} bytes]\n",
         .{ server_name, tool_name, full_output.len, max_tool_result_bytes },
     );
@@ -637,7 +636,7 @@ fn check_input_required_allocation_failures(alloc: Allocator) !void {
 
 test "input-required result releases every allocation failure path" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         check_input_required_allocation_failures,
         .{},
     );
@@ -659,7 +658,7 @@ fn check_legacy_url_required_allocation_failures(alloc: Allocator) !void {
 
 test "2025-11 URL-required errors become retry input only on that wire" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         check_legacy_url_required_allocation_failures,
         .{},
     );
@@ -697,7 +696,7 @@ test "invalid tool responses retain bounded protocol failures" {
 test "large tool results stay valid, bounded, and verbatim" {
     const alloc = std.testing.allocator;
     const needle = "MY_NOTE_TOKEN=abcdefgh";
-    const large_text = needle ++ ("x" ** 1800);
+    const large_text = needle ++ text_utils.repeat("x", 1800);
     const response = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"" ++ large_text ++ "\"}]}}";
     var result = try extract(alloc, .{
         .server_name = "filesystem",

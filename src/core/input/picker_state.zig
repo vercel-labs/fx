@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const file_picker_path = @import("file_picker_path.zig");
 const file_completion_state = @import("file_completion_state.zig");
 const editor_state = @import("editor_state.zig");
@@ -120,9 +121,10 @@ pub const State = struct {
     file_picker_episode_seen: bool = false,
 
     pub fn initInto(self: *State) void {
-        inline for (std.meta.fields(State)) |field| {
-            if (comptime std.mem.eql(u8, field.name, "file_completion")) continue;
-            @field(self.*, field.name) = field.defaultValue().?;
+        const state_info = @typeInfo(State).@"struct";
+        inline for (state_info.field_names, state_info.field_types, state_info.field_attrs) |field_name, field_type, field_attrs| {
+            if (comptime std.mem.eql(u8, field_name, "file_completion")) continue;
+            @field(self.*, field_name) = field_attrs.defaultValue(field_type).?;
         }
         self.file_completion.initInto();
     }
@@ -132,10 +134,11 @@ pub const State = struct {
         self.model_picker_pending_model.deinit(alloc);
         self.provider_picker_pending_provider.deinit(alloc);
         self.provider_picker_pending_method.deinit(alloc);
-        inline for (std.meta.fields(State)) |field| {
+        const state_info = @typeInfo(State).@"struct";
+        inline for (state_info.field_names, state_info.field_types, state_info.field_attrs) |field_name, field_type, field_attrs| {
             // The child's owner already restored its defaults.
-            if (comptime std.mem.eql(u8, field.name, "file_completion")) continue;
-            @field(self.*, field.name) = field.defaultValue().?;
+            if (comptime std.mem.eql(u8, field_name, "file_completion")) continue;
+            @field(self.*, field_name) = field_attrs.defaultValue(field_type).?;
         }
     }
 
@@ -630,14 +633,16 @@ test "picker deinit releases owned text and restores declared defaults" {
     state.file_completion.active = true;
     state.file_completion.episode = 51;
     state.deinit(alloc);
-    inline for (std.meta.fields(State)) |field| {
-        if (comptime std.mem.eql(u8, field.name, "file_completion")) {
-            inline for (std.meta.fields(file_completion_state.State)) |child| {
-                if (comptime std.mem.eql(u8, child.name, "raw_query") or std.mem.eql(u8, child.name, "lookup_query")) continue;
-                try std.testing.expectEqualDeep(child.defaultValue().?, @field(state.file_completion, child.name));
+    const state_info = @typeInfo(State).@"struct";
+    inline for (state_info.field_names, state_info.field_types, state_info.field_attrs) |field_name, field_type, field_attrs| {
+        if (comptime std.mem.eql(u8, field_name, "file_completion")) {
+            const child_info = @typeInfo(file_completion_state.State).@"struct";
+            inline for (child_info.field_names, child_info.field_types, child_info.field_attrs) |child_name, child_type, child_attrs| {
+                if (comptime std.mem.eql(u8, child_name, "raw_query") or std.mem.eql(u8, child_name, "lookup_query")) continue;
+                try std.testing.expectEqualDeep(child_attrs.defaultValue(child_type).?, @field(state.file_completion, child_name));
             }
         } else {
-            try std.testing.expectEqualDeep(field.defaultValue().?, @field(state, field.name));
+            try std.testing.expectEqualDeep(field_attrs.defaultValue(field_type).?, @field(state, field_name));
         }
     }
     state.deinit(alloc);
@@ -844,7 +849,7 @@ test "model picker flow accepts aliased pending model input" {
 }
 
 test "model picker flow preserves state when allocation fails" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var state: State = .{};
     defer state.deinit(alloc);
 

@@ -11,5 +11,5 @@ pub const HandlerError = definitions.HandlerError;
 pub const MutationDispatchError = definitions.MutationDispatchError;
 
 test "Hooks v1.0 scope kinds remain limited to the current surfaces" {
-    try std.testing.expectEqual(@as(usize, 4), @typeInfo(ScopeKind).@"enum".fields.len);
+    try std.testing.expectEqual(@as(usize, 4), @typeInfo(ScopeKind).@"enum".field_names.len);
 }

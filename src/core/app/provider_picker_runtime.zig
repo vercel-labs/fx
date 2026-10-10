@@ -99,8 +99,8 @@ pub fn Runtime(comptime App: type) type {
                     // `current` always means "used for inference right now",
                     // so a key is only current while the gateway is active.
                     const active = if (active_provider == .gateway) app.auth.credentialSource() else null;
-                    inline for (@typeInfo(provider_picker_catalog.KeySource).@"enum".fields) |field| {
-                        const key_source = @field(provider_picker_catalog.KeySource, field.name);
+                    inline for (@typeInfo(provider_picker_catalog.KeySource).@"enum".field_names) |field_name| {
+                        const key_source = @field(provider_picker_catalog.KeySource, field_name);
                         const credential = provider_picker_catalog.keySourceCredential(key_source);
                         const detected = if (credential) |value| view.available_sources.contains(value) else true;
                         if (detected) {
@@ -566,7 +566,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn setComposerText(app: *App, comptime fmt: []const u8, args: anytype) !void {
-            const text = try std.fmt.allocPrint(app.alloc, fmt, args);
+            const text = try app.alloc.print(fmt, args);
             defer app.alloc.free(text);
             try app.input_runtime.textReplacementState().replace(app.alloc, text);
         }
@@ -777,7 +777,7 @@ test "key column is a masked field, not a list of options" {
     app.auth.mask_count = 4;
     const typed = columnFor(&app, .api_key, "");
     try std.testing.expectEqual(@as(usize, 1), typed.count);
-    try std.testing.expect(std.mem.indexOf(u8, typed.labels[0], provider_picker_catalog.key_field_placeholder) == null);
+    try std.testing.expect(std.mem.find(u8, typed.labels[0], provider_picker_catalog.key_field_placeholder) == null);
 
     // While the save thread works the row says so instead of rendering an
     // empty ready-looking field.

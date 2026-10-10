@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host_contract = @import("../hosts/host.zig");
@@ -99,7 +100,7 @@ fn storageBackend() StorageBackend {
     // A temporary HOME does not isolate the host account's macOS Keychain.
     // Keychain-specific tests inject their backend explicitly.
     if (comptime builtin.is_test) return .profile_file;
-    return selectStorageBackend(builtin.os.tag, native_keychain.isDisabled());
+    return selectStorageBackend(builtin.target.os.tag, native_keychain.isDisabled());
 }
 
 pub fn presence() host_contract.SecretStorePresence {
@@ -1373,7 +1374,7 @@ test "JS host OAuth session revision conflict does not take session ownership" {
 }
 
 test "oauth session parse cleans up allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_parse_allocation_failures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, check_parse_allocation_failures, .{});
 }
 
 test "oauth session parse rejects non-object JSON" {
@@ -1394,14 +1395,14 @@ test "oauth session loading propagates allocation failures" {
     file.close(std.testing.io);
 
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         check_load_allocation_failures,
         .{&tmp.dir},
     );
 }
 
 test "OAuth mutation loads report auth file open failures" {
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.symLink(std.testing.io, "missing-auth-target", auth_file_name, .{ .is_directory = false });

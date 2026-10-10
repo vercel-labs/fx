@@ -20,7 +20,7 @@ pub const Category = enum {
     }
 };
 
-pub const category_count = std.meta.fields(Category).len;
+pub const category_count = @typeInfo(Category).@"enum".field_names.len;
 
 pub const SettingId = enum {
     statusline_context,
@@ -213,10 +213,10 @@ pub const Menu = struct {
     pub fn cycleCategory(self: *Menu, delta: i32) bool {
         if (!self.active) return false;
         const count: i32 = @intCast(category_count);
-        var next: i32 = @intFromEnum(self.category) + delta;
+        var next: i32 = @backingInt(self.category) + delta;
         while (next < 0) next += count;
         while (next >= count) next -= count;
-        self.category = @enumFromInt(next);
+        self.category = @fromBackingInt(@intCast(next));
         self.selected_index = 0;
         self.window_start = 0;
         return true;
@@ -389,10 +389,10 @@ fn matchesQuery(snapshot: Snapshot, spec: Spec, query: []const u8) bool {
 }
 
 fn tokenMatches(snapshot: Snapshot, spec: Spec, token: []const u8) bool {
-    return std.ascii.indexOfIgnoreCase(spec.label, token) != null or
-        std.ascii.indexOfIgnoreCase(spec.description, token) != null or
-        std.ascii.indexOfIgnoreCase(snapshot.value(spec.id), token) != null or
-        std.ascii.indexOfIgnoreCase(@tagName(spec.id), token) != null;
+    return std.ascii.findIgnoreCase(spec.label, token) != null or
+        std.ascii.findIgnoreCase(spec.description, token) != null or
+        std.ascii.findIgnoreCase(snapshot.value(spec.id), token) != null or
+        std.ascii.findIgnoreCase(@tagName(spec.id), token) != null;
 }
 
 fn onOff(value: bool) []const u8 {

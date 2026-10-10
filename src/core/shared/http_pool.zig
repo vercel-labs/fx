@@ -89,7 +89,7 @@ pub const HttpPool = struct {
             };
         }
         var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
-        const host = uri.getHost(&host_buf) catch return;
+        const host = std.Io.net.HostName.fromUri(uri, &host_buf) catch return;
         const port: u16 = uri.port orelse defaultPort(protocol);
         const started = io_mod.milliTimestamp();
         const conn = self.client.connect(host, port, protocol) catch |err| {
@@ -158,7 +158,7 @@ pub const HttpPool = struct {
         const uri = std.Uri.parse(url) catch return;
         const protocol = std.http.Client.Protocol.fromUri(uri) orelse return;
         var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
-        const host = uri.getHost(&host_buf) catch return;
+        const host = std.Io.net.HostName.fromUri(uri, &host_buf) catch return;
         const port: u16 = uri.port orelse defaultPort(protocol);
         const criteria: std.http.Client.ConnectionPool.Criteria = .{
             .host = host,
@@ -166,7 +166,14 @@ pub const HttpPool = struct {
             .protocol = protocol,
         };
         var drained: usize = 0;
-        while (self.client.connection_pool.findConnection(io, criteria)) |conn| {
+        while (true) {
+            // A cancelled drain stops early and leaves the cancellation pending.
+            const conn = (self.client.connection_pool.findConnection(io, criteria) catch |err| switch (err) {
+                error.Canceled => {
+                    io.recancel();
+                    break;
+                },
+            }) orelse break;
             // findConnection moves the connection to the used list; unlink it
             // there before destroying, since destroy does not touch the lists.
             self.client.connection_pool.mutex.lockUncancelable(io);
@@ -223,7 +230,7 @@ test "drain evicts a real parked connection past the TTL" {
     var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var server = try address.listen(zio, .{ .reuse_address = true });
     defer server.deinit(zio);
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/chat", .{server.socket.address.getPort()});
+    const url = try std.testing.allocator.print("http://127.0.0.1:{d}/chat", .{server.socket.address.getPort()});
     defer std.testing.allocator.free(url);
 
     var pool = HttpPool.init(std.testing.allocator);

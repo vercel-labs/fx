@@ -588,7 +588,7 @@ fn writeCommandReviewHint(
         &command_review_navigation_hints;
     const hint = display_width.widestFitting(variants, width -| 2);
     var line_buf: [96]u8 = undefined;
-    const line = std.fmt.bufPrint(&line_buf, "  {s}", .{hint}) catch hint;
+    const line = std.mem.print(&line_buf, "  {s}", .{hint}) catch hint;
     const clipped = text_utils.prefixTerminalSafeByWidth(line, width);
     try writer.print("\x1b[{d};1H", .{row});
     try writer.writeAll(ui_render.dim_style);
@@ -1362,9 +1362,9 @@ fn reviewPrefixWidth(line: diff_mod.ReviewLine, first_segment: bool) usize {
 fn reviewLineText(
     line: diff_mod.ReviewLine,
     elision_text: *[64]u8,
-) std.fmt.BufPrintError![]const u8 {
+) std.mem.PrintError![]const u8 {
     if (line.op != .elision) return line.text;
-    return try std.fmt.bufPrint(
+    return try std.mem.print(
         elision_text,
         "{d} unchanged lines ⋯",
         .{line.elision_count},
@@ -1403,7 +1403,7 @@ fn appendReviewPrefix(
 
     var number_buf: [16]u8 = undefined;
     const number_text = if (line.new_line orelse line.old_line) |number|
-        std.fmt.bufPrint(&number_buf, "{d}", .{number}) catch ""
+        std.mem.print(&number_buf, "{d}", .{number}) catch ""
     else
         "";
     try writeSpaces(
@@ -1652,7 +1652,7 @@ test "command approval screen preserves raw command newlines as rows" {
 test "command approval screen includes compact permission header" {
     const alloc = std.testing.allocator;
     var screen_state = interaction_state.ApprovalScreenState{};
-    const label = "shell.run printf '%s' '" ++ ("x" ** 256) ++ "'";
+    const label = "shell.run printf '%s' '" ++ text_utils.repeat("x", 256) ++ "'";
 
     var approval = approval_prompt.ApprovalPrompt{};
     defer approval.deinit(alloc);
@@ -1716,7 +1716,7 @@ test "command approval screen wraps commands at word boundaries" {
 }
 
 test "bounded command approval previews route by complete command fit" {
-    const command = "printf '" ++ ("x" ** 160) ++ "'";
+    const command = "printf '" ++ text_utils.repeat("x", 160) ++ "'";
     const request: permission_request.PermissionRequest = .{
         .label = "shell.run printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx...",
         .command = command,
@@ -1865,14 +1865,14 @@ test "file approval screen exposes a scrollable full review" {
 
     var first = try paintTest(alloc, approval.projection().?, &screen_state, &.{}, .{}, testLayout(12, 32), true);
     defer first.deinit(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, first.bytes, "line-01") == null);
-    try std.testing.expect(std.mem.indexOf(u8, first.bytes, "line-30") != null);
+    try std.testing.expect(std.mem.find(u8, first.bytes, "line-01") == null);
+    try std.testing.expect(std.mem.find(u8, first.bytes, "line-30") != null);
     try std.testing.expect(first.document_scrollable);
 
     screen_state.scrollDocument(1024);
     var last = try paintTest(alloc, approval.projection().?, &screen_state, &.{}, .{}, testLayout(12, 32), false);
     defer last.deinit(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, last.bytes, "line-01") != null);
+    try std.testing.expect(std.mem.find(u8, last.bytes, "line-01") != null);
     try std.testing.expect(last.changed_or_notice_visible);
 }
 
@@ -1905,8 +1905,8 @@ test "file approval screen anchors transcript and review at the document tail" {
 
     var tail = try paintTest(alloc, approval.projection().?, &screen_state, entries.items, .{}, testLayout(14, 100), true);
     defer tail.deinit(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, tail.bytes, "review-tail") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tail.bytes, "approval-history-0001") == null);
+    try std.testing.expect(std.mem.find(u8, tail.bytes, "review-tail") != null);
+    try std.testing.expect(std.mem.find(u8, tail.bytes, "approval-history-0001") == null);
     try std.testing.expect(tail.document_scrollable);
 
     var shell = struct {
@@ -1929,9 +1929,9 @@ test "file approval screen anchors transcript and review at the document tail" {
     screen_state.scrollDocument(10_000);
     var head = try paintTest(alloc, approval.projection().?, &screen_state, entries.items, .{}, testLayout(14, 100), false);
     defer head.deinit(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, head.bytes, "approval-history-0001") != null);
-    try std.testing.expect(std.mem.indexOf(u8, head.bytes, "review-tail") == null);
-    try std.testing.expect(std.mem.indexOf(u8, head.bytes, "Apply this change?") == null);
+    try std.testing.expect(std.mem.find(u8, head.bytes, "approval-history-0001") != null);
+    try std.testing.expect(std.mem.find(u8, head.bytes, "review-tail") == null);
+    try std.testing.expect(std.mem.find(u8, head.bytes, "Apply this change?") == null);
     try std.testing.expect(!head.file_identity_visible);
     try std.testing.expect(!head.all_decision_controls_visible);
     try std.testing.expect(!head.changed_or_notice_visible);
@@ -1989,7 +1989,7 @@ test "large file approval paints a bounded tail before hydrating the full docume
         var line_buf: [64]u8 = undefined;
         try changed.appendSlice(
             alloc,
-            try std.fmt.bufPrint(&line_buf, "progressive-tail-{d:0>2}\n", .{line}),
+            try std.mem.print(&line_buf, "progressive-tail-{d:0>2}\n", .{line}),
         );
     }
     try changed.appendSlice(alloc, "PROGRESSIVE_DIFF_TAIL_SENTINEL\n");
@@ -2083,7 +2083,7 @@ test "file approval document separates transcript, diff, and controls" {
     var row: std.ArrayList(u8) = .empty;
     defer row.deinit(alloc);
     try grid.rowTextTrimmed(1, &row);
-    try std.testing.expect(std.mem.indexOf(u8, row.items, "transcript-boundary-marker") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "transcript-boundary-marker") != null);
 
     row.clearRetainingCapacity();
     try grid.rowTextTrimmed(2, &row);
@@ -2094,7 +2094,7 @@ test "file approval document separates transcript, diff, and controls" {
 
     row.clearRetainingCapacity();
     try grid.rowTextTrimmed(4, &row);
-    try std.testing.expect(std.mem.indexOf(u8, row.items, "review-boundary-marker") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "review-boundary-marker") != null);
 
     const approval_divider = grid.cellAt(5, 1) orelse return error.TestMissingApprovalDivider;
     try std.testing.expectEqual(@as(u21, 0x2504), approval_divider.codepoint);
@@ -2174,14 +2174,14 @@ test "file approval top-aligns a fitting welcome document and clears below" {
     var row: std.ArrayList(u8) = .empty;
     defer row.deinit(alloc);
     try grid.rowTextTrimmed(1, &row);
-    try std.testing.expect(std.mem.indexOf(u8, row.items, "Run /help for commands") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "Run /help for commands") != null);
 
     const transcript_divider = grid.cellAt(4, 1) orelse return error.TestMissingTranscriptDivider;
     try std.testing.expectEqual(@as(u21, 0x2500), transcript_divider.codepoint);
 
     row.clearRetainingCapacity();
     try grid.rowTextTrimmed(5, &row);
-    try std.testing.expect(std.mem.indexOf(u8, row.items, "+ short review") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "+ short review") != null);
 
     const approval_divider = grid.cellAt(6, 1) orelse return error.TestMissingApprovalDivider;
     try std.testing.expectEqual(@as(u21, 0x2504), approval_divider.codepoint);
@@ -2191,7 +2191,7 @@ test "file approval top-aligns a fitting welcome document and clears below" {
 
     row.clearRetainingCapacity();
     try grid.rowTextTrimmed(16, &row);
-    try std.testing.expect(std.mem.indexOf(u8, row.items, "1–3 choose") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "1–3 choose") != null);
     row.clearRetainingCapacity();
     try grid.rowTextTrimmed(17, &row);
     try std.testing.expectEqualStrings("", row.items);
@@ -2241,7 +2241,7 @@ test "file approval transcript viewport resumes styled links without leaking int
     var review_row: std.ArrayList(u8) = .empty;
     defer review_row.deinit(alloc);
     try grid.rowTextTrimmed(6, &review_row);
-    try std.testing.expect(std.mem.indexOf(u8, review_row.items, "+ x") != null);
+    try std.testing.expect(std.mem.find(u8, review_row.items, "+ x") != null);
     try std.testing.expectEqual(@as(u32, 0), review_cell.style.hyperlink_id);
 
     try std.testing.expectEqual(@as(u32, 0), footer_cell.style.hyperlink_id);
@@ -2259,12 +2259,12 @@ test "file approval screen wraps changed source without omitting bytes" {
 
     var first = try paintTest(alloc, approval.projection().?, &screen_state, &.{}, .{}, testLayout(12, 12), true);
     defer first.deinit(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, first.bytes, "gh") != null);
+    try std.testing.expect(std.mem.find(u8, first.bytes, "gh") != null);
 
     screen_state.scrollDocument(3);
     var last = try paintTest(alloc, approval.projection().?, &screen_state, &.{}, .{}, testLayout(12, 12), false);
     defer last.deinit(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, last.bytes, "ab") != null);
+    try std.testing.expect(std.mem.find(u8, last.bytes, "ab") != null);
 }
 
 test "file approval renders exact unchanged-line elision markers" {
@@ -2298,9 +2298,9 @@ test "file approval renders exact unchanged-line elision markers" {
         row.clearRetainingCapacity();
         try grid.rowTextTrimmed(@intCast(row_number), &row);
         marker_found = marker_found or
-            std.mem.indexOf(u8, row.items, "⋯ 3 unchanged lines ⋯") != null;
+            std.mem.find(u8, row.items, "⋯ 3 unchanged lines ⋯") != null;
         numbered_elision_found = numbered_elision_found or
-            std.mem.indexOf(u8, row.items, "0 ⋯ 3 unchanged lines ⋯") != null;
+            std.mem.find(u8, row.items, "0 ⋯ 3 unchanged lines ⋯") != null;
     }
     try std.testing.expect(marker_found);
     try std.testing.expect(!numbered_elision_found);
@@ -2406,9 +2406,9 @@ test "file approval renders controls ready after inspecting a changed row" {
         row.clearRetainingCapacity();
         try grid.rowTextTrimmed(@intCast(row_number), &row);
         ready_choice_visible = ready_choice_visible or
-            std.mem.indexOf(u8, row.items, "❯ 1  Apply once") != null;
+            std.mem.find(u8, row.items, "❯ 1  Apply once") != null;
         blocked_choice_visible = blocked_choice_visible or
-            std.mem.indexOf(u8, row.items, "❯ ! 1  Apply once") != null;
+            std.mem.find(u8, row.items, "❯ ! 1  Apply once") != null;
     }
     try std.testing.expect(ready_choice_visible);
     try std.testing.expect(!blocked_choice_visible);

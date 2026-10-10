@@ -1,6 +1,7 @@
 const std = @import("std");
 const display_width = @import("../../core/shared/display_width.zig");
 const assistant_wrap = @import("assistant_wrap.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 
 pub const WalkResult = struct {
     end_row: u32,
@@ -220,7 +221,7 @@ test "positional tab changes following wrap geometry" {
 }
 
 test "nextCursorColForLine follows the final wrapped row" {
-    const record = "a" ** 249;
+    const record = text_utils.repeat("a", 249);
     try std.testing.expectEqual(@as(u16, 10), nextCursorColForLine(record, 120));
     try std.testing.expectEqual(@as(u16, 120), nextCursorColForLine(record[0..120], 120));
 }

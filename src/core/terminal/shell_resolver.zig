@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const contracts = @import("contracts.zig");
 const command_environment = @import("../execution/command_environment.zig");
@@ -17,19 +18,19 @@ pub const Environment = command_environment.Environment;
 pub const ShellKind = enum { bash, zsh };
 
 pub fn shellKind(path: []const u8) ?ShellKind {
-    const basename = std.fs.path.basename(path);
+    const basename = std.Io.Dir.path.basename(path);
     if (std.mem.eql(u8, basename, "bash")) return .bash;
     if (std.mem.eql(u8, basename, "zsh")) return .zsh;
     return null;
 }
 
 fn fallbackLoginShell() []const u8 {
-    return if (builtin.os.tag == .macos) "/bin/zsh" else "/bin/bash";
+    return if (builtin.target.os.tag == .macos) "/bin/zsh" else "/bin/bash";
 }
 
 fn supportedLoginShell(configured_login_shell: ?[]const u8) ResolveError![]const u8 {
     const path = configured_login_shell orelse return error.MissingLoginShell;
-    if (!std.fs.path.isAbsolute(path)) return error.RelativeShellPath;
+    if (!std.Io.Dir.path.isAbsolute(path)) return error.RelativeShellPath;
     if (shellKind(path) != null) return path;
     return fallbackLoginShell();
 }
@@ -72,7 +73,7 @@ pub fn resolve(
             .clean_start = value.clean_start,
         },
     };
-    if (!std.fs.path.isAbsolute(selection.path)) {
+    if (!std.Io.Dir.path.isAbsolute(selection.path)) {
         return error.RelativeShellPath;
     }
 
@@ -103,7 +104,7 @@ pub fn resolve(
 }
 
 pub fn configuredLoginShellInto(buffer: []u8) ?[]const u8 {
-    if (comptime !builtin.link_libc or builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (comptime !builtin.link_libc or builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         return null;
     }
     var entry: std.c.passwd = undefined;
@@ -202,7 +203,7 @@ pub fn capturedInvocation(
         },
         .user => |path| {
             var invocation = try resolve(path, .user_login);
-            if (std.mem.eql(u8, std.fs.path.basename(path), "bash")) {
+            if (std.mem.eql(u8, std.Io.Dir.path.basename(path), "bash")) {
                 removeInteractiveFlag(&invocation);
                 invocation.append("-O");
                 invocation.append("expand_aliases");
@@ -539,7 +540,7 @@ test "resolver rejects missing relative and unsupported shells" {
 test "login shell resolution falls back without accepting explicit unsupported shells" {
     const fallback = try resolve("/opt/homebrew/bin/fish", .user_login);
     try std.testing.expectEqualStrings(fallbackLoginShell(), fallback.path);
-    if (builtin.os.tag == .macos) {
+    if (builtin.target.os.tag == .macos) {
         try std.testing.expectEqualSlices(
             []const u8,
             &.{ "/bin/zsh", "-l", "-i" },
@@ -706,7 +707,7 @@ fn checkBootstrapAllocationFailures(alloc: Allocator) !void {
 
 test "bootstrap construction cleans every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkBootstrapAllocationFailures,
         .{},
     );

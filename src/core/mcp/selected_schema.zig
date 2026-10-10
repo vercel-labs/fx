@@ -46,13 +46,12 @@ fn buildToolSchemaJsonWithLimitMarker(
     defer if (encoded_instructions) |text| alloc.free(text);
     const merged_description = if (instructions != null)
         if (instructions_truncated)
-            try std.fmt.allocPrint(
-                alloc,
+            try alloc.print(
                 "{s}\n\nServer instructions: {s}\n<context_limit name=\"mcp_server_instructions_bytes\" action=\"truncated\" observed_bytes=\"{d}\" effective_bytes=\"{d}\" source=\"{s}\" override=\"--context-limit mcp_server_instructions_bytes=BYTES|off\" />",
                 .{ encoded_description, encoded_instructions.?, instruction_observed_bytes, limit.effectiveBytes(), limit.source.label() },
             )
         else
-            try std.fmt.allocPrint(alloc, "{s}\n\nServer instructions: {s}", .{ encoded_description, encoded_instructions.? })
+            try alloc.print("{s}\n\nServer instructions: {s}", .{ encoded_description, encoded_instructions.? })
     else
         try alloc.dupe(u8, encoded_description);
     defer alloc.free(merged_description);

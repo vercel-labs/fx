@@ -158,8 +158,8 @@ class PgsoCliTests(unittest.TestCase):
         class ToolchainInfo:
             host_arch: str = "arm64"
             target: str = "aarch64-macos"
-            zig_version: str = "0.16.0"
-            llvm_version: str = "21.1.8"
+            zig_version: str = "0.17.0"
+            llvm_version: str = "22.1.8"
 
         @dataclasses.dataclass(frozen=True)
         class CorpusInfo:

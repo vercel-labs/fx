@@ -271,8 +271,9 @@ const PreparedRequest = struct {
     }
 };
 
-// The pinned Zig 0.16 Response.reader has aborted on fixed-length MCP responses
-// by accessing body_remaining_content_length while its state was `.ready`.
+// Zig's Response.reader, unchanged from 0.16 through the pinned 0.17, has
+// aborted on fixed-length MCP responses by accessing
+// body_remaining_content_length while its state was `.ready`.
 // Keep MCP framing in independent state and requests one-shot so teardown never
 // re-enters that body-state path. Remove this adapter when Response.reader
 // passes the fixed-length JSON and SSE regression cases on the pinned toolchain.
@@ -632,7 +633,7 @@ fn appendProjectedProperties(
                 {
                     return error.InvalidProjectedHeaderValue;
                 }
-                break :blk try std.fmt.allocPrint(alloc, "{d}", .{argument.integer});
+                break :blk try alloc.print("{d}", .{argument.integer});
             } else blk: {
                 if (argument != .bool) return error.InvalidProjectedHeaderValue;
                 break :blk try alloc.dupe(u8, if (argument.bool) "true" else "false");
@@ -641,7 +642,7 @@ fn appendProjectedProperties(
 
             const encoded_value = try encodeHeaderValue(alloc, plain_value);
             defer alloc.free(encoded_value);
-            const header_name = try std.fmt.allocPrint(alloc, "Mcp-Param-{s}", .{annotation.string});
+            const header_name = try alloc.print("Mcp-Param-{s}", .{annotation.string});
             defer alloc.free(header_name);
             try headers.appendOwned(alloc, header_name, encoded_value);
         }
@@ -814,7 +815,7 @@ fn needsHeaderEncoding(value: []const u8) bool {
 const MediaType = enum { json, sse };
 
 fn parseMediaType(value: []const u8) ?MediaType {
-    const separator = std.mem.indexOfScalar(u8, value, ';') orelse value.len;
+    const separator = std.mem.findScalar(u8, value, ';') orelse value.len;
     const media_type = std.mem.trim(u8, value[0..separator], " \t");
     if (std.ascii.eqlIgnoreCase(media_type, "application/json")) return .json;
     if (std.ascii.eqlIgnoreCase(media_type, "text/event-stream")) return .sse;
@@ -822,7 +823,7 @@ fn parseMediaType(value: []const u8) ?MediaType {
 }
 
 fn isPlainTextMediaType(value: []const u8) bool {
-    const separator = std.mem.indexOfScalar(u8, value, ';') orelse value.len;
+    const separator = std.mem.findScalar(u8, value, ';') orelse value.len;
     const media_type = std.mem.trim(u8, value[0..separator], " \t");
     return std.ascii.eqlIgnoreCase(media_type, "text/plain");
 }
@@ -1000,7 +1001,7 @@ const SseParser = struct {
         }
         if (line[0] == ':') return;
 
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse line.len;
+        const colon = std.mem.findScalar(u8, line, ':') orelse line.len;
         if (!std.mem.eql(u8, line[0..colon], "data")) return;
         var value = if (colon < line.len) line[colon + 1 ..] else "";
         if (value.len > 0 and value[0] == ' ') value = value[1..];
@@ -1122,7 +1123,7 @@ fn readSseResponse(
         }
         const chunk = reader.buffered();
         if (chunk.len == 0) continue;
-        const chunk_len = if (std.mem.indexOfAny(u8, chunk, "\r\n")) |index|
+        const chunk_len = if (std.mem.findAny(u8, chunk, "\r\n")) |index|
             index + 1
         else
             chunk.len;

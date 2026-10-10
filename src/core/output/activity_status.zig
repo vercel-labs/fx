@@ -257,14 +257,14 @@ fn writeActivityPart(writer: *std.Io.Writer, first: *bool, part: ActivityPart) !
 }
 
 pub fn formatTokenCountCompact(buf: []u8, tokens: u64) []const u8 {
-    if (tokens < 1000) return std.fmt.bufPrint(buf, "{d}", .{tokens}) catch "0";
+    if (tokens < 1000) return std.mem.print(buf, "{d}", .{tokens}) catch "0";
 
     const whole = tokens / 1000;
     const tenths = (tokens % 1000) / 100;
     if (whole < 10 and tenths > 0) {
-        return std.fmt.bufPrint(buf, "{d}.{d}k", .{ whole, tenths }) catch "1k";
+        return std.mem.print(buf, "{d}.{d}k", .{ whole, tenths }) catch "1k";
     }
-    return std.fmt.bufPrint(buf, "{d}k", .{whole}) catch "1k";
+    return std.mem.print(buf, "{d}k", .{whole}) catch "1k";
 }
 
 fn writeTokenProgress(writer: *std.Io.Writer, progress: types.TurnTokenProgress) !void {

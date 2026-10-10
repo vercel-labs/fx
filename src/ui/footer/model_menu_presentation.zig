@@ -205,7 +205,7 @@ const ProviderTabs = struct {
     fn build(items: []const model_cache_runtime.ModelMenuItem) ProviderTabs {
         var tabs: ProviderTabs = .{};
         for (0..model_cache_runtime.model_provider_filter_count) |index| {
-            const filter: model_cache_runtime.ModelProviderFilter = @enumFromInt(index);
+            const filter: model_cache_runtime.ModelProviderFilter = @fromBackingInt(@intCast(index));
             if (!model_cache_runtime.modelProviderFilterAvailable(items, filter)) continue;
             tabs.indices[tabs.len] = index;
             tabs.len += 1;
@@ -224,7 +224,7 @@ const ProviderTabs = struct {
 fn appendHeaderTitle(alloc: Allocator, row: *std.ArrayList(u8), count: usize) !void {
     try row.appendSlice(alloc, ui_render.selected_completion_style);
     var buf: [48]u8 = undefined;
-    const title = std.fmt.bufPrint(&buf, "Models {d}", .{count}) catch "Models";
+    const title = std.mem.print(&buf, "Models {d}", .{count}) catch "Models";
     try row.appendSlice(alloc, title);
     try row.appendSlice(alloc, ui_render.reset_style);
 }
@@ -253,7 +253,7 @@ fn appendProviderOverflowMarker(alloc: Allocator, row: *std.ArrayList(u8)) !void
 }
 
 fn providerTabLabel(index: usize) []const u8 {
-    const filter: model_cache_runtime.ModelProviderFilter = @enumFromInt(index);
+    const filter: model_cache_runtime.ModelProviderFilter = @fromBackingInt(@intCast(index));
     return switch (filter) {
         .all => "All",
         .anthropic => "Anthropic",
@@ -378,12 +378,12 @@ fn tokenFactWidth(tokens: u32, suffix: []const u8) usize {
 
 fn formatTokenFact(buf: *[48]u8, tokens: u32, suffix: []const u8) ![]const u8 {
     if (tokens >= 1_000_000 and tokens % 1_000_000 == 0) {
-        return try std.fmt.bufPrint(buf, "{d}M {s}", .{ tokens / 1_000_000, suffix });
+        return try std.mem.print(buf, "{d}M {s}", .{ tokens / 1_000_000, suffix });
     }
     if (tokens >= 1_000 and tokens % 1_000 == 0) {
-        return try std.fmt.bufPrint(buf, "{d}K {s}", .{ tokens / 1_000, suffix });
+        return try std.mem.print(buf, "{d}K {s}", .{ tokens / 1_000, suffix });
     }
-    return try std.fmt.bufPrint(buf, "{d} {s}", .{ tokens, suffix });
+    return try std.mem.print(buf, "{d} {s}", .{ tokens, suffix });
 }
 
 fn appendMetadataFact(alloc: Allocator, text: *std.ArrayList(u8), fact: []const u8) !void {

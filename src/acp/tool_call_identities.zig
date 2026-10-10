@@ -30,7 +30,7 @@ pub const Target = union(enum) {
 
 pub const Record = struct {
     mutex: std.Io.Mutex = .init,
-    entries: std.StringArrayHashMapUnmanaged(Identity) = .empty,
+    entries: std.array_hash_map.String(Identity) = .empty,
 
     pub fn deinit(self: *Record, alloc: Allocator) void {
         for (self.entries.keys(), self.entries.values()) |name, identity| {
@@ -247,7 +247,7 @@ test "tool identity record refuses names that would outgrow the stored record" {
     var name_buf: [32]u8 = undefined;
     var accepted: usize = 0;
     const full = for (0..max_entries) |index| {
-        const name = try std.fmt.bufPrint(&name_buf, "mcp_s_tool_{d}", .{index});
+        const name = try std.mem.print(&name_buf, "mcp_s_tool_{d}", .{index});
         record.remember(alloc, .none, name, .{ .server = server_name, .tool = @constCast("tool") }) catch |err| {
             try std.testing.expectEqual(error.ToolIdentityRecordFull, err);
             break name;

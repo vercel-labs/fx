@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const lexical_relevance = @import("../../core/shared/lexical_relevance.zig");
 const result_store = @import("../../core/session/result_store.zig");
 const capability_retrieval = @import("../../core/tooling/capability_retrieval.zig");
@@ -172,8 +173,7 @@ fn executionFailure(
     domain: []const u8,
     err: anyerror,
 ) Allocator.Error!tool_dispatch.ToolResult {
-    return .{ .failure = try std.fmt.allocPrint(
-        alloc,
+    return .{ .failure = try alloc.print(
         "capability_search {s} search failed: {s}",
         .{ domain, @errorName(err) },
     ) };
@@ -203,7 +203,7 @@ fn searchMcp(
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Cancelled => return error.Cancelled,
-        else => return .{ .model_output = try std.fmt.allocPrint(ctx.allocator, "{{\"tools\":[],\"count\":0,\"error\":\"{s}\"}}", .{@errorName(err)}) },
+        else => return .{ .model_output = try ctx.allocator.print("{{\"tools\":[],\"count\":0,\"error\":\"{s}\"}}", .{@errorName(err)}) },
     };
 }
 
@@ -423,7 +423,7 @@ test "capability search combined projection releases every allocation failure" {
             alloc.free(output);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Case.run, .{});
 }
 
 test "capability search marks an empty search as terminal" {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
@@ -105,7 +106,7 @@ fn tmpPath(alloc: Allocator, dir: std.Io.Dir, sub_path: []const u8) ![]u8 {
 }
 
 fn writeTempFile(tmp: *std.testing.TmpDir, sub_path: []const u8, content: []const u8) !void {
-    if (std.fs.path.dirname(sub_path)) |parent| {
+    if (std.Io.Dir.path.dirname(sub_path)) |parent| {
         try tmp.dir.createDirPath(io_mod.getIo(), parent);
     }
     var file = try tmp.dir.createFile(io_mod.getIo(), sub_path, .{ .truncate = true });
@@ -166,7 +167,7 @@ test "loadSkills loads managed skills under HOME" {
 }
 
 test "loadSkills canonicalizes a symlinked HOME before discovering optional roots" {
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -179,7 +180,7 @@ test "loadSkills canonicalizes a symlinked HOME before discovering optional root
     };
     const tmp_root = try tmpPath(alloc, tmp.dir, ".");
     defer alloc.free(tmp_root);
-    const linked_home = try std.fs.path.join(alloc, &.{ tmp_root, "linked-home" });
+    const linked_home = try std.Io.Dir.path.join(alloc, &.{ tmp_root, "linked-home" });
     defer alloc.free(linked_home);
     const workspace_path = try tmpPath(alloc, tmp.dir, "real-home/workspace");
     defer alloc.free(workspace_path);
@@ -194,7 +195,7 @@ test "loadSkills canonicalizes a symlinked HOME before discovering optional root
 }
 
 test "loadSkills propagates allocation failure instead of returning an empty inventory" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io_mod.getIo(), "home/workspace");

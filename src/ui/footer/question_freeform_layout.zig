@@ -26,7 +26,7 @@ pub const option_row_indent = "    ";
 
 pub fn optionPrefixWidth(index: usize) usize {
     var ordinal_buf: [16]u8 = undefined;
-    const ordinal = std.fmt.bufPrint(&ordinal_buf, "{d}) ", .{index + 1}) catch "";
+    const ordinal = std.mem.print(&ordinal_buf, "{d}) ", .{index + 1}) catch "";
     return display_width.visibleWidth(option_row_indent) + display_width.visibleWidth(ordinal);
 }
 

@@ -478,12 +478,12 @@ fn matchesDetection(alloc: Allocator, detection: Detection, source: []const u8) 
 fn matchesDiffPatch(source: []const u8) bool {
     const line = firstNonblankLine(source);
     if (std.mem.startsWith(u8, line, "diff --git ") or std.mem.startsWith(u8, line, "@@ ")) return true;
-    return std.mem.startsWith(u8, line, "--- ") and std.mem.indexOf(u8, source, "\n+++ ") != null;
+    return std.mem.startsWith(u8, line, "--- ") and std.mem.find(u8, source, "\n+++ ") != null;
 }
 
 fn matchesTypeScriptAssertion(source: []const u8) bool {
     var start: usize = 0;
-    while (std.mem.indexOfPos(u8, source, start, "} as ")) |assertion_start| {
+    while (std.mem.findPos(u8, source, start, "} as ")) |assertion_start| {
         const type_start = assertion_start + "} as ".len;
         if (type_start < source.len and std.ascii.isUpper(source[type_start])) return true;
         start = type_start;
@@ -502,7 +502,7 @@ fn isValidJson(alloc: Allocator, source: []const u8) bool {
 fn matchesShellShebang(source: []const u8) bool {
     const line = firstNonblankLine(source);
     return std.mem.startsWith(u8, line, "#!") and
-        (std.mem.indexOf(u8, line, "bash") != null or std.mem.indexOf(u8, line, "zsh") != null or std.mem.indexOf(u8, line, "/sh") != null);
+        (std.mem.find(u8, line, "bash") != null or std.mem.find(u8, line, "zsh") != null or std.mem.find(u8, line, "/sh") != null);
 }
 
 fn matchesPythonHeader(source: []const u8) bool {
@@ -518,7 +518,7 @@ fn matchesSqlSelect(source: []const u8) bool {
 fn matchesRustFunction(source: []const u8) bool {
     const line = firstNonblankLine(source);
     if (!std.mem.startsWith(u8, line, "fn ") and !std.mem.startsWith(u8, line, "pub fn ")) return false;
-    return std.mem.indexOf(u8, source, "let ") != null or std.mem.indexOf(u8, source, "println!") != null or std.mem.indexOf(u8, line, "->") != null;
+    return std.mem.find(u8, source, "let ") != null or std.mem.find(u8, source, "println!") != null or std.mem.find(u8, line, "->") != null;
 }
 
 fn firstNonblankLine(source: []const u8) []const u8 {
@@ -533,7 +533,7 @@ fn firstNonblankLine(source: []const u8) []const u8 {
 fn containsLineStart(source: []const u8, prefix: []const u8) bool {
     if (std.mem.startsWith(u8, source, prefix)) return true;
     var start: usize = 0;
-    while (std.mem.indexOfPos(u8, source, start, "\n")) |newline| {
+    while (std.mem.findPos(u8, source, start, "\n")) |newline| {
         const line_start = newline + 1;
         if (std.mem.startsWith(u8, source[line_start..], prefix)) return true;
         start = line_start;

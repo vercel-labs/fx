@@ -79,7 +79,7 @@ pub fn nthLine(buf: []const u8, n: usize) ?[]const u8 {
     var idx: usize = 0;
     var start: usize = 0;
     while (start < buf.len) {
-        const end = std.mem.indexOfScalarPos(u8, buf, start, '\n') orelse buf.len;
+        const end = std.mem.findScalarPos(u8, buf, start, '\n') orelse buf.len;
         if (idx == n) return buf[start..end];
         idx += 1;
         start = end + 1;

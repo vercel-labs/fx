@@ -62,7 +62,7 @@ pub const State = struct {
         if (slot.cursor.* == 0) return;
         const start = text_boundaries.previousCharacterStart(slot.draft.items, slot.cursor.*);
         const count = slot.cursor.* - start;
-        std.mem.copyForwards(u8, slot.draft.items[start..], slot.draft.items[slot.cursor.*..]);
+        @memmove(slot.draft.items[start .. slot.draft.items.len - count], slot.draft.items[slot.cursor.*..]);
         slot.draft.items.len -= count;
         slot.cursor.* = start;
     }
@@ -364,7 +364,7 @@ test "approval amendment traces discarded drafts with their reason" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "approval-feedback.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "approval-feedback.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -394,7 +394,7 @@ test "approval amendment traces the unselected draft after submission" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "approval-feedback-accepted.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "approval-feedback-accepted.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();

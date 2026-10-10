@@ -251,7 +251,7 @@ live message test.
 
 ## Build from source
 
-Building fx requires [Zig 0.16.0+](https://ziglang.org/download/):
+Building fx requires [Zig 0.17.0+](https://ziglang.org/download/):
 
 ```bash
 git clone https://github.com/vercel-labs/fx.git

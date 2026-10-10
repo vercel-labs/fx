@@ -13,6 +13,7 @@
 const std = @import("std");
 const debug_trace = @import("debug_trace.zig");
 const io_mod = @import("io.zig");
+const text_utils = @import("text_utils.zig");
 
 pub const Rgb = struct { r: u8, g: u8, b: u8 };
 
@@ -378,7 +379,7 @@ pub fn closingFor(open: []const u8) []const u8 {
 fn slotEscapeChecked(alloc: std.mem.Allocator, spec: SlotSpec, truecolor: bool) ParseError![]u8 {
     return slotEscape(alloc, spec, truecolor) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        // Writer.Allocating reports allocation failure as WriteFailed in 0.16.
+        // Writer.Allocating reports allocation failure as WriteFailed in 0.17.
         error.WriteFailed => error.OutOfMemory,
     };
 }
@@ -449,16 +450,16 @@ fn jsonString(value: std.json.Value) ?[]const u8 {
 /// `_style` or `_open` ("divider", "inline_code"). Unknown keys are ignored
 /// so newer theme files keep loading on older binaries.
 fn assignSlotEscape(theme: *Theme, json_key: []const u8, escape: []const u8) void {
-    const fields = @typeInfo(Theme).@"struct".fields;
-    inline for (fields) |field| {
-        if (field.type == []const u8 and !std.mem.eql(u8, field.name, "name")) {
+    const info = @typeInfo(Theme).@"struct";
+    inline for (info.field_names, info.field_types) |field_name, field_type| {
+        if (field_type == []const u8 and !std.mem.eql(u8, field_name, "name")) {
             const stripped = comptime blk: {
-                if (std.mem.endsWith(u8, field.name, "_style")) break :blk field.name[0 .. field.name.len - "_style".len];
-                if (std.mem.endsWith(u8, field.name, "_open")) break :blk field.name[0 .. field.name.len - "_open".len];
-                break :blk field.name;
+                if (std.mem.endsWith(u8, field_name, "_style")) break :blk field_name[0 .. field_name.len - "_style".len];
+                if (std.mem.endsWith(u8, field_name, "_open")) break :blk field_name[0 .. field_name.len - "_open".len];
+                break :blk field_name;
             };
             if (std.mem.eql(u8, json_key, stripped)) {
-                @field(theme, field.name) = escape;
+                @field(theme, field_name) = escape;
                 return;
             }
         }
@@ -778,7 +779,7 @@ pub fn siblingName(alloc: std.mem.Allocator, name: []const u8, want_light: bool)
             (if (want_light) "Light" else "Dark")
         else
             (if (want_light) "light" else "dark");
-        return try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ base, suffix[0..1], replacement });
+        return try alloc.print("{s}{s}{s}", .{ base, suffix[0..1], replacement });
     }
     return null;
 }
@@ -822,12 +823,12 @@ pub fn loadNamed(alloc: std.mem.Allocator, name: []const u8, options: ParseOptio
     if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return error.InvalidName;
 
     const home = io_mod.getenv("HOME") orelse return error.ThemeNotFound;
-    const dir_path = try std.fmt.allocPrint(alloc, "{s}/.fx/themes", .{home});
+    const dir_path = try alloc.print("{s}/.fx/themes", .{home});
     defer alloc.free(dir_path);
     var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), dir_path, .{}) catch return error.ThemeNotFound;
     defer dir.close(io_mod.getIo());
 
-    const file_name = try std.fmt.allocPrint(alloc, "{s}.json", .{name});
+    const file_name = try alloc.print("{s}.json", .{name});
     defer alloc.free(file_name);
     var file = io_mod.openExistingRegularFile(dir, file_name, .read_only) catch return error.ThemeNotFound;
     defer file.close(io_mod.getIo());
@@ -847,17 +848,17 @@ test "builtin selects the variant matching the light flag" {
 }
 
 test "every theme slot is populated" {
-    const fields = @typeInfo(Theme).@"struct".fields;
-    inline for (fields) |field| {
-        if (field.type == []const u8) {
-            try std.testing.expect(@field(fx_dark, field.name).len > 0);
-            try std.testing.expect(@field(fx_light, field.name).len > 0);
-        } else if (field.type == SyntaxPalette) {
-            const syntax_fields = @typeInfo(SyntaxPalette).@"struct".fields;
-            inline for (syntax_fields) |syntax_field| {
-                if (syntax_field.type != []const u8) continue;
-                try std.testing.expect(@field(fx_dark.syntax, syntax_field.name).len > 0);
-                try std.testing.expect(@field(fx_light.syntax, syntax_field.name).len > 0);
+    const info = @typeInfo(Theme).@"struct";
+    inline for (info.field_names, info.field_types) |field_name, field_type| {
+        if (field_type == []const u8) {
+            try std.testing.expect(@field(fx_dark, field_name).len > 0);
+            try std.testing.expect(@field(fx_light, field_name).len > 0);
+        } else if (field_type == SyntaxPalette) {
+            const syntax_info = @typeInfo(SyntaxPalette).@"struct";
+            inline for (syntax_info.field_names, syntax_info.field_types) |syntax_name, syntax_type| {
+                if (syntax_type != []const u8) continue;
+                try std.testing.expect(@field(fx_dark.syntax, syntax_name).len > 0);
+                try std.testing.expect(@field(fx_light.syntax, syntax_name).len > 0);
             }
         }
     }
@@ -1010,7 +1011,7 @@ test "parse quantizes native themes for 256-color terminals" {
     try std.testing.expectEqualStrings("\x1b[38;5;196m", theme.divider_style);
     try std.testing.expectEqualStrings("\x1b[38;2;48;164;108m", theme.diff_added_marker_truecolor);
     const fallback_n = rgbToAnsi256(0x30, 0xa4, 0x6c);
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(alloc, "\x1b[38;5;{d}m", .{fallback_n}), theme.diff_added_marker_fallback);
+    try std.testing.expectEqualStrings(try alloc.print("\x1b[38;5;{d}m", .{fallback_n}), theme.diff_added_marker_fallback);
 }
 
 test "parse resolves a VS Code theme through the adapter" {
@@ -1047,7 +1048,7 @@ test "parse resolves a VS Code theme through the adapter" {
     try std.testing.expectEqualStrings("\x1b[38;2;240;240;240m", theme.hint_style);
     // Alpha colors blend over editor.background before resolution.
     const status_expected = blendOver(.{ .r = 0xf0, .g = 0xf0, .b = 0xf0 }, 0x99, .{ .r = 0x18, .g = 0x18, .b = 0x18 });
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(alloc, "\x1b[38;2;{d};{d};{d}m", .{ status_expected.r, status_expected.g, status_expected.b }), theme.statusline_style);
+    try std.testing.expectEqualStrings(try alloc.print("\x1b[38;2;{d};{d};{d}m", .{ status_expected.r, status_expected.g, status_expected.b }), theme.statusline_style);
     try std.testing.expectEqualStrings("\x1b[38;2;241;180;103m", theme.warning_style);
     try std.testing.expectEqualStrings("\x1b[38;2;63;162;102m", theme.green_style);
     try std.testing.expectEqualStrings("\x1b[38;2;252;107;131m", theme.red_style);
@@ -1157,7 +1158,7 @@ test "theme source copies the configured name and pin for live re-resolution" {
     try std.testing.expect(sourceName() == null);
     try std.testing.expect(variantPinned());
 
-    const too_long = "x" ** 65;
+    const too_long = text_utils.repeat("x", 65);
     setSource(too_long, false);
     try std.testing.expect(sourceName() == null);
 }

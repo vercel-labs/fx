@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const file_picker_path = @import("../input/file_picker_path.zig");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -10,6 +11,7 @@ const io_mod = @import("../shared/io.zig");
 const png_downscale = @import("png_downscale.zig");
 const types = @import("../shared/types.zig");
 const pathing = @import("../workspace/pathing.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 pub const max_image_bytes: usize = 20 * 1024 * 1024;
 const max_encoded_image_bytes: usize = 5 * 1024 * 1024;
@@ -243,8 +245,7 @@ pub fn createTempSnapshotDir(alloc: std.mem.Allocator) ![]u8 {
     for (0..16) |_| {
         var suffix: u64 = undefined;
         io_mod.getIo().random(std.mem.asBytes(&suffix));
-        const path = try std.fmt.allocPrint(
-            alloc,
+        const path = try alloc.print(
             "{s}/fx-image-snapshots-{x}",
             .{ temp_root, suffix },
         );
@@ -267,8 +268,8 @@ pub fn createTempSnapshotDir(alloc: std.mem.Allocator) ![]u8 {
 
 pub fn cleanupSnapshotDir(path: []const u8) void {
     if (path.len == 0) return;
-    const parent_path = std.fs.path.dirname(path) orelse return;
-    const name = std.fs.path.basename(path);
+    const parent_path = std.Io.Dir.path.dirname(path) orelse return;
+    const name = std.Io.Dir.path.basename(path);
     var parent = openDirectoryNoFollow(parent_path) catch |err| {
         debug_trace.logf(
             "images",
@@ -408,7 +409,7 @@ pub const VisionRegularFile = struct {
 /// blocking on a special file. Hard-linked regular files remain valid inputs.
 /// The caller owns the returned descriptor and must close it.
 pub fn openVisionRegularFile(canonical_path: []const u8) !VisionRegularFile {
-    if (!std.fs.path.isAbsolute(canonical_path)) return error.InvalidPath;
+    if (!std.Io.Dir.path.isAbsolute(canonical_path)) return error.InvalidPath;
 
     const cwd = std.Io.Dir.cwd();
     const initial = cwd.statFile(io_mod.getIo(), canonical_path, .{
@@ -419,7 +420,7 @@ pub fn openVisionRegularFile(canonical_path: []const u8) !VisionRegularFile {
     };
     if (initial.kind != .file) return error.NotRegularFile;
 
-    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         var file = cwd.openFile(io_mod.getIo(), canonical_path, .{
             .mode = .read_only,
             .allow_directory = false,
@@ -505,7 +506,7 @@ pub fn captureBoundImageAttachment(
     snapshot_dir: []const u8,
     budget: CaptureBudget,
 ) !types.ImageAttachment {
-    if (!std.fs.path.isAbsolute(canonical_path)) return error.InvalidPath;
+    if (!std.Io.Dir.path.isAbsolute(canonical_path)) return error.InvalidPath;
     if (image_id == 0) return error.InvalidImageId;
     try budget.check();
 
@@ -562,8 +563,7 @@ pub fn captureInlineImageBytes(
     defer snapshot_dir_handle.close(io_mod.getIo());
     var random_suffix: u64 = undefined;
     io_mod.getIo().random(std.mem.asBytes(&random_suffix));
-    const source_name = try std.fmt.allocPrint(
-        alloc,
+    const source_name = try alloc.print(
         "image-{d}.acp-source.{x}",
         .{ image_id, random_suffix },
     );
@@ -586,7 +586,7 @@ pub fn captureInlineImageBytes(
         try source.sync(io_mod.getIo());
     }
 
-    const source_path = try std.fs.path.join(alloc, &.{ snapshot_dir, source_name });
+    const source_path = try std.Io.Dir.path.join(alloc, &.{ snapshot_dir, source_name });
     defer alloc.free(source_path);
     var attachment = types.ImageAttachment{
         .id = image_id,
@@ -627,7 +627,7 @@ pub fn captureInlineImageBytesInMemory(
     if (!image_data.fitsEncodedImageLimit(bytes.len)) return error.ImageTooLarge;
     const owned_bytes = try alloc.dupe(u8, bytes);
     errdefer alloc.free(owned_bytes);
-    const owned_path = try std.fmt.allocPrint(alloc, inline_image_path_prefix ++ "{d}", .{image_id});
+    const owned_path = try alloc.print(inline_image_path_prefix ++ "{d}", .{image_id});
     errdefer alloc.free(owned_path);
     const owned_media_type = try alloc.dupe(u8, declared_media_type);
     errdefer alloc.free(owned_media_type);
@@ -660,8 +660,7 @@ fn captureImageSnapshotFromOpenFileWithBudget(
     var snapshot_dir_handle = try openOrCreateSnapshotDirectoryNoFollow(snapshot_dir);
     defer snapshot_dir_handle.close(io_mod.getIo());
 
-    const source_temp_name = try std.fmt.allocPrint(
-        alloc,
+    const source_temp_name = try alloc.print(
         "image-{d}.source.{d}",
         .{ attachment.id, io_mod.nanoTimestamp() },
     );
@@ -685,13 +684,12 @@ fn captureImageSnapshotFromOpenFileWithBudget(
     const media_type = try alloc.dupe(u8, metadata.media_type);
     errdefer alloc.free(media_type);
 
-    const final_name = try std.fmt.allocPrint(
-        alloc,
+    const final_name = try alloc.print(
         "image-{d}-{s}.bin",
         .{ attachment.id, metadata.digest_hex[0..16] },
     );
     defer alloc.free(final_name);
-    const final_path = try std.fs.path.join(alloc, &.{ snapshot_dir, final_name });
+    const final_path = try std.Io.Dir.path.join(alloc, &.{ snapshot_dir, final_name });
     errdefer alloc.free(final_path);
     try budget.check();
     try snapshot_dir_handle.rename(source_temp_name, snapshot_dir_handle, final_name, io_mod.getIo());
@@ -945,7 +943,7 @@ fn deleteSnapshotFile(dir: std.Io.Dir, name: []const u8, reason: []const u8) voi
 }
 
 fn deleteSnapshotPath(path: []const u8, reason: []const u8) void {
-    const parent_path = std.fs.path.dirname(path) orelse {
+    const parent_path = std.Io.Dir.path.dirname(path) orelse {
         debug_trace.logf(
             "images",
             "event=snapshot_cleanup_failed reason={s} err=ImageSnapshotPathUnsafe",
@@ -953,7 +951,7 @@ fn deleteSnapshotPath(path: []const u8, reason: []const u8) void {
         );
         return;
     };
-    const name = std.fs.path.basename(path);
+    const name = std.Io.Dir.path.basename(path);
     var parent = openDirectoryNoFollow(parent_path) catch |err| {
         debug_trace.logf(
             "images",
@@ -987,16 +985,16 @@ fn validateSnapshotPathComponent(component: []const u8) !void {
     if (component.len == 0 or
         std.mem.eql(u8, component, ".") or
         std.mem.eql(u8, component, "..") or
-        std.mem.indexOfAny(u8, component, "/\\") != null)
+        std.mem.findAny(u8, component, "/\\") != null)
     {
         return error.ImageSnapshotPathUnsafe;
     }
 }
 
 fn openDirectoryNoFollow(path: []const u8) !std.Io.Dir {
-    if (!std.fs.path.isAbsolute(path)) return error.ImageSnapshotPathUnsafe;
+    if (!std.Io.Dir.path.isAbsolute(path)) return error.ImageSnapshotPathUnsafe;
 
-    var components = std.fs.path.componentIterator(path);
+    var components = std.Io.Dir.path.componentIterator(path);
     const root = components.root() orelse return error.ImageSnapshotPathUnsafe;
     var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), root, .{
         .follow_symlinks = false,
@@ -1023,9 +1021,9 @@ const snapshot_dir_open_options: std.Io.Dir.OpenOptions = .{
 };
 
 fn openOrCreateSnapshotDirectoryNoFollow(path: []const u8) !std.Io.Dir {
-    if (!std.fs.path.isAbsolute(path)) return error.ImageSnapshotPathUnsafe;
-    const parent_path = std.fs.path.dirname(path) orelse return error.ImageSnapshotPathUnsafe;
-    const name = std.fs.path.basename(path);
+    if (!std.Io.Dir.path.isAbsolute(path)) return error.ImageSnapshotPathUnsafe;
+    const parent_path = std.Io.Dir.path.dirname(path) orelse return error.ImageSnapshotPathUnsafe;
+    const name = std.Io.Dir.path.basename(path);
     try validateSnapshotPathComponent(name);
 
     var parent = try openDirectoryNoFollow(parent_path);
@@ -1055,9 +1053,9 @@ fn openOrCreateSnapshotDirectoryNoFollow(path: []const u8) !std.Io.Dir {
 }
 
 fn openSnapshotFileNoFollow(path: []const u8) !std.Io.File {
-    if (!std.fs.path.isAbsolute(path)) return error.ImageSnapshotPathUnsafe;
-    const parent_path = std.fs.path.dirname(path) orelse return error.ImageSnapshotPathUnsafe;
-    const name = std.fs.path.basename(path);
+    if (!std.Io.Dir.path.isAbsolute(path)) return error.ImageSnapshotPathUnsafe;
+    const parent_path = std.Io.Dir.path.dirname(path) orelse return error.ImageSnapshotPathUnsafe;
+    const name = std.Io.Dir.path.basename(path);
     try validateSnapshotPathComponent(name);
 
     var parent = try openDirectoryNoFollow(parent_path);
@@ -1158,7 +1156,7 @@ pub fn cloneVerifiedImageAttachment(
     if (new_id == 0) return error.InvalidImageId;
     const source_snapshot_path = attachment.snapshot_path orelse
         return error.MissingImageSnapshot;
-    const snapshot_dir = std.fs.path.dirname(source_snapshot_path) orelse
+    const snapshot_dir = std.Io.Dir.path.dirname(source_snapshot_path) orelse
         return error.ImageSnapshotPathUnsafe;
     return copyVerifiedImageAttachmentToDir(
         alloc,
@@ -1187,17 +1185,15 @@ pub fn copyVerifiedImageAttachmentToDir(
     const digest = try alloc.dupe(u8, source_digest);
     errdefer alloc.free(digest);
 
-    const final_name = try std.fmt.allocPrint(
-        alloc,
+    const final_name = try alloc.print(
         "image-{d}-{s}.bin",
         .{ new_id, source_digest[0..16] },
     );
     defer alloc.free(final_name);
-    const final_path = try std.fs.path.join(alloc, &.{ snapshot_dir, final_name });
+    const final_path = try std.Io.Dir.path.join(alloc, &.{ snapshot_dir, final_name });
     errdefer alloc.free(final_path);
 
-    const temp_name = try std.fmt.allocPrint(
-        alloc,
+    const temp_name = try alloc.print(
         "image-{d}.clone.{d}",
         .{ new_id, io_mod.nanoTimestamp() },
     );
@@ -1343,7 +1339,7 @@ pub fn writeImageBadgeClipped(writer: *std.Io.Writer, image_id: usize, abs_path:
     if (max_cells == 0) return;
 
     var label_buf: [64]u8 = undefined;
-    const label = try std.fmt.bufPrint(&label_buf, "[Image {d}]", .{image_id});
+    const label = try std.mem.print(&label_buf, "[Image {d}]", .{image_id});
     const clipped_label = display_width.prefixByWidth(label, max_cells);
 
     try writer.writeAll("\x1b]8;;file://");
@@ -1777,18 +1773,17 @@ pub const ClipboardImageAttachment = struct {
 };
 
 pub fn loadClipboardImageAttachment(alloc: std.mem.Allocator) !ClipboardImageAttachment {
-    if (builtin.os.tag != .macos) return error.Unsupported;
+    if (builtin.target.os.tag != .macos) return error.Unsupported;
 
     const source_dir = try createTempSnapshotDir(alloc);
     errdefer {
         cleanupSnapshotDir(source_dir);
         alloc.free(source_dir);
     }
-    const temp_path = try std.fs.path.join(alloc, &.{ source_dir, "clipboard.png" });
+    const temp_path = try std.Io.Dir.path.join(alloc, &.{ source_dir, "clipboard.png" });
     defer alloc.free(temp_path);
 
-    const write_script = try std.fmt.allocPrint(
-        alloc,
+    const write_script = try alloc.print(
         "set outFile to POSIX file \"{s}\"\n" ++
             "set pngData to the clipboard as «class PNGf»\n" ++
             "set fileRef to open for access outFile with write permission\n" ++
@@ -1893,7 +1888,7 @@ pub fn splitImagePathToken(raw: []const u8) ?ImagePathToken {
             const payload = trimmed[token.path_start..token.path_end];
             var storage: [std.Io.Dir.max_path_bytes]u8 = undefined;
             const decoded = file_picker_path.decode_into(payload, &storage) catch return null;
-            const dot = std.mem.lastIndexOfScalar(u8, decoded, '.') orelse return null;
+            const dot = std.mem.findScalarLast(u8, decoded, '.') orelse return null;
             if (!supported_path_extension(decoded[dot..])) return null;
             return .{ .path = payload, .suffix = trimmed[token.quote_end.?..], .literal_payload = true };
         }
@@ -2232,7 +2227,7 @@ test "authorized image lookup cleans up allocation failure" {
         .media_type = @constCast("image/png"),
     }};
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     try std.testing.expectError(
@@ -2476,9 +2471,9 @@ test "extractInlineImageAttachments replaces supported paths with matching place
     const escaped = try std.mem.replaceOwned(u8, arena, path, " ", "\\ ");
 
     const inputs = [_][]const u8{
-        try std.fmt.allocPrint(arena, "look this {s} now", .{escaped}),
-        try std.fmt.allocPrint(arena, "look this \"{s}\" now", .{path}),
-        try std.fmt.allocPrint(arena, "look this '{s}' now", .{path}),
+        try arena.print("look this {s} now", .{escaped}),
+        try arena.print("look this \"{s}\" now", .{path}),
+        try arena.print("look this '{s}' now", .{path}),
     };
     for (inputs) |input| {
         const result = try extractInlineImageAttachments(arena, "/", input, 1);
@@ -2601,7 +2596,7 @@ test "inline image edits are pure lossless replacements with half open maps" {
     try std.testing.expectEqualStrings(" \t\r\n[Image #9] \n", unchanged.text);
     try std.testing.expectEqual(@as(usize, 0), unchanged.edits.len);
     try std.testing.expectError(error.InvalidImageOccurrence, rewrite_inline_images(alloc, source, &.{ replacements[1], replacements[0] }));
-    try std.testing.checkAllAllocationFailures(alloc, struct {
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
         fn check(a: std.mem.Allocator, text: []const u8, edits: []const InlineImageReplacement) !void {
             const rewritten = try rewrite_inline_images(a, text, edits);
             defer a.free(rewritten.text);
@@ -2627,7 +2622,7 @@ test "canonical at images load exact filenames and preserve legacy eligibility" 
         try std.testing.expect(token.literal_payload);
         const image = try load_inline_image_attachment(alloc, root, token);
         defer types.freeImageAttachment(alloc, image);
-        const expected = try std.fs.path.join(alloc, &.{ root, name });
+        const expected = try std.Io.Dir.path.join(alloc, &.{ root, name });
         defer alloc.free(expected);
         try std.testing.expectEqualStrings(expected, image.path);
     }
@@ -2682,7 +2677,7 @@ test "extractInlineImageAttachments preserves punctuation after attached paths" 
     }
     const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "punctuated.png");
     defer alloc.free(path);
-    const input = try std.fmt.allocPrint(alloc, "inspect {s}, then", .{path});
+    const input = try alloc.print("inspect {s}, then", .{path});
     defer alloc.free(input);
 
     const result = try extractInlineImageAttachments(alloc, "/", input, 1);
@@ -2695,7 +2690,7 @@ test "extractInlineImageAttachments preserves punctuation after attached paths" 
 fn testSnapshotDir(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    return std.fs.path.join(alloc, &.{ root, "snapshots" });
+    return std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
 }
 
 fn testCapturedAttachment(
@@ -3079,8 +3074,7 @@ test "requests leave out attachments over the model pixel limit and name their s
 
     try std.testing.expectEqual(@as(usize, 1), projected[0].images.len);
     try std.testing.expectEqual(@as(usize, 2), projected[0].images[0].id);
-    const expected = try std.fmt.allocPrint(
-        arena,
+    const expected = try arena.print(
         "[Image #1 not sent: image/jpeg is 3420x2224 pixels. This request permits at most 2000 per side and 5 MiB encoded per image. The original is saved at {s}. Use an available image tool to save a smaller copy to a new file ending in .jpg, then read_file the copy. If no image tool is available, ask the user before installing one.]\ncompare [Image #1] and [Image #2]",
         .{wide_path},
     );
@@ -3100,7 +3094,7 @@ test "request cache still withholds a snapshot deleted after dimension lookup" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "image-1-0000000000000001.bin", .data = &wide });
     const wide_path = try io_mod.dirRealpathAlloc(arena, tmp.dir, "image-1-0000000000000001.bin");
     const images = [_]types.ImageAttachment{
-        .{ .id = 1, .path = @constCast("photo.jpg"), .media_type = @constCast("image/jpeg"), .snapshot_path = wide_path, .snapshot_sha256 = @constCast("a" ** 64) },
+        .{ .id = 1, .path = @constCast("photo.jpg"), .media_type = @constCast("image/jpeg"), .snapshot_path = wide_path, .snapshot_sha256 = @constCast(text_utils.repeat("a", 64)) },
     };
     const messages = [_]types.ChatMessage{
         .{ .role = .user, .content = "[Image #1]", .images = &images },
@@ -3405,7 +3399,7 @@ test "partial multi-image capture rolls back earlier snapshots" {
     defer alloc.free(first_path);
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const missing_path = try std.fs.path.join(alloc, &.{ root, "missing.png" });
+    const missing_path = try std.Io.Dir.path.join(alloc, &.{ root, "missing.png" });
     defer alloc.free(missing_path);
     const snapshot_dir = try testSnapshotDir(alloc, &tmp);
     defer alloc.free(snapshot_dir);
@@ -3451,7 +3445,7 @@ test "twenty image capture retains one immutable snapshot per image" {
     }
     for (&attachments, 0..) |*attachment, index| {
         var name_buf: [32]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buf, "image-{d}.png", .{index + 1});
+        const name = try std.mem.print(&name_buf, "image-{d}.png", .{index + 1});
         {
             var file = try tmp.dir.createFile(std.testing.io, name, .{});
             defer file.close(std.testing.io);
@@ -3489,7 +3483,7 @@ test "snapshot capture rejects a symlinked destination directory" {
 
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const outside_path = try std.fs.path.join(alloc, &.{ root, "outside" });
+    const outside_path = try std.Io.Dir.path.join(alloc, &.{ root, "outside" });
     defer alloc.free(outside_path);
     var session_dir = try tmp.dir.openDir(std.testing.io, "session", .{});
     defer session_dir.close(std.testing.io);
@@ -3502,7 +3496,7 @@ test "snapshot capture rejects a symlinked destination directory" {
 
     const source_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "source.png");
     defer alloc.free(source_path);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "session", "images" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "session", "images" });
     defer alloc.free(snapshot_dir);
     var attachment = try loadImageAttachment(alloc, source_path);
     defer types.freeImageAttachment(alloc, attachment);
@@ -3532,14 +3526,14 @@ test "snapshot discard does not follow a replaced destination directory" {
     defer alloc.free(root);
     const source_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "source.png");
     defer alloc.free(source_path);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "session", "images" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "session", "images" });
     defer alloc.free(snapshot_dir);
     var attachment = try loadImageAttachment(alloc, source_path);
     defer types.freeImageAttachment(alloc, attachment);
     attachment.id = 1;
     try captureImageSnapshot(alloc, &attachment, snapshot_dir);
 
-    const leaf = try alloc.dupe(u8, std.fs.path.basename(attachment.snapshot_path.?));
+    const leaf = try alloc.dupe(u8, std.Io.Dir.path.basename(attachment.snapshot_path.?));
     defer alloc.free(leaf);
     var session_dir = try tmp.dir.openDir(std.testing.io, "session", .{});
     defer session_dir.close(std.testing.io);
@@ -3550,7 +3544,7 @@ test "snapshot discard does not follow a replaced destination directory" {
         .sub_path = leaf,
         .data = "outside-sentinel",
     });
-    const outside_path = try std.fs.path.join(alloc, &.{ root, "outside" });
+    const outside_path = try std.Io.Dir.path.join(alloc, &.{ root, "outside" });
     defer alloc.free(outside_path);
     session_dir.symLink(std.testing.io, outside_path, "images", .{
         .is_directory = true,
@@ -3593,7 +3587,7 @@ test "verified snapshot loading rejects a symlink before and after retargeting" 
     };
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const link_path = try std.fs.path.join(alloc, &.{ root, "snapshot-link.bin" });
+    const link_path = try std.Io.Dir.path.join(alloc, &.{ root, "snapshot-link.bin" });
     defer alloc.free(link_path);
     const digest = testSha256Hex(original);
     const attachment = types.ImageAttachment{
@@ -3670,7 +3664,7 @@ test "verified snapshot loading rejects a symlinked directory" {
     };
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const snapshot_path = try std.fs.path.join(alloc, &.{ root, "images-link", "snapshot.bin" });
+    const snapshot_path = try std.Io.Dir.path.join(alloc, &.{ root, "images-link", "snapshot.bin" });
     defer alloc.free(snapshot_path);
     const digest = testSha256Hex(original);
     const attachment = types.ImageAttachment{
@@ -3821,7 +3815,7 @@ test "capture derives media type from captured bytes" {
 }
 
 test "capture removes final snapshot when digest allocation fails after rename" {
-    const base_alloc = std.testing.allocator;
+    const base_alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     {
@@ -3884,7 +3878,7 @@ test "writeImageFilePartJson preserves attached bytes after source replacement" 
 }
 
 test "image file part serialization obeys the caller allocator" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{

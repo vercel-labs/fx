@@ -99,7 +99,7 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
         .request = request,
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return .{ .failure = try std.fmt.allocPrint(ctx.allocator, "ask_user_question failed: {s}", .{@errorName(err)}) },
+        else => return .{ .failure = try ctx.allocator.print("ask_user_question failed: {s}", .{@errorName(err)}) },
     };
     return .{ .success = output };
 }

@@ -145,7 +145,7 @@ test "codec round trips the shared generation fact shape" {
     defer decoded.deinit(alloc);
 
     try std.testing.expect(usage_report.GenerationFact.eql(expected, decoded));
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         encoded.written(),
         "request_count",

@@ -390,7 +390,7 @@ test "parse covers every registered slash command token and alias" {
 test "parse payload acceptance follows slash spec metadata" {
     var buf: [128]u8 = undefined;
     for (testSlashRegistry().commands) |spec| {
-        const command_with_payload = try std.fmt.bufPrint(&buf, "{s} sample", .{spec.command});
+        const command_with_payload = try std.mem.print(&buf, "{s} sample", .{spec.command});
         const parsed = parse(testSlashRegistry(), command_with_payload);
         if (spec.accepts_payload) {
             try std.testing.expect(!parsedIsUnknown(parsed));

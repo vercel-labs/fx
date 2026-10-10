@@ -739,7 +739,7 @@ fn loadStartupStateWithKeychainRead(
     if (auth_mode == .local and !state.model_requests_blocked) {
         if (credential_mode) |mode| defer_or_resolve: {
             if (keychain_read == .deferred and mode == .stored and keychainReadDeferrable(
-                builtin.os.tag == .macos,
+                builtin.target.os.tag == .macos,
                 secret_store.isDisabled(),
                 state.provider,
                 settings.credential_source,
@@ -2336,18 +2336,18 @@ test "full transcript drift recovery is explicit and scoped to lifecycle" {
 
 test "abnormal exit restoration leaves the alternate screen" {
     try std.testing.expect(std.mem.startsWith(u8, abnormal_exit_restore, "\x1b[?2026l"));
-    try std.testing.expect(std.mem.indexOf(u8, abnormal_exit_restore, "\x1b[?2026l").? <
-        std.mem.indexOf(u8, abnormal_exit_restore, ui_terminal.alternate_screen_leave_sequence).?);
+    try std.testing.expect(std.mem.find(u8, abnormal_exit_restore, "\x1b[?2026l").? <
+        std.mem.find(u8, abnormal_exit_restore, ui_terminal.alternate_screen_leave_sequence).?);
     try std.testing.expect(std.mem.startsWith(
         u8,
         normal_exit_restore,
         ui_terminal.theme_notification_disable_sequence ++ "\x1b[?2026l",
     ));
-    try std.testing.expect(std.mem.indexOf(u8, abnormal_exit_restore, "\x1b[?1000l") != null);
-    try std.testing.expect(std.mem.indexOf(u8, abnormal_exit_restore, "\x1b[?1006l") != null);
-    try std.testing.expect(std.mem.indexOf(u8, abnormal_exit_restore, "\x1b[?1049l") != null);
-    try std.testing.expect(std.mem.indexOf(u8, abnormal_exit_restore, "\x1b[?2031l") != null);
-    try std.testing.expect(std.mem.indexOf(u8, normal_exit_restore, "\x1b[?2031l") != null);
+    try std.testing.expect(std.mem.find(u8, abnormal_exit_restore, "\x1b[?1000l") != null);
+    try std.testing.expect(std.mem.find(u8, abnormal_exit_restore, "\x1b[?1006l") != null);
+    try std.testing.expect(std.mem.find(u8, abnormal_exit_restore, "\x1b[?1049l") != null);
+    try std.testing.expect(std.mem.find(u8, abnormal_exit_restore, "\x1b[?2031l") != null);
+    try std.testing.expect(std.mem.find(u8, normal_exit_restore, "\x1b[?2031l") != null);
 }
 
 test "exit and suspend restoration clear the program status record" {
@@ -2509,10 +2509,10 @@ test "shutdown cleanup erases from footer frame top after frame commit" {
 }
 
 test "startup credential modes select a refresh policy, never a narrower source set" {
-    const modes = std.meta.fields(CredentialLoadMode);
+    const modes = @typeInfo(CredentialLoadMode).@"enum".field_names;
     try std.testing.expectEqual(@as(usize, 2), modes.len);
-    try std.testing.expectEqualStrings("stored", modes[0].name);
-    try std.testing.expectEqualStrings("refresh_if_needed", modes[1].name);
+    try std.testing.expectEqualStrings("stored", modes[0]);
+    try std.testing.expectEqualStrings("refresh_if_needed", modes[1]);
 }
 
 test "loadStartupState applies core env overrides" {
@@ -2557,8 +2557,7 @@ test "ultrafast startup separates profile preferences from process overrides" {
     defer alloc.free(profile_off_root);
     const profile_on_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "profile-on");
     defer alloc.free(profile_on_root);
-    const settings = try std.fmt.allocPrint(
-        alloc,
+    const settings = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"ultrafast_mode\":false}},\"{s}\":{{\"ultrafast_mode\":true}}}}}}\n",
         .{ profile_off_root, profile_on_root },
     );
@@ -2639,8 +2638,7 @@ test "loadStartupState defaults fast mode off and requires bound explicit prefer
     const codex_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "codex");
     defer std.testing.allocator.free(codex_root);
 
-    const fixture = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const fixture = try std.testing.allocator.print(
         "{{\"workspaces\":{{\"{s}\":{{\"model\":\"openai/gpt-5\"}},\"{s}\":{{\"fast_mode\":false}},\"{s}\":{{\"model\":\"zai/glm-5.3\",\"fast_mode\":true}},\"{s}\":{{\"model\":\"provider/fast-toggle\",\"fast_mode\":true,\"fast_mode_model_bound\":true}},\"{s}\":{{\"provider\":\"codex\",\"codex_model\":\"gpt-5.4-mini\"}}}}}}\n",
         .{ configured_root, disabled_root, legacy_fast_root, bound_fast_root, codex_root },
     );
@@ -2703,8 +2701,7 @@ test "loadStartupState resolves startup scrollback default and explicit false" {
     const disabled_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "disabled");
     defer std.testing.allocator.free(disabled_root);
 
-    const fixture = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const fixture = try std.testing.allocator.print(
         "{{\"workspaces\":{{\"{s}\":{{\"startup_scrollback\":false}}}}}}\n",
         .{disabled_root},
     );
@@ -2900,7 +2897,7 @@ test "interactive launch leaves a Keychain credential unresolved for the caller"
         var state = try loadStartupStateWithKeychainRead(alloc, oauth_transport.unavailable_provider, keychain_store, try alloc.dupe(u8, workspace_root), "default/model", 25, .local, null, .stored, null, null, keychain_read);
         defer state.deinit(alloc);
         try std.testing.expect(state.credential == null);
-        if (keychain_read == .deferred and builtin.os.tag == .macos) {
+        if (keychain_read == .deferred and builtin.target.os.tag == .macos) {
             const request = state.deferred_credential orelse return error.TestExpectedDeferredCredential;
             try std.testing.expectEqual(model_provider.ProviderId.gateway, request.provider);
             try std.testing.expectEqual(@as(?credentials.Source, .fx_login), request.preferred);

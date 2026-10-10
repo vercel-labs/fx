@@ -17,9 +17,7 @@ const oauth_transport = @import("core/auth/oauth_transport.zig");
 const builtin_gateway = @import("builtins/gateway.zig");
 const builtin_modes = @import("builtins/modes.zig");
 
-const c = @cImport({
-    @cInclude("node_api.h");
-});
+const c = @import("node_api");
 
 const Allocator = std.mem.Allocator;
 const max_drain_bytes = 1024 * 1024;
@@ -52,7 +50,7 @@ const ReadyNotifier = struct {
 
     fn init() error{ReadyChannelFailed}!ReadyNotifier {
         var pair: [2]c_int = undefined;
-        const flags = if (@import("builtin").os.tag == .macos) 0 else std.c.SOCK.CLOEXEC | std.c.SOCK.NONBLOCK;
+        const flags = if (@import("builtin").target.os.tag == .macos) 0 else std.c.SOCK.CLOEXEC | std.c.SOCK.NONBLOCK;
         const socket_type = std.c.SOCK.STREAM | flags;
         if (std.c.socketpair(std.c.AF.UNIX, socket_type, 0, &pair) != 0) return error.ReadyChannelFailed;
         errdefer for (pair) |fd| {
@@ -134,7 +132,7 @@ const InputQueue = struct {
         const queued = self.bytes.items.len - self.offset;
         if (data.len > max_input_bytes or queued > max_input_bytes - data.len) return error.InputQueueFull;
         if (self.offset > 0) {
-            std.mem.copyForwards(u8, self.bytes.items[0..queued], self.bytes.items[self.offset..]);
+            @memmove(self.bytes.items[0..queued], self.bytes.items[self.offset..]);
             self.bytes.items.len = queued;
             self.offset = 0;
         }
@@ -168,11 +166,18 @@ const OutputQueue = struct {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        errdefer |err| if (err != error.OutputClosed) {
-            self.failed = true;
-            self.wake.broadcast(io);
-            self.ready.?.notify();
+        self.writeLocked(alloc, data) catch |err| {
+            if (err != error.OutputClosed) {
+                self.failed = true;
+                self.wake.broadcast(io);
+                self.ready.?.notify();
+            }
+            return err;
         };
+    }
+
+    fn writeLocked(self: *OutputQueue, alloc: Allocator, data: []const u8) !void {
+        const io = io_mod.getIo();
         if (data.len > max_output_message_bytes) return error.OutputMessageTooLarge;
         var written: usize = 0;
         while (written < data.len) {
@@ -184,7 +189,7 @@ const OutputQueue = struct {
                 continue;
             }
             if (self.offset > 0) {
-                std.mem.copyForwards(u8, self.bytes.items[0..queued], self.bytes.items[self.offset..]);
+                @memmove(self.bytes.items[0..queued], self.bytes.items[self.offset..]);
                 self.bytes.items.len = queued;
                 self.offset = 0;
             }
@@ -536,7 +541,7 @@ const FetchBridge = struct {
         const queued = self.response.items.len - self.response_offset;
         if (data.len > max_fetch_response_bytes or queued > max_fetch_response_bytes - data.len) return .backpressure;
         if (self.response_offset > 0) {
-            std.mem.copyForwards(u8, self.response.items[0..queued], self.response.items[self.response_offset..]);
+            @memmove(self.response.items[0..queued], self.response.items[self.response_offset..]);
             self.response.items.len = queued;
             self.response_offset = 0;
         }
@@ -1102,7 +1107,7 @@ fn fetch_handle_arg(env: c.napi_env, value: c.napi_value) ?fetch_state.Handle {
 
 fn fetch_operation_value(env: c.napi_env, result: FetchOperationResult) c.napi_value {
     var value: c.napi_value = undefined;
-    if (!statusOk(env, c.napi_create_uint32(env, @intFromEnum(result), &value), "could not create fetch operation result")) return null;
+    if (!statusOk(env, c.napi_create_uint32(env, @backingInt(result), &value), "could not create fetch operation result")) return null;
     return value;
 }
 
@@ -1268,7 +1273,7 @@ fn coreFetchDisposition(env: c.napi_env, info: c.napi_callback_info) callconv(.c
     defer unlockRuntime(runtime_handle);
     const disposition = runtime.fetch.disposition(fetch_handle);
     var value: c.napi_value = undefined;
-    if (!statusOk(env, c.napi_create_int32(env, @intFromEnum(disposition), &value), "could not query fetch disposition")) return null;
+    if (!statusOk(env, c.napi_create_int32(env, @backingInt(disposition), &value), "could not query fetch disposition")) return null;
     return value;
 }
 

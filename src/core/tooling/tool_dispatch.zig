@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const core_permissions = @import("../permissions/permissions.zig");
@@ -549,7 +550,7 @@ pub fn dispatchRunCommandCompatibility(
         registry,
         request.command,
     )) orelse return null;
-    if (std.mem.indexOfAny(u8, request.command, "|;&\n") != null) return null;
+    if (std.mem.findAny(u8, request.command, "|;&\n") != null) return null;
     return try matched.compatibility.execute(ctx, request.command);
 }
 
@@ -855,7 +856,7 @@ pub fn dispatchToolCall(ctx: DispatchContext, registry: Registry, call: message.
 
     const admission = try admitToolCall(call_ctx, registry, call);
     switch (admission) {
-        .not_registered => return failure(try std.fmt.allocPrint(call_ctx.allocator, "unknown tool: {s}", .{call.name})),
+        .not_registered => return failure(try call_ctx.allocator.print("unknown tool: {s}", .{call.name})),
         .failure => |reason| return failure(reason),
         .admitted => |admitted| {
             defer admitted.deinit();
@@ -893,7 +894,7 @@ pub fn dispatchAuthorizedToolCall(
 ) DispatchError!AuthorizedDispatchResult {
     const validated = try decodeAndValidateRegisteredToolCall(ctx, registry, call);
     switch (validated) {
-        .not_registered => return .{ .status = .failure, .body = try std.fmt.allocPrint(ctx.allocator, "unknown tool: {s}", .{call.name}) },
+        .not_registered => return .{ .status = .failure, .body = try ctx.allocator.print("unknown tool: {s}", .{call.name}) },
         .failure => |reason| return .{ .status = .failure, .body = reason },
         .input => |input| {
             defer input.value.deinit(ctx.allocator);
@@ -1371,7 +1372,7 @@ fn checkAdmitToolCallAskFailureAllocationFailures(alloc: Allocator) !void {
 
 test "admitToolCall cleans decoded input across ask failure-body allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkAdmitToolCallAskFailureAllocationFailures,
         .{},
     );
@@ -1417,7 +1418,7 @@ test "dispatchToolCall traces denied web_search query without secrets or executi
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "web-search-denied-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "web-search-denied-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();

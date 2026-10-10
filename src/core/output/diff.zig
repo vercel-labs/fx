@@ -110,7 +110,7 @@ pub fn wrapWithMarkers(alloc: Allocator, id: u32, content: []const u8) ![]u8 {
     errdefer out.deinit(alloc);
 
     var id_buf: [16]u8 = undefined;
-    const id_str = try std.fmt.bufPrint(&id_buf, "{d}", .{id});
+    const id_str = try std.mem.print(&id_buf, "{d}", .{id});
 
     try out.appendSlice(alloc, diff_block_start_prefix);
     try out.appendSlice(alloc, id_str);
@@ -125,13 +125,13 @@ pub fn wrapWithMarkers(alloc: Allocator, id: u32, content: []const u8) ![]u8 {
 pub fn markedDiffBlockId(bytes: []const u8) ?u32 {
     if (!std.mem.startsWith(u8, bytes, diff_block_start_prefix)) return null;
     const id_start = diff_block_start_prefix.len;
-    const bell_pos = std.mem.indexOfScalarPos(u8, bytes, id_start, osc_bell) orelse
+    const bell_pos = std.mem.findScalarPos(u8, bytes, id_start, osc_bell) orelse
         return null;
     const id_digits = bytes[id_start..bell_pos];
     const id = std.fmt.parseInt(u32, id_digits, 10) catch return null;
 
     var end_marker: [32]u8 = undefined;
-    const end = std.fmt.bufPrint(
+    const end = std.mem.print(
         &end_marker,
         "{s}{s}{c}",
         .{ diff_block_end_prefix, id_digits, osc_bell },
@@ -1015,7 +1015,7 @@ fn formatFileChangeReviewLines(
     for (lines) |line| {
         var elision_text: [64]u8 = undefined;
         const text = if (line.op == .elision)
-            try std.fmt.bufPrint(&elision_text, "{d} unchanged lines ⋯", .{line.elision_count})
+            try std.mem.print(&elision_text, "{d} unchanged lines ⋯", .{line.elision_count})
         else
             line.text;
         try appendDiffRenderLine(alloc, &out, .{
@@ -1134,7 +1134,7 @@ fn appendDiffLineNumber(
 ) !void {
     var number_buffer: [10]u8 = undefined;
     const number = if (line_number) |value|
-        try std.fmt.bufPrint(&number_buffer, "{d}", .{value})
+        try std.mem.print(&number_buffer, "{d}", .{value})
     else
         "";
     try out.appendNTimes(alloc, ' ', width - number.len);
@@ -1267,7 +1267,7 @@ const ForwardLineIterator = struct {
         if (self.cursor >= self.text.len) return null;
 
         const start = self.cursor;
-        const newline = std.mem.indexOfScalarPos(u8, self.text, start, '\n');
+        const newline = std.mem.findScalarPos(u8, self.text, start, '\n');
         const end = newline orelse self.text.len;
         self.cursor = if (newline) |index| index + 1 else self.text.len;
 
@@ -1767,7 +1767,7 @@ fn indexLineStarts(alloc: Allocator, text: []const u8) Allocator.Error![]usize {
     var cursor: usize = 0;
     for (starts) |*start| {
         start.* = cursor;
-        cursor = if (std.mem.indexOfScalarPos(u8, text, cursor, '\n')) |newline|
+        cursor = if (std.mem.findScalarPos(u8, text, cursor, '\n')) |newline|
             newline + 1
         else
             text.len;
@@ -1997,7 +1997,7 @@ test "formatUnified: gutter width fits largest line number" {
 
     var index: u32 = 1;
     while (index <= 12) : (index += 1) {
-        const line = try std.fmt.allocPrint(alloc, "line{d}\n", .{index});
+        const line = try alloc.print("line{d}\n", .{index});
         defer alloc.free(line);
         try old_buf.appendSlice(alloc, line);
         try new_buf.appendSlice(alloc, line);
@@ -2338,8 +2338,7 @@ test "buildBoundedPreview bounds selected rows with explicit elision" {
             retained_additions += @intFromBool(retained.op == .addition);
             retained_deletions += @intFromBool(retained.op == .deletion);
         }
-        const expected = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const expected = try std.testing.allocator.print(
             "⋯ +{d} -{d} omitted",
             .{
                 preview.additions - retained_additions,
@@ -2360,7 +2359,7 @@ test "file review exposes every changed line beyond the bounded preview cap" {
         var line: [32]u8 = undefined;
         try after.appendSlice(
             alloc,
-            try std.fmt.bufPrint(&line, "line {d}\n", .{line_number}),
+            try std.mem.print(&line, "line {d}\n", .{line_number}),
         );
     }
 
@@ -2389,11 +2388,11 @@ test "fallback file review seeks to replacement boundaries" {
         var line: [32]u8 = undefined;
         try before.appendSlice(
             alloc,
-            try std.fmt.bufPrint(&line, "old-{d:0>4}\n", .{line_number}),
+            try std.mem.print(&line, "old-{d:0>4}\n", .{line_number}),
         );
         try after.appendSlice(
             alloc,
-            try std.fmt.bufPrint(&line, "new-{d:0>4}\n", .{line_number}),
+            try std.mem.print(&line, "new-{d:0>4}\n", .{line_number}),
         );
     }
 
@@ -2482,7 +2481,7 @@ test "file review projects only proven fallback context with exact elisions" {
 
     for (1..1001) |line_number| {
         var line: [16]u8 = undefined;
-        const formatted = try std.fmt.bufPrint(&line, "line-{d:0>4}\n", .{line_number});
+        const formatted = try std.mem.print(&line, "line-{d:0>4}\n", .{line_number});
         try before.appendSlice(alloc, formatted);
         try after.appendSlice(alloc, formatted);
         if (line_number == 500) {
@@ -2719,12 +2718,12 @@ test "buildBoundedPreview bounds rows and escapes terminal controls" {
     var encoded_bytes: usize = 0;
     for (preview.lines) |line| {
         try std.testing.expect(line.text.len <= 4096);
-        try std.testing.expect(std.mem.indexOfScalar(u8, line.text, 0x1b) == null);
-        try std.testing.expect(std.mem.indexOfScalar(u8, line.text, '\n') == null);
+        try std.testing.expect(std.mem.findScalar(u8, line.text, 0x1b) == null);
+        try std.testing.expect(std.mem.findScalar(u8, line.text, '\n') == null);
         encoded_bytes += line.text.len;
     }
     try std.testing.expect(encoded_bytes <= max_encoded_preview_bytes);
-    try std.testing.expect(std.mem.indexOf(u8, preview.lines[0].text, "\\x1b") != null);
+    try std.testing.expect(std.mem.find(u8, preview.lines[0].text, "\\x1b") != null);
 }
 
 test "buildBoundedPreview enforces per-line and aggregate encoded budgets" {

@@ -290,7 +290,7 @@ fn appendItems(arena: Allocator, items: *std.ArrayList(summarize.Item), message:
             try items.append(arena, .{ .user = content });
         } else if (content.len > 0) {
             try items.append(arena, .{ .note = if (message.permission_feedback)
-                try std.fmt.allocPrint(arena, "Permission feedback: {s}", .{content})
+                try arena.print("Permission feedback: {s}", .{content})
             else
                 content });
         },

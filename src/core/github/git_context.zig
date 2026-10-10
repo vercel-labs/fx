@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const io_mod = @import("../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
@@ -174,7 +175,7 @@ test "git argv: read-only commands disable optional locks" {
 }
 
 test "git repository detection treats allocation failure as unavailable" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
     try std.testing.expect(!isGitRepository(failing.allocator()));
 }
 

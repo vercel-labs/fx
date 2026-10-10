@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("testing_allocator.zig");
 const text_utils = @import("text_utils.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 
@@ -347,7 +348,7 @@ pub const ModelRecoveryRequiredAction = enum {
 pub const ModelFailureDiagnostic = struct {
     pub const max_bytes: usize = 256;
 
-    bytes: [max_bytes]u8 = [_]u8{0} ** max_bytes,
+    bytes: [max_bytes]u8 = @splat(0),
     len: u16 = 0,
 
     pub fn defaultTextForCause(cause: ModelRecoveryCause) []const u8 {
@@ -478,7 +479,7 @@ pub const RouteRecoveryStatus = struct {
     pub fn label(self: RouteRecoveryStatus, buf: []u8) []const u8 {
         return switch (self.kind) {
             .auto_retry => self.recoveryLabel(buf),
-            .auto_recovered => std.fmt.bufPrint(
+            .auto_recovered => std.mem.print(
                 buf,
                 "✓ recovered · succeeded on attempt {d}",
                 .{self.succeeded_attempt},
@@ -502,7 +503,7 @@ pub const RouteRecoveryStatus = struct {
 
     fn manualRetryLabel(self: RouteRecoveryStatus, buf: []u8) []const u8 {
         if (self.diagnostic) |diagnostic| {
-            return std.fmt.bufPrint(
+            return std.mem.print(
                 buf,
                 "⚠ Provider route unavailable · {s} · continuing without Fast",
                 .{diagnostic.view()},
@@ -518,13 +519,13 @@ pub const RouteRecoveryStatus = struct {
         action: []const u8,
     ) []const u8 {
         if (self.diagnostic) |diagnostic| {
-            return std.fmt.bufPrint(
+            return std.mem.print(
                 buf,
                 "⚠ {s} · {s} · {s}",
                 .{ cause, diagnostic.view(), action },
             ) catch "⚠ Model response failed";
         }
-        return std.fmt.bufPrint(buf, "⚠ {s} · {s}", .{ cause, action }) catch "⚠ Model response failed";
+        return std.mem.print(buf, "⚠ {s} · {s}", .{ cause, action }) catch "⚠ Model response failed";
     }
 
     fn recoveryLabel(self: RouteRecoveryStatus, buf: []u8) []const u8 {
@@ -555,13 +556,13 @@ pub const RouteRecoveryStatus = struct {
         // counter and no raw error names, just the honest current state.
         if (action_value == .waiting_for_connectivity or action_value == .checking_liveness) {
             if (self.delay_seconds > 0) {
-                return std.fmt.bufPrint(
+                return std.mem.print(
                     buf,
                     "⚠ {s} · {s} · {d}s",
                     .{ cause, action, self.delay_seconds },
                 ) catch "⚠ Recovering model response";
             }
-            return std.fmt.bufPrint(
+            return std.mem.print(
                 buf,
                 "⚠ {s} · {s}",
                 .{ cause, action },
@@ -569,26 +570,26 @@ pub const RouteRecoveryStatus = struct {
         }
         if (self.delay_seconds > 0) {
             if (self.diagnostic) |diagnostic| {
-                return std.fmt.bufPrint(
+                return std.mem.print(
                     buf,
                     "⚠ {s} · {s} · {s} in {d}s",
                     .{ cause, diagnostic.humanText(), action, self.delay_seconds },
                 ) catch "⚠ Recovering model response";
             }
-            return std.fmt.bufPrint(
+            return std.mem.print(
                 buf,
                 "⚠ {s} · {s} in {d}s",
                 .{ cause, action, self.delay_seconds },
             ) catch "⚠ Recovering model response";
         }
         if (self.diagnostic) |diagnostic| {
-            return std.fmt.bufPrint(
+            return std.mem.print(
                 buf,
                 "⚠ {s} · {s} · {s}",
                 .{ cause, diagnostic.humanText(), action },
             ) catch "⚠ Recovering model response";
         }
-        return std.fmt.bufPrint(
+        return std.mem.print(
             buf,
             "⚠ {s} · {s}",
             .{ cause, action },
@@ -620,13 +621,13 @@ pub const RouteRecoveryStatus = struct {
             else
                 "Response failed";
             if (self.diagnostic) |diagnostic| {
-                return std.fmt.bufPrint(
+                return std.mem.print(
                     buf,
                     "⚠ {s} · {s} · kept failing at the same point · stopped",
                     .{ cause_text, diagnostic.humanText() },
                 ) catch "⚠ Response kept failing at the same point";
             }
-            return std.fmt.bufPrint(
+            return std.mem.print(
                 buf,
                 "⚠ {s} · kept failing at the same point · stopped",
                 .{cause_text},
@@ -635,13 +636,13 @@ pub const RouteRecoveryStatus = struct {
         const cause = self.cause orelse return self.pausedCauseLabel(buf, "Provider unavailable");
         if (cause == .rate_limited) {
             if (self.diagnostic) |diagnostic| {
-                return std.fmt.bufPrint(
+                return std.mem.print(
                     buf,
                     "⚠ Rate limited · {s} · server requested a longer wait · recovery paused · attempt {d}",
                     .{ diagnostic.view(), self.failed_attempt },
                 ) catch "⚠ Rate limited · recovery paused";
             }
-            return std.fmt.bufPrint(
+            return std.mem.print(
                 buf,
                 "⚠ Rate limited · server requested a longer wait · recovery paused · attempt {d}",
                 .{self.failed_attempt},
@@ -649,13 +650,13 @@ pub const RouteRecoveryStatus = struct {
         }
         if (cause == .system_resumed) {
             if (self.diagnostic) |diagnostic| {
-                return std.fmt.bufPrint(
+                return std.mem.print(
                     buf,
                     "⚠ Mac woke from sleep · {s} · connection still unavailable · recovery paused · attempt {d}",
                     .{ diagnostic.view(), self.failed_attempt },
                 ) catch "⚠ Connection unavailable · recovery paused";
             }
-            return std.fmt.bufPrint(
+            return std.mem.print(
                 buf,
                 "⚠ Mac woke from sleep · connection still unavailable · recovery paused · attempt {d}",
                 .{self.failed_attempt},
@@ -663,13 +664,13 @@ pub const RouteRecoveryStatus = struct {
         }
         if (cause == .provider_stream_timeout) {
             if (self.diagnostic) |diagnostic| {
-                return std.fmt.bufPrint(
+                return std.mem.print(
                     buf,
                     "⚠ Gateway stream timed out · {s} · automatic retry paused · attempt {d}",
                     .{ diagnostic.view(), self.failed_attempt },
                 ) catch "⚠ Gateway stream timed out · automatic retry paused";
             }
-            return std.fmt.bufPrint(
+            return std.mem.print(
                 buf,
                 "⚠ Gateway stream timed out · automatic retry paused · attempt {d}",
                 .{self.failed_attempt},
@@ -677,13 +678,13 @@ pub const RouteRecoveryStatus = struct {
         }
         if (cause == .request_limit_reached) {
             if (self.diagnostic) |diagnostic| {
-                return std.fmt.bufPrint(
+                return std.mem.print(
                     buf,
                     "⚠ Response paused · {s} · {d}/{d} provider-request safety limit reached",
                     .{ diagnostic.view(), self.failed_attempt, self.attempt_limit },
                 ) catch "⚠ Response paused · provider-request safety limit reached";
             }
-            return std.fmt.bufPrint(
+            return std.mem.print(
                 buf,
                 "⚠ Response paused · {d}/{d} provider-request safety limit reached",
                 .{ self.failed_attempt, self.attempt_limit },
@@ -705,13 +706,13 @@ pub const RouteRecoveryStatus = struct {
             "stopped";
         const plural: []const u8 = if (self.failed_attempt == 1) "" else "s";
         if (self.diagnostic) |diagnostic| {
-            return std.fmt.bufPrint(
+            return std.mem.print(
                 buf,
                 "⚠ {s} · {s} · {s} after {d} attempt{s}",
                 .{ name, diagnostic.humanText(), state_text, self.failed_attempt, plural },
             ) catch "⚠ Model response recovery ended";
         }
-        return std.fmt.bufPrint(
+        return std.mem.print(
             buf,
             "⚠ {s} · {s} after {d} attempt{s}",
             .{ name, state_text, self.failed_attempt, plural },
@@ -800,7 +801,7 @@ test "stalled recovery surfaces as a terminal stop with plain wording" {
 }
 
 test "model failure diagnostic truncation is bounded and utf8 safe" {
-    const long = "provider_error: " ++ ("é" ** 200);
+    const long = "provider_error: " ++ text_utils.repeat("é", 200);
     const diagnostic = ModelFailureDiagnostic.init(long);
 
     try std.testing.expect(diagnostic.view().len <= ModelFailureDiagnostic.max_bytes);
@@ -928,7 +929,7 @@ pub const McpToolBinding = struct {
     catalog_generation: u64,
     auth_generation: u64,
     authority_id: u64 = 0,
-    definition_digest: [32]u8 = .{0} ** 32,
+    definition_digest: [32]u8 = @splat(0),
 
     /// Transport renewal may change epochs without changing the advertised action.
     pub fn sameDefinition(self: McpToolBinding, other: McpToolBinding) bool {
@@ -981,7 +982,7 @@ pub const WebFetchArtifactState = enum {
 pub const WebFetchCompletion = struct {
     pub const max_url_len: usize = 192;
 
-    url_buf: [max_url_len]u8 = [_]u8{0} ** max_url_len,
+    url_buf: [max_url_len]u8 = @splat(0),
     url_len: u8 = 0,
     bytes: u64 = 0,
     status: u16 = 0,
@@ -1465,7 +1466,7 @@ test "dupeToolResultMemory frees only its own copies on allocation failure" {
     };
     // Every allocation failure point must leave the source's slices untouched
     // and release exactly what the partial copy allocated.
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
         fn check(alloc: std.mem.Allocator) !void {
             const copy = try dupeToolResultMemory(alloc, source);
             freeToolResultMemory(alloc, copy);
@@ -1578,7 +1579,7 @@ test "provider replay projection preserves matching origin and excludes other ro
         try std.testing.expect(messages[0].provider_replay != null);
         try std.testing.expect(try projectProviderReplay(alloc, projected, other) == null);
     }
-    try std.testing.checkAllAllocationFailures(alloc, struct {
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
         fn check(a: std.mem.Allocator) !void {
             const input = [_]ChatMessage{.{ .role = .assistant, .provider_replay = .{ .source = .{ .provider = .gateway, .model = "model" }, .parts_json = "[]" } }};
             const projected = (try projectProviderReplay(a, &input, .{ .provider = .codex, .model = "model" })).?;
@@ -2126,7 +2127,7 @@ test "authoritative tool admission rejects blank current call ids" {
 }
 
 test "authoritative tool admission rejects unstorable names" {
-    const oversized = [_]u8{'n'} ** 257;
+    const oversized: [257]u8 = @splat('n');
     const cases = [_]struct { value: []const u8, reason: ConversationIdentity.Failure }{
         .{ .value = "", .reason = .empty },
         .{ .value = &oversized, .reason = .too_long },
@@ -2144,7 +2145,7 @@ test "authoritative tool admission rejects unstorable names" {
 }
 
 test "authoritative tool admission rejects unstorable correlation identities" {
-    const oversized = [_]u8{'i'} ** 257;
+    const oversized: [257]u8 = @splat('i');
     const cases = [_]struct { value: []const u8, reason: ConversationIdentity.Failure }{
         .{ .value = &oversized, .reason = .too_long },
         .{ .value = "\xff", .reason = .invalid_utf8 },
@@ -2169,8 +2170,8 @@ test "authoritative tool admission rejects unstorable correlation identities" {
 }
 
 test "authoritative tool admission preserves bounded canonical identity formats" {
-    const boundary = [_]u8{'i'} ** 256;
-    const unicode_boundary = "é" ** 128;
+    const boundary: [256]u8 = @splat('i');
+    const unicode_boundary = text_utils.repeat("é", 128);
     for ([_][]const u8{ &boundary, unicode_boundary, "functions.read_file:0", "unknown/tool" }) |identity| {
         for ([_]ToolExecutionProvenance{ .fx_local, .provider_executed }) |provenance| {
             const calls = [_]ToolCall{.{ .id = identity, .name = identity, .provisional_id = identity, .arguments_json = "{}", .provenance = provenance, .provider_result = "result" }};
@@ -2255,7 +2256,7 @@ test "authoritative tool admission rejects malformed provider arguments but admi
 pub const ConversationLanguage = struct {
     pub const max_len: usize = 24;
 
-    bytes: [max_len]u8 = [_]u8{0} ** max_len,
+    bytes: [max_len]u8 = @splat(0),
     len: u8 = 0,
 
     pub fn default() ConversationLanguage {
@@ -2446,7 +2447,7 @@ pub const ReasoningEffort = union(enum) {
             }
 
             var name = Name{
-                .bytes = [_]u8{0} ** max_name_bytes,
+                .bytes = @as([max_name_bytes]u8, @splat(0)),
                 .len = @intCast(raw.len),
             };
             @memcpy(name.bytes[0..raw.len], raw);
@@ -3256,7 +3257,7 @@ test "function input classification distinguishes syntax from object shape" {
             try std.testing.expectEqual(ToolArgumentIntegrity.valid, try ToolArgumentIntegrity.classifySerialized(std.testing.allocator, case.input));
         }
     }
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
     try std.testing.expectError(error.OutOfMemory, ToolArgumentIntegrity.classifyFunctionInput(failing.allocator(), "{\"path\":\"file\"}"));
 }
 
@@ -3294,7 +3295,7 @@ test "ToolArgumentIntegrity rejects malformed trailing and duplicate-key JSON" {
 }
 
 test "ToolArgumentIntegrity preserves parser allocation failure" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
     try std.testing.expectError(
         error.OutOfMemory,
         ToolArgumentIntegrity.classifySerialized(failing.allocator(), "{\"path\":\"src/main.zig\"}"),
@@ -3332,8 +3333,8 @@ test "tool argument diagnostic locates truncated, syntax, and rejected input" {
         try ToolArgumentDiagnostic.diagnose(alloc, ""),
     );
 
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    try std.testing.expectError(error.OutOfMemory, ToolArgumentDiagnostic.diagnose(failing.allocator(), "[" ** 4096));
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, ToolArgumentDiagnostic.diagnose(failing.allocator(), text_utils.repeat("[", 4096)));
 }
 
 test "dupeToolCall keeps the argument diagnostic" {
@@ -3712,7 +3713,7 @@ test "finished prompt presentation allocation failures preserve ownership" {
             try std.testing.expectEqualStrings("earlier\ncurrent", copy.presentation_text.?);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Case.run, .{});
 }
 
 test "TurnSummary carries shared turn token progress" {
@@ -3785,7 +3786,7 @@ test "ImageAttachment source references clone independently and clean up allocat
     try std.testing.expect(copy[1].inline_data == null);
     try std.testing.expect(copy[1].snapshot_path == null);
     try std.testing.expect(copy[1].snapshot_sha256 == null);
-    try std.testing.checkAllAllocationFailures(alloc, struct {
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
         fn check(a: std.mem.Allocator, images: []const ImageAttachment) !void {
             const cloned = try dupeImageAttachmentSlice(a, images);
             defer freeImageAttachmentSlice(a, cloned);

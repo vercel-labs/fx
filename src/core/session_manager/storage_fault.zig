@@ -288,7 +288,7 @@ fn cutUnsynced(io: Io, random: std.Random, tracked: Fault.Tracked) bool {
     tracked.dup.setLength(io, keep) catch return false;
     if (keep < len and random.uintLessThan(u8, 4) == 0) {
         const zeros_len = random.intRangeAtMost(u64, 1, @min(len - keep, 64));
-        const zeros = [_]u8{0} ** 64;
+        const zeros: [64]u8 = @splat(0);
         tracked.dup.writePositionalAll(io, zeros[0..@intCast(zeros_len)], keep) catch {};
     }
     return true;
@@ -324,13 +324,13 @@ fn freeOp(gpa: std.mem.Allocator, op: Fault.NameOp) void {
 }
 
 fn realPath(gpa: std.mem.Allocator, io: Io, dir: storage.Dir) storage.Error![]u8 {
-    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const n = dir.handle.realPath(io, &buffer) catch return error.Io;
     return gpa.dupe(u8, buffer[0..n]) catch error.Io;
 }
 
 fn join(gpa: std.mem.Allocator, parent: []const u8, name: []const u8) storage.Error![]u8 {
-    return std.fs.path.join(gpa, &.{ parent, name }) catch error.Io;
+    return std.Io.Dir.path.join(gpa, &.{ parent, name }) catch error.Io;
 }
 
 /// Silent damage: flips one bit of a file without the fault layer noticing.
@@ -378,7 +378,7 @@ test "a power loss never loses a synced byte" {
                 synced = written.items.len;
             } else {
                 var line: [24]u8 = undefined;
-                const text = try std.fmt.bufPrint(&line, "line {d}\n", .{written.items.len});
+                const text = try std.mem.print(&line, "line {d}\n", .{written.items.len});
                 try s.writeAt(file, text, written.items.len);
                 try written.appendSlice(testing.allocator, text);
             }

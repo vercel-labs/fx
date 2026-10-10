@@ -44,7 +44,7 @@ fn testEncode(alloc: Allocator, width: u32, height: u32, color_type: ColorType, 
     std.mem.writeInt(u32, ihdr[0..4], width, .big);
     std.mem.writeInt(u32, ihdr[4..8], height, .big);
     ihdr[8] = bit_depth;
-    ihdr[9] = @intFromEnum(color_type);
+    ihdr[9] = @backingInt(color_type);
     @memset(ihdr[10..13], 0);
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();

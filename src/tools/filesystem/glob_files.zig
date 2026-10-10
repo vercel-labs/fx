@@ -106,7 +106,7 @@ fn callWithWorkspaceOptions(ctx: tool_dispatch.DispatchContext, erased: tool_dis
         if (tool_result_errors.isFilesystemAccessDenied(err)) {
             return .{ .failure = try tool_result_errors.filesystemAccessDeniedJson(ctx.allocator, "glob_files", input.path, err) };
         }
-        return .{ .failure = try std.fmt.allocPrint(ctx.allocator, "Unable to resolve glob search root: {s} ({s})", .{ input.path, @errorName(err) }) };
+        return .{ .failure = try ctx.allocator.print("Unable to resolve glob search root: {s} ({s})", .{ input.path, @errorName(err) }) };
     };
     const static_base = if (requested_root.is_directory)
         extractStaticGlobBase(input.pattern)
@@ -118,7 +118,7 @@ fn callWithWorkspaceOptions(ctx: tool_dispatch.DispatchContext, erased: tool_dis
             if (tool_result_errors.isFilesystemAccessDenied(err)) {
                 return .{ .failure = try tool_result_errors.filesystemAccessDeniedJson(ctx.allocator, "glob_files", requested_root.absolute, err) };
             }
-            return .{ .failure = try std.fmt.allocPrint(ctx.allocator, "Unable to resolve glob search root: {s} ({s})", .{ input.path, @errorName(err) }) };
+            return .{ .failure = try ctx.allocator.print("Unable to resolve glob search root: {s} ({s})", .{ input.path, @errorName(err) }) };
         }
     else
         requested_root;
@@ -131,7 +131,7 @@ fn callWithWorkspaceOptions(ctx: tool_dispatch.DispatchContext, erased: tool_dis
     const root_relative = try pathing.workspaceRelativePath(arena, ctx.workspace_root, root.absolute);
     var compiled_pattern = glob_pattern.Pattern.compile(arena, static_base.pattern) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.PatternTooLong => return .{ .failure = try std.fmt.allocPrint(ctx.allocator, "glob_files field \"pattern\" must be at most {d} bytes", .{glob_pattern.max_pattern_bytes}) },
+        error.PatternTooLong => return .{ .failure = try ctx.allocator.print("glob_files field \"pattern\" must be at most {d} bytes", .{glob_pattern.max_pattern_bytes}) },
     };
     defer compiled_pattern.deinit(arena);
 
@@ -155,7 +155,7 @@ fn callWithWorkspaceOptions(ctx: tool_dispatch.DispatchContext, erased: tool_dis
             if (tool_result_errors.isFilesystemAccessDenied(err)) {
                 return .{ .failure = try tool_result_errors.filesystemAccessDeniedJson(ctx.allocator, "glob_files", root.absolute, err) };
             }
-            return .{ .failure = try std.fmt.allocPrint(ctx.allocator, "Unable to discover glob candidates: {s} ({s})", .{ root.absolute, @errorName(err) }) };
+            return .{ .failure = try ctx.allocator.print("Unable to discover glob candidates: {s} ({s})", .{ root.absolute, @errorName(err) }) };
         };
         var candidate_files = discovered.files;
         candidate_incomplete = discovered.incomplete;
@@ -167,7 +167,7 @@ fn callWithWorkspaceOptions(ctx: tool_dispatch.DispatchContext, erased: tool_dis
                 if (tool_result_errors.isFilesystemAccessDenied(err)) {
                     return .{ .failure = try tool_result_errors.filesystemAccessDeniedJson(ctx.allocator, "glob_files", root.absolute, err) };
                 }
-                return .{ .failure = try std.fmt.allocPrint(ctx.allocator, "Unable to discover glob candidates: {s} ({s})", .{ root.absolute, @errorName(err) }) };
+                return .{ .failure = try ctx.allocator.print("Unable to discover glob candidates: {s} ({s})", .{ root.absolute, @errorName(err) }) };
             };
             candidate_files = merged.files;
             candidate_incomplete = candidate_incomplete or merged.incomplete;
@@ -188,7 +188,7 @@ fn callWithWorkspaceOptions(ctx: tool_dispatch.DispatchContext, erased: tool_dis
             try matches.append(arena, try joinRelativeSearchPath(arena, root_relative, candidate));
         }
     } else {
-        const basename = std.fs.path.basename(root_relative);
+        const basename = std.Io.Dir.path.basename(root_relative);
         if (compiled_pattern.matchesPath(basename)) {
             match_count += 1;
             if (input.mode == .matches) {
@@ -297,8 +297,8 @@ const StaticGlobBase = struct {
 
 fn extractStaticGlobBase(pattern: []const u8) StaticGlobBase {
     const first_glob = firstGlobChar(pattern) orelse {
-        const dirname = std.fs.path.dirname(pattern) orelse return .{ .base = "", .pattern = pattern };
-        return .{ .base = dirname, .pattern = std.fs.path.basename(pattern) };
+        const dirname = std.Io.Dir.path.dirname(pattern) orelse return .{ .base = "", .pattern = pattern };
+        return .{ .base = dirname, .pattern = std.Io.Dir.path.basename(pattern) };
     };
     const static_prefix = pattern[0..first_glob];
     const last_sep = lastPathSeparator(static_prefix) orelse return .{ .base = "", .pattern = pattern };
@@ -335,7 +335,7 @@ fn joinRelativeSearchPath(arena: Allocator, root_relative: []const u8, child_rel
     if (std.mem.eql(u8, root_relative, ".") or root_relative.len == 0) {
         return arena.dupe(u8, child_relative);
     }
-    return std.fs.path.join(arena, &.{ root_relative, child_relative });
+    return std.Io.Dir.path.join(arena, &.{ root_relative, child_relative });
 }
 
 fn shouldIncludeHidden(root_relative: []const u8, pattern: []const u8) bool {
@@ -550,7 +550,7 @@ fn runGitForTest(alloc: Allocator, cwd: []const u8, args: []const []const u8) !v
 }
 
 fn writeTempFile(alloc: Allocator, tmp: *std.testing.TmpDir, sub_path: []const u8, content: []const u8) ![]u8 {
-    if (std.fs.path.dirname(sub_path)) |parent| {
+    if (std.Io.Dir.path.dirname(sub_path)) |parent| {
         try tmp.dir.createDirPath(io_mod.getIo(), parent);
     }
     var file = try tmp.dir.createFile(std.testing.io, sub_path, .{});
@@ -566,7 +566,7 @@ fn writeTempFileWithMtime(
     content: []const u8,
     mtime_ns: i96,
 ) ![]u8 {
-    if (std.fs.path.dirname(sub_path)) |parent| {
+    if (std.Io.Dir.path.dirname(sub_path)) |parent| {
         try tmp.dir.createDirPath(io_mod.getIo(), parent);
     }
     var file = try tmp.dir.createFile(std.testing.io, sub_path, .{});
@@ -592,8 +592,8 @@ fn createNumberedFiles(tmp: *std.testing.TmpDir, count: usize) !void {
     var i: usize = 0;
     while (i < count) : (i += 1) {
         var name_buf: [64]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buf, "many/file-{d:0>4}.txt", .{i});
-        if (std.fs.path.dirname(name)) |parent| {
+        const name = try std.mem.print(&name_buf, "many/file-{d:0>4}.txt", .{i});
+        if (std.Io.Dir.path.dirname(name)) |parent| {
             try tmp.dir.createDirPath(io_mod.getIo(), parent);
         }
         {
@@ -657,7 +657,7 @@ test "glob_files reports overlong patterns during matching" {
 
     const result = try call(.{ .allocator = alloc, .workspace_root = workspace }, .{ .ptr = &input, .deinit_fn = noopInputDeinit });
     defer result.deinit(alloc);
-    const expected = try std.fmt.allocPrint(alloc, "glob_files field \"pattern\" must be at most {d} bytes", .{glob_pattern.max_pattern_bytes});
+    const expected = try alloc.print("glob_files field \"pattern\" must be at most {d} bytes", .{glob_pattern.max_pattern_bytes});
     defer alloc.free(expected);
     switch (result) {
         .rich => return error.TestUnexpectedRichResult,
@@ -750,15 +750,15 @@ test "glob_files resolver error for missing path returns failure result" {
 }
 
 test "glob_files permission denied directory returns structured recovery" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    const root = try std.fmt.allocPrint(alloc, "/tmp/fx-glob-files-access-{d}", .{io_mod.nanoTimestamp()});
+    const root = try alloc.print("/tmp/fx-glob-files-access-{d}", .{io_mod.nanoTimestamp()});
     defer alloc.free(root);
     defer std.Io.Dir.cwd().deleteTree(io_mod.getIo(), root) catch {};
     try std.Io.Dir.cwd().createDirPath(io_mod.getIo(), root);
     const workspace = try io_mod.realpathAlloc(alloc, root);
     defer alloc.free(workspace);
-    const blocked = try std.fs.path.join(alloc, &.{ workspace, "blocked" });
+    const blocked = try std.Io.Dir.path.join(alloc, &.{ workspace, "blocked" });
     defer alloc.free(blocked);
     try std.Io.Dir.cwd().createDirPath(io_mod.getIo(), blocked);
 
@@ -819,8 +819,7 @@ test "glob_files truncates output to active max list entries" {
     try std.testing.expectEqual(.success, result.status);
     try std.testing.expect(std.mem.startsWith(u8, result.body, "[glob] 100 matches for **/*.txt\n"));
     try std.testing.expectEqual(tool_dispatch.default_max_list_entries, countEmittedResultLines(result.body));
-    const expected_tail = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const expected_tail = try std.testing.allocator.print(
         "... truncated to first {d} matches\n",
         .{tool_dispatch.default_max_list_entries},
     );
@@ -995,12 +994,12 @@ test "glob_files allows external absolute path search roots" {
     const alloc = std.testing.allocator;
     // Keep the external root out of std.testing.tmpDir(), whose generated path
     // may contain ignored component names and invalidate this absolute-path case.
-    const root = try std.fmt.allocPrint(alloc, "/tmp/fx-glob-external-{d}", .{io_mod.nanoTimestamp()});
+    const root = try alloc.print("/tmp/fx-glob-external-{d}", .{io_mod.nanoTimestamp()});
     defer alloc.free(root);
     defer std.Io.Dir.cwd().deleteTree(io_mod.getIo(), root) catch {};
-    const workspace_dir = try std.fs.path.join(alloc, &.{ root, "workspace" });
+    const workspace_dir = try std.Io.Dir.path.join(alloc, &.{ root, "workspace" });
     defer alloc.free(workspace_dir);
-    const external_dir = try std.fs.path.join(alloc, &.{ root, "external" });
+    const external_dir = try std.Io.Dir.path.join(alloc, &.{ root, "external" });
     defer alloc.free(external_dir);
     try std.Io.Dir.cwd().createDirPath(io_mod.getIo(), workspace_dir);
     try std.Io.Dir.cwd().createDirPath(io_mod.getIo(), external_dir);
@@ -1009,7 +1008,7 @@ test "glob_files allows external absolute path search roots" {
     defer alloc.free(workspace);
     const external = try io_mod.realpathAlloc(alloc, external_dir);
     defer alloc.free(external);
-    const external_file = try std.fs.path.join(alloc, &.{ external, "outside.txt" });
+    const external_file = try std.Io.Dir.path.join(alloc, &.{ external, "outside.txt" });
     defer alloc.free(external_file);
     {
         var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), external_file, .{});
@@ -1021,7 +1020,7 @@ test "glob_files allows external absolute path search roots" {
     defer result.deinit(alloc);
 
     try std.testing.expectEqual(.success, result.status);
-    const expected = try std.fmt.allocPrint(alloc, "[glob] 1 matches for *.txt\n - {s}\n", .{external_file});
+    const expected = try alloc.print("[glob] 1 matches for *.txt\n - {s}\n", .{external_file});
     defer alloc.free(expected);
     try std.testing.expectEqualStrings(expected, result.body);
 }
@@ -1039,7 +1038,7 @@ test "glob_files pattern static base cannot escape the approved search root" {
     defer alloc.free(workspace);
     const external = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external");
     defer alloc.free(external);
-    const absolute_pattern = try std.fs.path.join(alloc, &.{ external, "*.txt" });
+    const absolute_pattern = try std.Io.Dir.path.join(alloc, &.{ external, "*.txt" });
     defer alloc.free(absolute_pattern);
 
     const patterns = [_][]const u8{

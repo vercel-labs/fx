@@ -88,7 +88,7 @@ pub fn streamModelCompletion(
                 completed.completion,
                 completed.usage,
             );
-            if (comptime @import("builtin").os.tag != .wasi) {
+            if (comptime @import("builtin").target.os.tag != .wasi) {
                 if (std.meta.activeTag(completed.usage) == .deferred) if (usage) |ledger| {
                     if (request.credential.secret()) |credential| {
                         ledger.startDeferredReconciliation(
@@ -438,7 +438,7 @@ pub fn gatewayHttpErrorDetail(
     model: []const u8,
     capabilities: model_capabilities.Capabilities,
 ) ![]const u8 {
-    if (@intFromEnum(status) != 413) return detail;
+    if (@backingInt(status) != 413) return detail;
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     if (detail.len > 0) try out.writer.print("{s}\n\n", .{detail});

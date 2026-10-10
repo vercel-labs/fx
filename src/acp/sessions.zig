@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const io_mod = @import("../core/shared/io.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const mem_utils = @import("../core/shared/mem_utils.zig");
+const text_utils = @import("../core/shared/text_utils.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const mcp_servers = @import("mcp_servers.zig");
@@ -1732,7 +1733,7 @@ fn writeSessionPage(
 ) !void {
     var next_cursor_buf: [320]u8 = undefined;
     const next_cursor = if (has_more and summaries.len > 0)
-        try std.fmt.bufPrint(&next_cursor_buf, "v1:{d}:{s}", .{
+        try std.mem.print(&next_cursor_buf, "v1:{d}:{s}", .{
             summaries[summaries.len - 1].updated_at_ms,
             summaries[summaries.len - 1].id,
         })
@@ -1753,7 +1754,7 @@ fn writeSessionPage(
             );
             continue;
         };
-        if (!std.fs.path.isAbsolute(workspace_root)) {
+        if (!std.Io.Dir.path.isAbsolute(workspace_root)) {
             debug_trace.logf(
                 "acp",
                 "session operation=list outcome=omitted id={s} reason=workspace_not_absolute",
@@ -1803,7 +1804,7 @@ fn parseListSessionsParams(
     var result = ListSessionsParams{};
     if (parsed.value.object.get("cwd")) |cwd| {
         if (cwd != .null) {
-            if (cwd != .string or !std.fs.path.isAbsolute(cwd.string)) {
+            if (cwd != .string or !std.Io.Dir.path.isAbsolute(cwd.string)) {
                 return error.InvalidParams;
             }
             result.cwd = cwd.string;
@@ -1918,7 +1919,7 @@ fn sendUserHistoryTurn(
                 .{ attachment.id, @errorName(err) },
             );
             var unavailable: [96]u8 = undefined;
-            const notice = try std.fmt.bufPrint(
+            const notice = try std.mem.print(
                 &unavailable,
                 "Image #{d} unavailable",
                 .{attachment.id},
@@ -2291,9 +2292,9 @@ fn formatIso8601(alloc: Allocator, timestamp_ms: i64) ![]u8 {
     const year_day = epoch.getEpochDay().calculateYearDay();
     const month_day = year_day.calculateMonthDay();
 
-    return std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+    return alloc.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
         year_day.year,
-        @intFromEnum(month_day.month),
+        @backingInt(month_day.month),
         month_day.day_index + 1,
         day.getHoursIntoDay(),
         day.getMinutesIntoHour(),
@@ -3180,7 +3181,7 @@ test "ACP ultrafast new load and resume preserve configured baselines on both ba
                 const id = try arena.dupe(u8, active.session_id);
                 inline for (.{ handleLoadSession, handleResumeSession }) |restore| {
                     try server.releaseActiveSession(&state);
-                    msg.params_raw = try std.fmt.allocPrint(arena, "{{\"sessionId\":\"{s}\",\"mcpServers\":[]}}", .{id});
+                    msg.params_raw = try arena.print("{{\"sessionId\":\"{s}\",\"mcpServers\":[]}}", .{id});
                     try restore(&state, arena, &msg);
                     const resumed = &state.active_session.?;
                     try std.testing.expectEqual(process orelse baseline, resumed.ultrafast_mode);
@@ -3213,13 +3214,12 @@ test "ACP host-disabled new load and resume skip project MCP effects" {
         "workspace",
     );
     defer alloc.free(workspace_path);
-    const marker_path = try std.fs.path.join(
+    const marker_path = try std.Io.Dir.path.join(
         alloc,
         &.{ workspace_path, "project-mcp-launched" },
     );
     defer alloc.free(marker_path);
-    const project_json = try std.fmt.allocPrint(
-        alloc,
+    const project_json = try alloc.print(
         "{{\"mcpServers\":{{\"fixture\":{{\"command\":\"/bin/sh\",\"args\":[\"-c\",\"printf launched > {s}\"]}},\"remote\":{{\"type\":\"http\",\"url\":\"http://127.0.0.1:1/mcp\",\"startup_timeout_ms\":5000}}}}}}",
         .{marker_path},
     );
@@ -3259,8 +3259,7 @@ test "ACP host-disabled new load and resume skip project MCP effects" {
         .{ .method = "session/load", .handler = handleLoadSession },
         .{ .method = "session/resume", .handler = handleResumeSession },
     }, 0..) |restore, index| {
-        const params = try std.fmt.allocPrint(
-            arena,
+        const params = try arena.print(
             "{{\"sessionId\":\"{s}\",\"mcpServers\":[]}}",
             .{session_id},
         );
@@ -3273,8 +3272,7 @@ test "ACP host-disabled new load and resume skip project MCP effects" {
         try std.testing.expect(state.active_session.?.mcp == null);
     }
 
-    const local_request = try std.fmt.allocPrint(
-        arena,
+    const local_request = try arena.print(
         "{{\"name\":\"request-local\",\"command\":\"/bin/sh\",\"args\":[\"-c\",\"printf launched > {s}\"],\"env\":[]}}",
         .{marker_path},
     );
@@ -3286,14 +3284,12 @@ test "ACP host-disabled new load and resume skip project MCP effects" {
         .{ .method = "session/resume", .handler = handleResumeSession, .server = local_request },
     }, 0..) |request, index| {
         const params = if (std.mem.eql(u8, request.method, "session/new"))
-            try std.fmt.allocPrint(
-                arena,
+            try arena.print(
                 "{{\"mcpServers\":[{s}]}}",
                 .{request.server},
             )
         else
-            try std.fmt.allocPrint(
-                arena,
+            try arena.print(
                 "{{\"sessionId\":\"{s}\",\"mcpServers\":[{s}]}}",
                 .{ session_id, request.server },
             );
@@ -3573,6 +3569,6 @@ test "libfx/new rejects a session id that is not header and path safe" {
     for (bad) |params| {
         try std.testing.expectError(error.InvalidSessionId, requestedLibfxSessionId(alloc, params));
     }
-    const long = "{\"sessionId\":\"" ++ "a" ** 256 ++ "\"}";
+    const long = "{\"sessionId\":\"" ++ text_utils.repeat("a", 256) ++ "\"}";
     try std.testing.expectError(error.InvalidSessionId, requestedLibfxSessionId(alloc, long));
 }

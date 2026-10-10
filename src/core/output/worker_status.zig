@@ -165,29 +165,29 @@ fn format_status_label(
     return if (status.isRecovered())
         format_recovered_label(buf, status)
     else if (status.action == .waiting_for_connectivity)
-        std.fmt.bufPrint(
+        std.mem.print(
             buf,
             "{s} · esc to pause",
             .{status.label(&base_buf)},
         ) catch status.label(buf)
     else if (status.action == .paused)
         switch (status.required_action) {
-            .continue_later => std.fmt.bufPrint(
+            .continue_later => std.mem.print(
                 buf,
                 "{s} · send a new message when you're ready",
                 .{status.label(&base_buf)},
             ) catch status.label(buf),
-            .inspect_uncertain_tool => std.fmt.bufPrint(
+            .inspect_uncertain_tool => std.mem.print(
                 buf,
                 "{s} · reopen the session to continue",
                 .{status.label(&base_buf)},
             ) catch status.label(buf),
-            .change_request => std.fmt.bufPrint(
+            .change_request => std.mem.print(
                 buf,
                 "{s} · change the request to continue",
                 .{status.label(&base_buf)},
             ) catch status.label(buf),
-            .surface_stall => std.fmt.bufPrint(
+            .surface_stall => std.mem.print(
                 buf,
                 "{s} · the response kept failing at the same point",
                 .{status.label(&base_buf)},
@@ -221,7 +221,7 @@ fn format_retry_label(
 fn format_recovered_label(buf: []u8, status: types.RouteRecoveryStatus) []const u8 {
     return switch (status.kind) {
         .auto_recovered => if (status.succeeded_attempt > 0)
-            std.fmt.bufPrint(
+            std.mem.print(
                 buf,
                 "✓ recovered · attempt {d}",
                 .{status.succeeded_attempt},

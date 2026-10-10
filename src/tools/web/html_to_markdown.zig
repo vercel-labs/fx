@@ -366,7 +366,7 @@ const Parser = struct {
         }
         var start: usize = 0;
         while (start < self.link_text.items.len and std.ascii.isWhitespace(self.link_text.items[start])) : (start += 1) {}
-        if (start > 0) std.mem.copyForwards(u8, self.link_text.items, self.link_text.items[start..]);
+        if (start > 0) @memmove(self.link_text.items[0 .. self.link_text.items.len - start], self.link_text.items[start..]);
         self.link_text.items.len -= start;
     }
 
@@ -376,7 +376,7 @@ const Parser = struct {
         }
         var start: usize = 0;
         while (start < self.title.items.len and std.ascii.isWhitespace(self.title.items[start])) : (start += 1) {}
-        if (start > 0) std.mem.copyForwards(u8, self.title.items, self.title.items[start..]);
+        if (start > 0) @memmove(self.title.items[0 .. self.title.items.len - start], self.title.items[start..]);
         self.title.items.len -= start;
     }
 

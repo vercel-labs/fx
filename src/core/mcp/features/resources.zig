@@ -1,10 +1,12 @@
 const std = @import("std");
+const testing_allocator = @import("../../shared/testing_allocator.zig");
 const common = @import("common.zig");
 const catalog_freshness = @import("../catalog_freshness.zig");
 const json_number = @import("../json_number.zig");
 const mrtr = @import("../mrtr.zig");
 const mem_utils = @import("../../shared/mem_utils.zig");
 const sort_utils = @import("../../shared/sort_utils.zig");
+const text_utils = @import("../../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -1223,12 +1225,12 @@ test "resource template matching shares one work budget across catalog candidate
 }
 
 test "resource template matching rejects adjacent expressions as unsupported" {
-    const uri = "memory://" ++ ("a" ** 2048) ++ "/42";
+    const uri = "memory://" ++ text_utils.repeat("a", 2048) ++ "/42";
     try std.testing.expect(!templateMayResolve("memory://{prefix}{/id}", uri));
 }
 
 test "resource template matching rejects malformed long expansions and unsupported syntax" {
-    const malformed = "memory://" ++ ("a" ** 2048) ++ "%GG";
+    const malformed = "memory://" ++ text_utils.repeat("a", 2048) ++ "%GG";
     try std.testing.expect(!templateMayResolve("memory://{value}", malformed));
     try std.testing.expect(!templateMayResolve("memory://{first,second}", "memory://one,two"));
     try std.testing.expect(!templateMayResolve("memory://{value*}", "memory://one"));
@@ -1420,7 +1422,7 @@ fn checkResourceCatalogAllocationFailures(alloc: Allocator) !void {
 
 test "resource catalog construction is allocation failure safe" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkResourceCatalogAllocationFailures,
         .{},
     );

@@ -10,8 +10,8 @@ The driver requires:
 
 - macOS on an arm64 host
 - generic `aarch64-macos` output
-- Zig `0.16.0`
-- LLVM `21.1.8` tools and profile runtime from one configured LLVM root
+- Zig `0.17.0`
+- LLVM `22.1.8` tools and profile runtime from one configured LLVM root
 - the selected Xcode macOS SDK and native Apple linker with arm64 support
 - Bun `1.3.14`
 - Hyperfine `1.20.0`
@@ -37,18 +37,18 @@ output fail closed.
 Every mutating command requires a fresh or empty output directory. State from separate runs is never merged implicitly.
 
 ```bash
-brew install llvm@21
+brew install llvm@22
 
 python3 -m scripts.pgso build \
-  --llvm-bin "$(brew --prefix llvm@21)/bin" \
+  --llvm-bin "$(brew --prefix llvm@22)/bin" \
   --output-dir /tmp/fx-pgso-build
 
 python3 -m scripts.pgso train \
-  --llvm-bin "$(brew --prefix llvm@21)/bin" \
+  --llvm-bin "$(brew --prefix llvm@22)/bin" \
   --output-dir /tmp/fx-pgso-train
 
 python3 -m scripts.pgso all \
-  --llvm-bin "$(brew --prefix llvm@21)/bin" \
+  --llvm-bin "$(brew --prefix llvm@22)/bin" \
   --output-dir /tmp/fx-pgso-candidate \
   --target aarch64-macos \
   --update-channel stable \

@@ -939,10 +939,10 @@ fn spawnStdioServer(alloc: Allocator, server: *McpServer, argv: []const []const 
         .argv = prepared.argv,
         .stdin = .pipe,
         .stdout = .pipe,
-        .stderr = if (builtin.os.tag == .windows) .ignore else .pipe,
+        .stderr = if (builtin.target.os.tag == .windows) .ignore else .pipe,
         .environ_map = if (server.env_map != null) &server.env_map.? else null,
         .cwd = if (server.config.cwd) |cwd| .{ .path = cwd } else .inherit,
-        .pgid = if (builtin.os.tag == .windows) null else 0,
+        .pgid = if (builtin.target.os.tag == .windows) null else 0,
     });
 
     server.dispatcher = stdio_dispatcher.StdioDispatcher.create(
@@ -1330,7 +1330,7 @@ fn writeSignalPhrase(writer: *std.Io.Writer, verb: []const u8, signal: anytype) 
     if (@TypeOf(signal) == void) {
         try writer.print("{s} a signal", .{verb});
     } else {
-        try writer.print("{s} signal {d}", .{ verb, @intFromEnum(signal) });
+        try writer.print("{s} signal {d}", .{ verb, @backingInt(signal) });
     }
 }
 
@@ -1576,7 +1576,7 @@ test "server stderr display keeps the first line and the end, bounded and masked
     try std.testing.expect(std.mem.find(u8, cut_display, "ijklmnop") == null);
 
     // An escape sequence cut at the gap cannot swallow the start of a token.
-    const token = "ghp_" ++ "a1b2c3d4e5" ** 4;
+    const token = "ghp_" ++ text_utils.repeat("a1b2c3d4e5", 4);
     var cut_escape = testOmittedCapture("log line \x1b[ ", "xx " ++ token ++ " rejected\n");
     const escape_display = try displayStderr(arena, &cut_escape);
     try std.testing.expect(std.mem.find(u8, escape_display, token[1..]) == null);

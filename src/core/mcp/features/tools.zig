@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../shared/testing_allocator.zig");
 const catalog_freshness = @import("../catalog_freshness.zig");
 const json_number = @import("../json_number.zig");
 const mcp_contract = @import("../mcp_contract.zig");
@@ -787,7 +788,7 @@ test "tools list parser handles fuzzed cache and cursor input" {
 
 test "tool protocol parsing releases every allocation failure path" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkToolParsingAllocationFailures,
         .{},
     );

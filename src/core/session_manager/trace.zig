@@ -54,7 +54,7 @@ pub const Trace = struct {
         var dir = try cwd.openDir(io, build_options.trace_dir, .{});
         defer dir.close(io);
         var name_buffer: [256]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buffer, "{s}--{s}.ndjson", .{ spec, case });
+        const name = try std.mem.print(&name_buffer, "{s}--{s}.ndjson", .{ spec, case });
         const file = try dir.createFile(io, name, .{ .truncate = true });
         return .{ .gpa = gpa, .io = io, .file = file };
     }
@@ -236,7 +236,7 @@ pub const TurnTraces = struct {
 
     /// The trace path for a session (caller frees).
     pub fn pathFor(gpa: std.mem.Allocator, dir: []const u8, case: []const u8, id: []const u8) ![]u8 {
-        return std.fmt.allocPrint(gpa, "{s}/TurnLifecycle--{s}-{s}.ndjson", .{ dir, case, id });
+        return gpa.print("{s}/TurnLifecycle--{s}-{s}.ndjson", .{ dir, case, id });
     }
 
     /// Continues a trace written by a process that was killed: restores
@@ -396,8 +396,8 @@ pub const TurnTraces = struct {
 /// from `.tmp/{id}/`. Caller frees.
 fn readSessionLog(gpa: std.mem.Allocator, io: Io, root: Io.Dir, id: []const u8) ?[]u8 {
     var buf: [300]u8 = undefined;
-    const direct = std.fmt.bufPrint(&buf, "{s}/log.jsonl", .{id}) catch return null;
+    const direct = std.mem.print(&buf, "{s}/log.jsonl", .{id}) catch return null;
     if (root.readFileAlloc(io, direct, gpa, .limited(64 << 20))) |bytes| return bytes else |_| {}
-    const staged = std.fmt.bufPrint(&buf, ".tmp/{s}/log.jsonl", .{id}) catch return null;
+    const staged = std.mem.print(&buf, ".tmp/{s}/log.jsonl", .{id}) catch return null;
     return root.readFileAlloc(io, staged, gpa, .limited(64 << 20)) catch null;
 }

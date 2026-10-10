@@ -3,6 +3,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const session_codec = @import("session_codec.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const history_file = profile_paths.prompt_history_file_name;
@@ -568,10 +569,10 @@ fn failParentSync(_: ?*anyopaque, _: std.Io.Dir) anyerror!void {
 }
 
 fn validateWorkspaceRoot(workspace_root: []const u8) !void {
-    if (workspace_root.len == 0 or workspace_root.len > std.fs.max_path_bytes) {
+    if (workspace_root.len == 0 or workspace_root.len > std.Io.Dir.max_path_bytes) {
         return error.InvalidDurableField;
     }
-    if (!std.fs.path.isAbsolute(workspace_root) or
+    if (!std.Io.Dir.path.isAbsolute(workspace_root) or
         !std.unicode.utf8ValidateSlice(workspace_root))
     {
         return error.InvalidDurableField;
@@ -699,7 +700,7 @@ fn repairIncompleteTail(file: std.Io.File) !void {
             start,
         );
         if (read_count != read_len) return error.PromptHistoryWriteFailed;
-        if (std.mem.lastIndexOfScalar(u8, buffer[0..read_count], '\n')) |newline| {
+        if (std.mem.findScalarLast(u8, buffer[0..read_count], '\n')) |newline| {
             try file.setLength(io_mod.getIo(), start + newline + 1);
             try file.sync(io_mod.getIo());
             return;
@@ -899,8 +900,7 @@ fn fixtureLine(
     workspace_root: []const u8,
     text: []const u8,
 ) ![]u8 {
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "{{\"schema_version\":1,\"timestamp_ms\":{d},\"workspace_root\":\"{s}\",\"text\":\"{s}\"}}\n",
         .{ timestamp_ms, workspace_root, text },
     );
@@ -924,7 +924,7 @@ test "reverse load filters workspace bounds results and preserves chronology" {
     defer store.deinit(alloc);
 
     for (0..105) |index| {
-        const text = try std.fmt.allocPrint(alloc, "a-{d}", .{index});
+        const text = try alloc.print("a-{d}", .{index});
         defer alloc.free(text);
         try std.testing.expectEqual(
             AppendOutcome.appended,
@@ -961,13 +961,13 @@ test "reverse load scans beyond one mebibyte of newer interleaved workspace reco
     var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(alloc);
     for (0..100) |index| {
-        const text = try std.fmt.allocPrint(alloc, "kept-{d}", .{index});
+        const text = try alloc.print("kept-{d}", .{index});
         defer alloc.free(text);
         const line = try fixtureLine(alloc, @intCast(index), "/tmp/workspace-a", text);
         defer alloc.free(line);
         try bytes.appendSlice(alloc, line);
     }
-    const filler = "x" ** 2048;
+    const filler = text_utils.repeat("x", 2048);
     var index: usize = 0;
     while (bytes.items.len < 1200 * 1024) : (index += 1) {
         const line = try fixtureLine(
@@ -997,7 +997,7 @@ test "reverse load reconstructs block-spanning records and ignores malformed or 
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(home);
 
-    const long_text = "block-spanning-" ++ ("x" ** 160);
+    const long_text = "block-spanning-" ++ text_utils.repeat("x", 160);
     const first = try fixtureLine(alloc, 1, "/tmp/workspace", long_text);
     defer alloc.free(first);
     const second = try fixtureLine(alloc, 2, "/tmp/workspace", "newer");
@@ -1103,10 +1103,9 @@ test "compaction retains newest one thousand valid records within one mebibyte" 
     var fixture: std.ArrayList(u8) = .empty;
     defer fixture.deinit(alloc);
     for (0..1005) |index| {
-        const text = try std.fmt.allocPrint(
-            alloc,
+        const text = try alloc.print(
             "{d:0>4}-{s}",
-            .{ index, "x" ** 1024 },
+            .{ index, text_utils.repeat("x", 1024) },
         );
         defer alloc.free(text);
         const line = try fixtureLine(alloc, @intCast(index), "/tmp/workspace", text);
@@ -1145,7 +1144,7 @@ test "compaction failure after append reports stale while keeping appended recor
             alloc,
             @intCast(index),
             "/tmp/other",
-            "x" ** (220 * 1024),
+            text_utils.repeat("x", 220 * 1024),
         );
         defer alloc.free(line);
         try fixture.appendSlice(alloc, line);

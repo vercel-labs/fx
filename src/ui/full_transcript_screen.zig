@@ -594,10 +594,10 @@ test "full projection replaces a compact command entry with the retained command
     const rendered = try renderProjectionViewportSource(alloc, &projection, null, 80, 12, 0);
     defer alloc.free(rendered);
 
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "│ first") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "│ second") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "│ third") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "folded") == null);
+    try std.testing.expect(std.mem.find(u8, rendered, "│ first") != null);
+    try std.testing.expect(std.mem.find(u8, rendered, "│ second") != null);
+    try std.testing.expect(std.mem.find(u8, rendered, "│ third") != null);
+    try std.testing.expect(std.mem.find(u8, rendered, "folded") == null);
     try std.testing.expectEqual(@as(?u32, 0), (try measureProjection(alloc, &projection, null, 80)).anchor_row);
 }
 
@@ -631,8 +631,8 @@ test "full projection wraps retained command records with a gutter on every phys
     const source = try renderProjectionViewportSource(alloc, &projection, null, 16, 8, 0);
     defer alloc.free(source);
 
-    try std.testing.expect(std.mem.indexOf(u8, source, "│ paragraph\n│ words\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "│ paragraph words") == null);
+    try std.testing.expect(std.mem.find(u8, source, "│ paragraph\n│ words\n") != null);
+    try std.testing.expect(std.mem.find(u8, source, "│ paragraph words") == null);
 }
 
 test "full projection keeps noncontiguous retained command records at source entries" {
@@ -702,11 +702,11 @@ test "full projection keeps noncontiguous retained command records at source ent
     defer projection.deinit(alloc);
     const source = try renderProjectionViewportSource(alloc, &projection, null, 80, 20, 0);
     defer alloc.free(source);
-    const first = std.mem.indexOf(u8, source, "FULL_FIRST") orelse return error.TestExpectedFirstRecord;
-    const notice = std.mem.indexOf(u8, source, "UNRELATED_NOTICE") orelse return error.TestExpectedNotice;
-    const second = std.mem.indexOf(u8, source, "FULL_SECOND") orelse return error.TestExpectedSecondRecord;
+    const first = std.mem.find(u8, source, "FULL_FIRST") orelse return error.TestExpectedFirstRecord;
+    const notice = std.mem.find(u8, source, "UNRELATED_NOTICE") orelse return error.TestExpectedNotice;
+    const second = std.mem.find(u8, source, "FULL_SECOND") orelse return error.TestExpectedSecondRecord;
     try std.testing.expect(first < notice and notice < second);
-    try std.testing.expect(std.mem.indexOf(u8, source, "STORED_DUPLICATE") == null);
+    try std.testing.expect(std.mem.find(u8, source, "STORED_DUPLICATE") == null);
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, source, "  result"));
 }
 
@@ -778,11 +778,11 @@ test "full projection matches file details to full diffs by marker and lifecycle
     const source = try renderProjectionViewportSource(alloc, &projection, null, 48, @intCast(measurement.total_rows), 0);
     defer alloc.free(source);
 
-    try std.testing.expect(std.mem.indexOf(u8, source, "  │     FULL_FIRST_TAIL") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "COMPACT_FIRST_TAIL") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "RAW_FIRST") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "  │     COMPACT_SECOND_TAIL") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "RAW_SECOND") != null);
+    try std.testing.expect(std.mem.find(u8, source, "  │     FULL_FIRST_TAIL") != null);
+    try std.testing.expect(std.mem.find(u8, source, "COMPACT_FIRST_TAIL") == null);
+    try std.testing.expect(std.mem.find(u8, source, "RAW_FIRST") == null);
+    try std.testing.expect(std.mem.find(u8, source, "  │     COMPACT_SECOND_TAIL") != null);
+    try std.testing.expect(std.mem.find(u8, source, "RAW_SECOND") != null);
 
     var wide_projection = try buildProjectionWithResolver(
         alloc,
@@ -810,10 +810,10 @@ test "full projection matches file details to full diffs by marker and lifecycle
     );
     defer alloc.free(wide_source);
 
-    try std.testing.expect(std.mem.indexOf(u8, wide_source, "FULL_FIRST_TAIL") != null);
-    try std.testing.expect(std.mem.indexOf(u8, wide_source, "COMPACT_SECOND_TAIL") != null);
-    try std.testing.expect(std.mem.indexOf(u8, wide_source, "  │     ") == null);
-    try std.testing.expect(std.mem.indexOf(u8, wide_source, "RAW_SECOND") != null);
+    try std.testing.expect(std.mem.find(u8, wide_source, "FULL_FIRST_TAIL") != null);
+    try std.testing.expect(std.mem.find(u8, wide_source, "COMPACT_SECOND_TAIL") != null);
+    try std.testing.expect(std.mem.find(u8, wide_source, "  │     ") == null);
+    try std.testing.expect(std.mem.find(u8, wide_source, "RAW_SECOND") != null);
 }
 
 test "full projection preserves inline block gaps around expanded tool detail" {
@@ -856,8 +856,8 @@ test "full projection preserves inline block gaps around expanded tool detail" {
     const source = try renderProjectionViewportSource(alloc, &projection, null, 80, 20, 0);
     defer alloc.free(source);
 
-    try std.testing.expect(std.mem.indexOf(u8, source, "\n\n  Summary before tool") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "  value\n\n  Summary after tool") != null);
+    try std.testing.expect(std.mem.find(u8, source, "\n\n  Summary before tool") != null);
+    try std.testing.expect(std.mem.find(u8, source, "  value\n\n  Summary after tool") != null);
 }
 
 test "full tool detail keeps wrapped rails primary while output stays secondary" {
@@ -919,8 +919,8 @@ test "full projection retains consecutive in-memory tool details" {
     const source = try renderProjectionViewportSource(alloc, &projection, null, 80, 24, 0);
     defer alloc.free(source);
 
-    try std.testing.expect(std.mem.indexOf(u8, source, "LIST_FULL_DETAIL_MARKER") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "READ_FULL_DETAIL_MARKER") != null);
+    try std.testing.expect(std.mem.find(u8, source, "LIST_FULL_DETAIL_MARKER") != null);
+    try std.testing.expect(std.mem.find(u8, source, "READ_FULL_DETAIL_MARKER") != null);
 }
 
 test "full projection applies modern width clipping to a tool status" {
@@ -945,8 +945,8 @@ test "full projection applies modern width clipping to a tool status" {
     const source = try renderProjectionViewportSource(alloc, &projection, null, 24, 8, 0);
     defer alloc.free(source);
 
-    try std.testing.expect(std.mem.indexOf(u8, source, "FULL_STATUS_TAIL") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "…") != null);
+    try std.testing.expect(std.mem.find(u8, source, "FULL_STATUS_TAIL") == null);
+    try std.testing.expect(std.mem.find(u8, source, "…") != null);
 }
 
 test "full projection preserves semantic arguments clipped from a tool heading" {
@@ -961,8 +961,7 @@ test "full projection preserves semantic arguments clipped from a tool heading" 
         .entry_id = 1,
         .tool_name = try alloc.dupe(u8, "terminal"),
         .captured_command = true,
-        .arguments_json = try std.fmt.allocPrint(
-            alloc,
+        .arguments_json = try alloc.print(
             "{{\"action\":\"exec\",\"command\":\"{s}\",\"profile\":\"clean\"}}",
             .{command},
         ),
@@ -991,11 +990,11 @@ test "full projection preserves semantic arguments clipped from a tool heading" 
     );
     defer alloc.free(source);
 
-    try std.testing.expect(std.mem.indexOf(u8, source, "command: printf") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "FULL_ARGUMENT_TAIL") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "action: exec") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "profile: clean") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "{\"command\"") == null);
+    try std.testing.expect(std.mem.find(u8, source, "command: printf") != null);
+    try std.testing.expect(std.mem.find(u8, source, "FULL_ARGUMENT_TAIL") != null);
+    try std.testing.expect(std.mem.find(u8, source, "action: exec") == null);
+    try std.testing.expect(std.mem.find(u8, source, "profile: clean") != null);
+    try std.testing.expect(std.mem.find(u8, source, "{\"command\"") == null);
 }
 
 test "stored result projection streams terminal-safe head middle and tail pages" {
@@ -1070,8 +1069,8 @@ test "stored result projection streams terminal-safe head middle and tail pages"
         measurement.total_rows - 3,
     );
     defer alloc.free(tail);
-    try std.testing.expect(std.mem.indexOf(u8, tail, "TAIL-SENTINEL") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tail, "after") != null);
+    try std.testing.expect(std.mem.find(u8, tail, "TAIL-SENTINEL") != null);
+    try std.testing.expect(std.mem.find(u8, tail, "after") != null);
 
     // Every physical row reserves the two-cell result prefix. Escaping ESC
     // adds three cells while the four-byte emoji occupies two, so the marker
@@ -1087,13 +1086,13 @@ test "stored result projection streams terminal-safe head middle and tail pages"
         middle_marker_row,
     );
     defer alloc.free(middle);
-    try std.testing.expect(std.mem.indexOf(u8, middle, "MIDDL") != null);
-    try std.testing.expect(std.mem.indexOf(u8, middle, "E-SENTINEL") != null);
+    try std.testing.expect(std.mem.find(u8, middle, "MIDDL") != null);
+    try std.testing.expect(std.mem.find(u8, middle, "E-SENTINEL") != null);
 
     const head = try renderProjectionViewportSource(alloc, &projection, &capability, 24, 3, 0);
     defer alloc.free(head);
-    try std.testing.expect(std.mem.indexOf(u8, head, "before") != null);
-    try std.testing.expect(std.mem.indexOf(u8, head, "HEAD-SENTINEL") != null);
+    try std.testing.expect(std.mem.find(u8, head, "before") != null);
+    try std.testing.expect(std.mem.find(u8, head, "HEAD-SENTINEL") != null);
 }
 
 test "stored Unicode result remains pageable at the minimum projection width" {
@@ -1154,7 +1153,7 @@ test "stored Unicode result remains pageable at the minimum projection width" {
     );
     defer alloc.free(head);
     try std.testing.expect(std.unicode.utf8ValidateSlice(head));
-    try std.testing.expect(std.mem.indexOf(u8, head, "MIN_WIDTH_HEAD") != null);
+    try std.testing.expect(std.mem.find(u8, head, "MIN_WIDTH_HEAD") != null);
 
     const tail = try renderProjectionViewportSource(
         alloc,
@@ -1166,7 +1165,7 @@ test "stored Unicode result remains pageable at the minimum projection width" {
     );
     defer alloc.free(tail);
     try std.testing.expect(std.unicode.utf8ValidateSlice(tail));
-    try std.testing.expect(std.mem.indexOf(u8, tail, "MIN_WIDTH_TAIL") != null);
+    try std.testing.expect(std.mem.find(u8, tail, "MIN_WIDTH_TAIL") != null);
 }
 
 test "stored result projection preserves line breaks" {
@@ -1212,9 +1211,9 @@ test "stored result projection preserves line breaks" {
 
     const source = try renderProjectionViewportSource(alloc, &projection, &capability, 80, 3, 0);
     defer alloc.free(source);
-    try std.testing.expect(std.mem.indexOf(u8, source, "FIRST_RESULT_LINE") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "SECOND_RESULT_LINE") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "THIRD_RESULT_LINE") != null);
+    try std.testing.expect(std.mem.find(u8, source, "FIRST_RESULT_LINE") != null);
+    try std.testing.expect(std.mem.find(u8, source, "SECOND_RESULT_LINE") != null);
+    try std.testing.expect(std.mem.find(u8, source, "THIRD_RESULT_LINE") != null);
 }
 
 test "stored tool result repeats its rail on every physical wrap row" {
@@ -1433,11 +1432,11 @@ test "viewport selector sees the degraded measurement when a stored segment is u
     try std.testing.expectEqual(@as(u32, 1), recorder.calls);
     try std.testing.expectEqual(post_degrade.total_rows, recorder.measurement.?.total_rows);
     try std.testing.expectEqual(@as(?u16, 8), recorder.visible_rows);
-    try std.testing.expect(std.mem.indexOf(u8, selected, "preview-line") != null);
-    try std.testing.expect(std.mem.indexOf(u8, selected, "Full saved result unavailable.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, selected, dim ++ "│") == null);
-    try std.testing.expect(std.mem.indexOf(u8, selected, reset ++ "│" ++ dim ++ "  preview-line" ++ reset) != null);
-    try std.testing.expect(std.mem.indexOf(u8, selected, reset ++ "│" ++ dim ++ "  Full saved result unavailable." ++ reset) != null);
+    try std.testing.expect(std.mem.find(u8, selected, "preview-line") != null);
+    try std.testing.expect(std.mem.find(u8, selected, "Full saved result unavailable.") != null);
+    try std.testing.expect(std.mem.find(u8, selected, dim ++ "│") == null);
+    try std.testing.expect(std.mem.find(u8, selected, reset ++ "│" ++ dim ++ "  preview-line" ++ reset) != null);
+    try std.testing.expect(std.mem.find(u8, selected, reset ++ "│" ++ dim ++ "  Full saved result unavailable." ++ reset) != null);
 }
 
 test "a window walk degrade re-selects the offset in the same frame" {
@@ -1510,8 +1509,8 @@ test "a window walk degrade re-selects the offset in the same frame" {
     try std.testing.expectEqual(@as(?u16, 8), saboteur.visible_rows);
     const post_degrade = try measureProjection(alloc, &projection, &capability, 80);
     try std.testing.expectEqual(post_degrade.total_rows, saboteur.last_total_rows.?);
-    try std.testing.expect(std.mem.indexOf(u8, selected, "stored-preview") != null);
-    try std.testing.expect(std.mem.indexOf(u8, selected, "Full saved result unavailable.") != null);
+    try std.testing.expect(std.mem.find(u8, selected, "stored-preview") != null);
+    try std.testing.expect(std.mem.find(u8, selected, "Full saved result unavailable.") != null);
 }
 
 test "full projection prefers a persisted command artifact over the compact tool sidecar" {
@@ -1588,12 +1587,12 @@ test "full projection prefers a persisted command artifact over the compact tool
     );
     defer alloc.free(source);
 
-    try std.testing.expect(std.mem.indexOf(u8, source, "COMMAND_ARTIFACT_HEAD") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "COMMAND_ARTIFACT_TAIL") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "<stdout>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "LITERAL_ARTIFACT_ENVELOPE") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "RETAINED_COMMAND_DUPLICATE") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "Full saved result unavailable.") == null);
+    try std.testing.expect(std.mem.find(u8, source, "COMMAND_ARTIFACT_HEAD") != null);
+    try std.testing.expect(std.mem.find(u8, source, "COMMAND_ARTIFACT_TAIL") != null);
+    try std.testing.expect(std.mem.find(u8, source, "<stdout>") != null);
+    try std.testing.expect(std.mem.find(u8, source, "LITERAL_ARTIFACT_ENVELOPE") != null);
+    try std.testing.expect(std.mem.find(u8, source, "RETAINED_COMMAND_DUPLICATE") == null);
+    try std.testing.expect(std.mem.find(u8, source, "Full saved result unavailable.") == null);
 
     const degraded_measurement = try measureProjection(alloc, &projection, null, 80);
     const degraded = try renderProjectionViewportSource(
@@ -1605,8 +1604,8 @@ test "full projection prefers a persisted command artifact over the compact tool
         degraded_measurement.total_rows -| 8,
     );
     defer alloc.free(degraded);
-    try std.testing.expect(std.mem.indexOf(u8, degraded, "RETAINED_COMMAND_DUPLICATE") != null);
-    try std.testing.expect(std.mem.indexOf(u8, degraded, "Full saved result unavailable.") != null);
+    try std.testing.expect(std.mem.find(u8, degraded, "RETAINED_COMMAND_DUPLICATE") != null);
+    try std.testing.expect(std.mem.find(u8, degraded, "Full saved result unavailable.") != null);
 }
 
 test "stored command artifact appends records beyond the callback count once" {
@@ -1807,13 +1806,13 @@ test "full projection prefers ordered replay and omits command envelopes and inp
     );
     defer alloc.free(source);
 
-    const a_index = std.mem.indexOf(u8, source, "│ A") orelse return error.TestExpectedStdout;
-    const b_index = std.mem.indexOf(u8, source, "│ B") orelse return error.TestExpectedStderr;
+    const a_index = std.mem.find(u8, source, "│ A") orelse return error.TestExpectedStdout;
+    const b_index = std.mem.find(u8, source, "│ B") orelse return error.TestExpectedStderr;
     try std.testing.expect(a_index < b_index);
-    try std.testing.expect(std.mem.indexOf(u8, source, "RETAINED_DUPLICATE") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "WRONG_ENVELOPE") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "<stdout>") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "  input") == null);
+    try std.testing.expect(std.mem.find(u8, source, "RETAINED_DUPLICATE") == null);
+    try std.testing.expect(std.mem.find(u8, source, "WRONG_ENVELOPE") == null);
+    try std.testing.expect(std.mem.find(u8, source, "<stdout>") == null);
+    try std.testing.expect(std.mem.find(u8, source, "  input") == null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "│ exit code 7"));
 }
 
@@ -1846,9 +1845,9 @@ test "cancelled command detail keeps its semantic heading without raw arguments"
     const source = try renderProjectionViewportSource(alloc, &projection, null, 80, 8, 0);
     defer alloc.free(source);
 
-    try std.testing.expect(std.mem.indexOf(u8, source, "Cancelled ./z.sh") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "  input") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "{\"command\":\"./z.sh\"}") == null);
+    try std.testing.expect(std.mem.find(u8, source, "Cancelled ./z.sh") != null);
+    try std.testing.expect(std.mem.find(u8, source, "  input") == null);
+    try std.testing.expect(std.mem.find(u8, source, "{\"command\":\"./z.sh\"}") == null);
 }
 
 test "head-pruned command replay fills absolute prefix and suffix ranges once" {
@@ -1967,13 +1966,13 @@ test "head-pruned command replay fills absolute prefix and suffix ranges once" {
         0,
     );
     defer alloc.free(source);
-    const head = std.mem.indexOf(u8, source, "LOST_HEAD") orelse return error.TestExpectedLostHead;
-    const survivor = std.mem.indexOf(u8, source, "SURVIVING_RECORD") orelse return error.TestExpectedSurvivor;
-    const notice = std.mem.indexOf(u8, source, "PRUNED_RANGE_NOTICE") orelse return error.TestExpectedNotice;
-    const suffix = std.mem.indexOf(u8, source, "LOST_SUFFIX") orelse return error.TestExpectedLostSuffix;
+    const head = std.mem.find(u8, source, "LOST_HEAD") orelse return error.TestExpectedLostHead;
+    const survivor = std.mem.find(u8, source, "SURVIVING_RECORD") orelse return error.TestExpectedSurvivor;
+    const notice = std.mem.find(u8, source, "PRUNED_RANGE_NOTICE") orelse return error.TestExpectedNotice;
+    const suffix = std.mem.find(u8, source, "LOST_SUFFIX") orelse return error.TestExpectedLostSuffix;
     try std.testing.expect(head < survivor and survivor < notice and notice < suffix);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "SURVIVING_RECORD"));
-    try std.testing.expect(std.mem.indexOf(u8, source, "INCOMPLETE_SUFFIX_PREFIX") == null);
+    try std.testing.expect(std.mem.find(u8, source, "INCOMPLETE_SUFFIX_PREFIX") == null);
 }
 
 test "active overflow marker is replaced by the terminal source" {
@@ -2052,18 +2051,18 @@ test "active overflow marker is replaced by the terminal source" {
         0,
     );
     defer alloc.free(active_source);
-    try std.testing.expect(std.mem.indexOf(u8, active_source, "│ stable prefix") != null);
-    try std.testing.expect(std.mem.indexOf(u8, active_source, "UNSTABLE_TRUNCATED_RECORD") == null);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(u8, active_source, "│ stable prefix") != null);
+    try std.testing.expect(std.mem.find(u8, active_source, "UNSTABLE_TRUNCATED_RECORD") == null);
+    try std.testing.expect(std.mem.find(
         u8,
         active_source,
         "│ … full output available when command finishes",
     ) != null);
-    const active_stable = std.mem.indexOf(u8, active_source, "│ stable prefix") orelse
+    const active_stable = std.mem.find(u8, active_source, "│ stable prefix") orelse
         return error.TestExpectedStablePrefix;
-    const active_notice = std.mem.indexOf(u8, active_source, "ACTIVE_UNRELATED_NOTICE") orelse
+    const active_notice = std.mem.find(u8, active_source, "ACTIVE_UNRELATED_NOTICE") orelse
         return error.TestExpectedNotice;
-    const active_marker = std.mem.indexOf(
+    const active_marker = std.mem.find(
         u8,
         active_source,
         "available when command finishes",
@@ -2095,16 +2094,16 @@ test "active overflow marker is replaced by the terminal source" {
         0,
     );
     defer alloc.free(terminal_source);
-    try std.testing.expect(std.mem.indexOf(u8, terminal_source, "TERMINAL_COMPLETE_TAIL") != null);
+    try std.testing.expect(std.mem.find(u8, terminal_source, "TERMINAL_COMPLETE_TAIL") != null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, terminal_source, "│ stable prefix"));
-    const terminal_stable = std.mem.indexOf(u8, terminal_source, "│ stable prefix") orelse
+    const terminal_stable = std.mem.find(u8, terminal_source, "│ stable prefix") orelse
         return error.TestExpectedStablePrefix;
-    const terminal_notice = std.mem.indexOf(u8, terminal_source, "ACTIVE_UNRELATED_NOTICE") orelse
+    const terminal_notice = std.mem.find(u8, terminal_source, "ACTIVE_UNRELATED_NOTICE") orelse
         return error.TestExpectedNotice;
-    const terminal_tail = std.mem.indexOf(u8, terminal_source, "TERMINAL_COMPLETE_TAIL") orelse
+    const terminal_tail = std.mem.find(u8, terminal_source, "TERMINAL_COMPLETE_TAIL") orelse
         return error.TestExpectedTerminalTail;
     try std.testing.expect(terminal_stable < terminal_notice and terminal_notice < terminal_tail);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         terminal_source,
         "available when command finishes",
@@ -2179,9 +2178,9 @@ test "corrupt required replay keeps a safe fallback and permanent marker" {
     defer projection.deinit(alloc);
     const source = try renderProjectionViewportSource(alloc, &projection, &capability, 80, 10, 0);
     defer alloc.free(source);
-    try std.testing.expect(std.mem.indexOf(u8, source, "SAFE_RETAINED_FALLBACK") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "│ … full output unavailable") != null);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(u8, source, "SAFE_RETAINED_FALLBACK") != null);
+    try std.testing.expect(std.mem.find(u8, source, "│ … full output unavailable") != null);
+    try std.testing.expect(std.mem.find(
         u8,
         source,
         "available when command finishes",
@@ -2221,12 +2220,12 @@ test "unavailable replay extracts a grammar-valid inline command fallback" {
     const source = try renderProjectionViewportSource(alloc, &projection, null, 80, 10, 0);
     defer alloc.free(source);
 
-    try std.testing.expect(std.mem.indexOf(u8, source, "│ INLINE_COMMAND_FALLBACK") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "exit_code=0") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "<stdout>") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "</stdout>") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "Full saved result unavailable") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "│ … full output unavailable") != null);
+    try std.testing.expect(std.mem.find(u8, source, "│ INLINE_COMMAND_FALLBACK") != null);
+    try std.testing.expect(std.mem.find(u8, source, "exit_code=0") == null);
+    try std.testing.expect(std.mem.find(u8, source, "<stdout>") == null);
+    try std.testing.expect(std.mem.find(u8, source, "</stdout>") == null);
+    try std.testing.expect(std.mem.find(u8, source, "Full saved result unavailable") == null);
+    try std.testing.expect(std.mem.find(u8, source, "│ … full output unavailable") != null);
 }
 
 test "unavailable replay terminal-safes an ambiguous inline command fallback" {
@@ -2262,11 +2261,11 @@ test "unavailable replay terminal-safes an ambiguous inline command fallback" {
     const source = try renderProjectionViewportSource(alloc, &projection, null, 80, 12, 0);
     defer alloc.free(source);
 
-    try std.testing.expect(std.mem.indexOf(u8, source, "AMBIGUOUS_INLINE") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "\x1b[2J") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "\\x1b") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "Full saved result unavailable") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "│ … full output unavailable") != null);
+    try std.testing.expect(std.mem.find(u8, source, "AMBIGUOUS_INLINE") != null);
+    try std.testing.expect(std.mem.find(u8, source, "\x1b[2J") == null);
+    try std.testing.expect(std.mem.find(u8, source, "\\x1b") != null);
+    try std.testing.expect(std.mem.find(u8, source, "Full saved result unavailable") == null);
+    try std.testing.expect(std.mem.find(u8, source, "│ … full output unavailable") != null);
 }
 
 test "stored command detail keeps one normal gap before a following assistant" {
@@ -2307,12 +2306,12 @@ test "stored command detail keeps one normal gap before a following assistant" {
     const source = try renderProjectionViewportSource(alloc, &projection, null, 80, 20, 0);
     defer alloc.free(source);
 
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         source,
         "│ … full output unavailable\n\n  AFTER_COMMAND",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         source,
         "│ … full output unavailable\n\n\n  AFTER_COMMAND",
@@ -2372,12 +2371,12 @@ test "deferred command replay keeps one normal gap before a following assistant"
     const source = try renderProjectionViewportSource(alloc, &projection, null, 80, 20, 0);
     defer alloc.free(source);
 
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         source,
         "│ … full output unavailable\n\n  AFTER_DEFERRED_COMMAND",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         source,
         "│ … full output unavailable\n\n\n  AFTER_DEFERRED_COMMAND",
@@ -2413,10 +2412,10 @@ test "legacy command result without replay does not claim permanent loss" {
     const source = try renderProjectionViewportSource(alloc, &projection, null, 80, 10, 0);
     defer alloc.free(source);
 
-    try std.testing.expect(std.mem.indexOf(u8, source, "LEGACY_COMMAND_RESULT") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "\x1b[2J") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "\\x1b") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "full output unavailable") == null);
+    try std.testing.expect(std.mem.find(u8, source, "LEGACY_COMMAND_RESULT") != null);
+    try std.testing.expect(std.mem.find(u8, source, "\x1b[2J") == null);
+    try std.testing.expect(std.mem.find(u8, source, "\\x1b") != null);
+    try std.testing.expect(std.mem.find(u8, source, "full output unavailable") == null);
 }
 
 test "bounded command source rejects a truncated absolute record range" {
@@ -2552,7 +2551,7 @@ test "oversized newline-free replay stays paged through measurement and tail ren
         measurement.total_rows -| 3,
     );
     defer alloc.free(tail);
-    try std.testing.expect(std.mem.indexOf(u8, tail, "OVERSIZED_REPLAY_TAIL") != null);
+    try std.testing.expect(std.mem.find(u8, tail, "OVERSIZED_REPLAY_TAIL") != null);
     var lines = std.mem.splitScalar(u8, tail, '\n');
     while (lines.next()) |line| {
         if (line.len == 0) continue;
@@ -2788,7 +2787,7 @@ test "oversized interleaved replay preserves more than sixty four record ordinal
     for (0..100) |index| {
         stderr_record.clearRetainingCapacity();
         var prefix_buffer: [16]u8 = undefined;
-        const prefix = try std.fmt.bufPrint(&prefix_buffer, "E{d:0>3}-", .{index});
+        const prefix = try std.mem.print(&prefix_buffer, "E{d:0>3}-", .{index});
         try stderr_record.appendSlice(alloc, prefix);
         try stderr_record.appendNTimes(alloc, 'x', 2048);
         if (index == 99) try stderr_record.appendSlice(alloc, "-INTERLEAVED_TAIL");
@@ -2847,12 +2846,12 @@ test "oversized interleaved replay preserves more than sixty four record ordinal
         measurement.total_rows -| 4,
     );
     defer alloc.free(tail);
-    const done_index = std.mem.indexOf(u8, head, "│ DONE") orelse return error.TestExpectedStdout;
-    const first_stderr_index = std.mem.indexOf(u8, head, "│ E000-") orelse return error.TestExpectedStderr;
+    const done_index = std.mem.find(u8, head, "│ DONE") orelse return error.TestExpectedStdout;
+    const first_stderr_index = std.mem.find(u8, head, "│ E000-") orelse return error.TestExpectedStderr;
     try std.testing.expect(done_index < first_stderr_index);
-    try std.testing.expect(std.mem.indexOf(u8, head, "progress") == null);
-    try std.testing.expect(std.mem.indexOf(u8, tail, "INTERLEAVED_TAIL") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tail, "\x1b") == null);
+    try std.testing.expect(std.mem.find(u8, head, "progress") == null);
+    try std.testing.expect(std.mem.find(u8, tail, "INTERLEAVED_TAIL") != null);
+    try std.testing.expect(std.mem.find(u8, tail, "\x1b") == null);
 }
 
 test "opaque command sources back a stored artifact without a duplicate static row" {
@@ -2900,7 +2899,7 @@ test "opaque command sources back a stored artifact without a duplicate static r
 
     var stored_segments: usize = 0;
     for (projection.segments.items) |segment| switch (segment) {
-        .static => |bytes| try std.testing.expect(std.mem.indexOf(u8, bytes, marker) == null),
+        .static => |bytes| try std.testing.expect(std.mem.find(u8, bytes, marker) == null),
         .stored_result => |stored| {
             stored_segments += 1;
             const retained = stored.retained_command_fallback orelse
@@ -2957,12 +2956,12 @@ test "stored result projection yields a terminal-safe source window for the shar
 
     const source = try renderProjectionViewportSource(alloc, &projection, &capability, 80, 5, 0);
     defer alloc.free(source);
-    try std.testing.expect(std.mem.indexOf(u8, source, "before") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "FIRST_SOURCE_LINE") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "SECOND_SOURCE_LINE") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "THIRD_SOURCE_LINE") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "<path>") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "\\x0a") == null);
+    try std.testing.expect(std.mem.find(u8, source, "before") != null);
+    try std.testing.expect(std.mem.find(u8, source, "FIRST_SOURCE_LINE") != null);
+    try std.testing.expect(std.mem.find(u8, source, "SECOND_SOURCE_LINE") != null);
+    try std.testing.expect(std.mem.find(u8, source, "THIRD_SOURCE_LINE") != null);
+    try std.testing.expect(std.mem.find(u8, source, "<path>") == null);
+    try std.testing.expect(std.mem.find(u8, source, "\\x0a") == null);
 }
 
 test "stored tool result keeps every physical rail primary and body secondary" {
@@ -3024,7 +3023,7 @@ test "stored tool result keeps every physical rail primary and body secondary" {
         @as(usize, measurement.total_rows),
         styled_rows,
     );
-    try std.testing.expect(std.mem.indexOf(u8, source, dim ++ "│") == null);
+    try std.testing.expect(std.mem.find(u8, source, dim ++ "│") == null);
     try std.testing.expect(std.mem.endsWith(
         u8,
         std.mem.trimEnd(u8, source, "\n"),
@@ -3049,8 +3048,8 @@ test "missing stored result renders the retained preview and partial notice" {
 
     const source = try renderProjectionViewportSource(alloc, &projection, null, 80, 3, 0);
     defer alloc.free(source);
-    try std.testing.expect(std.mem.indexOf(u8, source, "retained preview") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "Full saved result unavailable.") != null);
+    try std.testing.expect(std.mem.find(u8, source, "retained preview") != null);
+    try std.testing.expect(std.mem.find(u8, source, "Full saved result unavailable.") != null);
 }
 
 test "missing command artifact uses the retained tool result sidecar" {
@@ -3104,9 +3103,9 @@ test "missing command artifact uses the retained tool result sidecar" {
 
     const source = try renderProjectionViewportSource(alloc, &projection, &capability, 80, 3, 0);
     defer alloc.free(source);
-    try std.testing.expect(std.mem.indexOf(u8, source, "RETAINED_COMMAND_FALLBACK") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "<stdout>") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "Full saved result unavailable.") == null);
+    try std.testing.expect(std.mem.find(u8, source, "RETAINED_COMMAND_FALLBACK") != null);
+    try std.testing.expect(std.mem.find(u8, source, "<stdout>") == null);
+    try std.testing.expect(std.mem.find(u8, source, "Full saved result unavailable.") == null);
 }
 
 test "paged command result removes an envelope split across source pages" {
@@ -3188,10 +3187,10 @@ test "paged command result removes an envelope split across source pages" {
         measurement.total_rows -| 3,
     );
     defer alloc.free(tail);
-    try std.testing.expect(std.mem.indexOf(u8, head, "exit_code=0") == null);
-    try std.testing.expect(std.mem.indexOf(u8, head, "<stdout>") == null);
-    try std.testing.expect(std.mem.indexOf(u8, tail, tail_marker) != null);
-    try std.testing.expect(std.mem.indexOf(u8, tail, "</stdout>") == null);
+    try std.testing.expect(std.mem.find(u8, head, "exit_code=0") == null);
+    try std.testing.expect(std.mem.find(u8, head, "<stdout>") == null);
+    try std.testing.expect(std.mem.find(u8, tail, tail_marker) != null);
+    try std.testing.expect(std.mem.find(u8, tail, "</stdout>") == null);
 }
 
 test "resumed command detail pages its exact result handle without replay" {
@@ -3268,10 +3267,10 @@ test "resumed command detail pages its exact result handle without replay" {
     defer projection.deinit(alloc);
     const source = try renderProjectionViewportSource(alloc, &projection, &capability, 80, 10, 0);
     defer alloc.free(source);
-    try std.testing.expect(std.mem.indexOf(u8, source, "RESUMED_EXACT_RESULT") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "compact resumed placeholder") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "exit_code=0") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "<stdout>") == null);
+    try std.testing.expect(std.mem.find(u8, source, "RESUMED_EXACT_RESULT") != null);
+    try std.testing.expect(std.mem.find(u8, source, "compact resumed placeholder") == null);
+    try std.testing.expect(std.mem.find(u8, source, "exit_code=0") == null);
+    try std.testing.expect(std.mem.find(u8, source, "<stdout>") == null);
 }
 
 test "projection measurement continues across a stored segment boundary" {
@@ -3329,7 +3328,7 @@ test "projection measurement continues across a stored segment boundary" {
         measurement.total_rows - 1,
     );
     defer alloc.free(last_row);
-    try std.testing.expect(std.mem.indexOf(u8, last_row, "after") != null);
+    try std.testing.expect(std.mem.find(u8, last_row, "after") != null);
 
     const past_end = try renderProjectionViewportSource(
         alloc,
@@ -3372,7 +3371,7 @@ test "projection window applies the carriage return column reset measurement use
     // The overwritten tail must not wrap onto a row past the measured document.
     const row = try renderProjectionViewportSource(alloc, &projection, null, 10, 1, 0);
     defer alloc.free(row);
-    try std.testing.expect(std.mem.indexOf(u8, row, "BB") != null);
+    try std.testing.expect(std.mem.find(u8, row, "BB") != null);
 }
 
 test "projection window applies positional tab measurement and preserves bytes" {
@@ -3417,8 +3416,8 @@ test "projection window handles scroll offsets at and past the document tail" {
 
     const tail = try renderProjectionViewportSource(alloc, &projection, null, 10, 5, 2);
     defer alloc.free(tail);
-    try std.testing.expect(std.mem.indexOf(u8, tail, "three") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tail, "two") == null);
+    try std.testing.expect(std.mem.find(u8, tail, "three") != null);
+    try std.testing.expect(std.mem.find(u8, tail, "two") == null);
 
     const past_end = try renderProjectionViewportSource(
         alloc,
@@ -3995,13 +3994,13 @@ fn commandResultBodyRanges(
     for ([_]command_output_content.Stream{ .stdout, .stderr }) |stream| {
         const label = @tagName(stream);
         var open_buffer: [16]u8 = undefined;
-        const open = std.fmt.bufPrint(&open_buffer, "<{s}>\n", .{label}) catch
+        const open = std.mem.print(&open_buffer, "<{s}>\n", .{label}) catch
             unreachable;
         if (!try cursor.startsWithAt(alloc, offset, open)) continue;
         const body_start = offset + open.len;
 
         var close_buffer: [20]u8 = undefined;
-        const close = std.fmt.bufPrint(&close_buffer, "\n</{s}>\n", .{label}) catch
+        const close = std.mem.print(&close_buffer, "\n</{s}>\n", .{label}) catch
             unreachable;
         const close_start = try cursor.findFrom(alloc, body_start, close) orelse
             return error.InvalidCommandResultEnvelope;
@@ -4379,7 +4378,7 @@ const PagedLiteralCommandRecord = struct {
             suffix_start - break_index,
         );
         const suffix_len = self.row.items.len - suffix_start;
-        std.mem.copyForwards(u8, self.row.items[0..suffix_len], self.row.items[suffix_start..]);
+        @memmove(self.row.items[0..suffix_len], self.row.items[suffix_start..]);
         self.row.items.len = suffix_len;
         self.remeasureRow();
     }
@@ -4580,7 +4579,7 @@ const RecordOrderReader = struct {
             const tagged = try self.bytes.next(alloc) orelse {
                 inline for ([_]command_output_content.Stream{ .stdout, .stderr }) |stream| {
                     var sink = RecordOrderSink{ .reader = self, .stream = stream };
-                    try self.decoders[@intFromEnum(stream)].finish(&sink);
+                    try self.decoders[@backingInt(stream)].finish(&sink);
                 }
                 self.finished = true;
                 if (self.created) |stream| {
@@ -4589,7 +4588,7 @@ const RecordOrderReader = struct {
                 }
                 return null;
             };
-            const index = @intFromEnum(tagged.stream);
+            const index = @backingInt(tagged.stream);
             if (!self.open[index]) {
                 self.open[index] = true;
                 self.pending_byte = tagged;
@@ -4606,7 +4605,7 @@ const RecordOrderReader = struct {
     fn consume(self: *RecordOrderReader, tagged: TaggedCommandByte) !void {
         const one = [_]u8{tagged.byte};
         var sink = RecordOrderSink{ .reader = self, .stream = tagged.stream };
-        try self.decoders[@intFromEnum(tagged.stream)].append(&one, &sink);
+        try self.decoders[@backingInt(tagged.stream)].append(&one, &sink);
     }
 };
 
@@ -4615,7 +4614,7 @@ const RecordOrderSink = struct {
     stream: command_output_content.Stream,
 
     fn ensureOpen(self: *RecordOrderSink) void {
-        const index = @intFromEnum(self.stream);
+        const index = @backingInt(self.stream);
         if (self.reader.open[index]) return;
         self.reader.open[index] = true;
         self.reader.created = self.stream;
@@ -4627,7 +4626,7 @@ const RecordOrderSink = struct {
 
     pub fn finishLine(self: *RecordOrderSink) !void {
         self.ensureOpen();
-        self.reader.open[@intFromEnum(self.stream)] = false;
+        self.reader.open[@backingInt(self.stream)] = false;
     }
 
     pub fn replaceLine(self: *RecordOrderSink) !void {
@@ -4857,7 +4856,7 @@ fn appendMergedCommandSource(
 
     var record_ordinal: usize = 0;
     while (try order.nextRecord(alloc)) |stream| {
-        const index = @intFromEnum(stream);
+        const index = @backingInt(stream);
         const generation = try generations[index].nextRecord(alloc) orelse
             return error.CommandProjectionRecordMissing;
         const in_range = record_ordinal >= stored.start_record and
@@ -5896,14 +5895,14 @@ fn metadataKind(
 
 fn markedDiffContent(bytes: []const u8) ?[]const u8 {
     _ = diff_mod.markedDiffBlockId(bytes) orelse return null;
-    const start_marker_end = std.mem.indexOfScalarPos(
+    const start_marker_end = std.mem.findScalarPos(
         u8,
         bytes,
         diff_mod.diff_block_start_prefix.len,
         0x07,
     ) orelse return null;
     const content_start = start_marker_end + 1;
-    const content_end = std.mem.lastIndexOf(u8, bytes, diff_mod.diff_block_end_prefix) orelse
+    const content_end = std.mem.findLast(u8, bytes, diff_mod.diff_block_end_prefix) orelse
         return null;
     if (content_end < content_start) return null;
     return bytes[content_start..content_end];
@@ -6771,8 +6770,8 @@ fn appendCommandProcessPresentation(
     cols: u16,
 ) !void {
     const text = switch (presentation) {
-        .exit_code => |code| try std.fmt.allocPrint(alloc, "exit code {d}", .{code}),
-        .signal => |signal| try std.fmt.allocPrint(alloc, "signal {d}", .{signal}),
+        .exit_code => |code| try alloc.print("exit code {d}", .{code}),
+        .signal => |signal| try alloc.print("signal {d}", .{signal}),
         .timed_out => try alloc.dupe(u8, "timed out"),
         .output_capture_failed => try alloc.dupe(u8, "output capture failed"),
     };

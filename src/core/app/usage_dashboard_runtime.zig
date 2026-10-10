@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_usage_runtime = @import("../session/profile_usage_runtime.zig");
 const usage_recovery = @import("../session/usage_recovery.zig");
@@ -79,7 +80,7 @@ pub const Runtime = struct {
     /// a static release-binary template.
     pub fn initInto(storage: *Self, alloc: Allocator) void {
         comptime {
-            if (std.meta.fields(Self).len != 8) {
+            if (@typeInfo(Self).@"struct".field_names.len != 8) {
                 @compileError("update Runtime.initInto for the changed field set");
             }
         }
@@ -376,7 +377,7 @@ test "usage dashboard reports home-copy allocation failure without starting work
 
     var context: u8 = 0;
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     var runtime = Runtime.init(failing.allocator());

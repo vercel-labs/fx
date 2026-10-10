@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const build_checkpoint = @import("../render_engine/build_checkpoint.zig");
 const transcript_blocks = @import("../render_engine/transcript_blocks.zig");
 const types = @import("../../core/shared/types.zig");
@@ -9,6 +10,7 @@ const sort_utils = @import("../../core/shared/sort_utils.zig");
 const ui_render = @import("../render.zig");
 const code_highlight = @import("../../core/agent/presentation/code_highlight.zig");
 const code_highlight_languages = @import("../../core/agent/presentation/code_highlight_languages.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 
 const TranscriptEntry = transcript_blocks.TranscriptEntry;
 const ToolDetailRecord = transcript_blocks.ToolDetailRecord;
@@ -382,13 +384,13 @@ fn clipSummary(
     if (cols == 0) return try alloc.dupe(u8, "");
     if (cols == 1) return try alloc.dupe(u8, "…");
     const prefix = display_width.prefixByWidthIgnoringAnsi(text, cols - 1);
-    const clipped = try std.fmt.allocPrint(alloc, "{s}…", .{prefix});
+    const clipped = try alloc.print("{s}…", .{prefix});
     // A cut inside a styled run can leave the final SGR open; close it so the
     // accent cannot bleed into whatever the terminal paints next.
     if (std.mem.find(u8, clipped, "\x1b") == null or std.mem.endsWith(u8, clipped, "\x1b[0m"))
         return clipped;
     defer alloc.free(clipped);
-    return try std.fmt.allocPrint(alloc, "{s}\x1b[0m", .{clipped});
+    return try alloc.print("{s}\x1b[0m", .{clipped});
 }
 
 const StatToken = struct {
@@ -439,7 +441,7 @@ fn accentTrailingDiffStats(
         const before_slash = std.mem.trimEnd(u8, text[0 .. last.start - 2], " ");
         if (trailingStatToken(before_slash)) |first| {
             if (first.added) {
-                return try std.fmt.allocPrint(alloc, "{s}{s}{s}{s}{s} / {s}{s}{s}", .{
+                return try alloc.print("{s}{s}{s}{s}{s} / {s}{s}{s}", .{
                     before_slash[0..first.start],
                     added_style,
                     before_slash[first.start..],
@@ -454,7 +456,7 @@ fn accentTrailingDiffStats(
     }
     const style = if (last.added) added_style else removed_style;
     if (style.len == 0) return try alloc.dupe(u8, text);
-    return try std.fmt.allocPrint(alloc, "{s}{s}{s}{s}", .{
+    return try alloc.print("{s}{s}{s}{s}", .{
         text[0..last.start],
         style,
         text[last.start..],
@@ -606,7 +608,7 @@ fn formatGroupBlock(
         static_index += 1;
         const last_static_row = !focused_in_group and static_index == static_count;
         const connector = if (last_static_row) "└" else "├";
-        const child = try std.fmt.allocPrint(scratch, "{s} {s}", .{ connector, display_phrase });
+        const child = try scratch.print("{s} {s}", .{ connector, display_phrase });
         const clipped = try clipSummary(scratch, child, cols);
         try lines.append(alloc, .{ .entry = .{ .entry_id = entry_id, .entry_class = .tool_status, .projection_part = .group_child } });
         const accented = if (entryShowsDiffStats(detail))
@@ -618,8 +620,7 @@ fn formatGroupBlock(
         try out.writer.writeAll(accented);
         if (style.text_style.len > 0) try out.writer.writeAll(style.reset_style);
         if (subagentStatusContinuation(entry, detail)) |continuation| {
-            const continuation_row = try std.fmt.allocPrint(
-                scratch,
+            const continuation_row = try scratch.print(
                 "{s}{s}",
                 .{ if (last_static_row) "  " else "│ ", continuation },
             );
@@ -697,7 +698,7 @@ fn reprojectTruncatedCommandPhrase(
     const tail = commandTailMatch(body, command) orelse return null;
     const label = body[0 .. body.len - tail.len];
     if (label.len == 0 or label[label.len - 1] != ' ') return null;
-    return try std.fmt.allocPrint(scratch, "{s}{s}", .{ label, command });
+    return try scratch.print("{s}{s}", .{ label, command });
 }
 
 /// Shell-highlight the command portion of a command phrase ("Running <cmd>",
@@ -750,7 +751,7 @@ fn highlightCommandPhrase(
         const split_at = phrase.len - display.len - 1;
         break :blk if (phrase[split_at] == ' ') split_at else null;
     } else null;
-    const split = label_end orelse display_end orelse knownLabelPrefix(phrase) orelse std.mem.indexOfScalar(u8, phrase, ' ') orelse return null;
+    const split = label_end orelse display_end orelse knownLabelPrefix(phrase) orelse std.mem.findScalar(u8, phrase, ' ') orelse return null;
     const command = phrase[split + 1 ..];
     if (command.len == 0) return null;
     const theme = shared_theme.current();
@@ -766,7 +767,7 @@ fn highlightCommandPhrase(
         variant,
         if (base_style.len > 0) base_style else null,
     );
-    return try std.fmt.allocPrint(scratch, "{s} {s}", .{ phrase[0..split], highlighted });
+    return try scratch.print("{s} {s}", .{ phrase[0..split], highlighted });
 }
 
 fn formatExpandedChild(
@@ -791,19 +792,18 @@ fn formatExpandedChild(
     // Expanded rows carry no ambient text style, so tokens highlight over the
     // terminal default foreground.
     const display_phrase = try highlightCommandPhrase(scratch, phrase, detail, "") orelse phrase;
-    const child = try std.fmt.allocPrint(scratch, "{s} {s}", .{ connector, display_phrase });
+    const child = try scratch.print("{s} {s}", .{ connector, display_phrase });
     const clipped = try clipSummary(scratch, child, cols);
     const accented = if (entryShowsDiffStats(detail))
         try accentTrailingDiffStats(scratch, clipped, "")
     else
         clipped;
     const continuation = subagentStatusContinuation(entry, detail) orelse return alloc.dupe(u8, accented);
-    const continuation_row = try std.fmt.allocPrint(
-        scratch,
+    const continuation_row = try scratch.print(
         "{s}{s}",
         .{ if (std.mem.eql(u8, connector, "└")) "  " else "│ ", continuation },
     );
-    return std.fmt.allocPrint(alloc, "{s}\n{s}", .{ accented, try clipSummary(scratch, continuation_row, cols) });
+    return alloc.print("{s}\n{s}", .{ accented, try clipSummary(scratch, continuation_row, cols) });
 }
 
 test "expanded subagent row preserves status continuation" {
@@ -857,7 +857,7 @@ fn installExpandedGroup(
         const child = try formatExpandedChild(alloc, entry, detail, connector, cols);
         defer alloc.free(child);
         const bytes = if (child_index == 0)
-            try std.fmt.allocPrint(alloc, "{s}\n{s}", .{ header, child })
+            try alloc.print("{s}\n{s}", .{ header, child })
         else
             try alloc.dupe(u8, child);
         try projection.setOwnedOverride(alloc, status_index, .tool_status, bytes);
@@ -1735,8 +1735,7 @@ test "minimal command details expose running completed and failed process states
 test "completed command rows shell-highlight quoted strings without coloring the action" {
     const alloc = std.testing.allocator;
     const command = "printf 'hello world'";
-    const arguments_json = try std.fmt.allocPrint(
-        alloc,
+    const arguments_json = try alloc.print(
         "{{\"command\":{f}}}",
         .{std.json.fmt(command, .{})},
     );
@@ -1763,14 +1762,13 @@ test "completed command rows shell-highlight quoted strings without coloring the
     // The header, connector, and action label stay uncolored; the command
     // verb and quoted string pick up the syntax palette and close again.
     try std.testing.expect(std.mem.startsWith(u8, row, "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mprintf\x1b[39m "));
-    try std.testing.expect(std.mem.indexOf(u8, row, "\x1b[38;5;250m'hello world'\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, row, "\x1b[38;5;250m'hello world'\x1b[39m") != null);
 }
 
 test "minimal completed command rows reproject stored arguments at the current width" {
     const alloc = std.testing.allocator;
-    const command = "printf " ++ ("alpha-beta-gamma-delta-" ** 8);
-    const arguments_json = try std.fmt.allocPrint(
-        alloc,
+    const command = "printf " ++ text_utils.repeat("alpha-beta-gamma-delta-", 8);
+    const arguments_json = try alloc.print(
         "{{\"command\":{f}}}",
         .{std.json.fmt(command, .{})},
     );
@@ -1806,7 +1804,7 @@ test "minimal completed command rows reproject stored arguments at the current w
     var wide = try build(alloc, &entries, &details, 240);
     defer wide.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mprintf\x1b[39m " ++ ("alpha-beta-gamma-delta-" ** 8),
+        "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mprintf\x1b[39m " ++ text_utils.repeat("alpha-beta-gamma-delta-", 8),
         wide.entry_actions.items[0].override.bytes,
     );
 
@@ -1822,9 +1820,8 @@ test "minimal completed command rows reproject stored arguments at the current w
     defer legacy.deinit(alloc);
     try std.testing.expect(std.mem.endsWith(u8, legacy.entry_actions.items[0].override.bytes, "..."));
 
-    const relative_command = "cd ./packages/cli && " ++ ("printf relative-path " ** 6);
-    const relative_arguments_json = try std.fmt.allocPrint(
-        alloc,
+    const relative_command = "cd ./packages/cli && " ++ text_utils.repeat("printf relative-path ", 6);
+    const relative_arguments_json = try alloc.print(
         "{{\"command\":{f}}}",
         .{std.json.fmt(relative_command, .{})},
     );
@@ -1852,7 +1849,7 @@ test "minimal completed command rows reproject stored arguments at the current w
     var relative = try build(alloc, &relative_entries, &relative_details, 240);
     defer relative.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mcd\x1b[39m ./packages/cli \x1b[38;5;252m&&\x1b[39m \x1b[38;5;252mprintf\x1b[39m" ++ (" relative-path printf" ** 5) ++ " relative-path ",
+        "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mcd\x1b[39m ./packages/cli \x1b[38;5;252m&&\x1b[39m \x1b[38;5;252mprintf\x1b[39m" ++ text_utils.repeat(" relative-path printf", 5) ++ " relative-path ",
         relative.entry_actions.items[0].override.bytes,
     );
 
@@ -1877,15 +1874,15 @@ test "minimal completed command rows reproject stored arguments at the current w
     var compatibility = try build(alloc, &compatibility_entries, &compatibility_details, 240);
     defer compatibility.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Installed skill \x1b[38;5;252mprintf\x1b[39m " ++ ("alpha-beta-gamma-delta-" ** 8),
+        "● 1 tool call · 1 command\n└ Installed skill \x1b[38;5;252mprintf\x1b[39m " ++ text_utils.repeat("alpha-beta-gamma-delta-", 8),
         compatibility.entry_actions.items[0].override.bytes,
     );
 }
 
 test "completed session and tty command rows reproject stored commands at the current width" {
     const alloc = std.testing.allocator;
-    const tty_command = "bun run " ++ ("pipeline-stage-" ** 10);
-    const observe_command = "npm run " ++ ("dev-server-" ** 12);
+    const tty_command = "bun run " ++ text_utils.repeat("pipeline-stage-", 10);
+    const observe_command = "npm run " ++ text_utils.repeat("dev-server-", 12);
     const entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{
             .id = 1,
@@ -1941,15 +1938,15 @@ test "completed session and tty command rows reproject stored commands at the cu
     defer wide.deinit(alloc);
     try std.testing.expectEqualStrings(
         "● 2 tool calls · 2 commands\n" ++
-            "├ Ran \x1b[38;5;252mbun\x1b[39m run " ++ ("pipeline-stage-" ** 10) ++ "\n" ++
-            "└ Observed \x1b[38;5;252mnpm\x1b[39m run " ++ ("dev-server-" ** 12),
+            "├ Ran \x1b[38;5;252mbun\x1b[39m run " ++ text_utils.repeat("pipeline-stage-", 10) ++ "\n" ++
+            "└ Observed \x1b[38;5;252mnpm\x1b[39m run " ++ text_utils.repeat("dev-server-", 12),
         wide.entry_actions.items[0].override.bytes,
     );
 }
 
 test "expanded group children reproject stored commands at the current width" {
     const alloc = std.testing.allocator;
-    const command = "bun run " ++ ("pipeline-stage-" ** 10);
+    const command = "bun run " ++ text_utils.repeat("pipeline-stage-", 10);
     const entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{
             .id = 1,
@@ -1971,7 +1968,7 @@ test "expanded group children reproject stored commands at the current width" {
     var wide = try buildExpandedStyledInterruptible(alloc, &entries, &details, 400, .{}, .{}, null);
     defer wide.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mbun\x1b[39m run " ++ ("pipeline-stage-" ** 10),
+        "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mbun\x1b[39m run " ++ text_utils.repeat("pipeline-stage-", 10),
         wide.entry_actions.items[0].override.bytes,
     );
 
@@ -2010,7 +2007,7 @@ test "command reprojection rejects a record carrying a different command" {
 
 test "command reprojection keeps the row's own label across lifecycle states" {
     const alloc = std.testing.allocator;
-    const command = "printf " ++ ("alpha-beta-gamma-delta-" ** 8);
+    const command = "printf " ++ text_utils.repeat("alpha-beta-gamma-delta-", 8);
     const frozen_tail = "printf alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-";
 
     const Case = struct {
@@ -2032,8 +2029,7 @@ test "command reprojection keeps the row's own label across lifecycle states" {
     };
 
     for (cases, 0..) |case, index| {
-        const bytes = try std.fmt.allocPrint(
-            alloc,
+        const bytes = try alloc.print(
             "● {s}\x1b[0m \x1b[38;5;245m{s}...\x1b[0m\n",
             .{ case.label, frozen_tail },
         );
@@ -2058,7 +2054,7 @@ test "command reprojection keeps the row's own label across lifecycle states" {
         // row keeps its own label rather than the stored prediction.
         try std.testing.expect(std.mem.find(u8, row, "...") == null);
         try std.testing.expect(std.mem.find(u8, row, "alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta") != null);
-        const expected_prefix = try std.fmt.allocPrint(alloc, "\n└ {s} ", .{case.label});
+        const expected_prefix = try alloc.print("\n└ {s} ", .{case.label});
         defer alloc.free(expected_prefix);
         try std.testing.expect(std.mem.find(u8, row, expected_prefix) != null);
     }
@@ -2459,7 +2455,7 @@ fn checkPresentationGroupingAllocationFailures(alloc: std.mem.Allocator) !void {
 
 test "presentation grouping is atomic across allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkPresentationGroupingAllocationFailures,
         .{},
     );
@@ -2982,7 +2978,7 @@ test "prose-prefixed command rows highlight only the trailing stored command" {
     const rows = projection.entry_actions.items[0].override.bytes;
 
     // The prose prefix stays plain in full; the trailing command highlights.
-    try std.testing.expect(std.mem.indexOf(u8, rows, "\n└ Reading project instructions before continuing: \x1b[38;5;252mcat\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rows, "\x1b[38;5;252m&&\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rows, "\x1b[38;5;252mprintf\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, rows, "\n└ Reading project instructions before continuing: \x1b[38;5;252mcat\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, rows, "\x1b[38;5;252m&&\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, rows, "\x1b[38;5;252mprintf\x1b[39m") != null);
 }

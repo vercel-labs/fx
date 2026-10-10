@@ -83,7 +83,7 @@ pub noinline fn composeMcpMenuRow(
     }
     if (show_header and row_index == 1 and projection.state.query_len > 0) {
         var filter_buf: [160]u8 = undefined;
-        const filter = std.fmt.bufPrint(
+        const filter = std.mem.print(
             &filter_buf,
             "Filter: {s}",
             .{projection.state.queryText()},
@@ -143,7 +143,7 @@ fn composeArgumentRow(
     const field = projection.arguments[row_index];
     const selected = row_index == projection.state.argument_index;
     var label_buf: [160]u8 = undefined;
-    const label = std.fmt.bufPrint(
+    const label = std.mem.print(
         &label_buf,
         "{s}{s}{s}",
         .{ if (selected) "> " else "", field.name, if (field.required) " *" else "" },
@@ -171,11 +171,11 @@ fn composeHeader(alloc: Allocator, projection: McpMenuProjection, width: u16) !s
     defer wide.deinit(alloc);
     try wide.appendSlice(alloc, ui_render.selected_completion_style);
     var title_buf: [48]u8 = undefined;
-    const title = std.fmt.bufPrint(&title_buf, "MCP {d}", .{projection.servers.len}) catch "MCP";
+    const title = std.mem.print(&title_buf, "MCP {d}", .{projection.servers.len}) catch "MCP";
     try wide.appendSlice(alloc, title);
     try wide.appendSlice(alloc, ui_render.reset_style);
-    inline for (std.meta.fields(mcp_menu_state.Section)) |field| {
-        const section: mcp_menu_state.Section = @enumFromInt(field.value);
+    inline for (@typeInfo(mcp_menu_state.Section).@"enum".field_values) |field_value| {
+        const section: mcp_menu_state.Section = @fromBackingInt(@intCast(field_value));
         try wide.appendSlice(alloc, "  ");
         try appendSectionTab(alloc, &wide, section, section == projection.state.section);
     }
@@ -405,7 +405,7 @@ fn serverMetadata(buf: []u8, server: mcp_health.ServerSnapshot) []const u8 {
         .http => "HTTP",
         .sse => "SSE",
     };
-    return std.fmt.bufPrint(buf, "{s} · {s}", .{ transport, source }) catch source;
+    return std.mem.print(buf, "{s} · {s}", .{ transport, source }) catch source;
 }
 
 fn composeDetailsRow(
@@ -445,7 +445,7 @@ fn capabilitySummary(buf: []u8, counts: mcp_health.CapabilityCounts) []const u8 
     var resources_buf: [24]u8 = undefined;
     var templates_buf: [24]u8 = undefined;
     var prompts_buf: [24]u8 = undefined;
-    return std.fmt.bufPrint(buf, "tools={s} resources={s} templates={s} prompts={s}", .{
+    return std.mem.print(buf, "tools={s} resources={s} templates={s} prompts={s}", .{
         formatOptionalCount(&tools_buf, counts.tools),
         formatOptionalCount(&resources_buf, counts.resources),
         formatOptionalCount(&templates_buf, counts.resource_templates),
@@ -455,7 +455,7 @@ fn capabilitySummary(buf: []u8, counts: mcp_health.CapabilityCounts) []const u8 
 
 fn formatOptionalCount(buf: []u8, value: ?usize) []const u8 {
     return if (value) |count|
-        std.fmt.bufPrint(buf, "{d}", .{count}) catch "?"
+        std.mem.print(buf, "{d}", .{count}) catch "?"
     else
         "?";
 }
@@ -622,7 +622,7 @@ fn composeConfigurationIssueRow(
     const summary = if (issues.len == 1)
         "1 project MCP configuration error. Run fx mcp list for details. "
     else
-        std.fmt.bufPrint(
+        std.mem.print(
             &summary_buf,
             "{d} project MCP configuration errors. Run fx mcp list for details. ",
             .{issues.len},
@@ -852,7 +852,7 @@ fn expectMcpMenuVtContains(
         );
         defer row.deinit(alloc);
         var cursor_buf: [32]u8 = undefined;
-        const cursor = try std.fmt.bufPrint(
+        const cursor = try std.mem.print(
             &cursor_buf,
             "\x1b[{d};1H",
             .{row_index + 1},

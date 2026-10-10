@@ -1,4 +1,5 @@
 const std = @import("std");
+const display_width = @import("../../shared/display_width.zig");
 const Allocator = std.mem.Allocator;
 const ansi = @import("ansi.zig");
 const tu = @import("text_util.zig");
@@ -119,7 +120,7 @@ fn tokenize(
     // is not followed by `(` cannot be a link or image, and a footnote label
     // ends there too. Without this every `[` in a long run rescans to the
     // same `]`.
-    const last_close_bracket = std.mem.lastIndexOfScalar(u8, text, ']');
+    const last_close_bracket = std.mem.findScalarLast(u8, text, ']');
     var next_close_bracket: ?usize = null;
     // End of the most recent delimiter run that can open emphasis. A bare URL
     // may follow such a run directly, and the tokenizer owns that decision
@@ -130,7 +131,7 @@ fn tokenize(
         const c = text[i];
         const after_opening_delimiter = i > 0 and opening_delimiter_end == i;
         if (last_close_bracket != null and i <= last_close_bracket.? and (next_close_bracket == null or next_close_bracket.? < i)) {
-            next_close_bracket = std.mem.indexOfScalarPos(u8, text, i, ']');
+            next_close_bracket = std.mem.findScalarPos(u8, text, i, ']');
         }
         const bracket_link_possible = next_close_bracket != null and next_close_bracket.? >= i and
             next_close_bracket.? + 1 < text.len and text[next_close_bracket.? + 1] == '(';
@@ -320,7 +321,7 @@ fn codepointBefore(text: []const u8, index: usize) u21 {
     var start = index - 1;
     var steps: usize = 0;
     while (start > 0 and steps < 3 and text[start] & 0xC0 == 0x80) : (steps += 1) start -= 1;
-    return std.unicode.utf8Decode(text[start..index]) catch text[index - 1];
+    return display_width.decodeUtf8Sequence(text[start..index]) catch text[index - 1];
 }
 
 /// Code point starting at `index`, or a space at the line end.
@@ -328,7 +329,7 @@ fn codepointAt(text: []const u8, index: usize) u21 {
     if (index >= text.len) return ' ';
     const len = std.unicode.utf8ByteSequenceLength(text[index]) catch return text[index];
     if (index + len > text.len) return text[index];
-    return std.unicode.utf8Decode(text[index .. index + len]) catch text[index];
+    return display_width.decodeUtf8Sequence(text[index .. index + len]) catch text[index];
 }
 
 fn isFlankingWhitespace(cp: u21) bool {
@@ -353,7 +354,7 @@ fn matchDelimiters(alloc: Allocator, tokens: []Token, matches: *std.ArrayList(Ma
     var next_seq: u32 = 1;
     // Sequence number of the top entry when a search for this closer kind
     // last failed; entries at or below it stay unusable for that kind.
-    var openers_bottom: [3][2][3]u32 = .{.{.{ 0, 0, 0 }} ** 2} ** 3;
+    var openers_bottom: [3][2][3]u32 = @splat(@splat(@splat(0)));
 
     for (tokens, 0..) |*token, token_index| {
         const closer = switch (token.*) {
@@ -445,7 +446,7 @@ fn emitTokens(
                 const id = link_id.*;
                 link_id.* +%= 1;
                 var id_buf: [32]u8 = undefined;
-                const open = try std.fmt.bufPrint(&id_buf, "\x1b]8;id=fx-{d};", .{id});
+                const open = try std.mem.print(&id_buf, "\x1b]8;id=fx-{d};", .{id});
                 try out.appendSlice(alloc, open);
                 try out.appendSlice(alloc, content[0..url_end]);
                 try out.appendSlice(alloc, "\x1b\\");
@@ -474,7 +475,7 @@ fn emitTokens(
 }
 
 fn emitStyle(alloc: Allocator, out: *std.ArrayList(u8), style: Style, opening: bool, depth: *[3]usize, options: InlineOptions) !void {
-    const slot = @intFromEnum(style);
+    const slot = @backingInt(style);
     const open_seq: []const u8 = switch (style) {
         .bold => ansi.bold_open,
         .italic => ansi.italic_open,
@@ -514,7 +515,7 @@ fn parseFootnoteReference(text: []const u8, start: usize, close: usize) ?ParsedF
 
 fn writeFootnoteMarker(alloc: Allocator, out: *std.ArrayList(u8), number: usize) !void {
     var marker: [32]u8 = undefined;
-    const bytes = try std.fmt.bufPrint(&marker, "[{d}]", .{number});
+    const bytes = try std.mem.print(&marker, "[{d}]", .{number});
     try ansi.writeDim(alloc, out, bytes);
 }
 
@@ -537,7 +538,7 @@ fn emitInlineLink(
     const id = link_id.*;
     link_id.* +%= 1;
     var id_buf: [32]u8 = undefined;
-    const open = std.fmt.bufPrint(&id_buf, "\x1b]8;id=fx-{d};", .{id}) catch unreachable;
+    const open = std.mem.print(&id_buf, "\x1b]8;id=fx-{d};", .{id}) catch unreachable;
     try out.appendSlice(alloc, open);
     try out.appendSlice(alloc, link.destination_prefix);
     try out.appendSlice(alloc, link.url);
@@ -600,7 +601,7 @@ fn parseLinkDestination(text: []const u8, start: usize) ?LinkDestination {
 
     var url: []const u8 = undefined;
     if (text[k] == '<') {
-        const close = std.mem.indexOfScalarPos(u8, text, k + 1, '>') orelse return null;
+        const close = std.mem.findScalarPos(u8, text, k + 1, '>') orelse return null;
         url = text[k + 1 .. close];
         for (url) |byte| if (byte == '<' or byte == '\n') return null;
         k = close + 1;
@@ -723,7 +724,7 @@ fn decodeEntity(text: []const u8, start: usize) ?DecodedEntity {
     if (start >= text.len or text[start] != '&') return null;
     // Bound the terminator search so a line full of ampersands stays linear.
     const window_end = @min(text.len, start + 1 + max_entity_name_len + 1);
-    const semicolon = std.mem.indexOfScalarPos(u8, text[0..window_end], start + 1, ';') orelse return null;
+    const semicolon = std.mem.findScalarPos(u8, text[0..window_end], start + 1, ';') orelse return null;
     const name = text[start + 1 .. semicolon];
     if (name.len == 0) return null;
 
@@ -940,4 +941,15 @@ fn isBareUrlTerminator(c: u8) bool {
 
 fn isTrailingBareUrlByte(c: u8) bool {
     return tu.isTrailingUrlPunctuation(c) or c == '*' or c == '_' or c == '~';
+}
+
+test "emphasis after a truncated UTF-8 sequence renders instead of panicking" {
+    const alloc = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    var link_id: u32 = 0;
+    // The delimiter follows a three-byte lead with only one continuation
+    // byte, so the code point before the run has a mismatched length.
+    try writeInline(alloc, "\xe4\x80*bold*", &out, false, null, &link_id);
+    try std.testing.expect(std.mem.find(u8, out.items, "bold") != null);
 }

@@ -3,8 +3,10 @@
 //! are intentionally outside this module's contract.
 
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const display_width = @import("../shared/display_width.zig");
 const contracts = @import("contracts.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -309,11 +311,11 @@ pub const Grid = struct {
 
     state: State = .normal,
     /// CSI parameters accumulated from the digit/';' bytes after `\x1b[`.
-    csi_params: [max_csi_params]u16 = [_]u16{0} ** max_csi_params,
+    csi_params: [max_csi_params]u16 = @splat(0),
     csi_param_count: u8 = 0,
     csi_has_digit: bool = false,
     csi_private: u8 = 0,
-    csi_intermediates: [max_csi_intermediates]u8 = [_]u8{0} ** max_csi_intermediates,
+    csi_intermediates: [max_csi_intermediates]u8 = @splat(0),
     csi_intermediate_count: u8 = 0,
     osc_saw_esc: bool = false,
     /// Captured OSC payload bytes (between `\x1b]` and the terminator).
@@ -322,7 +324,7 @@ pub const Grid = struct {
     osc_buffer: std.ArrayList(u8) = .empty,
     dcs_saw_esc: bool = false,
     dcs_buffer: std.ArrayList(u8) = .empty,
-    utf8_buffer: [4]u8 = [_]u8{0} ** 4,
+    utf8_buffer: [4]u8 = @splat(0),
     utf8_len: u8 = 0,
     utf8_expected: u8 = 0,
     /// Allocator-owned URI/parameter pairs indexed by `Style.hyperlink_id`.
@@ -796,11 +798,11 @@ pub const Grid = struct {
     }
 
     fn resetCsi(self: *Grid) void {
-        self.csi_params = [_]u16{0} ** max_csi_params;
+        self.csi_params = @as([max_csi_params]u16, @splat(0));
         self.csi_param_count = 0;
         self.csi_has_digit = false;
         self.csi_private = 0;
-        self.csi_intermediates = [_]u8{0} ** max_csi_intermediates;
+        self.csi_intermediates = @as([max_csi_intermediates]u8, @splat(0));
         self.csi_intermediate_count = 0;
     }
 
@@ -840,7 +842,7 @@ pub const Grid = struct {
             try self.appendReply("\x1bP1$r0m\x1b\\");
         } else if (std.mem.eql(u8, query, "r")) {
             var buffer: [64]u8 = undefined;
-            const reply = try std.fmt.bufPrint(
+            const reply = try std.mem.print(
                 &buffer,
                 "\x1bP1$r{d};{d}r\x1b\\",
                 .{ self.scroll_top, self.scroll_bottom },
@@ -1457,8 +1459,7 @@ pub const Grid = struct {
         const base = self.rowBase(self.cursor_row);
         const start = base + self.cursor_col - 1;
         const end = base + self.cols;
-        std.mem.copyBackwards(
-            Cell,
+        @memmove(
             self.cells[start + count .. end],
             self.cells[start .. end - count],
         );
@@ -1475,8 +1476,7 @@ pub const Grid = struct {
         const base = self.rowBase(self.cursor_row);
         const start = base + self.cursor_col - 1;
         const end = base + self.cols;
-        std.mem.copyForwards(
-            Cell,
+        @memmove(
             self.cells[start .. end - count],
             self.cells[start + count .. end],
         );
@@ -1553,9 +1553,9 @@ pub const Grid = struct {
             self.cursor_row;
         var buffer: [64]u8 = undefined;
         const reply = if (self.csi_private == '?')
-            try std.fmt.bufPrint(&buffer, "\x1b[?{d};{d}R", .{ row, self.cursor_col })
+            try std.mem.print(&buffer, "\x1b[?{d};{d}R", .{ row, self.cursor_col })
         else
-            try std.fmt.bufPrint(&buffer, "\x1b[{d};{d}R", .{ row, self.cursor_col });
+            try std.mem.print(&buffer, "\x1b[{d};{d}R", .{ row, self.cursor_col });
         try self.appendReply(reply);
     }
 
@@ -1572,12 +1572,12 @@ pub const Grid = struct {
         const reply = switch (self.paramRaw(0, 0)) {
             14 => "\x1b[4;0;0t",
             16 => "\x1b[6;0;0t",
-            18 => try std.fmt.bufPrint(
+            18 => try std.mem.print(
                 &buffer,
                 "\x1b[8;{d};{d}t",
                 .{ self.rows, self.cols },
             ),
-            19 => try std.fmt.bufPrint(
+            19 => try std.mem.print(
                 &buffer,
                 "\x1b[9;{d};{d}t",
                 .{ self.rows, self.cols },
@@ -2573,7 +2573,7 @@ fn encodeGridState(encoder: *CheckpointEncoder, grid: Grid) !void {
     try encoder.boolean(grid.autowrap);
     try encoder.boolean(grid.pending_wrap);
     try encoder.boolean(grid.cursor_visible);
-    try encoder.int(u8, @intFromEnum(grid.cursor_shape));
+    try encoder.int(u8, @backingInt(grid.cursor_shape));
     try encoder.boolean(grid.cursor_blinking);
     try encoder.int(u16, grid.scroll_top);
     try encoder.int(u16, grid.scroll_bottom);
@@ -2590,7 +2590,7 @@ fn encodeGridState(encoder: *CheckpointEncoder, grid: Grid) !void {
     try encoder.boolean(grid.defer_sync_updates);
     try encoder.sizedBytes(grid.sync_buffer.items);
     try encodeStyle(encoder, grid.current_style);
-    try encoder.int(u8, @intFromEnum(grid.state));
+    try encoder.int(u8, @backingInt(grid.state));
     for (grid.csi_params) |param| try encoder.int(u16, param);
     try encoder.int(u8, grid.csi_param_count);
     try encoder.boolean(grid.csi_has_digit);
@@ -2678,7 +2678,7 @@ fn encodeSavedScreen(
     try encoder.boolean(saved.autowrap);
     try encoder.boolean(saved.pending_wrap);
     try encoder.boolean(saved.cursor_visible);
-    try encoder.int(u8, @intFromEnum(saved.cursor_shape));
+    try encoder.int(u8, @backingInt(saved.cursor_shape));
     try encoder.boolean(saved.cursor_blinking);
     try encodeStyle(encoder, saved.current_style);
     try encoder.sizedBytes(saved.active_hyperlink_params);
@@ -3343,7 +3343,7 @@ fn decodeUtf8(bytes: []const u8, start: usize) DecodedRune {
         };
     }
     const slice = bytes[start .. start + seq_len];
-    const cp = std.unicode.utf8Decode(slice) catch
+    const cp = display_width.decodeUtf8Sequence(slice) catch
         return .{ .codepoint = 0xfffd, .len = 1 };
     return .{ .codepoint = cp, .len = seq_len };
 }
@@ -3804,7 +3804,7 @@ test "writes clear any complete wide glyph overlapping the destination" {
         defer g.deinit();
         try g.feed(case.initial);
         var cursor: [16]u8 = undefined;
-        const move = try std.fmt.bufPrint(&cursor, "\x1b[1;{d}H", .{case.col});
+        const move = try std.mem.print(&cursor, "\x1b[1;{d}H", .{case.col});
         try g.feed(move);
         try g.feed(case.replacement);
         try expectWideCellInvariant(g);
@@ -4103,7 +4103,7 @@ test "scrolled repeated link IDs do not exhaust the hyperlink pool" {
     @memset(uri[prefix.len..], 'x');
     var line_buf: [2200]u8 = undefined;
     for (0..2300) |idx| {
-        const line = try std.fmt.bufPrint(&line_buf, "\x1b]8;id=fx-{d};{s}\x1b\\x\x1b]8;;\x1b\\\r\n", .{ idx, uri[0..] });
+        const line = try std.mem.print(&line_buf, "\x1b]8;id=fx-{d};{s}\x1b\\x\x1b]8;;\x1b\\\r\n", .{ idx, uri[0..] });
         try grid.feed(line);
     }
     try testing.expect(grid.hyperlink_pool.items.len <= 256);
@@ -4117,7 +4117,7 @@ test "hyperlink compaction cadence does not rescan each near-full frame" {
     const uri = "https://example.com/x";
     var line_buf: [128]u8 = undefined;
     for (0..255) |idx| {
-        const line = try std.fmt.bufPrint(&line_buf, "\x1b]8;id=fx-{d};{s}\x1b\\x\x1b]8;;\x1b\\", .{ idx, uri });
+        const line = try std.mem.print(&line_buf, "\x1b]8;id=fx-{d};{s}\x1b\\x\x1b]8;;\x1b\\", .{ idx, uri });
         try grid.feed(line);
     }
     try grid.feed("\x1b]8;id=fx-dead;https://example.com/x\x1b\\\x1b]8;;\x1b\\");
@@ -4134,13 +4134,13 @@ test "hyperlink compaction cadence does not rescan each near-full frame" {
 }
 
 test "hyperlink compaction allocation failure keeps cell links intact" {
-    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var failing = testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     const alloc = failing.allocator();
     var grid = try Grid.init(alloc, 260, 1);
     defer grid.deinit();
     var line_buf: [128]u8 = undefined;
     for (0..256) |idx| {
-        const line = try std.fmt.bufPrint(&line_buf, "\x1b]8;id=fx-{d};https://example.com/x\x1b\\x\x1b]8;;\x1b\\", .{idx});
+        const line = try std.mem.print(&line_buf, "\x1b]8;id=fx-{d};https://example.com/x\x1b\\x\x1b]8;;\x1b\\", .{idx});
         try grid.feed(line);
     }
     try grid.osc_buffer.ensureTotalCapacity(alloc, 128);
@@ -4166,7 +4166,7 @@ test "hyperlink compaction retains saved screen and cursor identities" {
 
     var line_buf: [128]u8 = undefined;
     for (0..300) |idx| {
-        const line = try std.fmt.bufPrint(&line_buf, "\x1b]8;id=fx-temp-{d};https://example.com/tmp\x1b\\x\x1b]8;;\x1b\\\r\n", .{idx});
+        const line = try std.mem.print(&line_buf, "\x1b]8;id=fx-temp-{d};https://example.com/tmp\x1b\\x\x1b]8;;\x1b\\\r\n", .{idx});
         try grid.feed(line);
     }
     try testing.expect(grid.hyperlink_pool.items.len <= 256);
@@ -4184,7 +4184,7 @@ test "hyperlink compaction retains saved screen and cursor identities" {
 }
 
 test "OSC 8 parameter replacement is atomic on allocation failure" {
-    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var failing = testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     const alloc = failing.allocator();
     var source = try Grid.init(alloc, 4, 1);
     defer source.deinit();
@@ -4480,7 +4480,7 @@ test "diffBand reopens an OSC 8 hyperlink for each emitted row" {
     const marker = "\x1b]8;;https://example.com\x1b\\";
     var opens: usize = 0;
     var start: usize = 0;
-    while (std.mem.indexOf(u8, buf.items[start..], marker)) |offset| {
+    while (std.mem.find(u8, buf.items[start..], marker)) |offset| {
         opens += 1;
         start += offset + marker.len;
     }
@@ -4794,7 +4794,7 @@ test "parser and reply collections enforce fixed bounds" {
     defer replies.deinit();
     try testing.expectError(
         error.ReplyEffectCapacityExceeded,
-        replies.feedMode("\x1b[5n" ** 17, .native_live),
+        replies.feedMode(text_utils.repeat("\x1b[5n", 17), .native_live),
     );
 
     var osc = try Grid.init(testing.allocator, 10, 2);
@@ -4822,7 +4822,7 @@ fn checkOwnedEngineAllocationFailures(alloc: Allocator) !void {
 
 test "owned effects snapshots and checkpoints handle allocation failure" {
     try testing.checkAllAllocationFailures(
-        testing.allocator,
+        testing_allocator.no_resize,
         checkOwnedEngineAllocationFailures,
         .{},
     );

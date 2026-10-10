@@ -570,7 +570,7 @@ test "traced reset reports dropped captures and clears only paste state" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "paste-reset.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "paste-reset.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -618,7 +618,7 @@ test "deinit traces an active capture once" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "paste-deinit.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "paste-deinit.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();

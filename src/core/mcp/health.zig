@@ -351,8 +351,7 @@ pub fn renderSummary(alloc: Allocator, snapshot: Snapshot) ![]u8 {
         );
     }
     if (snapshot.servers.len == 0) {
-        return std.fmt.allocPrint(
-            alloc,
+        return alloc.print(
             "MCP: {d} project .mcp.json {s}. Use /mcp list for details.",
             .{
                 snapshot.configuration_issues.len,

@@ -39,7 +39,7 @@ const Installation = struct {
 
 // The caller supplies an arena; the returned snapshot borrows its allocations.
 pub fn run(alloc: Allocator, action: Action, transport: transport_mod.Provider, opener: host.UrlOpener) !output.SlackSnapshot {
-    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SlackInstallationUnsupported;
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SlackInstallationUnsupported;
     const origin = io.getenv("FX_E2E_SLACK_ORIGIN") orelse "https://fx.sh";
     if (!std.mem.eql(u8, origin, "https://fx.sh") and !test_origin(origin)) return error.InvalidSlackTestOrigin;
     const home = io.getenv("HOME") orelse return error.HomeNotSet;
@@ -57,11 +57,11 @@ pub fn run(alloc: Allocator, action: Action, transport: transport_mod.Provider, 
         if (!std.mem.eql(u8, value.bridge_origin, origin)) return error.SlackInstallationOriginMismatch;
     }
     if (action == .refresh and previous == null) return error.SlackInstallationMissing;
-    const config_url = try std.fmt.allocPrint(alloc, "{s}/api/slack/install/config", .{origin});
+    const config_url = try alloc.print("{s}/api/slack/install/config", .{origin});
     const config = (try std.json.parseFromSlice(Config, alloc, try request(alloc, transport, .get, config_url, null, null), .{ .allocate = .alloc_always })).value;
     try validate_config(config);
-    const token_url = if (test_origin(origin)) try std.fmt.allocPrint(alloc, "{s}/api/oauth.v2.access", .{origin}) else "https://slack.com/api/oauth.v2.access";
-    const identity_url = if (test_origin(origin)) try std.fmt.allocPrint(alloc, "{s}/api/auth.test", .{origin}) else "https://slack.com/api/auth.test";
+    const token_url = if (test_origin(origin)) try alloc.print("{s}/api/oauth.v2.access", .{origin}) else "https://slack.com/api/oauth.v2.access";
+    const identity_url = if (test_origin(origin)) try alloc.print("{s}/api/auth.test", .{origin}) else "https://slack.com/api/auth.test";
     var form: std.Io.Writer.Allocating = .init(alloc);
     try append(&form.writer, "client_id", config.client_id, true);
     var accepted: ?browser.Accepted(oauth.FormCallback) = null;
@@ -88,10 +88,10 @@ pub fn run(alloc: Allocator, action: Action, transport: transport_mod.Provider, 
         try io.getIo().randomSecure(&entropy);
         var state_buf: [43]u8 = undefined;
         const state = std.base64.url_safe_no_pad.Encoder.encode(&state_buf, &entropy);
-        const start_url = try std.fmt.allocPrint(alloc, "{s}/api/slack/install?state={s}&challenge={s}&port={d}", .{ origin, state, challenge, listener.socket.address.getPort() });
+        const start_url = try alloc.print("{s}/api/slack/install?state={s}&challenge={s}&port={d}", .{ origin, state, challenge, listener.socket.address.getPort() });
         try std.Io.File.stderr().writeStreamingAll(io.getIo(), "Authorize the workspace installation in your browser. Keep fx running.\n");
         if (io.getenv("FX_NO_OPEN_BROWSER") != null or !try opener.open(alloc, start_url)) {
-            try std.Io.File.stderr().writeStreamingAll(io.getIo(), try std.fmt.allocPrint(alloc, "Open on this computer: {s}\n", .{start_url}));
+            try std.Io.File.stderr().writeStreamingAll(io.getIo(), try alloc.print("Open on this computer: {s}\n", .{start_url}));
         }
         var context = oauth.FormCallbackContext{
             .expected_state = state,
@@ -120,7 +120,7 @@ pub fn run(alloc: Allocator, action: Action, transport: transport_mod.Provider, 
     const issued_at = io.milliTimestamp();
     const exchange = try request(alloc, transport, .post_form, token_url, form.written(), null);
     var record = try installation(alloc, exchange, config, origin, if (action == .refresh) previous else null, issued_at);
-    const authorization = try std.fmt.allocPrint(alloc, "Bearer {s}", .{record.access_token});
+    const authorization = try alloc.print("Bearer {s}", .{record.access_token});
     const identity = try request(alloc, transport, .post_form, identity_url, "", authorization);
     try validate_identity(alloc, identity, &record, if (action == .refresh) previous else null);
     var serialized: std.Io.Writer.Allocating = .init(alloc);

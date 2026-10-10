@@ -220,7 +220,7 @@ fn sendGatewayReview(
         debug_trace.logf(
             "permission",
             "event=auto_review_transport result={s} http_status={d}",
-            .{ @tagName(std.meta.activeTag(outcome)), @intFromEnum(stream.status) },
+            .{ @tagName(std.meta.activeTag(outcome)), @backingInt(stream.status) },
         );
         return outcome;
     }
@@ -310,7 +310,7 @@ fn mapTransportError(
 }
 
 fn mapHttpStatus(status: std.http.Status) permission_auto_classifier.TransportOutcome {
-    const code: u16 = @intFromEnum(status);
+    const code: u16 = @backingInt(status);
     if (code == 408 or code == 425 or code == 429 or code >= 500) {
         return .transient_failure;
     }
@@ -399,8 +399,8 @@ const FakeStream = struct {
             },
             .timeout => error.Timeout,
             .cancelled => error.Cancelled,
-            .transient_http => .{ .status = @enumFromInt(429) },
-            .permanent_http => .{ .status = @enumFromInt(400) },
+            .transient_http => .{ .status = @fromBackingInt(@intCast(429)) },
+            .permanent_http => .{ .status = @fromBackingInt(@intCast(400)) },
         };
     }
 };

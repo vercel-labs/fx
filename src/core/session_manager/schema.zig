@@ -483,7 +483,7 @@ fn fastValue(comptime T: type, value: []const u8) ?T {
         .bool => return if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else null,
         .@"enum" => return std.meta.stringToEnum(T, plainString(value) orelse return null),
         .pointer => |ptr| {
-            if (ptr.size != .slice or ptr.child != u8 or !ptr.is_const) return null;
+            if (ptr.size != .slice or ptr.child != u8 or !ptr.attrs.@"const") return null;
             return plainString(value);
         },
         else => return null,
@@ -847,10 +847,10 @@ test "Fields fast paths decode exactly what the full parse decodes" {
 }
 
 test "validItemType: short lowercase names only" {
-    for ([_][]const u8{ "user", "assistant", "tool_call", "tool_result", "steering", "a", "v2", "x" ** 32 }) |name| {
+    for ([_][]const u8{ "user", "assistant", "tool_call", "tool_result", "steering", "a", "v2", &@as([32]u8, @splat('x')) }) |name| {
         try testing.expect(validItemType(name));
     }
-    for ([_][]const u8{ "", "x" ** 33, "Steering", "tool-call", "tool call", "caf\u{e9}", "a/b", "\"q\"" }) |name| {
+    for ([_][]const u8{ "", &@as([33]u8, @splat('x')), "Steering", "tool-call", "tool call", "caf\u{e9}", "a/b", "\"q\"" }) |name| {
         try testing.expect(!validItemType(name));
     }
 }

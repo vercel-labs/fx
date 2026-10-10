@@ -130,7 +130,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
         try context.build_fn(alloc, request.data());
     defer if (request.prepared_request_body == null) alloc.free(payload);
     const auth = if (request.credential.secret()) |credential|
-        try std.fmt.allocPrint(alloc, "Bearer {s}", .{credential})
+        try alloc.print("Bearer {s}", .{credential})
     else
         null;
     defer if (auth) |value| alloc.free(value);
@@ -176,7 +176,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
         try pulse(request.cooperative_pulse);
     }
 
-    const status: std.http.Status = @enumFromInt(status_code);
+    const status: std.http.Status = @fromBackingInt(@intCast(status_code));
     if (status != .ok) return .{ .failed = .{
         .kind = failureKind(status),
         .detail = try readBody(

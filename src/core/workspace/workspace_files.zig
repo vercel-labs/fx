@@ -159,7 +159,7 @@ fn hasGitMetadata(alloc: Allocator, workspace_root: []const u8) !bool {
     var current = workspace_root;
     while (current.len > 0) {
         const found = found: {
-            const marker = try std.fs.path.join(alloc, &.{ current, ".git" });
+            const marker = try std.Io.Dir.path.join(alloc, &.{ current, ".git" });
             defer alloc.free(marker);
             _ = std.Io.Dir.cwd().statFile(io_mod.getIo(), marker, .{ .follow_symlinks = false }) catch |err| switch (err) {
                 error.FileNotFound => break :found false,
@@ -169,7 +169,7 @@ fn hasGitMetadata(alloc: Allocator, workspace_root: []const u8) !bool {
         };
         if (found) return true;
 
-        const parent = std.fs.path.dirname(current) orelse return false;
+        const parent = std.Io.Dir.path.dirname(current) orelse return false;
         if (std.mem.eql(u8, parent, current)) return false;
         current = parent;
     }
@@ -258,7 +258,7 @@ fn runGitRawList(
 }
 
 fn trustedGitExecutable() ?[]const u8 {
-    const candidates = switch (builtin.os.tag) {
+    const candidates = switch (builtin.target.os.tag) {
         .windows => &[_][]const u8{
             "C:\\Program Files\\Git\\cmd\\git.exe",
             "C:\\Program Files\\Git\\bin\\git.exe",
@@ -295,7 +295,6 @@ fn runCancellable(
         .expand_arg0 = options.expand_arg0,
         .progress_node = options.progress_node,
         .create_no_window = options.create_no_window,
-        .disable_aslr = options.disable_aslr,
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
@@ -390,10 +389,10 @@ fn parseRawIgnoredDirectories(arena: Allocator, raw: []const u8) !PathSet {
     var entries = std.mem.splitScalar(u8, raw, separator);
     while (entries.next()) |entry| {
         const trimmed = if (separator == '\n') std.mem.trimEnd(u8, entry, "\r") else entry;
-        if (trimmed.len == 0 or !std.fs.path.isSep(trimmed[trimmed.len - 1])) continue;
+        if (trimmed.len == 0 or !std.Io.Dir.path.isSep(trimmed[trimmed.len - 1])) continue;
 
         var path_end = trimmed.len;
-        while (path_end > 0 and std.fs.path.isSep(trimmed[path_end - 1])) : (path_end -= 1) {}
+        while (path_end > 0 and std.Io.Dir.path.isSep(trimmed[path_end - 1])) : (path_end -= 1) {}
         if (path_end == 0) continue;
         const path = trimmed[0..path_end];
         if (ignored.contains(path)) continue;
@@ -587,11 +586,11 @@ const FrameEntry = struct {
 
 fn joinRelative(arena: Allocator, prefix: []const u8, name: []const u8) ![]u8 {
     if (prefix.len == 0) return arena.dupe(u8, name);
-    return std.fmt.allocPrint(arena, "{s}/{s}", .{ prefix, name });
+    return arena.print("{s}/{s}", .{ prefix, name });
 }
 
 pub fn pathContainsIgnoredDir(ignored: []const []const u8, path: []const u8) bool {
-    var it = std.fs.path.componentIterator(path);
+    var it = std.Io.Dir.path.componentIterator(path);
     while (it.next()) |component| {
         if (isIgnoredName(ignored, component.name)) return true;
     }
@@ -620,7 +619,7 @@ fn isIgnoredName(ignored: []const []const u8, name: []const u8) bool {
 }
 
 fn writeTestFile(dir: std.Io.Dir, path: []const u8, content: []const u8) !void {
-    if (std.fs.path.dirname(path)) |parent| {
+    if (std.Io.Dir.path.dirname(path)) |parent| {
         try dir.createDirPath(io_mod.getIo(), parent);
     }
     var file = try dir.createFile(std.testing.io, path, .{});
@@ -821,7 +820,7 @@ test "workspace directory provider honors its cap and cancellation" {
 }
 
 test "workspace file provider recursive fallback does not recurse symlink directories" {
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -878,7 +877,7 @@ test "workspace file provider falls back when git is skipped" {
 }
 
 test "workspace file provider treats empty successful git result as authoritative" {
-    if (comptime @import("builtin").os.tag == .windows or @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+    if (comptime @import("builtin").target.os.tag == .windows or @import("builtin").target.os.tag == .wasi) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -928,7 +927,7 @@ test "workspace file provider walks a Git worktree when no trusted Git executabl
 }
 
 test "workspace file provider does not recurse after a selected Git executable fails" {
-    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag == .wasi) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -954,7 +953,7 @@ test "workspace file provider does not recurse after a selected Git executable f
 }
 
 test "workspace file provider git result contains tracked files only" {
-    if (comptime @import("builtin").os.tag == .windows or @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+    if (comptime @import("builtin").target.os.tag == .windows or @import("builtin").target.os.tag == .wasi) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -983,7 +982,7 @@ test "workspace file provider git result contains tracked files only" {
 }
 
 test "workspace directory provider uses Git ignores without collapsing nested empty directories" {
-    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1029,7 +1028,7 @@ test "workspace file provider cancellable fallback stops before traversal" {
 }
 
 test "workspace file provider cancellation terminates an active child" {
-    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SkipZigTest;
 
     var stop_requested = std.atomic.Value(bool).init(false);
     const RequestStop = struct {

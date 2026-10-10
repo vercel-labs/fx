@@ -16,7 +16,7 @@ var global_environ_block: ?std.process.Environ.Block = null;
 var global_raw_environ: ?RawEnviron = null;
 
 pub fn setIo(zio: std.Io) void {
-    real_io = process_io_for(builtin.os.tag, zio);
+    real_io = process_io_for(builtin.target.os.tag, zio);
 }
 
 fn process_io_for(comptime os_tag: std.Target.Os.Tag, zio: std.Io) std.Io {
@@ -25,15 +25,15 @@ fn process_io_for(comptime os_tag: std.Target.Os.Tag, zio: std.Io) std.Io {
 
 pub fn getIo() std.Io {
     if (real_io) |zio| return zio;
-    if (comptime builtin.is_test) return process_io_for(builtin.os.tag, std.testing.io);
-    return process_io_for(builtin.os.tag, fallback_threaded.io());
+    if (comptime builtin.is_test) return process_io_for(builtin.target.os.tag, std.testing.io);
+    return process_io_for(builtin.target.os.tag, fallback_threaded.io());
 }
 
 /// Opens an absolute directory path without following any path component.
 /// The caller owns the returned directory handle.
 pub fn openDirAbsoluteNoFollow(path: []const u8, options: std.Io.Dir.OpenOptions) !std.Io.Dir {
-    if (!std.fs.path.isAbsolute(path)) return error.InvalidPath;
-    var components = std.fs.path.componentIterator(path);
+    if (!std.Io.Dir.path.isAbsolute(path)) return error.InvalidPath;
+    var components = std.Io.Dir.path.componentIterator(path);
     const root = components.root() orelse return error.InvalidPath;
     var component = components.next() orelse {
         var root_options = options;
@@ -69,17 +69,17 @@ test "Darwin process I/O replaces only processSpawn with stable storage" {
 
     try std.testing.expect(selected.userdata == original.userdata);
     try std.testing.expect(selected.vtable == selected_again.vtable);
-    inline for (@typeInfo(std.Io.VTable).@"struct".fields) |field| {
-        if (comptime std.mem.eql(u8, field.name, "processSpawn")) {
-            try std.testing.expect(@field(selected.vtable, field.name) != @field(original.vtable, field.name));
+    inline for (@typeInfo(std.Io.VTable).@"struct".field_names) |field_name| {
+        if (comptime std.mem.eql(u8, field_name, "processSpawn")) {
+            try std.testing.expect(@field(selected.vtable, field_name) != @field(original.vtable, field_name));
         } else {
-            try std.testing.expectEqual(@field(original.vtable, field.name), @field(selected.vtable, field.name));
+            try std.testing.expectEqual(@field(original.vtable, field_name), @field(selected.vtable, field_name));
         }
     }
 }
 
 test "getIo applies Darwin process selection to the test fallback" {
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos) return error.SkipZigTest;
 
     const previous = real_io;
     real_io = null;
@@ -91,7 +91,7 @@ test "getIo applies Darwin process selection to the test fallback" {
 }
 
 test "getIo Darwin test fallback runs a child through the selected backend" {
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos) return error.SkipZigTest;
 
     const previous = real_io;
     real_io = null;
@@ -135,11 +135,11 @@ test "openDirAbsoluteNoFollow rejects unsafe path components" {
 
     const root = try dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const linked_child = try std.fs.path.join(alloc, &.{ root, "linked/child" });
+    const linked_child = try std.Io.Dir.path.join(alloc, &.{ root, "linked/child" });
     defer alloc.free(linked_child);
-    const missing = try std.fs.path.join(alloc, &.{ root, "missing" });
+    const missing = try std.Io.Dir.path.join(alloc, &.{ root, "missing" });
     defer alloc.free(missing);
-    const wrong_kind = try std.fs.path.join(alloc, &.{ root, "plain-file" });
+    const wrong_kind = try std.Io.Dir.path.join(alloc, &.{ root, "plain-file" });
     defer alloc.free(wrong_kind);
 
     if (openDirAbsoluteNoFollow(linked_child, .{})) |dir| {
@@ -212,7 +212,7 @@ fn openExistingRegularFileWithPolicy(
     // read-only open accepts that snapshot as the check after the open does.
     try verifyOpenedRegularFileWithPolicy(initial, policy);
 
-    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         var file = try dir.openFile(getIo(), sub_path, .{
             .mode = policy.mode,
             .allow_directory = false,
@@ -305,7 +305,7 @@ fn makeFileBlocking(file: *std.Io.File) !void {
 }
 
 test "read-only regular files remain valid when atomic replacement unlinks the descriptor" {
-    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         return error.SkipZigTest;
     }
     const alloc = std.testing.allocator;
@@ -331,7 +331,7 @@ test "read-only regular files remain valid when atomic replacement unlinks the d
 }
 
 test "read-only opens accept a file that a concurrent atomic replacement unlinks" {
-    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         return error.SkipZigTest;
     }
     var tmp = std.testing.tmpDir(.{});
@@ -453,10 +453,10 @@ pub fn cloneEnvironMap(
 }
 
 fn getenvFromBlock(block: std.process.Environ.Block, key: []const u8) ?[]const u8 {
-    if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding or builtin.os.tag == .other) {
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .freestanding or builtin.target.os.tag == .other) {
         return null;
     }
-    if (comptime (builtin.os.tag == .wasi or builtin.os.tag == .emscripten) and !builtin.link_libc) {
+    if (comptime (builtin.target.os.tag == .wasi or builtin.target.os.tag == .emscripten) and !builtin.link_libc) {
         return null;
     }
 
@@ -495,7 +495,12 @@ pub fn readFileToEnd(alloc: std.mem.Allocator, file: *std.Io.File, max_bytes: us
     const zio = getIo();
     var read_buf: [8192]u8 = undefined;
     var r = file.reader(zio, &read_buf);
-    return r.interface.allocRemaining(alloc, std.Io.Limit.limited(max_bytes));
+    // A file of exactly `max_bytes` is too long. `appendRemaining` keeps that
+    // boundary, while `allocRemaining` accepts it.
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(alloc);
+    try r.interface.appendRemaining(alloc, &content, .limited(max_bytes));
+    return content.toOwnedSlice(alloc);
 }
 
 pub fn readFileToEndZ(alloc: std.mem.Allocator, file: *std.Io.File, max_bytes: usize) ![:0]u8 {
@@ -523,7 +528,7 @@ pub fn writeFileAtomic(alloc: std.mem.Allocator, path: []const u8, text: []const
         if (existing_permissions.toMode() & 0o222 == 0) return error.AccessDenied;
     }
     const permissions = maybe_existing_permissions orelse .default_file;
-    const temp_path = try std.fmt.allocPrint(alloc, "{s}.tmp.{d}", .{ path, nanoTimestamp() });
+    const temp_path = try alloc.print("{s}.tmp.{d}", .{ path, nanoTimestamp() });
     defer alloc.free(temp_path);
 
     var cleanup_temp = true;
@@ -602,7 +607,7 @@ fn validateRelativeLeaf(name: []const u8) !void {
     if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) {
         return error.DurablePathUnsafe;
     }
-    if (std.mem.indexOfAny(u8, name, "/\\") != null) return error.DurablePathUnsafe;
+    if (std.mem.findAny(u8, name, "/\\") != null) return error.DurablePathUnsafe;
 }
 
 fn verifyPrivateRegularFile(file: std.Io.File) !void {
@@ -620,7 +625,7 @@ fn verifyPrivateDirectory(dir: std.Io.Dir) !void {
 /// The handle must come from an `openDir` that requested iteration. Linux returns an
 /// `O_PATH` descriptor otherwise, and `fsync` rejects those with `EBADF`.
 pub fn syncVerifiedDir(dir: std.Io.Dir) !void {
-    if (comptime builtin.os.tag == .windows) return error.OperationUnsupported;
+    if (comptime builtin.target.os.tag == .windows) return error.OperationUnsupported;
     while (true) {
         const rc = std.c.fsync(dir.handle);
         if (rc == 0) return;
@@ -740,7 +745,7 @@ pub fn durableReplaceVerifiedWithOps(
     var random_bytes: [16]u8 = undefined;
     getIo().random(&random_bytes);
     const suffix = std.fmt.bytesToHex(random_bytes, .lower);
-    const temp_name = try std.fmt.allocPrint(alloc, ".{s}.tmp.{s}", .{ name, suffix });
+    const temp_name = try alloc.print(".{s}.tmp.{s}", .{ name, suffix });
     defer alloc.free(temp_name);
 
     var temp_exists = false;
@@ -906,7 +911,7 @@ pub fn copyFileAtomic(alloc: std.mem.Allocator, source_path: []const u8, dest_pa
         if (existing_permissions.toMode() & 0o222 == 0) return error.AccessDenied;
     }
 
-    const temp_path = try std.fmt.allocPrint(alloc, "{s}.tmp.{d}", .{ dest_path, nanoTimestamp() });
+    const temp_path = try alloc.print("{s}.tmp.{d}", .{ dest_path, nanoTimestamp() });
     defer alloc.free(temp_path);
 
     var cleanup_temp = true;
@@ -941,13 +946,54 @@ pub fn sleep(ns: u64) void {
     getIo().sleep(.{ .nanoseconds = @intCast(ns) }, .real) catch {};
 }
 
+/// Reads terminal attributes. Linux issues the kernel ioctl directly because
+/// Zig 0.17 sizes `std.posix.termios` to the kernel struct, while
+/// `std.posix.tcgetattr` calls into libc, which writes its larger struct and
+/// overruns the caller's stack.
+pub fn tcgetattr(fd: std.posix.fd_t) std.posix.TermiosGetError!std.posix.termios {
+    if (builtin.target.os.tag != .linux) return std.posix.tcgetattr(fd);
+    var term = std.mem.zeroes(std.posix.termios);
+    while (true) switch (std.os.linux.errno(std.os.linux.tcgetattr(fd, &term))) {
+        .SUCCESS => return term,
+        .INTR => continue,
+        .BADF => unreachable,
+        .NOTTY => return error.NotATerminal,
+        else => |err| return std.posix.unexpectedErrno(err),
+    };
+}
+
+/// Sets terminal attributes. See `tcgetattr` for why Linux bypasses libc.
+pub fn tcsetattr(
+    fd: std.posix.fd_t,
+    action: std.posix.TCSA,
+    term: std.posix.termios,
+) std.posix.TermiosSetError!void {
+    if (builtin.target.os.tag != .linux) return std.posix.tcsetattr(fd, action, term);
+    while (true) switch (std.os.linux.errno(std.os.linux.tcsetattr(fd, action, &term))) {
+        .SUCCESS => return,
+        .INTR => continue,
+        .BADF, .INVAL => unreachable,
+        .NOTTY => return error.NotATerminal,
+        .IO => return error.ProcessOrphaned,
+        else => |err| return std.posix.unexpectedErrno(err),
+    };
+}
+
+test "tcgetattr reports a regular file as not a terminal" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "plain", .{});
+    defer file.close(std.testing.io);
+    try std.testing.expectError(error.NotATerminal, tcgetattr(file.handle));
+}
+
 pub fn makeDirRecursive(path: []const u8) !void {
     const zio = getIo();
-    if (std.fs.path.isAbsolute(path)) {
+    if (std.Io.Dir.path.isAbsolute(path)) {
         std.Io.Dir.createDirAbsolute(zio, path, .default_dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => {
-                if (std.fs.path.dirname(path)) |parent| try makeDirRecursive(parent);
+                if (std.Io.Dir.path.dirname(path)) |parent| try makeDirRecursive(parent);
                 try std.Io.Dir.createDirAbsolute(zio, path, .default_dir);
             },
         };
@@ -960,9 +1006,9 @@ pub fn makeDirRecursive(path: []const u8) !void {
 }
 
 pub fn realpathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path_z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return error.NameTooLong;
-    var result_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_z = std.mem.printSentinel(&buf, "{s}", .{path}, 0) catch return error.NameTooLong;
+    var result_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const ptr = std.c.realpath(path_z, &result_buf) orelse {
         return switch (std.posix.errno(-1)) {
             .NOENT => error.FileNotFound,
@@ -982,16 +1028,16 @@ pub fn realpathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
 }
 
 fn handlePathAlloc(alloc: std.mem.Allocator, handle: std.Io.File.Handle) ![]u8 {
-    if (comptime builtin.os.tag == .macos or builtin.os.tag == .ios) {
+    if (comptime builtin.target.os.tag == .macos or builtin.target.os.tag == .ios) {
         // F_GETPATH (macOS fcntl command 50): resolve filesystem path for an fd.
-        var path_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+        var path_buf: [std.Io.Dir.max_path_bytes:0]u8 = undefined;
         const rc = std.c.fcntl(handle, @as(c_int, 50), @intFromPtr(&path_buf));
         if (rc == -1) return error.HandlePathUnavailable;
         return alloc.dupe(u8, std.mem.sliceTo(&path_buf, 0));
-    } else if (comptime builtin.os.tag == .linux) {
+    } else if (comptime builtin.target.os.tag == .linux) {
         var fd_path_buf: [64:0]u8 = undefined;
-        _ = std.fmt.bufPrintZ(&fd_path_buf, "/proc/self/fd/{d}", .{handle}) catch return error.HandlePathUnavailable;
-        var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+        _ = std.mem.printSentinel(&fd_path_buf, "/proc/self/fd/{d}", .{handle}, 0) catch return error.HandlePathUnavailable;
+        var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const rc = std.c.readlink(&fd_path_buf, &link_buf, link_buf.len);
         if (rc < 0) return error.HandlePathUnavailable;
         return alloc.dupe(u8, link_buf[0..@intCast(rc)]);
@@ -1008,37 +1054,37 @@ pub fn openedFilePathAlloc(alloc: std.mem.Allocator, file: std.Io.File) ![]u8 {
     if (stat.kind != .file or stat.nlink == 0) return error.HandlePathUnavailable;
     const path = try handlePathAlloc(alloc, file.handle);
     errdefer alloc.free(path);
-    if (!std.fs.path.isAbsolute(path)) return error.HandlePathUnavailable;
-    if (comptime builtin.os.tag == .linux) {
+    if (!std.Io.Dir.path.isAbsolute(path)) return error.HandlePathUnavailable;
+    if (comptime builtin.target.os.tag == .linux) {
         if (std.mem.endsWith(u8, path, " (deleted)")) return error.HandlePathUnavailable;
     }
     return path;
 }
 
 pub fn dirRealpathAlloc(alloc: std.mem.Allocator, dir: std.Io.Dir, sub_path: []const u8) ![]u8 {
-    if (comptime builtin.os.tag == .macos or builtin.os.tag == .ios) {
+    if (comptime builtin.target.os.tag == .macos or builtin.target.os.tag == .ios) {
         const dir_path = handlePathAlloc(alloc, dir.handle) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.FileNotFound,
         };
         if (sub_path.len == 0) return dir_path;
         defer alloc.free(dir_path);
-        const joined = try std.fs.path.join(alloc, &.{ dir_path, sub_path });
+        const joined = try std.Io.Dir.path.join(alloc, &.{ dir_path, sub_path });
         defer alloc.free(joined);
         return realpathAlloc(alloc, joined);
-    } else if (comptime builtin.os.tag == .linux) {
+    } else if (comptime builtin.target.os.tag == .linux) {
         const dir_path = handlePathAlloc(alloc, dir.handle) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.FileNotFound,
         };
         if (sub_path.len == 0) return dir_path;
         defer alloc.free(dir_path);
-        const joined = try std.fs.path.join(alloc, &.{ dir_path, sub_path });
+        const joined = try std.Io.Dir.path.join(alloc, &.{ dir_path, sub_path });
         defer alloc.free(joined);
         return realpathAlloc(alloc, joined);
-    } else if (comptime builtin.os.tag == .wasi) {
-        if (std.fs.path.isAbsolute(sub_path)) return alloc.dupe(u8, sub_path);
-        return std.fs.path.resolve(alloc, &.{sub_path});
+    } else if (comptime builtin.target.os.tag == .wasi) {
+        if (std.Io.Dir.path.isAbsolute(sub_path)) return alloc.dupe(u8, sub_path);
+        return std.Io.Dir.path.resolveAlloc(alloc, &.{sub_path});
     } else {
         @compileError("dirRealpathAlloc not implemented for this OS");
     }
@@ -1225,7 +1271,7 @@ test "writeFileAtomic replaces file content and leaves no temp file behind" {
 
     const root = try dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const file_path = try std.fs.path.join(alloc, &.{ root, "state.json" });
+    const file_path = try std.Io.Dir.path.join(alloc, &.{ root, "state.json" });
     defer alloc.free(file_path);
 
     try writeFileAtomic(alloc, file_path, "first");
@@ -1255,7 +1301,7 @@ test "writeFileAtomic preserves existing file permissions" {
 
     const root = try dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const file_path = try std.fs.path.join(alloc, &.{ root, "script.sh" });
+    const file_path = try std.Io.Dir.path.join(alloc, &.{ root, "script.sh" });
     defer alloc.free(file_path);
 
     try writeFileAtomic(alloc, file_path, "first");
@@ -1273,9 +1319,9 @@ test "copyFileAtomic copies through temp file and cleans up" {
 
     const root = try dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const source_path = try std.fs.path.join(alloc, &.{ root, "source.txt" });
+    const source_path = try std.Io.Dir.path.join(alloc, &.{ root, "source.txt" });
     defer alloc.free(source_path);
-    const dest_path = try std.fs.path.join(alloc, &.{ root, "dest.txt" });
+    const dest_path = try std.Io.Dir.path.join(alloc, &.{ root, "dest.txt" });
     defer alloc.free(dest_path);
 
     try writeFileAtomic(alloc, source_path, "source");
@@ -1302,9 +1348,9 @@ test "copyFileAtomic failed replacement leaves existing destination intact" {
 
     const root = try dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const source_path = try std.fs.path.join(alloc, &.{ root, "source.txt" });
+    const source_path = try std.Io.Dir.path.join(alloc, &.{ root, "source.txt" });
     defer alloc.free(source_path);
-    const dest_dir = try std.fs.path.join(alloc, &.{ root, "dest" });
+    const dest_dir = try std.Io.Dir.path.join(alloc, &.{ root, "dest" });
     defer alloc.free(dest_dir);
 
     try writeFileAtomic(alloc, source_path, "source");
@@ -1329,8 +1375,8 @@ test "dirRealpathAlloc resolves tmp file" {
 
     const resolved = try dirRealpathAlloc(alloc, tmp.dir, "resolved.txt");
     defer alloc.free(resolved);
-    try std.testing.expect(std.fs.path.isAbsolute(resolved));
-    try std.testing.expect(std.mem.endsWith(u8, resolved, std.fs.path.sep_str ++ "resolved.txt"));
+    try std.testing.expect(std.Io.Dir.path.isAbsolute(resolved));
+    try std.testing.expect(std.mem.endsWith(u8, resolved, std.Io.Dir.path.sep_str ++ "resolved.txt"));
 }
 
 test "realpathAlloc on nonexistent path returns FileNotFound" {
@@ -1339,7 +1385,7 @@ test "realpathAlloc on nonexistent path returns FileNotFound" {
     defer tmp.cleanup();
     const root = try dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const missing = try std.fs.path.join(alloc, &.{ root, "missing-realpath-target" });
+    const missing = try std.Io.Dir.path.join(alloc, &.{ root, "missing-realpath-target" });
     defer alloc.free(missing);
 
     try std.testing.expectError(error.FileNotFound, realpathAlloc(alloc, missing));
@@ -1353,9 +1399,9 @@ test "realpathAlloc distinguishes non-directory and symlink-loop paths" {
     try tmp.dir.symLink(getIo(), "loop", "loop", .{});
     const root = try dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const not_dir = try std.fs.path.join(alloc, &.{ root, "file/child" });
+    const not_dir = try std.Io.Dir.path.join(alloc, &.{ root, "file/child" });
     defer alloc.free(not_dir);
-    const loop = try std.fs.path.join(alloc, &.{ root, "loop/child" });
+    const loop = try std.Io.Dir.path.join(alloc, &.{ root, "loop/child" });
     defer alloc.free(loop);
 
     try std.testing.expectError(error.NotDir, realpathAlloc(alloc, not_dir));

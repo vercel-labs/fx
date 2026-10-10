@@ -29,7 +29,7 @@ fn fetch(
         if (flag.load(.seq_cst)) return .{ .failure = .{ .category = .cancellation } };
     }
 
-    const url = try std.fmt.allocPrint(alloc, "{s}{s}", .{
+    const url = try alloc.print("{s}{s}", .{
         builtin_gateway.default_model_catalog_base_url,
         input.endpoint,
     });
@@ -39,7 +39,7 @@ fn fetch(
     var headers: std.ArrayList(Header) = .empty;
     defer headers.deinit(alloc);
     const authorization = if (input.access.authorizationCredential()) |credential|
-        try std.fmt.allocPrint(alloc, "Bearer {s}", .{credential})
+        try alloc.print("Bearer {s}", .{credential})
     else
         null;
     defer if (authorization) |value| alloc.free(value);
@@ -75,7 +75,7 @@ fn fetch(
     if (response_len < 0) return .{ .failure = .{ .category = .transport, .retryable = true } };
     if (response_len > response.len) return .{ .failure = .{ .category = .resource_exhausted } };
     if (status != 200) {
-        return .{ .failure = model_catalog.failureForHttpStatus(@enumFromInt(status)) };
+        return .{ .failure = model_catalog.failureForHttpStatus(@fromBackingInt(@intCast(status))) };
     }
 
     const catalog = builtin_gateway.parseModelCatalogForView(

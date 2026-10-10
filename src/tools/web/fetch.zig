@@ -194,14 +194,14 @@ fn fetchConvertedOutcome(ctx: tool_dispatch.DispatchContext, url: []const u8, tr
 
     return switch (result) {
         .success => |success| blk: {
-            recordTargetHttpDiagnostic(transport_started_at_ms, @intFromEnum(success.status), success.body.len, "");
+            recordTargetHttpDiagnostic(transport_started_at_ms, @backingInt(success.status), success.body.len, "");
             const success_display_url = try text_utils.redactUrlForDisplay(ctx.allocator, success.final_url);
             defer ctx.allocator.free(success_display_url);
             emitProgress(ctx, .{ .converting = success_display_url });
             break :blk .{ .success = try convertSuccess(ctx.allocator, success) };
         },
         .failure => |failure| blk: {
-            recordTargetHttpDiagnostic(transport_started_at_ms, if (failure.status) |status| @intFromEnum(status) else 0, failure.body.len, "");
+            recordTargetHttpDiagnostic(transport_started_at_ms, if (failure.status) |status| @backingInt(status) else 0, failure.body.len, "");
             break :blk .{ .failure = try fetchResultFailure(ctx.allocator, url, failure) };
         },
         .cross_host_redirect => |cross_host_url| blk: {
@@ -286,7 +286,7 @@ fn nonSuccessFailure(alloc: Allocator, url: []const u8, failure: http_fetch.Fail
     const details = [_]tool_result_errors.Detail{
         .{ .name = "field", .value = .{ .string = "url" } },
         .{ .name = "url", .value = .{ .string = display_url } },
-        .{ .name = "status", .value = .{ .unsigned = @intFromEnum(failure.status.?) } },
+        .{ .name = "status", .value = .{ .unsigned = @backingInt(failure.status.?) } },
         .{ .name = "body_preview", .value = .{ .string = safe_preview } },
         .{ .name = "body_truncated", .value = .{ .boolean = failure.body.len > preview_len } },
     };
@@ -304,7 +304,7 @@ fn unexpectedEncodingFailure(alloc: Allocator, url: []const u8, failure: http_fe
     const details = [_]tool_result_errors.Detail{
         .{ .name = "field", .value = .{ .string = "url" } },
         .{ .name = "url", .value = .{ .string = display_url } },
-        .{ .name = "status", .value = .{ .unsigned = @intFromEnum(failure.status.?) } },
+        .{ .name = "status", .value = .{ .unsigned = @backingInt(failure.status.?) } },
         .{ .name = "content_encoding", .value = .{ .string = failure.content_encoding.? } },
     };
     return try tool_result_errors.toolExecutionFailureJson(alloc, .{
@@ -415,7 +415,7 @@ fn writeOutputMetadata(alloc: Allocator, writer: *std.Io.Writer, success: Output
         "<url>{s}</url>\n<status>{d}</status>\n<mime_type>{s}</mime_type>\n<content_kind>{s}</content_kind>\n<cache_hit>{s}</cache_hit>\n",
         .{
             display_url,
-            @intFromEnum(success.status),
+            @backingInt(success.status),
             success.mime_type,
             @tagName(success.content_kind),
             if (success.cache_hit) "true" else "false",
@@ -443,7 +443,7 @@ fn reportCompletion(ctx: tool_dispatch.DispatchContext, success: OutputView, sta
     defer ctx.allocator.free(display_url);
     var completion = types.WebFetchCompletion{
         .bytes = webFetchOutputBytes(success),
-        .status = @intFromEnum(success.status),
+        .status = @backingInt(success.status),
         .duration_ms = @intCast(clampI64MsToU32(io_mod.milliTimestamp() - started_at_ms)),
         .cache_hit = success.cache_hit,
         .artifact_state = webFetchArtifactState(success),

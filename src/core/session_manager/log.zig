@@ -9,6 +9,7 @@
 //! effectful shell over L0.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const schema = @import("schema.zig");
 const storage = @import("storage.zig");
 const trace = if (storage.hooks) @import("trace.zig") else struct {};
@@ -325,7 +326,7 @@ pub const Log = struct {
     pub fn append(log: *Log, batch: []const u8, line_count: u64) AppendError!void {
         if (log.status != .open or log.access != .read_write) return error.NotWritable;
         std.debug.assert(batch.len > 0 and batch[batch.len - 1] == '\n');
-        if (std.debug.runtime_safety) log.assertSeqs(batch, line_count);
+        if (builtin.optimize.runtimeSafety()) log.assertSeqs(batch, line_count);
         const traced = if (hooks) log.hook.tracer != null else false;
         if (traced) {
             try log.appendTraced(batch);
@@ -426,7 +427,7 @@ fn inspectTail(gpa: std.mem.Allocator, s: storage.Storage, file: storage.File, l
         start -= step;
         const old_len = window.items.len;
         try window.resize(gpa, old_len + step);
-        std.mem.copyBackwards(u8, window.items[step..], window.items[0..old_len]);
+        @memmove(window.items[step..], window.items[0..old_len]);
         const n = try s.readAt(file, window.items[0..step], start);
         if (n != step) return error.Io; // the file shrank under us
         newlines += std.mem.count(u8, window.items[0..step], "\n");
@@ -570,7 +571,7 @@ pub const ForwardReader = struct {
             }
             // Drop consumed bytes, then read the next block.
             const unread = r.buf.items.len - r.pos;
-            std.mem.copyForwards(u8, r.buf.items[0..unread], r.buf.items[r.pos..]);
+            @memmove(r.buf.items[0..unread], r.buf.items[r.pos..]);
             r.buf.shrinkRetainingCapacity(unread);
             r.buf_offset += r.pos;
             r.pos = 0;
@@ -645,7 +646,7 @@ pub const BackwardReader = struct {
             // Prepend the previous block.
             const want: usize = @intCast(@min(block_bytes, r.buf_offset));
             try r.buf.resize(r.gpa, have.len + want);
-            std.mem.copyBackwards(u8, r.buf.items[want..], r.buf.items[0..have.len]);
+            @memmove(r.buf.items[want..], r.buf.items[0..have.len]);
             r.buf_offset -= want;
             const n = try r.s.readAt(r.file, r.buf.items[0..want], r.buf_offset);
             if (n != want) return error.Io;
@@ -932,7 +933,7 @@ test "crc32c equals std's byte-at-a-time CRC32C at every length and alignment" {
     for (0..300) |len| {
         for (0..8) |start| {
             const slice = buffer[start..][0..len];
-            try testing.expectEqual(std.hash.crc.Crc32Iscsi.hash(slice), crc32c(slice));
+            try testing.expectEqual(std.hash.crc.@"CRC-32/ISCSI".hash(slice), crc32c(slice));
         }
     }
 }
@@ -1158,7 +1159,7 @@ const log_model_tests = struct {
 
     fn tracedSchedule(seed: u64) !void {
         var case_buffer: [64]u8 = undefined;
-        const case = try std.fmt.bufPrint(&case_buffer, "fault-schedule-seed-{d}", .{seed});
+        const case = try std.mem.print(&case_buffer, "fault-schedule-seed-{d}", .{seed});
         try runTraced(seed, case, .none);
     }
 

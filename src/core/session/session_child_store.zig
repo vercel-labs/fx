@@ -252,8 +252,8 @@ const CapabilityImpl = struct {
     terminal_state: ?io_mod.VerifiedDir = null,
     terminal_proofs: ?io_mod.VerifiedDir = null,
     client_context: ?io_mod.VerifiedDir = null,
-    indeterminate_names: [@typeInfo(ManagedChildKind).@"enum".fields.len]?[]u8 =
-        [_]?[]u8{null} ** @typeInfo(ManagedChildKind).@"enum".fields.len,
+    indeterminate_names: [@typeInfo(ManagedChildKind).@"enum".field_names.len]?[]u8 =
+        @splat(null),
 
     fn deinit(self: *CapabilityImpl) void {
         closeOptionalDir(&self.background_logs);
@@ -405,8 +405,8 @@ const CapabilityImpl = struct {
         const owner_path = self.display_session_path;
         if (self.blobs == null or owner_path.len == 0) return if (create) error.SessionChildStoreFailed else null;
         if (create and self.mode != .writable) return error.SessionChildReadOnly;
-        const root_path = std.fs.path.dirname(owner_path) orelse return error.SessionPathUnsafe;
-        const fx_path = std.fs.path.dirname(root_path) orelse return error.SessionPathUnsafe;
+        const root_path = std.Io.Dir.path.dirname(owner_path) orelse return error.SessionPathUnsafe;
+        const fx_path = std.Io.Dir.path.dirname(root_path) orelse return error.SessionPathUnsafe;
         var fx = io_mod.VerifiedDir{ .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), fx_path, .{
             .iterate = true,
             .follow_symlinks = false,
@@ -416,13 +416,13 @@ const CapabilityImpl = struct {
             else => return error.SessionChildStoreFailed,
         } };
         defer fx.close();
-        const root_name = std.fs.path.basename(root_path);
+        const root_name = std.Io.Dir.path.basename(root_path);
         var root = if (create)
             try io_mod.openOrCreateVerifiedPrivateDir(&fx, root_name)
         else
             (try io_mod.openVerifiedPrivateDirIfPresent(&fx, root_name)) orelse return null;
         defer root.close();
-        const id = std.fs.path.basename(owner_path);
+        const id = std.Io.Dir.path.basename(owner_path);
         self.terminal_dir = if (create)
             try io_mod.openOrCreateVerifiedPrivateDir(&root, id)
         else
@@ -513,7 +513,7 @@ const CapabilityImpl = struct {
     ) ![]u8 {
         const route_path = try self.displayRoutePath(alloc, kind);
         defer alloc.free(route_path);
-        return std.fs.path.join(alloc, &.{ route_path, name });
+        return std.Io.Dir.path.join(alloc, &.{ route_path, name });
     }
 
     fn displayRoutePath(
@@ -530,7 +530,7 @@ const CapabilityImpl = struct {
                     u8,
                     self.legacy_display_route.?,
                 ),
-                .background_logs => std.fs.path.join(
+                .background_logs => std.Io.Dir.path.join(
                     alloc,
                     &.{ self.legacy_display_route.?, "logs" },
                 ),
@@ -538,39 +538,39 @@ const CapabilityImpl = struct {
             };
         }
         return switch (kind) {
-            .background_records => std.fs.path.join(
+            .background_records => std.Io.Dir.path.join(
                 alloc,
                 &.{ self.display_session_path, "background" },
             ),
-            .background_logs => std.fs.path.join(
+            .background_logs => std.Io.Dir.path.join(
                 alloc,
                 &.{ self.display_session_path, "background", "logs" },
             ),
-            .command_artifacts => std.fs.path.join(
+            .command_artifacts => std.Io.Dir.path.join(
                 alloc,
                 &.{ self.display_session_path, "logs", "commands" },
             ),
-            .browser_artifacts => std.fs.path.join(
+            .browser_artifacts => std.Io.Dir.path.join(
                 alloc,
                 &.{ self.display_session_path, "artifacts", "browser" },
             ),
-            .tool_results => std.fs.path.join(
+            .tool_results => std.Io.Dir.path.join(
                 alloc,
                 &.{ self.display_session_path, "tool-results" },
             ),
-            .subagent_control => std.fs.path.join(
+            .subagent_control => std.Io.Dir.path.join(
                 alloc,
                 &.{ self.display_session_path, "subagent" },
             ),
-            .terminal_state => std.fs.path.join(
+            .terminal_state => std.Io.Dir.path.join(
                 alloc,
                 &.{ self.display_session_path, "terminal", "state" },
             ),
-            .terminal_proofs => std.fs.path.join(
+            .terminal_proofs => std.Io.Dir.path.join(
                 alloc,
                 &.{ self.display_session_path, "terminal", "proofs" },
             ),
-            .client_context => std.fs.path.join(
+            .client_context => std.Io.Dir.path.join(
                 alloc,
                 &.{ self.display_session_path, "client" },
             ),
@@ -591,19 +591,19 @@ const CapabilityImpl = struct {
         kind: ManagedChildKind,
         replacement: []u8,
     ) void {
-        const index = @intFromEnum(kind);
+        const index = @backingInt(kind);
         if (self.indeterminate_names[index]) |old| self.alloc.free(old);
         self.indeterminate_names[index] = replacement;
     }
 
     fn clearIndeterminate(self: *CapabilityImpl, kind: ManagedChildKind) void {
-        const index = @intFromEnum(kind);
+        const index = @backingInt(kind);
         if (self.indeterminate_names[index]) |name| self.alloc.free(name);
         self.indeterminate_names[index] = null;
     }
 
     fn resolveIndeterminate(self: *CapabilityImpl, kind: ManagedChildKind) !void {
-        const name = self.indeterminate_names[@intFromEnum(kind)] orelse return;
+        const name = self.indeterminate_names[@backingInt(kind)] orelse return;
         const route_dir = try self.route(kind, false) orelse
             return error.FileNotFound;
         var file = try openPrivateFile(route_dir, name, .read_only, self.mode);
@@ -625,7 +625,7 @@ pub const MemoryBlobsForTesting = struct {
     dir: ?[]const u8 = null,
     mutex: std.Io.Mutex = .init,
     bodies: std.StringHashMapUnmanaged([]u8) = .empty,
-    records: std.StringArrayHashMapUnmanaged(Blobs.Hash) = .empty,
+    records: std.array_hash_map.String(Blobs.Hash) = .empty,
     refs: usize = 0,
     closed: bool = false,
     puts: usize = 0,
@@ -693,7 +693,7 @@ pub const MemoryBlobsForTesting = struct {
         const body = try self.alloc.dupe(u8, bytes);
         errdefer self.alloc.free(body);
         if (self.dir) |dir| {
-            const file_path = try std.fs.path.join(self.alloc, &.{ dir, &hash });
+            const file_path = try std.Io.Dir.path.join(self.alloc, &.{ dir, &hash });
             defer self.alloc.free(file_path);
             var file = std.Io.Dir.createFileAbsolute(io_mod.getIo(), file_path, .{
                 .exclusive = true,
@@ -762,7 +762,7 @@ pub const MemoryBlobsForTesting = struct {
         defer self.mutex.unlock(io_mod.getIo());
         if (!self.bodies.contains(hash)) return error.BlobNotFound;
         const dir = self.dir orelse return error.BlobStoreFailed;
-        return std.fs.path.join(alloc, &.{ dir, hash });
+        return std.Io.Dir.path.join(alloc, &.{ dir, hash });
     }
 
     fn retain(ctx: *anyopaque) void {
@@ -943,7 +943,7 @@ pub const SessionChildCapability = struct {
             else => return err,
         };
         errdefer route.close(io_mod.getIo());
-        const display = try std.fs.path.join(alloc, &.{ display_session_path, "subagent" });
+        const display = try std.Io.Dir.path.join(alloc, &.{ display_session_path, "subagent" });
         defer alloc.free(display);
         return try initOpenedLegacyRoute(alloc, route, display, .subagent_control, .read_only);
     }
@@ -1543,7 +1543,7 @@ pub const SessionChildCapability = struct {
         kind: ManagedChildKind,
         name: []const u8,
     ) bool {
-        const pending = self.impl.indeterminate_names[@intFromEnum(kind)] orelse
+        const pending = self.impl.indeterminate_names[@backingInt(kind)] orelse
             return false;
         return std.mem.eql(u8, pending, name);
     }
@@ -1564,7 +1564,7 @@ pub const SessionChildCapability = struct {
         self: SessionChildCapability,
         kind: ManagedChildKind,
     ) ?[]const u8 {
-        return self.impl.indeterminate_names[@intFromEnum(kind)];
+        return self.impl.indeterminate_names[@backingInt(kind)];
     }
 
     /// Returns non-authoritative metadata for compatibility rendering only.
@@ -1725,8 +1725,8 @@ fn countEntries(dir: std.Io.Dir) !usize {
 }
 
 test "private read-only file remains valid after atomic replacement unlinks it" {
-    if (comptime @import("builtin").os.tag == .windows or
-        @import("builtin").os.tag == .wasi)
+    if (comptime @import("builtin").target.os.tag == .windows or
+        @import("builtin").target.os.tag == .wasi)
     {
         return error.SkipZigTest;
     }
@@ -1796,9 +1796,9 @@ test "managed child capability rejects invalid names and unsafe routes" {
     var linked = try capability.createExclusiveFile(alloc, .tool_results, "linked.txt");
     linked.deinit();
     var source_buf: [128]u8 = undefined;
-    const source = try std.fmt.bufPrintZ(&source_buf, "tool-results/linked.txt", .{});
+    const source = try std.mem.printSentinel(&source_buf, "tool-results/linked.txt", .{}, 0);
     var target_buf: [128]u8 = undefined;
-    const target = try std.fmt.bufPrintZ(&target_buf, "tool-results/linked-again.txt", .{});
+    const target = try std.mem.printSentinel(&target_buf, "tool-results/linked-again.txt", .{}, 0);
     try std.testing.expectEqual(
         @as(c_int, 0),
         std.c.linkat(session.dir.handle, source, session.dir.handle, target, 0),
@@ -2176,7 +2176,7 @@ test "a v2 capability keeps terminal kinds in the terminal folder, made only by 
     try tmp.dir.createDir(io_mod.getIo(), "fx", private_dir_permissions);
     const fx_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "fx");
     defer alloc.free(fx_path);
-    const terminal_path = try std.fs.path.join(alloc, &.{ fx_path, "terminal", "kYIGy8ik0H3K" });
+    const terminal_path = try std.Io.Dir.path.join(alloc, &.{ fx_path, "terminal", "kYIGy8ik0H3K" });
     defer alloc.free(terminal_path);
 
     var memory = MemoryBlobsForTesting.init(alloc);
@@ -2207,7 +2207,7 @@ test "a v2 capability keeps terminal kinds in the terminal folder, made only by 
     try std.testing.expectError(error.SessionChildStoreFailed, capability.atomicReplace(alloc, .background_records, "record.json", "{}"));
 
     // A read-only capability never makes the folder.
-    const other_path = try std.fs.path.join(alloc, &.{ fx_path, "terminal", "otherSession1" });
+    const other_path = try std.Io.Dir.path.join(alloc, &.{ fx_path, "terminal", "otherSession1" });
     defer alloc.free(other_path);
     var read_only = try SessionChildCapability.initBlobs(alloc, memory.blobs(), other_path, .read_only);
     defer read_only.deinit();

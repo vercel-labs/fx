@@ -1,10 +1,12 @@
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
 
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
 const skill_commands = @import("../core/skills/skill_commands.zig");
 const skill_contract = @import("../core/skills/skill_contract.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
+const text_utils = @import("../core/shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -184,7 +186,7 @@ fn removeCommandResult(alloc: Allocator, request: CommandRequest, name: []const 
         return noticeFmt(alloc, "Skill '{s}' comes from {s}, not the fx managed install root. Remove it from {s}.", .{ name, skill.source_label, skill.path }, false);
     }
 
-    removeSkill(request.skills_dir, std.fs.path.basename(skill.path)) catch {
+    removeSkill(request.skills_dir, std.Io.Dir.path.basename(skill.path)) catch {
         return noticeFmt(alloc, "Failed to remove skill '{s}'.", .{name}, false);
     };
     return noticeFmt(alloc, "Removed skill '{s}'.", .{name}, true);
@@ -195,7 +197,7 @@ fn noticeLiteral(alloc: Allocator, text: []const u8, reload: bool) !CommandResul
 }
 
 fn noticeFmt(alloc: Allocator, comptime fmt: []const u8, args: anytype, reload: bool) !CommandResult {
-    return .{ .notice = .{ .text = try std.fmt.allocPrint(alloc, fmt, args), .reload = reload } };
+    return .{ .notice = .{ .text = try alloc.print(fmt, args), .reload = reload } };
 }
 
 pub fn installFromSource(alloc: Allocator, skills_dir: []const u8, source: []const u8, filter: ?[]const u8) !InstallResult {
@@ -244,15 +246,15 @@ pub fn createSkillTemplate(alloc: Allocator, skills_dir: []const u8, name: []con
 
     try io_mod.makeDirRecursive(skills_dir);
 
-    const skill_dir = try std.fs.path.join(alloc, &.{ skills_dir, name });
+    const skill_dir = try std.Io.Dir.path.join(alloc, &.{ skills_dir, name });
     defer alloc.free(skill_dir);
 
     try io_mod.makeDirRecursive(skill_dir);
 
-    const skill_file_path = try std.fs.path.join(alloc, &.{ skill_dir, "SKILL.md" });
+    const skill_file_path = try std.Io.Dir.path.join(alloc, &.{ skill_dir, "SKILL.md" });
     errdefer alloc.free(skill_file_path);
 
-    const template = try std.fmt.allocPrint(alloc, "---\nname: {s}\ndescription: Describe when this skill should activate\n---\n\n# {s}\n\nInstructions for this skill...\n", .{ name, name });
+    const template = try alloc.print("---\nname: {s}\ndescription: Describe when this skill should activate\n---\n\n# {s}\n\nInstructions for this skill...\n", .{ name, name });
     defer alloc.free(template);
 
     var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), skill_file_path, .{});
@@ -265,7 +267,7 @@ pub fn createSkillTemplate(alloc: Allocator, skills_dir: []const u8, name: []con
 fn installFromGitHub(alloc: Allocator, skills_dir: []const u8, url: []const u8, filter: ?[]const u8) !InstallResult {
     try ensureDir(skills_dir);
 
-    const tmp_dir = try std.fmt.allocPrint(alloc, "/tmp/fx-skill-install-{d}", .{io_mod.milliTimestamp()});
+    const tmp_dir = try alloc.print("/tmp/fx-skill-install-{d}", .{io_mod.milliTimestamp()});
     defer alloc.free(tmp_dir);
     defer std.Io.Dir.cwd().deleteTree(io_mod.getIo(), tmp_dir) catch {};
 
@@ -297,7 +299,7 @@ fn installFromGitHub(alloc: Allocator, skills_dir: []const u8, url: []const u8, 
 fn installFromLocalDirectory(alloc: Allocator, skills_dir: []const u8, source: []const u8, filter: ?[]const u8) !?InstallResult {
     const source_dir = try resolveInstallDirectory(alloc, source) orelse return null;
     defer alloc.free(source_dir);
-    return try installFromDirectory(alloc, skills_dir, source_dir, std.fs.path.basename(source_dir), filter);
+    return try installFromDirectory(alloc, skills_dir, source_dir, std.Io.Dir.path.basename(source_dir), filter);
 }
 
 fn installFromDirectory(alloc: Allocator, skills_dir: []const u8, source_dir: []const u8, fallback_name: []const u8, filter: ?[]const u8) !InstallResult {
@@ -366,12 +368,12 @@ fn installFromDirectoryWithMetadataReader(
         if (entry.kind != .file) continue;
         if (!std.mem.eql(u8, entry.basename, "SKILL.md")) continue;
 
-        const parent_path = std.fs.path.dirname(entry.path) orelse continue;
-        const dir_name = std.fs.path.basename(parent_path);
+        const parent_path = std.Io.Dir.path.dirname(entry.path) orelse continue;
+        const dir_name = std.Io.Dir.path.basename(parent_path);
         if (std.mem.startsWith(u8, dir_name, ".")) continue;
         skill_contract.validateManagedSkillName(dir_name) catch continue;
 
-        const skill_file = try std.fs.path.join(alloc, &.{ source_dir, entry.path });
+        const skill_file = try std.Io.Dir.path.join(alloc, &.{ source_dir, entry.path });
         defer alloc.free(skill_file);
 
         var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), skill_file, .{}) catch |err| {
@@ -394,7 +396,7 @@ fn installFromDirectoryWithMetadataReader(
             if (!std.mem.eql(u8, dir_name, requested) and !std.mem.eql(u8, metadata.name, requested)) continue;
         }
 
-        const src_dir = try std.fs.path.join(alloc, &.{ source_dir, parent_path });
+        const src_dir = try std.Io.Dir.path.join(alloc, &.{ source_dir, parent_path });
         defer alloc.free(src_dir);
 
         try copySkillDir(alloc, src_dir, skills_dir, dir_name);
@@ -437,7 +439,7 @@ fn propagateInstallMetadataReadError(err: InstallMetadataReadError) InstallMetad
 }
 
 fn resolveInstallDirectory(alloc: Allocator, source: []const u8) !?[]u8 {
-    const resolved = if (std.fs.path.isAbsolute(source))
+    const resolved = if (std.Io.Dir.path.isAbsolute(source))
         try alloc.dupe(u8, source)
     else
         io_mod.realpathAlloc(alloc, source) catch return null;
@@ -516,7 +518,7 @@ fn parseRepoSkillSource(input: []const u8) ?ParsedSource {
 
 fn isLikelyRepoSkillSource(input: []const u8) bool {
     if (std.mem.startsWith(u8, input, "http://") or std.mem.startsWith(u8, input, "https://") or std.mem.startsWith(u8, input, "git@")) return false;
-    if (std.fs.path.isAbsolute(input)) return false;
+    if (std.Io.Dir.path.isAbsolute(input)) return false;
     if (std.mem.startsWith(u8, input, "./") or std.mem.startsWith(u8, input, "../") or std.mem.startsWith(u8, input, "~/")) return false;
 
     const at = std.mem.findScalarLast(u8, input, '@') orelse return false;
@@ -543,7 +545,7 @@ fn cloneUrlForSource(alloc: Allocator, url: []const u8) ![]u8 {
     if (std.mem.startsWith(u8, url, "http") or std.mem.startsWith(u8, url, "git@")) {
         return alloc.dupe(u8, url);
     }
-    return std.fmt.allocPrint(alloc, "https://github.com/{s}.git", .{url});
+    return alloc.print("https://github.com/{s}.git", .{url});
 }
 
 fn drainCloneOutput(alloc: Allocator, child: *std.process.Child) !void {
@@ -607,15 +609,14 @@ const InstallTransactionPaths = struct {
 
     fn init(alloc: Allocator, skills_dir: []const u8, token: [16]u8) !InstallTransactionPaths {
         const suffix = std.fmt.bytesToHex(token, .lower);
-        const root = try std.fmt.allocPrint(
-            alloc,
+        const root = try alloc.print(
             "{s}/.skill-install-{s}",
             .{ skills_dir, suffix },
         );
         errdefer alloc.free(root);
-        const staged = try std.fs.path.join(alloc, &.{ root, "staged" });
+        const staged = try std.Io.Dir.path.join(alloc, &.{ root, "staged" });
         errdefer alloc.free(staged);
-        const backup = try std.fs.path.join(alloc, &.{ root, "backup" });
+        const backup = try std.Io.Dir.path.join(alloc, &.{ root, "backup" });
         return .{ .root = root, .staged = staged, .backup = backup };
     }
 
@@ -686,7 +687,7 @@ fn acquireSkillInstallLock(
     deadline_ms: u64,
     lock_ops: io_mod.LockOps,
 ) !io_mod.TimedAdvisoryLock {
-    const parent_path = std.fs.path.dirname(skills_dir) orelse return error.InvalidSkillsDirectory;
+    const parent_path = std.Io.Dir.path.dirname(skills_dir) orelse return error.InvalidSkillsDirectory;
     var parent = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), parent_path, .{
         .iterate = true,
         .follow_symlinks = false,
@@ -716,7 +717,7 @@ fn copySkillDirWithOptions(
     try skill_contract.validateManagedSkillName(skill_name);
     try ensureDir(skills_dir);
 
-    const dest_dir = try std.fs.path.join(alloc, &.{ skills_dir, skill_name });
+    const dest_dir = try std.Io.Dir.path.join(alloc, &.{ skills_dir, skill_name });
     defer alloc.free(dest_dir);
     var transaction = try createInstallTransaction(alloc, skills_dir, options.transaction_tokens);
     defer transaction.deinit(alloc);
@@ -764,9 +765,9 @@ fn copyDirRecursive(alloc: Allocator, src_dir: []const u8, dest_dir: []const u8)
     while (try it.next(io_mod.getIo())) |entry| {
         if (std.mem.startsWith(u8, entry.name, ".git")) continue;
 
-        const src_path = try std.fs.path.join(alloc, &.{ src_dir, entry.name });
+        const src_path = try std.Io.Dir.path.join(alloc, &.{ src_dir, entry.name });
         defer alloc.free(src_path);
-        const dst_path = try std.fs.path.join(alloc, &.{ dest_dir, entry.name });
+        const dst_path = try std.Io.Dir.path.join(alloc, &.{ dest_dir, entry.name });
         defer alloc.free(dst_path);
 
         switch (entry.kind) {
@@ -778,7 +779,7 @@ fn copyDirRecursive(alloc: Allocator, src_dir: []const u8, dest_dir: []const u8)
 }
 
 fn copyFile(alloc: Allocator, src_path: []const u8, dst_path: []const u8) !void {
-    if (std.fs.path.dirname(dst_path)) |parent| try ensureDir(parent);
+    if (std.Io.Dir.path.dirname(dst_path)) |parent| try ensureDir(parent);
     try io_mod.copyFileAtomic(alloc, src_path, dst_path);
 }
 
@@ -786,7 +787,7 @@ fn ensureDir(path: []const u8) !void {
     std.Io.Dir.createDirAbsolute(io_mod.getIo(), path, .default_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => {
-            if (std.fs.path.dirname(path)) |parent| {
+            if (std.Io.Dir.path.dirname(path)) |parent| {
                 try ensureDir(parent);
                 try std.Io.Dir.createDirAbsolute(io_mod.getIo(), path, .default_dir);
             } else {
@@ -886,7 +887,7 @@ test "install transaction payloads are not immediate skill candidates" {
     defer alloc.free(source_dir);
     const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "dest");
     defer alloc.free(skills_dir);
-    var transaction = try InstallTransactionPaths.init(alloc, skills_dir, [_]u8{1} ** 16);
+    var transaction = try InstallTransactionPaths.init(alloc, skills_dir, @as([16]u8, @splat(1)));
     defer transaction.deinit(alloc);
     defer std.Io.Dir.cwd().deleteTree(io_mod.getIo(), transaction.root) catch {};
 
@@ -904,8 +905,8 @@ test "install transaction creation retries collisions without reusing roots" {
 
     const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "dest");
     defer alloc.free(skills_dir);
-    const collision_token = [_]u8{1} ** 16;
-    const fresh_token = [_]u8{2} ** 16;
+    const collision_token: [16]u8 = @splat(1);
+    const fresh_token: [16]u8 = @splat(2);
     var collision = try InstallTransactionPaths.init(alloc, skills_dir, collision_token);
     defer collision.deinit(alloc);
     try std.Io.Dir.createDirAbsolute(io_mod.getIo(), collision.root, .default_dir);
@@ -935,9 +936,9 @@ test "install transaction collision exhaustion leaves the destination unchanged"
     defer alloc.free(source_dir);
     const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "dest");
     defer alloc.free(skills_dir);
-    const installed_path = try std.fs.path.join(alloc, &.{ skills_dir, "review", "SKILL.md" });
+    const installed_path = try std.Io.Dir.path.join(alloc, &.{ skills_dir, "review", "SKILL.md" });
     defer alloc.free(installed_path);
-    const collision_token = [_]u8{3} ** 16;
+    const collision_token: [16]u8 = @splat(3);
     var collision = try InstallTransactionPaths.init(alloc, skills_dir, collision_token);
     defer collision.deinit(alloc);
     try std.Io.Dir.createDirAbsolute(io_mod.getIo(), collision.root, .default_dir);
@@ -945,7 +946,7 @@ test "install transaction collision exhaustion leaves the destination unchanged"
 
     var token_state = TestTransactionTokenState{
         .collision_token = collision_token,
-        .fresh_token = [_]u8{4} ** 16,
+        .fresh_token = @as([16]u8, @splat(4)),
         .collision_count = install_transaction_attempts,
     };
     try std.testing.expectError(
@@ -1003,7 +1004,7 @@ test "skill install lock leaves do not expand valid destination names" {
 
     const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "dest");
     defer alloc.free(skills_dir);
-    const long_name = "n" ** 240;
+    const long_name = text_utils.repeat("n", 240);
     try skill_contract.validateManagedSkillName(long_name);
     var long_lock = try acquireSkillInstallLock(skills_dir, long_name, 0, .{});
     long_lock.release();
@@ -1012,7 +1013,7 @@ test "skill install lock leaves do not expand valid destination names" {
     var unusual_lock = try acquireSkillInstallLock(skills_dir, unusual_name, 0, .{});
     unusual_lock.release();
 
-    const parent_path = std.fs.path.dirname(skills_dir).?;
+    const parent_path = std.Io.Dir.path.dirname(skills_dir).?;
     var parent = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), parent_path, .{});
     defer parent.close(io_mod.getIo());
     var lock_dir = try parent.openDir(io_mod.getIo(), install_lock_dir_name, .{});
@@ -1032,7 +1033,7 @@ test "busy skill install lock preserves the destination and cleans staging" {
     defer alloc.free(source_dir);
     const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "dest");
     defer alloc.free(skills_dir);
-    const installed_path = try std.fs.path.join(alloc, &.{ skills_dir, "review", "SKILL.md" });
+    const installed_path = try std.Io.Dir.path.join(alloc, &.{ skills_dir, "review", "SKILL.md" });
     defer alloc.free(installed_path);
 
     {
@@ -1065,7 +1066,7 @@ test "unsupported skill install locking fails closed before destination mutation
     defer alloc.free(source_dir);
     const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "dest");
     defer alloc.free(skills_dir);
-    const installed_path = try std.fs.path.join(alloc, &.{ skills_dir, "review", "SKILL.md" });
+    const installed_path = try std.Io.Dir.path.join(alloc, &.{ skills_dir, "review", "SKILL.md" });
     defer alloc.free(installed_path);
 
     try std.testing.expectError(
@@ -1091,7 +1092,7 @@ test "skill install lock remains held through rollback" {
     defer alloc.free(source_dir);
     const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "dest");
     defer alloc.free(skills_dir);
-    const installed_path = try std.fs.path.join(alloc, &.{ skills_dir, "review", "SKILL.md" });
+    const installed_path = try std.Io.Dir.path.join(alloc, &.{ skills_dir, "review", "SKILL.md" });
     defer alloc.free(installed_path);
     var rollback_state = RollbackLockTestState{ .skills_dir = skills_dir, .skill_name = "review" };
 
@@ -1121,12 +1122,12 @@ test "skill install coordination stays outside discovery" {
     install_lock.release();
 
     try std.testing.expectEqual(@as(usize, 1), try countImmediateSkillDirectories(skills_dir));
-    const parent_path = std.fs.path.dirname(skills_dir).?;
+    const parent_path = std.Io.Dir.path.dirname(skills_dir).?;
     var parent = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), parent_path, .{});
     defer parent.close(io_mod.getIo());
     var sibling = try parent.openDir(io_mod.getIo(), install_lock_dir_name, .{});
     sibling.close(io_mod.getIo());
-    const inside_path = try std.fs.path.join(alloc, &.{ skills_dir, install_lock_dir_name });
+    const inside_path = try std.Io.Dir.path.join(alloc, &.{ skills_dir, install_lock_dir_name });
     defer alloc.free(inside_path);
     try std.testing.expectError(
         error.FileNotFound,
@@ -1135,7 +1136,7 @@ test "skill install coordination stays outside discovery" {
 }
 
 test "copySkillDir preserves the installed skill across allocation failures" {
-    const backing = std.testing.allocator;
+    const backing = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1147,7 +1148,7 @@ test "copySkillDir preserves the installed skill across allocation failures" {
     defer backing.free(source_dir);
     const skills_dir = try io_mod.dirRealpathAlloc(backing, tmp.dir, "dest");
     defer backing.free(skills_dir);
-    const installed_path = try std.fs.path.join(backing, &.{ skills_dir, "review", "SKILL.md" });
+    const installed_path = try std.Io.Dir.path.join(backing, &.{ skills_dir, "review", "SKILL.md" });
     defer backing.free(installed_path);
 
     var counting = std.testing.FailingAllocator.init(backing, .{});
@@ -1213,7 +1214,7 @@ test "global skill roots cover compatibility installs only" {
 }
 
 fn writeTempFile(tmp: *std.testing.TmpDir, sub_path: []const u8, content: []const u8) !void {
-    if (std.fs.path.dirname(sub_path)) |parent| {
+    if (std.Io.Dir.path.dirname(sub_path)) |parent| {
         try tmp.dir.createDirPath(io_mod.getIo(), parent);
     }
     var file = try tmp.dir.createFile(std.testing.io, sub_path, .{ .truncate = true });
@@ -1222,7 +1223,7 @@ fn writeTempFile(tmp: *std.testing.TmpDir, sub_path: []const u8, content: []cons
 }
 
 fn writeLargeTempSkill(tmp: *std.testing.TmpDir, sub_path: []const u8, name: []const u8) !void {
-    if (std.fs.path.dirname(sub_path)) |parent| {
+    if (std.Io.Dir.path.dirname(sub_path)) |parent| {
         try tmp.dir.createDirPath(io_mod.getIo(), parent);
     }
     var file = try tmp.dir.createFile(std.testing.io, sub_path, .{ .truncate = true });
@@ -1230,7 +1231,7 @@ fn writeLargeTempSkill(tmp: *std.testing.TmpDir, sub_path: []const u8, name: []c
     try file.writeStreamingAll(io_mod.getIo(), "---\nname: ");
     try file.writeStreamingAll(io_mod.getIo(), name);
     try file.writeStreamingAll(io_mod.getIo(), "\ndescription: valid large skill\n---\n\n");
-    const body_chunk = [_]u8{'x'} ** (16 * 1024);
+    const body_chunk: [16 * 1024]u8 = @splat('x');
     for (0..257) |_| try file.writeStreamingAll(io_mod.getIo(), &body_chunk);
     try file.writeStreamingAll(io_mod.getIo(), "\nLARGE_SKILL_TAIL\n");
 }
@@ -1260,7 +1261,7 @@ test "removeSkill deletes managed skill directory from absolute root" {
 
     try removeSkill(skills_dir, "review");
 
-    const removed_path = try std.fs.path.join(alloc, &.{ skills_dir, "review", "SKILL.md" });
+    const removed_path = try std.Io.Dir.path.join(alloc, &.{ skills_dir, "review", "SKILL.md" });
     defer alloc.free(removed_path);
     try expectNoAbsoluteFile(removed_path);
 }
@@ -1272,7 +1273,7 @@ test "createSkillTemplate preserves exact generated template content" {
 
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const skills_dir = try std.fs.path.join(alloc, &.{ root, "skills" });
+    const skills_dir = try std.Io.Dir.path.join(alloc, &.{ root, "skills" });
     defer alloc.free(skills_dir);
 
     const path = try createSkillTemplate(alloc, skills_dir, "exact-skill");
@@ -1307,7 +1308,7 @@ test "valid skill name supports template creation and removal" {
 
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const skills_dir = try std.fs.path.join(alloc, &.{ root, "skills" });
+    const skills_dir = try std.Io.Dir.path.join(alloc, &.{ root, "skills" });
     defer alloc.free(skills_dir);
 
     const path = try createSkillTemplate(alloc, skills_dir, "simple-skill");
@@ -1337,13 +1338,13 @@ test "installFromSource installs from a local directory" {
     try std.testing.expectEqual(@as(usize, 1), result.installed.items.len);
     try std.testing.expectEqualStrings("review", result.installed.items[0]);
 
-    const asset_path = try std.fs.path.join(alloc, &.{ dest_dir, "review", "assets", "data.txt" });
+    const asset_path = try std.Io.Dir.path.join(alloc, &.{ dest_dir, "review", "assets", "data.txt" });
     defer alloc.free(asset_path);
     const asset = try readAbsoluteFile(alloc, asset_path, 1024);
     defer alloc.free(asset);
     try std.testing.expectEqualStrings("asset\n", asset);
 
-    const installed_skill_path = try std.fs.path.join(alloc, &.{ dest_dir, "review", "SKILL.md" });
+    const installed_skill_path = try std.Io.Dir.path.join(alloc, &.{ dest_dir, "review", "SKILL.md" });
     defer alloc.free(installed_skill_path);
     const installed_skill = try readAbsoluteFile(alloc, installed_skill_path, 1024);
     defer alloc.free(installed_skill);
@@ -1378,9 +1379,9 @@ test "installFromSource skips malformed metadata and installs a valid neighbor" 
     try std.testing.expectEqual(@as(usize, 1), result.installed.items.len);
     try std.testing.expectEqualStrings("valid", result.installed.items[0]);
 
-    const valid_path = try std.fs.path.join(alloc, &.{ dest_dir, "valid", "SKILL.md" });
+    const valid_path = try std.Io.Dir.path.join(alloc, &.{ dest_dir, "valid", "SKILL.md" });
     defer alloc.free(valid_path);
-    const malformed_path = try std.fs.path.join(alloc, &.{ dest_dir, "malformed", "SKILL.md" });
+    const malformed_path = try std.Io.Dir.path.join(alloc, &.{ dest_dir, "malformed", "SKILL.md" });
     defer alloc.free(malformed_path);
     const installed = try readAbsoluteFile(alloc, valid_path, 1024);
     defer alloc.free(installed);
@@ -1407,7 +1408,7 @@ test "installFromSource installs root skill using fallback name without frontmat
     try std.testing.expectEqual(@as(usize, 1), result.installed.items.len);
     try std.testing.expectEqualStrings("pack", result.installed.items[0]);
 
-    const installed_path = try std.fs.path.join(alloc, &.{ dest_dir, "pack", "SKILL.md" });
+    const installed_path = try std.Io.Dir.path.join(alloc, &.{ dest_dir, "pack", "SKILL.md" });
     defer alloc.free(installed_path);
     const content = try readAbsoluteFile(alloc, installed_path, 1024 * 1024);
     defer alloc.free(content);
@@ -1482,13 +1483,13 @@ test "installFromSource installs nested skills and preserves nested assets" {
     try std.testing.expectEqual(@as(usize, 1), result.installed.items.len);
     try std.testing.expectEqualStrings("parsed-review", result.installed.items[0]);
 
-    const asset_path = try std.fs.path.join(alloc, &.{ dest_dir, "review", "assets", "data.txt" });
+    const asset_path = try std.Io.Dir.path.join(alloc, &.{ dest_dir, "review", "assets", "data.txt" });
     defer alloc.free(asset_path);
     const asset = try readAbsoluteFile(alloc, asset_path, 1024);
     defer alloc.free(asset);
     try std.testing.expectEqualStrings("nested asset\n", asset);
 
-    const installed_path = try std.fs.path.join(alloc, &.{ dest_dir, "review", "SKILL.md" });
+    const installed_path = try std.Io.Dir.path.join(alloc, &.{ dest_dir, "review", "SKILL.md" });
     defer alloc.free(installed_path);
     const installed = try readAbsoluteFile(alloc, installed_path, 1024);
     defer alloc.free(installed);
@@ -1516,9 +1517,9 @@ test "installFromSource copies root and nested skill bodies beyond the former co
     try std.testing.expectEqualStrings("large-root", result.installed.items[0]);
     try std.testing.expectEqualStrings("large-nested", result.installed.items[1]);
 
-    const root_path = try std.fs.path.join(alloc, &.{ dest_dir, "pack", "SKILL.md" });
+    const root_path = try std.Io.Dir.path.join(alloc, &.{ dest_dir, "pack", "SKILL.md" });
     defer alloc.free(root_path);
-    const nested_path = try std.fs.path.join(alloc, &.{ dest_dir, "nested", "SKILL.md" });
+    const nested_path = try std.Io.Dir.path.join(alloc, &.{ dest_dir, "nested", "SKILL.md" });
     defer alloc.free(nested_path);
     const root_content = try readAbsoluteFile(alloc, root_path, 5 * 1024 * 1024);
     defer alloc.free(root_content);
@@ -1535,7 +1536,7 @@ test "installFromSource skips a symlinked root skill and installs a valid nested
 
     try writeTempFile(&tmp, "outside/SKILL.md", "---\nname: outside\ndescription: outside root\n---\n\nbody\n");
     try writeTempFile(&tmp, "pack/valid/SKILL.md", "---\nname: valid\ndescription: valid nested skill\n---\n\nbody\n");
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     tmp.dir.symLink(std.testing.io, "../outside/SKILL.md", "pack/SKILL.md", .{ .is_directory = false }) catch |err| {
         if (err == error.AccessDenied or err == error.FileSystem) return error.SkipZigTest;
         return err;
@@ -1553,9 +1554,9 @@ test "installFromSource skips a symlinked root skill and installs a valid nested
     try std.testing.expectEqual(@as(usize, 1), result.installed.items.len);
     try std.testing.expectEqualStrings("valid", result.installed.items[0]);
 
-    const root_path = try std.fs.path.join(alloc, &.{ dest_dir, "pack", "SKILL.md" });
+    const root_path = try std.Io.Dir.path.join(alloc, &.{ dest_dir, "pack", "SKILL.md" });
     defer alloc.free(root_path);
-    const nested_path = try std.fs.path.join(alloc, &.{ dest_dir, "valid", "SKILL.md" });
+    const nested_path = try std.Io.Dir.path.join(alloc, &.{ dest_dir, "valid", "SKILL.md" });
     defer alloc.free(nested_path);
     try expectNoAbsoluteFile(root_path);
     const nested = try readAbsoluteFile(alloc, nested_path, 1024);
@@ -1658,7 +1659,7 @@ test "installFromDirectory propagates root and nested metadata operational failu
 }
 
 test "installFromDirectory propagates nested metadata allocation failures" {
-    const backing = std.testing.allocator;
+    const backing = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1809,7 +1810,7 @@ test "installFromDirectory installs root skill using fallback when no frontmatte
     try std.testing.expectEqual(@as(usize, 1), result.installed.items.len);
     try std.testing.expectEqualStrings("pack", result.installed.items[0]);
 
-    const installed_path = try std.fs.path.join(alloc, &.{ dest_dir, "pack", "SKILL.md" });
+    const installed_path = try std.Io.Dir.path.join(alloc, &.{ dest_dir, "pack", "SKILL.md" });
     defer alloc.free(installed_path);
     const content = try readAbsoluteFile(alloc, installed_path, 1024 * 1024);
     defer alloc.free(content);
@@ -1882,7 +1883,7 @@ test "installFromDirectory installs nested skills with parent destination and pa
     try std.testing.expectEqual(@as(usize, 1), result.installed.items.len);
     try std.testing.expectEqualStrings("parsed-review", result.installed.items[0]);
 
-    const installed_path = try std.fs.path.join(alloc, &.{ dest_dir, "review", "SKILL.md" });
+    const installed_path = try std.Io.Dir.path.join(alloc, &.{ dest_dir, "review", "SKILL.md" });
     defer alloc.free(installed_path);
     const content = try readAbsoluteFile(alloc, installed_path, 1024 * 1024);
     defer alloc.free(content);
@@ -1907,15 +1908,15 @@ test "copySkillDir preserves nested assets and skips git entries" {
 
     try copySkillDir(alloc, src_dir, dest_dir, "copied");
 
-    const asset_path = try std.fs.path.join(alloc, &.{ dest_dir, "copied", "assets", "data.txt" });
+    const asset_path = try std.Io.Dir.path.join(alloc, &.{ dest_dir, "copied", "assets", "data.txt" });
     defer alloc.free(asset_path);
     const asset = try readAbsoluteFile(alloc, asset_path, 1024);
     defer alloc.free(asset);
     try std.testing.expectEqualStrings("hello\n", asset);
 
-    const git_path = try std.fs.path.join(alloc, &.{ dest_dir, "copied", ".git", "config" });
+    const git_path = try std.Io.Dir.path.join(alloc, &.{ dest_dir, "copied", ".git", "config" });
     defer alloc.free(git_path);
-    const github_path = try std.fs.path.join(alloc, &.{ dest_dir, "copied", ".github", "workflows", "test.yml" });
+    const github_path = try std.Io.Dir.path.join(alloc, &.{ dest_dir, "copied", ".github", "workflows", "test.yml" });
     defer alloc.free(github_path);
     try expectNoAbsoluteFile(git_path);
     try expectNoAbsoluteFile(github_path);
@@ -2031,7 +2032,7 @@ test "built-in skills command installs from a local pack" {
     defer alloc.free(dest_dir);
 
     var static_ctx = StaticSkillCtx{ .skills = &.{} };
-    const args = try std.fmt.allocPrint(alloc, "install {s}", .{pack_dir});
+    const args = try alloc.print("install {s}", .{pack_dir});
     defer alloc.free(args);
 
     var result = try executeCommand(alloc, parseCommand(args), staticCommandRequest(dest_dir, &static_ctx));
@@ -2047,7 +2048,7 @@ test "built-in skills command installs from a local pack" {
 }
 
 test "built-in skills install cleans empty result before notice allocation failure" {
-    const backing = std.testing.allocator;
+    const backing = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2104,9 +2105,9 @@ test "built-in skills command creates and removes managed skills" {
         else => return error.TestExpectedEqual,
     }
 
-    const skill_dir = try std.fs.path.join(alloc, &.{ skills_dir, "exact-skill" });
+    const skill_dir = try std.Io.Dir.path.join(alloc, &.{ skills_dir, "exact-skill" });
     defer alloc.free(skill_dir);
-    const skill_file = try std.fs.path.join(alloc, &.{ skill_dir, "SKILL.md" });
+    const skill_file = try std.Io.Dir.path.join(alloc, &.{ skill_dir, "SKILL.md" });
     defer alloc.free(skill_file);
     const content = try readAbsoluteFile(alloc, skill_file, 1024 * 1024);
     defer alloc.free(content);
@@ -2166,7 +2167,7 @@ test "built-in skills command creates a missing managed parent root" {
 
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const skills_dir = try std.fs.path.join(alloc, &.{ root, "home", ".fx", "skills" });
+    const skills_dir = try std.Io.Dir.path.join(alloc, &.{ root, "home", ".fx", "skills" });
     defer alloc.free(skills_dir);
 
     var empty_ctx = StaticSkillCtx{ .skills = &.{} };
@@ -2181,7 +2182,7 @@ test "built-in skills command creates a missing managed parent root" {
         else => return error.TestExpectedEqual,
     }
 
-    const skill_file = try std.fs.path.join(alloc, &.{ skills_dir, "fresh-root", "SKILL.md" });
+    const skill_file = try std.Io.Dir.path.join(alloc, &.{ skills_dir, "fresh-root", "SKILL.md" });
     defer alloc.free(skill_file);
     const content = try readAbsoluteFile(alloc, skill_file, 1024 * 1024);
     defer alloc.free(content);

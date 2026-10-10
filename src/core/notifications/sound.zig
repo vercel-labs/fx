@@ -8,7 +8,7 @@ const macos_player_path = "/usr/bin/afplay";
 
 // Sound defaults on only where a real audio player exists (macOS). Elsewhere
 // the fallback is the terminal bell, so notifications stay opt-in.
-pub const default_enabled: bool = builtin.os.tag == .macos;
+pub const default_enabled: bool = builtin.target.os.tag == .macos;
 
 // One-shot notifications still construct Player directly. Keep these aliases
 // until that path moves behind its own provider boundary.
@@ -33,19 +33,19 @@ fn materializedName(cue: Cue) []const u8 {
 }
 
 var sound_path_mutex: std.Io.Mutex = .init;
-var materialized_paths = [_]?[]const u8{null} ** std.enums.values(Cue).len;
-var sound_path_bufs: [std.enums.values(Cue).len][std.fs.max_path_bytes]u8 = undefined;
+var materialized_paths: [std.enums.values(Cue).len]?[]const u8 = @splat(null);
+var sound_path_bufs: [std.enums.values(Cue).len][std.Io.Dir.max_path_bytes]u8 = undefined;
 
 // Materialize lazily to protect startup latency. Atomic replacement avoids following symlinks.
 fn ensureCueSoundPath(cue: Cue) ?[]const u8 {
-    const idx = @intFromEnum(cue);
+    const idx = @backingInt(cue);
     sound_path_mutex.lockUncancelable(io_mod.getIo());
     defer sound_path_mutex.unlock(io_mod.getIo());
     if (materialized_paths[idx]) |path| return path;
 
     const dir = io_mod.getenv("TMPDIR") orelse "/tmp";
     const sep: []const u8 = if (dir.len > 0 and dir[dir.len - 1] == '/') "" else "/";
-    const path = std.fmt.bufPrint(&sound_path_bufs[idx], "{s}{s}{s}", .{ dir, sep, materializedName(cue) }) catch return null;
+    const path = std.mem.print(&sound_path_bufs[idx], "{s}{s}{s}", .{ dir, sep, materializedName(cue) }) catch return null;
     const chime = embeddedChime(cue);
 
     const reusable = cueFileMatches(path, chime);
@@ -130,10 +130,10 @@ const Dependencies = struct {
     sound_path: SoundPathFn,
 
     fn production() Dependencies {
-        if (comptime builtin.os.tag != .macos) {
+        if (comptime builtin.target.os.tag != .macos) {
             return .{
                 .ctx = null,
-                .platform = if (builtin.os.tag == .linux) .linux else .unsupported,
+                .platform = if (builtin.target.os.tag == .linux) .linux else .unsupported,
                 .spawn = unsupportedSpawnSoundProcess,
                 .start_waiter = unsupportedStartWaiter,
                 .sound_path = unavailableSoundPath,
@@ -241,12 +241,12 @@ const ChildWaiter = struct {
             .signal => |signal| debug_trace.logf(
                 "notifications",
                 "sound child signaled signal={d}",
-                .{@intFromEnum(signal)},
+                .{@backingInt(signal)},
             ),
             .stopped => |signal| debug_trace.logf(
                 "notifications",
                 "sound child stopped signal={d}",
-                .{@intFromEnum(signal)},
+                .{@backingInt(signal)},
             ),
             .unknown => |status| debug_trace.logf(
                 "notifications",
@@ -376,7 +376,7 @@ test "cue file write replaces a symlink without modifying its target" {
 
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const cue_path = try std.fs.path.join(alloc, &.{ root, "cue.wav" });
+    const cue_path = try std.Io.Dir.path.join(alloc, &.{ root, "cue.wav" });
     defer alloc.free(cue_path);
 
     try writeCueFile(cue_path, "replacement");
@@ -407,7 +407,7 @@ test "cue cache match verifies content, not only size" {
 
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const cue_path = try std.fs.path.join(alloc, &.{ root, "cue.wav" });
+    const cue_path = try std.Io.Dir.path.join(alloc, &.{ root, "cue.wav" });
     defer alloc.free(cue_path);
 
     try std.testing.expect(!cueFileMatches(cue_path, "sound"));

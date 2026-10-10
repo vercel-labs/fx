@@ -143,7 +143,7 @@ pub fn complete(alloc: Allocator, request: Request) Error!Outcome {
 }
 
 fn failed(alloc: Allocator, reason: Reason, comptime fmt: []const u8, args: anytype) Error!Outcome {
-    return .{ .failed = .{ .reason = reason, .detail = try std.fmt.allocPrint(alloc, fmt, args) } };
+    return .{ .failed = .{ .reason = reason, .detail = try alloc.print(fmt, args) } };
 }
 
 const StreamCapture = struct {

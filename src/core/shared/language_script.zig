@@ -1,4 +1,5 @@
 const std = @import("std");
+const display_width = @import("display_width.zig");
 
 pub const Script = enum {
     latin,
@@ -83,7 +84,7 @@ fn count_text(text: []const u8, prose_only: bool) Counts {
             continue;
         };
         if (index + width > text.len) break;
-        const codepoint = std.unicode.utf8Decode(text[index .. index + width]) catch {
+        const codepoint = display_width.decodeUtf8Sequence(text[index .. index + width]) catch {
             index += width;
             continue;
         };

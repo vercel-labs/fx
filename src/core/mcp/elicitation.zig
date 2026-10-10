@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const json_number = @import("json_number.zig");
 const json_schema_pattern = @import("json_schema_pattern.zig");
 
@@ -1795,8 +1796,7 @@ test "secret classification covers normalized forms without truncation bypasses"
     defer std.testing.allocator.free(description);
     @memset(description, 'a');
     @memcpy(description[description.len - " private key".len ..], " private key");
-    const schema = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const schema = try std.testing.allocator.print(
         "{{\"type\":\"object\",\"properties\":{{\"value\":{{\"type\":\"string\",\"description\":\"{s}\"}}}}}}",
         .{description},
     );
@@ -2111,8 +2111,7 @@ test "legacy URL completion notification classification validates the full bound
     const oversized_id = try alloc.alloc(u8, (Limits{}).max_elicitation_id_bytes + 1);
     defer alloc.free(oversized_id);
     @memset(oversized_id, 'x');
-    const oversized_json = try std.fmt.allocPrint(
-        alloc,
+    const oversized_json = try alloc.print(
         "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{{\"elicitationId\":\"{s}\"}}}}",
         .{oversized_id},
     );
@@ -2312,7 +2311,7 @@ test "continuation decisions reject stale cross-owner and duplicate answers" {
 }
 
 test "request parsing and validation release every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkAllocationFailures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkAllocationFailures, .{});
 }
 
 test "ACP projection keeps the wire distinctions from modern and legacy MCP" {

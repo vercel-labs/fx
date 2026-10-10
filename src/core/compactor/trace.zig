@@ -75,7 +75,7 @@ pub const Event = struct {
     kind: Kind = .log,
     detail_len: u16 = 0,
     truncated: bool = false,
-    detail_buf: [max_detail_bytes]u8 = [_]u8{0} ** max_detail_bytes,
+    detail_buf: [max_detail_bytes]u8 = @splat(0),
 
     pub fn name(self: *const Event) []const u8 {
         return @tagName(self.kind);
@@ -175,7 +175,7 @@ test "compaction diagnostics stay bounded and reset without file tracing" {
     reset();
     defer reset();
     record(.decision, 7, 3, 0, false, "automatic_threshold tokens={d}/{d}", .{ 279466, 280000 });
-    const oversized = [_]u8{'x'} ** (max_detail_bytes + 10);
+    const oversized: [max_detail_bytes + 10]u8 = @splat('x');
     record(.retention_exhausted, 7, 4, 0, true, "{s}", .{oversized});
     var events: [2]Event = undefined;
     try std.testing.expectEqual(@as(usize, 2), snapshot(&events));

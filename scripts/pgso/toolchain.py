@@ -12,8 +12,8 @@ import subprocess
 from scripts.pgso.model import PgsoError
 
 
-REQUIRED_ZIG_VERSION = "0.16.0"
-REQUIRED_LLVM_VERSION = "21.1.8"
+REQUIRED_ZIG_VERSION = "0.17.0"
+REQUIRED_LLVM_VERSION = "22.1.8"
 SUPPORTED_TARGET = "aarch64-macos"
 
 

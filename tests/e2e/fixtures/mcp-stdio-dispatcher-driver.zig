@@ -59,7 +59,7 @@ const Worker = struct {
     fn acceptProgress(raw: *anyopaque, progress: @import("mcp_test_exports").Progress) void {
         const self: *Worker = @ptrCast(@alignCast(raw));
         var expected_buf: [64]u8 = undefined;
-        const expected = std.fmt.bufPrint(
+        const expected = std.mem.print(
             &expected_buf,
             "progress:{s}",
             .{self.owner},
@@ -319,7 +319,7 @@ pub fn main(init: std.process.Init) !void {
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .inherit,
-        .pgid = if (@import("builtin").os.tag == .windows) null else 0,
+        .pgid = if (@import("builtin").target.os.tag == .windows) null else 0,
     });
     const child_id = child.id.?;
     const dispatcher = try mcp.StdioDispatcher.create(
@@ -898,15 +898,15 @@ fn runRuntimeScopedRecovery(
     {
         return error.InvalidScopedRecoveryChildMode;
     }
-    const marker_path = try std.fs.path.join(alloc, &.{ root, "mcp-crashed" });
+    const marker_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp-crashed" });
     defer alloc.free(marker_path);
-    const wire_log_path = try std.fs.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
+    const wire_log_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
     defer alloc.free(wire_log_path);
-    const pid_path = try std.fs.path.join(alloc, &.{ root, "mcp.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp.pid" });
     defer alloc.free(pid_path);
-    const unused_ready = try std.fs.path.join(alloc, &.{ root, "unused-ready" });
+    const unused_ready = try std.Io.Dir.path.join(alloc, &.{ root, "unused-ready" });
     defer alloc.free(unused_ready);
-    const unused_release = try std.fs.path.join(alloc, &.{ root, "unused-release" });
+    const unused_release = try std.Io.Dir.path.join(alloc, &.{ root, "unused-release" });
     defer alloc.free(unused_release);
 
     var runtime = mcp.McpRuntime.init(alloc);
@@ -934,7 +934,7 @@ fn runRuntimeScopedRecovery(
     if (runtime.servers.items.len != 1 or runtime.servers.items[0].state.load(.acquire) != .ready) {
         return error.ScopedRecoveryServerDidNotConnect;
     }
-    const owner_id = try std.fmt.allocPrint(alloc, "{s}-child", .{child_mode});
+    const owner_id = try alloc.print("{s}-child", .{child_mode});
     defer alloc.free(owner_id);
     var captured = try runtime.snapshotAccessView(
         alloc,
@@ -1072,15 +1072,15 @@ fn runRuntimeMrtrGuards(
     fixture_path: []const u8,
     root: []const u8,
 ) !void {
-    const marker_path = try std.fs.path.join(alloc, &.{ root, "mrtr-marker" });
+    const marker_path = try std.Io.Dir.path.join(alloc, &.{ root, "mrtr-marker" });
     defer alloc.free(marker_path);
-    const wire_log_path = try std.fs.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
+    const wire_log_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
     defer alloc.free(wire_log_path);
-    const pid_path = try std.fs.path.join(alloc, &.{ root, "mcp.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp.pid" });
     defer alloc.free(pid_path);
-    const unused_ready = try std.fs.path.join(alloc, &.{ root, "unused-ready" });
+    const unused_ready = try std.Io.Dir.path.join(alloc, &.{ root, "unused-ready" });
     defer alloc.free(unused_ready);
-    const unused_release = try std.fs.path.join(alloc, &.{ root, "unused-release" });
+    const unused_release = try std.Io.Dir.path.join(alloc, &.{ root, "unused-release" });
     defer alloc.free(unused_release);
 
     var runtime = mcp.McpRuntime.init(alloc);
@@ -1176,7 +1176,7 @@ fn countWireMethod(
         .limited(1024 * 1024),
     );
     defer alloc.free(contents);
-    const needle = try std.fmt.allocPrint(alloc, "\"method\":\"{s}\"", .{method});
+    const needle = try alloc.print("\"method\":\"{s}\"", .{method});
     defer alloc.free(needle);
     return std.mem.count(u8, contents, needle);
 }
@@ -1188,11 +1188,11 @@ fn runRuntimeRecovery(
     fixture_path: []const u8,
     root: []const u8,
 ) !void {
-    const marker_path = try std.fs.path.join(alloc, &.{ root, "blocked-write-marker" });
+    const marker_path = try std.Io.Dir.path.join(alloc, &.{ root, "blocked-write-marker" });
     defer alloc.free(marker_path);
-    const wire_log_path = try std.fs.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
+    const wire_log_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
     defer alloc.free(wire_log_path);
-    const pid_path = try std.fs.path.join(alloc, &.{ root, "mcp.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp.pid" });
     defer alloc.free(pid_path);
 
     const config_args = try alloc.alloc([]const u8, 1);
@@ -1270,11 +1270,11 @@ fn runRuntimeRecoveryBudget(
     fixture_path: []const u8,
     root: []const u8,
 ) !void {
-    const marker_path = try std.fs.path.join(alloc, &.{ root, "recovery-budget-marker" });
+    const marker_path = try std.Io.Dir.path.join(alloc, &.{ root, "recovery-budget-marker" });
     defer alloc.free(marker_path);
-    const wire_log_path = try std.fs.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
+    const wire_log_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
     defer alloc.free(wire_log_path);
-    const pid_path = try std.fs.path.join(alloc, &.{ root, "mcp.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp.pid" });
     defer alloc.free(pid_path);
 
     var runtime = mcp.McpRuntime.init(alloc);
@@ -1351,15 +1351,15 @@ fn runRuntimeStaleRecovery(
     fixture_path: []const u8,
     root: []const u8,
 ) !void {
-    const marker_path = try std.fs.path.join(alloc, &.{ root, "stale-recovery-marker" });
+    const marker_path = try std.Io.Dir.path.join(alloc, &.{ root, "stale-recovery-marker" });
     defer alloc.free(marker_path);
-    const wire_log_path = try std.fs.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
+    const wire_log_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
     defer alloc.free(wire_log_path);
-    const pid_path = try std.fs.path.join(alloc, &.{ root, "mcp.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp.pid" });
     defer alloc.free(pid_path);
-    const ready_path = try std.fs.path.join(alloc, &.{ root, "recovery-ready" });
+    const ready_path = try std.Io.Dir.path.join(alloc, &.{ root, "recovery-ready" });
     defer alloc.free(ready_path);
-    const release_path = try std.fs.path.join(alloc, &.{ root, "recovery-release" });
+    const release_path = try std.Io.Dir.path.join(alloc, &.{ root, "recovery-release" });
     defer alloc.free(release_path);
 
     var runtime = mcp.McpRuntime.init(alloc);
@@ -1493,11 +1493,11 @@ fn runRuntimeCatalogControl(
     root: []const u8,
     control: []const u8,
 ) !void {
-    const marker_path = try std.fs.path.join(alloc, &.{ root, "catalog-marker" });
+    const marker_path = try std.Io.Dir.path.join(alloc, &.{ root, "catalog-marker" });
     defer alloc.free(marker_path);
-    const wire_log_path = try std.fs.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
+    const wire_log_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
     defer alloc.free(wire_log_path);
-    const pid_path = try std.fs.path.join(alloc, &.{ root, "mcp.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp.pid" });
     defer alloc.free(pid_path);
 
     const cancel_control = std.mem.eql(u8, control, "cancel");
@@ -1587,13 +1587,13 @@ fn runRuntimeRecoveryControl(
     root: []const u8,
     control: []const u8,
 ) !void {
-    const marker_path = try std.fs.path.join(alloc, &.{ root, "blocked-write-marker" });
+    const marker_path = try std.Io.Dir.path.join(alloc, &.{ root, "blocked-write-marker" });
     defer alloc.free(marker_path);
-    const wire_log_path = try std.fs.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
+    const wire_log_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
     defer alloc.free(wire_log_path);
-    const pid_path = try std.fs.path.join(alloc, &.{ root, "mcp.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp.pid" });
     defer alloc.free(pid_path);
-    const ready_path = try std.fs.path.join(alloc, &.{ root, "recovery-ready" });
+    const ready_path = try std.Io.Dir.path.join(alloc, &.{ root, "recovery-ready" });
     defer alloc.free(ready_path);
 
     var runtime = mcp.McpRuntime.init(alloc);
@@ -1703,19 +1703,19 @@ fn runRuntimeRecoveryCollision(
     fixture_path: []const u8,
     root: []const u8,
 ) !void {
-    const wire_log_path = try std.fs.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
+    const wire_log_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
     defer alloc.free(wire_log_path);
-    const first_marker = try std.fs.path.join(alloc, &.{ root, "first-marker" });
+    const first_marker = try std.Io.Dir.path.join(alloc, &.{ root, "first-marker" });
     defer alloc.free(first_marker);
-    const second_marker = try std.fs.path.join(alloc, &.{ root, "second-marker" });
+    const second_marker = try std.Io.Dir.path.join(alloc, &.{ root, "second-marker" });
     defer alloc.free(second_marker);
-    const first_pid = try std.fs.path.join(alloc, &.{ root, "first.pid" });
+    const first_pid = try std.Io.Dir.path.join(alloc, &.{ root, "first.pid" });
     defer alloc.free(first_pid);
-    const second_pid = try std.fs.path.join(alloc, &.{ root, "second.pid" });
+    const second_pid = try std.Io.Dir.path.join(alloc, &.{ root, "second.pid" });
     defer alloc.free(second_pid);
-    const recovery_ready = try std.fs.path.join(alloc, &.{ root, "recovery-ready" });
+    const recovery_ready = try std.Io.Dir.path.join(alloc, &.{ root, "recovery-ready" });
     defer alloc.free(recovery_ready);
-    const recovery_release = try std.fs.path.join(alloc, &.{ root, "recovery-release" });
+    const recovery_release = try std.Io.Dir.path.join(alloc, &.{ root, "recovery-release" });
     defer alloc.free(recovery_release);
 
     var runtime = mcp.McpRuntime.init(alloc);
@@ -2034,7 +2034,7 @@ fn runBlockedWrite(
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .inherit,
-        .pgid = if (@import("builtin").os.tag == .windows) null else 0,
+        .pgid = if (@import("builtin").target.os.tag == .windows) null else 0,
     });
     const child_id = child.id.?;
     const dispatcher = try mcp.StdioDispatcher.create(
@@ -2060,7 +2060,7 @@ fn runBlockedWrite(
     }
     const exceeded_deadline = !blocked.done.load(.acquire);
     if (exceeded_deadline) {
-        if (@import("builtin").os.tag == .windows) {
+        if (@import("builtin").target.os.tag == .windows) {
             return error.SkipZigTest;
         }
         std.posix.kill(-child_id, .KILL) catch |err| switch (err) {
@@ -2102,7 +2102,7 @@ fn validateWorker(alloc: Allocator, worker: *const Worker) !void {
     const response = worker.response orelse return error.MissingResponse;
     defer alloc.free(response);
     var expected_buf: [64]u8 = undefined;
-    const expected = try std.fmt.bufPrint(
+    const expected = try std.mem.print(
         &expected_buf,
         "\"owner\":\"{s}\"",
         .{worker.owner},

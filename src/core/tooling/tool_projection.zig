@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const model_tool_schema = @import("model_tool_schema.zig");
 const permissions = @import("../permissions/permissions.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
@@ -755,7 +756,7 @@ fn checkEffectiveToolProjectionAllocationFailures(alloc: Allocator) !void {
 
 test "effective tool projection cleans up every partial allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkEffectiveToolProjectionAllocationFailures,
         .{},
     );

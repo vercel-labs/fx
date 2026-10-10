@@ -1,8 +1,10 @@
 const std = @import("std");
+const testing_allocator = @import("../../shared/testing_allocator.zig");
 const types = @import("../../shared/types.zig");
 const checkpoint_codec = @import("checkpoint.zig");
 const runtime_prompt_context = @import("prompt_context.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
+const text_utils = @import("../../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -190,7 +192,7 @@ test "Agent request token calibration survives startTurn and dies with cleared h
     try std.testing.expect(agent.request_token_calibration != null);
 
     // An unmatchable model id clears rather than stores.
-    agent.storeRequestTokenCalibration("x" ** (max_request_calibration_model_bytes + 1), cost);
+    agent.storeRequestTokenCalibration(text_utils.repeat("x", max_request_calibration_model_bytes + 1), cost);
     try std.testing.expectEqual(@as(?RequestTokenCalibrationState, null), agent.request_token_calibration);
 
     agent.storeRequestTokenCalibration("fixture/model", cost);
@@ -228,7 +230,7 @@ test "Agent accumulates per-turn usage with saturation" {
 }
 
 test "Agent history restore is transactional" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var agent: Agent = .{};
     defer agent.deinit(alloc);
 

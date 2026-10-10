@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const diagnostics = @import("../../core/workspace/diagnostics.zig");
 const managed_execution = @import("../../core/execution/managed_execution.zig");
@@ -31,6 +32,7 @@ const transcript_viewport_runtime = @import("viewport_runtime.zig");
 const transcript_writer = @import("writer.zig");
 const ui_render = @import("../render.zig");
 const types = @import("../../core/shared/types.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 
 /// One timestamped full-detail record (session assembly, network call,
 /// recovery transition) shown only in the ctrl+o full transcript. Kept out of
@@ -240,7 +242,7 @@ const TranscriptCommitState = union(enum) {
 };
 
 test "retention rebase carries stable and recovering source boundaries" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var before = try source_preparation.prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, "a\nb\nc\nd\ne\nf"), 80, null);
     defer before.deinit(alloc);
     var after = try source_preparation.prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, "c\nd\ne\nf"), 80, null);
@@ -525,16 +527,16 @@ const walkText = transcript_blocks.walkText;
 fn formatDurationCompact(buf: []u8, duration_ms: u64) []const u8 {
     const total_seconds = duration_ms / std.time.ms_per_s;
     if (total_seconds < 60) {
-        return std.fmt.bufPrint(buf, "{d}s", .{total_seconds}) catch "0s";
+        return std.mem.print(buf, "{d}s", .{total_seconds}) catch "0s";
     }
     if (total_seconds < 60 * 60) {
         const minutes = total_seconds / 60;
         const seconds = total_seconds % 60;
-        return std.fmt.bufPrint(buf, "{d}m {d}s", .{ minutes, seconds }) catch "1m 0s";
+        return std.mem.print(buf, "{d}m {d}s", .{ minutes, seconds }) catch "1m 0s";
     }
     const hours = total_seconds / (60 * 60);
     const minutes = (total_seconds % (60 * 60)) / 60;
-    return std.fmt.bufPrint(buf, "{d}h {d:0>2}m", .{ hours, minutes }) catch "1h 00m";
+    return std.mem.print(buf, "{d}h {d:0>2}m", .{ hours, minutes }) catch "1h 00m";
 }
 
 fn formatTurnSummaryLine(buf: []u8, summary: types.TurnSummary) []const u8 {
@@ -587,13 +589,12 @@ fn lifecycleStartLine(
     tool_name: ?[]const u8,
 ) ![]u8 {
     var label_buf: [512]u8 = undefined;
-    const label = std.fmt.bufPrint(
+    const label = std.mem.print(
         &label_buf,
         "● {s}",
         .{tool_name orelse "tool"},
     ) catch "● tool";
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "{s}{s}\n",
         .{ label, ui_render.reset_style },
     );
@@ -601,7 +602,7 @@ fn lifecycleStartLine(
 
 fn lifecycleLine(alloc: Allocator, text: []const u8) ![]u8 {
     if (std.mem.endsWith(u8, text, "\n")) return alloc.dupe(u8, text);
-    return std.fmt.allocPrint(alloc, "{s}\n", .{text});
+    return alloc.print("{s}\n", .{text});
 }
 
 const LifecycleMarker = struct {
@@ -643,8 +644,7 @@ fn lifecycleTerminalLine(
     const text_reset = if (cancelled) ui_render.reset_style else "";
     const follow_up = if (cancelled) " · What can fx do differently?" else "";
     const normalized = if (has_marker)
-        try std.fmt.allocPrint(
-            alloc,
+        try alloc.print(
             "{s}{s}{s}{s}{s}{s}{s}{s}",
             .{
                 marker.style,
@@ -658,8 +658,7 @@ fn lifecycleTerminalLine(
             },
         )
     else
-        try std.fmt.allocPrint(
-            alloc,
+        try alloc.print(
             "{s}{s}{s} {s}{s}{s}{s}",
             .{
                 marker.style,
@@ -1676,7 +1675,7 @@ test "user prompt card commit caches the same source a frame would rebuild" {
     defer runtime.deinit(alloc);
     var metrics: Metrics = .{};
     _ = try runtime.appendRawTranscriptEntryClassified(alloc, "WELCOME_ROW\n", .welcome);
-    _ = try runtime.appendRawTranscriptEntryClassified(alloc, "previous answer\n" ** 40, .unknown_raw);
+    _ = try runtime.appendRawTranscriptEntryClassified(alloc, text_utils.repeat("previous answer\n", 40), .unknown_raw);
     _ = try runtime.appendRawTranscriptEntryClassified(alloc, "  6m 25s (↑14 ↓30k)", .turn_summary);
     const revision_before = runtime.full_transcript_content_revision;
 
@@ -2197,7 +2196,7 @@ fn checkAutoPermissionNoticeAllocationFailures(alloc: Allocator) !void {
 
 test "auto permission notice write is atomic across allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkAutoPermissionNoticeAllocationFailures,
         .{},
     );
@@ -2778,7 +2777,7 @@ fn checkToolDetailResultReplacementAllocationFailures(alloc: Allocator) !void {
 
 test "tool detail result replacement preserves the prior allocation on failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkToolDetailResultReplacementAllocationFailures,
         .{},
     );
@@ -3025,8 +3024,7 @@ test "historical command detail keeps artifact handles after command block attac
     defer runtime.deinit(alloc);
 
     const raw_preview = "exit_code=0\ntruncated=true\nstdout_bytes=21\nstderr_bytes=0\noutput_file=/tmp/fx-command-replayed.log\n<stdout>RESUMED_EXACT_RESULT\n</stdout>";
-    const raw_result = try std.fmt.allocPrint(
-        alloc,
+    const raw_result = try alloc.print(
         "<tool_result_preview handle=\"{s}\" stored_bytes=\"{d}\">\n{s}\n</tool_result_preview>\n" ++
             "<tool_result_handle>{s}</tool_result_handle>",
         .{ result_handle, stored_result.len, raw_preview, result_handle },
@@ -3464,7 +3462,7 @@ test "command output consolidation preserves current compact ownership" {
     var metrics: Metrics = .{};
     for (0..80) |index| {
         var line: [32]u8 = undefined;
-        const text = try std.fmt.bufPrint(&line, "STREAM {d:0>3}\n", .{index + 1});
+        const text = try std.mem.print(&line, "STREAM {d:0>3}\n", .{index + 1});
         try runtime.writeCommandOutputChunkForLifecycle(
             alloc,
             &metrics,
@@ -3484,8 +3482,8 @@ test "command output consolidation preserves current compact ownership" {
 
     var compact = try runtime.prepareTranscriptSource(alloc, null);
     defer compact.deinit(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, compact.bytes, "STREAM 001") == null);
-    try std.testing.expect(std.mem.indexOf(u8, compact.bytes, "1 tool call") != null);
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "STREAM 001") == null);
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "1 tool call") != null);
 
     _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
         .id = id,
@@ -3494,9 +3492,9 @@ test "command output consolidation preserves current compact ownership" {
     var completed = try runtime.prepareTranscriptSource(alloc, null);
     defer completed.deinit(alloc);
 
-    const status_pos = std.mem.indexOf(u8, completed.bytes, "stream") orelse
+    const status_pos = std.mem.find(u8, completed.bytes, "stream") orelse
         return error.MissingCommandStatus;
-    try std.testing.expect(std.mem.indexOf(u8, completed.bytes, "STREAM 001") == null);
+    try std.testing.expect(std.mem.find(u8, completed.bytes, "STREAM 001") == null);
     try std.testing.expect(status_pos < completed.bytes.len);
 
     const output_entry_id = runtime.command_output_blocks.items[0].entry_id.?;
@@ -3647,7 +3645,7 @@ test "prepared canonical command mutation stays bounded across twenty four thous
 }
 
 test "oversized open command record stops growing after overflow" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var runtime = TranscriptRuntime{
         .layout = .{
             .rows = 24,
@@ -4040,14 +4038,14 @@ test "command output consolidation keeps compact tool order" {
     var compact = try runtime.prepareTranscriptSource(alloc, null);
     defer compact.deinit(alloc);
 
-    const first_status = std.mem.indexOf(u8, compact.bytes, "first") orelse
+    const first_status = std.mem.find(u8, compact.bytes, "first") orelse
         return error.MissingFirstStatus;
-    const second_status = std.mem.indexOf(u8, compact.bytes, "second") orelse
+    const second_status = std.mem.find(u8, compact.bytes, "second") orelse
         return error.MissingSecondStatus;
 
     try std.testing.expect(first_status < second_status);
-    try std.testing.expect(std.mem.indexOf(u8, compact.bytes, "FIRST_OUTPUT") == null);
-    try std.testing.expect(std.mem.indexOf(u8, compact.bytes, "SECOND_OUTPUT") == null);
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "FIRST_OUTPUT") == null);
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "SECOND_OUTPUT") == null);
 
     const first_status_entry = runtime.toolActivityRecord(first).?.entry_id;
     const second_status_entry = runtime.toolActivityRecord(second).?.entry_id;
@@ -4283,7 +4281,7 @@ const CachedCompactTranscriptSource = struct {
 const CompactTranscriptSourceCache = struct {
     const capacity = 4;
 
-    entries: [capacity]?CachedCompactTranscriptSource = .{null} ** capacity,
+    entries: [capacity]?CachedCompactTranscriptSource = @splat(null),
     next_replacement: usize = 0,
 
     fn deinit(self: *CompactTranscriptSourceCache, alloc: Allocator) void {
@@ -6570,7 +6568,7 @@ pub const TranscriptRuntime = struct {
     pub fn appendTurnSummaryEntry(self: *TranscriptRuntime, alloc: Allocator, summary: types.TurnSummary) !u32 {
         var line_buf: [128]u8 = undefined;
         const line = formatTurnSummaryLine(&line_buf, summary);
-        const entry = try std.fmt.allocPrint(alloc, "{s}{s}{s}\n", .{ ui_render.dim_style, line, ui_render.reset_style });
+        const entry = try alloc.print("{s}{s}{s}\n", .{ ui_render.dim_style, line, ui_render.reset_style });
         errdefer alloc.free(entry);
         const entry_id = try transcript_store.appendRawBytesEntryClassifiedAt(
             self,
@@ -11212,8 +11210,7 @@ pub const TranscriptRuntime = struct {
         detail: ToolDetailRecord,
     ) !void {
         if (snapshotContainsEntry(source.entries.items, detail.entry_id)) return;
-        const bytes = try std.fmt.allocPrint(
-            alloc,
+        const bytes = try alloc.print(
             "● {s}\n",
             .{detail.tool_name},
         );
@@ -12462,7 +12459,7 @@ test "owned stable transition traces a superseded pending resume source" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "resume-source-drop.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "resume-source-drop.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -13612,7 +13609,7 @@ test "source rewrite replays unchanged history prefix after footer projection re
 }
 
 test "append pending wrap history replay starts a fresh row at a soft wrap" {
-    try expectHistoryReplayBoundary("12345678" ** 60, true);
+    try expectHistoryReplayBoundary(text_utils.repeat("12345678", 60), true);
 }
 
 fn expectHistoryReplayBoundary(target_flow: []const u8, source_pending_wrap: bool) !void {

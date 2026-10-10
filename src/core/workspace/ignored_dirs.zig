@@ -12,7 +12,7 @@ pub const ignored_directory_names: []const []const u8 = &.{
 };
 
 pub fn pathContainsIgnoredDirectory(path: []const u8) bool {
-    var it = std.fs.path.componentIterator(path);
+    var it = std.Io.Dir.path.componentIterator(path);
     while (it.next()) |component| {
         if (isIgnoredDirectoryName(component.name)) return true;
     }

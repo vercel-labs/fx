@@ -29,10 +29,8 @@ from scripts.pgso.model import (
 )
 from scripts.pgso.pipeline import (
     GENERATION_FLAGS,
-    ArtifactSpec,
     PipelinePaths,
     apply_profile,
-    emit_bitcode,
     link_candidate,
     merge_profile_batch,
     verify_candidate,
@@ -883,12 +881,11 @@ def run_candidate(arguments: argparse.Namespace) -> pathlib.Path:
         paths,
     )
 
-    spec = ArtifactSpec(
-        repo_root=REPO_ROOT,
-        target=identity.target,
-        update_channel=identity.update_channel,
-    )
-    emit_bitcode(toolchain, spec, paths, expected_sha256=identity.bitcode_sha256)
+    # Zig 0.17 can number anonymous symbols differently on another runner, so
+    # rebuilding the same commit is not byte-identical. Profile the seed's
+    # verified bitcode, which the training profiles were collected from.
+    shutil.copy2(seed_paths.bitcode, paths.bitcode)
+    _require_hash(paths.bitcode, identity.bitcode_sha256, "candidate bitcode")
     apply_profile(toolchain, paths, identity.bitcode_sha256)
     link_candidate(toolchain, paths)
     linked_benchmarks = relink_profile_linked_benchmarks(

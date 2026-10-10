@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../shared/testing_allocator.zig");
 const common = @import("common.zig");
 const json_number = @import("../json_number.zig");
 
@@ -277,7 +278,7 @@ fn checkCompletionAllocationFailures(alloc: Allocator) !void {
 
 test "completion result construction is allocation failure safe" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkCompletionAllocationFailures,
         .{},
     );

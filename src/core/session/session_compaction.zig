@@ -41,6 +41,7 @@ const result_store = @import("result_store.zig");
 const session_event = @import("session_event.zig");
 const session_replay = @import("session_replay.zig");
 const types = @import("../shared/types.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -293,7 +294,7 @@ fn rewriteLog(
                 },
             };
             defer alloc.free(base);
-            result_dir = std.fs.path.join(alloc, &.{ base, "tool-results" }) catch |err| switch (err) {
+            result_dir = std.Io.Dir.path.join(alloc, &.{ base, "tool-results" }) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
             };
         }
@@ -618,7 +619,7 @@ fn writeMarkerBestEffort(
     session_id: []const u8,
     marker: Marker,
 ) !void {
-    const text = try std.fmt.allocPrint(alloc, "{d}\n{d}\n", .{ marker.log_len, marker.tail_crc });
+    const text = try alloc.print("{d}\n{d}\n", .{ marker.log_len, marker.tail_crc });
     defer alloc.free(text);
     io_mod.durableReplaceVerified(alloc, dir, marker_file, text) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -850,7 +851,7 @@ fn lineAt(text: []const u8, target: usize) ?[]const u8 {
 fn fixtureFatContent() []const u8 {
     // ~136 KB per copy: two copies push the fixture log past the 256 KB
     // log-size gate so tests exercise the real (unforced) entry condition.
-    return "FIXTURE_DIFF_LINE_0123456789abcdef\n" ** 4000;
+    return text_utils.repeat("FIXTURE_DIFF_LINE_0123456789abcdef\n", 4000);
 }
 
 test "compaction spills inline snapshots and preserves every frame" {
@@ -885,7 +886,7 @@ test "compaction spills inline snapshots and preserves every frame" {
     var handle_buf: []const u8 = "";
     var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, after, "\n"), '\n');
     while (lines.next()) |line| {
-        const frame_text = try std.fmt.allocPrint(alloc, "{s}\n", .{line});
+        const frame_text = try alloc.print("{s}\n", .{line});
         defer alloc.free(frame_text);
         var parsed = try session_event.decodeConversationFrame(alloc, frame_text);
         defer parsed.deinit();
@@ -915,7 +916,7 @@ test "compaction spills inline snapshots and preserves every frame" {
     // digest-verifying path resume uses.
     const base = try io_mod.dirRealpathAlloc(alloc, dir.dir, ".");
     defer alloc.free(base);
-    const result_dir = try std.fs.path.join(alloc, &.{ base, "tool-results" });
+    const result_dir = try std.Io.Dir.path.join(alloc, &.{ base, "tool-results" });
     defer alloc.free(result_dir);
     const artifact = try result_store.readByRange(alloc, result_dir, handle_buf, 0, result_store.diff_content_max_bytes);
     defer alloc.free(artifact);
@@ -934,7 +935,7 @@ test "compaction migrates small logs that can hold spillable payloads" {
     var dir = try openTestDir(&tmp);
     defer dir.close();
 
-    const small_spill = "SMALL_LEGACY_INLINE_PAYLOAD_0123456789abcdef\n" ** 128;
+    const small_spill = text_utils.repeat("SMALL_LEGACY_INLINE_PAYLOAD_0123456789abcdef\n", 128);
     try writeFatSessionLog(alloc, &dir, small_spill);
     const before = try readLogText(alloc, &dir);
     defer alloc.free(before);
@@ -1258,7 +1259,7 @@ test "compaction skips a fresh log without parsing it" {
     // pass must re-scan rather than trust a stale marker.
     var tampered = try alloc.dupe(u8, before);
     defer alloc.free(tampered);
-    const tail_at = std.mem.lastIndexOf(u8, tampered, "STEERING_PAD_LINE").?;
+    const tail_at = std.mem.findLast(u8, tampered, "STEERING_PAD_LINE").?;
     tampered[tail_at] = 'X';
     var rewrite = try dir.dir.createFile(std.testing.io, events_file, .{ .truncate = true });
     {

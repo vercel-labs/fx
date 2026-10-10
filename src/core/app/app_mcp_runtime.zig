@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -360,7 +361,7 @@ fn appendTemplateArgumentFields(
             if (variable.len > 0 and std.mem.findScalar(u8, "+#./;?&", variable[0]) != null) {
                 variable = variable[1..];
             }
-            const modifier = std.mem.indexOfAny(u8, variable, ":*") orelse variable.len;
+            const modifier = std.mem.findAny(u8, variable, ":*") orelse variable.len;
             const name = variable[0..modifier];
             if (name.len > 0) try appendMenuArgumentField(alloc, fields, name, true);
         }
@@ -408,7 +409,7 @@ fn expandResourceTemplate(
         var variables = std.mem.splitScalar(u8, variables_text, ',');
         var variable_index: usize = 0;
         while (variables.next()) |raw_variable| : (variable_index += 1) {
-            const modifier = std.mem.indexOfAny(u8, raw_variable, ":*") orelse raw_variable.len;
+            const modifier = std.mem.findAny(u8, raw_variable, ":*") orelse raw_variable.len;
             const name = raw_variable[0..modifier];
             const value = for (arguments) |argument| {
                 if (std.mem.eql(u8, argument.name, name)) break argument.value;
@@ -1540,8 +1541,7 @@ pub const State = struct {
                 .published => |published| if (published.health == .ready)
                     try alloc.dupe(u8, "MCP configuration reloaded.")
                 else
-                    try std.fmt.allocPrint(
-                        alloc,
+                    try alloc.print(
                         "MCP reloaded with {d} unavailable server{s}.",
                         .{
                             published.unavailable_server_names.len,
@@ -1604,13 +1604,12 @@ pub const State = struct {
                             },
                         )
                     else
-                        try std.fmt.allocPrint(
-                            alloc,
+                        try alloc.print(
                             "Authenticated '{s}'; repaired {d} credential entries.",
                             .{ completion.server_name, authenticated.repaired_entries },
                         );
                     if (completion.reconnect_error) |err| {
-                        const feedback = try std.fmt.allocPrint(alloc, "{s} Connection failed: {s}. Check /mcp list.", .{ self.menu_feedback.?, @errorName(err) });
+                        const feedback = try alloc.print("{s} Connection failed: {s}. Check /mcp list.", .{ self.menu_feedback.?, @errorName(err) });
                         alloc.free(self.menu_feedback.?);
                         self.menu_feedback = feedback;
                         _ = mcp_menu_state.apply(&self.menu, .{ .effect_failed = generation });
@@ -3069,7 +3068,7 @@ test "project prompt display escapes repository control bytes" {
 }
 
 test "project prompt allocation failure releases the runtime lease" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var state: State = .{};
     const runtime = try alloc.create(mcp_runtime.McpRuntime);
     runtime.* = mcp_runtime.McpRuntime.init(alloc);

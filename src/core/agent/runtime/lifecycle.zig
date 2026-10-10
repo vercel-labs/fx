@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../shared/testing_allocator.zig");
 const hooks = @import("../../hooks/hooks.zig");
 const types = @import("../../shared/types.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
@@ -193,7 +194,7 @@ fn checkNonObjectPreparationAllocationFailures(alloc: Allocator) !void {
 }
 
 test "non-object preparation cleans every failed allocation" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkNonObjectPreparationAllocationFailures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkNonObjectPreparationAllocationFailures, .{});
 }
 
 fn expectMalformedFeedback(model_output: []const u8, failure: []const u8, raw: []const u8) !void {
@@ -250,7 +251,7 @@ fn checkMalformedPreparationAllocationFailures(alloc: Allocator) !void {
 }
 
 test "malformed preparation cleans every failed allocation" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkMalformedPreparationAllocationFailures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkMalformedPreparationAllocationFailures, .{});
 }
 
 pub noinline fn prepareToolCallForLifecycle(

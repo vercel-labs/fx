@@ -338,7 +338,7 @@ pub fn Adapter(comptime Host: type) type {
         ) context_contract.InstructionFileError!?context_contract.InstructionFile {
             if (path.len > max_instruction_path_bytes or
                 !validAbsolutePath(path) or
-                !std.mem.eql(u8, std.fs.path.basename(path), instruction_file_name)) return error.UnsafePath;
+                !std.mem.eql(u8, std.Io.Dir.path.basename(path), instruction_file_name)) return error.UnsafePath;
 
             const buffer = try alloc.alloc(u8, @min(max_bytes, max_instruction_file_bytes));
             errdefer alloc.free(buffer);

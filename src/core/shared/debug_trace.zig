@@ -60,17 +60,17 @@ pub fn activeLogPath() ?[]const u8 {
 }
 
 pub fn nextTurnId() u64 {
-    if (comptime @import("builtin").os.tag == .wasi) return 1;
+    if (comptime @import("builtin").target.os.tag == .wasi) return 1;
     return next_turn_id.fetchAdd(1, .seq_cst);
 }
 
 pub fn nextStepId() u64 {
-    if (comptime @import("builtin").os.tag == .wasi) return 1;
+    if (comptime @import("builtin").target.os.tag == .wasi) return 1;
     return next_step_id.fetchAdd(1, .seq_cst);
 }
 
 pub fn nextSubagentId() u64 {
-    if (comptime @import("builtin").os.tag == .wasi) return 1;
+    if (comptime @import("builtin").target.os.tag == .wasi) return 1;
     return next_subagent_id.fetchAdd(1, .seq_cst);
 }
 
@@ -218,7 +218,7 @@ pub fn redactedJsonPreview(alloc: Allocator, text: []const u8) ![]u8 {
     if (text.len == 0) return alloc.dupe(u8, "<empty>");
 
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, text, .{}) catch {
-        return std.fmt.allocPrint(alloc, "<invalid-json bytes={d}>", .{text.len});
+        return alloc.print("<invalid-json bytes={d}>", .{text.len});
     };
     defer parsed.deinit();
 
@@ -233,7 +233,7 @@ pub fn keylessJsonPreview(alloc: Allocator, text: []const u8) ![]u8 {
 
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, text, .{}) catch |err| {
         if (err == error.OutOfMemory) return err;
-        return std.fmt.allocPrint(alloc, "<invalid-json bytes={d}>", .{text.len});
+        return alloc.print("<invalid-json bytes={d}>", .{text.len});
     };
     defer parsed.deinit();
 
@@ -464,8 +464,8 @@ fn scopeFilterAllows(filter: []const u8, scope: []const u8) bool {
 fn resolveLogPath(alloc: Allocator, workspace_root: []const u8, raw_path: []const u8) ![]u8 {
     const trimmed = std.mem.trim(u8, raw_path, " \t\r\n");
     if (trimmed.len == 0) return error.InvalidTracePath;
-    if (std.fs.path.isAbsolute(trimmed)) return alloc.dupe(u8, trimmed);
-    return std.fs.path.join(alloc, &.{ workspace_root, trimmed });
+    if (std.Io.Dir.path.isAbsolute(trimmed)) return alloc.dupe(u8, trimmed);
+    return std.Io.Dir.path.join(alloc, &.{ workspace_root, trimmed });
 }
 
 fn defaultLogPath(alloc: Allocator) ![]u8 {
@@ -480,11 +480,11 @@ fn defaultLogPathForHome(alloc: Allocator, home: []const u8) ![]u8 {
 }
 
 fn fallbackLogPathForMillis(alloc: Allocator, millis: i64) ![]u8 {
-    return std.fmt.allocPrint(alloc, "/tmp/fx-trace-{d}.log", .{millis});
+    return alloc.print("/tmp/fx-trace-{d}.log", .{millis});
 }
 
 fn ensureParentDir(path: []const u8) !void {
-    const parent = std.fs.path.dirname(path) orelse return;
+    const parent = std.Io.Dir.path.dirname(path) orelse return;
     try makeAbsolutePath(parent);
 }
 
@@ -493,7 +493,7 @@ fn makeAbsolutePath(path: []const u8) !void {
     std.Io.Dir.createDirAbsolute(zio, path, .default_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => {
-            if (std.fs.path.dirname(path)) |parent| {
+            if (std.Io.Dir.path.dirname(path)) |parent| {
                 try makeAbsolutePath(parent);
                 try std.Io.Dir.createDirAbsolute(zio, path, .default_dir);
             } else {
@@ -508,7 +508,7 @@ fn tmpRoot(alloc: Allocator, tmp: std.testing.TmpDir) ![]u8 {
 }
 
 fn tmpPath(alloc: Allocator, root: []const u8, name: []const u8) ![]u8 {
-    return std.fs.path.join(alloc, &.{ root, name });
+    return std.Io.Dir.path.join(alloc, &.{ root, name });
 }
 
 fn readFileForTest(alloc: Allocator, path: []const u8) ![]u8 {
@@ -669,7 +669,7 @@ test "resolveLogPath resolves absolute and relative paths" {
 
     const relative = try resolveLogPath(alloc, "/tmp/workspace", "logs/trace.log");
     defer alloc.free(relative);
-    const expected = try std.fs.path.join(alloc, &.{ "/tmp/workspace", "logs/trace.log" });
+    const expected = try std.Io.Dir.path.join(alloc, &.{ "/tmp/workspace", "logs/trace.log" });
     defer alloc.free(expected);
     try std.testing.expectEqualStrings(expected, relative);
 }

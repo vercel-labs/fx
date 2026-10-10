@@ -83,7 +83,7 @@ pub const State = struct {
     next_id: u64 = 1,
 
     pub fn begin(self: *State, origin: Origin, turn_id: ?u64, now_ms: i64) OperationId {
-        const id: OperationId = @enumFromInt(self.next_id);
+        const id: OperationId = @fromBackingInt(@intCast(self.next_id));
         // Neither counter is reused within a worker lifetime.
         self.next_id += 1;
         self.snapshot.operation = .{ .id = id, .turn_id = turn_id, .origin = origin, .started_at_ms = now_ms };

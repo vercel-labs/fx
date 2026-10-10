@@ -1363,7 +1363,7 @@ test "planner target policies use reviewed absolute executables and argv" {
             defer admission.deinit(std.testing.allocator);
             const direct = admission.direct_read_only;
             for (direct.stages) |stage| {
-                try std.testing.expect(std.fs.path.isAbsolute(stage.executable));
+                try std.testing.expect(std.Io.Dir.path.isAbsolute(stage.executable));
                 try std.testing.expectEqualStrings(stage.executable, stage.argv[0]);
                 try std.testing.expectEqual(EnvironmentProfile.basic_read_only, stage.environment_profile);
                 for (stage.argv) |arg| {
@@ -1552,7 +1552,7 @@ test "planner preserves accepted printf argv exactly" {
 
 test "planner native printf forms match shell-visible execution" {
     const builtin = @import("builtin");
-    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     const commands = [_][]const u8{
         "printf x",
@@ -1563,13 +1563,13 @@ test "planner native printf forms match shell-visible execution" {
         "printf '%s' 'caf\u{00e9}'",
     };
     for (commands) |command| {
-        try expectNativePrintfEquivalent(command, builtin.os.tag);
+        try expectNativePrintfEquivalent(command, builtin.target.os.tag);
     }
 }
 
 test "planner generated native printf matrix matches shell bytes status and stderr" {
     const builtin = @import("builtin");
-    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
     const data_classes = [_][]const u8{
@@ -1589,27 +1589,27 @@ test "planner generated native printf matrix matches shell bytes status and stde
     }) |format| {
         const command = try buildPrintfCommand(alloc, format, &.{});
         defer alloc.free(command);
-        try expectNativePrintfEquivalent(command, builtin.os.tag);
+        try expectNativePrintfEquivalent(command, builtin.target.os.tag);
     }
     for ([_][]const u8{ "%s", "prefix:%s", "%s:suffix", "a\\n%%:%s" }) |format| {
         for (data_classes) |data| {
             const command = try buildPrintfCommand(alloc, format, &.{data});
             defer alloc.free(command);
-            try expectNativePrintfEquivalent(command, builtin.os.tag);
+            try expectNativePrintfEquivalent(command, builtin.target.os.tag);
         }
     }
     for (data_classes) |first| {
         for (data_classes) |second| {
             const command = try buildPrintfCommand(alloc, "%s:%s", &.{ first, second });
             defer alloc.free(command);
-            try expectNativePrintfEquivalent(command, builtin.os.tag);
+            try expectNativePrintfEquivalent(command, builtin.target.os.tag);
         }
     }
 }
 
 test "planner native ls policy preserves reviewed target behavior" {
     const builtin = @import("builtin");
-    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1651,7 +1651,7 @@ test "planner native ls policy preserves reviewed target behavior" {
         .{ .command = "ls missing", .succeeds = false },
     };
     for (cases) |case| {
-        var admission = try expectDirect(case.command, builtin.os.tag);
+        var admission = try expectDirect(case.command, builtin.target.os.tag);
         defer admission.deinit(alloc);
         const stage = admission.direct_read_only.stages[0];
         const result = try std.process.run(alloc, std.testing.io, .{
@@ -1675,7 +1675,7 @@ test "planner native ls policy preserves reviewed target behavior" {
         }
     }
 
-    var hostile_failure = try expectDirect("ls '\x1bmissing'", builtin.os.tag);
+    var hostile_failure = try expectDirect("ls '\x1bmissing'", builtin.target.os.tag);
     defer hostile_failure.deinit(alloc);
     const hostile_failure_result = try std.process.run(alloc, std.testing.io, .{
         .argv = hostile_failure.direct_read_only.stages[0].argv,
@@ -1688,7 +1688,7 @@ test "planner native ls policy preserves reviewed target behavior" {
     try std.testing.expect(hostile_failure_result.stderr.len > 0);
     try std.testing.expect(std.mem.findScalar(u8, hostile_failure_result.stderr, 0x1b) == null);
 
-    var bare = try expectDirect("ls", builtin.os.tag);
+    var bare = try expectDirect("ls", builtin.target.os.tag);
     defer bare.deinit(alloc);
     const bare_result = try std.process.run(alloc, std.testing.io, .{
         .argv = bare.direct_read_only.stages[0].argv,
@@ -1704,7 +1704,7 @@ test "planner native ls policy preserves reviewed target behavior" {
         try std.testing.expect(std.mem.find(u8, bare_result.stdout, entry) != null);
     }
 
-    var numeric = try expectDirect("ls -l file", builtin.os.tag);
+    var numeric = try expectDirect("ls -l file", builtin.target.os.tag);
     defer numeric.deinit(alloc);
     const numeric_stage = numeric.direct_read_only.stages[0];
     const expected_numeric_argv = [_][]const u8{ "/bin/ls", "-q", "-n", "--", "file" };
@@ -1736,7 +1736,7 @@ test "planner bounds ls operands at sixty four" {
     try accepted.appendSlice(std.testing.allocator, "ls");
     for (0..64) |index| {
         var buffer: [32]u8 = undefined;
-        const operand = try std.fmt.bufPrint(&buffer, " path-{d}", .{index});
+        const operand = try std.mem.print(&buffer, " path-{d}", .{index});
         try accepted.appendSlice(std.testing.allocator, operand);
     }
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const message = @import("../shared/message.zig");
@@ -818,7 +819,7 @@ fn durableIdentifier(alloc: Allocator, value: []const u8) ![]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(value, &digest, .{});
     const hex = std.fmt.bytesToHex(digest[0..12].*, .lower);
-    return std.fmt.allocPrint(alloc, "redacted-{s}", .{&hex});
+    return alloc.print("redacted-{s}", .{&hex});
 }
 
 test "execution memory persists secret-bearing arguments results and provider output verbatim" {
@@ -1103,7 +1104,7 @@ test "durable execution memory preserves committed file presentation verbatim an
 }
 
 test "file evidence does not parse unknown tool arguments" {
-    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var failing_allocator = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     const alloc = failing_allocator.allocator();
     var files: std.ArrayList(types.FileEvidence) = .empty;
     defer files.deinit(alloc);
@@ -1114,7 +1115,7 @@ test "file evidence does not parse unknown tool arguments" {
         .{
             .id = "large_command",
             .name = "run_command",
-            .arguments_json = "{\"command\":\"" ++ ("x\\n" ** 20_000) ++ "\"}",
+            .arguments_json = "{\"command\":\"" ++ text_utils.repeat("x\\n", 20_000) ++ "\"}",
         },
         .success,
         null,
@@ -1609,12 +1610,12 @@ test "normal execution-memory builders clean every allocation failure" {
     };
 
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         ChatCheck.run,
         .{},
     );
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         MessageCheck.run,
         .{},
     );
@@ -1632,11 +1633,11 @@ test "normal execution-memory builders skip non-tool messages without allocation
         message.Message.assistantBorrowed("ignored", &.{}),
     };
     var chat_failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     var message_failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
 

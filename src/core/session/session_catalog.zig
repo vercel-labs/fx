@@ -54,12 +54,12 @@ pub fn relativeActivityAge(buf: []u8, updated_at_ms: i64, now_ms: i64) []const u
     const delta_ms: i64 = @max(0, now_ms - updated_at_ms);
     if (delta_ms < std.time.ms_per_min) return "just now";
     if (delta_ms < std.time.ms_per_hour) {
-        return std.fmt.bufPrint(buf, "{d}m ago", .{@divFloor(delta_ms, std.time.ms_per_min)}) catch "recently";
+        return std.mem.print(buf, "{d}m ago", .{@divFloor(delta_ms, std.time.ms_per_min)}) catch "recently";
     }
     if (delta_ms < std.time.ms_per_day) {
-        return std.fmt.bufPrint(buf, "{d}h ago", .{@divFloor(delta_ms, std.time.ms_per_hour)}) catch "recently";
+        return std.mem.print(buf, "{d}h ago", .{@divFloor(delta_ms, std.time.ms_per_hour)}) catch "recently";
     }
-    return std.fmt.bufPrint(buf, "{d}d ago", .{@divFloor(delta_ms, std.time.ms_per_day)}) catch "recently";
+    return std.mem.print(buf, "{d}d ago", .{@divFloor(delta_ms, std.time.ms_per_day)}) catch "recently";
 }
 
 // Same buckets as relativeActivityAge without the " ago" suffix, for tight
@@ -68,12 +68,12 @@ pub fn relativeActivityAgeCompact(buf: []u8, updated_at_ms: i64, now_ms: i64) []
     const delta_ms: i64 = @max(0, now_ms - updated_at_ms);
     if (delta_ms < std.time.ms_per_min) return "now";
     if (delta_ms < std.time.ms_per_hour) {
-        return std.fmt.bufPrint(buf, "{d}m", .{@divFloor(delta_ms, std.time.ms_per_min)}) catch "recently";
+        return std.mem.print(buf, "{d}m", .{@divFloor(delta_ms, std.time.ms_per_min)}) catch "recently";
     }
     if (delta_ms < std.time.ms_per_day) {
-        return std.fmt.bufPrint(buf, "{d}h", .{@divFloor(delta_ms, std.time.ms_per_hour)}) catch "recently";
+        return std.mem.print(buf, "{d}h", .{@divFloor(delta_ms, std.time.ms_per_hour)}) catch "recently";
     }
-    return std.fmt.bufPrint(buf, "{d}d", .{@divFloor(delta_ms, std.time.ms_per_day)}) catch "recently";
+    return std.mem.print(buf, "{d}d", .{@divFloor(delta_ms, std.time.ms_per_day)}) catch "recently";
 }
 
 fn matchesQuery(summary: session_store.SessionSummary, query: []const u8) bool {

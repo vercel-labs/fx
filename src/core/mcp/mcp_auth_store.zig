@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const mcp_auth = @import("mcp_auth.zig");
 const native_keychain = @import("../hosts/native_keychain.zig");
@@ -110,13 +111,13 @@ fn storageBackend(
     cancel_flag: ?*const std.atomic.Value(bool),
 ) !StorageBackend {
     const disabled = native_keychain.isDisabled();
-    const available = if (builtin.os.tag == .macos and !disabled) blk: {
+    const available = if (builtin.target.os.tag == .macos and !disabled) blk: {
         break :blk if (cancel_flag) |flag|
             try native_keychain.userDefaultKeychainAvailableCancellable(alloc, flag)
         else
             try native_keychain.userDefaultKeychainAvailable(alloc);
     } else false;
-    return selectStorageBackend(builtin.os.tag, disabled, available);
+    return selectStorageBackend(builtin.target.os.tag, disabled, available);
 }
 
 fn selectReadDecision(
@@ -1038,7 +1039,7 @@ fn checkCredentialStoreIsolationAllocationFailures(alloc: Allocator) !void {
 
 test "credential store isolation cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkCredentialStoreIsolationAllocationFailures,
         .{},
     );

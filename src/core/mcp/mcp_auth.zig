@@ -457,7 +457,7 @@ pub fn canonicalResource(alloc: Allocator, endpoint: []const u8) ![]u8 {
     defer alloc.free(origin);
     const path = rawPathAlloc(alloc, uri) catch return error.InvalidMcpAuthEndpoint;
     defer alloc.free(path);
-    return std.fmt.allocPrint(alloc, "{s}{s}", .{ origin, path });
+    return alloc.print("{s}{s}", .{ origin, path });
 }
 
 pub fn isLoopbackEndpoint(endpoint: []const u8) bool {
@@ -492,16 +492,14 @@ pub fn protectedResourceMetadataUrls(
     var urls: std.ArrayList([]u8) = .empty;
     errdefer freeStringList(alloc, &urls);
     if (!std.mem.eql(u8, path, "/")) {
-        const suffix = if (path[0] == '/') path else try std.fmt.allocPrint(alloc, "/{s}", .{path});
+        const suffix = if (path[0] == '/') path else try alloc.print("/{s}", .{path});
         defer if (suffix.ptr != path.ptr) alloc.free(suffix);
-        try urls.append(alloc, try std.fmt.allocPrint(
-            alloc,
+        try urls.append(alloc, try alloc.print(
             "{s}/.well-known/oauth-protected-resource{s}",
             .{ origin, suffix },
         ));
     }
-    try urls.append(alloc, try std.fmt.allocPrint(
-        alloc,
+    try urls.append(alloc, try alloc.print(
         "{s}/.well-known/oauth-protected-resource",
         .{origin},
     ));
@@ -525,29 +523,24 @@ pub fn authorizationMetadataUrls(
     var urls: std.ArrayList([]u8) = .empty;
     errdefer freeStringList(alloc, &urls);
     if (trimmed_path.len == 0) {
-        try urls.append(alloc, try std.fmt.allocPrint(
-            alloc,
+        try urls.append(alloc, try alloc.print(
             "{s}/.well-known/oauth-authorization-server",
             .{origin},
         ));
-        try urls.append(alloc, try std.fmt.allocPrint(
-            alloc,
+        try urls.append(alloc, try alloc.print(
             "{s}/.well-known/openid-configuration",
             .{origin},
         ));
     } else {
-        try urls.append(alloc, try std.fmt.allocPrint(
-            alloc,
+        try urls.append(alloc, try alloc.print(
             "{s}/.well-known/oauth-authorization-server/{s}",
             .{ origin, trimmed_path },
         ));
-        try urls.append(alloc, try std.fmt.allocPrint(
-            alloc,
+        try urls.append(alloc, try alloc.print(
             "{s}/.well-known/openid-configuration/{s}",
             .{ origin, trimmed_path },
         ));
-        try urls.append(alloc, try std.fmt.allocPrint(
-            alloc,
+        try urls.append(alloc, try alloc.print(
             "{s}/.well-known/openid-configuration",
             .{issuer},
         ));
@@ -737,9 +730,9 @@ pub fn parseAuthorizationRedirect(
     alloc: Allocator,
     location: []const u8,
 ) !AuthorizationResponse {
-    const question = std.mem.indexOfScalar(u8, location, '?') orelse
+    const question = std.mem.findScalar(u8, location, '?') orelse
         return error.InvalidAuthorizationRedirect;
-    const fragment = std.mem.indexOfScalarPos(u8, location, question + 1, '#') orelse location.len;
+    const fragment = std.mem.findScalarPos(u8, location, question + 1, '#') orelse location.len;
     const query = location[question + 1 .. fragment];
     const code = try queryValueAlloc(alloc, query, "code");
     errdefer secret.zeroAndFree(alloc, code);
@@ -807,7 +800,7 @@ test "PKCE base64url encoding covers complete and partial groups" {
 }
 
 pub fn bearerHeaderAlloc(alloc: Allocator, access_token: []const u8) ![]u8 {
-    return std.fmt.allocPrint(alloc, "Bearer {s}", .{access_token});
+    return alloc.print("Bearer {s}", .{access_token});
 }
 
 pub fn validateClientMetadataUrl(url: []const u8) !void {
@@ -1061,9 +1054,9 @@ pub fn authorizeAutomated(
 
 fn callbackRedirectUri(alloc: Allocator, configured_port: ?u16, bound_port: u16) ![]u8 {
     if (configured_port) |port| {
-        return std.fmt.allocPrint(alloc, "http://localhost:{d}/callback", .{port});
+        return alloc.print("http://localhost:{d}/callback", .{port});
     }
-    return std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/callback", .{bound_port});
+    return alloc.print("http://127.0.0.1:{d}/callback", .{bound_port});
 }
 
 const CallbackSocketCreation = struct {
@@ -1111,7 +1104,7 @@ fn listenPinnedCallback(address: std.Io.net.IpAddress) std.Io.net.IpAddress.List
             break :values .{ .family = posix.AF.INET6, .len = @sizeOf(posix.sockaddr.in6) };
         },
     };
-    const socket_creation = comptime callbackSocketCreation(builtin.os.tag);
+    const socket_creation = comptime callbackSocketCreation(builtin.target.os.tag);
 
     const socket_fd = while (true) {
         const rc = posix.system.socket(details.family, socket_creation.flags, 0);
@@ -1201,7 +1194,7 @@ pub fn authorizeInteractive(
     alloc: Allocator,
     options: InteractiveAuthorizationOptions,
 ) !AuthorizationResult {
-    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         return error.InteractiveMcpAuthorizationUnsupported;
     }
     const bridge = try slack_bridge_config(alloc, options.endpoint, options.config);
@@ -1275,10 +1268,10 @@ fn slack_bridge_config(alloc: Allocator, endpoint: []const u8, client_config: Cl
         const port = std.fmt.parseInt(u16, origin[17..], 10) catch return error.InvalidSlackTestOrigin;
         if (port < 1024) return error.InvalidSlackTestOrigin;
     }
-    const resource = if (fixture) try std.fmt.allocPrint(alloc, "{s}/mcp", .{origin}) else "https://mcp.slack.com/mcp";
+    const resource = if (fixture) try alloc.print("{s}/mcp", .{origin}) else "https://mcp.slack.com/mcp";
     defer if (fixture) alloc.free(resource);
     if (!std.mem.eql(u8, endpoint, resource)) return null;
-    const url = try std.fmt.allocPrint(alloc, "{s}/api/slack/install/config?flow=auth", .{origin});
+    const url = try alloc.print("{s}/api/slack/install/config?flow=auth", .{origin});
     defer alloc.free(url);
     var response = try request(alloc, .GET, url, null, null, &.{});
     defer response.deinit(alloc);
@@ -1636,10 +1629,10 @@ fn request_bridged_authorization(
 ) !AuthorizationResponse {
     const origin = ctx.bridge_origin.?;
     const fixture = !std.mem.eql(u8, origin, "https://fx.sh");
-    const endpoint = if (fixture) try std.fmt.allocPrint(alloc, "{s}/authorize", .{origin}) else "https://slack.com/oauth/v2_user/authorize";
+    const endpoint = if (fixture) try alloc.print("{s}/authorize", .{origin}) else "https://slack.com/oauth/v2_user/authorize";
     defer if (fixture) alloc.free(endpoint);
     if (!std.mem.eql(u8, authorization.endpoint, endpoint)) return error.InvalidSlackAuthorizationEndpoint;
-    const expected_resource = if (fixture) try std.fmt.allocPrint(alloc, "{s}/", .{origin}) else "https://mcp.slack.com/";
+    const expected_resource = if (fixture) try alloc.print("{s}/", .{origin}) else "https://mcp.slack.com/";
     defer if (fixture) alloc.free(expected_resource);
     if (!std.mem.eql(u8, authorization.resource, expected_resource)) return error.InvalidSlackAuthorizationResource;
     const scope = authorization.scope orelse return error.InvalidSlackBridgeConfiguration;
@@ -1652,7 +1645,7 @@ fn request_bridged_authorization(
     try form.append(&start.writer, "client_id", authorization.client_id);
     try form.append(&start.writer, "scope", scope);
     var port_buffer: [5]u8 = undefined;
-    try form.append(&start.writer, "port", try std.fmt.bufPrint(&port_buffer, "{d}", .{ctx.listener.socket.address.getPort()}));
+    try form.append(&start.writer, "port", try std.mem.print(&port_buffer, "{d}", .{ctx.listener.socket.address.getPort()}));
     const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .raw = .fromSeconds(300), .clock = .boot });
     try checkAuthorizationCancellation(ctx.cancellation);
     if (!try ctx.open_url(ctx.open_ctx, alloc, start.written())) return error.McpAuthorizationBrowserOpenFailed;
@@ -1757,13 +1750,13 @@ fn readInteractiveAuthorizationCallback(
         if (std.mem.endsWith(u8, request_bytes[0..request_len], "\r\n\r\n")) break;
     }
     if (request_len == request_bytes.len) return error.AuthorizationCallbackTooLarge;
-    const line_end = std.mem.indexOf(u8, request_bytes[0..request_len], "\r\n") orelse
+    const line_end = std.mem.find(u8, request_bytes[0..request_len], "\r\n") orelse
         return error.InvalidAuthorizationCallback;
     const request_line = request_bytes[0..line_end];
     if (!std.mem.startsWith(u8, request_line, "GET ")) {
         return error.InvalidAuthorizationCallback;
     }
-    const target_end = std.mem.indexOfScalarPos(u8, request_line, 4, ' ') orelse
+    const target_end = std.mem.findScalarPos(u8, request_line, 4, ' ') orelse
         return error.InvalidAuthorizationCallback;
     const target = request_line[4..target_end];
     if (!std.mem.startsWith(u8, target, "/callback?")) {
@@ -1779,8 +1772,8 @@ fn readInteractiveAuthorizationCallback(
 }
 
 fn validateRedirectTarget(location: []const u8, redirect_uri: []const u8) !void {
-    const query = std.mem.indexOfScalar(u8, location, '?') orelse
-        std.mem.indexOfScalar(u8, location, '#') orelse location.len;
+    const query = std.mem.findScalar(u8, location, '?') orelse
+        std.mem.findScalar(u8, location, '#') orelse location.len;
     if (!std.mem.eql(u8, location[0..query], redirect_uri)) {
         return error.InvalidAuthorizationCallback;
     }
@@ -1977,7 +1970,7 @@ fn buildAuthorizationUrl(
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     try out.writer.writeAll(endpoint);
-    try out.writer.writeByte(if (std.mem.indexOfScalar(u8, endpoint, '?') == null) '?' else '&');
+    try out.writer.writeByte(if (std.mem.findScalar(u8, endpoint, '?') == null) '?' else '&');
     var form: Form = .{};
     try form.append(&out.writer, "response_type", "code");
     try form.append(&out.writer, "client_id", client_id);
@@ -2066,7 +2059,7 @@ fn tokenEndpointAuthentication(
     );
     defer secret.zeroAndFree(alloc, encoded);
     _ = std.base64.standard.Encoder.encode(encoded, pair.written());
-    const authorization = try std.fmt.allocPrint(alloc, "Basic {s}", .{encoded});
+    const authorization = try alloc.print("Basic {s}", .{encoded});
     return .{
         .authorization = authorization,
         .header = .{.{
@@ -2412,13 +2405,12 @@ fn originAlloc(alloc: Allocator, uri: std.Uri) ![]u8 {
     const default_port = (std.ascii.eqlIgnoreCase(uri.scheme, "https") and uri.port == 443) or
         (std.ascii.eqlIgnoreCase(uri.scheme, "http") and uri.port == 80);
     if (uri.port) |port| {
-        if (!default_port) return std.fmt.allocPrint(
-            alloc,
+        if (!default_port) return alloc.print(
             "{s}://{s}:{d}",
             .{ scheme, canonical_host, port },
         );
     }
-    return std.fmt.allocPrint(alloc, "{s}://{s}", .{ scheme, canonical_host });
+    return alloc.print("{s}://{s}", .{ scheme, canonical_host });
 }
 
 fn rawPathAlloc(alloc: Allocator, uri: std.Uri) ![]u8 {
@@ -2941,7 +2933,7 @@ test "interactive callback redirect honors a pinned port" {
 }
 
 test "interactive callback rejects a pinned port already listening" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         return error.SkipZigTest;
     }
     var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
@@ -2966,7 +2958,7 @@ test "interactive callback rejects a pinned port already listening" {
 }
 
 test "interactive callback rejects a pinned IPv6 port already listening" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         return error.SkipZigTest;
     }
     var address = try std.Io.net.IpAddress.parse("::1", 0);
@@ -2994,7 +2986,7 @@ test "interactive callback rejects a pinned IPv6 port already listening" {
 }
 
 test "interactive callback immediately reuses a completed pinned port" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         return error.SkipZigTest;
     }
     var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
@@ -3058,7 +3050,7 @@ test "pinned callback sockets create close-on-exec atomically where supported" {
 }
 
 test "interactive callback wait observes caller and lifecycle cancellation" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         return error.SkipZigTest;
     }
     var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);

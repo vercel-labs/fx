@@ -441,7 +441,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
 
 fn reportShutdownFailure(deps: RunDeps, err: anyerror) void {
     var buffer: [256]u8 = undefined;
-    const text = std.fmt.bufPrint(&buffer, "fx: session save failed: {s}\n", .{@errorName(err)}) catch
+    const text = std.mem.print(&buffer, "fx: session save failed: {s}\n", .{@errorName(err)}) catch
         "fx: session save failed\n";
     writeStderr(deps, text);
 }
@@ -461,7 +461,7 @@ fn writeUpgradeRelaunchFailure(
     sessions_v2: bool,
 ) void {
     var buffer: [768]u8 = undefined;
-    const message = std.fmt.bufPrint(
+    const message = std.mem.print(
         &buffer,
         "fx: upgrade installed, but relaunch failed: {s}\nContinue session with: fx {s}--resume {s}\n",
         .{ @errorName(err), if (sessions_v2) "--sessions-v2 " else "", session_id },
@@ -536,7 +536,7 @@ fn writeRealStdout(_: ?*anyopaque, text: []const u8) !void {
 }
 
 fn formatResumeHandoff(buffer: []u8, session_id: []const u8, sessions_v2: bool) ![]const u8 {
-    return std.fmt.bufPrint(
+    return std.mem.print(
         buffer,
         "Continue session with: fx {s}--resume {s}\n",
         .{ if (sessions_v2) "--sessions-v2 " else "", session_id },
@@ -544,7 +544,7 @@ fn formatResumeHandoff(buffer: []u8, session_id: []const u8, sessions_v2: bool) 
 }
 
 fn formatUnexpectedError(buffer: []u8, err: anyerror) ![]const u8 {
-    return std.fmt.bufPrint(buffer, "fx: {s}\n", .{config_runtime.modelNotSelectedMessage(err) orelse @errorName(err)});
+    return std.mem.print(buffer, "fx: {s}\n", .{config_runtime.modelNotSelectedMessage(err) orelse @errorName(err)});
 }
 
 /// A v2 session that cannot be written at startup, in one sentence; null
@@ -666,7 +666,7 @@ fn appendInitEvent(launch: *const cli_surface.InteractiveLaunch) void {
             .pick => appendTestEvent("init:pick"),
             .last => appendTestEvent("init:last"),
             .remembered => appendTestEvent("init:remembered"),
-            .id => |id| appendTestEvent(std.fmt.bufPrint(&test_init_event_buf, "init:{s}", .{id}) catch "init:<invalid>"),
+            .id => |id| appendTestEvent(std.mem.print(&test_init_event_buf, "init:{s}", .{id}) catch "init:<invalid>"),
         }
     } else {
         appendTestEvent("init:none");
@@ -847,7 +847,7 @@ const TestApp = struct {
         return .{ .handoff = handoff, .failure = active_capture.?.shutdown_failure };
     }
 
-    fn takeUpgradeRelaunchRequest(_: *TestApp) ?auto_upgrade.RelaunchRequest {
+    pub fn takeUpgradeRelaunchRequest(_: *TestApp) ?auto_upgrade.RelaunchRequest {
         const path = active_capture.?.upgrade_relaunch_path orelse return null;
         var request = auto_upgrade.RelaunchRequest{
             .executable_path_len = path.len,
@@ -870,19 +870,19 @@ const TestApp = struct {
         appendTestEvent("resume-reconciliation");
     }
 
-    fn startAutoUpgrade(_: *TestApp) void {
+    pub fn startAutoUpgrade(_: *TestApp) void {
         appendTestEvent("auto-upgrade");
     }
 
-    fn startFileIndex(_: *TestApp) void {
+    pub fn startFileIndex(_: *TestApp) void {
         appendTestEvent("file-index");
     }
 
-    fn startMcpDiscovery(_: *TestApp) void {
+    pub fn startMcpDiscovery(_: *TestApp) void {
         appendTestEvent("mcp-discovery");
     }
 
-    fn rebindAfterInit(_: *TestApp) void {
+    pub fn rebindAfterInit(_: *TestApp) void {
         appendTestEvent("rebind-after-init");
     }
 
@@ -1243,7 +1243,7 @@ test "app entry releases terminal before reporting initial context failures exac
             runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()),
         );
         var expected_stderr_buf: [64]u8 = undefined;
-        const expected_stderr = try std.fmt.bufPrint(
+        const expected_stderr = try std.mem.print(
             &expected_stderr_buf,
             "fx: {s}\n",
             .{@errorName(expected_error)},

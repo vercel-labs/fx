@@ -29,6 +29,11 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import {
+  buildMcpDispatcherDriver,
+  ZIG_BUILD_WARMUP_TIMEOUT_MS,
+  zigGlobalCacheDir,
+} from "./zig-build";
 
 const MODEL = "openai/gpt-5";
 const TOOL_NAME = "mcp_fixture_echo";
@@ -119,6 +124,10 @@ function runMcpKeychainProbe(
 beforeAll(() => {
   process.env.FX_DISABLE_KEYCHAIN = "1";
 });
+
+beforeAll(() => {
+  buildMcpDispatcherDriver(REPO_ROOT);
+}, ZIG_BUILD_WARMUP_TIMEOUT_MS);
 
 afterAll(() => {
   if (inheritedKeychainDisable === undefined) {
@@ -681,6 +690,7 @@ function moveAuthFixtureToWorkspace(root: ReturnType<typeof createRoot>): void {
 function baseEnv(root: ReturnType<typeof createRoot>) {
   return {
     HOME: root.home,
+    ZIG_GLOBAL_CACHE_DIR: zigGlobalCacheDir(),
     PATH: `${root.bin}${delimiter}${process.env.PATH ?? ""}`,
     AI_GATEWAY_API_KEY: "fake-mcp-auth-key",
     VERCEL_OIDC_TOKEN: undefined,

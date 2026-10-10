@@ -539,8 +539,7 @@ pub fn Commands(comptime App: type) type {
                 target.pattern,
                 .allow,
             ) catch |err| {
-                const notice_rule_write_fail = try std.fmt.allocPrint(
-                    app.alloc,
+                const notice_rule_write_fail = try app.alloc.print(
                     "failed to add rule to settings (scope={s}, error={s})",
                     .{ @tagName(permission_scope), @errorName(err) },
                 );
@@ -580,8 +579,7 @@ pub fn Commands(comptime App: type) type {
                 target.category,
                 target.pattern,
             ) catch |err| {
-                const notice = try std.fmt.allocPrint(
-                    app.alloc,
+                const notice = try app.alloc.print(
                     "failed to remove rule from settings (scope={s}, error={s})",
                     .{ @tagName(permission_scope), @errorName(err) },
                 );
@@ -625,8 +623,7 @@ pub fn Commands(comptime App: type) type {
                 permissionWorkspaceRoot(app, permission_scope),
                 reset_scope,
             ) catch |err| {
-                const notice_reset_fail = try std.fmt.allocPrint(
-                    app.alloc,
+                const notice_reset_fail = try app.alloc.print(
                     "failed to reset rules in settings (scope={s}, error={s})",
                     .{ @tagName(permission_scope), @errorName(err) },
                 );
@@ -646,8 +643,7 @@ pub fn Commands(comptime App: type) type {
             };
 
             var detailed = loadDetailedSettingsForNotice(app) catch |err| {
-                const msg = try std.fmt.allocPrint(
-                    app.alloc,
+                const msg = try app.alloc.print(
                     "reset {s}: removed {d} rule{s} (scope={s}); saved but effective source unknown and runtime reload failed ({s})",
                     .{
                         allowlistResetScopeLabel(reset_scope),
@@ -663,8 +659,7 @@ pub fn Commands(comptime App: type) type {
             };
             defer detailed.deinit(app.alloc);
             if (postCommitResolutionError(detailed)) |err| {
-                const msg = try std.fmt.allocPrint(
-                    app.alloc,
+                const msg = try app.alloc.print(
                     "reset {s}: removed {d} rule{s} (scope={s}); saved but effective source unknown and runtime reload failed ({s})",
                     .{
                         allowlistResetScopeLabel(reset_scope),
@@ -681,8 +676,7 @@ pub fn Commands(comptime App: type) type {
             replaceEffectivePermissionRules(app, &detailed);
 
             const shadow = permissionShadowLabel(detailed.permission_sources, permission_scope);
-            const msg = try std.fmt.allocPrint(
-                app.alloc,
+            const msg = try app.alloc.print(
                 "reset {s}: removed {d} rule{s} (scope={s}){s}{s}",
                 .{
                     allowlistResetScopeLabel(reset_scope),
@@ -947,8 +941,7 @@ pub fn Commands(comptime App: type) type {
             target: AllowlistTarget,
         ) !void {
             var detailed = loadDetailedSettingsForNotice(app) catch |err| {
-                const detail = try std.fmt.allocPrint(
-                    app.alloc,
+                const detail = try app.alloc.print(
                     "saved but effective source unknown and runtime reload failed ({s})",
                     .{@errorName(err)},
                 );
@@ -960,8 +953,7 @@ pub fn Commands(comptime App: type) type {
             };
             defer detailed.deinit(app.alloc);
             if (postCommitResolutionError(detailed)) |err| {
-                const detail = try std.fmt.allocPrint(
-                    app.alloc,
+                const detail = try app.alloc.print(
                     "saved but effective source unknown and runtime reload failed ({s})",
                     .{@errorName(err)},
                 );
@@ -975,7 +967,7 @@ pub fn Commands(comptime App: type) type {
 
             const shadow = permissionShadowLabel(detailed.permission_sources, permission_scope);
             const detail = if (shadow.len > 0)
-                try std.fmt.allocPrint(app.alloc, "user rules shadowed by {s}", .{shadow})
+                try app.alloc.print("user rules shadowed by {s}", .{shadow})
             else
                 try app.alloc.dupe(u8, "");
             defer app.alloc.free(detail);
@@ -1047,7 +1039,7 @@ pub fn Commands(comptime App: type) type {
         fn writePermissionsStatus(app: *App) !void {
             const status = try app.permission_engine.formatPermissionsNoticeBody(app.alloc, app.workspace_root);
             defer app.alloc.free(status);
-            const notice = try std.fmt.allocPrint(app.alloc, "{s}\n{s}", .{ status, permissions_usage });
+            const notice = try app.alloc.print("{s}\n{s}", .{ status, permissions_usage });
             defer app.alloc.free(notice);
             try app.writeDomainNotice(.{ .topic = "permissions", .tone = .neutral, .body = notice }, true);
         }
@@ -1061,7 +1053,7 @@ pub fn Commands(comptime App: type) type {
             const settings = &detailed.settings;
 
             const startup_scrollback_label = if (settings.startup_scrollback orelse true) "on" else "off";
-            const msg = try std.fmt.allocPrint(app.alloc, "model: {s}\nmodel_config_source: {s}\npermission_mode: {s}\nworkspace: {s}\nstep_limit: {d}\nstartup_scrollback: {s}", .{
+            const msg = try app.alloc.print("model: {s}\nmodel_config_source: {s}\npermission_mode: {s}\nworkspace: {s}\nstep_limit: {d}\nstartup_scrollback: {s}", .{
                 provider_runtime.model(app),
                 @tagName(detailed.sources.models.get(model_provider.NameKey.fromProvider(.gateway))),
                 permissions.permissionModeDisplayLabel(app.permission_engine.mode),
@@ -1135,7 +1127,7 @@ pub fn Commands(comptime App: type) type {
         }
 
         fn writeSettingsLoadError(app: *App, err: anyerror) !void {
-            const msg = try std.fmt.allocPrint(app.alloc, "Failed to load settings: {s}", .{@errorName(err)});
+            const msg = try app.alloc.print("Failed to load settings: {s}", .{@errorName(err)});
             defer app.alloc.free(msg);
             try app.writeDomainNotice(.{ .topic = "settings", .tone = .@"error", .body = msg }, true);
         }
@@ -1273,7 +1265,7 @@ pub fn Commands(comptime App: type) type {
                 "fast"
             else
                 "normal";
-            const line = try std.fmt.allocPrint(app.alloc, "{s}{s} (effort: {s}, speed: {s})", .{ prefix, selected, app.effort.displayLabel(), speed });
+            const line = try app.alloc.print("{s}{s} (effort: {s}, speed: {s})", .{ prefix, selected, app.effort.displayLabel(), speed });
             defer app.alloc.free(line);
             try app.writeDomainNotice(.{ .topic = "", .tone = .neutral, .body = line }, true);
             if (comptime @hasDecl(App, "playInteractionSound")) app.playInteractionSound();
@@ -1856,13 +1848,13 @@ const FakeApp = struct {
         self.semantic_write_count += 1;
         self.last_tone = notice.tone;
         const rendered = if (notice.topic.len > 0)
-            try std.fmt.allocPrint(self.alloc, "{s} {s}: {s}\n", .{
+            try self.alloc.print("{s} {s}: {s}\n", .{
                 types.noticeGlyph(notice.tone),
                 notice.topic,
                 notice.body,
             })
         else
-            try std.fmt.allocPrint(self.alloc, "{s} {s}\n", .{ types.noticeGlyph(notice.tone), notice.body });
+            try self.alloc.print("{s} {s}\n", .{ types.noticeGlyph(notice.tone), notice.body });
         defer self.alloc.free(rendered);
         try self.transcript.appendSlice(self.alloc, rendered);
     }
@@ -1944,7 +1936,7 @@ const FakeApp = struct {
         return makeStringList(self.alloc, self.fetch_ids);
     }
 
-    fn loadDetailedSettingsForNotice(self: *FakeApp) !config_runtime.DetailedSettings {
+    pub fn loadDetailedSettingsForNotice(self: *FakeApp) !config_runtime.DetailedSettings {
         self.post_commit_resolution_count += 1;
         if (self.post_commit_resolution_error) |err| return err;
         if (self.post_commit_resolution_diagnostic) |cause| {
@@ -1958,7 +1950,7 @@ const FakeApp = struct {
         return config_runtime.loadMergedSettingsDetailed(self.alloc, self.workspace_root);
     }
 
-    fn persistRuntimePreferences(
+    pub fn persistRuntimePreferences(
         self: *FakeApp,
         patch: app_session_runtime.SessionPreferencePatch,
     ) app_session_runtime.PreferenceCommitResult {
@@ -3079,8 +3071,7 @@ test "session_commands user save notice uses one post-commit load after legacy c
     defer std.testing.allocator.free(home_root);
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
-    const fixture = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const fixture = try std.testing.allocator.print(
         "{{\"model\":\"user/old\",\"workspaces\":{{\"{s}\":{{\"model\":\"legacy/local\"}}}}}}\n",
         .{workspace_root},
     );
@@ -3113,8 +3104,7 @@ test "session_commands durable user save survives post-commit resolver failure" 
     defer std.testing.allocator.free(home_root);
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
-    const fixture = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const fixture = try std.testing.allocator.print(
         "{{\"workspaces\":{{\"{s}\":{{\"model\":\"legacy/local\"}}}}}}\n",
         .{workspace_root},
     );

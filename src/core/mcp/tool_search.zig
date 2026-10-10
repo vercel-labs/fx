@@ -225,7 +225,7 @@ pub fn search(
 }
 
 fn appendSearchNotice(alloc: Allocator, notice: *?[]u8, message: []const u8) !void {
-    const combined = if (notice.*) |current| try std.fmt.allocPrint(alloc, "{s}\n{s}", .{ current, message }) else try alloc.dupe(u8, message);
+    const combined = if (notice.*) |current| try alloc.print("{s}\n{s}", .{ current, message }) else try alloc.dupe(u8, message);
     if (notice.*) |current| alloc.free(current);
     notice.* = combined;
 }
@@ -386,8 +386,8 @@ pub fn boundedEncodedScalar(alloc: Allocator, value: []const u8, max_bytes: usiz
     if (observed <= max_bytes) return .{ .text = encoded, .observed_bytes = observed };
 
     var prefix_len = context_limits.utf8PrefixLength(encoded, max_bytes);
-    if (std.mem.lastIndexOfScalar(u8, encoded[0..prefix_len], '&')) |amp_index| {
-        if (std.mem.indexOfScalar(u8, encoded[amp_index..prefix_len], ';') == null) prefix_len = amp_index;
+    if (std.mem.findScalarLast(u8, encoded[0..prefix_len], '&')) |amp_index| {
+        if (std.mem.findScalar(u8, encoded[amp_index..prefix_len], ';') == null) prefix_len = amp_index;
     }
     return .{ .text = try alloc.realloc(encoded, prefix_len), .observed_bytes = observed };
 }
@@ -440,7 +440,7 @@ pub fn renderAuthenticationRequired(
         switch (mode) {
             .oauth => {
                 try out.writer.writeAll(",\"interactive\":true,\"message\":");
-                const guidance = try std.fmt.allocPrint(alloc, "Run /mcp auth {s} --open in an interactive fx session.", .{server.config.name});
+                const guidance = try alloc.print("Run /mcp auth {s} --open in an interactive fx session.", .{server.config.name});
                 defer alloc.free(guidance);
                 try writeEncodedJsonScalar(alloc, &out.writer, guidance);
             },
@@ -480,8 +480,7 @@ pub fn renderServerFailure(
         defer server.status_lock.unlock(io_mod.getIo());
         if (server.state.load(.acquire) != .failed) continue;
         const failure = server.last_error orelse continue;
-        const message = try std.fmt.allocPrint(
-            alloc,
+        const message = try alloc.print(
             "MCP server '{s}' is unavailable: {s}",
             .{ server.config.name, failure },
         );

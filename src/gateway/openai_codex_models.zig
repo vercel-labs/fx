@@ -184,7 +184,7 @@ const FetchOperation = struct {
             .accept_encoding = .omit,
         };
         if (self.credential) |credential| {
-            auth_header = try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{credential});
+            auth_header = try self.alloc.print("Bearer {s}", .{credential});
             headers.authorization = .{ .override = auth_header.? };
         }
         const body_buffer = try self.alloc.alloc(u8, max_catalog_bytes + 1);
@@ -227,8 +227,7 @@ fn modelsUrl(alloc: std.mem.Allocator, version: ?versions.Version) ![]u8 {
     }
     const compatible = version orelse return alloc.dupe(u8, base);
     const separator: u8 = if (std.mem.findScalar(u8, base, '?') == null) '?' else '&';
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "{s}{c}client_version={s}",
         .{ base, separator, compatible.slice() },
     );

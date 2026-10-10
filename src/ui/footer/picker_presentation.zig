@@ -392,7 +392,7 @@ fn composeOnboardingPickerRow(
         const selected = view.choiceIsSelected(choice);
         try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
         var label_buf: [96]u8 = undefined;
-        const label = std.fmt.bufPrint(
+        const label = std.mem.print(
             &label_buf,
             "{s}{s}",
             .{ if (selected) "   › " else "     ", view.choiceLabel(choice) },
@@ -554,7 +554,7 @@ fn composeSignInPickerRow(
         else
             "   Sign in with Vercel",
         1, 4 => "",
-        2 => std.fmt.bufPrint(
+        2 => std.mem.print(
             &label_buf,
             "   Open   {s}",
             .{snapshot.verification_uri},
@@ -567,7 +567,7 @@ fn composeSignInPickerRow(
         3 => if (snapshot.user_code.len == 0)
             ""
         else
-            std.fmt.bufPrint(
+            std.mem.print(
                 &label_buf,
                 "   Code   {s}",
                 .{snapshot.user_code},
@@ -618,7 +618,7 @@ fn composeApiKeyPickerRow(
         2 => try row_text.appendClipped(alloc, &row, "   enter saves · esc cancels", width),
         3 => {
             var label_buf: [128]u8 = undefined;
-            const label = std.fmt.bufPrint(
+            const label = std.mem.print(
                 &label_buf,
                 "   Saves to {s}",
                 .{credentials.stored_key_backend_label},
@@ -933,9 +933,9 @@ fn appendFilePickerLabel(
         return;
     }
 
-    const basename = std.fs.path.basename(path);
+    const basename = std.Io.Dir.path.basename(path);
     const basename_start = @intFromPtr(basename.ptr) - @intFromPtr(path.ptr);
-    const dirname = std.fs.path.dirname(path) orelse {
+    const dirname = std.Io.Dir.path.dirname(path) orelse {
         try appendBasenameProjection(alloc, row, item, basename_start, width_usize, base_style);
         return;
     };
@@ -1204,13 +1204,13 @@ pub fn composeSlashMenuHeaderRow(
     const noun = if (layout.command_count == layout.result_count) "Commands" else "Results";
     var left_buf: [96]u8 = undefined;
     const left = if (std.mem.eql(u8, prefix, "/"))
-        std.fmt.bufPrint(&left_buf, "{s} {d} · type to filter", .{ noun, layout.result_count }) catch noun
+        std.mem.print(&left_buf, "{s} {d} · type to filter", .{ noun, layout.result_count }) catch noun
     else
-        std.fmt.bufPrint(&left_buf, "{s} {d}", .{ noun, layout.result_count }) catch noun;
+        std.mem.print(&left_buf, "{s} {d}", .{ noun, layout.result_count }) catch noun;
 
     var range_buf: [48]u8 = undefined;
     const range = if (layout.result_count > layout.selectable_rows)
-        std.fmt.bufPrint(&range_buf, "{d}–{d}", .{ layout.window.start + 1, layout.window.end }) catch ""
+        std.mem.print(&range_buf, "{d}–{d}", .{ layout.window.start + 1, layout.window.end }) catch ""
     else
         "";
 

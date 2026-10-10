@@ -387,8 +387,7 @@ fn runBatchAttempt(
 
 fn failedArguments(alloc: Allocator, err: anyerror) !tool_contracts.ToolExecutionResult {
     return .{
-        .model_output = try std.fmt.allocPrint(
-            alloc,
+        .model_output = try alloc.print(
             "Vision request rejected before image access: {s}",
             .{@errorName(err)},
         ),

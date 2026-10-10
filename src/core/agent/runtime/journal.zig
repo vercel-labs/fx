@@ -34,6 +34,7 @@
 //! runs it.
 const std = @import("std");
 const types = @import("../../shared/types.zig");
+const testing_allocator = @import("../../shared/testing_allocator.zig");
 const session_codec = @import("../../session/session_codec.zig");
 const checkpoint_codec = @import("checkpoint.zig");
 const compactor = @import("../../compactor/compactor.zig");
@@ -534,11 +535,9 @@ pub fn foldFrom(alloc: Allocator, events_json: []const u8, base: Base) LoadError
         else => return error.InvalidJournal,
     };
     errdefer if (open_turn) |*checkpoint| checkpoint.deinit(alloc);
-    const announced = session_codec.parseToolCalls(alloc, .{ .array = .{
-        .items = running.items,
-        .capacity = running.items.len,
-        .allocator = alloc,
-    } }) catch |err| switch (err) {
+    const announced = session_codec.parseToolCalls(alloc, .{
+        .array = std.json.Array.fromOwnedSlice(alloc, running.items),
+    }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidJournal,
     };
@@ -1016,7 +1015,7 @@ test "a fold that runs out of memory frees what it built" {
         .{ .tool_intent = &calls },
     });
     defer alloc.free(bytes);
-    try std.testing.checkAllAllocationFailures(alloc, foldAndFree, .{bytes});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, foldAndFree, .{bytes});
 }
 
 fn foldAndFree(alloc: Allocator, bytes: []const u8) !void {

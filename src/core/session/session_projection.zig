@@ -736,7 +736,7 @@ fn testManifest() Manifest {
         .total_output_tokens = 20,
         .last_event_seq = 9,
         .event_log_bytes = 4096,
-        .event_log_stat_fingerprint = [_]u8{0x55} ** 32,
+        .event_log_stat_fingerprint = @as([32]u8, @splat(0x55)),
         .generation_base_seq = 1,
         .generation_base_bytes = 512,
         .checkpoint_seq = null,

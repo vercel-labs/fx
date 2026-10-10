@@ -6,6 +6,7 @@
 //! https://www.superlogical.com/rex/docs/build/program-status
 
 const std = @import("std");
+const display_width = @import("../../core/shared/display_width.zig");
 const compaction_activity = @import("../../core/output/compaction_activity.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
@@ -175,7 +176,7 @@ fn oneLineMessage(raw: []const u8, buffer: *[max_message_bytes]u8) []const u8 {
         };
         if (raw.len - index < sequence_len) break;
         const sequence = raw[index .. index + sequence_len];
-        const codepoint = std.unicode.utf8Decode(sequence) catch {
+        const codepoint = display_width.decodeUtf8Sequence(sequence) catch {
             index += 1;
             continue;
         };
@@ -346,7 +347,7 @@ test "program status messages are one bounded line without control characters" {
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, report, "\x1b"));
     try std.testing.expect(std.mem.endsWith(u8, report, terminator));
 
-    const long = "é" ** 200;
+    const long = text_utils.repeat("é", 200);
     const long_report = reporter.update(.{ .blocked = .{ .kind = .permission, .message = long } }).?;
     const message = try decodedMessage(long_report, &decoded);
     try std.testing.expect(message.len <= max_message_bytes);

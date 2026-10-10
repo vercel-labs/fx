@@ -89,7 +89,7 @@ pub fn earliestExpiry(current: ?u64, page_expiry_ms: u64) u64 {
         page_expiry_ms;
 }
 
-const RefreshDecision = struct {
+pub const RefreshDecision = struct {
     action: enum {
         hit,
         refresh,

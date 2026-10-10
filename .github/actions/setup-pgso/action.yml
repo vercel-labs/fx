@@ -7,7 +7,7 @@ inputs:
     required: false
     default: "false"
   llvm:
-    description: Install LLVM 21
+    description: Install LLVM 22
     required: false
     default: "false"
   bun:
@@ -37,7 +37,7 @@ runs:
       if: inputs.zig == 'true' || inputs.llvm == 'true'
       uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
       with:
-        version: "0.16.0"
+        version: "0.17.0"
         cache-key: pgso-macos-arm64
 
     - name: Install pinned LLVM
@@ -45,9 +45,9 @@ runs:
       if: inputs.llvm == 'true'
       shell: bash
       run: |
-        brew install llvm@21
-        llvm_bin="$(brew --prefix llvm@21)/bin"
-        "$llvm_bin/opt" --version | grep -F "version 21.1.8"
+        brew install llvm@22
+        llvm_bin="$(brew --prefix llvm@22)/bin"
+        "$llvm_bin/opt" --version | grep -F "version 22.1.8"
         echo "path=$llvm_bin" >> "$GITHUB_OUTPUT"
 
     - name: Setup Bun

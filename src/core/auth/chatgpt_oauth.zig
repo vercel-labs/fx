@@ -115,8 +115,7 @@ fn prepareBrowserSignIn(alloc: Allocator) !PreparedBrowserLogin {
     var listener_owned = true;
     errdefer if (listener_owned) listener.deinit(io_mod.getIo());
     const callback_port = listener.socket.address.getPort();
-    const redirect_uri = try std.fmt.allocPrint(
-        alloc,
+    const redirect_uri = try alloc.print(
         "http://localhost:{d}/auth/callback",
         .{callback_port},
     );
@@ -762,7 +761,7 @@ test "ChatGPT account id is extracted from the namespaced JWT claim" {
     const encoded = try alloc.alloc(u8, encoded_len);
     defer alloc.free(encoded);
     _ = std.base64.url_safe_no_pad.Encoder.encode(encoded, payload);
-    const token = try std.fmt.allocPrint(alloc, "header.{s}.signature", .{encoded});
+    const token = try alloc.print("header.{s}.signature", .{encoded});
     defer alloc.free(token);
 
     const account_id = try extractAccountId(alloc, token);

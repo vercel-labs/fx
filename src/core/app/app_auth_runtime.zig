@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
@@ -189,7 +190,7 @@ pub fn Runtime(comptime App: type) type {
                     else
                         "Authentication is unavailable. Run /provider to repair this source.";
                     debug_trace.logf("auth", "resumed credential unavailable source={t} err={s}", .{ failure.source, @errorName(failure.err) });
-                    const body = try std.fmt.allocPrint(app.alloc, "{s}: {s}", .{ credentials.sourceLabel(failure.source), message });
+                    const body = try app.alloc.print("{s}: {s}", .{ credentials.sourceLabel(failure.source), message });
                     defer app.alloc.free(body);
                     try app.writeDomainNotice(.{ .topic = "auth", .tone = .@"error", .body = body }, true);
                 },
@@ -580,8 +581,7 @@ pub fn Runtime(comptime App: type) type {
                     }
                     var unavailable = app.auth.pickerView().unavailable_sources.iterator();
                     while (unavailable.next()) |source| {
-                        const body = try std.fmt.allocPrint(
-                            app.alloc,
+                        const body = try app.alloc.print(
                             "{s} is unavailable. Check the saved credential or choose another option.",
                             .{credentials.sourceLabel(source)},
                         );
@@ -879,8 +879,7 @@ pub fn Runtime(comptime App: type) type {
                 .saved => |changed| {
                     applyCredentialChange(app, changed);
                     rememberCredentialSource(app, .stored_key);
-                    const body = try std.fmt.allocPrint(
-                        app.alloc,
+                    const body = try app.alloc.print(
                         "Saved the API key to {s} and made it active.",
                         .{credentials.stored_key_backend_label},
                     );
@@ -913,8 +912,7 @@ pub fn Runtime(comptime App: type) type {
                     .body = "Could not verify that API key with AI Gateway. Nothing was stored.",
                 }, true),
                 .store_failed => {
-                    const body = try std.fmt.allocPrint(
-                        app.alloc,
+                    const body = try app.alloc.print(
                         "Could not save the API key to {s}. Nothing was stored.",
                         .{credentials.stored_key_backend_label},
                     );
@@ -926,8 +924,7 @@ pub fn Runtime(comptime App: type) type {
                     }, true);
                 },
                 .reload_failed => {
-                    const body = try std.fmt.allocPrint(
-                        app.alloc,
+                    const body = try app.alloc.print(
                         "Saved the API key to {s}, but could not make it active.",
                         .{credentials.stored_key_backend_label},
                     );
@@ -976,8 +973,7 @@ pub fn Runtime(comptime App: type) type {
         /// when it did not. Failure is already explained to the user here.
         pub fn applySourceChoice(app: *App, source: credentials.Source) !bool {
             if (try rejectPendingPreparation(app)) return false;
-            const body = try std.fmt.allocPrint(
-                app.alloc,
+            const body = try app.alloc.print(
                 "Switched credential to {s}.",
                 .{credentials.sourceLabel(source)},
             );
@@ -1157,7 +1153,7 @@ pub fn Runtime(comptime App: type) type {
             })) {
                 .prepare => {},
                 .no_change => {
-                    const body = try std.fmt.allocPrint(app.alloc, "Already using {s}.", .{provider_catalog.label(target)});
+                    const body = try app.alloc.print("Already using {s}.", .{provider_catalog.label(target)});
                     defer app.alloc.free(body);
                     try app.writeDomainNotice(.{
                         .topic = "provider",
@@ -1236,7 +1232,7 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             };
-            const body = try std.fmt.allocPrint(app.alloc, "Preparing {s}.", .{provider_catalog.label(input.target())});
+            const body = try app.alloc.print("Preparing {s}.", .{provider_catalog.label(input.target())});
             defer app.alloc.free(body);
             try app.writeDomainNotice(.{
                 .topic = "provider",
@@ -1380,8 +1376,7 @@ pub fn Runtime(comptime App: type) type {
             if (credential) |*value| _ = app.auth.adoptCredential(app.alloc, value);
             reconcileGatewayCredential(app);
 
-            const body = try std.fmt.allocPrint(
-                app.alloc,
+            const body = try app.alloc.print(
                 "Switched to {s} with {s}.",
                 .{ provider_catalog.label(target), provider_runtime.model(app) },
             );
@@ -1599,7 +1594,7 @@ pub fn Runtime(comptime App: type) type {
             const selection = app.auth.loadedTeamSelection() orelse return false;
             if (index >= selection.teams.items.len) return false;
             const team = selection.teams.items[index];
-            const body = try std.fmt.allocPrint(app.alloc, "Changed Vercel team to {s} ({s}).", .{ team.name, team.slug });
+            const body = try app.alloc.print("Changed Vercel team to {s} ({s}).", .{ team.name, team.slug });
             defer app.alloc.free(body);
             if (validation == .rejected) {
                 cancelPromptRetryAfterAuth(app);
@@ -1996,28 +1991,23 @@ pub fn Runtime(comptime App: type) type {
         ) ![]u8 {
             const source_label = credentials.sourceLabel(failure.source);
             return switch (failure.reason) {
-                .invalid_credential => std.fmt.allocPrint(
-                    alloc,
+                .invalid_credential => alloc.print(
                     "{s} sign-in expired.\npress enter to sign in again. Your prompt is saved.",
                     .{source_label},
                 ),
-                .invalid_storage => std.fmt.allocPrint(
-                    alloc,
+                .invalid_storage => alloc.print(
                     "{s}: Saved credential storage is unavailable.\nCheck credential storage, then press enter to retry. Your prompt is saved.",
                     .{source_label},
                 ),
-                .persistence_uncertain => std.fmt.allocPrint(
-                    alloc,
+                .persistence_uncertain => alloc.print(
                     "{s} refresh could not be saved.\npress enter to sign in again. Your prompt is saved.",
                     .{source_label},
                 ),
-                .authority_changed => std.fmt.allocPrint(
-                    alloc,
+                .authority_changed => alloc.print(
                     "{s} account or team changed during refresh.\nReview authentication before retrying. Your prompt is saved.",
                     .{source_label},
                 ),
-                .temporary_unavailable => std.fmt.allocPrint(
-                    alloc,
+                .temporary_unavailable => alloc.print(
                     "{s} credential refresh failed.\npress enter to retry. Your prompt is saved.",
                     .{source_label},
                 ),
@@ -2090,7 +2080,7 @@ pub fn Runtime(comptime App: type) type {
             const failure = auth_runtime.classifyCredentialFailure(source, err);
             if (failure.reason == .invalid_storage or failure.reason == .persistence_uncertain) {
                 const notice = auth_runtime.preparationFailureNotice(auth_runtime.preparationError(failure).?).?;
-                const body = try std.fmt.allocPrint(app.alloc, "{s}: {s}", .{ credentials.sourceLabel(source), notice });
+                const body = try app.alloc.print("{s}: {s}", .{ credentials.sourceLabel(source), notice });
                 defer app.alloc.free(body);
                 try writeAuthNotice(app, .{ .topic = "auth", .tone = .@"error", .body = body });
                 return;
@@ -2435,7 +2425,7 @@ const TestAuth = struct {
         };
     }
 
-    fn beginPromptCredentialRefresh(self: *TestAuth) auth_runtime.PromptCredentialRefreshStart {
+    pub fn beginPromptCredentialRefresh(self: *TestAuth) auth_runtime.PromptCredentialRefreshStart {
         self.prompt_refresh_start_count += 1;
         return self.prompt_refresh_start;
     }
@@ -2444,7 +2434,7 @@ const TestAuth = struct {
         return .idle;
     }
 
-    fn cancelPromptCredentialRefresh(_: *TestAuth) void {}
+    pub fn cancelPromptCredentialRefresh(_: *TestAuth) void {}
 
     fn selectSource(self: *TestAuth, _: std.mem.Allocator, source: credentials.Source) !?bool {
         self.selected_source = source;
@@ -2480,7 +2470,7 @@ const TestAuth = struct {
         return self.openSignInPicker(alloc);
     }
 
-    fn startupCredentialPending(self: *const TestAuth) bool {
+    pub fn startupCredentialPending(self: *const TestAuth) bool {
         return self.startup_pending;
     }
 
@@ -2540,7 +2530,7 @@ const TestAuth = struct {
         return false;
     }
 
-    fn pickerView(_: *const TestAuth) auth_runtime.PickerView {
+    pub fn pickerView(_: *const TestAuth) auth_runtime.PickerView {
         return .{
             .active = false,
             .available_sources = .empty,
@@ -2620,7 +2610,7 @@ const TestAuth = struct {
             .{ .ready = action };
     }
 
-    fn recordCredentialFailure(
+    pub fn recordCredentialFailure(
         self: *TestAuth,
         failure: auth_runtime.CredentialFailure,
         options: struct { notify: bool = true },
@@ -2638,7 +2628,7 @@ const TestAuth = struct {
         return true;
     }
 
-    fn credentialFailure(self: *const TestAuth) ?auth_runtime.CredentialFailure {
+    pub fn credentialFailure(self: *const TestAuth) ?auth_runtime.CredentialFailure {
         return self.credential_failure;
     }
 
@@ -2765,7 +2755,7 @@ const TestApp = struct {
         self.transcript.deinit(self.alloc);
     }
 
-    fn startModelCacheWarmup(self: *TestApp) void {
+    pub fn startModelCacheWarmup(self: *TestApp) void {
         self.model_cache_warmup_count += 1;
     }
 
@@ -2785,12 +2775,12 @@ const TestApp = struct {
         return self.test_url_opener.opener();
     }
 
-    fn persistCredentialSourcePreference(self: *TestApp, source: credentials.Source) void {
+    pub fn persistCredentialSourcePreference(self: *TestApp, source: credentials.Source) void {
         self.preference_write_count += 1;
         if (self.preference_write_succeeds) self.last_preference_source = source;
     }
 
-    fn providerCatalog(self: *TestApp, _: model_provider.ProviderId) ?model_catalog.Provider {
+    pub fn providerCatalog(self: *TestApp, _: model_provider.ProviderId) ?model_catalog.Provider {
         return .{ .context = self, .fetch_fn = fetchTestCatalog };
     }
 
@@ -2880,7 +2870,7 @@ test "provider inventory completion does not reclaim a changed composer" {
 }
 
 test "provider picker preparation failure starts no inventory task" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
     var app: TestApp = .{ .alloc = failing.allocator() };
     defer app.deinit();
 
@@ -3179,8 +3169,7 @@ test "completed credential switch emits exactly one transcript line" {
     try std.testing.expectEqual(@as(usize, 1), app.preference_write_count);
     try std.testing.expectEqual(credentials.Source.stored_key, app.last_preference_source.?);
     try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
-    const expected = try std.fmt.allocPrint(
-        app.alloc,
+    const expected = try app.alloc.print(
         "Switched credential to {s}.\n",
         .{credentials.sourceLabel(.stored_key)},
     );
@@ -3675,7 +3664,7 @@ const StartupCredentialApp = struct {
         self.notices += 1;
     }
 
-    fn startModelCacheWarmup(self: *@This()) void {
+    pub fn startModelCacheWarmup(self: *@This()) void {
         self.warmups += 1;
     }
 

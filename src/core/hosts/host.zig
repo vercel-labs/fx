@@ -237,7 +237,7 @@ pub const Clipboard = struct {
 };
 
 pub fn current() Capabilities {
-    return capabilitiesForTarget(builtin.cpu.arch, builtin.os.tag);
+    return capabilitiesForTarget(builtin.target.cpu.arch, builtin.target.os.tag);
 }
 
 fn capabilitiesForTarget(
@@ -274,18 +274,18 @@ pub fn nativeForOs(os_tag: std.Target.Os.Tag) Capabilities {
 /// Returns an owned description of the current operating system. The caller
 /// owns the returned slice and must free it with `alloc`.
 pub fn operatingSystemText(alloc: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
-    if (comptime wasm.isTarget(builtin.cpu.arch)) {
-        return wasm.operatingSystemText(alloc, builtin.os.tag);
+    if (comptime wasm.isTarget(builtin.target.cpu.arch)) {
+        return wasm.operatingSystemText(alloc, builtin.target.os.tag);
     }
-    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
-        return alloc.dupe(u8, @tagName(builtin.os.tag));
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
+        return alloc.dupe(u8, @tagName(builtin.target.os.tag));
     }
 
     const uts = std.posix.uname();
     const sysname = std.mem.sliceTo(&uts.sysname, 0);
     const release = std.mem.sliceTo(&uts.release, 0);
     if (release.len == 0) return alloc.dupe(u8, sysname);
-    return std.fmt.allocPrint(alloc, "{s} {s}", .{ sysname, release });
+    return alloc.print("{s} {s}", .{ sysname, release });
 }
 
 test "terminal title forwards borrowed label bytes and clear" {
@@ -401,7 +401,7 @@ test "current host describes its operating system" {
     defer std.testing.allocator.free(text);
 
     try std.testing.expect(text.len > 0);
-    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
-        try std.testing.expectEqualStrings(@tagName(builtin.os.tag), text);
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
+        try std.testing.expectEqualStrings(@tagName(builtin.target.os.tag), text);
     }
 }

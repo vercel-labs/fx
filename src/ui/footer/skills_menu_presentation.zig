@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const skill_runtime = @import("../../core/skills/skill_runtime.zig");
 const list_window = @import("../../core/shared/list_window.zig");
@@ -343,7 +344,7 @@ fn composeHeaderRow(
 fn appendHeaderTitle(alloc: Allocator, row: *std.ArrayList(u8), count: usize) !void {
     try row.appendSlice(alloc, ui_render.selected_completion_style);
     var buf: [48]u8 = undefined;
-    const title = std.fmt.bufPrint(&buf, "Skills {d}", .{count}) catch "Skills";
+    const title = std.mem.print(&buf, "Skills {d}", .{count}) catch "Skills";
     try row.appendSlice(alloc, title);
     try row.appendSlice(alloc, ui_render.reset_style);
 }
@@ -423,7 +424,7 @@ fn composeEmptyRow(
         "No skills found."
     else blk: {
         var buf: [96]u8 = undefined;
-        break :blk std.fmt.bufPrint(
+        break :blk std.mem.print(
             &buf,
             "No {s} skills found.",
             .{skill_runtime.skillMenuFilterLabel(source_filter)},
@@ -618,7 +619,7 @@ test "prepared skills menu borrows one indexed query without allocating" {
         .index_ready = true,
     };
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
 

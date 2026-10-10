@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
 fn needs_quotes(path: []const u8) bool {
@@ -282,7 +283,7 @@ test "at path codec bounds decoding and cleans up failed allocations" {
     try std.testing.expectError(error.InvalidPath, decode_into("\\", &small));
     try std.testing.expect(query_at("@\"a\\\"b\"tail", 5) == null);
     try std.testing.expect(contains_position("@\"a\\", 4));
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
         fn check(alloc: std.mem.Allocator) !void {
             const path = "a\\b\"$c";
             const encoded = try encode(alloc, path, .{});

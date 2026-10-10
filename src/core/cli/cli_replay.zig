@@ -170,7 +170,7 @@ fn runWithOutput(alloc: Allocator, args: []const [:0]const u8, output: anytype) 
         }
 
         if (opts.frames and frame.kind != .marker) {
-            const header_text = try std.fmt.allocPrint(alloc, "\n--- frame {d} ({s}, +{d}ms) ---\n", .{ frame_count, frameKindName(frame.kind), frame.delta_ms });
+            const header_text = try alloc.print("\n--- frame {d} ({s}, +{d}ms) ---\n", .{ frame_count, frameKindName(frame.kind), frame.delta_ms });
             defer alloc.free(header_text);
             try output.writeStdout(header_text);
             var snapshot: std.ArrayList(u8) = .empty;
@@ -228,16 +228,17 @@ fn runWithOutput(alloc: Allocator, args: []const [:0]const u8, output: anytype) 
 }
 
 fn frameKindName(kind: record_tape.Kind) []const u8 {
-    const raw = @intFromEnum(kind);
-    inline for (std.meta.fields(record_tape.Kind)) |field| {
-        if (raw == field.value) return field.name;
+    const raw = @backingInt(kind);
+    const kind_info = @typeInfo(record_tape.Kind).@"enum";
+    inline for (kind_info.field_names, kind_info.field_values) |field_name, field_value| {
+        if (raw == field_value) return field_name;
     }
     return "unknown";
 }
 
 fn prepareFramesDir(alloc: Allocator, root: []const u8) !void {
     try io_mod.makeDirRecursive(root);
-    const frames_path = try std.fs.path.join(alloc, &.{ root, "frames" });
+    const frames_path = try std.Io.Dir.path.join(alloc, &.{ root, "frames" });
     defer alloc.free(frames_path);
     try io_mod.makeDirRecursive(frames_path);
 }
@@ -255,15 +256,15 @@ fn writeFrameArtifacts(
     defer snapshot.deinit(alloc);
     try grid.snapshot(&snapshot);
 
-    const stem = try std.fmt.allocPrint(alloc, "{d:0>4}", .{index});
+    const stem = try alloc.print("{d:0>4}", .{index});
     defer alloc.free(stem);
-    const json_name = try std.fmt.allocPrint(alloc, "{s}.json", .{stem});
+    const json_name = try alloc.print("{s}.json", .{stem});
     defer alloc.free(json_name);
-    const grid_name = try std.fmt.allocPrint(alloc, "{s}.grid.txt", .{stem});
+    const grid_name = try alloc.print("{s}.grid.txt", .{stem});
     defer alloc.free(grid_name);
-    const json_path = try std.fs.path.join(alloc, &.{ root, "frames", json_name });
+    const json_path = try std.Io.Dir.path.join(alloc, &.{ root, "frames", json_name });
     defer alloc.free(json_path);
-    const grid_path = try std.fs.path.join(alloc, &.{ root, "frames", grid_name });
+    const grid_path = try std.Io.Dir.path.join(alloc, &.{ root, "frames", grid_name });
     defer alloc.free(grid_path);
 
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -313,7 +314,7 @@ fn writeFramesManifest(
         .{ frame_count, resize_count, stdout_bytes },
     );
 
-    const manifest_path = try std.fs.path.join(alloc, &.{ root, "manifest.json" });
+    const manifest_path = try std.Io.Dir.path.join(alloc, &.{ root, "manifest.json" });
     defer alloc.free(manifest_path);
     try writeFile(manifest_path, out.written());
 }
@@ -381,7 +382,7 @@ fn trimSnapshotFrame(line: []const u8) []const u8 {
 
 fn writeFile(path: []const u8, bytes: []const u8) !void {
     const zio = io_mod.getIo();
-    var file = if (std.fs.path.isAbsolute(path))
+    var file = if (std.Io.Dir.path.isAbsolute(path))
         try std.Io.Dir.createFileAbsolute(zio, path, .{ .truncate = true })
     else
         try std.Io.Dir.cwd().createFile(zio, path, .{ .truncate = true });
@@ -400,7 +401,7 @@ fn replyFormattedError(
     fallback: []const u8,
 ) !u8 {
     var buf: [buffer_len]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, fmt, args) catch fallback;
+    const msg = std.mem.print(&buf, fmt, args) catch fallback;
     return replyError(alloc, output, json, code, msg);
 }
 
@@ -501,7 +502,7 @@ fn buildTape(alloc: Allocator, cols: u16, rows: u16, version: []const u8, frames
     for (frames) |frame| {
         var frame_header: [9]u8 = undefined;
         std.mem.writeInt(i32, frame_header[0..4], frame.delta_ms, .little);
-        frame_header[4] = @intFromEnum(frame.kind);
+        frame_header[4] = @backingInt(frame.kind);
         std.mem.writeInt(u32, frame_header[5..9], @intCast(frame.payload.len), .little);
         try out.writer.writeAll(&frame_header);
         try out.writer.writeAll(frame.payload);
@@ -524,7 +525,7 @@ fn resizePayload(cols: u16, rows: u16) [4]u8 {
 }
 
 fn unknownKind(raw: u8) record_tape.Kind {
-    return @enumFromInt(raw);
+    return @fromBackingInt(@intCast(raw));
 }
 
 fn writeTestFile(path: []const u8, content: []const u8) !void {
@@ -542,7 +543,7 @@ fn readTestFile(alloc: Allocator, path: []const u8) ![]u8 {
 fn testPath(alloc: Allocator, dir: std.Io.Dir, name: []const u8) ![]u8 {
     const root = try io_mod.dirRealpathAlloc(alloc, dir, ".");
     defer alloc.free(root);
-    return std.fs.path.join(alloc, &.{ root, name });
+    return std.Io.Dir.path.join(alloc, &.{ root, name });
 }
 
 fn runCaptured(alloc: Allocator, args: []const [:0]const u8, capture: *CaptureOutput) !u8 {
@@ -588,7 +589,7 @@ test "minimal stdout tape replays to final grid snapshot" {
     });
     defer alloc.free(tape);
     try writeTestFile(tape_path, tape);
-    const tape_arg = try alloc.dupeZ(u8, tape_path);
+    const tape_arg = try alloc.dupeSentinel(u8, tape_path, 0);
     defer alloc.free(tape_arg);
 
     var capture = CaptureOutput.init(alloc);
@@ -614,7 +615,7 @@ test "frames mode prints non-marker frame snapshots only" {
     });
     defer alloc.free(tape);
     try writeTestFile(tape_path, tape);
-    const tape_arg = try alloc.dupeZ(u8, tape_path);
+    const tape_arg = try alloc.dupeSentinel(u8, tape_path, 0);
     defer alloc.free(tape_arg);
 
     var capture = CaptureOutput.init(alloc);
@@ -642,7 +643,7 @@ test "json summary reports frame resize and stdout metadata" {
     });
     defer alloc.free(tape);
     try writeTestFile(tape_path, tape);
-    const tape_arg = try alloc.dupeZ(u8, tape_path);
+    const tape_arg = try alloc.dupeSentinel(u8, tape_path, 0);
     defer alloc.free(tape_arg);
 
     var capture = CaptureOutput.init(alloc);
@@ -669,7 +670,7 @@ test "json output escapes metadata strings" {
     });
     defer alloc.free(tape);
     try writeTestFile(tape_path, tape);
-    const tape_arg = try alloc.dupeZ(u8, tape_path);
+    const tape_arg = try alloc.dupeSentinel(u8, tape_path, 0);
     defer alloc.free(tape_arg);
 
     var capture = CaptureOutput.init(alloc);
@@ -695,7 +696,7 @@ test "json output includes unknown frame metadata without altering grid" {
     });
     defer alloc.free(tape);
     try writeTestFile(tape_path, tape);
-    const tape_arg = try alloc.dupeZ(u8, tape_path);
+    const tape_arg = try alloc.dupeSentinel(u8, tape_path, 0);
     defer alloc.free(tape_arg);
 
     var capture = CaptureOutput.init(alloc);
@@ -730,7 +731,7 @@ test "json replay recovers an incomplete final frame through stderr" {
     try truncated.appendSlice(alloc, &.{ 1, 2, 3 });
     try writeTestFile(tape_path, truncated.items);
 
-    const tape_arg = try alloc.dupeZ(u8, tape_path);
+    const tape_arg = try alloc.dupeSentinel(u8, tape_path, 0);
     defer alloc.free(tape_arg);
     var capture = CaptureOutput.init(alloc);
     defer capture.deinit();
@@ -756,7 +757,7 @@ test "frames mode prints unknown frame snapshots without trapping" {
     });
     defer alloc.free(tape);
     try writeTestFile(tape_path, tape);
-    const tape_arg = try alloc.dupeZ(u8, tape_path);
+    const tape_arg = try alloc.dupeSentinel(u8, tape_path, 0);
     defer alloc.free(tape_arg);
 
     var capture = CaptureOutput.init(alloc);
@@ -782,9 +783,9 @@ test "golden path writes final snapshot and suppresses final stdout" {
     });
     defer alloc.free(tape);
     try writeTestFile(tape_path, tape);
-    const tape_arg = try alloc.dupeZ(u8, tape_path);
+    const tape_arg = try alloc.dupeSentinel(u8, tape_path, 0);
     defer alloc.free(tape_arg);
-    const golden_arg = try alloc.dupeZ(u8, golden_path);
+    const golden_arg = try alloc.dupeSentinel(u8, golden_path, 0);
     defer alloc.free(golden_arg);
 
     var capture = CaptureOutput.init(alloc);
@@ -817,9 +818,9 @@ test "frames-dir writes manifest and per-frame grid artifacts" {
     });
     defer alloc.free(tape);
     try writeTestFile(tape_path, tape);
-    const tape_arg = try alloc.dupeZ(u8, tape_path);
+    const tape_arg = try alloc.dupeSentinel(u8, tape_path, 0);
     defer alloc.free(tape_arg);
-    const frames_dir_arg = try alloc.dupeZ(u8, frames_dir);
+    const frames_dir_arg = try alloc.dupeSentinel(u8, frames_dir, 0);
     defer alloc.free(frames_dir_arg);
 
     var capture = CaptureOutput.init(alloc);
@@ -828,11 +829,11 @@ test "frames-dir writes manifest and per-frame grid artifacts" {
     const exit_code = try runCaptured(alloc, &.{ tape_arg, "--frames-dir", frames_dir_arg }, &capture);
     try testing.expectEqual(@as(u8, 0), exit_code);
 
-    const manifest_path = try std.fs.path.join(alloc, &.{ frames_dir, "manifest.json" });
+    const manifest_path = try std.Io.Dir.path.join(alloc, &.{ frames_dir, "manifest.json" });
     defer alloc.free(manifest_path);
-    const frame_json_path = try std.fs.path.join(alloc, &.{ frames_dir, "frames", "0001.json" });
+    const frame_json_path = try std.Io.Dir.path.join(alloc, &.{ frames_dir, "frames", "0001.json" });
     defer alloc.free(frame_json_path);
-    const frame_grid_path = try std.fs.path.join(alloc, &.{ frames_dir, "frames", "0001.grid.txt" });
+    const frame_grid_path = try std.Io.Dir.path.join(alloc, &.{ frames_dir, "frames", "0001.grid.txt" });
     defer alloc.free(frame_grid_path);
 
     const manifest = try readTestFile(alloc, manifest_path);
@@ -898,7 +899,7 @@ test "json failures use stdout for missing arguments files and malformed tapes" 
     const path = try testPath(alloc, tmp.dir, "bad-json.fxtape");
     defer alloc.free(path);
     try writeTestFile(path, "not a tape");
-    const path_arg: [:0]u8 = try alloc.dupeZ(u8, path);
+    const path_arg: [:0]u8 = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_arg);
     var malformed = CaptureOutput.init(alloc);
     defer malformed.deinit();
@@ -925,7 +926,7 @@ test "run malformed tape returns bad tape stderr" {
     const tape_path = try testPath(alloc, tmp.dir, "malformed.fxtape");
     defer alloc.free(tape_path);
     try writeTestFile(tape_path, "not a tape");
-    const tape_arg = try alloc.dupeZ(u8, tape_path);
+    const tape_arg = try alloc.dupeSentinel(u8, tape_path, 0);
     defer alloc.free(tape_arg);
 
     var capture = CaptureOutput.init(alloc);

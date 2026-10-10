@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const diff_mod = @import("../output/diff.zig");
 const approval_decision = @import("approval_decision.zig");
 const permission_request = @import("permission_request.zig");
@@ -371,7 +372,7 @@ fn checkApprovalPromptCloneAllocationFailures(alloc: Allocator) !void {
 
 test "approval prompt frees partial cloned request allocations" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkApprovalPromptCloneAllocationFailures,
         .{},
     );

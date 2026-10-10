@@ -3,6 +3,7 @@ const stream_provider = @import("../agent/stream_provider.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
 const tool_set = @import("tool_set.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -325,7 +326,7 @@ test "host tool runtime rejects unknown provider tools" {
 
 test "host tool runtime preserves long MCP descriptions" {
     const alloc = std.testing.allocator;
-    const description = "Tool parameter guidance. " ** 100;
+    const description = text_utils.repeat("Tool parameter guidance. ", 100);
     const parsed = try std.json.parseFromSlice(
         std.json.Value,
         alloc,
@@ -344,7 +345,7 @@ test "host tool runtime bounds descriptions at 64 KiB" {
     defer alloc.free(description);
     @memset(description, 'a');
     for ([_]usize{ 64 * 1024, 64 * 1024 + 1 }) |length| {
-        const json = try std.fmt.allocPrint(alloc, "[{{\"name\":\"lookup\",\"description\":\"{s}\",\"inputSchema\":{{}}}}]", .{description[0..length]});
+        const json = try alloc.print("[{{\"name\":\"lookup\",\"description\":\"{s}\",\"inputSchema\":{{}}}}]", .{description[0..length]});
         defer alloc.free(json);
         const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
         defer parsed.deinit();
@@ -388,7 +389,7 @@ test "host tool runtime rejects duplicate and invalid names" {
         const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
         defer parsed.deinit();
         try std.testing.expectError(
-            if (std.mem.indexOf(u8, json, "bad name") != null)
+            if (std.mem.find(u8, json, "bad name") != null)
                 error.InvalidHostToolName
             else
                 error.DuplicateHostToolName,

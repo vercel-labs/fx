@@ -30,6 +30,7 @@ const visual_layout = @import("../input/visual_layout.zig");
 const render_engine = @import("../render_engine.zig");
 const render_request = @import("../render_request.zig");
 const transcript_runtime = @import("../transcript/runtime.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const activity_overlay = render_engine.activity_overlay;
@@ -1489,7 +1490,7 @@ test "surface footer frame snapshots manual compaction blink with an inactive st
     var force_redraw = false;
     var ctx = surfaceTestContext(&input);
     ctx.compaction = .{ .revision = 1, .operation = .{
-        .id = @enumFromInt(1),
+        .id = @fromBackingInt(@intCast(1)),
         .turn_id = 1,
         .origin = .manual,
         .phase = .{ .running = .summary },
@@ -2125,7 +2126,7 @@ test "footer reservation traces stale off-screen external clear" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -2598,7 +2599,7 @@ test "command approval fit includes the steering banner" {
 
 test "command approval footer sizing paths use the complete command" {
     const alloc = std.testing.allocator;
-    const command = "printf 'SURFACE_COMMAND_START_" ++ ("x" ** 88) ++ "_SURFACE_COMMAND_END'";
+    const command = "printf 'SURFACE_COMMAND_START_" ++ text_utils.repeat("x", 88) ++ "_SURFACE_COMMAND_END'";
     var input = InputRuntime{};
     defer input.deinit(alloc);
     var prompt = ApprovalPrompt{};

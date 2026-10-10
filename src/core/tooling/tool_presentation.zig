@@ -77,28 +77,28 @@ pub fn subagentAction(
     const preview = try subagentPreview(scratch, raw_preview);
     const label = switch (state) {
         .identity => try alloc.dupe(u8, name.bytes),
-        .active => try std.fmt.allocPrint(alloc, "{s} working", .{name.bytes}),
-        .pending => try std.fmt.allocPrint(alloc, "{s} still running", .{name.bytes}),
-        .completed => try std.fmt.allocPrint(alloc, "{s} {s}", .{ name.bytes, if (named) "replied" else "finished" }),
-        .feedback => |delivery| try std.fmt.allocPrint(alloc, "{s} feedback {s}", .{ name.bytes, switch (delivery) {
+        .active => try alloc.print("{s} working", .{name.bytes}),
+        .pending => try alloc.print("{s} still running", .{name.bytes}),
+        .completed => try alloc.print("{s} {s}", .{ name.bytes, if (named) "replied" else "finished" }),
+        .feedback => |delivery| try alloc.print("{s} feedback {s}", .{ name.bytes, switch (delivery) {
             .queued => "queued",
             .applied => "applied",
             .not_applied => "not applied",
         } }),
         .stopped => |reason| if (std.mem.eql(u8, reason, "Failed"))
-            try std.fmt.allocPrint(alloc, "{s} failed", .{name.bytes})
+            try alloc.print("{s} failed", .{name.bytes})
         else if (std.mem.eql(u8, reason, "Busy"))
-            try std.fmt.allocPrint(alloc, "{s} busy; message not sent", .{name.bytes})
+            try alloc.print("{s} busy; message not sent", .{name.bytes})
         else if (std.mem.eql(u8, reason, "Cancelled") or std.mem.eql(u8, reason, "Interrupted"))
-            try std.fmt.allocPrint(alloc, "{s} interrupted", .{name.bytes})
+            try alloc.print("{s} interrupted", .{name.bytes})
         else
-            try std.fmt.allocPrint(alloc, "{s} {s}", .{ reason, name.bytes }),
+            try alloc.print("{s} {s}", .{ reason, name.bytes }),
     };
     errdefer alloc.free(label);
     const detail = if (preview.len == 0)
         try alloc.dupe(u8, "")
     else
-        try std.fmt.allocPrint(alloc, "· {s}", .{preview});
+        try alloc.print("· {s}", .{preview});
     return .{ .label = label, .detail = detail };
 }
 
@@ -200,7 +200,7 @@ test "subagent rows project request identity state and bounded safe previews" {
     try std.testing.expect(text_utils.isTerminalSafe(unsafe.label));
     try std.testing.expect(text_utils.isTerminalSafe(unsafe.detail));
     try std.testing.expect(std.mem.find(u8, unsafe.detail, "日本語") != null);
-    const long = try subagentPreview(alloc, "日本語" ** 100);
+    const long = try subagentPreview(alloc, text_utils.repeat("日本語", 100));
     defer alloc.free(long);
     try std.testing.expect(long.len <= 120);
     try std.testing.expect(text_utils.isTerminalSafe(long));
@@ -239,7 +239,7 @@ test "subagent receipts describe message delivery rather than child completion" 
 pub fn formatSubagentPlainAction(alloc: Allocator, call: ToolCall, state: SubagentActionState) Allocator.Error!?[]u8 {
     const action = try subagentAction(alloc, call, state) orelse return null;
     defer action.deinit(alloc);
-    return try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ action.label, if (action.detail.len == 0) "" else " ", action.detail });
+    return try alloc.print("{s}{s}{s}", .{ action.label, if (action.detail.len == 0) "" else " ", action.detail });
 }
 
 pub const RunCommandActivity = struct {
@@ -363,7 +363,7 @@ pub fn formatRunCommandPermissionLabel(
         max_run_command_activity_bytes,
     );
     const suffix = try commandApprovalLabelSuffix(scratch, "shell", command);
-    return std.fmt.allocPrint(alloc, "shell.run {s}{s}", .{ encoded.bytes, suffix });
+    return alloc.print("shell.run {s}{s}", .{ encoded.bytes, suffix });
 }
 
 pub fn isAdvertisedDynamicMcpName(registry: tool_dispatch.Registry, name: []const u8, advertised: []const []const u8) bool {
@@ -512,7 +512,7 @@ fn resolveTerminalSessionTargetFromRows(
         max_encoded_bytes -| "session ".len,
     );
     defer encoded.deinit(alloc);
-    return try std.fmt.allocPrint(alloc, "session {s}", .{encoded.bytes});
+    return try alloc.print("session {s}", .{encoded.bytes});
 }
 
 /// The caller owns the returned allocation and must free it with `alloc`.
@@ -636,9 +636,8 @@ pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
     }
     if (file_mutation_contract.isToolName(call.name)) {
         const spec = input.tool_registry.lookup(call.name) orelse
-            return std.fmt.allocPrint(alloc, "Working: {s}", .{call.name});
-        return std.fmt.allocPrint(
-            alloc,
+            return alloc.print("Working: {s}", .{call.name});
+        return alloc.print(
             "{s} {s}",
             .{ spec.action_label, input.display_target orelse spec.label_arg_default },
         );
@@ -647,7 +646,7 @@ pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
     if (try formatRunCommandActivity(alloc, input.tool_registry, input.workspace_root, call)) |activity| {
         defer alloc.free(activity.detail);
         const action_label = if (activity.compatibility_tool) |tool| tool.action_label else "Running";
-        return std.fmt.allocPrint(alloc, "{s} {s}", .{ action_label, activity.detail });
+        return alloc.print("{s} {s}", .{ action_label, activity.detail });
     }
 
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
@@ -657,26 +656,26 @@ pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
     const spec = input.tool_registry.lookup(call.name) orelse {
         if (isProviderSearchAlias(call.name)) {
             const args = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch {
-                return std.fmt.allocPrint(alloc, "Searching web", .{});
+                return alloc.print("Searching web", .{});
             };
-            return std.fmt.allocPrint(alloc, "Searching {s}", .{try formatWebSearchActionDetail(scratch, args)});
+            return alloc.print("Searching {s}", .{try formatWebSearchActionDetail(scratch, args)});
         }
-        if (input.is_available_dynamic_mcp_tool) return std.fmt.allocPrint(alloc, "MCP: {s}", .{call.name});
-        return std.fmt.allocPrint(alloc, "Working: {s}", .{call.name});
+        if (input.is_available_dynamic_mcp_tool) return alloc.print("MCP: {s}", .{call.name});
+        return alloc.print("Working: {s}", .{call.name});
     };
     const args = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch {
-        return std.fmt.allocPrint(alloc, "Working: {s}", .{call.name});
+        return alloc.print("Working: {s}", .{call.name});
     };
 
     const presentation = tool_dispatch.presentationForArgs(spec.*, args);
     if (spec.executor_kind == .web_search) {
-        return std.fmt.allocPrint(alloc, "{s} {s}", .{ presentation.action_label, try formatWebSearchActionDetail(scratch, args) });
+        return alloc.print("{s} {s}", .{ presentation.action_label, try formatWebSearchActionDetail(scratch, args) });
     }
     const value = input.display_target orelse
         resolvedSkillName(call, presentation) orelse
         tool_dispatch.presentationLabelValue(presentation, args) orelse
         presentation.label_arg_default;
-    return std.fmt.allocPrint(alloc, "{s} {s}", .{ presentation.action_label, value });
+    return alloc.print("{s} {s}", .{ presentation.action_label, value });
 }
 
 /// The caller owns the returned allocation and must free it with `alloc`.
@@ -686,7 +685,7 @@ pub fn formatPermissionLabel(alloc: Allocator, registry: tool_dispatch.Registry,
     const scratch = scratch_state.allocator();
 
     if (try runCommandCompatibilitySource(scratch, registry, call)) |source| {
-        return std.fmt.allocPrint(alloc, "{s} {s}", .{ source.tool.name, source.command });
+        return alloc.print("{s} {s}", .{ source.tool.name, source.command });
     }
     const args = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch {
         return try alloc.dupe(u8, call.name);
@@ -698,8 +697,7 @@ pub fn formatPermissionLabel(alloc: Allocator, registry: tool_dispatch.Registry,
     }
     const spec = registry.lookup(call.name) orelse return try alloc.dupe(u8, call.name);
     if (file_mutation_contract.isToolName(call.name)) {
-        return std.fmt.allocPrint(
-            alloc,
+        return alloc.print(
             "{s} {s}",
             .{ call.name, spec.label_arg_default },
         );
@@ -709,12 +707,12 @@ pub fn formatPermissionLabel(alloc: Allocator, registry: tool_dispatch.Registry,
     if (spec.label_arg_kind == .command) {
         const suffix = try commandApprovalLabelSuffix(scratch, call.name, value);
         if (tool_args.optionalStringArg(args, "cwd")) |cwd| {
-            return std.fmt.allocPrint(alloc, "{s} {s} @ {s}{s}", .{ call.name, value, cwd, suffix });
+            return alloc.print("{s} {s} @ {s}{s}", .{ call.name, value, cwd, suffix });
         }
-        return std.fmt.allocPrint(alloc, "{s} {s}{s}", .{ call.name, value, suffix });
+        return alloc.print("{s} {s}{s}", .{ call.name, value, suffix });
     }
 
-    return std.fmt.allocPrint(alloc, "{s} {s}", .{ call.name, value });
+    return alloc.print("{s} {s}", .{ call.name, value });
 }
 
 /// The caller owns the returned allocation and must free it with `alloc`.
@@ -733,13 +731,11 @@ pub fn formatWebSearchActionDetail(alloc: Allocator, args: std.json.ObjectMap) !
 pub fn formatWebSearchProgressPlain(alloc: Allocator, progress: types.WebSearchProgress) ![]u8 {
     var query_buf: [160]u8 = undefined;
     return switch (progress) {
-        .query_started => |query| std.fmt.allocPrint(
-            alloc,
+        .query_started => |query| alloc.print(
             "Searching {s}",
             .{text_utils.clippedLabel(&query_buf, query, 120)},
         ),
-        .results_received => |entry| std.fmt.allocPrint(
-            alloc,
+        .results_received => |entry| alloc.print(
             "Found {d} result{s} for {s}",
             .{ entry.result_count, if (entry.result_count == 1) "" else "s", text_utils.clippedLabel(&query_buf, entry.query, 120) },
         ),
@@ -750,8 +746,8 @@ pub fn formatWebSearchProgressPlain(alloc: Allocator, progress: types.WebSearchP
 pub fn formatWebFetchProgressPlain(alloc: Allocator, progress: types.WebFetchProgress) ![]u8 {
     var url_buf: [types.WebFetchCompletion.max_url_len]u8 = undefined;
     return switch (progress) {
-        .fetching => |url| std.fmt.allocPrint(alloc, "Fetching {s}", .{text_utils.clippedLabel(&url_buf, url, 96)}),
-        .converting => |url| std.fmt.allocPrint(alloc, "Converting {s}", .{text_utils.clippedLabel(&url_buf, url, 96)}),
+        .fetching => |url| alloc.print("Fetching {s}", .{text_utils.clippedLabel(&url_buf, url, 96)}),
+        .converting => |url| alloc.print("Converting {s}", .{text_utils.clippedLabel(&url_buf, url, 96)}),
     };
 }
 
@@ -782,12 +778,12 @@ fn commandApprovalLabelSuffix(alloc: Allocator, tool_name: []const u8, command: 
     const risk_text = if (risk) |note| stripNotePrefix(note) else null;
     if (risk_text) |note| {
         if (safer) |alternative| {
-            return std.fmt.allocPrint(alloc, " (risk: {s}; {s})", .{ note, alternative });
+            return alloc.print(" (risk: {s}; {s})", .{ note, alternative });
         }
-        return std.fmt.allocPrint(alloc, " (risk: {s})", .{note});
+        return alloc.print(" (risk: {s})", .{note});
     }
     if (safer) |alternative| {
-        return std.fmt.allocPrint(alloc, " ({s})", .{alternative});
+        return alloc.print(" ({s})", .{alternative});
     }
     return "";
 }
@@ -1015,9 +1011,8 @@ test "run command activity projects line boundaries without changing other bytes
 
 test "run command detail uses the caller bound without changing activity labels" {
     const alloc = std.testing.allocator;
-    const command = "printf " ++ ("alpha-beta-gamma-delta-" ** 8);
-    const arguments_json = try std.fmt.allocPrint(
-        alloc,
+    const command = "printf " ++ text_utils.repeat("alpha-beta-gamma-delta-", 8);
+    const arguments_json = try alloc.print(
         "{{\"command\":{f}}}",
         .{std.json.fmt(command, .{})},
     );
@@ -1047,7 +1042,7 @@ test "run command detail uses the caller bound without changing activity labels"
     try std.testing.expect(activity.detail.len <= max_run_command_activity_bytes);
     try std.testing.expect(std.mem.endsWith(u8, activity.detail, "..."));
 
-    const hidden_workspace_path = "printf " ++ ("prefix-" ** 20) ++ " /Users/example/workspace/file";
+    const hidden_workspace_path = "printf " ++ text_utils.repeat("prefix-", 20) ++ " /Users/example/workspace/file";
     try std.testing.expectEqual(
         @as(?[]u8, null),
         try formatRunCommandDetailBounded(
@@ -1140,7 +1135,7 @@ test "run command activity hides only a leading no-op current directory prefix" 
     };
 
     for (cases) |case| {
-        const arguments_json = try std.fmt.allocPrint(alloc, "{{\"command\":{f}}}", .{std.json.fmt(case.command, .{})});
+        const arguments_json = try alloc.print("{{\"command\":{f}}}", .{std.json.fmt(case.command, .{})});
         defer alloc.free(arguments_json);
         const activity = (try formatRunCommandActivity(alloc, test_tool_registry, "", .{
             .id = "current_directory_command",
@@ -1177,7 +1172,7 @@ test "tool presentation formats bounded web search action detail" {
 
 test "tool presentation bounds a large multiline run command activity" {
     const alloc = std.testing.allocator;
-    const arguments_json = "{\"command\":\"" ++ ("é\\r\\n" ** 20_000) ++ "\"}";
+    const arguments_json = "{\"command\":\"" ++ text_utils.repeat("é\\r\\n", 20_000) ++ "\"}";
     const label = try formatPlainAction(alloc, .{
         .tool_registry = test_tool_registry,
         .call = .{
@@ -1263,7 +1258,7 @@ test "tool presentation uses the resolved skill name for location calls" {
 }
 
 test "captured display target uses retained command without consuming output" {
-    if (comptime builtin.os.tag == .wasi) return;
+    if (comptime builtin.target.os.tag == .wasi) return;
     const alloc = std.testing.allocator;
     var executions = managed_execution.Runtime.init(alloc);
     defer executions.deinit();
@@ -1278,7 +1273,7 @@ test "captured display target uses retained command without consuming output" {
             .fingerprint = .init(admission.CommandContext{
                 .command = command,
                 .resolved_cwd = "/tmp",
-                .target_os = builtin.os.tag,
+                .target_os = builtin.target.os.tag,
                 .environment = .legacy,
             }),
             .source = .yolo,
@@ -1326,7 +1321,7 @@ test "captured display target uses retained command without consuming output" {
 
 test "terminal display target bounds and sanitizes command metadata" {
     const alloc = std.testing.allocator;
-    const target = try formatTerminalDisplayTarget(alloc, "/tmp/workspace", "/tmp/workspace/build\n\x1b[31m" ++ ("é" ** 120), max_run_command_activity_bytes);
+    const target = try formatTerminalDisplayTarget(alloc, "/tmp/workspace", "/tmp/workspace/build\n\x1b[31m" ++ text_utils.repeat("é", 120), max_run_command_activity_bytes);
     defer alloc.free(target);
     try std.testing.expect(std.mem.startsWith(u8, target, "./build "));
     try std.testing.expect(target.len <= max_run_command_activity_bytes);
@@ -1338,7 +1333,7 @@ test "terminal display target bounds and sanitizes command metadata" {
 
 test "terminal display target bounded variant keeps the launch command up to the caller bound" {
     const alloc = std.testing.allocator;
-    const command = "bun run " ++ ("pipeline-stage-" ** 30);
+    const command = "bun run " ++ text_utils.repeat("pipeline-stage-", 30);
     const compact = try formatTerminalDisplayTarget(alloc, "", command, max_run_command_activity_bytes);
     defer alloc.free(compact);
     try std.testing.expect(compact.len <= max_run_command_activity_bytes);

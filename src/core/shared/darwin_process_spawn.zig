@@ -33,7 +33,7 @@ pub fn spawn_inheriting_fd(
     options: std.process.SpawnOptions,
     inherited_fd: std.posix.fd_t,
 ) std.process.SpawnError!std.process.Child {
-    if (comptime builtin.os.tag != .macos) return error.OperationUnsupported;
+    if (comptime builtin.target.os.tag != .macos) return error.OperationUnsupported;
     return process_spawn_inheriting_fd(io.userdata, options, inherited_fd);
 }
 
@@ -42,8 +42,10 @@ fn process_spawn_inheriting_fd(
     options: std.process.SpawnOptions,
     inherited_fd: ?std.posix.fd_t,
 ) std.process.SpawnError!std.process.Child {
-    if (comptime builtin.os.tag != .macos) return error.OperationUnsupported;
+    if (comptime builtin.target.os.tag != .macos) return error.OperationUnsupported;
     if (options.uid != null or options.gid != null) return error.OperationUnsupported;
+    if (options.exe != .detect) return error.OperationUnsupported;
+    if (options.inherit_dirs.len != 0 or options.inherit_files.len != 0) return error.OperationUnsupported;
     if (options.argv.len == 0) return error.InvalidName;
     if (options.expand_arg0 == .expand) return error.OperationUnsupported;
 
@@ -62,7 +64,7 @@ fn process_spawn_inheriting_fd(
 
     const argv = try arena.allocSentinel(?[*:0]const u8, options.argv.len, null);
     for (options.argv, 0..) |arg, index| {
-        argv[index] = (try arena.dupeZ(u8, arg)).ptr;
+        argv[index] = (try arena.dupeSentinel(u8, arg, 0)).ptr;
     }
 
     const progress_fileno: std.posix.fd_t = 3;
@@ -97,7 +99,6 @@ fn process_spawn_inheriting_fd(
     var flags: std.c.POSIX_SPAWN = .{
         .CLOEXEC_DEFAULT = true,
         .START_SUSPENDED = options.start_suspended,
-        .DISABLE_ASLR = options.disable_aslr,
     };
     if (options.pgid) |process_group| {
         flags.SETPGROUP = true;
@@ -201,7 +202,7 @@ fn add_cwd_action(
             std.c.posix_spawn_file_actions_addfchdir_np(actions, dir.handle),
         ),
         .path => |path| {
-            const path_z = try arena.dupeZ(u8, path);
+            const path_z = try arena.dupeSentinel(u8, path, 0);
             try check_spawn_call(
                 std.c.posix_spawn_file_actions_addchdir_np(actions, path_z.ptr),
             );
@@ -277,21 +278,21 @@ fn set_process_group(
 ) std.process.SpawnError!void {
     const result = posix_spawnattr_setpgroup(attributes, process_group);
     if (result == 0) return;
-    const err: std.posix.E = @enumFromInt(@as(u16, @intCast(result)));
+    const err: std.posix.E = @fromBackingInt(@intCast(result));
     if (err == .INVAL) return error.InvalidProcessGroupId;
     return map_errno(err);
 }
 
 fn check_spawn_call(result: c_int) std.process.SpawnError!void {
     if (result == 0) return;
-    return map_errno(@enumFromInt(@as(u16, @intCast(result))));
+    return map_errno(@fromBackingInt(@intCast(result)));
 }
 
 fn map_spawn_error(
     result: c_int,
     options: std.process.SpawnOptions,
 ) std.process.SpawnError {
-    const err: std.posix.E = @enumFromInt(@as(u16, @intCast(result)));
+    const err: std.posix.E = @fromBackingInt(@intCast(result));
     if (err == .INVAL and options.pgid != null) return error.InvalidProcessGroupId;
     return map_errno(err);
 }
@@ -331,7 +332,7 @@ fn close_fd(fd: std.posix.fd_t) void {
 }
 
 fn darwin_io() !std.Io {
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos) return error.SkipZigTest;
     return wrap(std.testing.io);
 }
 
@@ -360,7 +361,7 @@ const ChildPidSnapshot = struct {
     len: usize,
 
     fn contains(self: ChildPidSnapshot, pid: std.posix.pid_t) bool {
-        return std.mem.containsAtLeastScalar(std.posix.pid_t, self.pids[0..self.len], 1, pid);
+        return std.mem.containsAtLeastScalar(std.posix.pid_t, self.pids[0..self.len], pid, 1);
     }
 };
 
@@ -371,7 +372,7 @@ extern "c" fn proc_listchildpids(
 ) c_int;
 
 fn child_pid_snapshot() !ChildPidSnapshot {
-    if (comptime builtin.os.tag != .macos) return error.OperationUnsupported;
+    if (comptime builtin.target.os.tag != .macos) return error.OperationUnsupported;
     var snapshot: ChildPidSnapshot = .{ .len = 0 };
     const result = proc_listchildpids(
         std.c.getpid(),
@@ -427,10 +428,10 @@ fn reap_child(io: std.Io, pid: std.posix.pid_t) void {
     }
 }
 
-const max_tracked_fd = if (builtin.os.tag == .macos) std.c.OPEN_MAX else 256;
+const max_tracked_fd = if (builtin.target.os.tag == .macos) std.c.OPEN_MAX else 256;
 
 fn open_fd_snapshot() [max_tracked_fd]bool {
-    var result = [_]bool{false} ** max_tracked_fd;
+    var result: [max_tracked_fd]bool = @splat(false);
     for (&result, 0..) |*open, fd| {
         const rc = std.posix.system.fcntl(@intCast(fd), std.posix.F.GETFD, @as(usize, 0));
         open.* = std.posix.errno(rc) == .SUCCESS;
@@ -483,9 +484,9 @@ test "Darwin explicit inherited descriptor avoids low user descriptors" {
     try std.testing.expect(pipe[1] != target_fd);
     try std.testing.expect(target_fd >= preferred_inherited_fd_target);
     var source_buffer: [32]u8 = undefined;
-    const source = try std.fmt.bufPrint(&source_buffer, "{d}", .{pipe[1]});
+    const source = try std.mem.print(&source_buffer, "{d}", .{pipe[1]});
     var target_buffer: [32]u8 = undefined;
-    const target = try std.fmt.bufPrint(
+    const target = try std.mem.print(
         &target_buffer,
         "{d}",
         .{target_fd},
@@ -525,7 +526,7 @@ test "Darwin inherited descriptor survives Bash script execution" {
         );
     }
     var fd_buffer: [32]u8 = undefined;
-    const fd_text = try std.fmt.bufPrint(
+    const fd_text = try std.mem.print(
         &fd_buffer,
         "{d}",
         .{target_fd},
@@ -545,7 +546,7 @@ test "Darwin spawn accepts path and directory working directories" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path_len = try tmp.dir.realPath(io, &path_buffer);
     const expected = path_buffer[0..path_len];
 

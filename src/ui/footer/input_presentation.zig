@@ -223,7 +223,7 @@ fn questionInteractionHint(
     // footer chrome; a lone question needs no counter.
     if (projection.entry_count > 1) {
         var counter_buf: [32]u8 = undefined;
-        const counter = std.fmt.bufPrint(
+        const counter = std.mem.print(
             &counter_buf,
             "Question {d} of {d}",
             .{ projection.current_index + 1, projection.entry_count },
@@ -1176,7 +1176,7 @@ test "composeVisibleInputRows avoids clear-to-eol after full-width input" {
     var full = try composeVisibleInputRows(alloc, full_source, full_window);
     defer full.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), full.rows.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, full.rows.items[0].items, "\x1b[K") == null);
+    try std.testing.expect(std.mem.find(u8, full.rows.items[0].items, "\x1b[K") == null);
 
     const short_source = visual_layout.Source{
         .input = "1234",
@@ -1188,7 +1188,7 @@ test "composeVisibleInputRows avoids clear-to-eol after full-width input" {
     var short = try composeVisibleInputRows(alloc, short_source, short_window);
     defer short.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), short.rows.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, short.rows.items[0].items, "\x1b[K") != null);
+    try std.testing.expect(std.mem.find(u8, short.rows.items[0].items, "\x1b[K") != null);
 }
 
 test "composeVisibleInputRows paints selected input without changing visible width" {
@@ -1326,7 +1326,7 @@ test "footer raw geometry windows capped input around the cursor" {
     const alloc = std.testing.allocator;
     var input = InputRuntime{};
     defer input.deinit(alloc);
-    try input.edit_state.input.appendSlice(alloc, "x" ** 5000);
+    try input.edit_state.input.appendSlice(alloc, text_utils.repeat("x", 5000));
     input.edit_state.cursor = input.edit_state.input.items.len;
     const geometry = measureRawInputGeometry(testRenderContext(&input), 80, 8, true, false, false, false);
     try std.testing.expect(geometry.summary.total_rows > geometry.window.row_count);

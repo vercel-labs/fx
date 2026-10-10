@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import {
   existsSync,
   mkdirSync,
@@ -22,6 +22,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { buildMcpDispatcherDriver, ZIG_BUILD_WARMUP_TIMEOUT_MS } from "./zig-build";
 
 const MODEL = "openai/gpt-5";
 const TOOL_NAME = "mcp_fixture_echo";
@@ -67,6 +68,10 @@ type WireEntry = {
 let tui: TmuxSession | null = null;
 let gateway: ReturnType<typeof startFakeGateway> | null = null;
 let cleanupRoot: string | null = null;
+
+beforeAll(() => {
+  buildMcpDispatcherDriver(REPO_ROOT);
+}, ZIG_BUILD_WARMUP_TIMEOUT_MS);
 
 afterEach(async () => {
   const activeTui = tui;

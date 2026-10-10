@@ -95,7 +95,7 @@ pub fn executeBearerGet(
     url: []const u8,
     access_token: []const u8,
 ) !oauth_transport.Response {
-    const authorization = try std.fmt.allocPrint(alloc, "Bearer {s}", .{access_token});
+    const authorization = try alloc.print("Bearer {s}", .{access_token});
     defer secret.zeroAndFree(alloc, authorization);
     return executeRequest(alloc, "GET", url, &.{.{
         .name = "authorization",

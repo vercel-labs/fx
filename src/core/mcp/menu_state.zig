@@ -271,15 +271,15 @@ pub fn apply(next: *State, event: Event) ?Effect {
         },
         .cycle_section => |delta| blk: {
             if (!next.active or delta == 0) break :blk null;
-            const count = @typeInfo(Section).@"enum".fields.len;
-            const current_index: usize = @intFromEnum(next.section);
+            const count = @typeInfo(Section).@"enum".field_names.len;
+            const current_index: usize = @backingInt(next.section);
             const section_index = if (delta > 0)
                 (current_index + 1) % count
             else if (current_index == 0)
                 count - 1
             else
                 current_index - 1;
-            next.section = @enumFromInt(section_index);
+            next.section = @fromBackingInt(@intCast(section_index));
             next.screen = .browse;
             next.selected_index = 0;
             next.window_start = 0;

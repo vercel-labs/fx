@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -492,7 +493,7 @@ test "owned stream result copies preserve service tier metadata" {
             try std.testing.expectEqualStrings("account", reference.account_id.?);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Copy.check, .{source});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Copy.check, .{source});
 }
 
 test "owned failure copies preserve diagnostics after source teardown and allocation failures" {
@@ -517,7 +518,7 @@ test "owned failure copies preserve diagnostics after source teardown and alloca
             try std.testing.expectEqual(@as(?u64, 3), copied.failed.retry_after_seconds);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Copy.check, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Copy.check, .{});
 }
 
 pub inline fn failResult(err: anytype) @TypeOf(err)!Result {
@@ -728,8 +729,7 @@ test "stream provider exposes its exact request serializer without streaming" {
         ) anyerror![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.calls += 1;
-            return std.fmt.allocPrint(
-                alloc,
+            return alloc.print(
                 "model={s};instructions={d};messages={d};tools={d}",
                 .{ request.model, request.instructions.len, request.messages.len, request.tools.advertised_names.len },
             );

@@ -22,6 +22,7 @@ from scripts.pgso.pipeline import (
     MacosLinkContract,
     PipelinePaths,
     apply_profile,
+    apple_ld_system_stub,
     cleanup_outlined_ir_argv,
     candidate_object_argv,
     candidate_link_argv,
@@ -49,6 +50,7 @@ from scripts.pgso.pipeline import (
     split_ir_argv,
     verify_release_safe_ir,
     zig_build_argv,
+    zig_build_env,
 )
 from scripts.pgso.toolchain import Toolchain
 
@@ -154,11 +156,40 @@ class PgsoPipelineTests(unittest.TestCase):
         with self.assertRaises(PgsoError):
             validate_temporal_link_map(link_map, self.root / "other.o", ("_alpha",))
 
+    def test_apple_ld_system_stub_drops_only_arm64e_x1_targets(self) -> None:
+        stub = (
+            "--- !tapi-tbd\n"
+            "targets:         [ x86_64-macos, arm64e-macos, \n"
+            "                   arm64e.x1-macos, arm64e.x1-maccatalyst ]\n"
+            "install-name:    '/usr/lib/libSystem.B.dylib'\n"
+            "exports:\n"
+            "  - targets:         [ arm64e.x1-macos, arm64e-macos ]\n"
+            "    symbols:         [ _a, _b ]\n"
+        )
+        self.assertEqual(
+            "--- !tapi-tbd\n"
+            "targets:         [ x86_64-macos, arm64e-macos ]\n"
+            "install-name:    '/usr/lib/libSystem.B.dylib'\n"
+            "exports:\n"
+            "  - targets:         [ arm64e-macos ]\n"
+            "    symbols:         [ _a, _b ]\n",
+            apple_ld_system_stub(stub),
+        )
+        older = "targets:         [ x86_64-macos, arm64e-macos ]\n"
+        self.assertEqual(older, apple_ld_system_stub(older))
+        for invalid in (
+            "  - targets:         [ arm64e.x1-macos, arm64e.x1-maccatalyst ]\n",
+            "    symbols:         [ _arm64e.x1 ]\n",
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(PgsoError):
+                apple_ld_system_stub(invalid)
+
     def test_temporal_link_preserves_the_control_platform_and_original_object(self) -> None:
         runtime = self.root / "libcompiler_rt_zcu.o"
         contract = MacosLinkContract(1, "13.3", "26.4", 16 * 1024 * 1024, ())
         toolchain = dataclasses.replace(self.toolchain, sdk_version="15.5")
-        command = temporal_candidate_link_argv(toolchain, self.paths, runtime, contract)
+        stub = self.root / "linked" / "libSystem.tbd"
+        command = temporal_candidate_link_argv(toolchain, self.paths, runtime, contract, stub)
         self.assertEqual(str(self.toolchain.apple_ld), command[0])
         platform = command.index("-platform_version")
         self.assertEqual(("macos", "13.3", "26.4"), command[platform + 1:platform + 4])
@@ -167,7 +198,8 @@ class PgsoPipelineTests(unittest.TestCase):
         self.assertNotIn(str(self.paths.instrumented_object), command)
         self.assertNotIn(str(self.toolchain.profile_runtime), command)
         self.assertEqual("1000000", command[command.index("-stack_size") + 1])
-        self.assertIn(str(toolchain.zig_darwin_sdk / "libSystem.tbd"), command)
+        self.assertIn(str(stub), command)
+        self.assertNotIn(str(toolchain.zig_darwin_sdk / "libSystem.tbd"), command)
         self.assertIn(str(self.paths.logs / "candidate-order.txt"), command)
         for flag in ("-order_file", "-no_deduplicate", "-no_function_starts", "-map"):
             self.assertIn(flag, command)
@@ -224,8 +256,8 @@ class PgsoPipelineTests(unittest.TestCase):
             "zig_darwin_sdk": self.root / "ZigDarwin.sdk",
             "zig_sdk_version": "26.4",
             "profile_runtime": self.root / "libclang_rt.profile_osx.a",
-            "zig_version": "0.16.0",
-            "llvm_version": "21.1.8",
+            "zig_version": "0.17.0",
+            "llvm_version": "22.1.8",
             "target": "aarch64-macos",
             "host_arch": "arm64",
         }
@@ -245,7 +277,7 @@ class PgsoPipelineTests(unittest.TestCase):
                 "--runtime-counter-relocation",
                 "--pgo-temporal-instrumentation",
                 "-pgo-kind=pgo-instr-gen-pipeline",
-                "-passes=default<O2>",
+                "-passes=function(sroa,instcombine<no-verify-fixpoint>,loop-unroll-full,instcombine<no-verify-fixpoint>,simplifycfg),default<O2>",
             ),
             GENERATION_FLAGS,
         )
@@ -255,7 +287,7 @@ class PgsoPipelineTests(unittest.TestCase):
                 "-pgo-kind=pgo-instr-use-pipeline",
                 "-pgo-cold-func-opt=minsize",
                 "-profile-summary-cutoff-cold=600000",
-                "-passes=default<O2>,mergefunc",
+                "-passes=function(sroa,instcombine<no-verify-fixpoint>,loop-unroll-full,instcombine<no-verify-fixpoint>,simplifycfg),default<O2>,mergefunc",
             ),
             USE_FLAGS,
         )
@@ -274,7 +306,7 @@ class PgsoPipelineTests(unittest.TestCase):
                 "-pgo-kind=pgo-instr-use-pipeline",
                 "-pgo-cold-func-opt=minsize",
                 "-profile-summary-cutoff-cold=990000",
-                "-passes=default<O2>,mergefunc,iroutliner",
+                "-passes=function(sroa,instcombine<no-verify-fixpoint>,loop-unroll-full,instcombine<no-verify-fixpoint>,simplifycfg),default<O2>,mergefunc,iroutliner",
             ),
             BENCHMARK_USE_FLAGS,
         )
@@ -410,6 +442,11 @@ class PgsoPipelineTests(unittest.TestCase):
         self.assertNotEqual(
             control[control.index("--cache-dir") + 1],
             ir[ir.index("--cache-dir") + 1],
+        )
+        self.assertNotIn("--global-cache-dir", control)
+        self.assertEqual(
+            str(self.paths.global_cache),
+            zig_build_env(self.paths)["ZIG_GLOBAL_CACHE_DIR"],
         )
 
     def test_benchmark_artifacts_use_their_existing_build_owners_and_names(self) -> None:
@@ -609,6 +646,7 @@ pathlib.Path(sys.argv[sys.argv.index('-map') + 1]).write_bytes({link_map!r}.enco
                     toolchain, self.paths,
                     self.paths.candidate_binary.parent / "compiler-runtime" / "libcompiler_rt_zcu.o",
                     self.good_link_contract(),
+                    self.paths.candidate_binary.parent / "system-stub" / "libSystem.tbd",
                 )[1:]),
                 f"strip -S -x {self.paths.candidate_binary}",
                 "codesign --force --sign - --options linker-signed "
@@ -621,6 +659,10 @@ pathlib.Path(sys.argv[sys.argv.index('-map') + 1]).write_bytes({link_map!r}.enco
         layout = json.loads((self.paths.logs / "candidate-layout.json").read_text())
         self.assertEqual("26.4", layout["sdk_version"])
         self.assertEqual("15.5", layout["sysroot_sdk_version"])
+        self.assertEqual(
+            sha256_file(self.paths.candidate_binary.parent / "system-stub" / "libSystem.tbd"),
+            layout["linked_system_stub_sha256"],
+        )
         self.assertEqual(16777216, layout["main_stack_size"])
         self.assertEqual(8, layout["ordered_bytes"])
         self.assertIn(
@@ -778,7 +820,7 @@ print('_main T ---------------- 0')""",
         self.assertEqual(b"bitcode", result.read_bytes())
         lines = actions.read_text().splitlines()
         self.assertEqual(8, len(lines))
-        self.assertIn("-passes=default<O2>,mergefunc", lines[0])
+        self.assertIn("-passes=function(sroa,instcombine<no-verify-fixpoint>,loop-unroll-full,instcombine<no-verify-fixpoint>,simplifycfg),default<O2>,mergefunc", lines[0])
         self.assertNotIn("iroutliner", lines[0])
         self.assertEqual("nm", lines[1])
         self.assertTrue(lines[2].startswith("split -j 2 -o "))

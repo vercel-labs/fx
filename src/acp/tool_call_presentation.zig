@@ -48,9 +48,9 @@ pub fn describeToolTitle(registry: tool_dispatch.Registry, arena: Allocator, cal
         });
     }
     if (tool_dispatch.toolCallPresentation(arena, registry, call)) |presentation| {
-        return std.fmt.allocPrint(arena, "{s}", .{presentation.action_label});
+        return arena.print("{s}", .{presentation.action_label});
     }
-    return std.fmt.allocPrint(arena, "{s}", .{call.name});
+    return arena.print("{s}", .{call.name});
 }
 
 pub const ToolCallPresentation = struct {
@@ -162,7 +162,7 @@ test "describeToolCall flags internal discovery and names MCP identity" {
 }
 
 test "toolUpdateContentText clips long output and guards unsafe bytes" {
-    const long = "x" ** 500;
+    const long = text_utils.repeat("x", 500);
     const clipped = toolUpdateContentText(false, long);
     try std.testing.expectEqual(@as(usize, 200), clipped.len);
 

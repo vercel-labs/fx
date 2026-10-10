@@ -130,7 +130,7 @@ fn fetchCatalogForProvider(
     defer if (modalities_response) |*metadata| metadata.deinit(alloc);
     const modalities_json = if (modalities_response) |metadata| blk: {
         if (metadata.status == .ok) break :blk @as(?[]const u8, metadata.body);
-        debug_trace.logf("catalog", "Grok modality enrichment unavailable status={d}", .{@intFromEnum(metadata.status)});
+        debug_trace.logf("catalog", "Grok modality enrichment unavailable status={d}", .{@backingInt(metadata.status)});
         break :blk null;
     } else null;
     const catalog = parseCatalog(alloc, response.body, modalities_json) catch |err| {
@@ -196,7 +196,7 @@ const FetchOperation = struct {
             .accept_encoding = .omit,
         };
         if (self.credential) |credential| {
-            auth_header = try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{credential});
+            auth_header = try self.alloc.print("Bearer {s}", .{credential});
             headers.authorization = .{ .override = auth_header.? };
         }
         const body_buffer = try self.alloc.alloc(u8, max_catalog_bytes + 1);
@@ -520,7 +520,7 @@ test "Grok catalog retains subscription models without losing provider capabilit
         \\{"models":[{"id":"current-a","input_modalities":["text","image"],"output_modalities":["text"]},{"id":"current-b","input_modalities":["text"],"output_modalities":["text"]}]}
     ;
     for (orders, 0..) |rows, unmatched_index| {
-        const subscription = try std.fmt.allocPrint(alloc, "{{\"data\":[{s},{s},{s}]}}", .{ rows[0], rows[1], rows[2] });
+        const subscription = try alloc.print("{{\"data\":[{s},{s},{s}]}}", .{ rows[0], rows[1], rows[2] });
         defer alloc.free(subscription);
         var catalog = try parseCatalog(alloc, subscription, modalities);
         defer model_catalog.freeModelCatalog(alloc, &catalog);
@@ -863,7 +863,7 @@ const CatalogEndpointEnvironment = struct {
 };
 
 fn catalogFixtureUrl(alloc: std.mem.Allocator, fixture: *CatalogBodyFixture, path: []const u8) ![]u8 {
-    return std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/{s}", .{ fixture.port(), path });
+    return alloc.print("http://127.0.0.1:{d}/{s}", .{ fixture.port(), path });
 }
 
 fn expectCatalogProviderFailure(
@@ -887,8 +887,7 @@ fn fetchCatalogFixture(body: []const u8) !FetchResponse {
     var fixture = try CatalogBodyFixture.init(body);
     defer fixture.deinit();
     try fixture.start();
-    const url = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const url = try std.testing.allocator.print(
         "http://127.0.0.1:{d}/models",
         .{fixture.port()},
     );

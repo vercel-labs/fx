@@ -106,8 +106,7 @@ fn call(
 fn unsupported(
     ctx: tool_dispatch.DispatchContext,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    return .{ .failure = try std.fmt.allocPrint(
-        ctx.allocator,
+    return .{ .failure = try ctx.allocator.print(
         "Unsupported tool: {s}",
         .{ctx.tool_call_name},
     ) };

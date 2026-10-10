@@ -24,6 +24,7 @@
 //! the store, so every compaction and every test runs this same code.
 
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const checkpoint = @import("checkpoint.zig");
 const ledger = @import("ledger.zig");
 const lint = @import("lint.zig");
@@ -998,7 +999,7 @@ fn heading(alloc: Allocator, turn: Prepared, findable: bool) Allocator.Error!led
     const lines = try alloc.alloc([]const u8, turn.tools.len);
     for (lines, turn.tools) |*line, tool| {
         const index = if (tool.call) |call| try indexLine(alloc, call.arguments) else "";
-        line.* = try std.fmt.allocPrint(alloc, "T{d} {s}: {s}", .{ tool.number, tool.name, try shortLine(alloc, index, max_findable_tool_bytes) });
+        line.* = try alloc.print("T{d} {s}: {s}", .{ tool.number, tool.name, try shortLine(alloc, index, max_findable_tool_bytes) });
     }
     result.tools = lines;
     return result;
@@ -1015,7 +1016,7 @@ fn shortLine(alloc: Allocator, text: []const u8, max: usize) Allocator.Error![]c
     try appendFlat(alloc, &line, text);
     const flat = std.mem.trim(u8, line.items, " ");
     if (flat.len <= max) return flat;
-    return std.fmt.allocPrint(alloc, "{s}\u{2026}", .{std.mem.trimEnd(u8, flat[0..text_utils.utf8BackwardBoundary(flat, max)], " ")});
+    return alloc.print("{s}\u{2026}", .{std.mem.trimEnd(u8, flat[0..text_utils.utf8BackwardBoundary(flat, max)], " ")});
 }
 
 /// The saved file for one tool call: an index line, then its arguments and
@@ -1095,7 +1096,7 @@ fn appendFlat(alloc: Allocator, line: *std.ArrayList(u8), text: []const u8) Allo
 }
 
 fn savedOutputNote(alloc: Allocator, handle: []const u8) Allocator.Error![]const u8 {
-    return std.fmt.allocPrint(alloc, "The whole result is saved as {s}; open it with read_tool_result.", .{handle});
+    return alloc.print("The whole result is saved as {s}; open it with read_tool_result.", .{handle});
 }
 
 /// Texts are clipped no shorter than this, or else only their note stays.
@@ -1170,9 +1171,9 @@ fn clipped(alloc: Allocator, text: []const u8, limit: usize, saved_in: []const u
     const head = text_utils.utf8BackwardBoundary(text, limit / 2);
     const tail = text_utils.utf8ForwardBoundary(text, text.len - limit / 2);
     const note = if (saved_in.len == 0)
-        try std.fmt.allocPrint(alloc, "[{d} bytes left out here]", .{tail - head})
+        try alloc.print("[{d} bytes left out here]", .{tail - head})
     else
-        try std.fmt.allocPrint(alloc, "[{d} bytes left out here; the whole text is saved in {s}]", .{ tail - head, saved_in });
+        try alloc.print("[{d} bytes left out here; the whole text is saved in {s}]", .{ tail - head, saved_in });
     if (note.len + 2 >= tail - head) return text;
     return std.mem.concat(alloc, u8, &.{ text[0..head], "\n", note, "\n", text[tail..] });
 }
@@ -1221,7 +1222,7 @@ fn longestExact(turns: []const checkpoint.Turn) usize {
 fn clippedTurns(alloc: Allocator, compacted: Compacted, clip: usize) Allocator.Error![]const checkpoint.Turn {
     const turns = try alloc.alloc(checkpoint.Turn, compacted.turns.len);
     for (turns, compacted.turns) |*slot, turn| {
-        const saved_in = if (compacted.saved and turn.number > 0) try std.fmt.allocPrint(alloc, "M{d}", .{turn.number}) else "";
+        const saved_in = if (compacted.saved and turn.number > 0) try alloc.print("M{d}", .{turn.number}) else "";
         const users = try alloc.alloc([]const u8, turn.users.len);
         for (users, turn.users) |*user, text| user.* = try clipped(alloc, text, clip, saved_in);
         slot.* = turn;
@@ -1251,7 +1252,7 @@ fn renderTranscript(alloc: Allocator, plan: Plan, clip: usize, earlier_clip: usi
         if (earlier.earlier.len > 0) try text.print(alloc, "[Earlier summary]\n{s}\n\n", .{try clipped(alloc, earlier.earlier, earlier_clip, "")});
     }
     for (plan.turns) |turn| {
-        const turn_id = if (plan.saved and turn.number > 0) try std.fmt.allocPrint(alloc, "M{d}", .{turn.number}) else "";
+        const turn_id = if (plan.saved and turn.number > 0) try alloc.print("M{d}", .{turn.number}) else "";
         const first_user = try clipped(alloc, turn.source.user, clip, turn_id);
         if (turn.number > 0) {
             try text.print(alloc, "[Turn {d}]\n[User]\n{s}\n\n", .{ turn.number, first_user });
@@ -1264,7 +1265,7 @@ fn renderTranscript(alloc: Allocator, plan: Plan, clip: usize, earlier_clip: usi
             if (part.first_tool > 0) try text.print(alloc, "[Its tools so far: T{d} to T{d}]\n\n", .{ part.first_tool, part.last_tool });
         }
         for (turn.source.items, turn.tool_numbers) |item, number| {
-            const tool_id = if (plan.saved and number > 0) try std.fmt.allocPrint(alloc, "T{d}", .{number}) else "";
+            const tool_id = if (plan.saved and number > 0) try alloc.print("T{d}", .{number}) else "";
             switch (item) {
                 .user => |added| try text.print(alloc, "[User, added while the assistant worked]\n{s}\n\n", .{try clipped(alloc, added, clip, turn_id)}),
                 .assistant => |assistant| if (assistant.len > 0) try text.print(alloc, "[Assistant]\n{s}\n\n", .{try clipped(alloc, assistant, clip, turn_id)}),
@@ -1555,7 +1556,7 @@ test "a follow-up after the conversation lists only the skipped turns, findable"
 }
 
 test "the conversation serves only a request for every turn" {
-    const output = "x" ** 4000;
+    const output = text_utils.repeat("x", 4000);
     const turns = [_]Turn{ workedTurn("first", "call-1", output), workedTurn("second", "call-2", output) };
     var model = FakeModel{ .replies = &.{ "Turn 1\nIn between: Ran the first build.", "Turn 2\nIn between: Ran the second build." } };
     defer model.deinit();
@@ -1618,7 +1619,7 @@ test "the tool line says what code knows: the call, how it ended and its size" {
     try testing.expectEqualStrings("read_file src/a.zig (3 lines)", try codeLine(arena, .{ .number = 2, .name = "read_file", .call = .{ .id = "r", .name = "read_file", .arguments = "{\"path\":\"src/a.zig\"}" }, .result = .{ .call_id = "r", .name = "read_file", .output = "a\nb\nc" } }));
     try testing.expectEqualStrings("shell zig build test (no result)", try codeLine(arena, .{ .number = 3, .name = "shell", .call = call }));
     // Long arguments are cut; the record keeps them whole.
-    const long = try codeLine(arena, .{ .number = 4, .name = "write_file", .call = .{ .id = "w", .name = "write_file", .arguments = "{\"content\":\"" ++ ("é" ** 200) ++ "\"}" } });
+    const long = try codeLine(arena, .{ .number = 4, .name = "write_file", .call = .{ .id = "w", .name = "write_file", .arguments = "{\"content\":\"" ++ text_utils.repeat("é", 200) ++ "\"}" } });
     try testing.expect(std.mem.endsWith(u8, long, "… (no result)"));
     try testing.expect(std.unicode.utf8ValidateSlice(long));
     try testing.expectEqual(@as(?i64, -1), exitCode("{\"exit_code\":-1}"));
@@ -2005,8 +2006,8 @@ test "every turn stays, each long user message and final reply whole" {
     defer model.deinit();
     var store = MemoryStore{ .alloc = testing.allocator };
     defer store.deinit();
-    const pasted = "PASTE_START " ++ ("log line " ** 2000) ++ "PASTE_END";
-    const plan = "PLAN " ** 400;
+    const pasted = "PASTE_START " ++ text_utils.repeat("log line ", 2000) ++ "PASTE_END";
+    const plan = text_utils.repeat("PLAN ", 400);
     var turns: [12]Turn = undefined;
     const items = [_]Item{
         .{ .tool_call = .{ .id = "c", .name = "shell", .arguments = "{\"command\":\"make\"}" } },
@@ -2035,7 +2036,7 @@ test "only a text over its room clips its longest messages, whole in their saved
     defer model.deinit();
     var store = MemoryStore{ .alloc = testing.allocator };
     defer store.deinit();
-    const long_reply = "REPLY_START " ++ ("detail " ** 3000) ++ "REPLY_END";
+    const long_reply = "REPLY_START " ++ text_utils.repeat("detail ", 3000) ++ "REPLY_END";
     const turns = [_]Turn{
         .{ .user = "write the plan", .items = &.{.{ .assistant = long_reply }} },
         .{ .user = "thanks", .items = &.{.{ .assistant = "Sure." }} },
@@ -2294,7 +2295,7 @@ test "the index line is built the same way for any tool" {
     try testing.expectEqualStrings("not json at all", try indexLine(arena, "not   json\nat all"));
 
     // Long arguments are cut to one short line without splitting a character.
-    const long = try indexLine(arena, "{\"content\":\"" ++ ("é" ** 300) ++ "\"}");
+    const long = try indexLine(arena, "{\"content\":\"" ++ text_utils.repeat("é", 300) ++ "\"}");
     try testing.expect(long.len <= max_index_bytes);
     try testing.expect(std.unicode.utf8ValidateSlice(long));
 }
@@ -2380,7 +2381,7 @@ test "compaction survives every allocation failure" {
             }
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(testing_allocator.no_resize, Run.run, .{});
 }
 
 test "without a store nothing is saved and the notes keep tool details" {
@@ -2408,7 +2409,7 @@ test "turns too large for one request go oldest first, each part adding to the o
     defer model.deinit();
     var store = MemoryStore{ .alloc = testing.allocator };
     defer store.deinit();
-    const output = "build output line " ** 400;
+    const output = text_utils.repeat("build output line ", 400);
     const turns = [_]Turn{ workedTurn("first", "call-1", output), workedTurn("second", "call-2", output), workedTurn("third", "call-3", output) };
     // Room for one turn per request.
     const one = turnTokens(turns[0]);
@@ -2452,7 +2453,7 @@ test "a turn too large for one request keeps the start and end of its long texts
     defer model.deinit();
     var store = MemoryStore{ .alloc = testing.allocator };
     defer store.deinit();
-    const output = "START_OF_OUTPUT " ++ ("filler " ** 20_000) ++ "END_OF_OUTPUT";
+    const output = "START_OF_OUTPUT " ++ text_utils.repeat("filler ", 20_000) ++ "END_OF_OUTPUT";
     const turns = [_]Turn{workedTurn("Run the build.", "call-1", output)};
     const room = 4000;
     var result = try compact(testing.allocator, .{ .model = "m", .turns = &turns, .max_prompt_tokens = room }, model.model(), store.store());
@@ -2490,10 +2491,10 @@ test "a request fits even when a turn has many texts too short to clip" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const output = "one short line of build output " ** 48;
+    const output = text_utils.repeat("one short line of build output ", 48);
     var items: std.ArrayList(Item) = .empty;
     for (0..300) |index| {
-        const id = try std.fmt.allocPrint(arena, "call-{d}", .{index});
+        const id = try arena.print("call-{d}", .{index});
         try items.append(arena, .{ .tool_call = .{ .id = id, .name = "shell", .arguments = "{\"command\":\"make\"}" } });
         try items.append(arena, .{ .tool_result = .{ .call_id = id, .name = "shell", .output = output } });
     }
@@ -2516,9 +2517,9 @@ test "a request fits even when a turn has many texts too short to clip" {
 }
 
 test "clipping the turns keeps the earlier summary whole when that is enough" {
-    const previous = "EARLIER_START " ++ ("older work " ** 1500) ++ "EARLIER_END";
+    const previous = "EARLIER_START " ++ text_utils.repeat("older work ", 1500) ++ "EARLIER_END";
     const earlier: Compacted = .{ .earlier = previous, .turn_count = 2, .tool_count = 1, .saved = true };
-    const turns = [_]Turn{workedTurn("Run it again.", "call-1", "build output line " ** 3000)};
+    const turns = [_]Turn{workedTurn("Run it again.", "call-1", text_utils.repeat("build output line ", 3000))};
     var model = FakeModel{};
     defer model.deinit();
     var store = MemoryStore{ .alloc = testing.allocator };
@@ -2535,7 +2536,7 @@ test "clipping the turns keeps the earlier summary whole when that is enough" {
 }
 
 test "the earlier summary is clipped only when the turns alone cannot make the request fit" {
-    const previous = "EARLIER_START " ++ ("older work " ** 8000) ++ "EARLIER_END";
+    const previous = "EARLIER_START " ++ text_utils.repeat("older work ", 8000) ++ "EARLIER_END";
     const earlier: Compacted = .{ .earlier = previous, .turn_count = 2, .tool_count = 1, .saved = true };
     const turns = [_]Turn{workedTurn("Run it again.", "call-1", "ok")};
     var model = FakeModel{};

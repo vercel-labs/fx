@@ -1091,10 +1091,19 @@ pub fn Runtime(comptime App: type) type {
             defer if (app.worker.isCancelRequested()) {
                 app.worker.settleCompactionActivity(operation_id, .{ .outcome = .cancelled });
             };
-            errdefer |err| {
+            compactWithActivity(app, job, gateway_retry_count, operation_id) catch |err| {
                 app.worker.settleCompactionActivity(operation_id, compaction_activity.failure(err, .preparation, app.worker.isCancelRequested()));
                 if (failure_provenance) |out| out.* = .{ .operation_id = operation_id, .turn_id = job.turn_id, .err = err };
-            }
+                return err;
+            };
+        }
+
+        fn compactWithActivity(
+            app: *App,
+            job: worker_runtime.ContextCompactionTask,
+            gateway_retry_count: usize,
+            operation_id: compaction_activity.OperationId,
+        ) anyerror!void {
             var arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
             defer arena_state.deinit();
             const arena = arena_state.allocator();
@@ -1391,14 +1400,14 @@ fn formatMissingSpecToolAction(arena: Allocator, state: ToolActionState, denied_
 
 fn formatInvalidArgsToolAction(arena: Allocator, state: ToolActionState, denied_label: ?[]const u8) ![]const u8 {
     return switch (state) {
-        .active => std.fmt.allocPrint(arena, "● Working…\x1b[0m", .{}),
+        .active => arena.print("● Working…\x1b[0m", .{}),
         .completed => formatToolActionValue(arena, "Completed", "tool call"),
         .denied => formatToolActionValue(arena, denied_label.?, "tool call"),
     };
 }
 
 fn formatToolActionValue(arena: Allocator, label: []const u8, value: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(arena, "● {s}\x1b[0m {s}{s}\x1b[0m", .{ label, shared_theme.current().tool_stdout_style, value });
+    return arena.print("● {s}\x1b[0m {s}{s}\x1b[0m", .{ label, shared_theme.current().tool_stdout_style, value });
 }
 
 /// Command rows keep the muted tool-text base and add shell syntax colors for
@@ -1414,7 +1423,7 @@ fn formatCommandActionValue(arena: Allocator, label: []const u8, command: []cons
         if (theme.light) .light else .dark,
         theme.tool_stdout_style,
     );
-    return std.fmt.allocPrint(arena, "● {s}\x1b[0m {s}\x1b[0m", .{ label, highlighted });
+    return arena.print("● {s}\x1b[0m {s}\x1b[0m", .{ label, highlighted });
 }
 
 fn specLabel(spec: *const tool_dispatch.Tool, state: ToolActionState, denied_label: ?[]const u8) []const u8 {
@@ -1490,13 +1499,12 @@ fn gatherTestProjectContext(_: Allocator, _: context_contract.InitialContextInpu
 }
 
 fn appendTestStaticContext(input: context_contract.StaticContextInput, alloc: Allocator, messages: *std.ArrayList(ChatMessage)) context_contract.ProviderError!void {
-    const content = try std.fmt.allocPrint(alloc, "provider static:{s}", .{input.project_context});
+    const content = try alloc.print("provider static:{s}", .{input.project_context});
     try messages.append(alloc, .{ .role = .system, .content = content });
 }
 
 fn appendTestTransientContext(input: context_contract.TransientContextInput, alloc: Allocator, messages: *std.ArrayList(ChatMessage)) context_contract.ProviderError!void {
-    const content = try std.fmt.allocPrint(
-        alloc,
+    const content = try alloc.print(
         "provider transient:{s}:{s}",
         .{ input.workspace_root, @tagName(input.permission_mode) },
     );
@@ -1529,7 +1537,7 @@ fn gatherFreshProjectContext(alloc: Allocator, input: context_contract.InitialCo
     refresh_targets_match = input.targets.len == 1 and
         input.targets[0].kind == .file and
         std.mem.eql(u8, input.targets[0].path, "/tmp/workspace/images/example.png");
-    const content = try std.fmt.allocPrint(alloc, "fresh:{s}", .{input.workspace_root});
+    const content = try alloc.print("fresh:{s}", .{input.workspace_root});
     errdefer alloc.free(content);
     const notices = try alloc.alloc([]u8, 1);
     errdefer alloc.free(notices);
@@ -1577,7 +1585,7 @@ const RefreshContextApp = struct {
         return self.context_registry;
     }
 
-    fn workspaceHostInfo(self: *const RefreshContextApp) ?*const js_host_workspace.Info {
+    pub fn workspaceHostInfo(self: *const RefreshContextApp) ?*const js_host_workspace.Info {
         return if (self.host_info) |*info| info else null;
     }
 
@@ -1587,7 +1595,7 @@ const RefreshContextApp = struct {
         self.session.deinit(self.alloc);
     }
 
-    fn writeDomainNotice(self: *RefreshContextApp, notice: types.SemanticNotice, _: bool) !void {
+    pub fn writeDomainNotice(self: *RefreshContextApp, notice: types.SemanticNotice, _: bool) !void {
         self.context_notice_tone = notice.tone;
         self.context_notice_visibility = notice.visibility;
         try self.context_notices.appendSlice(self.alloc, notice.body);
@@ -1682,7 +1690,7 @@ const FakeApp = struct {
         return app;
     }
 
-    fn toolRegistry(self: *const FakeApp) tool_dispatch.Registry {
+    pub fn toolRegistry(self: *const FakeApp) tool_dispatch.Registry {
         return self.tool_registry;
     }
 
@@ -1690,7 +1698,7 @@ const FakeApp = struct {
         return self.context_registry;
     }
 
-    fn snapshotMcpModelCatalog(
+    pub fn snapshotMcpModelCatalog(
         self: *FakeApp,
         alloc: Allocator,
         _: types.PermissionRuleSet,
@@ -1873,7 +1881,7 @@ const FakeApp = struct {
 
     pub fn formatToolExecutionErrorForAgent(self: *FakeApp, arena: Allocator, tool_name: []const u8, err: anyerror) ![]const u8 {
         _ = self;
-        return std.fmt.allocPrint(arena, "Tool {s} failed: {s}", .{ tool_name, @errorName(err) });
+        return arena.print("Tool {s} failed: {s}", .{ tool_name, @errorName(err) });
     }
 };
 
@@ -2346,7 +2354,7 @@ test "app agent runtime bounds a large multiline run command activity" {
     var app = try FakeApp.init(alloc);
     defer app.deinit();
 
-    const arguments_json = "{\"action\":\"run\",\"command\":\"" ++ ("x\\n" ** 20_000) ++ "\"}";
+    const arguments_json = "{\"action\":\"run\",\"command\":\"" ++ text_utils.repeat("x\\n", 20_000) ++ "\"}";
     const label = try app.describeToolAction(arena, .{
         .id = "large_command",
         .name = "shell",
@@ -2946,7 +2954,7 @@ test "manual compaction worker call commits a checkpoint without a continuation"
     const steps = [_]types.ToolExecutionStep{.{ .tool_calls = @constCast(&calls), .tool_results = @constCast(&results) }};
     job.history[0] = try types.dupeHistoryTurn(alloc, .{ .assistant = .{
         .user = .{ .text = @constCast("exact user request") },
-        .assistant = @constCast("exact completed response\n" ++ ("evidence " ** 1_000)),
+        .assistant = @constCast("exact completed response\n" ++ text_utils.repeat("evidence ", 1_000)),
         .execution = .{ .tool_steps = @constCast(&steps) },
     } });
     job.history[1] = try types.dupeHistoryTurn(alloc, .{ .assistant = .{
@@ -3511,12 +3519,12 @@ test "app agent runtime highlights shell command rows over the tool text base" {
     // while the command verb and quoted string pick up syntax palette colors
     // and return to the base after their closes.
     try std.testing.expect(std.mem.startsWith(u8, completed, "● Ran\x1b[0m \x1b[38;5;245m"));
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         completed,
         "\x1b[38;5;252mprintf\x1b[39m\x1b[38;5;245m",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         completed,
         "\x1b[38;5;250m'hello world'\x1b[39m\x1b[38;5;245m",
@@ -3524,7 +3532,7 @@ test "app agent runtime highlights shell command rows over the tool text base" {
     try std.testing.expect(std.mem.endsWith(u8, completed, "\x1b[0m"));
     // The pipe and the command after it take the keyword color, the flag the
     // number color; plain bytes are intact beneath the styling.
-    try std.testing.expect(std.mem.indexOf(u8, completed, "\x1b[38;5;252m|\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, completed, "\x1b[38;5;252mwc\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, completed, "\x1b[38;5;250m-c\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, completed, "\x1b[38;5;252m|\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, completed, "\x1b[38;5;252mwc\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, completed, "\x1b[38;5;250m-c\x1b[39m") != null);
 }

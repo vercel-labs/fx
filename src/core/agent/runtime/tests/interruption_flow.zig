@@ -119,8 +119,8 @@ test "processQueuedPrompt sends former intent text normally with tools" {
         try runFakePrompt(&gateway, &hooks, config, job);
 
         const body = gateway.request_bodies.items[0];
-        const runtime_idx = std.mem.indexOf(u8, body, "runtime context unique") orelse return error.TestExpectedEqual;
-        const current_idx = std.mem.indexOf(u8, body, text) orelse return error.TestExpectedEqual;
+        const runtime_idx = std.mem.find(u8, body, "runtime context unique") orelse return error.TestExpectedEqual;
+        const current_idx = std.mem.find(u8, body, text) orelse return error.TestExpectedEqual;
         try std.testing.expect(runtime_idx < current_idx);
         try expectGatewayPromptFinalUserText(&gateway, 0, text);
         try expectBodyContains(&gateway, 0, "\"name\":\"read_file\"");
@@ -359,7 +359,7 @@ test "processQueuedPrompt persists completed tool names when cancelled during ne
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "completed-tools-interrupt.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "completed-tools-interrupt.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -573,7 +573,7 @@ test "processQueuedPrompt retains cancelled command replay in interrupted histor
         .{},
     );
     defer capability.deinit();
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "cancelled-command.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "cancelled-command.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -656,8 +656,7 @@ test "processQueuedPrompt retains cancelled command replay in interrupted histor
     defer artifacts.deinit();
     try std.testing.expectEqual(@as(usize, 1), artifacts.names.len);
 
-    const complete_log = try std.fmt.allocPrint(
-        alloc,
+    const complete_log = try alloc.print(
         "command_output_complete:{d}:call_cancelled_command",
         .{terminal.id.turn_id},
     );
@@ -878,7 +877,7 @@ test "processQueuedPrompt trace records partial interrupted projection closures"
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "partial-interrupt-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "partial-interrupt-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();

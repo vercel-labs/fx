@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const builtin_skills = @import("../../builtins/skills.zig");
 const context_limits = @import("../../core/config/context_limits.zig");
 const lexical_relevance = @import("../../core/shared/lexical_relevance.zig");
@@ -6,6 +7,7 @@ const capability_retrieval = @import("../../core/tooling/capability_retrieval.zi
 const skill_runtime = @import("../../core/skills/skill_runtime.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const tool_result_limits = @import("../../core/tooling/tool_result_limits.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -236,7 +238,7 @@ test "skill search preserves projected identities and verbatim descriptions" {
 test "skill search caps ranked entries and atomically omits byte overflow" {
     const alloc = std.testing.allocator;
     const skills = [_]skill_runtime.Skill{
-        .{ .name = "one", .description = "x" ** 700, .path = "/skills/one/SKILL.md", .source = .workspace_fx },
+        .{ .name = "one", .description = text_utils.repeat("x", 700), .path = "/skills/one/SKILL.md", .source = .workspace_fx },
         .{ .name = "two", .description = "two", .path = "/skills/two/SKILL.md", .source = .workspace_fx },
         .{ .name = "three", .description = "three", .path = "/skills/three/SKILL.md", .source = .workspace_fx },
         .{ .name = "four", .description = "four", .path = "/skills/four/SKILL.md", .source = .workspace_fx },
@@ -271,7 +273,7 @@ test "skill search projection releases every allocation failure" {
         fn run(alloc: Allocator) !void {
             const skills = [_]skill_runtime.Skill{
                 .{ .name = "unsafe", .description = "unsafe", .path = "/skills/TOKEN=runtime-location-secret/SKILL.md", .source = .workspace_fx },
-                .{ .name = "oversized", .description = "x" ** 700, .path = "/skills/oversized/SKILL.md", .source = .workspace_fx },
+                .{ .name = "oversized", .description = text_utils.repeat("x", 700), .path = "/skills/oversized/SKILL.md", .source = .workspace_fx },
                 .{ .name = "three", .description = "three", .path = "/skills/three/SKILL.md", .source = .workspace_fx },
                 .{ .name = "four", .description = "four", .path = "/skills/four/SKILL.md", .source = .workspace_fx },
                 .{ .name = "five", .description = "five", .path = "/skills/five/SKILL.md", .source = .workspace_fx },
@@ -291,5 +293,5 @@ test "skill search projection releases every allocation failure" {
             result.deinit(alloc);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Case.run, .{});
 }

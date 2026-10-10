@@ -118,7 +118,7 @@ fn appendProjectedSingleLine(
 
 pub fn appendAbsoluteColumn(alloc: Allocator, out: *std.ArrayList(u8), col: u16) !void {
     var buf: [16]u8 = undefined;
-    const seq = try std.fmt.bufPrint(&buf, "\x1b[{d}G", .{col});
+    const seq = try std.mem.print(&buf, "\x1b[{d}G", .{col});
     try out.appendSlice(alloc, seq);
 }
 

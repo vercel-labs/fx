@@ -25,7 +25,7 @@ pub const FrameCommit = enum {
     reset,
 };
 
-pub const supports_resize_signal = switch (builtin.os.tag) {
+pub const supports_resize_signal = switch (builtin.target.os.tag) {
     .linux,
     .plan9,
     .illumos,

@@ -20,7 +20,7 @@ Contributions should preserve that direction:
 
 Requirements:
 
-* Zig `0.16.0+`
+* Zig `0.17.0+`
 
 * interactive terminal for manual shell testing
 

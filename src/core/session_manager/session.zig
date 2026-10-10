@@ -233,7 +233,7 @@ pub const Session = struct {
     /// Written under `mutex`, read under `sync_mutex`.
     written_seq: SeqCell = .{},
     /// A sync that failed outside `mutex`, as a `FaultCode`; `none` until then.
-    sync_fault: std.atomic.Value(u8) = .init(@intFromEnum(FaultCode.none)),
+    sync_fault: std.atomic.Value(u8) = .init(@backingInt(FaultCode.none)),
     /// Under `mutex`: the cause of the write or sync that failed the
     /// session. Every later call reports it (D40).
     fault: ?storage.IoFault = null,
@@ -406,12 +406,16 @@ pub const Session = struct {
     /// durable, then rename it into place and sync the root, so a visible
     /// session always has a durable first line (`tla/Lifecycle.tla`).
     fn publish(session: *Session, bodies: []const schema.Body, ts: u64) AppendError!void {
-        const gpa = session.env.gpa;
-        // Nothing is visible; later calls name the cause (D40).
-        errdefer |err| {
+        session.writeFirstTurn(bodies, ts) catch |err| {
+            // Nothing is visible; later calls name the cause (D40).
             session.phase = .{ .failed = null };
             if (session.fault == null) session.fault = asIoFault(err);
-        }
+            return err;
+        };
+    }
+
+    fn writeFirstTurn(session: *Session, bodies: []const schema.Body, ts: u64) AppendError!void {
+        const gpa = session.env.gpa;
 
         // Frame everything first: line 1, the held lines, then the batch.
         session.batch.clearRetainingCapacity();
@@ -567,7 +571,7 @@ pub const Session = struct {
         var tmp_name: [1 + 7 + 1 + 16 + 4]u8 = undefined;
         var suffix: [8]u8 = undefined;
         io.random(&suffix);
-        const name = std.fmt.bufPrint(&tmp_name, ".pending.{x}.tmp", .{&suffix}) catch unreachable;
+        const name = std.mem.print(&tmp_name, ".pending.{x}.tmp", .{&suffix}) catch unreachable;
         const file = s.createReadOnlyFile(dir, name) catch |io_err| return storage.ioFault(io_err);
         var file_open = true;
         defer if (file_open) s.closeFile(file);
@@ -725,7 +729,7 @@ pub const Session = struct {
         session.env.s.sync(file) catch |err| {
             const fault = storage.ioFault(err);
             // Only the first cause is kept; a later failure changes nothing.
-            _ = session.sync_fault.cmpxchgStrong(@intFromEnum(FaultCode.none), @intFromEnum(faultCode(fault)), .release, .monotonic);
+            _ = session.sync_fault.cmpxchgStrong(@backingInt(FaultCode.none), @backingInt(faultCode(fault)), .release, .monotonic);
             return fault;
         };
         session.synced_seq = target;
@@ -905,8 +909,8 @@ fn faultFromCode(code: u8) ?storage.IoFault {
 
 test "a fault code round trips every I/O fault, and none is no fault" {
     const faults = [_]storage.IoFault{ error.Io, error.NoSpaceLeft, error.AccessDenied, error.ReadOnlyFileSystem, error.FileTooBig };
-    for (faults) |fault| try std.testing.expectEqual(fault, faultFromCode(@intFromEnum(faultCode(fault))).?);
-    try std.testing.expectEqual(@as(?storage.IoFault, null), faultFromCode(@intFromEnum(FaultCode.none)));
+    for (faults) |fault| try std.testing.expectEqual(fault, faultFromCode(@backingInt(faultCode(fault))).?);
+    try std.testing.expectEqual(@as(?storage.IoFault, null), faultFromCode(@backingInt(FaultCode.none)));
 }
 
 fn hasBlobRefs(bodies: []const schema.Body) bool {
@@ -2217,7 +2221,7 @@ const session_tests = struct {
         var value_buffer: [32]u8 = undefined;
         for (0..60) |turn| {
             _ = try s.append(&.{ .turn_started, item, item });
-            const value = try std.fmt.bufPrint(&value_buffer, "{{\"model\":\"m{d}\"}}", .{turn});
+            const value = try std.mem.print(&value_buffer, "{{\"model\":\"m{d}\"}}", .{turn});
             _ = try s.append(&.{.{ .set = .{ .key = .prefs, .value = value } }});
             if (random.boolean()) {
                 _ = try s.append(&.{.turn_committed});
@@ -2407,7 +2411,7 @@ const session_tests = struct {
         const dir = try t.env.s.openDir(t.env.root, id);
         defer t.env.s.closeDir(dir);
         var path_buffer: [300]u8 = undefined;
-        const path = try std.fmt.bufPrint(&path_buffer, "{s}/log.jsonl", .{id});
+        const path = try std.mem.print(&path_buffer, "{s}/log.jsonl", .{id});
         const bytes = try t.tmp.dir.readFileAlloc(io, path, gpa, .limited(1 << 20));
         defer gpa.free(bytes);
         const line2 = std.mem.findScalar(u8, bytes, '\n').? + 1;
@@ -2564,7 +2568,7 @@ const session_tests = struct {
         t.init(.{ .snapshot_every_bytes = 256 });
         defer t.deinit();
         const s = try newRoot(&t);
-        const big: fold.Event = .{ .item = .{ .type = "assistant", .data = "{\"text\":\"" ++ "x" ** 200 ++ "\"}" } };
+        const big: fold.Event = .{ .item = .{ .type = "assistant", .data = "{\"text\":\"" ++ &@as([200]u8, @splat('x')) ++ "\"}" } };
         _ = try s.append(&.{ .turn_started, big, .turn_committed });
         _ = try s.append(&.{ .turn_started, .{ .compacted = "{}" }, big, .turn_committed });
         _ = try s.append(&.{ .turn_started, big, .turn_committed });
@@ -2627,7 +2631,7 @@ const session_tests = struct {
         defer gpa.free(source.id);
         // Damage the item of turn 3 (line 9).
         var path_buffer: [300]u8 = undefined;
-        const path = try std.fmt.bufPrint(&path_buffer, "{s}/log.jsonl", .{source.id});
+        const path = try std.mem.print(&path_buffer, "{s}/log.jsonl", .{source.id});
         const bytes = try t.tmp.dir.readFileAlloc(io, path, gpa, .limited(1 << 20));
         defer gpa.free(bytes);
         var line_start: usize = 0;
@@ -2765,9 +2769,9 @@ const session_model_tests = struct {
 
     fn readLog(root: Io.Dir, id: []const u8) !?[]u8 {
         var path: [300]u8 = undefined;
-        const visible = try std.fmt.bufPrint(&path, "{s}/log.jsonl", .{id});
+        const visible = try std.mem.print(&path, "{s}/log.jsonl", .{id});
         if (root.readFileAlloc(io, visible, gpa, .limited(8 << 20))) |bytes| return bytes else |_| {}
-        const staged = try std.fmt.bufPrint(&path, ".tmp/{s}/log.jsonl", .{id});
+        const staged = try std.mem.print(&path, ".tmp/{s}/log.jsonl", .{id});
         if (root.readFileAlloc(io, staged, gpa, .limited(8 << 20))) |bytes| return bytes else |_| {}
         return null;
     }
@@ -2924,7 +2928,7 @@ const session_model_tests = struct {
             const id = t.ids[i] orelse return "none";
             var path: [300]u8 = undefined;
             if (exists(t.root, id)) return "visible";
-            if (exists(t.root, std.fmt.bufPrint(&path, ".tmp/{s}", .{id}) catch return "none")) return "tmp";
+            if (exists(t.root, std.mem.print(&path, ".tmp/{s}", .{id}) catch return "none")) return "tmp";
             return "none";
         }
 
@@ -2933,7 +2937,7 @@ const session_model_tests = struct {
             const folder = t.where(i);
             if (std.mem.eql(u8, folder, "none")) return "none";
             var path: [300]u8 = undefined;
-            const dir_path = if (std.mem.eql(u8, folder, "visible")) id else std.fmt.bufPrint(&path, ".tmp/{s}", .{id}) catch return "none";
+            const dir_path = if (std.mem.eql(u8, folder, "visible")) id else std.mem.print(&path, ".tmp/{s}", .{id}) catch return "none";
             var dir = t.root.openDir(io, dir_path, .{}) catch return "none";
             defer dir.close(io);
             const bytes = dir.readFileAlloc(io, "log.jsonl", gpa, .limited(1 << 20)) catch return "none";
@@ -3489,7 +3493,7 @@ const session_model_tests = struct {
         fn folder(t: *ForkTracer, buffer: []u8, i: usize) ?[]const u8 {
             const id = t.ids[i] orelse return null;
             if (exists(t.root, id)) return id;
-            const staged = std.fmt.bufPrint(buffer, ".tmp/{s}", .{id}) catch return null;
+            const staged = std.mem.print(buffer, ".tmp/{s}", .{id}) catch return null;
             return if (exists(t.root, staged)) staged else null;
         }
 
@@ -3777,7 +3781,7 @@ const session_model_tests = struct {
             var path: [300]u8 = undefined;
             var has_log: [2]bool = .{ false, false };
             for (t.children, 0..) |maybe, i| if (maybe) |child| {
-                has_log[i] = exists(t.root, std.fmt.bufPrint(&path, "{s}/log.jsonl", .{child}) catch continue);
+                has_log[i] = exists(t.root, std.mem.print(&path, "{s}/log.jsonl", .{child}) catch continue);
             };
             const Bools = struct { c1: bool, c2: bool };
             const Names = struct { c1: []const u8, c2: []const u8 };

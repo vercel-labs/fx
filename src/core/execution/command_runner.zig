@@ -76,8 +76,8 @@ pub const termination_settle_timeout_ms: i64 = 5_000;
 pub const supports_foreground_session = builtin.link_libc and
     std.process.can_spawn and
     std.process.can_replace and
-    builtin.os.tag != .windows and
-    builtin.os.tag != .wasi;
+    builtin.target.os.tag != .windows and
+    builtin.target.os.tag != .wasi;
 const foreground_session_token = "__fx_foreground_session__";
 const foreground_session_ready_byte: u8 = 0x1e;
 const foreground_session_release_byte: u8 = 0x06;
@@ -104,11 +104,11 @@ const ForegroundSessionTerminationRequest = enum(std.c.sig_atomic_t) {
     force,
 };
 var foreground_session_termination_request: std.c.sig_atomic_t =
-    @intFromEnum(ForegroundSessionTerminationRequest.none);
+    @backingInt(ForegroundSessionTerminationRequest.none);
 const foreground_session_replace_error_name_bytes = blk: {
     var max_len: usize = 0;
-    for (std.meta.fields(std.process.ReplaceError)) |field| {
-        max_len = @max(max_len, field.name.len);
+    for (@typeInfo(std.process.ReplaceError).error_set.error_names.?) |error_name| {
+        max_len = @max(max_len, error_name.len);
     }
     break :blk max_len;
 };
@@ -187,7 +187,7 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
     };
 
     @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_request).* =
-        @intFromEnum(ForegroundSessionTerminationRequest.none);
+        @backingInt(ForegroundSessionTerminationRequest.none);
     const supervisor_action: std.posix.Sigaction = .{
         .handler = .{ .handler = recordForegroundSessionTermination },
         .mask = foregroundSupervisorSignalMask(),
@@ -195,11 +195,11 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
     };
     std.posix.sigaction(std.posix.SIG.TERM, &supervisor_action, null);
     std.posix.sigaction(foreground_session_force_signal, &supervisor_action, null);
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.target.os.tag == .linux) {
         _ = try std.posix.prctl(.SET_CHILD_SUBREAPER, .{@as(usize, 1)});
     }
     var process_witness: ?process_tree.DarwinProcessWitness =
-        if (comptime builtin.os.tag == .macos)
+        if (comptime builtin.target.os.tag == .macos)
             try .init()
         else
             null;
@@ -209,9 +209,9 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
         .stdin = .pipe,
         .stdout = .inherit,
         .stderr = .inherit,
-        .start_suspended = builtin.os.tag == .macos,
+        .start_suspended = builtin.target.os.tag == .macos,
     };
-    var target = (if (comptime builtin.os.tag == .macos)
+    var target = (if (comptime builtin.target.os.tag == .macos)
         darwin_process_spawn.spawn_inheriting_fd(
             zio,
             spawn_options,
@@ -293,8 +293,8 @@ fn writeForegroundTargetScript(target_input: std.Io.File, script: []const u8) vo
 
 fn recordForegroundSessionTermination(signal: std.posix.SIG) callconv(.c) void {
     const request = @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_request);
-    request.* = @intFromEnum(mergeForegroundSessionTerminationRequest(
-        @enumFromInt(request.*),
+    request.* = @backingInt(mergeForegroundSessionTerminationRequest(
+        @fromBackingInt(@intCast(request.*)),
         signal,
     ));
 }
@@ -316,9 +316,9 @@ fn mergeForegroundSessionTerminationRequest(
 }
 
 fn foregroundSessionTerminationRequest() ForegroundSessionTerminationRequest {
-    return @enumFromInt(
+    return @fromBackingInt(@intCast(
         @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_request).*,
-    );
+    ));
 }
 
 const ForegroundTerminationAction = enum {
@@ -433,7 +433,7 @@ fn waitForForegroundTarget(
     if (process_witness) |witness| {
         descendants.bindProcessWitness(witness);
     }
-    if (comptime builtin.os.tag == .macos) {
+    if (comptime builtin.target.os.tag == .macos) {
         try descendants.refresh(target_pid);
         try std.posix.kill(target_pid, std.posix.SIG.CONT);
     }
@@ -463,7 +463,7 @@ fn waitForForegroundTarget(
         );
         if (request == .force) {
             @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_request).* =
-                @intFromEnum(ForegroundSessionTerminationRequest.force);
+                @backingInt(ForegroundSessionTerminationRequest.force);
         }
         try refreshForegroundTargetTree(&descendants, target_pid);
         advanceForegroundTargetTermination(
@@ -564,10 +564,10 @@ fn refreshForegroundTargetTree(
     target_pid: std.posix.pid_t,
 ) !void {
     try descendants.refresh(target_pid);
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.target.os.tag == .linux) {
         try descendants.refreshAdditionalRoot(std.c.getpid());
     }
-    if (comptime builtin.os.tag == .macos) {
+    if (comptime builtin.target.os.tag == .macos) {
         if (foregroundSessionTerminationRequest() != .none) {
             try descendants.refreshLineageProcesses();
         }
@@ -659,7 +659,7 @@ fn writeForegroundSessionReplaceFailure(
     err: anyerror,
 ) void {
     var buffer: [256]u8 = undefined;
-    const message = std.fmt.bufPrint(
+    const message = std.mem.print(
         &buffer,
         foreground_session_replace_failure_prefix ++ "{s}:{s}\n",
         .{ nonce, @errorName(err) },
@@ -683,7 +683,7 @@ fn exitForegroundSessionSupervisor(term: std.process.Child.Term) noreturn {
             std.posix.sigaddset(&signal_mask, signal);
             std.posix.sigprocmask(std.posix.SIG.UNBLOCK, &signal_mask, null);
             std.posix.raise(signal) catch {};
-            std.process.exit(128 + @as(u8, @truncate(@intFromEnum(signal))));
+            std.process.exit(128 + @as(u8, @truncate(@backingInt(signal))));
         },
         .stopped, .unknown => std.process.exit(127),
     }
@@ -979,7 +979,7 @@ const StreamPreview = struct {
         if (self.tail.items.len + bytes.len > self.tail_limit) {
             const drop = self.tail.items.len + bytes.len - self.tail_limit;
             const keep = self.tail.items.len - drop;
-            std.mem.copyForwards(u8, self.tail.items[0..keep], self.tail.items[drop..]);
+            @memmove(self.tail.items[0..keep], self.tail.items[drop..]);
             self.tail.items.len = keep;
         }
         try self.tail.appendSlice(alloc, bytes);
@@ -1062,7 +1062,7 @@ const CommandArtifact = struct {
         var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
         var hasher = self.output_hasher;
         hasher.final(&digest);
-        const source_handle = std.fs.path.basename(self.output_file);
+        const source_handle = std.Io.Dir.path.basename(self.output_file);
         const target_handle = try artifact_digest.contentAddressedHandle(
             alloc,
             source_handle,
@@ -1070,9 +1070,9 @@ const CommandArtifact = struct {
             digest,
         );
         defer alloc.free(target_handle);
-        const parent = std.fs.path.dirname(self.output_file) orelse
+        const parent = std.Io.Dir.path.dirname(self.output_file) orelse
             return error.InvalidCommandArtifactPath;
-        const target_path = try std.fs.path.join(
+        const target_path = try std.Io.Dir.path.join(
             alloc,
             &.{ parent, target_handle },
         );
@@ -1274,7 +1274,7 @@ fn executeProcessWithInput(
         .stdout = .pipe,
         .stderr = .pipe,
         .cwd = .{ .path = cwd },
-        .pgid = if (isolate_process_group and builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
+        .pgid = if (isolate_process_group and builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) 0 else null,
     });
     if (child.stdin) |input| {
         input.close(io_mod.getIo());
@@ -1288,7 +1288,7 @@ fn executeProcessWithInput(
     errdefer if (child_needs_cleanup) cleanupChild(&child);
 
     const process_group_id = if (isolate_process_group and
-        builtin.os.tag != .windows and builtin.os.tag != .wasi)
+        builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi)
         child.id
     else
         null;
@@ -1377,7 +1377,7 @@ fn executeProcessWithDetachedSession(
     const deadline_ms = ExecutionControl.init(cfg).deadlineMs();
     const supervisor_deadline_ms = foreground_supervisor_fallback_deadline_ms(deadline_ms);
     const deadline_text = if (supervisor_deadline_ms) |value|
-        try std.fmt.allocPrint(scratch, "{d}", .{value})
+        try scratch.print("{d}", .{value})
     else
         "none";
     try helper_argv.append(scratch, deadline_text);
@@ -1503,11 +1503,6 @@ pub fn spawnDetachedSession(
 }
 
 fn foregroundSessionExecutable(scratch: Allocator) ![]const u8 {
-    if (comptime builtin.is_test) {
-        const path_z = std.c.getenv("FX_TEST_PRODUCT_EXE") orelse
-            return error.TestProductExecutableMissing;
-        return std.mem.sliceTo(path_z, 0);
-    }
     return self_exe.pathForReexec(scratch);
 }
 
@@ -1612,7 +1607,7 @@ fn executeProcessWithScriptUnisolated(
         .stdout = .pipe,
         .stderr = .pipe,
         .cwd = .{ .path = cwd },
-        .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
+        .pgid = if (builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) 0 else null,
         .environ_map = environ_map,
     });
 
@@ -1683,8 +1678,7 @@ fn createManagedCommandArtifact(
     alloc: Allocator,
     capability: *session_child_store.SessionChildCapability,
 ) !CommandArtifact {
-    const stem = try std.fmt.allocPrint(
-        alloc,
+    const stem = try alloc.print(
         "{s}{d}-{d}",
         .{
             command_artifact_file_prefix,
@@ -1760,8 +1754,7 @@ fn createManagedCommandArtifact(
 fn createCommandArtifactInDir(alloc: Allocator, dir: []const u8) !CommandArtifact {
     try config_runtime.makeAbsolutePath(dir);
 
-    const stem = try std.fmt.allocPrint(
-        alloc,
+    const stem = try alloc.print(
         "{s}{d}-{d}",
         .{ command_artifact_file_prefix, io_mod.milliTimestamp(), io_mod.nanoTimestamp() },
     );
@@ -1797,20 +1790,20 @@ fn artifactName(
     stem: []const u8,
     suffix: []const u8,
 ) ![]u8 {
-    return std.fmt.allocPrint(alloc, "{s}{s}", .{ stem, suffix });
+    return alloc.print("{s}{s}", .{ stem, suffix });
 }
 
 fn artifactPath(alloc: Allocator, dir: []const u8, stem: []const u8, suffix: []const u8) ![]u8 {
-    const name = try std.fmt.allocPrint(alloc, "{s}{s}", .{ stem, suffix });
+    const name = try alloc.print("{s}{s}", .{ stem, suffix });
     defer alloc.free(name);
-    return std.fs.path.join(alloc, &.{ dir, name });
+    return std.Io.Dir.path.join(alloc, &.{ dir, name });
 }
 
 fn fallbackCommandArtifactDir(alloc: Allocator) ![]u8 {
     const temp_root = io_mod.getenv("TMPDIR") orelse "/tmp";
-    const pid_text = try std.fmt.allocPrint(alloc, "{d}", .{currentProcessId()});
+    const pid_text = try alloc.print("{d}", .{currentProcessId()});
     defer alloc.free(pid_text);
-    return std.fs.path.join(alloc, &.{ temp_root, command_artifact_fallback_dir_name, pid_text });
+    return std.Io.Dir.path.join(alloc, &.{ temp_root, command_artifact_fallback_dir_name, pid_text });
 }
 
 fn currentProcessId() u64 {
@@ -1846,7 +1839,7 @@ fn executeRawBashWithResultCommand(
     result_command: []const u8,
     cwd: []const u8,
 ) !command_contract.RunCommandResult {
-    if (builtin.os.tag == .windows) {
+    if (builtin.target.os.tag == .windows) {
         const argv = [_][]const u8{ "cmd", "/C", execution_command };
         const result = try executeProcess(scratch, cfg, &argv, cwd);
         return formatCollectedOutput(alloc, result_command, cwd, result);
@@ -1876,7 +1869,7 @@ fn executeRawInvocation(
     cwd: []const u8,
     invocation: *const shell_resolver.Invocation,
 ) !command_contract.RunCommandResult {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         return error.InvalidCommandEnvironment;
     }
     const result = try executeProcessWithScript(
@@ -1891,7 +1884,7 @@ fn executeRawInvocation(
 }
 
 test "explicit captured profiles execute exact shells without synthetic stderr" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
     std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/bash", .{}) catch
         return error.SkipZigTest;
     const shell_path = "/bin/bash";
@@ -1941,7 +1934,7 @@ test "explicit captured profiles execute exact shells without synthetic stderr" 
 }
 
 test "zsh user profile reports natural SIGTERM after alias-safe startup" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
     std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
         return error.SkipZigTest;
 
@@ -1958,8 +1951,8 @@ test "zsh user profile reports natural SIGTERM after alias-safe startup" {
     const home = try io_mod.dirRealpathAlloc(arena, tmp.dir, "home");
     const workspace = try io_mod.dirRealpathAlloc(arena, tmp.dir, "workspace");
     const wrapper_dir = try io_mod.dirRealpathAlloc(arena, tmp.dir, "wrapper");
-    const wrapper_path = try std.fs.path.join(arena, &.{ wrapper_dir, "zsh" });
-    const debug_log = try std.fs.path.join(arena, &.{ workspace, "debug.log" });
+    const wrapper_path = try std.Io.Dir.path.join(arena, &.{ wrapper_dir, "zsh" });
+    const debug_log = try std.Io.Dir.path.join(arena, &.{ workspace, "debug.log" });
     const quoted_home = try shellQuote(arena, home);
     const quoted_debug_log = try shellQuote(arena, debug_log);
 
@@ -1983,8 +1976,7 @@ test "zsh user profile reports natural SIGTERM after alias-safe startup" {
             .{ .truncate = true },
         );
         defer wrapper.close(io_mod.getIo());
-        const source = try std.fmt.allocPrint(
-            arena,
+        const source = try arena.print(
             "#!/bin/sh\nexport HOME={s}\nexport ZDOTDIR={s}\nexport FX_SIGTERM_DEBUG_LOG={s}\nexec /bin/zsh \"$@\"\n",
             .{ quoted_home, quoted_home, quoted_debug_log },
         );
@@ -2006,7 +1998,7 @@ test "zsh user profile reports natural SIGTERM after alias-safe startup" {
     try std.testing.expect(std.mem.startsWith(u8, signaled.output, "signal=15\n"));
     const foreground = signaled.command_result.?;
     try std.testing.expectEqual(@as(?i64, null), foreground.exit_code);
-    try std.testing.expectEqual(@as(?u32, @intFromEnum(std.posix.SIG.TERM)), foreground.signal);
+    try std.testing.expectEqual(@as(?u32, @backingInt(std.posix.SIG.TERM)), foreground.signal);
 
     // The startup files ran once into the snapshot. The aliased `builtin`
     // could not intercept the alias-safe `\builtin eval` that runs the
@@ -2052,14 +2044,13 @@ fn writeSnapshotTestShellFor(
     const home = try io_mod.dirRealpathAlloc(arena, tmp.dir, "home");
     const workspace = try io_mod.dirRealpathAlloc(arena, tmp.dir, "workspace");
     const wrapper_dir = try io_mod.dirRealpathAlloc(arena, tmp.dir, "wrapper");
-    const rc_path = try std.fs.path.join(arena, &.{ "home", rc_name });
+    const rc_path = try std.Io.Dir.path.join(arena, &.{ "home", rc_name });
     try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = rc_path, .data = rc });
-    const source = try std.fmt.allocPrint(
-        arena,
+    const source = try arena.print(
         "#!/bin/sh\nexport HOME={s}\nexport ZDOTDIR={s}\nexec /bin/{s} \"$@\"\n",
         .{ try shellQuote(arena, home), try shellQuote(arena, home), shell_name },
     );
-    const wrapper_path = try std.fs.path.join(arena, &.{ "wrapper", shell_name });
+    const wrapper_path = try std.Io.Dir.path.join(arena, &.{ "wrapper", shell_name });
     var wrapper = try tmp.dir.createFile(io_mod.getIo(), wrapper_path, .{ .truncate = true });
     defer wrapper.close(io_mod.getIo());
     try wrapper.writeStreamingAll(io_mod.getIo(), source);
@@ -2067,7 +2058,7 @@ fn writeSnapshotTestShellFor(
     return .{
         .home = home,
         .workspace = workspace,
-        .shell = try std.fs.path.join(arena, &.{ wrapper_dir, shell_name }),
+        .shell = try std.Io.Dir.path.join(arena, &.{ wrapper_dir, shell_name }),
     };
 }
 
@@ -2115,11 +2106,11 @@ test "bash user profile commands reuse one startup-file snapshot" {
         paths.workspace,
         .{ .user = paths.shell },
     );
-    const expected_pwd = try std.fmt.allocPrint(arena, "pwd={s} leak=unset", .{paths.workspace});
+    const expected_pwd = try arena.print("pwd={s} leak=unset", .{paths.workspace});
     try std.testing.expect(std.mem.find(u8, third.output, expected_pwd) != null);
     try std.testing.expectEqual(@as(?i64, 7), third.command_result.?.exit_code);
 
-    const loads_path = try std.fs.path.join(arena, &.{ paths.home, "rc-loads.log" });
+    const loads_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "rc-loads.log" });
     try std.testing.expectEqualStrings("loaded\n", try readAbsoluteFile(arena, loads_path, 4096));
 }
 
@@ -2176,12 +2167,12 @@ test "user profile commands reuse one startup-file snapshot" {
         paths.workspace,
         .{ .user = paths.shell },
     );
-    const expected_pwd = try std.fmt.allocPrint(arena, "pwd={s} leak=unset", .{paths.workspace});
+    const expected_pwd = try arena.print("pwd={s} leak=unset", .{paths.workspace});
     try std.testing.expect(std.mem.find(u8, third.output, expected_pwd) != null);
     try std.testing.expect(std.mem.find(u8, third.output, "alias-unset") != null);
     try std.testing.expectEqual(@as(?i64, 7), third.command_result.?.exit_code);
 
-    const loads_path = try std.fs.path.join(arena, &.{ paths.home, "rc-loads.log" });
+    const loads_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "rc-loads.log" });
     const loads = try readAbsoluteFile(arena, loads_path, 4096);
     try std.testing.expectEqualStrings("loaded\n", loads);
 }
@@ -2199,8 +2190,8 @@ test "user profile command with an approval from an earlier shell epoch does not
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const paths = try writeSnapshotTestShell(arena, &tmp, "alias fxsnap_alias='print -r -- alias-ok'\n");
-    const marker_path = try std.fs.path.join(arena, &.{ paths.workspace, "ran.log" });
-    const command = try std.fmt.allocPrint(arena, "print -r -- ran >> {s}", .{try shellQuote(arena, marker_path)});
+    const marker_path = try std.Io.Dir.path.join(arena, &.{ paths.workspace, "ran.log" });
+    const command = try arena.print("print -r -- ran >> {s}", .{try shellQuote(arena, marker_path)});
 
     // The grant was checked under epoch 0; a refresh moved the shell to 1.
     shell_snapshot.processOwner().markDirty(.user_reload);
@@ -2257,8 +2248,8 @@ test "user profile command reruns once with full startup after a failed replay" 
         &tmp,
         "print -r -- loaded >> \"$HOME/rc-loads.log\"\n",
     );
-    const marker_path = try std.fs.path.join(arena, &.{ paths.workspace, "runs.log" });
-    const command = try std.fmt.allocPrint(arena, "print -r -- ran >> {s}; print -r -- done", .{try shellQuote(arena, marker_path)});
+    const marker_path = try std.Io.Dir.path.join(arena, &.{ paths.workspace, "runs.log" });
+    const command = try arena.print("print -r -- ran >> {s}; print -r -- done", .{try shellQuote(arena, marker_path)});
     const config = Config{ .max_command_output_bytes = 16 * 1024 };
 
     const result = try executeCommandInEnvironment(config, arena, command, paths.workspace, .{ .user = paths.shell });
@@ -2270,7 +2261,7 @@ test "user profile command reruns once with full startup after a failed replay" 
     // Later commands fall back to full startup without retrying the replay.
     _ = try executeCommandInEnvironment(config, arena, command, paths.workspace, .{ .user = paths.shell });
     try std.testing.expectEqualStrings("ran\nran\n", try readAbsoluteFile(arena, marker_path, 4096));
-    const loads_path = try std.fs.path.join(arena, &.{ paths.home, "rc-loads.log" });
+    const loads_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "rc-loads.log" });
     try std.testing.expectEqualStrings("loaded\nloaded\n", try readAbsoluteFile(arena, loads_path, 4096));
     var notice_buffer: [256]u8 = undefined;
     const notice = shell_snapshot.processOwner().takeUiNotice(&notice_buffer).?;
@@ -2316,7 +2307,7 @@ fn formatOutputWithStatus(
 fn commandStatusFromTerm(term: std.process.Child.Term) command_contract.CommandStatus {
     return switch (term) {
         .exited => |code| .{ .exit_code = @intCast(code) },
-        .signal => |sig| .{ .signal = @intFromEnum(sig) },
+        .signal => |sig| .{ .signal = @backingInt(sig) },
         .stopped, .unknown => .indeterminate,
     };
 }
@@ -2562,7 +2553,7 @@ const OutputChunkEmitter = struct {
         }
         if (line_start > 0) {
             const remaining = pending.items.len - line_start;
-            std.mem.copyForwards(u8, pending.items[0..remaining], pending.items[line_start..]);
+            @memmove(pending.items[0..remaining], pending.items[line_start..]);
             pending.items.len = remaining;
         }
         // The final flush always delivers the last partial line. It is one
@@ -2726,9 +2717,9 @@ const ForegroundLaunchFailureProbe = struct {
 };
 
 fn parseReplaceError(name: []const u8) ?std.process.ReplaceError {
-    inline for (std.meta.fields(std.process.ReplaceError)) |field| {
-        if (std.mem.eql(u8, name, field.name)) {
-            return @field(std.process.ReplaceError, field.name);
+    inline for (comptime @typeInfo(std.process.ReplaceError).error_set.error_names.?) |error_name| {
+        if (std.mem.eql(u8, name, error_name)) {
+            return @field(std.process.ReplaceError, error_name);
         }
     }
     return null;
@@ -2745,8 +2736,8 @@ const ProcessObserver = struct {
         const process_id = child.id orelse return error.SpawnFailed;
         const stdout = child.stdout orelse return error.SpawnFailed;
         const stderr = child.stderr orelse return error.SpawnFailed;
-        const detached_pipes = comptime builtin.os.tag != .windows and
-            builtin.os.tag != .wasi;
+        const detached_pipes = comptime builtin.target.os.tag != .windows and
+            builtin.target.os.tag != .wasi;
         if (detached_pipes) {
             child.stdout = null;
             child.stderr = null;
@@ -2769,12 +2760,12 @@ const ProcessObserver = struct {
     }
 
     fn start(self: *ProcessObserver) !void {
-        if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+        if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
         try self.waiter.start();
     }
 
     fn observe(self: *ProcessObserver) ?command_contract.CommandStatus {
-        if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return null;
+        if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return null;
         if (!self.waiter.isReady()) return null;
         const term = self.waiter.awaitReady() catch |err| {
             return indeterminateStatus(err);
@@ -2786,7 +2777,7 @@ const ProcessObserver = struct {
         self: *ProcessObserver,
         source: TerminationSource,
     ) !command_contract.CommandStatus {
-        if (comptime builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        if (comptime builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) {
             self.waiter.awaitDiscard();
             return self.observe().?;
         }
@@ -2846,7 +2837,7 @@ const ProcessObserver = struct {
         protocol: TerminationProtocol,
         intent: TerminationIntent,
     ) !void {
-        if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
             self.waiter.child.kill(self.waiter.io);
             return;
         }
@@ -2859,7 +2850,7 @@ const ProcessObserver = struct {
     }
 
     fn abort(self: *ProcessObserver, process_group_id: ?std.posix.pid_t) void {
-        if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
             cleanupChild(self.waiter.child);
             return;
         }
@@ -3232,7 +3223,7 @@ fn waitForCollectedProcess(
     leader_status: ?command_contract.CommandStatus,
 ) !command_contract.CommandStatus {
     if (leader_status) |status| {
-        if (comptime builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        if (comptime builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) {
             observer.waiter.awaitDiscard();
         }
         return status;
@@ -3454,9 +3445,9 @@ fn terminateRemainingProcessGroup(pid: std.posix.pid_t) void {
 }
 
 fn remainingProcessGroupAlive(process_group_id: ?std.posix.pid_t) bool {
-    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return false;
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return false;
     const pid = process_group_id orelse return false;
-    std.posix.kill(-pid, @enumFromInt(0)) catch |err| return switch (err) {
+    std.posix.kill(-pid, @fromBackingInt(@intCast(0))) catch |err| return switch (err) {
         error.ProcessNotFound => false,
         else => true,
     };
@@ -3468,7 +3459,7 @@ fn cleanupChild(child: *std.process.Child) void {
         closeChildPipes(child);
         return;
     }
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         child.kill(io_mod.getIo());
         return;
     }
@@ -3561,11 +3552,11 @@ test "authorized command executes exactly once" {
     defer tmp.cleanup();
     const cwd = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(cwd);
-    const marker = try std.fs.path.join(alloc, &.{ cwd, "attempts" });
+    const marker = try std.Io.Dir.path.join(alloc, &.{ cwd, "attempts" });
     defer alloc.free(marker);
     const quoted_marker = try shellQuote(alloc, marker);
     defer alloc.free(quoted_marker);
-    const command = try std.fmt.allocPrint(alloc, "printf x >> {s}", .{quoted_marker});
+    const command = try alloc.print("printf x >> {s}", .{quoted_marker});
     defer alloc.free(command);
 
     const result = try executeCommand(.{
@@ -3583,6 +3574,7 @@ fn spawnForegroundSessionBootstrapForTest(
     target_script: []const u8,
 ) !std.process.Child {
     const product_path = try foregroundSessionExecutable(std.testing.allocator);
+    defer std.testing.allocator.free(product_path);
     const argv = [_][]const u8{
         product_path,
         foreground_session_token,
@@ -3635,11 +3627,11 @@ fn expectRejectedForegroundSessionReleaseForTest(release: ?u8) !void {
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const marker_path = try std.fs.path.join(alloc, &.{ workspace, "rejected-release-target.txt" });
+    const marker_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "rejected-release-target.txt" });
     defer alloc.free(marker_path);
     const quoted_marker = try shellQuote(alloc, marker_path);
     defer alloc.free(quoted_marker);
-    const target_script = try std.fmt.allocPrint(alloc, "printf unexpected > {s}", .{quoted_marker});
+    const target_script = try alloc.print("printf unexpected > {s}", .{quoted_marker});
     defer alloc.free(target_script);
 
     var child = try spawnForegroundSessionBootstrapForTest(workspace, target_script);
@@ -3668,13 +3660,13 @@ fn spawnUnreadyForegroundSessionChildForTest(argv: []const []const u8) !std.proc
 
 fn expectReapedChildForTest(child: *std.process.Child, pid: std.posix.pid_t) !void {
     try std.testing.expect(child.id == null);
-    try std.testing.expectError(error.ProcessNotFound, std.posix.kill(pid, @enumFromInt(0)));
+    try std.testing.expectError(error.ProcessNotFound, std.posix.kill(pid, @fromBackingInt(@intCast(0))));
 }
 
 fn expectProcessGoneWithinForTest(pid: std.posix.pid_t, timeout_ms: i64) !void {
     const deadline_ms = io_mod.milliTimestamp() + timeout_ms;
     while (io_mod.milliTimestamp() < deadline_ms) {
-        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
+        std.posix.kill(pid, @fromBackingInt(@intCast(0))) catch |err| switch (err) {
             error.ProcessNotFound => return,
             else => return err,
         };
@@ -3684,7 +3676,7 @@ fn expectProcessGoneWithinForTest(pid: std.posix.pid_t, timeout_ms: i64) !void {
 }
 
 test "captured foreground command runs beneath a detached session supervisor" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const command =
         "exec python3 -c 'import os,sys; " ++
@@ -3707,11 +3699,11 @@ test "foreground session bootstrap waits for release before executing target" {
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const marker_path = try std.fs.path.join(alloc, &.{ workspace, "released-target.txt" });
+    const marker_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "released-target.txt" });
     defer alloc.free(marker_path);
     const quoted_marker = try shellQuote(alloc, marker_path);
     defer alloc.free(quoted_marker);
-    const target_script = try std.fmt.allocPrint(alloc, "printf released > {s}", .{quoted_marker});
+    const target_script = try alloc.print("printf released > {s}", .{quoted_marker});
     defer alloc.free(target_script);
     var child = try spawnForegroundSessionBootstrapForTest(workspace, target_script);
     defer child.kill(io_mod.getIo());
@@ -3742,17 +3734,16 @@ test "foreground session owner loss kills the target and descendant before delay
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pids_path = try std.fs.path.join(alloc, &.{ workspace, "owner-loss.pids" });
+    const pids_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "owner-loss.pids" });
     defer alloc.free(pids_path);
-    const effect_path = try std.fs.path.join(alloc, &.{ workspace, "owner-loss.finished" });
+    const effect_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "owner-loss.finished" });
     defer alloc.free(effect_path);
     const quoted_pids = try shellQuote(alloc, pids_path);
     defer alloc.free(quoted_pids);
     const quoted_effect = try shellQuote(alloc, effect_path);
     defer alloc.free(quoted_effect);
     // Keep a write window open, but publish readiness only after the PID record is complete.
-    const target_script = try std.fmt.allocPrint(
-        alloc,
+    const target_script = try alloc.print(
         "sleep 30 & child=$!; (sleep 0.05; printf '%s %s' \"$$\" \"$child\") > {s}.pending && mv {s}.pending {s}; sleep 3; printf FINISHED > {s}",
         .{ quoted_pids, quoted_pids, quoted_pids, quoted_effect },
     );
@@ -3846,14 +3837,13 @@ test "target replacement marker prefix remains ordinary stderr" {
 }
 
 test "target cannot recover replacement nonce from supervisor" {
-    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return error.SkipZigTest;
 
-    const token_probe = if (builtin.os.tag == .linux)
+    const token_probe = if (builtin.target.os.tag == .linux)
         "tr '\\000' '\\n' < /proc/$PPID/cmdline | grep -E '^[0-9a-f]{32}$' | head -1"
     else
         "ps -ww -p $PPID -o command= | grep -Eo '[0-9a-f]{32}' | head -1";
-    const command = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const command = try std.testing.allocator.print(
         "token=$({s}); printf '\\000FX_FOREGROUND_EXEC_FAILED:%s:FileNotFound\\n' \"$token\" >&2; exit 125",
         .{token_probe},
     );
@@ -4011,7 +4001,7 @@ test "detached session preserves replacement failure with a zero output budget" 
 }
 
 test "raw process execution transports long scripts without exposing stdin" {
-    if (builtin.os.tag == .windows) return;
+    if (builtin.target.os.tag == .windows) return;
 
     const alloc = std.testing.allocator;
     var script: std.ArrayList(u8) = .empty;
@@ -4144,7 +4134,7 @@ test "managed command artifact confirms an indeterminate rename target" {
         "session",
     );
     defer alloc.free(session_path);
-    const commands = try std.fs.path.join(
+    const commands = try std.Io.Dir.path.join(
         alloc,
         &.{ session_path, "logs", "commands" },
     );
@@ -4184,7 +4174,7 @@ test "managed command artifact confirms an indeterminate rename target" {
     try std.testing.expectEqual(@as(usize, 3), entries.names.len);
     const output_path = metadataField(result.output, "output_file=").?;
     try std.testing.expect(std.mem.startsWith(u8, output_path, commands));
-    const output_handle = std.fs.path.basename(output_path);
+    const output_handle = std.Io.Dir.path.basename(output_path);
     try std.testing.expect(!capability.hasIndeterminateEntry(
         .command_artifacts,
         output_handle,
@@ -4391,7 +4381,7 @@ test "line buffered streaming preserves stderr stream and tail" {
 }
 
 test "multi-reader stream failure marks output incomplete" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const failed_pipe = try std.Io.Threaded.pipe2(.{});
     const clean_pipe = try std.Io.Threaded.pipe2(.{});
@@ -4434,7 +4424,7 @@ test "multi-reader stream failure marks output incomplete" {
 }
 
 test "presentation failure preserves the complete command result" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     var trigger = FailOutput{};
     const result = try executeCommand(.{
@@ -4450,7 +4440,7 @@ test "presentation failure preserves the complete command result" {
 }
 
 test "raw callback projection preserves bytes without changing command result" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     var safe_capture = StreamCapture{ .alloc = std.testing.allocator };
     defer safe_capture.deinit();
@@ -4512,7 +4502,7 @@ test "accepted callbacks preserve repeated newline-free stream order" {
 }
 
 test "cancellation requested by a failing output callback dominates its error" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     var cancel = std.atomic.Value(bool).init(false);
     var trigger = FailOutput{ .cancel_flag = &cancel };
@@ -4527,7 +4517,7 @@ test "cancellation requested by a failing output callback dominates its error" {
 }
 
 test "cancellation preserves the termination grace beneath the session supervisor" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     var cancel = std.atomic.Value(bool).init(false);
     var trigger = CancelAfterOutput{
@@ -4549,7 +4539,7 @@ test "cancellation preserves the termination grace beneath the session superviso
 }
 
 test "cancellation preserves the termination grace in an invoked script" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4597,7 +4587,7 @@ test "cancellation preserves the termination grace in an invoked script" {
 }
 
 test "cap-crossing cancellation returns a synchronized bounded result" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4640,7 +4630,7 @@ test "cap-crossing cancellation returns a synchronized bounded result" {
 }
 
 test "cancelled managed command confirms an indeterminate artifact target" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4706,7 +4696,7 @@ test "cancelled managed command confirms an indeterminate artifact target" {
     const foreground = result.command_result.?;
     const output_path = foreground.output_file orelse
         return error.TestExpectedEqual;
-    const output_handle = std.fs.path.basename(output_path);
+    const output_handle = std.Io.Dir.path.basename(output_path);
     try std.testing.expect(!capability.hasIndeterminateEntry(
         .command_artifacts,
         output_handle,
@@ -4737,7 +4727,7 @@ test "cancelled managed command confirms an indeterminate artifact target" {
 }
 
 test "below-cap cancellation retains complete artifact and non-truncated metadata" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4791,12 +4781,11 @@ test "zero-output cancellation remains a bare error" {
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const ready_path = try std.fs.path.join(alloc, &.{ workspace, "zero-output-ready" });
+    const ready_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "zero-output-ready" });
     defer alloc.free(ready_path);
     const quoted_ready = try shellQuote(alloc, ready_path);
     defer alloc.free(quoted_ready);
-    const command = try std.fmt.allocPrint(
-        alloc,
+    const command = try alloc.print(
         ": > {s}; exec sleep 5",
         .{quoted_ready},
     );
@@ -4837,19 +4826,18 @@ test "zero-output cancellation remains a bare error" {
 }
 
 test "artifact write failure after cancellation remains a bare error" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const ready_path = try std.fs.path.join(alloc, &.{ workspace, "cancel-ready" });
+    const ready_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "cancel-ready" });
     defer alloc.free(ready_path);
     const quoted_ready = try shellQuote(alloc, ready_path);
     defer alloc.free(quoted_ready);
-    const script = try std.fmt.allocPrint(
-        alloc,
+    const script = try alloc.print(
         "trap 'printf \"CANCEL-TAIL\\n\"; exit 0' TERM; : > {s}; while :; do :; done",
         .{quoted_ready},
     );
@@ -5059,7 +5047,7 @@ test "pending termination source makes supervisor fallback timeout dominant" {
 }
 
 test "timeout prevents captured user shell from evaluating trailing statements" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
     std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
         return error.SkipZigTest;
 
@@ -5069,14 +5057,13 @@ test "timeout prevents captured user shell from evaluating trailing statements" 
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
-    const effect_path = try std.fs.path.join(alloc, &.{ workspace, "post-timeout-effect.txt" });
+    const effect_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "post-timeout-effect.txt" });
     defer alloc.free(effect_path);
     const quoted_effect = try shellQuote(alloc, effect_path);
     defer alloc.free(quoted_effect);
     var capture = StreamCapture{ .alloc = alloc };
     defer capture.deinit();
-    const command = try std.fmt.allocPrint(
-        alloc,
+    const command = try alloc.print(
         "sleep 2; printf 'SHOULD-NOT-RUN\\n'; printf 'SHOULD-NOT-RUN' > {s}",
         .{quoted_effect},
     );
@@ -5110,7 +5097,7 @@ test "timeout remains dominant when its output callback fails" {
 }
 
 test "timeout terminates foreground process group descendants" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -5118,12 +5105,11 @@ test "timeout terminates foreground process group descendants" {
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
-    const ready_path = try std.fs.path.join(alloc, &.{ workspace, "timeout-ready.txt" });
+    const ready_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "timeout-ready.txt" });
     defer alloc.free(ready_path);
     const quoted_ready = try shellQuote(alloc, ready_path);
     defer alloc.free(quoted_ready);
-    const command = try std.fmt.allocPrint(
-        alloc,
+    const command = try alloc.print(
         "sleep 30 & child=$!; printf '%s' \"$child\" > {s}; wait",
         .{quoted_ready},
     );
@@ -5144,7 +5130,7 @@ test "timeout terminates foreground process group descendants" {
 
     const started_ms = io_mod.milliTimestamp();
     while (true) {
-        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
+        std.posix.kill(pid, @fromBackingInt(@intCast(0))) catch |err| switch (err) {
             error.ProcessNotFound => break,
             else => return err,
         };
@@ -5157,17 +5143,16 @@ test "timeout terminates foreground process group descendants" {
 }
 
 test "timeout terminates redirected descendant after setsid" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "escaped-timeout.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "escaped-timeout.pid" });
     defer alloc.free(pid_path);
-    const command = try std.fmt.allocPrint(
-        alloc,
+    const command = try alloc.print(
         "python3 -c 'import os,time\n" ++
             "pid=os.fork()\n" ++
             "if pid == 0:\n" ++
@@ -5198,17 +5183,16 @@ test "timeout terminates redirected descendant after setsid" {
 }
 
 test "timeout terminates double-forked descendant after setsid" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "double-fork-timeout.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "double-fork-timeout.pid" });
     defer alloc.free(pid_path);
-    const command = try std.fmt.allocPrint(
-        alloc,
+    const command = try alloc.print(
         "python3 -c 'import os,time\n" ++
             "pid=os.fork()\n" ++
             "if pid == 0:\n" ++
@@ -5241,17 +5225,16 @@ test "timeout terminates double-forked descendant after setsid" {
 }
 
 test "timeout terminates environment-sanitized double-fork descendants" {
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "env-clear-timeout.pids" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "env-clear-timeout.pids" });
     defer alloc.free(pid_path);
-    const command = try std.fmt.allocPrint(
-        alloc,
+    const command = try alloc.print(
         "/usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/python3 -c 'import os,time\n" ++
             "for index in range(16):\n" ++
             " pid=os.fork()\n" ++
@@ -5301,19 +5284,18 @@ fn expectProcessGone(pid: std.posix.pid_t) !void {
 }
 
 test "natural command completion terminates background child inheriting pipes" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "inherited-child.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "inherited-child.pid" });
     defer alloc.free(pid_path);
     const quoted_pid_path = try shellQuote(alloc, pid_path);
     defer alloc.free(quoted_pid_path);
-    const command = try std.fmt.allocPrint(
-        alloc,
+    const command = try alloc.print(
         "sleep 30 & child=$!; printf '%s' \"$child\" > {s}",
         .{quoted_pid_path},
     );
@@ -5337,19 +5319,18 @@ test "natural command completion terminates background child inheriting pipes" {
 }
 
 test "natural command completion terminates background child with redirected streams" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "redirected-child.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "redirected-child.pid" });
     defer alloc.free(pid_path);
     const quoted_pid_path = try shellQuote(alloc, pid_path);
     defer alloc.free(quoted_pid_path);
-    const command = try std.fmt.allocPrint(
-        alloc,
+    const command = try alloc.print(
         "sleep 30 >/dev/null 2>&1 & child=$!; printf '%s' \"$child\" > {s}",
         .{quoted_pid_path},
     );
@@ -5373,19 +5354,18 @@ test "natural command completion terminates background child with redirected str
 }
 
 test "natural command completion keeps a daemon that detached after setsid" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "escaped-child.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "escaped-child.pid" });
     defer alloc.free(pid_path);
     // Natural cleanup stops the child while it is still in the command
     // session, so the parent waits for readiness after setsid and redirection.
-    const command = try std.fmt.allocPrint(
-        alloc,
+    const command = try alloc.print(
         "python3 -c 'import os,time\n" ++
             "ready_r,ready_w=os.pipe()\n" ++
             "pid=os.fork()\n" ++
@@ -5420,19 +5400,18 @@ test "natural command completion keeps a daemon that detached after setsid" {
 }
 
 test "natural command completion keeps a double-forked daemon and its children" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "daemon.pids" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "daemon.pids" });
     defer alloc.free(pid_path);
     // The daemon keeps every inherited descriptor except the output streams,
     // like CLIs that spawn a detached background server and a browser child.
-    const command = try std.fmt.allocPrint(
-        alloc,
+    const command = try alloc.print(
         "python3 -c 'import os,time\n" ++
             "ready_r,ready_w=os.pipe()\n" ++
             "if os.fork() == 0:\n" ++
@@ -5462,7 +5441,7 @@ test "natural command completion keeps a double-forked daemon and its children" 
     }, alloc, command, workspace);
     defer alloc.free(result.output);
     try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "DAEMON-STARTED") != null);
+    try std.testing.expect(std.mem.find(u8, result.output, "DAEMON-STARTED") != null);
 
     const pids = try readPidsForTest(alloc, pid_path);
     defer alloc.free(pids);
@@ -5474,19 +5453,18 @@ test "natural command completion keeps a double-forked daemon and its children" 
 }
 
 test "natural command completion returns while a detached daemon keeps command output" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "output-holder.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "output-holder.pid" });
     defer alloc.free(pid_path);
     // The daemon keeps a duplicate of the output pipe on a high descriptor,
     // so end of file never arrives while it runs.
-    const command = try std.fmt.allocPrint(
-        alloc,
+    const command = try alloc.print(
         "python3 -c 'import os,time\n" ++
             "ready_r,ready_w=os.pipe()\n" ++
             "if os.fork() == 0:\n" ++
@@ -5514,7 +5492,7 @@ test "natural command completion returns while a detached daemon keeps command o
     defer alloc.free(result.output);
     const elapsed_ms = io_mod.milliTimestamp() - started_ms;
     try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "BEFORE-EXIT") != null);
+    try std.testing.expect(std.mem.find(u8, result.output, "BEFORE-EXIT") != null);
     try std.testing.expect(elapsed_ms >= natural_completion_wait_ms);
     try std.testing.expect(elapsed_ms < 5_000);
 
@@ -5526,19 +5504,18 @@ test "natural command completion returns while a detached daemon keeps command o
 }
 
 test "natural command completion keeps a detached daemon that hides its descriptors" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "hidden-daemon.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "hidden-daemon.pid" });
     defer alloc.free(pid_path);
     // Like ssh-agent, the daemon turns off Linux process inspection, then it
     // closes every descriptor. Neither may decide whether it survives.
-    const command = try std.fmt.allocPrint(
-        alloc,
+    const command = try alloc.print(
         "python3 -c 'import ctypes,os,sys,time\n" ++
             "ready_r,ready_w=os.pipe()\n" ++
             "if os.fork() == 0:\n" ++
@@ -5629,7 +5606,7 @@ const SlowOutputConsumer = struct {
 };
 
 test "natural completion delivers all leftover output to a slow consumer" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -5653,19 +5630,18 @@ test "natural completion delivers all leftover output to a slow consumer" {
 }
 
 test "natural command completion stops a same-session process that left the process group" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "own-group.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "own-group.pid" });
     defer alloc.free(pid_path);
     // A process group kill cannot reach this child, so only the session
     // rule stops it.
-    const command = try std.fmt.allocPrint(
-        alloc,
+    const command = try alloc.print(
         "python3 -c 'import os,time\n" ++
             "ready_r,ready_w=os.pipe()\n" ++
             "if os.fork() == 0:\n" ++
@@ -5698,21 +5674,20 @@ test "natural command completion stops a same-session process that left the proc
 }
 
 test "natural completion keeps its exit when the deadline passes during the output drain" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "drain-deadline.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "drain-deadline.pid" });
     defer alloc.free(pid_path);
     const timeout_ms: usize = 3_000;
     // The command exits about 800 ms before its deadline while a detached
     // daemon keeps the output open, so the deadline lands inside the drain.
     // Its last line has no newline, so only the final flush delivers it live.
-    const command = try std.fmt.allocPrint(
-        alloc,
+    const command = try alloc.print(
         "python3 -c 'import os,sys,time\n" ++
             "ready_r,ready_w=os.pipe()\n" ++
             "if os.fork() == 0:\n" ++
@@ -5746,7 +5721,7 @@ test "natural completion keeps its exit when the deadline passes during the outp
     const elapsed_ms = io_mod.milliTimestamp() - started_ms;
     try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
     try std.testing.expect(
-        std.mem.indexOf(u8, result.output, "FINISHED-BEFORE-DEADLINE") != null,
+        std.mem.find(u8, result.output, "FINISHED-BEFORE-DEADLINE") != null,
     );
     try std.testing.expect(elapsed_ms < @as(i64, timeout_ms) + 1_000);
     try std.testing.expect(!result.command_result.?.output_incomplete);
@@ -5760,19 +5735,18 @@ test "natural completion keeps its exit when the deadline passes during the outp
 }
 
 test "natural completion stops waiting on a detached daemon that keeps writing" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "chatty-daemon.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "chatty-daemon.pid" });
     defer alloc.free(pid_path);
     // The daemon writes to the command's output every 5 ms, so the pipes
     // never reach end of file and no read waits a whole poll.
-    const command = try std.fmt.allocPrint(
-        alloc,
+    const command = try alloc.print(
         "python3 -c 'import os,time\n" ++
             "ready_r,ready_w=os.pipe()\n" ++
             "if os.fork() == 0:\n" ++
@@ -5820,7 +5794,7 @@ const CancelOnOutput = struct {
 
     fn onChunk(ctx: *anyopaque, _: ?types.ToolLifecycleId, _: CommandOutputStream, bytes: []const u8) !void {
         const self: *@This() = @ptrCast(@alignCast(ctx));
-        if (std.mem.indexOf(u8, bytes, self.needle) == null) return;
+        if (std.mem.find(u8, bytes, self.needle) == null) return;
         self.seen += 1;
         io_mod.sleep(self.delay_ms * std.time.ns_per_ms);
         if (self.seen >= self.cancel_after) self.cancel.store(true, .release);
@@ -5828,19 +5802,18 @@ const CancelOnOutput = struct {
 };
 
 test "natural completion ends live delivery of drained output at a cancel" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "burst-daemon.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "burst-daemon.pid" });
     defer alloc.free(pid_path);
     // After the command exits, the daemon writes 200 lines at once, and the
     // reader takes 20 ms per line and cancels at the 20th.
-    const command = try std.fmt.allocPrint(
-        alloc,
+    const command = try alloc.print(
         "python3 -c 'import os,time\n" ++
             "ready_r,ready_w=os.pipe()\n" ++
             "if os.fork() == 0:\n" ++
@@ -5885,7 +5858,7 @@ test "natural completion ends live delivery of drained output at a cancel" {
 }
 
 test "natural completion keeps complete output when a cancel follows the command's last line" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -5909,23 +5882,22 @@ test "natural completion keeps complete output when a cancel follows the command
     try std.testing.expectEqual(@as(?i64, 0), command_result.exit_code);
     try std.testing.expectEqual(@as(?u32, null), command_result.signal);
     try std.testing.expect(!command_result.output_incomplete);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "FINAL-LINE") != null);
+    try std.testing.expect(std.mem.find(u8, result.output, "FINAL-LINE") != null);
 }
 
 test "natural completion keeps complete output when a cancel follows only daemon output" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "late-daemon.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "late-daemon.pid" });
     defer alloc.free(pid_path);
     // The daemon writes once after the command exits, and that output
     // triggers the cancel, so only daemon output is left unread.
-    const command = try std.fmt.allocPrint(
-        alloc,
+    const command = try alloc.print(
         "python3 -c 'import os,time\n" ++
             "ready_r,ready_w=os.pipe()\n" ++
             "if os.fork() == 0:\n" ++
@@ -5965,7 +5937,7 @@ test "natural completion keeps complete output when a cancel follows only daemon
     try std.testing.expectEqual(@as(?i64, 0), command_result.exit_code);
     try std.testing.expectEqual(@as(?u32, null), command_result.signal);
     try std.testing.expect(!command_result.output_incomplete);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "COMMAND-DONE") != null);
+    try std.testing.expect(std.mem.find(u8, result.output, "COMMAND-DONE") != null);
     try std.testing.expect(elapsed_ms < 3_000);
 }
 
@@ -6013,7 +5985,7 @@ test "output emitter delivers each line once and flushes the last partial line a
 }
 
 test "natural completion marks output incomplete when the deadline cuts leftover output" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -6057,19 +6029,18 @@ fn stopProcessesForTest(pids: []const std.posix.pid_t) void {
 }
 
 test "cancellation preserves grace and removes an escaped descendant" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "escaped-cancel.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "escaped-cancel.pid" });
     defer alloc.free(pid_path);
-    const term_path = try std.fs.path.join(alloc, &.{ workspace, "escaped-cancel.term" });
+    const term_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "escaped-cancel.term" });
     defer alloc.free(term_path);
-    const command = try std.fmt.allocPrint(
-        alloc,
+    const command = try alloc.print(
         "python3 -c 'import os,signal,time\n" ++
             "pid=os.fork()\n" ++
             "if pid == 0:\n" ++
@@ -6154,7 +6125,7 @@ test "cancel and timeout tie chooses cancellation" {
 }
 
 test "runtime cancellation observed at the timeout deadline stays graceful" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     for (0..10) |_| {
         const alloc = std.testing.allocator;
@@ -6162,12 +6133,11 @@ test "runtime cancellation observed at the timeout deadline stays graceful" {
         defer tmp.cleanup();
         const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
         defer alloc.free(workspace);
-        const term_path = try std.fs.path.join(alloc, &.{ workspace, "tie.term" });
+        const term_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "tie.term" });
         defer alloc.free(term_path);
         const quoted_term = try shellQuote(alloc, term_path);
         defer alloc.free(quoted_term);
-        const command = try std.fmt.allocPrint(
-            alloc,
+        const command = try alloc.print(
             "trap 'printf TERM > {s}; sleep 3; exit 130' TERM; printf 'TIE-READY\n'; while :; do sleep 1; done",
             .{quoted_term},
         );
@@ -6220,7 +6190,7 @@ test "runtime cancellation observed at the timeout deadline stays graceful" {
 }
 
 test "accepted short timeout matrix returns timeout errors" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     for ([_]usize{ 1, 2, 5, 10, 25, 50 }) |timeout_ms| {
         try std.testing.expectError(error.TimeoutExpired, executeCommand(.{
@@ -6231,19 +6201,18 @@ test "accepted short timeout matrix returns timeout errors" {
 }
 
 test "supervisor handoff does not extend the parent timeout deadline" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const effect_path = try std.fs.path.join(alloc, &.{ workspace, "handoff-effect" });
+    const effect_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "handoff-effect" });
     defer alloc.free(effect_path);
     const quoted_effect = try shellQuote(alloc, effect_path);
     defer alloc.free(quoted_effect);
-    const command = try std.fmt.allocPrint(
-        alloc,
+    const command = try alloc.print(
         "sleep 0.6; printf trailing > {s}",
         .{quoted_effect},
     );
@@ -6257,19 +6226,18 @@ test "supervisor handoff does not extend the parent timeout deadline" {
 }
 
 test "supervisor fallback force remains timeout dominant" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const term_path = try std.fs.path.join(alloc, &.{ workspace, "fallback.term" });
+    const term_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "fallback.term" });
     defer alloc.free(term_path);
     const quoted_term = try shellQuote(alloc, term_path);
     defer alloc.free(quoted_term);
-    const command = try std.fmt.allocPrint(
-        alloc,
+    const command = try alloc.print(
         "trap 'printf TERM > {s}; exit 130' TERM; printf 'FALLBACK-BLOCK\n'; while :; do sleep 1; done",
         .{quoted_term},
     );

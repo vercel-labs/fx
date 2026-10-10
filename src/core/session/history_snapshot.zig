@@ -74,7 +74,7 @@ fn encodeAny(out: *std.ArrayList(u8), alloc: Allocator, value: anytype) EncodeEr
         },
         .@"enum" => |info| {
             if (@bitSizeOf(info.tag_type) > 8) @compileError("snapshot codec: enum tag too wide: " ++ @typeName(T));
-            try out.append(alloc, std.math.cast(u8, @intFromEnum(value)) orelse return error.PayloadTooLarge);
+            try out.append(alloc, std.math.cast(u8, @backingInt(value)) orelse return error.PayloadTooLarge);
         },
         .optional => {
             if (value) |inner| {
@@ -104,8 +104,8 @@ fn encodeAny(out: *std.ArrayList(u8), alloc: Allocator, value: anytype) EncodeEr
             }
         },
         .@"struct" => |info| {
-            inline for (info.fields) |field| {
-                try encodeAny(out, alloc, @field(value, field.name));
+            inline for (info.field_names) |field_name| {
+                try encodeAny(out, alloc, @field(value, field_name));
             }
         },
         .@"union" => |info| {
@@ -113,7 +113,7 @@ fn encodeAny(out: *std.ArrayList(u8), alloc: Allocator, value: anytype) EncodeEr
                 @compileError("snapshot codec: untagged union: " ++ @typeName(T))).@"enum";
             if (@bitSizeOf(tag_info.tag_type) > 8) @compileError("snapshot codec: union tag too wide: " ++ @typeName(T));
             const active = std.meta.activeTag(value);
-            try out.append(alloc, std.math.cast(u8, @intFromEnum(active)) orelse return error.PayloadTooLarge);
+            try out.append(alloc, std.math.cast(u8, @backingInt(active)) orelse return error.PayloadTooLarge);
             switch (value) {
                 inline else => |payload| try encodeAny(out, alloc, payload),
             }
@@ -159,8 +159,8 @@ fn decodeAny(comptime T: type, alloc: Allocator, cur: *ByteCursor) DecodeError!T
         .@"enum" => |info| {
             const tag = (try cur.take(1))[0];
             const raw = std.math.cast(info.tag_type, tag) orelse return error.InvalidCache;
-            inline for (@typeInfo(T).@"enum".fields) |field| {
-                if (field.value == raw) return @enumFromInt(raw);
+            inline for (@typeInfo(T).@"enum".field_values) |field_value| {
+                if (field_value == raw) return @fromBackingInt(@intCast(raw));
             }
             return error.InvalidCache;
         },
@@ -205,8 +205,8 @@ fn decodeAny(comptime T: type, alloc: Allocator, cur: *ByteCursor) DecodeError!T
         },
         .@"struct" => |info| {
             var value: T = undefined;
-            inline for (info.fields) |field| {
-                @field(value, field.name) = try decodeAny(field.type, alloc, cur);
+            inline for (info.field_names, info.field_types) |field_name, field_type| {
+                @field(value, field_name) = try decodeAny(field_type, alloc, cur);
             }
             return value;
         },
@@ -216,10 +216,9 @@ fn decodeAny(comptime T: type, alloc: Allocator, cur: *ByteCursor) DecodeError!T
             const raw = (try cur.take(1))[0];
             _ = tag_type;
             const tag: std.meta.Tag(T) = tagblk: {
-                const fields = @typeInfo(T).@"union".fields;
-                inline for (fields) |field| {
-                    const candidate = @field(std.meta.Tag(T), field.name);
-                    if (@as(u64, @intFromEnum(candidate)) == raw) break :tagblk candidate;
+                inline for (@typeInfo(T).@"union".field_names) |field_name| {
+                    const candidate = @field(std.meta.Tag(T), field_name);
+                    if (@as(u64, @backingInt(candidate)) == raw) break :tagblk candidate;
                 }
                 return error.InvalidCache;
             };
@@ -249,8 +248,8 @@ fn freeAny(alloc: Allocator, comptime T: type, value: T) void {
             },
             else => unreachable,
         },
-        .@"struct" => |info| inline for (info.fields) |field| {
-            freeAny(alloc, field.type, @field(value, field.name));
+        .@"struct" => |info| inline for (info.field_names, info.field_types) |field_name, field_type| {
+            freeAny(alloc, field_type, @field(value, field_name));
         },
         .@"union" => switch (value) {
             inline else => |payload| freeAny(alloc, @TypeOf(payload), payload),

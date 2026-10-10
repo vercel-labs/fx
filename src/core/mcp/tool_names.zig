@@ -41,7 +41,7 @@ pub const Registry = struct {
         const io = @import("../shared/io.zig").getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        const identity = try std.fmt.allocPrint(self.alloc, "{d}:{s}{s}", .{ server.len, server, tool });
+        const identity = try self.alloc.print("{d}:{s}{s}", .{ server.len, server, tool });
         defer self.alloc.free(identity);
         if (self.by_identity.get(identity)) |existing| return alloc.dupe(u8, existing);
         if (self.by_identity.count() >= max_aliases) return error.McpToolNameLimitExceeded;
@@ -116,11 +116,11 @@ fn writeSanitizedSegment(writer: *std.Io.Writer, segment: []const u8) !void {
 fn candidateWithSuffix(alloc: Allocator, base: []const u8, suffix_index: ?usize) ![]u8 {
     const max_name_len = 64;
     if (suffix_index) |index| {
-        const suffix = try std.fmt.allocPrint(alloc, "_{d}", .{index});
+        const suffix = try alloc.print("_{d}", .{index});
         defer alloc.free(suffix);
 
         const prefix_len = @min(base.len, max_name_len - suffix.len);
-        return std.fmt.allocPrint(alloc, "{s}{s}", .{ base[0..prefix_len], suffix });
+        return alloc.print("{s}{s}", .{ base[0..prefix_len], suffix });
     }
 
     return alloc.dupe(u8, base[0..@min(base.len, max_name_len)]);

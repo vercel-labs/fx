@@ -499,7 +499,7 @@ test "theme monitor discards incomplete OSC 11 on idle timeout with one trace" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "theme-osc11-idle.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "theme-osc11-idle.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -518,8 +518,7 @@ test "theme monitor discards incomplete OSC 11 on idle timeout with one trace" {
     debug_trace.shutdown();
     const trace = try readTraceFileForTest(alloc, trace_path);
     defer alloc.free(trace);
-    const needle = try std.fmt.allocPrint(
-        alloc,
+    const needle = try alloc.print(
         "theme osc11 candidate dropped bytes={d} reason=osc11_idle_timeout",
         .{incomplete.len},
     );
@@ -535,7 +534,7 @@ test "theme monitor idle discard does not swallow CSI partials" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "theme-csi-idle.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "theme-csi-idle.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();

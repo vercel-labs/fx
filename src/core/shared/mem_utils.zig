@@ -12,7 +12,7 @@ pub fn free(alloc: std.mem.Allocator, memory: anytype) void {
         alloc,
         bytes.ptr,
         bytes.len,
-        .fromByteUnits(info.alignment orelse @alignOf(info.child)),
+        .fromByteUnits(info.attrs.@"align" orelse @alignOf(info.child)),
         @returnAddress(),
     );
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const config_runtime = @import("../config/config_runtime.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -26,6 +27,7 @@ const session_display_metadata = @import("session_display_metadata.zig");
 const session_usage = @import("session_usage.zig");
 const session_usage_sidecar = @import("session_usage_sidecar.zig");
 const subagent_child_state = @import("../subagent/child_state.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const Allocator = std.mem.Allocator;
 
 const authority_module = @import("session_authority.zig");
@@ -109,7 +111,7 @@ pub fn imageSnapshotStorageDir(
     if (sessions_dir) |root| {
         const durable_dir = try sessionDirPath(alloc, root, session_id.?);
         defer alloc.free(durable_dir);
-        return std.fs.path.join(alloc, &.{ durable_dir, "images" });
+        return std.Io.Dir.path.join(alloc, &.{ durable_dir, "images" });
     }
     if (temp_dir.* == null) {
         temp_dir.* = try image_attachments.createTempSnapshotDir(alloc);
@@ -186,7 +188,7 @@ fn formatConversationHistoryPageCursor(
     buffer: []u8,
     cursor: ConversationHistoryPageCursor,
 ) ![]u8 {
-    return std.fmt.bufPrint(buffer, "v3:{s}:{d}:{d}", .{
+    return std.mem.print(buffer, "v3:{s}:{d}:{d}", .{
         cursor.session_id,
         cursor.history_len,
         cursor.start,
@@ -215,7 +217,7 @@ fn parseHistoryPageCursor(raw: []const u8) LoadHistoryPageError!HistoryPageCurso
 }
 
 fn formatHistoryPageCursor(buffer: []u8, cursor: HistoryPageCursor) ![]u8 {
-    return std.fmt.bufPrint(buffer, "v2:{s}:{d}:{d}:{x}:{d}", .{ cursor.session_id, cursor.history_len, cursor.revision_ms, cursor.prefix_digest, cursor.start });
+    return std.mem.print(buffer, "v2:{s}:{d}:{d}:{x}:{d}", .{ cursor.session_id, cursor.history_len, cursor.revision_ms, cursor.prefix_digest, cursor.start });
 }
 
 fn duplicateHistoryPage(alloc: Allocator, turns: []const session.HistoryTurn) ![]session.HistoryTurn {
@@ -624,7 +626,7 @@ pub const Store = struct {
         defer directory.close();
         const name = self.rememberedSessionFilename();
         var buffer: [256]u8 = undefined;
-        const bytes = try std.fmt.bufPrint(&buffer, "{s}\n", .{session_id});
+        const bytes = try std.mem.print(&buffer, "{s}\n", .{session_id});
         try io_mod.durableReplaceVerified(alloc, &directory, &name, bytes);
     }
 
@@ -718,7 +720,7 @@ pub const Store = struct {
         errdefer staging.close();
         return .{
             .sessions = staging,
-            .display_root = try std.fs.path.join(
+            .display_root = try std.Io.Dir.path.join(
                 alloc,
                 &.{ self.sessions_dir, recovery_staging_dir },
             ),
@@ -2067,8 +2069,7 @@ pub const Store = struct {
         if (existing) |timestamp_ms| {
             if (timestamp_ms == protected_updated_at_ms) return;
         }
-        const marker_bytes = try std.fmt.allocPrint(
-            alloc,
+        const marker_bytes = try alloc.print(
             "{s}{d}\n",
             .{ usage_recovery_marker_prefix, protected_updated_at_ms },
         );
@@ -3328,7 +3329,7 @@ pub const Store = struct {
             recovered_id,
         );
         defer alloc.free(staged_target_dir);
-        const staged_target_images = try std.fs.path.join(
+        const staged_target_images = try std.Io.Dir.path.join(
             alloc,
             &.{ staged_target_dir, "images" },
         );
@@ -3339,7 +3340,7 @@ pub const Store = struct {
             recovered_id,
         );
         defer alloc.free(target_dir);
-        const target_images = try std.fs.path.join(
+        const target_images = try std.Io.Dir.path.join(
             alloc,
             &.{ target_dir, "images" },
         );
@@ -3506,13 +3507,13 @@ fn rebaseRecoveredImageSlice(
 ) !void {
     for (images) |*image| {
         const staged_path = image.snapshot_path orelse continue;
-        const parent = std.fs.path.dirname(staged_path) orelse
+        const parent = std.Io.Dir.path.dirname(staged_path) orelse
             return error.SessionRecoveryBoundaryInvalid;
         if (!std.mem.eql(u8, parent, staged_images)) {
             return error.SessionRecoveryBoundaryInvalid;
         }
-        const leaf = std.fs.path.basename(staged_path);
-        const target_path = try std.fs.path.join(
+        const leaf = std.Io.Dir.path.basename(staged_path);
+        const target_path = try std.Io.Dir.path.join(
             alloc,
             &.{ target_images, leaf },
         );
@@ -4041,8 +4042,7 @@ test "recovery rejects digest-matching handles from the wrong artifact family" {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash("stored output", &digest, .{});
     const content_hex = std.fmt.bytesToHex(digest[0..8].*, .lower);
-    const foreign_handle = try std.fmt.allocPrint(
-        alloc,
+    const foreign_handle = try alloc.print(
         "other-{s}.txt",
         .{&content_hex},
     );
@@ -4057,8 +4057,7 @@ test "recovery rejects digest-matching handles from the wrong artifact family" {
             digest,
         ),
     );
-    const foreign_replay = try std.fmt.allocPrint(
-        alloc,
+    const foreign_replay = try alloc.print(
         "other-{s}.bin",
         .{&content_hex},
     );
@@ -4073,8 +4072,7 @@ test "recovery rejects digest-matching handles from the wrong artifact family" {
             digest,
         ),
     );
-    const foreign_log = try std.fmt.allocPrint(
-        alloc,
+    const foreign_log = try alloc.print(
         "other-{s}.log",
         .{&content_hex},
     );
@@ -4185,12 +4183,12 @@ fn validateRecoveredManagedChildDigest(
 }
 
 fn canonicalSnapshotLeaf(image: session.ImageAttachment, stored: []const u8) ![]const u8 {
-    if (std.fs.path.isAbsolute(stored)) return error.InvalidSessionFormat;
+    if (std.Io.Dir.path.isAbsolute(stored)) return error.InvalidSessionFormat;
     const prefix = "images/";
     if (!std.mem.startsWith(u8, stored, prefix)) return error.InvalidSessionFormat;
     const leaf = stored[prefix.len..];
     if (leaf.len == 0 or
-        std.mem.indexOfAny(u8, leaf, "/\\") != null or
+        std.mem.findAny(u8, leaf, "/\\") != null or
         std.mem.eql(u8, leaf, ".") or
         std.mem.eql(u8, leaf, ".."))
     {
@@ -4205,7 +4203,7 @@ fn canonicalSnapshotLeaf(image: session.ImageAttachment, stored: []const u8) ![]
         }
     }
     var expected_buffer: [128]u8 = undefined;
-    const expected = std.fmt.bufPrint(
+    const expected = std.mem.print(
         &expected_buffer,
         "image-{d}-{s}.bin",
         .{ image.id, digest[0..16] },
@@ -4223,7 +4221,7 @@ fn resolveSessionSnapshotLocators(
 ) !void {
     const session_dir = try sessionDirPath(alloc, sessions_dir, session_id);
     defer alloc.free(session_dir);
-    const image_dir = try std.fs.path.join(alloc, &.{ session_dir, "images" });
+    const image_dir = try std.Io.Dir.path.join(alloc, &.{ session_dir, "images" });
     defer alloc.free(image_dir);
 
     for (history) |*turn| {
@@ -4245,7 +4243,7 @@ fn resolveImageSnapshotLocators(
     for (images) |*image| {
         const stored = image.snapshot_path orelse continue;
         const leaf = try canonicalSnapshotLeaf(image.*, stored);
-        const resolved = try std.fs.path.join(alloc, &.{ image_dir, leaf });
+        const resolved = try std.Io.Dir.path.join(alloc, &.{ image_dir, leaf });
         alloc.free(stored);
         image.snapshot_path = resolved;
     }
@@ -4371,13 +4369,13 @@ test "session snapshot locator resolver rejects symlink leaves and directories" 
     std.crypto.hash.sha2.Sha256.hash(image_bytes, &digest_bytes, .{});
     const digest = std.fmt.bytesToHex(digest_bytes, .lower);
     var canonical_leaf_buffer: [64]u8 = undefined;
-    const canonical_leaf = try std.fmt.bufPrint(
+    const canonical_leaf = try std.mem.print(
         &canonical_leaf_buffer,
         "image-1-{s}.bin",
         .{digest[0..16]},
     );
     var locator_buffer: [80]u8 = undefined;
-    const locator = try std.fmt.bufPrint(
+    const locator = try std.mem.print(
         &locator_buffer,
         "images/{s}",
         .{canonical_leaf},
@@ -4737,8 +4735,8 @@ test "recovery copy preserves spilled diff artifacts end to end" {
     );
     defer initial.deinit(alloc);
 
-    const previous = "RECOVERY_PREVIOUS_0123456789abcdef\n" ** 180;
-    const after = "RECOVERY_AFTER_0123456789abcdef\n" ** 180;
+    const previous = text_utils.repeat("RECOVERY_PREVIOUS_0123456789abcdef\n", 180);
+    const after = text_utils.repeat("RECOVERY_AFTER_0123456789abcdef\n", 180);
     const output = "edited source.zig";
     const output_handle = try testStoredResultHandle(
         alloc,
@@ -4811,7 +4809,7 @@ test "recovery copy preserves spilled diff artifacts end to end" {
         initial.id,
     );
     defer alloc.free(source_dir);
-    const source_events_path = try std.fs.path.join(
+    const source_events_path = try std.Io.Dir.path.join(
         alloc,
         &.{ source_dir, "events.jsonl" },
     );
@@ -4883,7 +4881,7 @@ test "recovery copy preserves spilled diff artifacts end to end" {
         recovery.recovered_session_id,
     );
     defer alloc.free(recovered_dir);
-    const recovered_result_dir = try std.fs.path.join(
+    const recovered_result_dir = try std.Io.Dir.path.join(
         alloc,
         &.{ recovered_dir, "tool-results" },
     );
@@ -4969,7 +4967,7 @@ test "resume commits legacy permission state migration before publication" {
 }
 
 fn chmodPath(alloc: Allocator, path: []const u8, mode: std.c.mode_t) !void {
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     if (std.c.chmod(path_z.ptr, mode) != 0) return error.ChmodFailed;
 }
@@ -5219,7 +5217,7 @@ fn replaceHistoryPageFixture(
     var writable = try store.resumeForWrite(alloc, id);
     defer writable.deinit(alloc);
     for (0..count) |index| {
-        const prompt = try std.fmt.allocPrint(alloc, "{s}-{d}", .{ label, index });
+        const prompt = try alloc.print("{s}-{d}", .{ label, index });
         defer alloc.free(prompt);
         const turn = try session.makeAssistantTurn(alloc, prompt, "saved response");
         defer session.freeHistoryTurn(alloc, turn);
@@ -5244,7 +5242,7 @@ fn makeTaggedHistoryPageTurns(
         alloc.free(history);
     }
     for (history, 0..) |*turn, index| {
-        const prompt = try std.fmt.allocPrint(alloc, "{s}-{d}", .{ label, index });
+        const prompt = try alloc.print("{s}-{d}", .{ label, index });
         defer alloc.free(prompt);
         turn.* = try session.makeAssistantTurn(alloc, prompt, "saved response");
         initialized += 1;
@@ -5372,7 +5370,7 @@ fn readFixtureFile(
 ) ![]u8 {
     const session_dir = try sessionDirPath(alloc, store.sessions_dir, id);
     defer alloc.free(session_dir);
-    const path = try std.fs.path.join(alloc, &.{ session_dir, name });
+    const path = try std.Io.Dir.path.join(alloc, &.{ session_dir, name });
     defer alloc.free(path);
     var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
     defer file.close(io_mod.getIo());
@@ -5388,7 +5386,7 @@ fn writeFixtureEntry(
 ) !void {
     const session_dir = try sessionDirPath(alloc, store.sessions_dir, id);
     defer alloc.free(session_dir);
-    const path = try std.fs.path.join(alloc, &.{ session_dir, name });
+    const path = try std.Io.Dir.path.join(alloc, &.{ session_dir, name });
     defer alloc.free(path);
     try writeRawFile(path, bytes);
 }
@@ -6190,7 +6188,7 @@ test "durable resume repairs legacy zero image ids without changing valid ids" {
         second_path,
         resumed.state.history[1].assistant.user.images[0].path,
     );
-    try std.testing.expect(std.fs.path.isAbsolute(
+    try std.testing.expect(std.Io.Dir.path.isAbsolute(
         resumed.state.history[1].assistant.user.images[0].snapshot_path.?,
     ));
 
@@ -6506,7 +6504,7 @@ test "doctor ignores legacy task records" {
         "tasks",
         std.Io.File.Permissions.fromMode(0o700),
     );
-    const corrupt_path = try std.fs.path.join(alloc, &.{
+    const corrupt_path = try std.Io.Dir.path.join(alloc, &.{
         session_path,
         "tasks",
         "1.json",
@@ -6544,8 +6542,7 @@ fn testStoredResultHandle(
     var content_digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &content_digest, .{});
     const content_hex = std.fmt.bytesToHex(content_digest[0..8].*, .lower);
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "result-{s}-{s}-{s}.txt",
         .{ tool_name, &call_hex, &content_hex },
     );
@@ -6562,8 +6559,7 @@ fn testDiffContentHandle(
     var content_digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &content_digest, .{});
     const content_hex = std.fmt.bytesToHex(content_digest[0..8].*, .lower);
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "diff-{s}-{s}.json",
         .{ &call_hex, &content_hex },
     );
@@ -6592,7 +6588,7 @@ test "recovery command replay allocation failures propagate without changing sou
     var source_file = try source.openFileReadOnly(alloc, .command_artifacts, replay.available.handle);
     defer source_file.deinit();
     const before = try managedFileDigest(&source_file, replay.available.framed_bytes);
-    try std.testing.checkAllAllocationFailures(alloc, struct {
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
         fn check(test_alloc: Allocator, input: *session_child_store.SessionChildCapability, output: *session_child_store.SessionChildCapability, value: core_types.CommandOutputReplay) !void {
             // Each failure run starts from the same absent-target state.
             defer output.delete(.command_artifacts, value.available.handle) catch {};
@@ -6769,7 +6765,7 @@ test "recovery rejects unloadable diff artifacts before promotion" {
 
 test "recovery canonicalizes inline diff snapshots to the persisted handle" {
     const alloc = std.testing.allocator;
-    const content = "recovered-inline-snapshot\n" ** 180;
+    const content = text_utils.repeat("recovered-inline-snapshot\n", 180);
     var inline_results = [_]core_types.PersistedToolResult{.{
         .tool_call_id = @constCast("recover-edit"),
         .tool_name = @constCast("edit_file"),
@@ -6902,8 +6898,8 @@ test "recovery copies diff content artifacts and rejects changed content" {
     defer source.deinit();
     var target = try session_child_store.SessionChildCapability.initLegacyRoute(alloc, target_path, .tool_results, .writable);
     defer target.deinit();
-    const previous = "before\n" ** 800;
-    const after = "after\n" ** 800;
+    const previous = text_utils.repeat("before\n", 800);
+    const after = text_utils.repeat("after\n", 800);
     const handle = try result_store.storeDiffContent(
         alloc,
         source_path,
@@ -7217,7 +7213,7 @@ test "list does not write a session summary index" {
     defer freeSummaries(alloc, &listed);
     try std.testing.expectEqual(@as(usize, 1), listed.items.len);
 
-    const index_path = try std.fs.path.join(alloc, &.{ ctx.store.sessions_dir, "index.json" });
+    const index_path = try std.Io.Dir.path.join(alloc, &.{ ctx.store.sessions_dir, "index.json" });
     defer alloc.free(index_path);
     try std.testing.expectError(
         error.FileNotFound,
@@ -7259,7 +7255,7 @@ test "workspace list filters by workspace without changing global list" {
     try std.testing.expectEqual(@as(usize, 1), workspace_b_list.items.len);
     try std.testing.expectEqualStrings("workspace-b-newest", workspace_b_list.items[0].id);
 
-    const index_path = try std.fs.path.join(alloc, &.{ ctx.store.sessions_dir, "index.json" });
+    const index_path = try std.Io.Dir.path.join(alloc, &.{ ctx.store.sessions_dir, "index.json" });
     defer alloc.free(index_path);
     try std.testing.expectError(
         error.FileNotFound,
@@ -7305,10 +7301,9 @@ test "resumable session pages filter before paging and preserve continuation ord
     defer ctx.deinit(alloc);
 
     inline for (0..21) |index| {
-        const id = try std.fmt.allocPrint(alloc, "session-{d:0>2}", .{index});
+        const id = try alloc.print("session-{d:0>2}", .{index});
         defer alloc.free(id);
-        const body = try std.fmt.allocPrint(
-            alloc,
+        const body = try alloc.print(
             "{{\"schema_version\":1,\"id\":\"{s}\",\"created_at_ms\":1,\"updated_at_ms\":{d},\"workspace_root\":\"/tmp/ws\",\"conversation_language\":\"en\",\"history_len\":1,\"history\":[{{\"role\":\"user\",\"content\":\"saved\"}}]}}",
             .{ id, index },
         );
@@ -7322,8 +7317,7 @@ test "resumable session pages filter before paging and preserve continuation ord
         .{ "current", 2000, 1 },
         .{ "empty", 1500, 0 },
     }) |fixture| {
-        const body = try std.fmt.allocPrint(
-            alloc,
+        const body = try alloc.print(
             "{{\"schema_version\":1,\"id\":\"{s}\",\"created_at_ms\":1,\"updated_at_ms\":{d},\"workspace_root\":\"/tmp/ws\",\"conversation_language\":\"en\",\"history_len\":{d},\"history\":[{{\"role\":\"user\",\"content\":\"saved\"}}]}}",
             .{ fixture[0], fixture[1], fixture[2] },
         );
@@ -7377,12 +7371,12 @@ test "workspace resumable pages filter workspace before paging and preserve cont
     defer alloc.free(workspace_b);
 
     inline for (0..12) |index| {
-        const id = try std.fmt.allocPrint(alloc, "workspace-b-{d:0>2}", .{index});
+        const id = try alloc.print("workspace-b-{d:0>2}", .{index});
         defer alloc.free(id);
         try writeSummaryFixture(alloc, ctx.store, id, workspace_b, 1000 + @as(i64, @intCast(index)), 1);
     }
     inline for (0..11) |index| {
-        const id = try std.fmt.allocPrint(alloc, "workspace-a-{d:0>2}", .{index});
+        const id = try alloc.print("workspace-a-{d:0>2}", .{index});
         defer alloc.free(id);
         try writeSummaryFixture(alloc, ctx.store, id, ctx.workspace, 100 + @as(i64, @intCast(index)), 1);
     }
@@ -7422,7 +7416,7 @@ test "list breaks updated_at ties by descending id" {
         .{ "1700000000000-100-aaaaaaaaaaaaaaaa", "1" },
         .{ "1700000000001-100-bbbbbbbbbbbbbbbb", "2" },
     }) |fixture| {
-        const body = try std.fmt.allocPrint(alloc, "{{\"schema_version\":1,\"id\":\"{s}\",\"created_at_ms\":{s},\"updated_at_ms\":40,\"workspace_root\":\"/tmp/ws\",\"conversation_language\":\"en\",\"history_len\":0,\"history\":[]}}", .{ fixture[0], fixture[1] });
+        const body = try alloc.print("{{\"schema_version\":1,\"id\":\"{s}\",\"created_at_ms\":{s},\"updated_at_ms\":40,\"workspace_root\":\"/tmp/ws\",\"conversation_language\":\"en\",\"history_len\":0,\"history\":[]}}", .{ fixture[0], fixture[1] });
         defer alloc.free(body);
         const path = try writeSessionFixture(alloc, ctx.store, fixture[0], body);
         defer alloc.free(path);
@@ -7442,7 +7436,7 @@ test "invalid/corrupt record skipping" {
     defer tmp.cleanup();
     var ctx = try initTempStore(alloc, &tmp);
     defer ctx.deinit(alloc);
-    const trace_path = try std.fs.path.join(alloc, &.{ ctx.home, "trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ ctx.home, "trace.log" });
     defer alloc.free(trace_path);
     debug_trace.resetForTest();
     try debug_trace.configureForTest(alloc, trace_path);
@@ -7530,7 +7524,7 @@ test "missing session ID error and unsupported schema error" {
 }
 
 test "list propagates OOM and access errors" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var ctx = try initTempStore(alloc, &tmp);
@@ -7991,8 +7985,8 @@ test "a FIFO in a session never blocks listing or latest resume" {
             };
             const root = try io_mod.dirRealpathAlloc(alloc, dir.dir, ".");
             defer alloc.free(root);
-            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const path = try std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ root, case.file });
+            var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const path = try std.mem.printSentinel(&path_buf, "{s}/{s}", .{ root, case.file }, 0);
             if (mkfifo(path, 0o600) != 0) return error.SkipZigTest;
         }
         // A blocking open of the FIFO would wait for a writer that never comes.
@@ -8334,7 +8328,7 @@ test "missing home is empty for reads and bootstrapped privately for writes" {
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const tmp_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(tmp_root);
-    const missing_home = try std.fs.path.join(alloc, &.{ tmp_root, "missing-home" });
+    const missing_home = try std.Io.Dir.path.join(alloc, &.{ tmp_root, "missing-home" });
     defer alloc.free(missing_home);
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
@@ -8356,13 +8350,13 @@ test "missing home is empty for reads and bootstrapped privately for writes" {
     const home_stat = try home_dir.stat(io_mod.getIo());
     try std.testing.expectEqual(std.Io.File.Kind.directory, home_stat.kind);
     try std.testing.expectEqual(@as(u32, 0o700), home_stat.permissions.toMode() & 0o777);
-    const sessions_path = try std.fs.path.join(alloc, &.{ missing_home, ".fx", "sessions" });
+    const sessions_path = try std.Io.Dir.path.join(alloc, &.{ missing_home, ".fx", "sessions" });
     defer alloc.free(sessions_path);
     try std.Io.Dir.accessAbsolute(io_mod.getIo(), sessions_path, .{});
 }
 
 test "first write traces and maps shared layout failure" {
-    if (comptime builtin.os.tag == .windows) return;
+    if (comptime builtin.target.os.tag == .windows) return;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8370,14 +8364,14 @@ test "first write traces and maps shared layout failure" {
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const tmp_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(tmp_root);
-    const trace_path = try std.fs.path.join(alloc, &.{ tmp_root, "trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ tmp_root, "trace.log" });
     defer alloc.free(trace_path);
     debug_trace.resetForTest();
     try debug_trace.configureForTestWithScopes(alloc, trace_path, "session");
     defer debug_trace.resetForTest();
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
-    const home_z = try alloc.dupeZ(u8, home);
+    const home_z = try alloc.dupeSentinel(u8, home, 0);
     defer alloc.free(home_z);
     if (std.c.chmod(home_z.ptr, 0o500) != 0) return error.TestUnexpectedResult;
     defer _ = std.c.chmod(home_z.ptr, 0o700);
@@ -8497,7 +8491,7 @@ test "exact legacy read does not create state" {
         "legacy-detail",
     );
     defer alloc.free(session_dir);
-    const commit_lock = try std.fs.path.join(alloc, &.{ session_dir, "commit.lock" });
+    const commit_lock = try std.Io.Dir.path.join(alloc, &.{ session_dir, "commit.lock" });
     defer alloc.free(commit_lock);
     try std.testing.expectError(
         error.FileNotFound,
@@ -8511,7 +8505,7 @@ test "malformed settings do not block legacy detail or migration" {
     defer tmp.cleanup();
     var ctx = try initTempStore(alloc, &tmp);
     defer ctx.deinit(alloc);
-    const settings_path = try std.fs.path.join(alloc, &.{ ctx.home, ".fx", "settings.json" });
+    const settings_path = try std.Io.Dir.path.join(alloc, &.{ ctx.home, ".fx", "settings.json" });
     defer alloc.free(settings_path);
     try writeRawFile(settings_path, "{broken");
     try writeLegacyFixture(alloc, ctx.store, "legacy-with-bad-settings", ctx.workspace, 20);
@@ -8764,7 +8758,7 @@ test "session list ignores stale json cache without matching sessions" {
     var ctx = try initTempStore(alloc, &tmp);
     defer ctx.deinit(alloc);
 
-    const cache_path = try std.fs.path.join(alloc, &.{ ctx.store.sessions_dir, "list.json" });
+    const cache_path = try std.Io.Dir.path.join(alloc, &.{ ctx.store.sessions_dir, "list.json" });
     defer alloc.free(cache_path);
     try writeRawFile(
         cache_path,
@@ -8936,7 +8930,7 @@ test "history pages expose per-turn provenance through replacement checkpoint an
     try std.testing.expectEqual(@as(usize, 5), reloaded.history.len);
     try std.testing.expectEqualStrings("work-4", reloaded.last_subagent_work_id.?);
     for (reloaded.history, 0..) |turn, index| {
-        const expected = try std.fmt.allocPrint(alloc, "work-{d}", .{index});
+        const expected = try alloc.print("work-{d}", .{index});
         defer alloc.free(expected);
         try std.testing.expectEqualStrings(
             expected,
@@ -9232,7 +9226,7 @@ test "history page digest rejects invalid review feedback" {
 }
 
 test "conversation visitation releases turns on consumer and allocation failure" {
-    const backing = std.testing.allocator;
+    const backing = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var ctx = try initTempStore(backing, &tmp);
@@ -9289,7 +9283,7 @@ test "conversation visitation releases turns on consumer and allocation failure"
 }
 
 test "history page allocation failure sweep frees replay and page ownership" {
-    const backing = std.testing.allocator;
+    const backing = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var ctx = try initTempStore(backing, &tmp);
@@ -9368,7 +9362,7 @@ test "recovery copies and rebases checkpoint-only image snapshots" {
     );
     try std.testing.expectEqualStrings(
         staged_images,
-        std.fs.path.dirname(images[0].snapshot_path.?).?,
+        std.Io.Dir.path.dirname(images[0].snapshot_path.?).?,
     );
     var verified = try image_attachments.loadVerifiedSnapshot(alloc, images[0], .{});
     verified.deinit(alloc);
@@ -9381,7 +9375,7 @@ test "recovery copies and rebases checkpoint-only image snapshots" {
     );
     try std.testing.expectEqualStrings(
         target_images,
-        std.fs.path.dirname(images[0].snapshot_path.?).?,
+        std.Io.Dir.path.dirname(images[0].snapshot_path.?).?,
     );
 }
 

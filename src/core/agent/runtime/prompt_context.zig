@@ -1,7 +1,9 @@
 const std = @import("std");
+const testing_allocator = @import("../../shared/testing_allocator.zig");
 const token_estimate = @import("../../shared/token_estimate.zig");
 const types = @import("../../shared/types.zig");
 const stream_provider = @import("../stream_provider.zig");
+const text_utils = @import("../../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
@@ -392,7 +394,7 @@ test "provider request image accounting excludes encoded payload length" {
     };
     inline for (cases) |case| {
         const small = try measureProviderRequest(std.testing.allocator, case.prefix ++ "AAAA" ++ case.suffix, measurement_test_request(true));
-        const large = try measureProviderRequest(std.testing.allocator, case.prefix ++ ("AAAA" ** 1000) ++ case.suffix, measurement_test_request(true));
+        const large = try measureProviderRequest(std.testing.allocator, case.prefix ++ text_utils.repeat("AAAA", 1000) ++ case.suffix, measurement_test_request(true));
         try std.testing.expect(large.serialized_bytes > small.serialized_bytes);
         try std.testing.expectEqual(small.text_tokens, large.text_tokens);
         try std.testing.expectEqual(small.estimated_input_tokens, large.estimated_input_tokens);
@@ -511,7 +513,7 @@ test "provider request measurement degrades to text estimate on unknown envelope
 }
 
 test "provider request image calibration uses exact usage plus text growth without compounding" {
-    const first = RequestCost{ .serialized_bytes = 4_000_000, .text_tokens = 100, .image_identity = [_]u8{1} ** 32, .estimated_input_tokens = 100 };
+    const first = RequestCost{ .serialized_bytes = 4_000_000, .text_tokens = 100, .image_identity = @as([32]u8, @splat(1)), .estimated_input_tokens = 100 };
     var next = first;
     next.text_tokens = 150;
     next.estimated_input_tokens = 150;
@@ -526,7 +528,7 @@ test "provider request image calibration uses exact usage plus text growth witho
     try std.testing.expectEqual(@as(usize, 1100), repeated.estimated_input_tokens);
     try std.testing.expectEqual(@as(usize, 1000), calibrateProviderRequest(first, .{ .request = calibrated, .exact_input_tokens = 1050 }).estimated_input_tokens);
 
-    next.image_identity = [_]u8{2} ** 32;
+    next.image_identity = @as([32]u8, @splat(2));
     try std.testing.expectEqual(next, calibrateProviderRequest(next, .{ .request = first, .exact_input_tokens = 1000 }));
     next.image_identity = null;
     try std.testing.expectEqual(next, calibrateProviderRequest(next, .{ .request = first, .exact_input_tokens = 1000 }));
@@ -541,7 +543,7 @@ test "provider request image accounting borrows large payloads and releases scra
     const payload = try alloc.alloc(u8, 4 * 1024 * 1024);
     defer alloc.free(payload);
     @memset(payload, 'A');
-    const body = try std.fmt.allocPrint(alloc, "{{\"input\":[{{\"role\":\"user\",\"content\":[{{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,{s}\"}}]}}]}}", .{payload});
+    const body = try alloc.print("{{\"input\":[{{\"role\":\"user\",\"content\":[{{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,{s}\"}}]}}]}}", .{payload});
     defer alloc.free(body);
     var storage: [8192]u8 = undefined;
     var scratch = std.heap.FixedBufferAllocator.init(&storage);
@@ -577,7 +579,7 @@ test "provider request image accounting handles allocation and malformed input f
             _ = try measureProviderRequest(alloc, "{\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,AAAA\"}]}]}", measurement_test_request(true));
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Probe.run, .{});
     for ([_][]const u8{
         "{",
         "{\"input\":[],\"prompt\":[]}",

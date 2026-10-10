@@ -1,10 +1,12 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const contracts = @import("contracts.zig");
 const operation = @import("operation.zig");
 const recovery = @import("recovery.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const session_layout = @import("../session/session_layout.zig");
 const process_identity = @import("../execution/process_identity.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const process_provider_mod = @import(
     "../execution/process_provider.zig",
 );
@@ -230,7 +232,7 @@ pub const Record = struct {
             return error.InvalidTerminalRecord;
         if (self.host_identity.len == 0 or self.backend_identity.len == 0 or
             self.shell.len == 0 or self.cwd.len == 0 or
-            !std.fs.path.isAbsolute(self.cwd))
+            !std.Io.Dir.path.isAbsolute(self.cwd))
         {
             return error.InvalidTerminalRecord;
         }
@@ -522,7 +524,7 @@ pub const ProfileStore = struct {
         var joined: usize = 0;
         errdefer for (display_outside_paths[0..joined]) |path| alloc.free(path);
         for (outside_roots, &display_outside_paths) |root_name, *path| {
-            path.* = try std.fs.path.join(alloc, &.{ home, profile_paths.root_dir_name, root_name });
+            path.* = try std.Io.Dir.path.join(alloc, &.{ home, profile_paths.root_dir_name, root_name });
             joined += 1;
         }
         return .{
@@ -739,7 +741,7 @@ pub const ProfileStore = struct {
     };
 
     fn owner_iterator(self: *ProfileStore) !OwnerIterator {
-        var roots: [outside_roots.len]?io_mod.VerifiedDir = .{null} ** outside_roots.len;
+        var roots: [outside_roots.len]?io_mod.VerifiedDir = @splat(null);
         errdefer for (&roots) |*maybe| if (maybe.*) |*value| value.close();
         for (outside_roots, &roots) |root_name, *root| root.* = try self.open_outside_root(root_name, false);
         return .{ .store = self, .sessions = self.sessions_dir.dir.iterate(), .roots = roots };
@@ -1339,7 +1341,7 @@ pub fn formatOwnerIdentity(
     token: process_identity.ProcessInstanceToken,
 ) error{ NoSpaceLeft, InvalidOwnerIdentity }![]const u8 {
     if (instance_hex.len != owner_instance_hex_len) return error.InvalidOwnerIdentity;
-    return std.fmt.bufPrint(buffer, "{s}{s}/{d}/{s}", .{
+    return std.mem.print(buffer, "{s}{s}/{d}/{s}", .{
         owner_identity_prefix,
         instance_hex,
         pid,
@@ -1423,7 +1425,7 @@ fn takeover_owner_matches(
     const pid = record.takeover_owner_pid orelse return false;
     const process_token = record.takeover_owner_process_token orelse return false;
     var pid_buffer: [32]u8 = undefined;
-    const owner_pid = std.fmt.bufPrint(&pid_buffer, "{d}", .{owner.pid}) catch
+    const owner_pid = std.mem.print(&pid_buffer, "{d}", .{owner.pid}) catch
         return false;
     return std.mem.eql(u8, pid, owner_pid) and
         std.mem.eql(u8, process_token, owner.token());
@@ -1621,7 +1623,7 @@ fn terminal_id_from_artifact_name(name: []const u8) ?[]const u8 {
             continue;
         }
         const body = name[shape.prefix.len .. name.len - shape.suffix.len];
-        const separator = std.mem.lastIndexOfScalar(u8, body, '-') orelse continue;
+        const separator = std.mem.findScalarLast(u8, body, '-') orelse continue;
         if (separator == 0 or separator + 1 == body.len) continue;
         _ = std.fmt.parseInt(u64, body[separator + 1 ..], 10) catch continue;
         const id = body[0..separator];
@@ -1881,7 +1883,7 @@ fn make_name(
     session_id: []const u8,
     suffix: []const u8,
 ) Allocator.Error![]u8 {
-    return std.fmt.allocPrint(alloc, "{s}-{s}{s}", .{
+    return alloc.print("{s}-{s}{s}", .{
         prefix,
         session_id,
         suffix,
@@ -1905,8 +1907,7 @@ fn checkpoint_name(
     session_id: []const u8,
     generation: u64,
 ) Allocator.Error![]u8 {
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "checkpoint-{s}-{d}.bin",
         .{ session_id, generation },
     );
@@ -1924,8 +1925,7 @@ fn journal_name(
     session_id: []const u8,
     segment: u64,
 ) Allocator.Error![]u8 {
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "journal-{s}-{d}.bin",
         .{ session_id, segment },
     );
@@ -1957,8 +1957,7 @@ fn event_name(
     session_id: []const u8,
     event_id: u64,
 ) Allocator.Error![]u8 {
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "event-{s}-{d}.json",
         .{ session_id, event_id },
     );
@@ -2124,7 +2123,7 @@ fn verify_owner_catalog_claim(
     defer capability.deinit();
     const key = owner_catalog_key(claim.principal, claim.actor);
     var name_buffer: [96]u8 = undefined;
-    const name = try std.fmt.bufPrint(
+    const name = try std.mem.print(
         &name_buffer,
         "catalog-authority-{s}.json",
         .{&key},
@@ -2288,19 +2287,19 @@ pub fn loadOrCreateOwnerCatalogClaim(
     try principal.validate();
     const key = owner_catalog_key(principal, input.actor);
     var authority_name_buffer: [96]u8 = undefined;
-    const catalog_authority_name = try std.fmt.bufPrint(
+    const catalog_authority_name = try std.mem.print(
         &authority_name_buffer,
         "catalog-authority-{s}.json",
         .{&key},
     );
     var proof_name_buffer: [96]u8 = undefined;
-    const catalog_proof_name = try std.fmt.bufPrint(
+    const catalog_proof_name = try std.mem.print(
         &proof_name_buffer,
         "catalog-proof-{s}",
         .{&key},
     );
     var lock_name_buffer: [96]u8 = undefined;
-    const lock_name = try std.fmt.bufPrint(
+    const lock_name = try std.mem.print(
         &lock_name_buffer,
         "catalog-{s}.lock",
         .{&key},
@@ -2548,15 +2547,25 @@ pub const DurableSession = struct {
             true,
         );
         defer proofs.deinit();
-        errdefer |err| if (err != error.InjectedCrash) {
-            cleanup_partial_start(
-                profile.alloc,
-                &state,
-                &proofs,
-                input.session_id,
-            );
+        return create_started(profile, input, &state, &proofs) catch |err| {
+            if (err != error.InjectedCrash) {
+                cleanup_partial_start(
+                    profile.alloc,
+                    &state,
+                    &proofs,
+                    input.session_id,
+                );
+            }
+            return err;
         };
+    }
 
+    fn create_started(
+        profile: *ProfileStore,
+        input: CreateInput,
+        state: *session_child_store.SessionChildCapability,
+        proofs: *session_child_store.SessionChildCapability,
+    ) !DurableSession {
         const reserve = try checkpoint_reserve_bytes(input.dimensions);
         if (reserve > profile.options.per_session_limit) {
             return error.CapacityExceeded;
@@ -2653,14 +2662,14 @@ pub const DurableSession = struct {
             return error.InjectedCrash;
         }
 
-        try write_proof(alloc, &proofs, input.session_id, input.persistence.proof);
+        try write_proof(alloc, proofs, input.session_id, input.persistence.proof);
         if (profile.options.fail_at == .after_proof_write) {
             return error.InjectedCrash;
         }
         if (profile.options.fail_at == .grant) return error.InjectedFailure;
         try write_authority(
             alloc,
-            &state,
+            state,
             input.session_id,
             input.persistence.grant,
             input.persistence.proof,
@@ -2670,10 +2679,10 @@ pub const DurableSession = struct {
             return error.InjectedCrash;
         }
         if (profile.options.fail_at == .start) return error.InjectedFailure;
-        try save_record(alloc, &state, record);
+        try save_record(alloc, state, record);
         return .{
             .profile = profile,
-            .state = state,
+            .state = state.*,
             .record = record,
             .journal = journal,
         };
@@ -3030,7 +3039,15 @@ pub const DurableSession = struct {
         var replacement: ?session_child_store.ManagedFile = null;
         var replacement_name: ?[]u8 = null;
         defer if (replacement_name) |name| alloc.free(name);
-        errdefer |err| {
+        self.write_journal_chunk(
+            bytes,
+            now_ms,
+            previous_files,
+            &working,
+            &working_owned,
+            &replacement,
+            &replacement_name,
+        ) catch |err| {
             if (replacement) |*file| file.deinit();
             if (err != error.InjectedCrash) {
                 if (replacement_name) |name| {
@@ -3053,37 +3070,50 @@ pub const DurableSession = struct {
                     }
                 }
             }
-        }
+            return err;
+        };
+    }
 
+    fn write_journal_chunk(
+        self: *DurableSession,
+        bytes: []const u8,
+        now_ms: i64,
+        previous_files: []JournalFile,
+        working: *[]JournalFile,
+        working_owned: *bool,
+        replacement: *?session_child_store.ManagedFile,
+        replacement_name: *?[]u8,
+    ) !void {
+        const alloc = self.profile.alloc;
         const resumes_reopened_journal = self.journal == null;
         if (resumes_reopened_journal or
-            working[working.len - 1].payload_bytes ==
+            working.*[working.*.len - 1].payload_bytes ==
                 self.profile.options.segment_bytes)
         {
             const next_id = std.math.add(
                 u64,
-                working[working.len - 1].file_id,
+                working.*[working.*.len - 1].file_id,
                 1,
             ) catch return error.CapacityExceeded;
-            const expanded = try alloc.alloc(JournalFile, working.len + 1);
-            @memcpy(expanded[0..working.len], working);
-            alloc.free(working);
-            working = expanded;
+            const expanded = try alloc.alloc(JournalFile, working.*.len + 1);
+            @memcpy(expanded[0..working.*.len], working.*);
+            alloc.free(working.*);
+            working.* = expanded;
             const cursor = self.record.output_cursor;
-            working[working.len - 1] = .{
+            working.*[working.*.len - 1] = .{
                 .file_id = next_id,
                 .range = .{ .start = cursor, .end = cursor },
                 .payload_bytes = 0,
                 .checksum = contracts.checkpoint_checksum(""),
             };
             const name = try journal_name(alloc, self.record.session_id, next_id);
-            replacement_name = name;
-            replacement = try (try self.state_capability()).createExclusiveFile(
+            replacement_name.* = name;
+            replacement.* = try (try self.state_capability()).createExclusiveFile(
                 alloc,
                 .terminal_state,
                 name,
             );
-            try replacement.?.sync();
+            try replacement.*.?.sync();
             if (resumes_reopened_journal) {
                 debug_trace.logf(
                     "terminal_store",
@@ -3098,7 +3128,7 @@ pub const DurableSession = struct {
             }
         }
 
-        const file = if (replacement) |*value|
+        const file = if (replacement.*) |*value|
             value
         else if (self.journal) |*value|
             value
@@ -3110,7 +3140,7 @@ pub const DurableSession = struct {
             return error.InjectedCrash;
         }
 
-        const extent = &working[working.len - 1];
+        const extent = &working.*[working.*.len - 1];
         const next_offset = std.math.add(
             u64,
             self.record.output_cursor.offset,
@@ -3131,7 +3161,7 @@ pub const DurableSession = struct {
         const previous_output_cursor = self.record.output_cursor;
         const previous_journal_bytes = self.record.journal_payload_bytes;
         const previous_updated_at_ms = self.record.updated_at_ms;
-        self.record.journal_files = working;
+        self.record.journal_files = working.*;
         self.record.output_cursor.offset = next_offset;
         self.record.journal_payload_bytes = std.math.add(
             u64,
@@ -3151,11 +3181,11 @@ pub const DurableSession = struct {
             return error.TerminalStoreFailed;
         };
         alloc.free(previous_files);
-        working_owned = false;
-        if (replacement) |new_file| {
+        working_owned.* = false;
+        if (replacement.*) |new_file| {
             if (self.journal) |*old_file| old_file.deinit();
             self.journal = new_file;
-            replacement = null;
+            replacement.* = null;
         }
     }
 
@@ -4574,7 +4604,7 @@ pub const DurableSession = struct {
         now_ms: i64,
     ) !void {
         var pid_buffer: [32]u8 = undefined;
-        const pid = try std.fmt.bufPrint(&pid_buffer, "{d}", .{owner.pid});
+        const pid = try std.mem.print(&pid_buffer, "{d}", .{owner.pid});
         return self.persist_attention_state_locked(
             attention,
             pid,
@@ -5619,7 +5649,7 @@ fn validate_recovery_principal(
         !std.mem.eql(u8, record.cwd, principal.cwd) or
         record.backend != principal.backend or
         principal.lifetime != .session or
-        !std.fs.path.isAbsolute(principal.workspace_root))
+        !std.Io.Dir.path.isAbsolute(principal.workspace_root))
     {
         return error.InvalidAuthorityRecord;
     }
@@ -6270,7 +6300,7 @@ fn test_process_owner(
 ) !contracts.ProcessOwner {
     var pid_buffer: [32]u8 = undefined;
     const pid = std.c.getpid();
-    const pid_text = try std.fmt.bufPrint(&pid_buffer, "{d}", .{pid});
+    const pid_text = try std.mem.print(&pid_buffer, "{d}", .{pid});
     const token = try process_provider.captureToken(
         alloc,
         pid_text,
@@ -6423,9 +6453,9 @@ test "owner reconcile ends only terminals whose owner process is gone" {
         "macos:00000000000000000000000000000000:1:2",
     );
     var running_buffer: [max_owner_identity_bytes]u8 = undefined;
-    const running_owner = try formatOwnerIdentity(&running_buffer, "a" ** 32, 4242, token);
+    const running_owner = try formatOwnerIdentity(&running_buffer, text_utils.repeat("a", 32), 4242, token);
     var gone_buffer: [max_owner_identity_bytes]u8 = undefined;
-    const gone_owner = try formatOwnerIdentity(&gone_buffer, "b" ** 32, 4243, token);
+    const gone_owner = try formatOwnerIdentity(&gone_buffer, text_utils.repeat("b", 32), 4243, token);
     // The retired daemon wrote a bare instance id, so its records are judged
     // by their terminal process.
     const legacy_owner = "0123456789abcdef0123456789abcdef";
@@ -6482,9 +6512,9 @@ test "owner identities round trip and reject malformed text" {
         "linux:00112233445566778899aabbccddeeff:12345",
     );
     var buffer: [max_owner_identity_bytes]u8 = undefined;
-    const text = try formatOwnerIdentity(&buffer, "c" ** 32, 77, token);
+    const text = try formatOwnerIdentity(&buffer, text_utils.repeat("c", 32), 77, token);
     try std.testing.expectEqualStrings(
-        "fx-process-v1/" ++ "c" ** 32 ++ "/77/linux:00112233445566778899aabbccddeeff:12345",
+        "fx-process-v1/" ++ text_utils.repeat("c", 32) ++ "/77/linux:00112233445566778899aabbccddeeff:12345",
         text,
     );
     const parsed = parse_owner_identity(text).?;
@@ -6495,8 +6525,8 @@ test "owner identities round trip and reject malformed text" {
         formatOwnerIdentity(&buffer, "short", 77, token),
     );
     try std.testing.expect(parse_owner_identity("0123456789abcdef0123456789abcdef") == null);
-    try std.testing.expect(parse_owner_identity("fx-process-v1/" ++ "c" ** 32 ++ "/x/linux:00112233445566778899aabbccddeeff:1") == null);
-    try std.testing.expect(parse_owner_identity("fx-process-v1/" ++ "c" ** 32 ++ "/77/not-a-token") == null);
+    try std.testing.expect(parse_owner_identity("fx-process-v1/" ++ text_utils.repeat("c", 32) ++ "/x/linux:00112233445566778899aabbccddeeff:1") == null);
+    try std.testing.expect(parse_owner_identity("fx-process-v1/" ++ text_utils.repeat("c", 32) ++ "/77/not-a-token") == null);
 }
 
 fn recovered_session_index(
@@ -6611,7 +6641,7 @@ test "durable journal rotates with monotonic cursors and reads exact bytes" {
 
 test "durable create load and replay release every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkStoreAllocationFailures,
         .{},
     );
@@ -6971,7 +7001,7 @@ test "holder proof verifier ignores packed control padding" {
 
 test "authority reload covers allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkAuthorityReloadAllocationFailures,
         .{},
     );
@@ -7693,7 +7723,7 @@ test "terminal records require takeover attention lease and owner as one state" 
         fixture.profile.process_provider,
     );
     var pid_buffer: [32]u8 = undefined;
-    const pid = try std.fmt.bufPrint(&pid_buffer, "{d}", .{process_owner.pid});
+    const pid = try std.mem.print(&pid_buffer, "{d}", .{process_owner.pid});
     malformed = session.record;
     malformed.takeover_owner_pid = @constCast(pid);
     malformed.takeover_owner_process_token = @constCast(process_owner.token());
@@ -8025,8 +8055,7 @@ test "close intent converges every durable boundary without reviving authority" 
     for (points, 0..) |point, index| {
         var fixture = try TestStoreFixture.init(alloc, test_options());
         defer fixture.deinit();
-        const session_id = try std.fmt.allocPrint(
-            alloc,
+        const session_id = try alloc.print(
             "terminal-close-boundary-{d}",
             .{index},
         );
@@ -8242,7 +8271,7 @@ test "recovery leaves partial start artifacts to the process writing them" {
         .after_authority_write,
     };
     for (points, 0..) |point, index| {
-        const id = try std.fmt.allocPrint(alloc, "terminal-partial-{d}", .{index});
+        const id = try alloc.print("terminal-partial-{d}", .{index});
         defer alloc.free(id);
         fixture.profile.options.fail_at = point;
         try std.testing.expectError(error.InjectedCrash, fixture.create(id));

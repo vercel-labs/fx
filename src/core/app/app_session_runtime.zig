@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const auto_classifier_context = @import("../permissions/auto_classifier_context.zig");
@@ -513,7 +514,7 @@ pub const SessionPicker = struct {
 
     pub fn setQuery(self: *SessionPicker, query_text: []const u8) void {
         const len = @min(query_text.len, self.query_buf.len);
-        if (len > 0) std.mem.copyForwards(u8, self.query_buf[0..len], query_text[0..len]);
+        if (len > 0) @memmove(self.query_buf[0..len], query_text[0..len]);
         self.query_len = len;
         self.selected = 0;
         self.window_start = 0;
@@ -1319,7 +1320,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (std.meta.fields(Persistence).len != 30) {
+            if (@typeInfo(Persistence).@"struct".field_names.len != 30) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -2756,8 +2757,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn writeSessionPickerError(app: *App, err: anyerror) !void {
-            const notice = try std.fmt.allocPrint(
-                app.alloc,
+            const notice = try app.alloc.print(
                 "unable to list saved sessions: {s}",
                 .{@errorName(err)},
             );
@@ -2955,11 +2955,20 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             checkpoint: session_codec.RecoveryCheckpoint,
         ) !void {
-            errdefer |err| if (err == error.SessionPersistenceUncertain) {
-                if (comptime @hasDecl(@TypeOf(app.worker), "preservePromptSnapshots")) {
-                    app.worker.preservePromptSnapshots(checkpoint.turn_id, checkpoint.user.images);
+            writeRecoveryCheckpoint(app, checkpoint) catch |err| {
+                if (err == error.SessionPersistenceUncertain) {
+                    if (comptime @hasDecl(@TypeOf(app.worker), "preservePromptSnapshots")) {
+                        app.worker.preservePromptSnapshots(checkpoint.turn_id, checkpoint.user.images);
+                    }
                 }
+                return err;
             };
+        }
+
+        fn writeRecoveryCheckpoint(
+            app: *App,
+            checkpoint: session_codec.RecoveryCheckpoint,
+        ) !void {
             if (comptime !@hasField(App, "session_persistence")) {
                 return error.SessionPersistenceUnavailable;
             }
@@ -3391,14 +3400,12 @@ pub fn Runtime(comptime App: type) type {
                 }
                 if (comptime @hasDecl(App, "writeDomainNotice")) {
                     const body = if (loaded.conversation_writer.turn_open)
-                        try std.fmt.allocPrint(
-                            app.alloc,
+                        try app.alloc.print(
                             "Turn completed, but fx could not save it ({s}). New messages are blocked until you reopen the session. The turn may run again.",
                             .{@errorName(err)},
                         )
                     else
-                        try std.fmt.allocPrint(
-                            app.alloc,
+                        try app.alloc.print(
                             "Turn completed, but fx could not save it ({s}). The session keeps running; this turn may be missing after a resume.",
                             .{@errorName(err)},
                         );
@@ -3444,8 +3451,7 @@ pub fn Runtime(comptime App: type) type {
                 .finished_prompt => {
                     recordShutdownFailure(app, failure);
                     if (comptime @hasDecl(App, "writeDomainNotice")) {
-                        const body = try std.fmt.allocPrint(
-                            app.alloc,
+                        const body = try app.alloc.print(
                             "Turn completed, but fx could not save it ({s}). The session keeps running; this turn may be missing after a resume.",
                             .{@errorName(failure)},
                         );
@@ -3615,13 +3621,13 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             const basename = if (comptime @hasField(App, "workspace_root"))
-                std.fs.path.basename(app.workspace_root)
+                std.Io.Dir.path.basename(app.workspace_root)
             else
                 "";
             const folder = if (basename.len == 0) "workspace" else basename;
             const prefix = "fx v" ++ build_options.app_version ++ " | ";
-            var label_buffer: [prefix.len + std.fs.max_path_bytes]u8 = undefined;
-            const label = std.fmt.bufPrint(&label_buffer, "{s}{s}", .{ prefix, folder }) catch |err| {
+            var label_buffer: [prefix.len + std.Io.Dir.max_path_bytes]u8 = undefined;
+            const label = std.mem.print(&label_buffer, "{s}{s}", .{ prefix, folder }) catch |err| {
                 debug_trace.logf("session", "terminal title workspace omitted err={s}", .{@errorName(err)});
                 provider.set("fx v" ++ build_options.app_version);
                 return;
@@ -5063,8 +5069,7 @@ pub fn Runtime(comptime App: type) type {
             );
             const formatted_action = if (outcome_decision) |decision|
                 if (decision.detail) |detail|
-                    try std.fmt.allocPrint(
-                        action_arena.allocator(),
+                    try action_arena.allocator().print(
                         "{s}: {s}",
                         .{ formatted_action_base, detail },
                     )
@@ -5407,8 +5412,7 @@ pub fn Runtime(comptime App: type) type {
             sink: anytype,
             call: types.ToolCall,
         ) !void {
-            const status = try std.fmt.allocPrint(
-                app.alloc,
+            const status = try app.alloc.print(
                 "● Tool completion was not reported: {s}",
                 .{call.name},
             );
@@ -5422,8 +5426,7 @@ pub fn Runtime(comptime App: type) type {
             sink: anytype,
             result: types.PersistedToolResult,
         ) !void {
-            const status = try std.fmt.allocPrint(
-                app.alloc,
+            const status = try app.alloc.print(
                 "● {s} tool result: {s}",
                 .{ @tagName(result.status), result.tool_name },
             );
@@ -6231,7 +6234,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn reportRememberFailure(app: *App, failure: RememberFailure, comptime from_worker: bool) void {
             const alloc = std.heap.c_allocator;
-            const body = std.fmt.allocPrint(alloc, "Session saved, but could not remember it for -c ({s}). Resume with fx --resume {s}.", .{ @errorName(failure.err), failure.id[0..failure.len] }) catch return;
+            const body = alloc.print("Session saved, but could not remember it for -c ({s}). Resume with fx --resume {s}.", .{ @errorName(failure.err), failure.id[0..failure.len] }) catch return;
             defer alloc.free(body);
             const notice = types.SemanticNotice{ .topic = "session", .tone = .warning, .body = body };
             if (comptime @hasDecl(@TypeOf(app.worker), "pushEvent") and (from_worker or !@hasDecl(App, "writeDomainNotice"))) {
@@ -6250,8 +6253,7 @@ pub fn Runtime(comptime App: type) type {
             label: []const u8,
             err: anyerror,
         ) !void {
-            const notice = try std.fmt.allocPrint(
-                app.alloc,
+            const notice = try app.alloc.print(
                 "{s}: {s}; continuing non-durably",
                 .{ label, @errorName(err) },
             );
@@ -6484,7 +6486,7 @@ test "session transition retires queued and running compaction only after worker
             .history = try app.alloc.alloc(types.HistoryTurn, 0),
         });
         const next = app.worker.compactionActivitySnapshot();
-        try std.testing.expect(@intFromEnum(next.operation.?.id) > @intFromEnum(old.operation.?.id));
+        try std.testing.expect(@backingInt(next.operation.?.id) > @backingInt(old.operation.?.id));
         try std.testing.expect(next.revision > retired.revision);
         app.worker.settleCompactionActivity(old.operation.?.id, .{ .outcome = .failed });
         try std.testing.expect(!app.worker.dismissCompactionActivity(old.operation.?.id, terminal.revision));
@@ -6703,7 +6705,7 @@ const TestApp = struct {
         );
     }
 
-    fn snapshotMcpToolNames(self: *TestApp, alloc: Allocator) ![][]u8 {
+    pub fn snapshotMcpToolNames(self: *TestApp, alloc: Allocator) ![][]u8 {
         const names = try alloc.alloc([]u8, self.mcp_tool_names.items.len);
         var initialized: usize = 0;
         errdefer {
@@ -6717,7 +6719,7 @@ const TestApp = struct {
         return names;
     }
 
-    fn terminalTitle(self: *TestApp) host_capability.TerminalTitle {
+    pub fn terminalTitle(self: *TestApp) host_capability.TerminalTitle {
         return .{
             .context = self,
             .set_fn = setTerminalTitleLabelForTest,
@@ -6784,20 +6786,19 @@ const TestApp = struct {
         self.* = undefined;
     }
 
-    fn writeDomainNotice(self: *TestApp, notice: types.SemanticNotice, _: bool) !void {
+    pub fn writeDomainNotice(self: *TestApp, notice: types.SemanticNotice, _: bool) !void {
         if (self.fail_system_notice) {
             self.writable_seen_during_notice_failure =
                 self.session_persistence.writable != null;
             return error.TestSystemNoticeFailure;
         }
         try self.notices.append(self.alloc, if (notice.topic.len > 0)
-            try std.fmt.allocPrint(
-                self.alloc,
+            try self.alloc.print(
                 "{s} {s}: {s}",
                 .{ types.noticeGlyph(notice.tone), notice.topic, notice.body },
             )
         else
-            try std.fmt.allocPrint(self.alloc, "{s} {s}", .{ types.noticeGlyph(notice.tone), notice.body }));
+            try self.alloc.print("{s} {s}", .{ types.noticeGlyph(notice.tone), notice.body }));
     }
 
     fn commitStartupResumeReplayAnchor(self: *TestApp) !void {
@@ -6852,13 +6853,13 @@ const TestApp = struct {
         const line = if (std.mem.endsWith(u8, text, "\n"))
             try self.alloc.dupe(u8, text)
         else
-            try std.fmt.allocPrint(self.alloc, "{s}\n", .{text});
+            try self.alloc.print("{s}\n", .{text});
         try self.completed_tool_statuses.append(self.alloc, line);
         try self.completed_tool_outcomes.append(self.alloc, kind);
         try self.replay_events.append(self.alloc, .completed_tool_status);
     }
 
-    fn writeCompletedToolStatusReturningEntryId(
+    pub fn writeCompletedToolStatusReturningEntryId(
         self: *TestApp,
         kind: types.ToolOutcomeKind,
         text: []const u8,
@@ -6868,7 +6869,7 @@ const TestApp = struct {
         return self.allocateTranscriptEntryId();
     }
 
-    fn writeHistoricalQuestionResolution(
+    pub fn writeHistoricalQuestionResolution(
         self: *TestApp,
         answers: []const types.QuestionAnswer,
     ) !u32 {
@@ -6878,7 +6879,7 @@ const TestApp = struct {
         return entry_id;
     }
 
-    fn attachHistoricalToolDetail(
+    pub fn attachHistoricalToolDetail(
         self: *TestApp,
         entry_id: u32,
         _: types.ToolCall,
@@ -6887,7 +6888,7 @@ const TestApp = struct {
         try self.historical_tool_detail_entry_ids.append(self.alloc, entry_id);
     }
 
-    fn attachHistoricalCancelledCommandDetail(
+    pub fn attachHistoricalCancelledCommandDetail(
         self: *TestApp,
         entry_id: u32,
         _: types.ToolCall,
@@ -6937,16 +6938,16 @@ const TestApp = struct {
             return arena.dupe(u8, "● Ran pwd");
         }
         if (display_target) |target| {
-            return std.fmt.allocPrint(arena, "● Completed {s} {s}", .{ call.name, target });
+            return arena.print("● Completed {s} {s}", .{ call.name, target });
         }
-        return std.fmt.allocPrint(arena, "● Completed {s}", .{call.name});
+        return arena.print("● Completed {s}", .{call.name});
     }
 
     fn describeToolActionDeniedWithAdvertised(self: *TestApp, arena: Allocator, call: types.ToolCall, _: ?[]const u8, label: []const u8, _: []const []const u8) ![]const u8 {
         if (self.action_description_allocates_scratch) {
             _ = try arena.dupe(u8, "temporary parsed arguments");
         }
-        return std.fmt.allocPrint(arena, "● {s} {s}", .{ label, call.name });
+        return arena.print("● {s} {s}", .{ label, call.name });
     }
 
     fn pacerEmit(ctx: *anyopaque, text: []const u8) anyerror!void {
@@ -7541,7 +7542,7 @@ test "v2 ultrafast resume applies process overrides without persisting them" {
     const home = try TestHome.install(alloc, paths.home);
     defer home.deinit();
     // fx keeps `.fx` private, and resuming a v2 session verifies that.
-    const fx_dir = try std.fs.path.joinZ(alloc, &.{ paths.home, ".fx" });
+    const fx_dir = try std.Io.Dir.path.joinZ(alloc, &.{ paths.home, ".fx" });
     defer alloc.free(fx_dir);
     if (std.c.chmod(fx_dir.ptr, 0o700) != 0) return error.TestChmodFailed;
     for ([_]bool{ false, true }) |baseline| {
@@ -7769,7 +7770,7 @@ test "resume handoff requires no derived cache write" {
     const session_dir = (try Runtime(TestApp).activeSessionDisplayPath(&app, alloc)) orelse
         return error.TestExpectedSessionDirectory;
     defer alloc.free(session_dir);
-    const session_dir_z = try alloc.dupeZ(u8, session_dir);
+    const session_dir_z = try alloc.dupeSentinel(u8, session_dir, 0);
     defer alloc.free(session_dir_z);
     if (std.c.chmod(session_dir_z.ptr, 0o500) != 0) return error.TestChmodFailed;
     defer _ = std.c.chmod(session_dir_z.ptr, 0o700);
@@ -7782,7 +7783,7 @@ test "resume handoff requires no derived cache write" {
 }
 
 test "resume handoff suppresses session id allocation failure" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const paths = try testPaths(alloc, &tmp);
@@ -8198,12 +8199,12 @@ test "resume projection stores reflow metadata for session action rows" {
         .labels = &labels,
     };
 
-    const command = "bun run " ++ ("pipeline-stage-" ** 10);
+    const command = "bun run " ++ text_utils.repeat("pipeline-stage-", 10);
     const run_output = "{\"session_id\":\"shell-4\",\"state\":\"running\",\"backend\":\"captured\"}";
     var run_calls = [_]types.ToolCall{.{
         .id = "call_run",
         .name = "shell",
-        .arguments_json = try std.fmt.allocPrint(alloc, "{{\"action\":\"run\",\"command\":{f}}}", .{std.json.fmt(command, .{})}),
+        .arguments_json = try alloc.print("{{\"action\":\"run\",\"command\":{f}}}", .{std.json.fmt(command, .{})}),
     }};
     defer alloc.free(run_calls[0].arguments_json);
     var run_results = [_]types.PersistedToolResult{.{
@@ -8292,12 +8293,12 @@ test "resume projection restores session action rows with labels seeded from the
         .labels = &labels,
     };
 
-    const command = "cd /workspace/packages/cli && " ++ ("printf relative-path " ** 6);
+    const command = "cd /workspace/packages/cli && " ++ text_utils.repeat("printf relative-path ", 6);
     const run_output = "{\"session_id\":\"shell-4\",\"state\":\"running\",\"backend\":\"captured\"}";
     var run_calls = [_]types.ToolCall{.{
         .id = "call_run",
         .name = "shell",
-        .arguments_json = try std.fmt.allocPrint(alloc, "{{\"action\":\"run\",\"command\":{f}}}", .{std.json.fmt(command, .{})}),
+        .arguments_json = try alloc.print("{{\"action\":\"run\",\"command\":{f}}}", .{std.json.fmt(command, .{})}),
     }};
     defer alloc.free(run_calls[0].arguments_json);
     var run_results = [_]types.PersistedToolResult{.{
@@ -8369,11 +8370,11 @@ test "resume projection stores reflow metadata after the session moved workspace
         .labels = &labels,
     };
 
-    const command = "cd /workspace/packages/cli && " ++ ("printf relative-path " ** 6);
+    const command = "cd /workspace/packages/cli && " ++ text_utils.repeat("printf relative-path ", 6);
     var run_calls = [_]types.ToolCall{.{
         .id = "call_run",
         .name = "shell",
-        .arguments_json = try std.fmt.allocPrint(alloc, "{{\"action\":\"run\",\"command\":{f}}}", .{std.json.fmt(command, .{})}),
+        .arguments_json = try alloc.print("{{\"action\":\"run\",\"command\":{f}}}", .{std.json.fmt(command, .{})}),
     }};
     defer alloc.free(run_calls[0].arguments_json);
     var run_results = [_]types.PersistedToolResult{.{
@@ -8684,7 +8685,7 @@ test "resume falls back to saved command output when replay contains an empty fr
         "exit_code=0\n<stdout>\nFALLBACK_STDOUT_MARKER\n</stdout>\n" ++
         "<stderr>\n</stderr>\n";
     const replay_handle = "fx-command-replay-empty-frame.bin";
-    var empty_replay = [_]u8{0} ** ("FXRPLY01".len + 9);
+    var empty_replay: ["FXRPLY01".len + 9]u8 = @splat(0);
     @memcpy(empty_replay[0.."FXRPLY01".len], "FXRPLY01");
 
     var calls = [_]types.ToolCall{.{
@@ -9761,7 +9762,7 @@ test "subagent host publication requires successful registry recovery" {
             return error.HostAuthorityUnavailable;
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &app.session_persistence.store.?, parent_id });
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, AllocationCheck.run, .{ &app.session_persistence.store.?, parent_id });
 }
 
 test "interactive session resume uses the live transition and shared restore path" {
@@ -9960,7 +9961,7 @@ test "resumeRequestedSession replays persisted model Markdown without parsing ge
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Cancelling") == null);
     try std.testing.expectEqual(
         transcript_runtime.RawEntryClass.turn_cancellation,
-        app.raw_transcript_classes.getLast(),
+        app.raw_transcript_classes.last().?,
     );
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
 }
@@ -10229,7 +10230,7 @@ test "cancelled command presentation survives a persisted session restart" {
 }
 
 test "cancelled command metadata allocation failure preserves core presentation" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var failing = std.testing.FailingAllocator.init(alloc, .{});
     const app_alloc = failing.allocator();
     var app = try TestApp.init(app_alloc, "/workspace");
@@ -10542,7 +10543,7 @@ test "cancelled command replay rejects unsafe handles without partial output" {
     };
     for (unsafe_handles, 0..) |handle, index| {
         var call_id_buf: [32]u8 = undefined;
-        const call_id = try std.fmt.bufPrint(&call_id_buf, "unsafe-{d}", .{index});
+        const call_id = try std.mem.print(&call_id_buf, "unsafe-{d}", .{index});
         const history = [_]types.HistoryTurn{.{ .interrupted = .{
             .user = .{ .text = @constCast("cancel") },
             .tool_call = .{
@@ -10567,7 +10568,7 @@ test "cancelled command replay rejects unsafe handles without partial output" {
 }
 
 test "authoritative cancelled replay survives history insertion failure" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const paths = try testPaths(alloc, &tmp);
@@ -10957,7 +10958,7 @@ test "appendFinishedPrompt transfers snapshot ownership after history acceptance
 }
 
 test "appendFinishedPrompt does not transfer snapshot ownership when history insertion fails" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var app = try TestApp.init(alloc, "/tmp/workspace");
     defer app.deinit();
     var probe = SnapshotOwnershipProbe{};
@@ -11030,7 +11031,7 @@ test "appendFinishedPrompt keeps the session alive when the turn cannot be saved
     );
     // The user sees a warning instead of a disappearing process.
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, app.notices.items[0], "could not save") != null);
+    try std.testing.expect(std.mem.find(u8, app.notices.items[0], "could not save") != null);
 
     // Nothing of the rejected turn reached the journal.
     {
@@ -11390,7 +11391,7 @@ test "session picker reuses a held catalog after resize and workspace switch" {
         held.catalog = .{};
         for (0..100) |index| {
             var id_buffer: [32]u8 = undefined;
-            const id = try std.fmt.bufPrint(&id_buffer, "saved-{d}", .{index});
+            const id = try std.mem.print(&id_buffer, "saved-{d}", .{index});
             var summary = try session_summary_codec.cloneSessionSummary(catalog_alloc, .{
                 .id = @constCast(id),
                 .workspace_root = if (index % 2 == 0) paths.workspace else @constCast("/foreign-workspace"),
@@ -11842,7 +11843,7 @@ test "session picker clears selection feedback when the target context changes" 
 }
 
 test "session picker summary append releases ownership when cloning fails" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var summary = session_store.SessionSummary{
         .id = try alloc.dupe(u8, "allocation-failure"),
         .created_at_ms = 1,
@@ -12191,7 +12192,7 @@ test "validateSessionTitle accepts printable text and rejects malformed input" {
     try std.testing.expectError(error.InvalidTitle, V("bad\ttitle"));
     try std.testing.expectError(error.InvalidTitle, V("bad\x07title"));
 
-    const long = "x" ** (session_display_metadata.max_title_bytes + 1);
+    const long = text_utils.repeat("x", session_display_metadata.max_title_bytes + 1);
     try std.testing.expectError(error.TitleTooLong, V(long));
 }
 
@@ -12288,7 +12289,7 @@ const ReconciliationOriginUsage = struct {
     replaced_provider: ?model_provider.ProviderId = null,
     replaced_source: ?types.CredentialSource = null,
 
-    fn replaceProviderReconciliationCredential(
+    pub fn replaceProviderReconciliationCredential(
         self: *@This(),
         _: Allocator,
         provider: model_provider.ProviderId,
@@ -12304,7 +12305,7 @@ const ReconciliationOriginUsage = struct {
 const ReconciliationOriginAuth = struct {
     source: types.CredentialSource,
 
-    fn credentialSource(self: *const @This()) ?types.CredentialSource {
+    pub fn credentialSource(self: *const @This()) ?types.CredentialSource {
         return self.source;
     }
 
@@ -12312,7 +12313,7 @@ const ReconciliationOriginAuth = struct {
         return "origin-bound-token";
     }
 
-    fn accountId(_: *const @This()) ?[]const u8 {
+    pub fn accountId(_: *const @This()) ?[]const u8 {
         return null;
     }
 
@@ -12427,7 +12428,7 @@ const TitleGenerationFakeApp = struct {
             return .{ .api_key = "test-key", .gateway_team = null, .source = .ai_gateway_api_key };
         }
 
-        fn accountId(_: *const TitleTestAuth) ?[]const u8 {
+        pub fn accountId(_: *const TitleTestAuth) ?[]const u8 {
             return null;
         }
     };
@@ -12447,11 +12448,11 @@ const TitleGenerationFakeApp = struct {
         self.alloc.free(self.workspace_root);
     }
 
-    fn agentStreamProvider(self: *TitleGenerationFakeApp) @import("../agent/stream_provider.zig").Provider {
+    pub fn agentStreamProvider(self: *TitleGenerationFakeApp) @import("../agent/stream_provider.zig").Provider {
         return .{ .context = self, .stream_fn = titleStream };
     }
 
-    fn sessionTitleModel(_: *TitleGenerationFakeApp) ?[]const u8 {
+    pub fn sessionTitleModel(_: *TitleGenerationFakeApp) ?[]const u8 {
         return "test/title-model";
     }
 
@@ -12756,7 +12757,7 @@ test "terminal title uses the workspace basename and handles unnamed roots" {
         defer app.deinit();
         Runtime(TestApp).syncTerminalTitle(&app);
         var expected_buffer: [128]u8 = undefined;
-        const expected = try std.fmt.bufPrint(&expected_buffer, "fx v{s} | {s}", .{ build_options.app_version, case.folder });
+        const expected = try std.mem.print(&expected_buffer, "fx v{s} | {s}", .{ build_options.app_version, case.folder });
         try std.testing.expectEqualStrings(expected, app.terminalTitleLabelText());
     }
 }
@@ -12774,10 +12775,10 @@ test "terminal title shows the session title once cached and keeps model context
     var app = try TestApp.init(alloc, paths.workspace);
     defer app.deinit();
 
-    try app.selected_model.appendSlice(alloc, "provider/" ++ ("model" ** 20));
-    try Runtime(TestApp).setCachedSessionTitle(&app, "session-" ++ ("title" ** 20));
+    try app.selected_model.appendSlice(alloc, "provider/" ++ text_utils.repeat("model", 20));
+    try Runtime(TestApp).setCachedSessionTitle(&app, "session-" ++ text_utils.repeat("title", 20));
 
-    const expected = "session-" ++ ("title" ** 20);
+    const expected = "session-" ++ text_utils.repeat("title", 20);
     try std.testing.expectEqualStrings(expected, app.terminalTitleLabelText());
     try std.testing.expect(std.mem.find(u8, app.terminalTitleLabelText(), "model") == null);
 }
@@ -12971,7 +12972,7 @@ test "remembered selection write failure leaves pending user work durable and wa
 }
 
 fn parseTestRecoveryCheckpoint(alloc: Allocator, cause: []const u8) !session_codec.RecoveryCheckpoint {
-    const json = try std.fmt.allocPrint(alloc, "{{\"version\":2,\"turn_id\":1,\"user\":{{\"text\":\"saved request\",\"images\":[]}},\"assistant_source\":\"partial\",\"execution\":{{\"schema_version\":3,\"tool_steps\":[],\"files\":[]}},\"cause\":\"{s}\",\"action\":\"continuing_response\",\"tool_state\":\"uncertain\",\"authority\":{{\"provider\":\"gateway\",\"model\":\"test/model\",\"credential_source\":null,\"credential_identity\":null}},\"requested_fast_mode\":false,\"fast_mode\":false,\"max_provider_attempts\":3,\"consumed_provider_attempts\":0,\"outstanding_reservation\":false}}", .{cause});
+    const json = try alloc.print("{{\"version\":2,\"turn_id\":1,\"user\":{{\"text\":\"saved request\",\"images\":[]}},\"assistant_source\":\"partial\",\"execution\":{{\"schema_version\":3,\"tool_steps\":[],\"files\":[]}},\"cause\":\"{s}\",\"action\":\"continuing_response\",\"tool_state\":\"uncertain\",\"authority\":{{\"provider\":\"gateway\",\"model\":\"test/model\",\"credential_source\":null,\"credential_identity\":null}},\"requested_fast_mode\":false,\"fast_mode\":false,\"max_provider_attempts\":3,\"consumed_provider_attempts\":0,\"outstanding_reservation\":false}}", .{cause});
     defer alloc.free(json);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
     defer parsed.deinit();

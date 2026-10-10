@@ -1,4 +1,5 @@
 const std = @import("std");
+const display_width = @import("../shared/display_width.zig");
 const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -151,7 +152,7 @@ pub const Decoder = struct {
             }
 
             const sequence = self.utf8_pending[0..sequence_len];
-            const scalar = std.unicode.utf8Decode(sequence) catch {
+            const scalar = display_width.decodeUtf8Sequence(sequence) catch {
                 try emitEscapedByte(sink, .byte_escape, self.utf8_pending[0]);
                 self.shiftUtf8Pending(1);
                 continue;
@@ -177,8 +178,7 @@ pub const Decoder = struct {
     fn shiftUtf8Pending(self: *Decoder, count: usize) void {
         const remaining = self.utf8_pending_len - count;
         if (remaining > 0) {
-            std.mem.copyForwards(
-                u8,
+            @memmove(
                 self.utf8_pending[0..remaining],
                 self.utf8_pending[count..self.utf8_pending_len],
             );
@@ -400,7 +400,7 @@ const CollectorSink = struct {
         try self.output.records.items[index].text.appendSlice(self.alloc, bytes);
     }
 
-    fn recordTransform(
+    pub fn recordTransform(
         self: *CollectorSink,
         kind: TransformKind,
         byte: u8,
@@ -441,7 +441,7 @@ const CollectorSink = struct {
 };
 
 fn streamIndex(stream: Stream) usize {
-    return @intFromEnum(stream);
+    return @backingInt(stream);
 }
 
 pub fn eql(lhs: CanonicalOutput, rhs: CanonicalOutput) bool {
@@ -489,12 +489,12 @@ pub fn canonicalizeForegroundResult(
     for ([_]Stream{ .stdout, .stderr }) |stream| {
         const label = @tagName(stream);
         var open_buf: [16]u8 = undefined;
-        const open = std.fmt.bufPrint(&open_buf, "<{s}>\n", .{label}) catch
+        const open = std.mem.print(&open_buf, "<{s}>\n", .{label}) catch
             unreachable;
         if (!std.mem.startsWith(u8, remaining, open)) continue;
 
         var close_buf: [20]u8 = undefined;
-        const close = std.fmt.bufPrint(&close_buf, "\n</{s}>\n", .{label}) catch
+        const close = std.mem.print(&close_buf, "\n</{s}>\n", .{label}) catch
             unreachable;
         const body_and_tail = remaining[open.len..];
         const close_start = std.mem.find(u8, body_and_tail, close) orelse {

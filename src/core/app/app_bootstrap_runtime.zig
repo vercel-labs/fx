@@ -265,7 +265,7 @@ pub fn Runtime(comptime App: type) type {
 
         // Neutral one-line summary inline; the full detail stays behind Ctrl+O.
         fn writeCollapsedStartupNotice(app: *App, topic: []const u8, summary_lead: []const u8, detail: []const u8) !void {
-            const summary = try std.fmt.allocPrint(app.alloc, "{s} (ctrl+o to view)", .{summary_lead});
+            const summary = try app.alloc.print("{s} (ctrl+o to view)", .{summary_lead});
             defer app.alloc.free(summary);
             try app.writeDomainNotice(.{ .topic = topic, .tone = .neutral, .body = summary }, true);
             try app.writeDomainNotice(.{ .topic = topic, .tone = .neutral, .body = detail, .visibility = .full_only }, true);
@@ -300,7 +300,7 @@ pub fn Runtime(comptime App: type) type {
                 _ = try app.session.claimContextNotice(app.alloc, skills_body);
             }
 
-            const skills_summary = try std.fmt.allocPrint(app.alloc, "{d} discovery issue{s}; some skills may be missing", .{
+            const skills_summary = try app.alloc.print("{d} discovery issue{s}; some skills may be missing", .{
                 app.skills.diagnostics.len,
                 if (app.skills.diagnostics.len == 1) "" else "s",
             });
@@ -651,8 +651,7 @@ pub fn Runtime(comptime App: type) type {
             var recording = try record_tape.captureStatus(app.alloc);
             defer recording.deinit(app.alloc);
             if (recording == .active) {
-                const recording_body = try std.fmt.allocPrint(
-                    app.alloc,
+                const recording_body = try app.alloc.print(
                     "visual terminal capture: {s}\nvisible terminal content, including typed prompt text, is recorded",
                     .{recording.active.path},
                 );
@@ -679,7 +678,7 @@ pub fn Runtime(comptime App: type) type {
                     reported += 1;
                 }
                 if (reported > 0) {
-                    const summary = try std.fmt.allocPrint(app.alloc, "{d} configuration issue{s}", .{
+                    const summary = try app.alloc.print("{d} configuration issue{s}", .{
                         reported,
                         if (reported == 1) "" else "s",
                     });
@@ -704,8 +703,7 @@ pub fn Runtime(comptime App: type) type {
                             "startup load failed err={s}",
                             .{@errorName(err)},
                         );
-                        const history_body = try std.fmt.allocPrint(
-                            app.alloc,
+                        const history_body = try app.alloc.print(
                             "failed to load durable prompt history ({s})",
                             .{@errorName(err)},
                         );
@@ -883,14 +881,14 @@ const TestApp = struct {
             styles.system_notice_text_style.len > 0 and
             styles.reset_style.len > 0;
         const notice = if (semantic_notice.topic.len > 0)
-            try std.fmt.allocPrint(self.alloc, "{s} {s}: {s}{s}\n", .{
+            try self.alloc.print("{s} {s}: {s}{s}\n", .{
                 types.noticeGlyph(semantic_notice.tone),
                 semantic_notice.topic,
                 semantic_notice.body,
                 if (semantic_notice.visibility == .full_only) " [full-only]" else "",
             })
         else
-            try std.fmt.allocPrint(self.alloc, "{s} {s}{s}\n", .{
+            try self.alloc.print("{s} {s}{s}\n", .{
                 types.noticeGlyph(semantic_notice.tone),
                 semantic_notice.body,
                 if (semantic_notice.visibility == .full_only) " [full-only]" else "",
@@ -1462,7 +1460,7 @@ test "writeSessionAssemblyBody caps long tool and server lists" {
     defer body.deinit();
     var tool_names: [12][]const u8 = undefined;
     for (&tool_names, 0..) |*name, index| {
-        name.* = try std.fmt.allocPrint(alloc, "tool_{d}", .{index});
+        name.* = try alloc.print("tool_{d}", .{index});
     }
     defer for (&tool_names) |*name| alloc.free(name.*);
     try writeSessionAssemblyBody(&body.writer, .{

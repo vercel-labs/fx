@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const acp_types = @import("types.zig");
 const builtin_tools = @import("../builtins/tools.zig");
 const mcp_contract = @import("../core/mcp/mcp_contract.zig");
@@ -148,8 +149,7 @@ pub fn prepare(
             "Authentication required; supply an Authorization header in the ACP MCP server configuration."
         else
             reason;
-        return .{ .failed = try std.fmt.allocPrint(
-            alloc,
+        return .{ .failed = try alloc.print(
             "Required MCP server '{s}' failed to start: {s}",
             .{ server_state.config.name, acp_reason },
         ) };
@@ -225,7 +225,7 @@ noinline fn parseServerInto(
     if (command_value != .string or command_value.string.len == 0) {
         return error.InvalidCommand;
     }
-    if (!std.fs.path.isAbsolute(command_value.string)) {
+    if (!std.Io.Dir.path.isAbsolute(command_value.string)) {
         return error.CommandNotAbsolute;
     }
     const args_value = object.get("args") orelse return error.MissingArgs;
@@ -564,7 +564,7 @@ fn checkPreparationOwnershipAllocFailures(alloc: Allocator) !void {
 
 test "ACP MCP preparation releases heap runtime ownership on allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkPreparationOwnershipAllocFailures,
         .{},
     );

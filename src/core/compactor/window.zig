@@ -13,6 +13,7 @@ const model_provider = @import("../config/model_provider.zig");
 const trace = @import("trace.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const HistoryTurn = types.HistoryTurn;
@@ -370,7 +371,7 @@ test "compactor input budget follows normal model capacity" {
 }
 
 test "retained context budgets provider replay on completed exchanges" {
-    const replay = types.ProviderReplay{ .source = .{ .provider = .gateway, .model = "fixture/model" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"\",\"providerOptions\":{\"openai\":{\"reasoningEncryptedContent\":\"" ++ ("r" ** 80_000) ++ "\"}}}]" };
+    const replay = types.ProviderReplay{ .source = .{ .provider = .gateway, .model = "fixture/model" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"\",\"providerOptions\":{\"openai\":{\"reasoningEncryptedContent\":\"" ++ text_utils.repeat("r", 80_000) ++ "\"}}}]" };
     var steps = [_]types.ToolExecutionStep{
         .{ .assistant = @constCast("one"), .provider_replay = replay },
         .{ .assistant = @constCast("two"), .provider_replay = replay },
@@ -396,7 +397,7 @@ test "retained context budgets replay on standalone assistant replies" {
     const turn = types.AssistantHistoryTurn{
         .user = .{ .text = @constCast("continue") },
         .assistant = @constCast("small reply"),
-        .provider_replay = .{ .source = .{ .provider = .gateway, .model = "fixture/model" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"\",\"providerOptions\":{\"openai\":{\"reasoningEncryptedContent\":\"" ++ ("r" ** 80_000) ++ "\"}}}]" },
+        .provider_replay = .{ .source = .{ .provider = .gateway, .model = "fixture/model" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"\",\"providerOptions\":{\"openai\":{\"reasoningEncryptedContent\":\"" ++ text_utils.repeat("r", 80_000) ++ "\"}}}]" },
     };
     const history = [_]HistoryTurn{ .{ .assistant = turn }, .{ .assistant = turn }, .{ .assistant = turn } };
     const same_model: model_provider.ProviderSelection = .{ .provider = .gateway, .model = "fixture/model" };
@@ -404,7 +405,7 @@ test "retained context budgets replay on standalone assistant replies" {
 }
 
 test "retained context keeps or compacts a parallel tool exchange whole without shortening results" {
-    const body = "large output " ** 2000;
+    const body = text_utils.repeat("large output ", 2000);
     const calls = [_]types.ToolCall{
         .{ .id = "one", .name = "read_file", .arguments_json = "{}" },
         .{ .id = "two", .name = "read_file", .arguments_json = "{}" },
@@ -508,7 +509,7 @@ test "the window keeps the newest turns and compacts the rest" {
 test "the window ends an unfinished turn at its completed exchange" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
-    const calls = [_]types.ToolCall{.{ .id = "large-write", .name = "write_file", .arguments_json = "x" ** 32_000 }};
+    const calls = [_]types.ToolCall{.{ .id = "large-write", .name = "write_file", .arguments_json = text_utils.repeat("x", 32_000) }};
     const results = [_]types.PersistedToolResult{.{
         .tool_call_id = @constCast("large-write"),
         .tool_name = @constCast("write_file"),
@@ -536,7 +537,7 @@ test "what stays after the cut includes the rest of an unfinished turn" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const calls = [_]types.ToolCall{
-        .{ .id = "large-write", .name = "write_file", .arguments_json = "x" ** 32_000 },
+        .{ .id = "large-write", .name = "write_file", .arguments_json = text_utils.repeat("x", 32_000) },
         .{ .id = "small-read", .name = "read_file", .arguments_json = "{\"path\":\"src/a.zig\"}" },
     };
     const results = [_]types.PersistedToolResult{

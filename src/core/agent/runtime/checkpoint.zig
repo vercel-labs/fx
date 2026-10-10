@@ -1,5 +1,6 @@
 const std = @import("std");
 const types = @import("../../shared/types.zig");
+const text_utils = @import("../../shared/text_utils.zig");
 const session_codec = @import("../../session/session_codec.zig");
 
 const Allocator = std.mem.Allocator;
@@ -324,7 +325,7 @@ test "kernel checkpoint refuses meta that is not short text" {
     const cases = [_][]const u8{
         "{\"history\":[],\"usage\":{},\"meta\":7}",
         "{\"history\":[],\"usage\":{},\"meta\":{\"model\":7}}",
-        "{\"history\":[],\"usage\":{},\"meta\":{\"model\":\"" ++ "m" ** (max_meta_field_bytes + 1) ++ "\"}}",
+        "{\"history\":[],\"usage\":{},\"meta\":{\"model\":\"" ++ text_utils.repeat("m", max_meta_field_bytes + 1) ++ "\"}}",
     };
     for (cases) |json| try std.testing.expectError(error.InvalidCheckpoint, decodeJson(alloc, json, null));
     // Fields it does not know are left alone.

@@ -203,7 +203,7 @@ fn targetPathShapeValid(
     components: []const PathSpan,
 ) bool {
     if (canonical.len == 0 or canonical.len > std.Io.Dir.max_path_bytes) return false;
-    if (!std.fs.path.isAbsolute(canonical)) return false;
+    if (!std.Io.Dir.path.isAbsolute(canonical)) return false;
     if (targets.anchor.path_end == 0 or targets.anchor.path_end > canonical.len) return false;
     if (targets.anchor.identity.kind != .directory) return false;
 
@@ -213,14 +213,14 @@ fn targetPathShapeValid(
     if (targets.traversal_directories.len != components.len - 1) return false;
 
     var expected_start = targets.anchor.path_end;
-    if (expected_start < canonical.len and std.fs.path.isSep(canonical[expected_start])) {
+    if (expected_start < canonical.len and std.Io.Dir.path.isSep(canonical[expected_start])) {
         expected_start += 1;
     }
     for (components) |component| {
         if (component.start != expected_start) return false;
         if (component.end <= component.start or component.end > canonical.len) return false;
         expected_start = component.end;
-        if (expected_start < canonical.len and std.fs.path.isSep(canonical[expected_start])) {
+        if (expected_start < canonical.len and std.Io.Dir.path.isSep(canonical[expected_start])) {
             expected_start += 1;
         }
     }
@@ -343,11 +343,11 @@ fn optionalIdentityEql(a: ?FileIdentity, b: ?FileIdentity) bool {
 }
 
 test "policy target proof validation accepts and rejects owned target shapes" {
-    const canonical = if (std.fs.path.sep == '\\')
+    const canonical = if (std.Io.Dir.path.sep == '\\')
         "C:\\workspace\\parent\\note.txt"
     else
         "/workspace/parent/note.txt";
-    const anchor_end = if (std.fs.path.sep == '\\')
+    const anchor_end = if (std.Io.Dir.path.sep == '\\')
         "C:\\workspace".len
     else
         "/workspace".len;

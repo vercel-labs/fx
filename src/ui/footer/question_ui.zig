@@ -105,7 +105,7 @@ fn writeQuestionPanelOptionLine(
     const option_style = if (selected) ui_render.selected_completion_style else ui_render.dim_style;
 
     var ordinal_buf: [16]u8 = undefined;
-    const ordinal = std.fmt.bufPrint(&ordinal_buf, "{d}) ", .{index + 1}) catch "";
+    const ordinal = std.mem.print(&ordinal_buf, "{d}) ", .{index + 1}) catch "";
     const prefix_width = question_freeform_layout.optionPrefixWidth(index);
 
     if (selected and opt.is_freeform_slot) {
@@ -469,7 +469,7 @@ fn writeQuestionAnswerResolution(
     // answer hangs beneath, aligned under the question text. Pure
     // typography, so the block never reads as a tool group.
     var prefix_buf: [16]u8 = undefined;
-    const question_prefix = std.fmt.bufPrint(&prefix_buf, "  {d}) ", .{number}) catch "  ";
+    const question_prefix = std.mem.print(&prefix_buf, "  {d}) ", .{number}) catch "  ";
     var indent_buf: [16]u8 = undefined;
     const indent = blk: {
         const width = @min(display_width.visibleWidth(question_prefix), indent_buf.len);
@@ -630,10 +630,10 @@ test "compose question panel renders only the current paginated entry" {
     try std.testing.expect(std.mem.find(u8, text, "❯") == null);
     try std.testing.expect(std.mem.find(u8, text, "[✓]") == null);
     var sel_buf: [64]u8 = undefined;
-    const selected_one = try std.fmt.bufPrint(&sel_buf, "{s}    1) One", .{ui_render.selected_completion_style});
+    const selected_one = try std.mem.print(&sel_buf, "{s}    1) One", .{ui_render.selected_completion_style});
     try std.testing.expect(std.mem.find(u8, text, selected_one) != null);
     var unsel_buf: [64]u8 = undefined;
-    const unselected_two = try std.fmt.bufPrint(&unsel_buf, "{s}    2) Two", .{ui_render.dim_style});
+    const unselected_two = try std.mem.print(&unsel_buf, "{s}    2) Two", .{ui_render.dim_style});
     try std.testing.expect(std.mem.find(u8, text, unselected_two) != null);
 }
 
@@ -713,8 +713,7 @@ test "compose question resolutions emits answered summary block" {
 
     const cancelled_text = try composeQuestionResolutions(std.testing.allocator, &prompt, true, 60);
     defer std.testing.allocator.free(cancelled_text);
-    const expected_cancelled = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const expected_cancelled = try std.testing.allocator.print(
         "{s}■{s} Cancelled\n",
         .{ ui_render.red_style, ui_render.reset_style },
     );
@@ -759,8 +758,7 @@ test "resolved multiline question fields keep every row inside the transcript ra
     const text = try composeResolvedQuestionAnswers(std.testing.allocator, &answers, 60);
     defer std.testing.allocator.free(text);
 
-    const expected = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const expected = try std.testing.allocator.print(
         "  1) Choose one\n" ++
             "     carefully\n" ++
             "{s}     line-one{s}\n" ++
@@ -998,7 +996,7 @@ test "long answer descriptions wrap in their measured column" {
 
 fn expectVisibleIndentBefore(text: []const u8, needle: []const u8, expected: usize) !void {
     const needle_start = std.mem.find(u8, text, needle) orelse return error.TestExpectedEqual;
-    const line_start = if (std.mem.lastIndexOfScalar(u8, text[0..needle_start], '\n')) |newline|
+    const line_start = if (std.mem.findScalarLast(u8, text[0..needle_start], '\n')) |newline|
         newline + 1
     else
         0;

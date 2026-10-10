@@ -2,6 +2,7 @@ const std = @import("std");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
 const jsonrpc = @import("jsonrpc.zig");
+const text_utils = @import("../core/shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const RequestId = jsonrpc.RequestId;
@@ -63,8 +64,8 @@ pub const Finished = struct {
 /// Owns bounded steering text shared by the ACP reader and prompt worker.
 pub const Runtime = struct {
     mutex: std.Io.Mutex = .init,
-    messages: std.ArrayListUnmanaged(Entry) = .empty,
-    absorbed: std.ArrayListUnmanaged(RequestId) = .empty,
+    messages: std.ArrayList(Entry) = .empty,
+    absorbed: std.ArrayList(RequestId) = .empty,
     queued_bytes: usize = 0,
     accepting: bool = false,
 
@@ -338,7 +339,7 @@ test "libfx steering runtime bounds each message and total queue" {
     @memset(oversized, 'x');
     try std.testing.expectError(error.SteeringMessageTooLarge, runtime.enqueue(alloc, oversized));
 
-    const message = "x" ** (max_queued_bytes / max_messages);
+    const message = text_utils.repeat("x", max_queued_bytes / max_messages);
     for (0..max_messages) |_| try runtime.enqueue(alloc, message);
     try std.testing.expectError(error.SteeringQueueFull, runtime.enqueue(alloc, "overflow"));
     runtime.clear(alloc, "test");

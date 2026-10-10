@@ -61,7 +61,7 @@ pub const Journal = struct {
     barrier_next_progress: bool = false,
     /// Inputs taken for the next model request; its progress places them.
     /// Owned by the session's allocator.
-    placed_next: std.ArrayListUnmanaged([]const u8) = .empty,
+    placed_next: std.ArrayList([]const u8) = .empty,
     /// Inputs the pending resume accepted and never placed, in order. Owned
     /// by the session's allocator.
     pending_inputs: []journal.PendingInput = &.{},
@@ -653,7 +653,7 @@ const TestRerunner = struct {
     pub fn run(self: TestRerunner, alloc: Allocator, call: types.ToolCall) !?tool_dispatch.ToolResult {
         if (self.stop_at) |id| if (std.mem.eql(u8, call.id, id)) return null;
         try self.ran.append(std.testing.allocator, call.id);
-        return .{ .success = try std.fmt.allocPrint(alloc, "ran again as {s}", .{call.id}) };
+        return .{ .success = try alloc.print("ran again as {s}", .{call.id}) };
     }
 };
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const file_picker_path = @import("../input/file_picker_path.zig");
 const question_prompt = @import("../agent/question_prompt.zig");
 const app_auth_runtime = @import("app_auth_runtime.zig");
@@ -896,8 +897,7 @@ pub fn Runtime(comptime App: type) type {
                     defer app.alloc.free(name);
                     const display = try text_utils.encodeTerminalSafe(app.alloc, name, 256);
                     defer app.alloc.free(display.bytes);
-                    const body = try std.fmt.allocPrint(
-                        app.alloc,
+                    const body = try app.alloc.print(
                         "Approving project MCP server '{s}'.",
                         .{display.bytes},
                     );
@@ -915,8 +915,7 @@ pub fn Runtime(comptime App: type) type {
                     defer app.alloc.free(name);
                     const display = try text_utils.encodeTerminalSafe(app.alloc, name, 256);
                     defer app.alloc.free(display.bytes);
-                    const body = try std.fmt.allocPrint(
-                        app.alloc,
+                    const body = try app.alloc.print(
                         "Rejecting project MCP server '{s}'.",
                         .{display.bytes},
                     );
@@ -1522,7 +1521,7 @@ pub fn Runtime(comptime App: type) type {
                             } else if (command_specs.nthSlashCompletion(app.slashRegistry(), prefix, idx)) |completion| {
                                 if (command_specs.slashCompletionHasArgs(app.slashRegistry(), completion)) {
                                     var buf: [128]u8 = undefined;
-                                    const with_space = std.fmt.bufPrint(&buf, "{s} ", .{completion}) catch completion;
+                                    const with_space = std.mem.print(&buf, "{s} ", .{completion}) catch completion;
                                     try app.input_runtime.textReplacementState().replace(app.alloc, with_space);
                                 } else {
                                     try app.input_runtime.textReplacementState().replace(app.alloc, completion);
@@ -1790,8 +1789,7 @@ pub fn Runtime(comptime App: type) type {
             if (!app.session_persistence.session_picker.active) return false;
 
             if (app.loadMoreSessionPicker() catch |err| {
-                const notice = try std.fmt.allocPrint(
-                    app.alloc,
+                const notice = try app.alloc.print(
                     "unable to load more saved sessions: {s}",
                     .{@errorName(err)},
                 );
@@ -3966,7 +3964,7 @@ const RoutingFakeApp = struct {
         var count: usize = 0;
         for (self.model_completion_values) |value| {
             if (count == out.len) break;
-            if (query.len > 0 and std.ascii.indexOfIgnoreCase(value, query) == null) continue;
+            if (query.len > 0 and std.ascii.findIgnoreCase(value, query) == null) continue;
             out[count] = value;
             count += 1;
         }
@@ -4094,13 +4092,13 @@ const RoutingFakeApp = struct {
         self.notice_tone = notice.tone;
         self.notice_visibility = notice.visibility;
         const rendered = if (notice.topic.len > 0)
-            try std.fmt.allocPrint(self.alloc, "{s} {s}: {s}", .{
+            try self.alloc.print("{s} {s}: {s}", .{
                 types.noticeGlyph(notice.tone),
                 notice.topic,
                 notice.body,
             })
         else
-            try std.fmt.allocPrint(self.alloc, "{s} {s}", .{ types.noticeGlyph(notice.tone), notice.body });
+            try self.alloc.print("{s} {s}", .{ types.noticeGlyph(notice.tone), notice.body });
         defer self.alloc.free(rendered);
         try self.transcript.appendSlice(self.alloc, rendered);
     }
@@ -4313,13 +4311,13 @@ fn appendRoutingSessionPickerSummary(
     picker: *app_session_runtime.SessionPicker,
     index: usize,
 ) !void {
-    const id = try std.fmt.allocPrint(alloc, "session-{d}", .{index});
+    const id = try alloc.print("session-{d}", .{index});
     errdefer alloc.free(id);
-    const workspace_root = try std.fmt.allocPrint(alloc, "/tmp/workspace-{d}", .{index});
+    const workspace_root = try alloc.print("/tmp/workspace-{d}", .{index});
     errdefer alloc.free(workspace_root);
-    const title = try std.fmt.allocPrint(alloc, "session {d}", .{index});
+    const title = try alloc.print("session {d}", .{index});
     errdefer alloc.free(title);
-    const preview = try std.fmt.allocPrint(alloc, "session {d} preview", .{index});
+    const preview = try alloc.print("session {d} preview", .{index});
     errdefer alloc.free(preview);
     try picker.summaries.append(alloc, .{
         .id = id,
@@ -4607,7 +4605,7 @@ test "app_input_runtime workspace add handoff dismisses argument completion" {
 }
 
 test "help menu whole replacement preserves the prior draft when staging fails" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     const alloc = failing.allocator();
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -4631,7 +4629,7 @@ test "help menu whole replacement preserves the prior draft when staging fails" 
 }
 
 test "workspace menu whole replacement preserves the prior draft when staging fails" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     const alloc = failing.allocator();
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -5602,7 +5600,7 @@ test "app_input_runtime redraws a closed skill picker when the input limit notic
 }
 
 test "app_input_runtime keeps the skill picker open when binding allocation fails" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     const alloc = failing.allocator();
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -5863,7 +5861,7 @@ test "app_input_runtime ctrl-l preserves an active inline picker" {
 }
 
 test "app_input_runtime Enter keeps backslash newline semantics when history allocation fails" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     try app.input_runtime.textReplacementState().replace(alloc, "draft\\");
@@ -6925,8 +6923,8 @@ test "app_input_runtime bare model Tab keeps current selection across catalog re
 
 test "app_input_runtime bare model Tab keeps current selection beyond completion window" {
     const alloc = std.testing.allocator;
-    const current_model = "anthropic/claude-opus-4.8";
-    var completions = [_][]const u8{"anthropic/claude-opus-4.8-preview"} ** 33;
+    const current_model = "provider/current-model";
+    var completions: [33][]const u8 = @splat("provider/current-model-preview");
     completions[completions.len - 1] = current_model;
 
     var app = try RoutingFakeApp.init(alloc);
@@ -8673,7 +8671,7 @@ test "app_input_runtime owns pending image discard and release" {
     defer alloc.free(source_path);
     const snapshot_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(snapshot_root);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ snapshot_root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ snapshot_root, "snapshots" });
     defer alloc.free(snapshot_dir);
 
     var app = PendingImageLifecycleApp{ .alloc = alloc };
@@ -8778,7 +8776,7 @@ fn openRoutingModelMenu(app: *RoutingFakeApp, model_ids: []const []const u8) !vo
         const owned_id = try app.alloc.dupe(u8, model_id);
         var item_owns_id = false;
         errdefer if (!item_owns_id) app.alloc.free(owned_id);
-        const provider_end = std.mem.indexOfScalar(u8, owned_id, '/') orelse owned_id.len;
+        const provider_end = std.mem.findScalar(u8, owned_id, '/') orelse owned_id.len;
         const provider = owned_id[0..provider_end];
         try menu.items.append(app.alloc, .{
             .id = owned_id,
@@ -8916,7 +8914,7 @@ fn setRoutingModelMenuReady(app: *RoutingFakeApp, model_ids: []const []const u8)
     for (model_ids) |model_id| {
         const owned_id = try app.alloc.dupe(u8, model_id);
         errdefer app.alloc.free(owned_id);
-        const provider_end = std.mem.indexOfScalar(u8, owned_id, '/') orelse owned_id.len;
+        const provider_end = std.mem.findScalar(u8, owned_id, '/') orelse owned_id.len;
         try app.model_cache.menu.items.append(app.alloc, .{
             .id = owned_id,
             .provider = owned_id[0..provider_end],
@@ -9063,7 +9061,7 @@ test "app_input_runtime ctrl+p model stage never submits the borrowed composer" 
 }
 
 test "app_input_runtime ctrl+p catalog enter failure restores the draft without later input" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     const alloc = failing.allocator();
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -9185,7 +9183,7 @@ test "app_input_runtime ctrl+d while the picker borrows the composer closes inst
 }
 
 test "app_input_runtime ctrl+p catalog enter failure still closes and restores the draft" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     const alloc = failing.allocator();
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -9247,7 +9245,7 @@ test "app_input_runtime image path paste stays text while ctrl+p inline stages b
     try writeTestImage(&tmp, "staged.png");
     const image_path = try realTmpPath(alloc, &tmp, "staged.png");
     defer alloc.free(image_path);
-    const paste = try std.fmt.allocPrint(alloc, "\x1b[200~{s}\x1b[201~", .{image_path});
+    const paste = try alloc.print("\x1b[200~{s}\x1b[201~", .{image_path});
     defer alloc.free(paste);
 
     var app = try RoutingFakeApp.init(alloc);
@@ -9806,7 +9804,7 @@ test "app_input_runtime decision prompt owns and discards bracketed paste" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "decision-paste.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "decision-paste.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -9833,7 +9831,7 @@ test "app_input_runtime decision prompt owns and discards bracketed paste" {
 
     const trace = try readTraceFileForTest(alloc, trace_path);
     defer alloc.free(trace);
-    const needle = try std.fmt.allocPrint(alloc, "decision prompt paste dropped bytes={d} reason=decision_prompt_active", .{payload.len});
+    const needle = try alloc.print("decision prompt paste dropped bytes={d} reason=decision_prompt_active", .{payload.len});
     defer alloc.free(needle);
     try std.testing.expect(std.mem.find(u8, trace, needle) != null);
 }
@@ -9963,7 +9961,7 @@ test "app_input_runtime keeps composer and decision input limits independent" {
 }
 
 test "app_input_runtime approval amendment paste finalization resets state after allocation failure" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
@@ -10030,7 +10028,7 @@ test "app_input_runtime zero-content decision paste logs once" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "zero-decision-paste.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "zero-decision-paste.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -10197,7 +10195,7 @@ test "app_input_runtime question freeform rejects paste beyond input limit" {
     app.question_prompt.moveChoice(-1);
 
     try feedRoutingBytes(&app, "\x1b[200~");
-    try feedRoutingBytes(&app, "x" ** 4097);
+    try feedRoutingBytes(&app, text_utils.repeat("x", 4097));
     try feedRoutingBytes(&app, "\x1b[201~");
 
     try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
@@ -11033,7 +11031,7 @@ test "app_input_runtime new paste traces and clears stale inactive state" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "stale-paste.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "stale-paste.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -11101,7 +11099,7 @@ test "app_input_runtime modal disappearance keeps decision-owned paste pinned" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "modal-disappear-paste.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "modal-disappear-paste.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -11903,7 +11901,7 @@ test "primary composer pointer press places the caret without starting a drag se
 
     const prefix_cells: u16 = @intCast(visual_layout.inputPrefix(0).cell_width);
     var report: [48]u8 = undefined;
-    const click = try std.fmt.bufPrint(
+    const click = try std.mem.print(
         &report,
         "\x1b[<0;{d};22M\x1b[<0;{d};22m",
         .{ prefix_cells + 4, prefix_cells + 4 },
@@ -11965,7 +11963,7 @@ test "file approval digit submits the mapped choice when the modal is ready" {
 }
 
 test "file approval keeps the active review when feedback materialization fails" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     try installReadyRoutingFileApproval(&app);
@@ -12210,7 +12208,7 @@ test "bare escape trace captures approval interrupt context" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "escape-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "escape-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -13354,7 +13352,7 @@ test "app_input_runtime routes image slash commands before inline attachment ext
     for ([_][]const u8{ "/image", "/img" }) |command| {
         var app = FakeSubmitApp{ .alloc = alloc, .prompt_admitted = false };
         defer app.deinit();
-        const input = try std.fmt.allocPrint(alloc, "{s} {s}", .{ command, image_path });
+        const input = try alloc.print("{s} {s}", .{ command, image_path });
         defer alloc.free(input);
         try app.input_runtime.edit_state.input.appendSlice(alloc, input);
         app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
@@ -13409,7 +13407,7 @@ test "app_input_runtime keeps a repeated image command local while an image is p
         defer app.deinit();
         try appendOwnedPendingImage(&app, 1, "/tmp/first.png");
         app.next_image_id_counter = 2;
-        const input = try std.fmt.allocPrint(alloc, "[Image #1]{s} {s}", .{ command, second_path });
+        const input = try alloc.print("[Image #1]{s} {s}", .{ command, second_path });
         defer alloc.free(input);
         try app.input_runtime.edit_state.input.appendSlice(alloc, input);
         try appendImageTokenForPlaceholderAt(&app, 1, 0);
@@ -13451,7 +13449,7 @@ test "app_input_runtime attaches three sequential image commands in appearance o
     for (names, 1..) |name, expected_id| {
         const path = try realTmpPath(alloc, &tmp, name);
         defer alloc.free(path);
-        const suffix = try std.fmt.allocPrint(alloc, "/image {s}", .{path});
+        const suffix = try alloc.print("/image {s}", .{path});
         defer alloc.free(suffix);
         try app.input_runtime.insertionState().insertSlice(alloc, suffix, .preserve);
 
@@ -13480,7 +13478,7 @@ test "app_input_runtime submits one prompt carrying every image attached by repe
     defer app.deinit();
     try appendOwnedPendingImage(&app, 1, "/tmp/first.png");
     app.next_image_id_counter = 2;
-    const attach = try std.fmt.allocPrint(alloc, "[Image #1]/image {s}", .{second_path});
+    const attach = try alloc.print("[Image #1]/image {s}", .{second_path});
     defer alloc.free(attach);
     try app.input_runtime.edit_state.input.appendSlice(alloc, attach);
     try appendImageTokenForPlaceholderAt(&app, 1, 0);
@@ -13520,7 +13518,7 @@ test "app_input_runtime rejected second image keeps the first pending image and 
         .snapshot_dir = snapshot_dir,
     };
     defer app.deinit();
-    const attach_first = try std.fmt.allocPrint(alloc, "/image {s}", .{first_path});
+    const attach_first = try alloc.print("/image {s}", .{first_path});
     defer alloc.free(attach_first);
     try app.input_runtime.insertionState().insertSlice(alloc, attach_first, .preserve);
     try Runtime(FakeSubmitApp).submit(&app, 100);
@@ -13530,7 +13528,7 @@ test "app_input_runtime rejected second image keeps the first pending image and 
 
     const missing = try realTmpPath(alloc, &tmp, ".");
     defer alloc.free(missing);
-    const attach_missing = try std.fmt.allocPrint(alloc, "/image {s}/absent.png", .{missing});
+    const attach_missing = try alloc.print("/image {s}/absent.png", .{missing});
     defer alloc.free(attach_missing);
     try app.input_runtime.insertionState().insertSlice(alloc, attach_missing, .preserve);
 
@@ -13547,20 +13545,20 @@ test "app_input_runtime rejected second image keeps the first pending image and 
     try std.testing.expectEqual(@as(usize, 0), app.queue_accept_count);
     try std.testing.expect(app.last_prompt == null);
 
-    var probe = try std.Io.Dir.openDirAbsolute(std.testing.io, first_snapshot[0..std.mem.lastIndexOfScalar(u8, first_snapshot, '/').?], .{});
+    var probe = try std.Io.Dir.openDirAbsolute(std.testing.io, first_snapshot[0..std.mem.findScalarLast(u8, first_snapshot, '/').?], .{});
     defer probe.close(std.testing.io);
-    var snapshot_file = try probe.openFile(std.testing.io, std.fs.path.basename(first_snapshot), .{});
+    var snapshot_file = try probe.openFile(std.testing.io, std.Io.Dir.path.basename(first_snapshot), .{});
     snapshot_file.close(std.testing.io);
 }
 
 test "app_input_runtime repeated image command releases every allocation on failure" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try writeTestImage(&tmp, "second.png");
     const second_path = try realTmpPath(alloc, &tmp, "second.png");
     defer alloc.free(second_path);
-    const input = try std.fmt.allocPrint(alloc, "[Image #1]/image {s}", .{second_path});
+    const input = try alloc.print("[Image #1]/image {s}", .{second_path});
     defer alloc.free(input);
 
     var counting = std.testing.FailingAllocator.init(alloc, .{});
@@ -13835,7 +13833,7 @@ test "app_input_runtime disabled prompt history skips composer recall recording"
 test "app_input_runtime accepted large paste recalls compact and editable" {
     const alloc = std.testing.allocator;
     const placeholder = "[Pasted text #7, 1 line]";
-    const backing = "x" ** (paste_blocks.large_paste_char_threshold + 1);
+    const backing = text_utils.repeat("x", paste_blocks.large_paste_char_threshold + 1);
     var app = FakeSubmitApp{ .alloc = alloc };
     defer app.deinit();
 
@@ -13888,7 +13886,7 @@ test "app_input_runtime recalled image and skill resubmit with fresh provenance"
     defer alloc.free(image_path);
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
     defer alloc.free(snapshot_dir);
 
     var app = FakeSubmitApp{
@@ -13896,7 +13894,7 @@ test "app_input_runtime recalled image and skill resubmit with fresh provenance"
         .snapshot_dir = snapshot_dir,
     };
     defer app.deinit();
-    const input = try std.fmt.allocPrint(alloc, "{s} $review", .{image_path});
+    const input = try alloc.print("{s} $review", .{image_path});
     defer alloc.free(input);
     try app.input_runtime.edit_state.input.appendSlice(alloc, input);
     app.input_runtime.edit_state.cursor = input.len;
@@ -13964,7 +13962,7 @@ test "app_input_runtime recalls image after post-ack finalization failure" {
     defer alloc.free(image_path);
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
     defer alloc.free(snapshot_dir);
 
     var app = FakeSubmitApp{
@@ -14023,7 +14021,7 @@ test "app_input_runtime terminal pending cleanup preserves image history" {
         defer alloc.free(image_path);
         const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
         defer alloc.free(root);
-        const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+        const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
         defer alloc.free(snapshot_dir);
 
         var app = FakeSubmitApp{ .alloc = alloc, .snapshot_dir = snapshot_dir };
@@ -14122,7 +14120,7 @@ test "app_input_runtime preflight rejection removes captured inline snapshot" {
     defer alloc.free(image_path);
     const root = try realTmpPath(alloc, &tmp, ".");
     defer alloc.free(root);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
     defer alloc.free(snapshot_dir);
 
     var app = FakeSubmitApp{
@@ -14240,7 +14238,7 @@ test "app_input_runtime queue rejection removes captured inline snapshot" {
     defer alloc.free(image_path);
     const root = try realTmpPath(alloc, &tmp, ".");
     defer alloc.free(root);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
     defer alloc.free(snapshot_dir);
 
     var app = FakeSubmitApp{
@@ -14278,14 +14276,14 @@ fn checkAcceptedPromptCleanupAcrossAllocationFailures(failing: *std.testing.Fail
 }
 
 test "app_input_runtime accepted prompt cleanup survives allocation failures" {
-    var probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var probe = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     try checkAcceptedPromptCleanupAcrossAllocationFailures(&probe);
     const allocation_count = probe.alloc_index;
     try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
 
     for (0..allocation_count) |fail_index| {
         var failing = std.testing.FailingAllocator.init(
-            std.testing.allocator,
+            testing_allocator.no_resize,
             .{ .fail_index = fail_index },
         );
         checkAcceptedPromptCleanupAcrossAllocationFailures(&failing) catch |err| {
@@ -14371,7 +14369,7 @@ test "app_input_runtime inline image edits retain draft IDs and snapshots on fai
     defer alloc.free(root);
     const existing = try realTmpPath(alloc, &tmp, "existing.png");
     defer alloc.free(existing);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
     defer alloc.free(snapshot_dir);
     const input = " \t[Image #8]\n@./first.png @./second.png  \r\n";
     const cases = [_]struct { capture_error: ?anyerror = null, queue_admitted: bool = true, enqueue_failure: bool = false, first_id: usize = 9, expected_error: ?anyerror = null }{
@@ -14462,13 +14460,13 @@ test "app_input_runtime inline image edits roll back across allocation failures"
     try writeTestImage(&tmp, "first.png");
     const root = try realTmpPath(std.testing.allocator, &tmp, ".");
     defer std.testing.allocator.free(root);
-    const snapshot_dir = try std.fs.path.join(std.testing.allocator, &.{ root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(std.testing.allocator, &.{ root, "snapshots" });
     defer std.testing.allocator.free(snapshot_dir);
-    var probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var probe = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     try check_inline_image_edit_allocation_failure(&probe, root, snapshot_dir);
     try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
     for (0..probe.alloc_index) |index| {
-        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = index });
+        var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = index });
         check_inline_image_edit_allocation_failure(&failing, root, snapshot_dir) catch |err| {
             try std.testing.expectEqual(error.OutOfMemory, err);
         };
@@ -14499,8 +14497,7 @@ test "app_input_runtime submit projects selected skill spans onto transformed pr
         },
     });
 
-    const prefix = try std.fmt.allocPrint(
-        alloc,
+    const prefix = try alloc.print(
         "  [Pasted text #7, 1 line] {s}, ",
         .{image_path},
     );
@@ -14614,7 +14611,7 @@ test "app_input_runtime submit keeps selected skill on its exact marker after im
             },
         });
         var path_buf: [32]u8 = undefined;
-        const path = try std.fmt.bufPrint(&path_buf, "/tmp/image-{d}.png", .{id});
+        const path = try std.mem.print(&path_buf, "/tmp/image-{d}.png", .{id});
         try appendOwnedPendingImage(&app, id, path);
     }
 
@@ -14775,7 +14772,7 @@ test "app_input_runtime submits nonexistent relative and absolute image paths as
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const absolute_path = try std.fs.path.join(alloc, &.{ root, "missing.png" });
+    const absolute_path = try std.Io.Dir.path.join(alloc, &.{ root, "missing.png" });
     defer alloc.free(absolute_path);
 
     for ([_][]const u8{ "fx-missing-image.png", absolute_path }) |missing_path| {
@@ -14839,7 +14836,7 @@ test "app_input_runtime preserves punctuation after a submitted image path" {
 
     var app = FakeSubmitApp{ .alloc = alloc };
     defer app.deinit();
-    const input = try std.fmt.allocPrint(alloc, "inspect {s},", .{image_path});
+    const input = try alloc.print("inspect {s},", .{image_path});
     defer alloc.free(input);
     try app.input_runtime.edit_state.input.appendSlice(alloc, input);
     app.input_runtime.edit_state.cursor = input.len;
@@ -14890,7 +14887,7 @@ test "app_input_runtime queues existing and typed images in placeholder order" {
     defer app.deinit();
     try appendOwnedPendingImage(&app, 7, "/tmp/existing.png");
     app.next_image_id_counter = 8;
-    const input = try std.fmt.allocPrint(alloc, "before [Image #7] then {s}", .{typed_path});
+    const input = try alloc.print("before [Image #7] then {s}", .{typed_path});
     defer alloc.free(input);
     try app.input_runtime.edit_state.input.appendSlice(alloc, input);
     try app.input_runtime.entities.image_tokens.append(alloc, .{
@@ -14929,7 +14926,7 @@ test "app_input_runtime restores composer and pending images after late enqueue 
     try appendOwnedPendingImage(&app, 7, "/tmp/original-a.png");
     try appendOwnedPendingImage(&app, 11, "/tmp/original-b.png");
     app.next_image_id_counter = 12;
-    const input = try std.fmt.allocPrint(alloc, "[Image #11] {s} [Image #7]", .{typed_path});
+    const input = try alloc.print("[Image #11] {s} [Image #7]", .{typed_path});
     defer alloc.free(input);
     try app.input_runtime.edit_state.input.appendSlice(alloc, input);
     try app.input_runtime.entities.image_tokens.append(alloc, .{
@@ -14973,10 +14970,9 @@ test "app_input_runtime inline image rejection preserves the draft and rolls bac
     defer alloc.free(second_path);
     const root = try realTmpPath(alloc, &tmp, ".");
     defer alloc.free(root);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
     defer alloc.free(snapshot_dir);
-    const input = try std.fmt.allocPrint(
-        alloc,
+    const input = try alloc.print(
         "draft [Image #7] {s} {s}",
         .{ first_path, second_path },
     );
@@ -15041,7 +15037,7 @@ test "app_input_runtime pasted image rejection preserves the raw paste and exist
 
     const path = try realTmpPath(alloc, &tmp, "rejected.png");
     defer alloc.free(path);
-    const expected = try std.fmt.allocPrint(alloc, "draft {s}", .{path});
+    const expected = try alloc.print("draft {s}", .{path});
     defer alloc.free(expected);
 
     var app = FakeSubmitApp{
@@ -15076,7 +15072,7 @@ test "app_input_runtime pasted image rejection preserves the raw paste and exist
         " next",
         FakeSubmitApp.input_byte_limit,
     );
-    const expected_after = try std.fmt.allocPrint(alloc, "{s} next", .{expected});
+    const expected_after = try alloc.print("{s} next", .{expected});
     defer alloc.free(expected_after);
     try std.testing.expectEqualStrings(
         expected_after,
@@ -15333,7 +15329,7 @@ test "app_input_runtime image path paste rejects the complete edit without chang
     defer alloc.free(path_a);
     const path_b = try realTmpPath(alloc, &tmp, "b.png");
     defer alloc.free(path_b);
-    const paste = try std.fmt.allocPrint(alloc, "{s} {s}", .{ path_a, path_b });
+    const paste = try alloc.print("{s} {s}", .{ path_a, path_b });
     defer alloc.free(paste);
 
     var app = FakeSubmitApp{ .alloc = alloc };
@@ -15377,15 +15373,14 @@ test "app_input_runtime image path paste commits complete text and attachments i
     const path_b = try realTmpPath(alloc, &tmp, "b.png");
     defer alloc.free(path_b);
 
-    const paste = try std.fmt.allocPrint(
-        alloc,
+    const paste = try alloc.print(
         "before {s} middle {s} after",
         .{ path_a, path_b },
     );
     defer alloc.free(paste);
     const root = try realTmpPath(alloc, &tmp, ".");
     defer alloc.free(root);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
     defer alloc.free(snapshot_dir);
 
     var app = FakeSubmitApp{ .alloc = alloc, .snapshot_dir = snapshot_dir };
@@ -15475,7 +15470,7 @@ test "app_input_runtime image path paste keeps trailing punctuation outside the 
     try writeTestImage(&tmp, "punctuated.png");
     const path = try realTmpPath(alloc, &tmp, "punctuated.png");
     defer alloc.free(path);
-    const paste = try std.fmt.allocPrint(alloc, "{s},", .{path});
+    const paste = try alloc.print("{s},", .{path});
     defer alloc.free(paste);
 
     var app = FakeSubmitApp{ .alloc = alloc };
@@ -15530,14 +15525,14 @@ test "app_input_runtime image path paste stays atomic across allocation failures
     const path = try realTmpPath(std.testing.allocator, &tmp, "oom.png");
     defer std.testing.allocator.free(path);
 
-    var probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var probe = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     try checkImagePathPasteAllocationFailureIsAtomic(&probe, path);
     const allocation_count = probe.alloc_index;
     try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
 
     for (0..allocation_count) |fail_index| {
         var failing = std.testing.FailingAllocator.init(
-            std.testing.allocator,
+            testing_allocator.no_resize,
             .{ .fail_index = fail_index },
         );
         checkImagePathPasteAllocationFailureIsAtomic(&failing, path) catch |err| {
@@ -15562,7 +15557,7 @@ test "app_input_runtime oversized image path paste reports rejection without a s
     defer alloc.free(path);
     const root = try realTmpPath(alloc, &tmp, ".");
     defer alloc.free(root);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
     defer alloc.free(snapshot_dir);
 
     var app = FakeSubmitApp{ .alloc = alloc, .snapshot_dir = snapshot_dir };
@@ -15589,7 +15584,7 @@ test "app_input_runtime repeated image path paste appends keep pending images so
     defer alloc.free(path_a);
     const path_b = try realTmpPath(alloc, &tmp, "b.png");
     defer alloc.free(path_b);
-    const paste = try std.fmt.allocPrint(alloc, "{s} {s}", .{ path_a, path_b });
+    const paste = try alloc.print("{s} {s}", .{ path_a, path_b });
     defer alloc.free(paste);
 
     var app = FakeSubmitApp{ .alloc = alloc };
@@ -15608,7 +15603,7 @@ test "app_input_runtime finalizePastedBlock registers large text placeholder ato
     var app = FakeSubmitApp{ .alloc = alloc };
     defer app.deinit();
 
-    const large_paste = "x" ** (paste_blocks.large_paste_char_threshold + 1);
+    const large_paste = text_utils.repeat("x", paste_blocks.large_paste_char_threshold + 1);
 
     try app.input_runtime.insertionState().insertByte(alloc, 'a', .clear);
     try app.input_runtime.paste.buffer.appendSlice(alloc, large_paste);
@@ -15626,7 +15621,7 @@ test "app_input_runtime finalizePastedBlock registers large text placeholder ato
 
 test "app_input_runtime large paste replaces selection within its expanded byte budget" {
     const alloc = std.testing.allocator;
-    const large_paste = "x" ** (paste_blocks.large_paste_char_threshold + 1);
+    const large_paste = text_utils.repeat("x", paste_blocks.large_paste_char_threshold + 1);
     var app = FakeSubmitApp{ .alloc = alloc };
     defer app.deinit();
     try app.input_runtime.textReplacementState().replace(alloc, "abcde");
@@ -15647,7 +15642,7 @@ test "app_input_runtime rejects a large paste when its backing text does not fit
     const alloc = std.testing.allocator;
     var app = FakeSubmitApp{ .alloc = alloc };
     defer app.deinit();
-    const large_paste = "x" ** (paste_blocks.large_paste_char_threshold + 1);
+    const large_paste = text_utils.repeat("x", paste_blocks.large_paste_char_threshold + 1);
     try app.input_runtime.textReplacementState().replace(alloc, "draft");
     try app.input_runtime.paste.buffer.appendSlice(alloc, large_paste);
 
@@ -15664,7 +15659,7 @@ test "app_input_runtime rejects a large paste when its backing text does not fit
 
 test "app_input_runtime multiple large pastes share one expanded byte budget" {
     const alloc = std.testing.allocator;
-    const large_paste = "x" ** (paste_blocks.large_paste_char_threshold + 1);
+    const large_paste = text_utils.repeat("x", paste_blocks.large_paste_char_threshold + 1);
     var app = FakeSubmitApp{ .alloc = alloc };
     defer app.deinit();
 
@@ -15682,8 +15677,8 @@ test "app_input_runtime multiple large pastes share one expanded byte budget" {
 }
 
 test "app_input_runtime finalizePastedBlock leaves large paste unchanged on allocation failure" {
-    const base = std.testing.allocator;
-    const large_paste = "x" ** (paste_blocks.large_paste_char_threshold + 1);
+    const base = testing_allocator.no_resize;
+    const large_paste = text_utils.repeat("x", paste_blocks.large_paste_char_threshold + 1);
 
     var saw_failure = false;
     var fail_index: usize = 0;
@@ -15712,8 +15707,8 @@ test "app_input_runtime finalizePastedBlock leaves large paste unchanged on allo
 }
 
 test "app_input_runtime finishPaste leaves no orphan placeholder after late finalization failure" {
-    const base = std.testing.allocator;
-    const large_paste = "x" ** (paste_blocks.large_paste_char_threshold + 1);
+    const base = testing_allocator.no_resize;
+    const large_paste = text_utils.repeat("x", paste_blocks.large_paste_char_threshold + 1);
 
     var saw_failure = false;
     var fail_index: usize = 0;
@@ -15722,7 +15717,7 @@ test "app_input_runtime finishPaste leaves no orphan placeholder after late fina
         defer tmp.cleanup();
         const root = try io_mod.dirRealpathAlloc(base, tmp.dir, ".");
         defer base.free(root);
-        const trace_path = try std.fs.path.join(base, &.{ root, "late-finalize-failed.log" });
+        const trace_path = try std.Io.Dir.path.join(base, &.{ root, "late-finalize-failed.log" });
         defer base.free(trace_path);
 
         debug_trace.resetForTest();
@@ -15754,8 +15749,7 @@ test "app_input_runtime finishPaste leaves no orphan placeholder after late fina
 
             const trace = try readTraceFileForTest(base, trace_path);
             defer base.free(trace);
-            const needle = try std.fmt.allocPrint(
-                base,
+            const needle = try base.print(
                 "composer paste dropped bytes={d} reason=finalize_failed error=OutOfMemory",
                 .{large_paste.len},
             );
@@ -15767,12 +15761,12 @@ test "app_input_runtime finishPaste leaves no orphan placeholder after late fina
 }
 
 test "app_input_runtime composer paste finalization failure clears inactive state" {
-    const base = std.testing.allocator;
+    const base = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(base, tmp.dir, ".");
     defer base.free(root);
-    const trace_path = try std.fs.path.join(base, &.{ root, "finalize-failed-paste.log" });
+    const trace_path = try std.Io.Dir.path.join(base, &.{ root, "finalize-failed-paste.log" });
     defer base.free(trace_path);
 
     debug_trace.resetForTest();
@@ -15831,7 +15825,7 @@ test "app input bridge loads the most recent durable history in chronological or
     defer seed.deinit(alloc);
     for (0..101) |index| {
         var text_buf: [32]u8 = undefined;
-        const text = try std.fmt.bufPrint(&text_buf, "prompt-{d}", .{index});
+        const text = try std.mem.print(&text_buf, "prompt-{d}", .{index});
         _ = try seed.append(alloc, @intCast(index), "/tmp/workspace", text);
     }
 

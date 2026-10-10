@@ -354,7 +354,7 @@ pub fn refreshSharedCredentials(
 }
 
 pub fn authRecoveryMessage(buffer: []u8, reason: []const u8, name: []const u8) []const u8 {
-    return std.fmt.bufPrint(buffer, "{s} Run /mcp auth {s} --open.", .{ reason, name }) catch reason;
+    return std.mem.print(buffer, "{s} Run /mcp auth {s} --open.", .{ reason, name }) catch reason;
 }
 
 /// Marks a server whose stored credentials can no longer be used (refresh
@@ -375,8 +375,7 @@ fn markReauthenticationRequired(server: *McpServer, expected_generation: u64) vo
 }
 
 pub fn markAuthenticationRequired(alloc: Allocator, server: *McpServer) void {
-    const message = std.fmt.allocPrint(
-        alloc,
+    const message = alloc.print(
         "Authentication required. Run /mcp auth {s} --open, or configure bearer_token_env.",
         .{server.config.name},
     ) catch {

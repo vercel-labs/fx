@@ -39,7 +39,7 @@ class PgsoToolchainTests(unittest.TestCase):
         (self.zig_sdk / "SDKSettings.json").write_text('{"MinimalDisplayName":"26.4"}')
         zig_env = f'.{{\n    .lib_dir = {json.dumps(str(self.zig_lib))},\n}}\n'
         self.write_executable(self.zig, f"""case "$1" in
-  version) printf '0.16.0\\n' ;;
+  version) printf '0.17.0\\n' ;;
   env) printf '%s' {shlex.quote(zig_env)} ;;
   *) exit 2 ;;
 esac""")
@@ -74,13 +74,13 @@ esac""",
         path.write_text(f"#!/bin/sh\n{body}\n")
         path.chmod(0o755)
 
-    def write_llvm_tool(self, name: str, version: str = "21.1.8") -> None:
+    def write_llvm_tool(self, name: str, version: str = "22.1.8") -> None:
         self.write_executable(
             self.llvm_bin / name,
             f"printf 'LLVM version {version}\\n'",
         )
 
-    def write_clang(self, version: str = "21.1.8") -> None:
+    def write_clang(self, version: str = "22.1.8") -> None:
         body = f"""case "$1" in
   --print-resource-dir) printf '%s\\n' {shlex.quote(str(self.resource_dir))} ;;
   --version) printf 'clang version {version}\\n' ;;
@@ -136,8 +136,8 @@ esac"""
         self.assertEqual(self.zig_sdk.resolve(), toolchain.zig_darwin_sdk)
         self.assertEqual("26.4", toolchain.zig_sdk_version)
         self.assertEqual(self.profile_runtime.resolve(), toolchain.profile_runtime)
-        self.assertEqual("0.16.0", toolchain.zig_version)
-        self.assertEqual("21.1.8", toolchain.llvm_version)
+        self.assertEqual("0.17.0", toolchain.zig_version)
+        self.assertEqual("22.1.8", toolchain.llvm_version)
         self.assertEqual("aarch64-macos", toolchain.target)
         self.assertEqual("arm64", toolchain.host_arch)
 
@@ -166,15 +166,15 @@ esac"""
                 )
 
     def test_discover_rejects_the_wrong_zig_version(self) -> None:
-        self.write_executable(self.zig, "printf '0.16.1\\n'")
+        self.write_executable(self.zig, "printf '0.17.1\\n'")
 
-        with self.assertRaisesRegex(PgsoError, "requires Zig 0.16.0"):
+        with self.assertRaisesRegex(PgsoError, "requires Zig 0.17.0"):
             self.discover()
 
     def test_discover_rejects_a_mixed_llvm_version(self) -> None:
         self.write_llvm_tool("llc", version="21.1.9")
 
-        with self.assertRaisesRegex(PgsoError, "requires LLVM 21.1.8"):
+        with self.assertRaisesRegex(PgsoError, "requires LLVM 22.1.8"):
             self.discover()
 
     def test_discover_rejects_a_missing_executable(self) -> None:
@@ -185,7 +185,7 @@ esac"""
 
     def test_discover_rejects_an_llvm_tool_outside_the_root(self) -> None:
         outside = self.root / "outside-opt"
-        self.write_executable(outside, "printf 'LLVM version 21.1.8\\n'")
+        self.write_executable(outside, "printf 'LLVM version 22.1.8\\n'")
         (self.llvm_bin / "opt").unlink()
         (self.llvm_bin / "opt").symlink_to(outside)
 
@@ -223,7 +223,7 @@ esac"""
 
     def test_discover_rejects_unusable_zig_library_metadata(self) -> None:
         for env_text in (".{}", '.{\n.lib_dir = "relative",\n}', '.{\n.lib_dir = "a",\n.lib_dir = "b",\n}'):
-            self.write_executable(self.zig, f"""if [ "$1" = version ]; then printf '0.16.0\\n'; else printf '%s' {shlex.quote(env_text)}; fi""")
+            self.write_executable(self.zig, f"""if [ "$1" = version ]; then printf '0.17.0\\n'; else printf '%s' {shlex.quote(env_text)}; fi""")
             with self.subTest(env_text=env_text), self.assertRaises(PgsoError):
                 self.discover()
 
