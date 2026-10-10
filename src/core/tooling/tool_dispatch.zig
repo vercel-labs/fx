@@ -462,10 +462,6 @@ pub const Tool = struct {
     /// tools. A host tool that declares `writes` leaves it unset and runs
     /// alone. Concurrency never changes a call's permission review.
     host_concurrent: bool = false,
-    /// A host tool the host declares idempotent: running a call again has
-    /// the effect of running it once, so a journaled session need not store
-    /// its intent before it runs.
-    host_idempotent: bool = false,
     executor_kind: ExecutorKind = .read_file,
     activity_kind: core_types.ToolActivityKind = .read,
     requires_approval: bool = false,

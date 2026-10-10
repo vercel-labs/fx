@@ -371,10 +371,9 @@ if (childMode) {
   const agent = createFxAgent(agentOptions(process.argv[7] === "leased" ? await leasedAt(dir) : await durabilityAt(dir)));
   const session = agent.session();
   void session.prompt(`use ${tool}`, { messageId: "crash-turn" }).result.catch(() => {});
+  // A call starts only after its record lands, so the crash comes the moment
+  // the tool runs.
   await gates.get(tool).started;
-  // A safe call starts before its record lands: wait for it, so the crash
-  // comes after the log holds the call.
-  await agent[Symbol.for("libfx.durableInternals")].settled(session.id);
   console.log(JSON.stringify({ sessionId: session.id }));
   await new Promise(() => {});
 }

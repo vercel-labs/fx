@@ -2053,7 +2053,6 @@ function normalizeHostTools(value) {
       description,
       inputSchema: schema,
       ...(writes === undefined ? {} : { writes }),
-      ...(idempotent === true ? { idempotent: true } : {}),
     });
     executors.set(name, execute);
   }

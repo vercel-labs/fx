@@ -259,7 +259,9 @@ test("a tool turn records progress before each model request", async () => {
   assert.equal(toolResults(requests[0]).length, 1, "restored history keeps the tool result");
 });
 
-test("a tool call starts only after its intent is stored", async () => {
+// After a crash only a stored intent lets a call run again, so no call the
+// host runs starts before its intent is stored, an idempotent one included.
+async function startsAfterIntent(tool) {
   // A remote store: each call lands 30 ms after it, behind earlier calls.
   const stored = [];
   let previous = Promise.resolve();
@@ -273,10 +275,10 @@ test("a tool call starts only after its intent is stored", async () => {
   };
   const seen = [];
   const send = {
-    ...lookup,
+    ...tool,
     execute: async (input, { executionId: callId }) => {
       seen.push(stored.some((event) => event.type === "tool_intent" && event.data.some((call) => call.id === callId)));
-      return lookup.execute(input);
+      return tool.execute(input);
     },
   };
   const agent = await createFxEngine(options(sourceBackend, journal, { tools: [send] }));
@@ -284,7 +286,11 @@ test("a tool call starts only after its intent is stored", async () => {
   await agent.close();
   assert.deepEqual(seen, [true], "the intent was durable when execute started");
   assertContiguous(stored);
-});
+}
+
+test("a tool call starts only after its intent is stored", () => startsAfterIntent(lookup));
+
+test("an idempotent tool call starts only after its intent is stored too", () => startsAfterIntent({ ...lookup, idempotent: true }));
 
 test("resume continues a crashed turn and tells the model", async () => {
   const journal = eventJournal();

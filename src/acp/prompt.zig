@@ -2711,10 +2711,11 @@ fn appendJournalToolIntent(raw_ctx: *anyopaque, progress: agent_runtime.TurnProg
     const registry = ctx.toolRegistry();
     for (progress.running_calls) |call| {
         const tool = registry.lookup(call.name) orelse continue;
-        // Every call fx runs itself waits for its intent to be stored; a
-        // call the provider runs has no effect here to guard, and one the
-        // host declares idempotent may simply run again.
-        if (!tool.provider_executed and !tool.host_idempotent) return flushJournal(ctx.state, ctx.alloc, session.session_id);
+        // Every call fx runs itself waits for its intent to be stored, an
+        // idempotent one included: after a crash, only a stored intent lets
+        // a call run again. A call the provider runs has no effect here to
+        // guard.
+        if (!tool.provider_executed) return flushJournal(ctx.state, ctx.alloc, session.session_id);
     }
 }
 
