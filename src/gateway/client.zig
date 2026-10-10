@@ -475,7 +475,7 @@ fn runCancellableGatewayJsonFetch(
 
     const Event = union(enum) {
         request: anyerror!GatewayJsonResult,
-        cancelled: anyerror!void,
+        watch: anyerror!BoundedRequestWatch.Outcome,
     };
     const Runner = struct {
         fn run(value: *GatewayJsonFetchOperation) anyerror!GatewayJsonResult {
@@ -483,32 +483,34 @@ fn runCancellableGatewayJsonFetch(
         }
     };
     const Cleanup = struct {
-        fn drain(result_alloc: std.mem.Allocator, select: *std.Io.Select(Event)) void {
+        fn drain(result_alloc: std.mem.Allocator, select: *std.Io.Select(Event), watch: *BoundedRequestWatch) void {
+            watch.stopped.set(select.io);
             while (select.cancel()) |item| switch (item) {
                 .request => |request_result| {
                     var late_result = request_result catch continue;
                     late_result.deinit(result_alloc);
                 },
-                .cancelled => {},
+                .watch => {},
             };
         }
     };
 
+    var watch: BoundedRequestWatch = .{};
     var select_buffer: [2]Event = undefined;
     var select: std.Io.Select(Event) = .init(io_mod.getIo(), &select_buffer);
-    select.concurrent(.cancelled, waitForBoundedCancellation, .{cancel_flag}) catch |err| return err;
+    select.concurrent(.watch, BoundedRequestWatch.run, .{ &watch, cancel_flag, null }) catch |err| return err;
     select.concurrent(.request, Runner.run, .{operation}) catch |err| {
-        select.cancelDiscard();
+        watch.finish(&select);
         return err;
     };
 
     const event = select.await() catch |err| {
-        Cleanup.drain(alloc, &select);
+        Cleanup.drain(alloc, &select, &watch);
         return err;
     };
     switch (event) {
         .request => |request_result| {
-            Cleanup.drain(alloc, &select);
+            watch.finish(&select);
             if (cancel_flag.load(.seq_cst)) {
                 var result = request_result catch return error.Cancelled;
                 result.deinit(alloc);
@@ -516,12 +518,9 @@ fn runCancellableGatewayJsonFetch(
             }
             return request_result;
         },
-        .cancelled => |cancel_result| {
-            cancel_result catch |err| {
-                Cleanup.drain(alloc, &select);
-                return err;
-            };
-            Cleanup.drain(alloc, &select);
+        .watch => |watch_result| {
+            Cleanup.drain(alloc, &select, &watch);
+            _ = try watch_result;
             return error.Cancelled;
         },
     }
@@ -1038,17 +1037,17 @@ fn openGatewayRequestBounded(
 
     const Event = union(enum) {
         request: anyerror!std.http.Client.Request,
-        cancelled: anyerror!void,
-        deadline: anyerror!void,
+        watch: anyerror!BoundedRequestWatch.Outcome,
     };
     const Cleanup = struct {
-        fn drain(select: *std.Io.Select(Event)) void {
+        fn drain(select: *std.Io.Select(Event), watch: *BoundedRequestWatch) void {
+            watch.stopped.set(select.io);
             while (select.cancel()) |item| switch (item) {
                 .request => |request_result| {
                     var late_request = request_result catch continue;
                     late_request.deinit();
                 },
-                .cancelled, .deadline => {},
+                .watch => {},
             };
         }
     };
@@ -1059,58 +1058,42 @@ fn openGatewayRequestBounded(
         .options = options,
         .request_open_override = request_open_override,
     };
-    var select_buffer: [3]Event = undefined;
+    var watch: BoundedRequestWatch = .{};
+    var select_buffer: [2]Event = undefined;
     var select: std.Io.Select(Event) = .init(io_mod.getIo(), &select_buffer);
-    select.concurrent(.cancelled, waitForBoundedCancellation, .{cancel_flag}) catch |err| return err;
-    select.concurrent(.deadline, waitForBoundedDeadline, .{epoch.deadline}) catch |err| {
-        select.cancelDiscard();
-        return err;
-    };
+    select.concurrent(.watch, BoundedRequestWatch.run, .{ &watch, cancel_flag, epoch.deadline }) catch |err| return err;
     select.concurrent(.request, RequestOpenOperation.run, .{&operation}) catch |err| {
-        select.cancelDiscard();
+        watch.finish(&select);
         return err;
     };
 
-    while (true) {
-        const event = select.await() catch |err| {
-            Cleanup.drain(&select);
-            return err;
-        };
-        switch (event) {
-            .request => |request_result| {
-                Cleanup.drain(&select);
-                if (cancel_flag.load(.seq_cst)) {
-                    var cancelled_request = request_result catch return error.Cancelled;
-                    cancelled_request.deinit();
-                    return error.Cancelled;
-                }
-
-                var owned_request = request_result catch |request_err| return request_err;
-                const result_now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
-                if (!std.Io.Clock.Timestamp.compare(result_now, .lt, epoch.deadline)) {
-                    owned_request.deinit();
-                    return error.ConnectionSetupTimedOut;
-                }
-                return owned_request;
-            },
-            .cancelled => |cancelled_result| {
-                cancelled_result catch |err| {
-                    Cleanup.drain(&select);
-                    return err;
-                };
-                Cleanup.drain(&select);
+    const event = select.await() catch |err| {
+        Cleanup.drain(&select, &watch);
+        return err;
+    };
+    switch (event) {
+        .request => |request_result| {
+            watch.finish(&select);
+            if (cancel_flag.load(.seq_cst)) {
+                var cancelled_request = request_result catch return error.Cancelled;
+                cancelled_request.deinit();
                 return error.Cancelled;
-            },
-            .deadline => |deadline_result| {
-                deadline_result catch |err| {
-                    Cleanup.drain(&select);
-                    return err;
-                };
-                Cleanup.drain(&select);
-                if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+            }
+
+            var owned_request = request_result catch |request_err| return request_err;
+            const result_now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+            if (!std.Io.Clock.Timestamp.compare(result_now, .lt, epoch.deadline)) {
+                owned_request.deinit();
                 return error.ConnectionSetupTimedOut;
-            },
-        }
+            }
+            return owned_request;
+        },
+        .watch => |watch_result| {
+            Cleanup.drain(&select, &watch);
+            const outcome = try watch_result;
+            if (outcome == .cancelled or cancel_flag.load(.seq_cst)) return error.Cancelled;
+            return error.ConnectionSetupTimedOut;
+        },
     }
 }
 
@@ -2019,8 +2002,7 @@ pub fn runBoundedHttpOperation(
 
     const Event = union(enum) {
         request: anyerror!Result,
-        cancelled: anyerror!void,
-        deadline: anyerror!void,
+        watch: anyerror!BoundedRequestWatch.Outcome,
     };
     const Operation = @TypeOf(operation);
     const Runner = struct {
@@ -2029,38 +2011,36 @@ pub fn runBoundedHttpOperation(
         }
     };
     const Cleanup = struct {
-        fn drain(result_alloc: std.mem.Allocator, select: *std.Io.Select(Event)) void {
+        fn drain(result_alloc: std.mem.Allocator, select: *std.Io.Select(Event), watch: *BoundedRequestWatch) void {
+            watch.stopped.set(select.io);
             while (select.cancel()) |item| switch (item) {
                 .request => |request_result| {
                     var late_result = request_result catch continue;
                     late_result.deinit(result_alloc);
                 },
-                .cancelled, .deadline => {},
+                .watch => {},
             };
         }
     };
 
-    var select_buffer: [3]Event = undefined;
+    var watch: BoundedRequestWatch = .{};
+    var select_buffer: [2]Event = undefined;
     var select: std.Io.Select(Event) = .init(zio, &select_buffer);
-    select.concurrent(.cancelled, waitForBoundedCancellation, .{cancel_flag}) catch |err| {
-        return err;
-    };
-    select.concurrent(.deadline, waitForBoundedDeadline, .{deadline}) catch |err| {
-        select.cancelDiscard();
+    select.concurrent(.watch, BoundedRequestWatch.run, .{ &watch, cancel_flag, deadline }) catch |err| {
         return err;
     };
     select.concurrent(.request, Runner.run, .{operation}) catch |err| {
-        select.cancelDiscard();
+        watch.finish(&select);
         return err;
     };
 
     const event = select.await() catch |err| {
-        Cleanup.drain(alloc, &select);
+        Cleanup.drain(alloc, &select, &watch);
         return err;
     };
     switch (event) {
         .request => |request_result| {
-            Cleanup.drain(alloc, &select);
+            watch.finish(&select);
             if (cancel_flag.load(.seq_cst)) {
                 debug_trace.logf("stream", "bounded termination cause=cancellation phase=request_result", .{});
                 var owned_result = request_result catch return error.Cancelled;
@@ -2069,21 +2049,13 @@ pub fn runBoundedHttpOperation(
             }
             return request_result;
         },
-        .cancelled => |cancel_result| {
-            cancel_result catch |err| {
-                Cleanup.drain(alloc, &select);
-                return err;
-            };
-            Cleanup.drain(alloc, &select);
-            debug_trace.logf("stream", "bounded termination cause=cancellation phase=control", .{});
-            return error.Cancelled;
-        },
-        .deadline => |deadline_result| {
-            deadline_result catch |err| {
-                Cleanup.drain(alloc, &select);
-                return err;
-            };
-            Cleanup.drain(alloc, &select);
+        .watch => |watch_result| {
+            Cleanup.drain(alloc, &select, &watch);
+            const outcome = try watch_result;
+            if (outcome == .cancelled) {
+                debug_trace.logf("stream", "bounded termination cause=cancellation phase=control", .{});
+                return error.Cancelled;
+            }
             if (cancel_flag.load(.seq_cst)) {
                 debug_trace.logf("stream", "bounded termination cause=cancellation phase=deadline_cleanup", .{});
                 return error.Cancelled;
@@ -2094,15 +2066,47 @@ pub fn runBoundedHttpOperation(
     }
 }
 
-fn waitForBoundedCancellation(cancel_flag: *std.atomic.Value(bool)) anyerror!void {
-    while (!cancel_flag.load(.seq_cst)) {
-        try io_mod.getIo().sleep(.fromMilliseconds(5), .awake);
-    }
-}
+/// Watches one bounded request for cancellation and its deadline. The request
+/// owner stops it with `finish` instead of cancelling it: in Zig 0.16 a cancel
+/// can interrupt whatever task the watch's worker thread runs next, and an
+/// interrupted connect then fails with ISCONN.
+const BoundedRequestWatch = struct {
+    stopped: std.Io.Event = .unset,
 
-fn waitForBoundedDeadline(deadline: std.Io.Clock.Timestamp) anyerror!void {
-    try deadline.wait(io_mod.getIo());
-}
+    const Outcome = enum { stopped, cancelled, deadline };
+
+    fn run(
+        watch: *BoundedRequestWatch,
+        cancel_flag: *std.atomic.Value(bool),
+        deadline: ?std.Io.Clock.Timestamp,
+    ) anyerror!Outcome {
+        const zio = io_mod.getIo();
+        while (true) {
+            if (cancel_flag.load(.seq_cst)) return .cancelled;
+            if (deadline) |limit| {
+                const now = std.Io.Clock.Timestamp.now(zio, .awake);
+                if (!std.Io.Clock.Timestamp.compare(now, .lt, limit)) return .deadline;
+            }
+            watch.stopped.waitTimeout(zio, .{ .duration = .{
+                .raw = .fromMilliseconds(5),
+                .clock = .awake,
+            } }) catch |err| switch (err) {
+                error.Timeout => continue,
+                else => |e| return e,
+            };
+            return .stopped;
+        }
+    }
+
+    /// Stops the watch and waits for its event, then releases the select.
+    /// Call only when the watch event is the one still outstanding.
+    fn finish(watch: *BoundedRequestWatch, select: anytype) void {
+        watch.stopped.set(select.io);
+        const event = select.queue.getOneUncancelable(select.io) catch unreachable;
+        std.debug.assert(event == .watch);
+        std.debug.assert(select.cancel() == null);
+    }
+};
 
 const GatewayCancelWatcher = struct {
     fn run(
