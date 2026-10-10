@@ -481,34 +481,6 @@ fn projected_read_tool_result_arguments(
     return try out.toOwnedSlice();
 }
 
-fn free_projected_tool_replay(alloc: Allocator, source: ChatMessage, projected: ChatMessage) void {
-    if (source.role != .assistant) return;
-    const replay = projected.provider_replay orelse return;
-    if (source.provider_replay) |original| {
-        if (original.parts_json.ptr == replay.parts_json.ptr) return;
-    }
-    alloc.free(@constCast(replay.parts_json));
-}
-
-fn free_terminal_request_projection(
-    alloc: Allocator,
-    source: []const ChatMessage,
-    projected: []const ChatMessage,
-) void {
-    if (source.ptr == projected.ptr) return;
-    for (projected, 0..) |message, index| {
-        free_projected_tool_replay(alloc, source[index], message);
-        if (message.content) |content| alloc.free(@constCast(content));
-        for (message.tool_calls) |call| {
-            alloc.free(@constCast(call.arguments_json));
-        }
-        if (message.tool_calls.len != 0) {
-            alloc.free(@constCast(message.tool_calls));
-        }
-    }
-    alloc.free(@constCast(projected));
-}
-
 const LegacyTerminalCall = struct {
     assistant_index: usize,
     id: []const u8,
@@ -686,9 +658,9 @@ fn complete_projected_tool_exchanges(
     }
 }
 
-/// Returns source unchanged or an owned projection released by free_terminal_request_projection.
+/// Borrows source bytes; transformed arrays and strings live in the step arena.
 fn project_terminal_request_messages(
-    alloc: Allocator,
+    arena_state: *std.heap.ArenaAllocator,
     registry: tool_dispatch.Registry,
     attempt_eligible: bool,
     source: []const ChatMessage,
@@ -697,6 +669,7 @@ fn project_terminal_request_messages(
 ) ![]const ChatMessage {
     if (!attempt_eligible) return source;
     if (registry.lookup("shell") == null) return source;
+    const alloc = arena_state.allocator();
 
     var legacy_calls: std.ArrayList(LegacyTerminalCall) = .empty;
     defer legacy_calls.deinit(alloc);
@@ -744,42 +717,16 @@ fn project_terminal_request_messages(
     }
     if (!needs_projection) return source;
 
-    const projected = try alloc.alloc(ChatMessage, source.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (projected[0..initialized], 0..) |message, index| {
-            free_projected_tool_replay(alloc, source[index], message);
-            if (message.content) |content| alloc.free(@constCast(content));
-            for (message.tool_calls) |call| {
-                alloc.free(@constCast(call.arguments_json));
-            }
-            if (message.tool_calls.len != 0) {
-                alloc.free(@constCast(message.tool_calls));
-            }
-        }
-        alloc.free(projected);
-    }
+    const projected = try alloc.dupe(ChatMessage, source);
     var assistant_index: ?usize = null;
     for (source, projected, 0..) |message, *target, message_index| {
         if (message.role != .tool) assistant_index = if (message.role == .assistant) message_index else null;
-        target.* = message;
-        target.content = null;
-        target.tool_calls = &.{};
-        initialized += 1;
-        target.content = if (message.content) |content|
-            try alloc.dupe(u8, content)
-        else
-            null;
 
         if (message.role == .tool and message.tool_call_id != null) {
             if (findLegacyCall(legacy_calls.items, assistant_index, message.tool_call_id.?)) |legacy| {
                 if (legacy.mapped) {
                     target.tool_name = "shell";
                 } else {
-                    if (target.content) |content| {
-                        alloc.free(@constCast(content));
-                        target.content = null;
-                    }
                     target.role = .assistant;
                     target.content = try legacyToolSummary(
                         alloc,
@@ -794,10 +741,7 @@ fn project_terminal_request_messages(
 
         if (message.tool_calls.len != 0) {
             var calls: std.ArrayList(ToolCall) = .empty;
-            errdefer {
-                for (calls.items) |call| alloc.free(@constCast(call.arguments_json));
-                calls.deinit(alloc);
-            }
+            errdefer calls.deinit(alloc);
             for (message.tool_calls) |call| {
                 if (call.argument_integrity == .valid and
                     std.mem.eql(u8, call.name, "terminal"))
@@ -811,10 +755,7 @@ fn project_terminal_request_messages(
                     var mapped = call;
                     mapped.name = "shell";
                     mapped.arguments_json = arguments;
-                    calls.append(alloc, mapped) catch |err| {
-                        alloc.free(arguments);
-                        return err;
-                    };
+                    try calls.append(alloc, mapped);
                     continue;
                 }
                 const registered_terminal = if (registry.lookup(call.name)) |tool|
@@ -826,15 +767,12 @@ fn project_terminal_request_messages(
                     (try projected_terminal_request_arguments(
                         alloc,
                         call.arguments_json,
-                    )) orelse try alloc.dupe(u8, call.arguments_json)
+                    )) orelse call.arguments_json
                 else
-                    try alloc.dupe(u8, call.arguments_json);
+                    call.arguments_json;
                 var copied = call;
                 copied.arguments_json = arguments;
-                calls.append(alloc, copied) catch |err| {
-                    alloc.free(arguments);
-                    return err;
-                };
+                try calls.append(alloc, copied);
             }
             target.tool_calls = try calls.toOwnedSlice(alloc);
         }
@@ -843,10 +781,7 @@ fn project_terminal_request_messages(
             target.tool_calls.len == 0 and
             target.content == null)
         {
-            target.content = try alloc.dupe(
-                u8,
-                "Prior terminal actions are represented as completed history summaries below.",
-            );
+            target.content = "Prior terminal actions are represented as completed history summaries below.";
         }
     }
     try complete_projected_tool_exchanges(alloc, source, projected, provider, selection);
@@ -966,9 +901,9 @@ fn subagent_history_summary(
         );
 }
 
-/// Returns source unchanged or an owned projection released by free_terminal_request_projection.
+/// Borrows source bytes; transformed arrays and strings live in the step arena.
 fn project_subagent_request_messages(
-    alloc: Allocator,
+    arena_state: *std.heap.ArenaAllocator,
     registry: tool_dispatch.Registry,
     attempt_eligible: bool,
     source: []const ChatMessage,
@@ -976,6 +911,7 @@ fn project_subagent_request_messages(
     selection: model_provider.ProviderSelection,
 ) ![]const ChatMessage {
     if (!attempt_eligible or registry.lookup("subagent") == null) return source;
+    const alloc = arena_state.allocator();
 
     var calls: std.ArrayList(SubagentHistoryCall) = .empty;
     defer calls.deinit(alloc);
@@ -1027,30 +963,14 @@ fn project_subagent_request_messages(
     }
     if (!needs_projection) return source;
 
-    const projected = try alloc.alloc(ChatMessage, source.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (projected[0..initialized], 0..) |message, index| {
-            free_projected_tool_replay(alloc, source[index], message);
-            if (message.content) |content| alloc.free(@constCast(content));
-            for (message.tool_calls) |call| alloc.free(@constCast(call.arguments_json));
-            if (message.tool_calls.len != 0) alloc.free(@constCast(message.tool_calls));
-        }
-        alloc.free(projected);
-    }
+    const projected = try alloc.dupe(ChatMessage, source);
     assistant_index = null;
     for (source, projected, 0..) |message, *target, message_index| {
         if (message.role != .tool) assistant_index = if (message.role == .assistant) message_index else null;
-        target.* = message;
-        target.content = if (message.content) |content| try alloc.dupe(u8, content) else null;
-        target.tool_calls = &.{};
-        initialized += 1;
 
         if (message.role == .tool and message.tool_call_id != null) {
             if (find_subagent_history_call(calls.items, assistant_index, message.tool_call_id.?)) |call| {
                 if (call.disposition == .inert) {
-                    if (target.content) |content| alloc.free(@constCast(content));
-                    target.content = null;
                     target.role = .assistant;
                     target.content = try subagent_history_summary(
                         alloc,
@@ -1061,7 +981,6 @@ fn project_subagent_request_messages(
                     target.tool_name = null;
                 } else if (message.content) |content| {
                     if (try project_subagent_result_content(alloc, content)) |compact| {
-                        if (target.content) |owned| alloc.free(@constCast(owned));
                         target.content = compact;
                     }
                 }
@@ -1070,10 +989,7 @@ fn project_subagent_request_messages(
 
         if (message.tool_calls.len != 0) {
             var projected_calls: std.ArrayList(ToolCall) = .empty;
-            errdefer {
-                for (projected_calls.items) |call| alloc.free(@constCast(call.arguments_json));
-                projected_calls.deinit(alloc);
-            }
+            errdefer projected_calls.deinit(alloc);
             for (message.tool_calls) |call| {
                 const history_call = if (std.mem.eql(u8, call.name, "subagent"))
                     find_subagent_history_call(calls.items, message_index, call.id)
@@ -1084,31 +1000,20 @@ fn project_subagent_request_messages(
                     const arguments = (try normalized_subagent_request_arguments(
                         alloc,
                         call.arguments_json,
-                    )) orelse try alloc.dupe(u8, call.arguments_json);
+                    )) orelse call.arguments_json;
                     var copied = call;
                     copied.arguments_json = arguments;
-                    projected_calls.append(alloc, copied) catch |err| {
-                        alloc.free(arguments);
-                        return err;
-                    };
+                    try projected_calls.append(alloc, copied);
                     continue;
                 }
-                var copied = call;
-                copied.arguments_json = try alloc.dupe(u8, call.arguments_json);
-                projected_calls.append(alloc, copied) catch |err| {
-                    alloc.free(@constCast(copied.arguments_json));
-                    return err;
-                };
+                try projected_calls.append(alloc, call);
             }
             target.tool_calls = try projected_calls.toOwnedSlice(alloc);
         }
         if (message.role == .assistant and message.tool_calls.len != 0 and
             target.tool_calls.len == 0 and target.content == null)
         {
-            target.content = try alloc.dupe(
-                u8,
-                "Prior removed subagent actions are represented as completed history summaries below.",
-            );
+            target.content = "Prior removed subagent actions are represented as completed history summaries below.";
         }
     }
     try complete_projected_tool_exchanges(alloc, source, projected, provider, selection);
@@ -1118,7 +1023,6 @@ fn project_subagent_request_messages(
 test "rejected subagent arguments keep their call and result during projection" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const alloc = arena_state.allocator();
     const tool = tool_dispatch.Tool{
         .name = "subagent",
         .description = "subagent",
@@ -1143,7 +1047,7 @@ test "rejected subagent arguments keep their call and result during projection" 
     for ([_]types.ToolArgumentIntegrity{ .non_object_json, .malformed_json, .valid }) |integrity| {
         calls[0].argument_integrity = integrity;
         const projected = try project_subagent_request_messages(
-            alloc,
+            &arena_state,
             .{ .tools = &.{tool} },
             true,
             &messages,
@@ -1163,7 +1067,6 @@ test "rejected subagent arguments keep their call and result during projection" 
 test "subagent history makes every removed manager action inert" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const arena = arena_state.allocator();
     const tool = tool_dispatch.Tool{
         .name = "subagent",
         .description = "subagent",
@@ -1202,7 +1105,7 @@ test "subagent history makes every removed manager action inert" {
     };
 
     const projected = try project_subagent_request_messages(
-        arena,
+        &arena_state,
         registry,
         true,
         &messages,
@@ -1230,7 +1133,7 @@ test "subagent history makes every removed manager action inert" {
     try std.testing.expectEqualStrings(calls[0].arguments_json, messages[0].tool_calls[0].arguments_json);
 
     const idempotent = try project_subagent_request_messages(
-        arena,
+        &arena_state,
         registry,
         true,
         projected,
@@ -1239,7 +1142,7 @@ test "subagent history makes every removed manager action inert" {
     );
     try std.testing.expectEqual(projected.ptr, idempotent.ptr);
     const ineligible = try project_subagent_request_messages(
-        arena,
+        &arena_state,
         registry,
         false,
         &messages,
@@ -1250,6 +1153,8 @@ test "subagent history makes every removed manager action inert" {
 }
 
 fn check_subagent_history_projection_allocation_failures(alloc: Allocator) !void {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
     const tool = tool_dispatch.Tool{
         .name = "subagent",
         .description = "subagent",
@@ -1276,7 +1181,7 @@ fn check_subagent_history_projection_allocation_failures(alloc: Allocator) !void
         },
     };
     const projected = try project_subagent_request_messages(
-        alloc,
+        &arena_state,
         registry,
         true,
         &messages,
@@ -1284,7 +1189,6 @@ fn check_subagent_history_projection_allocation_failures(alloc: Allocator) !void
         .{ .provider = .gateway, .model = "test" },
     );
     if (projected.ptr == messages[0..].ptr) return error.TestUnexpectedResult;
-    defer free_terminal_request_projection(alloc, &messages, projected);
 }
 
 test "subagent history projection cleans every partial allocation failure" {
@@ -1676,7 +1580,6 @@ test "terminal inferred model input round trips every atomic write payload" {
 test "shell request projection wraps eligible flat objects without changing source messages" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const arena = arena_state.allocator();
 
     const terminal_tool = tool_dispatch.Tool{
         .name = "shell",
@@ -1727,7 +1630,7 @@ test "shell request projection wraps eligible flat objects without changing sour
     };
 
     const projected = try project_terminal_request_messages(
-        arena,
+        &arena_state,
         registry,
         true,
         &messages,
@@ -1749,7 +1652,7 @@ test "shell request projection wraps eligible flat objects without changing sour
     try std.testing.expectEqualStrings("{}", projected[1].tool_calls[cases.len + 2].arguments_json);
 
     const idempotent = try project_terminal_request_messages(
-        arena,
+        &arena_state,
         registry,
         true,
         projected,
@@ -1758,7 +1661,7 @@ test "shell request projection wraps eligible flat objects without changing sour
     );
     try std.testing.expectEqual(projected.ptr, idempotent.ptr);
     const ineligible = try project_terminal_request_messages(
-        arena,
+        &arena_state,
         registry,
         false,
         &messages,
@@ -1837,7 +1740,6 @@ test "legacy request projection preserves complete surviving exchanges" {
         for ([_]bool{ false, true }) |removed_first| {
             var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
             defer arena_state.deinit();
-            const arena = arena_state.allocator();
             const removed = ToolCall{
                 .id = "removed",
                 .name = case.name,
@@ -1855,7 +1757,7 @@ test "legacy request projection preserves complete surviving exchanges" {
             };
             const projected = if (is_subagent)
                 try project_subagent_request_messages(
-                    arena,
+                    &arena_state,
                     registry,
                     true,
                     &messages,
@@ -1864,7 +1766,7 @@ test "legacy request projection preserves complete surviving exchanges" {
                 )
             else
                 try project_terminal_request_messages(
-                    arena,
+                    &arena_state,
                     registry,
                     true,
                     &messages,
@@ -1888,7 +1790,7 @@ test "legacy request projection preserves complete surviving exchanges" {
             invalid[1].tool_call_id = "unmatched";
             try std.testing.expectError(error.InvalidToolHistoryProjection, if (is_subagent)
                 project_subagent_request_messages(
-                    arena,
+                    &arena_state,
                     registry,
                     true,
                     &invalid,
@@ -1897,7 +1799,7 @@ test "legacy request projection preserves complete surviving exchanges" {
                 )
             else
                 project_terminal_request_messages(
-                    arena,
+                    &arena_state,
                     registry,
                     true,
                     &invalid,
@@ -1906,7 +1808,7 @@ test "legacy request projection preserves complete surviving exchanges" {
                 ));
             try std.testing.expectError(error.InvalidToolHistoryProjection, if (is_subagent)
                 project_subagent_request_messages(
-                    arena,
+                    &arena_state,
                     registry,
                     true,
                     messages[0..2],
@@ -1915,7 +1817,7 @@ test "legacy request projection preserves complete surviving exchanges" {
                 )
             else
                 project_terminal_request_messages(
-                    arena,
+                    &arena_state,
                     registry,
                     true,
                     messages[0..2],
@@ -1924,6 +1826,87 @@ test "legacy request projection preserves complete surviving exchanges" {
                 ));
         }
     }
+}
+
+test "composed tool history projection preserves borrowed input and downstream failures" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const shell = tool_dispatch.Tool{
+        .name = "shell",
+        .description = "shell",
+        .model_schema = .{ .name = "shell", .description = "shell" },
+        .executor_kind = .terminal,
+        .decode = undefined,
+        .call = undefined,
+        .reads_only_fn = undefined,
+        .irreversible_fn = undefined,
+    };
+    var subagent = shell;
+    subagent.name = "subagent";
+    subagent.executor_kind = .subagent;
+    const registry = tool_dispatch.Registry{ .tools = &.{ shell, subagent } };
+    const selection = model_provider.ProviderSelection{ .provider = .gateway, .model = "test" };
+    const calls = [_]ToolCall{
+        .{ .id = "old-shell", .name = "terminal", .arguments_json = "{\"action\":\"read\"}" },
+        .{ .id = "old-child", .name = "subagent", .arguments_json = "{\"command\":{\"inspect\":{\"id\":\"missing\"}}}" },
+        .{ .id = "shell", .name = "shell", .arguments_json = "{\"action\":\"list\"}" },
+        .{ .id = "result", .name = "read_tool_result", .arguments_json = "{\"handle\":\"saved-output\"}" },
+    };
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "unchanged user message" },
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .tool_call_id = calls[0].id, .tool_name = calls[0].name, .content = "old shell result" },
+        .{ .role = .tool, .tool_call_id = calls[1].id, .tool_name = calls[1].name, .content = "old child result" },
+        .{ .role = .tool, .tool_call_id = calls[2].id, .tool_name = calls[2].name, .content = "current shell result" },
+        .{ .role = .tool, .tool_call_id = calls[3].id, .tool_name = calls[3].name, .content = "current saved output" },
+        .{ .role = .assistant, .content = "unchanged assistant message" },
+    };
+    const terminal = try project_terminal_request_messages(&arena_state, registry, true, &messages, agent_stream_provider.unavailable_provider, selection);
+    const children = try project_subagent_request_messages(&arena_state, registry, true, terminal, agent_stream_provider.unavailable_provider, selection);
+    const result = try project_read_tool_result_request_messages(arena, true, children);
+    try std.testing.expectEqual(messages.len, result.len);
+    try std.testing.expectEqual(@as(usize, 2), result[1].tool_calls.len);
+    try std.testing.expectEqualStrings("shell", result[1].tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"request\":{\"action\":\"list\"}}", result[1].tool_calls[0].arguments_json);
+    try std.testing.expectEqualStrings("read_tool_result", result[1].tool_calls[1].name);
+    try std.testing.expectEqualStrings("{\"request\":{\"handle\":\"saved-output\"}}", result[1].tool_calls[1].arguments_json);
+    try std.testing.expectEqualStrings("shell", result[2].tool_call_id.?);
+    try std.testing.expectEqualStrings("result", result[3].tool_call_id.?);
+    try std.testing.expectEqual(types.ChatRole.assistant, result[4].role);
+    try std.testing.expectEqual(types.ChatRole.assistant, result[5].role);
+    try std.testing.expect(std.mem.find(u8, result[4].content.?, "old child result") != null);
+    try std.testing.expect(std.mem.find(u8, result[5].content.?, "old shell result") != null);
+    try std.testing.expectEqual(@as(usize, 4), messages[1].tool_calls.len);
+    try std.testing.expectEqualStrings("old-shell", messages[2].tool_call_id.?);
+    try std.testing.expectEqualStrings("{\"action\":\"list\"}", messages[1].tool_calls[2].arguments_json);
+    try std.testing.expectEqualStrings("{\"handle\":\"saved-output\"}", messages[1].tool_calls[3].arguments_json);
+
+    const Probe = struct {
+        fn project(alloc: Allocator, replay: ?types.ProviderReplay, retained: []const ToolCall, _: bool, _: bool) !?types.ProviderReplay {
+            if (retained.len == 2) return error.InvalidProviderState;
+            try std.testing.expectEqual(@as(usize, 3), retained.len);
+            return .{ .source = replay.?.source, .parts_json = try alloc.dupe(u8, "[]") };
+        }
+    };
+    var with_replay = messages;
+    with_replay[1].provider_replay = .{ .source = selection, .parts_json = "[]" };
+    const provider = agent_stream_provider.Provider{
+        .stream_fn = agent_stream_provider.unavailable_provider.stream_fn,
+        .project_replay_fn = Probe.project,
+    };
+    const reordered = try project_terminal_request_messages(&arena_state, registry, true, &with_replay, provider, selection);
+    try std.testing.expectEqualStrings("old-child", reordered[2].tool_call_id.?);
+    try std.testing.expectEqual(types.ChatRole.assistant, reordered[5].role);
+    try std.testing.expectError(error.InvalidProviderState, project_subagent_request_messages(&arena_state, registry, true, reordered, provider, selection));
+    try std.testing.expectEqualStrings("old-shell", with_replay[2].tool_call_id.?);
+    try std.testing.expectEqualStrings("old-child", reordered[2].tool_call_id.?);
+    try std.testing.expectEqualStrings("[]", with_replay[1].provider_replay.?.parts_json);
+
+    try std.testing.expectEqual(messages[0].content.?.ptr, terminal[0].content.?.ptr);
+    try std.testing.expectEqual(messages[6].content.?.ptr, children[6].content.?.ptr);
+    try std.testing.expectEqual(messages[4].content.?.ptr, result[2].content.?.ptr);
+    try std.testing.expectEqual(calls[3].arguments_json.ptr, terminal[1].tool_calls[2].arguments_json.ptr);
 }
 
 test "legacy request projection scopes reused call identities to their exchange" {
@@ -1944,7 +1927,6 @@ test "legacy request projection scopes reused call identities to their exchange"
     for ([_]bool{ false, true }) |is_subagent| {
         var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena_state.deinit();
-        const arena = arena_state.allocator();
         const kept = ToolCall{
             .id = "reused",
             .name = if (is_subagent) "subagent" else "terminal",
@@ -1966,7 +1948,7 @@ test "legacy request projection scopes reused call identities to their exchange"
         };
         const projected = if (is_subagent)
             try project_subagent_request_messages(
-                arena,
+                &arena_state,
                 registry,
                 true,
                 &messages,
@@ -1975,7 +1957,7 @@ test "legacy request projection scopes reused call identities to their exchange"
             )
         else
             try project_terminal_request_messages(
-                arena,
+                &arena_state,
                 registry,
                 true,
                 &messages,
@@ -1994,6 +1976,8 @@ test "legacy request projection scopes reused call identities to their exchange"
 }
 
 fn check_legacy_replay_projection_allocations(alloc: Allocator) !void {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
     const Probe = struct {
         const selected = "[{\"type\":\"text\",\"offset\":0,\"length\":8},{\"type\":\"tool-call\",\"toolCallId\":\"retained\"}]";
 
@@ -2033,14 +2017,14 @@ fn check_legacy_replay_projection_allocations(alloc: Allocator) !void {
         .{ .role = .tool, .tool_call_id = "retained", .tool_name = "read_file", .content = "read result" },
     };
     const projected = try project_terminal_request_messages(
-        alloc,
+        &arena_state,
         registry,
         true,
         &messages,
         provider,
         selection,
     );
-    defer free_terminal_request_projection(alloc, &messages, projected);
+
     try std.testing.expectEqualStrings(Probe.selected, projected[0].provider_replay.?.parts_json);
     try std.testing.expectEqualStrings("original", projected[0].content.?);
     try std.testing.expectEqualStrings(original, messages[0].provider_replay.?.parts_json);
@@ -2049,14 +2033,13 @@ fn check_legacy_replay_projection_allocations(alloc: Allocator) !void {
     invalid_tail[0].provider_replay.?.parts_json = "invalid";
     const combined = messages ++ invalid_tail;
     if (project_terminal_request_messages(
-        alloc,
+        &arena_state,
         registry,
         true,
         &combined,
         provider,
         selection,
-    )) |unexpected| {
-        free_terminal_request_projection(alloc, &combined, unexpected);
+    )) |_| {
         return error.TestUnexpectedResult;
     } else |err| {
         if (err == error.OutOfMemory) return err;
@@ -2066,14 +2049,14 @@ fn check_legacy_replay_projection_allocations(alloc: Allocator) !void {
 
     messages[0].provider_replay.?.source.model = "other-model";
     const foreign = try project_terminal_request_messages(
-        alloc,
+        &arena_state,
         registry,
         true,
         &messages,
         agent_stream_provider.unavailable_provider,
         selection,
     );
-    defer free_terminal_request_projection(alloc, &messages, foreign);
+
     try std.testing.expectEqual(messages[0].provider_replay.?.parts_json.ptr, foreign[0].provider_replay.?.parts_json.ptr);
 }
 
@@ -2084,7 +2067,6 @@ test "legacy request projection preserves replay ownership and source binding on
 test "mixed legacy terminal batches become inert in every order" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const arena = arena_state.allocator();
     const shell_tool = tool_dispatch.Tool{
         .name = "shell",
         .description = "shell",
@@ -2125,7 +2107,7 @@ test "mixed legacy terminal batches become inert in every order" {
     };
 
     const projected = try project_terminal_request_messages(
-        arena,
+        &arena_state,
         registry,
         true,
         &messages,
@@ -2150,7 +2132,7 @@ test "mixed legacy terminal batches become inert in every order" {
     try std.testing.expectEqualStrings("terminal", messages[0].tool_calls[0].name);
 
     const idempotent = try project_terminal_request_messages(
-        arena,
+        &arena_state,
         registry,
         true,
         projected,
@@ -2176,7 +2158,7 @@ test "mixed legacy terminal batches become inert in every order" {
         },
     };
     const reversed = try project_terminal_request_messages(
-        arena,
+        &arena_state,
         registry,
         true,
         &reversed_messages,
@@ -2202,7 +2184,7 @@ test "mixed legacy terminal batches become inert in every order" {
         messages[1],
     };
     const exec_only = try project_terminal_request_messages(
-        arena,
+        &arena_state,
         registry,
         true,
         &exec_only_messages,
@@ -2216,6 +2198,8 @@ test "mixed legacy terminal batches become inert in every order" {
 }
 
 fn check_terminal_request_projection_allocation_failures(alloc: Allocator) !void {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
     const terminal_tool = tool_dispatch.Tool{
         .name = "shell",
         .description = "shell",
@@ -2241,7 +2225,7 @@ fn check_terminal_request_projection_allocation_failures(alloc: Allocator) !void
         .{ .role = .assistant, .tool_calls = &second_calls },
     };
     const projected = try project_terminal_request_messages(
-        alloc,
+        &arena_state,
         registry,
         true,
         &source,
@@ -2249,7 +2233,7 @@ fn check_terminal_request_projection_allocation_failures(alloc: Allocator) !void
         .{ .provider = .gateway, .model = "test" },
     );
     if (projected.ptr == source[0..].ptr) return error.TestUnexpectedResult;
-    defer free_terminal_request_projection(alloc, &source, projected);
+
     try std.testing.expectEqualStrings("{\"request\":{}}", projected[0].tool_calls[0].arguments_json);
     try std.testing.expectEqualStrings("{\"request\":{\"action\":null}}", projected[0].tool_calls[1].arguments_json);
     try std.testing.expectEqualStrings(
@@ -7179,7 +7163,7 @@ fn processQueuedPromptLoop(
                     vision_mode,
                 );
             const terminal_request_messages = try project_terminal_request_messages(
-                overlay_arena,
+                overlay_arena_state,
                 deps.tool_registry,
                 terminal_request_eligible,
                 projected_request_messages,
@@ -7187,7 +7171,7 @@ fn processQueuedPromptLoop(
                 .{ .provider = job.provider, .model = gateway_model },
             );
             const subagent_request_messages = try project_subagent_request_messages(
-                overlay_arena,
+                overlay_arena_state,
                 deps.tool_registry,
                 subagent_request_eligible,
                 terminal_request_messages,
