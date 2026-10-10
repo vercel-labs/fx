@@ -136,6 +136,8 @@ Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`
 
 `skill_symlink_authorities` is an array of absolute directories that symlinked skills may resolve into, such as an app bundle or `/nix/store`. It is read at startup, a workspace override replaces the global list, and its entries are combined with the colon-separated `FX_SKILL_SYMLINK_AUTHORITIES` environment variable.
 
+`effort` is catalog-gated: fx sends it to the gateway only when the active model's catalog entry declares that effort tier. When it does not, fx reports this once via a system notice instead of silently discarding the setting.
+
 Runtime state lives under `~/.fx/`:
 
 * `~/.fx/sessions/<session-id>/session.json`

@@ -6790,6 +6790,7 @@ fn processQueuedPromptLoop(
     for (config.initial_dynamic_tools) |tool| {
         selected_dynamic_tools.appendAssumeCapacity(tool);
     }
+    var last_dropped_effort_notice: ?struct { model: []const u8, effort: types.ReasoningEffort } = null;
     const current_user_effective = current_user_message;
     const initial_pending_image_ids = try arena.alloc(usize, job.images.len);
     for (job.images, 0..) |attachment, index| initial_pending_image_ids[index] = attachment.id;
@@ -7262,6 +7263,21 @@ fn processQueuedPromptLoop(
                 fast_unavailable_notified = true;
                 try deps.push_text(deps.ctx, .{ .operational = "Fast mode is unavailable for this model right now; continuing at standard speed." });
                 try deps.push_text(deps.ctx, .{ .operational = "\n" });
+            }
+            if (model_capabilities.reasoningEffortDropped(request_capabilities, config.effort)) {
+                const already_notified = if (last_dropped_effort_notice) |pair|
+                    pair.effort.eql(config.effort) and std.mem.eql(u8, pair.model, gateway_model)
+                else
+                    false;
+                if (!already_notified) {
+                    last_dropped_effort_notice = .{ .model = gateway_model, .effort = config.effort };
+                    const notice = try std.fmt.allocPrint(
+                        arena,
+                        "reasoning effort \"{s}\" is not available for {s}; the model's catalog entry does not declare that effort tier, so the request uses the provider default",
+                        .{ config.effort.displayLabel(), gateway_model },
+                    );
+                    try deps.push_system_notice(deps.ctx, notice);
+                }
             }
             const tool_choice: types.ToolChoice = if (recovery_strategy == .reconcile_tool)
                 .none
