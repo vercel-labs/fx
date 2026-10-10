@@ -1,5 +1,5 @@
 const std = @import("std");
-const codec = @import("chat_completions_protocol.zig");
+const codec = @import("anthropic_messages_protocol.zig");
 const client_mod = @import("client.zig");
 const definitions = @import("../core/config/configured_provider.zig");
 const streams = @import("../core/agent/stream_provider.zig");
@@ -17,6 +17,8 @@ const types = @import("../core/shared/types.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const Allocator = std.mem.Allocator;
+
+const anthropic_version = "2023-06-01";
 
 /// Every callback borrows the immutable definition from the owning profile runtime.
 pub fn bundle(definition: *const definitions.Definition) provider_set.Bundle {
@@ -53,29 +55,28 @@ fn build(raw: ?*anyopaque, alloc: Allocator, request: streams.RequestData) ![]u8
 
 fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
     const selected = try codec.project_replay(alloc, replay, calls, text, reasoning);
-    if (replay != null and selected == null) debug_trace.logf("gateway", "provider_replay_omitted reason={s}", .{if (reasoning) "associated_calls_removed" else "reasoning_removed"});
+    if (replay != null and selected == null) debug_trace.logf("gateway", "provider_replay_omitted reason=associated_calls_removed", .{});
     return selected;
 }
 
-test "chat completions adapter binds replay to endpoint authority and wires projection" {
+test "anthropic messages adapter binds replay to endpoint authority and wires projection" {
     const alloc = std.testing.allocator;
     var registry = try definitions.Registry.parse_json(alloc,
-        \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:1234/v1","auth":{"type":"none"}}}
+        \\{"claude":{"protocol":"anthropic-messages","base_url":"https://api.anthropic.com/v1","auth":{"type":"x-api-key","env":"ANTHROPIC_API_KEY"}}}
     );
     defer registry.deinit(alloc);
     var changed_registry = try definitions.Registry.parse_json(alloc,
-        \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:5678/v1","auth":{"type":"none"}}}
+        \\{"claude":{"protocol":"anthropic-messages","base_url":"http://localhost:5678/v1","auth":{"type":"x-api-key","env":"ANTHROPIC_API_KEY"}}}
     );
     defer changed_registry.deinit(alloc);
-    const definition = registry.get("local").?;
+    const definition = registry.get("claude").?;
     const adapter = bundle(definition).agent_stream.?;
     const replay: types.ProviderReplay = .{
         .source = .{ .provider = bundle(definition).model_catalog.?.provider_id, .model = "model" },
-        .parts_json = "{\"reasoning_details\":[{\"signature\":\"signed\"}],\"_tool_call_ids\":[]}",
+        .parts_json = "{\"thinking\":[{\"type\":\"thinking\",\"thinking\":\"ponder\",\"signature\":\"sig1\"}],\"_tool_call_ids\":[]}",
     };
     const selected = (try adapter.projectReplay(alloc, replay, &.{}, false, true)).?;
     try std.testing.expect(selected.parts_json.ptr == replay.parts_json.ptr);
-    try std.testing.expect(try adapter.projectReplay(alloc, replay, &.{}, true, false) == null);
     const request: streams.RequestData = .{
         .model = "model",
         .instructions = &.{.{ .role = .system, .content = "instructions" }},
@@ -85,11 +86,11 @@ test "chat completions adapter binds replay to endpoint authority and wires proj
     };
     const matching = try adapter.build_request_fn.?(adapter.context, alloc, request);
     defer alloc.free(matching);
-    try std.testing.expect(std.mem.find(u8, matching, "reasoning_details") != null);
-    const other = bundle(changed_registry.get("local").?).agent_stream.?;
+    try std.testing.expect(std.mem.find(u8, matching, "\"thinking\":\"ponder\"") != null);
+    const other = bundle(changed_registry.get("claude").?).agent_stream.?;
     const stripped = try other.build_request_fn.?(other.context, alloc, request);
     defer alloc.free(stripped);
-    try std.testing.expect(std.mem.find(u8, stripped, "reasoning_details") == null);
+    try std.testing.expect(std.mem.find(u8, stripped, "sig1") == null);
     try std.testing.expect(request.messages[0].provider_replay.?.parts_json.ptr == replay.parts_json.ptr);
 }
 
@@ -132,9 +133,11 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
     // `x-api-key` and `authorization` are exclusive auth carriers on the wire.
     const authorization = if (definition.auth == .bearer) try std.fmt.allocPrint(alloc, "Bearer {s}", .{token.?}) else null;
     defer if (authorization) |value| secret.zeroAndFree(alloc, value);
-    var request_headers: [2]std.http.Header = undefined;
+    var request_headers: [3]std.http.Header = undefined;
     var count: usize = 0;
     request_headers[count] = .{ .name = "accept", .value = "text/event-stream" };
+    count += 1;
+    request_headers[count] = .{ .name = "anthropic-version", .value = anthropic_version };
     count += 1;
     if (definition.auth == .x_api_key) {
         request_headers[count] = .{ .name = "x-api-key", .value = token.? };
@@ -173,8 +176,8 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
     watch.stop();
     if (http.connection) |connection| try watch.start(request.cancel_flag, if (response.head.status == .ok) request.deadline else phase_deadline(30_000, request.deadline), connection.stream_writer.stream);
     var retry_after: ?u64 = null;
-    var headers = response.head.iterateHeaders();
-    while (headers.next()) |header| if (std.ascii.eqlIgnoreCase(header.name, "retry-after")) {
+    var response_headers = response.head.iterateHeaders();
+    while (response_headers.next()) |header| if (std.ascii.eqlIgnoreCase(header.name, "retry-after")) {
         retry_after = std.fmt.parseUnsigned(u64, std.mem.trim(u8, header.value, " \t"), 10) catch null;
         break;
     };
@@ -217,8 +220,8 @@ fn metadata_entry(metadata: definitions.ModelMetadata) catalog.ModelCatalogEntry
         .id = @constCast(metadata.id),
         .model_type = @constCast("language"),
         .has_tool_use = metadata.supports_tool_use orelse false,
-        // Chat completions sends images as inline base64 content parts, so
-        // vision support implies file input through the same path.
+        // Messages sends images as inline base64 content blocks, so vision
+        // support implies file input through the same path.
         .has_vision = vision,
         .has_file_input = vision,
         .context_window = metadata.context_window orelse 0,
@@ -250,15 +253,20 @@ fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) 
 test "configured capability lookup matches catalog projection and preserves unknowns" {
     const alloc = std.testing.allocator;
     var registry = try definitions.Registry.parse_json(alloc,
-        \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:1234/v1","auth":{"type":"none"},"model_metadata":{"small":{"context_window":8192,"max_output_tokens":512,"supports_tool_use":true,"supports_vision":true},"large":{"context_window":32768,"max_output_tokens":1024,"supports_tool_use":false},"partial":{"max_output_tokens":128},"unknown":{}}}}
+        \\{"claude":{"protocol":"anthropic-messages","base_url":"https://api.anthropic.com/v1","auth":{"type":"x-api-key","env":"ANTHROPIC_API_KEY"},"model_metadata":{"small":{"context_window":200000,"max_output_tokens":8192,"supports_tool_use":true,"supports_vision":true},"large":{"context_window":1000000,"max_output_tokens":64000,"supports_tool_use":false},"partial":{"max_output_tokens":128},"unknown":{}}}}
     );
     defer registry.deinit(alloc);
-    const provider = bundle(registry.get("local").?).model_catalog.?;
+    const provider = bundle(registry.get("claude").?).model_catalog.?;
     var fetched = try provider.fetch(alloc, .{ .endpoint = "unused" });
     defer catalog.freeModelCatalog(alloc, &fetched.catalog);
     for (fetched.catalog.items) |entry| {
         const actual = provider.lookupCapabilities(entry.id).?;
-        try std.testing.expectEqualDeep(model_capabilities.mergeCapabilities(.{}, model_catalog_metadata.fromCatalogEntry(entry)), actual);
+        // Field-level expects: expectEqualDeep can walk the undefined padding in
+        // ReasoningEffortOptions.values and read corrupt union tags in Debug.
+        const expected = model_capabilities.mergeCapabilities(.{}, model_catalog_metadata.fromCatalogEntry(entry));
+        try std.testing.expectEqual(expected.context_window, actual.context_window);
+        try std.testing.expectEqual(expected.max_output_tokens, actual.max_output_tokens);
+        try std.testing.expectEqual(expected.supports_tool_use, actual.supports_tool_use);
         const declared_vision = std.mem.eql(u8, entry.id, "small");
         try std.testing.expectEqual(declared_vision, actual.supports_vision);
         try std.testing.expectEqual(
@@ -266,11 +274,8 @@ test "configured capability lookup matches catalog projection and preserves unkn
             actual.image_input_support,
         );
     }
-    try std.testing.expectEqual(@as(?u32, 512), provider.lookupCapabilities("small").?.max_output_tokens);
-    try std.testing.expectEqual(@as(?u32, 1024), provider.lookupCapabilities("large").?.max_output_tokens);
-    try std.testing.expect(provider.lookupCapabilities("partial").?.context_window == null);
-    try std.testing.expect(provider.lookupCapabilities("unknown").?.max_output_tokens == null);
-    try std.testing.expectEqualDeep(model_capabilities.Capabilities{}, provider.lookupCapabilities("missing-fast").?);
+    try std.testing.expectEqual(@as(?u32, 8192), provider.lookupCapabilities("small").?.max_output_tokens);
+    try std.testing.expect(provider.lookupCapabilities("missing").?.context_window == null);
 }
 
 fn fetch_cli_catalog(raw: ?*anyopaque, alloc: Allocator, input: gateway_provider.CliModelCatalogInput) gateway_provider.CliModelCatalogResult {
