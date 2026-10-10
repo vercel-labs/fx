@@ -11,6 +11,22 @@ const jsonrpc = @import("../../acp/jsonrpc.zig");
 
 pub const State = enum { idle, working, blocked };
 
+/// Why the pane's session is being reported. herdr moves a pane to a
+/// different session only when the report names a recognized start source.
+pub const SessionStart = enum {
+    startup,
+    new,
+    resumed,
+
+    fn wireName(self: SessionStart) []const u8 {
+        return switch (self) {
+            .startup => "startup",
+            .new => "new",
+            .resumed => "resume",
+        };
+    }
+};
+
 // herdr protocol limits custom status to 32 bytes.
 const custom_status_max = 32;
 /// Maximum wait for herdr's one-line reply.
@@ -22,7 +38,7 @@ const agent_name = "fx";
 
 const Request = union(enum) {
     report: struct { state: State, custom_status: ?[]const u8 },
-    session: []const u8,
+    session: SessionStart,
     /// null clears the pane label.
     pane_rename: ?[]const u8,
     /// null clears the agent name.
@@ -36,6 +52,10 @@ pub const Client = struct {
     alloc: ?std.mem.Allocator = null,
     socket_path: []u8 = &.{},
     pane_id: []u8 = &.{},
+    /// Owned copy of the session herdr should resume in this pane. Every
+    /// state report carries it because herdr drops a pane's session when a
+    /// state report arrives without one.
+    session_id: []u8 = &.{},
     next_id: u64 = 1,
 
     pub fn shouldEnable(
@@ -86,9 +106,11 @@ pub const Client = struct {
         if (self.alloc) |alloc| {
             if (self.socket_path.len > 0) alloc.free(self.socket_path);
             if (self.pane_id.len > 0) alloc.free(self.pane_id);
+            if (self.session_id.len > 0) alloc.free(self.session_id);
         }
         self.socket_path = &.{};
         self.pane_id = &.{};
+        self.session_id = &.{};
         self.alloc = null;
         self.enabled = false;
     }
@@ -99,11 +121,33 @@ pub const Client = struct {
         self.send(.{ .report = .{ .state = state, .custom_status = clampStatus(custom_status) } });
     }
 
-    /// Report fx's session id so herdr can associate the pane with a resumable
-    /// session. Does not affect herdr's semantic state.
-    pub fn reportSession(self: *Client, session_id: []const u8) void {
-        if (session_id.len == 0) return;
-        self.send(.{ .session = session_id });
+    /// Report fx's active session so herdr can resume it in this pane after a
+    /// restart. Later state reports carry the same session. Does not affect
+    /// herdr's semantic state.
+    pub fn reportSession(self: *Client, session_id: []const u8, start: SessionStart) void {
+        if (comptime host_target.is_wasm) return;
+        if (!self.enabled or session_id.len == 0) return;
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.retainSessionLocked(session_id) catch |err| {
+            // herdr keeps the previously reported session for this pane.
+            debug_trace.logf(
+                "herdr",
+                "session id not retained session={s} err={s}",
+                .{ session_id, @errorName(err) },
+            );
+            return;
+        };
+        self.sendAllLocked(&.{.{ .session = start }});
+    }
+
+    fn retainSessionLocked(self: *Client, session_id: []const u8) !void {
+        if (std.mem.eql(u8, self.session_id, session_id)) return;
+        const alloc = self.alloc orelse return error.ClientNotInitialized;
+        const copy = try alloc.dupe(u8, session_id);
+        if (self.session_id.len > 0) alloc.free(self.session_id);
+        self.session_id = copy;
     }
 
     /// Name the pane/agent so herdr lists fx even while idle. Best-effort;
@@ -135,6 +179,10 @@ pub const Client = struct {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
+        self.sendAllLocked(requests);
+    }
+
+    fn sendAllLocked(self: *Client, requests: []const Request) void {
         for (requests) |request| {
             self.sendLocked(request) catch |err| {
                 debug_trace.logf(
@@ -157,8 +205,8 @@ pub const Client = struct {
         const w = &stream_writer.interface;
         const id = self.takeIdLocked();
         switch (request) {
-            .report => |r| try writeReportAgent(w, id, self.pane_id, r.state, r.custom_status),
-            .session => |session_id| try writeReportAgentSession(w, id, self.pane_id, session_id),
+            .report => |r| try writeReportAgent(w, id, self.pane_id, r.state, r.custom_status, self.session_id),
+            .session => |start| try writeReportAgentSession(w, id, self.pane_id, self.session_id, start),
             .pane_rename => |label| try writeRename(w, id, "pane.rename", "pane_id", self.pane_id, "label", label),
             .agent_rename => |name| try writeRename(w, id, "agent.rename", "target", self.pane_id, "name", name),
             .clear_authority => try writeClearAuthority(w, id, self.pane_id),
@@ -218,6 +266,7 @@ fn writeReportAgent(
     pane_id: []const u8,
     state: State,
     custom_status: ?[]const u8,
+    session_id: []const u8,
 ) !void {
     try writeId(w, id);
     try w.writeAll(",\"method\":\"pane.report_agent\",\"params\":{\"pane_id\":");
@@ -232,6 +281,10 @@ fn writeReportAgent(
         try w.writeAll(",\"custom_status\":");
         try jsonrpc.writeJsonStr(status, w);
     }
+    if (session_id.len > 0) {
+        try w.writeAll(",\"agent_session_id\":");
+        try jsonrpc.writeJsonStr(session_id, w);
+    }
     try w.writeAll("}}\n");
 }
 
@@ -240,6 +293,7 @@ fn writeReportAgentSession(
     id: u64,
     pane_id: []const u8,
     session_id: []const u8,
+    start: SessionStart,
 ) !void {
     try writeId(w, id);
     try w.writeAll(",\"method\":\"pane.report_agent_session\",\"params\":{\"pane_id\":");
@@ -250,6 +304,8 @@ fn writeReportAgentSession(
     try jsonrpc.writeJsonStr(agent_name, w);
     try w.writeAll(",\"agent_session_id\":");
     try jsonrpc.writeJsonStr(session_id, w);
+    try w.writeAll(",\"session_start_source\":");
+    try jsonrpc.writeJsonStr(start.wireName(), w);
     try w.writeAll("}}\n");
 }
 
@@ -303,7 +359,7 @@ test "shouldEnable honors FX_HERDR opt-out" {
 test "report_agent serializes a single newline-delimited json line" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try writeReportAgent(&out.writer, 7, "w1:p1", .working, "editing");
+    try writeReportAgent(&out.writer, 7, "w1:p1", .working, "editing", "");
     try std.testing.expectEqualStrings(
         "{\"id\":\"7\",\"method\":\"pane.report_agent\",\"params\":{\"pane_id\":\"w1:p1\"," ++
             "\"source\":\"custom:fx\",\"agent\":\"fx\",\"state\":\"working\"," ++
@@ -315,7 +371,7 @@ test "report_agent serializes a single newline-delimited json line" {
 test "report_agent omits custom_status when null" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try writeReportAgent(&out.writer, 1, "w1:p1", .idle, null);
+    try writeReportAgent(&out.writer, 1, "w1:p1", .idle, null, "");
     try std.testing.expectEqualStrings(
         "{\"id\":\"1\",\"method\":\"pane.report_agent\",\"params\":{\"pane_id\":\"w1:p1\"," ++
             "\"source\":\"custom:fx\",\"agent\":\"fx\",\"state\":\"idle\"}}\n",
@@ -326,7 +382,7 @@ test "report_agent omits custom_status when null" {
 test "report_agent escapes pane id" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try writeReportAgent(&out.writer, 2, "pane\"x", .blocked, null);
+    try writeReportAgent(&out.writer, 2, "pane\"x", .blocked, null, "");
     try std.testing.expectEqualStrings(
         "{\"id\":\"2\",\"method\":\"pane.report_agent\",\"params\":{\"pane_id\":\"pane\\\"x\"," ++
             "\"source\":\"custom:fx\",\"agent\":\"fx\",\"state\":\"blocked\"}}\n",
@@ -374,15 +430,53 @@ test "clear_agent_authority removes fx from the pane" {
     );
 }
 
-test "report_agent_session serializes session identity" {
+test "report_agent_session serializes session identity and start source" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try writeReportAgentSession(&out.writer, 3, "w1:p1", "session-42");
+    try writeReportAgentSession(&out.writer, 3, "w1:p1", "session-42", .resumed);
     try std.testing.expectEqualStrings(
         "{\"id\":\"3\",\"method\":\"pane.report_agent_session\",\"params\":{\"pane_id\":\"w1:p1\"," ++
-            "\"source\":\"custom:fx\",\"agent\":\"fx\",\"agent_session_id\":\"session-42\"}}\n",
+            "\"source\":\"custom:fx\",\"agent\":\"fx\",\"agent_session_id\":\"session-42\"," ++
+            "\"session_start_source\":\"resume\"}}\n",
         out.written(),
     );
+}
+
+test "report_agent carries the retained session" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeReportAgent(&out.writer, 8, "w1:p1", .idle, null, "session-42");
+    try std.testing.expectEqualStrings(
+        "{\"id\":\"8\",\"method\":\"pane.report_agent\",\"params\":{\"pane_id\":\"w1:p1\"," ++
+            "\"source\":\"custom:fx\",\"agent\":\"fx\",\"state\":\"idle\"," ++
+            "\"agent_session_id\":\"session-42\"}}\n",
+        out.written(),
+    );
+}
+
+test "reportSession retains the latest session for later state reports" {
+    const alloc = std.testing.allocator;
+    var client: Client = .{
+        .enabled = true,
+        .alloc = alloc,
+        // Connecting fails, so each report is dropped after the session is kept.
+        .socket_path = try alloc.dupe(u8, "/nonexistent/fx-herdr-test.sock"),
+        .pane_id = try alloc.dupe(u8, "w1:p1"),
+    };
+    defer client.deinit();
+
+    client.reportSession("session-1", .startup);
+    try std.testing.expectEqualStrings("session-1", client.session_id);
+    client.reportSession("session-2", .new);
+    try std.testing.expectEqualStrings("session-2", client.session_id);
+    client.reportSession("", .new);
+    try std.testing.expectEqualStrings("session-2", client.session_id);
+}
+
+test "reportSession is a no-op outside herdr" {
+    var client: Client = .{};
+    client.reportSession("session-1", .startup);
+    try std.testing.expectEqual(@as(usize, 0), client.session_id.len);
 }
 
 test "clampStatus caps to 32 bytes and normalizes empty" {
